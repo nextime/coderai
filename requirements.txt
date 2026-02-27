@@ -3,20 +3,27 @@ fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 pydantic>=2.5.0
 
-# PyTorch - Uncomment the appropriate version for your system:
-# For NVIDIA (CUDA):
-# torch>=2.0.0
-# torchvision>=0.15.0
-# torchaudio>=2.0.0
+# PyTorch - Uncomment the appropriate version for your system.
+# IMPORTANT: Use quotes around version specifiers to prevent shell interpretation!
+# The >= operator will be interpreted as output redirection without quotes!
+#
+# Option 1: Use exact versions (recommended for requirements.txt)
+# Option 2: Use quotes: pip install "torch>=2.0.0"
 
-# For AMD (ROCm):
-# --index-url https://download.pytorch.org/whl/rocm5.4.2
-# torch>=2.0.0
-# torchvision>=0.15.0
-# torchaudio>=2.0.0
+# For NVIDIA (CUDA):
+# torch==2.0.0
+# torchvision==0.15.0
+# torchaudio==2.0.0
+
+# For AMD (ROCm) - see available versions at https://pytorch.org/get-started/locally/
+# rocm6.0 is recommended for newer AMD GPUs, rocm5.6 for older ones
+# --index-url https://download.pytorch.org/whl/rocm6.0
+# torch==2.0.0
+# torchvision==0.15.0
+# torchaudio==2.0.0
 
 # For CPU only:
-torch>=2.0.0
+torch==2.0.0
 
 # ML dependencies
 transformers>=4.35.0
@@ -37,6 +44,16 @@ procname>=0.3.0
 # flash-attn>=2.5.0
 
 # Installation instructions:
-# 1. For NVIDIA GPUs: pip install torch torchvision torchaudio
-# 2. For AMD GPUs: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm5.4.2
-# 3. For CPU only: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+# IMPORTANT: Always use quotes or exact versions to avoid shell redirection issues!
+#
+# 1. For NVIDIA GPUs (CUDA 12.1):
+#    pip install torch torchvision torchaudio
+#
+# 2. For AMD GPUs (ROCm 6.0 recommended):
+#    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.0
+#
+# 3. For CPU only:
+#    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+#
+# If you see "No such file or directory: '0.0'" errors, you forgot to use quotes!
+# The shell interprets >= as redirection. Fix: pip install "torch>=2.0.0" (with quotes)

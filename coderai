@@ -13,6 +13,7 @@ import re
 import sys
 import time
 import uuid
+import warnings
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Dict, List, Optional, Union
 
@@ -28,6 +29,8 @@ from transformers import (
     TextIteratorStreamer,
     StoppingCriteria,
     StoppingCriteriaList,
+    LogitsProcessor,
+    LogitsProcessorList,
 )
 from threading import Thread
 
@@ -43,6 +46,24 @@ def check_flash_attn_availability() -> bool:
         return True
     except ImportError:
         return False
+
+
+# =============================================================================
+# Logits Processor for Numerical Stability
+# =============================================================================
+
+class InvalidLogitsProcessor(LogitsProcessor):
+    """Replace NaN and Inf values in logits with finite values."""
+    
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        """Replace invalid values in logits."""
+        # Replace NaN with very negative number (near -inf but finite)
+        scores = torch.where(torch.isnan(scores), torch.tensor(-1e9, dtype=scores.dtype, device=scores.device), scores)
+        # Replace Inf with large finite number
+        scores = torch.where(torch.isinf(scores), torch.tensor(1e9, dtype=scores.dtype, device=scores.device), scores)
+        # Replace -Inf with very negative finite number
+        scores = torch.where(scores < -1e9, torch.tensor(-1e9, dtype=scores.dtype, device=scores.device), scores)
+        return scores
 
 
 # =============================================================================
@@ -611,6 +632,22 @@ class ModelManager:
         formatted.append("Assistant:")
         return "\n\n".join(formatted)
     
+    def _validate_generation_params(self, temperature: float, top_p: float) -> tuple:
+        """Validate and clamp generation parameters for numerical stability."""
+        # Clamp temperature to avoid numerical issues
+        # Temperature must be > 0 for sampling, but very small values can cause issues
+        if temperature <= 0:
+            temperature = 1.0
+            do_sample = False
+        else:
+            temperature = max(0.01, min(temperature, 2.0))
+            do_sample = True
+        
+        # Clamp top_p
+        top_p = max(0.0, min(top_p, 1.0))
+        
+        return temperature, top_p, do_sample
+    
     def generate_stream(
         self,
         prompt: str,
@@ -628,6 +665,9 @@ class ModelManager:
         if max_tokens is None:
             max_tokens = 512
         
+        # Validate parameters
+        temperature, top_p, do_sample = self._validate_generation_params(temperature, top_p)
+        
         streamer = TextIteratorStreamer(
             self.tokenizer,
             skip_prompt=True,
@@ -638,13 +678,18 @@ class ModelManager:
             "input_ids": inputs["input_ids"],
             "attention_mask": inputs["attention_mask"],
             "max_new_tokens": max_tokens,
-            "temperature": temperature if temperature > 0 else 1.0,
+            "temperature": temperature,
             "top_p": top_p,
-            "do_sample": temperature > 0,
+            "do_sample": do_sample,
             "streamer": streamer,
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
         }
+        
+        # Add logits processor to handle NaN/Inf values
+        generation_kwargs["logits_processor"] = LogitsProcessorList([
+            InvalidLogitsProcessor()
+        ])
         
         # Handle stop sequences
         if stop:
@@ -661,16 +706,34 @@ class ModelManager:
                 StopOnSequence(stop, self.tokenizer)
             ])
         
-        # Run generation in a separate thread
-        thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
-        thread.start()
-        
+        # Run generation in a separate thread with error handling
         generated_text = ""
-        for text in streamer:
-            generated_text += text
-            yield text
-        
-        thread.join()
+        try:
+            thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
+            thread.start()
+            
+            for text in streamer:
+                generated_text += text
+                yield text
+            
+            thread.join()
+        except RuntimeError as e:
+            if "probability tensor contains" in str(e):
+                print(f"Warning: Numerical error during generation: {e}")
+                print("This may be due to temperature=0 or numerical instability.")
+                print("Trying again with greedy decoding...")
+                # Fallback to greedy decoding
+                generation_kwargs["do_sample"] = False
+                generation_kwargs["temperature"] = None
+                generation_kwargs["top_p"] = None
+                thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
+                thread.start()
+                for text in streamer:
+                    generated_text += text
+                    yield text
+                thread.join()
+            else:
+                raise
     
     def generate(
         self,
@@ -687,21 +750,46 @@ class ModelManager:
         if max_tokens is None:
             max_tokens = 512
         
-        with torch.no_grad():
-            outputs = self.model.generate(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                max_new_tokens=max_tokens,
-                temperature=temperature if temperature > 0 else 1.0,
-                top_p=top_p,
-                do_sample=temperature > 0,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                stopping_criteria=self._create_stopping_criteria(stop) if stop else None,
-            )
+        # Validate parameters
+        temperature, top_p, do_sample = self._validate_generation_params(temperature, top_p)
         
-        generated_tokens = outputs[0][inputs["input_ids"].shape[1]:]
-        return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        try:
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    max_new_tokens=max_tokens,
+                    temperature=temperature if do_sample else None,
+                    top_p=top_p if do_sample else None,
+                    do_sample=do_sample,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    stopping_criteria=self._create_stopping_criteria(stop) if stop else None,
+                    logits_processor=LogitsProcessorList([InvalidLogitsProcessor()]),
+                )
+            
+            generated_tokens = outputs[0][inputs["input_ids"].shape[1]:]
+            return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        except RuntimeError as e:
+            if "probability tensor contains" in str(e):
+                print(f"Warning: Numerical error during generation: {e}")
+                print("Retrying with greedy decoding...")
+                # Fallback to greedy decoding
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                        max_new_tokens=max_tokens,
+                        do_sample=False,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                        stopping_criteria=self._create_stopping_criteria(stop) if stop else None,
+                        logits_processor=LogitsProcessorList([InvalidLogitsProcessor()]),
+                    )
+                generated_tokens = outputs[0][inputs["input_ids"].shape[1]:]
+                return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            else:
+                raise
     
     def _create_stopping_criteria(self, stop_sequences):
         """Create stopping criteria for stop sequences."""
@@ -821,33 +909,16 @@ async def stream_chat_response(
     
     generated_text = ""
     
-    for chunk in model_manager.generate_stream(
-        prompt=prompt,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        stop=stop,
-    ):
-        generated_text += chunk
-        
-        data = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model_name,
-            "choices": [{
-                "index": 0,
-                "delta": {"content": chunk},
-                "finish_reason": None,
-            }],
-        }
-        yield f"data: {json.dumps(data)}\n\n"
-    
-    # Check for tool calls in complete output
-    if tools:
-        tool_calls = model_manager.tool_parser.extract_tool_calls(generated_text, tools)
-        if tool_calls:
-            # Send tool calls as final delta
+    try:
+        for chunk in model_manager.generate_stream(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+        ):
+            generated_text += chunk
+            
             data = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
@@ -855,17 +926,51 @@ async def stream_chat_response(
                 "model": model_name,
                 "choices": [{
                     "index": 0,
-                    "delta": {"tool_calls": tool_calls},
-                    "finish_reason": "tool_calls",
+                    "delta": {"content": chunk},
+                    "finish_reason": None,
                 }],
             }
             yield f"data: {json.dumps(data)}\n\n"
+        
+        # Check for tool calls in complete output
+        if tools:
+            tool_calls = model_manager.tool_parser.extract_tool_calls(generated_text, tools)
+            if tool_calls:
+                # Send tool calls as final delta
+                data = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"tool_calls": tool_calls},
+                        "finish_reason": "tool_calls",
+                    }],
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+            else:
+                yield f"data: {json.dumps({'choices': [{'finish_reason': 'stop'}]})}\n\n"
         else:
             yield f"data: {json.dumps({'choices': [{'finish_reason': 'stop'}]})}\n\n"
-    else:
-        yield f"data: {json.dumps({'choices': [{'finish_reason': 'stop'}]})}\n\n"
-    
-    yield "data: [DONE]\n\n"
+        
+        yield "data: [DONE]\n\n"
+    except Exception as e:
+        print(f"Error during streaming generation: {e}")
+        # Send error event
+        data = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_name,
+            "choices": [{
+                "index": 0,
+                "delta": {"content": f"\n[Generation error: {str(e)}]"},
+                "finish_reason": "stop",
+            }],
+        }
+        yield f"data: {json.dumps(data)}\n\n"
+        yield "data: [DONE]\n\n"
 
 
 async def generate_chat_response(
@@ -881,45 +986,49 @@ async def generate_chat_response(
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     
-    generated_text = model_manager.generate(
-        prompt=prompt,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        stop=stop,
-    )
-    
-    response_message = {
-        "role": "assistant",
-        "content": generated_text,
-    }
-    
-    finish_reason = "stop"
-    
-    # Check for tool calls
-    if tools:
-        tool_calls = model_manager.tool_parser.extract_tool_calls(generated_text, tools)
-        if tool_calls:
-            response_message["tool_calls"] = tool_calls
-            response_message["content"] = None
-            finish_reason = "tool_calls"
-    
-    return {
-        "id": completion_id,
-        "object": "chat.completion",
-        "created": created,
-        "model": model_name,
-        "choices": [{
-            "index": 0,
-            "message": response_message,
-            "finish_reason": finish_reason,
-        }],
-        "usage": {
-            "prompt_tokens": len(model_manager.tokenizer.encode(prompt)),
-            "completion_tokens": len(model_manager.tokenizer.encode(generated_text)),
-            "total_tokens": len(model_manager.tokenizer.encode(prompt)) + len(model_manager.tokenizer.encode(generated_text)),
-        },
-    }
+    try:
+        generated_text = model_manager.generate(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+        )
+        
+        response_message = {
+            "role": "assistant",
+            "content": generated_text,
+        }
+        
+        finish_reason = "stop"
+        
+        # Check for tool calls
+        if tools:
+            tool_calls = model_manager.tool_parser.extract_tool_calls(generated_text, tools)
+            if tool_calls:
+                response_message["tool_calls"] = tool_calls
+                response_message["content"] = None
+                finish_reason = "tool_calls"
+        
+        return {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model_name,
+            "choices": [{
+                "index": 0,
+                "message": response_message,
+                "finish_reason": finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": len(model_manager.tokenizer.encode(prompt)),
+                "completion_tokens": len(model_manager.tokenizer.encode(generated_text)),
+                "total_tokens": len(model_manager.tokenizer.encode(prompt)) + len(model_manager.tokenizer.encode(generated_text)),
+            },
+        }
+    except Exception as e:
+        print(f"Error during generation: {e}")
+        raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
 
 
 @app.post("/v1/completions")
@@ -968,29 +1077,34 @@ async def stream_completion_response(
     completion_id = f"cmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     
-    for chunk in model_manager.generate_stream(
-        prompt=prompt,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        stop=stop,
-    ):
-        data = {
-            "id": completion_id,
-            "object": "text_completion",
-            "created": created,
-            "model": model_name,
-            "choices": [{
-                "text": chunk,
-                "index": 0,
-                "logprobs": None,
-                "finish_reason": None,
-            }],
-        }
-        yield f"data: {json.dumps(data)}\n\n"
-    
-    yield f"data: {json.dumps({'choices': [{'finish_reason': 'stop'}]})}\n\n"
-    yield "data: [DONE]\n\n"
+    try:
+        for chunk in model_manager.generate_stream(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+        ):
+            data = {
+                "id": completion_id,
+                "object": "text_completion",
+                "created": created,
+                "model": model_name,
+                "choices": [{
+                    "text": chunk,
+                    "index": 0,
+                    "logprobs": None,
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(data)}\n\n"
+        
+        yield f"data: {json.dumps({'choices': [{'finish_reason': 'stop'}]})}\n\n"
+        yield "data: [DONE]\n\n"
+    except Exception as e:
+        print(f"Error during streaming completion: {e}")
+        yield f"data: {json.dumps({'choices': [{'finish_reason': 'stop'}]})}\n\n"
+        yield "data: [DONE]\n\n"
 
 
 async def generate_completion_response(
@@ -1005,31 +1119,35 @@ async def generate_completion_response(
     completion_id = f"cmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     
-    generated_text = model_manager.generate(
-        prompt=prompt,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        stop=stop,
-    )
-    
-    return {
-        "id": completion_id,
-        "object": "text_completion",
-        "created": created,
-        "model": model_name,
-        "choices": [{
-            "text": generated_text,
-            "index": 0,
-            "logprobs": None,
-            "finish_reason": "stop",
-        }],
-        "usage": {
-            "prompt_tokens": len(model_manager.tokenizer.encode(prompt)),
-            "completion_tokens": len(model_manager.tokenizer.encode(generated_text)),
-            "total_tokens": len(model_manager.tokenizer.encode(prompt)) + len(model_manager.tokenizer.encode(generated_text)),
-        },
-    }
+    try:
+        generated_text = model_manager.generate(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+        )
+        
+        return {
+            "id": completion_id,
+            "object": "text_completion",
+            "created": created,
+            "model": model_name,
+            "choices": [{
+                "text": generated_text,
+                "index": 0,
+                "logprobs": None,
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": len(model_manager.tokenizer.encode(prompt)),
+                "completion_tokens": len(model_manager.tokenizer.encode(generated_text)),
+                "total_tokens": len(model_manager.tokenizer.encode(prompt)) + len(model_manager.tokenizer.encode(generated_text)),
+            },
+        }
+    except Exception as e:
+        print(f"Error during completion: {e}")
+        raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
 
 
 # =============================================================================

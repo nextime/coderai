@@ -21,7 +21,7 @@ An OpenAI-compatible API server for HuggingFace models with intelligent memory m
 
 - Python 3.8+
 - For NVIDIA GPUs: CUDA toolkit (11.8+ recommended)
-- For AMD GPUs: ROCm (5.4+ recommended)
+- For AMD GPUs: ROCm (5.6+ recommended, 6.0+ preferred)
 - For CPU-only: No additional requirements
 
 ### Basic Installation
@@ -43,36 +43,44 @@ pip install -r requirements.txt
 
 PyTorch installation varies by platform. Uncomment the appropriate section in [`requirements.txt`](requirements.txt) or install manually:
 
+> **⚠️ WARNING: Shell Redirection Issue**
+> When using `>=` in pip commands, always use **quotes** around the package specifier!
+> Without quotes, the shell interprets `>` as output redirection.
+>
+> ❌ Wrong: `pip install torch>=2.0.0`  (creates file named "=2.0.0")
+> ✅ Correct: `pip install "torch>=2.0.0"` (with quotes)
+> ✅ Also correct: `pip install torch==2.0.0` (exact version, no >=)
+
 #### NVIDIA (CUDA)
 
 ```bash
 # For CUDA 11.8
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0" --index-url https://download.pytorch.org/whl/cu118
 
 # For CUDA 12.1
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0" --index-url https://download.pytorch.org/whl/cu121
 
 # For CUDA 12.4 (latest)
-pip install torch torchvision torchaudio
+pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0"
 ```
 
 #### AMD (ROCm)
 
 ```bash
-# For ROCm 5.4.2
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm5.4.2
+# For ROCm 6.0 (recommended for newer AMD GPUs)
+pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0" --index-url https://download.pytorch.org/whl/rocm6.0
 
-# For ROCm 5.6
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm5.6
-
-# For ROCm 6.0
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.0
+# For ROCm 5.6 (for older AMD GPUs)
+pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0" --index-url https://download.pytorch.org/whl/rocm5.6
 ```
+
+> **Note**: ROCm 5.4.2 is deprecated. Use ROCm 5.6 or 6.0 for better compatibility.
+> Check available versions at: https://pytorch.org/get-started/locally/
 
 #### CPU Only
 
 ```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0" --index-url https://download.pytorch.org/whl/cpu
 ```
 
 ### Optional Dependencies
@@ -83,7 +91,7 @@ For 4-bit and 8-bit quantization support (reduces VRAM requirements):
 
 ```bash
 # CUDA
-pip install bitsandbytes>=0.41.0
+pip install "bitsandbytes>=0.41.0"
 
 # ROCm support may require building from source
 # See: https://github.com/TimDettmers/bitsandbytes
@@ -272,7 +280,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 ```bash
 # Install CUDA-enabled PyTorch
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0" --index-url https://download.pytorch.org/whl/cu121
 
 # Run with GPU acceleration (automatic)
 python coderai --model meta-llama/Llama-2-7b-chat-hf
@@ -284,8 +292,8 @@ python coderai --model meta-llama/Llama-2-7b-chat-hf --flash-attn
 ### ROCm (AMD GPU)
 
 ```bash
-# Install ROCm-enabled PyTorch
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm5.4.2
+# Install ROCm-enabled PyTorch (use 6.0 for newer GPUs, 5.6 for older)
+pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0" --index-url https://download.pytorch.org/whl/rocm6.0
 
 # Run with GPU acceleration (automatic)
 python coderai --model meta-llama/Llama-2-7b-chat-hf
@@ -297,7 +305,7 @@ python coderai --model meta-llama/Llama-2-7b-chat-hf
 
 ```bash
 # Install CPU-only PyTorch
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0" --index-url https://download.pytorch.org/whl/cpu
 
 # Run on CPU (automatic fallback)
 python coderai --model microsoft/DialoGPT-medium
@@ -352,6 +360,17 @@ python coderai --model meta-llama/Llama-2-70b-chat-hf --load-in-8bit
 
 ## Troubleshooting
 
+### Shell Redirection Error: "No such file or directory: '0.0'"
+
+**Problem**: Running `pip install torch>=2.0.0` fails with an error about file "0.0" or "=2.0.0" not found.
+
+**Cause**: The shell interprets `>` as output redirection. The command creates a file named "=2.0.0" and installs an unversioned torch package.
+
+**Solutions**:
+1. **Use quotes** (recommended): `pip install "torch>=2.0.0"`
+2. **Use exact versions**: `pip install torch==2.0.0`
+3. **Use requirements.txt**: Add exact versions to requirements.txt and run `pip install -r requirements.txt`
+
 ### Out of Memory Errors
 
 **Problem**: `CUDA out of memory` or system RAM exhausted
@@ -372,6 +391,33 @@ python coderai --model meta-llama/Llama-2-70b-chat-hf --load-in-8bit
 3. Try without build isolation: `pip install flash-attn --no-build-isolation`
 4. Check GPU compatibility (Ampere, Ada Lovelace, Hopper for NVIDIA)
 5. Skip Flash Attention - the server works without it
+
+### Flash Attention: No module named 'torch' during build
+
+**Problem**: Flash Attention build fails with `ModuleNotFoundError: No module named 'torch'` even though PyTorch is installed (e.g., PyTorch 2.9.1+rocm6.4).
+
+**Cause**: pip uses isolated build environments by default, which prevents flash-attention from seeing the installed torch package during compilation.
+
+**Solutions**:
+1. **Use --no-build-isolation flag** (recommended):
+   ```bash
+   pip install flash-attn --no-build-isolation
+   ```
+
+2. **For ROCm systems**, you may also need to limit parallel jobs to avoid resource exhaustion:
+   ```bash
+   MAX_JOBS=4 pip install flash-attn --no-build-isolation
+   ```
+
+3. **Use pre-built wheels** if available for your platform (check https://github.com/Dao-AILab/flash-attention/releases)
+
+4. **ROCm 6.4 compatibility note**: Flash Attention may not officially support ROCm 6.4 yet (it was primarily built for ROCm 6.0). If build fails on ROCm 6.4, you can run without Flash Attention:
+   ```bash
+   python coderai --model meta-llama/Llama-2-7b-chat-hf
+   # (omit the --flash-attn flag)
+   ```
+
+5. **Fallback**: The server works perfectly without Flash Attention - simply omit the `--flash-attn` flag when starting the server.
 
 ### bitsandbytes Not Working on ROCm
 
