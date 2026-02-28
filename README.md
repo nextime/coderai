@@ -1,16 +1,17 @@
 # CoderAI
 
-An OpenAI-compatible API server for HuggingFace models with intelligent memory management, GPU auto-detection, and advanced features like tool calling and streaming.
+An OpenAI-compatible API server supporting both NVIDIA (CUDA) and AMD (Vulkan) GPUs. Uses HuggingFace Transformers for NVIDIA GPUs and llama-cpp-python with Vulkan for AMD GPUs.
 
 ## Features
 
+- **Dual Backend Support**: NVIDIA (CUDA) via PyTorch + Transformers, AMD (Vulkan) via llama-cpp-python
 - **OpenAI-Compatible API**: Drop-in replacement for OpenAI's API endpoints
-- **Memory-Aware Model Loading**: Automatically determines optimal loading strategy based on available VRAM and RAM
-- **Sequential Offloading**: Smart offload from VRAM → RAM → Disk when needed
-- **Multi-GPU Support**: Automatic distribution across multiple CUDA/ROCm devices
-- **GPU Auto-Detection**: Automatically detects CUDA (NVIDIA) or ROCm (AMD) GPUs
-- **Quantization Support**: 4-bit and 8-bit quantization via bitsandbytes for reduced memory usage
-- **Flash Attention 2**: Optional faster attention implementation for supported GPUs
+- **Memory-Aware Model Loading**: Automatically determines optimal loading strategy based on available VRAM and RAM (NVIDIA)
+- **Sequential Offloading**: Smart offload from VRAM → RAM → Disk when needed (NVIDIA)
+- **Multi-GPU Support**: Automatic distribution across multiple CUDA devices (NVIDIA)
+- **GPU Auto-Detection**: Automatically detects available backends
+- **Quantization Support**: 4-bit and 8-bit quantization via bitsandbytes (NVIDIA) or built-in GGUF quantization (Vulkan)
+- **Flash Attention 2**: Optional faster attention implementation for supported NVIDIA GPUs
 - **Streaming Responses**: Server-sent events for real-time token generation
 - **Tool Calling**: Support for function calling and tool use
 - **Multiple Endpoints**: `/v1/chat/completions`, `/v1/completions`, and `/v1/models`
@@ -21,67 +22,80 @@ An OpenAI-compatible API server for HuggingFace models with intelligent memory m
 
 - Python 3.8+
 - For NVIDIA GPUs: CUDA toolkit (11.8+ recommended)
-- For AMD GPUs: ROCm (5.6+ recommended, 6.0+ preferred)
+- For AMD GPUs (Vulkan): Vulkan drivers and SDK
 - For CPU-only: No additional requirements
 
-### Basic Installation
+### Quick Install with Build Script
+
+The easiest way to install is using the provided build script:
 
 ```bash
 # Clone the repository
 git clone git@git.nexlab.net:nexlab/coderai.git
 cd coderai
 
-# Create virtual environment (recommended)
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# For NVIDIA GPUs (default)
+./build.sh nvidia
 
-# Install base requirements
-pip install -r requirements.txt
+# For AMD GPUs with Vulkan support
+./build.sh vulkan
 ```
 
-### Platform-Specific PyTorch Installation
+The build script will:
+- Create a virtual environment
+- Install the appropriate dependencies for your GPU
+- Set up the correct backend
 
-PyTorch installation varies by platform. Uncomment the appropriate section in [`requirements.txt`](requirements.txt) or install manually:
+### Manual Installation
 
-> **⚠️ WARNING: Shell Redirection Issue**
-> When using `>=` in pip commands, always use **quotes** around the package specifier!
-> Without quotes, the shell interprets `>` as output redirection.
->
-> ❌ Wrong: `pip install torch>=2.0.0`  (creates file named "=2.0.0")
-> ✅ Correct: `pip install "torch>=2.0.0"` (with quotes)
-> ✅ Also correct: `pip install torch==2.0.0` (exact version, no >=)
+If you prefer manual installation:
+
+```bash
+# Create virtual environment
+python -m venv venv
+source venv/bin/activate
+
+# For NVIDIA GPUs
+pip install torch torchvision torchaudio
+pip install -r requirements-nvidia.txt
+
+# For AMD GPUs with Vulkan
+CMAKE_ARGS="-DGGML_VULKAN=ON" pip install llama-cpp-python --no-cache-dir
+pip install -r requirements-vulkan.txt
+```
+
+### Platform-Specific Requirements
 
 #### NVIDIA (CUDA)
 
+Requires:
+- NVIDIA GPU with CUDA support
+- CUDA toolkit (11.8+ or 12.1+)
+- PyTorch with CUDA
+
+Models: HuggingFace format (safetensors/pytorch)
+
+#### AMD (Vulkan)
+
+Requires:
+- AMD GPU with Vulkan support (RX 400 series and newer)
+- Vulkan drivers and SDK
+
+**Install Vulkan drivers:**
 ```bash
-# For CUDA 11.8
-pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0" --index-url https://download.pytorch.org/whl/cu118
+# Debian/Ubuntu
+sudo apt install libvulkan-dev vulkan-tools mesa-vulkan-drivers
 
-# For CUDA 12.1
-pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0" --index-url https://download.pytorch.org/whl/cu121
+# Fedora
+sudo dnf install vulkan-loader-devel vulkan-tools mesa-vulkan-drivers
 
-# For CUDA 12.4 (latest)
-pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0"
+# Arch Linux
+sudo pacman -S vulkan-headers vulkan-icd-loader vulkan-radeon
 ```
 
-#### AMD (ROCm)
+Models: GGUF format (from HuggingFace or local files)
 
-```bash
-# For ROCm 6.0 (recommended for newer AMD GPUs)
-pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0" --index-url https://download.pytorch.org/whl/rocm6.0
-
-# For ROCm 5.6 (for older AMD GPUs)
-pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0" --index-url https://download.pytorch.org/whl/rocm5.6
-```
-
-> **Note**: ROCm 5.4.2 is deprecated. Use ROCm 5.6 or 6.0 for better compatibility.
-> Check available versions at: https://pytorch.org/get-started/locally/
-
-#### CPU Only
-
-```bash
-pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0" --index-url https://download.pytorch.org/whl/cpu
-```
+**Note**: The Vulkan backend uses llama-cpp-python with GGUF models, which provides excellent performance on AMD GPUs without requiring ROCm.
 
 ### Optional Dependencies
 
@@ -116,8 +130,14 @@ pip install flash-attn --no-build-isolation
 ### Basic Usage
 
 ```bash
-# Run with a specific model
-python coderai --model microsoft/DialoGPT-medium
+# Activate the virtual environment created by build.sh
+source venv/bin/activate
+
+# Run with NVIDIA backend (HuggingFace models)
+python coderai --model microsoft/DialoGPT-medium --backend nvidia
+
+# Run with Vulkan backend (GGUF models)
+python coderai --model ./phi-3-mini-4k-instruct-q4_k_m.gguf --backend vulkan
 
 # The server will start on http://0.0.0.0:8000 by default
 ```
@@ -125,27 +145,67 @@ python coderai --model microsoft/DialoGPT-medium
 ### Command-Line Options
 
 ```
-usage: coderai [-h] [--model MODEL] [--host HOST] [--port PORT]
-               [--offload-dir OFFLOAD_DIR] [--load-in-4bit] [--load-in-8bit]
-               [--ram RAM] [--flash-attn]
+usage: coderai [-h] [--model MODEL] [--backend {auto,nvidia,vulkan}] [--host HOST]
+               [--port PORT] [--offload-dir OFFLOAD_DIR] [--load-in-4bit]
+               [--load-in-8bit] [--ram RAM] [--flash-attn] [--n-gpu-layers N]
+               [--n-ctx N]
 
-OpenAI-compatible API server with memory-aware model loading
+OpenAI-compatible API server supporting NVIDIA (CUDA) and Vulkan backends
 
 options:
   -h, --help            show this help message and exit
-  --model MODEL         HuggingFace model name or path
+  --model MODEL         Model name or path. For NVIDIA: HuggingFace model.
+                        For Vulkan: GGUF file path or HF repo
+  --backend {auto,nvidia,vulkan}
+                        Backend to use: auto (detect), nvidia (CUDA), or
+                        vulkan (AMD GPUs)
   --host HOST           Host to bind to (default: 0.0.0.0)
   --port PORT           Port to bind to (default: 8000)
   --offload-dir OFFLOAD_DIR
-                        Directory for disk offload when model doesn't fit in
-                        VRAM+RAM (default: ./offload)
-  --load-in-4bit        Load model in 4-bit precision (requires bitsandbytes)
-  --load-in-8bit        Load model in 8-bit precision (requires bitsandbytes)
-  --ram RAM             Manually specify available RAM in GB (bypasses auto-
-                        detection)
-  --flash-attn          Use Flash Attention 2 for faster inference (requires
-                        flash-attn package and compatible GPU)
+                        Directory for disk offload (NVIDIA only, default: ./offload)
+  --load-in-4bit        Load model in 4-bit precision (NVIDIA only, requires bitsandbytes)
+  --load-in-8bit        Load model in 8-bit precision (NVIDIA only, requires bitsandbytes)
+  --ram RAM             Manually specify available RAM in GB (NVIDIA only)
+  --flash-attn          Use Flash Attention 2 (NVIDIA only, requires flash-attn)
+  --n-gpu-layers N      Number of layers to offload to GPU (Vulkan only,
+                        default: -1 = all layers)
+  --n-ctx N             Context window size (Vulkan only, default: 2048)
 ```
+
+### Backend Selection
+
+The `--backend` option controls which backend to use:
+
+- **`auto`** (default): Automatically detects available backends, preferring NVIDIA if available
+- **`nvidia`**: Use PyTorch + Transformers with CUDA (for NVIDIA GPUs)
+- **`vulkan`**: Use llama-cpp-python with Vulkan (for AMD GPUs)
+
+### Model Formats by Backend
+
+#### NVIDIA Backend
+Uses HuggingFace Transformers format:
+```bash
+python coderai --model microsoft/DialoGPT-medium --backend nvidia
+python coderai --model meta-llama/Llama-2-7b-chat-hf --backend nvidia
+```
+
+#### Vulkan Backend
+Uses GGUF format (can be local files or downloaded from HuggingFace):
+```bash
+# Local GGUF file
+python coderai --model ./phi-3-mini-4k-instruct-q4_k_m.gguf --backend vulkan
+
+# Download from HuggingFace (auto-selects GGUF file)
+python coderai --model microsoft/Phi-3-mini-4k-instruct-gguf --backend vulkan
+
+# Specific GGUF file from repo
+python coderai --model TheBloke/Llama-2-7B-GGUF/llama-2-7b.Q4_K_M.gguf --backend vulkan
+```
+
+**Finding GGUF models:**
+- Search on HuggingFace: https://huggingface.co/models?search=gguf
+- Popular collections: TheBloke, unsloth, bartowski
+- Recommended quantization: Q4_K_M for best speed/quality balance
 
 ### Examples
 
@@ -276,40 +336,71 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 ## Configuration for Different Setups
 
-### CUDA (NVIDIA GPU)
+### NVIDIA (CUDA)
 
 ```bash
-# Install CUDA-enabled PyTorch
-pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0" --index-url https://download.pytorch.org/whl/cu121
+# Using build script
+./build.sh nvidia
 
-# Run with GPU acceleration (automatic)
-python coderai --model meta-llama/Llama-2-7b-chat-hf
+# Or manually install CUDA-enabled PyTorch
+pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0"
+pip install -r requirements-nvidia.txt
+
+# Run with GPU acceleration
+python coderai --model meta-llama/Llama-2-7b-chat-hf --backend nvidia
 
 # Optional: Enable Flash Attention 2 for faster inference
-python coderai --model meta-llama/Llama-2-7b-chat-hf --flash-attn
+python coderai --model meta-llama/Llama-2-7b-chat-hf --backend nvidia --flash-attn
 ```
 
-### ROCm (AMD GPU)
+### AMD (Vulkan)
 
 ```bash
-# Install ROCm-enabled PyTorch (use 6.0 for newer GPUs, 5.6 for older)
-pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0" --index-url https://download.pytorch.org/whl/rocm6.0
+# Install Vulkan drivers first
+# Debian/Ubuntu:
+sudo apt install libvulkan-dev vulkan-tools mesa-vulkan-drivers
 
-# Run with GPU acceleration (automatic)
-python coderai --model meta-llama/Llama-2-7b-chat-hf
+# Using build script
+./build.sh vulkan
 
-# Check ROCm detection in output
+# Run with GGUF model
+python coderai --model ./phi-3-mini-4k-instruct-q4_k_m.gguf --backend vulkan
+
+# Or download automatically from HuggingFace
+python coderai --model TheBloke/Llama-2-7B-GGUF --backend vulkan
+
+# Control GPU layer offloading (default: -1 = all layers)
+python coderai --model model.gguf --backend vulkan --n-gpu-layers 35
+
+# Adjust context window (default: 2048)
+python coderai --model model.gguf --backend vulkan --n-ctx 4096
 ```
+
+**Vulkan Backend Notes:**
+- Uses GGUF format models (much smaller than full HuggingFace models)
+- Q4_K_M quantization recommended for 4GB+ VRAM GPUs
+- Q5_K_M or Q6_K for higher quality
+- Works on AMD RX 400 series and newer
+- Also works on NVIDIA GPUs but CUDA backend is preferred for NVIDIA
 
 ### CPU-Only
 
-```bash
-# Install CPU-only PyTorch
-pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0" --index-url https://download.pytorch.org/whl/cpu
+While not recommended for performance, you can run on CPU:
 
-# Run on CPU (automatic fallback)
-python coderai --model microsoft/DialoGPT-medium
+```bash
+# NVIDIA backend on CPU
+pip install "torch>=2.0.0" --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements-nvidia.txt
+python coderai --model microsoft/DialoGPT-medium --backend nvidia
+
+# Or Vulkan backend on CPU (llama-cpp supports CPU fallback)
+CMAKE_ARGS="-DGGML_VULKAN=OFF" pip install llama-cpp-python
+python coderai --model model.gguf --backend vulkan
 ```
+
+### ROCm Alternative (deprecated)
+
+While the Vulkan backend is now recommended for AMD GPUs, ROCm support is still available through the NVIDIA backend if you have ROCm-enabled PyTorch installed.
 
 ### Low VRAM Configuration
 
@@ -340,23 +431,58 @@ python coderai --model meta-llama/Llama-2-70b-chat-hf --load-in-8bit
 
 ## Model Recommendations
 
-### Small Models (For Testing)
+### NVIDIA Backend (HuggingFace Models)
+
+#### Small Models (For Testing)
 
 - `microsoft/DialoGPT-medium` (~345M parameters)
 - `TinyLlama/TinyLlama-1.1B-Chat-v1.0` (~1.1B parameters)
 - `facebook/blenderbot-400M-distill` (~400M parameters)
 
-### Medium Models (4-8GB VRAM with 4-bit)
+#### Medium Models (4-8GB VRAM with 4-bit)
 
 - `meta-llama/Llama-2-7b-chat-hf` (~7B parameters)
 - `mistralai/Mistral-7B-Instruct-v0.2` (~7B parameters)
 - `HuggingFaceH4/zephyr-7b-beta` (~7B parameters)
 
-### Large Models (Multiple GPUs or High VRAM)
+#### Large Models (Multiple GPUs or High VRAM)
 
 - `meta-llama/Llama-2-13b-chat-hf` (~13B parameters)
 - `meta-llama/Llama-2-70b-chat-hf` (~70B parameters) - requires multiple GPUs or disk offload
 - `bigscience/bloom-7b1` (~7B parameters)
+
+### Vulkan Backend (GGUF Models)
+
+#### Small Models (2-4GB VRAM)
+
+- `TheBloke/phi-2-GGUF` - phi-2.Q4_K_M.gguf (~1.6B parameters, ~1GB file)
+- `TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF` - tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+
+#### Medium Models (4-8GB VRAM)
+
+- `TheBloke/Llama-2-7B-GGUF` - llama-2-7b.Q4_K_M.gguf (~4GB file)
+- `TheBloke/Mistral-7B-Instruct-v0.2-GGUF` - mistral-7b-instruct-v0.2.Q4_K_M.gguf
+- `microsoft/Phi-3-mini-4k-instruct-gguf` - Phi-3-mini-4k-instruct-q4.gguf
+
+#### Large Models (8GB+ VRAM)
+
+- `TheBloke/Llama-2-13B-GGUF` - llama-2-13b.Q4_K_M.gguf (~7.5GB file)
+- `TheBloke/deepseek-coder-6.7B-base-GGUF` - deepseek-coder-6.7b-base.Q4_K_M.gguf
+
+**GGUF Quantization Guide:**
+- `Q4_K_M` - Best balance of speed/quality (recommended)
+- `Q5_K_M` - Higher quality, slightly slower
+- `Q6_K` - Near-unquantized quality
+- `Q8_0` - Maximum quality, largest size
+
+**Download Example:**
+```bash
+# Using huggingface-cli
+huggingface-cli download TheBloke/Llama-2-7B-GGUF llama-2-7b.Q4_K_M.gguf --local-dir ./models
+
+# Or let coderai download automatically
+python coderai --model TheBloke/Llama-2-7B-GGUF --backend vulkan
+```
 
 ## Troubleshooting
 
@@ -473,6 +599,94 @@ python coderai --model meta-llama/Llama-2-70b-chat-hf --load-in-8bit
 2. Check Python version: `python --version` (should be 3.8+)
 3. Verify virtual environment is activated
 
+### Vulkan-Specific Issues
+
+**Problem**: "Vulkan backend not available" or llama-cpp fails to load
+
+**Solutions**:
+1. **Verify Vulkan drivers are installed:**
+   ```bash
+   # Check Vulkan installation
+   vulkaninfo | grep "deviceName"
+   
+   # Or install if missing
+   # Debian/Ubuntu:
+   sudo apt install libvulkan-dev vulkan-tools mesa-vulkan-drivers
+   
+   # Fedora:
+   sudo dnf install vulkan-loader-devel vulkan-tools mesa-vulkan-drivers
+   ```
+
+2. **Reinstall llama-cpp-python with Vulkan:**
+   ```bash
+   pip uninstall llama-cpp-python -y
+   CMAKE_ARGS="-DGGML_VULKAN=ON" pip install llama-cpp-python --no-cache-dir
+   ```
+
+3. **Check GPU compatibility:**
+   - AMD RX 400 series and newer
+   - NVIDIA GTX 900 series and newer (but CUDA backend preferred for NVIDIA)
+   - Intel Arc GPUs (experimental)
+
+**Problem**: GGUF model fails to load or produces garbled output
+
+**Solutions**:
+1. **Verify model format**: Must be GGUF format, not regular HuggingFace format
+   ```bash
+   # Check file extension
+   ls -la model.gguf  # Should end in .gguf
+   ```
+
+2. **Try different quantization**: Some GGUF files may be incompatible
+   - Q4_K_M is most compatible (recommended)
+   - Q5_K_M or Q6_K for higher quality
+   - Avoid IQ quants if having issues
+
+3. **Check model architecture**: Some very new models may need updated llama-cpp
+   ```bash
+   pip install --upgrade llama-cpp-python
+   ```
+
+**Problem**: Vulkan backend runs on CPU instead of GPU
+
+**Solutions**:
+1. **Check layer offloading**: Verify layers are being offloaded
+   ```bash
+   # Check GPU layers parameter (default -1 = all layers)
+   python coderai --model model.gguf --backend vulkan --n-gpu-layers 35
+   ```
+
+2. **Check verbose output**: Look for Vulkan device initialization in logs
+   ```bash
+   # Run with verbose logging
+   python coderai --model model.gguf --backend vulkan 2>&1 | grep -i vulkan
+   ```
+
+3. **Verify GPU visibility**: Check that Vulkan sees your GPU
+   ```bash
+   vulkaninfo | grep -A 5 "GPU0\|GPU1"
+   ```
+
+### Backend Not Detected
+
+**Problem**: "No suitable backend found" error
+
+**Solutions**:
+1. **Check which backends are available:**
+   ```bash
+   python -c "import coderai; print(coderai.detect_available_backends())"
+   ```
+
+2. **For NVIDIA**: Ensure PyTorch with CUDA is installed
+   ```bash
+   python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+   ```
+
+3. **For Vulkan**: Ensure llama-cpp-python is installed with Vulkan support
+   ```bash
+   python -c "from llama_cpp import Llama; print('llama-cpp available')"
+   ```
+
 ## License
 
 This project is licensed under the GNU General Public License v3.0 - see the [LICENSE.md](LICENSE.md) file for details.
@@ -484,5 +698,10 @@ Contributions are welcome! Please feel free to submit a merge request.
 ## Acknowledgments
 
 - Built with [FastAPI](https://fastapi.tiangolo.com/)
-- Powered by [HuggingFace Transformers](https://huggingface.co/docs/transformers/)
+- Powered by [HuggingFace Transformers](https://huggingface.co/docs/transformers/) (NVIDIA backend)
+- Powered by [llama-cpp-python](https://github.com/abetlen/llama-cpp-python) with Vulkan support (AMD backend)
 - Inspired by the OpenAI API specification
+
+---
+
+**Note on AI.PROMPT**: This project was enhanced following instructions to add Vulkan support for AMD GPUs alongside the existing NVIDIA/CUDA support. The implementation uses llama-cpp-python for Vulkan/GGUF model support while maintaining full compatibility with the existing HuggingFace/Transformers backend for NVIDIA GPUs.

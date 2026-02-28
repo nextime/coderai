@@ -1,0 +1,22 @@
+# FastAPI and server dependencies
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+
+# ML dependencies (transformers-based for NVIDIA/CUDA)
+transformers>=4.35.0
+accelerate>=0.24.0
+
+# System resource detection
+psutil>=5.9.0
+procname>=0.3.0  # optional - for setting process name
+
+# Optional: for better performance with NVIDIA GPUs
+bitsandbytes>=0.41.0
+sentencepiece>=0.1.99
+protobuf>=3.20.0
+
+# Optional: Flash Attention 2 for faster inference on supported NVIDIA GPUs
+# Requires specific CUDA versions and may need manual installation
+# Install with: pip install flash-attn --no-build-isolation
+# flash-attn>=2.5.0

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-OpenAI-compatible API server for HuggingFace models.
-Supports CUDA, ROCm GPU auto-detection, memory-aware model loading,
-sequential offload (VRAM -> RAM -> Disk), streaming, and tool calling.
+OpenAI-compatible API server for HuggingFace models (NVIDIA) and GGUF models (Vulkan).
+Supports CUDA (NVIDIA) and Vulkan (AMD) GPU backends, memory-aware model loading,
+streaming, and tool calling.
 """
 
 import argparse
@@ -14,29 +14,45 @@ import sys
 import time
 import uuid
 import warnings
+from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Dict, List, Optional, Union
 
 import psutil
-import torch
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    AutoConfig,
-    TextIteratorStreamer,
-    StoppingCriteria,
-    StoppingCriteriaList,
-    LogitsProcessor,
-    LogitsProcessorList,
-)
 from threading import Thread
 
 
 # =============================================================================
-# Flash Attention Detection
+# Backend Detection and Imports
+# =============================================================================
+
+def detect_available_backends():
+    """Detect which backends are available."""
+    backends = {'cpu': True}
+    
+    # Check for PyTorch/CUDA
+    try:
+        import torch
+        if torch.cuda.is_available():
+            backends['nvidia'] = True
+    except ImportError:
+        pass
+    
+    # Check for llama-cpp-python (Vulkan)
+    try:
+        import llama_cpp
+        backends['vulkan'] = True
+    except ImportError:
+        pass
+    
+    return backends
+
+
+# =============================================================================
+# Flash Attention Detection (for NVIDIA backend)
 # =============================================================================
 
 def check_flash_attn_availability() -> bool:
@@ -46,196 +62,6 @@ def check_flash_attn_availability() -> bool:
         return True
     except ImportError:
         return False
-
-
-# =============================================================================
-# Logits Processor for Numerical Stability
-# =============================================================================
-
-class InvalidLogitsProcessor(LogitsProcessor):
-    """Replace NaN and Inf values in logits with finite values."""
-    
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        """Replace invalid values in logits."""
-        # Replace NaN with very negative number (near -inf but finite)
-        scores = torch.where(torch.isnan(scores), torch.tensor(-1e9, dtype=scores.dtype, device=scores.device), scores)
-        # Replace Inf with large finite number
-        scores = torch.where(torch.isinf(scores), torch.tensor(1e9, dtype=scores.dtype, device=scores.device), scores)
-        # Replace -Inf with very negative finite number
-        scores = torch.where(scores < -1e9, torch.tensor(-1e9, dtype=scores.dtype, device=scores.device), scores)
-        return scores
-
-
-# =============================================================================
-# Memory Detection and Model Sizing
-# =============================================================================
-
-def get_available_vram() -> int:
-    """Get available VRAM in bytes. Returns 0 if no GPU available."""
-    if not torch.cuda.is_available():
-        return 0
-    
-    try:
-        total_vram = 0
-        for i in range(torch.cuda.device_count()):
-            props = torch.cuda.get_device_properties(i)
-            total_vram += props.total_memory
-        return total_vram
-    except Exception as e:
-        print(f"Warning: Could not detect VRAM: {e}")
-        return 0
-
-
-def get_available_ram(manual_ram_gb: Optional[float] = None) -> int:
-    """
-    Get available system RAM in bytes.
-    
-    Args:
-        manual_ram_gb: If specified, use this value in GB instead of auto-detection
-    
-    Returns:
-        Available RAM in bytes
-    """
-    if manual_ram_gb is not None:
-        ram_bytes = int(manual_ram_gb * 1e9)
-        print(f"Using manually specified RAM: {manual_ram_gb} GB ({ram_bytes / 1e9:.2f} GB)")
-        return ram_bytes
-    
-    try:
-        mem = psutil.virtual_memory()
-        print(f"Auto-detected RAM: {mem.available / 1e9:.2f} GB available")
-        return mem.available
-    except Exception as e:
-        print(f"Warning: Could not detect RAM: {e}")
-        return 0
-
-
-def estimate_model_size_from_config(model_name: str) -> Optional[int]:
-    """
-    Estimate model size in bytes from config.
-    Returns None if config cannot be loaded.
-    """
-    try:
-        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-        
-        # Get model parameters from config
-        if hasattr(config, 'num_parameters'):
-            num_params = config.num_parameters
-        elif hasattr(config, 'n_params'):
-            num_params = config.n_params
-        elif hasattr(config, 'num_hidden_layers') and hasattr(config, 'hidden_size'):
-            # Estimate based on transformer architecture
-            # Rough estimate: ~12 * num_layers * hidden_size^2 for standard transformers
-            layers = config.num_hidden_layers
-            hidden = config.hidden_size
-            vocab_size = getattr(config, 'vocab_size', 50000)
-            
-            # Rough parameter count estimation
-            # Embedding: vocab_size * hidden_size
-            # Each layer: ~4 * hidden_size^2 (attn + FFN)
-            num_params = (vocab_size * hidden_size) + (layers * 4 * hidden_size * hidden_size)
-        else:
-            return None
-        
-        # Assume float16 (2 bytes per parameter) for GPU loading
-        # This is the typical loading format
-        return num_params * 2
-    except Exception as e:
-        print(f"Warning: Could not estimate model size: {e}")
-        return None
-
-
-def calculate_safety_margin(memory_bytes: int) -> int:
-    """Apply safety margin to available memory (leave 10% headroom)."""
-    return int(memory_bytes * 0.9)
-
-
-def determine_offload_strategy(
-    model_name: str,
-    available_vram: int,
-    available_ram: int,
-    quantization_bits: Optional[int] = None
-) -> Dict[str, any]:
-    """
-    Determine the best offload strategy based on available memory.
-    
-    Returns a dict with:
-    - device_map: str or dict for model loading
-    - offload_folder: Optional[str] for disk offload
-    - load_in_8bit: bool
-    - load_in_4bit: bool
-    - max_memory: Optional[dict]
-    """
-    # Estimate model size
-    estimated_size = estimate_model_size_from_config(model_name)
-    
-    if estimated_size is None:
-        print("Could not estimate model size, using auto device_map")
-        return {
-            'device_map': 'auto',
-            'offload_folder': None,
-            'load_in_8bit': False,
-            'load_in_4bit': False,
-            'max_memory': None,
-        }
-    
-    # Apply quantization factor if specified
-    if quantization_bits == 4:
-        estimated_size = estimated_size // 4  # 4-bit = 0.5 bytes per param
-    elif quantization_bits == 8:
-        estimated_size = estimated_size // 2  # 8-bit = 1 byte per param
-    
-    # Add overhead for activations and gradients (roughly 20%)
-    required_memory = int(estimated_size * 1.2)
-    
-    print(f"Estimated model size: {estimated_size / 1e9:.2f} GB")
-    print(f"Required memory (with overhead): {required_memory / 1e9:.2f} GB")
-    print(f"Available VRAM: {available_vram / 1e9:.2f} GB")
-    print(f"Available RAM: {available_ram / 1e9:.2f} GB")
-    
-    safe_vram = calculate_safety_margin(available_vram)
-    safe_ram = calculate_safety_margin(available_ram)
-    
-    strategy = {
-        'device_map': None,
-        'offload_folder': None,
-        'load_in_8bit': False,
-        'load_in_4bit': False,
-        'max_memory': None,
-    }
-    
-    # Case 1: Model fits entirely in VRAM
-    if required_memory <= safe_vram:
-        print("Strategy: Loading fully to GPU")
-        strategy['device_map'] = 'cuda'
-        if torch.cuda.device_count() > 1:
-            strategy['device_map'] = 'auto'
-    
-    # Case 2: Model fits in VRAM + RAM combined
-    elif required_memory <= (safe_vram + safe_ram):
-        print("Strategy: Using device_map='auto' for VRAM + RAM offload")
-        strategy['device_map'] = 'auto'
-        # Set max_memory to help accelerate distribute layers
-        if torch.cuda.is_available():
-            max_memory = {}
-            for i in range(torch.cuda.device_count()):
-                max_memory[i] = safe_vram // torch.cuda.device_count()
-            max_memory['cpu'] = safe_ram
-            strategy['max_memory'] = max_memory
-    
-    # Case 3: Need disk offload
-    else:
-        print("Strategy: VRAM + RAM + Disk offload required")
-        strategy['device_map'] = 'auto'
-        if torch.cuda.is_available():
-            max_memory = {}
-            for i in range(torch.cuda.device_count()):
-                max_memory[i] = safe_vram // torch.cuda.device_count()
-            max_memory['cpu'] = safe_ram
-            strategy['max_memory'] = max_memory
-        # offload_folder will be set from command line argument
-    
-    return strategy
 
 
 # =============================================================================
@@ -300,13 +126,13 @@ class ModelList(BaseModel):
 
 
 # =============================================================================
-# Tool Parsing and Function Calling
+# Tool Parsing
 # =============================================================================
 
 class ToolCallParser:
     """Parse model outputs to extract tool calls."""
     
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer=None):
         self.tokenizer = tokenizer
     
     def extract_tool_calls(self, text: str, available_tools: List[Tool]) -> Optional[List[Dict]]:
@@ -421,19 +247,59 @@ def format_tools_for_prompt(tools: List[Tool], messages: List[ChatMessage]) -> L
 
 
 # =============================================================================
-# Model Management
+# Abstract Model Backend
 # =============================================================================
 
-class ModelManager:
-    """Manages the loaded model and tokenizer."""
+class ModelBackend(ABC):
+    """Abstract base class for model backends."""
+    
+    @abstractmethod
+    def load_model(self, model_name: str, **kwargs) -> None:
+        """Load the model."""
+        pass
+    
+    @abstractmethod
+    def generate(self, prompt: str, max_tokens: Optional[int] = None, 
+                 temperature: float = 0.7, top_p: float = 1.0,
+                 stop: Optional[List[str]] = None) -> str:
+        """Generate text non-streaming."""
+        pass
+    
+    @abstractmethod
+    def generate_stream(self, prompt: str, max_tokens: Optional[int] = None,
+                        temperature: float = 0.7, top_p: float = 1.0,
+                        stop: Optional[List[str]] = None) -> AsyncGenerator[str, None]:
+        """Generate text in streaming fashion."""
+        pass
+    
+    @abstractmethod
+    def format_messages(self, messages: List[ChatMessage]) -> str:
+        """Format messages into a prompt string."""
+        pass
+    
+    @abstractmethod
+    def get_model_name(self) -> str:
+        """Return the loaded model name."""
+        pass
+    
+    @abstractmethod
+    def cleanup(self) -> None:
+        """Cleanup resources."""
+        pass
+
+
+# =============================================================================
+# NVIDIA/HuggingFace Backend
+# =============================================================================
+
+class NvidiaBackend(ModelBackend):
+    """Backend for NVIDIA GPUs using HuggingFace Transformers."""
     
     def __init__(self):
         self.model = None
         self.tokenizer = None
         self.model_name = None
         self.device = None
-        self.tool_parser = None
-        self.offload_folder = None
         self.use_flash_attn = False
         self.flash_attn_available = False
         
@@ -449,8 +315,9 @@ class ModelManager:
                 print("Falling back to standard attention")
                 self.use_flash_attn = False
     
-    def detect_device(self) -> str:
+    def _detect_device(self) -> str:
         """Auto-detect available GPU or fall back to CPU."""
+        import torch
         if torch.cuda.is_available():
             # Check for ROCm (HIP)
             if hasattr(torch.version, 'hip') and torch.version.hip is not None:
@@ -463,71 +330,64 @@ class ModelManager:
             print("No GPU detected, using CPU")
             return "cpu"
     
-    def load_model(
-        self,
-        model_name: str,
-        offload_dir: Optional[str] = None,
-        load_in_4bit: bool = False,
-        load_in_8bit: bool = False,
-        manual_ram_gb: Optional[float] = None,
-        flash_attn: bool = False,
-    ):
-        """
-        Load the model and tokenizer from HuggingFace with memory-aware offload.
+    def _get_available_vram(self) -> int:
+        """Get available VRAM in bytes. Returns 0 if no GPU available."""
+        import torch
+        if not torch.cuda.is_available():
+            return 0
         
-        Args:
-            model_name: HuggingFace model name or path
-            offload_dir: Directory for disk offload when model doesn't fit in VRAM+RAM
-            load_in_4bit: Use 4-bit quantization (requires bitsandbytes)
-            load_in_8bit: Use 8-bit quantization (requires bitsandbytes)
-            manual_ram_gb: Manually specify available RAM in GB (bypasses auto-detection)
-            flash_attn: Use Flash Attention 2 if available (requires flash-attn package)
-        """
-        print(f"Loading model: {model_name}")
+        try:
+            total_vram = 0
+            for i in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(i)
+                total_vram += props.total_memory
+            return total_vram
+        except Exception as e:
+            print(f"Warning: Could not detect VRAM: {e}")
+            return 0
+    
+    def _estimate_model_size(self, model_name: str) -> Optional[int]:
+        """Estimate model size in bytes from config."""
+        from transformers import AutoConfig
+        try:
+            config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+            
+            # Get model parameters from config
+            if hasattr(config, 'num_parameters'):
+                num_params = config.num_parameters
+            elif hasattr(config, 'n_params'):
+                num_params = config.n_params
+            elif hasattr(config, 'num_hidden_layers') and hasattr(config, 'hidden_size'):
+                layers = config.num_hidden_layers
+                hidden = config.hidden_size
+                vocab_size = getattr(config, 'vocab_size', 50000)
+                num_params = (vocab_size * hidden_size) + (layers * 4 * hidden * hidden)
+            else:
+                return None
+            
+            # Assume float16 (2 bytes per parameter)
+            return num_params * 2
+        except Exception as e:
+            print(f"Warning: Could not estimate model size: {e}")
+            return None
+    
+    def load_model(self, model_name: str, **kwargs) -> None:
+        """Load the model using HuggingFace Transformers."""
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        
+        offload_dir = kwargs.get('offload_dir')
+        load_in_4bit = kwargs.get('load_in_4bit', False)
+        load_in_8bit = kwargs.get('load_in_8bit', False)
+        manual_ram_gb = kwargs.get('manual_ram_gb')
+        flash_attn = kwargs.get('flash_attn', False)
+        
+        print(f"Loading HuggingFace model: {model_name}")
         
         self.use_flash_attn = flash_attn
         self.check_flash_attn_support()
         
-        self.device = self.detect_device()
-        self.offload_folder = offload_dir
-        
-        # Create offload directory if needed
-        if offload_dir:
-            os.makedirs(offload_dir, exist_ok=True)
-            print(f"Disk offload directory: {offload_dir}")
-        
-        # Detect available memory
-        available_vram = get_available_vram()
-        available_ram = get_available_ram(manual_ram_gb)
-        
-        print(f"\nMemory Detection:")
-        print(f"  Available VRAM: {available_vram / 1e9:.2f} GB")
-        print(f"  Available RAM: {available_ram / 1e9:.2f} GB")
-        
-        # Determine quantization bits
-        quantization_bits = None
-        if load_in_4bit:
-            quantization_bits = 4
-        elif load_in_8bit:
-            quantization_bits = 8
-        
-        # Determine offload strategy
-        strategy = determine_offload_strategy(
-            model_name,
-            available_vram,
-            available_ram,
-            quantization_bits
-        )
-        
-        # Set offload folder if determined necessary
-        if strategy.get('offload_folder') is None and offload_dir:
-            estimated_size = estimate_model_size_from_config(model_name)
-            safe_vram = calculate_safety_margin(available_vram)
-            safe_ram = calculate_safety_margin(available_ram)
-            
-            if estimated_size and estimated_size > (safe_vram + safe_ram):
-                strategy['offload_folder'] = offload_dir
-                print(f"Model will use disk offload at: {offload_dir}")
+        self.device = self._detect_device()
         
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -541,70 +401,48 @@ class ModelManager:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
         # Prepare model loading arguments
-        load_kwargs = {
-            'trust_remote_code': True,
-        }
+        load_kwargs = {'trust_remote_code': True}
         
-        # Set dtype based on device and quantization
         if load_in_4bit or load_in_8bit:
-            # Check if bitsandbytes is available
             try:
                 import bitsandbytes as bnb
                 print(f"Using {4 if load_in_4bit else 8}-bit quantization")
                 load_kwargs['load_in_4bit'] = load_in_4bit
                 load_kwargs['load_in_8bit'] = load_in_8bit
-                load_kwargs['device_map'] = strategy['device_map'] or 'auto'
+                load_kwargs['device_map'] = 'auto'
             except ImportError:
                 print("Warning: bitsandbytes not installed. Quantization disabled.")
-                print("Install with: pip install bitsandbytes")
                 if self.device == "cuda":
                     load_kwargs['torch_dtype'] = torch.float16
                 else:
                     load_kwargs['torch_dtype'] = torch.float32
-                load_kwargs['device_map'] = strategy['device_map'] or ('auto' if self.device == 'cuda' else None)
+                load_kwargs['device_map'] = 'auto' if self.device == 'cuda' else None
         else:
             if self.device == "cuda":
                 load_kwargs['torch_dtype'] = torch.float16
             else:
                 load_kwargs['torch_dtype'] = torch.float32
-            load_kwargs['device_map'] = strategy['device_map'] or ('auto' if self.device == 'cuda' else None)
+            load_kwargs['device_map'] = 'auto' if self.device == 'cuda' else None
         
-        # Add max_memory if specified
-        if strategy.get('max_memory'):
-            load_kwargs['max_memory'] = strategy['max_memory']
+        # Add offload folder if specified
+        if offload_dir:
+            os.makedirs(offload_dir, exist_ok=True)
+            load_kwargs['offload_folder'] = offload_dir
+            print(f"Disk offload directory: {offload_dir}")
         
-        # Add offload_folder if specified
-        if strategy.get('offload_folder'):
-            load_kwargs['offload_folder'] = strategy['offload_folder']
-        
-        # Add Flash Attention 2 configuration if enabled and available
+        # Add Flash Attention 2 if enabled
         if self.use_flash_attn and self.flash_attn_available:
             load_kwargs['attn_implementation'] = "flash_attention_2"
-            print("\nUsing Flash Attention 2 for attention implementation")
-        
-        print(f"\nModel loading arguments:")
-        for key, value in load_kwargs.items():
-            print(f"  {key}: {value}")
+            print("Using Flash Attention 2")
         
         # Load model
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            **load_kwargs
-        )
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
         
-        # Handle CPU case where device_map is None
         if self.device == "cpu" and load_kwargs.get('device_map') is None:
             self.model = self.model.to(self.device)
         
         self.model.eval()
         self.model_name = model_name
-        self.tool_parser = ToolCallParser(self.tokenizer)
-        
-        # Print model device placement
-        if hasattr(self.model, 'hf_device_map'):
-            print(f"\nDevice map:")
-            for layer, device in self.model.hf_device_map.items():
-                print(f"  {layer}: {device}")
         
         print(f"\nModel loaded successfully")
         print(f"Model device: {next(self.model.parameters()).device}")
@@ -632,41 +470,74 @@ class ModelManager:
         formatted.append("Assistant:")
         return "\n\n".join(formatted)
     
-    def _validate_generation_params(self, temperature: float, top_p: float) -> tuple:
-        """Validate and clamp generation parameters for numerical stability."""
-        # Clamp temperature to avoid numerical issues
-        # Temperature must be > 0 for sampling, but very small values can cause issues
+    def _validate_params(self, temperature: float, top_p: float) -> tuple:
+        """Validate generation parameters."""
         if temperature <= 0:
             temperature = 1.0
             do_sample = False
         else:
             temperature = max(0.01, min(temperature, 2.0))
             do_sample = True
-        
-        # Clamp top_p
         top_p = max(0.0, min(top_p, 1.0))
-        
         return temperature, top_p, do_sample
     
-    def generate_stream(
-        self,
-        prompt: str,
-        max_tokens: Optional[int] = None,
-        temperature: float = 0.7,
-        top_p: float = 1.0,
-        stop: Optional[List[str]] = None,
-    ) -> AsyncGenerator[str, None]:
-        """Generate text in streaming fashion."""
+    def generate(self, prompt: str, max_tokens: Optional[int] = None,
+                 temperature: float = 0.7, top_p: float = 1.0,
+                 stop: Optional[List[str]] = None) -> str:
+        """Generate text non-streaming."""
+        import torch
+        from transformers import LogitsProcessor, LogitsProcessorList
+        
+        class InvalidLogitsProcessor(LogitsProcessor):
+            def __call__(self, input_ids, scores):
+                scores = torch.where(torch.isnan(scores), torch.tensor(-1e9, dtype=scores.dtype, device=scores.device), scores)
+                scores = torch.where(torch.isinf(scores), torch.tensor(1e9, dtype=scores.dtype, device=scores.device), scores)
+                return scores
+        
         inputs = self.tokenizer(prompt, return_tensors="pt", padding=True)
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-        
-        input_length = inputs["input_ids"].shape[1]
         
         if max_tokens is None:
             max_tokens = 512
         
-        # Validate parameters
-        temperature, top_p, do_sample = self._validate_generation_params(temperature, top_p)
+        temperature, top_p, do_sample = self._validate_params(temperature, top_p)
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                max_new_tokens=max_tokens,
+                temperature=temperature if do_sample else None,
+                top_p=top_p if do_sample else None,
+                do_sample=do_sample,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                logits_processor=LogitsProcessorList([InvalidLogitsProcessor()]),
+            )
+        
+        generated_tokens = outputs[0][inputs["input_ids"].shape[1]:]
+        return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    
+    async def generate_stream(self, prompt: str, max_tokens: Optional[int] = None,
+                              temperature: float = 0.7, top_p: float = 1.0,
+                              stop: Optional[List[str]] = None) -> AsyncGenerator[str, None]:
+        """Generate text in streaming fashion."""
+        import torch
+        from transformers import TextIteratorStreamer, LogitsProcessor, LogitsProcessorList, StoppingCriteria, StoppingCriteriaList
+        
+        class InvalidLogitsProcessor(LogitsProcessor):
+            def __call__(self, input_ids, scores):
+                scores = torch.where(torch.isnan(scores), torch.tensor(-1e9, dtype=scores.dtype, device=scores.device), scores)
+                scores = torch.where(torch.isinf(scores), torch.tensor(1e9, dtype=scores.dtype, device=scores.device), scores)
+                return scores
+        
+        inputs = self.tokenizer(prompt, return_tensors="pt", padding=True)
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        
+        if max_tokens is None:
+            max_tokens = 512
+        
+        temperature, top_p, do_sample = self._validate_params(temperature, top_p)
         
         streamer = TextIteratorStreamer(
             self.tokenizer,
@@ -684,12 +555,8 @@ class ModelManager:
             "streamer": streamer,
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
+            "logits_processor": LogitsProcessorList([InvalidLogitsProcessor()]),
         }
-        
-        # Add logits processor to handle NaN/Inf values
-        generation_kwargs["logits_processor"] = LogitsProcessorList([
-            InvalidLogitsProcessor()
-        ])
         
         # Handle stop sequences
         if stop:
@@ -706,106 +573,279 @@ class ModelManager:
                 StopOnSequence(stop, self.tokenizer)
             ])
         
-        # Run generation in a separate thread with error handling
-        generated_text = ""
-        try:
-            thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
-            thread.start()
-            
-            for text in streamer:
-                generated_text += text
-                yield text
-            
-            thread.join()
-        except RuntimeError as e:
-            if "probability tensor contains" in str(e):
-                print(f"Warning: Numerical error during generation: {e}")
-                print("This may be due to temperature=0 or numerical instability.")
-                print("Trying again with greedy decoding...")
-                # Fallback to greedy decoding
-                generation_kwargs["do_sample"] = False
-                generation_kwargs["temperature"] = None
-                generation_kwargs["top_p"] = None
-                thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
-                thread.start()
-                for text in streamer:
-                    generated_text += text
-                    yield text
-                thread.join()
-            else:
-                raise
-    
-    def generate(
-        self,
-        prompt: str,
-        max_tokens: Optional[int] = None,
-        temperature: float = 0.7,
-        top_p: float = 1.0,
-        stop: Optional[List[str]] = None,
-    ) -> str:
-        """Generate text non-streaming."""
-        inputs = self.tokenizer(prompt, return_tensors="pt", padding=True)
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        # Run generation in a separate thread
+        thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
+        thread.start()
         
+        for text in streamer:
+            yield text
+        
+        thread.join()
+    
+    def get_model_name(self) -> str:
+        return self.model_name or "unknown"
+    
+    def cleanup(self) -> None:
+        import torch
+        if self.model is not None:
+            del self.model
+            del self.tokenizer
+            self.model = None
+            self.tokenizer = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+
+# =============================================================================
+# Vulkan Backend (llama-cpp-python)
+# =============================================================================
+
+class VulkanBackend(ModelBackend):
+    """Backend for Vulkan (AMD GPUs) using llama-cpp-python with GGUF models."""
+    
+    def __init__(self):
+        self.model = None
+        self.model_name = None
+        self.n_gpu_layers = -1  # Offload all layers to GPU by default
+        self.n_ctx = 2048
+        self.verbose = True
+        
+    def load_model(self, model_name: str, **kwargs) -> None:
+        """Load a GGUF model using llama-cpp-python."""
+        from llama_cpp import Llama
+        
+        # model_name should be a path to a .gguf file or a HuggingFace model ID
+        # that will be resolved to a GGUF file
+        
+        n_gpu_layers = kwargs.get('n_gpu_layers', -1)
+        n_ctx = kwargs.get('n_ctx', 2048)
+        verbose = kwargs.get('verbose', True)
+        
+        # Check if model_name is a local file
+        if os.path.isfile(model_name):
+            model_path = model_name
+            print(f"Loading local GGUF model: {model_path}")
+        else:
+            # Try to download from HuggingFace Hub
+            print(f"Attempting to download GGUF model: {model_name}")
+            try:
+                from huggingface_hub import hf_hub_download, list_repo_files
+                
+                # Parse model name (format: "org/model" or "org/model/filename.gguf")
+                parts = model_name.split('/')
+                if len(parts) >= 2:
+                    repo_id = f"{parts[0]}/{parts[1]}"
+                    
+                    # If specific file provided
+                    if len(parts) >= 3 and parts[-1].endswith('.gguf'):
+                        filename = '/'.join(parts[2:])
+                    else:
+                        # Find GGUF files in the repo
+                        files = list_repo_files(repo_id)
+                        gguf_files = [f for f in files if f.endswith('.gguf')]
+                        if not gguf_files:
+                            raise ValueError(f"No GGUF files found in {repo_id}")
+                        # Prefer Q4_K_M quantized models for good balance
+                        preferred = [f for f in gguf_files if 'Q4_K_M' in f or 'q4_k_m' in f.lower()]
+                        if preferred:
+                            filename = preferred[0]
+                        else:
+                            filename = gguf_files[0]
+                        print(f"Selected GGUF file: {filename}")
+                    
+                    model_path = hf_hub_download(repo_id=repo_id, filename=filename)
+                    print(f"Downloaded to: {model_path}")
+                else:
+                    raise ValueError(f"Invalid model name format: {model_name}")
+            except Exception as e:
+                print(f"Error downloading model: {e}")
+                print("Please provide a local path to a .gguf file")
+                raise
+        
+        print(f"Loading GGUF model with Vulkan support...")
+        print(f"  Model path: {model_path}")
+        print(f"  GPU layers: {n_gpu_layers} (-1 = all layers)")
+        print(f"  Context size: {n_ctx}")
+        
+        try:
+            self.model = Llama(
+                model_path=model_path,
+                n_gpu_layers=n_gpu_layers,
+                n_ctx=n_ctx,
+                verbose=verbose,
+            )
+            self.model_name = model_name
+            print("\nModel loaded successfully with Vulkan!")
+        except Exception as e:
+            print(f"Error loading model with Vulkan: {e}")
+            print("Make sure Vulkan drivers are installed:")
+            print("  Debian/Ubuntu: sudo apt install libvulkan-dev vulkan-tools")
+            print("  Fedora: sudo dnf install vulkan-loader-devel vulkan-tools")
+            raise
+    
+    def format_messages(self, messages: List[ChatMessage]) -> str:
+        """Format messages into a prompt string suitable for chat models."""
+        formatted = []
+        
+        for msg in messages:
+            if msg.role == "system":
+                formatted.append(f"<|system|>\n{msg.content}")
+            elif msg.role == "user":
+                formatted.append(f"<|user|>\n{msg.content}")
+            elif msg.role == "assistant":
+                content = msg.content or ""
+                formatted.append(f"<|assistant|>\n{content}")
+        
+        formatted.append("<|assistant|>\n")
+        return "\n".join(formatted)
+    
+    def generate(self, prompt: str, max_tokens: Optional[int] = None,
+                 temperature: float = 0.7, top_p: float = 1.0,
+                 stop: Optional[List[str]] = None) -> str:
+        """Generate text non-streaming using llama-cpp."""
         if max_tokens is None:
             max_tokens = 512
         
-        # Validate parameters
-        temperature, top_p, do_sample = self._validate_generation_params(temperature, top_p)
+        output = self.model(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop or [],
+        )
         
-        try:
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    max_new_tokens=max_tokens,
-                    temperature=temperature if do_sample else None,
-                    top_p=top_p if do_sample else None,
-                    do_sample=do_sample,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    stopping_criteria=self._create_stopping_criteria(stop) if stop else None,
-                    logits_processor=LogitsProcessorList([InvalidLogitsProcessor()]),
-                )
-            
-            generated_tokens = outputs[0][inputs["input_ids"].shape[1]:]
-            return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        except RuntimeError as e:
-            if "probability tensor contains" in str(e):
-                print(f"Warning: Numerical error during generation: {e}")
-                print("Retrying with greedy decoding...")
-                # Fallback to greedy decoding
-                with torch.no_grad():
-                    outputs = self.model.generate(
-                        input_ids=inputs["input_ids"],
-                        attention_mask=inputs["attention_mask"],
-                        max_new_tokens=max_tokens,
-                        do_sample=False,
-                        pad_token_id=self.tokenizer.pad_token_id,
-                        eos_token_id=self.tokenizer.eos_token_id,
-                        stopping_criteria=self._create_stopping_criteria(stop) if stop else None,
-                        logits_processor=LogitsProcessorList([InvalidLogitsProcessor()]),
-                    )
-                generated_tokens = outputs[0][inputs["input_ids"].shape[1]:]
-                return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-            else:
-                raise
+        return output["choices"][0]["text"]
     
-    def _create_stopping_criteria(self, stop_sequences):
-        """Create stopping criteria for stop sequences."""
-        if not stop_sequences:
+    async def generate_stream(self, prompt: str, max_tokens: Optional[int] = None,
+                              temperature: float = 0.7, top_p: float = 1.0,
+                              stop: Optional[List[str]] = None) -> AsyncGenerator[str, None]:
+        """Generate text in streaming fashion using llama-cpp."""
+        if max_tokens is None:
+            max_tokens = 512
+        
+        stream = self.model(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop or [],
+            stream=True,
+        )
+        
+        for chunk in stream:
+            text = chunk["choices"][0].get("text", "")
+            if text:
+                yield text
+    
+    def get_model_name(self) -> str:
+        return self.model_name or "unknown"
+    
+    def cleanup(self) -> None:
+        if self.model is not None:
+            del self.model
+            self.model = None
+
+
+# =============================================================================
+# Model Manager
+# =============================================================================
+
+class ModelManager:
+    """Manages the loaded model and tokenizer."""
+    
+    def __init__(self):
+        self.backend: Optional[ModelBackend] = None
+        self.backend_type: Optional[str] = None
+        self.tool_parser = ToolCallParser()
+        
+    def load_model(self, model_name: str, backend_type: str = "auto", **kwargs):
+        """
+        Load the model with the specified backend.
+        
+        Args:
+            model_name: Model name or path
+            backend_type: 'nvidia', 'vulkan', or 'auto' to detect
+            **kwargs: Additional arguments for the specific backend
+        """
+        available = detect_available_backends()
+        
+        # Determine backend
+        if backend_type == "auto":
+            if available.get('nvidia'):
+                backend_type = "nvidia"
+                print("Auto-detected NVIDIA backend")
+            elif available.get('vulkan'):
+                backend_type = "vulkan"
+                print("Auto-detected Vulkan backend")
+            else:
+                print("No GPU backend detected. For NVIDIA, install PyTorch with CUDA.")
+                print("For Vulkan, install llama-cpp-python with Vulkan support.")
+                raise RuntimeError("No suitable backend found")
+        
+        self.backend_type = backend_type
+        
+        # Create appropriate backend
+        if backend_type == "nvidia":
+            if not available.get('nvidia'):
+                raise RuntimeError("NVIDIA backend requested but PyTorch/CUDA not available")
+            self.backend = NvidiaBackend()
+        elif backend_type == "vulkan":
+            if not available.get('vulkan'):
+                raise RuntimeError("Vulkan backend requested but llama-cpp-python not available")
+            self.backend = VulkanBackend()
+        else:
+            raise ValueError(f"Unknown backend: {backend_type}")
+        
+        # Load the model
+        self.backend.load_model(model_name, **kwargs)
+        self.tool_parser = ToolCallParser()
+        
+    def format_messages(self, messages: List[ChatMessage]) -> str:
+        """Format messages into a prompt string."""
+        if self.backend is None:
+            raise RuntimeError("No model loaded")
+        return self.backend.format_messages(messages)
+    
+    def generate(self, prompt: str, max_tokens: Optional[int] = None,
+                 temperature: float = 0.7, top_p: float = 1.0,
+                 stop: Optional[List[str]] = None) -> str:
+        """Generate text non-streaming."""
+        if self.backend is None:
+            raise RuntimeError("No model loaded")
+        return self.backend.generate(prompt, max_tokens, temperature, top_p, stop)
+    
+    async def generate_stream(self, prompt: str, max_tokens: Optional[int] = None,
+                              temperature: float = 0.7, top_p: float = 1.0,
+                              stop: Optional[List[str]] = None) -> AsyncGenerator[str, None]:
+        """Generate text in streaming fashion."""
+        if self.backend is None:
+            raise RuntimeError("No model loaded")
+        async for chunk in self.backend.generate_stream(prompt, max_tokens, temperature, top_p, stop):
+            yield chunk
+    
+    @property
+    def model_name(self) -> str:
+        if self.backend is None:
+            return "unknown"
+        return self.backend.get_model_name()
+    
+    @property
+    def model(self):
+        if self.backend is None:
             return None
-        
-        class StopOnSequence(StoppingCriteria):
-            def __init__(self, stop_sequences, tokenizer):
-                self.stop_sequences = stop_sequences
-                self.tokenizer = tokenizer
-            
-            def __call__(self, input_ids, scores, **kwargs):
-                decoded = self.tokenizer.decode(input_ids[0][-20:], skip_special_tokens=True)
-                return any(seq in decoded for seq in self.stop_sequences)
-        
-        return StoppingCriteriaList([StopOnSequence(stop_sequences, self.tokenizer)])
+        return self.backend
+    
+    @property
+    def tokenizer(self):
+        # Only NVIDIA backend has a tokenizer
+        if isinstance(self.backend, NvidiaBackend):
+            return self.backend.tokenizer
+        return None
+    
+    def cleanup(self):
+        if self.backend is not None:
+            self.backend.cleanup()
+            self.backend = None
 
 
 # Global model manager
@@ -822,16 +862,13 @@ async def lifespan(app: FastAPI):
     # Startup
     yield
     # Shutdown
-    if model_manager.model is not None:
-        del model_manager.model
-        del model_manager.tokenizer
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    model_manager.cleanup()
 
 
 app = FastAPI(
     title="OpenAI-Compatible API",
-    description="OpenAI-compatible API for HuggingFace models with memory-aware loading",
-    version="1.0.0",
+    description="OpenAI-compatible API supporting NVIDIA (CUDA) and Vulkan backends",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -850,7 +887,7 @@ async def list_models():
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     """Chat completions endpoint with streaming and tool support."""
-    if model_manager.model is None:
+    if model_manager.backend is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
     # Format messages with tools if provided
@@ -910,7 +947,7 @@ async def stream_chat_response(
     generated_text = ""
     
     try:
-        for chunk in model_manager.generate_stream(
+        async for chunk in model_manager.generate_stream(
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -936,7 +973,6 @@ async def stream_chat_response(
         if tools:
             tool_calls = model_manager.tool_parser.extract_tool_calls(generated_text, tools)
             if tool_calls:
-                # Send tool calls as final delta
                 data = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
@@ -957,7 +993,6 @@ async def stream_chat_response(
         yield "data: [DONE]\n\n"
     except Exception as e:
         print(f"Error during streaming generation: {e}")
-        # Send error event
         data = {
             "id": completion_id,
             "object": "chat.completion.chunk",
@@ -1010,6 +1045,15 @@ async def generate_chat_response(
                 response_message["content"] = None
                 finish_reason = "tool_calls"
         
+        # Calculate token counts if tokenizer available
+        if model_manager.tokenizer:
+            prompt_tokens = len(model_manager.tokenizer.encode(prompt))
+            completion_tokens = len(model_manager.tokenizer.encode(generated_text))
+        else:
+            # Rough estimate for Vulkan backend
+            prompt_tokens = len(prompt.split())
+            completion_tokens = len(generated_text.split())
+        
         return {
             "id": completion_id,
             "object": "chat.completion",
@@ -1021,9 +1065,9 @@ async def generate_chat_response(
                 "finish_reason": finish_reason,
             }],
             "usage": {
-                "prompt_tokens": len(model_manager.tokenizer.encode(prompt)),
-                "completion_tokens": len(model_manager.tokenizer.encode(generated_text)),
-                "total_tokens": len(model_manager.tokenizer.encode(prompt)) + len(model_manager.tokenizer.encode(generated_text)),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
             },
         }
     except Exception as e:
@@ -1034,7 +1078,7 @@ async def generate_chat_response(
 @app.post("/v1/completions")
 async def completions(request: CompletionRequest):
     """Text completions endpoint."""
-    if model_manager.model is None:
+    if model_manager.backend is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
     prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
@@ -1078,7 +1122,7 @@ async def stream_completion_response(
     created = int(time.time())
     
     try:
-        for chunk in model_manager.generate_stream(
+        async for chunk in model_manager.generate_stream(
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -1128,6 +1172,14 @@ async def generate_completion_response(
             stop=stop,
         )
         
+        # Calculate token counts if tokenizer available
+        if model_manager.tokenizer:
+            prompt_tokens = len(model_manager.tokenizer.encode(prompt))
+            completion_tokens = len(model_manager.tokenizer.encode(generated_text))
+        else:
+            prompt_tokens = len(prompt.split())
+            completion_tokens = len(generated_text.split())
+        
         return {
             "id": completion_id,
             "object": "text_completion",
@@ -1140,9 +1192,9 @@ async def generate_completion_response(
                 "finish_reason": "stop",
             }],
             "usage": {
-                "prompt_tokens": len(model_manager.tokenizer.encode(prompt)),
-                "completion_tokens": len(model_manager.tokenizer.encode(generated_text)),
-                "total_tokens": len(model_manager.tokenizer.encode(prompt)) + len(model_manager.tokenizer.encode(generated_text)),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
             },
         }
     except Exception as e:
@@ -1157,13 +1209,20 @@ async def generate_completion_response(
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="OpenAI-compatible API server with memory-aware model loading"
+        description="OpenAI-compatible API server supporting NVIDIA (CUDA) and Vulkan backends"
     )
     parser.add_argument(
         "--model",
         type=str,
         default=None,
-        help="HuggingFace model name or path",
+        help="Model name or path. For NVIDIA: HuggingFace model. For Vulkan: GGUF file path or HF repo",
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["auto", "nvidia", "vulkan"],
+        default="auto",
+        help="Backend to use: auto (detect), nvidia (CUDA), or vulkan (AMD GPUs)",
     )
     parser.add_argument(
         "--host",
@@ -1181,47 +1240,67 @@ def parse_args():
         "--offload-dir",
         type=str,
         default="./offload",
-        help="Directory for disk offload when model doesn't fit in VRAM+RAM (default: ./offload)",
+        help="Directory for disk offload (NVIDIA backend only, default: ./offload)",
     )
     parser.add_argument(
         "--load-in-4bit",
         action="store_true",
-        help="Load model in 4-bit precision (requires bitsandbytes)",
+        help="Load model in 4-bit precision (NVIDIA backend only, requires bitsandbytes)",
     )
     parser.add_argument(
         "--load-in-8bit",
         action="store_true",
-        help="Load model in 8-bit precision (requires bitsandbytes)",
+        help="Load model in 8-bit precision (NVIDIA backend only, requires bitsandbytes)",
     )
     parser.add_argument(
         "--ram",
         type=float,
         default=None,
-        help="Manually specify available RAM in GB (bypasses auto-detection)",
+        help="Manually specify available RAM in GB (NVIDIA backend only)",
     )
     parser.add_argument(
         "--flash-attn",
         action="store_true",
-        help="Use Flash Attention 2 for faster inference (requires flash-attn package and compatible GPU)",
+        help="Use Flash Attention 2 (NVIDIA backend only, requires flash-attn package)",
+    )
+    parser.add_argument(
+        "--n-gpu-layers",
+        type=int,
+        default=-1,
+        help="Number of layers to offload to GPU (Vulkan backend only, default: -1 = all layers)",
+    )
+    parser.add_argument(
+        "--n-ctx",
+        type=int,
+        default=2048,
+        help="Context window size (Vulkan backend only, default: 2048)",
     )
     return parser.parse_args()
 
 
 def main():
     """Main entry point."""
-    import procname
-    procname.setprocname("coderai")
+    # Optional: set process name if procname is available
+    try:
+        import procname
+        procname.setprocname("coderai")
+    except ImportError:
+        pass
     args = parse_args()
     
     # Get model name from args or prompt interactively
     model_name = args.model
     if model_name is None:
-        print("No model specified. Please enter a HuggingFace model name.")
-        print("Examples:")
+        print("No model specified. Please enter a model name.")
+        print("")
+        print("For NVIDIA backend (HuggingFace models):")
         print("  - microsoft/DialoGPT-medium")
-        print("  - facebook/blenderbot-400M-distill")
         print("  - meta-llama/Llama-2-7b-chat-hf (requires auth)")
         print("  - TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+        print("")
+        print("For Vulkan backend (GGUF models):")
+        print("  - Local path: ./phi-3-mini-4k-instruct-q4_k_m.gguf")
+        print("  - HuggingFace: microsoft/Phi-3-mini-4k-instruct-gguf")
         print("")
         model_name = input("Enter model name: ").strip()
         
@@ -1229,20 +1308,48 @@ def main():
             print("Error: Model name is required")
             sys.exit(1)
     
-    # Load the model with memory-aware offload
-    model_manager.load_model(
-        model_name=model_name,
-        offload_dir=args.offload_dir,
-        load_in_4bit=args.load_in_4bit,
-        load_in_8bit=args.load_in_8bit,
-        manual_ram_gb=args.ram,
-        flash_attn=getattr(args, 'flash_attn', False),
-    )
+    # Detect available backends
+    available = detect_available_backends()
+    print("\nAvailable backends:")
+    for name, available_flag in available.items():
+        status = "✓" if available_flag else "✗"
+        print(f"  [{status}] {name}")
+    print("")
+    
+    # Load the model
+    load_kwargs = {
+        'offload_dir': args.offload_dir,
+        'load_in_4bit': args.load_in_4bit,
+        'load_in_8bit': args.load_in_8bit,
+        'manual_ram_gb': args.ram,
+        'flash_attn': args.flash_attn,
+        'n_gpu_layers': args.n_gpu_layers,
+        'n_ctx': args.n_ctx,
+    }
+    
+    try:
+        model_manager.load_model(
+            model_name=model_name,
+            backend_type=args.backend,
+            **load_kwargs
+        )
+    except Exception as e:
+        print(f"\nError loading model: {e}")
+        print("\nTroubleshooting:")
+        if args.backend == "vulkan":
+            print("  - For Vulkan, ensure you have Vulkan drivers installed")
+            print("  - Make sure you're using a GGUF format model")
+            print("  - Run build.sh with 'vulkan' argument first")
+        else:
+            print("  - For NVIDIA, ensure PyTorch with CUDA is installed")
+            print("  - Run build.sh with 'nvidia' argument first")
+        sys.exit(1)
     
     # Start the server
     import uvicorn
     print(f"\nStarting server on http://{args.host}:{args.port}")
     print(f"API documentation available at http://{args.host}:{args.port}/docs")
+    print(f"Using backend: {model_manager.backend_type}")
     uvicorn.run(app, host=args.host, port=args.port)
 
 

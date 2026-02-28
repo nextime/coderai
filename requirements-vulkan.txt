@@ -1,0 +1,16 @@
+# FastAPI and server dependencies
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+
+# llama-cpp-python is installed by build.sh with Vulkan support
+# CMAKE_ARGS="-DGGML_VULKAN=ON" pip install llama-cpp-python --no-cache-dir
+
+# System resource detection
+psutil>=5.9.0
+procname>=0.3.0  # optional - for setting process name
+
+# HuggingFace Hub for downloading GGUF models
+huggingface-hub>=0.19.0
+
+# No PyTorch needed for Vulkan backend - llama-cpp handles everything
