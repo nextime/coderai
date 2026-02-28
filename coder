@@ -1,0 +1,795 @@
+#!/usr/bin/env python3
+"""
+coder - A CLI tool for interacting with coderai API
+Connects to OpenAI-compatible API and executes tools automatically.
+"""
+
+import os
+import sys
+import json
+import argparse
+import subprocess
+from pathlib import Path
+from typing import Optional, Dict, Any, List, Callable
+from dataclasses import dataclass, field
+
+import requests
+
+
+# Default system prompt for normal models
+DEFAULT_SYSTEM_PROMPT = """You are Coder, an AI coding assistant. You help users write, read, and modify code files. You have access to tools for file operations.
+
+## CRITICAL: Response Format
+
+1. ALWAYS maintain proper spacing between words and after punctuation.
+2. Use complete sentences with normal spacing.
+3. When showing code, use proper code blocks with language identifiers.
+
+## Available Tools
+
+You can invoke tools by outputting JSON inside <tool> tags:
+
+<tool>{"name": "TOOL_NAME", "arguments": {PARAMETERS}}</tool>
+
+### read_file - Read file contents
+Purpose: Read one or more files to understand the codebase
+Parameters: {"path": "relative/path/to/file"}
+Example: <tool>{"name": "read_file", "arguments": {"path": "main.py"}}</tool>
+
+### write_file - Create or overwrite files
+Purpose: Write new files or completely replace existing ones
+Parameters: {"path": "relative/path", "content": "full file content"}
+Example: <tool>{"name": "write_file", "arguments": {"path": "hello.py", "content": "print('Hello World')"}}</tool>
+
+### apply_diff - Modify existing files
+Purpose: Make targeted changes to specific sections of files
+Parameters: {"path": "relative/path", "diff": "SEARCH/REPLACE block"}
+Example: <tool>{"name": "apply_diff", "arguments": {"path": "main.py", "diff": "<<<<<<< SEARCH\ndef old_func():\n    pass\n=======\ndef new_func():\n    return 42\n>>>>>>> REPLACE"}}</tool>
+
+### execute_command - Run shell commands
+Purpose: Execute commands like git, npm, python, ls, etc.
+Parameters: {"command": "shell command string"}
+Example: <tool>{"name": "execute_command", "arguments": {"command": "ls -la"}}</tool>
+
+## Tool Usage Rules
+
+1. READ FIRST: Always read files before modifying them
+2. COMPLETE REPLACEMENTS: When using write_file, include the ENTIRE file content
+3. TARGETED EDITS: Use apply_diff for small changes to preserve the rest of the file
+4. ONE TOOL AT A TIME: Make one tool call, wait for results, then proceed
+5. VERIFY CHANGES: After writing files, read them back to confirm
+
+## Workflow Example
+
+User: "Add a function to main.py"
+You: <tool>{"name": "read_file", "arguments": {"path": "main.py"}}</tool>
+[Tool result shown]
+You: [Explain what you'll add, then call write_file or apply_diff]
+
+## Output Style
+
+- Use markdown for formatting
+- Show file paths as [`filename`](path/to/file)
+- Include code blocks with language tags
+- Maintain normal spacing in all responses"""
+
+# Simplified system prompt for tiny models (under 3B parameters)
+TINY_MODEL_SYSTEM_PROMPT = """You are Coder, an AI assistant. Help with coding tasks.
+
+IMPORTANT RULES:
+1. Put ONE space between EVERY word.
+2. Put ONE space after periods and commas.
+3. Use code blocks with triple backticks.
+4. Be concise.
+
+TOOLS:
+Use <tool>{"name": "TOOL", "arguments": {}}</tool> format.
+
+Available tools:
+- read_file: {"path": "file.py"} - Read a file
+- write_file: {"path": "file.py", "content": "code"} - Write a file
+- apply_diff: {"path": "file.py", "diff": "SEARCH...REPLACE"} - Edit file
+- execute_command: {"command": "ls"} - Run command
+
+ALWAYS add spaces between words."""
+
+
+@dataclass
+class Config:
+    """Configuration for the coder CLI."""
+    api_url: str = "http://localhost:6744/v1"
+    token: Optional[str] = None
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT
+    model: str = "default"
+    tiny: bool = False  # Use tiny model optimizations
+
+    @classmethod
+    def load(cls, config_path: Optional[str] = None) -> "Config":
+        """Load configuration from file or create default."""
+        if config_path is None:
+            config_path = os.path.expanduser("~/.config/coderai/cli.json")
+        
+        config = cls()
+        
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    data = json.load(f)
+                config.api_url = data.get('api_url', config.api_url)
+                config.token = data.get('token')
+                config.system_prompt = data.get('system_prompt', config.system_prompt)
+                config.model = data.get('model', config.model)
+                config.tiny = data.get('tiny', config.tiny)
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"Warning: Could not load config from {config_path}: {e}", file=sys.stderr)
+        
+        return config
+    
+    def save(self, config_path: Optional[str] = None) -> None:
+        """Save configuration to file."""
+        if config_path is None:
+            config_path = os.path.expanduser("~/.config/coderai/cli.json")
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        
+        data = {
+            'api_url': self.api_url,
+            'token': self.token,
+            'system_prompt': self.system_prompt,
+            'model': self.model,
+            'tiny': self.tiny
+        }
+        
+        with open(config_path, 'w') as f:
+            json.dump(data, f, indent=2)
+
+
+class ToolExecutor:
+    """Executes tool calls from the LLM."""
+    
+    def __init__(self, working_dir: str = "."):
+        self.working_dir = working_dir
+        self.tools = self._define_tools()
+    
+    def _define_tools(self) -> List[Dict[str, Any]]:
+        """Define available tools in OpenAI format."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read the contents of a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Path to the file to read (relative to working directory)"
+                            }
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write content to a file (creates or overwrites)",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Path to the file to write (relative to working directory)"
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Content to write to the file"
+                            }
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "apply_diff",
+                    "description": "Apply a diff/patch to a file. Use SEARCH/REPLACE blocks format.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Path to the file to modify"
+                            },
+                            "diff": {
+                                "type": "string",
+                                "description": "Diff content in SEARCH/REPLACE format: <<<<<<< SEARCH\\n[old content]\\n=======\\n[new content]\\n>>>>>>> REPLACE"
+                            }
+                        },
+                        "required": ["path", "diff"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "execute_command",
+                    "description": "Execute a shell command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "The shell command to execute"
+                            },
+                            "cwd": {
+                                "type": "string",
+                                "description": "Working directory for the command (optional, defaults to current)"
+                            }
+                        },
+                        "required": ["command"]
+                    }
+                }
+            }
+        ]
+    
+    def execute(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a tool call and return the result."""
+        try:
+            if tool_name == "read_file":
+                return self._read_file(arguments["path"])
+            elif tool_name == "write_file":
+                return self._write_file(arguments["path"], arguments["content"])
+            elif tool_name == "apply_diff":
+                return self._apply_diff(arguments["path"], arguments["diff"])
+            elif tool_name == "execute_command":
+                cwd = arguments.get("cwd", self.working_dir)
+                return self._execute_command(arguments["command"], cwd)
+            else:
+                return {"error": f"Unknown tool: {tool_name}"}
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def _read_file(self, path: str) -> Dict[str, Any]:
+        """Read a file and return its contents."""
+        full_path = os.path.join(self.working_dir, path)
+        full_path = os.path.abspath(full_path)
+        
+        if not os.path.exists(full_path):
+            return {"error": f"File not found: {path}"}
+        
+        if not os.path.isfile(full_path):
+            return {"error": f"Path is not a file: {path}"}
+        
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+            return {"content": content, "path": path}
+        except Exception as e:
+            return {"error": f"Failed to read file: {e}"}
+    
+    def _write_file(self, path: str, content: str) -> Dict[str, Any]:
+        """Write content to a file."""
+        full_path = os.path.join(self.working_dir, path)
+        full_path = os.path.abspath(full_path)
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        
+        try:
+            with open(full_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            return {"success": True, "path": path, "bytes_written": len(content)}
+        except Exception as e:
+            return {"error": f"Failed to write file: {e}"}
+    
+    def _apply_diff(self, path: str, diff: str) -> Dict[str, Any]:
+        """Apply a SEARCH/REPLACE diff to a file."""
+        full_path = os.path.join(self.working_dir, path)
+        full_path = os.path.abspath(full_path)
+        
+        if not os.path.exists(full_path):
+            return {"error": f"File not found: {path}"}
+        
+        try:
+            with open(full_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Parse and apply SEARCH/REPLACE blocks
+            import re
+            pattern = r'<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE'
+            matches = list(re.finditer(pattern, diff, re.DOTALL))
+            
+            if not matches:
+                return {"error": "No valid SEARCH/REPLACE blocks found in diff"}
+            
+            new_content = content
+            replacements = 0
+            
+            for match in matches:
+                search_text = match.group(1)
+                replace_text = match.group(2)
+                
+                if search_text in new_content:
+                    new_content = new_content.replace(search_text, replace_text, 1)
+                    replacements += 1
+                else:
+                    return {"error": f"Search text not found in file: {search_text[:50]}..."}
+            
+            with open(full_path, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            
+            return {
+                "success": True, 
+                "path": path, 
+                "replacements": replacements
+            }
+        except Exception as e:
+            return {"error": f"Failed to apply diff: {e}"}
+    
+    def _execute_command(self, command: str, cwd: str) -> Dict[str, Any]:
+        """Execute a shell command."""
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minute timeout
+            )
+            
+            return {
+                "success": result.returncode == 0,
+                "returncode": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "command": command
+            }
+        except subprocess.TimeoutExpired:
+            return {"error": "Command timed out after 5 minutes"}
+        except Exception as e:
+            return {"error": f"Failed to execute command: {e}"}
+
+
+class CoderClient:
+    """Client for interacting with the coderai API."""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.tool_executor = ToolExecutor()
+        self.conversation_history: List[Dict[str, Any]] = []
+    
+    def chat(self, message: str, stream: bool = True) -> str:
+        """Send a message to the API and get response."""
+        # Add user message to history
+        self.conversation_history.append({
+            "role": "user",
+            "content": message
+        })
+        
+        # Prepare messages with system prompt
+        messages = [{"role": "system", "content": self.config.system_prompt}]
+        messages.extend(self.conversation_history)
+        
+        headers = {"Content-Type": "application/json"}
+        if self.config.token:
+            headers["Authorization"] = f"Bearer {self.config.token}"
+        
+        payload = {
+            "model": self.config.model,
+            "messages": messages,
+            "tools": self.tool_executor.tools,
+            "tool_choice": "auto",
+            "stream": stream
+        }
+        
+        try:
+            response = requests.post(
+                f"{self.config.api_url}/chat/completions",
+                headers=headers,
+                json=payload,
+                stream=stream,
+                timeout=60
+            )
+            response.raise_for_status()
+            
+            if stream:
+                return self._handle_streaming_response(response)
+            else:
+                return self._handle_non_streaming_response(response)
+                
+        except requests.exceptions.ConnectionError:
+            return "Error: Could not connect to API. Is the server running?"
+        except requests.exceptions.Timeout:
+            return "Error: Request timed out."
+        except requests.exceptions.RequestException as e:
+            return f"Error: API request failed: {e}"
+    
+    def _handle_streaming_response(self, response: requests.Response) -> str:
+        """Handle streaming response from API."""
+        full_content = ""
+        tool_calls = []
+        current_tool_call = None
+        
+        for line in response.iter_lines():
+            if not line:
+                continue
+            
+            line = line.decode('utf-8')
+            
+            # Handle SSE format
+            if line.startswith('data: '):
+                line = line[6:]
+            
+            if line == '[DONE]':
+                break
+            
+            try:
+                data = json.loads(line)
+                delta = data.get('choices', [{}])[0].get('delta', {})
+                
+                # Handle content
+                content = delta.get('content')
+                if content:
+                    print(content, end='', flush=True)
+                    full_content += content
+                
+                # Handle tool calls
+                delta_tool_calls = delta.get('tool_calls')
+                if delta_tool_calls:
+                    for tc in delta_tool_calls:
+                        index = tc.get('index', 0)
+                        
+                        # Extend tool_calls list if needed
+                        while len(tool_calls) <= index:
+                            tool_calls.append({
+                                'id': '',
+                                'type': 'function',
+                                'function': {'name': '', 'arguments': ''}
+                            })
+                        
+                        # Update tool call
+                        if 'id' in tc:
+                            tool_calls[index]['id'] = tc['id']
+                        if 'function' in tc:
+                            if 'name' in tc['function']:
+                                tool_calls[index]['function']['name'] = tc['function']['name']
+                            if 'arguments' in tc['function']:
+                                tool_calls[index]['function']['arguments'] += tc['function']['arguments']
+                
+            except json.JSONDecodeError:
+                continue
+        
+        print()  # Newline after streaming
+        
+        # Execute tool calls if any
+        if tool_calls:
+            print("\n[Executing tools...]")
+            tool_results = []
+            
+            for tc in tool_calls:
+                tool_name = tc['function']['name']
+                try:
+                    arguments = json.loads(tc['function']['arguments'])
+                except json.JSONDecodeError:
+                    arguments = {}
+                
+                print(f"  → {tool_name}({arguments})")
+                result = self.tool_executor.execute(tool_name, arguments)
+                tool_results.append({
+                    "tool_call_id": tc['id'],
+                    "role": "tool",
+                    "content": json.dumps(result)
+                })
+                
+                if "error" in result:
+                    print(f"    Error: {result['error']}")
+                else:
+                    print(f"    Success")
+            
+            # Add assistant message with tool calls to history
+            self.conversation_history.append({
+                "role": "assistant",
+                "content": full_content or None,
+                "tool_calls": [
+                    {
+                        "id": tc['id'],
+                        "type": "function",
+                        "function": tc['function']
+                    } for tc in tool_calls
+                ]
+            })
+            
+            # Add tool results to history
+            self.conversation_history.extend(tool_results)
+            
+            # Get follow-up response with tool results
+            print("\n[Getting follow-up response...]")
+            return self._get_follow_up_response()
+        
+        # Add assistant response to history
+        if full_content:
+            self.conversation_history.append({
+                "role": "assistant",
+                "content": full_content
+            })
+        
+        return full_content
+    
+    def _handle_non_streaming_response(self, response: requests.Response) -> str:
+        """Handle non-streaming response from API."""
+        data = response.json()
+        message = data.get('choices', [{}])[0].get('message', {})
+        content = message.get('content', '')
+        tool_calls = message.get('tool_calls', [])
+        
+        if content:
+            print(content)
+        
+        # Execute tool calls if any
+        if tool_calls:
+            print("\n[Executing tools...]")
+            tool_results = []
+            
+            for tc in tool_calls:
+                tool_name = tc['function']['name']
+                try:
+                    arguments = json.loads(tc['function']['arguments'])
+                except json.JSONDecodeError:
+                    arguments = {}
+                
+                print(f"  → {tool_name}({arguments})")
+                result = self.tool_executor.execute(tool_name, arguments)
+                tool_results.append({
+                    "tool_call_id": tc['id'],
+                    "role": "tool",
+                    "content": json.dumps(result)
+                })
+                
+                if "error" in result:
+                    print(f"    Error: {result['error']}")
+                else:
+                    print(f"    Success")
+            
+            # Add to history
+            self.conversation_history.append({
+                "role": "assistant",
+                "content": content or None,
+                "tool_calls": tool_calls
+            })
+            self.conversation_history.extend(tool_results)
+            
+            # Get follow-up response
+            print("\n[Getting follow-up response...]")
+            return self._get_follow_up_response()
+        
+        # Add to history
+        self.conversation_history.append({
+            "role": "assistant",
+            "content": content
+        })
+        
+        return content
+    
+    def _get_follow_up_response(self) -> str:
+        """Get follow-up response after tool execution."""
+        messages = [{"role": "system", "content": self.config.system_prompt}]
+        messages.extend(self.conversation_history)
+        
+        headers = {"Content-Type": "application/json"}
+        if self.config.token:
+            headers["Authorization"] = f"Bearer {self.config.token}"
+        
+        payload = {
+            "model": self.config.model,
+            "messages": messages,
+            "tools": self.tool_executor.tools,
+            "tool_choice": "auto",
+            "stream": True
+        }
+        
+        response = requests.post(
+            f"{self.config.api_url}/chat/completions",
+            headers=headers,
+            json=payload,
+            stream=True,
+            timeout=60
+        )
+        response.raise_for_status()
+        
+        return self._handle_streaming_response(response)
+    
+    def clear_history(self):
+        """Clear conversation history."""
+        self.conversation_history = []
+
+
+def run_interactive_shell(client: CoderClient) -> None:
+    """Run interactive REPL shell."""
+    print("=" * 60)
+    print("  coder - Interactive Coding Assistant")
+    print("=" * 60)
+    print("Type 'quit', 'exit' or press Ctrl+C to exit.")
+    print("Type 'clear' to clear conversation history.")
+    print("Type 'help' for more commands.")
+    print("-" * 60)
+    
+    while True:
+        try:
+            print()
+            user_input = input("> ").strip()
+            
+            if not user_input:
+                continue
+            
+            if user_input.lower() in ('quit', 'exit', 'q'):
+                print("Goodbye!")
+                break
+            
+            if user_input.lower() == 'clear':
+                client.clear_history()
+                print("Conversation history cleared.")
+                continue
+            
+            if user_input.lower() == 'help':
+                print_help()
+                continue
+            
+            if user_input.lower().startswith('/read '):
+                path = user_input[6:].strip()
+                result = client.tool_executor._read_file(path)
+                if 'content' in result:
+                    print(f"\n--- Content of {path} ---")
+                    print(result['content'])
+                    print("--- End ---")
+                else:
+                    print(f"Error: {result.get('error', 'Unknown error')}")
+                continue
+            
+            if user_input.lower().startswith('/exec '):
+                command = user_input[6:].strip()
+                result = client.tool_executor._execute_command(command, ".")
+                print(f"\n$ {command}")
+                if result.get('stdout'):
+                    print(result['stdout'])
+                if result.get('stderr'):
+                    print("stderr:", result['stderr'], file=sys.stderr)
+                if result.get('returncode', 0) != 0:
+                    print(f"Exit code: {result['returncode']}")
+                continue
+            
+            # Send message to LLM
+            client.chat(user_input)
+            
+        except KeyboardInterrupt:
+            print("\nGoodbye!")
+            break
+        except EOFError:
+            print("\nGoodbye!")
+            break
+
+
+def print_help():
+    """Print help information."""
+    print("""
+Commands:
+  quit, exit, q    Exit the shell
+  clear            Clear conversation history
+  help             Show this help message
+  
+Shortcuts:
+  /read <path>     Read a file directly
+  /exec <command>  Execute a shell command directly
+
+The assistant can use tools to:
+  - read_file: Read file contents
+  - write_file: Write/create files
+  - apply_diff: Apply patches to files
+  - execute_command: Run shell commands
+""")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="coder - CLI tool for coderai API",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  coder                    Start interactive shell
+  coder "Hello!"           Send a single message
+  coder -m "Fix bug"       Send message non-interactively
+  coder --config /path     Use custom config file
+        """
+    )
+    
+    parser.add_argument(
+        'message',
+        nargs='?',
+        help='Message to send (if not provided, starts interactive shell)'
+    )
+    
+    parser.add_argument(
+        '-m', '--message',
+        dest='msg_flag',
+        help='Message to send (alternative to positional argument)'
+    )
+    
+    parser.add_argument(
+        '--api-url',
+        help='API URL (default: from config or http://localhost:6744/v1)'
+    )
+    
+    parser.add_argument(
+        '--token',
+        help='API token (default: from config)'
+    )
+    
+    parser.add_argument(
+        '--config',
+        help='Path to config file (default: ~/.config/coderai/cli.json)'
+    )
+    
+    parser.add_argument(
+        '--init-config',
+        action='store_true',
+        help='Create default config file and exit'
+    )
+    
+    parser.add_argument(
+        '--no-stream',
+        action='store_true',
+        help='Disable streaming responses'
+    )
+    
+    parser.add_argument(
+        '--tiny',
+        action='store_true',
+        help='Use tiny model mode (simplified system prompt for models under 3B parameters)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Handle init-config
+    if args.init_config:
+        config = Config()
+        config.save()
+        config_path = os.path.expanduser("~/.config/coderai/cli.json")
+        print(f"Created default config at: {config_path}")
+        print(json.dumps({
+            'api_url': config.api_url,
+            'token': config.token,
+            'system_prompt': config.system_prompt,
+            'model': config.model
+        }, indent=2))
+        return
+    
+    # Load config
+    config = Config.load(args.config)
+    
+    # Override with command line args
+    if args.api_url:
+        config.api_url = args.api_url
+    if args.token:
+        config.token = args.token
+    
+    # Create client
+    client = CoderClient(config)
+    
+    # Get message
+    message = args.message or args.msg_flag
+    
+    if message:
+        # Single message mode
+        client.chat(message, stream=not args.no_stream)
+    else:
+        # Interactive shell mode
+        run_interactive_shell(client)
+
+
+if __name__ == "__main__":
+    main()
