@@ -622,7 +622,26 @@ class VulkanBackend(ModelBackend):
                 print(result.stdout)
         except Exception:
             pass
-        
+    
+    def count_vulkan_devices(self):
+        """Count the number of Vulkan GPU devices available."""
+        try:
+            from llama_cpp import llama_get_devices
+            devices = llama_get_devices()
+            return len(devices)
+        except:
+            # Fallback: try to parse vulkaninfo
+            try:
+                import subprocess
+                result = subprocess.run(['vulkaninfo', '--summary'], capture_output=True, text=True)
+                if result.returncode == 0:
+                    # Count GPU devices in output
+                    gpu_count = result.stdout.count('GPU') + result.stdout.count('device')
+                    return max(gpu_count, 1)
+            except:
+                pass
+        return 2  # Default to 2 if we can't detect
+    
     def load_model(self, model_name: str, **kwargs) -> None:
         """Load a GGUF model using llama-cpp-python."""
         from llama_cpp import Llama
@@ -686,14 +705,39 @@ class VulkanBackend(ModelBackend):
         # List available devices for user reference
         self.list_vulkan_devices()
         
+        # Check if single GPU mode is requested
+        single_gpu = kwargs.get('single_gpu', False)
+        tensor_split = None
+        
+        if single_gpu:
+            # Build tensor_split to force all layers onto one GPU
+            # We need to detect how many GPUs are visible to Vulkan
+            num_devices = self.count_vulkan_devices()
+            # Create tensor_split array: 1.0 for selected GPU, 0.0 for others
+            tensor_split = [0.0] * num_devices
+            if main_gpu < len(tensor_split):
+                tensor_split[main_gpu] = 1.0
+            else:
+                print(f"Warning: main_gpu={main_gpu} exceeds detected devices ({num_devices})")
+                tensor_split = None
+            
+            if tensor_split:
+                print(f"  Single GPU mode: Forcing all layers to GPU {main_gpu}")
+                print(f"  Tensor split: {tensor_split}")
+        
         try:
-            self.model = Llama(
-                model_path=model_path,
-                n_gpu_layers=n_gpu_layers,
-                n_ctx=n_ctx,
-                verbose=verbose,
-                main_gpu=main_gpu,
-            )
+            llama_kwargs = {
+                'model_path': model_path,
+                'n_gpu_layers': n_gpu_layers,
+                'n_ctx': n_ctx,
+                'verbose': verbose,
+                'main_gpu': main_gpu,
+            }
+            
+            if tensor_split:
+                llama_kwargs['tensor_split'] = tensor_split
+            
+            self.model = Llama(**llama_kwargs)
             self.model_name = model_name
             print("\nModel loaded successfully with Vulkan!")
         except Exception as e:
@@ -1302,6 +1346,11 @@ def parse_args():
         help="Vulkan GPU device ID to use (Vulkan backend only, default: 0). Use --vulkan-list-devices to see available devices",
     )
     parser.add_argument(
+        "--vulkan-single-gpu",
+        action="store_true",
+        help="Force Vulkan to use only the specified GPU device (prevents layer distribution across multiple GPUs)",
+    )
+    parser.add_argument(
         "--vulkan-list-devices",
         action="store_true",
         help="List available Vulkan GPU devices and exit",
@@ -1371,6 +1420,7 @@ def main():
         'n_gpu_layers': args.n_gpu_layers,
         'n_ctx': args.n_ctx,
         'main_gpu': args.vulkan_device,
+        'single_gpu': args.vulkan_single_gpu,
     }
     
     try:

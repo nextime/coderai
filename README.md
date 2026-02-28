@@ -184,6 +184,7 @@ options:
                         default: -1 = all layers)
   --n-ctx N             Context window size (Vulkan only, default: 2048)
   --vulkan-device N     Vulkan GPU device ID to use (Vulkan only, default: 0)
+  --vulkan-single-gpu   Force Vulkan to use only the specified GPU (prevents layer distribution across multiple GPUs)
   --vulkan-list-devices List available Vulkan GPU devices and exit
 ```
 
@@ -441,9 +442,18 @@ python coderai --model bigscience/bloom-7b1 --offload-dir /path/to/fast/storage
 
 ### Using Vulkan with Multiple GPUs (NVIDIA + AMD)
 
-If your system has both NVIDIA and AMD GPUs, Vulkan may allocate some resources on all visible GPUs. To force Vulkan to use **only** the AMD GPU and prevent VRAM allocation on the NVIDIA GPU:
+If your system has both NVIDIA and AMD GPUs, llama.cpp's Vulkan backend will automatically distribute layers across all visible GPUs for performance. To force Vulkan to use **only** the AMD GPU and prevent VRAM allocation on the NVIDIA GPU:
 
-**Method 1: Use environment variable to select specific Vulkan device**
+**Method 1: Use `--vulkan-single-gpu` flag (Recommended)**
+```bash
+# Force all layers onto the specified GPU device only
+# For example, to use only device 1 (AMD GPU):
+python coderai --model model.gguf --backend vulkan --vulkan-device 1 --vulkan-single-gpu --port 6744
+
+# This creates a tensor_split that puts 0% on other GPUs and 100% on the selected GPU
+```
+
+**Method 2: Use environment variable to select specific Vulkan device**
 ```bash
 # List available Vulkan devices first
 python coderai --vulkan-list-devices
@@ -453,30 +463,19 @@ python coderai --vulkan-list-devices
 VK_DEVICE_SELECT_DEVICE=1 python coderai --model model.gguf --backend vulkan --vulkan-device 0 --port 6744
 ```
 
-**Method 2: Hide NVIDIA GPU from CUDA (prevents any CUDA usage)**
+**Method 3: Hide NVIDIA GPU from CUDA (prevents any CUDA usage)**
 ```bash
 # Make NVIDIA GPU invisible to CUDA/Vulkan
 CUDA_VISIBLE_DEVICES="" python coderai --model model.gguf --backend vulkan --vulkan-device 0 --port 6744
 ```
 
-**Method 3: Use llama-cpp-python's device filtering (in code)**
-```python
-# In your own scripts using llama-cpp-python directly:
-from llama_cpp import Llama
-
-# main_gpu parameter selects which Vulkan device to use
-llm = Llama(
-    model_path="./model.gguf",
-    n_gpu_layers=-1,
-    n_ctx=2048,
-    main_gpu=0,  # Use first Vulkan device (should be AMD if NVIDIA is hidden)
-)
-```
+**Understanding the Issue:**
+When you have multiple Vulkan-compatible GPUs, llama.cpp automatically distributes model layers across them (shown in logs as "layer X assigned to device VulkanY"). The `--vulkan-single-gpu` flag prevents this by using the `tensor_split` parameter with a value of `[0.0, 1.0]` (or similar depending on device count), which tells llama.cpp to put 0% of layers on some GPUs and 100% on the selected GPU.
 
 **Notes:**
 - The `--vulkan-device` argument maps to `main_gpu` in llama-cpp-python
+- The `--vulkan-single-gpu` flag builds a `tensor_split` array to force single GPU usage
 - Vulkan enumerates all GPUs in your system, so device IDs may differ from CUDA device IDs
-- If you see VRAM allocated on both GPUs, use `VK_DEVICE_SELECT_DEVICE` or hide NVIDIA from CUDA
 - The `vulkaninfo` command shows all GPUs visible to Vulkan
 
 ### Multi-GPU Setup
