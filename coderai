@@ -21,7 +21,8 @@ from typing import AsyncGenerator, Dict, List, Optional, Union
 import psutil
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator, field_validator
+from pydantic_core import PydanticCustomError
 from threading import Thread
 
 
@@ -81,10 +82,34 @@ class Tool(BaseModel):
 
 class ChatMessage(BaseModel):
     role: str
-    content: Optional[str] = None
+    content: Optional[Union[str, List[Dict]]] = None
     name: Optional[str] = None
     tool_calls: Optional[List[Dict]] = None
     tool_call_id: Optional[str] = None
+    
+    @field_validator('content', mode='before')
+    @classmethod
+    def convert_content_array_to_string(cls, v):
+        """Convert multipart content array to string for compatibility."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return v
+        if isinstance(v, list):
+            # Handle multipart content array format (e.g., from KiloCode)
+            # Format: [{"type": "text", "text": "..."}, {"type": "text", "text": "..."}]
+            parts = []
+            for item in v:
+                if isinstance(item, dict):
+                    if item.get('type') == 'text' and 'text' in item:
+                        parts.append(item['text'])
+                    else:
+                        # Handle other content types (image_url, etc.) by converting to placeholder
+                        parts.append(f"[{item.get('type', 'unknown')} content]")
+                else:
+                    parts.append(str(item))
+            return '\n'.join(parts)
+        return str(v)
 
 
 class ChatCompletionRequest(BaseModel):
