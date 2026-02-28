@@ -1064,6 +1064,9 @@ class VulkanBackend(ModelBackend):
                 print(f"DEBUG: generate_chat_stream: Raw chunk {chunk_count}: {repr(chunk)}")
                 delta = chunk["choices"][0].get("delta", {})
                 content = delta.get("content", "")
+                
+                # Handle Qwen3's special thinking token - skip it and continue
+                # Qwen3 uses `<think>` tags for reasoning, we should pass through the content
                 if content:
                     total_content += content
                     yield content
@@ -1082,7 +1085,8 @@ class VulkanBackend(ModelBackend):
                 async for chunk in self.generate_stream(prompt, max_tokens, temperature, top_p, stop):
                     yield chunk
             else:
-                print(f"DEBUG: Stream completed with {chunk_count} chunks")
+                print(f"DEBUG: Stream completed with {chunk_count} chunks")    
+    def _manual_format_messages(self, messages: List[Dict]) -> str:
     
     def _manual_format_messages(self, messages: List[Dict]) -> str:
         """Manual fallback for formatting messages when create_chat_completion fails."""
