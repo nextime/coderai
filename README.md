@@ -1,10 +1,13 @@
 # CoderAI
 
-An OpenAI-compatible API server supporting both NVIDIA (CUDA) and AMD (Vulkan) GPUs. Uses HuggingFace Transformers for NVIDIA GPUs and llama-cpp-python with Vulkan for AMD GPUs.
+An OpenAI-compatible API server supporting multiple GPU backends: NVIDIA (CUDA), AMD (Vulkan), and Intel (Vulkan). Uses HuggingFace Transformers for NVIDIA GPUs and llama-cpp-python with Vulkan for AMD/Intel GPUs.
 
 ## Features
 
-- **Dual Backend Support**: NVIDIA (CUDA) via PyTorch + Transformers, AMD (Vulkan) via llama-cpp-python
+- **Multi-Backend Support**: 
+  - NVIDIA (CUDA) via PyTorch + Transformers
+  - AMD GPUs via llama-cpp-python + Vulkan
+  - Intel GPUs (iGPU/Arc) via llama-cpp-python + Vulkan
 - **OpenAI-Compatible API**: Drop-in replacement for OpenAI's API endpoints
 - **Memory-Aware Model Loading**: Automatically determines optimal loading strategy based on available VRAM and RAM (NVIDIA)
 - **Sequential Offloading**: Smart offload from VRAM → RAM → Disk when needed (NVIDIA)
@@ -22,8 +25,15 @@ An OpenAI-compatible API server supporting both NVIDIA (CUDA) and AMD (Vulkan) G
 
 - Python 3.8+
 - For NVIDIA GPUs: CUDA toolkit (11.8+ recommended)
-- For AMD GPUs (Vulkan): Vulkan drivers and SDK
+- For AMD/Intel GPUs (Vulkan): Vulkan drivers and SDK
 - For CPU-only: No additional requirements
+
+**Note**: The Vulkan backend works with:
+- AMD GPUs (RX 400 series and newer) - **Recommended**
+- Intel integrated GPUs (HD 600 series and newer) and Intel Arc GPUs
+- NVIDIA GPUs (GTX 900 series and newer) - *CUDA backend preferred*
+
+Any GPU with Vulkan 1.2+ driver support should work with the Vulkan backend.
 
 ### Quick Install with Build Script
 
@@ -37,9 +47,11 @@ cd coderai
 # For NVIDIA GPUs (default)
 ./build.sh nvidia
 
-# For AMD GPUs with Vulkan support
+# For AMD or Intel GPUs with Vulkan support
 ./build.sh vulkan
 ```
+
+**Note**: The `vulkan` option works for both AMD and Intel GPUs.
 
 The build script will:
 - Create a virtual environment
@@ -75,10 +87,13 @@ Requires:
 
 Models: HuggingFace format (safetensors/pytorch)
 
-#### AMD (Vulkan)
+#### AMD and Intel (Vulkan)
 
 Requires:
-- AMD GPU with Vulkan support (RX 400 series and newer)
+- GPU with Vulkan 1.2+ support:
+  - AMD: RX 400 series and newer (recommended)
+  - Intel: HD 600 series integrated graphics or newer, Intel Arc GPUs
+  - NVIDIA: GTX 900 series and newer (but CUDA backend preferred)
 - Vulkan drivers and SDK
 
 **Install Vulkan drivers and tools:**
@@ -108,7 +123,7 @@ sudo ln -s $(which glslangValidator) /usr/local/bin/glslc
 
 Models: GGUF format (from HuggingFace or local files)
 
-**Note**: The Vulkan backend uses llama-cpp-python with GGUF models, which provides excellent performance on AMD GPUs without requiring ROCm.
+**Note**: The Vulkan backend uses llama-cpp-python with GGUF models, which provides excellent performance on AMD and Intel GPUs without requiring vendor-specific SDKs (ROCm/OneAPI).
 
 ### Optional Dependencies
 
@@ -171,7 +186,7 @@ options:
                         For Vulkan: GGUF file path or HF repo
   --backend {auto,nvidia,vulkan}
                         Backend to use: auto (detect), nvidia (CUDA), or
-                        vulkan (AMD GPUs)
+                        vulkan (AMD/Intel GPUs via Vulkan)
   --host HOST           Host to bind to (default: 0.0.0.0)
   --port PORT           Port to bind to (default: 8000)
   --offload-dir OFFLOAD_DIR
@@ -194,7 +209,7 @@ The `--backend` option controls which backend to use:
 
 - **`auto`** (default): Automatically detects available backends, preferring NVIDIA if available
 - **`nvidia`**: Use PyTorch + Transformers with CUDA (for NVIDIA GPUs)
-- **`vulkan`**: Use llama-cpp-python with Vulkan (for AMD GPUs)
+- **`vulkan`**: Use llama-cpp-python with Vulkan (for AMD and Intel GPUs)
 
 ### Model Formats by Backend
 
@@ -369,12 +384,15 @@ python coderai --model meta-llama/Llama-2-7b-chat-hf --backend nvidia
 python coderai --model meta-llama/Llama-2-7b-chat-hf --backend nvidia --flash-attn
 ```
 
-### AMD (Vulkan)
+### AMD and Intel (Vulkan)
 
 ```bash
 # Install Vulkan drivers first
-# Debian/Ubuntu:
-sudo apt install libvulkan-dev vulkan-tools mesa-vulkan-drivers
+# Debian/Ubuntu (AMD and Intel):
+sudo apt install libvulkan-dev vulkan-tools mesa-vulkan-drivers intel-media-va-driver
+
+# Fedora:
+sudo dnf install vulkan-loader-devel vulkan-tools mesa-vulkan-drivers intel-gpu-tools
 
 # Using build script
 ./build.sh vulkan
@@ -391,7 +409,7 @@ python coderai --model model.gguf --backend vulkan --n-gpu-layers 35
 # Adjust context window (default: 2048)
 python coderai --model model.gguf --backend vulkan --n-ctx 4096
 
-# Select specific GPU device (if you have multiple GPUs - e.g., NVIDIA + AMD)
+# Select specific GPU device (if you have multiple GPUs - e.g., NVIDIA + AMD + Intel)
 python coderai --model model.gguf --backend vulkan --vulkan-device 1
 
 # List available Vulkan GPU devices
@@ -402,9 +420,17 @@ python coderai --vulkan-list-devices
 - Uses GGUF format models (much smaller than full HuggingFace models)
 - Q4_K_M quantization recommended for 4GB+ VRAM GPUs
 - Q5_K_M or Q6_K for higher quality
-- Works on AMD RX 400 series and newer
-- Also works on NVIDIA GPUs but CUDA backend is preferred for NVIDIA
+- Works on:
+  - AMD RX 400 series and newer (**recommended**)
+  - Intel integrated graphics (HD 600 series+) and Intel Arc GPUs
+  - NVIDIA GTX 900 series and newer (but CUDA backend is preferred)
+- Any GPU with Vulkan 1.2+ driver support should work
 - **Update llama-cpp-python** for newer model support: `pip install --upgrade llama-cpp-python --no-cache-dir`
+
+**Intel GPU Specific Notes:**
+- Intel integrated GPUs have limited VRAM (shared with system RAM), so use smaller models
+- Recommended for Intel iGPUs: `Q4_K_M` quantized models under 2GB file size
+- Intel Arc GPUs work well with the same settings as AMD GPUs
 
 ### CPU-Only
 
@@ -697,9 +723,15 @@ python coderai --model TheBloke/Llama-2-7B-GGUF --backend vulkan
    ```
 
 3. **Check GPU compatibility:**
-   - AMD RX 400 series and newer
-   - NVIDIA GTX 900 series and newer (but CUDA backend preferred for NVIDIA)
-   - Intel Arc GPUs (experimental)
+    - **AMD**: RX 400 series and newer (best experience)
+    - **Intel**: HD 600 series integrated graphics or newer, all Intel Arc GPUs
+    - **NVIDIA**: GTX 900 series and newer (but CUDA backend preferred for NVIDIA)
+    - Any GPU with Vulkan 1.2+ driver support should work
+
+**Performance expectations by GPU:**
+- AMD dedicated GPUs: Full performance, all layer offloading supported
+- Intel Arc GPUs: Good performance, similar to AMD
+- Intel integrated GPUs: Limited by shared system RAM, use smaller models (Q4_K_M under 2GB)
 
 **Problem**: GGUF model fails to load or produces garbled output
 
@@ -772,9 +804,9 @@ Contributions are welcome! Please feel free to submit a merge request.
 
 - Built with [FastAPI](https://fastapi.tiangolo.com/)
 - Powered by [HuggingFace Transformers](https://huggingface.co/docs/transformers/) (NVIDIA backend)
-- Powered by [llama-cpp-python](https://github.com/abetlen/llama-cpp-python) with Vulkan support (AMD backend)
+- Powered by [llama-cpp-python](https://github.com/abetlen/llama-cpp-python) with Vulkan support (AMD/Intel backend)
 - Inspired by the OpenAI API specification
 
 ---
 
-**Note on AI.PROMPT**: This project was enhanced following instructions to add Vulkan support for AMD GPUs alongside the existing NVIDIA/CUDA support. The implementation uses llama-cpp-python for Vulkan/GGUF model support while maintaining full compatibility with the existing HuggingFace/Transformers backend for NVIDIA GPUs.
+**Note on AI.PROMPT**: This project was enhanced following instructions to add Vulkan support for AMD and Intel GPUs alongside the existing NVIDIA/CUDA support. The implementation uses llama-cpp-python for Vulkan/GGUF model support while maintaining full compatibility with the existing HuggingFace/Transformers backend for NVIDIA GPUs.
