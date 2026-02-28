@@ -97,21 +97,45 @@ elif [ "$BACKEND" = "vulkan" ]; then
     fi
     
     # Check for glslc (Vulkan shader compiler) which is required for building
-    if ! command -v glslc &> /dev/null; then
-        echo -e "${YELLOW}Warning: glslc (Vulkan shader compiler) not found${NC}"
-        echo -e "${YELLOW}You need to install the shader compiler:${NC}"
-        echo "  Debian/Ubuntu: sudo apt install glslang-tools"
+    # Note: glslc might also be named glslangValidator on some systems
+    GLSLC_CMD=""
+    if command -v glslc &> /dev/null; then
+        GLSLC_CMD="glslc"
+    elif command -v glslangValidator &> /dev/null; then
+        GLSLC_CMD="glslangValidator"
+    fi
+    
+    if [ -z "$GLSLC_CMD" ]; then
+        echo -e "${YELLOW}Warning: glslc/glslangValidator (Vulkan shader compiler) not found in PATH${NC}"
+        echo -e "${YELLOW}You may need to install the shader compiler:${NC}"
+        echo "  Debian/Ubuntu: sudo apt install glslc glslang-tools glslang-dev"
         echo "  Fedora:        sudo dnf install glslang"
         echo "  Arch:          sudo pacman -S glslang"
         echo ""
-        echo -e "${RED}Error: Cannot build llama-cpp-python with Vulkan without glslc${NC}"
-        exit 1
+        echo -e "${YELLOW}Attempting build anyway - CMake may find it in a non-standard location...${NC}"
+        echo ""
+    else
+        echo -e "${GREEN}✓ Found Vulkan shader compiler: $GLSLC_CMD${NC}"
     fi
     
     # Install llama-cpp-python with Vulkan support
     # CMAKE_ARGS is used to enable Vulkan during compilation
-    echo -e "${YELLOW}Building llama-cpp-python with Vulkan support (this may take a few minutes)...${NC}"
-    CMAKE_ARGS="-DGGML_VULKAN=ON" pip install llama-cpp-python --no-cache-dir
+    echo -e "${YELLOW}Building llama-cpp-python with Vulkan support (this may take several minutes)...${NC}"
+    echo -e "${YELLOW}If this fails with 'Could NOT find Vulkan (missing: glslc)', install:${NC}"
+    echo -e "${YELLOW}  sudo apt install glslc glslang-tools glslang-dev${NC}"
+    echo ""
+    CMAKE_ARGS="-DGGML_VULKAN=ON" pip install llama-cpp-python --no-cache-dir || {
+        echo ""
+        echo -e "${RED}Build failed!${NC}"
+        echo -e "${YELLOW}If the error mentions 'missing: glslc', install the shader compiler:${NC}"
+        echo "  sudo apt install glslc glslang-tools glslang-dev"
+        echo ""
+        echo -e "${YELLOW}If glslc is already installed but not in PATH, you may need to:${NC}"
+        echo "  export PATH=\$PATH:/usr/lib/shaderc/bin"
+        echo "  or"
+        echo "  sudo ln -s /usr/bin/glslangValidator /usr/local/bin/glslc"
+        exit 1
+    }
     
     echo -e "${YELLOW}Installing Vulkan-specific requirements...${NC}"
     pip install -r requirements-vulkan.txt

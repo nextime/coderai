@@ -84,7 +84,7 @@ Requires:
 **Install Vulkan drivers and tools:**
 ```bash
 # Debian/Ubuntu
-sudo apt install libvulkan-dev vulkan-tools mesa-vulkan-drivers glslang-tools
+sudo apt install libvulkan-dev vulkan-tools mesa-vulkan-drivers glslc glslang-tools glslang-dev
 
 # Fedora
 sudo dnf install vulkan-loader-devel vulkan-tools mesa-vulkan-drivers glslang
@@ -93,7 +93,18 @@ sudo dnf install vulkan-loader-devel vulkan-tools mesa-vulkan-drivers glslang
 sudo pacman -S vulkan-headers vulkan-icd-loader vulkan-radeon glslang
 ```
 
-**Note:** The `glslang-tools` (Debian/Ubuntu) or `glslang` (Fedora/Arch) package provides `glslc`, the Vulkan shader compiler required to build llama-cpp-python with Vulkan support.
+**Note:** The shader compiler `glslc` is required to build llama-cpp-python with Vulkan support. On Debian/Ubuntu, it's provided by the `glslc` package. If `glslc` is not found after installing, try:
+
+```bash
+# Check if glslc exists somewhere
+find /usr -name "glslc" 2>/dev/null
+
+# If found in a non-standard location, add to PATH
+export PATH=$PATH:/usr/lib/shaderc/bin
+
+# Or create a symlink if glslangValidator exists
+sudo ln -s $(which glslangValidator) /usr/local/bin/glslc
+```
 
 Models: GGUF format (from HuggingFace or local files)
 
@@ -622,7 +633,14 @@ python coderai --model TheBloke/Llama-2-7B-GGUF --backend vulkan
    sudo dnf install vulkan-loader-devel vulkan-tools mesa-vulkan-drivers glslang
    ```
    
-   **Note:** `glslc` is required to compile llama-cpp-python with Vulkan support. If you see "Could NOT find Vulkan (missing: glslc)", install the `glslang-tools` (Debian/Ubuntu) or `glslang` (Fedora/Arch) package.
+   **Note:** `glslc` is required to compile llama-cpp-python with Vulkan support. If you see "Could NOT find Vulkan (missing: glslc)", install the `glslc` package:
+   ```bash
+   sudo apt install glslc glslang-tools glslang-dev
+   
+   # If glslc still not found, check location and symlink:
+   find /usr -name "glslc" 2>/dev/null
+   sudo ln -s /usr/lib/shaderc/bin/glslc /usr/local/bin/glslc 2>/dev/null || sudo ln -s $(which glslangValidator) /usr/local/bin/glslc 2>/dev/null || echo "glslc not found, please install glslc package"
+   ```
 
 2. **Reinstall llama-cpp-python with Vulkan:**
    ```bash
