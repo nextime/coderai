@@ -197,7 +197,8 @@ def filter_malformed_content(text: str) -> str:
     # Clean up excessive newlines left from removal
     filtered = re.sub(r'\n{3,}', '\n\n', filtered)
     
-    return filtered.strip()
+    # Don't strip single newlines or whitespace - they might be valid content
+    return filtered
 
 
 # =============================================================================
