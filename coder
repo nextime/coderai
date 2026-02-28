@@ -764,7 +764,8 @@ Examples:
             'api_url': config.api_url,
             'token': config.token,
             'system_prompt': config.system_prompt,
-            'model': config.model
+            'model': config.model,
+            'tiny': config.tiny
         }, indent=2))
         return
     
@@ -776,6 +777,13 @@ Examples:
         config.api_url = args.api_url
     if args.token:
         config.token = args.token
+    if args.tiny:
+        config.tiny = True
+    
+    # Apply tiny model system prompt if enabled
+    if config.tiny:
+        config.system_prompt = TINY_MODEL_SYSTEM_PROMPT
+        print("[Tiny model mode enabled - using simplified system prompt]")
     
     # Create client
     client = CoderClient(config)
