@@ -439,6 +439,46 @@ python coderai --model meta-llama/Llama-2-13b-chat-hf --load-in-8bit
 python coderai --model bigscience/bloom-7b1 --offload-dir /path/to/fast/storage
 ```
 
+### Using Vulkan with Multiple GPUs (NVIDIA + AMD)
+
+If your system has both NVIDIA and AMD GPUs, Vulkan may allocate some resources on all visible GPUs. To force Vulkan to use **only** the AMD GPU and prevent VRAM allocation on the NVIDIA GPU:
+
+**Method 1: Use environment variable to select specific Vulkan device**
+```bash
+# List available Vulkan devices first
+python coderai --vulkan-list-devices
+
+# Then use VK_DEVICE_SELECT_DEVICE to force a specific device
+# For example, if device 1 is your AMD GPU:
+VK_DEVICE_SELECT_DEVICE=1 python coderai --model model.gguf --backend vulkan --vulkan-device 0 --port 6744
+```
+
+**Method 2: Hide NVIDIA GPU from CUDA (prevents any CUDA usage)**
+```bash
+# Make NVIDIA GPU invisible to CUDA/Vulkan
+CUDA_VISIBLE_DEVICES="" python coderai --model model.gguf --backend vulkan --vulkan-device 0 --port 6744
+```
+
+**Method 3: Use llama-cpp-python's device filtering (in code)**
+```python
+# In your own scripts using llama-cpp-python directly:
+from llama_cpp import Llama
+
+# main_gpu parameter selects which Vulkan device to use
+llm = Llama(
+    model_path="./model.gguf",
+    n_gpu_layers=-1,
+    n_ctx=2048,
+    main_gpu=0,  # Use first Vulkan device (should be AMD if NVIDIA is hidden)
+)
+```
+
+**Notes:**
+- The `--vulkan-device` argument maps to `main_gpu` in llama-cpp-python
+- Vulkan enumerates all GPUs in your system, so device IDs may differ from CUDA device IDs
+- If you see VRAM allocated on both GPUs, use `VK_DEVICE_SELECT_DEVICE` or hide NVIDIA from CUDA
+- The `vulkaninfo` command shows all GPUs visible to Vulkan
+
 ### Multi-GPU Setup
 
 Multiple GPUs are automatically detected and utilized. The model will be distributed across available devices based on memory availability.
