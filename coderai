@@ -503,6 +503,37 @@ class NvidiaBackend(ModelBackend):
             print(f"Warning: Could not estimate model size: {e}")
             return None
     
+    def _get_gpu_memory_map(self) -> Dict:
+        """Get max_memory dict for Accelerate with 95% GPU limit, then CPU, then disk."""
+        import torch
+        max_memory = {}
+        
+        # GPU memory: 95% of available VRAM per GPU
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(i)
+                total_vram = props.total_memory
+                # Leave 5% headroom for CUDA overhead
+                usable_vram = int(total_vram * 0.95)
+                max_memory[i] = usable_vram
+                print(f"  GPU {i}: {total_vram / 1e9:.1f}GB total, {usable_vram / 1e9:.1f}GB usable")
+        
+        # CPU memory: use manual limit or auto-detect
+        manual_ram_gb = self._pending_ram_gb
+        if manual_ram_gb:
+            # Convert GB to bytes
+            max_memory['cpu'] = int(manual_ram_gb * 1e9)
+            print(f"  CPU: {manual_ram_gb}GB (user specified)")
+        else:
+            # Auto-detect available system RAM, leave 4GB for system
+            import psutil
+            available_ram = psutil.virtual_memory().available
+            usable_ram = max(0, available_ram - int(4e9))  # Leave 4GB for OS
+            max_memory['cpu'] = usable_ram
+            print(f"  CPU: {usable_ram / 1e9:.1f}GB (auto-detected, 4GB reserved for system)")
+        
+        return max_memory
+    
     def load_model(self, model_name: str, **kwargs) -> None:
         """Load the model using HuggingFace Transformers."""
         import torch
@@ -513,6 +544,9 @@ class NvidiaBackend(ModelBackend):
         load_in_8bit = kwargs.get('load_in_8bit', False)
         manual_ram_gb = kwargs.get('manual_ram_gb')
         flash_attn = kwargs.get('flash_attn', False)
+        
+        # Store RAM limit for use in _get_gpu_memory_map
+        self._pending_ram_gb = manual_ram_gb
         
         print(f"Loading HuggingFace model: {model_name}")
         
@@ -535,32 +569,36 @@ class NvidiaBackend(ModelBackend):
         # Prepare model loading arguments
         load_kwargs = {'trust_remote_code': True}
         
+        # Setup memory management: GPU (95%) → CPU (limit) → Disk
+        if self.device == "cuda":
+            max_memory = self._get_gpu_memory_map()
+            load_kwargs['max_memory'] = max_memory
+            load_kwargs['device_map'] = 'auto'
+            print(f"  Memory strategy: GPU (95% VRAM) → CPU → Disk")
+        else:
+            # CPU-only mode
+            load_kwargs['device_map'] = None
+        
         if load_in_4bit or load_in_8bit:
             try:
                 import bitsandbytes as bnb
                 print(f"Using {4 if load_in_4bit else 8}-bit quantization")
                 load_kwargs['load_in_4bit'] = load_in_4bit
                 load_kwargs['load_in_8bit'] = load_in_8bit
-                load_kwargs['device_map'] = 'auto'
             except ImportError:
                 print("Warning: bitsandbytes not installed. Quantization disabled.")
-                if self.device == "cuda":
-                    load_kwargs['torch_dtype'] = torch.float16
-                else:
-                    load_kwargs['torch_dtype'] = torch.float32
-                load_kwargs['device_map'] = 'auto' if self.device == 'cuda' else None
-        else:
-            if self.device == "cuda":
-                load_kwargs['torch_dtype'] = torch.float16
-            else:
-                load_kwargs['torch_dtype'] = torch.float32
-            load_kwargs['device_map'] = 'auto' if self.device == 'cuda' else None
         
-        # Add offload folder if specified
+        # Set dtype
+        if self.device == "cuda":
+            load_kwargs['torch_dtype'] = torch.float16
+        else:
+            load_kwargs['torch_dtype'] = torch.float32
+        
+        # Add offload folder if specified (disk offloading is last resort)
         if offload_dir:
             os.makedirs(offload_dir, exist_ok=True)
             load_kwargs['offload_folder'] = offload_dir
-            print(f"Disk offload directory: {offload_dir}")
+            print(f"Disk offload directory: {offload_dir} (used only when GPU+CPU full)")
         
         # Add Flash Attention 2 if enabled
         if self.use_flash_attn and self.flash_attn_available:
@@ -1568,7 +1606,7 @@ def parse_args():
         "--ram",
         type=float,
         default=None,
-        help="Manually specify available RAM in GB (NVIDIA backend only)",
+        help="Maximum CPU RAM to use for model offloading in GB (NVIDIA backend only). Auto-detected if not specified. Disk offloading only occurs after this limit is exceeded.",
     )
     parser.add_argument(
         "--flash-attn",
