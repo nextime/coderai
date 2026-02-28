@@ -958,20 +958,39 @@ class VulkanBackend(ModelBackend):
             raise
     
     def format_messages(self, messages: List[ChatMessage]) -> str:
-        """Format messages into a prompt string suitable for chat models."""
-        formatted = []
+        """Format messages into a prompt string suitable for chat models.
         
+        Uses llama.cpp's built-in chat template support for proper formatting.
+        """
+        # Convert to format expected by llama.cpp
+        chat_messages = []
         for msg in messages:
-            if msg.role == "system":
-                formatted.append(f"<|system|>\n{msg.content}")
-            elif msg.role == "user":
-                formatted.append(f"<|user|>\n{msg.content}")
-            elif msg.role == "assistant":
-                content = msg.content or ""
-                formatted.append(f"<|assistant|>\n{content}")
+            chat_msg = {"role": msg.role}
+            if msg.content:
+                chat_msg["content"] = msg.content
+            if msg.tool_calls:
+                chat_msg["tool_calls"] = msg.tool_calls
+            chat_messages.append(chat_msg)
         
-        formatted.append("<|assistant|>\n")
-        return "\n".join(formatted)
+        # Use llama.cpp's apply_chat_template if available
+        try:
+            prompt = self.model.apply_chat_template(chat_messages, tokenize=False, add_generation_prompt=True)
+            return prompt
+        except Exception as e:
+            # Fallback to manual formatting if apply_chat_template fails
+            print(f"Warning: apply_chat_template failed ({e}), using fallback formatting")
+            formatted = []
+            for msg in messages:
+                if msg.role == "system":
+                    formatted.append(f"<|im_start|>system\n{msg.content}<|im_end|>")
+                elif msg.role == "user":
+                    formatted.append(f"<|im_start|>user\n{msg.content}<|im_end|>")
+                elif msg.role == "assistant":
+                    content = msg.content or ""
+                    formatted.append(f"<|im_start|>assistant\n{content}<|im_end|>")
+            
+            formatted.append("<|im_start|>assistant\n")
+            return "\n".join(formatted)
     
     def generate(self, prompt: str, max_tokens: Optional[int] = None,
                  temperature: float = 0.7, top_p: float = 1.0,
