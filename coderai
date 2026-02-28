@@ -961,6 +961,45 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Add request logging middleware for debugging
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all incoming requests for debugging."""
+    if request.url.path in ["/v1/chat/completions", "/v1/completions"]:
+        body = await request.body()
+        try:
+            body_str = body.decode('utf-8')
+            print(f"\n=== INCOMING REQUEST ===")
+            print(f"Path: {request.url.path}")
+            print(f"Method: {request.method}")
+            print(f"Headers: {dict(request.headers)}")
+            print(f"Body: {body_str}")
+            
+            # Try to parse as JSON to see if it's valid
+            try:
+                json.loads(body_str)
+            except json.JSONDecodeError as e:
+                print(f"JSON Parse Error: {e}")
+        except Exception as e:
+            print(f"Error logging request: {e}")
+        
+        # Re-create request with body for downstream handlers
+        async def receive():
+            return {"type": "http.request", "body": body}
+        request = Request(request.scope, receive, request._send)
+    
+    try:
+        response = await call_next(request)
+        if request.url.path in ["/v1/chat/completions", "/v1/completions"]:
+            print(f"Response status: {response.status_code}")
+        return response
+    except Exception as e:
+        print(f"Error processing request: {e}")
+        raise
+    finally:
+        if request.url.path in ["/v1/chat/completions", "/v1/completions"]:
+            print(f"=== END REQUEST ===\n")
+
 
 @app.get("/v1/models", response_model=ModelList)
 async def list_models():
