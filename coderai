@@ -1025,7 +1025,12 @@ class VulkanBackend(ModelBackend):
                 stop=stop or [],
                 tools=tools,
             )
-            return response["choices"][0]["message"].get("content", "")
+            content = response["choices"][0]["message"].get("content", "")
+            print(f"DEBUG: generate_chat returned content length: {len(content) if content else 0}")
+            if not content or not content.strip():
+                print(f"DEBUG: Empty content from create_chat_completion, using fallback")
+                raise Exception("Empty response from create_chat_completion")
+            return content
         except Exception as e:
             print(f"Warning: create_chat_completion failed ({e}), falling back to text generation")
             # Fallback: format messages manually and use text generation
@@ -1039,6 +1044,8 @@ class VulkanBackend(ModelBackend):
         if max_tokens is None:
             max_tokens = 512
         
+        total_content = ""
+        chunk_count = 0
         try:
             stream = self.model.create_chat_completion(
                 messages=messages,
@@ -1050,16 +1057,25 @@ class VulkanBackend(ModelBackend):
                 stream=True,
             )
             for chunk in stream:
+                chunk_count += 1
                 delta = chunk["choices"][0].get("delta", {})
                 content = delta.get("content", "")
                 if content:
+                    total_content += content
                     yield content
+            print(f"DEBUG: generate_chat_stream yielded {chunk_count} chunks, total content length: {len(total_content)}")
+            if chunk_count == 0 or not total_content.strip():
+                print(f"DEBUG: Empty stream from create_chat_completion, using fallback")
+                raise Exception("Empty stream response")
         except Exception as e:
-            print(f"Warning: create_chat_completion stream failed ({e}), falling back to text generation")
-            # Fallback: format messages manually and use text generation
-            prompt = self._manual_format_messages(messages)
-            async for chunk in self.generate_stream(prompt, max_tokens, temperature, top_p, stop):
-                yield chunk
+            if chunk_count == 0:
+                print(f"Warning: create_chat_completion stream failed ({e}), falling back to text generation")
+                # Fallback: format messages manually and use text generation
+                prompt = self._manual_format_messages(messages)
+                async for chunk in self.generate_stream(prompt, max_tokens, temperature, top_p, stop):
+                    yield chunk
+            else:
+                print(f"DEBUG: Stream completed with {chunk_count} chunks")
     
     def _manual_format_messages(self, messages: List[Dict]) -> str:
         """Manual fallback for formatting messages when create_chat_completion fails."""
@@ -1481,7 +1497,6 @@ async def chat_completions(request: ChatCompletionRequest):
             tools_dict,
         )
 
-
 async def stream_chat_response(
     messages: List[Dict],
     model_name: str,
@@ -1496,8 +1511,11 @@ async def stream_chat_response(
     created = int(time.time())
     
     generated_text = ""
+    print(f"DEBUG: stream_chat_response started, stream=True, tools={tools is not None}")
+    
     
     try:
+        chunk_count = 0
         # Use generate_chat_stream for proper chat template handling
         async for chunk in model_manager.generate_chat_stream(
             messages=messages,
@@ -1507,9 +1525,11 @@ async def stream_chat_response(
             stop=stop,
             tools=tools,
         ):
+            chunk_count += 1
             # Filter malformed content from each chunk
             filtered_chunk = filter_malformed_content(chunk)
             if not filtered_chunk:
+                print(f"DEBUG: filtered_chunk was empty (original chunk: {repr(chunk[:50])})")
                 continue
                 
             generated_text += filtered_chunk
@@ -1526,6 +1546,10 @@ async def stream_chat_response(
                 }],
             }
             yield f"data: {json.dumps(data)}\n\n"
+        
+        print(f"DEBUG: stream_chat_response completed, {chunk_count} chunks, generated_text length: {len(generated_text)}")
+        if not generated_text.strip():
+            print(f"DEBUG: Warning - no content generated!")
         
         # Check for tool calls in complete output
         if tools:
