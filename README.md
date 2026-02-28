@@ -81,17 +81,19 @@ Requires:
 - AMD GPU with Vulkan support (RX 400 series and newer)
 - Vulkan drivers and SDK
 
-**Install Vulkan drivers:**
+**Install Vulkan drivers and tools:**
 ```bash
 # Debian/Ubuntu
-sudo apt install libvulkan-dev vulkan-tools mesa-vulkan-drivers
+sudo apt install libvulkan-dev vulkan-tools mesa-vulkan-drivers glslang-tools
 
 # Fedora
-sudo dnf install vulkan-loader-devel vulkan-tools mesa-vulkan-drivers
+sudo dnf install vulkan-loader-devel vulkan-tools mesa-vulkan-drivers glslang
 
 # Arch Linux
-sudo pacman -S vulkan-headers vulkan-icd-loader vulkan-radeon
+sudo pacman -S vulkan-headers vulkan-icd-loader vulkan-radeon glslang
 ```
+
+**Note:** The `glslang-tools` (Debian/Ubuntu) or `glslang` (Fedora/Arch) package provides `glslc`, the Vulkan shader compiler required to build llama-cpp-python with Vulkan support.
 
 Models: GGUF format (from HuggingFace or local files)
 
@@ -604,18 +606,23 @@ python coderai --model TheBloke/Llama-2-7B-GGUF --backend vulkan
 **Problem**: "Vulkan backend not available" or llama-cpp fails to load
 
 **Solutions**:
-1. **Verify Vulkan drivers are installed:**
+1. **Verify Vulkan drivers and shader compiler are installed:**
    ```bash
    # Check Vulkan installation
    vulkaninfo | grep "deviceName"
    
+   # Check glslc (shader compiler) - REQUIRED for building
+   glslc --version
+   
    # Or install if missing
    # Debian/Ubuntu:
-   sudo apt install libvulkan-dev vulkan-tools mesa-vulkan-drivers
+   sudo apt install libvulkan-dev vulkan-tools mesa-vulkan-drivers glslang-tools
    
    # Fedora:
-   sudo dnf install vulkan-loader-devel vulkan-tools mesa-vulkan-drivers
+   sudo dnf install vulkan-loader-devel vulkan-tools mesa-vulkan-drivers glslang
    ```
+   
+   **Note:** `glslc` is required to compile llama-cpp-python with Vulkan support. If you see "Could NOT find Vulkan (missing: glslc)", install the `glslang-tools` (Debian/Ubuntu) or `glslang` (Fedora/Arch) package.
 
 2. **Reinstall llama-cpp-python with Vulkan:**
    ```bash

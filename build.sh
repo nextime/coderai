@@ -96,8 +96,21 @@ elif [ "$BACKEND" = "vulkan" ]; then
         echo -e "${YELLOW}Attempting installation anyway...${NC}"
     fi
     
+    # Check for glslc (Vulkan shader compiler) which is required for building
+    if ! command -v glslc &> /dev/null; then
+        echo -e "${YELLOW}Warning: glslc (Vulkan shader compiler) not found${NC}"
+        echo -e "${YELLOW}You need to install the shader compiler:${NC}"
+        echo "  Debian/Ubuntu: sudo apt install glslang-tools"
+        echo "  Fedora:        sudo dnf install glslang"
+        echo "  Arch:          sudo pacman -S glslang"
+        echo ""
+        echo -e "${RED}Error: Cannot build llama-cpp-python with Vulkan without glslc${NC}"
+        exit 1
+    fi
+    
     # Install llama-cpp-python with Vulkan support
     # CMAKE_ARGS is used to enable Vulkan during compilation
+    echo -e "${YELLOW}Building llama-cpp-python with Vulkan support (this may take a few minutes)...${NC}"
     CMAKE_ARGS="-DGGML_VULKAN=ON" pip install llama-cpp-python --no-cache-dir
     
     echo -e "${YELLOW}Installing Vulkan-specific requirements...${NC}"
