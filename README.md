@@ -403,6 +403,7 @@ python coderai --vulkan-list-devices
 - Q5_K_M or Q6_K for higher quality
 - Works on AMD RX 400 series and newer
 - Also works on NVIDIA GPUs but CUDA backend is preferred for NVIDIA
+- **Update llama-cpp-python** for newer model support: `pip install --upgrade llama-cpp-python --no-cache-dir`
 
 ### CPU-Only
 
