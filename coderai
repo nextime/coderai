@@ -625,22 +625,26 @@ class VulkanBackend(ModelBackend):
     
     def count_vulkan_devices(self):
         """Count the number of Vulkan GPU devices available."""
+        # llama.cpp filters out some devices (like CPU llvmpipe), so we need to
+        # count only the devices that llama.cpp will actually use
         try:
-            from llama_cpp import llama_get_devices
-            devices = llama_get_devices()
-            return len(devices)
+            import subprocess
+            result = subprocess.run(['vulkaninfo', '--summary'], capture_output=True, text=True)
+            if result.returncode == 0:
+                # Count GPU0, GPU1, etc. entries (these are actual GPUs, not CPU)
+                import re
+                gpu_matches = re.findall(r'^GPU\d+:', result.stdout, re.MULTILINE)
+                # Filter out CPU devices (llvmpipe)
+                non_cpu_gpus = 0
+                for i, match in enumerate(gpu_matches):
+                    # Check if this GPU is a CPU device
+                    gpu_section = result.stdout.split(match)[1].split('\nGPU')[0] if i < len(gpu_matches) - 1 else result.stdout.split(match)[1]
+                    if 'llvmpipe' not in gpu_section and 'CPU' not in gpu_section:
+                        non_cpu_gpus += 1
+                return max(non_cpu_gpus, 1)
         except:
-            # Fallback: try to parse vulkaninfo
-            try:
-                import subprocess
-                result = subprocess.run(['vulkaninfo', '--summary'], capture_output=True, text=True)
-                if result.returncode == 0:
-                    # Count GPU devices in output
-                    gpu_count = result.stdout.count('GPU') + result.stdout.count('device')
-                    return max(gpu_count, 1)
-            except:
-                pass
-        return 2  # Default to 2 if we can't detect
+            pass
+        return 2  # Default to 2 (common for NVIDIA + AMD setups)
     
     def load_model(self, model_name: str, **kwargs) -> None:
         """Load a GGUF model using llama-cpp-python."""
