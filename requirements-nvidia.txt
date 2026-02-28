@@ -9,7 +9,7 @@ accelerate>=0.24.0
 
 # System resource detection
 psutil>=5.9.0
-procname>=0.3.0  # optional - for setting process name
+# procname>=0.3.0  # optional - uncomment to set process name (requires libproc2-dev)
 
 # Optional: for better performance with NVIDIA GPUs
 bitsandbytes>=0.41.0
