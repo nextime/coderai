@@ -1085,8 +1085,7 @@ class VulkanBackend(ModelBackend):
                 async for chunk in self.generate_stream(prompt, max_tokens, temperature, top_p, stop):
                     yield chunk
             else:
-                print(f"DEBUG: Stream completed with {chunk_count} chunks")    
-    def _manual_format_messages(self, messages: List[Dict]) -> str:
+                print(f"DEBUG: Stream completed with {chunk_count} chunks")
     
     def _manual_format_messages(self, messages: List[Dict]) -> str:
         """Manual fallback for formatting messages when create_chat_completion fails."""
