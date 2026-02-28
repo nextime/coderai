@@ -172,6 +172,35 @@ class ModelList(BaseModel):
 
 
 # =============================================================================
+# Content Filtering Utility
+# =============================================================================
+
+def filter_malformed_content(text: str) -> str:
+    """Filter out malformed SEARCH/REPLACE blocks that the model might output as content."""
+    if not text:
+        return text
+    
+    # Remove diff-like blocks that shouldn't be in the output
+    filtered = text
+    
+    # Remove git-style diff markers and SEARCH/REPLACE patterns
+    filtered = re.sub(r'<<<<<<<\s+SEARCH.*?=======', '', filtered, flags=re.DOTALL)
+    filtered = re.sub(r'=======.*?>>>>>>>\s+REPLACE', '', filtered, flags=re.DOTALL)
+    filtered = re.sub(r'>>>>>>>\s+REPLACE', '', filtered)
+    
+    # Also remove common malformed patterns seen in outputs
+    filtered = re.sub(r'<<<<<<<\s+SEARCH\s*:start_line:\d+[^<]*', '', filtered, flags=re.DOTALL)
+    filtered = re.sub(r'<button>Stop Generation</button>', '', filtered)
+    filtered = re.sub(r'\<\|assistant\|\>', '', filtered)
+    filtered = re.sub(r'\</\|assistant\|\>', '', filtered)
+    
+    # Clean up excessive newlines left from removal
+    filtered = re.sub(r'\n{3,}', '\n\n', filtered)
+    
+    return filtered.strip()
+
+
+# =============================================================================
 # Tool Parsing
 # =============================================================================
 
@@ -242,8 +271,15 @@ class ToolCallParser:
         
         return result if result else xml_content
     
+    def _filter_malformed_content(self, text: str) -> str:
+        """Filter out malformed SEARCH/REPLACE blocks - delegates to standalone function."""
+        return filter_malformed_content(text)
+    
     def extract_tool_calls(self, text: str, available_tools: List[Tool]) -> Optional[List[Dict]]:
         """Extract tool calls from model output."""
+        # First filter out malformed content
+        text = self._filter_malformed_content(text)
+        
         tool_calls = []
         
         # Look for function calls in various formats
@@ -504,17 +540,17 @@ class NvidiaBackend(ModelBackend):
             return None
     
     def _get_gpu_memory_map(self) -> Dict:
-        """Get max_memory dict for Accelerate with 95% GPU limit, then CPU, then disk."""
+        """Get max_memory dict for Accelerate with 99.9% GPU limit, then CPU, then disk."""
         import torch
         max_memory = {}
         
-        # GPU memory: 95% of available VRAM per GPU
+        # GPU memory: 99.9% of available VRAM per GPU
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
                 props = torch.cuda.get_device_properties(i)
                 total_vram = props.total_memory
-                # Leave 5% headroom for CUDA overhead
-                usable_vram = int(total_vram * 0.95)
+                # Leave 0.1% headroom for CUDA overhead
+                usable_vram = int(total_vram * 0.999)
                 max_memory[i] = usable_vram
                 print(f"  GPU {i}: {total_vram / 1e9:.1f}GB total, {usable_vram / 1e9:.1f}GB usable")
         
@@ -574,7 +610,7 @@ class NvidiaBackend(ModelBackend):
             max_memory = self._get_gpu_memory_map()
             load_kwargs['max_memory'] = max_memory
             load_kwargs['device_map'] = 'auto'
-            print(f"  Memory strategy: GPU (95% VRAM) → CPU → Disk")
+            print(f"  Memory strategy: GPU (99.9% VRAM) → CPU → Disk")
         else:
             # CPU-only mode
             load_kwargs['device_map'] = None
@@ -1089,6 +1125,10 @@ class ModelManager:
 # Global model manager
 model_manager = ModelManager()
 
+# Global system prompt (set via --system-prompt flag)
+# None = don't inject, True = use default, string = use custom text
+global_system_prompt = None
+
 
 # =============================================================================
 # FastAPI Application
@@ -1115,9 +1155,10 @@ app = FastAPI(
 async def log_requests(request: Request, call_next):
     """Log all incoming requests for debugging."""
     if request.url.path in ["/v1/chat/completions", "/v1/completions"]:
-        body = await request.body()
+        body = b""
         body_str = ""
         try:
+            body = await request.body()
             body_str = body.decode('utf-8')
             print(f"\n{'='*60}")
             print(f"=== INCOMING REQUEST ===")
@@ -1151,12 +1192,16 @@ async def log_requests(request: Request, call_next):
             except Exception as e:
                 print(f"\n*** Error analyzing JSON: {e} ***")
         except Exception as e:
+            # Handle ClientDisconnect and other exceptions gracefully
             print(f"Error logging request: {e}")
+            # Continue with empty body if we couldn't read it
+            body = b""
         
-        # Re-create request with body for downstream handlers
-        async def receive():
-            return {"type": "http.request", "body": body}
-        request = Request(request.scope, receive, request._send)
+        # Re-create request with body for downstream handlers (only if we successfully read it)
+        if body:
+            async def receive():
+                return {"type": "http.request", "body": body}
+            request = Request(request.scope, receive, request._send)
     
     try:
         response = await call_next(request)
@@ -1240,8 +1285,23 @@ async def chat_completions(request: ChatCompletionRequest):
     if model_manager.backend is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
-    # Format messages with tools if provided
+    # Inject system prompt if --system-prompt flag was provided
     messages = request.messages
+    if global_system_prompt is not None:
+        # Check if there's already a system message
+        has_system = any(msg.role == "system" for msg in messages)
+        if not has_system:
+            # Use default or custom system prompt
+            if global_system_prompt is True:
+                # Default system prompt
+                system_text = "You are a helpful assistant."
+            else:
+                # Custom system prompt provided as argument
+                system_text = str(global_system_prompt)
+            # Insert system message at the beginning
+            messages = [ChatMessage(role="system", content=system_text)] + list(messages)
+    
+    # Format messages with tools if provided
     if request.tools:
         messages = format_tools_for_prompt(request.tools, messages)
     
@@ -1304,7 +1364,12 @@ async def stream_chat_response(
             top_p=top_p,
             stop=stop,
         ):
-            generated_text += chunk
+            # Filter malformed content from each chunk
+            filtered_chunk = filter_malformed_content(chunk)
+            if not filtered_chunk:
+                continue
+                
+            generated_text += filtered_chunk
             
             data = {
                 "id": completion_id,
@@ -1313,7 +1378,7 @@ async def stream_chat_response(
                 "model": model_name,
                 "choices": [{
                     "index": 0,
-                    "delta": {"content": chunk},
+                    "delta": {"content": filtered_chunk},
                     "finish_reason": None,
                 }],
             }
@@ -1379,6 +1444,9 @@ async def generate_chat_response(
             top_p=top_p,
             stop=stop,
         )
+        
+        # Filter out malformed content from generated text
+        generated_text = filter_malformed_content(generated_text)
         
         response_message = {
             "role": "assistant",
@@ -1641,11 +1709,20 @@ def parse_args():
         action="store_true",
         help="List available Vulkan GPU devices and exit",
     )
+    parser.add_argument(
+        "--system-prompt",
+        nargs="?",
+        const=True,
+        default=None,
+        help="Inject a system prompt at the beginning of conversations. Use without a value for a default prompt, or provide custom text.",
+    )
     return parser.parse_args()
 
 
 def main():
     """Main entry point."""
+    global global_system_prompt
+    
     # Optional: set process name if procname is available
     try:
         import procname
@@ -1653,6 +1730,9 @@ def main():
     except ImportError:
         pass
     args = parse_args()
+    
+    # Set global system prompt from --system-prompt flag
+    global_system_prompt = args.system_prompt
     
     # Handle --vulkan-list-devices
     if args.vulkan_list_devices:

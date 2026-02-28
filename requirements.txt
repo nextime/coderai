@@ -3,6 +3,9 @@ fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 pydantic>=2.5.0
 
+# CLI dependencies
+requests>=2.31.0  # for the coder CLI tool
+
 # PyTorch - Uncomment the appropriate version for your system.
 # IMPORTANT: Use quotes around version specifiers to prevent shell interpretation!
 # The >= operator will be interpreted as output redirection without quotes!
