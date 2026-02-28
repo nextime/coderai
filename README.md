@@ -183,6 +183,8 @@ options:
   --n-gpu-layers N      Number of layers to offload to GPU (Vulkan only,
                         default: -1 = all layers)
   --n-ctx N             Context window size (Vulkan only, default: 2048)
+  --vulkan-device N     Vulkan GPU device ID to use (Vulkan only, default: 0)
+  --vulkan-list-devices List available Vulkan GPU devices and exit
 ```
 
 ### Backend Selection
@@ -387,6 +389,12 @@ python coderai --model model.gguf --backend vulkan --n-gpu-layers 35
 
 # Adjust context window (default: 2048)
 python coderai --model model.gguf --backend vulkan --n-ctx 4096
+
+# Select specific GPU device (if you have multiple GPUs - e.g., NVIDIA + AMD)
+python coderai --model model.gguf --backend vulkan --vulkan-device 1
+
+# List available Vulkan GPU devices
+python coderai --vulkan-list-devices
 ```
 
 **Vulkan Backend Notes:**

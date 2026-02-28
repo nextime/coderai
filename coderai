@@ -609,6 +609,19 @@ class VulkanBackend(ModelBackend):
         self.n_gpu_layers = -1  # Offload all layers to GPU by default
         self.n_ctx = 2048
         self.verbose = True
+        self.main_gpu = 0  # Default to first GPU
+        
+    def list_vulkan_devices(self):
+        """List available Vulkan GPU devices."""
+        try:
+            # Try to get device info via vulkaninfo or similar
+            import subprocess
+            result = subprocess.run(['vulkaninfo', '--summary'], capture_output=True, text=True)
+            if result.returncode == 0:
+                print("\nAvailable Vulkan devices:")
+                print(result.stdout)
+        except Exception:
+            pass
         
     def load_model(self, model_name: str, **kwargs) -> None:
         """Load a GGUF model using llama-cpp-python."""
@@ -620,6 +633,8 @@ class VulkanBackend(ModelBackend):
         n_gpu_layers = kwargs.get('n_gpu_layers', -1)
         n_ctx = kwargs.get('n_ctx', 2048)
         verbose = kwargs.get('verbose', True)
+        main_gpu = kwargs.get('main_gpu', 0)
+        self.main_gpu = main_gpu
         
         # Check if model_name is a local file
         if os.path.isfile(model_name):
@@ -666,6 +681,10 @@ class VulkanBackend(ModelBackend):
         print(f"  Model path: {model_path}")
         print(f"  GPU layers: {n_gpu_layers} (-1 = all layers)")
         print(f"  Context size: {n_ctx}")
+        print(f"  GPU device: {main_gpu}")
+        
+        # List available devices for user reference
+        self.list_vulkan_devices()
         
         try:
             self.model = Llama(
@@ -673,6 +692,7 @@ class VulkanBackend(ModelBackend):
                 n_gpu_layers=n_gpu_layers,
                 n_ctx=n_ctx,
                 verbose=verbose,
+                main_gpu=main_gpu,
             )
             self.model_name = model_name
             print("\nModel loaded successfully with Vulkan!")
@@ -1275,6 +1295,17 @@ def parse_args():
         default=2048,
         help="Context window size (Vulkan backend only, default: 2048)",
     )
+    parser.add_argument(
+        "--vulkan-device",
+        type=int,
+        default=0,
+        help="Vulkan GPU device ID to use (Vulkan backend only, default: 0). Use --vulkan-list-devices to see available devices",
+    )
+    parser.add_argument(
+        "--vulkan-list-devices",
+        action="store_true",
+        help="List available Vulkan GPU devices and exit",
+    )
     return parser.parse_args()
 
 
@@ -1287,6 +1318,20 @@ def main():
     except ImportError:
         pass
     args = parse_args()
+    
+    # Handle --vulkan-list-devices
+    if args.vulkan_list_devices:
+        print("\nListing Vulkan devices...")
+        try:
+            import subprocess
+            result = subprocess.run(['vulkaninfo', '--summary'], capture_output=True, text=True)
+            if result.returncode == 0:
+                print(result.stdout)
+            else:
+                print("Could not run vulkaninfo. Make sure vulkan-tools is installed.")
+        except Exception as e:
+            print(f"Error listing devices: {e}")
+        sys.exit(0)
     
     # Get model name from args or prompt interactively
     model_name = args.model
@@ -1325,6 +1370,7 @@ def main():
         'flash_attn': args.flash_attn,
         'n_gpu_layers': args.n_gpu_layers,
         'n_ctx': args.n_ctx,
+        'main_gpu': args.vulkan_device,
     }
     
     try:
