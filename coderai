@@ -967,19 +967,40 @@ async def log_requests(request: Request, call_next):
     """Log all incoming requests for debugging."""
     if request.url.path in ["/v1/chat/completions", "/v1/completions"]:
         body = await request.body()
+        body_str = ""
         try:
             body_str = body.decode('utf-8')
-            print(f"\n=== INCOMING REQUEST ===")
+            print(f"\n{'='*60}")
+            print(f"=== INCOMING REQUEST ===")
+            print(f"{'='*60}")
             print(f"Path: {request.url.path}")
             print(f"Method: {request.method}")
             print(f"Headers: {dict(request.headers)}")
-            print(f"Body: {body_str}")
+            print(f"\n--- RAW BODY ({len(body)} bytes) ---")
+            # Print body with truncation for very large bodies
+            if len(body_str) > 2000:
+                print(f"{body_str[:1000]}...\n... [truncated {len(body_str)-2000} chars] ...\n...{body_str[-1000:]}")
+            else:
+                print(body_str)
+            print(f"--- END RAW BODY ---")
             
             # Try to parse as JSON to see if it's valid
             try:
-                json.loads(body_str)
+                parsed = json.loads(body_str)
+                print(f"\n--- PARSED JSON STRUCTURE ---")
+                print(f"Keys: {list(parsed.keys())}")
+                if 'messages' in parsed and isinstance(parsed['messages'], list):
+                    print(f"Number of messages: {len(parsed['messages'])}")
+                    for i, msg in enumerate(parsed['messages']):
+                        role = msg.get('role', 'unknown')
+                        content_preview = str(msg.get('content', ''))[:50].replace('\n', ' ')
+                        print(f"  [{i}] {role}: {content_preview}...")
+                print(f"--- END PARSED JSON ---")
             except json.JSONDecodeError as e:
-                print(f"JSON Parse Error: {e}")
+                print(f"\n*** JSON Parse Error: {e} ***")
+                print(f"Error at position: char {e.pos}, line {e.lineno}, column {e.colno}")
+            except Exception as e:
+                print(f"\n*** Error analyzing JSON: {e} ***")
         except Exception as e:
             print(f"Error logging request: {e}")
         
@@ -991,14 +1012,66 @@ async def log_requests(request: Request, call_next):
     try:
         response = await call_next(request)
         if request.url.path in ["/v1/chat/completions", "/v1/completions"]:
-            print(f"Response status: {response.status_code}")
+            print(f"\n--- RESPONSE ---")
+            print(f"Status Code: {response.status_code}")
+            
+            # For error responses, try to read and log the body, then create a new response
+            if response.status_code >= 400:
+                try:
+                    # Read the response body
+                    response_body = b""
+                    async for chunk in response.body_iterator:
+                        response_body += chunk
+                    
+                    error_body = response_body.decode('utf-8')
+                    print(f"Error Response Body: {error_body}")
+                    
+                    # Try to parse and pretty-print error details
+                    try:
+                        error_json = json.loads(error_body)
+                        if 'detail' in error_json:
+                            print(f"\n*** VALIDATION ERROR DETAILS ***")
+                            detail = error_json['detail']
+                            if isinstance(detail, list):
+                                for err in detail:
+                                    if isinstance(err, dict):
+                                        loc = err.get('loc', [])
+                                        msg = err.get('msg', 'Unknown error')
+                                        err_type = err.get('type', 'unknown')
+                                        print(f"  - Location: {loc}")
+                                        print(f"    Message: {msg}")
+                                        print(f"    Type: {err_type}")
+                            else:
+                                print(f"  Detail: {detail}")
+                            print(f"*** END ERROR DETAILS ***")
+                    except Exception as parse_err:
+                        print(f"Could not parse error details: {parse_err}")
+                    
+                    # Create new response with the same body
+                    from starlette.responses import Response
+                    return Response(
+                        content=response_body,
+                        status_code=response.status_code,
+                        headers=dict(response.headers),
+                        media_type=response.media_type
+                    )
+                except Exception as read_err:
+                    print(f"Could not read error response body: {read_err}")
+            
+            print(f"--- END RESPONSE ---")
+            print(f"{'='*60}\n")
         return response
     except Exception as e:
-        print(f"Error processing request: {e}")
+        print(f"\n*** EXCEPTION DURING REQUEST PROCESSING ***")
+        print(f"Error type: {type(e).__name__}")
+        print(f"Error message: {e}")
+        import traceback
+        traceback.print_exc()
+        print(f"*** END EXCEPTION ***\n")
         raise
     finally:
         if request.url.path in ["/v1/chat/completions", "/v1/completions"]:
-            print(f"=== END REQUEST ===\n")
+            pass  # End logging already done above for successful responses
 
 
 @app.get("/v1/models", response_model=ModelList)
