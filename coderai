@@ -1048,8 +1048,10 @@ class VulkanBackend(ModelBackend):
         total_content = ""
         chunk_count = 0
         
-        def sync_generator():
-            """Synchronous generator that runs in executor."""
+        # Collect all chunks synchronously then yield them
+        # This avoids issues with generators across thread boundaries
+        def collect_chunks():
+            """Collect all chunks from the stream."""
             print(f"DEBUG: generate_chat_stream: Calling create_chat_completion with tools={tools}")
             stream = self.model.create_chat_completion(
                 messages=messages,
@@ -1061,32 +1063,31 @@ class VulkanBackend(ModelBackend):
                 stream=True,
             )
             print(f"DEBUG: generate_chat_stream: Got stream object: {type(stream)}")
+            chunks = []
             for chunk in stream:
-                yield chunk
+                chunks.append(chunk)
+            print(f"DEBUG: generate_chat_stream: Collected {len(chunks)} chunks")
+            return chunks
         
         try:
-            # Run synchronous generator in thread pool
+            # Run the collection in thread pool
             loop = asyncio.get_event_loop()
-            gen = sync_generator()
+            chunks = await loop.run_in_executor(None, collect_chunks)
             
-            while True:
-                try:
-                    chunk = await loop.run_in_executor(None, lambda: next(gen, None))
-                    if chunk is None:
-                        break
-                    
-                    chunk_count += 1
-                    print(f"DEBUG: generate_chat_stream: Raw chunk {chunk_count}: {repr(chunk)}")
-                    delta = chunk["choices"][0].get("delta", {})
-                    content = delta.get("content", "")
-                    
-                    # Handle Qwen3's special thinking token - skip it and continue
-                    # Qwen3 uses `<think>` tags for reasoning, we should pass through the content
-                    if content:
-                        total_content += content
-                        yield content
-                except StopIteration:
-                    break
+            for chunk in chunks:
+                chunk_count += 1
+                print(f"DEBUG: generate_chat_stream: Processing chunk {chunk_count}: {repr(chunk)}")
+                delta = chunk["choices"][0].get("delta", {})
+                content = delta.get("content", "")
+                
+                # Handle Qwen3's special thinking token - skip it and continue
+                # Qwen3 uses `<think>` tags for reasoning, we should pass through the content
+                if content:
+                    total_content += content
+                    yield content
+                
+                # Small yield to allow other async tasks
+                await asyncio.sleep(0)
             
             print(f"DEBUG: generate_chat_stream yielded {chunk_count} chunks, total content length: {len(total_content)}")
             if chunk_count == 0 or not total_content.strip():
