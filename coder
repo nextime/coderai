@@ -416,54 +416,61 @@ class CoderClient:
         tool_calls = []
         current_tool_call = None
         
-        for line in response.iter_lines():
-            if not line:
-                continue
-            
-            line = line.decode('utf-8')
-            
-            # Handle SSE format
-            if line.startswith('data: '):
-                line = line[6:]
-            
-            if line == '[DONE]':
-                break
-            
-            try:
-                data = json.loads(line)
-                delta = data.get('choices', [{}])[0].get('delta', {})
+        # Use iter_content with smaller chunk size for better real-time handling
+        buffer = ""
+        for chunk in response.iter_content(chunk_size=256, decode_unicode=True):
+            if chunk:
+                buffer += chunk
                 
-                # Handle content
-                content = delta.get('content')
-                if content:
-                    print(content, end='', flush=True)
-                    full_content += content
-                
-                # Handle tool calls
-                delta_tool_calls = delta.get('tool_calls')
-                if delta_tool_calls:
-                    for tc in delta_tool_calls:
-                        index = tc.get('index', 0)
+                # Process complete lines from buffer
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    
+                    # Handle SSE format
+                    if line.startswith('data: '):
+                        line = line[6:]
+                    
+                    if line == '[DONE]':
+                        break
+                    
+                    if not line:
+                        continue
+                    
+                    try:
+                        data = json.loads(line)
+                        delta = data.get('choices', [{}])[0].get('delta', {})
                         
-                        # Extend tool_calls list if needed
-                        while len(tool_calls) <= index:
-                            tool_calls.append({
-                                'id': '',
-                                'type': 'function',
-                                'function': {'name': '', 'arguments': ''}
-                            })
+                        # Handle content
+                        content = delta.get('content')
+                        if content:
+                            print(content, end='', flush=True)
+                            full_content += content
                         
-                        # Update tool call
-                        if 'id' in tc:
-                            tool_calls[index]['id'] = tc['id']
-                        if 'function' in tc:
-                            if 'name' in tc['function']:
-                                tool_calls[index]['function']['name'] = tc['function']['name']
-                            if 'arguments' in tc['function']:
-                                tool_calls[index]['function']['arguments'] += tc['function']['arguments']
-                
-            except json.JSONDecodeError:
-                continue
+                        # Handle tool calls
+                        delta_tool_calls = delta.get('tool_calls')
+                        if delta_tool_calls:
+                            for tc in delta_tool_calls:
+                                index = tc.get('index', 0)
+                                
+                                # Extend tool_calls list if needed
+                                while len(tool_calls) <= index:
+                                    tool_calls.append({
+                                        'id': '',
+                                        'type': 'function',
+                                        'function': {'name': '', 'arguments': ''}
+                                    })
+                                
+                                # Update tool call
+                                if 'id' in tc:
+                                    tool_calls[index]['id'] = tc['id']
+                                if 'function' in tc:
+                                    if 'name' in tc['function']:
+                                        tool_calls[index]['function']['name'] = tc['function']['name']
+                                    if 'arguments' in tc['function']:
+                                        tool_calls[index]['function']['arguments'] += tc['function']['arguments']
+                        
+                    except json.JSONDecodeError:
+                        continue
         
         print()  # Newline after streaming
         
