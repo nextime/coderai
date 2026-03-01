@@ -665,14 +665,20 @@ class NvidiaBackend(ModelBackend):
         # Prepare model loading arguments
         load_kwargs = {'trust_remote_code': True}
         
+        # Check if model supports quantization
         if load_in_4bit or load_in_8bit:
-            try:
-                import bitsandbytes as bnb
-                print(f"Using {4 if load_in_4bit else 8}-bit quantization")
-                load_kwargs['load_in_4bit'] = load_in_4bit
-                load_kwargs['load_in_8bit'] = load_in_8bit
-            except ImportError:
-                print("Warning: bitsandbytes not installed. Quantization disabled.")
+            # Qwen3.5-A3B/MoE models don't support bitsandbytes quantization
+            if 'qwen3.5' in model_name.lower() and ('a3b' in model_name.lower() or 'moe' in model_name.lower()):
+                print(f"Warning: {model_name} does not support bitsandbytes quantization (load_in_4bit/load_in_8bit)")
+                print("Quantization disabled for this model")
+            else:
+                try:
+                    import bitsandbytes as bnb
+                    print(f"Using {4 if load_in_4bit else 8}-bit quantization")
+                    load_kwargs['load_in_4bit'] = load_in_4bit
+                    load_kwargs['load_in_8bit'] = load_in_8bit
+                except ImportError:
+                    print("Warning: bitsandbytes not installed. Quantization disabled.")
         
         # Set dtype
         if self.device == "cuda":
