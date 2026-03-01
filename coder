@@ -150,6 +150,7 @@ class Config:
     confirm_commands: Dict[str, bool] = None  # Per-command confirmation settings
     debug: bool = False  # Show debug output including raw tool calls
     max_context: int = 32768  # Maximum context size in tokens
+    no_prompt: bool = False  # Don't send system prompt
     
     def __post_init__(self):
         if self.confirm_commands is None:
@@ -177,6 +178,7 @@ class Config:
                 config.timeout = data.get('timeout', config.timeout)
                 config.debug = data.get('debug', config.debug)
                 config.max_context = data.get('max_context', config.max_context)
+                config.no_prompt = data.get('no_prompt', config.no_prompt)
             except (json.JSONDecodeError, IOError) as e:
                 print(f"Warning: Could not load config from {config_path}: {e}", file=sys.stderr)
         
@@ -200,7 +202,8 @@ class Config:
             'micro': self.micro,
             'timeout': self.timeout,
             'debug': self.debug,
-            'max_context': self.max_context
+            'max_context': self.max_context,
+            'no_prompt': self.no_prompt
         }
         
         with open(config_path, 'w') as f:
@@ -530,8 +533,11 @@ class CoderClient:
             "content": message
         })
         
-        # Prepare messages with system prompt
-        messages = [{"role": "system", "content": self.config.system_prompt}]
+        # Prepare messages with system prompt (if not disabled)
+        if self.config.no_prompt:
+            messages = []
+        else:
+            messages = [{"role": "system", "content": self.config.system_prompt}]
         messages.extend(self.conversation_history)
         
         headers = {"Content-Type": "application/json"}
@@ -1384,6 +1390,13 @@ Examples:
     )
     
     parser.add_argument(
+        '--no-prompt',
+        action='store_true',
+        dest='no_prompt',
+        help='Do not send system prompt (for custom use cases)'
+    )
+    
+    parser.add_argument(
         '--timeout',
         type=int,
         default=600,
@@ -1451,6 +1464,8 @@ Examples:
         config.debug = True
     if args.max_context:
         config.max_context = args.max_context
+    if args.no_prompt:
+        config.no_prompt = True
     
     # Apply small/tiny model system prompt if enabled
     if config.micro:
@@ -1484,8 +1499,12 @@ Examples:
     message = args.message or args.msg_flag
     
     if message:
-        # Single message mode
-        client.chat(message, stream=not args.no_stream)
+        # Single message mode - disable confirmations for non-interactive use
+        client.config.confirm_all = False
+        result = client.chat(message, stream=not args.no_stream)
+        # Print result if non-streaming (streaming prints internally)
+        if args.no_stream and result:
+            print(result)
     else:
         # Interactive shell mode
         run_interactive_shell(client, session_manager)
