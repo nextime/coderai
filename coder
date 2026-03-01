@@ -453,55 +453,25 @@ class CoderClient:
         """Handle streaming response from API."""
         import time
         import re
-        import threading
+        import sys
         
         full_content = ""
         tool_calls = []
         in_thinking = False
         thinking_content = ""
         thinking_start_time = 0
-        last_elapsed = -1
-        thinking_line_printed = False
-        timer_thread = None
-        stop_timer = threading.Event()
+        last_update_time = 0
+        displayed_elapsed = 0
         
-        def update_timer():
-            """Background thread to update timer every second."""
-            while not stop_timer.is_set():
-                if in_thinking:
-                    current_time = time.time()
-                    elapsed = int(current_time - thinking_start_time)
-                    print_thinking_line(elapsed, thinking_content, timer_update=True)
-                time.sleep(0.5)
-        
-        def print_thinking_line(elapsed, content, final=False, timer_update=False):
-            """Print or update the thinking line."""
-            nonlocal thinking_line_printed, last_elapsed
-            
-            # Only update if elapsed changed or it's a forced update
-            if timer_update and elapsed == last_elapsed:
-                return
-            last_elapsed = elapsed
-            
-            # Filter out <tool>, <tool_call>, and <tools> tags and newlines for display
-            display_content = re.sub(r'<tool>.*?</tool>', '', content, flags=re.DOTALL)
-            display_content = re.sub(r'<tool_call>.*?</tool_call>', '', display_content, flags=re.DOTALL)
-            display_content = re.sub(r'<tools>.*?</tools>', '', display_content, flags=re.DOTALL)
-            display_content = display_content.replace('\n', ' ').replace('\r', '')
-            display_content = display_content.strip()
-            
-            # Get last 60 chars to fit on screen
-            if len(display_content) > 60:
-                display_content = "..." + display_content[-60:]
-            
-            line = f"[{elapsed}s] Thinking: [{display_content}]"
-            
-            # Clear line and print
-            print(f"\r\033[K{Colors.DIM}{line}{Colors.RESET}", end='', flush=True)
-            thinking_line_printed = True
-            
-            if final:
-                print()  # Move to new line
+        def format_thinking_line(elapsed, content):
+            """Format the thinking line for display."""
+            # Filter out tool tags and normalize
+            display = re.sub(r'<tool.*?>.*?</tool>', '', content, flags=re.DOTALL)
+            display = re.sub(r'<tool_call.*?>.*?</tool_call>', '', display, flags=re.DOTALL)
+            display = display.replace('\n', ' ').strip()
+            if len(display) > 50:
+                display = "..." + display[-50:]
+            return f"[{elapsed}s] Thinking: [{display}]"
         
         def parse_tool_calls_from_content(text):
             """Parse tool calls from content in various formats."""
@@ -524,8 +494,7 @@ class CoderClient:
                 except json.JSONDecodeError:
                     continue
             
-            # Format 2: XML format with <tools><tool><name>...</name><arguments>...</arguments></tool></tools>
-            # Parse write_file format
+            # Format 2: XML format
             write_file_pattern = r'<tool>\s*<name>write_file</name>\s*<arguments>\s*<file\s+path="([^"]+)">\s*<content>(.*?)</content>\s*</file>\s*</arguments>\s*</tool>'
             for match in re.finditer(write_file_pattern, text, re.DOTALL | re.IGNORECASE):
                 path = match.group(1)
@@ -539,7 +508,6 @@ class CoderClient:
                     }
                 })
             
-            # Parse read_file format
             read_file_pattern = r'<tool>\s*<name>read_file</name>\s*<arguments>\s*<path>([^<]+)</path>\s*</arguments>\s*</tool>'
             for match in re.finditer(read_file_pattern, text, re.DOTALL | re.IGNORECASE):
                 path = match.group(1).strip()
@@ -552,7 +520,6 @@ class CoderClient:
                     }
                 })
             
-            # Parse execute_command format
             exec_pattern = r'<tool>\s*<name>execute_command</name>\s*<arguments>\s*(?:<command>)?([^<]+)(?:</command>)?\s*</arguments>\s*</tool>'
             for match in re.finditer(exec_pattern, text, re.DOTALL | re.IGNORECASE):
                 command = match.group(1).strip()
@@ -565,7 +532,6 @@ class CoderClient:
                     }
                 })
             
-            # Parse apply_diff format
             diff_pattern = r'<tool>\s*<name>apply_diff</name>\s*<arguments>\s*<path>([^<]+)</path>\s*<diff>(.*?)</diff>\s*</arguments>\s*</tool>'
             for match in re.finditer(diff_pattern, text, re.DOTALL | re.IGNORECASE):
                 path = match.group(1).strip()
@@ -581,123 +547,79 @@ class CoderClient:
             
             return parsed
         
-        # Start timer thread
-        timer_thread = threading.Thread(target=update_timer, daemon=True)
-        timer_thread.start()
-        
-        # Use iter_content with smaller chunk size for better real-time handling
-        buffer = ""
-        
-        try:
-            for chunk in response.iter_content(chunk_size=256, decode_unicode=True):
-                if chunk:
-                    buffer += chunk
+        # Process streaming response line by line
+        for line in response.iter_lines():
+            if not line:
+                continue
+                
+            line = line.decode('utf-8')
+            
+            # Handle SSE format
+            if line.startswith('data: '):
+                line = line[6:]
+            
+            if line == '[DONE]':
+                break
+            
+            try:
+                data = json.loads(line)
+                delta = data.get('choices', [{}])[0].get('delta', {})
+                content = delta.get('content')
+                
+                if not content:
+                    continue
+                
+                full_content += content
+                current_time = time.time()
+                
+                # Handle thinking state
+                if '<think>' in content:
+                    in_thinking = True
+                    thinking_start_time = current_time
+                    last_update_time = current_time
+                    displayed_elapsed = 0
+                    thinking_content = ""
+                    sys.stdout.write(f"\r{Colors.DIM}{format_thinking_line(0, '')}{Colors.RESET}")
+                    sys.stdout.flush()
+                    continue
+                
+                if in_thinking:
+                    if '</think>' in content:
+                        in_thinking = False
+                        elapsed = int(current_time - thinking_start_time)
+                        parts = content.split('</think>', 1)
+                        if parts[0]:
+                            thinking_content += parts[0]
+                        sys.stdout.write(f"\r{Colors.DIM}{format_thinking_line(elapsed, thinking_content)}{Colors.RESET}\n")
+                        sys.stdout.flush()
+                        # Content after </think>
+                        if len(parts) > 1 and parts[1]:
+                            actual = parts[1]
+                            sys.stdout.write(actual)
+                            sys.stdout.flush()
+                    else:
+                        thinking_content += content
+                        # Update display every 0.1 seconds or on new content
+                        elapsed = int(current_time - thinking_start_time)
+                        if elapsed != displayed_elapsed or current_time - last_update_time >= 0.1:
+                            sys.stdout.write(f"\r{Colors.DIM}{format_thinking_line(elapsed, thinking_content)}{Colors.RESET}")
+                            sys.stdout.flush()
+                            displayed_elapsed = elapsed
+                            last_update_time = current_time
+                else:
+                    sys.stdout.write(content)
+                    sys.stdout.flush()
                     
-                    # Process complete lines from buffer
-                    while '\n' in buffer:
-                        line, buffer = buffer.split('\n', 1)
-                        
-                        # Handle SSE format
-                        if line.startswith('data: '):
-                            line = line[6:]
-                        
-                        if line == '[DONE]':
-                            break
-                        
-                        if not line:
-                            continue
-                        
-                        try:
-                            data = json.loads(line)
-                            delta = data.get('choices', [{}])[0].get('delta', {})
-                            
-                            # Handle content
-                            content = delta.get('content')
-                            if content:
-                                # Check for thinking tags
-                                if '<think>' in content:
-                                    in_thinking = True
-                                    thinking_start_time = time.time()
-                                    last_elapsed = 0
-                                    thinking_content = ""
-                                    thinking_line_printed = False
-                                    # Print initial thinking line immediately
-                                    print_thinking_line(0, "")
-                                    continue
-                                
-                                if in_thinking:
-                                    if '</think>' in content:
-                                        # End of thinking
-                                        in_thinking = False
-                                        parts = content.split('</think>', 1)
-                                        think_part = parts[0]
-                                        if think_part:
-                                            thinking_content += think_part
-                                            # Update display one last time
-                                            elapsed = int(time.time() - thinking_start_time)
-                                            print_thinking_line(elapsed, thinking_content)
-                                        
-                                        # Show final thinking line with newline
-                                        elapsed = int(time.time() - thinking_start_time)
-                                        print_thinking_line(elapsed, thinking_content, final=True)
-                                        
-                                        # Get content after </think>
-                                        actual_content = parts[1] if len(parts) > 1 else ""
-                                        if actual_content:
-                                            # Check for tool calls in the content
-                                            parsed_tools = parse_tool_calls_from_content(actual_content)
-                                            if parsed_tools:
-                                                tool_calls.extend(parsed_tools)
-                                            else:
-                                                print(actual_content, end='', flush=True)
-                                                full_content += actual_content
-                                    else:
-                                        # Still thinking - accumulate and update display immediately
-                                        thinking_content += content
-                                        elapsed = int(time.time() - thinking_start_time)
-                                        print_thinking_line(elapsed, thinking_content)
-                                else:
-                                    # Check for tool calls in normal content too
-                                    parsed_tools = parse_tool_calls_from_content(content)
-                                    if parsed_tools:
-                                        tool_calls.extend(parsed_tools)
-                                    else:
-                                        print(content, end='', flush=True)
-                                        full_content += content
-                            
-                            # Handle tool calls (OpenAI format)
-                            delta_tool_calls = delta.get('tool_calls')
-                            if delta_tool_calls:
-                                for tc in delta_tool_calls:
-                                    index = tc.get('index', 0)
-                                    
-                                    # Extend tool_calls list if needed
-                                    while len(tool_calls) <= index:
-                                        tool_calls.append({
-                                            'id': '',
-                                            'type': 'function',
-                                            'function': {'name': '', 'arguments': ''}
-                                        })
-                                    
-                                    # Update tool call
-                                    if 'id' in tc:
-                                        tool_calls[index]['id'] = tc['id']
-                                    if 'function' in tc:
-                                        if 'name' in tc['function']:
-                                            tool_calls[index]['function']['name'] = tc['function']['name']
-                                        if 'arguments' in tc['function']:
-                                            tool_calls[index]['function']['arguments'] += tc['function']['arguments']
-                            
-                        except json.JSONDecodeError:
-                            continue
-        finally:
-            stop_timer.set()
-            if timer_thread:
-                timer_thread.join(timeout=1)
+            except json.JSONDecodeError:
+                continue
         
         if in_thinking:
-            print()  # End thinking line if still in thinking
-        print()  # Newline after streaming
+            sys.stdout.write('\n')
+        sys.stdout.write('\n')
+        sys.stdout.flush()
+        
+        # Parse tool calls from full content after streaming
+        tool_calls = parse_tool_calls_from_content(full_content)
         
         # Execute tool calls if any
         if tool_calls:
