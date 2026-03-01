@@ -589,7 +589,7 @@ class NvidiaBackend(ModelBackend):
     
     def _is_moe_model(self, model_name: str) -> bool:
         """Check if model is a MoE (Mixture of Experts) model which needs more VRAM headroom."""
-        moe_indicators = ['moe', 'mixtral', 'qwen3_5_moe', 'qwen3.5_moe', 'expert']
+        moe_indicators = ['moe', 'mixtral', 'qwen3_5_moe', 'qwen3.5_moe', 'expert', 'a3b']
         model_name_lower = model_name.lower()
         return any(indicator in model_name_lower for indicator in moe_indicators)
     
