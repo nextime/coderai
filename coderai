@@ -593,8 +593,40 @@ class NvidiaBackend(ModelBackend):
         model_name_lower = model_name.lower()
         return any(indicator in model_name_lower for indicator in moe_indicators)
     
-    def _get_vram_percentages_for_gpu(self, model_name: str = "") -> list:
-        """Get VRAM percentage steps based on GPU memory size and model type."""
+    def _get_vram_percentages_for_strategy(self, strategy: str, is_moe: bool, total_vram_gb: float) -> list:
+        """Get VRAM percentage steps based on offload strategy."""
+        if strategy == "conservative":
+            print(f"  Using conservative offload strategy - minimal VRAM usage for maximum stability")
+            if is_moe:
+                return [0.70, 0.65, 0.60, 0.50, 0.40, 0.30, 0.20, 0.0]
+            return [0.80, 0.75, 0.70, 0.65, 0.50, 0.40, 0.30, 0.20, 0.0]
+        elif strategy == "balanced":
+            print(f"  Using balanced offload strategy - good performance with reasonable stability")
+            if is_moe:
+                return [0.75, 0.70, 0.65, 0.60, 0.50, 0.40, 0.30, 0.20, 0.0]
+            return [0.85, 0.80, 0.75, 0.70, 0.65, 0.50, 0.40, 0.30, 0.20, 0.0]
+        elif strategy == "aggressive":
+            print(f"  Using aggressive offload strategy - maximize VRAM usage for performance")
+            if is_moe:
+                return [0.85, 0.80, 0.75, 0.70, 0.65, 0.60, 0.50, 0.40, 0.30, 0.20, 0.0]
+            return [0.95, 0.90, 0.85, 0.80, 0.75, 0.70, 0.65, 0.50, 0.40, 0.30, 0.20, 0.0]
+        else:  # auto
+            if total_vram_gb < 3:
+                print(f"  Detected small GPU ({total_vram_gb:.1f}GB), using aggressive VRAM usage (99% start)")
+                return [0.99, 0.95, 0.90, 0.85, 0.75, 0.65, 0.50, 0.35, 0.20, 0.0]
+            elif total_vram_gb <= 8:
+                print(f"  Detected medium GPU ({total_vram_gb:.1f}GB), using high VRAM usage (96% start)")
+                return [0.96, 0.90, 0.85, 0.75, 0.65, 0.50, 0.35, 0.20, 0.0]
+            else:
+                if is_moe:
+                    print(f"  Detected large GPU ({total_vram_gb:.1f}GB), using MoE-safe VRAM usage (80% start)")
+                    return [0.80, 0.75, 0.70, 0.65, 0.60, 0.50, 0.40, 0.30, 0.20, 0.0]
+                else:
+                    print(f"  Detected large GPU ({total_vram_gb:.1f}GB), using conservative VRAM usage (93% start)")
+                    return [0.93, 0.85, 0.75, 0.65, 0.50, 0.35, 0.20, 0.0]
+    
+    def _get_vram_percentages_for_gpu(self, model_name: str = "", strategy: str = "auto") -> list:
+        """Get VRAM percentage steps based on GPU memory size, model type, and offload strategy."""
         import torch
         
         if not torch.cuda.is_available():
@@ -611,24 +643,7 @@ class NvidiaBackend(ModelBackend):
         if is_moe:
             print(f"  Detected MoE model, using extra conservative VRAM limits for generation headroom")
         
-        # Determine starting percentage based on VRAM size and model type
-        if total_vram_gb < 3:
-            # Small GPUs (< 3GB): start with 99%
-            print(f"  Detected small GPU ({total_vram_gb:.1f}GB), using aggressive VRAM usage (99% start)")
-            return [0.99, 0.95, 0.90, 0.85, 0.75, 0.65, 0.50, 0.35, 0.20, 0.0]
-        elif total_vram_gb <= 8:
-            # Medium GPUs (3-8GB): start with 96%
-            print(f"  Detected medium GPU ({total_vram_gb:.1f}GB), using high VRAM usage (96% start)")
-            return [0.96, 0.90, 0.85, 0.75, 0.65, 0.50, 0.35, 0.20, 0.0]
-        else:
-            # Large GPUs (> 8GB)
-            if is_moe:
-                # MoE models need more headroom for generation activations
-                print(f"  Detected large GPU ({total_vram_gb:.1f}GB), using MoE-safe VRAM usage (80% start)")
-                return [0.80, 0.75, 0.70, 0.65, 0.60, 0.50, 0.40, 0.30, 0.20, 0.0]
-            else:
-                print(f"  Detected large GPU ({total_vram_gb:.1f}GB), using conservative VRAM usage (93% start)")
-                return [0.93, 0.85, 0.75, 0.65, 0.50, 0.35, 0.20, 0.0]
+        return self._get_vram_percentages_for_strategy(strategy, is_moe, total_vram_gb)
     
     def load_model(self, model_name: str, **kwargs) -> None:
         """Load the model using HuggingFace Transformers with automatic OOM handling."""
@@ -640,6 +655,7 @@ class NvidiaBackend(ModelBackend):
         load_in_8bit = kwargs.get('load_in_8bit', False)
         manual_ram_gb = kwargs.get('manual_ram_gb')
         flash_attn = kwargs.get('flash_attn', False)
+        offload_strategy = kwargs.get('offload_strategy', 'auto')
         
         # Store RAM limit for use in _get_gpu_memory_map
         self._pending_ram_gb = manual_ram_gb
@@ -698,7 +714,7 @@ class NvidiaBackend(ModelBackend):
         
         # Try loading with automatic fallback on OOM
         model = None
-        vram_percentages = self._get_vram_percentages_for_gpu(model_name)
+        vram_percentages = self._get_vram_percentages_for_gpu(model_name, offload_strategy)
         first_vram_pct = vram_percentages[0] if vram_percentages else 0.93
         
         for vram_pct in vram_percentages:
@@ -2018,6 +2034,13 @@ def parse_args():
         help="Use Flash Attention 2 (NVIDIA backend only, requires flash-attn package)",
     )
     parser.add_argument(
+        "--offload-strategy",
+        type=str,
+        choices=["auto", "conservative", "balanced", "aggressive"],
+        default="auto",
+        help="Offload strategy for NVIDIA backend (default: auto)",
+    )
+    parser.add_argument(
         "--n-gpu-layers",
         type=int,
         default=-1,
@@ -2119,6 +2142,7 @@ def main():
         'load_in_8bit': args.load_in_8bit,
         'manual_ram_gb': args.ram,
         'flash_attn': args.flash_attn,
+        'offload_strategy': args.offload_strategy,
         'n_gpu_layers': args.n_gpu_layers,
         'n_ctx': args.n_ctx,
         'main_gpu': args.vulkan_device,
