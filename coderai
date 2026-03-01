@@ -587,8 +587,14 @@ class NvidiaBackend(ModelBackend):
                 return None
             raise
     
-    def _get_vram_percentages_for_gpu(self) -> list:
-        """Get VRAM percentage steps based on GPU memory size."""
+    def _is_moe_model(self, model_name: str) -> bool:
+        """Check if model is a MoE (Mixture of Experts) model which needs more VRAM headroom."""
+        moe_indicators = ['moe', 'mixtral', 'qwen3_5_moe', 'qwen3.5_moe', 'expert']
+        model_name_lower = model_name.lower()
+        return any(indicator in model_name_lower for indicator in moe_indicators)
+    
+    def _get_vram_percentages_for_gpu(self, model_name: str = "") -> list:
+        """Get VRAM percentage steps based on GPU memory size and model type."""
         import torch
         
         if not torch.cuda.is_available():
@@ -600,7 +606,12 @@ class NvidiaBackend(ModelBackend):
             props = torch.cuda.get_device_properties(i)
             total_vram_gb += props.total_memory / 1e9
         
-        # Determine starting percentage based on VRAM size
+        # Check if MoE model (needs more headroom for generation)
+        is_moe = self._is_moe_model(model_name)
+        if is_moe:
+            print(f"  Detected MoE model, using extra conservative VRAM limits for generation headroom")
+        
+        # Determine starting percentage based on VRAM size and model type
         if total_vram_gb < 3:
             # Small GPUs (< 3GB): start with 99%
             print(f"  Detected small GPU ({total_vram_gb:.1f}GB), using aggressive VRAM usage (99% start)")
@@ -610,9 +621,14 @@ class NvidiaBackend(ModelBackend):
             print(f"  Detected medium GPU ({total_vram_gb:.1f}GB), using high VRAM usage (96% start)")
             return [0.96, 0.90, 0.85, 0.75, 0.65, 0.50, 0.35, 0.20, 0.0]
         else:
-            # Large GPUs (> 8GB): start with 93% (conservative)
-            print(f"  Detected large GPU ({total_vram_gb:.1f}GB), using conservative VRAM usage (93% start)")
-            return [0.93, 0.85, 0.75, 0.65, 0.50, 0.35, 0.20, 0.0]
+            # Large GPUs (> 8GB)
+            if is_moe:
+                # MoE models need more headroom for generation activations
+                print(f"  Detected large GPU ({total_vram_gb:.1f}GB), using MoE-safe VRAM usage (80% start)")
+                return [0.80, 0.75, 0.70, 0.65, 0.60, 0.50, 0.40, 0.30, 0.20, 0.0]
+            else:
+                print(f"  Detected large GPU ({total_vram_gb:.1f}GB), using conservative VRAM usage (93% start)")
+                return [0.93, 0.85, 0.75, 0.65, 0.50, 0.35, 0.20, 0.0]
     
     def load_model(self, model_name: str, **kwargs) -> None:
         """Load the model using HuggingFace Transformers with automatic OOM handling."""
@@ -676,7 +692,7 @@ class NvidiaBackend(ModelBackend):
         
         # Try loading with automatic fallback on OOM
         model = None
-        vram_percentages = self._get_vram_percentages_for_gpu()
+        vram_percentages = self._get_vram_percentages_for_gpu(model_name)
         first_vram_pct = vram_percentages[0] if vram_percentages else 0.93
         
         for vram_pct in vram_percentages:
