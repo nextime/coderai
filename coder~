@@ -1282,10 +1282,7 @@ def print_help():
   {Colors.YELLOW}/confirm <tool> <y/n>{Colors.RESET}  Enable/disable tool confirmation
 
 {Colors.BOLD}{Colors.CYAN}Multiline Input:{Colors.RESET}
-  - End a line with {Colors.YELLOW}\\{Colors.RESET} to continue
-  - Or paste multiline content directly
-  - Or press Enter twice to finish
-  - Unclosed brackets ( ) [ ] {{ }} or : continue automatically
+  End a line with {Colors.YELLOW}\\{Colors.RESET} to continue on next line
   Example:
     CoderCLI> This is a \\
       ...> multiline message
