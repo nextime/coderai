@@ -508,7 +508,7 @@ class CoderClient:
             parsed = []
             
             # Format 1: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
-            pattern1 = r'<tool_call>\s*(\{[^}]+\})\s*</tool_call>'
+            pattern1 = r'<tool_call>\s*(\{.*?\})\s*</tool_call>'
             matches1 = re.findall(pattern1, text, re.DOTALL)
             for match in matches1:
                 try:
