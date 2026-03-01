@@ -608,6 +608,9 @@ class CoderClient:
         
         # Replace with summary
         self.conversation_history = [{"role": "system", "content": summary}] + keep
+        
+        # Save the updated session after compression
+        self._save_current_session()
     
     def _save_current_session(self):
         """Save current session if it has a name."""
@@ -642,6 +645,9 @@ class CoderClient:
             # Generate default name
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.session_name = f"session_{timestamp}"
+        
+        # Save the new empty session immediately
+        self._save_current_session()
         
         return self.session_name
     
