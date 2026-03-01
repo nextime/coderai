@@ -4,7 +4,14 @@ coder - A CLI tool for interacting with coderai API
 Connects to OpenAI-compatible API and executes tools automatically.
 """
 
+# Debug: Verify script execution - imports must come first
+import sys
 import os
+
+if os.environ.get('CODER_DEBUG'):
+    print(f"DEBUG: Script started", file=sys.stderr)
+    print(f"DEBUG: Arguments: {sys.argv}", file=sys.stderr)
+    print(f"DEBUG: Python executable: {sys.executable}", file=sys.stderr)
 import sys
 import json
 import argparse
@@ -151,6 +158,7 @@ class Config:
     debug: bool = False  # Show debug output including raw tool calls
     max_context: int = 32768  # Maximum context size in tokens
     no_prompt: bool = False  # Don't send system prompt
+    no_tools: bool = False   # Don't send tool definitions
     
     def __post_init__(self):
         if self.confirm_commands is None:
@@ -179,6 +187,7 @@ class Config:
                 config.debug = data.get('debug', config.debug)
                 config.max_context = data.get('max_context', config.max_context)
                 config.no_prompt = data.get('no_prompt', config.no_prompt)
+                config.no_tools = data.get('no_tools', config.no_tools)
             except (json.JSONDecodeError, IOError) as e:
                 print(f"Warning: Could not load config from {config_path}: {e}", file=sys.stderr)
         
@@ -203,7 +212,8 @@ class Config:
             'timeout': self.timeout,
             'debug': self.debug,
             'max_context': self.max_context,
-            'no_prompt': self.no_prompt
+            'no_prompt': self.no_prompt,
+            'no_tools': self.no_tools
         }
         
         with open(config_path, 'w') as f:
@@ -544,13 +554,17 @@ class CoderClient:
         if self.config.token:
             headers["Authorization"] = f"Bearer {self.config.token}"
         
+        # Build payload, conditionally including tools
         payload = {
             "model": self.config.model,
             "messages": messages,
-            "tools": self.tool_executor.tools,
-            "tool_choice": "auto",
             "stream": stream
         }
+        
+        # Only include tools if not disabled
+        if not self.config.no_tools:
+            payload["tools"] = self.tool_executor.tools
+            payload["tool_choice"] = "auto"
         
         try:
             response = requests.post(
@@ -1024,13 +1038,17 @@ class CoderClient:
         if self.config.token:
             headers["Authorization"] = f"Bearer {self.config.token}"
         
+        # Build payload, conditionally including tools
         payload = {
             "model": self.config.model,
             "messages": messages,
-            "tools": self.tool_executor.tools,
-            "tool_choice": "auto",
             "stream": True
         }
+        
+        # Only include tools if not disabled
+        if not self.config.no_tools:
+            payload["tools"] = self.tool_executor.tools
+            payload["tool_choice"] = "auto"
         
         response = requests.post(
             f"{self.config.api_url}/chat/completions",
@@ -1410,6 +1428,13 @@ Examples:
     )
     
     parser.add_argument(
+        '--no-tools',
+        action='store_true',
+        dest='no_tools',
+        help='Do not send tool definitions to the API (plain chat mode)'
+    )
+    
+    parser.add_argument(
         '--ctx',
         type=int,
         dest='max_context',
@@ -1436,7 +1461,8 @@ Examples:
             'model': config.model,
             'small': config.small,
             'tiny': config.tiny,
-            'max_context': config.max_context
+            'max_context': config.max_context,
+            'no_tools': config.no_tools
         }, indent=2))
         return
     
@@ -1466,6 +1492,8 @@ Examples:
         config.max_context = args.max_context
     if args.no_prompt:
         config.no_prompt = True
+    if args.no_tools:
+        config.no_tools = True
     
     # Apply small/tiny model system prompt if enabled
     if config.micro:
@@ -1498,15 +1526,25 @@ Examples:
     # Get message
     message = args.message or args.msg_flag
     
+    if os.environ.get('CODER_DEBUG'):
+        print(f"DEBUG: message = {message}", file=sys.stderr)
+        print(f"DEBUG: args.no_stream = {args.no_stream}", file=sys.stderr)
+    
     if message:
         # Single message mode - disable confirmations for non-interactive use
+        if os.environ.get('CODER_DEBUG'):
+            print(f"DEBUG: Entering single message mode", file=sys.stderr)
         client.config.confirm_all = False
         result = client.chat(message, stream=not args.no_stream)
         # Print result if non-streaming (streaming prints internally)
         if args.no_stream and result:
             print(result)
+        if os.environ.get('CODER_DEBUG'):
+            print(f"DEBUG: chat() returned", file=sys.stderr)
     else:
         # Interactive shell mode
+        if os.environ.get('CODER_DEBUG'):
+            print(f"DEBUG: Entering interactive shell mode", file=sys.stderr)
         run_interactive_shell(client, session_manager)
 
 

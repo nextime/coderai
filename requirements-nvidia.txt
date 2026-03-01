@@ -14,6 +14,8 @@ psutil>=5.9.0
 # Optional: for better performance with NVIDIA GPUs
 bitsandbytes>=0.41.0
 sentencepiece>=0.1.99
+tiktoken>=0.5.0
+tokenizers>=0.15.0
 protobuf>=3.20.0
 
 # Optional: Flash Attention 2 for faster inference on supported NVIDIA GPUs

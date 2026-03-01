@@ -2012,6 +2012,7 @@ def main():
         )
     except Exception as e:
         print(f"\nError loading model: {e}")
+        error_str = str(e).lower()
         print("\nTroubleshooting:")
         if args.backend == "vulkan":
             print("  - For Vulkan, ensure you have Vulkan drivers installed")
@@ -2020,6 +2021,16 @@ def main():
         else:
             print("  - For NVIDIA, ensure PyTorch with CUDA is installed")
             print("  - Run build.sh with 'nvidia' argument first")
+            if "tokenizer" in error_str or "sentencepiece" in error_str or "tiktoken" in error_str:
+                print("  - Tokenizer error: ensure sentencepiece and tiktoken are installed")
+                print("    pip install sentencepiece tiktoken tokenizers")
+            # Check if trying to load GGUF model with NVIDIA backend
+            if "gguf" in model_name.lower():
+                print(f"\n  *** IMPORTANT: '{model_name}' appears to be a GGUF model ***")
+                print("  GGUF models are NOT compatible with the NVIDIA backend.")
+                print("  Use --backend vulkan instead, or choose a HuggingFace Transformers model.")
+                print("\n  Example Vulkan command:")
+                print(f"    coderai --backend vulkan --model {model_name}")
         sys.exit(1)
     
     # Start the server
