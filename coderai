@@ -587,6 +587,33 @@ class NvidiaBackend(ModelBackend):
                 return None
             raise
     
+    def _get_vram_percentages_for_gpu(self) -> list:
+        """Get VRAM percentage steps based on GPU memory size."""
+        import torch
+        
+        if not torch.cuda.is_available():
+            return [0.0]  # CPU only
+        
+        # Get total VRAM of the first GPU
+        total_vram_gb = 0
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            total_vram_gb += props.total_memory / 1e9
+        
+        # Determine starting percentage based on VRAM size
+        if total_vram_gb < 3:
+            # Small GPUs (< 3GB): start with 99%
+            print(f"  Detected small GPU ({total_vram_gb:.1f}GB), using aggressive VRAM usage (99% start)")
+            return [0.99, 0.95, 0.90, 0.85, 0.75, 0.65, 0.50, 0.35, 0.20, 0.0]
+        elif total_vram_gb <= 8:
+            # Medium GPUs (3-8GB): start with 96%
+            print(f"  Detected medium GPU ({total_vram_gb:.1f}GB), using high VRAM usage (96% start)")
+            return [0.96, 0.90, 0.85, 0.75, 0.65, 0.50, 0.35, 0.20, 0.0]
+        else:
+            # Large GPUs (> 8GB): start with 93% (conservative)
+            print(f"  Detected large GPU ({total_vram_gb:.1f}GB), using conservative VRAM usage (93% start)")
+            return [0.93, 0.85, 0.75, 0.65, 0.50, 0.35, 0.20, 0.0]
+    
     def load_model(self, model_name: str, **kwargs) -> None:
         """Load the model using HuggingFace Transformers with automatic OOM handling."""
         import torch
@@ -649,7 +676,8 @@ class NvidiaBackend(ModelBackend):
         
         # Try loading with automatic fallback on OOM
         model = None
-        vram_percentages = [0.93, 0.85, 0.75, 0.65, 0.50, 0.35, 0.20, 0.0]
+        vram_percentages = self._get_vram_percentages_for_gpu()
+        first_vram_pct = vram_percentages[0] if vram_percentages else 0.93
         
         for vram_pct in vram_percentages:
             if self.device != "cuda":
@@ -673,8 +701,8 @@ class NvidiaBackend(ModelBackend):
                 
                 if model is not None:
                     print(f"  ✓ Model loaded successfully with {vram_pct*100:.0f}% GPU VRAM limit")
-                    if vram_pct < 0.93:
-                        print(f"  (Reduced from 93% due to memory constraints)")
+                    if vram_pct < first_vram_pct:
+                        print(f"  (Reduced from {first_vram_pct*100:.0f}% due to memory constraints)")
                     break
                 else:
                     print(f"  ✗ Out of memory with {vram_pct*100:.0f}% GPU VRAM, trying lower limit...")
