@@ -16,6 +16,21 @@ from dataclasses import dataclass, field
 import requests
 
 
+# ANSI color codes
+class Colors:
+    """ANSI color codes for terminal output."""
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN = "\033[96m"
+    WHITE = "\033[97m"
+
+
 # Default system prompt for normal models
 DEFAULT_SYSTEM_PROMPT = """You are Coder, an AI coding assistant. You help users write, read, and modify code files. You have access to tools for file operations.
 
@@ -683,86 +698,90 @@ class CoderClient:
 
 def run_interactive_shell(client: CoderClient) -> None:
     """Run interactive REPL shell."""
-    print("=" * 60)
-    print("  coder - Interactive Coding Assistant")
-    print("=" * 60)
-    print("Type 'quit', 'exit' or press Ctrl+C to exit.")
-    print("Type 'clear' to clear conversation history.")
-    print("Type 'help' for more commands.")
-    print("-" * 60)
+    print(f"{Colors.CYAN}{'=' * 60}{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.GREEN}  coder - Interactive Coding Assistant{Colors.RESET}")
+    print(f"{Colors.CYAN}{'=' * 60}{Colors.RESET}")
+    print(f"{Colors.DIM}Type /quit, /exit or press Ctrl+C to exit.{Colors.RESET}")
+    print(f"{Colors.DIM}Type /clear to clear conversation history.{Colors.RESET}")
+    print(f"{Colors.DIM}Type /help for more commands.{Colors.RESET}")
+    print(f"{Colors.CYAN}{'-' * 60}{Colors.RESET}")
     
     while True:
         try:
-            print()
-            user_input = input("> ").strip()
+            # Colorful prompt
+            prompt = f"{Colors.BOLD}{Colors.BLUE}CoderCLI>{Colors.RESET} "
+            user_input = input(prompt).strip()
             
             if not user_input:
                 continue
             
-            if user_input.lower() in ('quit', 'exit', 'q'):
-                print("Goodbye!")
+            # Handle commands with / prefix
+            cmd = user_input.lower()
+            
+            if cmd in ('/quit', '/exit', '/q'):
+                print(f"{Colors.GREEN}Goodbye!{Colors.RESET}")
                 break
             
-            if user_input.lower() == 'clear':
+            if cmd == '/clear' or cmd == '/c':
                 client.clear_history()
-                print("Conversation history cleared.")
+                print(f"{Colors.YELLOW}Conversation history cleared.{Colors.RESET}")
                 continue
             
-            if user_input.lower() == 'help':
+            if cmd == '/help' or cmd == '/h':
                 print_help()
                 continue
             
-            if user_input.lower().startswith('/read '):
+            if cmd.startswith('/read '):
                 path = user_input[6:].strip()
                 result = client.tool_executor._read_file(path)
                 if 'content' in result:
-                    print(f"\n--- Content of {path} ---")
+                    print(f"\n{Colors.CYAN}--- Content of {path} ---{Colors.RESET}")
                     print(result['content'])
-                    print("--- End ---")
+                    print(f"{Colors.CYAN}--- End ---{Colors.RESET}")
                 else:
-                    print(f"Error: {result.get('error', 'Unknown error')}")
+                    print(f"{Colors.RED}Error: {result.get('error', 'Unknown error')}{Colors.RESET}")
                 continue
             
-            if user_input.lower().startswith('/exec '):
+            if cmd.startswith('/exec '):
                 command = user_input[6:].strip()
                 result = client.tool_executor._execute_command(command, ".")
-                print(f"\n$ {command}")
+                print(f"\n{Colors.GREEN}$ {command}{Colors.RESET}")
                 if result.get('stdout'):
                     print(result['stdout'])
                 if result.get('stderr'):
-                    print("stderr:", result['stderr'], file=sys.stderr)
+                    print(f"{Colors.RED}stderr: {result['stderr']}{Colors.RESET}", file=sys.stderr)
                 if result.get('returncode', 0) != 0:
-                    print(f"Exit code: {result['returncode']}")
+                    print(f"{Colors.RED}Exit code: {result['returncode']}{Colors.RESET}")
                 continue
             
             # Send message to LLM
             client.chat(user_input)
             
         except KeyboardInterrupt:
-            print("\nGoodbye!")
+            print(f"\n{Colors.GREEN}Goodbye!{Colors.RESET}")
             break
         except EOFError:
-            print("\nGoodbye!")
+            print(f"\n{Colors.GREEN}Goodbye!{Colors.RESET}")
             break
 
 
 def print_help():
     """Print help information."""
-    print("""
-Commands:
-  quit, exit, q    Exit the shell
-  clear            Clear conversation history
-  help             Show this help message
+    print(f"""
+{Colors.BOLD}{Colors.CYAN}Commands:{Colors.RESET}
+  {Colors.GREEN}/quit, /exit, /q{Colors.RESET}    Exit the shell
+  {Colors.GREEN}/clear, /c{Colors.RESET}          Clear conversation history
+  {Colors.GREEN}/help, /h{Colors.RESET}           Show this help message
   
-Shortcuts:
-  /read <path>     Read a file directly
-  /exec <command>  Execute a shell command directly
+{Colors.BOLD}{Colors.CYAN}Shortcuts:{Colors.RESET}
+  {Colors.YELLOW}/read <path>{Colors.RESET}      Read a file directly
+  {Colors.YELLOW}/exec <command>{Colors.RESET}   Execute a shell command directly
 
-The assistant can use tools to:
-  - read_file: Read file contents
-  - write_file: Write/create files
-  - apply_diff: Apply patches to files
-  - execute_command: Run shell commands
+{Colors.BOLD}{Colors.CYAN}The assistant can use tools to:{Colors.RESET}
+  - {Colors.BLUE}read_file{Colors.RESET}: Read file contents
+  - {Colors.BLUE}write_file{Colors.RESET}: Write/create files
+  - {Colors.BLUE}apply_diff{Colors.RESET}: Apply patches to files
+  - {Colors.BLUE}execute_command{Colors.RESET}: Run shell commands
 """)
 
 
