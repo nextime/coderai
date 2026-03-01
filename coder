@@ -133,6 +133,7 @@ class Config:
     timeout: int = 600   # Request timeout in seconds
     confirm_all: bool = True  # Confirm before executing tools by default
     confirm_commands: Dict[str, bool] = None  # Per-command confirmation settings
+    debug: bool = False  # Show debug output including raw tool calls
     
     def __post_init__(self):
         if self.confirm_commands is None:
@@ -157,6 +158,7 @@ class Config:
                 config.small = data.get('small', config.small)
                 config.tiny = data.get('tiny', config.tiny)
                 config.timeout = data.get('timeout', config.timeout)
+                config.debug = data.get('debug', config.debug)
             except (json.JSONDecodeError, IOError) as e:
                 print(f"Warning: Could not load config from {config_path}: {e}", file=sys.stderr)
         
@@ -177,7 +179,8 @@ class Config:
             'model': self.model,
             'small': self.small,
             'tiny': self.tiny,
-            'timeout': self.timeout
+            'timeout': self.timeout,
+            'debug': self.debug
         }
         
         with open(config_path, 'w') as f:
@@ -402,6 +405,8 @@ class CoderClient:
         self.config = config
         self.tool_executor = ToolExecutor()
         self.conversation_history: List[Dict[str, Any]] = []
+        self.in_tool_call = False
+        self.tool_call_buffer = ""
     
     def chat(self, message: str, stream: bool = True) -> str:
         """Send a message to the API and get response."""
@@ -462,6 +467,8 @@ class CoderClient:
         thinking_start_time = 0
         last_update_time = 0
         displayed_elapsed = 0
+        in_tool_call = False
+        tool_call_buffer = ""
         
         def format_thinking_line(elapsed, content):
             """Format the thinking line for display."""
@@ -572,8 +579,41 @@ class CoderClient:
                 full_content += content
                 current_time = time.time()
                 
+                # Filter out tool calls from display (unless debug mode)
+                display_content = content
+                if not self.config.debug:
+                    # Check for tool_call tag start
+                    if '<tool_call>' in content:
+                        if not in_tool_call:
+                            # Start of tool call - hide everything from <tool_call> onwards
+                            parts = content.split('<tool_call>', 1)
+                            if parts[0]:
+                                display_content = parts[0]
+                            else:
+                                display_content = ""
+                            in_tool_call = True
+                            tool_call_buffer = '<tool_call>' + (parts[1] if len(parts) > 1 else "")
+                        else:
+                            tool_call_buffer += content
+                            display_content = ""
+                    elif in_tool_call:
+                        # We're inside a tool call
+                        tool_call_buffer += content
+                        if '</tool_call>' in content:
+                            # End of tool call
+                            in_tool_call = False
+                            # Check if there's content after </tool_call>
+                            parts = content.split('</tool_call>', 1)
+                            if len(parts) > 1 and parts[1]:
+                                display_content = parts[1]
+                            else:
+                                display_content = ""
+                            tool_call_buffer = ""
+                        else:
+                            display_content = ""
+                
                 # Handle thinking state
-                if '<think>' in content:
+                if '<think>' in display_content:
                     in_thinking = True
                     thinking_start_time = current_time
                     last_update_time = current_time
@@ -584,10 +624,10 @@ class CoderClient:
                     continue
                 
                 if in_thinking:
-                    if '</think>' in content:
+                    if '</think>' in display_content:
                         in_thinking = False
                         elapsed = int(current_time - thinking_start_time)
-                        parts = content.split('</think>', 1)
+                        parts = display_content.split('</think>', 1)
                         if parts[0]:
                             thinking_content += parts[0]
                         sys.stdout.write(f"\r{Colors.DIM}{format_thinking_line(elapsed, thinking_content)}{Colors.RESET}\n")
@@ -598,7 +638,7 @@ class CoderClient:
                             sys.stdout.write(actual)
                             sys.stdout.flush()
                     else:
-                        thinking_content += content
+                        thinking_content += display_content
                         # Update display every 0.1 seconds or on new content
                         elapsed = int(current_time - thinking_start_time)
                         if elapsed != displayed_elapsed or current_time - last_update_time >= 0.1:
@@ -607,8 +647,9 @@ class CoderClient:
                             displayed_elapsed = elapsed
                             last_update_time = current_time
                 else:
-                    sys.stdout.write(content)
-                    sys.stdout.flush()
+                    if display_content:
+                        sys.stdout.write(display_content)
+                        sys.stdout.flush()
                     
             except json.JSONDecodeError:
                 continue
@@ -1019,6 +1060,12 @@ Examples:
         help='Request timeout in seconds (default: 600)'
     )
     
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='Show debug output including raw tool calls'
+    )
+    
     args = parser.parse_args()
     
     # Handle init-config
@@ -1055,6 +1102,8 @@ Examples:
         config.tiny = True
     if args.timeout:
         config.timeout = args.timeout
+    if args.debug:
+        config.debug = True
     
     # Apply small/tiny model system prompt if enabled
     if config.tiny:
