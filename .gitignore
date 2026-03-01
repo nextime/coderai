@@ -1,0 +1,17 @@
+# Backend selection file
+.backend
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Debug logs
+debug.log
