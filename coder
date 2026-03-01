@@ -702,16 +702,32 @@ def run_interactive_shell(client: CoderClient) -> None:
     print(f"{Colors.DIM}Type /quit, /exit or press Ctrl+C to exit.{Colors.RESET}")
     print(f"{Colors.DIM}Type /clear to clear conversation history.{Colors.RESET}")
     print(f"{Colors.DIM}Type /help for more commands.{Colors.RESET}")
+    print(f"{Colors.DIM}End line with \\ to continue on next line (multiline){Colors.RESET}")
     print(f"{Colors.CYAN}{'-' * 60}{Colors.RESET}")
     
     while True:
         try:
             # Colorful prompt
             prompt = f"{Colors.BOLD}{Colors.BLUE}CoderCLI>{Colors.RESET} "
-            user_input = input(prompt).strip()
+            lines = []
+            
+            while True:
+                line = input(prompt)
+                # Check if line ends with backslash for continuation
+                if line.rstrip().endswith('\\'):
+                    lines.append(line.rstrip()[:-1])  # Remove backslash
+                    prompt = f"{Colors.BLUE}  ...>{Colors.RESET} "  # Continuation prompt
+                else:
+                    lines.append(line)
+                    break
+            
+            user_input = '\n'.join(lines).strip()
             
             if not user_input:
                 continue
+            
+            # Print separator after user input
+            print(f"{Colors.CYAN}{'─' * 40}{Colors.RESET}")
             
             # Handle commands with / prefix
             cmd = user_input.lower()
@@ -774,6 +790,12 @@ def print_help():
 {Colors.BOLD}{Colors.CYAN}Shortcuts:{Colors.RESET}
   {Colors.YELLOW}/read <path>{Colors.RESET}      Read a file directly
   {Colors.YELLOW}/exec <command>{Colors.RESET}   Execute a shell command directly
+
+{Colors.BOLD}{Colors.CYAN}Multiline Input:{Colors.RESET}
+  End a line with {Colors.YELLOW}\\{Colors.RESET} to continue on next line
+  Example:
+    CoderCLI> This is a \\
+      ...> multiline message
 
 {Colors.BOLD}{Colors.CYAN}The assistant can use tools to:{Colors.RESET}
   - {Colors.BLUE}read_file{Colors.RESET}: Read file contents
