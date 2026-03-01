@@ -73,8 +73,8 @@ You: [Explain what you'll add, then call write_file or apply_diff]
 - Include code blocks with language tags
 - Maintain normal spacing in all responses"""
 
-# Simplified system prompt for tiny models (under 3B parameters)
-TINY_MODEL_SYSTEM_PROMPT = """You are Coder, an AI assistant. Help with coding tasks.
+# Simplified system prompt for small models (under 7B parameters)
+SMALL_MODEL_SYSTEM_PROMPT = """You are Coder, an AI assistant. Help with coding tasks.
 
 IMPORTANT RULES:
 1. Put ONE space between EVERY word.
@@ -93,6 +93,18 @@ Available tools:
 
 ALWAYS add spaces between words."""
 
+# Minimal system prompt for tiny models (under 3B parameters)
+TINY_MODEL_SYSTEM_PROMPT = """You are Coder. Help with code.
+
+Rules:
+- Space between words
+- Space after punctuation
+- Use ``` for code
+- Be brief
+
+Tools: <tool>{"name":"TOOL","arguments":{}}</tool>
+Tools: read_file, write_file, apply_diff, execute_command"""
+
 
 @dataclass
 class Config:
@@ -101,8 +113,9 @@ class Config:
     token: Optional[str] = None
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     model: str = "default"
-    tiny: bool = False  # Use tiny model optimizations
-    timeout: int = 600  # Request timeout in seconds
+    small: bool = False  # Use small model optimizations
+    tiny: bool = False   # Use tiny model optimizations (minimal)
+    timeout: int = 600   # Request timeout in seconds
 
     @classmethod
     def load(cls, config_path: Optional[str] = None) -> "Config":
@@ -120,6 +133,7 @@ class Config:
                 config.token = data.get('token')
                 config.system_prompt = data.get('system_prompt', config.system_prompt)
                 config.model = data.get('model', config.model)
+                config.small = data.get('small', config.small)
                 config.tiny = data.get('tiny', config.tiny)
                 config.timeout = data.get('timeout', config.timeout)
             except (json.JSONDecodeError, IOError) as e:
@@ -140,6 +154,7 @@ class Config:
             'token': self.token,
             'system_prompt': self.system_prompt,
             'model': self.model,
+            'small': self.small,
             'tiny': self.tiny,
             'timeout': self.timeout
         }
@@ -415,11 +430,15 @@ class CoderClient:
     
     def _handle_streaming_response(self, response: requests.Response) -> str:
         """Handle streaming response from API."""
+        import time
+        
         full_content = ""
         tool_calls = []
         current_tool_call = None
         in_thinking = False
-        thinking_dots = 0
+        thinking_content = ""
+        thinking_start_time = 0
+        last_timer_update = 0
         
         # Use iter_content with smaller chunk size for better real-time handling
         buffer = ""
@@ -451,24 +470,40 @@ class CoderClient:
                             # Check for thinking tags
                             if '<think>' in content:
                                 in_thinking = True
-                                print("[Thinking", end='', flush=True)
+                                thinking_start_time = time.time()
+                                last_timer_update = thinking_start_time
+                                print("<think> ", end='', flush=True)
                                 continue
                             
                             if in_thinking:
+                                current_time = time.time()
+                                # Update timer display every second
+                                if current_time - last_timer_update >= 1.0:
+                                    elapsed = int(current_time - thinking_start_time)
+                                    print(f"[{elapsed}s]", end=' ', flush=True)
+                                    last_timer_update = current_time
+                                
                                 if '</think>' in content:
                                     # End of thinking
                                     in_thinking = False
-                                    print("]\n", end='', flush=True)
+                                    # Show final timer
+                                    elapsed = int(current_time - thinking_start_time)
+                                    print(f"[{elapsed}s]", end=' ', flush=True)
+                                    # Show remaining thinking content and close tag
+                                    think_part = content.split('</think>')[0]
+                                    if think_part:
+                                        print(think_part, end='', flush=True)
+                                        thinking_content += think_part
+                                    print("</think>\n", flush=True)
                                     # Get content after </think>
                                     actual_content = content.split('</think>', 1)[-1]
                                     if actual_content:
                                         print(actual_content, end='', flush=True)
                                         full_content += actual_content
                                 else:
-                                    # Still thinking - show animated dots
-                                    thinking_dots = (thinking_dots + 1) % 4
-                                    dots = '.' * thinking_dots + ' ' * (3 - thinking_dots)
-                                    print(f"\r[Thinking{dots}]", end='', flush=True)
+                                    # Still thinking - show content as it arrives
+                                    print(content, end='', flush=True)
+                                    thinking_content += content
                             else:
                                 # Normal content
                                 print(content, end='', flush=True)
@@ -784,9 +819,15 @@ Examples:
     )
     
     parser.add_argument(
+        '--small',
+        action='store_true',
+        help='Use small model mode (simplified prompt for models under 7B parameters)'
+    )
+    
+    parser.add_argument(
         '--tiny',
         action='store_true',
-        help='Use tiny model mode (simplified system prompt for models under 3B parameters)'
+        help='Use tiny model mode (minimal prompt for models under 3B parameters)'
     )
     
     parser.add_argument(
@@ -809,6 +850,7 @@ Examples:
             'token': config.token,
             'system_prompt': config.system_prompt,
             'model': config.model,
+            'small': config.small,
             'tiny': config.tiny
         }, indent=2))
         return
@@ -821,15 +863,20 @@ Examples:
         config.api_url = args.api_url
     if args.token:
         config.token = args.token
+    if args.small:
+        config.small = True
     if args.tiny:
         config.tiny = True
     if args.timeout:
         config.timeout = args.timeout
     
-    # Apply tiny model system prompt if enabled
+    # Apply small/tiny model system prompt if enabled
     if config.tiny:
         config.system_prompt = TINY_MODEL_SYSTEM_PROMPT
-        print("[Tiny model mode enabled - using simplified system prompt]")
+        print("[Tiny model mode enabled - using minimal system prompt]")
+    elif config.small:
+        config.system_prompt = SMALL_MODEL_SYSTEM_PROMPT
+        print("[Small model mode enabled - using simplified system prompt]")
     
     # Create client
     client = CoderClient(config)
