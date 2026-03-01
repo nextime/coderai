@@ -467,19 +467,22 @@ class CoderClient:
         
         def update_timer():
             """Background thread to update timer every second."""
-            nonlocal last_elapsed
             while not stop_timer.is_set():
                 if in_thinking:
                     current_time = time.time()
                     elapsed = int(current_time - thinking_start_time)
-                    if elapsed != last_elapsed:
-                        last_elapsed = elapsed
-                        print_thinking_line(elapsed, thinking_content)
+                    print_thinking_line(elapsed, thinking_content, timer_update=True)
                 time.sleep(0.5)
         
-        def print_thinking_line(elapsed, content, final=False):
+        def print_thinking_line(elapsed, content, final=False, timer_update=False):
             """Print or update the thinking line."""
-            nonlocal thinking_line_printed
+            nonlocal thinking_line_printed, last_elapsed
+            
+            # Only update if elapsed changed or it's a forced update
+            if timer_update and elapsed == last_elapsed:
+                return
+            last_elapsed = elapsed
+            
             # Filter out <tool> and <tool_call> tags and newlines for display
             display_content = re.sub(r'<tool[^>]*>.*?</tool>', '', content, flags=re.DOTALL)
             display_content = re.sub(r'<tool_call[^>]*>.*?</tool_call>', '', display_content, flags=re.DOTALL)
@@ -571,8 +574,11 @@ class CoderClient:
                                         think_part = parts[0]
                                         if think_part:
                                             thinking_content += think_part
+                                            # Update display one last time
+                                            elapsed = int(time.time() - thinking_start_time)
+                                            print_thinking_line(elapsed, thinking_content)
                                         
-                                        # Show final thinking line
+                                        # Show final thinking line with newline
                                         elapsed = int(time.time() - thinking_start_time)
                                         print_thinking_line(elapsed, thinking_content, final=True)
                                         
@@ -587,12 +593,10 @@ class CoderClient:
                                                 print(actual_content, end='', flush=True)
                                                 full_content += actual_content
                                     else:
-                                        # Still thinking - accumulate
+                                        # Still thinking - accumulate and update display immediately
                                         thinking_content += content
-                                        # Update display every few chars
-                                        if len(thinking_content) % 10 == 0:
-                                            elapsed = int(time.time() - thinking_start_time)
-                                            print_thinking_line(elapsed, thinking_content)
+                                        elapsed = int(time.time() - thinking_start_time)
+                                        print_thinking_line(elapsed, thinking_content)
                                 else:
                                     # Check for tool calls in normal content too
                                     parsed_tools = parse_tool_calls_from_content(content)
