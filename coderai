@@ -1556,6 +1556,8 @@ async def stream_chat_response(
                 }],
             }
             yield f"data: {json.dumps(data)}\n\n"
+            # Explicitly flush to ensure data is sent immediately
+            await asyncio.sleep(0)
         
         print(f"DEBUG: stream_chat_response completed, {chunk_count} chunks, generated_text length: {len(generated_text)}")
         if not generated_text.strip():
