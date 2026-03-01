@@ -710,8 +710,8 @@ class CoderClient:
                     pass  # Already printed "Skipped"
                 else:
                     print(f"{Colors.GREEN}Success{Colors.RESET}")
-                    # Show command output for execute_command
-                    if tool_name == 'execute_command' and 'stdout' in result:
+                    # Show command output for execute_command only in debug mode
+                    if self.config.debug and tool_name == 'execute_command' and 'stdout' in result:
                         stdout = result['stdout'].strip()
                         if stdout:
                             # Show first few lines of output
