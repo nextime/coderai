@@ -452,45 +452,56 @@ class CoderClient:
     def _handle_streaming_response(self, response: requests.Response) -> str:
         """Handle streaming response from API."""
         import time
+        import re
         
         full_content = ""
         tool_calls = []
-        current_tool_call = None
         in_thinking = False
         thinking_content = ""
         thinking_start_time = 0
         last_elapsed = -1
-        printed_final_thinking = False
+        thinking_line_printed = False
         
-        def update_thinking_display(force=False):
-            """Update the thinking display line."""
-            nonlocal last_elapsed
-            if not in_thinking:
-                return
-            current_time = time.time()
-            elapsed = int(current_time - thinking_start_time)
-            if elapsed != last_elapsed or force:
-                last_elapsed = elapsed
-                # Clear line and redraw
-                display_text = thinking_content[-70:]  # Last 70 chars to fit on screen
-                if len(thinking_content) > 70:
-                    display_text = "..." + display_text
-                # Use carriage return to overwrite the line
-                line = f"[{elapsed}s] Thinking: [{display_text}]"
-                # Pad with spaces to clear previous content
-                print(f"\r{Colors.DIM}{line:<100}{Colors.RESET}", end='', flush=True)
+        def print_thinking_line(elapsed, content, final=False):
+            """Print or update the thinking line."""
+            nonlocal thinking_line_printed
+            # Filter out <tool> tags and newlines for display
+            display_content = re.sub(r'<tool[^>]*>.*?</tool>', '', content, flags=re.DOTALL)
+            display_content = display_content.replace('\n', ' ').replace('\r', '')
+            display_content = display_content.strip()
+            
+            # Get last 60 chars to fit on screen
+            if len(display_content) > 60:
+                display_content = "..." + display_content[-60:]
+            
+            line = f"[{elapsed}s] Thinking: [{display_content}]"
+            
+            if not thinking_line_printed:
+                # First time - just print
+                print(f"\r{Colors.DIM}{line}{Colors.RESET}", end='', flush=True)
+                thinking_line_printed = True
+            else:
+                # Overwrite existing line
+                # Clear to end of line and print new content
+                print(f"\r\033[K{Colors.DIM}{line}{Colors.RESET}", end='', flush=True)
+            
+            if final:
+                print()  # Move to new line
         
         # Use iter_content with smaller chunk size for better real-time handling
         buffer = ""
-        last_update = time.time()
+        last_timer_update = time.time()
         
         for chunk in response.iter_content(chunk_size=256, decode_unicode=True):
             current_time = time.time()
             
-            # Update thinking timer every second even without new content
-            if in_thinking and current_time - last_update >= 1.0:
-                update_thinking_display()
-                last_update = current_time
+            # Update thinking timer every second
+            if in_thinking:
+                elapsed = int(current_time - thinking_start_time)
+                if elapsed != last_elapsed and current_time - last_timer_update >= 1.0:
+                    last_elapsed = elapsed
+                    last_timer_update = current_time
+                    print_thinking_line(elapsed, thinking_content)
             
             if chunk:
                 buffer += chunk
@@ -520,35 +531,35 @@ class CoderClient:
                             if '<think>' in content:
                                 in_thinking = True
                                 thinking_start_time = time.time()
-                                last_update = thinking_start_time
+                                last_timer_update = thinking_start_time
+                                last_elapsed = 0
                                 thinking_content = ""
+                                thinking_line_printed = False
+                                # Print initial thinking line
+                                print_thinking_line(0, "")
                                 continue
                             
                             if in_thinking:
                                 if '</think>' in content:
                                     # End of thinking
                                     in_thinking = False
-                                    # Show final thinking line
-                                    elapsed = int(current_time - thinking_start_time)
-                                    think_part = content.split('</think>')[0]
+                                    parts = content.split('</think>', 1)
+                                    think_part = parts[0]
                                     if think_part:
                                         thinking_content += think_part
-                                    # Clear line and show final thinking
-                                    display_text = thinking_content[-70:]  # Last 70 chars
-                                    if len(thinking_content) > 70:
-                                        display_text = "..." + display_text
-                                    line = f"[{elapsed}s] Thinking: [{display_text}]"
-                                    print(f"\r{Colors.DIM}{line:<100}{Colors.RESET}\n", end='', flush=True)
-                                    printed_final_thinking = True
+                                    
+                                    # Show final thinking line
+                                    elapsed = int(current_time - thinking_start_time)
+                                    print_thinking_line(elapsed, thinking_content, final=True)
+                                    
                                     # Get content after </think>
-                                    actual_content = content.split('</think>', 1)[-1]
+                                    actual_content = parts[1] if len(parts) > 1 else ""
                                     if actual_content:
                                         print(actual_content, end='', flush=True)
                                         full_content += actual_content
                                 else:
-                                    # Still thinking - accumulate and display
+                                    # Still thinking - accumulate
                                     thinking_content += content
-                                    update_thinking_display(force=True)
                             else:
                                 # Normal content
                                 print(content, end='', flush=True)
@@ -580,8 +591,8 @@ class CoderClient:
                     except json.JSONDecodeError:
                         continue
         
-        if in_thinking and not printed_final_thinking:
-            print("\n", end='', flush=True)
+        if in_thinking:
+            print()  # End thinking line if still in thinking
         print()  # Newline after streaming
         
         # Execute tool calls if any
@@ -625,16 +636,30 @@ class CoderClient:
                 else:
                     result = self.tool_executor.execute(tool_name, arguments)
                 
+                # Show result summary
+                if "error" in result:
+                    print(f"{Colors.RED}Error: {result['error']}{Colors.RESET}")
+                elif result.get('declined'):
+                    pass  # Already printed "Skipped"
+                else:
+                    print(f"{Colors.GREEN}Success{Colors.RESET}")
+                    # Show command output for execute_command
+                    if tool_name == 'execute_command' and 'stdout' in result:
+                        stdout = result['stdout'].strip()
+                        if stdout:
+                            # Show first few lines of output
+                            lines = stdout.split('\n')[:20]
+                            print(f"{Colors.CYAN}Output:{Colors.RESET}")
+                            for line in lines:
+                                print(f"  {line}")
+                            if len(stdout.split('\n')) > 20:
+                                print(f"  {Colors.DIM}... ({len(stdout.split(chr(10))) - 20} more lines){Colors.RESET}")
+                
                 tool_results.append({
                     "tool_call_id": tc['id'],
                     "role": "tool",
                     "content": json.dumps(result)
                 })
-                
-                if "error" in result:
-                    print(f"{Colors.RED}Error: {result['error']}{Colors.RESET}")
-                elif not result.get('declined'):
-                    print(f"{Colors.GREEN}Success{Colors.RESET}")
             
             # Add assistant message with tool calls to history
             self.conversation_history.append({
@@ -653,7 +678,7 @@ class CoderClient:
             self.conversation_history.extend(tool_results)
             
             # Get follow-up response with tool results
-            print("\n[Getting follow-up response...]")
+            print(f"\n{Colors.DIM}[Getting follow-up response...]{Colors.RESET}")
             return self._get_follow_up_response()
         
         # Add assistant response to history
