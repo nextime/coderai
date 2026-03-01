@@ -9,9 +9,13 @@ import sys
 import json
 import argparse
 import subprocess
+import readline
+import random
+import string
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import requests
 
@@ -120,6 +124,16 @@ Rules:
 Tools: <tool>{"name":"TOOL","arguments":{}}</tool>
 Tools: read_file, write_file, apply_diff, execute_command"""
 
+# Ultra-minimal system prompt for micro models (under 1.5B parameters)
+MICRO_MODEL_SYSTEM_PROMPT = """Coder AI. Help code.
+
+Rules:
+- Space between words
+- Use ``` for code blocks
+
+Tools: read_file, write_file, apply_diff, execute_command
+Format: <tool>{"name":"TOOL","arguments":{}}</tool>"""
+
 
 @dataclass
 class Config:
@@ -130,10 +144,12 @@ class Config:
     model: str = "default"
     small: bool = False  # Use small model optimizations
     tiny: bool = False   # Use tiny model optimizations (minimal)
+    micro: bool = False  # Use micro model optimizations (ultra-minimal)
     timeout: int = 600   # Request timeout in seconds
     confirm_all: bool = True  # Confirm before executing tools by default
     confirm_commands: Dict[str, bool] = None  # Per-command confirmation settings
     debug: bool = False  # Show debug output including raw tool calls
+    max_context: int = 32768  # Maximum context size in tokens
     
     def __post_init__(self):
         if self.confirm_commands is None:
@@ -157,8 +173,10 @@ class Config:
                 config.model = data.get('model', config.model)
                 config.small = data.get('small', config.small)
                 config.tiny = data.get('tiny', config.tiny)
+                config.micro = data.get('micro', config.micro)
                 config.timeout = data.get('timeout', config.timeout)
                 config.debug = data.get('debug', config.debug)
+                config.max_context = data.get('max_context', config.max_context)
             except (json.JSONDecodeError, IOError) as e:
                 print(f"Warning: Could not load config from {config_path}: {e}", file=sys.stderr)
         
@@ -179,12 +197,99 @@ class Config:
             'model': self.model,
             'small': self.small,
             'tiny': self.tiny,
+            'micro': self.micro,
             'timeout': self.timeout,
-            'debug': self.debug
+            'debug': self.debug,
+            'max_context': self.max_context
         }
         
         with open(config_path, 'w') as f:
             json.dump(data, f, indent=2)
+
+
+class SessionManager:
+    """Manages named sessions for the CLI."""
+    
+    def __init__(self, sessions_dir: str = None):
+        if sessions_dir is None:
+            sessions_dir = os.path.expanduser("~/.cache/coderai/sessions")
+        self.sessions_dir = sessions_dir
+        os.makedirs(sessions_dir, exist_ok=True)
+    
+    def _get_session_path(self, name: str) -> str:
+        """Get the file path for a session."""
+        # Sanitize name for filesystem
+        safe_name = "".join(c for c in name if c.isalnum() or c in ('-', '_')).rstrip()
+        return os.path.join(self.sessions_dir, f"{safe_name}.json")
+    
+    def session_exists(self, name: str) -> bool:
+        """Check if a session exists."""
+        return os.path.exists(self._get_session_path(name))
+    
+    def save_session(self, name: str, history: List[Dict[str, Any]]) -> None:
+        """Save a session to disk."""
+        session_data = {
+            'name': name,
+            'timestamp': datetime.now().isoformat(),
+            'history': history
+        }
+        with open(self._get_session_path(name), 'w') as f:
+            json.dump(session_data, f, indent=2)
+    
+    def load_session(self, name: str) -> Optional[List[Dict[str, Any]]]:
+        """Load a session from disk."""
+        path = self._get_session_path(name)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+            return data.get('history', [])
+        except (json.JSONDecodeError, IOError):
+            return None
+    
+    def delete_session(self, name: str) -> bool:
+        """Delete a session. Returns True if deleted, False if not found."""
+        path = self._get_session_path(name)
+        if os.path.exists(path):
+            os.remove(path)
+            return True
+        return False
+    
+    def delete_all_sessions(self) -> int:
+        """Delete all sessions. Returns count of deleted sessions."""
+        count = 0
+        for filename in os.listdir(self.sessions_dir):
+            if filename.endswith('.json'):
+                os.remove(os.path.join(self.sessions_dir, filename))
+                count += 1
+        return count
+    
+    def list_sessions(self) -> List[Dict[str, Any]]:
+        """List all available sessions."""
+        sessions = []
+        for filename in sorted(os.listdir(self.sessions_dir)):
+            if filename.endswith('.json'):
+                path = os.path.join(self.sessions_dir, filename)
+                try:
+                    with open(path, 'r') as f:
+                        data = json.load(f)
+                    sessions.append({
+                        'name': data.get('name', filename[:-5]),
+                        'timestamp': data.get('timestamp', ''),
+                        'message_count': len(data.get('history', []))
+                    })
+                except (json.JSONDecodeError, IOError):
+                    pass
+        return sessions
+    
+    def generate_unique_name(self, base_name: str) -> str:
+        """Generate a unique session name by adding random characters if needed."""
+        if not self.session_exists(base_name):
+            return base_name
+        # Add random suffix
+        suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+        return f"{base_name}_{suffix}"
 
 
 class ToolExecutor:
@@ -401,15 +506,24 @@ class ToolExecutor:
 class CoderClient:
     """Client for interacting with the coderai API."""
     
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, session_manager: SessionManager = None):
         self.config = config
         self.tool_executor = ToolExecutor()
         self.conversation_history: List[Dict[str, Any]] = []
         self.in_tool_call = False
         self.tool_call_buffer = ""
+        self.session_manager = session_manager
+        self.session_name: Optional[str] = None
+        self.input_history: List[str] = []  # Track user inputs for readline
     
     def chat(self, message: str, stream: bool = True) -> str:
         """Send a message to the API and get response."""
+        # Add to input history for readline
+        self.input_history.append(message)
+        
+        # Check context size and compress if needed
+        self._manage_context()
+        
         # Add user message to history
         self.conversation_history.append({
             "role": "user",
@@ -443,9 +557,13 @@ class CoderClient:
             response.raise_for_status()
             
             if stream:
-                return self._handle_streaming_response(response)
+                result = self._handle_streaming_response(response)
             else:
-                return self._handle_non_streaming_response(response)
+                result = self._handle_non_streaming_response(response)
+            
+            # Save session after each interaction
+            self._save_current_session()
+            return result
                 
         except requests.exceptions.ConnectionError:
             return "Error: Could not connect to API. Is the server running?"
@@ -453,6 +571,79 @@ class CoderClient:
             return "Error: Request timed out."
         except requests.exceptions.RequestException as e:
             return f"Error: API request failed: {e}"
+    
+    def _estimate_tokens(self, text: str) -> int:
+        """Rough estimation of token count (4 chars per token on average)."""
+        return len(text) // 4
+    
+    def _manage_context(self):
+        """Manage context size and compress if approaching limit."""
+        # Calculate current context size
+        total_text = ""
+        for msg in self.conversation_history:
+            total_text += msg.get("content", "") or ""
+            if "tool_calls" in msg:
+                for tc in msg["tool_calls"]:
+                    total_text += tc.get("function", {}).get("arguments", "")
+        
+        current_tokens = self._estimate_tokens(total_text)
+        threshold = int(self.config.max_context * 0.9)  # 90% threshold
+        
+        if current_tokens > threshold:
+            print(f"{Colors.YELLOW}[Context at {current_tokens}/{self.config.max_context} tokens - compressing...]{Colors.RESET}")
+            self._compress_context()
+    
+    def _compress_context(self):
+        """Compress context by summarizing old messages."""
+        if len(self.conversation_history) <= 4:
+            return
+        
+        # Keep system message (implicit), first user message, and last 2 exchanges
+        # Summarize the middle portion
+        to_summarize = self.conversation_history[:-4]
+        keep = self.conversation_history[-4:]
+        
+        # Create a summary placeholder
+        summary = f"[Previous {len(to_summarize)} messages summarized]"
+        
+        # Replace with summary
+        self.conversation_history = [{"role": "system", "content": summary}] + keep
+    
+    def _save_current_session(self):
+        """Save current session if it has a name."""
+        if self.session_manager and self.session_name and self.conversation_history:
+            self.session_manager.save_session(self.session_name, self.conversation_history)
+    
+    def load_session(self, name: str) -> bool:
+        """Load a session by name."""
+        if not self.session_manager:
+            return False
+        
+        history = self.session_manager.load_session(name)
+        if history is not None:
+            self.conversation_history = history
+            self.session_name = name
+            return True
+        return False
+    
+    def new_session(self, name: str = None) -> str:
+        """Start a new session. Returns the session name."""
+        # Save current session if exists
+        self._save_current_session()
+        
+        # Clear history
+        self.conversation_history = []
+        
+        if name:
+            if self.session_manager and self.session_manager.session_exists(name):
+                name = self.session_manager.generate_unique_name(name)
+            self.session_name = name
+        else:
+            # Generate default name
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.session_name = f"session_{timestamp}"
+        
+        return self.session_name
     
     def _handle_streaming_response(self, response: requests.Response) -> str:
         """Handle streaming response from API."""
@@ -845,10 +1036,24 @@ class CoderClient:
         self.conversation_history = []
 
 
-def run_interactive_shell(client: CoderClient) -> None:
+def run_interactive_shell(client: CoderClient, session_manager: SessionManager) -> None:
     """Run interactive REPL shell."""
+    # Set up readline for history
+    readline_history_file = os.path.expanduser("~/.cache/coderai/input_history")
+    os.makedirs(os.path.dirname(readline_history_file), exist_ok=True)
+    try:
+        readline.read_history_file(readline_history_file)
+    except FileNotFoundError:
+        pass
+    
+    # Save history on exit
+    import atexit
+    atexit.register(readline.write_history_file, readline_history_file)
+    
     print(f"{Colors.CYAN}{'=' * 60}{Colors.RESET}")
     print(f"{Colors.BOLD}{Colors.GREEN}  coder - Interactive Coding Assistant{Colors.RESET}")
+    if client.session_name:
+        print(f"{Colors.DIM}  Session: {client.session_name}{Colors.RESET}")
     print(f"{Colors.CYAN}{'=' * 60}{Colors.RESET}")
     print(f"{Colors.DIM}Type /quit, /exit or press Ctrl+C to exit.{Colors.RESET}")
     print(f"{Colors.DIM}Type /clear to clear conversation history.{Colors.RESET}")
@@ -858,8 +1063,26 @@ def run_interactive_shell(client: CoderClient) -> None:
     
     while True:
         try:
-            # Colorful prompt
-            prompt = f"{Colors.BOLD}{Colors.BLUE}CoderCLI>{Colors.RESET} "
+            # Calculate context usage
+            total_text = ""
+            for msg in client.conversation_history:
+                total_text += msg.get("content", "") or ""
+                if "tool_calls" in msg:
+                    for tc in msg["tool_calls"]:
+                        total_text += tc.get("function", {}).get("arguments", "")
+            current_tokens = client._estimate_tokens(total_text)
+            max_ctx = client.config.max_context
+            
+            # Choose color based on usage
+            if current_tokens > int(max_ctx * 0.9):
+                ctx_color = Colors.RED
+            elif current_tokens > int(max_ctx * 0.7):
+                ctx_color = Colors.YELLOW
+            else:
+                ctx_color = Colors.DIM
+            
+            # Colorful prompt with context counter
+            prompt = f"{ctx_color}[{current_tokens}/{max_ctx}]{Colors.RESET} {Colors.BOLD}{Colors.BLUE}CoderCLI>{Colors.RESET} "
             lines = []
             
             while True:
@@ -938,6 +1161,47 @@ def run_interactive_shell(client: CoderClient) -> None:
                     print(f"  Example: /confirm write_file yes")
                 continue
             
+            # Handle /new command
+            if cmd == '/new' or cmd.startswith('/new '):
+                name = user_input[5:].strip() if len(user_input) > 5 else None
+                session_name = client.new_session(name)
+                print(f"{Colors.GREEN}Started new session: {session_name}{Colors.RESET}")
+                continue
+            
+            # Handle /session command
+            if cmd.startswith('/session '):
+                name = user_input[9:].strip()
+                if client.load_session(name):
+                    print(f"{Colors.GREEN}Loaded session: {name}{Colors.RESET}")
+                else:
+                    print(f"{Colors.RED}Session not found: {name}{Colors.RESET}")
+                continue
+            
+            # Handle /delete command
+            if cmd.startswith('/delete '):
+                target = user_input[8:].strip()
+                if target.upper() == 'ALL':
+                    count = session_manager.delete_all_sessions()
+                    print(f"{Colors.YELLOW}Deleted {count} sessions{Colors.RESET}")
+                else:
+                    if session_manager.delete_session(target):
+                        print(f"{Colors.YELLOW}Deleted session: {target}{Colors.RESET}")
+                    else:
+                        print(f"{Colors.RED}Session not found: {target}{Colors.RESET}")
+                continue
+            
+            # Handle /sessions command (list sessions)
+            if cmd == '/sessions' or cmd == '/ls':
+                sessions = session_manager.list_sessions()
+                if sessions:
+                    print(f"{Colors.CYAN}Available sessions:{Colors.RESET}")
+                    for s in sessions:
+                        current = " (current)" if s['name'] == client.session_name else ""
+                        print(f"  {Colors.GREEN}{s['name']}{Colors.RESET}{current} - {s['message_count']} messages - {s['timestamp'][:19]}")
+                else:
+                    print(f"{Colors.DIM}No saved sessions{Colors.RESET}")
+                continue
+            
             # Send message to LLM
             client.chat(user_input)
             
@@ -956,6 +1220,10 @@ def print_help():
   {Colors.GREEN}/quit, /exit, /q{Colors.RESET}    Exit the shell
   {Colors.GREEN}/clear, /c{Colors.RESET}          Clear conversation history
   {Colors.GREEN}/help, /h{Colors.RESET}           Show this help message
+  {Colors.GREEN}/new [name]{Colors.RESET}         Start a new session (optional name)
+  {Colors.GREEN}/session <name>{Colors.RESET}     Load a saved session
+  {Colors.GREEN}/sessions, /ls{Colors.RESET}      List all saved sessions
+  {Colors.GREEN}/delete <name|ALL>{Colors.RESET}  Delete a session or all sessions
   
 {Colors.BOLD}{Colors.CYAN}Shortcuts:{Colors.RESET}
   {Colors.YELLOW}/read <path>{Colors.RESET}      Read a file directly
@@ -989,6 +1257,8 @@ Examples:
   coder "Hello!"           Send a single message
   coder -m "Fix bug"       Send message non-interactively
   coder --config /path     Use custom config file
+  coder --ctx 65536        Set max context to 65536 tokens
+  coder --session myproj   Load session 'myproj'
         """
     )
     
@@ -1054,6 +1324,12 @@ Examples:
     )
     
     parser.add_argument(
+        '--micro',
+        action='store_true',
+        help='Use micro model mode (ultra-minimal prompt for models under 1.5B parameters)'
+    )
+    
+    parser.add_argument(
         '--timeout',
         type=int,
         default=600,
@@ -1064,6 +1340,18 @@ Examples:
         '--debug',
         action='store_true',
         help='Show debug output including raw tool calls'
+    )
+    
+    parser.add_argument(
+        '--ctx',
+        type=int,
+        dest='max_context',
+        help='Maximum context size in tokens (default: 32768)'
+    )
+    
+    parser.add_argument(
+        '--session',
+        help='Load a saved session by name'
     )
     
     args = parser.parse_args()
@@ -1080,7 +1368,8 @@ Examples:
             'system_prompt': config.system_prompt,
             'model': config.model,
             'small': config.small,
-            'tiny': config.tiny
+            'tiny': config.tiny,
+            'max_context': config.max_context
         }, indent=2))
         return
     
@@ -1100,21 +1389,42 @@ Examples:
         config.small = True
     if args.tiny:
         config.tiny = True
+    if args.micro:
+        config.micro = True
     if args.timeout:
         config.timeout = args.timeout
     if args.debug:
         config.debug = True
+    if args.max_context:
+        config.max_context = args.max_context
     
     # Apply small/tiny model system prompt if enabled
-    if config.tiny:
+    if config.micro:
+        config.system_prompt = MICRO_MODEL_SYSTEM_PROMPT
+        print("[Micro model mode enabled - using ultra-minimal system prompt]")
+    elif config.tiny:
         config.system_prompt = TINY_MODEL_SYSTEM_PROMPT
         print("[Tiny model mode enabled - using minimal system prompt]")
     elif config.small:
         config.system_prompt = SMALL_MODEL_SYSTEM_PROMPT
         print("[Small model mode enabled - using simplified system prompt]")
     
+    # Create session manager
+    session_manager = SessionManager()
+    
     # Create client
-    client = CoderClient(config)
+    client = CoderClient(config, session_manager)
+    
+    # Load session if specified
+    if args.session:
+        if client.load_session(args.session):
+            print(f"[Loaded session: {args.session}]")
+        else:
+            print(f"[Session not found: {args.session}, starting new session]")
+            client.new_session(args.session)
+    else:
+        # Start with a default session name
+        client.new_session()
     
     # Get message
     message = args.message or args.msg_flag
@@ -1124,7 +1434,7 @@ Examples:
         client.chat(message, stream=not args.no_stream)
     else:
         # Interactive shell mode
-        run_interactive_shell(client)
+        run_interactive_shell(client, session_manager)
 
 
 if __name__ == "__main__":
