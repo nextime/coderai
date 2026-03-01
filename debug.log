@@ -1,0 +1,494 @@
+/home/nextime/coderai/coderai:115: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.12/migration/
+  class ChatCompletionRequest(BaseModel):
+/home/nextime/coderai/coderai:139: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.12/migration/
+  class CompletionRequest(BaseModel):
+pci id for fd 10: 10de:2204, driver (null)
+pci id for fd 11: 10de:2204, driver (null)
+Can't open bumblebee display.
+ggml_vulkan: Found 2 Vulkan devices:
+ggml_vulkan: 0 = NVIDIA GeForce RTX 3090 (NVIDIA) | uma: 0 | fp16: 1 | bf16: 0 | warp size: 32 | shared memory: 49152 | int dot: 1 | matrix cores: KHR_coopmat
+ggml_vulkan: 1 = Radeon RX 580 Series (RADV POLARIS10) (radv) | uma: 0 | fp16: 0 | bf16: 0 | warp size: 64 | shared memory: 65536 | int dot: 0 | matrix cores: none
+llama_model_load_from_file_impl: using device Vulkan0 (NVIDIA GeForce RTX 3090) - 24576 MiB free
+llama_model_load_from_file_impl: using device Vulkan1 (Radeon RX 580 Series (RADV POLARIS10)) - 7936 MiB free
+llama_model_loader: loaded meta data with 28 key-value pairs and 399 tensors from /home/nextime/.cache/huggingface/hub/models--TeichAI--Qwen3-8B-Claude-4.5-Opus-High-Reasoning-Distill-GGUF/snapshots/4b33b7fd0cbeadd7d03acea142633c315c34115a/Qwen3-8B-claude-4.5-opus-high-reasoning-distill-Q4_K_M.gguf (version GGUF V3 (latest))
+llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+llama_model_loader: - kv   0:                       general.architecture str              = qwen3
+llama_model_loader: - kv   1:                               general.type str              = model
+llama_model_loader: - kv   2:                               general.name str              = Qwen3 8B Claude 4.5 Opus 250x High Re...
+llama_model_loader: - kv   3:                            general.version str              = 4.5
+llama_model_loader: - kv   4:                           general.finetune str              = claude-opus-250x-high-reasoning-distill
+llama_model_loader: - kv   5:                           general.basename str              = Qwen3
+llama_model_loader: - kv   6:                         general.size_label str              = 8B
+llama_model_loader: - kv   7:                          qwen3.block_count u32              = 36
+llama_model_loader: - kv   8:                       qwen3.context_length u32              = 40960
+llama_model_loader: - kv   9:                     qwen3.embedding_length u32              = 4096
+llama_model_loader: - kv  10:                  qwen3.feed_forward_length u32              = 12288
+llama_model_loader: - kv  11:                 qwen3.attention.head_count u32              = 32
+llama_model_loader: - kv  12:              qwen3.attention.head_count_kv u32              = 8
+llama_model_loader: - kv  13:                       qwen3.rope.freq_base f32              = 1000000.000000
+llama_model_loader: - kv  14:     qwen3.attention.layer_norm_rms_epsilon f32              = 0.000001
+llama_model_loader: - kv  15:                 qwen3.attention.key_length u32              = 128
+llama_model_loader: - kv  16:               qwen3.attention.value_length u32              = 128
+llama_model_loader: - kv  17:                       tokenizer.ggml.model str              = gpt2
+llama_model_loader: - kv  18:                         tokenizer.ggml.pre str              = qwen2
+llama_model_loader: - kv  19:                      tokenizer.ggml.tokens arr[str,151936]  = ["!", "\"", "#", "$", "%", "&", "'", ...
+llama_model_loader: - kv  20:                  tokenizer.ggml.token_type arr[i32,151936]  = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, ...
+llama_model_loader: - kv  21:                      tokenizer.ggml.merges arr[str,151387]  = ["Ġ Ġ", "ĠĠ ĠĠ", "i n", "Ġ t",...
+llama_model_loader: - kv  22:                tokenizer.ggml.eos_token_id u32              = 151645
+llama_model_loader: - kv  23:            tokenizer.ggml.padding_token_id u32              = 151654
+llama_model_loader: - kv  24:               tokenizer.ggml.add_bos_token bool             = false
+llama_model_loader: - kv  25:                    tokenizer.chat_template str              = {%- if tools %}\n    {{- '<|im_start|>...
+llama_model_loader: - kv  26:               general.quantization_version u32              = 2
+llama_model_loader: - kv  27:                          general.file_type u32              = 15
+llama_model_loader: - type  f32:  145 tensors
+llama_model_loader: - type q4_K:  217 tensors
+llama_model_loader: - type q6_K:   37 tensors
+print_info: file format = GGUF V3 (latest)
+print_info: file type   = Q4_K - Medium
+print_info: file size   = 4.68 GiB (4.90 BPW) 
+init_tokenizer: initializing tokenizer for type 2
+load: control token: 151660 '<|fim_middle|>' is not marked as EOG
+load: control token: 151659 '<|fim_prefix|>' is not marked as EOG
+load: control token: 151653 '<|vision_end|>' is not marked as EOG
+load: control token: 151648 '<|box_start|>' is not marked as EOG
+load: control token: 151646 '<|object_ref_start|>' is not marked as EOG
+load: control token: 151649 '<|box_end|>' is not marked as EOG
+load: control token: 151655 '<|image_pad|>' is not marked as EOG
+load: control token: 151651 '<|quad_end|>' is not marked as EOG
+load: control token: 151647 '<|object_ref_end|>' is not marked as EOG
+load: control token: 151652 '<|vision_start|>' is not marked as EOG
+load: control token: 151654 '<|vision_pad|>' is not marked as EOG
+load: control token: 151656 '<|video_pad|>' is not marked as EOG
+load: control token: 151644 '<|im_start|>' is not marked as EOG
+load: control token: 151661 '<|fim_suffix|>' is not marked as EOG
+load: control token: 151650 '<|quad_start|>' is not marked as EOG
+load: printing all EOG tokens:
+load:   - 151643 ('<|endoftext|>')
+load:   - 151645 ('<|im_end|>')
+load:   - 151662 ('<|fim_pad|>')
+load:   - 151663 ('<|repo_name|>')
+load:   - 151664 ('<|file_sep|>')
+load: special tokens cache size = 26
+load: token to piece cache size = 0.9311 MB
+print_info: arch             = qwen3
+print_info: vocab_only       = 0
+print_info: n_ctx_train      = 40960
+print_info: n_embd           = 4096
+print_info: n_layer          = 36
+print_info: n_head           = 32
+print_info: n_head_kv        = 8
+print_info: n_rot            = 128
+print_info: n_swa            = 0
+print_info: is_swa_any       = 0
+print_info: n_embd_head_k    = 128
+print_info: n_embd_head_v    = 128
+print_info: n_gqa            = 4
+print_info: n_embd_k_gqa     = 1024
+print_info: n_embd_v_gqa     = 1024
+print_info: f_norm_eps       = 0.0e+00
+print_info: f_norm_rms_eps   = 1.0e-06
+print_info: f_clamp_kqv      = 0.0e+00
+print_info: f_max_alibi_bias = 0.0e+00
+print_info: f_logit_scale    = 0.0e+00
+print_info: f_attn_scale     = 0.0e+00
+print_info: n_ff             = 12288
+print_info: n_expert         = 0
+print_info: n_expert_used    = 0
+print_info: causal attn      = 1
+print_info: pooling type     = -1
+print_info: rope type        = 2
+print_info: rope scaling     = linear
+print_info: freq_base_train  = 1000000.0
+print_info: freq_scale_train = 1
+print_info: n_ctx_orig_yarn  = 40960
+print_info: rope_finetuned   = unknown
+print_info: model type       = 8B
+print_info: model params     = 8.19 B
+print_info: general.name     = Qwen3 8B Claude 4.5 Opus 250x High Reasoning Distill F16
+print_info: vocab type       = BPE
+print_info: n_vocab          = 151936
+print_info: n_merges         = 151387
+print_info: BOS token        = 11 ','
+print_info: EOS token        = 151645 '<|im_end|>'
+print_info: EOT token        = 151645 '<|im_end|>'
+print_info: PAD token        = 151654 '<|vision_pad|>'
+print_info: LF token         = 198 'Ċ'
+print_info: FIM PRE token    = 151659 '<|fim_prefix|>'
+print_info: FIM SUF token    = 151661 '<|fim_suffix|>'
+print_info: FIM MID token    = 151660 '<|fim_middle|>'
+print_info: FIM PAD token    = 151662 '<|fim_pad|>'
+print_info: FIM REP token    = 151663 '<|repo_name|>'
+print_info: FIM SEP token    = 151664 '<|file_sep|>'
+print_info: EOG token        = 151643 '<|endoftext|>'
+print_info: EOG token        = 151645 '<|im_end|>'
+print_info: EOG token        = 151662 '<|fim_pad|>'
+print_info: EOG token        = 151663 '<|repo_name|>'
+print_info: EOG token        = 151664 '<|file_sep|>'
+print_info: max token length = 256
+load_tensors: loading model tensors, this can take a while... (mmap = true)
+load_tensors: layer   0 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer   1 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer   2 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer   3 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer   4 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer   5 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer   6 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer   7 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer   8 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer   9 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  10 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  11 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  12 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  13 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  14 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  15 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  16 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  17 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  18 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  19 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  20 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  21 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  22 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  23 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  24 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  25 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  26 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  27 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  28 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  29 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  30 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  31 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  32 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  33 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  34 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  35 assigned to device Vulkan1, is_swa = 0
+load_tensors: layer  36 assigned to device Vulkan1, is_swa = 0
+load_tensors: tensor 'token_embd.weight' (q4_K) (and 0 others) cannot be used with preferred buffer type Vulkan_Host, using CPU instead
+load_tensors: offloading 36 repeating layers to GPU
+load_tensors: offloading output layer to GPU
+load_tensors: offloaded 37/37 layers to GPU
+load_tensors:      Vulkan1 model buffer size =  4455.34 MiB
+load_tensors:   CPU_Mapped model buffer size =   333.84 MiB
+.....................................................................................
+llama_context: constructing llama_context
+llama_context: n_seq_max     = 1
+llama_context: n_ctx         = 57500
+llama_context: n_ctx_per_seq = 57500
+llama_context: n_batch       = 512
+llama_context: n_ubatch      = 512
+llama_context: causal_attn   = 1
+llama_context: flash_attn    = 0
+llama_context: kv_unified    = false
+llama_context: freq_base     = 1000000.0
+llama_context: freq_scale    = 1
+llama_context: n_ctx_per_seq (57500) > n_ctx_train (40960) -- possible training context overflow
+set_abort_callback: call
+llama_context: Vulkan_Host  output buffer size =     0.58 MiB
+create_memory: n_ctx = 57504 (padded)
+llama_kv_cache_unified: layer   0: dev = Vulkan1
+llama_kv_cache_unified: layer   1: dev = Vulkan1
+llama_kv_cache_unified: layer   2: dev = Vulkan1
+llama_kv_cache_unified: layer   3: dev = Vulkan1
+llama_kv_cache_unified: layer   4: dev = Vulkan1
+llama_kv_cache_unified: layer   5: dev = Vulkan1
+llama_kv_cache_unified: layer   6: dev = Vulkan1
+llama_kv_cache_unified: layer   7: dev = Vulkan1
+llama_kv_cache_unified: layer   8: dev = Vulkan1
+llama_kv_cache_unified: layer   9: dev = Vulkan1
+llama_kv_cache_unified: layer  10: dev = Vulkan1
+llama_kv_cache_unified: layer  11: dev = Vulkan1
+llama_kv_cache_unified: layer  12: dev = Vulkan1
+llama_kv_cache_unified: layer  13: dev = Vulkan1
+llama_kv_cache_unified: layer  14: dev = Vulkan1
+llama_kv_cache_unified: layer  15: dev = Vulkan1
+llama_kv_cache_unified: layer  16: dev = Vulkan1
+llama_kv_cache_unified: layer  17: dev = Vulkan1
+llama_kv_cache_unified: layer  18: dev = Vulkan1
+llama_kv_cache_unified: layer  19: dev = Vulkan1
+llama_kv_cache_unified: layer  20: dev = Vulkan1
+llama_kv_cache_unified: layer  21: dev = Vulkan1
+llama_kv_cache_unified: layer  22: dev = Vulkan1
+llama_kv_cache_unified: layer  23: dev = Vulkan1
+llama_kv_cache_unified: layer  24: dev = Vulkan1
+llama_kv_cache_unified: layer  25: dev = Vulkan1
+llama_kv_cache_unified: layer  26: dev = Vulkan1
+llama_kv_cache_unified: layer  27: dev = Vulkan1
+llama_kv_cache_unified: layer  28: dev = Vulkan1
+llama_kv_cache_unified: layer  29: dev = Vulkan1
+llama_kv_cache_unified: layer  30: dev = Vulkan1
+llama_kv_cache_unified: layer  31: dev = Vulkan1
+llama_kv_cache_unified: layer  32: dev = Vulkan1
+llama_kv_cache_unified: layer  33: dev = Vulkan1
+llama_kv_cache_unified: layer  34: dev = Vulkan1
+llama_kv_cache_unified: layer  35: dev = Vulkan1
+llama_kv_cache_unified:    Vulkan1 KV buffer size =  8086.50 MiB
+llama_kv_cache_unified: size = 8086.50 MiB ( 57504 cells,  36 layers,  1/1 seqs), K (f16): 4043.25 MiB, V (f16): 4043.25 MiB
+llama_context: enumerating backends
+llama_context: backend_ptrs.size() = 3
+llama_context: max_nodes = 3192
+llama_context: worst-case: n_tokens = 512, n_seqs = 1, n_outputs = 0
+graph_reserve: reserving a graph for ubatch with n_tokens =  512, n_seqs =  1, n_outputs =  512
+graph_reserve: reserving a graph for ubatch with n_tokens =    1, n_seqs =  1, n_outputs =    1
+graph_reserve: reserving a graph for ubatch with n_tokens =  512, n_seqs =  1, n_outputs =  512
+llama_context:    Vulkan1 compute buffer size =  3742.32 MiB
+llama_context: Vulkan_Host compute buffer size =   124.32 MiB
+llama_context: graph nodes  = 1410
+llama_context: graph splits = 2
+CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+Model metadata: {'general.file_type': '15', 'tokenizer.ggml.add_bos_token': 'false', 'tokenizer.ggml.eos_token_id': '151645', 'qwen3.attention.value_length': '128', 'qwen3.attention.key_length': '128', 'qwen3.rope.freq_base': '1000000.000000', 'general.architecture': 'qwen3', 'tokenizer.ggml.padding_token_id': '151654', 'general.basename': 'Qwen3', 'tokenizer.chat_template': '{%- if tools %}\n    {{- \'<|im_start|>system\\n\' }}\n    {%- if messages[0].role == \'system\' %}\n        {{- messages[0].content + \'\\n\\n\' }}\n    {%- endif %}\n    {{- "# Tools\\n\\nYou may call one or more functions to assist with the user query.\\n\\nYou are provided with function signatures within <tools></tools> XML tags:\\n<tools>" }}\n    {%- for tool in tools %}\n        {{- "\\n" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- "\\n</tools>\\n\\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\\n<tool_call>\\n{\\"name\\": <function-name>, \\"arguments\\": <args-json-object>}\\n</tool_call><|im_end|>\\n" }}\n{%- else %}\n    {%- if messages[0].role == \'system\' %}\n        {{- \'<|im_start|>system\\n\' + messages[0].content + \'<|im_end|>\\n\' }}\n    {%- endif %}\n{%- endif %}\n{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}\n{%- for forward_message in messages %}\n    {%- set index = (messages|length - 1) - loop.index0 %}\n    {%- set message = messages[index] %}\n    {%- set tool_start = \'<tool_response>\' %}\n    {%- set tool_start_length = tool_start|length %}\n    {%- set start_of_message = message.content[:tool_start_length] %}\n    {%- set tool_end = \'</tool_response>\' %}\n    {%- set tool_end_length = tool_end|length %}\n    {%- set start_pos = (message.content|length) - tool_end_length %}\n    {%- if start_pos < 0 %}\n        {%- set start_pos = 0 %}\n    {%- endif %}\n    {%- set end_of_message = message.content[start_pos:] %}\n    {%- if ns.multi_step_tool and message.role == "user" and not(start_of_message == tool_start and end_of_message == tool_end) %}\n        {%- set ns.multi_step_tool = false %}\n        {%- set ns.last_query_index = index %}\n    {%- endif %}\n{%- endfor %}\n{%- for message in messages %}\n    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}\n        {{- \'<|im_start|>\' + message.role + \'\\n\' + message.content + \'<|im_end|>\' + \'\\n\' }}\n    {%- elif message.role == "assistant" %}\n        {%- set content = message.content %}\n        {%- set reasoning_content = \'\' %}\n        {%- if message.reasoning_content is defined and message.reasoning_content is not none %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- else %}\n            {%- if \'</think>\' in message.content %}\n                {%- set content = (message.content.split(\'</think>\')|last).lstrip(\'\\n\') %}\n                {%- set reasoning_content = (message.content.split(\'</think>\')|first).rstrip(\'\\n\') %}\n                {%- set reasoning_content = (reasoning_content.split(\'<think>\')|last).lstrip(\'\\n\') %}\n            {%- endif %}\n        {%- endif %}\n        {%- if loop.index0 > ns.last_query_index %}\n            {%- if loop.last or (not loop.last and reasoning_content) %}\n                {{- \'<|im_start|>\' + message.role + \'\\n<think>\\n\' + reasoning_content.strip(\'\\n\') + \'\\n</think>\\n\\n\' + content.lstrip(\'\\n\') }}\n            {%- else %}\n                {{- \'<|im_start|>\' + message.role + \'\\n\' + content }}\n            {%- endif %}\n        {%- else %}\n            {{- \'<|im_start|>\' + message.role + \'\\n\' + content }}\n        {%- endif %}\n        {%- if message.tool_calls %}\n            {%- for tool_call in message.tool_calls %}\n                {%- if (loop.first and content) or (not loop.first) %}\n                    {{- \'\\n\' }}\n                {%- endif %}\n                {%- if tool_call.function %}\n                    {%- set tool_call = tool_call.function %}\n                {%- endif %}\n                {{- \'<tool_call>\\n{"name": "\' }}\n                {{- tool_call.name }}\n                {{- \'", "arguments": \' }}\n                {%- if tool_call.arguments is string %}\n                    {{- tool_call.arguments }}\n                {%- else %}\n                    {{- tool_call.arguments | tojson }}\n                {%- endif %}\n                {{- \'}\\n</tool_call>\' }}\n            {%- endfor %}\n        {%- endif %}\n        {{- \'<|im_end|>\\n\' }}\n    {%- elif message.role == "tool" %}\n        {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}\n            {{- \'<|im_start|>user\' }}\n        {%- endif %}\n        {{- \'\\n<tool_response>\\n\' }}\n        {{- message.content }}\n        {{- \'\\n</tool_response>\' }}\n        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}\n            {{- \'<|im_end|>\\n\' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- \'<|im_start|>assistant\\n\' }}\n    {%- if enable_thinking is defined and enable_thinking is false %}\n        {{- \'<think>\\n\\n</think>\\n\\n\' }}\n    {%- endif %}\n{%- endif %}', 'qwen3.context_length': '40960', 'tokenizer.ggml.pre': 'qwen2', 'general.name': 'Qwen3 8B Claude 4.5 Opus 250x High Reasoning Distill F16', 'qwen3.feed_forward_length': '12288', 'general.finetune': 'claude-opus-250x-high-reasoning-distill', 'qwen3.attention.layer_norm_rms_epsilon': '0.000001', 'general.type': 'model', 'general.size_label': '8B', 'qwen3.block_count': '36', 'qwen3.embedding_length': '4096', 'general.quantization_version': '2', 'tokenizer.ggml.model': 'gpt2', 'qwen3.attention.head_count': '32', 'general.version': '4.5', 'qwen3.attention.head_count_kv': '8'}
+Available chat formats from metadata: chat_template.default
+Using gguf chat template: {%- if tools %}
+    {{- '<|im_start|>system\n' }}
+    {%- if messages[0].role == 'system' %}
+        {{- messages[0].content + '\n\n' }}
+    {%- endif %}
+    {{- "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
+{%- else %}
+    {%- if messages[0].role == 'system' %}
+        {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for forward_message in messages %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- set message = messages[index] %}
+    {%- set tool_start = '<tool_response>' %}
+    {%- set tool_start_length = tool_start|length %}
+    {%- set start_of_message = message.content[:tool_start_length] %}
+    {%- set tool_end = '</tool_response>' %}
+    {%- set tool_end_length = tool_end|length %}
+    {%- set start_pos = (message.content|length) - tool_end_length %}
+    {%- if start_pos < 0 %}
+        {%- set start_pos = 0 %}
+    {%- endif %}
+    {%- set end_of_message = message.content[start_pos:] %}
+    {%- if ns.multi_step_tool and message.role == "user" and not(start_of_message == tool_start and end_of_message == tool_end) %}
+        {%- set ns.multi_step_tool = false %}
+        {%- set ns.last_query_index = index %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+        {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- set content = message.content %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is defined and message.reasoning_content is not none %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- else %}
+            {%- if '</think>' in message.content %}
+                {%- set content = (message.content.split('</think>')|last).lstrip('\n') %}
+                {%- set reasoning_content = (message.content.split('</think>')|first).rstrip('\n') %}
+                {%- set reasoning_content = (reasoning_content.split('<think>')|last).lstrip('\n') %}
+            {%- endif %}
+        {%- endif %}
+        {%- if loop.index0 > ns.last_query_index %}
+            {%- if loop.last or (not loop.last and reasoning_content) %}
+                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
+            {%- else %}
+                {{- '<|im_start|>' + message.role + '\n' + content }}
+            {%- endif %}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}
+        {%- if message.tool_calls %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if (loop.first and content) or (not loop.first) %}
+                    {{- '\n' }}
+                {%- endif %}
+                {%- if tool_call.function %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {{- '<tool_call>\n{"name": "' }}
+                {{- tool_call.name }}
+                {{- '", "arguments": ' }}
+                {%- if tool_call.arguments is string %}
+                    {{- tool_call.arguments }}
+                {%- else %}
+                    {{- tool_call.arguments | tojson }}
+                {%- endif %}
+                {{- '}\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- message.content }}
+        {{- '\n</tool_response>' }}
+        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- endif %}
+{%- endif %}
+Using chat eos_token: <|im_end|>
+Using chat bos_token: ,
+INFO:     Started server process [30339]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:6744 (Press CTRL+C to quit)
+
+Available backends:
+  [✓] cpu
+  [✓] vulkan
+
+Attempting to download GGUF model: TeichAI/Qwen3-8B-Claude-4.5-Opus-High-Reasoning-Distill-GGUF
+Selected GGUF file: Qwen3-8B-claude-4.5-opus-high-reasoning-distill-Q4_K_M.gguf
+Downloaded to: /home/nextime/.cache/huggingface/hub/models--TeichAI--Qwen3-8B-Claude-4.5-Opus-High-Reasoning-Distill-GGUF/snapshots/4b33b7fd0cbeadd7d03acea142633c315c34115a/Qwen3-8B-claude-4.5-opus-high-reasoning-distill-Q4_K_M.gguf
+Loading GGUF model with Vulkan support...
+  Model path: /home/nextime/.cache/huggingface/hub/models--TeichAI--Qwen3-8B-Claude-4.5-Opus-High-Reasoning-Distill-GGUF/snapshots/4b33b7fd0cbeadd7d03acea142633c315c34115a/Qwen3-8B-claude-4.5-opus-high-reasoning-distill-Q4_K_M.gguf
+  GPU layers: -1 (-1 = all layers)
+  Context size: 57500
+  GPU device: 1
+
+Available Vulkan devices:
+==========
+VULKANINFO
+==========
+
+Vulkan Instance Version: 1.4.341
+
+
+Instance Extensions: count = 24
+-------------------------------
+VK_EXT_acquire_drm_display             : extension revision 1
+VK_EXT_acquire_xlib_display            : extension revision 1
+VK_EXT_debug_report                    : extension revision 10
+VK_EXT_debug_utils                     : extension revision 2
+VK_EXT_direct_mode_display             : extension revision 1
+VK_EXT_display_surface_counter         : extension revision 1
+VK_EXT_headless_surface                : extension revision 1
+VK_EXT_surface_maintenance1            : extension revision 1
+VK_EXT_swapchain_colorspace            : extension revision 5
+VK_KHR_device_group_creation           : extension revision 1
+VK_KHR_display                         : extension revision 23
+VK_KHR_external_fence_capabilities     : extension revision 1
+VK_KHR_external_memory_capabilities    : extension revision 1
+VK_KHR_external_semaphore_capabilities : extension revision 1
+VK_KHR_get_display_properties2         : extension revision 1
+VK_KHR_get_physical_device_properties2 : extension revision 2
+VK_KHR_get_surface_capabilities2       : extension revision 1
+VK_KHR_portability_enumeration         : extension revision 1
+VK_KHR_surface                         : extension revision 25
+VK_KHR_surface_protected_capabilities  : extension revision 1
+VK_KHR_wayland_surface                 : extension revision 6
+VK_KHR_xcb_surface                     : extension revision 6
+VK_KHR_xlib_surface                    : extension revision 6
+VK_LUNARG_direct_driver_loading        : extension revision 1
+
+Instance Layers: count = 12
+---------------------------
+VK_LAYER_ALVR_capture              ALVR display intercept layer                         1.0.68   version 1
+VK_LAYER_FROG_gamescope_wsi_x86_64 Gamescope WSI (XWayland Bypass) Layer (x86_64)       1.3.221  version 1
+VK_LAYER_INTEL_nullhw              INTEL NULL HW                                        1.1.73   version 1
+VK_LAYER_MESA_device_select        Linux device selection layer                         1.4.303  version 1
+VK_LAYER_MESA_overlay              Mesa Overlay layer                                   1.4.303  version 1
+VK_LAYER_NV_optimus                NVIDIA Optimus layer                                 1.3.277  version 1
+VK_LAYER_PRIMUS_PrimusVK           Primus-vk - https://github.com/felixdoerre/primus_vk 1.2.0    version 1
+VK_LAYER_VALVE_steam_fossilize_32  Steam Pipeline Caching Layer                         1.3.207  version 1
+VK_LAYER_VALVE_steam_fossilize_64  Steam Pipeline Caching Layer                         1.3.207  version 1
+VK_LAYER_VALVE_steam_overlay_32    Steam Overlay Layer                                  1.3.207  version 1
+VK_LAYER_VALVE_steam_overlay_64    Steam Overlay Layer                                  1.3.207  version 1
+VK_LAYER_VKBASALT_post_processing  a post processing layer                              1.3.223  version 1
+
+Devices:
+========
+GPU0:
+	apiVersion         = 1.3.277
+	driverVersion      = 550.163.1.0
+	vendorID           = 0x10de
+	deviceID           = 0x2204
+	deviceType         = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+	deviceName         = NVIDIA GeForce RTX 3090
+	driverID           = DRIVER_ID_NVIDIA_PROPRIETARY
+	driverName         = NVIDIA
+	driverInfo         = 550.163.01
+	conformanceVersion = 1.3.7.2
+	deviceUUID         = c8ea099f-7be1-bae6-358c-abdc95426b16
+	driverUUID         = 2485a78d-e39e-5aba-a0e9-b1139a1e6395
+GPU1:
+	apiVersion         = 1.4.318
+	driverVersion      = 25.2.2
+	vendorID           = 0x1002
+	deviceID           = 0x67df
+	deviceType         = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+	deviceName         = Radeon RX 580 Series (RADV POLARIS10)
+	driverID           = DRIVER_ID_MESA_RADV
+	driverName         = radv
+	driverInfo         = Mesa 25.2.2-1
+	conformanceVersion = 1.4.0.0
+	deviceUUID         = 00000000-0500-0000-0000-000000000000
+	driverUUID         = 414d442d-4d45-5341-2d44-525600000000
+GPU2:
+	apiVersion         = 1.4.318
+	driverVersion      = 25.2.2
+	vendorID           = 0x10005
+	deviceID           = 0x0000
+	deviceType         = PHYSICAL_DEVICE_TYPE_CPU
+	deviceName         = llvmpipe (LLVM 19.1.7, 256 bits)
+	driverID           = DRIVER_ID_MESA_LLVMPIPE
+	driverName         = llvmpipe
+	driverInfo         = Mesa 25.2.2-1 (LLVM 19.1.7)
+	conformanceVersion = 1.3.1.1
+	deviceUUID         = 6d657361-3235-2e32-2e32-2d3100000000
+	driverUUID         = 6c6c766d-7069-7065-5555-494400000000
+
+  Single GPU mode: Forcing all layers to GPU 1
+  Tensor split: [0.0, 1.0]
+
+Model loaded successfully with Vulkan!
+
+Starting server on http://0.0.0.0:6744
+API documentation available at http://0.0.0.0:6744/docs
+Using backend: vulkan
+
+============================================================
+=== INCOMING REQUEST ===
+============================================================
+Path: /v1/chat/completions
+Method: POST
+Headers: {'host': 'localhost:6744', 'user-agent': 'python-requests/2.32.5', 'accept-encoding': 'gzip, deflate', 'accept': '*/*', 'connection': 'keep-alive', 'content-type': 'application/json', 'content-length': '4174'}
+
+--- RAW BODY (4174 bytes) ---
+{"model": "default", "messages": [{"role": "system", "content": "You are Coder, an AI coding assistant. You help users write, read, and modify code files. You have access to tools for file operations.\n\n## CRITICAL: Response Format\n\n1. ALWAYS maintain proper spacing between words and after punctuation.\n2. Use complete sentences with normal spacing.\n3. When showing code, use proper code blocks with language identifiers.\n\n## Available Tools\n\nYou can invoke tools by outputting JSON inside <tool> tags:\n\n<tool>{\"name\": \"TOOL_NAME\", \"arguments\": {PARAMETERS}}</tool>\n\n### read_file - Read file contents\nPurpose: Read one or more files to understand the codebase\nParameters: {\"path\": \"relative/path/to/file\"}\nExample: <tool>{\"name\": \"read_file\", \"arguments\": {\"path\": \"main.py\"}}</tool>\n\n### write_file - Create or overwrite files\nPurpose: Write new files or completely replace existing ones\nParameters: {\"path\": \"relative/path\", \"content\": \"full file co...
+... [truncated 2174 chars] ...
+...o working directory)"}, "content": {"type": "string", "description": "Content to write to the file"}}, "required": ["path", "content"]}}}, {"type": "function", "function": {"name": "apply_diff", "description": "Apply a diff/patch to a file. Use SEARCH/REPLACE blocks format.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Path to the file to modify"}, "diff": {"type": "string", "description": "Diff content in SEARCH/REPLACE format: <<<<<<< SEARCH\\n[old content]\\n=======\\n[new content]\\n>>>>>>> REPLACE"}}, "required": ["path", "diff"]}}}, {"type": "function", "function": {"name": "execute_command", "description": "Execute a shell command", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The shell command to execute"}, "cwd": {"type": "string", "description": "Working directory for the command (optional, defaults to current)"}}, "required": ["command"]}}}], "tool_choice": "auto", "stream": true}
+--- END RAW BODY ---
+
+--- PARSED JSON STRUCTURE ---
+Keys: ['model', 'messages', 'tools', 'tool_choice', 'stream']
+Number of messages: 2
+  [0] system: You are Coder, an AI coding assistant. You help us...
+  [1] user: hello...
+--- END PARSED JSON ---
+DEBUG: stream_chat_response started, stream=True, tools=True
+DEBUG: generate_chat_stream: Calling create_chat_completion with tools=[{'type': 'function', 'function': {'name': 'read_file', 'description': 'Read the contents of a file', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Path to the file to read (relative to working directory)'}}, 'required': ['path']}}}, {'type': 'function', 'function': {'name': 'write_file', 'description': 'Write content to a file (creates or overwrites)', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Path to the file to write (relative to working directory)'}, 'content': {'type': 'string', 'description': 'Content to write to the file'}}, 'required': ['path', 'content']}}}, {'type': 'function', 'function': {'name': 'apply_diff', 'description': 'Apply a diff/patch to a file. Use SEARCH/REPLACE blocks format.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Path to the file to modify'}, 'diff': {'type': 'string', 'description': 'Diff content in SEARCH/REPLACE format: <<<<<<< SEARCH\\n[old content]\\n=======\\n[new content]\\n>>>>>>> REPLACE'}}, 'required': ['path', 'diff']}}}, {'type': 'function', 'function': {'name': 'execute_command', 'description': 'Execute a shell command', 'parameters': {'type': 'object', 'properties': {'command': {'type': 'string', 'description': 'The shell command to execute'}, 'cwd': {'type': 'string', 'description': 'Working directory for the command (optional, defaults to current)'}}, 'required': ['command']}}}]
+DEBUG: generate_chat_stream: Got stream object: <class 'generator'>
+DEBUG: generate_chat_stream: Raw chunk 1: {'id': 'chatcmpl-e8b521b1-a291-4b9d-9dd5-070750615e78', 'model': '/home/nextime/.cache/huggingface/hub/models--TeichAI--Qwen3-8B-Claude-4.5-Opus-High-Reasoning-Distill-GGUF/snapshots/4b33b7fd0cbeadd7d03acea142633c315c34115a/Qwen3-8B-claude-4.5-opus-high-reasoning-distill-Q4_K_M.gguf', 'created': 1772307655, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'logprobs': None, 'finish_reason': None}]}
+DEBUG: generate_chat_stream: Raw chunk 2: {'id': 'chatcmpl-e8b521b1-a291-4b9d-9dd5-070750615e78', 'model': '/home/nextime/.cache/huggingface/hub/models--TeichAI--Qwen3-8B-Claude-4.5-Opus-High-Reasoning-Distill-GGUF/snapshots/4b33b7fd0cbeadd7d03acea142633c315c34115a/Qwen3-8B-claude-4.5-opus-high-reasoning-distill-Q4_K_M.gguf', 'created': 1772307655, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'content': '<think>'}, 'logprobs': None, 'finish_reason': None}]}
+
+--- RESPONSE ---
+Status Code: 200
+--- END RESPONSE ---
+============================================================
+
+INFO:     127.0.0.1:35194 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [30339]
+DEBUG: generate_chat_stream: Raw chunk 3: {'id': 'chatcmpl-e8b521b1-a291-4b9d-9dd5-070750615e78', 'model': '/home/nextime/.cache/huggingface/hub/models--TeichAI--Qwen3-8B-Claude-4.5-Opus-High-Reasoning-Distill-GGUF/snapshots/4b33b7fd0cbeadd7d03acea142633c315c34115a/Qwen3-8B-claude-4.5-opus-high-reasoning-distill-Q4_K_M.gguf', 'created': 1772307655, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'content': '\n'}, 'logprobs': None, 'finish_reason': None}]}
+DEBUG: generate_chat_stream: Raw chunk 4: {'id': 'chatcmpl-e8b521b1-a291-4b9d-9dd5-070750615e78', 'model': '/home/nextime/.cache/huggingface/hub/models--TeichAI--Qwen3-8B-Claude-4.5-Opus-High-Reasoning-Distill-GGUF/snapshots/4b33b7fd0cbeadd7d03acea142633c315c34115a/Qwen3-8B-claude-4.5-opus-high-reasoning-distill-Q4_K_M.gguf', 'created': 1772307655, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'content': 'The'}, 'logprobs': None, 'finish_reason': None}]}

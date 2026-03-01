@@ -131,6 +131,12 @@ class Config:
     small: bool = False  # Use small model optimizations
     tiny: bool = False   # Use tiny model optimizations (minimal)
     timeout: int = 600   # Request timeout in seconds
+    confirm_all: bool = True  # Confirm before executing tools by default
+    confirm_commands: Dict[str, bool] = None  # Per-command confirmation settings
+    
+    def __post_init__(self):
+        if self.confirm_commands is None:
+            self.confirm_commands = {}
 
     @classmethod
     def load(cls, config_path: Optional[str] = None) -> "Config":
@@ -453,10 +459,39 @@ class CoderClient:
         in_thinking = False
         thinking_content = ""
         thinking_start_time = 0
+        last_elapsed = -1
+        printed_final_thinking = False
+        
+        def update_thinking_display(force=False):
+            """Update the thinking display line."""
+            nonlocal last_elapsed
+            if not in_thinking:
+                return
+            current_time = time.time()
+            elapsed = int(current_time - thinking_start_time)
+            if elapsed != last_elapsed or force:
+                last_elapsed = elapsed
+                # Clear line and redraw
+                display_text = thinking_content[-70:]  # Last 70 chars to fit on screen
+                if len(thinking_content) > 70:
+                    display_text = "..." + display_text
+                # Use carriage return to overwrite the line
+                line = f"[{elapsed}s] Thinking: [{display_text}]"
+                # Pad with spaces to clear previous content
+                print(f"\r{Colors.DIM}{line:<100}{Colors.RESET}", end='', flush=True)
         
         # Use iter_content with smaller chunk size for better real-time handling
         buffer = ""
+        last_update = time.time()
+        
         for chunk in response.iter_content(chunk_size=256, decode_unicode=True):
+            current_time = time.time()
+            
+            # Update thinking timer every second even without new content
+            if in_thinking and current_time - last_update >= 1.0:
+                update_thinking_display()
+                last_update = current_time
+            
             if chunk:
                 buffer += chunk
                 
@@ -485,11 +520,11 @@ class CoderClient:
                             if '<think>' in content:
                                 in_thinking = True
                                 thinking_start_time = time.time()
+                                last_update = thinking_start_time
+                                thinking_content = ""
                                 continue
                             
                             if in_thinking:
-                                current_time = time.time()
-                                
                                 if '</think>' in content:
                                     # End of thinking
                                     in_thinking = False
@@ -499,11 +534,12 @@ class CoderClient:
                                     if think_part:
                                         thinking_content += think_part
                                     # Clear line and show final thinking
-                                    display_text = thinking_content[-80:]  # Last 80 chars
-                                    if len(thinking_content) > 80:
+                                    display_text = thinking_content[-70:]  # Last 70 chars
+                                    if len(thinking_content) > 70:
                                         display_text = "..." + display_text
-                                    print(f"\r{Colors.DIM}[{elapsed}s] Thinking: [{display_text}]{Colors.RESET}", end='', flush=True)
-                                    print()  # Newline after thinking
+                                    line = f"[{elapsed}s] Thinking: [{display_text}]"
+                                    print(f"\r{Colors.DIM}{line:<100}{Colors.RESET}\n", end='', flush=True)
+                                    printed_final_thinking = True
                                     # Get content after </think>
                                     actual_content = content.split('</think>', 1)[-1]
                                     if actual_content:
@@ -512,11 +548,7 @@ class CoderClient:
                                 else:
                                     # Still thinking - accumulate and display
                                     thinking_content += content
-                                    elapsed = int(current_time - thinking_start_time)
-                                    display_text = thinking_content[-80:]  # Last 80 chars
-                                    if len(thinking_content) > 80:
-                                        display_text = "..." + display_text
-                                    print(f"\r{Colors.DIM}[{elapsed}s] Thinking: [{display_text}]{Colors.RESET}", end='', flush=True)
+                                    update_thinking_display(force=True)
                             else:
                                 # Normal content
                                 print(content, end='', flush=True)
@@ -548,13 +580,12 @@ class CoderClient:
                     except json.JSONDecodeError:
                         continue
         
-        if in_thinking:
-            print("]\n", end='', flush=True)
+        if in_thinking and not printed_final_thinking:
+            print("\n", end='', flush=True)
         print()  # Newline after streaming
         
         # Execute tool calls if any
         if tool_calls:
-            print("\n[Executing tools...]")
             tool_results = []
             
             for tc in tool_calls:
@@ -564,8 +595,36 @@ class CoderClient:
                 except json.JSONDecodeError:
                     arguments = {}
                 
-                print(f"  → {tool_name}({arguments})")
-                result = self.tool_executor.execute(tool_name, arguments)
+                # Format arguments for display
+                if tool_name == 'execute_command':
+                    args_str = arguments.get('command', '')
+                elif tool_name == 'read_file':
+                    args_str = arguments.get('path', '')
+                elif tool_name == 'write_file':
+                    args_str = f"{arguments.get('path', '')} ({len(arguments.get('content', ''))} bytes)"
+                elif tool_name == 'apply_diff':
+                    args_str = arguments.get('path', '')
+                else:
+                    args_str = str(arguments)
+                
+                # Show tool call with colors: yellow "Calling tool:", red tool name, white args
+                print(f"\n{Colors.YELLOW}Calling tool:{Colors.RESET} {Colors.RED}{tool_name}{Colors.RESET} -> {args_str}")
+                
+                # Check if confirmation is needed
+                needs_confirm = self.config.confirm_all
+                if tool_name in self.config.confirm_commands:
+                    needs_confirm = self.config.confirm_commands[tool_name]
+                
+                if needs_confirm:
+                    confirm = input(f"{Colors.YELLOW}Execute? (y/N): {Colors.RESET}").strip().lower()
+                    if confirm not in ('y', 'yes'):
+                        result = {"error": "User declined execution", "declined": True}
+                        print(f"{Colors.YELLOW}Skipped{Colors.RESET}")
+                    else:
+                        result = self.tool_executor.execute(tool_name, arguments)
+                else:
+                    result = self.tool_executor.execute(tool_name, arguments)
+                
                 tool_results.append({
                     "tool_call_id": tc['id'],
                     "role": "tool",
@@ -573,9 +632,9 @@ class CoderClient:
                 })
                 
                 if "error" in result:
-                    print(f"    Error: {result['error']}")
-                else:
-                    print(f"    Success")
+                    print(f"{Colors.RED}Error: {result['error']}{Colors.RESET}")
+                elif not result.get('declined'):
+                    print(f"{Colors.GREEN}Success{Colors.RESET}")
             
             # Add assistant message with tool calls to history
             self.conversation_history.append({
@@ -768,6 +827,25 @@ def run_interactive_shell(client: CoderClient) -> None:
                     print(f"{Colors.RED}Exit code: {result['returncode']}{Colors.RESET}")
                 continue
             
+            if cmd.startswith('/confirm '):
+                parts = user_input[9:].strip().split()
+                if len(parts) >= 2:
+                    tool_name = parts[0]
+                    setting = parts[1].lower()
+                    if setting in ('yes', 'y', 'true', '1'):
+                        client.config.confirm_commands[tool_name] = True
+                        print(f"{Colors.GREEN}Confirmation enabled for {tool_name}{Colors.RESET}")
+                    elif setting in ('no', 'n', 'false', '0'):
+                        client.config.confirm_commands[tool_name] = False
+                        print(f"{Colors.YELLOW}Confirmation disabled for {tool_name}{Colors.RESET}")
+                    else:
+                        print(f"{Colors.RED}Invalid setting. Use 'yes' or 'no'{Colors.RESET}")
+                else:
+                    print(f"{Colors.RED}Usage: /confirm <tool_name> <yes/no>{Colors.RESET}")
+                    print(f"  Example: /confirm execute_command no")
+                    print(f"  Example: /confirm write_file yes")
+                continue
+            
             # Send message to LLM
             client.chat(user_input)
             
@@ -790,6 +868,7 @@ def print_help():
 {Colors.BOLD}{Colors.CYAN}Shortcuts:{Colors.RESET}
   {Colors.YELLOW}/read <path>{Colors.RESET}      Read a file directly
   {Colors.YELLOW}/exec <command>{Colors.RESET}   Execute a shell command directly
+  {Colors.YELLOW}/confirm <tool> <y/n>{Colors.RESET}  Enable/disable tool confirmation
 
 {Colors.BOLD}{Colors.CYAN}Multiline Input:{Colors.RESET}
   End a line with {Colors.YELLOW}\\{Colors.RESET} to continue on next line
@@ -802,6 +881,9 @@ def print_help():
   - {Colors.BLUE}write_file{Colors.RESET}: Write/create files
   - {Colors.BLUE}apply_diff{Colors.RESET}: Apply patches to files
   - {Colors.BLUE}execute_command{Colors.RESET}: Run shell commands
+  
+{Colors.DIM}Tool execution requires confirmation by default.{Colors.RESET}
+{Colors.DIM}Disable confirmation with: /confirm <tool_name> no{Colors.RESET}
 """)
 
 
