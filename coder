@@ -1047,8 +1047,18 @@ Examples:
     )
     
     parser.add_argument(
+        '--endpoint',
+        help='API endpoint URL (same as --api-url, temporary override)'
+    )
+    
+    parser.add_argument(
         '--token',
-        help='API token (default: from config)'
+        help='API token (default: from config, temporary override)'
+    )
+    
+    parser.add_argument(
+        '--model',
+        help='Model name to use (default: "default", temporary override)'
     )
     
     parser.add_argument(
@@ -1108,11 +1118,15 @@ Examples:
     # Load config
     config = Config.load(args.config)
     
-    # Override with command line args
+    # Override with command line args (temporary, not saved to config)
     if args.api_url:
         config.api_url = args.api_url
+    if args.endpoint:
+        config.api_url = args.endpoint
     if args.token:
         config.token = args.token
+    if args.model:
+        config.model = args.model
     if args.small:
         config.small = True
     if args.tiny:
