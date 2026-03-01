@@ -453,7 +453,6 @@ class CoderClient:
         in_thinking = False
         thinking_content = ""
         thinking_start_time = 0
-        last_timer_update = 0
         
         # Use iter_content with smaller chunk size for better real-time handling
         buffer = ""
@@ -486,39 +485,38 @@ class CoderClient:
                             if '<think>' in content:
                                 in_thinking = True
                                 thinking_start_time = time.time()
-                                last_timer_update = thinking_start_time
-                                print("<think> ", end='', flush=True)
                                 continue
                             
                             if in_thinking:
                                 current_time = time.time()
-                                # Update timer display every second
-                                if current_time - last_timer_update >= 1.0:
-                                    elapsed = int(current_time - thinking_start_time)
-                                    print(f"[{elapsed}s]", end=' ', flush=True)
-                                    last_timer_update = current_time
                                 
                                 if '</think>' in content:
                                     # End of thinking
                                     in_thinking = False
-                                    # Show final timer
+                                    # Show final thinking line
                                     elapsed = int(current_time - thinking_start_time)
-                                    print(f"[{elapsed}s]", end=' ', flush=True)
-                                    # Show remaining thinking content and close tag
                                     think_part = content.split('</think>')[0]
                                     if think_part:
-                                        print(think_part, end='', flush=True)
                                         thinking_content += think_part
-                                    print("</think>\n", flush=True)
+                                    # Clear line and show final thinking
+                                    display_text = thinking_content[-80:]  # Last 80 chars
+                                    if len(thinking_content) > 80:
+                                        display_text = "..." + display_text
+                                    print(f"\r{Colors.DIM}[{elapsed}s] Thinking: [{display_text}]{Colors.RESET}", end='', flush=True)
+                                    print()  # Newline after thinking
                                     # Get content after </think>
                                     actual_content = content.split('</think>', 1)[-1]
                                     if actual_content:
                                         print(actual_content, end='', flush=True)
                                         full_content += actual_content
                                 else:
-                                    # Still thinking - show content as it arrives
-                                    print(content, end='', flush=True)
+                                    # Still thinking - accumulate and display
                                     thinking_content += content
+                                    elapsed = int(current_time - thinking_start_time)
+                                    display_text = thinking_content[-80:]  # Last 80 chars
+                                    if len(thinking_content) > 80:
+                                        display_text = "..." + display_text
+                                    print(f"\r{Colors.DIM}[{elapsed}s] Thinking: [{display_text}]{Colors.RESET}", end='', flush=True)
                             else:
                                 # Normal content
                                 print(content, end='', flush=True)
