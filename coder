@@ -483,9 +483,10 @@ class CoderClient:
                 return
             last_elapsed = elapsed
             
-            # Filter out <tool> and <tool_call> tags and newlines for display
-            display_content = re.sub(r'<tool[^>]*>.*?</tool>', '', content, flags=re.DOTALL)
-            display_content = re.sub(r'<tool_call[^>]*>.*?</tool_call>', '', display_content, flags=re.DOTALL)
+            # Filter out <tool>, <tool_call>, and <tools> tags and newlines for display
+            display_content = re.sub(r'<tool>.*?</tool>', '', content, flags=re.DOTALL)
+            display_content = re.sub(r'<tool_call>.*?</tool_call>', '', display_content, flags=re.DOTALL)
+            display_content = re.sub(r'<tools>.*?</tools>', '', display_content, flags=re.DOTALL)
             display_content = display_content.replace('\n', ' ').replace('\r', '')
             display_content = display_content.strip()
             
@@ -503,11 +504,13 @@ class CoderClient:
                 print()  # Move to new line
         
         def parse_tool_calls_from_content(text):
-            """Parse <tool_call> tags from content."""
-            pattern = r'<tool_call>\s*(\{[^}]+\})\s*</tool_call>'
-            matches = re.findall(pattern, text, re.DOTALL)
+            """Parse tool calls from content in various formats."""
             parsed = []
-            for match in matches:
+            
+            # Format 1: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+            pattern1 = r'<tool_call>\s*(\{[^}]+\})\s*</tool_call>'
+            matches1 = re.findall(pattern1, text, re.DOTALL)
+            for match in matches1:
                 try:
                     tool_data = json.loads(match)
                     parsed.append({
@@ -520,6 +523,62 @@ class CoderClient:
                     })
                 except json.JSONDecodeError:
                     continue
+            
+            # Format 2: XML format with <tools><tool><name>...</name><arguments>...</arguments></tool></tools>
+            # Parse write_file format
+            write_file_pattern = r'<tool>\s*<name>write_file</name>\s*<arguments>\s*<file\s+path="([^"]+)">\s*<content>(.*?)</content>\s*</file>\s*</arguments>\s*</tool>'
+            for match in re.finditer(write_file_pattern, text, re.DOTALL | re.IGNORECASE):
+                path = match.group(1)
+                content = match.group(2)
+                parsed.append({
+                    'id': f'call_{len(parsed)}',
+                    'type': 'function',
+                    'function': {
+                        'name': 'write_file',
+                        'arguments': json.dumps({'path': path, 'content': content.strip()})
+                    }
+                })
+            
+            # Parse read_file format
+            read_file_pattern = r'<tool>\s*<name>read_file</name>\s*<arguments>\s*<path>([^<]+)</path>\s*</arguments>\s*</tool>'
+            for match in re.finditer(read_file_pattern, text, re.DOTALL | re.IGNORECASE):
+                path = match.group(1).strip()
+                parsed.append({
+                    'id': f'call_{len(parsed)}',
+                    'type': 'function',
+                    'function': {
+                        'name': 'read_file',
+                        'arguments': json.dumps({'path': path})
+                    }
+                })
+            
+            # Parse execute_command format
+            exec_pattern = r'<tool>\s*<name>execute_command</name>\s*<arguments>\s*(?:<command>)?([^<]+)(?:</command>)?\s*</arguments>\s*</tool>'
+            for match in re.finditer(exec_pattern, text, re.DOTALL | re.IGNORECASE):
+                command = match.group(1).strip()
+                parsed.append({
+                    'id': f'call_{len(parsed)}',
+                    'type': 'function',
+                    'function': {
+                        'name': 'execute_command',
+                        'arguments': json.dumps({'command': command})
+                    }
+                })
+            
+            # Parse apply_diff format
+            diff_pattern = r'<tool>\s*<name>apply_diff</name>\s*<arguments>\s*<path>([^<]+)</path>\s*<diff>(.*?)</diff>\s*</arguments>\s*</tool>'
+            for match in re.finditer(diff_pattern, text, re.DOTALL | re.IGNORECASE):
+                path = match.group(1).strip()
+                diff = match.group(2).strip()
+                parsed.append({
+                    'id': f'call_{len(parsed)}',
+                    'type': 'function',
+                    'function': {
+                        'name': 'apply_diff',
+                        'arguments': json.dumps({'path': path, 'diff': diff})
+                    }
+                })
+            
             return parsed
         
         # Start timer thread
