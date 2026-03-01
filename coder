@@ -102,6 +102,7 @@ class Config:
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     model: str = "default"
     tiny: bool = False  # Use tiny model optimizations
+    timeout: int = 600  # Request timeout in seconds
 
     @classmethod
     def load(cls, config_path: Optional[str] = None) -> "Config":
@@ -120,6 +121,7 @@ class Config:
                 config.system_prompt = data.get('system_prompt', config.system_prompt)
                 config.model = data.get('model', config.model)
                 config.tiny = data.get('tiny', config.tiny)
+                config.timeout = data.get('timeout', config.timeout)
             except (json.JSONDecodeError, IOError) as e:
                 print(f"Warning: Could not load config from {config_path}: {e}", file=sys.stderr)
         
@@ -138,7 +140,8 @@ class Config:
             'token': self.token,
             'system_prompt': self.system_prompt,
             'model': self.model,
-            'tiny': self.tiny
+            'tiny': self.tiny,
+            'timeout': self.timeout
         }
         
         with open(config_path, 'w') as f:
@@ -394,7 +397,7 @@ class CoderClient:
                 headers=headers,
                 json=payload,
                 stream=stream,
-                timeout=60
+                timeout=self.config.timeout
             )
             response.raise_for_status()
             
@@ -415,6 +418,8 @@ class CoderClient:
         full_content = ""
         tool_calls = []
         current_tool_call = None
+        in_thinking = False
+        thinking_dots = 0
         
         # Use iter_content with smaller chunk size for better real-time handling
         buffer = ""
@@ -443,8 +448,31 @@ class CoderClient:
                         # Handle content
                         content = delta.get('content')
                         if content:
-                            print(content, end='', flush=True)
-                            full_content += content
+                            # Check for thinking tags
+                            if '<think>' in content:
+                                in_thinking = True
+                                print("[Thinking", end='', flush=True)
+                                continue
+                            
+                            if in_thinking:
+                                if '</think>' in content:
+                                    # End of thinking
+                                    in_thinking = False
+                                    print("]\n", end='', flush=True)
+                                    # Get content after </think>
+                                    actual_content = content.split('</think>', 1)[-1]
+                                    if actual_content:
+                                        print(actual_content, end='', flush=True)
+                                        full_content += actual_content
+                                else:
+                                    # Still thinking - show animated dots
+                                    thinking_dots = (thinking_dots + 1) % 4
+                                    dots = '.' * thinking_dots + ' ' * (3 - thinking_dots)
+                                    print(f"\r[Thinking{dots}]", end='', flush=True)
+                            else:
+                                # Normal content
+                                print(content, end='', flush=True)
+                                full_content += content
                         
                         # Handle tool calls
                         delta_tool_calls = delta.get('tool_calls')
@@ -472,6 +500,8 @@ class CoderClient:
                     except json.JSONDecodeError:
                         continue
         
+        if in_thinking:
+            print("]\n", end='', flush=True)
         print()  # Newline after streaming
         
         # Execute tool calls if any
@@ -605,7 +635,7 @@ class CoderClient:
             headers=headers,
             json=payload,
             stream=True,
-            timeout=60
+            timeout=self.config.timeout
         )
         response.raise_for_status()
         
@@ -759,6 +789,13 @@ Examples:
         help='Use tiny model mode (simplified system prompt for models under 3B parameters)'
     )
     
+    parser.add_argument(
+        '--timeout',
+        type=int,
+        default=600,
+        help='Request timeout in seconds (default: 600)'
+    )
+    
     args = parser.parse_args()
     
     # Handle init-config
@@ -786,6 +823,8 @@ Examples:
         config.token = args.token
     if args.tiny:
         config.tiny = True
+    if args.timeout:
+        config.timeout = args.timeout
     
     # Apply tiny model system prompt if enabled
     if config.tiny:
