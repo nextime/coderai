@@ -631,12 +631,32 @@ class NvidiaBackend(ModelBackend):
                     print(f"  Detected large GPU ({total_vram_gb:.1f}GB), using conservative VRAM usage (93% start)")
                     return [0.93, 0.85, 0.75, 0.65, 0.50, 0.35, 0.20, 0.0]
     
-    def _get_vram_percentages_for_gpu(self, model_name: str = "", strategy: str = "auto") -> list:
+    def _get_vram_percentages_for_gpu(self, model_name: str = "", strategy: str = "auto", max_gpu_percent: float = None) -> list:
         """Get VRAM percentage steps based on GPU memory size, model type, and offload strategy."""
         import torch
         
         if not torch.cuda.is_available():
             return [0.0]  # CPU only
+        
+        # If max_gpu_percent is specified, use it to create custom percentage steps
+        if max_gpu_percent is not None:
+            # Clamp to valid range (5-100%)
+            max_pct = max(0.05, min(1.0, max_gpu_percent / 100.0))
+            print(f"  Using custom max GPU percent: {max_pct*100:.0f}%")
+            # Create a descending series from max_pct down to 0
+            steps = []
+            current = max_pct
+            while current > 0.05:
+                steps.append(current)
+                # Reduce by 5% each step, or smaller steps near the end
+                if current > 0.3:
+                    current -= 0.05
+                elif current > 0.15:
+                    current -= 0.03
+                else:
+                    current -= 0.02
+            steps.append(0.0)
+            return steps
         
         # Get total VRAM of the first GPU
         total_vram_gb = 0
@@ -662,6 +682,7 @@ class NvidiaBackend(ModelBackend):
         manual_ram_gb = kwargs.get('manual_ram_gb')
         flash_attn = kwargs.get('flash_attn', False)
         offload_strategy = kwargs.get('offload_strategy', 'auto')
+        max_gpu_percent = kwargs.get('max_gpu_percent', None)
         
         # Store RAM limit for use in _get_gpu_memory_map
         self._pending_ram_gb = manual_ram_gb
@@ -720,7 +741,7 @@ class NvidiaBackend(ModelBackend):
         
         # Try loading with automatic fallback on OOM
         model = None
-        vram_percentages = self._get_vram_percentages_for_gpu(model_name, offload_strategy)
+        vram_percentages = self._get_vram_percentages_for_gpu(model_name, offload_strategy, max_gpu_percent)
         first_vram_pct = vram_percentages[0] if vram_percentages else 0.93
         
         for vram_pct in vram_percentages:
@@ -2047,6 +2068,12 @@ def parse_args():
         help="Offload strategy for NVIDIA backend (default: auto)",
     )
     parser.add_argument(
+        "--max-gpu-percent",
+        type=float,
+        default=None,
+        help="Maximum GPU VRAM to use as percentage (0-100). Overrides offload-strategy. Lower values offload more to CPU/RAM (default: None = use offload-strategy)",
+    )
+    parser.add_argument(
         "--n-gpu-layers",
         type=int,
         default=-1,
@@ -2149,6 +2176,7 @@ def main():
         'manual_ram_gb': args.ram,
         'flash_attn': args.flash_attn,
         'offload_strategy': args.offload_strategy,
+        'max_gpu_percent': args.max_gpu_percent,
         'n_gpu_layers': args.n_gpu_layers,
         'n_ctx': args.n_ctx,
         'main_gpu': args.vulkan_device,
