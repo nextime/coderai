@@ -873,21 +873,49 @@ class NvidiaBackend(ModelBackend):
         
         temperature, top_p, do_sample = self._validate_params(temperature, top_p)
         
-        with torch.no_grad():
-            outputs = self.model.generate(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                max_new_tokens=max_tokens,
-                temperature=temperature if do_sample else None,
-                top_p=top_p if do_sample else None,
-                do_sample=do_sample,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                logits_processor=LogitsProcessorList([InvalidLogitsProcessor()]),
-            )
-        
-        generated_tokens = outputs[0][inputs["input_ids"].shape[1]:]
-        return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        # Try generation with OOM handling
+        try:
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    max_new_tokens=max_tokens,
+                    temperature=temperature if do_sample else None,
+                    top_p=top_p if do_sample else None,
+                    do_sample=do_sample,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    logits_processor=LogitsProcessorList([InvalidLogitsProcessor()]),
+                )
+            
+            generated_tokens = outputs[0][inputs["input_ids"].shape[1]:]
+            return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+            error_msg = str(e).lower()
+            if "out of memory" in error_msg or "cuda" in error_msg or "oom" in error_msg:
+                print(f"Warning: CUDA OOM during generation. Clearing cache and retrying with reduced tokens...")
+                torch.cuda.empty_cache()
+                # Retry with half the tokens
+                try:
+                    with torch.no_grad():
+                        outputs = self.model.generate(
+                            input_ids=inputs["input_ids"],
+                            attention_mask=inputs["attention_mask"],
+                            max_new_tokens=max(1, max_tokens // 2),
+                            temperature=temperature if do_sample else None,
+                            top_p=top_p if do_sample else None,
+                            do_sample=do_sample,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                            eos_token_id=self.tokenizer.eos_token_id,
+                            logits_processor=LogitsProcessorList([InvalidLogitsProcessor()]),
+                        )
+                    
+                    generated_tokens = outputs[0][inputs["input_ids"].shape[1]:]
+                    return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                except Exception as e2:
+                    print(f"Error: Generation failed even with reduced tokens: {e2}")
+                    return "[Error: Out of memory during generation. Try reducing --max-gpu-percent or using a smaller model.]"
+            raise
     
     async def generate_stream(self, prompt: str, max_tokens: Optional[int] = None,
                               temperature: float = 0.7, top_p: float = 1.0,
@@ -944,14 +972,38 @@ class NvidiaBackend(ModelBackend):
                 StopOnSequence(stop, self.tokenizer)
             ])
         
-        # Run generation in a separate thread
-        thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
+        # Run generation in a separate thread with OOM handling
+        generation_error = None
+        
+        def generate_with_error_handling():
+            nonlocal generation_error
+            try:
+                self.model.generate(**generation_kwargs)
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                error_msg = str(e).lower()
+                if "out of memory" in error_msg or "cuda" in error_msg or "oom" in error_msg:
+                    generation_error = "oom"
+                    print(f"Warning: CUDA OOM during streaming generation. Clearing cache...")
+                    torch.cuda.empty_cache()
+                else:
+                    generation_error = str(e)
+        
+        thread = Thread(target=generate_with_error_handling)
         thread.start()
         
-        for text in streamer:
-            yield text
+        try:
+            for text in streamer:
+                yield text
+        except Exception as e:
+            print(f"Error during stream iteration: {e}")
         
         thread.join()
+        
+        # Check if there was an OOM error
+        if generation_error == "oom":
+            yield "\n[Warning: Generation stopped due to out-of-memory. Try reducing --max-gpu-percent.]"
+        elif generation_error:
+            yield f"\n[Error during generation: {generation_error}]"
     
     def get_model_name(self) -> str:
         return self.model_name or "unknown"
