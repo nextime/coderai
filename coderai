@@ -572,7 +572,7 @@ class NvidiaBackend(ModelBackend):
         return max_memory
     
     def _try_load_model(self, model_name: str, load_kwargs: dict, device: str) -> Optional[any]:
-        """Try to load model with given settings, return None on OOM."""
+        """Try to load model with given settings, return None on OOM or retry without quantization if unsupported."""
         import torch
         from transformers import AutoModelForCausalLM
         
@@ -585,6 +585,35 @@ class NvidiaBackend(ModelBackend):
             error_msg = str(e).lower()
             if "out of memory" in error_msg or "cuda" in error_msg or "oom" in error_msg:
                 return None
+            raise
+        except TypeError as e:
+            error_msg = str(e).lower()
+            # Check if the error is about unsupported quantization arguments
+            if "load_in_4bit" in error_msg or "load_in_8bit" in error_msg or "unexpected keyword argument" in error_msg:
+                # Check if we have quantization args that need to be removed
+                if 'load_in_4bit' in load_kwargs or 'load_in_8bit' in load_kwargs:
+                    print(f"Warning: Model does not support bitsandbytes quantization (load_in_4bit/load_in_8bit)")
+                    print("Retrying without quantization...")
+                    # Create a copy of load_kwargs without quantization args
+                    retry_kwargs = load_kwargs.copy()
+                    retry_kwargs.pop('load_in_4bit', None)
+                    retry_kwargs.pop('load_in_8bit', None)
+                    # Retry loading without quantization
+                    try:
+                        model = AutoModelForCausalLM.from_pretrained(model_name, **retry_kwargs)
+                        if device == "cpu" and retry_kwargs.get('device_map') is None:
+                            model = model.to(device)
+                        print("Model loaded successfully without quantization")
+                        return model
+                    except (RuntimeError, torch.cuda.OutOfMemoryError) as e2:
+                        error_msg2 = str(e2).lower()
+                        if "out of memory" in error_msg2 or "cuda" in error_msg2 or "oom" in error_msg2:
+                            return None
+                        raise
+                    except TypeError:
+                        # If it still fails with TypeError, re-raise the original error
+                        raise e
+            # Re-raise if not a quantization-related error
             raise
     
     def _is_moe_model(self, model_name: str) -> bool:
