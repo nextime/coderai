@@ -1724,14 +1724,37 @@ async def chat_completions(request: ChatCompletionRequest):
     for msg in messages:
         msg_dict = {"role": msg.role}
         # Always include content key - llama_cpp template expects it
-        msg_dict["content"] = msg.content if msg.content is not None else ""
+        # Convert content to string if it's a list (multipart content)
+        content = msg.content
+        if content is None:
+            content = ""
+        elif isinstance(content, list):
+            # Handle multipart content array format: [{"type": "text", "text": "..."}]
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get('type') == 'text' and 'text' in item:
+                        parts.append(item['text'])
+                    else:
+                        parts.append(f"[{item.get('type', 'unknown')} content]")
+                else:
+                    parts.append(str(item))
+            content = '\n'.join(parts)
+        msg_dict["content"] = content
+        # Handle tool_calls - convert to proper format if present
         if msg.tool_calls:
+            # tool_calls should be a list of dicts with 'id', 'type', 'function' keys
             msg_dict["tool_calls"] = msg.tool_calls
         if msg.name:
             msg_dict["name"] = msg.name
         if msg.tool_call_id:
             msg_dict["tool_call_id"] = msg.tool_call_id
         messages_dict.append(msg_dict)
+    
+    # Debug: print first few messages to see their structure
+    print(f"DEBUG: messages_dict[0] keys: {list(messages_dict[0].keys()) if messages_dict else 'empty'}")
+    if len(messages_dict) > 1:
+        print(f"DEBUG: messages_dict[1] keys: {list(messages_dict[1].keys()) if len(messages_dict) > 1 else 'empty'}")
     
     # Convert tools to dict format if present
     tools_dict = None
