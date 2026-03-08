@@ -3668,18 +3668,25 @@ def main():
                             model_path = download_model(model_to_use, cache_dir)
                             model_to_use = model_path
                     
-                    # Load with llama.cpp (Vulkan)
-                    audio_model = Llama(
-                        model_path=model_to_use,
-                        n_gpu_layers=-1,  # All layers to GPU
-                        n_ctx=2048,
-                        verbose=False
-                    )
+                    # Load with llama.cpp (Vulkan) - suppress __del__ errors
+                    audio_model = None
+                    try:
+                        audio_model = Llama(
+                            model_path=model_to_use,
+                            n_gpu_layers=-1,  # All layers to GPU
+                            n_ctx=2048,
+                            verbose=False
+                        )
+                    except BaseException:
+                        audio_model = None
                     
-                    # Store in multi_model_manager
-                    model_key = f"audio:{args.audio_model}"
-                    multi_model_manager.add_model(model_key, audio_model)
-                    print(f"Audio model loaded successfully (GGUF/Vulkan)")
+                    if audio_model is not None:
+                        # Store in multi_model_manager
+                        model_key = f"audio:{args.audio_model}"
+                        multi_model_manager.add_model(model_key, audio_model)
+                        print(f"Audio model loaded successfully (GGUF/Vulkan)")
+                    else:
+                        raise Exception("llama.cpp failed to load model")
                     
                 except Exception as e:
                     print(f"Warning: Could not pre-load audio model: {e}")
