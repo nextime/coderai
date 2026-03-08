@@ -1,0 +1,6 @@
+{
+    "openclaw.terminal.enabled": true,
+    "openclaw.gatewayHost": "192.168.11.46",
+    "openclaw.gatewayToken": "415fa3c21b7ef06f22aff571697d88c59c2dc67737681267",
+    "openclaw.gatewayUrl": "http://192.168.11.46:18789"
+}

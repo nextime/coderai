@@ -1224,21 +1224,48 @@ class VulkanBackend(ModelBackend):
         single_gpu = kwargs.get('single_gpu', False)
         tensor_split = None
         
+        # First, get the number of Vulkan devices from llama.cpp's perspective
+        # We'll try to detect from ggml_vulkan output by checking available GPUs
+        num_devices = 2  # Default
+        
+        # Try to parse vulkaninfo to get actual device count
+        try:
+            import subprocess
+            result = subprocess.run(['vulkaninfo', '--summary'], capture_output=True, text=True)
+            if result.returncode == 0:
+                # Count actual GPU devices (exclude llvmpipe CPU)
+                import re
+                lines = result.stdout.split('\n')
+                gpu_count = 0
+                for i, line in enumerate(lines):
+                    if line.strip().startswith('GPU'):
+                        # Check next few lines for device type
+                        section = '\n'.join(lines[i:i+10])
+                        if 'llvmpipe' not in section.lower() and 'cpu' not in section.split('deviceType')[0] if 'deviceType' in result.stdout else '':
+                            gpu_count += 1
+                if gpu_count > 0:
+                    num_devices = gpu_count
+        except Exception as e:
+            print(f"Warning: Could not detect Vulkan device count: {e}")
+        
+        print(f"DEBUG: Detected {num_devices} Vulkan GPU devices")
+        
+        # Also try to set GGML_VULKAN_DEVICE env var to force the device
+        # This affects which GPU does the actual computation
+        if main_gpu >= 0:
+            os.environ['GGML_VULKAN_DEVICE'] = str(main_gpu)
+            print(f"DEBUG: Set GGML_VULKAN_DEVICE={main_gpu}")
+        
         if single_gpu:
             # Build tensor_split to force all layers onto one GPU
-            # We need to detect how many GPUs are visible to Vulkan
-            num_devices = self.count_vulkan_devices()
-            # Create tensor_split array: 1.0 for selected GPU, 0.0 for others
+            # tensor_split is a list where index = GPU device, value = weight (0.0 = don't use)
             tensor_split = [0.0] * num_devices
-            if main_gpu < len(tensor_split):
+            if main_gpu < num_devices:
                 tensor_split[main_gpu] = 1.0
+                print(f"  Single GPU mode: Setting tensor_split for GPU {main_gpu}: {tensor_split}")
             else:
-                print(f"Warning: main_gpu={main_gpu} exceeds detected devices ({num_devices})")
+                print(f"Warning: main_gpu={main_gpu} exceeds detected devices ({num_devices}), ignoring single_gpu")
                 tensor_split = None
-            
-            if tensor_split:
-                print(f"  Single GPU mode: Forcing all layers to GPU {main_gpu}")
-                print(f"  Tensor split: {tensor_split}")
         
         try:
             llama_kwargs = {
@@ -1326,10 +1353,11 @@ class VulkanBackend(ModelBackend):
             max_tokens = 512
         
         # Check if we should use manual formatting based on detected template
-        use_manual = self.chat_template in ("unknown", "jinja_fallback", None) or tools is None
+        # Always use manual formatting when tools are present, since Jinja templates often fail with tool messages
+        use_manual = self.chat_template in ("unknown", "jinja_fallback", None) or tools is not None
         
         if use_manual:
-            print(f"DEBUG: Using manual message formatting (template: {self.chat_template})")
+            print(f"DEBUG: Using manual message formatting (template: {self.chat_template}, tools: {tools is not None})")
             prompt = self._manual_format_messages(messages)
             return self.generate(prompt, max_tokens, temperature, top_p, stop)
         
@@ -1365,10 +1393,11 @@ class VulkanBackend(ModelBackend):
         chunk_count = 0
         
         # Check if we should use manual formatting based on detected template
-        use_manual = self.chat_template in ("unknown", "jinja_fallback", None) or tools is None
+        # Always use manual formatting when tools are present, since Jinja templates often fail with tool messages
+        use_manual = self.chat_template in ("unknown", "jinja_fallback", None) or tools is not None
         
         if use_manual:
-            print(f"DEBUG: Using manual message formatting for streaming (template: {self.chat_template})")
+            print(f"DEBUG: Using manual message formatting for streaming (template: {self.chat_template}, tools: {tools is not None})")
             prompt = self._manual_format_messages(messages)
             async for chunk in self.generate_stream(prompt, max_tokens, temperature, top_p, stop):
                 yield chunk
@@ -1437,13 +1466,28 @@ class VulkanBackend(ModelBackend):
         formatted = []
         for msg in messages:
             role = msg.get("role", "")
-            content = msg.get("content", "")
+            content = msg.get("content", "") or ""
+            
             if role == "system":
                 formatted.append(f"<|im_start|>system\n{content}<|im_end|>")
             elif role == "user":
                 formatted.append(f"<|im_start|>user\n{content}<|im_end|>")
             elif role == "assistant":
+                # Handle tool_calls if present
+                tool_calls = msg.get("tool_calls", [])
+                if tool_calls:
+                    for tc in tool_calls:
+                        if isinstance(tc, dict) and "function" in tc:
+                            func = tc["function"]
+                            tc_str = f'<tool>{{"name": "{func.get("name", "")}", "arguments": {func.get("arguments", "{}")}}}</tool>'
+                            content = content + "\n" + tc_str if content else tc_str
                 formatted.append(f"<|im_start|>assistant\n{content}<|im_end|>")
+            elif role == "tool":
+                # Tool result messages
+                tool_call_id = msg.get("tool_call_id", "")
+                name = msg.get("name", "")
+                formatted.append(f"<|im_start|>tool (tool_call_id={tool_call_id}, name={name})\n{content}<|im_end|>")
+        
         formatted.append("<|im_start|>assistant\n")
         return "\n".join(formatted)
     
