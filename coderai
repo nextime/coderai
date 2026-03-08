@@ -3494,6 +3494,74 @@ def main():
             'ctx': args.audio_ctx,
             'offload': args.audio_offload,
         })
+        # Pre-load audio model at startup
+        if load_mode in ("loadall", "loadswap"):
+            print(f"Pre-loading audio model...")
+            try:
+                from faster_whisper import WhisperModel
+                import torch
+                
+                model_to_use = args.audio_model
+                model_path = None
+                
+                # Check if model is a URL - handle caching
+                if model_to_use.startswith('http://') or model_to_use.startswith('https://'):
+                    cached_path = get_cached_model_path(model_to_use)
+                    if cached_path:
+                        model_path = cached_path
+                        print(f"Using cached model: {model_path}")
+                    else:
+                        # Download and cache
+                        print(f"Downloading audio model: {model_to_use}")
+                        import requests
+                        import hashlib
+                        
+                        cache_dir = get_model_cache_dir()
+                        url_path = model_to_use.split('?')[0]
+                        filename = os.path.basename(url_path)
+                        
+                        if not filename.endswith('.bin') and not filename.endswith('.ggml'):
+                            filename = "whisper-model.bin"
+                        
+                        url_hash = hashlib.sha256(model_to_use.encode()).hexdigest()
+                        cached_filename = f"{url_hash}_{filename}"
+                        model_path = os.path.join(cache_dir, cached_filename)
+                        
+                        response = requests.get(model_to_use, stream=True)
+                        response.raise_for_status()
+                        
+                        total_size = int(response.headers.get('content-length', 0))
+                        downloaded = 0
+                        
+                        with open(model_path, 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=8192*1024):
+                                if chunk:
+                                    f.write(chunk)
+                                    downloaded += len(chunk)
+                                    if total_size > 0:
+                                        percent = (downloaded / total_size) * 100
+                                        print(f"Downloaded: {percent:.1f}%", end='\r')
+                        
+                        print(f"\nDownloaded and cached to: {model_path}")
+                        model_to_use = model_path
+                
+                # Determine compute type
+                compute_type = "float16" if torch.cuda.is_available() else "int8"
+                
+                # Load the model
+                whisper_model = WhisperModel(
+                    model_to_use,
+                    device="cuda" if torch.cuda.is_available() else "cpu",
+                    compute_type=compute_type
+                )
+                
+                # Store in multi_model_manager
+                model_key = f"audio:{args.audio_model}"
+                multi_model_manager.add_model(model_key, whisper_model)
+                print(f"Audio model loaded successfully")
+                
+            except Exception as e:
+                print(f"Warning: Could not pre-load audio model: {e}")
     
     # Set up TTS model if specified
     if args.tts_model:
