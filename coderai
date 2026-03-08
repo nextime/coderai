@@ -391,9 +391,14 @@ class ToolCallParser:
         if not text:
             return text
         
-        # Remove <tool>...</tool> and <function>...</function> patterns
+        # Remove <tool>...</tool> and <function>...</function> patterns (including JSON content)
         text = re.sub(r'<tool>.*?</tool>', '', text, flags=re.DOTALL)
         text = re.sub(r'<function>.*?</function>', '', text, flags=re.DOTALL)
+        
+        # Also remove JSON format: <tool>{"name":"exec",...}</tool>
+        # This regex matches <tool> followed by JSON until </tool>
+        text = re.sub(r'<tool>\{.*?\}</tool>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<function>\{.*?\}</function>', '', text, flags=re.DOTALL)
         
         # Also remove common tool name tags like <read>...</read>, <exec>...</exec>
         for tool_name in ['read', 'write', 'exec', 'browser', 'message', 'web_search', 'web_fetch', 
@@ -1339,8 +1344,11 @@ class VulkanBackend(ModelBackend):
         chat_messages = []
         for msg in messages:
             chat_msg = {"role": msg.role}
-            if msg.content:
+            # CRITICAL: Ensure content is never None - Jinja templates fail on None
+            if msg.content is not None:
                 chat_msg["content"] = msg.content
+            else:
+                chat_msg["content"] = ""
             if msg.tool_calls:
                 chat_msg["tool_calls"] = msg.tool_calls
             chat_messages.append(chat_msg)
@@ -1504,7 +1512,12 @@ class VulkanBackend(ModelBackend):
         formatted = []
         for msg in messages:
             role = msg.get("role", "")
-            content = msg.get("content", "") or ""
+            # CRITICAL: Ensure content is never None - Jinja templates fail on None
+            content = msg.get("content")
+            if content is None:
+                content = ""
+            elif not isinstance(content, str):
+                content = str(content)
             
             if role == "system":
                 formatted.append(f"<|im_start|>system\n{content}<|im_end|>")
@@ -1903,7 +1916,8 @@ async def chat_completions(request: ChatCompletionRequest):
                 else:
                     parts.append(str(item))
             content = '\n'.join(parts)
-        msg_dict["content"] = content
+        # Ensure content is never None - convert to string
+        msg_dict["content"] = str(content) if content is not None else ""
         # Handle tool_calls - convert to proper format if present
         if msg.tool_calls:
             # tool_calls should be a list of dicts with 'id', 'type', 'function' keys
@@ -1913,6 +1927,11 @@ async def chat_completions(request: ChatCompletionRequest):
         if msg.tool_call_id:
             msg_dict["tool_call_id"] = msg.tool_call_id
         messages_dict.append(msg_dict)
+    
+    # Final safety check: ensure NO message has None content before passing to llama_cpp
+    for i, m in enumerate(messages_dict):
+        if m.get("content") is None:
+            messages_dict[i]["content"] = ""
     
     # Debug: print first few messages to see their structure
     print(f"DEBUG: messages_dict[0] keys: {list(messages_dict[0].keys()) if messages_dict else 'empty'}")
@@ -1989,9 +2008,8 @@ async def stream_chat_response(
             # Filter malformed content from each chunk
             filtered_chunk = filter_malformed_content(chunk)
             
-            # Also filter out tool call format from content when tools are available
-            if tools:
-                filtered_chunk = model_manager.tool_parser.strip_tool_calls_from_content(filtered_chunk)
+            # Always filter out tool call format - some may slip through even without tools
+            filtered_chunk = model_manager.tool_parser.strip_tool_calls_from_content(filtered_chunk)
             
             if not filtered_chunk:
                 print(f"DEBUG: filtered_chunk was empty (original chunk: {repr(chunk[:50])})")
