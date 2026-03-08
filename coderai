@@ -3650,6 +3650,7 @@ def main():
             except ImportError:
                 # faster-whisper not available, try GGUF with llama.cpp
                 print("faster-whisper not available, trying GGUF with llama.cpp...")
+                audio_load_success = False
                 try:
                     from llama_cpp import Llama
                     
@@ -3668,28 +3669,25 @@ def main():
                             model_path = download_model(model_to_use, cache_dir)
                             model_to_use = model_path
                     
-                    # Load with llama.cpp (Vulkan) - suppress __del__ errors
-                    audio_model = None
-                    try:
-                        audio_model = Llama(
-                            model_path=model_to_use,
-                            n_gpu_layers=-1,  # All layers to GPU
-                            n_ctx=2048,
-                            verbose=False
-                        )
-                    except BaseException:
-                        audio_model = None
+                    # Load with llama.cpp (Vulkan)
+                    audio_model = Llama(
+                        model_path=model_to_use,
+                        n_gpu_layers=-1,  # All layers to GPU
+                        n_ctx=2048,
+                        verbose=False
+                    )
                     
-                    if audio_model is not None:
-                        # Store in multi_model_manager
-                        model_key = f"audio:{args.audio_model}"
-                        multi_model_manager.add_model(model_key, audio_model)
-                        print(f"Audio model loaded successfully (GGUF/Vulkan)")
-                    else:
-                        raise Exception("llama.cpp failed to load model")
+                    # Store in multi_model_manager
+                    model_key = f"audio:{args.audio_model}"
+                    multi_model_manager.add_model(model_key, audio_model)
+                    print(f"Audio model loaded successfully (GGUF/Vulkan)")
+                    audio_load_success = True
                     
-                except Exception as e:
-                    print(f"Warning: Could not pre-load audio model: {e}")
+                except:
+                    pass  # Ignore all errors, will load on-demand
+                
+                if not audio_load_success:
+                    print(f"Warning: Could not pre-load audio model (llama.cpp may not support this format)")
                     print("Audio model will load on-demand when transcription is requested.")
             
             except Exception as e:
