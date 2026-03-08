@@ -21,7 +21,7 @@ from typing import AsyncGenerator, Dict, List, Optional, Union
 import psutil
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, validator, field_validator
+from pydantic import BaseModel, Field, validator, field_validator, ConfigDict
 from pydantic_core import PydanticCustomError
 from threading import Thread
 
@@ -132,8 +132,7 @@ class ChatCompletionRequest(BaseModel):
     response_format: Optional[Dict] = None
     user: Optional[str] = None
     
-    class Config:
-        extra = "allow"  # Allow extra fields to prevent 422 errors
+    model_config = ConfigDict(extra="allow")  # Allow extra fields to prevent 422 errors
 
 
 class CompletionRequest(BaseModel):
@@ -155,8 +154,7 @@ class CompletionRequest(BaseModel):
     echo: Optional[bool] = None
     user: Optional[str] = None
     
-    class Config:
-        extra = "allow"  # Allow extra fields to prevent 422 errors
+    model_config = ConfigDict(extra="allow")  # Allow extra fields to prevent 422 errors
 
 
 class ModelInfo(BaseModel):
@@ -185,15 +183,12 @@ class TranscriptionRequest(BaseModel):
     temperature: Optional[float] = 0.0
     timestamp_granularities: Optional[List[str]] = None
     
-    class Config:
-        extra = "allow"  # Allow extra fields to prevent 422 errors
+    model_config = ConfigDict(extra="allow")
 
 
 class TranscriptionResponse(BaseModel):
     text: str
-    
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 # =============================================================================
@@ -211,16 +206,13 @@ class ImageGenerationRequest(BaseModel):
     seed: Optional[int] = None
     user: Optional[str] = None
     
-    class Config:
-        extra = "allow"  # Allow extra fields to prevent 422 errors
+    model_config = ConfigDict(extra="allow")
 
 
 class ImageGenerationResponse(BaseModel):
     created: int
     data: List[Dict]
-    
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 # =============================================================================
@@ -1461,9 +1453,19 @@ class VulkanBackend(ModelBackend):
         
         # CRITICAL: Ensure NO message has None content - Jinja templates fail on None
         # This is a safety check in case messages bypass the main endpoint validation
+        cleaned_messages = []
         for msg in messages:
-            if msg.get("content") is None:
-                msg["content"] = ""
+            cleaned_msg = dict(msg)  # Make a copy to avoid modifying original
+            # Ensure content key exists and is never None
+            if "content" not in cleaned_msg:
+                cleaned_msg["content"] = ""
+            elif cleaned_msg.get("content") is None:
+                cleaned_msg["content"] = ""
+            # Convert non-string content to string
+            elif not isinstance(cleaned_msg["content"], str):
+                cleaned_msg["content"] = str(cleaned_msg["content"])
+            cleaned_messages.append(cleaned_msg)
+        messages = cleaned_messages
         
         # Check if we should use manual formatting based on detected template
         # Always use manual formatting when tools are present, since Jinja templates often fail with tool messages
@@ -1508,9 +1510,19 @@ class VulkanBackend(ModelBackend):
         
         # CRITICAL: Ensure NO message has None content - Jinja templates fail on None
         # This is a safety check in case messages bypass the main endpoint validation
+        cleaned_messages = []
         for msg in messages:
-            if msg.get("content") is None:
-                msg["content"] = ""
+            cleaned_msg = dict(msg)  # Make a copy to avoid modifying original
+            # Ensure content key exists and is never None
+            if "content" not in cleaned_msg:
+                cleaned_msg["content"] = ""
+            elif cleaned_msg.get("content") is None:
+                cleaned_msg["content"] = ""
+            # Convert non-string content to string
+            elif not isinstance(cleaned_msg["content"], str):
+                cleaned_msg["content"] = str(cleaned_msg["content"])
+            cleaned_messages.append(cleaned_msg)
+        messages = cleaned_messages
         
         # Check if we should use manual formatting based on detected template
         # Always use manual formatting when tools are present, since Jinja templates often fail with tool messages
@@ -2458,11 +2470,15 @@ async def chat_completions(request: ChatCompletionRequest):
     # Final safety check: ensure NO message has None content before passing to llama_cpp
     # Also ensure content key always exists (not just None check)
     for i, m in enumerate(messages_dict):
-        if m.get("content") is None:
+        # Handle missing content key entirely
+        if "content" not in m:
             messages_dict[i]["content"] = ""
-        # Also handle missing content key entirely
-        if "content" not in messages_dict[i]:
+        # Handle None content
+        elif m.get("content") is None:
             messages_dict[i]["content"] = ""
+        # Handle content that's not a string (shouldn't happen but be safe)
+        elif not isinstance(m["content"], str):
+            messages_dict[i]["content"] = str(m["content"])
     
     # Debug: print first few messages to see their structure
     print(f"DEBUG: messages_dict[0] keys: {list(messages_dict[0].keys()) if messages_dict else 'empty'}")
