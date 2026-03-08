@@ -2999,7 +2999,7 @@ def parse_args():
         "--model",
         type=str,
         default=None,
-        help="Model name or path. For NVIDIA: HuggingFace model. For Vulkan: GGUF file path or HF repo",
+        help="Model name, path, or URL for text-to-text LLM. Optional if only using --audio-model or --image-model",
     )
     parser.add_argument(
         "--backend",
@@ -3186,8 +3186,10 @@ def main():
     
     # Get model name from args or prompt interactively
     model_name = args.model
-    if model_name is None:
-        print("No model specified. Please enter a model name.")
+    
+    # Validate: must have at least one model specified
+    if model_name is None and args.audio_model is None and args.image_model is None:
+        print("Error: At least one of --model, --audio-model, or --image-model must be specified.")
         print("")
         print("For NVIDIA backend (HuggingFace models):")
         print("  - microsoft/DialoGPT-medium")
@@ -3197,12 +3199,14 @@ def main():
         print("For Vulkan backend (GGUF models):")
         print("  - Local path: ./phi-3-mini-4k-instruct-q4_k_m.gguf")
         print("  - HuggingFace: microsoft/Phi-3-mini-4k-instruct-gguf")
+        print("  - URL: https://huggingface.co/.../model.gguf")
         print("")
-        model_name = input("Enter model name: ").strip()
-        
-        if not model_name:
-            print("Error: Model name is required")
-            sys.exit(1)
+        print("For audio transcription:")
+        print("  - --audio-model base")
+        print("")
+        print("For image generation:")
+        print("  - --image-model stabilityai/stable-diffusion-xl-base-1.0")
+        sys.exit(1)
     
     # Detect available backends
     available = detect_available_backends()
@@ -3212,52 +3216,56 @@ def main():
         print(f"  [{status}] {name}")
     print("")
     
-    # Load the main model
-    load_kwargs = {
-        'offload_dir': args.offload_dir,
-        'load_in_4bit': args.load_in_4bit,
-        'load_in_8bit': args.load_in_8bit,
-        'manual_ram_gb': args.ram,
-        'flash_attn': args.flash_attn,
-        'offload_strategy': args.offload_strategy,
-        'max_gpu_percent': args.max_gpu_percent,
-        'n_gpu_layers': args.n_gpu_layers,
-        'n_ctx': args.n_ctx,
-        'main_gpu': args.vulkan_device,
-        'single_gpu': args.vulkan_single_gpu,
-    }
-    
-    try:
-        model_manager.load_model(
-            model_name=model_name,
-            backend_type=args.backend,
-            **load_kwargs
-        )
-        # Register with multi_model_manager
-        multi_model_manager.set_default_model(model_name, load_kwargs)
-        multi_model_manager.add_model(model_name, model_manager)
-    except Exception as e:
-        print(f"\nError loading model: {e}")
-        error_str = str(e).lower()
-        print("\nTroubleshooting:")
-        if args.backend == "vulkan":
-            print("  - For Vulkan, ensure you have Vulkan drivers installed")
-            print("  - Make sure you're using a GGUF format model")
-            print("  - Run build.sh with 'vulkan' argument first")
-        else:
-            print("  - For NVIDIA, ensure PyTorch with CUDA is installed")
-            print("  - Run build.sh with 'nvidia' argument first")
-            if "tokenizer" in error_str or "sentencepiece" in error_str or "tiktoken" in error_str:
-                print("  - Tokenizer error: ensure sentencepiece and tiktoken are installed")
-                print("    pip install sentencepiece tiktoken tokenizers")
-            # Check if trying to load GGUF model with NVIDIA backend
-            if "gguf" in model_name.lower():
-                print(f"\n  *** IMPORTANT: '{model_name}' appears to be a GGUF model ***")
-                print("  GGUF models are NOT compatible with the NVIDIA backend.")
-                print("  Use --backend vulkan instead, or choose a HuggingFace Transformers model.")
-                print("\n  Example Vulkan command:")
-                print(f"    coderai --backend vulkan --model {model_name}")
-        sys.exit(1)
+    # Load the main model (only if specified)
+    if model_name:
+        load_kwargs = {
+            'offload_dir': args.offload_dir,
+            'load_in_4bit': args.load_in_4bit,
+            'load_in_8bit': args.load_in_8bit,
+            'manual_ram_gb': args.ram,
+            'flash_attn': args.flash_attn,
+            'offload_strategy': args.offload_strategy,
+            'max_gpu_percent': args.max_gpu_percent,
+            'n_gpu_layers': args.n_gpu_layers,
+            'n_ctx': args.n_ctx,
+            'main_gpu': args.vulkan_device,
+            'single_gpu': args.vulkan_single_gpu,
+        }
+        
+        try:
+            model_manager.load_model(
+                model_name=model_name,
+                backend_type=args.backend,
+                **load_kwargs
+            )
+            # Register with multi_model_manager
+            multi_model_manager.set_default_model(model_name, load_kwargs)
+            multi_model_manager.add_model(model_name, model_manager)
+            print(f"\nMain text model loaded: {model_name}")
+        except Exception as e:
+            print(f"\nError loading model: {e}")
+            error_str = str(e).lower()
+            print("\nTroubleshooting:")
+            if args.backend == "vulkan":
+                print("  - For Vulkan, ensure you have Vulkan drivers installed")
+                print("  - Make sure you're using a GGUF format model")
+                print("  - Run build.sh with 'vulkan' argument first")
+            else:
+                print("  - For NVIDIA, ensure PyTorch with CUDA is installed")
+                print("  - Run build.sh with 'nvidia' argument first")
+                if "tokenizer" in error_str or "sentencepiece" in error_str or "tiktoken" in error_str:
+                    print("  - Tokenizer error: ensure sentencepiece and tiktoken are installed")
+                    print("    pip install sentencepiece tiktoken tokenizers")
+                # Check if trying to load GGUF model with NVIDIA backend
+                if "gguf" in model_name.lower():
+                    print(f"\n  *** IMPORTANT: '{model_name}' appears to be a GGUF model ***")
+                    print("  GGUF models are NOT compatible with the NVIDIA backend.")
+                    print("  Use --backend vulkan instead, or choose a HuggingFace Transformers model.")
+                    print("\n  Example Vulkan command:")
+                    print(f"    coderai --backend vulkan --model {model_name}")
+            sys.exit(1)
+    else:
+        print("\nNo main text model specified (--model). Running with audio/image models only.")
     
     # Set up audio model if specified
     if args.audio_model:
@@ -3291,7 +3299,8 @@ def main():
     import uvicorn
     print(f"\nStarting server on http://{args.host}:{args.port}")
     print(f"API documentation available at http://{args.host}:{args.port}/docs")
-    print(f"Using backend: {model_manager.backend_type}")
+    if model_manager.backend is not None:
+        print(f"Using backend: {model_manager.backend_type}")
     
     # Print available models
     models = multi_model_manager.list_models()
