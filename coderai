@@ -3613,16 +3613,48 @@ def main():
         if should_preload:
             print(f"Pre-loading audio model...")
             try:
+                # Try faster-whisper first (requires torch)
+                from faster_whisper import WhisperModel
+                import torch
+                
                 model_to_use = args.audio_model
                 model_path = None
                 
-                # Check if model is a GGUF file - use llama.cpp (Vulkan) instead of faster-whisper
-                is_gguf = model_to_use.endswith('.gguf') or '.gguf?' in model_to_use or 'gguf' in model_to_use.lower()
+                # Check if model is a URL - handle caching
+                if model_to_use.startswith('http://') or model_to_use.startswith('https://'):
+                    cached_path = get_cached_model_path(model_to_use)
+                    if cached_path:
+                        model_path = cached_path
+                        print(f"Using cached model: {model_path}")
+                    else:
+                        # Download with progress
+                        cache_dir = get_model_cache_dir()
+                        model_path = download_model(model_to_use, cache_dir)
+                        model_to_use = model_path
                 
-                if is_gguf:
-                    # Use llama.cpp for GGUF audio models (works with Vulkan)
-                    print(f"Using GGUF format with llama.cpp (Vulkan)...")
+                # Determine compute type
+                compute_type = "float16" if torch.cuda.is_available() else "int8"
+                
+                # Load the model
+                whisper_model = WhisperModel(
+                    model_to_use,
+                    device="cuda" if torch.cuda.is_available() else "cpu",
+                    compute_type=compute_type
+                )
+                
+                # Store in multi_model_manager
+                model_key = f"audio:{args.audio_model}"
+                multi_model_manager.add_model(model_key, whisper_model)
+                print(f"Audio model loaded successfully (faster-whisper)")
+                
+            except ImportError:
+                # faster-whisper not available, try GGUF with llama.cpp
+                print("faster-whisper not available, trying GGUF with llama.cpp...")
+                try:
                     from llama_cpp import Llama
+                    
+                    model_to_use = args.audio_model
+                    model_path = None
                     
                     # Check if model is a URL - handle caching
                     if model_to_use.startswith('http://') or model_to_use.startswith('https://'):
@@ -3648,42 +3680,14 @@ def main():
                     model_key = f"audio:{args.audio_model}"
                     multi_model_manager.add_model(model_key, audio_model)
                     print(f"Audio model loaded successfully (GGUF/Vulkan)")
-                else:
-                    # Use faster-whisper for non-GGUF models
-                    from faster_whisper import WhisperModel
-                    import torch
                     
-                    # Check if model is a URL - handle caching
-                    if model_to_use.startswith('http://') or model_to_use.startswith('https://'):
-                        cached_path = get_cached_model_path(model_to_use)
-                        if cached_path:
-                            model_path = cached_path
-                            print(f"Using cached model: {model_path}")
-                        else:
-                            # Download with progress
-                            cache_dir = get_model_cache_dir()
-                            model_path = download_model(model_to_use, cache_dir)
-                            model_to_use = model_path
-                    
-                    # Determine compute type
-                    compute_type = "float16" if torch.cuda.is_available() else "int8"
-                    
-                    # Load the model
-                    whisper_model = WhisperModel(
-                        model_to_use,
-                        device="cuda" if torch.cuda.is_available() else "cpu",
-                        compute_type=compute_type
-                    )
-                    
-                    # Store in multi_model_manager
-                    model_key = f"audio:{args.audio_model}"
-                    multi_model_manager.add_model(model_key, whisper_model)
-                    print(f"Audio model loaded successfully")
-                
+                except Exception as e:
+                    print(f"Warning: Could not pre-load audio model: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
             except Exception as e:
                 print(f"Warning: Could not pre-load audio model: {e}")
-                import traceback
-                traceback.print_exc()
     
     # Set up TTS model if specified
     if args.tts_model:
