@@ -1998,6 +1998,9 @@ model_manager = ModelManager()
 # None = don't inject, True = use default, string = use custom text
 global_system_prompt = None
 
+# Global debug flag
+global_debug = False
+
 
 # =============================================================================
 # FastAPI Application
@@ -2030,19 +2033,33 @@ async def log_requests(request: Request, call_next):
         try:
             body = await request.body()
             body_str = body.decode('utf-8')
-            print(f"\n{'='*60}")
-            print(f"=== INCOMING REQUEST ===")
-            print(f"{'='*60}")
-            print(f"Path: {request.url.path}")
-            print(f"Method: {request.method}")
-            print(f"Headers: {dict(request.headers)}")
-            print(f"\n--- RAW BODY ({len(body)} bytes) ---")
-            # Print body with truncation for very large bodies
-            if len(body_str) > 2000:
-                print(f"{body_str[:1000]}...\n... [truncated {len(body_str)-2000} chars] ...\n...{body_str[-1000:]}")
-            else:
+            
+            # In debug mode, dump the full request
+            if global_debug:
+                print(f"\n{'='*80}")
+                print(f"=== FULL DEBUG REQUEST ===")
+                print(f"{'='*80}")
+                print(f"Path: {request.url.path}")
+                print(f"Method: {request.method}")
+                print(f"Headers: {dict(request.headers)}")
+                print(f"\n--- FULL BODY ({len(body)} bytes) ---")
                 print(body_str)
-            print(f"--- END RAW BODY ---")
+                print(f"--- END FULL BODY ---")
+                print(f"{'='*80}\n")
+            else:
+                print(f"\n{'='*60}")
+                print(f"=== INCOMING REQUEST ===")
+                print(f"{'='*60}")
+                print(f"Path: {request.url.path}")
+                print(f"Method: {request.method}")
+                print(f"Headers: {dict(request.headers)}")
+                print(f"\n--- RAW BODY ({len(body)} bytes) ---")
+                # Print body with truncation for very large bodies
+                if len(body_str) > 2000:
+                    print(f"{body_str[:1000]}...\n... [truncated {len(body_str)-2000} chars] ...\n...{body_str[-1000:]}")
+                else:
+                    print(body_str)
+                print(f"--- END RAW BODY ---")
             
             # Try to parse as JSON to see if it's valid
             try:
@@ -2589,6 +2606,14 @@ async def stream_chat_response(
         if not generated_text.strip():
             print(f"DEBUG: Warning - no content generated!")
         
+        # In debug mode, dump the full generated text
+        if global_debug:
+            print(f"\n{'='*80}")
+            print(f"=== FULL GENERATED TEXT (DEBUG) ===")
+            print(f"{'='*80}")
+            print(repr(generated_text))
+            print(f"{'='*80}\n")
+        
         # Check for tool calls in complete output (for API response format)
         if tools:
             # Convert tools back to Tool objects for parsing
@@ -2603,6 +2628,13 @@ async def stream_chat_response(
                 tool_objects.append(Tool(type=t.get("type", "function"), function=tool_func))
             tool_calls = tool_parser.extract_tool_calls(generated_text, tool_objects)
             if tool_calls:
+                # In debug mode, dump tool calls
+                if global_debug:
+                    print(f"\n{'='*80}")
+                    print(f"=== EXTRACTED TOOL CALLS (DEBUG) ===")
+                    print(f"{'='*80}")
+                    print(json.dumps(tool_calls, indent=2))
+                    print(f"{'='*80}\n")
                 # Tool calls were extracted and stripped from content during streaming
                 # Just send the tool_calls chunk
                 data = {
@@ -3021,12 +3053,17 @@ def parse_args():
         default=None,
         help="Vision model GPU offload percentage (0-100). If not set, loads fully on GPU",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode - dumps full request/response to stdout for troubleshooting",
+    )
     return parser.parse_args()
 
 
 def main():
     """Main entry point."""
-    global global_system_prompt, model_manager, multi_model_manager
+    global global_system_prompt, model_manager, multi_model_manager, global_debug
     
     # Optional: set process name if procname is available
     try:
@@ -3038,6 +3075,11 @@ def main():
     
     # Set global system prompt from --system-prompt flag
     global_system_prompt = args.system_prompt
+    
+    # Set global debug flag
+    global_debug = args.debug
+    if global_debug:
+        print("DEBUG MODE ENABLED - Full requests and replies will be dumped to stdout")
     
     # Handle --vulkan-list-devices
     if args.vulkan_list_devices:
