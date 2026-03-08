@@ -3434,6 +3434,15 @@ def main():
     """Main entry point."""
     global global_system_prompt, model_manager, multi_model_manager, global_debug
     
+    # Suppress unraisable exceptions from LlamaModel.__del__
+    import sys
+    original_unraisablehook = sys.unraisablehook
+    def suppress_llama_del_errors(unraisable):
+        if isinstance(unraisable.exc_value, AttributeError) and 'LlamaModel' in repr(unraisable.object) and 'sampler' in str(unraisable.exc_value):
+            return  # Ignore this specific error
+        original_unraisablehook(unraisable)
+    sys.unraisablehook = suppress_llama_del_errors
+    
     # Optional: set process name if procname is available
     try:
         import procname
