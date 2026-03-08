@@ -16,12 +16,13 @@ NC='\033[0m' # No Color
 BACKEND="${1:-nvidia}"
 BACKEND=$(echo "$BACKEND" | tr '[:upper:]' '[:lower:]')
 
-if [[ "$BACKEND" != "nvidia" && "$BACKEND" != "vulkan" && "$BACKEND" != "vulkan-nvidia" ]]; then
+if [[ "$BACKEND" != "nvidia" && "$BACKEND" != "vulkan" && "$BACKEND" != "vulkan-nvidia" && "$BACKEND" != "cuda" ]]; then
     echo -e "${RED}Error: Invalid backend '$BACKEND'${NC}"
-    echo "Usage: ./build.sh [nvidia|vulkan|vulkan-nvidia]"
+    echo "Usage: ./build.sh [nvidia|vulkan|vulkan-nvidia|cuda]"
     echo "  nvidia       - Use PyTorch with CUDA for NVIDIA GPUs"
-    echo "  vulkan       - Use llama-cpp-python with Vulkan for AMD GPUs"
+    echo "  vulkan      - Use llama-cpp-python with Vulkan for AMD GPUs"
     echo "  vulkan-nvidia - Use llama-cpp-python with Vulkan for NVIDIA GPU only"
+    echo "  cuda        - Use llama-cpp-python with CUDA for NVIDIA GPUs"
     exit 1
 fi
 
@@ -49,6 +50,8 @@ elif [ "$BACKEND" = "vulkan" ]; then
     VENV_DIR="venv_vulkan"
 elif [ "$BACKEND" = "vulkan-nvidia" ]; then
     VENV_DIR="venv_vulkan_nvidia"
+elif [ "$BACKEND" = "cuda" ]; then
+    VENV_DIR="venv_cuda"
 fi
 
 # Create virtual environment if it doesn't exist
@@ -86,7 +89,7 @@ if [ "$BACKEND" = "nvidia" ]; then
     echo -e "${GREEN}========================================${NC}"
     echo ""
     echo "Usage:"
-    echo "  source venv/bin/activate"
+    echo "  source $VENV_DIR/bin/activate"
     echo "  python coderai --model <huggingface-model-name>"
     echo ""
     echo "Example:"
@@ -187,6 +190,53 @@ elif [ "$BACKEND" = "vulkan-nvidia" ]; then
     echo ""
     echo "Note: This build includes both AMD and NVIDIA Vulkan support."
     echo "      At runtime, use VK_ICD_FILENAMES to select only NVIDIA."
+    echo ""
+ 
+elif [ "$BACKEND" = "cuda" ]; then
+    # llama-cpp-python with CUDA backend (NVIDIA only)
+    echo -e "${YELLOW}Installing llama-cpp-python with CUDA support...${NC}"
+    
+    # Check for CUDA toolkit
+    if ! command -v nvcc &> /dev/null; then
+        echo -e "${YELLOW}Warning: CUDA toolkit (nvcc) not found in PATH${NC}"
+        echo -e "${YELLOW}You may need to install CUDA toolkit:${NC}"
+        echo "  Download from: https://developer.nvidia.com/cuda-downloads"
+    else
+        CUDA_VERSION=$(nvcc --version | grep "release" | sed -n 's/.*release \([0-9.]*\),.*/\1/p')
+        echo -e "${GREEN}✓ Found CUDA $CUDA_VERSION${NC}"
+    fi
+    
+    # Check for CUDA libraries
+    if [ -d "/usr/local/cuda" ]; then
+        echo -e "${GREEN}✓ Found CUDA at /usr/local/cuda${NC}"
+    fi
+    
+    # Build llama-cpp-python with CUDA support
+    echo -e "${YELLOW}Building llama-cpp-python with CUDA support...${NC}"
+    echo -e "${YELLOW}This may take several minutes...${NC}"
+    CMAKE_ARGS="-DGGML_CUDA=ON" pip install --upgrade llama-cpp-python --no-cache-dir || {
+        echo ""
+        echo -e "${RED}Build failed!${NC}"
+        echo -e "${YELLOW}Make sure CUDA toolkit is installed:${NC}"
+        echo "  sudo apt install cuda-toolkit-12"
+        echo "  or"
+        echo "  Download from: https://developer.nvidia.com/cuda-downloads"
+        exit 1
+    }
+    
+    echo -e "${YELLOW}Installing Vulkan-specific requirements...${NC}"
+    pip install -r requirements-vulkan.txt
+    
+    echo ""
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}  llama-cpp-python CUDA build complete!${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo ""
+    echo "Usage:"
+    echo "  source $VENV_DIR/bin/activate"
+    echo "  python coderai --model <gguf-model> --backend vulkan --vulkan-device 0"
+    echo ""
+    echo "Note: With CUDA backend, llama-cpp-python will only use NVIDIA GPUs."
     echo ""
 fi
 
