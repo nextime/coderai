@@ -3543,8 +3543,11 @@ def main():
             'ctx': args.audio_ctx,
             'offload': args.audio_offload,
         })
-        # Pre-load audio model at startup if using loadall or loadswap mode
-        if load_mode in ("loadall", "loadswap"):
+        # Pre-load audio model at startup if:
+        # - Using loadall or loadswap mode, OR
+        # - No main model is specified (only audio model configured)
+        should_preload = load_mode in ("loadall", "loadswap") or (model_name is None and args.audio_model)
+        if should_preload:
             print(f"Pre-loading audio model...")
             try:
                 from faster_whisper import WhisperModel
@@ -3616,6 +3619,11 @@ def main():
     if args.tts_model:
         print(f"\nText-to-speech model: {args.tts_model}")
         multi_model_manager.set_tts_model(args.tts_model, {})
+        
+        # Pre-load TTS model if it's the only model configured
+        if model_name is None and not args.audio_model and not args.image_model:
+            print(f"Pre-loading TTS model...")
+            # TTS models load on-demand, but we can pre-download if needed
     
     # Set up image model if specified
     if args.image_model:
@@ -3624,6 +3632,10 @@ def main():
             'ctx': args.vision_ctx,
             'offload': args.vision_offload,
         })
+        
+        # Pre-load image model if it's the only model configured
+        if model_name is None and not args.audio_model and not args.tts_model:
+            print(f"Pre-loading image model...")
     
     
     # Start the server
