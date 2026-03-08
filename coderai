@@ -14,6 +14,7 @@ import sys
 import time
 import uuid
 import warnings
+import requests
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Dict, List, Optional, Union
@@ -1256,8 +1257,10 @@ class VulkanBackend(ModelBackend):
         """Load a GGUF model using llama-cpp-python."""
         from llama_cpp import Llama
         
-        # model_name should be a path to a .gguf file or a HuggingFace model ID
-        # that will be resolved to a GGUF file
+        # model_name can be:
+        # - Local file path to .gguf
+        # - HuggingFace model ID (e.g., "microsoft/Phi-3-mini-4k-instruct-gguf")
+        # - Full URL to a GGUF file
         
         n_gpu_layers = kwargs.get('n_gpu_layers', -1)
         n_ctx = kwargs.get('n_ctx', 2048)
@@ -1265,8 +1268,51 @@ class VulkanBackend(ModelBackend):
         main_gpu = kwargs.get('main_gpu', 0)
         self.main_gpu = main_gpu
         
+        # Check if model_name is a URL - download it
+        model_path = None
+        if model_name.startswith('http://') or model_name.startswith('https://'):
+            print(f"Downloading model from URL: {model_name}")
+            try:
+                import requests
+                from huggingface_hub import hf_hub_download
+                import tempfile
+                import os
+                
+                # Extract filename from URL
+                url_path = model_name.split('?')[0]  # Remove query params
+                filename = os.path.basename(url_path)
+                
+                if not filename.endswith('.gguf'):
+                    filename = "model.gguf"
+                
+                # Download to temp file
+                response = requests.get(model_name, stream=True)
+                response.raise_for_status()
+                
+                temp_dir = tempfile.gettempdir()
+                model_path = os.path.join(temp_dir, filename)
+                
+                total_size = int(response.headers.get('content-length', 0))
+                downloaded = 0
+                
+                with open(model_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192*1024):  # 8MB chunks
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total_size > 0:
+                                percent = (downloaded / total_size) * 100
+                                print(f"Downloaded: {percent:.1f}%", end='\r')
+                
+                print(f"\nDownloaded to: {model_path}")
+                print(f"File size: {os.path.getsize(model_path) / 1e9:.2f} GB")
+                
+            except Exception as e:
+                print(f"Error downloading model: {e}")
+                raise
+        
         # Check if model_name is a local file
-        if os.path.isfile(model_name):
+        elif os.path.isfile(model_name):
             model_path = model_name
             print(f"Loading local GGUF model: {model_path}")
         else:
@@ -2219,6 +2265,49 @@ async def create_transcription(
         
         if whisper_model is None:
             print(f"Loading faster-whisper model: {model_to_use}")
+            
+            # Check if model_to_use is a URL - download it
+            model_path = None
+            if model_to_use.startswith('http://') or model_to_use.startswith('https://'):
+                print(f"Downloading model from URL: {model_to_use}")
+                try:
+                    import requests
+                    import tempfile
+                    import os
+                    
+                    # Extract filename from URL
+                    url_path = model_to_use.split('?')[0]
+                    filename = os.path.basename(url_path)
+                    
+                    if not filename.endswith('.bin') and not filename.endswith('.ggml'):
+                        filename = "whisper-model.bin"
+                    
+                    # Download to temp file
+                    response = requests.get(model_to_use, stream=True)
+                    response.raise_for_status()
+                    
+                    temp_dir = tempfile.gettempdir()
+                    model_path = os.path.join(temp_dir, filename)
+                    
+                    total_size = int(response.headers.get('content-length', 0))
+                    downloaded = 0
+                    
+                    with open(model_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192*1024):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                if total_size > 0:
+                                    percent = (downloaded / total_size) * 100
+                                    print(f"Downloaded: {percent:.1f}%", end='\r')
+                    
+                    print(f"\nDownloaded to: {model_path}")
+                    model_to_use = model_path
+                    
+                except Exception as e:
+                    print(f"Error downloading model: {e}")
+                    raise
+            
             whisper_model = WhisperModel(
                 model_to_use,
                 device="cuda" if torch.cuda.is_available() else "cpu",
