@@ -443,19 +443,28 @@ class ToolCallParser:
         if not text:
             return text
         
-        # Remove <tool>...</tool> and <function>...</function> patterns (including JSON content)
+        # Use greedy matching with re.DOTALL to match across newlines and handle nested content
+        # Remove <tool>...</tool> and <function>...</function> patterns
         text = re.sub(r'<tool>.*?</tool>', '', text, flags=re.DOTALL)
         text = re.sub(r'<function>.*?</function>', '', text, flags=re.DOTALL)
         
-        # Also remove JSON format: <tool>{"name":"exec",...}</tool>
-        # This regex matches <tool> followed by JSON until </tool>
+        # Also remove JSON format with greedy matching: <tool>{...}</tool>
+        # Use greedy .* to match the entire JSON object including nested braces
         text = re.sub(r'<tool>\{.*?\}</tool>', '', text, flags=re.DOTALL)
         text = re.sub(r'<function>\{.*?\}</function>', '', text, flags=re.DOTALL)
         
+        # More aggressive pattern: match <tool> followed by anything until </tool>
+        # This handles cases where JSON might be split or malformed
+        text = re.sub(r'<tool>[\s\S]*?</tool>', '', text)
+        text = re.sub(r'<function>[\s\S]*?</function>', '', text)
+        
         # Also remove common tool name tags like <read>...</read>, <exec>...</exec>
         for tool_name in ['read', 'write', 'exec', 'browser', 'message', 'web_search', 'web_fetch', 
-                         'memory_search', 'memory_get', 'sessions_list', 'sessions_send', 'tts', 'canvas', 'nodes']:
-            text = re.sub(rf'<{tool_name}>.*?</{tool_name}>', '', text, flags=re.DOTALL)
+                         'memory_search', 'memory_get', 'sessions_list', 'sessions_send', 'tts', 'canvas', 'nodes',
+                         'read_file', 'write_file', 'exec', 'process', 'browser', 'message', 'web_search', 'web_fetch',
+                         'tts', 'canvas', 'nodes', 'agents_list', 'sessions_list', 'sessions_history', 'sessions_spawn',
+                         'subagents', 'session_status', 'memory_search', 'memory_get']:
+            text = re.sub(rf'<{tool_name}>[\s\S]*?</{tool_name}>', '', text)
         
         # Clean up excessive newlines left from removal
         text = re.sub(r'\n{3,}', '\n\n', text)
@@ -1397,6 +1406,7 @@ class VulkanBackend(ModelBackend):
         for msg in messages:
             chat_msg = {"role": msg.role}
             # CRITICAL: Ensure content is never None - Jinja templates fail on None
+            # Also ensure content key exists
             if msg.content is not None:
                 chat_msg["content"] = msg.content
             else:
@@ -1577,6 +1587,7 @@ class VulkanBackend(ModelBackend):
         for msg in messages:
             role = msg.get("role", "")
             # CRITICAL: Ensure content is never None - Jinja templates fail on None
+            # Also ensure content key exists
             content = msg.get("content")
             if content is None:
                 content = ""
@@ -2445,8 +2456,12 @@ async def chat_completions(request: ChatCompletionRequest):
         messages_dict.append(msg_dict)
     
     # Final safety check: ensure NO message has None content before passing to llama_cpp
+    # Also ensure content key always exists (not just None check)
     for i, m in enumerate(messages_dict):
         if m.get("content") is None:
+            messages_dict[i]["content"] = ""
+        # Also handle missing content key entirely
+        if "content" not in messages_dict[i]:
             messages_dict[i]["content"] = ""
     
     # Debug: print first few messages to see their structure
