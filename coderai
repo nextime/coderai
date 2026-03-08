@@ -3683,11 +3683,13 @@ def main():
                     
                 except Exception as e:
                     print(f"Warning: Could not pre-load audio model: {e}")
+                    print("Audio model will load on-demand when transcription is requested.")
                     import traceback
                     traceback.print_exc()
             
             except Exception as e:
                 print(f"Warning: Could not pre-load audio model: {e}")
+                print("Audio model will load on-demand when transcription is requested.")
     
     # Set up TTS model if specified
     if args.tts_model:
