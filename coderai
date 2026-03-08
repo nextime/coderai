@@ -57,6 +57,69 @@ def get_cached_model_path(url: str) -> Optional[str]:
     return None
 
 
+def download_model(url: str, cache_dir: str) -> str:
+    """Download a model from URL with progress reporting. Returns cached path."""
+    import requests
+    import hashlib
+    
+    url_path = url.split('?')[0]
+    filename = os.path.basename(url_path)
+    
+    # Determine file extension
+    if 'gguf' in url.lower():
+        ext = '.gguf'
+    elif 'bin' in url.lower():
+        ext = '.bin'
+    elif 'ggml' in url.lower():
+        ext = '.ggml'
+    else:
+        ext = '.bin'
+    
+    if not filename.endswith(ext):
+        filename = f"model{ext}"
+    
+    # Create safe filename in cache
+    url_hash = hashlib.sha256(url.encode()).hexdigest()
+    cached_filename = f"{url_hash}_{filename}"
+    model_path = os.path.join(cache_dir, cached_filename)
+    
+    # Check if already cached
+    if os.path.exists(model_path):
+        print(f"Using cached model: {model_path}")
+        return model_path
+    
+    # Download
+    print(f"Downloading model: {url}")
+    response = requests.get(url, stream=True)
+    response.raise_for_status()
+    
+    total_size = int(response.headers.get('content-length', 0))
+    total_mb = total_size / (1024 * 1024) if total_size > 0 else 0
+    
+    downloaded = 0
+    start_time = time.time()
+    
+    with open(model_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8192*1024):
+            if chunk:
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total_size > 0:
+                    percent = (downloaded / total_size) * 100
+                    elapsed = time.time() - start_time
+                    speed = downloaded / elapsed if elapsed > 0 else 0
+                    speed_mb = speed / (1024 * 1024)
+                    dl_mb = downloaded / (1024 * 1024)
+                    print(f"Downloaded: {percent:.1f}% ({dl_mb:.1f}/{total_mb:.1f} MB) at {speed_mb:.1f} MB/s", end='\r')
+    
+    print()  # New line after progress
+    print(f"Downloaded and cached to: {model_path}")
+    if total_mb > 0:
+        print(f"File size: {total_mb:.1f} MB")
+    
+    return model_path
+
+
 # =============================================================================
 # Backend Detection and Imports
 # =============================================================================
