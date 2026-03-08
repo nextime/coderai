@@ -282,6 +282,7 @@ class ToolCallParser:
         text = self._filter_malformed_content(text)
         
         tool_calls = []
+        seen_signatures = set()  # Track seen tool calls to avoid duplicates
         
         # Look for function calls in various formats
         # Format 1: <tool> or <function> tags with JSON content
@@ -293,14 +294,18 @@ class ToolCallParser:
             try:
                 tool_data = json.loads(match.strip())
                 if 'name' in tool_data and 'arguments' in tool_data:
-                    tool_calls.append({
-                        "id": f"call_{uuid.uuid4().hex[:16]}",
-                        "type": "function",
-                        "function": {
-                            "name": tool_data["name"],
-                            "arguments": json.dumps(tool_data["arguments"])
-                        }
-                    })
+                    # Create a signature to detect duplicates
+                    sig = (tool_data['name'], json.dumps(tool_data['arguments'], sort_keys=True))
+                    if sig not in seen_signatures:
+                        seen_signatures.add(sig)
+                        tool_calls.append({
+                            "id": f"call_{uuid.uuid4().hex[:16]}",
+                            "type": "function",
+                            "function": {
+                                "name": tool_data["name"],
+                                "arguments": json.dumps(tool_data["arguments"])
+                            }
+                        })
                     continue
             except json.JSONDecodeError:
                 pass
@@ -309,14 +314,18 @@ class ToolCallParser:
             try:
                 tool_data = self._parse_nested_xml_tool(match)
                 if tool_data and 'name' in tool_data and 'arguments' in tool_data:
-                    tool_calls.append({
-                        "id": f"call_{uuid.uuid4().hex[:16]}",
-                        "type": "function",
-                        "function": {
-                            "name": tool_data["name"],
-                            "arguments": json.dumps(tool_data["arguments"]) if isinstance(tool_data["arguments"], dict) else str(tool_data["arguments"])
-                        }
-                    })
+                    args_str = json.dumps(tool_data["arguments"]) if isinstance(tool_data["arguments"], dict) else str(tool_data["arguments"])
+                    sig = (tool_data['name'], args_str)
+                    if sig not in seen_signatures:
+                        seen_signatures.add(sig)
+                        tool_calls.append({
+                            "id": f"call_{uuid.uuid4().hex[:16]}",
+                            "type": "function",
+                            "function": {
+                                "name": tool_data["name"],
+                                "arguments": args_str
+                            }
+                        })
             except Exception:
                 pass
         
@@ -328,14 +337,17 @@ class ToolCallParser:
                     data = json.loads(json_match.group())
                     if "function_call" in data:
                         fc = data["function_call"]
-                        tool_calls.append({
-                            "id": f"call_{uuid.uuid4().hex[:16]}",
-                            "type": "function",
-                            "function": {
-                                "name": fc.get("name", ""),
-                                "arguments": fc.get("arguments", "{}")
-                            }
-                        })
+                        sig = (fc.get("name", ""), fc.get("arguments", "{}"))
+                        if sig not in seen_signatures:
+                            seen_signatures.add(sig)
+                            tool_calls.append({
+                                "id": f"call_{uuid.uuid4().hex[:16]}",
+                                "type": "function",
+                                "function": {
+                                    "name": fc.get("name", ""),
+                                    "arguments": fc.get("arguments", "{}")
+                                }
+                            })
         except (json.JSONDecodeError, AttributeError):
             pass
         
@@ -347,26 +359,51 @@ class ToolCallParser:
             for match in matches:
                 try:
                     args = json.loads(match.strip())
-                    tool_calls.append({
-                        "id": f"call_{uuid.uuid4().hex[:16]}",
-                        "type": "function",
-                        "function": {
-                            "name": tool_name,
-                            "arguments": json.dumps(args)
-                        }
-                    })
+                    sig = (tool_name, json.dumps(args, sort_keys=True))
+                    if sig not in seen_signatures:
+                        seen_signatures.add(sig)
+                        tool_calls.append({
+                            "id": f"call_{uuid.uuid4().hex[:16]}",
+                            "type": "function",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": json.dumps(args)
+                            }
+                        })
                 except json.JSONDecodeError:
                     # Try to use the raw text as arguments
-                    tool_calls.append({
-                        "id": f"call_{uuid.uuid4().hex[:16]}",
-                        "type": "function",
-                        "function": {
-                            "name": tool_name,
-                            "arguments": match.strip()
-                        }
-                    })
+                    sig = (tool_name, match.strip())
+                    if sig not in seen_signatures:
+                        seen_signatures.add(sig)
+                        tool_calls.append({
+                            "id": f"call_{uuid.uuid4().hex[:16]}",
+                            "type": "function",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": match.strip()
+                            }
+                        })
         
         return tool_calls if tool_calls else None
+
+    def strip_tool_calls_from_content(self, text: str) -> str:
+        """Remove tool call format from text after extracting tool calls."""
+        if not text:
+            return text
+        
+        # Remove <tool>...</tool> and <function>...</function> patterns
+        text = re.sub(r'<tool>.*?</tool>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<function>.*?</function>', '', text, flags=re.DOTALL)
+        
+        # Also remove common tool name tags like <read>...</read>, <exec>...</exec>
+        for tool_name in ['read', 'write', 'exec', 'browser', 'message', 'web_search', 'web_fetch', 
+                         'memory_search', 'memory_get', 'sessions_list', 'sessions_send', 'tts', 'canvas', 'nodes']:
+            text = re.sub(rf'<{tool_name}>.*?</{tool_name}>', '', text, flags=re.DOTALL)
+        
+        # Clean up excessive newlines left from removal
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        return text.strip()
 
 
 def format_tools_for_prompt(tools: List[Tool], messages: List[ChatMessage]) -> List[ChatMessage]:
@@ -1391,6 +1428,7 @@ class VulkanBackend(ModelBackend):
         
         total_content = ""
         chunk_count = 0
+        has_tools = tools is not None  # Track if tools are available
         
         # Check if we should use manual formatting based on detected template
         # Always use manual formatting when tools are present, since Jinja templates often fail with tool messages
@@ -1950,6 +1988,11 @@ async def stream_chat_response(
             chunk_count += 1
             # Filter malformed content from each chunk
             filtered_chunk = filter_malformed_content(chunk)
+            
+            # Also filter out tool call format from content when tools are available
+            if tools:
+                filtered_chunk = model_manager.tool_parser.strip_tool_calls_from_content(filtered_chunk)
+            
             if not filtered_chunk:
                 print(f"DEBUG: filtered_chunk was empty (original chunk: {repr(chunk[:50])})")
                 continue
@@ -1975,7 +2018,7 @@ async def stream_chat_response(
         if not generated_text.strip():
             print(f"DEBUG: Warning - no content generated!")
         
-        # Check for tool calls in complete output
+        # Check for tool calls in complete output (for API response format)
         if tools:
             # Convert tools back to Tool objects for parsing
             from typing import cast
@@ -1989,6 +2032,8 @@ async def stream_chat_response(
                 tool_objects.append(Tool(type=t.get("type", "function"), function=tool_func))
             tool_calls = model_manager.tool_parser.extract_tool_calls(generated_text, tool_objects)
             if tool_calls:
+                # Tool calls were extracted and stripped from content during streaming
+                # Just send the tool_calls chunk
                 data = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
@@ -2071,8 +2116,10 @@ async def generate_chat_response(
                 tool_objects.append(Tool(type=t.get("type", "function"), function=tool_func))
             tool_calls = model_manager.tool_parser.extract_tool_calls(generated_text, tool_objects)
             if tool_calls:
+                # Strip tool call format from content so user doesn't see raw tags
+                clean_content = model_manager.tool_parser.strip_tool_calls_from_content(generated_text)
+                response_message["content"] = clean_content if clean_content.strip() else None
                 response_message["tool_calls"] = tool_calls
-                response_message["content"] = None
                 finish_reason = "tool_calls"
         
         # Calculate token counts - rough estimate since we don't have direct access to tokenizer
