@@ -3485,16 +3485,65 @@ def main():
                     print(f"    coderai --backend vulkan --model {model_name}")
             sys.exit(1)
     else:
-        print("\nNo main text model specified (--model). Running with audio/image models only.")
+        print("\nNo main text model specified (--model). Running with audio/image/TTS models only.")
     
-    # Set up audio model if specified
+    # Determine load mode BEFORE setting up other models
+    load_mode = "ondemand"
+    if args.loadall:
+        load_mode = "loadall"
+    elif args.loadswap:
+        load_mode = "loadswap"
+    
+    # Set load mode in multi_model_manager
+    multi_model_manager.set_load_mode(load_mode)
+    
+    # Pre-load models based on mode
+    if load_mode == "loadall":
+        # Load all models into VRAM up to full capacity, then offload to CPU RAM
+        print("\n=== Load All Mode ===")
+        
+        # Load main text model first
+        if model_name:
+            print(f"Pre-loading main text model: {model_name}")
+        
+        # Load image model
+        if args.image_model:
+            print(f"Pre-loading image model: {args.image_model}")
+            print(f"  Image model will load on first request")
+        
+        # Load audio model
+        if args.audio_model:
+            print(f"Pre-loading audio model: {args.audio_model}")
+        
+        # Load TTS model
+        if args.tts_model:
+            print(f"Pre-loading TTS model: {args.tts_model}")
+            
+    elif load_mode == "loadswap":
+        # Load models in order: model > image > audio > TTS, keep active in VRAM
+        print("\n=== Load Swap Mode ===")
+        if model_name:
+            print(f"Main text model will be in VRAM: {model_name}")
+        if args.image_model:
+            print(f"Image model in RAM: {args.image_model}")
+        if args.audio_model:
+            print(f"Audio model in RAM: {args.audio_model}")
+        if args.tts_model:
+            print(f"TTS model in RAM: {args.tts_model}")
+        
+    else:
+        # No flags: only one model gets loaded (the main text model if specified)
+        print("\n=== On-Demand Mode ===")
+        print("Models will load on first request")
+    
+    # Set up audio model if specified (with pre-loading if in loadall/loadswap mode)
     if args.audio_model:
         print(f"\nAudio transcription model: {args.audio_model}")
         multi_model_manager.set_audio_model(args.audio_model, {
             'ctx': args.audio_ctx,
             'offload': args.audio_offload,
         })
-        # Pre-load audio model at startup
+        # Pre-load audio model at startup if using loadall or loadswap mode
         if load_mode in ("loadall", "loadswap"):
             print(f"Pre-loading audio model...")
             try:
@@ -3576,17 +3625,6 @@ def main():
             'offload': args.vision_offload,
         })
     
-    # Determine load mode
-    load_mode = "ondemand"
-    if args.loadall:
-        load_mode = "loadall"
-    elif args.loadswap:
-        load_mode = "loadswap"
-    
-    # Set load mode in multi_model_manager
-    multi_model_manager.set_load_mode(load_mode)
-    
-    # If --loadall or --loadswap, pre-load all models
     
     # Start the server
     import uvicorn
