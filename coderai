@@ -3677,6 +3677,8 @@ def main():
                 
             except Exception as e:
                 print(f"Warning: Could not pre-load audio model: {e}")
+                import traceback
+                traceback.print_exc()
     
     # Set up TTS model if specified
     if args.tts_model:
