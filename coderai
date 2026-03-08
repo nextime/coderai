@@ -7,8 +7,10 @@ streaming, and tool calling.
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
+import pathlib
 import re
 import sys
 import time
@@ -25,6 +27,34 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, validator, field_validator, ConfigDict
 from pydantic_core import PydanticCustomError
 from threading import Thread
+
+
+# =============================================================================
+# Model Cache Directory
+# =============================================================================
+
+def get_model_cache_dir() -> str:
+    """Get or create the model cache directory."""
+    # Use XDG_CACHE_HOME if set, otherwise use ~/.cache/coderai
+    cache_home = os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache'))
+    cache_dir = os.path.join(cache_home, 'coderai', 'models')
+    pathlib.Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+def get_cached_model_path(url: str) -> Optional[str]:
+    """Check if a model URL is already cached. Returns path if cached, None otherwise."""
+    cache_dir = get_model_cache_dir()
+    # Create a safe filename from the URL using SHA-256 hash
+    url_hash = hashlib.sha256(url.encode()).hexdigest()
+    url_path = url.split('?')[0]  # Remove query params
+    ext = os.path.splitext(url_path)[1] or '.gguf'
+    cached_filename = f"{url_hash}{ext}"
+    cached_path = os.path.join(cache_dir, cached_filename)
+    
+    if os.path.exists(cached_path):
+        print(f"Using cached model: {cached_path}")
+        return cached_path
+    return None
 
 
 # =============================================================================
@@ -1268,48 +1298,59 @@ class VulkanBackend(ModelBackend):
         main_gpu = kwargs.get('main_gpu', 0)
         self.main_gpu = main_gpu
         
-        # Check if model_name is a URL - download it
+        # Check if model_name is a URL - download it (with caching)
         model_path = None
         if model_name.startswith('http://') or model_name.startswith('https://'):
-            print(f"Downloading model from URL: {model_name}")
-            try:
-                import requests
-                from huggingface_hub import hf_hub_download
-                import tempfile
-                import os
-                
-                # Extract filename from URL
-                url_path = model_name.split('?')[0]  # Remove query params
-                filename = os.path.basename(url_path)
-                
-                if not filename.endswith('.gguf'):
-                    filename = "model.gguf"
-                
-                # Download to temp file
-                response = requests.get(model_name, stream=True)
-                response.raise_for_status()
-                
-                temp_dir = tempfile.gettempdir()
-                model_path = os.path.join(temp_dir, filename)
-                
-                total_size = int(response.headers.get('content-length', 0))
-                downloaded = 0
-                
-                with open(model_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192*1024):  # 8MB chunks
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            if total_size > 0:
-                                percent = (downloaded / total_size) * 100
-                                print(f"Downloaded: {percent:.1f}%", end='\r')
-                
-                print(f"\nDownloaded to: {model_path}")
-                print(f"File size: {os.path.getsize(model_path) / 1e9:.2f} GB")
-                
-            except Exception as e:
-                print(f"Error downloading model: {e}")
-                raise
+            # Check cache first
+            cached_path = get_cached_model_path(model_name)
+            if cached_path:
+                model_path = cached_path
+                print(f"Using cached model: {model_path}")
+            else:
+                print(f"Downloading model from URL: {model_name}")
+                try:
+                    import requests
+                    from huggingface_hub import hf_hub_download
+                    import tempfile
+                    import hashlib
+                    
+                    # Get cache directory
+                    cache_dir = get_model_cache_dir()
+                    
+                    # Extract filename from URL
+                    url_path = model_name.split('?')[0]  # Remove query params
+                    filename = os.path.basename(url_path)
+                    
+                    if not filename.endswith('.gguf'):
+                        filename = "model.gguf"
+                    
+                    # Create safe filename in cache (use hash to avoid special char issues)
+                    url_hash = hashlib.sha256(model_name.encode()).hexdigest()
+                    cached_filename = f"{url_hash}_{filename}"
+                    model_path = os.path.join(cache_dir, cached_filename)
+                    
+                    # Download to cache
+                    response = requests.get(model_name, stream=True)
+                    response.raise_for_status()
+                    
+                    total_size = int(response.headers.get('content-length', 0))
+                    downloaded = 0
+                    
+                    with open(model_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192*1024):  # 8MB chunks
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                if total_size > 0:
+                                    percent = (downloaded / total_size) * 100
+                                    print(f"Downloaded: {percent:.1f}%", end='\r')
+                    
+                    print(f"\nDownloaded and cached to: {model_path}")
+                    print(f"File size: {os.path.getsize(model_path) / 1e9:.2f} GB")
+                    
+                except Exception as e:
+                    print(f"Error downloading model: {e}")
+                    raise
         
         # Check if model_name is a local file
         elif os.path.isfile(model_name):
@@ -1856,6 +1897,7 @@ class MultiModelManager:
         self.models: Dict[str, ModelManager] = {}
         self.default_model: Optional[str] = None
         self.audio_model: Optional[str] = None
+        self.tts_model: Optional[str] = None
         self.image_model: Optional[str] = None
         self.tool_parser = ToolCallParser()
         self.current_model_key: Optional[str] = None
@@ -1878,6 +1920,11 @@ class MultiModelManager:
         """Set the audio transcription model."""
         self.audio_model = model_name
         self.config[f"audio:{model_name}"] = config or {}
+    
+    def set_tts_model(self, model_name: str, config: Dict = None):
+        """Set the text-to-speech model."""
+        self.tts_model = model_name
+        self.config[f"tts:{model_name}"] = config or {}
     
     def set_image_model(self, model_name: str, config: Dict = None):
         """Set the image generation model."""
@@ -1910,6 +1957,18 @@ class MultiModelManager:
             elif self.audio_model:
                 # Try loading audio model on demand
                 key = f"audio:{self.audio_model}"
+                return None  # Signal that we need to load
+            return None
+        
+        if requested_model.startswith("tts:"):
+            tts_name = requested_model[4:]  # Remove "tts:" prefix
+            key = f"tts:{tts_name}"
+            if key in self.models:
+                self.current_model_key = key
+                return self.models[key]
+            elif self.tts_model:
+                # Try loading TTS model on demand
+                key = f"tts:{self.tts_model}"
                 return None  # Signal that we need to load
             return None
         
@@ -1973,6 +2032,11 @@ class MultiModelManager:
         if self.audio_model:
             audio_id = f"audio:{self.audio_model}"
             models.append(ModelInfo(id=audio_id))
+        
+        # Add TTS models
+        if self.tts_model:
+            tts_id = f"tts:{self.tts_model}"
+            models.append(ModelInfo(id=tts_id))
         
         # Add image models
         if self.image_model:
@@ -2266,47 +2330,58 @@ async def create_transcription(
         if whisper_model is None:
             print(f"Loading faster-whisper model: {model_to_use}")
             
-            # Check if model_to_use is a URL - download it
+            # Check if model_to_use is a URL - download it (with caching)
             model_path = None
             if model_to_use.startswith('http://') or model_to_use.startswith('https://'):
-                print(f"Downloading model from URL: {model_to_use}")
-                try:
-                    import requests
-                    import tempfile
-                    import os
-                    
-                    # Extract filename from URL
-                    url_path = model_to_use.split('?')[0]
-                    filename = os.path.basename(url_path)
-                    
-                    if not filename.endswith('.bin') and not filename.endswith('.ggml'):
-                        filename = "whisper-model.bin"
-                    
-                    # Download to temp file
-                    response = requests.get(model_to_use, stream=True)
-                    response.raise_for_status()
-                    
-                    temp_dir = tempfile.gettempdir()
-                    model_path = os.path.join(temp_dir, filename)
-                    
-                    total_size = int(response.headers.get('content-length', 0))
-                    downloaded = 0
-                    
-                    with open(model_path, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192*1024):
-                            if chunk:
-                                f.write(chunk)
-                                downloaded += len(chunk)
-                                if total_size > 0:
-                                    percent = (downloaded / total_size) * 100
-                                    print(f"Downloaded: {percent:.1f}%", end='\r')
-                    
-                    print(f"\nDownloaded to: {model_path}")
-                    model_to_use = model_path
-                    
-                except Exception as e:
-                    print(f"Error downloading model: {e}")
-                    raise
+                # Check cache first
+                cached_path = get_cached_model_path(model_to_use)
+                if cached_path:
+                    model_to_use = cached_path
+                    print(f"Using cached model: {model_to_use}")
+                else:
+                    print(f"Downloading model from URL: {model_to_use}")
+                    try:
+                        import requests
+                        import tempfile
+                        import hashlib
+                        
+                        # Get cache directory
+                        cache_dir = get_model_cache_dir()
+                        
+                        # Extract filename from URL
+                        url_path = model_to_use.split('?')[0]
+                        filename = os.path.basename(url_path)
+                        
+                        if not filename.endswith('.bin') and not filename.endswith('.ggml'):
+                            filename = "whisper-model.bin"
+                        
+                        # Create safe filename in cache
+                        url_hash = hashlib.sha256(model_to_use.encode()).hexdigest()
+                        cached_filename = f"{url_hash}_{filename}"
+                        model_path = os.path.join(cache_dir, cached_filename)
+                        
+                        # Download to cache
+                        response = requests.get(model_to_use, stream=True)
+                        response.raise_for_status()
+                        
+                        total_size = int(response.headers.get('content-length', 0))
+                        downloaded = 0
+                        
+                        with open(model_path, 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=8192*1024):
+                                if chunk:
+                                    f.write(chunk)
+                                    downloaded += len(chunk)
+                                    if total_size > 0:
+                                        percent = (downloaded / total_size) * 100
+                                        print(f"Downloaded: {percent:.1f}%", end='\r')
+                        
+                        print(f"\nDownloaded and cached to: {model_path}")
+                        model_to_use = model_path
+                        
+                    except Exception as e:
+                        print(f"Error downloading model: {e}")
+                        raise
             
             whisper_model = WhisperModel(
                 model_to_use,
@@ -2318,7 +2393,6 @@ async def create_transcription(
         
         # Write to temp file
         import tempfile
-        import os
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{file.filename}") as tmp:
             tmp.write(file_content)
@@ -2488,6 +2562,143 @@ async def create_image_generation(request: ImageGenerationRequest):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Image generation error: {str(e)}")
+
+
+# =============================================================================
+# Text-to-Speech Endpoint
+# =============================================================================
+
+class TTSRequest(BaseModel):
+    model: str
+    input: str
+    voice: Optional[str] = "af_sarah"
+    response_format: Optional[str] = "mp3"
+    speed: Optional[float] = 1.0
+    
+    model_config = ConfigDict(extra="allow")
+
+
+class TTSResponse(BaseModel):
+    audio: str  # base64 encoded audio
+    model_config = ConfigDict(extra="allow")
+
+
+@app.post("/v1/audio/speech")
+async def create_speech(request: TTSRequest):
+    """
+    Text-to-speech endpoint (OpenAI-compatible).
+    
+    Supports:
+    - Kokoro TTS models (when --tts-model is specified)
+    """
+    tts_model = multi_model_manager.tts_model
+    
+    # If no TTS model configured, return an error
+    if not tts_model:
+        raise HTTPException(
+            status_code=400,
+            detail="TTS not configured. Use --tts-model to specify a model."
+        )
+    
+    # Determine model to use
+    model_to_use = request.model
+    if model_to_use.startswith("tts:"):
+        model_to_use = tts_model
+    
+    # Try to use kokoro if available
+    try:
+        from kokoro import Kokoro
+        
+        # Determine model key
+        model_key = f"tts:{model_to_use}"
+        kokoro_model = multi_model_manager.get_model(model_key)
+        
+        if kokoro_model is None:
+            print(f"Loading Kokoro TTS model: {model_to_use}")
+            
+            # Check if model_to_use is a URL - download it (with caching)
+            model_path = None
+            if model_to_use.startswith('http://') or model_to_use.startswith('https://'):
+                # Check cache first
+                cached_path = get_cached_model_path(model_to_use)
+                if cached_path:
+                    model_path = cached_path
+                    print(f"Using cached model: {model_path}")
+                else:
+                    print(f"Downloading model from URL: {model_to_use}")
+                    try:
+                        import requests
+                        import hashlib
+                        
+                        # Get cache directory
+                        cache_dir = get_model_cache_dir()
+                        
+                        # Extract filename from URL
+                        url_path = model_to_use.split('?')[0]
+                        filename = os.path.basename(url_path)
+                        
+                        if not filename.endswith('.pt') and not filename.endswith('.bin'):
+                            filename = "kokoro-model.pt"
+                        
+                        # Create safe filename in cache
+                        url_hash = hashlib.sha256(model_to_use.encode()).hexdigest()
+                        cached_filename = f"{url_hash}_{filename}"
+                        model_path = os.path.join(cache_dir, cached_filename)
+                        
+                        # Download to cache
+                        response = requests.get(model_to_use, stream=True)
+                        response.raise_for_status()
+                        
+                        total_size = int(response.headers.get('content-length', 0))
+                        downloaded = 0
+                        
+                        with open(model_path, 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=8192*1024):
+                                if chunk:
+                                    f.write(chunk)
+                                    downloaded += len(chunk)
+                                    if total_size > 0:
+                                        percent = (downloaded / total_size) * 100
+                                        print(f"Downloaded: {percent:.1f}%", end='\r')
+                        
+                        print(f"\nDownloaded and cached to: {model_path}")
+                        
+                    except Exception as e:
+                        print(f"Error downloading model: {e}")
+                        raise
+            else:
+                # Use local path or model name
+                model_path = model_to_use
+            
+            # Load the Kokoro model
+            kokoro_model = Kokoro(model_path if model_path else model_to_use)
+            multi_model_manager.add_model(model_key, kokoro_model)
+        
+        # Generate speech
+        voice = request.voice or "af_sarah"
+        speed = request.speed or 1.0
+        
+        audio_bytes = kokoro_model.generate(request.input, voice=voice, speed=speed)
+        
+        # Convert to base64
+        import base64
+        audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
+        
+        return {
+            "audio": audio_base64
+        }
+        
+    except ImportError as e:
+        # kokoro not installed
+        raise HTTPException(
+            status_code=501,
+            detail=f"TTS not available. Install kokoro: pip install kokoro. Error: {str(e)}"
+        )
+    except Exception as e:
+        print(f"TTS error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"TTS error: {str(e)}")
 
 
 @app.post("/v1/chat/completions")
@@ -3097,6 +3308,12 @@ def parse_args():
     )
     # Multi-model arguments
     parser.add_argument(
+        "--tts-model",
+        type=str,
+        default=None,
+        help="Model for text-to-speech (e.g., kokoro, or path/URL to Kokoro model)",
+    )
+    parser.add_argument(
         "--audio-model",
         type=str,
         default=None,
@@ -3188,8 +3405,8 @@ def main():
     model_name = args.model
     
     # Validate: must have at least one model specified
-    if model_name is None and args.audio_model is None and args.image_model is None:
-        print("Error: At least one of --model, --audio-model, or --image-model must be specified.")
+    if model_name is None and args.audio_model is None and args.image_model is None and args.tts_model is None:
+        print("Error: At least one of --model, --audio-model, --image-model, or --tts-model must be specified.")
         print("")
         print("For NVIDIA backend (HuggingFace models):")
         print("  - microsoft/DialoGPT-medium")
@@ -3203,6 +3420,9 @@ def main():
         print("")
         print("For audio transcription:")
         print("  - --audio-model base")
+        print("")
+        print("For text-to-speech:")
+        print("  - --tts-model kokoro")
         print("")
         print("For image generation:")
         print("  - --image-model stabilityai/stable-diffusion-xl-base-1.0")
@@ -3274,6 +3494,11 @@ def main():
             'ctx': args.audio_ctx,
             'offload': args.audio_offload,
         })
+    
+    # Set up TTS model if specified
+    if args.tts_model:
+        print(f"\nText-to-speech model: {args.tts_model}")
+        multi_model_manager.set_tts_model(args.tts_model, {})
     
     # Set up image model if specified
     if args.image_model:
