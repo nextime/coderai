@@ -1,6 +1,6 @@
 #!/bin/bash
-# Build script for CoderAI - Supports NVIDIA (CUDA) and Vulkan (AMD GPUs) backends
-# Usage: ./build.sh [nvidia|vulkan]
+# Build script for CoderAI - Supports NVIDIA (CUDA) and Vulkan backends
+# Usage: ./build.sh [nvidia|vulkan|vulkan-nvidia]
 # Default: nvidia
 
 set -e
@@ -16,11 +16,12 @@ NC='\033[0m' # No Color
 BACKEND="${1:-nvidia}"
 BACKEND=$(echo "$BACKEND" | tr '[:upper:]' '[:lower:]')
 
-if [[ "$BACKEND" != "nvidia" && "$BACKEND" != "vulkan" ]]; then
+if [[ "$BACKEND" != "nvidia" && "$BACKEND" != "vulkan" && "$BACKEND" != "vulkan-nvidia" ]]; then
     echo -e "${RED}Error: Invalid backend '$BACKEND'${NC}"
-    echo "Usage: ./build.sh [nvidia|vulkan]"
-    echo "  nvidia  - Use PyTorch with CUDA for NVIDIA GPUs"
-    echo "  vulkan  - Use llama-cpp-python with Vulkan for AMD GPUs"
+    echo "Usage: ./build.sh [nvidia|vulkan|vulkan-nvidia]"
+    echo "  nvidia       - Use PyTorch with CUDA for NVIDIA GPUs"
+    echo "  vulkan       - Use llama-cpp-python with Vulkan for AMD GPUs"
+    echo "  vulkan-nvidia - Use llama-cpp-python with Vulkan for NVIDIA GPU only"
     exit 1
 fi
 
@@ -82,8 +83,8 @@ if [ "$BACKEND" = "nvidia" ]; then
     echo ""
     
 elif [ "$BACKEND" = "vulkan" ]; then
-    # Vulkan backend
-    echo -e "${YELLOW}Installing llama-cpp-python with Vulkan support...${NC}"
+    # Vulkan backend (all GPUs)
+    echo -e "${YELLOW}Installing llama-cpp-python with Vulkan support (all GPUs)...${NC}"
     
     # Check for required Vulkan development libraries
     if ! pkg-config --exists vulkan 2>/dev/null; then
@@ -96,8 +97,7 @@ elif [ "$BACKEND" = "vulkan" ]; then
         echo -e "${YELLOW}Attempting installation anyway...${NC}"
     fi
     
-    # Check for glslc (Vulkan shader compiler) which is required for building
-    # Note: glslc might also be named glslangValidator on some systems
+    # Check for glslc (Vulkan shader compiler)
     GLSLC_CMD=""
     if command -v glslc &> /dev/null; then
         GLSLC_CMD="glslc"
@@ -106,34 +106,15 @@ elif [ "$BACKEND" = "vulkan" ]; then
     fi
     
     if [ -z "$GLSLC_CMD" ]; then
-        echo -e "${YELLOW}Warning: glslc/glslangValidator (Vulkan shader compiler) not found in PATH${NC}"
-        echo -e "${YELLOW}You may need to install the shader compiler:${NC}"
-        echo "  Debian/Ubuntu: sudo apt install glslc glslang-tools glslang-dev"
-        echo "  Fedora:        sudo dnf install glslang"
-        echo "  Arch:          sudo pacman -S glslang"
-        echo ""
-        echo -e "${YELLOW}Attempting build anyway - CMake may find it in a non-standard location...${NC}"
-        echo ""
+        echo -e "${YELLOW}Warning: glslc/glslangValidator not found in PATH${NC}"
     else
         echo -e "${GREEN}✓ Found Vulkan shader compiler: $GLSLC_CMD${NC}"
     fi
     
-    # Install/Upgrade llama-cpp-python with Vulkan support
-    # CMAKE_ARGS is used to enable Vulkan during compilation
-    echo -e "${YELLOW}Building llama-cpp-python with Vulkan support (this may take several minutes)...${NC}"
-    echo -e "${YELLOW}If this fails with 'Could NOT find Vulkan (missing: glslc)', install:${NC}"
-    echo -e "${YELLOW}  sudo apt install glslc glslang-tools glslang-dev${NC}"
-    echo ""
+    # Build with Vulkan support
+    echo -e "${YELLOW}Building llama-cpp-python with Vulkan support...${NC}"
     CMAKE_ARGS="-DGGML_VULKAN=ON" pip install --upgrade llama-cpp-python --no-cache-dir || {
-        echo ""
         echo -e "${RED}Build failed!${NC}"
-        echo -e "${YELLOW}If the error mentions 'missing: glslc', install the shader compiler:${NC}"
-        echo "  sudo apt install glslc glslang-tools glslang-dev"
-        echo ""
-        echo -e "${YELLOW}If glslc is already installed but not in PATH, you may need to:${NC}"
-        echo "  export PATH=\$PATH:/usr/lib/shaderc/bin"
-        echo "  or"
-        echo "  sudo ln -s /usr/bin/glslangValidator /usr/local/bin/glslc"
         exit 1
     }
     
@@ -146,14 +127,55 @@ elif [ "$BACKEND" = "vulkan" ]; then
     echo -e "${GREEN}========================================${NC}"
     echo ""
     echo "Usage:"
-    echo "  source venv/bin/activate"
-    echo "  python coderai --model <path-to-gguf-model> --backend vulkan"
+    echo "  python coderai --model <gguf-model> --backend vulkan"
     echo ""
-    echo "Example:"
-    echo "  python coderai --model ./phi-3-mini-4k-instruct-q4_k_m.gguf --backend vulkan"
+    
+elif [ "$BACKEND" = "vulkan-nvidia" ]; then
+    # Vulkan backend (NVIDIA only)
+    echo -e "${YELLOW}Installing llama-cpp-python with Vulkan support (NVIDIA-only)...${NC}"
+    
+    # Check for required Vulkan development libraries
+    if ! pkg-config --exists vulkan 2>/dev/null; then
+        echo -e "${YELLOW}Warning: Vulkan development libraries not found via pkg-config${NC}"
+    fi
+    
+    # Check for glslc (Vulkan shader compiler)
+    GLSLC_CMD=""
+    if command -v glslc &> /dev/null; then
+        GLSLC_CMD="glslc"
+    elif command -v glslangValidator &> /dev/null; then
+        GLSLC_CMD="glslangValidator"
+    fi
+    
+    if [ -z "$GLSLC_CMD" ]; then
+        echo -e "${YELLOW}Warning: glslc/glslangValidator not found in PATH${NC}"
+    else
+        echo -e "${GREEN}✓ Found Vulkan shader compiler: $GLSLC_CMD${NC}"
+    fi
+    
+    # Build with Vulkan support
+    # Note: llama.cpp doesn't have a compile-time option to disable specific GPUs
+    # The device selection happens at runtime via environment variables
+    echo -e "${YELLOW}Building llama-cpp-python with Vulkan support...${NC}"
+    CMAKE_ARGS="-DGGML_VULKAN=ON" pip install --upgrade llama-cpp-python --no-cache-dir || {
+        echo -e "${RED}Build failed!${NC}"
+        exit 1
+    }
+    
+    echo -e "${YELLOW}Installing Vulkan-specific requirements...${NC}"
+    pip install -r requirements-vulkan.txt
+    
     echo ""
-    echo "Note: For Vulkan, you need to use GGUF format models."
-    echo "      Download from: https://huggingface.co/models?search=gguf"
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}  Vulkan (NVIDIA-only) build complete!${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo ""
+    echo "Usage:"
+    echo "  VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json \\"
+    echo "  python coderai --model <gguf-model> --backend vulkan"
+    echo ""
+    echo "Note: This build includes both AMD and NVIDIA Vulkan support."
+    echo "      At runtime, use VK_ICD_FILENAMES to select only NVIDIA."
     echo ""
 fi
 
