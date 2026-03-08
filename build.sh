@@ -42,11 +42,22 @@ fi
 
 echo -e "${GREEN}✓ Python version: $PYTHON_VERSION${NC}"
 
+# Determine venv directory based on backend
+if [ "$BACKEND" = "nvidia" ]; then
+    VENV_DIR="venv_nvidia"
+elif [ "$BACKEND" = "vulkan" ]; then
+    VENV_DIR="venv_vulkan"
+elif [ "$BACKEND" = "vulkan-nvidia" ]; then
+    VENV_DIR="venv_vulkan_nvidia"
+fi
+
 # Create virtual environment if it doesn't exist
-VENV_DIR="venv"
+echo -e "${YELLOW}Creating virtual environment: $VENV_DIR${NC}"
 if [ ! -d "$VENV_DIR" ]; then
-    echo -e "${YELLOW}Creating virtual environment...${NC}"
     python3 -m venv "$VENV_DIR"
+    echo -e "${GREEN}✓ Created virtual environment: $VENV_DIR${NC}"
+else
+    echo -e "${YELLOW}Using existing virtual environment: $VENV_DIR${NC}"
 fi
 
 # Activate virtual environment
@@ -185,4 +196,4 @@ echo "$BACKEND" > .backend
 echo -e "${GREEN}Build completed successfully!${NC}"
 echo ""
 echo "To activate the environment in the future, run:"
-echo "  source venv/bin/activate"
+echo "  source $VENV_DIR/bin/activate"
