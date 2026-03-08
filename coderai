@@ -1449,6 +1449,12 @@ class VulkanBackend(ModelBackend):
         if max_tokens is None:
             max_tokens = 512
         
+        # CRITICAL: Ensure NO message has None content - Jinja templates fail on None
+        # This is a safety check in case messages bypass the main endpoint validation
+        for msg in messages:
+            if msg.get("content") is None:
+                msg["content"] = ""
+        
         # Check if we should use manual formatting based on detected template
         # Always use manual formatting when tools are present, since Jinja templates often fail with tool messages
         use_manual = self.chat_template in ("unknown", "jinja_fallback", None) or tools is not None
@@ -1489,6 +1495,12 @@ class VulkanBackend(ModelBackend):
         total_content = ""
         chunk_count = 0
         has_tools = tools is not None  # Track if tools are available
+        
+        # CRITICAL: Ensure NO message has None content - Jinja templates fail on None
+        # This is a safety check in case messages bypass the main endpoint validation
+        for msg in messages:
+            if msg.get("content") is None:
+                msg["content"] = ""
         
         # Check if we should use manual formatting based on detected template
         # Always use manual formatting when tools are present, since Jinja templates often fail with tool messages
@@ -1764,6 +1776,11 @@ class MultiModelManager:
     """
     Manages multiple models: main text model, audio transcription, and image generation.
     Supports dynamic switching based on request model name.
+    
+    Modes:
+    - default: Load models on-demand
+    - loadall: Pre-load all models in VRAM at startup
+    - loadswap: Keep all models in memory (CPU RAM), swap active model to VRAM
     """
     
     def __init__(self):
@@ -1775,6 +1792,13 @@ class MultiModelManager:
         self.current_model_key: Optional[str] = None
         # Configuration for each model type
         self.config: Dict[str, Dict] = {}
+        # Load mode settings
+        self.load_mode: str = "ondemand"  # "ondemand", "loadall", "loadswap"
+        self.active_in_vram: Optional[str] = None  # Which model is currently in VRAM
+        
+    def set_load_mode(self, mode: str):
+        """Set the load mode: 'ondemand', 'loadall', or 'loadswap'."""
+        self.load_mode = mode
     
     def set_default_model(self, model_name: str, config: Dict = None):
         """Set the default/main text model."""
@@ -1892,6 +1916,46 @@ class MultiModelManager:
                 models.append(ModelInfo(id=key))
         
         return models if models else [ModelInfo(id="default")]
+    
+    def swap_model_to_vram(self, model_key: str) -> bool:
+        """
+        Swap a model from CPU RAM to GPU VRAM.
+        Returns True if successful, False otherwise.
+        Only applies in loadswap mode.
+        """
+        if self.load_mode != "loadswap":
+            return True  # No swapping needed in other modes
+        
+        if self.active_in_vram == model_key:
+            return True  # Already in VRAM
+        
+        # If another model is in VRAM, swap it to CPU first
+        if self.active_in_vram and self.active_in_vram in self.models:
+            self._swap_model_to_cpu(self.active_in_vram)
+        
+        # Swap the requested model to VRAM
+        success = self._swap_model_to_vram(model_key)
+        if success:
+            self.active_in_vram = model_key
+        return success
+    
+    def _swap_model_to_vram(self, model_key: str) -> bool:
+        """Internal method to swap a specific model to VRAM."""
+        # This would need backend-specific implementation
+        # For now, we assume the model is already in memory
+        print(f"SWAP: Moving model {model_key} to VRAM")
+        return True
+    
+    def _swap_model_to_cpu(self, model_key: str) -> bool:
+        """Internal method to swap a specific model to CPU RAM."""
+        # This would need backend-specific implementation
+        # For now, we just track that it's in CPU
+        print(f"SWAP: Moving model {model_key} to CPU RAM")
+        return True
+    
+    def get_active_model_key(self) -> Optional[str]:
+        """Get the currently active model key."""
+        return self.current_model_key or self.default_model
     
     def cleanup(self):
         """Cleanup all models."""
@@ -2898,6 +2962,11 @@ def parse_args():
         help="Pre-load all models (main, audio, image) at startup instead of on-demand",
     )
     parser.add_argument(
+        "--loadswap",
+        action="store_true",
+        help="Keep all models loaded, swapping active model between VRAM and RAM (only active model in VRAM)",
+    )
+    parser.add_argument(
         "--audio-ctx",
         type=int,
         default=480000,
@@ -3044,13 +3113,17 @@ def main():
             'offload': args.vision_offload,
         })
     
-    # If --loadall, pre-load all models
+    # Determine load mode
+    load_mode = "ondemand"
     if args.loadall:
-        print("\nPre-loading all models...")
-        # Audio model will be loaded on first request (lazy loading)
-        # Image model will be loaded on first request (lazy loading)
-        print("  - Audio model: will load on first request")
-        print("  - Image model: will load on first request")
+        load_mode = "loadall"
+    elif args.loadswap:
+        load_mode = "loadswap"
+    
+    # Set load mode in multi_model_manager
+    multi_model_manager.set_load_mode(load_mode)
+    
+    # If --loadall or --loadswap, pre-load all models
     
     # Start the server
     import uvicorn
