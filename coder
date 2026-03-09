@@ -149,6 +149,7 @@ class Config:
     token: Optional[str] = None
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     model: str = "default"
+    model_aliases: Dict[str, str] = None  # Alias -> Model mapping
     small: bool = False  # Use small model optimizations
     tiny: bool = False   # Use tiny model optimizations (minimal)
     micro: bool = False  # Use micro model optimizations (ultra-minimal)
@@ -163,6 +164,12 @@ class Config:
     def __post_init__(self):
         if self.confirm_commands is None:
             self.confirm_commands = {}
+        if self.model_aliases is None:
+            self.model_aliases = {}
+    
+    def resolve_model(self, model: str) -> str:
+        """Resolve model alias to actual model name."""
+        return self.model_aliases.get(model, model)
 
     @classmethod
     def load(cls, config_path: Optional[str] = None) -> "Config":
@@ -180,6 +187,7 @@ class Config:
                 config.token = data.get('token')
                 config.system_prompt = data.get('system_prompt', config.system_prompt)
                 config.model = data.get('model', config.model)
+                config.model_aliases = data.get('model_aliases', config.model_aliases)
                 config.small = data.get('small', config.small)
                 config.tiny = data.get('tiny', config.tiny)
                 config.micro = data.get('micro', config.micro)
@@ -206,6 +214,7 @@ class Config:
             'token': self.token,
             'system_prompt': self.system_prompt,
             'model': self.model,
+            'model_aliases': self.model_aliases,
             'small': self.small,
             'tiny': self.tiny,
             'micro': self.micro,
@@ -556,7 +565,7 @@ class CoderClient:
         
         # Build payload, conditionally including tools
         payload = {
-            "model": self.config.model,
+            "model": self.config.resolve_model(self.config.model),
             "messages": messages,
             "stream": stream
         }
@@ -1040,7 +1049,7 @@ class CoderClient:
         
         # Build payload, conditionally including tools
         payload = {
-            "model": self.config.model,
+            "model": self.config.resolve_model(self.config.model),
             "messages": messages,
             "stream": True
         }
@@ -1373,6 +1382,11 @@ Examples:
     )
     
     parser.add_argument(
+        '--alias',
+        help='Create an alias for the model (alias -> model mapping)'
+    )
+    
+    parser.add_argument(
         '--config',
         help='Path to config file (default: ~/.config/coderai/cli.json)'
     )
@@ -1459,6 +1473,7 @@ Examples:
             'token': config.token,
             'system_prompt': config.system_prompt,
             'model': config.model,
+            'model_aliases': config.model_aliases,
             'small': config.small,
             'tiny': config.tiny,
             'max_context': config.max_context,
@@ -1478,6 +1493,12 @@ Examples:
         config.token = args.token
     if args.model:
         config.model = args.model
+    if args.alias:
+        # Register alias: alias -> model mapping
+        # If model not specified, alias points to "default"
+        target_model = args.model if args.model else config.model
+        config.model_aliases[args.alias] = target_model
+        print(f"[Alias registered: {args.alias} -> {target_model}]")
     if args.small:
         config.small = True
     if args.tiny:

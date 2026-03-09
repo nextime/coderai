@@ -1969,6 +1969,8 @@ class MultiModelManager:
         # Load mode settings
         self.load_mode: str = "ondemand"  # "ondemand", "loadall", "loadswap"
         self.active_in_vram: Optional[str] = None  # Which model is currently in VRAM
+        # Model aliases: alias -> actual model name mapping
+        self.model_aliases: Dict[str, str] = {}
         
     @property
     def audio_model(self) -> Optional[str]:
@@ -2006,6 +2008,10 @@ class MultiModelManager:
             self.image_models.append(model_name)
         self.config[f"image:{model_name}"] = config or {}
     
+    def set_model_alias(self, alias: str, model_name: str):
+        """Register an alias for a model."""
+        self.model_aliases[alias] = model_name
+    
     def get_model_for_request(self, requested_model: str) -> Optional[ModelManager]:
         """
         Get the appropriate model manager for a request based on model name.
@@ -2018,8 +2024,13 @@ class MultiModelManager:
         - "vision:modelname" or "image:modelname" -> use specific image model
         - "tts" -> use TTS model
         - "tts:modelname" -> use specific TTS model
+        - Custom aliases -> resolve to actual model name
         - Otherwise match by model ID in multi_model_manager.models
         """
+        # Resolve custom aliases first
+        if requested_model in self.model_aliases:
+            requested_model = self.model_aliases[requested_model]
+        
         # Handle empty or "default" model names
         if not requested_model or requested_model == "default":
             if self.default_model and self.default_model in self.models:
@@ -2174,6 +2185,10 @@ class MultiModelManager:
             if self.default_model and key == self.default_model.split("/")[-1]:
                 continue
             models.append(ModelInfo(id=key))
+        
+        # Add custom model aliases
+        for alias in self.model_aliases:
+            models.append(ModelInfo(id=alias))
         
         return models if models else [ModelInfo(id="default")]
     
@@ -3736,6 +3751,16 @@ def parse_args():
         help="Model name, path, or URL for text-to-text LLM. Can be specified multiple times for multiple models.",
     )
     parser.add_argument(
+        "--model-alias",
+        type=str,
+        action="append",
+        default=None,
+        dest="model_aliases",
+        nargs=2,
+        metavar=("ALIAS", "MODEL"),
+        help="Register an alias for a model. Format: --model-alias <alias_name> <actual_model>",
+    )
+    parser.add_argument(
         "--backend",
         type=str,
         choices=["auto", "nvidia", "vulkan"],
@@ -4388,6 +4413,12 @@ def main():
         if model_name is None and not audio_models and not args.tts_model:
             print(f"Pre-loading image model...")
     
+    # Register model aliases if specified
+    if args.model_aliases:
+        print(f"\nRegistering model aliases:")
+        for alias, model in args.model_aliases:
+            multi_model_manager.set_model_alias(alias, model)
+            print(f"  {alias} -> {model}")
     
     # Start the server
     import uvicorn
