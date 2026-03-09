@@ -2655,13 +2655,29 @@ async def create_transcription(
                     try:
                         import subprocess
                         
+                        # Determine the model path
+                        model_path = model_to_use if os.path.isfile(model_to_use) else None
+                        if not model_path:
+                            # Check cache for downloaded model
+                            cached = get_cached_model_path(model_to_use)
+                            if cached and os.path.isfile(cached):
+                                model_path = cached
+                        
+                        print(f"DEBUG: Whisper model: {model_to_use}")
+                        print(f"DEBUG: Whisper model path (resolved): {model_path}")
+                        
                         # Run whisper.cpp CLI
-                        cmd = [whisper_cpp_path, "--model", model_to_use, "--output", "/tmp/whisper_output.txt", tmp_path]
+                        cmd = [whisper_cpp_path]
+                        if model_path:
+                            cmd.extend(["--model", model_path])
+                        cmd.extend(["--output", "/tmp/whisper_output.txt", tmp_path])
                         
                         # Add Vulkan device if specified
                         audio_vulkan_device = getattr(global_args, 'audio_vulkan_device', 0)
                         if audio_vulkan_device is not None:
                             cmd.extend(["--device", str(audio_vulkan_device)])
+                        
+                        print(f"DEBUG: Running whisper.cpp command: {' '.join(cmd)}")
                         
                         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
                         
