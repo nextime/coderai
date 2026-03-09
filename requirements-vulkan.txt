@@ -13,4 +13,6 @@ psutil>=5.9.0
 # HuggingFace Hub for downloading GGUF models
 huggingface-hub>=0.19.0
 
-# No PyTorch needed for Vulkan backend - llama-cpp handles everything
+# Optional: Audio transcription without PyTorch (whispercpp)
+# Note: faster-whisper requires PyTorch, but whispercpp works without it
+whispercpp>=1.0.0  # For GGUF-based Whisper transcription without PyTorch

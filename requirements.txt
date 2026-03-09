@@ -38,7 +38,7 @@ procname>=0.3.0
 
 # Optional: Audio transcription dependencies
 faster-whisper>=0.10.0  # For NVIDIA/CUDA whisper transcription
-# whispercpp>=1.0.0  # Alternative whisper library (requires system dependencies)
+whispercpp>=1.0.0  # Alternative whisper library (works without PyTorch)
 
 # Optional: for better performance
 # bitsandbytes>=0.41.0  # for 4-bit/8-bit quantization
