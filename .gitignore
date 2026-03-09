@@ -15,3 +15,6 @@ __pycache__/
 
 # Debug logs
 debug.log
+
+# Test files
+test_*.py
