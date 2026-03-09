@@ -11,6 +11,9 @@ accelerate>=0.24.0
 psutil>=5.9.0
 # procname>=0.3.0  # optional - uncomment to set process name (requires libproc2-dev)
 
+# Optional: Audio transcription dependencies
+faster-whisper>=0.10.0  # For NVIDIA/CUDA whisper transcription
+
 # Optional: for better performance with NVIDIA GPUs
 bitsandbytes>=0.41.0
 sentencepiece>=0.1.99
