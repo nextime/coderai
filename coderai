@@ -2089,18 +2089,21 @@ class WhisperServerManager:
             if prompt:
                 data["prompt"] = prompt
             
+            print(f"DEBUG: Sending POST to {self.base_url}/inference with data={data}, file_size={len(audio_data)}")
             response = requests.post(
                 f"{self.base_url}/inference",
                 files=files,
                 data=data,
                 timeout=300
             )
+            print(f"DEBUG: whisper-server response status={response.status_code}, body={response.text[:500] if response.text else 'empty'}")
             
             if response.status_code == 200:
                 return response.json()
             else:
                 return {"error": f"Server error: {response.status_code}", "detail": response.text}
         except Exception as e:
+            print(f"DEBUG: whisper-server exception: {e}")
             return {"error": str(e)}
     
     def _wait_for_server(self, timeout: int = 30) -> bool:
@@ -2697,11 +2700,13 @@ async def create_transcription(
     if multi_model_manager.whisper_server and multi_model_manager.whisper_server.is_running():
         # Use whisper-server - read file and send to server
         file_content = await file.read()
+        print(f"DEBUG: whisper-server transcription request - file_size={len(file_content)}, language={language}, prompt={prompt}")
         result = multi_model_manager.whisper_server.transcribe(
             file_content,
             language=language,
             prompt=prompt
         )
+        print(f"DEBUG: whisper-server transcription result: {result}")
         if "error" in result:
             raise HTTPException(status_code=500, detail=result["error"])
         # Convert whisper-server response to OpenAI format
