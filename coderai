@@ -2383,109 +2383,117 @@ async def create_transcription(
         tmp_path = tmp.name
     
     try:
-        # Try faster-whisper first (requires PyTorch), fall back to whispercpp if it fails
-        faster_whisper_failed = False
-        try:
-            from faster_whisper import WhisperModel
-            
-            # Determine compute type based on GPU availability
-            import torch
-            if torch.cuda.is_available():
-                compute_type = "float16"
-            else:
-                compute_type = "int8"
-            
-            # Try to load the model (lazy loading)
-            model_key = f"audio:{model_to_use}"
-            whisper_model = multi_model_manager.get_model(model_key)
-            
-            if whisper_model is None:
-                print(f"Loading faster-whisper model: {model_to_use}")
-                
-                # Check if model_to_use is a URL - download it (with caching)
-                model_path = None
-                if model_to_use.startswith('http://') or model_to_use.startswith('https://'):
-                    # Check cache first
-                    cached_path = get_cached_model_path(model_to_use)
-                    if cached_path:
-                        model_to_use = cached_path
-                        print(f"Using cached model: {model_to_use}")
-                    else:
-                        print(f"Downloading model from URL: {model_to_use}")
-                        try:
-                            import requests
-                            import hashlib
-                            
-                            # Get cache directory
-                            cache_dir = get_model_cache_dir()
-                            
-                            # Extract filename from URL
-                            url_path = model_to_use.split('?')[0]
-                            filename = os.path.basename(url_path)
-                            
-                            if not filename.endswith('.bin') and not filename.endswith('.ggml'):
-                                filename = "whisper-model.bin"
-                            
-                            # Create safe filename in cache
-                            url_hash = hashlib.sha256(model_to_use.encode()).hexdigest()
-                            cached_filename = f"{url_hash}_{filename}"
-                            model_path = os.path.join(cache_dir, cached_filename)
-                            
-                            # Download to cache
-                            response = requests.get(model_to_use, stream=True)
-                            response.raise_for_status()
-                            
-                            total_size = int(response.headers.get('content-length', 0))
-                            downloaded = 0
-                            
-                            with open(model_path, 'wb') as f:
-                                for chunk in response.iter_content(chunk_size=8192*1024):
-                                    if chunk:
-                                        f.write(chunk)
-                                        downloaded += len(chunk)
-                                        if total_size > 0:
-                                            percent = (downloaded / total_size) * 100
-                                            print(f"Downloaded: {percent:.1f}%", end='\r')
-                            
-                            print(f"\nDownloaded and cached to: {model_path}")
-                            model_to_use = model_path
-                            
-                        except Exception as e:
-                            print(f"Error downloading model: {e}")
-                            raise
-                
-                whisper_model = WhisperModel(
-                    model_to_use,
-                    device="cuda" if torch.cuda.is_available() else "cpu",
-                    compute_type=compute_type
-                )
-                # Store in multi_model_manager
-                multi_model_manager.add_model(model_key, whisper_model)
-            
-            # Run transcription
-            segments, info = whisper_model.transcribe(
-                tmp_path,
-                language=language,
-                initial_prompt=prompt,
-                temperature=temperature or 0.0,
-            )
-            
-            # Collect all segments
-            text_parts = []
-            for segment in segments:
-                text_parts.append(segment.text.strip())
-            
-            full_text = " ".join(text_parts)
-            
-            return {"text": full_text}
+        # Check if model is a GGUF file - faster-whisper doesn't support GGUF format
+        is_gguf_model = model_to_use.endswith('.gguf') or 'gguf' in model_to_use.lower()
         
-        except ImportError:
-            # faster-whisper not available, will try whispercpp below
+        if is_gguf_model:
+            # Skip faster-whisper for GGUF files - go directly to whispercpp
+            print("Detected GGUF model - using whispercpp backend")
             faster_whisper_failed = True
-        except Exception as e:
-            # faster-whisper failed for some other reason (e.g., GGUF file not supported)
-            print(f"Warning: faster-whisper failed to load model: {e}")
-            faster_whisper_failed = True
+        else:
+            # Try faster-whisper first
+            faster_whisper_failed = False
+            try:
+                from faster_whisper import WhisperModel
+                
+                # Determine compute type based on GPU availability
+                import torch
+                if torch.cuda.is_available():
+                    compute_type = "float16"
+                else:
+                    compute_type = "int8"
+                
+                # Try to load the model (lazy loading)
+                model_key = f"audio:{model_to_use}"
+                whisper_model = multi_model_manager.get_model(model_key)
+                
+                if whisper_model is None:
+                    print(f"Loading faster-whisper model: {model_to_use}")
+                    
+                    # Check if model_to_use is a URL - download it (with caching)
+                    model_path = None
+                    if model_to_use.startswith('http://') or model_to_use.startswith('https://'):
+                        # Check cache first
+                        cached_path = get_cached_model_path(model_to_use)
+                        if cached_path:
+                            model_to_use = cached_path
+                            print(f"Using cached model: {model_to_use}")
+                        else:
+                            print(f"Downloading model from URL: {model_to_use}")
+                            try:
+                                import requests
+                                import hashlib
+                                
+                                # Get cache directory
+                                cache_dir = get_model_cache_dir()
+                                
+                                # Extract filename from URL
+                                url_path = model_to_use.split('?')[0]
+                                filename = os.path.basename(url_path)
+                                
+                                if not filename.endswith('.bin') and not filename.endswith('.ggml'):
+                                    filename = "whisper-model.bin"
+                                
+                                # Create safe filename in cache
+                                url_hash = hashlib.sha256(model_to_use.encode()).hexdigest()
+                                cached_filename = f"{url_hash}_{filename}"
+                                model_path = os.path.join(cache_dir, cached_filename)
+                                
+                                # Download to cache
+                                response = requests.get(model_to_use, stream=True)
+                                response.raise_for_status()
+                                
+                                total_size = int(response.headers.get('content-length', 0))
+                                downloaded = 0
+                                
+                                with open(model_path, 'wb') as f:
+                                    for chunk in response.iter_content(chunk_size=8192*1024):
+                                        if chunk:
+                                            f.write(chunk)
+                                            downloaded += len(chunk)
+                                            if total_size > 0:
+                                                percent = (downloaded / total_size) * 100
+                                                print(f"Downloaded: {percent:.1f}%", end='\r')
+                                
+                                print(f"\nDownloaded and cached to: {model_path}")
+                                model_to_use = model_path
+                                
+                            except Exception as e:
+                                print(f"Error downloading model: {e}")
+                                raise
+                    
+                    whisper_model = WhisperModel(
+                        model_to_use,
+                        device="cuda" if torch.cuda.is_available() else "cpu",
+                        compute_type=compute_type
+                    )
+                    # Store in multi_model_manager
+                    multi_model_manager.add_model(model_key, whisper_model)
+                
+                # Run transcription
+                segments, info = whisper_model.transcribe(
+                    tmp_path,
+                    language=language,
+                    initial_prompt=prompt,
+                    temperature=temperature or 0.0,
+                )
+                
+                # Collect all segments
+                text_parts = []
+                for segment in segments:
+                    text_parts.append(segment.text.strip())
+                
+                full_text = " ".join(text_parts)
+                
+                return {"text": full_text}
+            
+            except ImportError:
+                # faster-whisper not available, will try whispercpp below
+                faster_whisper_failed = True
+            except Exception as e:
+                # faster-whisper failed for some other reason
+                print(f"Warning: faster-whisper failed to load model: {e}")
+                faster_whisper_failed = True
         
         # If faster-whisper failed (not installed or couldn't load), try whispercpp
         if faster_whisper_failed:
@@ -3755,8 +3763,19 @@ def main():
         should_preload = load_mode in ("loadall", "loadswap") or (model_name is None and args.audio_model)
         if should_preload:
             print(f"Pre-loading audio model...")
-            # First try faster-whisper, then fall back to whispercpp if it fails
-            faster_whisper_failed = False
+            
+            # Check if model is a GGUF file - faster-whisper doesn't support GGUF format
+            model_to_use = args.audio_model
+            is_gguf_model = model_to_use.endswith('.gguf') or 'gguf' in model_to_use.lower()
+            
+            if is_gguf_model:
+                # Skip faster-whisper for GGUF files - it doesn't support them
+                # Go directly to whispercpp
+                print("Detected GGUF model - using whispercpp backend")
+                faster_whisper_failed = True
+            else:
+                # Try faster-whisper first
+                faster_whisper_failed = False
             try:
                 # Try faster-whisper first (requires torch)
                 from faster_whisper import WhisperModel
@@ -3802,6 +3821,8 @@ def main():
             
             # If faster-whisper failed (not installed or couldn't load), try whispercpp
             if faster_whisper_failed:
+                # Check if model is a GGUF file - whispercpp can handle those
+                model_is_gguf = model_to_use.endswith('.gguf') or (model_path and model_path.endswith('.gguf'))
                 try:
                     import whispercpp
                     
