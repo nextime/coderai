@@ -3786,15 +3786,28 @@ def main():
                             model_path = download_model(model_to_use, cache_dir)
                             model_to_use = model_path
                     
-                    # whispercpp needs a local file
+                    # whispercpp needs a local file or a built-in model name
+                    # whispercpp supports: tiny, base, small, medium, large-v1, large (built-in)
+                    # or pre-converted GGUF files (NOT HuggingFace GGUF format)
                     if not model_path:
-                        model_path = model_to_use if os.path.isfile(model_to_use) else None
+                        # Check if it's a local file
+                        if os.path.isfile(model_to_use):
+                            model_path = model_to_use
+                        elif model_to_use in ['tiny.en', 'tiny', 'base.en', 'base', 'small.en', 'small', 'medium.en', 'medium', 'large-v1', 'large']:
+                            # It's a built-in model name - whispercpp will download automatically
+                            model_path = model_to_use
+                        else:
+                            # Could be a model name without .gguf extension - try it
+                            model_path = model_to_use
                     
-                    if not model_path or not os.path.isfile(model_path):
-                        print(f"Warning: whispercpp requires a local GGUF file, not: {model_to_use}")
-                        print("For Vulkan audio transcription, use a built-in model name (tiny/base/small/medium/large-v1/large)")
-                        print("or install faster-whisper with PyTorch for HuggingFace GGUF support.")
-                        print("Audio model will load on-demand when transcription is requested.")
+                    if not model_path or (model_path != model_to_use and not os.path.isfile(model_path)):
+                        # If model_path is not a valid built-in name, check if file exists
+                        if model_path and model_path not in ['tiny.en', 'tiny', 'base.en', 'base', 'small.en', 'small', 'medium.en', 'medium', 'large-v1', 'large']:
+                            if not os.path.isfile(model_path):
+                                print(f"Warning: whispercpp requires a local GGUF file or built-in model name, not: {model_to_use}")
+                                print("For Vulkan audio transcription, use a built-in model name (tiny/base/small/medium/large-v1/large)")
+                                print("or install faster-whisper with PyTorch for HuggingFace GGUF support.")
+                                print("Audio model will load on-demand when transcription is requested.")
                     else:
                         # Load the whispercpp model
                         try:
