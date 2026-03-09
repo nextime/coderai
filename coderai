@@ -2026,6 +2026,9 @@ class WhisperServerManager:
             # Add GPU device
             cmd.extend(["-dev", str(gpu_device)])
             
+            # Add --convert flag to convert audio to 16kHz mono on the server side
+            cmd.append("--convert")
+            
             # Add host and port
             cmd.extend(["--host", "127.0.0.1"])
             cmd.extend(["--port", str(self.port)])
