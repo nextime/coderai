@@ -2554,7 +2554,26 @@ async def create_transcription(
                     
                     # Load the whispercpp model
                     # Note: whispercpp uses model files directly, not paths like Llama
-                    whisper_model = whispercpp.Whisper.from_pretrained(model_path)
+                    # whispercpp only supports:
+                    # 1. Built-in model names (tiny, base, small, medium, large-v1, large)
+                    # 2. Pre-converted GGUF files in whisper.cpp format (NOT HuggingFace GGUF)
+                    try:
+                        whisper_model = whispercpp.Whisper.from_pretrained(model_path)
+                    except Exception as e:
+                        error_msg = str(e).lower()
+                        if 'not a valid preconverted model' in error_msg:
+                            # This is expected for HuggingFace GGUF files
+                            print(f"Warning: whispercpp does not support HuggingFace GGUF format")
+                            print("whispercpp only supports its own pre-converted models or built-in names.")
+                            print("For Vulkan audio transcription, please either:")
+                            print("  1. Install PyTorch + faster-whisper: pip install torch faster-whisper")
+                            print("  2. Use a built-in whispercpp model: --audio-model base")
+                            raise HTTPException(
+                                status_code=400,
+                                detail="whispercpp does not support HuggingFace GGUF Whisper models. Use --audio-model with a built-in name (tiny/base/small/medium/large-v1/large) or install faster-whisper with PyTorch."
+                            )
+                        else:
+                            raise
                     
                     # Store in multi_model_manager
                     multi_model_manager.add_model(model_key, whisper_model)
@@ -3773,15 +3792,30 @@ def main():
                     
                     if not model_path or not os.path.isfile(model_path):
                         print(f"Warning: whispercpp requires a local GGUF file, not: {model_to_use}")
+                        print("For Vulkan audio transcription, use a built-in model name (tiny/base/small/medium/large-v1/large)")
+                        print("or install faster-whisper with PyTorch for HuggingFace GGUF support.")
                         print("Audio model will load on-demand when transcription is requested.")
                     else:
                         # Load the whispercpp model
-                        whisper_model = whispercpp.Whisper.from_pretrained(model_path)
-                        
-                        # Store in multi_model_manager
-                        model_key = f"audio:{args.audio_model}"
-                        multi_model_manager.add_model(model_key, whisper_model)
-                        print(f"Audio model loaded successfully (whispercpp)")
+                        try:
+                            whisper_model = whispercpp.Whisper.from_pretrained(model_path)
+                            
+                            # Store in multi_model_manager
+                            model_key = f"audio:{args.audio_model}"
+                            multi_model_manager.add_model(model_key, whisper_model)
+                            print(f"Audio model loaded successfully (whispercpp)")
+                        except Exception as e:
+                            error_msg = str(e).lower()
+                            if 'not a valid preconverted model' in error_msg:
+                                print(f"Warning: whispercpp does not support this model format")
+                                print("whispercpp only supports built-in model names or pre-converted GGUF files.")
+                                print("For Vulkan audio transcription, please either:")
+                                print("  1. Install PyTorch + faster-whisper: pip install torch faster-whisper")
+                                print("  2. Use a built-in whispercpp model: --audio-model base")
+                                print("Audio model will load on-demand when transcription is requested.")
+                            else:
+                                print(f"Warning: Could not pre-load audio model with whispercpp: {e}")
+                                print("Audio model will load on-demand when transcription is requested.")
                 except ImportError:
                     # Neither faster-whisper nor whispercpp available
                     print("Warning: No audio transcription library available.")
