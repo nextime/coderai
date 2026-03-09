@@ -2655,13 +2655,25 @@ async def create_transcription(
                     try:
                         import subprocess
                         
-                        # Determine the model path
-                        model_path = model_to_use if os.path.isfile(model_to_use) else None
-                        if not model_path:
+                        # Determine the model path - check if it's already cached or needs downloading
+                        model_path = None
+                        
+                        # First check if it's a local file
+                        if os.path.isfile(model_to_use):
+                            model_path = model_to_use
+                            print(f"DEBUG: Using local model file: {model_path}")
+                        else:
                             # Check cache for downloaded model
                             cached = get_cached_model_path(model_to_use)
                             if cached and os.path.isfile(cached):
                                 model_path = cached
+                                print(f"DEBUG: Using cached model: {model_path}")
+                            else:
+                                # Download the model if not cached
+                                print(f"DEBUG: Model not cached, downloading: {model_to_use}")
+                                cache_dir = get_model_cache_dir()
+                                model_path = download_model(model_to_use, cache_dir)
+                                print(f"DEBUG: Downloaded model to: {model_path}")
                         
                         print(f"DEBUG: Whisper model: {model_to_use}")
                         print(f"DEBUG: Whisper model path (resolved): {model_path}")
