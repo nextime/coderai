@@ -1991,8 +1991,8 @@ class WhisperServerManager:
             return False
         return self.process.poll() is None
     
-    def start(self, model_path: str = None, gpu_device: int = 0) -> bool:
-        """Start whisper-server with the specified model."""
+    def start(self, model_path: str = None, gpu_device: int = 0) -> str:
+        """Start whisper-server with the specified model. Returns actual model path or empty string on failure."""
         with self.lock:
             # Stop existing server if running
             if self.is_running():
@@ -2000,7 +2000,7 @@ class WhisperServerManager:
             
             if not self.server_path:
                 print("Error: whisper-server path not set")
-                return False
+                return ""
             
             # Handle URL models - download if needed
             actual_model_path = model_path
@@ -2039,20 +2039,20 @@ class WhisperServerManager:
                     stderr=subprocess.PIPE,
                     preexec_fn=lambda: signal.signal(signal.SIGTERM, signal.SIG_DFL)
                 )
-                self.current_model = model_path
+                self.current_model = actual_model_path
                 
                 # Wait for server to be ready
                 if self._wait_for_server(30):
                     print(f"whisper-server started on {self.base_url}")
                     self._running = True
-                    return True
+                    return actual_model_path
                 else:
                     print("Error: whisper-server failed to start")
                     self.stop()
-                    return False
+                    return ""
             except Exception as e:
                 print(f"Error starting whisper-server: {e}")
-                return False
+                return ""
     
     def stop(self):
         """Stop whisper-server."""
@@ -4457,8 +4457,16 @@ def main():
             if audio_models and (should_preload or not args.whisper_cpp):
                 model_to_use = audio_models[0] if audio_models else None
                 gpu_device = getattr(args, 'audio_vulkan_device', 0) or 0
-                if whisper_server_mgr.start(model_path=model_to_use, gpu_device=gpu_device):
-                    print(f"Whisper server started with model: {model_to_use}")
+                actual_model_path = whisper_server_mgr.start(model_path=model_to_use, gpu_device=gpu_device)
+                if actual_model_path:
+                    # Update audio_models to store the actual path (not the URL)
+                    if model_to_use != actual_model_path:
+                        audio_models[0] = actual_model_path
+                        multi_model_manager.set_audio_model(actual_model_path, {
+                            'ctx': args.audio_ctx,
+                            'offload': args.audio_offload,
+                        })
+                    print(f"Whisper server started with model: {actual_model_path}")
                 else:
                     print("Warning: Failed to start whisper-server, falling back to other backends")
         elif should_preload:
