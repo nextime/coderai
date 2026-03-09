@@ -2369,11 +2369,12 @@ async def create_transcription(
             detail="Audio transcription not configured. Use --audio-model to specify a model."
         )
     
-    # Determine model to use
-    model_to_use = model
-    if model == "whisper-1" or model.startswith("audio:"):
-        # Use configured audio model
-        model_to_use = audio_model
+    # Determine model to use - always use the configured audio model
+    # The model parameter from the request is ignored in favor of the configured transcription model
+    actual_model = audio_model  # This is the configured transcription model from --audio-model
+    model_to_use = actual_model
+    
+    print(f"DEBUG: Transcription request model: {model}, using configured model: {actual_model}")
     
     # Check if Vulkan is available for whispercpp
     whisper_vulkan_available = False
