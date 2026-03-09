@@ -2591,11 +2591,26 @@ async def create_transcription(
                 
                 return {"text": full_text}
             
-            except ImportError:
-                # Neither faster-whisper nor whispercpp available
+            except ImportError as e:
+                # Check if it's a specific error about whispercpp not working
+                error_msg = str(e).lower()
+                if 'invalid elf' in error_msg or 'mach-o' in error_msg:
+                    # whispercpp library failed to load - architecture mismatch
+                    print(f"Warning: whispercpp library failed to load: {e}")
+                    print("This usually means whispercpp was installed for a different OS/architecture.")
+                    print("Try reinstalling: pip install whispercpp --force-reinstall")
+                    print("Audio model will load on-demand when transcription is requested.")
+                else:
+                    # Neither faster-whisper nor whispercpp available
+                    print(f"Warning: No audio transcription library available: {e}")
+                    print("Options:")
+                    print("  1. Install PyTorch + faster-whisper: pip install torch faster-whisper")
+                    print("  2. Use a built-in whispercpp model: --audio-model base")
+                    print("Audio model will load on-demand when transcription is requested.")
+                # Return error response instead of None
                 raise HTTPException(
                     status_code=501,
-                    detail="Audio transcription not available. Install faster-whisper (requires PyTorch) or whispercpp: pip install whispercpp"
+                    detail="Audio transcription not available. Install faster-whisper (requires PyTorch) or use a built-in whispercpp model (tiny/base/small/medium/large)."
                 )
         
     finally:
@@ -3832,7 +3847,9 @@ def main():
                 except ImportError:
                     # Neither faster-whisper nor whispercpp available
                     print("Warning: No audio transcription library available.")
-                    print("Install faster-whisper (requires PyTorch) or whispercpp: pip install whispercpp")
+                    print("Options:")
+                    print("  1. Install PyTorch + faster-whisper: pip install torch faster-whisper")
+                    print("  2. Use a built-in whispercpp model: --audio-model base")
                     print("Audio model will load on-demand when transcription is requested.")
                 except Exception as e:
                     print(f"Warning: Could not pre-load audio model with whispercpp: {e}")
