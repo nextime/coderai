@@ -4022,7 +4022,7 @@ def main():
     print("")
     
     # Load the main model (only if specified)
-    if model_name:
+    if model_names:
         load_kwargs = {
             'offload_dir': args.offload_dir,
             'load_in_4bit': args.load_in_4bit,
@@ -4171,8 +4171,8 @@ def main():
         print("\n=== Load All Mode ===")
         
         # Load main text model first
-        if model_name:
-            print(f"Pre-loading main text model: {model_name}")
+        if model_names:
+            print(f"Pre-loading main text model: {model_names[0]}")
         
         # Load image model
         if image_models:
@@ -4190,8 +4190,8 @@ def main():
     elif load_mode == "loadswap":
         # Load models in order: model > image > audio > TTS, keep active in VRAM
         print("\n=== Load Swap Mode ===")
-        if model_name:
-            print(f"Main text model will be in VRAM: {model_name}")
+        if model_names:
+            print(f"Main text model will be in VRAM: {model_names[0]}")
         if image_models:
             print(f"Image model in RAM: {image_models[0]}")
         if audio_models:
