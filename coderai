@@ -3858,6 +3858,9 @@ def main():
             
             # If faster-whisper failed (not installed or couldn't load), try whispercpp
             if faster_whisper_failed:
+                # Initialize model_path
+                model_path = None
+                
                 # Check if model is a GGUF file - whispercpp can handle those
                 model_is_gguf = model_to_use.endswith('.gguf') or (model_path and model_path.endswith('.gguf'))
                 
