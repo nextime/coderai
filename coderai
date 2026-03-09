@@ -1955,7 +1955,7 @@ import threading
 class WhisperServerManager:
     """Manages whisper-server subprocess for audio transcription with model swapping support."""
     
-    def __init__(self, server_path: str = None, port: int = 8081):
+    def __init__(self, server_path: str = None, port: int = 8744):
         self.server_path = server_path
         self.port = port
         self.process = None
@@ -1964,6 +1964,26 @@ class WhisperServerManager:
         self.lock = threading.Lock()
         self._health_check_thread = None
         self._running = False
+        
+        # Check if port is available
+        if not self._is_port_available(port):
+            # Try to find an available port
+            for new_port in range(port + 1, port + 100):
+                if self._is_port_available(new_port):
+                    self.port = new_port
+                    self.base_url = f"http://127.0.0.1:{new_port}"
+                    print(f"Port {port} in use, using port {new_port} instead")
+                    break
+    
+    def _is_port_available(self, port: int) -> bool:
+        """Check if a port is available."""
+        import socket
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('127.0.0.1', port))
+                return True
+        except OSError:
+            return False
     
     def is_running(self) -> bool:
         """Check if whisper-server is running."""
@@ -1982,11 +2002,26 @@ class WhisperServerManager:
                 print("Error: whisper-server path not set")
                 return False
             
+            # Handle URL models - download if needed
+            actual_model_path = model_path
+            if model_path and (model_path.startswith('http://') or model_path.startswith('https://')):
+                # Check cache first
+                cached_path = get_cached_model_path(model_path)
+                if cached_path:
+                    actual_model_path = cached_path
+                    print(f"Using cached model: {actual_model_path}")
+                else:
+                    # Download the model
+                    cache_dir = get_model_cache_dir()
+                    print(f"Downloading model: {model_path}")
+                    actual_model_path = download_model(model_path, cache_dir)
+                    print(f"Downloaded model to: {actual_model_path}")
+            
             # Build command
             cmd = [self.server_path]
             
-            if model_path:
-                cmd.extend(["-m", model_path])
+            if actual_model_path:
+                cmd.extend(["-m", actual_model_path])
             
             # Add GPU device
             cmd.extend(["-dev", str(gpu_device)])
@@ -4089,8 +4124,8 @@ def parse_args():
     parser.add_argument(
         "--whisper-server-port",
         type=int,
-        default=8081,
-        help="Port for whisper-server (default: 8081).",
+        default=8744,
+        help="Port for whisper-server (default: 8744).",
     )
     parser.add_argument(
         "--vision-ctx",
