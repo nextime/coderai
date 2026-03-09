@@ -2167,6 +2167,9 @@ multi_model_manager = MultiModelManager()
 # Global model manager (for backward compatibility)
 model_manager = ModelManager()
 
+# Global args for access in endpoints
+global_args = None
+
 # Global system prompt (set via --system-prompt flag)
 # None = don't inject, True = use default, string = use custom text
 global_system_prompt = None
@@ -2646,7 +2649,7 @@ async def create_transcription(
                     print("Audio model will load on-demand when transcription is requested.")
                 
                 # Try whisper.cpp CLI as fallback if specified
-                whisper_cpp_path = getattr(args, 'whisper_cpp', None)
+                whisper_cpp_path = getattr(global_args, 'whisper_cpp', None)
                 if whisper_cpp_path and os.path.isfile(whisper_cpp_path):
                     print(f"Using whisper.cpp CLI: {whisper_cpp_path}")
                     try:
@@ -2656,7 +2659,7 @@ async def create_transcription(
                         cmd = [whisper_cpp_path, "--model", model_to_use, "--output", "/tmp/whisper_output.txt", tmp_path]
                         
                         # Add Vulkan device if specified
-                        audio_vulkan_device = getattr(args, 'audio_vulkan_device', 0)
+                        audio_vulkan_device = getattr(global_args, 'audio_vulkan_device', 0)
                         if audio_vulkan_device is not None:
                             cmd.extend(["--device", str(audio_vulkan_device)])
                         
@@ -3639,7 +3642,7 @@ def parse_args():
 
 def main():
     """Main entry point."""
-    global global_system_prompt, model_manager, multi_model_manager, global_debug
+    global global_system_prompt, model_manager, multi_model_manager, global_debug, global_args
     
     # Suppress unraisable exceptions from LlamaModel.__del__
     import sys
@@ -3657,6 +3660,9 @@ def main():
     except ImportError:
         pass
     args = parse_args()
+    
+    # Store args globally for access in endpoints
+    global_args = args
     
     # Set global system prompt from --system-prompt flag
     global_system_prompt = args.system_prompt
