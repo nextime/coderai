@@ -4223,7 +4223,7 @@ def main():
         # Pre-load first audio model at startup if:
         # - Using loadall or loadswap mode, OR
         # - No main model is specified (only audio model configured)
-        should_preload = load_mode in ("loadall", "loadswap") or (model_name is None and audio_models)
+        should_preload = load_mode in ("loadall", "loadswap") or (not model_names and audio_models)
         if should_preload:
             print(f"Pre-loading audio model... {audio_models[0]}")
             
@@ -4391,7 +4391,7 @@ def main():
         multi_model_manager.set_tts_model(args.tts_model, {})
         
         # Pre-load TTS model if it's the only model configured
-        if model_name is None and not audio_models and not image_models:
+        if not model_names and not audio_models and not image_models:
             print(f"Pre-loading TTS model...")
             # TTS models load on-demand, but we can pre-download if needed
     
@@ -4410,7 +4410,7 @@ def main():
             })
         
         # Pre-load image model if it's the only model configured
-        if model_name is None and not audio_models and not args.tts_model:
+        if not model_names and not audio_models and not args.tts_model:
             print(f"Pre-loading image model...")
     
     # Register model aliases if specified
