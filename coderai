@@ -3875,8 +3875,8 @@ def main():
                     elif os.path.exists('/dev/dri'):
                         whisper_vulkan_available = True
                         print(f"Whisper Vulkan: Auto-detected GPU, will use device {whisper_vulkan_device}")
-                except ImportError:
-                    pass
+                except ImportError as e:
+                    print(f"Debug: whispercpp import failed: {e}")
                 
                 try:
                     import whispercpp
@@ -3941,9 +3941,9 @@ def main():
                             else:
                                 print(f"Warning: Could not pre-load audio model with whispercpp: {e}")
                                 print("Audio model will load on-demand when transcription is requested.")
-                except ImportError:
+                except ImportError as e:
                     # Neither faster-whisper nor whispercpp available
-                    print("Warning: No audio transcription library available.")
+                    print(f"Warning: No audio transcription library available: {e}")
                     print("Options:")
                     print("  1. Install PyTorch + faster-whisper: pip install torch faster-whisper")
                     print("  2. Use a built-in whispercpp model: --audio-model base")
