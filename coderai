@@ -3811,6 +3811,12 @@ def main():
                 multi_model_manager.add_model(model_key, whisper_model)
                 print(f"Audio model loaded successfully (faster-whisper)")
                 
+                # Warn if using CPU (no CUDA available)
+                import torch
+                if not torch.cuda.is_available():
+                    print("Note: faster-whisper is running on CPU (no CUDA GPU detected)")
+                    print("      For GPU acceleration, use NVIDIA GPU with CUDA or wait for Vulkan support.")
+                
             except ImportError:
                 # faster-whisper not available, will try whispercpp below
                 faster_whisper_failed = True
