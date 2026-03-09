@@ -2383,7 +2383,8 @@ async def create_transcription(
         tmp_path = tmp.name
     
     try:
-        # Try faster-whisper first (requires PyTorch)
+        # Try faster-whisper first (requires PyTorch), fall back to whispercpp if it fails
+        faster_whisper_failed = False
         try:
             from faster_whisper import WhisperModel
             
@@ -2479,7 +2480,15 @@ async def create_transcription(
             return {"text": full_text}
         
         except ImportError:
-            # faster-whisper not available, try whispercpp (no PyTorch required)
+            # faster-whisper not available, will try whispercpp below
+            faster_whisper_failed = True
+        except Exception as e:
+            # faster-whisper failed for some other reason (e.g., GGUF file not supported)
+            print(f"Warning: faster-whisper failed to load model: {e}")
+            faster_whisper_failed = True
+        
+        # If faster-whisper failed (not installed or couldn't load), try whispercpp
+        if faster_whisper_failed:
             try:
                 import whispercpp
                 
@@ -3746,6 +3755,8 @@ def main():
         should_preload = load_mode in ("loadall", "loadswap") or (model_name is None and args.audio_model)
         if should_preload:
             print(f"Pre-loading audio model...")
+            # First try faster-whisper, then fall back to whispercpp if it fails
+            faster_whisper_failed = False
             try:
                 # Try faster-whisper first (requires torch)
                 from faster_whisper import WhisperModel
@@ -3782,7 +3793,15 @@ def main():
                 print(f"Audio model loaded successfully (faster-whisper)")
                 
             except ImportError:
-                # faster-whisper not available, try whispercpp (no torch required)
+                # faster-whisper not available, will try whispercpp below
+                faster_whisper_failed = True
+            except Exception as e:
+                # faster-whisper failed for some other reason (e.g., GGUF file not supported)
+                print(f"Warning: faster-whisper failed to load model: {e}")
+                faster_whisper_failed = True
+            
+            # If faster-whisper failed (not installed or couldn't load), try whispercpp
+            if faster_whisper_failed:
                 try:
                     import whispercpp
                     
@@ -3854,10 +3873,6 @@ def main():
                 except Exception as e:
                     print(f"Warning: Could not pre-load audio model with whispercpp: {e}")
                     print("Audio model will load on-demand when transcription is requested.")
-            
-            except Exception as e:
-                print(f"Warning: Could not pre-load audio model: {e}")
-                print("Audio model will load on-demand when transcription is requested.")
     
     # Set up TTS model if specified
     if args.tts_model:
