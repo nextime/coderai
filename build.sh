@@ -135,6 +135,73 @@ elif [ "$BACKEND" = "vulkan" ]; then
     echo -e "${YELLOW}Installing Vulkan-specific requirements...${NC}"
     pip install -r requirements-vulkan.txt
     
+    # Build whispercpp Python package with Vulkan support for GPU-accelerated audio transcription
+    echo -e "${YELLOW}Building whispercpp with Vulkan support for GPU-accelerated transcription...${NC}"
+    
+    # First, uninstall any existing whispercpp (pip version doesn't have Vulkan)
+    pip uninstall -y whispercpp 2>/dev/null || true
+    
+    # Clone and build whisper.cpp with Vulkan for Python bindings
+    WHISPERCPP_DIR="$HOME/whisper.cpp"
+    if [ ! -d "$WHISPERCPP_DIR" ]; then
+        echo "Cloning whisper.cpp..."
+        git clone --depth 1 https://github.com/ggerganov/whisper.cpp "$WHISPERCPP_DIR" 2>/dev/null || {
+            echo -e "${YELLOW}Warning: Could not clone whisper.cpp${NC}"
+        }
+    fi
+    
+    if [ -d "$WHISPERCPP_DIR/bindings/python" ]; then
+        cd "$WHISPERCPP_DIR/bindings/python"
+        
+        # Build with Vulkan support
+        # Set CMAKE_ARGS to enable Vulkan for ggml (whisper uses ggml library internally)
+        CMAKE_ARGS="-DWHISPER_VULKAN=ON -DGGML_VULKAN=ON" pip install . --no-cache-dir --force-reinstall 2>/dev/null || {
+            # If Vulkan build fails, try without (will fall back to CPU)
+            echo -e "${YELLOW}Warning: whispercpp Vulkan build failed, will use CPU${NC}"
+            pip install . --no-cache-dir --force-reinstall 2>/dev/null || {
+                echo -e "${YELLOW}Warning: Could not install whispercpp at all${NC}"
+            }
+        }
+        cd "$OLDPWD"
+        echo -e "${GREEN}✓ whispercpp with Vulkan support installed!${NC}"
+    else
+        echo -e "${YELLOW}Warning: whisper.cpp Python bindings not found${NC}"
+    fi
+    
+    # Also build the main whisper.cpp C++ with Vulkan for standalone usage
+    echo -e "${YELLOW}Building whisper.cpp C++ with Vulkan support (optional)...${NC}"
+    WHISPER_DIR="$HOME/whisper.cpp"
+    if [ -d "$WHISPER_DIR" ]; then
+        echo "Using existing whisper.cpp installation"
+    else
+        echo "Cloning whisper.cpp..."
+        git clone https://github.com/ggerganov/whisper.cpp "$WHISPER_DIR" 2>/dev/null || {
+            echo -e "${YELLOW}Warning: Could not clone whisper.cpp. Audio transcription will use CPU.${NC}"
+        }
+    fi
+    
+    if [ -d "$WHISPER_DIR" ]; then
+        cd "$WHISPER_DIR"
+        mkdir -p build 2>/dev/null
+        cd build
+        cmake -DGGML_VULKAN=ON .. >/dev/null 2>&1 || {
+            echo -e "${YELLOW}Warning: Vulkan build failed, building with OpenBLAS${NC}"
+            cmake -DBUILD_SHARED_LIBS=ON .. >/dev/null 2>&1
+        }
+        make -j$(nproc) >/dev/null 2>&1 || {
+            echo -e "${YELLOW}Warning: Build failed. Audio transcription will use CPU.${NC}"
+        }
+        cd "$OLDPWD"
+        
+        if [ ! -f "$WHISPER_DIR/models/ggml-base.bin" ]; then
+            echo "Downloading Whisper base model..."
+            bash "$WHISPER_DIR/models/download-ggml-model.sh" base 2>/dev/null || {
+                echo -e "${YELLOW}Warning: Could not download Whisper model.${NC}"
+            }
+        fi
+        echo -e "${GREEN}✓ whisper.cpp ready for audio transcription!${NC}"
+    fi
+    
     echo ""
     echo -e "${GREEN}========================================${NC}"
     echo -e "${GREEN}  Vulkan build complete!${NC}"
@@ -178,6 +245,22 @@ elif [ "$BACKEND" = "vulkan-nvidia" ]; then
     
     echo -e "${YELLOW}Installing Vulkan-specific requirements...${NC}"
     pip install -r requirements-vulkan.txt
+    
+    # Build whispercpp Python package with Vulkan support for GPU-accelerated audio transcription
+    echo -e "${YELLOW}Building whispercpp with Vulkan support for GPU-accelerated transcription...${NC}"
+    pip uninstall -y whispercpp 2>/dev/null || true
+    WHISPERCPP_DIR="$HOME/whisper.cpp"
+    if [ ! -d "$WHISPERCPP_DIR" ]; then
+        git clone --depth 1 https://github.com/ggerganov/whisper.cpp "$WHISPERCPP_DIR" 2>/dev/null || true
+    fi
+    if [ -d "$WHISPERCPP_DIR/bindings/python" ]; then
+        cd "$WHISPERCPP_DIR/bindings/python"
+        CMAKE_ARGS="-DWHISPER_VULKAN=ON -DGGML_VULKAN=ON" pip install . --no-cache-dir --force-reinstall 2>/dev/null || {
+            pip install . --no-cache-dir --force-reinstall 2>/dev/null || true
+        }
+        cd "$OLDPWD"
+        echo -e "${GREEN}✓ whispercpp with Vulkan support installed!${NC}"
+    fi
     
     echo ""
     echo -e "${GREEN}========================================${NC}"

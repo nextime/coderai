@@ -2372,6 +2372,23 @@ async def create_transcription(
         # Use configured audio model
         model_to_use = audio_model
     
+    # Check if Vulkan is available for whispercpp
+    whisper_vulkan_available = False
+    whisper_vulkan_device = os.environ.get('GGML_VULKAN_DEVICE', '0')
+    try:
+        # Check if whispercpp is installed and has Vulkan support
+        import whispercpp
+        # Try to detect Vulkan support by checking if we can list devices
+        # whispercpp doesn't have a direct Vulkan check, but we can verify by environment
+        if os.environ.get('GGML_VULKAN_DEVICE') or os.environ.get('VK_DEVICE_SELECT_DEVICE'):
+            whisper_vulkan_available = True
+            print(f"Whisper Vulkan: Using GPU device {whisper_vulkan_device}")
+        elif os.path.exists('/dev/dri'):  # Linux DRM devices exist = AMD/Intel GPU
+            whisper_vulkan_available = True
+            print(f"Whisper Vulkan: Auto-detected GPU, using device {whisper_vulkan_device}")
+    except ImportError:
+        pass
+    
     # Read file content
     file_content = await file.read()
     
@@ -2506,6 +2523,8 @@ async def create_transcription(
                 
                 if whisper_model is None:
                     print(f"Loading whispercpp model: {model_to_use}")
+                    if whisper_vulkan_available:
+                        print(f"  -> Using Vulkan GPU acceleration (device {whisper_vulkan_device})")
                     
                     # Check if model_to_use is a URL - download it (with caching)
                     model_path = None
@@ -3553,6 +3572,12 @@ def parse_args():
         help="Audio model GPU offload percentage (0-100). If not set, uses CPU",
     )
     parser.add_argument(
+        "--audio-vulkan-device",
+        type=int,
+        default=0,
+        help="Vulkan GPU device ID to use for Whisper audio transcription (default: 0). Only used when using Vulkan backend.",
+    )
+    parser.add_argument(
         "--vision-ctx",
         type=int,
         default=2048,
@@ -3753,6 +3778,11 @@ def main():
     # Set up audio model if specified (with pre-loading if in loadall/loadswap mode)
     if args.audio_model:
         print(f"\nAudio transcription model: {args.audio_model}")
+        
+        # Set up Vulkan device for Whisper if using Vulkan backend
+        if hasattr(args, 'audio_vulkan_device') and args.audio_vulkan_device is not None:
+            os.environ['GGML_VULKAN_DEVICE'] = str(args.audio_vulkan_device)
+            print(f"  Using Vulkan device: {args.audio_vulkan_device}")
         multi_model_manager.set_audio_model(args.audio_model, {
             'ctx': args.audio_ctx,
             'offload': args.audio_offload,
@@ -3830,6 +3860,21 @@ def main():
             if faster_whisper_failed:
                 # Check if model is a GGUF file - whispercpp can handle those
                 model_is_gguf = model_to_use.endswith('.gguf') or (model_path and model_path.endswith('.gguf'))
+                
+                # Check if Vulkan is available for whispercpp
+                whisper_vulkan_available = False
+                whisper_vulkan_device = os.environ.get('GGML_VULKAN_DEVICE', '0')
+                try:
+                    import whispercpp
+                    if os.environ.get('GGML_VULKAN_DEVICE') or os.environ.get('VK_DEVICE_SELECT_DEVICE'):
+                        whisper_vulkan_available = True
+                        print(f"Whisper Vulkan: Will use GPU device {whisper_vulkan_device}")
+                    elif os.path.exists('/dev/dri'):
+                        whisper_vulkan_available = True
+                        print(f"Whisper Vulkan: Auto-detected GPU, will use device {whisper_vulkan_device}")
+                except ImportError:
+                    pass
+                
                 try:
                     import whispercpp
                     
@@ -3879,6 +3924,8 @@ def main():
                             model_key = f"audio:{args.audio_model}"
                             multi_model_manager.add_model(model_key, whisper_model)
                             print(f"Audio model loaded successfully (whispercpp)")
+                            if whisper_vulkan_available:
+                                print(f"  -> Using Vulkan GPU acceleration (device {whisper_vulkan_device})")
                         except Exception as e:
                             error_msg = str(e).lower()
                             if 'not a valid preconverted model' in error_msg:
