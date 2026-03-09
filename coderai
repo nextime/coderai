@@ -2666,31 +2666,44 @@ async def create_transcription(
                         print(f"DEBUG: Whisper model: {model_to_use}")
                         print(f"DEBUG: Whisper model path (resolved): {model_path}")
                         
-                        # Run whisper.cpp CLI
+                        # Build whisper.cpp CLI command
+                        # Usage: whisper-cli [options] file0 file1 ...
+                        # Options:
+                        #   -m, --model FNAME    model path
+                        #   -f, --file FNAME    input audio file
+                        #   -of, --output-file  output file (without extension)
+                        #   -dev, --device N   GPU device ID
+                        #   -otxt, --output-txt output as text file
                         cmd = [whisper_cpp_path]
                         if model_path:
-                            cmd.extend(["--model", model_path])
-                        cmd.extend(["--output", "/tmp/whisper_output.txt", tmp_path])
+                            cmd.extend(["-m", model_path])
+                        cmd.extend(["-f", tmp_path])
+                        cmd.extend(["-otxt"])  # Output as text
                         
                         # Add Vulkan device if specified
                         audio_vulkan_device = getattr(global_args, 'audio_vulkan_device', 0)
                         if audio_vulkan_device is not None:
-                            cmd.extend(["--device", str(audio_vulkan_device)])
+                            cmd.extend(["-dev", str(audio_vulkan_device)])
                         
                         print(f"DEBUG: Running whisper.cpp command: {' '.join(cmd)}")
                         
                         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
                         
                         if result.returncode == 0:
-                            # Read output
-                            output_file = "/tmp/whisper_output.txt"
-                            if os.path.exists(output_file):
-                                with open(output_file, 'r') as f:
-                                    full_text = f.read()
-                                os.unlink(output_file)
-                                return {"text": full_text}
+                            # Read output - whisper.cpp -otxt outputs to stdout or a file
+                            # With -otxt flag, it outputs the transcribed text
+                            if result.stdout:
+                                full_text = result.stdout
                             else:
-                                return {"text": result.stdout}
+                                # Try to read from a file with same name as input but .txt extension
+                                output_txt = tmp_path + ".txt"
+                                if os.path.exists(output_txt):
+                                    with open(output_txt, 'r') as f:
+                                        full_text = f.read()
+                                    os.unlink(output_txt)
+                                else:
+                                    full_text = ""
+                            return {"text": full_text}
                         else:
                             print(f"whisper.cpp CLI error: {result.stderr}")
                     except Exception as subprocess_error:
