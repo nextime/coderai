@@ -2642,11 +2642,45 @@ async def create_transcription(
                     print("Options:")
                     print("  1. Install PyTorch + faster-whisper: pip install torch faster-whisper")
                     print("  2. Use a built-in whispercpp model: --audio-model base")
+                    print("  3. Use --whisper-cpp to specify whisper.cpp CLI path")
                     print("Audio model will load on-demand when transcription is requested.")
-                # Return error response instead of None
+                
+                # Try whisper.cpp CLI as fallback if specified
+                whisper_cpp_path = getattr(args, 'whisper_cpp', None)
+                if whisper_cpp_path and os.path.isfile(whisper_cpp_path):
+                    print(f"Using whisper.cpp CLI: {whisper_cpp_path}")
+                    try:
+                        import subprocess
+                        
+                        # Run whisper.cpp CLI
+                        cmd = [whisper_cpp_path, "--model", model_to_use, "--output", "/tmp/whisper_output.txt", tmp_path]
+                        
+                        # Add Vulkan device if specified
+                        audio_vulkan_device = getattr(args, 'audio_vulkan_device', 0)
+                        if audio_vulkan_device is not None:
+                            cmd.extend(["--device", str(audio_vulkan_device)])
+                        
+                        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                        
+                        if result.returncode == 0:
+                            # Read output
+                            output_file = "/tmp/whisper_output.txt"
+                            if os.path.exists(output_file):
+                                with open(output_file, 'r') as f:
+                                    full_text = f.read()
+                                os.unlink(output_file)
+                                return {"text": full_text}
+                            else:
+                                return {"text": result.stdout}
+                        else:
+                            print(f"whisper.cpp CLI error: {result.stderr}")
+                    except Exception as subprocess_error:
+                        print(f"whisper.cpp CLI subprocess error: {subprocess_error}")
+                
+                # Return error response
                 raise HTTPException(
                     status_code=501,
-                    detail="Audio transcription not available. Install faster-whisper (requires PyTorch) or use a built-in whispercpp model (tiny/base/small/medium/large)."
+                    detail="Audio transcription not available. Install faster-whisper (requires PyTorch) or use --whisper-cpp to specify whisper.cpp CLI path."
                 )
         
     finally:
@@ -3576,6 +3610,12 @@ def parse_args():
         type=int,
         default=0,
         help="Vulkan GPU device ID to use for Whisper audio transcription (default: 0). Only used when using Vulkan backend.",
+    )
+    parser.add_argument(
+        "--whisper-cpp",
+        type=str,
+        default=None,
+        help="Path to whisper.cpp CLI executable (e.g., ~/whisper.cpp/build/bin/whisper-cli). Uses Vulkan if available.",
     )
     parser.add_argument(
         "--vision-ctx",
