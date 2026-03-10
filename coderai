@@ -4520,7 +4520,6 @@ def main():
                 print(f"Detected GGUF image model, loading with llama.cpp...")
                 try:
                     from llama_cpp import Llama
-                    import os
                     
                     model_key = f"image:{original_model_name}"
                     
@@ -4924,7 +4923,7 @@ def main():
                 print(f"Detected GGUF image model, loading with llama.cpp...")
                 try:
                     from llama_cpp import Llama
-                    import os
+                    from llama_cpp import Llama
                     
                     model_key = f"image:{original_model_name}"
                     
@@ -5003,7 +5002,7 @@ def main():
                     print(f"Warning: Failed to pre-load GGUF image model: {e}")
                 try:
                     from llama_cpp import Llama
-                    import os
+                    from llama_cpp import Llama
                     
                     model_key = f"image:{model_name}"
                     
