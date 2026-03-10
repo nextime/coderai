@@ -4398,45 +4398,117 @@ def main():
         # Load image model
         if image_models:
             print(f"Pre-loading image model: {image_models[0]}")
-            # Actually load the image model using diffusers
-            try:
-                import torch
-                from diffusers import StableDiffusionXLPipeline, DiffusionPipeline
-                
-                model_key = f"image:{image_models[0]}"
-                print(f"Loading diffusers pipeline: {image_models[0]}")
-                
-                # Try to load as Stable Diffusion XL first
+            
+            # Check if the image model is a GGUF model
+            model_name = image_models[0]
+            is_gguf = model_name.endswith('.gguf') or 'gguf' in model_name.lower()
+            
+            if is_gguf:
+                # Load GGUF image model using llama.cpp (VulkanBackend)
+                print(f"Detected GGUF image model, loading with llama.cpp...")
                 try:
-                    pipeline = StableDiffusionXLPipeline.from_pretrained(
-                        image_models[0],
-                        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                        use_safetensors=True,
-                    )
+                    from llama_cpp import Llama
+                    import os
+                    
+                    model_key = f"image:{model_name}"
+                    
+                    # Download GGUF model if needed (similar to VulkanBackend)
+                    model_path = None
+                    if model_name.startswith('http://') or model_name.startswith('https://'):
+                        cached_path = get_cached_model_path(model_name)
+                        if cached_path:
+                            model_path = cached_path
+                            print(f"Using cached GGUF model: {model_path}")
+                        else:
+                            print(f"Downloading GGUF model: {model_name}")
+                            cache_dir = get_model_cache_dir()
+                            model_path = download_model(model_name, cache_dir)
+                    elif os.path.isfile(model_name):
+                        model_path = model_name
+                        print(f"Loading local GGUF model: {model_path}")
+                    else:
+                        # Try to download from HuggingFace Hub
+                        try:
+                            from huggingface_hub import hf_hub_download, list_repo_files
+                            parts = model_name.split('/')
+                            if len(parts) >= 2:
+                                repo_id = f"{parts[0]}/{parts[1]}"
+                                files = list_repo_files(repo_id)
+                                gguf_files = [f for f in files if f.endswith('.gguf')]
+                                if not gguf_files:
+                                    raise ValueError(f"No GGUF files found in {repo_id}")
+                                filename = gguf_files[0]
+                                model_path = hf_hub_download(repo_id=repo_id, filename=filename)
+                                print(f"Downloaded GGUF model to: {model_path}")
+                        except Exception as e:
+                            print(f"Could not resolve GGUF model path: {e}")
+                            print(f"Image model will load on first request")
+                            model_path = None
+                    
+                    if model_path and os.path.isfile(model_path):
+                        # Load with llama.cpp - use Vulkan backend for GGUF
+                        # GGUF models for image generation need special handling
+                        # Most llama.cpp based image models need GPU layers
+                        n_gpu_layers = -1  # Load all layers to GPU
+                        n_ctx = 2048
+                        
+                        llama_model = Llama(
+                            model_path=model_path,
+                            n_gpu_layers=n_gpu_layers,
+                            n_ctx=n_ctx,
+                            verbose=False,
+                        )
+                        multi_model_manager.add_model(model_key, llama_model)
+                        print(f"GGUF image model loaded successfully: {model_name}")
+                    else:
+                        print(f"Could not load GGUF image model: no valid model path")
+                        
+                except ImportError as e:
+                    print(f"Warning: llama_cpp not installed: {e}")
+                    print(f"Image model will load on first request")
                 except Exception as e:
-                    print(f"SDXL failed, trying generic pipeline: {e}")
-                    # Try generic diffusion pipeline
-                    pipeline = DiffusionPipeline.from_pretrained(
-                        image_models[0],
-                        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                        use_safetensors=True,
-                    )
-                
-                # Move to GPU if available
-                if torch.cuda.is_available():
-                    pipeline = pipeline.to("cuda")
-                    pipeline.enable_attention_slicing()
-                else:
-                    pipeline = pipeline.to("cpu")
-                
-                multi_model_manager.add_model(model_key, pipeline)
-                print(f"Image model loaded successfully: {image_models[0]}")
-                
-            except ImportError as e:
-                print(f"Warning: diffusers not installed, image model will load on first request: {e}")
-            except Exception as e:
-                print(f"Warning: Failed to pre-load image model: {e}")
-                print(f"  Image model will load on first request")
+                    print(f"Warning: Failed to pre-load GGUF image model: {e}")
+                    print(f"Image model will load on first request")
+            else:
+                # Load diffusers image model (Stable Diffusion)
+                try:
+                    import torch
+                    from diffusers import StableDiffusionXLPipeline, DiffusionPipeline
+                    
+                    model_key = f"image:{model_name}"
+                    print(f"Loading diffusers pipeline: {model_name}")
+                    
+                    # Try to load as Stable Diffusion XL first
+                    try:
+                        pipeline = StableDiffusionXLPipeline.from_pretrained(
+                            model_name,
+                            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                            use_safetensors=True,
+                        )
+                    except Exception as e:
+                        print(f"SDXL failed, trying generic pipeline: {e}")
+                        # Try generic diffusion pipeline
+                        pipeline = DiffusionPipeline.from_pretrained(
+                            model_name,
+                            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                            use_safetensors=True,
+                        )
+                    
+                    # Move to GPU if available
+                    if torch.cuda.is_available():
+                        pipeline = pipeline.to("cuda")
+                        pipeline.enable_attention_slicing()
+                    else:
+                        pipeline = pipeline.to("cpu")
+                    
+                    multi_model_manager.add_model(model_key, pipeline)
+                    print(f"Image model loaded successfully: {model_name}")
+                    
+                except ImportError as e:
+                    print(f"Warning: diffusers not installed, image model will load on first request: {e}")
+                except Exception as e:
+                    print(f"Warning: Failed to pre-load image model: {e}")
+                    print(f"  Image model will load on first request")
         
         # Load audio model
         if audio_models:
@@ -4696,44 +4768,108 @@ def main():
         # Pre-load image model if it's the only model configured
         if not model_names and not audio_models and not args.tts_model:
             print(f"Pre-loading image model...")
-            # Actually load the image model using diffusers
-            try:
-                import torch
-                from diffusers import StableDiffusionXLPipeline, DiffusionPipeline
-                
-                model_key = f"image:{image_models[0]}"
-                print(f"Loading diffusers pipeline: {image_models[0]}")
-                
-                # Try to load as Stable Diffusion XL first
+            # Check if the image model is a GGUF model
+            model_name = image_models[0]
+            is_gguf = model_name.endswith('.gguf') or 'gguf' in model_name.lower()
+            
+            if is_gguf:
+                # Load GGUF image model using llama.cpp (VulkanBackend)
+                print(f"Detected GGUF image model, loading with llama.cpp...")
                 try:
-                    pipeline = StableDiffusionXLPipeline.from_pretrained(
-                        image_models[0],
-                        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                        use_safetensors=True,
-                    )
+                    from llama_cpp import Llama
+                    import os
+                    
+                    model_key = f"image:{model_name}"
+                    
+                    # Download GGUF model if needed (similar to VulkanBackend)
+                    model_path = None
+                    if model_name.startswith('http://') or model_name.startswith('https://'):
+                        cached_path = get_cached_model_path(model_name)
+                        if cached_path:
+                            model_path = cached_path
+                            print(f"Using cached GGUF model: {model_path}")
+                        else:
+                            print(f"Downloading GGUF model: {model_name}")
+                            cache_dir = get_model_cache_dir()
+                            model_path = download_model(model_name, cache_dir)
+                    elif os.path.isfile(model_name):
+                        model_path = model_name
+                        print(f"Loading local GGUF model: {model_path}")
+                    else:
+                        # Try to download from HuggingFace Hub
+                        try:
+                            from huggingface_hub import hf_hub_download, list_repo_files
+                            parts = model_name.split('/')
+                            if len(parts) >= 2:
+                                repo_id = f"{parts[0]}/{parts[1]}"
+                                files = list_repo_files(repo_id)
+                                gguf_files = [f for f in files if f.endswith('.gguf')]
+                                if not gguf_files:
+                                    raise ValueError(f"No GGUF files found in {repo_id}")
+                                filename = gguf_files[0]
+                                model_path = hf_hub_download(repo_id=repo_id, filename=filename)
+                                print(f"Downloaded GGUF model to: {model_path}")
+                        except Exception as e:
+                            print(f"Could not resolve GGUF model path: {e}")
+                            model_path = None
+                    
+                    if model_path and os.path.isfile(model_path):
+                        # Load with llama.cpp
+                        n_gpu_layers = -1  # Load all layers to GPU
+                        n_ctx = 2048
+                        
+                        llama_model = Llama(
+                            model_path=model_path,
+                            n_gpu_layers=n_gpu_layers,
+                            n_ctx=n_ctx,
+                            verbose=False,
+                        )
+                        multi_model_manager.add_model(model_key, llama_model)
+                        print(f"GGUF image model loaded successfully: {model_name}")
+                    else:
+                        print(f"Could not load GGUF image model: no valid model path")
+                        
+                except ImportError as e:
+                    print(f"Warning: llama_cpp not installed: {e}")
                 except Exception as e:
-                    print(f"SDXL failed, trying generic pipeline: {e}")
-                    # Try generic diffusion pipeline
-                    pipeline = DiffusionPipeline.from_pretrained(
-                        image_models[0],
-                        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                        use_safetensors=True,
-                    )
-                
-                # Move to GPU if available
-                if torch.cuda.is_available():
-                    pipeline = pipeline.to("cuda")
-                    pipeline.enable_attention_slicing()
-                else:
-                    pipeline = pipeline.to("cpu")
-                
-                multi_model_manager.add_model(model_key, pipeline)
-                print(f"Image model loaded successfully: {image_models[0]}")
-                
-            except ImportError as e:
-                print(f"Warning: diffusers not installed: {e}")
-            except Exception as e:
-                print(f"Warning: Failed to pre-load image model: {e}")
+                    print(f"Warning: Failed to pre-load GGUF image model: {e}")
+            else:
+                # Load diffusers image model (Stable Diffusion)
+                try:
+                    import torch
+                    from diffusers import StableDiffusionXLPipeline, DiffusionPipeline
+                    
+                    model_key = f"image:{model_name}"
+                    print(f"Loading diffusers pipeline: {model_name}")
+                    
+                    # Try to load as Stable Diffusion XL first
+                    try:
+                        pipeline = StableDiffusionXLPipeline.from_pretrained(
+                            model_name,
+                            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                            use_safetensors=True,
+                        )
+                    except Exception as e:
+                        print(f"SDXL failed, trying generic pipeline: {e}")
+                        pipeline = DiffusionPipeline.from_pretrained(
+                            model_name,
+                            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                            use_safetensors=True,
+                        )
+                    
+                    if torch.cuda.is_available():
+                        pipeline = pipeline.to("cuda")
+                        pipeline.enable_attention_slicing()
+                    else:
+                        pipeline = pipeline.to("cpu")
+                    
+                    multi_model_manager.add_model(model_key, pipeline)
+                    print(f"Image model loaded successfully: {model_name}")
+                    
+                except ImportError as e:
+                    print(f"Warning: diffusers not installed: {e}")
+                except Exception as e:
+                    print(f"Warning: Failed to pre-load image model: {e}")
     
     # Register model aliases if specified
     if args.model_aliases:
