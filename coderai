@@ -4497,7 +4497,7 @@ def main():
         if model_names:
             print(f"Pre-loading main text model: {model_names[0]}")
         
-        # Load image model
+        # Load image model (first one only in loadall mode currently)
         if image_models:
             print(f"Pre-loading image model: {image_models[0]}")
             
@@ -4520,8 +4520,6 @@ def main():
                 print(f"Detected GGUF image model, loading with llama.cpp...")
                 try:
                     from llama_cpp import Llama
-                    
-                    model_key = f"image:{original_model_name}"
                     
                     # Download GGUF model if needed (similar to VulkanBackend)
                     model_path = None
@@ -4563,6 +4561,9 @@ def main():
                             model_path = None
                     
                     if model_path and os.path.isfile(model_path):
+                        # Use the cached path for the model key
+                        model_key = f"image:{model_path}"
+                        
                         # Load with llama.cpp
                         n_gpu_layers = -1  # Load all layers to GPU
                         n_ctx = 2048
@@ -4967,8 +4968,6 @@ def main():
                     from llama_cpp import Llama
                     from llama_cpp import Llama
                     
-                    model_key = f"image:{original_model_name}"
-                    
                     # Download GGUF model if needed
                     model_path = None
                     
@@ -5088,8 +5087,6 @@ def main():
                     from llama_cpp import Llama
                     from llama_cpp import Llama
                     
-                    model_key = f"image:{model_name}"
-                    
                     # Download GGUF model if needed (similar to VulkanBackend)
                     model_path = None
                     if model_name.startswith('http://') or model_name.startswith('https://'):
@@ -5123,6 +5120,9 @@ def main():
                             model_path = None
                     
                     if model_path and os.path.isfile(model_path):
+                        # Use the cached path for the model key
+                        model_key = f"image:{model_path}"
+                        
                         # Load with llama.cpp
                         n_gpu_layers = -1  # Load all layers to GPU
                         n_ctx = 2048
