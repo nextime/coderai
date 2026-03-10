@@ -4597,10 +4597,10 @@ def main():
                                     print(f"Trying stable-diffusion-cpp-python fallback...")
                                     # Try stable-diffusion-cpp-python as fallback
                                     try:
-                                        import stable_diffusion_cpp as sd
+                                        from stable_diffusion_cpp import StableDiffusion
                                         
                                         print(f"Loading with sd.cpp: {model_path}")
-                                        sd_model = sd.load_model(model_path)
+                                        sd_model = StableDiffusion(model_path=model_path)
                                         multi_model_manager.add_model(model_key, sd_model)
                                         print(f"Image model loaded successfully via sd.cpp: {original_model_name}")
                                     except ImportError as sd_error:
@@ -5009,10 +5009,10 @@ def main():
                                     print(f"Trying stable-diffusion-cpp-python fallback...")
                                     # Try stable-diffusion-cpp-python as fallback
                                     try:
-                                        import stable_diffusion_cpp as sd
+                                        from stable_diffusion_cpp import StableDiffusion
                                         
                                         print(f"Loading with sd.cpp: {model_path}")
-                                        sd_model = sd.load_model(model_path)
+                                        sd_model = StableDiffusion(model_path=model_path)
                                         multi_model_manager.add_model(model_key, sd_model)
                                         print(f"Image model loaded successfully via sd.cpp: {original_model_name}")
                                     except ImportError as sd_error:
