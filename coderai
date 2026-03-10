@@ -4594,9 +4594,21 @@ def main():
                                     print(f"GGUF image model loaded successfully: {original_model_name}")
                                 except Exception as llama_error:
                                     print(f"llama.cpp load error: {llama_error}")
-                                    print(f"This usually means llama.cpp does not support this model architecture.")
-                                    print(f"Server will continue starting...")
-                                    print(f"Image model will load on first request")
+                                    print(f"Trying stable-diffusion-cpp-python fallback...")
+                                    # Try stable-diffusion-cpp-python as fallback
+                                    try:
+                                        import sd
+                                        
+                                        print(f"Loading with sd.cpp: {model_path}")
+                                        sd_model = sd.load_model(model_path)
+                                        multi_model_manager.add_model(model_key, sd_model)
+                                        print(f"Image model loaded successfully via sd.cpp: {original_model_name}")
+                                    except ImportError as sd_error:
+                                        print(f"stable-diffusion-cpp-python not installed: {sd_error}")
+                                        print(f"Image model will load on first request")
+                                    except Exception as sd_error:
+                                        print(f"sd.cpp load error: {sd_error}")
+                                        print(f"Image model will load on first request")
                     else:
                         print(f"Could not load GGUF image model: no valid model path")
                         
@@ -4994,9 +5006,21 @@ def main():
                                     print(f"GGUF image model loaded successfully: {original_model_name}")
                                 except Exception as llama_error:
                                     print(f"llama.cpp load error: {llama_error}")
-                                    print(f"This usually means llama.cpp does not support this model architecture.")
-                                    print(f"Server will continue starting...")
-                                    print(f"Image model will load on first request")
+                                    print(f"Trying stable-diffusion-cpp-python fallback...")
+                                    # Try stable-diffusion-cpp-python as fallback
+                                    try:
+                                        import sd
+                                        
+                                        print(f"Loading with sd.cpp: {model_path}")
+                                        sd_model = sd.load_model(model_path)
+                                        multi_model_manager.add_model(model_key, sd_model)
+                                        print(f"Image model loaded successfully via sd.cpp: {original_model_name}")
+                                    except ImportError as sd_error:
+                                        print(f"stable-diffusion-cpp-python not installed: {sd_error}")
+                                        print(f"Image model will load on first request")
+                                    except Exception as sd_error:
+                                        print(f"sd.cpp load error: {sd_error}")
+                                        print(f"Image model will load on first request")
                     else:
                         print(f"Could not load GGUF image model: no valid model path")
                         
