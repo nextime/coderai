@@ -4598,7 +4598,7 @@ def main():
                                     print(f"Try updating llama.cpp: pip install llama-cpp-python --upgrade")
                                     print(f"Or rebuild with latest ggml:")
                                     print(f"  pip install llama-cpp-python --force-reinstall --no-cache-dir \\")
-                                    print(f"    CMAKE_ARGS=\"-DGGML_VULKAN=ON\" \\")
+                                    print(f"    CMAKE_ARGS='-DGGML_VULKAN=ON' \\")
                                     print(f"    FORCE_CMAKE=1")
                                     print(f"Image model will load on first request")
                     else:
@@ -5002,7 +5002,7 @@ def main():
                                     print(f"Try updating llama.cpp: pip install llama-cpp-python --upgrade")
                                     print(f"Or rebuild with latest ggml:")
                                     print(f"  pip install llama-cpp-python --force-reinstall --no-cache-dir \\")
-                                    print(f"    CMAKE_ARGS=\"-DGGML_VULKAN=ON\" \\")
+                                    print(f"    CMAKE_ARGS='-DGGML_VULKAN=ON' \\")
                                     print(f"    FORCE_CMAKE=1")
                                     print(f"Image model will load on first request")
                     else:
