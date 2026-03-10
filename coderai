@@ -4186,6 +4186,12 @@ def main():
     # Set global debug flag
     global_debug = args.debug
     if global_debug:
+        # Print the full command line that was used to invoke coderai
+        import shlex
+        cmd_line = ' '.join(shlex.quote(arg) for arg in sys.argv)
+        print(f"\n{'='*80}")
+        print(f"=== COMMAND LINE: {cmd_line}")
+        print(f"{'='*80}\n")
         print("DEBUG MODE ENABLED - Full requests and replies will be dumped to stdout")
     
     # Handle --vulkan-list-devices
@@ -4264,16 +4270,18 @@ def main():
             'single_gpu': args.vulkan_single_gpu,
         }
         
+        # Load the first model
+        first_model_name = model_names[0]
         try:
             model_manager.load_model(
-                model_name=model_name,
+                model_name=first_model_name,
                 backend_type=args.backend,
                 **load_kwargs
             )
             # Register with multi_model_manager
-            multi_model_manager.set_default_model(model_name, load_kwargs)
-            multi_model_manager.add_model(model_name, model_manager)
-            print(f"\nMain text model loaded: {model_name}")
+            multi_model_manager.set_default_model(first_model_name, load_kwargs)
+            multi_model_manager.add_model(first_model_name, model_manager)
+            print(f"\nMain text model loaded: {first_model_name}")
         except Exception as e:
             print(f"\nError loading model: {e}")
             error_str = str(e).lower()
@@ -4289,12 +4297,12 @@ def main():
                     print("  - Tokenizer error: ensure sentencepiece and tiktoken are installed")
                     print("    pip install sentencepiece tiktoken tokenizers")
                 # Check if trying to load GGUF model with NVIDIA backend
-                if "gguf" in model_name.lower():
-                    print(f"\n  *** IMPORTANT: '{model_name}' appears to be a GGUF model ***")
+                if "gguf" in first_model_name.lower():
+                    print(f"\n  *** IMPORTANT: '{first_model_name}' appears to be a GGUF model ***")
                     print("  GGUF models are NOT compatible with the NVIDIA backend.")
                     print("  Use --backend vulkan instead, or choose a HuggingFace Transformers model.")
                     print("\n  Example Vulkan command:")
-                    print(f"    coderai --backend vulkan --model {model_name}")
+                    print(f"    coderai --backend vulkan --model {first_model_name}")
             sys.exit(1)
     else:
         print("\nNo main text model specified (--model). Running with audio/image/TTS models only.")
@@ -4316,7 +4324,10 @@ def main():
         
         if load_mode == "loadall":
             # Load all models into VRAM
-            for i, model_name in enumerate(model_names):
+            # Skip first model if it's already loaded (at lines 4274-4281)
+            start_index = 1 if model_names[0] in multi_model_manager.models else 0
+            for i in range(start_index, len(model_names)):
+                model_name = model_names[i]
                 print(f"\nLoading model {i+1}/{len(model_names)}: {model_name}")
                 try:
                     manager = ModelManager()
@@ -4332,55 +4343,38 @@ def main():
         
         elif load_mode == "loadswap":
             # First model in VRAM, others in RAM
-            for i, model_name in enumerate(model_names):
-                print(f"\nLoading model {i+1}/{len(model_names)}: {model_name} ({'VRAM' if i == 0 else 'RAM'})")
+            # Skip first model if it's already loaded (at lines 4274-4281)
+            start_index = 1 if model_names[0] in multi_model_manager.models else 0
+            for i in range(start_index, len(model_names)):
+                model_name = model_names[i]
+                # In loadswap, all additional models go to RAM (CPU-only)
+                print(f"\nLoading model {i+1}/{len(model_names)}: {model_name} (RAM)")
                 try:
                     manager = ModelManager()
-                    # For non-first models, we'll load them in CPU mode initially
-                    if i > 0:
-                        # Modify kwargs for CPU-only loading
-                        swap_kwargs = load_kwargs.copy()
-                        swap_kwargs['n_gpu_layers'] = 0  # Force CPU only
-                        manager.load_model(
-                            model_name=model_name,
-                            backend_type=args.backend,
-                            **swap_kwargs
-                        )
-                    else:
-                        manager.load_model(
-                            model_name=model_name,
-                            backend_type=args.backend,
-                            **load_kwargs
-                        )
+                    # Modify kwargs for CPU-only loading
+                    swap_kwargs = load_kwargs.copy()
+                    swap_kwargs['n_gpu_layers'] = 0  # Force CPU only for swap mode
+                    manager.load_model(
+                        model_name=model_name,
+                        backend_type=args.backend,
+                        **swap_kwargs
+                    )
                     multi_model_manager.add_model(model_name, manager)
-                    print(f"Loaded: {model_name} ({'VRAM' if i == 0 else 'RAM'})")
+                    print(f"Loaded: {model_name} (RAM)")
                 except Exception as e:
                     print(f"Error loading {model_name}: {e}")
         
         else:  # ondemand
-            # Only load first model, others on-demand
-            print(f"\nLoading first model (VRAM): {model_names[0]}")
-            try:
-                model_manager.load_model(
-                    model_name=model_names[0],
-                    backend_type=args.backend,
-                    **load_kwargs
-                )
-                multi_model_manager.set_default_model(model_names[0], load_kwargs)
-                multi_model_manager.add_model(model_names[0], model_manager)
-                print(f"Loaded: {model_names[0]}")
-                
-                # Register other models but don't load them
-                for model_name in model_names[1:]:
-                    multi_model_manager.set_default_model(model_name, load_kwargs)
-                
-                print(f"\nOther models will load on-demand: {model_names[1:]}")
-            except Exception as e:
-                print(f"Error loading model: {e}")
-                sys.exit(1)
-    elif len(model_names) == 1:
-        # Single model - load it
-        model_name = model_names[0]
+            # First model already loaded at lines 4274-4281
+            # Just register other models but don't load them
+            print(f"\nFirst model already loaded: {model_names[0]}")
+            
+            # Register other models but don't load them
+            for model_name in model_names[1:]:
+                multi_model_manager.set_default_model(model_name, load_kwargs)
+            
+            print(f"Other models will load on-demand: {model_names[1:]}")
+    # Model is already loaded at lines 4274-4281
     
     # Determine load mode BEFORE setting up other models
     load_mode = "ondemand"
