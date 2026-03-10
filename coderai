@@ -4602,7 +4602,6 @@ def main():
                                         print(f"Loading with sd.cpp: {model_path}")
                                         # For models like Z-Image-Turbo/Flux, use diffusion_model_path
                                         # Look for additional model files in same directory
-                                        import os
                                         model_dir = os.path.dirname(model_path)
                                         model_name = os.path.basename(model_path)
                                         
@@ -5043,7 +5042,6 @@ def main():
                                         print(f"Loading with sd.cpp: {model_path}")
                                         # For models like Z-Image-Turbo/Flux, use diffusion_model_path
                                         # Look for additional model files in same directory
-                                        import os
                                         model_dir = os.path.dirname(model_path)
                                         model_name = os.path.basename(model_path)
                                         
