@@ -4401,6 +4401,9 @@ def main():
             
             # Check if the image model is a GGUF model
             model_name = image_models[0]
+            # Strip query parameters from URL if present
+            if '?' in model_name:
+                model_name = model_name.split('?')[0]
             is_gguf = model_name.endswith('.gguf') or 'gguf' in model_name.lower()
             
             if is_gguf:
@@ -4770,6 +4773,9 @@ def main():
             print(f"Pre-loading image model...")
             # Check if the image model is a GGUF model
             model_name = image_models[0]
+            # Strip query parameters from URL if present
+            if '?' in model_name:
+                model_name = model_name.split('?')[0]
             is_gguf = model_name.endswith('.gguf') or 'gguf' in model_name.lower()
             
             if is_gguf:
