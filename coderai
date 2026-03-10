@@ -4597,7 +4597,7 @@ def main():
                                     print(f"Trying stable-diffusion-cpp-python fallback...")
                                     # Try stable-diffusion-cpp-python as fallback
                                     try:
-                                        import sd
+                                        import stable_diffusion_cpp as sd
                                         
                                         print(f"Loading with sd.cpp: {model_path}")
                                         sd_model = sd.load_model(model_path)
@@ -5009,7 +5009,7 @@ def main():
                                     print(f"Trying stable-diffusion-cpp-python fallback...")
                                     # Try stable-diffusion-cpp-python as fallback
                                     try:
-                                        import sd
+                                        import stable_diffusion_cpp as sd
                                         
                                         print(f"Loading with sd.cpp: {model_path}")
                                         sd_model = sd.load_model(model_path)
