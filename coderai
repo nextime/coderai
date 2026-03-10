@@ -4467,14 +4467,22 @@ def main():
                         n_ctx = 2048
                         
                         print(f"Loading GGUF model from: {model_path}")
-                        llama_model = Llama(
-                            model_path=model_path,
-                            n_gpu_layers=n_gpu_layers,
-                            n_ctx=n_ctx,
-                            verbose=False,
-                        )
-                        multi_model_manager.add_model(model_key, llama_model)
-                        print(f"GGUF image model loaded successfully: {original_model_name}")
+                        print(f"GGUF model file size: {os.path.getsize(model_path) / (1024*1024):.1f} MB")
+                        
+                        try:
+                            llama_model = Llama(
+                                model_path=model_path,
+                                n_gpu_layers=n_gpu_layers,
+                                n_ctx=n_ctx,
+                                verbose=True,  # Enable verbose to see errors
+                            )
+                            multi_model_manager.add_model(model_key, llama_model)
+                            print(f"GGUF image model loaded successfully: {original_model_name}")
+                        except Exception as llama_error:
+                            print(f"llama.cpp load error: {llama_error}")
+                            import traceback
+                            traceback.print_exc()
+                            print(f"Will try loading image model on first request instead")
                     else:
                         print(f"Could not load GGUF image model: no valid model path")
                         
@@ -4849,14 +4857,22 @@ def main():
                         n_ctx = 2048
                         
                         print(f"Loading GGUF model from: {model_path}")
-                        llama_model = Llama(
-                            model_path=model_path,
-                            n_gpu_layers=n_gpu_layers,
-                            n_ctx=n_ctx,
-                            verbose=False,
-                        )
-                        multi_model_manager.add_model(model_key, llama_model)
-                        print(f"GGUF image model loaded successfully: {original_model_name}")
+                        print(f"GGUF model file size: {os.path.getsize(model_path) / (1024*1024):.1f} MB")
+                        
+                        try:
+                            llama_model = Llama(
+                                model_path=model_path,
+                                n_gpu_layers=n_gpu_layers,
+                                n_ctx=n_ctx,
+                                verbose=True,
+                            )
+                            multi_model_manager.add_model(model_key, llama_model)
+                            print(f"GGUF image model loaded successfully: {original_model_name}")
+                        except Exception as llama_error:
+                            print(f"llama.cpp load error: {llama_error}")
+                            import traceback
+                            traceback.print_exc()
+                            print(f"Will try loading image model on first request instead")
                     else:
                         print(f"Could not load GGUF image model: no valid model path")
                         
