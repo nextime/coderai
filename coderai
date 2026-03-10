@@ -4575,7 +4575,7 @@ def main():
                         with open(model_path, 'rb') as f:
                             magic = f.read(8)
                             print(f"File magic bytes: {magic}")
-                            if magic != b'GGUF':
+                            if not magic.startswith(b'GGUF'):
                                 print(f"ERROR: File is NOT a valid GGUF! Expected 'GGUF', got: {magic}")
                                 print(f"This means the download returned an HTML error page instead of the model.")
                                 print(f"The URL must be a DIRECT download link (ends with .gguf, not a model page)")
@@ -4976,7 +4976,7 @@ def main():
                         with open(model_path, 'rb') as f:
                             magic = f.read(8)
                             print(f"File magic bytes: {magic}")
-                            if magic != b'GGUF':
+                            if not magic.startswith(b'GGUF'):
                                 print(f"ERROR: File is NOT a valid GGUF! Expected 'GGUF', got: {magic}")
                                 print(f"The URL must be a DIRECT download link (ends with .gguf)")
                                 print(f"Image model will load on first request")
