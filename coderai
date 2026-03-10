@@ -4149,6 +4149,22 @@ def parse_args():
         help="Vision model GPU offload percentage (0-100). If not set, loads fully on GPU",
     )
     parser.add_argument(
+        "--list-cached-models",
+        action="store_true",
+        help="List all cached models in the model cache directory",
+    )
+    parser.add_argument(
+        "--remove-all-models",
+        action="store_true",
+        help="Remove all cached models from the model cache directory",
+    )
+    parser.add_argument(
+        "--remove-model",
+        type=str,
+        default=None,
+        help="Remove a specific cached model by name or hash (partial match)",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug mode - dumps full request/response to stdout for troubleshooting",
@@ -4206,6 +4222,92 @@ def main():
                 print("Could not run vulkaninfo. Make sure vulkan-tools is installed.")
         except Exception as e:
             print(f"Error listing devices: {e}")
+        sys.exit(0)
+    
+    # Handle --list-cached-models
+    if args.list_cached_models:
+        print("\nListing cached models...")
+        cache_dir = get_model_cache_dir()
+        print(f"Cache directory: {cache_dir}")
+        print("")
+        
+        if not os.path.exists(cache_dir):
+            print("Cache directory does not exist.")
+            sys.exit(0)
+        
+        files = os.listdir(cache_dir)
+        if not files:
+            print("No cached models found.")
+            sys.exit(0)
+        
+        print(f"Found {len(files)} cached files:")
+        total_size = 0
+        for f in sorted(files):
+            filepath = os.path.join(cache_dir, f)
+            size = os.path.getsize(filepath)
+            total_size += size
+            size_mb = size / (1024 * 1024)
+            print(f"  {f} ({size_mb:.1f} MB)")
+        
+        print(f"\nTotal: {len(files)} files, {total_size / (1024*1024*1024):.2f} GB")
+        sys.exit(0)
+    
+    # Handle --remove-all-models
+    if args.remove_all_models:
+        print("\nRemoving all cached models...")
+        cache_dir = get_model_cache_dir()
+        
+        if not os.path.exists(cache_dir):
+            print("Cache directory does not exist.")
+            sys.exit(0)
+        
+        files = os.listdir(cache_dir)
+        if not files:
+            print("No cached models to remove.")
+            sys.exit(0)
+        
+        print(f"Found {len(files)} cached files. Deleting...")
+        import shutil
+        for f in files:
+            filepath = os.path.join(cache_dir, f)
+            os.remove(filepath)
+            print(f"  Deleted: {f}")
+        
+        print(f"\nAll {len(files)} cached models removed.")
+        sys.exit(0)
+    
+    # Handle --remove-model
+    if args.remove_model:
+        print(f"\nRemoving cached model matching: {args.remove_model}")
+        cache_dir = get_model_cache_dir()
+        
+        if not os.path.exists(cache_dir):
+            print("Cache directory does not exist.")
+            sys.exit(0)
+        
+        files = os.listdir(cache_dir)
+        # Find files that contain the search term
+        matching = [f for f in files if args.remove_model.lower() in f.lower()]
+        
+        if not matching:
+            print(f"No cached models found matching: {args.remove_model}")
+            print(f"\nUse --list-cached-models to see available models.")
+            sys.exit(0)
+        
+        print(f"Found {len(matching)} matching file(s):")
+        for f in matching:
+            filepath = os.path.join(cache_dir, f)
+            size = os.path.getsize(filepath)
+            print(f"  {f} ({size / (1024*1024):.1f} MB)")
+        
+        # Confirm before deleting
+        print(f"\nDeleting {len(matching)} file(s)...")
+        for f in matching:
+            filepath = os.path.join(cache_dir, f)
+            os.remove(filepath)
+            print(f"  Deleted: {f}")
+        
+        print(f"\nRemoved {len(matching)} cached model(s).")
         sys.exit(0)
     
     # Get model names from args - support multiple models
