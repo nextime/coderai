@@ -4600,7 +4600,36 @@ def main():
                                         from stable_diffusion_cpp import StableDiffusion
                                         
                                         print(f"Loading with sd.cpp: {model_path}")
-                                        sd_model = StableDiffusion(model_path=model_path)
+                                        # For models like Z-Image-Turbo/Flux, use diffusion_model_path
+                                        # Look for additional model files in same directory
+                                        import os
+                                        model_dir = os.path.dirname(model_path)
+                                        model_name = os.path.basename(model_path)
+                                        
+                                        # Try to find additional model files
+                                        clip_l_path = None
+                                        t5xxl_path = None
+                                        vae_path = None
+                                        
+                                        # Look for common file patterns
+                                        for f in os.listdir(model_dir) if os.path.exists(model_dir) else []:
+                                            if 'clip_l' in f.lower() and f.endswith(('.safetensors', '.bin')):
+                                                clip_l_path = os.path.join(model_dir, f)
+                                            elif 't5xxl' in f.lower() and f.endswith(('.safetensors', '.bin')):
+                                                t5xxl_path = os.path.join(model_dir, f)
+                                            elif f.endswith('.safetensors') and 'ae' in f.lower():
+                                                vae_path = os.path.join(model_dir, f)
+                                        
+                                        # Build kwargs based on available files
+                                        sd_kwargs = {'diffusion_model_path': model_path}
+                                        if clip_l_path:
+                                            sd_kwargs['clip_l_path'] = clip_l_path
+                                        if t5xxl_path:
+                                            sd_kwargs['t5xxl_path'] = t5xxl_path
+                                        if vae_path:
+                                            sd_kwargs['vae_path'] = vae_path
+                                        
+                                        sd_model = StableDiffusion(**sd_kwargs)
                                         multi_model_manager.add_model(model_key, sd_model)
                                         print(f"Image model loaded successfully via sd.cpp: {original_model_name}")
                                     except ImportError as sd_error:
@@ -5012,7 +5041,36 @@ def main():
                                         from stable_diffusion_cpp import StableDiffusion
                                         
                                         print(f"Loading with sd.cpp: {model_path}")
-                                        sd_model = StableDiffusion(model_path=model_path)
+                                        # For models like Z-Image-Turbo/Flux, use diffusion_model_path
+                                        # Look for additional model files in same directory
+                                        import os
+                                        model_dir = os.path.dirname(model_path)
+                                        model_name = os.path.basename(model_path)
+                                        
+                                        # Try to find additional model files
+                                        clip_l_path = None
+                                        t5xxl_path = None
+                                        vae_path = None
+                                        
+                                        # Look for common file patterns
+                                        for f in os.listdir(model_dir) if os.path.exists(model_dir) else []:
+                                            if 'clip_l' in f.lower() and f.endswith(('.safetensors', '.bin')):
+                                                clip_l_path = os.path.join(model_dir, f)
+                                            elif 't5xxl' in f.lower() and f.endswith(('.safetensors', '.bin')):
+                                                t5xxl_path = os.path.join(model_dir, f)
+                                            elif f.endswith('.safetensors') and 'ae' in f.lower():
+                                                vae_path = os.path.join(model_dir, f)
+                                        
+                                        # Build kwargs based on available files
+                                        sd_kwargs = {'diffusion_model_path': model_path}
+                                        if clip_l_path:
+                                            sd_kwargs['clip_l_path'] = clip_l_path
+                                        if t5xxl_path:
+                                            sd_kwargs['t5xxl_path'] = t5xxl_path
+                                        if vae_path:
+                                            sd_kwargs['vae_path'] = vae_path
+                                        
+                                        sd_model = StableDiffusion(**sd_kwargs)
                                         multi_model_manager.add_model(model_key, sd_model)
                                         print(f"Image model loaded successfully via sd.cpp: {original_model_name}")
                                     except ImportError as sd_error:
