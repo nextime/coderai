@@ -4468,6 +4468,12 @@ def main():
                         
                         print(f"Loading GGUF model from: {model_path}")
                         print(f"GGUF model file size: {os.path.getsize(model_path) / (1024*1024):.1f} MB")
+                        print(f"File exists: {os.path.exists(model_path)}")
+                        
+                        # Try to verify it's a valid GGUF file
+                        with open(model_path, 'rb') as f:
+                            magic = f.read(8)
+                            print(f"GGUF magic bytes: {magic.hex()}")
                         
                         try:
                             llama_model = Llama(
