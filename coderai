@@ -4399,43 +4399,56 @@ def main():
         if image_models:
             print(f"Pre-loading image model: {image_models[0]}")
             
-            # Check if the image model is a GGUF model
-            model_name = image_models[0]
+            # Get the original model name
+            original_model_name = image_models[0]
+            
+            # Check if it's a URL first (before any processing)
+            is_url = original_model_name.startswith('http://') or original_model_name.startswith('https://')
+            
             # Strip query parameters from URL if present
+            model_name = original_model_name
             if '?' in model_name:
                 model_name = model_name.split('?')[0]
+            
+            # Check if the image model is a GGUF model
             is_gguf = model_name.endswith('.gguf') or 'gguf' in model_name.lower()
             
             if is_gguf:
-                # Load GGUF image model using llama.cpp (VulkanBackend)
+                # Load GGUF image model using llama.cpp
                 print(f"Detected GGUF image model, loading with llama.cpp...")
                 try:
                     from llama_cpp import Llama
                     import os
                     
-                    model_key = f"image:{model_name}"
+                    model_key = f"image:{original_model_name}"
                     
                     # Download GGUF model if needed (similar to VulkanBackend)
                     model_path = None
-                    if model_name.startswith('http://') or model_name.startswith('https://'):
-                        cached_path = get_cached_model_path(model_name)
+                    
+                    # Check if it's a URL - download directly
+                    if is_url:
+                        print(f"Image model is a URL: {original_model_name}")
+                        cached_path = get_cached_model_path(original_model_name)
                         if cached_path:
                             model_path = cached_path
                             print(f"Using cached GGUF model: {model_path}")
                         else:
-                            print(f"Downloading GGUF model: {model_name}")
+                            print(f"Downloading GGUF model: {original_model_name}")
                             cache_dir = get_model_cache_dir()
-                            model_path = download_model(model_name, cache_dir)
+                            model_path = download_model(original_model_name, cache_dir)
                     elif os.path.isfile(model_name):
+                        # Local file
                         model_path = model_name
                         print(f"Loading local GGUF model: {model_path}")
                     else:
                         # Try to download from HuggingFace Hub
+                        print(f"Trying to resolve as HuggingFace model: {model_name}")
                         try:
                             from huggingface_hub import hf_hub_download, list_repo_files
                             parts = model_name.split('/')
                             if len(parts) >= 2:
                                 repo_id = f"{parts[0]}/{parts[1]}"
+                                print(f"Looking for GGUF files in repo: {repo_id}")
                                 files = list_repo_files(repo_id)
                                 gguf_files = [f for f in files if f.endswith('.gguf')]
                                 if not gguf_files:
@@ -4449,12 +4462,11 @@ def main():
                             model_path = None
                     
                     if model_path and os.path.isfile(model_path):
-                        # Load with llama.cpp - use Vulkan backend for GGUF
-                        # GGUF models for image generation need special handling
-                        # Most llama.cpp based image models need GPU layers
+                        # Load with llama.cpp
                         n_gpu_layers = -1  # Load all layers to GPU
                         n_ctx = 2048
                         
+                        print(f"Loading GGUF model from: {model_path}")
                         llama_model = Llama(
                             model_path=model_path,
                             n_gpu_layers=n_gpu_layers,
@@ -4462,7 +4474,7 @@ def main():
                             verbose=False,
                         )
                         multi_model_manager.add_model(model_key, llama_model)
-                        print(f"GGUF image model loaded successfully: {model_name}")
+                        print(f"GGUF image model loaded successfully: {original_model_name}")
                     else:
                         print(f"Could not load GGUF image model: no valid model path")
                         
@@ -4771,16 +4783,87 @@ def main():
         # Pre-load image model if it's the only model configured
         if not model_names and not audio_models and not args.tts_model:
             print(f"Pre-loading image model...")
-            # Check if the image model is a GGUF model
-            model_name = image_models[0]
+            
+            # Get the original model name
+            original_model_name = image_models[0]
+            
+            # Check if it's a URL first (before any processing)
+            is_url = original_model_name.startswith('http://') or original_model_name.startswith('https://')
+            
             # Strip query parameters from URL if present
+            model_name = original_model_name
             if '?' in model_name:
                 model_name = model_name.split('?')[0]
+            
+            # Check if the image model is a GGUF model
             is_gguf = model_name.endswith('.gguf') or 'gguf' in model_name.lower()
             
             if is_gguf:
-                # Load GGUF image model using llama.cpp (VulkanBackend)
+                # Load GGUF image model using llama.cpp
                 print(f"Detected GGUF image model, loading with llama.cpp...")
+                try:
+                    from llama_cpp import Llama
+                    import os
+                    
+                    model_key = f"image:{original_model_name}"
+                    
+                    # Download GGUF model if needed
+                    model_path = None
+                    
+                    # Check if it's a URL - download directly
+                    if is_url:
+                        print(f"Image model is a URL: {original_model_name}")
+                        cached_path = get_cached_model_path(original_model_name)
+                        if cached_path:
+                            model_path = cached_path
+                            print(f"Using cached GGUF model: {model_path}")
+                        else:
+                            print(f"Downloading GGUF model: {original_model_name}")
+                            cache_dir = get_model_cache_dir()
+                            model_path = download_model(original_model_name, cache_dir)
+                    elif os.path.isfile(model_name):
+                        model_path = model_name
+                        print(f"Loading local GGUF model: {model_name}")
+                    else:
+                        # Try to download from HuggingFace Hub
+                        print(f"Trying to resolve as HuggingFace model: {model_name}")
+                        try:
+                            from huggingface_hub import hf_hub_download, list_repo_files
+                            parts = model_name.split('/')
+                            if len(parts) >= 2:
+                                repo_id = f"{parts[0]}/{parts[1]}"
+                                print(f"Looking for GGUF files in repo: {repo_id}")
+                                files = list_repo_files(repo_id)
+                                gguf_files = [f for f in files if f.endswith('.gguf')]
+                                if not gguf_files:
+                                    raise ValueError(f"No GGUF files found in {repo_id}")
+                                filename = gguf_files[0]
+                                model_path = hf_hub_download(repo_id=repo_id, filename=filename)
+                                print(f"Downloaded GGUF model to: {model_path}")
+                        except Exception as e:
+                            print(f"Could not resolve GGUF model path: {e}")
+                            model_path = None
+                    
+                    if model_path and os.path.isfile(model_path):
+                        n_gpu_layers = -1
+                        n_ctx = 2048
+                        
+                        print(f"Loading GGUF model from: {model_path}")
+                        llama_model = Llama(
+                            model_path=model_path,
+                            n_gpu_layers=n_gpu_layers,
+                            n_ctx=n_ctx,
+                            verbose=False,
+                        )
+                        multi_model_manager.add_model(model_key, llama_model)
+                        print(f"GGUF image model loaded successfully: {original_model_name}")
+                    else:
+                        print(f"Could not load GGUF image model: no valid model path")
+                        
+                except ImportError as e:
+                    print(f"Warning: llama_cpp not installed: {e}")
+                except Exception as e:
+                    print(f"Warning: Failed to pre-load GGUF image model: {e}")
                 try:
                     from llama_cpp import Llama
                     import os
