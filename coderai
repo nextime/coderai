@@ -4900,8 +4900,8 @@ def main():
                 'offload': args.vision_offload,
             })
         
-        # Pre-load image model if it's the only model configured
-        if not model_names and not audio_models and not args.tts_model:
+        # Pre-load image model if it's configured (even with audio models)
+        if image_models:
             print(f"Pre-loading image model...")
             
             # Get the original model name
