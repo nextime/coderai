@@ -4398,7 +4398,45 @@ def main():
         # Load image model
         if image_models:
             print(f"Pre-loading image model: {image_models[0]}")
-            print(f"  Image model will load on first request")
+            # Actually load the image model using diffusers
+            try:
+                import torch
+                from diffusers import StableDiffusionXLPipeline, DiffusionPipeline
+                
+                model_key = f"image:{image_models[0]}"
+                print(f"Loading diffusers pipeline: {image_models[0]}")
+                
+                # Try to load as Stable Diffusion XL first
+                try:
+                    pipeline = StableDiffusionXLPipeline.from_pretrained(
+                        image_models[0],
+                        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                        use_safetensors=True,
+                    )
+                except Exception as e:
+                    print(f"SDXL failed, trying generic pipeline: {e}")
+                    # Try generic diffusion pipeline
+                    pipeline = DiffusionPipeline.from_pretrained(
+                        image_models[0],
+                        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                        use_safetensors=True,
+                    )
+                
+                # Move to GPU if available
+                if torch.cuda.is_available():
+                    pipeline = pipeline.to("cuda")
+                    pipeline.enable_attention_slicing()
+                else:
+                    pipeline = pipeline.to("cpu")
+                
+                multi_model_manager.add_model(model_key, pipeline)
+                print(f"Image model loaded successfully: {image_models[0]}")
+                
+            except ImportError as e:
+                print(f"Warning: diffusers not installed, image model will load on first request: {e}")
+            except Exception as e:
+                print(f"Warning: Failed to pre-load image model: {e}")
+                print(f"  Image model will load on first request")
         
         # Load audio model
         if audio_models:
@@ -4658,6 +4696,44 @@ def main():
         # Pre-load image model if it's the only model configured
         if not model_names and not audio_models and not args.tts_model:
             print(f"Pre-loading image model...")
+            # Actually load the image model using diffusers
+            try:
+                import torch
+                from diffusers import StableDiffusionXLPipeline, DiffusionPipeline
+                
+                model_key = f"image:{image_models[0]}"
+                print(f"Loading diffusers pipeline: {image_models[0]}")
+                
+                # Try to load as Stable Diffusion XL first
+                try:
+                    pipeline = StableDiffusionXLPipeline.from_pretrained(
+                        image_models[0],
+                        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                        use_safetensors=True,
+                    )
+                except Exception as e:
+                    print(f"SDXL failed, trying generic pipeline: {e}")
+                    # Try generic diffusion pipeline
+                    pipeline = DiffusionPipeline.from_pretrained(
+                        image_models[0],
+                        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                        use_safetensors=True,
+                    )
+                
+                # Move to GPU if available
+                if torch.cuda.is_available():
+                    pipeline = pipeline.to("cuda")
+                    pipeline.enable_attention_slicing()
+                else:
+                    pipeline = pipeline.to("cpu")
+                
+                multi_model_manager.add_model(model_key, pipeline)
+                print(f"Image model loaded successfully: {image_models[0]}")
+                
+            except ImportError as e:
+                print(f"Warning: diffusers not installed: {e}")
+            except Exception as e:
+                print(f"Warning: Failed to pre-load image model: {e}")
     
     # Register model aliases if specified
     if args.model_aliases:
