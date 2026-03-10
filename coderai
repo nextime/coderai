@@ -4594,40 +4594,7 @@ def main():
                                     print(f"GGUF image model loaded successfully: {original_model_name}")
                                 except Exception as llama_error:
                                     print(f"llama.cpp load error: {llama_error}")
-                                    print(f"GGUF loading failed, trying diffusers fallback...")
-                                    try:
-                                        import torch
-                                        from diffusers import StableDiffusionXLPipeline, DiffusionPipeline
-                                        
-                                        print(f"Loading diffusers pipeline: {model_name}")
-                                        try:
-                                            pipeline = StableDiffusionXLPipeline.from_pretrained(
-                                                model_name,
-                                                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                                                use_safetensors=True,
-                                            )
-                                        except Exception as e:
-                                            print(f"SDXL failed, trying generic pipeline: {e}")
-                                            pipeline = DiffusionPipeline.from_pretrained(
-                                                model_name,
-                                                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                                                use_safetensors=True,
-                                            )
-                                        
-                                        if torch.cuda.is_available():
-                                            pipeline = pipeline.to("cuda")
-                                            pipeline.enable_attention_slicing()
-                                        else:
-                                            pipeline = pipeline.to("cpu")
-                                        
-                                        multi_model_manager.add_model(model_key, pipeline)
-                                        print(f"Image model loaded successfully via diffusers: {model_name}")
-                                    except ImportError as diffusers_err:
-                                        print(f"Warning: diffusers not installed: {diffusers_err}")
-                                        print(f"Image model will load on first request")
-                                    except Exception as diffusers_err:
-                                        print(f"Warning: diffusers fallback also failed: {diffusers_err}")
-                                        print(f"Image model will load on first request")
+                                    print(f"Will try loading image model on first request instead")
                     else:
                         print(f"Could not load GGUF image model: no valid model path")
                         
@@ -5025,40 +4992,7 @@ def main():
                                     print(f"GGUF image model loaded successfully: {original_model_name}")
                                 except Exception as llama_error:
                                     print(f"llama.cpp load error: {llama_error}")
-                                    print(f"GGUF loading failed, trying diffusers fallback...")
-                                    try:
-                                        import torch
-                                        from diffusers import StableDiffusionXLPipeline, DiffusionPipeline
-                                        
-                                        print(f"Loading diffusers pipeline: {model_name}")
-                                        try:
-                                            pipeline = StableDiffusionXLPipeline.from_pretrained(
-                                                model_name,
-                                                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                                                use_safetensors=True,
-                                            )
-                                        except Exception as e:
-                                            print(f"SDXL failed, trying generic pipeline: {e}")
-                                            pipeline = DiffusionPipeline.from_pretrained(
-                                                model_name,
-                                                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                                                use_safetensors=True,
-                                            )
-                                        
-                                        if torch.cuda.is_available():
-                                            pipeline = pipeline.to("cuda")
-                                            pipeline.enable_attention_slicing()
-                                        else:
-                                            pipeline = pipeline.to("cpu")
-                                        
-                                        multi_model_manager.add_model(model_key, pipeline)
-                                        print(f"Image model loaded successfully via diffusers: {model_name}")
-                                    except ImportError as diffusers_err:
-                                        print(f"Warning: diffusers not installed: {diffusers_err}")
-                                        print(f"Image model will load on first request")
-                                    except Exception as diffusers_err:
-                                        print(f"Warning: diffusers fallback also failed: {diffusers_err}")
-                                        print(f"Image model will load on first request")
+                                    print(f"Will try loading image model on first request instead")
                     else:
                         print(f"Could not load GGUF image model: no valid model path")
                         
