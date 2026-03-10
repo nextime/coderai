@@ -4467,28 +4467,33 @@ def main():
                         n_ctx = 2048
                         
                         print(f"Loading GGUF model from: {model_path}")
-                        print(f"GGUF model file size: {os.path.getsize(model_path) / (1024*1024):.1f} MB")
-                        print(f"File exists: {os.path.exists(model_path)}")
+                        file_size = os.path.getsize(model_path)
+                        print(f"GGUF model file size: {file_size / (1024*1024):.1f} MB")
                         
-                        # Try to verify it's a valid GGUF file
+                        # Verify it's a valid GGUF file (check magic bytes)
                         with open(model_path, 'rb') as f:
                             magic = f.read(8)
-                            print(f"GGUF magic bytes: {magic.hex()}")
-                        
-                        try:
-                            llama_model = Llama(
-                                model_path=model_path,
-                                n_gpu_layers=n_gpu_layers,
-                                n_ctx=n_ctx,
-                                verbose=True,  # Enable verbose to see errors
-                            )
-                            multi_model_manager.add_model(model_key, llama_model)
-                            print(f"GGUF image model loaded successfully: {original_model_name}")
-                        except Exception as llama_error:
-                            print(f"llama.cpp load error: {llama_error}")
-                            import traceback
-                            traceback.print_exc()
-                            print(f"Will try loading image model on first request instead")
+                            print(f"File magic bytes: {magic}")
+                            if magic != b'GGUF':
+                                print(f"ERROR: File is NOT a valid GGUF! Expected 'GGUF', got: {magic}")
+                                print(f"This means the download returned an HTML error page instead of the model.")
+                                print(f"The URL must be a DIRECT download link (ends with .gguf, not a model page)")
+                                print(f"Example: https://huggingface.co/owner/repo/resolve/main/model.gguf")
+                                print(f"Image model will load on first request")
+                            else:
+                                # Valid GGUF, try to load
+                                try:
+                                    llama_model = Llama(
+                                        model_path=model_path,
+                                        n_gpu_layers=n_gpu_layers,
+                                        n_ctx=n_ctx,
+                                        verbose=True,
+                                    )
+                                    multi_model_manager.add_model(model_key, llama_model)
+                                    print(f"GGUF image model loaded successfully: {original_model_name}")
+                                except Exception as llama_error:
+                                    print(f"llama.cpp load error: {llama_error}")
+                                    print(f"Will try loading image model on first request instead")
                     else:
                         print(f"Could not load GGUF image model: no valid model path")
                         
@@ -4863,22 +4868,30 @@ def main():
                         n_ctx = 2048
                         
                         print(f"Loading GGUF model from: {model_path}")
-                        print(f"GGUF model file size: {os.path.getsize(model_path) / (1024*1024):.1f} MB")
+                        file_size = os.path.getsize(model_path)
+                        print(f"GGUF model file size: {file_size / (1024*1024):.1f} MB")
                         
-                        try:
-                            llama_model = Llama(
-                                model_path=model_path,
-                                n_gpu_layers=n_gpu_layers,
-                                n_ctx=n_ctx,
-                                verbose=True,
-                            )
-                            multi_model_manager.add_model(model_key, llama_model)
-                            print(f"GGUF image model loaded successfully: {original_model_name}")
-                        except Exception as llama_error:
-                            print(f"llama.cpp load error: {llama_error}")
-                            import traceback
-                            traceback.print_exc()
-                            print(f"Will try loading image model on first request instead")
+                        # Verify it's a valid GGUF file (check magic bytes)
+                        with open(model_path, 'rb') as f:
+                            magic = f.read(8)
+                            print(f"File magic bytes: {magic}")
+                            if magic != b'GGUF':
+                                print(f"ERROR: File is NOT a valid GGUF! Expected 'GGUF', got: {magic}")
+                                print(f"The URL must be a DIRECT download link (ends with .gguf)")
+                                print(f"Image model will load on first request")
+                            else:
+                                try:
+                                    llama_model = Llama(
+                                        model_path=model_path,
+                                        n_gpu_layers=n_gpu_layers,
+                                        n_ctx=n_ctx,
+                                        verbose=True,
+                                    )
+                                    multi_model_manager.add_model(model_key, llama_model)
+                                    print(f"GGUF image model loaded successfully: {original_model_name}")
+                                except Exception as llama_error:
+                                    print(f"llama.cpp load error: {llama_error}")
+                                    print(f"Will try loading image model on first request instead")
                     else:
                         print(f"Could not load GGUF image model: no valid model path")
                         
