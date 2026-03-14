@@ -34,6 +34,7 @@ from threading import Thread
 # Per-model semaphores for request concurrency control
 model_semaphores: dict = {}
 load_mode = {"mode": "ondemand"}  # Track load mode globally
+queue_flags = {"model_1": False, "image_1": False, "audio_1": False, "tts_1": False}  # Track --X-1 flags
 # =============================================================================
 # Model Cache Directory
 # =============================================================================
@@ -3137,9 +3138,20 @@ def get_load_mode():
 
 @app.post("/v1/images/generations")
 async def create_image_generation(request: ImageGenerationRequest):
+    """
+    Image generation endpoint (OpenAI-compatible).
+    
+    Supports:
+    - Stable Diffusion via stable-diffusion-cpp-python (sd.cpp)
+    - Stable Diffusion XL (via local inference with diffusers)
+    - Other diffusers models
+    """
     # Get or create semaphore for this model
     model_key = f"image:{request.model}" if request.model else "image"
     mode = get_load_mode()
+    
+    # Check if --image-1 is set (no queue, return 409 if busy)
+    use_1_mode = queue_flags.get("image_1", False)
     
     # In loadall mode, allow 1 concurrent request per model
     # In ondemand mode, serialize all requests (use global semaphore)
@@ -3153,16 +3165,16 @@ async def create_image_generation(request: ImageGenerationRequest):
             model_semaphores["global_image"] = asyncio.Semaphore(1)
         semaphore = model_semaphores["global_image"]
     
-    async with semaphore:
-
-    """
-    Image generation endpoint (OpenAI-compatible).
+    # Try to acquire semaphore without blocking
+    if use_1_mode:
+        acquired = semaphore.locked()
+        if acquired:
+            raise HTTPException(
+                status_code=409,
+                detail="Image model is busy. Try again later."
+            )
     
-    Supports:
-    - Stable Diffusion via stable-diffusion-cpp-python (sd.cpp)
-    - Stable Diffusion XL (via local inference with diffusers)
-    - Other diffusers models
-    """
+    async with semaphore:
     image_model = multi_model_manager.image_model
     
     # If no image model configured, return an error
@@ -4222,11 +4234,21 @@ def parse_args():
         help="Model for audio transcription (e.g., whisper-1, base, or path to faster-whisper model). Can be specified multiple times for multiple models.",
     )
     parser.add_argument(
+        "--audio-1",
+        action="store_true",
+        help="Disable request queue for audio models - return 409 if model is busy",
+    )
+    parser.add_argument(
         "--image-model",
         type=str,
         action="append",
         default=None,
         help="Model for image generation (e.g., stable-diffusion-xl-base-1.0). Can be specified multiple times for multiple models.",
+    )
+    parser.add_argument(
+        "--image-1",
+        action="store_true",
+        help="Disable request queue for image models - return 409 if model is busy",
     )
     parser.add_argument(
         "--llm-path",
