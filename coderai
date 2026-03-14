@@ -4712,7 +4712,7 @@ def main():
             print(f"Pre-loading main text model: {model_names[0]}")
         
         # Load image model (first one only in loadall mode currently)
-        print(f"DEBUG: image_models check at line 4718: {image_models}")
+        print(f"DEBUG: image_models check at line 4718: {image_models}, backend = {args.backend}")
         if image_models:
             print(f"Pre-loading image model: {image_models[0]}")
             
