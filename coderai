@@ -57,6 +57,37 @@ def get_cached_model_path(url: str) -> Optional[str]:
     return None
 
 
+def is_huggingface_model_id(path: str) -> bool:
+    """Check if the path is a Hugging Face model ID (e.g., 'Qwen/Qwen3-4B-Instruct-2507-Q3_K_S')."""
+    # Must contain / but not be a URL
+    return '/' in path and not path.startswith('http://') and not path.startswith('https://')
+
+
+def download_huggingface_model(model_id: str, cache_dir: str, file_pattern: str = '.gguf') -> Optional[str]:
+    """Download a model from Hugging Face by model ID. Returns cached path or None on failure."""
+    try:
+        from huggingface_hub import hf_hub_download, list_repo_files
+        
+        print(f"Downloading from Hugging Face: {model_id}")
+        files = list_repo_files(model_id)
+        
+        # Filter files by extension pattern
+        matching_files = [f for f in files if f.endswith(file_pattern)]
+        if not matching_files:
+            print(f"No {file_pattern} files found in {model_id}")
+            return None
+        
+        # Download the first matching file
+        filename = matching_files[0]
+        print(f"Downloading: {filename}")
+        model_path = hf_hub_download(repo_id=model_id, filename=filename, cache_dir=cache_dir)
+        print(f"Downloaded model to: {model_path}")
+        return model_path
+    except Exception as e:
+        print(f"Error downloading from Hugging Face: {e}")
+        return None
+
+
 def download_model(url: str, cache_dir: str) -> str:
     """Download a model from URL with progress reporting. Returns cached path."""
     import requests
@@ -4655,16 +4686,27 @@ def main():
                                         
                                         # Use CLI arguments if provided, download and cache if URL
                                         if args.llm_path:
-                                            # Check if it's a URL and download if needed
-                                            if args.llm_path.startswith('http://') or args.llm_path.startswith('https://'):
+                                            # Check if it's a Hugging Face model ID, URL, or local path
+                                            if is_huggingface_model_id(args.llm_path):
+                                                # Download from Hugging Face
                                                 cached = get_cached_model_path(args.llm_path)
                                                 if cached:
                                                     clip_l_path = cached
-                                                    print(f"Using cached CLIP model: {clip_l_path}")
+                                                    print(f"Using cached LLM model: {clip_l_path}")
+                                                else:
+                                                    cache_dir = get_model_cache_dir()
+                                                    clip_l_path = download_huggingface_model(args.llm_path, cache_dir, '.gguf')
+                                                    if clip_l_path:
+                                                        print(f"Downloaded LLM model to: {clip_l_path}")
+                                            elif args.llm_path.startswith('http://') or args.llm_path.startswith('https://'):
+                                                cached = get_cached_model_path(args.llm_path)
+                                                if cached:
+                                                    clip_l_path = cached
+                                                    print(f"Using cached LLM model: {clip_l_path}")
                                                 else:
                                                     cache_dir = get_model_cache_dir()
                                                     clip_l_path = download_model(args.llm_path, cache_dir)
-                                                    print(f"Downloaded CLIP model to: {clip_l_path}")
+                                                    print(f"Downloaded LLM model to: {clip_l_path}")
                                             else:
                                                 clip_l_path = args.llm_path
                                         if args.vae_path:
@@ -5139,16 +5181,27 @@ def main():
                                         
                                         # Use CLI arguments if provided, download and cache if URL
                                         if args.llm_path:
-                                            # Check if it's a URL and download if needed
-                                            if args.llm_path.startswith('http://') or args.llm_path.startswith('https://'):
+                                            # Check if it's a Hugging Face model ID, URL, or local path
+                                            if is_huggingface_model_id(args.llm_path):
+                                                # Download from Hugging Face
                                                 cached = get_cached_model_path(args.llm_path)
                                                 if cached:
                                                     clip_l_path = cached
-                                                    print(f"Using cached CLIP model: {clip_l_path}")
+                                                    print(f"Using cached LLM model: {clip_l_path}")
+                                                else:
+                                                    cache_dir = get_model_cache_dir()
+                                                    clip_l_path = download_huggingface_model(args.llm_path, cache_dir, '.gguf')
+                                                    if clip_l_path:
+                                                        print(f"Downloaded LLM model to: {clip_l_path}")
+                                            elif args.llm_path.startswith('http://') or args.llm_path.startswith('https://'):
+                                                cached = get_cached_model_path(args.llm_path)
+                                                if cached:
+                                                    clip_l_path = cached
+                                                    print(f"Using cached LLM model: {clip_l_path}")
                                                 else:
                                                     cache_dir = get_model_cache_dir()
                                                     clip_l_path = download_model(args.llm_path, cache_dir)
-                                                    print(f"Downloaded CLIP model to: {clip_l_path}")
+                                                    print(f"Downloaded LLM model to: {clip_l_path}")
                                             else:
                                                 clip_l_path = args.llm_path
                                         if args.vae_path:
