@@ -29,6 +29,11 @@ from pydantic_core import PydanticCustomError
 from threading import Thread
 
 
+
+
+# Per-model semaphores for request concurrency control
+model_semaphores: dict = {}
+load_mode = {"mode": "ondemand"}  # Track load mode globally
 # =============================================================================
 # Model Cache Directory
 # =============================================================================
@@ -3126,8 +3131,30 @@ async def create_transcription(
 # Image Generation Endpoint
 # =============================================================================
 
+# Global load_mode tracker - will be set in main()
+def get_load_mode():
+    return load_mode.get("mode", "ondemand")
+
 @app.post("/v1/images/generations")
 async def create_image_generation(request: ImageGenerationRequest):
+    # Get or create semaphore for this model
+    model_key = f"image:{request.model}" if request.model else "image"
+    mode = get_load_mode()
+    
+    # In loadall mode, allow 1 concurrent request per model
+    # In ondemand mode, serialize all requests (use global semaphore)
+    if mode == "loadall":
+        if model_key not in model_semaphores:
+            model_semaphores[model_key] = asyncio.Semaphore(1)
+        semaphore = model_semaphores[model_key]
+    else:
+        # Use a global semaphore for ondemand mode
+        if "global_image" not in model_semaphores:
+            model_semaphores["global_image"] = asyncio.Semaphore(1)
+        semaphore = model_semaphores["global_image"]
+    
+    async with semaphore:
+
     """
     Image generation endpoint (OpenAI-compatible).
     
@@ -3188,8 +3215,9 @@ async def create_image_generation(request: ImageGenerationRequest):
                 # Determine number of steps
                 steps = request.steps if request.steps else 4
                 
-                # Generate images using sd.cpp
-                result = sd_model.generate_image(
+                # Generate images using sd.cpp (run in thread to not block event loop)
+                result = await asyncio.to_thread(
+                    sd_model.generate_image,
                     prompt=request.prompt,
                     negative_prompt='',
                     width=width,
@@ -4572,6 +4600,8 @@ def main():
     load_mode = "ondemand"
     if args.loadall:
         load_mode = "loadall"
+    # Update global load_mode for semaphore system
+    load_mode["mode"] = load_mode
     elif args.loadswap:
         load_mode = "loadswap"
     
@@ -4641,6 +4671,8 @@ def main():
     load_mode = "ondemand"
     if args.loadall:
         load_mode = "loadall"
+    # Update global load_mode for semaphore system
+    load_mode["mode"] = load_mode
     elif args.loadswap:
         load_mode = "loadswap"
     
