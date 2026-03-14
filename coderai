@@ -4689,15 +4689,13 @@ def main():
                                             # Check if it's a Hugging Face model ID, URL, or local path
                                             if is_huggingface_model_id(args.llm_path):
                                                 # Download from Hugging Face
-                                                cached = get_cached_model_path(args.llm_path)
-                                                if cached:
-                                                    clip_l_path = cached
-                                                    print(f"Using cached LLM model: {clip_l_path}")
+                                                print(f"Attempting to download LLM model from Hugging Face: {args.llm_path}")
+                                                cache_dir = get_model_cache_dir()
+                                                clip_l_path = download_huggingface_model(args.llm_path, cache_dir, '.gguf')
+                                                if clip_l_path:
+                                                    print(f"Downloaded LLM model to: {clip_l_path}")
                                                 else:
-                                                    cache_dir = get_model_cache_dir()
-                                                    clip_l_path = download_huggingface_model(args.llm_path, cache_dir, '.gguf')
-                                                    if clip_l_path:
-                                                        print(f"Downloaded LLM model to: {clip_l_path}")
+                                                    print(f"Warning: Failed to download LLM model from Hugging Face, will try as local path")
                                             elif args.llm_path.startswith('http://') or args.llm_path.startswith('https://'):
                                                 cached = get_cached_model_path(args.llm_path)
                                                 if cached:
@@ -4737,6 +4735,10 @@ def main():
                                         sd_kwargs = {'diffusion_model_path': model_path}
                                         if clip_l_path:
                                             sd_kwargs['llm_path'] = clip_l_path
+                                            print(f"DEBUG: Adding llm_path to sd_kwargs: {clip_l_path}")
+                                        else:
+                                            print(f"DEBUG: clip_l_path is None or empty, not adding to sd_kwargs")
+                                            print(f"DEBUG: args.llm_path = {args.llm_path}")
                                         if args.vae_path:
                                             sd_kwargs['vae_path'] = vae_path
                                         elif vae_path:
@@ -5181,15 +5183,13 @@ def main():
                                             # Check if it's a Hugging Face model ID, URL, or local path
                                             if is_huggingface_model_id(args.llm_path):
                                                 # Download from Hugging Face
-                                                cached = get_cached_model_path(args.llm_path)
-                                                if cached:
-                                                    clip_l_path = cached
-                                                    print(f"Using cached LLM model: {clip_l_path}")
+                                                print(f"Attempting to download LLM model from Hugging Face: {args.llm_path}")
+                                                cache_dir = get_model_cache_dir()
+                                                clip_l_path = download_huggingface_model(args.llm_path, cache_dir, '.gguf')
+                                                if clip_l_path:
+                                                    print(f"Downloaded LLM model to: {clip_l_path}")
                                                 else:
-                                                    cache_dir = get_model_cache_dir()
-                                                    clip_l_path = download_huggingface_model(args.llm_path, cache_dir, '.gguf')
-                                                    if clip_l_path:
-                                                        print(f"Downloaded LLM model to: {clip_l_path}")
+                                                    print(f"Warning: Failed to download LLM model from Hugging Face, will try as local path")
                                             elif args.llm_path.startswith('http://') or args.llm_path.startswith('https://'):
                                                 cached = get_cached_model_path(args.llm_path)
                                                 if cached:
@@ -5229,6 +5229,10 @@ def main():
                                         sd_kwargs = {'diffusion_model_path': model_path}
                                         if clip_l_path:
                                             sd_kwargs['llm_path'] = clip_l_path
+                                            print(f"DEBUG: Adding llm_path to sd_kwargs: {clip_l_path}")
+                                        else:
+                                            print(f"DEBUG: clip_l_path is None or empty, not adding to sd_kwargs")
+                                            print(f"DEBUG: args.llm_path = {args.llm_path}")
                                         if args.vae_path:
                                             sd_kwargs['vae_path'] = vae_path
                                         elif vae_path:
