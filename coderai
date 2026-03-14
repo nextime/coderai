@@ -3151,8 +3151,21 @@ async def create_image_generation(request: ImageGenerationRequest):
         model_to_use = image_model
     
     # First, try to use stable-diffusion-cpp-python (sd.cpp) if available
-    sd_model_key = f"image:{model_to_use}"
-    sd_model = multi_model_manager.get_model(sd_model_key)
+    # Check all available image models to find one loaded via sd.cpp
+    sd_model = None
+    for key in multi_model_manager.models:
+        if key.startswith("image:"):
+            potential_model = multi_model_manager.get_model(key)
+            if potential_model is not None:
+                # Check if it's a stable-diffusion-cpp model
+                try:
+                    from stable_diffusion_cpp import StableDiffusion
+                    if isinstance(potential_model, StableDiffusion):
+                        sd_model = potential_model
+                        print(f"Found stable-diffusion-cpp model with key: {key}")
+                        break
+                except ImportError:
+                    pass
     
     if sd_model is not None:
         # Check if it's a stable-diffusion-cpp model (has generate method from sd.cpp)
