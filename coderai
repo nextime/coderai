@@ -4654,7 +4654,7 @@ def main():
                                         vae_path = None
                                         
                                         # Use CLI arguments if provided, download and cache if URL
-                                        if clip_l_path:
+                                        if args.clip_l_path:
                                             # Check if it's a URL and download if needed
                                             if args.clip_l_path.startswith('http://') or args.clip_l_path.startswith('https://'):
                                                 cached = get_cached_model_path(args.clip_l_path)
@@ -5134,7 +5134,7 @@ def main():
                                         vae_path = None
                                         
                                         # Use CLI arguments if provided, download and cache if URL
-                                        if clip_l_path:
+                                        if args.clip_l_path:
                                             # Check if it's a URL and download if needed
                                             if args.clip_l_path.startswith('http://') or args.clip_l_path.startswith('https://'):
                                                 cached = get_cached_model_path(args.clip_l_path)
