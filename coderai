@@ -4437,13 +4437,13 @@ def parse_args():
         help="Port for whisper-server (default: 8744).",
     )
     parser.add_argument(
-        "--vision-ctx",
+        "--image-ctx",
         type=int,
         default=2048,
         help="Vision model context size (default: 2048)",
     )
     parser.add_argument(
-        "--vision-offload",
+        "--image-offload",
         type=float,
         default=None,
         help="Vision model GPU offload percentage (0-100). If not set, loads fully on GPU",
@@ -5343,8 +5343,8 @@ def main():
     if image_models:
         print(f"\nImage generation model(s): {image_models}")
         multi_model_manager.set_image_model(image_models[0], {
-            'ctx': args.vision_ctx,
-            'offload': args.vision_offload,
+            'ctx': args.image_ctx,
+            'offload': args.image_offload,
             'llm_path': args.llm_path,
             'vae_path': args.vae_path,
             'sample_method': args.image_sample_method,
@@ -5356,8 +5356,8 @@ def main():
         # Register all image models
         for img_m in image_models[1:]:
             multi_model_manager.set_image_model(img_m, {
-                'ctx': args.vision_ctx,
-                'offload': args.vision_offload,
+                'ctx': args.image_ctx,
+                'offload': args.image_offload,
             })
         
         # Pre-load image model if it's configured (even with audio models)
