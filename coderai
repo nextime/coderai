@@ -4271,6 +4271,12 @@ def parse_args():
         help="Vulkan GPU device ID to use for Whisper audio transcription (default: 0). Only used when using Vulkan backend.",
     )
     parser.add_argument(
+        "--image-vulkan-device",
+        type=int,
+        default=None,
+        help="Vulkan GPU device ID to use for image generation models (default: same as --vulkan-device). Use --vulkan-list-devices to see available devices",
+    )
+    parser.add_argument(
         "--whisper-cpp",
         type=str,
         default=None,
@@ -4812,6 +4818,12 @@ def main():
                                         
                                         # Build kwargs based on available files
                                         sd_kwargs = {'diffusion_model_path': model_path}
+                                        
+                                        # Set Vulkan device for image models
+                                        image_vulkan_device = args.image_vulkan_device if args.image_vulkan_device is not None else args.vulkan_device
+                                        sd_kwargs['main_gpu'] = image_vulkan_device
+                                        print(f"Using Vulkan device {image_vulkan_device} for image model")
+                                        
                                         if clip_l_path:
                                             sd_kwargs['llm_path'] = clip_l_path
                                             print(f"DEBUG: Adding llm_path to sd_kwargs: {clip_l_path}")
@@ -5312,6 +5324,12 @@ def main():
                                         
                                         # Build kwargs based on available files
                                         sd_kwargs = {'diffusion_model_path': model_path}
+                                        
+                                        # Set Vulkan device for image models
+                                        image_vulkan_device = args.image_vulkan_device if args.image_vulkan_device is not None else args.vulkan_device
+                                        sd_kwargs['main_gpu'] = image_vulkan_device
+                                        print(f"Using Vulkan device {image_vulkan_device} for image model")
+                                        
                                         if clip_l_path:
                                             sd_kwargs['llm_path'] = clip_l_path
                                             print(f"DEBUG: Adding llm_path to sd_kwargs: {clip_l_path}")
