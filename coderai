@@ -4654,7 +4654,7 @@ def main():
                                         vae_path = None
                                         
                                         # Use CLI arguments if provided, download and cache if URL
-                                        if args.clip_l_path:
+                                        if clip_l_path:
                                             # Check if it's a URL and download if needed
                                             if args.clip_l_path.startswith('http://') or args.clip_l_path.startswith('https://'):
                                                 cached = get_cached_model_path(args.clip_l_path)
@@ -4693,12 +4693,10 @@ def main():
                                         
                                         # Build kwargs based on available files
                                         sd_kwargs = {'diffusion_model_path': model_path}
-                                        if args.clip_l_path:
-                                            sd_kwargs['clip_l_path'] = args.clip_l_path
-                                        elif clip_l_path:
+                                        if clip_l_path:
                                             sd_kwargs['clip_l_path'] = clip_l_path
                                         if args.vae_path:
-                                            sd_kwargs['vae_path'] = args.vae_path
+                                            sd_kwargs['vae_path'] = vae_path
                                         elif vae_path:
                                             sd_kwargs['vae_path'] = vae_path
                                         if t5xxl_path:
@@ -5136,7 +5134,7 @@ def main():
                                         vae_path = None
                                         
                                         # Use CLI arguments if provided, download and cache if URL
-                                        if args.clip_l_path:
+                                        if clip_l_path:
                                             # Check if it's a URL and download if needed
                                             if args.clip_l_path.startswith('http://') or args.clip_l_path.startswith('https://'):
                                                 cached = get_cached_model_path(args.clip_l_path)
@@ -5175,12 +5173,10 @@ def main():
                                         
                                         # Build kwargs based on available files
                                         sd_kwargs = {'diffusion_model_path': model_path}
-                                        if args.clip_l_path:
-                                            sd_kwargs['clip_l_path'] = args.clip_l_path
-                                        elif clip_l_path:
+                                        if clip_l_path:
                                             sd_kwargs['clip_l_path'] = clip_l_path
                                         if args.vae_path:
-                                            sd_kwargs['vae_path'] = args.vae_path
+                                            sd_kwargs['vae_path'] = vae_path
                                         elif vae_path:
                                             sd_kwargs['vae_path'] = vae_path
                                         if t5xxl_path:
