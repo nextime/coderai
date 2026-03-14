@@ -4653,11 +4653,33 @@ def main():
                                         t5xxl_path = None
                                         vae_path = None
                                         
-                                        # Use CLI arguments if provided
+                                        # Use CLI arguments if provided, download and cache if URL
                                         if args.clip_l_path:
-                                            clip_l_path = args.clip_l_path
+                                            # Check if it's a URL and download if needed
+                                            if args.clip_l_path.startswith('http://') or args.clip_l_path.startswith('https://'):
+                                                cached = get_cached_model_path(args.clip_l_path)
+                                                if cached:
+                                                    clip_l_path = cached
+                                                    print(f"Using cached CLIP model: {clip_l_path}")
+                                                else:
+                                                    cache_dir = get_model_cache_dir()
+                                                    clip_l_path = download_model(args.clip_l_path, cache_dir)
+                                                    print(f"Downloaded CLIP model to: {clip_l_path}")
+                                            else:
+                                                clip_l_path = args.clip_l_path
                                         if args.vae_path:
-                                            vae_path = args.vae_path
+                                            # Check if it's a URL and download if needed
+                                            if args.vae_path.startswith('http://') or args.vae_path.startswith('https://'):
+                                                cached = get_cached_model_path(args.vae_path)
+                                                if cached:
+                                                    vae_path = cached
+                                                    print(f"Using cached VAE model: {vae_path}")
+                                                else:
+                                                    cache_dir = get_model_cache_dir()
+                                                    vae_path = download_model(args.vae_path, cache_dir)
+                                                    print(f"Downloaded VAE model to: {vae_path}")
+                                            else:
+                                                vae_path = args.vae_path
                                         
                                         # Look for common file patterns only if CLI args not provided
                                         if not args.clip_l_path or not args.vae_path:
@@ -5113,11 +5135,33 @@ def main():
                                         t5xxl_path = None
                                         vae_path = None
                                         
-                                        # Use CLI arguments if provided
+                                        # Use CLI arguments if provided, download and cache if URL
                                         if args.clip_l_path:
-                                            clip_l_path = args.clip_l_path
+                                            # Check if it's a URL and download if needed
+                                            if args.clip_l_path.startswith('http://') or args.clip_l_path.startswith('https://'):
+                                                cached = get_cached_model_path(args.clip_l_path)
+                                                if cached:
+                                                    clip_l_path = cached
+                                                    print(f"Using cached CLIP model: {clip_l_path}")
+                                                else:
+                                                    cache_dir = get_model_cache_dir()
+                                                    clip_l_path = download_model(args.clip_l_path, cache_dir)
+                                                    print(f"Downloaded CLIP model to: {clip_l_path}")
+                                            else:
+                                                clip_l_path = args.clip_l_path
                                         if args.vae_path:
-                                            vae_path = args.vae_path
+                                            # Check if it's a URL and download if needed
+                                            if args.vae_path.startswith('http://') or args.vae_path.startswith('https://'):
+                                                cached = get_cached_model_path(args.vae_path)
+                                                if cached:
+                                                    vae_path = cached
+                                                    print(f"Using cached VAE model: {vae_path}")
+                                                else:
+                                                    cache_dir = get_model_cache_dir()
+                                                    vae_path = download_model(args.vae_path, cache_dir)
+                                                    print(f"Downloaded VAE model to: {vae_path}")
+                                            else:
+                                                vae_path = args.vae_path
                                         
                                         # Look for common file patterns only if CLI args not provided
                                         if not args.clip_l_path or not args.vae_path:
