@@ -2188,7 +2188,7 @@ class MultiModelManager:
         - "default", empty, or matches default model -> use main model
         - "audio" -> use first/default audio model
         - "audio:modelname" -> use specific audio model
-        - "vision" or "image" -> use first/default image model  
+        - "image" -> use first/default image model  
         - "vision:modelname" or "image:modelname" -> use specific image model
         - "tts" -> use TTS model
         - "tts:modelname" -> use specific TTS model
@@ -2218,8 +2218,8 @@ class MultiModelManager:
                 return None
             return None
         
-        # Handle "vision" or "image" alias - use first/default image model
-        if requested_model in ("vision", "image"):
+        # Handle "image" alias - use first/default image model
+        if requested_model == "image":
             if self.image_models:
                 first_image = self.image_models[0]
                 key = f"image:{first_image}"
@@ -2337,7 +2337,7 @@ class MultiModelManager:
         
         # Add vision/image models
         if self.image_models:
-            models.append(ModelInfo(id="vision"))  # Alias for first image model
+            models.append(ModelInfo(id="image"))  # Alias for first image model
             models.append(ModelInfo(id="image"))    # Alias for first image model
             # Add all image models - convert URLs to cached paths for display
             for image_id in self.image_models:
@@ -5007,9 +5007,9 @@ def main():
                                         
                                         sd_model = StableDiffusion(**sd_kwargs)
                                         multi_model_manager.add_model(model_key, sd_model)
-                                        # Add aliases for "image" and "vision" 
+                                        # Add alias for "image" 
                                         multi_model_manager.add_model("image", sd_model)
-                                        multi_model_manager.add_model("vision", sd_model)
+                                        
                                         print(f"Image model loaded successfully via sd.cpp: {original_model_name}")
                                     except ImportError as sd_error:
                                         print(f"stable-diffusion-cpp-python not installed: {sd_error}")
@@ -5060,9 +5060,9 @@ def main():
                         pipeline = pipeline.to("cpu")
                     
                     multi_model_manager.add_model(model_key, pipeline)
-                    # Add aliases for "image" and "vision"
+                    # Add alias for "image"
                     multi_model_manager.add_model("image", pipeline)
-                    multi_model_manager.add_model("vision", pipeline)
+                    
                     print(f"Image model loaded successfully: {model_name}")
                     
                 except ImportError as e:
@@ -5553,9 +5553,9 @@ def main():
                                         model_key = f"image:{model_path}"
                                         sd_model = StableDiffusion(**sd_kwargs)
                                         multi_model_manager.add_model(model_key, sd_model)
-                                        # Add aliases for "image" and "vision" 
+                                        # Add alias for "image" 
                                         multi_model_manager.add_model("image", sd_model)
-                                        multi_model_manager.add_model("vision", sd_model)
+                                        
                                         print(f"Image model loaded successfully via sd.cpp: {original_model_name}")
                                     except ImportError as sd_error:
                                         print(f"stable-diffusion-cpp-python not installed: {sd_error}")
@@ -5661,9 +5661,9 @@ def main():
                         pipeline = pipeline.to("cpu")
                     
                     multi_model_manager.add_model(model_key, pipeline)
-                    # Add aliases for "image" and "vision"
+                    # Add alias for "image"
                     multi_model_manager.add_model("image", pipeline)
-                    multi_model_manager.add_model("vision", pipeline)
+                    
                     print(f"Image model loaded successfully: {model_name}")
                     
                 except ImportError as e:
