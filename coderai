@@ -4718,6 +4718,8 @@ def main():
                                     try:
                                         from stable_diffusion_cpp import StableDiffusion
                                         
+                                        # Define model_key for this scope
+                                        model_key = f"image:{model_path}"
                                         print(f"Loading with sd.cpp: {model_path}")
                                         # For models like Z-Image-Turbo/Flux, use diffusion_model_path
                                         # Look for additional model files in same directory
@@ -4824,8 +4826,10 @@ def main():
                     import torch
                     from diffusers import StableDiffusionXLPipeline, DiffusionPipeline
                     
-                    model_key = f"image:{model_name}"
-                    print(f"Loading diffusers pipeline: {model_name}")
+                    # Use cached path if available
+                    key_model = model_path if model_path and os.path.isfile(model_path) else model_name
+                    model_key = f"image:{key_model}"
+                    print(f"Loading diffusers pipeline: {key_model}")
                     
                     # Try to load as Stable Diffusion XL first
                     try:
@@ -5409,8 +5413,10 @@ def main():
                     import torch
                     from diffusers import StableDiffusionXLPipeline, DiffusionPipeline
                     
-                    model_key = f"image:{model_name}"
-                    print(f"Loading diffusers pipeline: {model_name}")
+                    # Use cached path if available
+                    key_model = model_path if model_path and os.path.isfile(model_path) else model_name
+                    model_key = f"image:{key_model}"
+                    print(f"Loading diffusers pipeline: {key_model}")
                     
                     # Try to load as Stable Diffusion XL first
                     try:
