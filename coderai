@@ -4701,7 +4701,7 @@ def main():
     multi_model_manager.set_load_mode(load_mode)
     
     # Pre-load models based on mode
-    print(f"DEBUG: load_mode at line 4710 = '{load_mode}'")
+    print(f"DEBUG: load_mode at line 4710 = '{load_mode}', backend = {args.backend}")
     if load_mode in ("loadall", "loadswap"):
         # Load all models into VRAM (or RAM for CUDA loadswap)
         mode_name = "Load All" if load_mode == "loadall" else "Load Swap"
