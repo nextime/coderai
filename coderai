@@ -5005,6 +5005,7 @@ def main():
         print("Models will load on first request")
     
     # Set up audio model if specified (with pre-loading if in loadall/loadswap mode)
+    print(f"DEBUG: models in manager before audio setup: {list(multi_model_manager.models.keys())}")
     if audio_models:
         print(f"\nAudio transcription model(s): {audio_models}")
         
