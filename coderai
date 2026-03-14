@@ -3285,6 +3285,10 @@ async def create_image_generation(request: ImageGenerationRequest):
                     batch_count=request.n if request.n else 1,
                 )
                 
+                # Small delay to let Vulkan driver settle after generation
+                import time
+                time.sleep(0.1)
+                
                 # Convert results to response format
                 images = []
                 import base64
@@ -3372,6 +3376,10 @@ async def create_image_generation(request: ImageGenerationRequest):
                     seed=seed if seed is not None else 42,
                     batch_count=request.n if request.n else 1,
                 )
+                
+                # Small delay to let Vulkan driver settle after generation
+                import time
+                time.sleep(0.1)
                 
                 # Convert results to response format
                 images = []
