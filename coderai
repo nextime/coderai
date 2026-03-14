@@ -4929,11 +4929,16 @@ def main():
                                         
                                         # Add sd.cpp-specific options from CLI args
                                         if getattr(global_args, 'vae_tiling', False):
-                                            sd_kwargs['vae_tiling'] = True
-                                            print(f"DEBUG: Enabling VAE tiling for lower VRAM usage")
+                                            # VAE tiling is handled internally in newer builds
+                                            print(f"DEBUG: VAE tiling is handled internally in stable-diffusion-cpp-python")
                                         if getattr(global_args, 'clip_on_cpu', False):
-                                            sd_kwargs['clip_on_cpu'] = True
-                                            print(f"DEBUG: Running CLIP on CPU to save VRAM")
+                                            sd_kwargs['keep_clip_on_cpu'] = True
+                                            print(f"DEBUG: Running CLIP on CPU to save VRAM (keep_clip_on_cpu=True)")
+                                        
+                                        # Use all available CPU cores for processing
+                                        import psutil
+                                        sd_kwargs['n_threads'] = psutil.cpu_count()
+                                        print(f"DEBUG: Using {psutil.cpu_count()} CPU cores for sd.cpp")
 
                                         # Add generation parameters from CLI args
                                         # sd_kwargs['sample_method'] = args.image_sample_method  # Not valid for __init__
@@ -5468,11 +5473,16 @@ def main():
                                         
                                         # Add sd.cpp-specific options from CLI args
                                         if getattr(global_args, 'vae_tiling', False):
-                                            sd_kwargs['vae_tiling'] = True
-                                            print(f"DEBUG: Enabling VAE tiling for lower VRAM usage")
+                                            # VAE tiling is handled internally in newer builds
+                                            print(f"DEBUG: VAE tiling is handled internally in stable-diffusion-cpp-python")
                                         if getattr(global_args, 'clip_on_cpu', False):
-                                            sd_kwargs['clip_on_cpu'] = True
-                                            print(f"DEBUG: Running CLIP on CPU to save VRAM")
+                                            sd_kwargs['keep_clip_on_cpu'] = True
+                                            print(f"DEBUG: Running CLIP on CPU to save VRAM (keep_clip_on_cpu=True)")
+                                        
+                                        # Use all available CPU cores for processing
+                                        import psutil
+                                        sd_kwargs['n_threads'] = psutil.cpu_count()
+                                        print(f"DEBUG: Using {psutil.cpu_count()} CPU cores for sd.cpp")
 
                                         # Add generation parameters from CLI args
                                         # sd_kwargs['sample_method'] = args.image_sample_method  # Not valid for __init__
