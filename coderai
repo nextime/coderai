@@ -4702,9 +4702,10 @@ def main():
     
     # Pre-load models based on mode
     print(f"DEBUG: load_mode at line 4710 = '{load_mode}'")
-    if load_mode == "loadall":
-        # Load all models into VRAM up to full capacity, then offload to CPU RAM
-        print("\n=== Load All Mode ===")
+    if load_mode in ("loadall", "loadswap"):
+        # Load all models into VRAM (or RAM for CUDA loadswap)
+        mode_name = "Load All" if load_mode == "loadall" else "Load Swap"
+        print(f"\n=== {mode_name} Mode ===")
         
         # Load main text model first
         if model_names:
@@ -4973,15 +4974,30 @@ def main():
             
     elif load_mode == "loadswap":
         # Load models in order: model > image > audio > TTS, keep active in VRAM
+        # For Vulkan backend, load all models to VRAM like loadall (VRAM is not limited like CUDA)
         print("\n=== Load Swap Mode ===")
-        if model_names:
-            print(f"Main text model will be in VRAM: {model_names[0]}")
-        if image_models:
-            print(f"Image model in RAM: {image_models[0]}")
-        if audio_models:
-            print(f"Audio model in RAM: {audio_models[0]}")
-        if args.tts_model:
-            print(f"TTS model in RAM: {args.tts_model}")
+        
+        # For Vulkan, use same preloading as loadall
+        if args.backend == "vulkan":
+            # Vulkan: Load all models to GPU like loadall
+            if model_names:
+                print(f"Pre-loading main text model: {model_names[0]}")
+            if image_models:
+                print(f"Pre-loading image model: {image_models[0]}")
+            if audio_models:
+                print(f"Pre-loading audio model: {audio_models[0]}")
+            if args.tts_model:
+                print(f"Pre-loading TTS model: {args.tts_model}")
+        else:
+            # NVIDIA/CUDA: First model in VRAM, others in RAM
+            if model_names:
+                print(f"Main text model will be in VRAM: {model_names[0]}")
+            if image_models:
+                print(f"Image model in RAM: {image_models[0]}")
+            if audio_models:
+                print(f"Audio model in RAM: {audio_models[0]}")
+            if args.tts_model:
+                print(f"TTS model in RAM: {args.tts_model}")
         
     else:
         # No flags: only one model gets loaded (the main text model if specified)
