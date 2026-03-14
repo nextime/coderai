@@ -3175,7 +3175,7 @@ async def create_image_generation(request: ImageGenerationRequest):
             )
     
     async with semaphore:
-    image_model = multi_model_manager.image_model
+        image_model = multi_model_manager.image_model
     
     # If no image model configured, return an error
     if not image_model:
@@ -3224,8 +3224,8 @@ async def create_image_generation(request: ImageGenerationRequest):
                         except ValueError:
                             pass
                 
-                # Determine number of steps
-                steps = request.steps if request.steps else 4
+                # Use default steps for Z-Image Turbo (very fast)
+                steps = 4  # Default for fast generation
                 
                 # Generate images using sd.cpp (run in thread to not block event loop)
                 result = await asyncio.to_thread(
@@ -4622,10 +4622,11 @@ def main():
     load_mode = "ondemand"
     if args.loadall:
         load_mode = "loadall"
-    # Update global load_mode for semaphore system
-    load_mode["mode"] = load_mode
     elif args.loadswap:
         load_mode = "loadswap"
+    
+    # Update global load_mode for semaphore system
+    load_mode_dict = {"mode": load_mode}
     
     # Set load mode in multi_model_manager
     multi_model_manager.set_load_mode(load_mode)
@@ -4693,10 +4694,11 @@ def main():
     load_mode = "ondemand"
     if args.loadall:
         load_mode = "loadall"
-    # Update global load_mode for semaphore system
-    load_mode["mode"] = load_mode
     elif args.loadswap:
         load_mode = "loadswap"
+    
+    # Update global load_mode for semaphore system
+    load_mode_dict = {"mode": load_mode}
     
     # Set load mode in multi_model_manager
     multi_model_manager.set_load_mode(load_mode)
