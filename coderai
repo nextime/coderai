@@ -3177,9 +3177,11 @@ async def create_image_generation(request: ImageGenerationRequest):
             multi_model_manager.add_model(model_key, pipeline)
         
         # Generate images
+        # Use request seed if provided, otherwise use CLI default seed
+        seed = request.seed if request.seed is not None else getattr(global_args, 'image_seed', None)
         generator = None
-        if request.seed is not None:
-            generator = torch.Generator(device=pipeline.device).manual_seed(request.seed)
+        if seed is not None:
+            generator = torch.Generator(device=pipeline.device).manual_seed(seed)
         
         # Quality: "standard" or "hd"
         quality = request.quality or "standard"
@@ -3268,6 +3270,9 @@ async def create_image_generation(request: ImageGenerationRequest):
                 steps = 4  # Default for fast generation
                 
                 # Generate images using sd.cpp (run in thread to not block event loop)
+                # Use request seed if provided, otherwise use CLI default seed
+                seed = request.seed if request.seed is not None else getattr(global_args, 'image_seed', None)
+                
                 result = await asyncio.to_thread(
                     sd_model.generate_image,
                     prompt=request.prompt,
@@ -3276,7 +3281,7 @@ async def create_image_generation(request: ImageGenerationRequest):
                     height=height,
                     cfg_scale=7.0,
                     sample_steps=steps,
-                    seed=42,
+                    seed=seed if seed is not None else 42,
                     batch_count=request.n if request.n else 1,
                 )
                 
@@ -3353,6 +3358,9 @@ async def create_image_generation(request: ImageGenerationRequest):
                 
                 steps = 4
                 
+                # Use request seed if provided, otherwise use CLI default seed
+                seed = request.seed if request.seed is not None else getattr(global_args, 'image_seed', None)
+                
                 result = await asyncio.to_thread(
                     sd_model.generate_image,
                     prompt=request.prompt,
@@ -3361,7 +3369,7 @@ async def create_image_generation(request: ImageGenerationRequest):
                     height=height,
                     cfg_scale=7.0,
                     sample_steps=steps,
-                    seed=42,
+                    seed=seed if seed is not None else 42,
                     batch_count=request.n if request.n else 1,
                 )
                 
@@ -4305,6 +4313,12 @@ def parse_args():
         type=float,
         default=1.0,
         help="CFG scale for image generation (default: 1.0 for Z-Image Turbo).",
+    )
+    parser.add_argument(
+        "--image-seed",
+        type=int,
+        default=None,
+        help="Default seed for image generation (default: random).",
     )
     parser.add_argument(
         "--loadall",
