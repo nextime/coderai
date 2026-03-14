@@ -4744,9 +4744,6 @@ def main():
                                         if t5xxl_path:
                                             sd_kwargs['t5xxl_path'] = t5xxl_path
                                         
-                                        # Add model_type and backend for stable-diffusion-cpp-python
-                                        sd_kwargs['model_type'] = 'z-image'
-                                        sd_kwargs['backend'] = 'vulkan'
 
                                         # Add generation parameters from CLI args
                                         # sd_kwargs['sample_method'] = args.image_sample_method  # Not valid for __init__
@@ -5239,9 +5236,6 @@ def main():
                                         if t5xxl_path:
                                             sd_kwargs['t5xxl_path'] = t5xxl_path
                                         
-                                        # Add model_type and backend for stable-diffusion-cpp-python
-                                        sd_kwargs['model_type'] = 'z-image'
-                                        sd_kwargs['backend'] = 'vulkan'
 
                                         # Add generation parameters from CLI args
                                         # sd_kwargs['sample_method'] = args.image_sample_method  # Not valid for __init__
