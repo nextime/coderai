@@ -5013,7 +5013,6 @@ def main():
         
         # Set up Vulkan device for Whisper if using Vulkan backend
         if hasattr(args, 'audio_vulkan_device') and args.audio_vulkan_device is not None:
-            os.environ['GGML_VK_VISIBLE_DEVICES'] = str(args.audio_vulkan_device)
             print(f"  Using Vulkan device: {args.audio_vulkan_device}")
         
         # Register all audio models
@@ -5053,7 +5052,6 @@ def main():
                 model_to_use = audio_models[0] if audio_models else None
                 gpu_device = getattr(args, 'audio_vulkan_device', 0) or 0
                 print(f"DEBUG: Starting whisper-server with gpu_device={gpu_device}")
-                print(f"DEBUG: GGML_VK_VISIBLE_DEVICES = {os.environ.get('GGML_VK_VISIBLE_DEVICES', 'not set')}")
                 actual_model_path = whisper_server_mgr.start(model_path=model_to_use, gpu_device=gpu_device)
                 if actual_model_path:
                     # Update audio_models in multi_model_manager to store the actual path (not the URL)
