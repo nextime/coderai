@@ -3132,6 +3132,7 @@ async def create_image_generation(request: ImageGenerationRequest):
     Image generation endpoint (OpenAI-compatible).
     
     Supports:
+    - Stable Diffusion via stable-diffusion-cpp-python (sd.cpp)
     - Stable Diffusion XL (via local inference with diffusers)
     - Other diffusers models
     """
@@ -3148,6 +3149,68 @@ async def create_image_generation(request: ImageGenerationRequest):
     model_to_use = request.model
     if model_to_use.startswith("image:"):
         model_to_use = image_model
+    
+    # First, try to use stable-diffusion-cpp-python (sd.cpp) if available
+    sd_model_key = f"image:{model_to_use}"
+    sd_model = multi_model_manager.get_model(sd_model_key)
+    
+    if sd_model is not None:
+        # Check if it's a stable-diffusion-cpp model (has generate method from sd.cpp)
+        try:
+            from stable_diffusion_cpp import StableDiffusion
+            if isinstance(sd_model, StableDiffusion):
+                print(f"Using stable-diffusion-cpp-python for image generation")
+                # Use sd.cpp for generation
+                # Parse size
+                width, height = 512, 512
+                if request.size:
+                    parts = request.size.split("x")
+                    if len(parts) == 2:
+                        try:
+                            width = int(parts[0])
+                            height = int(parts[1])
+                        except ValueError:
+                            pass
+                
+                # Determine number of steps
+                steps = request.steps if request.steps else 4
+                
+                # Generate images using sd.cpp
+                result = sd_model.generate(
+                    prompt=request.prompt,
+                    width=width,
+                    height=height,
+                    sample_steps=steps,
+                    n=request.n if request.n else 1,
+                )
+                
+                # Convert results to response format
+                images = []
+                import base64
+                import io
+                from PIL import Image
+                
+                for img in result:
+                    # Convert to base64
+                    buffered = io.BytesIO()
+                    if isinstance(img, Image.Image):
+                        img.save(buffered, format="PNG")
+                    else:
+                        # Might be numpy array
+                        Image.fromarray(img).save(buffered, format="PNG")
+                    img_bytes = buffered.getvalue()
+                    img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+                    images.append({"b64_json": img_base64})
+                
+                return {
+                    "created": int(time.time()),
+                    "data": images
+                }
+        except ImportError:
+            pass  # stable-diffusion-cpp not available, continue to diffusers
+        except Exception as e:
+            print(f"sd.cpp generation error: {e}")
+            # Continue to try diffusers
     
     # Parse size (e.g., "1024x1024")
     width, height = 1024, 1024
