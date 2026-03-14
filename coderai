@@ -3189,12 +3189,15 @@ async def create_image_generation(request: ImageGenerationRequest):
                 steps = request.steps if request.steps else 4
                 
                 # Generate images using sd.cpp
-                result = sd_model.generate(
+                result = sd_model.generate_image(
                     prompt=request.prompt,
+                    negative_prompt='',
                     width=width,
                     height=height,
+                    cfg_scale=7.0,
                     sample_steps=steps,
-                    n=request.n if request.n else 1,
+                    seed=42,
+                    batch_count=request.n if request.n else 1,
                 )
                 
                 # Convert results to response format
