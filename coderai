@@ -2737,6 +2737,7 @@ async def create_transcription(
     - whisper.cpp server (when --whisper-server is specified)
     """
     # Check if whisper-server is available FIRST (before checking audio_model)
+    print(f"DEBUG: Audio request - whisper_server available: {multi_model_manager.whisper_server is not None}, running: {multi_model_manager.whisper_server.is_running() if multi_model_manager.whisper_server else 'N/A'}")
     if multi_model_manager.whisper_server and multi_model_manager.whisper_server.is_running():
         # Use whisper-server - read file and send to server
         file_content = await file.read()
@@ -5046,9 +5047,11 @@ def main():
                 print("Whisper server already running, using existing instance")
             
             # Start whisper-server if we should preload or if it's the only audio option
+            print(f"DEBUG: whisper-server start check - audio_models={audio_models}, should_preload={should_preload}, whisper_cpp={args.whisper_cpp}")
             if audio_models and (should_preload or not args.whisper_cpp):
                 model_to_use = audio_models[0] if audio_models else None
                 gpu_device = getattr(args, 'audio_vulkan_device', 0) or 0
+                print(f"DEBUG: Starting whisper-server with gpu_device={gpu_device}")
                 actual_model_path = whisper_server_mgr.start(model_path=model_to_use, gpu_device=gpu_device)
                 if actual_model_path:
                     # Update audio_models in multi_model_manager to store the actual path (not the URL)
