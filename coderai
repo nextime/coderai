@@ -4270,12 +4270,7 @@ def parse_args():
         default=0,
         help="Vulkan GPU device ID to use for Whisper audio transcription (default: 0). Only used when using Vulkan backend.",
     )
-    parser.add_argument(
-        "--image-vulkan-device",
-        type=int,
-        default=None,
-        help="Vulkan GPU device ID to use for image generation models (default: same as --vulkan-device). Use --vulkan-list-devices to see available devices",
-    )
+
     parser.add_argument(
         "--whisper-cpp",
         type=str,
@@ -4755,10 +4750,6 @@ def main():
                                     print(f"llama.cpp load error: {llama_error}")
                                     print(f"Trying stable-diffusion-cpp-python fallback...")
                                     # Try stable-diffusion-cpp-python as fallback
-                                    # Set Vulkan device BEFORE importing stable_diffusion_cpp
-                                    if args.image_vulkan_device is not None:
-                                        os.environ['GGML_VULKAN_DEVICE'] = str(args.image_vulkan_device)
-                                        print(f"Setting GGML_VULKAN_DEVICE={args.image_vulkan_device} for image model")
                                     try:
                                         from stable_diffusion_cpp import StableDiffusion
                                         
@@ -5260,10 +5251,6 @@ def main():
                                     print(f"llama.cpp load error: {llama_error}")
                                     print(f"Trying stable-diffusion-cpp-python fallback...")
                                     # Try stable-diffusion-cpp-python as fallback
-                                    # Set Vulkan device BEFORE importing stable_diffusion_cpp
-                                    if args.image_vulkan_device is not None:
-                                        os.environ['GGML_VULKAN_DEVICE'] = str(args.image_vulkan_device)
-                                        print(f"Setting GGML_VULKAN_DEVICE={args.image_vulkan_device} for image model")
                                     try:
                                         from stable_diffusion_cpp import StableDiffusion
                                         
