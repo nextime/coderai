@@ -4705,8 +4705,8 @@ def main():
                                             sd_kwargs['t5xxl_path'] = t5xxl_path
                                         
                                         # Add generation parameters from CLI args
-                                        sd_kwargs['sample_method'] = args.image_sample_method
-                                        sd_kwargs['steps'] = args.image_steps
+                                        # sd_kwargs['sample_method'] = args.image_sample_method  # Not valid for __init__
+                                        # sd_kwargs['steps'] = args.image_steps  # Not valid for __init__
                                         
                                         sd_model = StableDiffusion(**sd_kwargs)
                                         multi_model_manager.add_model(model_key, sd_model)
@@ -5187,8 +5187,8 @@ def main():
                                             sd_kwargs['t5xxl_path'] = t5xxl_path
                                         
                                         # Add generation parameters from CLI args
-                                        sd_kwargs['sample_method'] = args.image_sample_method
-                                        sd_kwargs['steps'] = args.image_steps
+                                        # sd_kwargs['sample_method'] = args.image_sample_method  # Not valid for __init__
+                                        # sd_kwargs['steps'] = args.image_steps  # Not valid for __init__
                                         
                                         sd_model = StableDiffusion(**sd_kwargs)
                                         multi_model_manager.add_model(model_key, sd_model)
