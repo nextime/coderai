@@ -4821,11 +4821,6 @@ def main():
                                         
                                         # Set Vulkan device for image models via GGML_VULKAN_DEVICE environment variable
                                         if args.image_vulkan_device is not None:
-                                            import os
-                                            # Map Vulkan device index to GGML_VULKAN_DEVICE value
-                                            # Device 0 = first GPU, Device 1 = second GPU, etc.
-                                            # GGML_VULKAN_DEVICE=0 uses integrated GPU, GGML_VULKAN_DEVICE=1 uses discrete GPU
-                                            # For multiple GPUs, we need to use VK_ICD_FILENAMES or other methods
                                             os.environ['GGML_VULKAN_DEVICE'] = str(args.image_vulkan_device)
                                             print(f"Setting GGML_VULKAN_DEVICE={args.image_vulkan_device} for image model")
                                         
@@ -5332,11 +5327,6 @@ def main():
                                         
                                         # Set Vulkan device for image models via GGML_VULKAN_DEVICE environment variable
                                         if args.image_vulkan_device is not None:
-                                            import os
-                                            # Map Vulkan device index to GGML_VULKAN_DEVICE value
-                                            # Device 0 = first GPU, Device 1 = second GPU, etc.
-                                            # GGML_VULKAN_DEVICE=0 uses integrated GPU, GGML_VULKAN_DEVICE=1 uses discrete GPU
-                                            # For multiple GPUs, we need to use VK_ICD_FILENAMES or other methods
                                             os.environ['GGML_VULKAN_DEVICE'] = str(args.image_vulkan_device)
                                             print(f"Setting GGML_VULKAN_DEVICE={args.image_vulkan_device} for image model")
                                         
