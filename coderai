@@ -5034,11 +5034,16 @@ def main():
         if args.whisper_server:
             print(f"\nWhisper server: {args.whisper_server}")
             print(f"  Port: {args.whisper_server_port}")
-            whisper_server_mgr = WhisperServerManager(
-                server_path=args.whisper_server,
-                port=args.whisper_server_port
-            )
-            multi_model_manager.whisper_server = whisper_server_mgr
+            # Check if whisper-server is already running
+            if multi_model_manager.whisper_server is None:
+                whisper_server_mgr = WhisperServerManager(
+                    server_path=args.whisper_server,
+                    port=args.whisper_server_port
+                )
+                multi_model_manager.whisper_server = whisper_server_mgr
+            else:
+                whisper_server_mgr = multi_model_manager.whisper_server
+                print("Whisper server already running, using existing instance")
             
             # Start whisper-server if we should preload or if it's the only audio option
             if audio_models and (should_preload or not args.whisper_cpp):
