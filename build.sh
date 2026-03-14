@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build script for CoderAI - Supports NVIDIA (CUDA) and Vulkan backends
-# Usage: ./build.sh [nvidia|vulkan|vulkan-nvidia]
+# Usage: ./build.sh [nvidia|vulkan|vulkan-nvidia|opencl]
 # Default: nvidia
 
 set -e
@@ -16,13 +16,14 @@ NC='\033[0m' # No Color
 BACKEND="${1:-nvidia}"
 BACKEND=$(echo "$BACKEND" | tr '[:upper:]' '[:lower:]')
 
-if [[ "$BACKEND" != "nvidia" && "$BACKEND" != "vulkan" && "$BACKEND" != "vulkan-nvidia" && "$BACKEND" != "cuda" ]]; then
+if [[ "$BACKEND" != "nvidia" && "$BACKEND" != "vulkan" && "$BACKEND" != "vulkan-nvidia" && "$BACKEND" != "cuda" && "$BACKEND" != "opencl" ]]; then
     echo -e "${RED}Error: Invalid backend '$BACKEND'${NC}"
-    echo "Usage: ./build.sh [nvidia|vulkan|vulkan-nvidia|cuda]"
+    echo "Usage: ./build.sh [nvidia|vulkan|vulkan-nvidia|cuda|opencl]"
     echo "  nvidia       - Use PyTorch with CUDA for NVIDIA GPUs"
     echo "  vulkan      - Use llama-cpp-python with Vulkan for AMD GPUs"
     echo "  vulkan-nvidia - Use llama-cpp-python with Vulkan for NVIDIA GPU only"
     echo "  cuda        - Use llama-cpp-python with CUDA for NVIDIA GPUs"
+    echo "  opencl      - Use stable-diffusion-cpp-python with OpenCL"
     exit 1
 fi
 
@@ -52,6 +53,8 @@ elif [ "$BACKEND" = "vulkan-nvidia" ]; then
     VENV_DIR="venv_vulkan_nvidia"
 elif [ "$BACKEND" = "cuda" ]; then
     VENV_DIR="venv_cuda"
+elif [ "$BACKEND" = "opencl" ]; then
+    VENV_DIR="venv_opencl"
 fi
 
 # Create virtual environment if it doesn't exist
@@ -320,6 +323,47 @@ elif [ "$BACKEND" = "cuda" ]; then
     echo "  python coderai --model <gguf-model> --backend vulkan --vulkan-device 0"
     echo ""
     echo "Note: With CUDA backend, llama-cpp-python will only use NVIDIA GPUs."
+    echo ""
+elif [ "$BACKEND" = "opencl" ]; then
+    # stable-diffusion-cpp-python with OpenCL backend
+    echo -e "${YELLOW}Installing stable-diffusion-cpp-python with OpenCL support...${NC}"
+    
+    # Check for OpenCL
+    if ! command -v clinfo &> /dev/null && ! ls /usr/lib/*/libOpenCL* &> /dev/null; then
+        echo -e "${YELLOW}Warning: OpenCL not found in system${NC}"
+        echo -e "${YELLOW}You may need to install OpenCL runtime:${NC}"
+        echo "  Debian/Ubuntu: sudo apt install ocl-icd-opencl-dev"
+        echo "  Fedora: sudo dnf install ocl-icd-devel"
+    else
+        echo -e "${GREEN}✓ Found OpenCL${NC}"
+    fi
+    
+    # Install base requirements
+    echo -e "${YELLOW}Installing base requirements...${NC}"
+    pip install -r requirements.txt
+    
+    # Install stable-diffusion-cpp-python with OpenCL
+    echo -e "${YELLOW}Installing stable-diffusion-cpp-python with OpenCL...${NC}"
+    pip install stable-diffusion-cpp-python || {
+        echo ""
+        echo -e "${YELLOW}Note: If stable-diffusion-cpp-python is not available with pip,${NC}"
+        echo -e "${YELLOW}you may need to build from source.${NC}"
+    }
+    
+    # Install additional requirements for OpenCL
+    echo -e "${YELLOW}Installing additional requirements for OpenCL...${NC}"
+    pip install numpy pillow
+    
+    echo ""
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}  OpenCL build complete!${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo ""
+    echo "Usage:"
+    echo "  source $VENV_DIR/bin/activate"
+    echo "  python coderai --model <model> --image-backend opencl"
+    echo ""
+    echo "Note: With OpenCL backend, stable-diffusion-cpp-python can use various GPUs."
     echo ""
 fi
 

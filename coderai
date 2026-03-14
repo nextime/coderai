@@ -4198,9 +4198,30 @@ def parse_args():
     parser.add_argument(
         "--backend",
         type=str,
-        choices=["auto", "nvidia", "vulkan"],
+        choices=["auto", "nvidia", "vulkan", "opencl"],
         default="auto",
-        help="Backend to use: auto (detect), nvidia (CUDA), or vulkan (AMD GPUs)",
+        help="Backend to use: auto (detect), nvidia (CUDA), vulkan (AMD), or opencl",
+    )
+    parser.add_argument(
+        "--image-backend",
+        type=str,
+        choices=["auto", "nvidia", "vulkan", "opencl"],
+        default="auto",
+        help="Image generation backend: auto, nvidia (CUDA), vulkan (AMD), or opencl",
+    )
+    parser.add_argument(
+        "--audio-backend",
+        type=str,
+        choices=["auto", "nvidia", "vulkan", "opencl"],
+        default="auto",
+        help="Audio transcription backend: auto, nvidia (CUDA), vulkan (AMD), or opencl",
+    )
+    parser.add_argument(
+        "--tts-backend",
+        type=str,
+        choices=["auto", "nvidia", "vulkan", "opencl"],
+        default="auto",
+        help="TTS backend: auto, nvidia (CUDA), vulkan (AMD), or opencl",
     )
     parser.add_argument(
         "--host",
