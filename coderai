@@ -1526,11 +1526,11 @@ class VulkanBackend(ModelBackend):
         
         print(f"DEBUG: Detected {num_devices} Vulkan GPU devices")
         
-        # Also try to set GGML_VULKAN_DEVICE env var to force the device
+        # Also try to set GGML_VK_VISIBLE_DEVICES env var to force the device
         # This affects which GPU does the actual computation
         if main_gpu >= 0:
-            os.environ['GGML_VULKAN_DEVICE'] = str(main_gpu)
-            print(f"DEBUG: Set GGML_VULKAN_DEVICE={main_gpu}")
+            os.environ['GGML_VK_VISIBLE_DEVICES'] = str(main_gpu)
+            print(f"DEBUG: Set GGML_VK_VISIBLE_DEVICES={main_gpu}")
         
         if single_gpu:
             # Build tensor_split to force all layers onto one GPU
@@ -2767,13 +2767,13 @@ async def create_transcription(
     
     # Check if Vulkan is available for whispercpp
     whisper_vulkan_available = False
-    whisper_vulkan_device = os.environ.get('GGML_VULKAN_DEVICE', '0')
+    whisper_vulkan_device = os.environ.get('GGML_VK_VISIBLE_DEVICES', '0')
     try:
         # Check if whispercpp is installed and has Vulkan support
         import whispercpp
         # Try to detect Vulkan support by checking if we can list devices
         # whispercpp doesn't have a direct Vulkan check, but we can verify by environment
-        if os.environ.get('GGML_VULKAN_DEVICE') or os.environ.get('VK_DEVICE_SELECT_DEVICE'):
+        if os.environ.get('GGML_VK_VISIBLE_DEVICES') or os.environ.get('VK_DEVICE_SELECT_DEVICE'):
             whisper_vulkan_available = True
             print(f"Whisper Vulkan: Using GPU device {whisper_vulkan_device}")
         elif os.path.exists('/dev/dri'):  # Linux DRM devices exist = AMD/Intel GPU
@@ -4270,6 +4270,12 @@ def parse_args():
         default=0,
         help="Vulkan GPU device ID to use for Whisper audio transcription (default: 0). Only used when using Vulkan backend.",
     )
+    parser.add_argument(
+        "--image-vulkan-device",
+        type=int,
+        default=None,
+        help="Vulkan GPU device ID to use for image generation models (default: same as --vulkan-device). Use --vulkan-list-devices to see available devices",
+    )
 
     parser.add_argument(
         "--whisper-cpp",
@@ -4750,6 +4756,10 @@ def main():
                                     print(f"llama.cpp load error: {llama_error}")
                                     print(f"Trying stable-diffusion-cpp-python fallback...")
                                     # Try stable-diffusion-cpp-python as fallback
+                                    # Set Vulkan device for image models (GGML_VK_VISIBLE_DEVICES=1 for GPU1)
+                                    if args.image_vulkan_device is not None:
+                                        os.environ['GGML_VK_VISIBLE_DEVICES'] = str(args.image_vulkan_device)
+                                        print(f"Setting GGML_VK_VISIBLE_DEVICES={args.image_vulkan_device} for image model (sd.cpp)")
                                     try:
                                         from stable_diffusion_cpp import StableDiffusion
                                         
@@ -4928,7 +4938,7 @@ def main():
         
         # Set up Vulkan device for Whisper if using Vulkan backend
         if hasattr(args, 'audio_vulkan_device') and args.audio_vulkan_device is not None:
-            os.environ['GGML_VULKAN_DEVICE'] = str(args.audio_vulkan_device)
+            os.environ['GGML_VK_VISIBLE_DEVICES'] = str(args.audio_vulkan_device)
             print(f"  Using Vulkan device: {args.audio_vulkan_device}")
         
         # Register all audio models
@@ -5042,10 +5052,10 @@ def main():
                 
                 # Check if Vulkan is available for whispercpp
                 whisper_vulkan_available = False
-                whisper_vulkan_device = os.environ.get('GGML_VULKAN_DEVICE', '0')
+                whisper_vulkan_device = os.environ.get('GGML_VK_VISIBLE_DEVICES', '0')
                 try:
                     import whispercpp
-                    if os.environ.get('GGML_VULKAN_DEVICE') or os.environ.get('VK_DEVICE_SELECT_DEVICE'):
+                    if os.environ.get('GGML_VK_VISIBLE_DEVICES') or os.environ.get('VK_DEVICE_SELECT_DEVICE'):
                         whisper_vulkan_available = True
                         print(f"Whisper Vulkan: Will use GPU device {whisper_vulkan_device}")
                     elif os.path.exists('/dev/dri'):
@@ -5251,6 +5261,10 @@ def main():
                                     print(f"llama.cpp load error: {llama_error}")
                                     print(f"Trying stable-diffusion-cpp-python fallback...")
                                     # Try stable-diffusion-cpp-python as fallback
+                                    # Set Vulkan device for image models (GGML_VK_VISIBLE_DEVICES=1 for GPU1)
+                                    if args.image_vulkan_device is not None:
+                                        os.environ['GGML_VK_VISIBLE_DEVICES'] = str(args.image_vulkan_device)
+                                        print(f"Setting GGML_VK_VISIBLE_DEVICES={args.image_vulkan_device} for image model (sd.cpp)")
                                     try:
                                         from stable_diffusion_cpp import StableDiffusion
                                         
