@@ -4091,7 +4091,7 @@ def parse_args():
         help="Model for image generation (e.g., stable-diffusion-xl-base-1.0). Can be specified multiple times for multiple models.",
     )
     parser.add_argument(
-        "--clip-l-path",
+        "--llm-path",
         type=str,
         default=None,
         help="Path to CLIP LLM model for image generation (stable-diffusion-cpp-python).",
@@ -4654,19 +4654,19 @@ def main():
                                         vae_path = None
                                         
                                         # Use CLI arguments if provided, download and cache if URL
-                                        if args.clip_l_path:
+                                        if args.llm_path:
                                             # Check if it's a URL and download if needed
-                                            if args.clip_l_path.startswith('http://') or args.clip_l_path.startswith('https://'):
-                                                cached = get_cached_model_path(args.clip_l_path)
+                                            if args.llm_path.startswith('http://') or args.llm_path.startswith('https://'):
+                                                cached = get_cached_model_path(args.llm_path)
                                                 if cached:
                                                     clip_l_path = cached
                                                     print(f"Using cached CLIP model: {clip_l_path}")
                                                 else:
                                                     cache_dir = get_model_cache_dir()
-                                                    clip_l_path = download_model(args.clip_l_path, cache_dir)
+                                                    clip_l_path = download_model(args.llm_path, cache_dir)
                                                     print(f"Downloaded CLIP model to: {clip_l_path}")
                                             else:
-                                                clip_l_path = args.clip_l_path
+                                                clip_l_path = args.llm_path
                                         if args.vae_path:
                                             # Check if it's a URL and download if needed
                                             if args.vae_path.startswith('http://') or args.vae_path.startswith('https://'):
@@ -4682,9 +4682,9 @@ def main():
                                                 vae_path = args.vae_path
                                         
                                         # Look for common file patterns only if CLI args not provided
-                                        if not args.clip_l_path or not args.vae_path:
+                                        if not args.llm_path or not args.vae_path:
                                             for f in os.listdir(model_dir) if os.path.exists(model_dir) else []:
-                                                if not args.clip_l_path and 'clip_l' in f.lower() and f.endswith(('.safetensors', '.bin')):
+                                                if not args.llm_path and 'clip_l' in f.lower() and f.endswith(('.safetensors', '.bin')):
                                                     clip_l_path = os.path.join(model_dir, f)
                                                 elif 't5xxl' in f.lower() and f.endswith(('.safetensors', '.bin')):
                                                     t5xxl_path = os.path.join(model_dir, f)
@@ -4694,7 +4694,7 @@ def main():
                                         # Build kwargs based on available files
                                         sd_kwargs = {'diffusion_model_path': model_path}
                                         if clip_l_path:
-                                            sd_kwargs['clip_l_path'] = clip_l_path
+                                            sd_kwargs['llm_path'] = clip_l_path
                                         if args.vae_path:
                                             sd_kwargs['vae_path'] = vae_path
                                         elif vae_path:
@@ -4702,6 +4702,10 @@ def main():
                                         if t5xxl_path:
                                             sd_kwargs['t5xxl_path'] = t5xxl_path
                                         
+                                        # Add model_type and backend for stable-diffusion-cpp-python
+                                        sd_kwargs['model_type'] = 'z-image'
+                                        sd_kwargs['backend'] = 'vulkan'
+
                                         # Add generation parameters from CLI args
                                         # sd_kwargs['sample_method'] = args.image_sample_method  # Not valid for __init__
                                         # sd_kwargs['steps'] = args.image_steps  # Not valid for __init__
@@ -5012,7 +5016,7 @@ def main():
         multi_model_manager.set_image_model(image_models[0], {
             'ctx': args.vision_ctx,
             'offload': args.vision_offload,
-            'clip_l_path': args.clip_l_path,
+            'llm_path': args.llm_path,
             'vae_path': args.vae_path,
             'sample_method': args.image_sample_method,
             'steps': args.image_steps,
@@ -5134,19 +5138,19 @@ def main():
                                         vae_path = None
                                         
                                         # Use CLI arguments if provided, download and cache if URL
-                                        if args.clip_l_path:
+                                        if args.llm_path:
                                             # Check if it's a URL and download if needed
-                                            if args.clip_l_path.startswith('http://') or args.clip_l_path.startswith('https://'):
-                                                cached = get_cached_model_path(args.clip_l_path)
+                                            if args.llm_path.startswith('http://') or args.llm_path.startswith('https://'):
+                                                cached = get_cached_model_path(args.llm_path)
                                                 if cached:
                                                     clip_l_path = cached
                                                     print(f"Using cached CLIP model: {clip_l_path}")
                                                 else:
                                                     cache_dir = get_model_cache_dir()
-                                                    clip_l_path = download_model(args.clip_l_path, cache_dir)
+                                                    clip_l_path = download_model(args.llm_path, cache_dir)
                                                     print(f"Downloaded CLIP model to: {clip_l_path}")
                                             else:
-                                                clip_l_path = args.clip_l_path
+                                                clip_l_path = args.llm_path
                                         if args.vae_path:
                                             # Check if it's a URL and download if needed
                                             if args.vae_path.startswith('http://') or args.vae_path.startswith('https://'):
@@ -5162,9 +5166,9 @@ def main():
                                                 vae_path = args.vae_path
                                         
                                         # Look for common file patterns only if CLI args not provided
-                                        if not args.clip_l_path or not args.vae_path:
+                                        if not args.llm_path or not args.vae_path:
                                             for f in os.listdir(model_dir) if os.path.exists(model_dir) else []:
-                                                if not args.clip_l_path and 'clip_l' in f.lower() and f.endswith(('.safetensors', '.bin')):
+                                                if not args.llm_path and 'clip_l' in f.lower() and f.endswith(('.safetensors', '.bin')):
                                                     clip_l_path = os.path.join(model_dir, f)
                                                 elif 't5xxl' in f.lower() and f.endswith(('.safetensors', '.bin')):
                                                     t5xxl_path = os.path.join(model_dir, f)
@@ -5174,7 +5178,7 @@ def main():
                                         # Build kwargs based on available files
                                         sd_kwargs = {'diffusion_model_path': model_path}
                                         if clip_l_path:
-                                            sd_kwargs['clip_l_path'] = clip_l_path
+                                            sd_kwargs['llm_path'] = clip_l_path
                                         if args.vae_path:
                                             sd_kwargs['vae_path'] = vae_path
                                         elif vae_path:
@@ -5182,6 +5186,10 @@ def main():
                                         if t5xxl_path:
                                             sd_kwargs['t5xxl_path'] = t5xxl_path
                                         
+                                        # Add model_type and backend for stable-diffusion-cpp-python
+                                        sd_kwargs['model_type'] = 'z-image'
+                                        sd_kwargs['backend'] = 'vulkan'
+
                                         # Add generation parameters from CLI args
                                         # sd_kwargs['sample_method'] = args.image_sample_method  # Not valid for __init__
                                         # sd_kwargs['steps'] = args.image_steps  # Not valid for __init__
