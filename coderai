@@ -4829,6 +4829,9 @@ def main():
                                         
                                         sd_model = StableDiffusion(**sd_kwargs)
                                         multi_model_manager.add_model(model_key, sd_model)
+                                        # Add aliases for "image" and "vision" 
+                                        multi_model_manager.add_model("image", sd_model)
+                                        multi_model_manager.add_model("vision", sd_model)
                                         print(f"Image model loaded successfully via sd.cpp: {original_model_name}")
                                     except ImportError as sd_error:
                                         print(f"stable-diffusion-cpp-python not installed: {sd_error}")
@@ -4878,6 +4881,9 @@ def main():
                         pipeline = pipeline.to("cpu")
                     
                     multi_model_manager.add_model(model_key, pipeline)
+                    # Add aliases for "image" and "vision"
+                    multi_model_manager.add_model("image", pipeline)
+                    multi_model_manager.add_model("vision", pipeline)
                     print(f"Image model loaded successfully: {model_name}")
                     
                 except ImportError as e:
@@ -5323,6 +5329,9 @@ def main():
                                         
                                         sd_model = StableDiffusion(**sd_kwargs)
                                         multi_model_manager.add_model(model_key, sd_model)
+                                        # Add aliases for "image" and "vision" 
+                                        multi_model_manager.add_model("image", sd_model)
+                                        multi_model_manager.add_model("vision", sd_model)
                                         print(f"Image model loaded successfully via sd.cpp: {original_model_name}")
                                     except ImportError as sd_error:
                                         print(f"stable-diffusion-cpp-python not installed: {sd_error}")
@@ -5427,6 +5436,9 @@ def main():
                         pipeline = pipeline.to("cpu")
                     
                     multi_model_manager.add_model(model_key, pipeline)
+                    # Add aliases for "image" and "vision"
+                    multi_model_manager.add_model("image", pipeline)
+                    multi_model_manager.add_model("vision", pipeline)
                     print(f"Image model loaded successfully: {model_name}")
                     
                 except ImportError as e:
