@@ -4405,12 +4405,6 @@ def main():
         pass
     args = parse_args()
     
-    # Update global load_mode based on command line args
-    if args.loadall:
-        load_mode["mode"] = "loadall"
-    elif args.loadswap:
-        load_mode["mode"] = "loadswap"
-    
     # Store args globally for access in endpoints
     global_args = args
     
