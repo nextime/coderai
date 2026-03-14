@@ -4755,6 +4755,10 @@ def main():
                                     print(f"llama.cpp load error: {llama_error}")
                                     print(f"Trying stable-diffusion-cpp-python fallback...")
                                     # Try stable-diffusion-cpp-python as fallback
+                                    # Set Vulkan device BEFORE importing stable_diffusion_cpp
+                                    if args.image_vulkan_device is not None:
+                                        os.environ['GGML_VULKAN_DEVICE'] = str(args.image_vulkan_device)
+                                        print(f"Setting GGML_VULKAN_DEVICE={args.image_vulkan_device} for image model")
                                     try:
                                         from stable_diffusion_cpp import StableDiffusion
                                         
@@ -4818,11 +4822,6 @@ def main():
                                         
                                         # Build kwargs based on available files
                                         sd_kwargs = {'diffusion_model_path': model_path}
-                                        
-                                        # Set Vulkan device for image models via GGML_VULKAN_DEVICE environment variable
-                                        if args.image_vulkan_device is not None:
-                                            os.environ['GGML_VULKAN_DEVICE'] = str(args.image_vulkan_device)
-                                            print(f"Setting GGML_VULKAN_DEVICE={args.image_vulkan_device} for image model")
                                         
                                         if clip_l_path:
                                             sd_kwargs['llm_path'] = clip_l_path
@@ -5261,6 +5260,10 @@ def main():
                                     print(f"llama.cpp load error: {llama_error}")
                                     print(f"Trying stable-diffusion-cpp-python fallback...")
                                     # Try stable-diffusion-cpp-python as fallback
+                                    # Set Vulkan device BEFORE importing stable_diffusion_cpp
+                                    if args.image_vulkan_device is not None:
+                                        os.environ['GGML_VULKAN_DEVICE'] = str(args.image_vulkan_device)
+                                        print(f"Setting GGML_VULKAN_DEVICE={args.image_vulkan_device} for image model")
                                     try:
                                         from stable_diffusion_cpp import StableDiffusion
                                         
@@ -5324,11 +5327,6 @@ def main():
                                         
                                         # Build kwargs based on available files
                                         sd_kwargs = {'diffusion_model_path': model_path}
-                                        
-                                        # Set Vulkan device for image models via GGML_VULKAN_DEVICE environment variable
-                                        if args.image_vulkan_device is not None:
-                                            os.environ['GGML_VULKAN_DEVICE'] = str(args.image_vulkan_device)
-                                            print(f"Setting GGML_VULKAN_DEVICE={args.image_vulkan_device} for image model")
                                         
                                         if clip_l_path:
                                             sd_kwargs['llm_path'] = clip_l_path
