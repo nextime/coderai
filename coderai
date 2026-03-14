@@ -4707,6 +4707,7 @@ def main():
     multi_model_manager.set_load_mode(load_mode)
     
     # Pre-load models based on mode
+    print(f"DEBUG: load_mode at line 4710 = '{load_mode}'")
     if load_mode == "loadall":
         # Load all models into VRAM up to full capacity, then offload to CPU RAM
         print("\n=== Load All Mode ===")
@@ -4716,6 +4717,7 @@ def main():
             print(f"Pre-loading main text model: {model_names[0]}")
         
         # Load image model (first one only in loadall mode currently)
+        print(f"DEBUG: image_models check at line 4718: {image_models}")
         if image_models:
             print(f"Pre-loading image model: {image_models[0]}")
             
@@ -4967,6 +4969,7 @@ def main():
                     print(f"  Image model will load on first request")
         
         # Load audio model
+        print(f"DEBUG: audio_models check at line 4970: {audio_models}")
         if audio_models:
             print(f"Pre-loading audio model: {audio_models[0]}")
         
@@ -5012,7 +5015,9 @@ def main():
         # Pre-load first audio model at startup if:
         # - Using loadall or loadswap mode, OR
         # - No main model is specified (only audio model configured)
+        print(f"DEBUG: load_mode at line 5015 = '{load_mode}', model_names = {model_names}, audio_models = {audio_models}")
         should_preload = load_mode in ("loadall", "loadswap") or (not model_names and audio_models)
+        print(f"DEBUG: should_preload = {should_preload}")
         
         # Initialize whisper-server if specified
         if args.whisper_server:
