@@ -4091,6 +4091,48 @@ def parse_args():
         help="Model for image generation (e.g., stable-diffusion-xl-base-1.0). Can be specified multiple times for multiple models.",
     )
     parser.add_argument(
+        "--clip-l-path",
+        type=str,
+        default=None,
+        help="Path to CLIP LLM model for image generation (stable-diffusion-cpp-python).",
+    )
+    parser.add_argument(
+        "--vae-path",
+        type=str,
+        default=None,
+        help="Path to VAE model for image generation (stable-diffusion-cpp-python).",
+    )
+    parser.add_argument(
+        "--image-sample-method",
+        type=str,
+        default="res_multistep",
+        help="Sample method for image generation (default: res_multistep for Z-Image Turbo).",
+    )
+    parser.add_argument(
+        "--image-steps",
+        type=int,
+        default=4,
+        help="Number of inference steps for image generation (default: 4 for Z-Image Turbo).",
+    )
+    parser.add_argument(
+        "--image-width",
+        type=int,
+        default=512,
+        help="Image width for generation (default: 512).",
+    )
+    parser.add_argument(
+        "--image-height",
+        type=int,
+        default=512,
+        help="Image height for generation (default: 512).",
+    )
+    parser.add_argument(
+        "--image-cfg-scale",
+        type=float,
+        default=1.0,
+        help="CFG scale for image generation (default: 1.0 for Z-Image Turbo).",
+    )
+    parser.add_argument(
         "--loadall",
         action="store_true",
         help="Pre-load all models (main, audio, image) at startup instead of on-demand",
@@ -4611,23 +4653,38 @@ def main():
                                         t5xxl_path = None
                                         vae_path = None
                                         
-                                        # Look for common file patterns
-                                        for f in os.listdir(model_dir) if os.path.exists(model_dir) else []:
-                                            if 'clip_l' in f.lower() and f.endswith(('.safetensors', '.bin')):
-                                                clip_l_path = os.path.join(model_dir, f)
-                                            elif 't5xxl' in f.lower() and f.endswith(('.safetensors', '.bin')):
-                                                t5xxl_path = os.path.join(model_dir, f)
-                                            elif f.endswith('.safetensors') and 'ae' in f.lower():
-                                                vae_path = os.path.join(model_dir, f)
+                                        # Use CLI arguments if provided
+                                        if args.clip_l_path:
+                                            clip_l_path = args.clip_l_path
+                                        if args.vae_path:
+                                            vae_path = args.vae_path
+                                        
+                                        # Look for common file patterns only if CLI args not provided
+                                        if not args.clip_l_path or not args.vae_path:
+                                            for f in os.listdir(model_dir) if os.path.exists(model_dir) else []:
+                                                if not args.clip_l_path and 'clip_l' in f.lower() and f.endswith(('.safetensors', '.bin')):
+                                                    clip_l_path = os.path.join(model_dir, f)
+                                                elif 't5xxl' in f.lower() and f.endswith(('.safetensors', '.bin')):
+                                                    t5xxl_path = os.path.join(model_dir, f)
+                                                elif not args.vae_path and f.endswith('.safetensors') and 'ae' in f.lower():
+                                                    vae_path = os.path.join(model_dir, f)
                                         
                                         # Build kwargs based on available files
                                         sd_kwargs = {'diffusion_model_path': model_path}
-                                        if clip_l_path:
+                                        if args.clip_l_path:
+                                            sd_kwargs['clip_l_path'] = args.clip_l_path
+                                        elif clip_l_path:
                                             sd_kwargs['clip_l_path'] = clip_l_path
+                                        if args.vae_path:
+                                            sd_kwargs['vae_path'] = args.vae_path
+                                        elif vae_path:
+                                            sd_kwargs['vae_path'] = vae_path
                                         if t5xxl_path:
                                             sd_kwargs['t5xxl_path'] = t5xxl_path
-                                        if vae_path:
-                                            sd_kwargs['vae_path'] = vae_path
+                                        
+                                        # Add generation parameters from CLI args
+                                        sd_kwargs['sample_method'] = args.image_sample_method
+                                        sd_kwargs['steps'] = args.image_steps
                                         
                                         sd_model = StableDiffusion(**sd_kwargs)
                                         multi_model_manager.add_model(model_key, sd_model)
@@ -4935,6 +4992,13 @@ def main():
         multi_model_manager.set_image_model(image_models[0], {
             'ctx': args.vision_ctx,
             'offload': args.vision_offload,
+            'clip_l_path': args.clip_l_path,
+            'vae_path': args.vae_path,
+            'sample_method': args.image_sample_method,
+            'steps': args.image_steps,
+            'width': args.image_width,
+            'height': args.image_height,
+            'cfg_scale': args.image_cfg_scale,
         })
         # Register all image models
         for img_m in image_models[1:]:
@@ -5049,23 +5113,38 @@ def main():
                                         t5xxl_path = None
                                         vae_path = None
                                         
-                                        # Look for common file patterns
-                                        for f in os.listdir(model_dir) if os.path.exists(model_dir) else []:
-                                            if 'clip_l' in f.lower() and f.endswith(('.safetensors', '.bin')):
-                                                clip_l_path = os.path.join(model_dir, f)
-                                            elif 't5xxl' in f.lower() and f.endswith(('.safetensors', '.bin')):
-                                                t5xxl_path = os.path.join(model_dir, f)
-                                            elif f.endswith('.safetensors') and 'ae' in f.lower():
-                                                vae_path = os.path.join(model_dir, f)
+                                        # Use CLI arguments if provided
+                                        if args.clip_l_path:
+                                            clip_l_path = args.clip_l_path
+                                        if args.vae_path:
+                                            vae_path = args.vae_path
+                                        
+                                        # Look for common file patterns only if CLI args not provided
+                                        if not args.clip_l_path or not args.vae_path:
+                                            for f in os.listdir(model_dir) if os.path.exists(model_dir) else []:
+                                                if not args.clip_l_path and 'clip_l' in f.lower() and f.endswith(('.safetensors', '.bin')):
+                                                    clip_l_path = os.path.join(model_dir, f)
+                                                elif 't5xxl' in f.lower() and f.endswith(('.safetensors', '.bin')):
+                                                    t5xxl_path = os.path.join(model_dir, f)
+                                                elif not args.vae_path and f.endswith('.safetensors') and 'ae' in f.lower():
+                                                    vae_path = os.path.join(model_dir, f)
                                         
                                         # Build kwargs based on available files
                                         sd_kwargs = {'diffusion_model_path': model_path}
-                                        if clip_l_path:
+                                        if args.clip_l_path:
+                                            sd_kwargs['clip_l_path'] = args.clip_l_path
+                                        elif clip_l_path:
                                             sd_kwargs['clip_l_path'] = clip_l_path
+                                        if args.vae_path:
+                                            sd_kwargs['vae_path'] = args.vae_path
+                                        elif vae_path:
+                                            sd_kwargs['vae_path'] = vae_path
                                         if t5xxl_path:
                                             sd_kwargs['t5xxl_path'] = t5xxl_path
-                                        if vae_path:
-                                            sd_kwargs['vae_path'] = vae_path
+                                        
+                                        # Add generation parameters from CLI args
+                                        sd_kwargs['sample_method'] = args.image_sample_method
+                                        sd_kwargs['steps'] = args.image_steps
                                         
                                         sd_model = StableDiffusion(**sd_kwargs)
                                         multi_model_manager.add_model(model_key, sd_model)
