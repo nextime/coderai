@@ -4824,6 +4824,9 @@ def main():
                                     try:
                                         from stable_diffusion_cpp import StableDiffusion
                                         
+                                        # Initialize model_key to None first so Python knows it exists
+                                        model_key = None
+                                        
                                         # Define model_key for this scope
                                         model_key = f"image:{model_path}"
                                         print(f"Loading with sd.cpp: {model_path}")
@@ -4932,10 +4935,9 @@ def main():
                     import torch
                     from diffusers import StableDiffusionXLPipeline, DiffusionPipeline
                     
-                    # Use cached path if available
-                    key_model = model_path if model_path and os.path.isfile(model_path) else model_name
-                    model_key = f"image:{key_model}"
-                    print(f"Loading diffusers pipeline: {key_model}")
+                    # Use model name directly for diffusers (model_path is only set in GGUF branch)
+                    model_key = f"image:{model_name}"
+                    print(f"Loading diffusers pipeline: {model_name}")
                     
                     # Try to load as Stable Diffusion XL first
                     try:
@@ -5519,10 +5521,9 @@ def main():
                     import torch
                     from diffusers import StableDiffusionXLPipeline, DiffusionPipeline
                     
-                    # Use cached path if available
-                    key_model = model_path if model_path and os.path.isfile(model_path) else model_name
-                    model_key = f"image:{key_model}"
-                    print(f"Loading diffusers pipeline: {key_model}")
+                    # Use model name directly for diffusers (model_path is only set in GGUF branch)
+                    model_key = f"image:{model_name}"
+                    print(f"Loading diffusers pipeline: {model_name}")
                     
                     # Try to load as Stable Diffusion XL first
                     try:
