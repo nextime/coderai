@@ -3088,6 +3088,46 @@ async def create_transcription(
 def get_load_mode():
     return load_mode.get("mode", "ondemand")
 
+# Helper function to get CFG scale for image generation
+def get_cfg_scale():
+    """Get CFG scale for image generation. Auto-detect VRAM for Vulkan."""
+    cfg_scale = getattr(global_args, 'image_cfg_scale', 1.0)
+    
+    # If using Vulkan and CLI didn't specify cfg_scale (default 1.0), check VRAM
+    if cfg_scale == 1.0:  # Only auto-detect if using default
+        backend = getattr(global_args, 'backend', 'auto')
+        image_backend = getattr(global_args, 'image_backend', 'auto')
+        
+        # Check if using Vulkan (either global or image-specific)
+        use_vulkan = (backend == 'vulkan') or (image_backend == 'vulkan') or (image_backend == 'auto' and backend == 'auto')
+        
+        if use_vulkan:
+            # Try to detect VRAM
+            try:
+                import subprocess
+                # Try vulkaninfo first
+                result = subprocess.run(['vulkaninfo', '-J'], capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    import json
+                    data = json.loads(result.stdout)
+                    # Find device memory
+                    for dev in data.get('devices', []):
+                        mem = dev.get('deviceMemoryHeap', [{}])
+                        for heap in mem:
+                            if heap.get('flags', []).get('deviceLocal', False):
+                                vram_mb = heap.get('size', 0) / (1024 * 1024)
+                                print(f"DEBUG: Detected VRAM: {vram_mb:.0f} MB")
+                                if vram_mb < 16000:  # Less than 16GB
+                                    print(f"DEBUG: VRAM < 16GB, using cfg_scale=1.0 for better performance")
+                                    return 1.0
+                                break
+            except Exception as e:
+                print(f"DEBUG: Could not detect VRAM: {e}")
+                # Default to 1.0 for Vulkan if detection fails
+                return 1.0
+    
+    return cfg_scale
+
 # Helper function to save generated images and return response dict
 def save_image_response(img, request_format="base64"):
     """
@@ -3248,7 +3288,7 @@ async def create_image_generation(request: ImageGenerationRequest):
             height=height,
             width=width,
             generator=generator,
-            guidance_scale=7.5 if quality == "standard" else 9.0,
+            guidance_scale=getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0,
             num_inference_steps=30 if quality == "standard" else 50,
         )
         
@@ -3331,7 +3371,7 @@ async def create_image_generation(request: ImageGenerationRequest):
                     negative_prompt='',
                     width=width,
                     height=height,
-                    cfg_scale=7.0,
+                    cfg_scale=get_cfg_scale(),
                     sample_steps=steps,
                     seed=seed if seed is not None else 42,
                     batch_count=request.n if request.n else 1,
@@ -3416,7 +3456,7 @@ async def create_image_generation(request: ImageGenerationRequest):
                     negative_prompt='',
                     width=width,
                     height=height,
-                    cfg_scale=7.0,
+                    cfg_scale=get_cfg_scale(),
                     sample_steps=steps,
                     seed=seed if seed is not None else 42,
                     batch_count=request.n if request.n else 1,
