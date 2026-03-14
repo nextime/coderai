@@ -23,7 +23,7 @@ from typing import AsyncGenerator, Dict, List, Optional, Union
 
 import psutil
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, Field, validator, field_validator, ConfigDict
 from pydantic_core import PydanticCustomError
 from threading import Thread
@@ -2426,6 +2426,7 @@ global_system_prompt = None
 
 # Global debug flag
 global_debug = False
+global_file_path = None
 
 # =============================================================================
 # Queue Manager for Model Loading Notifications
@@ -2645,6 +2646,24 @@ async def list_models():
     """List available models."""
     models = multi_model_manager.list_models()
     return ModelList(data=models)
+
+# =============================================================================
+# Static File Serving Endpoint
+# =============================================================================
+
+@app.get("/v1/files/{filename}")
+async def get_file(filename: str):
+    """Serve generated files (images, audio) from the file path directory."""
+    import os
+    if not global_file_path:
+        raise HTTPException(status_code=404, detail="File path not configured")
+    
+    file_path = os.path.join(global_file_path, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    return FileResponse(file_path)
+
 # =============================================================================
 # Audio Transcription Endpoint
 # =============================================================================
@@ -3069,6 +3088,41 @@ async def create_transcription(
 def get_load_mode():
     return load_mode.get("mode", "ondemand")
 
+# Helper function to save generated images and return response dict
+def save_image_response(img, request_format="base64"):
+    """
+    Save image to file path if configured, return response dict with b64_json and optional url.
+    """
+    import base64
+    import io
+    import os
+    import uuid
+    from PIL import Image
+    
+    # Convert to PIL Image if needed
+    if not isinstance(img, Image.Image):
+        img = Image.fromarray(img)
+    
+    # Convert to base64
+    buffered = io.BytesIO()
+    img.save(buffered, format="PNG")
+    img_bytes = buffered.getvalue()
+    img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+    
+    result = {"b64_json": img_base64}
+    
+    # Save to file path if configured
+    if global_file_path:
+        os.makedirs(global_file_path, exist_ok=True)
+        # Generate unique filename
+        filename = f"{uuid.uuid4().hex}.png"
+        file_path = os.path.join(global_file_path, filename)
+        img.save(file_path, format="PNG")
+        # Add URL to response
+        result["url"] = f"/v1/files/{filename}"
+    
+    return result
+
 @app.post("/v1/images/generations")
 async def create_image_generation(request: ImageGenerationRequest):
     """
@@ -3205,17 +3259,9 @@ async def create_image_generation(request: ImageGenerationRequest):
             import base64
             import io
             
-            buffered = io.BytesIO()
-            img.save(buffered, format="PNG")
-            img_bytes = buffered.getvalue()
-            img_base64 = base64.b64encode(img_bytes).decode('utf-8')
-            
-            if request.response_format == "base64":
-                images.append({"b64_json": img_base64})
-            else:
-                # For URL format, we'd need to save somewhere
-                # For now, return base64
-                images.append({"b64_json": img_base64})
+            # Use helper function to save and get response
+            img_data = save_image_response(img, request.response_format)
+            images.append(img_data)
         
         return {
             "created": int(time.time()),
@@ -3233,20 +3279,26 @@ async def create_image_generation(request: ImageGenerationRequest):
     
     # Try stable-diffusion-cpp-python (sd.cpp) as fallback
     # First, check all available image models to find one loaded via sd.cpp
+    # Skip if --nopreload was specified (model will load on first request in worker thread)
+    nopreload = getattr(global_args, 'nopreload', False)
+    
     sd_model = None
-    for key in multi_model_manager.models:
-        if key.startswith("image:"):
-            potential_model = multi_model_manager.get_model(key)
-            if potential_model is not None:
-                # Check if it's a stable-diffusion-cpp model
-                try:
-                    from stable_diffusion_cpp import StableDiffusion
-                    if isinstance(potential_model, StableDiffusion):
-                        sd_model = potential_model
-                        print(f"Found stable-diffusion-cpp model with key: {key}")
-                        break
-                except ImportError:
-                    pass
+    if not nopreload:
+        for key in multi_model_manager.models:
+            if key.startswith("image:"):
+                potential_model = multi_model_manager.get_model(key)
+                if potential_model is not None:
+                    # Check if it's a stable-diffusion-cpp model
+                    try:
+                        from stable_diffusion_cpp import StableDiffusion
+                        if isinstance(potential_model, StableDiffusion):
+                            sd_model = potential_model
+                            print(f"Found stable-diffusion-cpp model with key: {key}")
+                            break
+                    except ImportError:
+                        pass
+    else:
+        print(f"DEBUG: Skipping preloaded model check (--nopreload specified)")
     
     if sd_model is not None:
         # Check if it's a stable-diffusion-cpp model (has generate method from sd.cpp)
@@ -3296,16 +3348,9 @@ async def create_image_generation(request: ImageGenerationRequest):
                 from PIL import Image
                 
                 for img in result:
-                    # Convert to base64
-                    buffered = io.BytesIO()
-                    if isinstance(img, Image.Image):
-                        img.save(buffered, format="PNG")
-                    else:
-                        # Might be numpy array
-                        Image.fromarray(img).save(buffered, format="PNG")
-                    img_bytes = buffered.getvalue()
-                    img_base64 = base64.b64encode(img_bytes).decode('utf-8')
-                    images.append({"b64_json": img_base64})
+                    # Use helper function to save and get response
+                    img_data = save_image_response(img)
+                    images.append(img_data)
                 
                 return {
                     "created": int(time.time()),
@@ -3388,14 +3433,9 @@ async def create_image_generation(request: ImageGenerationRequest):
                 from PIL import Image
                 
                 for img in result:
-                    buffered = io.BytesIO()
-                    if isinstance(img, Image.Image):
-                        img.save(buffered, format="PNG")
-                    else:
-                        Image.fromarray(img).save(buffered, format="PNG")
-                    img_bytes = buffered.getvalue()
-                    img_base64 = base64.b64encode(img_bytes).decode('utf-8')
-                    images.append({"b64_json": img_base64})
+                    # Use helper function to save and get response
+                    img_data = save_image_response(img)
+                    images.append(img_data)
                 
                 return {
                     "created": int(time.time()),
@@ -4349,6 +4389,11 @@ def parse_args():
         help="Keep all models loaded, swapping active model between VRAM and RAM (only active model in VRAM)",
     )
     parser.add_argument(
+        "--nopreload",
+        action="store_true",
+        help="Disable model preloading. Models will load on first request instead of at startup",
+    )
+    parser.add_argument(
         "--audio-ctx",
         type=int,
         default=480000,
@@ -4424,10 +4469,16 @@ def parse_args():
         action="store_true",
         help="Enable debug mode - dumps full request/response to stdout for troubleshooting",
     )
+    parser.add_argument(
+        "--file-path",
+        type=str,
+        default=None,
+        help="Path to store generated files (images, audio). If specified, files will be saved here and served over web.",
+    )
     return parser.parse_args()
 def main():
     """Main entry point."""
-    global global_system_prompt, model_manager, multi_model_manager, global_debug, global_args
+    global global_system_prompt, model_manager, multi_model_manager, global_debug, global_args, global_file_path
     
     # Suppress unraisable exceptions from LlamaModel.__del__
     import sys
@@ -4454,6 +4505,8 @@ def main():
     
     # Set global debug flag
     global_debug = args.debug
+    # Set global file path for storing generated files
+    global_file_path = args.file_path
     if global_debug:
         # Print the full command line that was used to invoke coderai
         import shlex
@@ -4754,7 +4807,7 @@ def main():
         
         # Load image model (first one only in loadall mode currently)
         print(f"DEBUG: image_models check at line 4718: {image_models}, backend = {args.backend}")
-        if image_models:
+        if image_models and not getattr(args, 'nopreload', False):
             print(f"Pre-loading image model: {image_models[0]}")
             
             # Get the original model name
@@ -5037,7 +5090,7 @@ def main():
             # Vulkan: Load all models to GPU like loadall
             if model_names:
                 print(f"Pre-loading main text model: {model_names[0]}")
-            if image_models:
+            if image_models and not getattr(args, 'nopreload', False):
                 print(f"Pre-loading image model: {image_models[0]}")
             if audio_models:
                 print(f"Pre-loading audio model: {audio_models[0]}")
@@ -5047,7 +5100,7 @@ def main():
             # NVIDIA/CUDA: First model in VRAM, others in RAM
             if model_names:
                 print(f"Main text model will be in VRAM: {model_names[0]}")
-            if image_models:
+            if image_models and not getattr(args, 'nopreload', False):
                 print(f"Image model in RAM: {image_models[0]}")
             if audio_models:
                 print(f"Audio model in RAM: {audio_models[0]}")
@@ -5308,7 +5361,7 @@ def main():
             })
         
         # Pre-load image model if it's configured (even with audio models)
-        if image_models:
+        if image_models and not getattr(args, 'nopreload', False):
             print(f"Pre-loading image model...")
             
             # Get the original model name
