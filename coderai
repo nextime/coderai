@@ -2757,6 +2757,9 @@ async def create_transcription(
     
     audio_model = multi_model_manager.audio_model
     
+    # DEBUG: Print audio model status
+    print(f"DEBUG: audio_model check - audio_models list: {multi_model_manager.audio_models}, audio_model: {audio_model}, whisper_server: {multi_model_manager.whisper_server}")
+    
     # If no audio model configured, return an error
     if not audio_model:
         raise HTTPException(
@@ -4402,6 +4405,12 @@ def main():
         pass
     args = parse_args()
     
+    # Update global load_mode based on command line args
+    if args.loadall:
+        load_mode["mode"] = "loadall"
+    elif args.loadswap:
+        load_mode["mode"] = "loadswap"
+    
     # Store args globally for access in endpoints
     global_args = args
     
@@ -4625,9 +4634,6 @@ def main():
     elif args.loadswap:
         load_mode = "loadswap"
     
-    # Update global load_mode for semaphore system
-    load_mode_dict = {"mode": load_mode}
-    
     # Set load mode in multi_model_manager
     multi_model_manager.set_load_mode(load_mode)
     
@@ -4696,9 +4702,6 @@ def main():
         load_mode = "loadall"
     elif args.loadswap:
         load_mode = "loadswap"
-    
-    # Update global load_mode for semaphore system
-    load_mode_dict = {"mode": load_mode}
     
     # Set load mode in multi_model_manager
     multi_model_manager.set_load_mode(load_mode)
@@ -4998,11 +5001,13 @@ def main():
             print(f"  Using Vulkan device: {args.audio_vulkan_device}")
         
         # Register all audio models
+        print(f"DEBUG: Registering audio models: {audio_models}")
         for audio_m in audio_models:
             multi_model_manager.set_audio_model(audio_m, {
                 'ctx': args.audio_ctx,
                 'offload': args.audio_offload,
             })
+        print(f"DEBUG: After registration, audio_models in manager: {multi_model_manager.audio_models}")
         
         # Pre-load first audio model at startup if:
         # - Using loadall or loadswap mode, OR
