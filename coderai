@@ -2339,10 +2339,17 @@ class MultiModelManager:
         if self.image_models:
             models.append(ModelInfo(id="vision"))  # Alias for first image model
             models.append(ModelInfo(id="image"))    # Alias for first image model
-            # Add all image models
+            # Add all image models - convert URLs to cached paths for display
             for image_id in self.image_models:
-                models.append(ModelInfo(id=f"image:{image_id}"))
-                models.append(ModelInfo(id=f"vision:{image_id}"))
+                # Check if image_id is a URL and try to get cached path
+                display_id = image_id
+                if image_id.startswith('http://') or image_id.startswith('https://'):
+                    cached_path = get_cached_model_path(image_id)
+                    if cached_path:
+                        # Use the filename from cached path for display
+                        display_id = os.path.basename(cached_path)
+                models.append(ModelInfo(id=f"image:{display_id}"))
+                models.append(ModelInfo(id=f"vision:{display_id}"))
         
         # Add loaded models that aren't in the above categories
         for key in self.models:
