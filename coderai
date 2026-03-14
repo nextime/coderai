@@ -5358,6 +5358,9 @@ def main():
                                     try:
                                         from stable_diffusion_cpp import StableDiffusion
                                         
+                                        # Initialize model_key to avoid unbound variable error
+                                        model_key = None
+                                        
                                         print(f"Loading with sd.cpp: {model_path}")
                                         # For models like Z-Image-Turbo/Flux, use diffusion_model_path
                                         # Look for additional model files in same directory
@@ -5437,6 +5440,8 @@ def main():
                                         # sd_kwargs['sample_method'] = args.image_sample_method  # Not valid for __init__
                                         # sd_kwargs['steps'] = args.image_steps  # Not valid for __init__
                                         
+                                        # Define model_key for adding to manager
+                                        model_key = f"image:{model_path}"
                                         sd_model = StableDiffusion(**sd_kwargs)
                                         multi_model_manager.add_model(model_key, sd_model)
                                         # Add aliases for "image" and "vision" 
