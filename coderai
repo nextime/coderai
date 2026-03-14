@@ -4715,9 +4715,6 @@ def main():
                                     print(f"llama.cpp load error: {llama_error}")
                                     print(f"Trying stable-diffusion-cpp-python fallback...")
                                     # Try stable-diffusion-cpp-python as fallback
-                                    if args.image_vulkan_device is not None:
-                                        
-                                        
                                     try:
                                         from stable_diffusion_cpp import StableDiffusion
                                         
@@ -5246,9 +5243,6 @@ def main():
                                     print(f"llama.cpp load error: {llama_error}")
                                     print(f"Trying stable-diffusion-cpp-python fallback...")
                                     # Try stable-diffusion-cpp-python as fallback
-                                    if args.image_vulkan_device is not None:
-                                        
-                                        
                                     try:
                                         from stable_diffusion_cpp import StableDiffusion
                                         
