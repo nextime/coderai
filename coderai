@@ -4321,6 +4321,16 @@ def parse_args():
         help="Default seed for image generation (default: random).",
     )
     parser.add_argument(
+        "--vae-tiling",
+        action="store_true",
+        help="Enable VAE tiling for lower VRAM usage (sd.cpp only).",
+    )
+    parser.add_argument(
+        "--clip-on-cpu",
+        action="store_true",
+        help="Run CLIP on CPU to save VRAM (sd.cpp only).",
+    )
+    parser.add_argument(
         "--loadall",
         action="store_true",
         help="Pre-load all models (main, audio, image) at startup instead of on-demand",
@@ -4917,6 +4927,13 @@ def main():
                                         if t5xxl_path:
                                             sd_kwargs['t5xxl_path'] = t5xxl_path
                                         
+                                        # Add sd.cpp-specific options from CLI args
+                                        if getattr(global_args, 'vae_tiling', False):
+                                            sd_kwargs['vae_tiling'] = True
+                                            print(f"DEBUG: Enabling VAE tiling for lower VRAM usage")
+                                        if getattr(global_args, 'clip_on_cpu', False):
+                                            sd_kwargs['clip_on_cpu'] = True
+                                            print(f"DEBUG: Running CLIP on CPU to save VRAM")
 
                                         # Add generation parameters from CLI args
                                         # sd_kwargs['sample_method'] = args.image_sample_method  # Not valid for __init__
@@ -5449,6 +5466,13 @@ def main():
                                         if t5xxl_path:
                                             sd_kwargs['t5xxl_path'] = t5xxl_path
                                         
+                                        # Add sd.cpp-specific options from CLI args
+                                        if getattr(global_args, 'vae_tiling', False):
+                                            sd_kwargs['vae_tiling'] = True
+                                            print(f"DEBUG: Enabling VAE tiling for lower VRAM usage")
+                                        if getattr(global_args, 'clip_on_cpu', False):
+                                            sd_kwargs['clip_on_cpu'] = True
+                                            print(f"DEBUG: Running CLIP on CPU to save VRAM")
 
                                         # Add generation parameters from CLI args
                                         # sd_kwargs['sample_method'] = args.image_sample_method  # Not valid for __init__
