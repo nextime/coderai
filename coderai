@@ -3539,9 +3539,16 @@ def save_image_response(img, request_format="base64", http_request=None):
         # Determine base URL based on --url argument
         url_setting = getattr(global_args, 'url', 'auto') if global_args else 'auto'
         if url_setting == 'auto':
-            # Use client IP from request
+            # Use server host from request headers (what client used to connect)
             if http_request:
-                client_host = http_request.client.host if http_request.client else '127.0.0.1'
+                # Get the Host header - this is what the client used to reach the server
+                client_host = http_request.headers.get('host', '')
+                if not client_host:
+                    # Fallback to client IP if no Host header
+                    client_host = http_request.client.host if http_request.client else '127.0.0.1'
+                # Strip port if present in Host header
+                if ':' in client_host and not client_host.replace(':', '').isdigit():
+                    client_host = client_host.split(':')[0]
                 # Check if HTTPS is enabled
                 use_https = getattr(global_args, 'https', False) or getattr(global_args, 'pubkey', None)
                 protocol = "https" if use_https else "http"
