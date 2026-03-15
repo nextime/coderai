@@ -202,7 +202,7 @@ options:
   --vulkan-single-gpu   Force Vulkan to use only the specified GPU (prevents layer distribution across multiple GPUs)
   --vulkan-list-devices List available Vulkan GPU devices and exit
   --reply-filters      Enable filtering of model replies. Can be repeated. See "Reply Filters" section for details.
-  --hf-chat-template  Use HuggingFace transformers apply_chat_template for GGUF models instead of llama.cpp built-in
+  --hf-chat-template  Use HuggingFace transformers apply_chat_template. Can be repeated. See "HuggingFace Chat Template" section for details.
 ```
 
 ### Reply Filters
@@ -261,15 +261,30 @@ The `--hf-chat-template` option enables using HuggingFace's `apply_chat_template
 **Usage:**
 
 ```bash
-# Use HuggingFace chat template (requires transformers)
-coderai --hf-chat-template --model llama-3.1-8b-instruct-q4_k_m.gguf
+# Use HuggingFace chat template for ALL text models
+coderai --hf-chat-template text --model llama-3.1-8b-instruct-q4_k_m.gguf
+
+# Use HuggingFace chat template for SPECIFIC model
+coderai --hf-chat-template text:llama-3.1 --model llama-3.1-8b-instruct-q4_k_m.gguf
+
+# Different chat templates for different models
+coderai --hf-chat-template text:llama-3.1 --hf-chat-template text:phi-3 --model llama-3.1-8b-instruct-q4_k_m.gguf
 
 # Or with Vulkan backend
-coderai --backend vulkan --hf-chat-template --model llama-3.1-8b-instruct-q4_k_m.gguf
+coderai --backend vulkan --hf-chat-template text --model llama-3.1-8b-instruct-q4_k_m.gguf
 ```
 
+**Syntax:**
+
+| Syntax | Applies To |
+|--------|------------|
+| `--hf-chat-template text` | All text models |
+| `--hf-chat-template image` | All image models |
+| `--hf-chat-template text:model_name` | Specific text model |
+| `--hf-chat-template image:model_name` | Specific image model |
+
 **How it works:**
-1. When `--hf-chat-template` is specified, the server attempts to load a HuggingFace tokenizer
+1. When `--hf-chat-template` is specified for a model, the server attempts to load a HuggingFace tokenizer
 2. It first checks for a local `tokenizer_config.json` in the model directory
 3. If not found locally, it tries to infer the model name from the GGUF filename and load from HuggingFace Hub
 4. The tokenizer's `apply_chat_template` method is then used for formatting chat messages

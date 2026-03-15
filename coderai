@@ -1435,9 +1435,15 @@ class VulkanBackend(ModelBackend):
     def _finalize_chat_template_detection(self):
         """Finalize chat template detection after model is loaded."""
         # Check if we should use HuggingFace tokenizer for chat template
-        hf_chat_template = getattr(global_args, 'hf_chat_template', False)
+        # Try to get model info
+        model_name = getattr(self, 'model_name', None) or "unknown"
         
-        if hf_chat_template:
+        # Determine model type - text models use GGUF, images would be different
+        model_type = "text"
+        if model_name.startswith("image:"):
+            model_type = "image"
+        
+        if check_hf_chat_template(model_type, model_name):
             self._load_huggingface_tokenizer()
             return
         
@@ -3112,6 +3118,60 @@ def check_single_filter(filter_spec: str, filter_type: str, model_type: str, mod
     else:
         # Simple filter: "malformed" or "all" - applies to all models
         return filter_spec == 'all' or filter_spec == filter_type
+
+
+def check_hf_chat_template(model_type: str = "text", model_name: str = None) -> bool:
+    """
+    Check if HuggingFace chat template should be used for the model.
+    
+    Args:
+        model_type: The model type ('text', 'image', etc.)
+        model_name: The specific model name (optional)
+    
+    Returns:
+        True if HF chat template should be used, False otherwise.
+    
+    Syntax:
+        # Apply to all text models
+        --hf-chat-template text
+        
+        # Apply to specific model
+        --hf-chat-template text:llama-3.1
+        --hf-chat-template image:sd-xl
+        
+        # Multiple models
+        --hf-chat-template text:llama-3.1 --hf-chat-template text:phi-3
+    """
+    hf_chat_template = getattr(global_args, 'hf_chat_template', []) or []
+    
+    # If empty list, HF chat template is not enabled
+    if not hf_chat_template:
+        return False
+    
+    for spec in hf_chat_template:
+        if ':' in spec:
+            # Format: text:model_name or image:model_name
+            parts = spec.split(':')
+            spec_model_type = parts[0]
+            spec_model_name = parts[1] if len(parts) > 1 else None
+            
+            # Check if model type matches
+            if spec_model_type != model_type and spec_model_type != '*':
+                continue
+            
+            # If no specific model name, applies to all of this type
+            if spec_model_name is None or spec_model_name == '':
+                return True
+            
+            # If specific model name, check for match
+            if spec_model_name == model_name:
+                return True
+        else:
+            # Just a type like "text" or "image" - applies to all of that type
+            if spec == model_type or spec == '*':
+                return True
+    
+    return False
 
 # Global system prompt (set via --system-prompt flag)
 # None = don't inject, True = use default, string = use custom text
@@ -5359,8 +5419,9 @@ def parse_args():
     )
     parser.add_argument(
         "--hf-chat-template",
-        action="store_true",
-        help="Use HuggingFace transformers apply_chat_template for GGUF models instead of llama.cpp built-in (requires transformers library)",
+        action="append",
+        default=[],
+        help="Use HuggingFace transformers apply_chat_template for specific model(s). Format: --hf-chat-template text:model_name or --hf-chat-template text (all text models)",
     )
     parser.add_argument(
         "--system-prompt",
