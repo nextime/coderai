@@ -1243,7 +1243,7 @@ class VulkanBackend(ModelBackend):
         self.chat_template = None  # Detected chat template name
         self.force_cuda = original_backend in ("nvidia", "cuda")  # Force CUDA if original was nvidia
         if self.force_cuda:
-            print("DEBUG: VulkanBackend will use CUDA backend (forced by original backend)")
+            print("DEBUG: GGUF model will use CUDA backend (forced by --backend nvidia)")
         self._detect_chat_template()
     
     def _detect_chat_template(self):
