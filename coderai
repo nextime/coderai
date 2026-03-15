@@ -3560,17 +3560,9 @@ async def create_image_generation(request: ImageGenerationRequest):
             print(f"sd.cpp error: {sd_cpp_error}")
     
     # Both backends failed - return error with installation instructions
-    error_details = []
-    if diffusers_error:
-        error_details.append(f"diffusers: {diffusers_error}")
-    if sd_cpp_error:
-        error_details.append(f"sd.cpp: {sd_cpp_error}")
-    
     raise HTTPException(
-        status_code=501,
-        detail=f"Image generation not available. Tried: {', '.join(error_details)}. "
-               f"Install either: pip install diffusers torch accelerate safetensors (for NVIDIA) "
-               f"or: pip install stable-diffusion-cpp-python (for Vulkan/AMD)"
+        status_code=400,
+        detail=f"Model '{model_to_use}' does not support image generation"
     )
 # =============================================================================
 # Text-to-Speech Endpoint
