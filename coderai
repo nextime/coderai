@@ -2444,6 +2444,37 @@ class MultiModelManager:
             if self.default_model and self.default_model in self.models:
                 self.current_model_key = self.default_model
                 return self.models[self.default_model]
+            # Model not loaded - check if it's in config (registered but unloaded)
+            if self.default_model and self.default_model in self.config:
+                # Need to reload the default model - cleanup image models first
+                for key in list(self.models.keys()):
+                    if key.startswith("image:"):
+                        model_to_cleanup = self.models.get(key)
+                        if model_to_cleanup is not None:
+                            print(f"Unloading image model '{key}' from VRAM to reload text model")
+                            try:
+                                if hasattr(model_to_cleanup, 'cleanup') and callable(getattr(model_to_cleanup, 'cleanup')):
+                                    model_to_cleanup.cleanup()
+                                elif hasattr(model_to_cleanup, 'model') and model_to_cleanup.model is not None:
+                                    if hasattr(model_to_cleanup.model, 'cleanup'):
+                                        model_to_cleanup.model.cleanup()
+                            except Exception as e:
+                                print(f"Warning during cleanup of '{key}': {e}")
+                        del self.models[key]
+                # Now try to reload the default model
+                try:
+                    from llama_cpp import Llama
+                    backend = self.config[self.default_model].get('backend_type', 'auto')
+                    model_path = self.default_model
+                    load_kwargs = self.config[self.default_model].copy()
+                    load_kwargs.pop('backend_type', None)
+                    print(f"Reloading default model: {model_path}")
+                    llm = Llama(model_path=model_path, **load_kwargs)
+                    self.models[self.default_model] = ModelManager(llm, backend=backend)
+                    self.current_model_key = self.default_model
+                    return self.models[self.default_model]
+                except Exception as e:
+                    print(f"Error reloading default model: {e}")
             return None
         
         # Handle "audio" alias - use first/default audio model
