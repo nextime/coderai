@@ -3754,10 +3754,8 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
             torch_dtype = precision_map.get(precision, torch.float32)
             print(f"Using precision: {precision} ({torch_dtype})")
             
-            # Check if offload strategy is specified (for auto-OOM handling)
-            offload_strategy = getattr(global_args, 'offload_strategy', None)
-            offload_dir = getattr(global_args, 'offload_dir', None)
-            use_sequential_offload = offload_strategy is not None or offload_dir is not None
+            # Check if CPU offload is requested via CLI
+            use_sequential_offload = getattr(global_args, 'image_cpu_offload', False)
             
             # Track loading attempts for OOM handling
             load_attempt = 0
@@ -5150,6 +5148,11 @@ def parse_args():
         default="f32",
         choices=["bf16", "f32", "f16", "f8"],
         help="Model precision for image generation (default: f32). bf16 recommended for modern GPUs.",
+    )
+    parser.add_argument(
+        "--image-cpu-offload",
+        action="store_true",
+        help="Enable sequential CPU offload for image models (lower VRAM usage).",
     )
     parser.add_argument(
         "--image-seed",
