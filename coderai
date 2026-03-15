@@ -3463,7 +3463,7 @@ def get_cfg_scale():
     return cfg_scale
 
 # Helper function to save generated images and return response dict
-def save_image_response(img, request_format="base64"):
+def save_image_response(img, request_format="base64", http_request=None):
     """
     Save image to file path if configured, return response dict.
     
@@ -3691,7 +3691,7 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
             import io
             
             # Use helper function to save and get response
-            img_data = save_image_response(img, request.response_format)
+            img_data = save_image_response(img, request.response_format, http_request)
             images.append(img_data)
         
         return {
@@ -3780,7 +3780,7 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                 
                 for img in result:
                     # Use helper function to save and get response
-                    img_data = save_image_response(img)
+                    img_data = save_image_response(img, http_request=http_request)
                     images.append(img_data)
                 
                 return {
@@ -3878,7 +3878,7 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                 
                 for img in result:
                     # Use helper function to save and get response
-                    img_data = save_image_response(img)
+                    img_data = save_image_response(img, http_request=http_request)
                     images.append(img_data)
                 
                 return {
