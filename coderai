@@ -628,7 +628,11 @@ class ToolCallParser:
         # Clean up excessive newlines left from removal
         text = re.sub(r'\n{3,}', '\n\n', text)
         
-        return text.strip()
+        # Only strip if there's actual content (not just whitespace)
+        if text.strip():
+            text = text.strip()
+        
+        return text
 def format_tools_for_prompt(tools: List[Tool], messages: List[ChatMessage]) -> List[ChatMessage]:
     """Format tools into the system message or add a tool description."""
     if not tools:
@@ -4478,10 +4482,7 @@ async def stream_chat_response(
             # Always filter out tool call format - some may slip through even without tools
             filtered_chunk = tool_parser.strip_tool_calls_from_content(filtered_chunk)
             
-            if not filtered_chunk:
-                print(f"DEBUG: filtered_chunk was empty (original chunk: {repr(chunk[:50])})")
-                continue
-                
+            # Pass through all content including whitespace - it's essential for message composition
             generated_text += filtered_chunk
             
             data = {
