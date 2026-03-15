@@ -2704,12 +2704,14 @@ class MultiModelManager:
         # Add default model(s)
         if self.default_model:
             model_id = self.default_model
-            # Also add short name
-            short_name = self.default_model.split("/")[-1] if "/" in self.default_model else self.default_model
-            if short_name != self.default_model:
-                models.append(ModelInfo(id=short_name))
-            models.append(ModelInfo(id=model_id))
-            models.append(ModelInfo(id="default"))
+            # Skip URLs - they are download sources, not model identifiers
+            if not (model_id.startswith("http://") or model_id.startswith("https://")):
+                # Also add short name
+                short_name = self.default_model.split("/")[-1] if "/" in self.default_model else self.default_model
+                if short_name != self.default_model:
+                    models.append(ModelInfo(id=short_name))
+                models.append(ModelInfo(id=model_id))
+                models.append(ModelInfo(id="default"))
         
         # Add aliases for first/default models
         if self.audio_models:
