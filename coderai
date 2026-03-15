@@ -49,8 +49,11 @@ def get_cached_model_path(url: str) -> Optional[str]:
     # Create a safe filename from the URL using SHA-256 hash
     url_hash = hashlib.sha256(url.encode()).hexdigest()
     url_path = url.split('?')[0]  # Remove query params
-    ext = os.path.splitext(url_path)[1] or '.gguf'
-    cached_filename = f"{url_hash}{ext}"
+    filename = os.path.basename(url_path)
+    if not filename:
+        filename = "model.gguf"
+    # Match the format used in load_model: {hash}_{filename}
+    cached_filename = f"{url_hash}_{filename}"
     cached_path = os.path.join(cache_dir, cached_filename)
     
     if os.path.exists(cached_path):
