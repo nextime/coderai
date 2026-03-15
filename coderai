@@ -652,9 +652,7 @@ class ToolCallParser:
         # Clean up excessive newlines left from removal
         text = re.sub(r'\n{3,}', '\n\n', text)
         
-        # Only strip if there's actual content (not just whitespace)
-        if text.strip():
-            text = text.strip()
+        # Don't strip whitespace - spaces and newlines are valid content
         
         return text
 def format_tools_for_prompt(tools: List[Tool], messages: List[ChatMessage]) -> List[ChatMessage]:
