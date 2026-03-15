@@ -3901,6 +3901,14 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
             # Convert to base64
             import base64
             import io
+            import numpy as np
+            
+            # Handle NaN/Inf values in image data - convert to valid values
+            if isinstance(img, np.ndarray):
+                # Replace NaN and Inf with valid values
+                img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
+                # Clip to valid range [0, 1]
+                img = np.clip(img, 0.0, 1.0)
             
             # Use helper function to save and get response
             img_data = save_image_response(img, request.response_format, http_request)
