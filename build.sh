@@ -1,7 +1,7 @@
 #!/bin/bash
-# Build script for CoderAI - Supports NVIDIA (CUDA) and Vulkan backends
-# Usage: ./build.sh [nvidia|vulkan|vulkan-nvidia|opencl]
-# Default: nvidia
+# Build script for CoderAI - Supports NVIDIA (CUDA), Vulkan, OpenCL, and CPU backends
+# Usage: ./build.sh [nvidia|vulkan|vulkan-nvidia|cuda|opencl|all]
+# Default: all (installs all backends)
 
 set -e
 
@@ -13,17 +13,18 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Determine backend
-BACKEND="${1:-nvidia}"
+BACKEND="${1:-all}"
 BACKEND=$(echo "$BACKEND" | tr '[:upper:]' '[:lower:]')
 
-if [[ "$BACKEND" != "nvidia" && "$BACKEND" != "vulkan" && "$BACKEND" != "vulkan-nvidia" && "$BACKEND" != "cuda" && "$BACKEND" != "opencl" ]]; then
+if [[ "$BACKEND" != "nvidia" && "$BACKEND" != "vulkan" && "$BACKEND" != "vulkan-nvidia" && "$BACKEND" != "cuda" && "$BACKEND" != "opencl" && "$BACKEND" != "all" ]]; then
     echo -e "${RED}Error: Invalid backend '$BACKEND'${NC}"
-    echo "Usage: ./build.sh [nvidia|vulkan|vulkan-nvidia|cuda|opencl]"
+    echo "Usage: ./build.sh [nvidia|vulkan|vulkan-nvidia|cuda|opencl|all]"
     echo "  nvidia       - Use PyTorch with CUDA for NVIDIA GPUs"
     echo "  vulkan      - Use llama-cpp-python with Vulkan for AMD GPUs"
     echo "  vulkan-nvidia - Use llama-cpp-python with Vulkan for NVIDIA GPU only"
     echo "  cuda        - Use llama-cpp-python with CUDA for NVIDIA GPUs"
     echo "  opencl      - Use stable-diffusion-cpp-python with OpenCL"
+    echo "  all         - Install all backends (nvidia, cuda, vulkan, opencl, cpu) - DEFAULT"
     exit 1
 fi
 
@@ -55,6 +56,8 @@ elif [ "$BACKEND" = "cuda" ]; then
     VENV_DIR="venv_cuda"
 elif [ "$BACKEND" = "opencl" ]; then
     VENV_DIR="venv_opencl"
+elif [ "$BACKEND" = "all" ]; then
+    VENV_DIR="venv_all"
 fi
 
 # Create virtual environment if it doesn't exist
@@ -364,6 +367,136 @@ elif [ "$BACKEND" = "opencl" ]; then
     echo "  python coderai --model <model> --image-backend opencl"
     echo ""
     echo "Note: With OpenCL backend, stable-diffusion-cpp-python can use various GPUs."
+    echo ""
+
+elif [ "$BACKEND" = "all" ]; then
+    # Install ALL backends: nvidia (CUDA), vulkan, opencl, and cpu
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}  Installing ALL backends${NC}"
+    echo -e "${BLUE}  (NVIDIA/CUDA, Vulkan, OpenCL, CPU)${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo ""
+    
+    # Install base requirements
+    echo -e "${YELLOW}Installing base requirements...${NC}"
+    pip install --upgrade pip
+    pip install -r requirements.txt
+    
+    # Install PyTorch with CUDA support (for nvidia backend)
+    echo -e "${YELLOW}Installing PyTorch with CUDA support (NVIDIA backend)...${NC}"
+    pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0" || {
+        echo -e "${YELLOW}Warning: PyTorch with CUDA failed, will try CPU version${NC}"
+        pip install torch torchvision torchaudio
+    }
+    
+    echo -e "${YELLOW}Installing NVIDIA-specific requirements...${NC}"
+    pip install -r requirements-nvidia.txt || true
+    
+    # Check for Vulkan development libraries
+    VULKAN_AVAILABLE=false
+    if pkg-config --exists vulkan 2>/dev/null; then
+        VULKAN_AVAILABLE=true
+        echo -e "${GREEN}✓ Found Vulkan development libraries${NC}"
+    else
+        echo -e "${YELLOW}Warning: Vulkan development libraries not found${NC}"
+        echo -e "${YELLOW}  Vulkan support will be limited${NC}"
+    fi
+    
+    # Check for CUDA
+    CUDA_AVAILABLE=false
+    if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
+        CUDA_AVAILABLE=true
+        echo -e "${GREEN}✓ Found CUDA toolkit${NC}"
+    else
+        echo -e "${YELLOW}Warning: CUDA toolkit not found${NC}"
+        echo -e "${YELLOW}  CUDA support will be limited${NC}"
+    fi
+    
+    # Check for OpenCL
+    OPENCL_AVAILABLE=false
+    if command -v clinfo &> /dev/null || ls /usr/lib/*/libOpenCL* &> /dev/null 2>&1; then
+        OPENCL_AVAILABLE=true
+        echo -e "${GREEN}✓ Found OpenCL${NC}"
+    else
+        echo -e "${YELLOW}Warning: OpenCL not found${NC}"
+        echo -e "${YELLOW}  OpenCL support will be limited${NC}"
+    fi
+    
+    # Build llama-cpp-python with both CUDA and Vulkan support
+    echo -e "${YELLOW}Building llama-cpp-python with CUDA and Vulkan support...${NC}"
+    echo -e "${YELLOW}This may take several minutes...${NC}"
+    
+    # Determine CMAKE_ARGS based on available hardware
+    CMAKE_ARGS=""
+    if [ "$CUDA_AVAILABLE" = true ]; then
+        CMAKE_ARGS="-DGGML_CUDA=ON"
+        echo -e "${GREEN}  ✓ Enabling CUDA support${NC}"
+    fi
+    
+    if [ "$VULKAN_AVAILABLE" = true ]; then
+        if [ -n "$CMAKE_ARGS" ]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DGGML_VULKAN=ON"
+        else
+            CMAKE_ARGS="-DGGML_VULKAN=ON"
+        fi
+        echo -e "${GREEN}  ✓ Enabling Vulkan support${NC}"
+    fi
+    
+    if [ -n "$CMAKE_ARGS" ]; then
+        echo -e "${YELLOW}  Building with: $CMAKE_ARGS${NC}"
+        CMAKE_ARGS="$CMAKE_ARGS" pip install --upgrade llama-cpp-python --no-cache-dir || {
+            echo -e "${YELLOW}Warning: llama-cpp-python build failed, installing from pip${NC}"
+            pip install llama-cpp-python
+        }
+    else
+        echo -e "${YELLOW}Warning: No GPU backends available, installing CPU version${NC}"
+        pip install llama-cpp-python
+    fi
+    
+    # Install Vulkan-specific requirements
+    echo -e "${YELLOW}Installing Vulkan-specific requirements...${NC}"
+    pip install -r requirements-vulkan.txt || true
+    
+    # Try to install stable-diffusion-cpp-python with OpenCL
+    if [ "$OPENCL_AVAILABLE" = true ]; then
+        echo -e "${YELLOW}Installing stable-diffusion-cpp-python with OpenCL support...${NC}"
+        pip install stable-diffusion-cpp-python || {
+            echo -e "${YELLOW}Warning: stable-diffusion-cpp-python not available${NC}"
+        }
+    else
+        echo -e "${YELLOW}Skipping OpenCL (stable-diffusion-cpp-python) - OpenCL not available${NC}"
+    fi
+    
+    # Install additional requirements
+    echo -e "${YELLOW}Installing additional requirements...${NC}"
+    pip install numpy pillow || true
+    
+    echo ""
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}  ALL backends build complete!${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo ""
+    echo "Available backends:"
+    [ "$CUDA_AVAILABLE" = true ] && echo "  ✓ NVIDIA/CUDA (PyTorch)"
+    [ "$CUDA_AVAILABLE" = true ] && echo "  ✓ CUDA (llama-cpp-python)"
+    [ "$VULKAN_AVAILABLE" = true ] && echo "  ✓ Vulkan (llama-cpp-python)"
+    [ "$OPENCL_AVAILABLE" = true ] && echo "  ✓ OpenCL (stable-diffusion-cpp-python)"
+    echo "  ✓ CPU (fallback for all)"
+    echo ""
+    echo "Usage:"
+    echo "  source $VENV_DIR/bin/activate"
+    echo ""
+    echo "  # For text models with NVIDIA:"
+    echo "  python coderai --model <model> --backend nvidia"
+    echo ""
+    echo "  # For GGUF models with CUDA:"
+    echo "  python coderai --model <gguf-model> --backend vulkan"
+    echo ""
+    echo "  # For GGUF models with Vulkan:"
+    echo "  python coderai --model <gguf-model> --backend vulkan"
+    echo ""
+    echo "  # For image generation with OpenCL:"
+    echo "  python coderai --model <model> --image-backend opencl"
     echo ""
 fi
 
