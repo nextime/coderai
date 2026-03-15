@@ -3665,12 +3665,34 @@ async def create_image_generation(request: ImageGenerationRequest):
                 sd_cpp_error = "Could not resolve model path"
             else:
                 # Load sd.cpp model
-                sd_model = StableDiffusion(
-                    model_path=model_path,
-                    vae_path=None,
-                    n_threads=4,
-                    n_gpu_layers=-1,  # All layers to GPU
-                )
+                # Determine backend to use
+                backend = getattr(global_args, 'backend', 'auto')
+                image_backend = getattr(global_args, 'image_backend', 'auto')
+                
+                # Use CUDA if available, otherwise Vulkan
+                use_cuda = False
+                try:
+                    import torch
+                    use_cuda = torch.cuda.is_available()
+                except ImportError:
+                    pass
+                
+                if use_cuda:
+                    print(f"Using CUDA backend for sd.cpp image generation")
+                    sd_model = StableDiffusion(
+                        model_path=model_path,
+                        vae_path=None,
+                        n_threads=4,
+                        n_gpu_layers=-1,  # All layers to GPU
+                    )
+                else:
+                    print(f"Using Vulkan backend for sd.cpp image generation")
+                    sd_model = StableDiffusion(
+                        model_path=model_path,
+                        vae_path=None,
+                        n_threads=4,
+                        n_gpu_layers=-1,  # All layers to GPU
+                    )
                 
                 print(f"Using stable-diffusion-cpp-python for image generation")
                 
