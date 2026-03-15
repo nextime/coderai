@@ -1350,6 +1350,7 @@ class VulkanBackend(ModelBackend):
         self.verbose = True
         self.main_gpu = 0  # Default to first GPU
         self.chat_template = None  # Detected chat template name
+        self.hf_tokenizer = None  # HuggingFace tokenizer for apply_chat_template
         self.force_cuda = original_backend in ("nvidia", "cuda")  # Force CUDA if original was nvidia
         if self.force_cuda:
             print("DEBUG: GGUF model will use CUDA backend (forced by --backend nvidia)")
@@ -1368,8 +1369,78 @@ class VulkanBackend(ModelBackend):
             print(f"DEBUG: Could not initialize chat template detection: {e}")
             self.chat_template = None
     
+    def _load_huggingface_tokenizer(self):
+        """Load HuggingFace tokenizer for apply_chat_template support."""
+        if self.hf_tokenizer is not None:
+            return  # Already loaded
+        
+        hf_chat_template = getattr(global_args, 'hf_chat_template', False)
+        if not hf_chat_template:
+            return
+        
+        model_path = getattr(self, 'model_name', None)
+        if not model_path:
+            print("DEBUG: No model name available for HuggingFace tokenizer")
+            return
+        
+        try:
+            from transformers import AutoTokenizer
+            
+            # Try to determine the model identifier
+            # If model_path is a GGUF file, try to find the corresponding HF model
+            if model_path.endswith('.gguf'):
+                # Try to extract model name from path
+                # Common patterns: .../models/llama-3.1-8b-instruct-q4_k_m.gguf
+                model_dir = os.path.dirname(model_path)
+                model_file = os.path.basename(model_path)
+                
+                # Try to find a tokenizer config in the model directory
+                tokenizer_config_path = os.path.join(model_dir, 'tokenizer_config.json')
+                if os.path.exists(tokenizer_config_path):
+                    # Load from local directory
+                    self.hf_tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+                    print(f"DEBUG: Loaded HuggingFace tokenizer from local: {model_dir}")
+                    self.chat_template = "hf_local"
+                    return
+                
+                # Try to infer model name from file name
+                # Common patterns: llama-3.1-8b-instruct-q4_k_m.gguf -> llama-3.1-8b-instruct
+                model_base = model_file.replace('.gguf', '')
+                # Remove common quantization suffixes
+                for suffix in ['_q4_k_m', '_q4_k', '_q5_k', '_q5_k_m', '_q8_0', '_f16', '_q4_0', '_q3_k_m', '_q2_k']:
+                    model_base = model_base.replace(suffix, '')
+                
+                # Try to load from HuggingFace hub
+                try:
+                    self.hf_tokenizer = AutoTokenizer.from_pretrained(model_base, trust_remote_code=True)
+                    print(f"DEBUG: Loaded HuggingFace tokenizer from hub: {model_base}")
+                    self.chat_template = "hf_hub"
+                    return
+                except Exception as hub_err:
+                    print(f"DEBUG: Could not load tokenizer from hub ({model_base}): {hub_err}")
+            else:
+                # Not a GGUF file, try to load directly
+                self.hf_tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                print(f"DEBUG: Loaded HuggingFace tokenizer from: {model_path}")
+                self.chat_template = "hf"
+                return
+                
+        except ImportError as e:
+            print(f"DEBUG: transformers not installed, cannot use HuggingFace chat template: {e}")
+            self.chat_template = None
+        except Exception as e:
+            print(f"DEBUG: Failed to load HuggingFace tokenizer: {e}")
+            self.chat_template = None
+    
     def _finalize_chat_template_detection(self):
         """Finalize chat template detection after model is loaded."""
+        # Check if we should use HuggingFace tokenizer for chat template
+        hf_chat_template = getattr(global_args, 'hf_chat_template', False)
+        
+        if hf_chat_template:
+            self._load_huggingface_tokenizer()
+            return
+        
         try:
             # Try to get the chat template name from the model's chat formatter
             if hasattr(self.model, 'tokenizer') and self.model.tokenizer:
@@ -1729,11 +1800,46 @@ class VulkanBackend(ModelBackend):
                 print("  Fedora: sudo dnf install vulkan-loader-devel vulkan-tools")
             raise
     
+    def _format_messages_hf(self, messages: List[ChatMessage]) -> str:
+        """Format messages using HuggingFace transformers apply_chat_template."""
+        if self.hf_tokenizer is None:
+            return self._manual_format_messages([{"role": m.role, "content": m.content or ""} for m in messages])
+        
+        # Convert messages to the format expected by transformers
+        chat_messages = []
+        for msg in messages:
+            chat_msg = {"role": msg.role}
+            # Ensure content is never None
+            if msg.content is not None:
+                chat_msg["content"] = msg.content
+            else:
+                chat_msg["content"] = ""
+            if msg.tool_calls:
+                chat_msg["tool_calls"] = msg.tool_calls
+            chat_messages.append(chat_msg)
+        
+        try:
+            # Use HuggingFace's apply_chat_template
+            prompt = self.hf_tokenizer.apply_chat_template(
+                chat_messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            return prompt
+        except Exception as e:
+            print(f"Warning: HF apply_chat_template failed ({e}), using manual formatting")
+            return self._manual_format_messages(chat_messages)
+    
     def format_messages(self, messages: List[ChatMessage]) -> str:
         """Format messages into a prompt string suitable for chat models.
         
-        Uses llama.cpp's built-in chat template support for proper formatting.
+        Uses HuggingFace transformers apply_chat_template if available and enabled,
+        otherwise falls back to llama.cpp's built-in support.
         """
+        # Check if we should use HuggingFace tokenizer
+        if self.hf_tokenizer is not None:
+            return self._format_messages_hf(messages)
+        
         # Convert to format expected by llama.cpp
         chat_messages = []
         for msg in messages:
@@ -1811,6 +1917,20 @@ class VulkanBackend(ModelBackend):
         # Check if we should use manual formatting based on detected template
         # Always use manual formatting when tools are present, since Jinja templates often fail with tool messages
         use_manual = self.chat_template in ("unknown", "jinja_fallback", None) or tools is not None
+        use_hf = self.hf_tokenizer is not None
+        
+        if use_hf:
+            # Use HuggingFace tokenizer for chat template
+            try:
+                prompt = self.hf_tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                print(f"DEBUG: Using HuggingFace chat template")
+                return self.generate(prompt, max_tokens, temperature, top_p, stop)
+            except Exception as e:
+                print(f"Warning: HF apply_chat_template failed ({e}), falling back")
         
         if use_manual:
             print(f"DEBUG: Using manual message formatting (template: {self.chat_template}, tools: {tools is not None})")
@@ -1868,6 +1988,22 @@ class VulkanBackend(ModelBackend):
         # Check if we should use manual formatting based on detected template
         # Always use manual formatting when tools are present, since Jinja templates often fail with tool messages
         use_manual = self.chat_template in ("unknown", "jinja_fallback", None) or tools is not None
+        use_hf = self.hf_tokenizer is not None
+        
+        if use_hf:
+            # Use HuggingFace tokenizer for chat template
+            try:
+                prompt = self.hf_tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                print(f"DEBUG: Using HuggingFace chat template for streaming")
+                async for chunk in self.generate_stream(prompt, max_tokens, temperature, top_p, stop):
+                    yield chunk
+                return
+            except Exception as e:
+                print(f"Warning: HF apply_chat_template failed ({e}), falling back")
         
         if use_manual:
             print(f"DEBUG: Using manual message formatting for streaming (template: {self.chat_template}, tools: {tools is not None})")
@@ -5220,6 +5356,11 @@ def parse_args():
         "--vulkan-list-devices",
         action="store_true",
         help="List available Vulkan GPU devices and exit",
+    )
+    parser.add_argument(
+        "--hf-chat-template",
+        action="store_true",
+        help="Use HuggingFace transformers apply_chat_template for GGUF models instead of llama.cpp built-in (requires transformers library)",
     )
     parser.add_argument(
         "--system-prompt",
