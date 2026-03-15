@@ -3766,6 +3766,10 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
             
             multi_model_manager.add_model(model_key, pipeline)
         
+        # Get timestamp BEFORE calling diffusers (to avoid scope issues)
+        import time as time_module
+        timestamp = int(time_module.time())
+        
         # Generate images
         # Use request seed if provided, otherwise use CLI default seed
         seed = request.seed if request.seed is not None else getattr(global_args, 'image_seed', None)
@@ -3809,7 +3813,7 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
             images.append(img_data)
         
         return {
-            "created": int(time.time()),
+            "created": timestamp,
             "data": images
         }
         
