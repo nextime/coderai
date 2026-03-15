@@ -2466,6 +2466,15 @@ class MultiModelManager:
                     from llama_cpp import Llama
                     backend = self.config[self.default_model].get('backend_type', 'auto')
                     model_path = self.default_model
+                    # Check if model_path is a URL and try to get cached path
+                    if model_path.startswith('http://') or model_path.startswith('https://'):
+                        cached_path = get_cached_model_path(model_path)
+                        if cached_path:
+                            model_path = cached_path
+                            print(f"Using cached model path: {model_path}")
+                        else:
+                            print(f"Warning: Model URL not cached, cannot reload: {model_path}")
+                            return None
                     load_kwargs = self.config[self.default_model].copy()
                     load_kwargs.pop('backend_type', None)
                     print(f"Reloading default model: {model_path}")
