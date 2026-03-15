@@ -1929,7 +1929,7 @@ class ModelManager:
         original_backend = None
         if is_gguf and backend_type in ("nvidia", "cuda"):
             original_backend = backend_type
-            print(f"GGUF model detected, using llama-cpp-python ({backend_type} backend)")
+            print(f"GGUF model detected, using llama-cpp-python (original backend: {original_backend})")
             backend_type = "vulkan"  # Use llama-cpp-python for GGUF
         
         self.backend_type = backend_type
@@ -5923,7 +5923,11 @@ def main():
     print(f"\nStarting server on http://{args.host}:{args.port}")
     print(f"API documentation available at http://{args.host}:{args.port}/docs")
     if model_manager.backend is not None:
-        print(f"Using backend: {model_manager.backend_type}")
+        # Show actual backend being used
+        actual_backend = model_manager.backend_type
+        if hasattr(model_manager.backend, 'force_cuda') and model_manager.backend.force_cuda:
+            actual_backend = "cuda (via llama-cpp-python)"
+        print(f"Using backend: {actual_backend}")
     
     # Print available models
     models = multi_model_manager.list_models()
