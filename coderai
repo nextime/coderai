@@ -5812,7 +5812,6 @@ def main():
     # Run server with or without HTTPS
     if args.https:
         import ssl
-        import os
         
         # Determine SSL context
         ssl_keyfile = None
