@@ -3601,6 +3601,16 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
     elif model_to_use.startswith("image:"):
         # Legacy format - strip prefix and use default
         model_to_use = image_model
+    else:
+        # Check if model_to_use is a valid model (URL, file, or known model)
+        # If not, fallback to the configured image model to avoid HF resolution errors
+        if image_model:
+            is_url = model_to_use.startswith('http://') or model_to_use.startswith('https://')
+            is_file = os.path.isfile(model_to_use) if model_to_use else False
+            if not is_url and not is_file:
+                # Unknown model name - use default instead of trying to resolve as HF
+                print(f"Warning: Unknown model '{model_to_use}' in image generation request, using configured --image-model")
+                model_to_use = image_model
     
     # Track errors for proper fallback chain
     diffusers_error = None
@@ -3714,26 +3724,21 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
     
     # Try stable-diffusion-cpp-python (sd.cpp) as fallback
     # First, check all available image models to find one loaded via sd.cpp
-    # Skip if --nopreload was specified (model will load on first request in worker thread)
-    nopreload = getattr(global_args, 'nopreload', False)
-    
+    # Always check for cached models - allows dynamically loaded models to be reused across requests
     sd_model = None
-    if not nopreload:
-        for key in multi_model_manager.models:
-            if key.startswith("image:"):
-                potential_model = multi_model_manager.get_model(key)
-                if potential_model is not None:
-                    # Check if it's a stable-diffusion-cpp model
-                    try:
-                        from stable_diffusion_cpp import StableDiffusion
-                        if isinstance(potential_model, StableDiffusion):
-                            sd_model = potential_model
-                            print(f"Found stable-diffusion-cpp model with key: {key}")
-                            break
-                    except ImportError:
-                        pass
-    else:
-        print(f"DEBUG: Skipping preloaded model check (--nopreload specified)")
+    for key in multi_model_manager.models:
+        if key.startswith("image:"):
+            potential_model = multi_model_manager.get_model(key)
+            if potential_model is not None:
+                # Check if it's a stable-diffusion-cpp model
+                try:
+                    from stable_diffusion_cpp import StableDiffusion
+                    if isinstance(potential_model, StableDiffusion):
+                        sd_model = potential_model
+                        print(f"Found cached stable-diffusion-cpp model with key: {key}")
+                        break
+                except ImportError:
+                    pass
     
     if sd_model is not None:
         # Check if it's a stable-diffusion-cpp model (has generate method from sd.cpp)
@@ -3930,6 +3935,9 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                 
                 sd_model = StableDiffusion(**sd_kwargs)
                 
+                # Cache the model for reuse on subsequent requests
+                cache_key = f"image:{model_path}"
+                multi_model_manager.add_model(cache_key, sd_model)
                 print(f"Using stable-diffusion-cpp-python for image generation")
                 
                 # Generate images
