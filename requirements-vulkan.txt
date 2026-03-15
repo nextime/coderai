@@ -2,6 +2,8 @@
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 pydantic>=2.5.0
+python-multipart>=0.0.6  # for multipart form data parsing
+requests>=2.31.0  # for HTTP requests
 
 # llama-cpp-python is installed by build.sh with Vulkan support
 # CMAKE_ARGS="-DGGML_VULKAN=ON" pip install llama-cpp-python --no-cache-dir

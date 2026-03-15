@@ -1808,10 +1808,13 @@ class ModelManager:
         
         Args:
             model_name: Model name or path
-            backend_type: 'nvidia', 'vulkan', or 'auto' to detect
+            backend_type: 'nvidia', 'vulkan', 'cuda', or 'auto' to detect
             **kwargs: Additional arguments for the specific backend
         """
         available = detect_available_backends()
+        
+        # Check if model is a GGUF file
+        is_gguf = model_name.endswith('.gguf') or 'gguf' in model_name.lower()
         
         # Determine backend
         if backend_type == "auto":
@@ -1825,6 +1828,11 @@ class ModelManager:
                 print("No GPU backend detected. For NVIDIA, install PyTorch with CUDA.")
                 print("For Vulkan, install llama-cpp-python with Vulkan support.")
                 raise RuntimeError("No suitable backend found")
+        
+        # If GGUF file and backend is nvidia/cuda, use llama-cpp-python (vulkan backend)
+        if is_gguf and backend_type in ("nvidia", "cuda"):
+            print(f"GGUF model detected, using llama-cpp-python ({backend_type} backend)")
+            backend_type = "vulkan"  # Use llama-cpp-python for GGUF
         
         self.backend_type = backend_type
         
