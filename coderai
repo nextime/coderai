@@ -5262,8 +5262,8 @@ def main():
                 print(f"  No cached files.")
                 continue
             
-            # For diffusers, show directory structure
-            if cache_name == 'diffusers':
+            # For diffusers and huggingface, show directory structure
+            if cache_name in ('diffusers', 'huggingface'):
                 for root, dirs, files in os.walk(cache_dir):
                     for f in files:
                         filepath = os.path.join(root, f)
@@ -5351,8 +5351,8 @@ def main():
             if not os.path.exists(cache_dir):
                 continue
             
-            # For diffusers, search in subdirectories
-            if cache_name == 'diffusers':
+            # For diffusers and huggingface, search recursively
+            if cache_name in ('diffusers', 'huggingface'):
                 for root, dirs, files in os.walk(cache_dir):
                     for f in files:
                         if args.remove_model.lower() in f.lower():
