@@ -5306,7 +5306,8 @@ def main():
         
         # Load image model (first one only in loadall mode currently)
         print(f"DEBUG: image_models check at line 4718: {image_models}, backend = {args.backend}")
-        if image_models and not getattr(args, 'nopreload', False):
+        # Only preload image model if loadall or loadswap mode is set
+        if image_models and not getattr(args, 'nopreload', False) and load_mode in ("loadall", "loadswap"):
             print(f"Pre-loading image model: {image_models[0]}")
             
             # Get the original model name
@@ -5589,7 +5590,8 @@ def main():
             # Vulkan: Load all models to GPU like loadall
             if model_names:
                 print(f"Pre-loading main text model: {model_names[0]}")
-            if image_models and not getattr(args, 'nopreload', False):
+            # Only preload image model if loadall or loadswap mode is set
+            if image_models and not getattr(args, 'nopreload', False) and load_mode in ("loadall", "loadswap"):
                 print(f"Pre-loading image model: {image_models[0]}")
             if audio_models:
                 print(f"Pre-loading audio model: {audio_models[0]}")
@@ -5599,7 +5601,8 @@ def main():
             # NVIDIA/CUDA: First model in VRAM, others in RAM
             if model_names:
                 print(f"Main text model will be in VRAM: {model_names[0]}")
-            if image_models and not getattr(args, 'nopreload', False):
+            # Only preload image model if loadall or loadswap mode is set
+            if image_models and not getattr(args, 'nopreload', False) and load_mode in ("loadall", "loadswap"):
                 print(f"Image model in RAM: {image_models[0]}")
             if audio_models:
                 print(f"Audio model in RAM: {audio_models[0]}")
@@ -5859,8 +5862,8 @@ def main():
                 'offload': args.image_offload,
             })
         
-        # Pre-load image model if it's configured (even with audio models)
-        if image_models and not getattr(args, 'nopreload', False):
+        # Pre-load image model if configured and in loadall/loadswap mode
+        if image_models and not getattr(args, 'nopreload', False) and load_mode in ("loadall", "loadswap"):
             print(f"Pre-loading image model...")
             
             # Get the original model name
