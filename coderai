@@ -5253,6 +5253,18 @@ def main():
                                     try:
                                         from stable_diffusion_cpp import StableDiffusion
                                         
+                                        # Disable Vulkan to force CUDA only for sd.cpp when using nvidia backend
+                                        image_backend = getattr(global_args, 'image_backend', 'auto')
+                                        backend = getattr(global_args, 'backend', 'auto')
+                                        use_cuda = (backend == 'nvidia' or backend == 'cuda' or 
+                                                   image_backend == 'nvidia' or image_backend == 'cuda')
+                                        if use_cuda:
+                                            print(f"Using CUDA backend for sd.cpp image generation")
+                                            # Disable Vulkan to force CUDA only
+                                            os.environ['VK_ICD_FILENAMES'] = '/dev/null'
+                                        else:
+                                            print(f"Using Vulkan backend for sd.cpp image generation")
+                                        
                                         # Initialize model_key to None first so Python knows it exists
                                         model_key = None
                                         
@@ -5798,6 +5810,18 @@ def main():
                                     # Try stable-diffusion-cpp-python as fallback
                                     try:
                                         from stable_diffusion_cpp import StableDiffusion
+                                        
+                                        # Disable Vulkan to force CUDA only for sd.cpp when using nvidia backend
+                                        image_backend = getattr(global_args, 'image_backend', 'auto')
+                                        backend = getattr(global_args, 'backend', 'auto')
+                                        use_cuda = (backend == 'nvidia' or backend == 'cuda' or 
+                                                   image_backend == 'nvidia' or image_backend == 'cuda')
+                                        if use_cuda:
+                                            print(f"Using CUDA backend for sd.cpp image generation")
+                                            # Disable Vulkan to force CUDA only
+                                            os.environ['VK_ICD_FILENAMES'] = '/dev/null'
+                                        else:
+                                            print(f"Using Vulkan backend for sd.cpp image generation")
                                         
                                         # Initialize model_key to avoid unbound variable error
                                         model_key = None
