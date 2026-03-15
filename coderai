@@ -2725,7 +2725,6 @@ class MultiModelManager:
         # Add vision/image models
         if self.image_models:
             models.append(ModelInfo(id="image"))  # Alias for first image model
-            models.append(ModelInfo(id="image"))    # Alias for first image model
             # Add all image models - convert URLs to cached paths for display
             for image_id in self.image_models:
                 # Check if image_id is a URL and try to get cached path
@@ -2736,7 +2735,6 @@ class MultiModelManager:
                         # Use the filename from cached path for display
                         display_id = os.path.basename(cached_path)
                 models.append(ModelInfo(id=f"image:{display_id}"))
-                models.append(ModelInfo(id=f"vision:{display_id}"))
         
         # Add loaded models that aren't in the above categories
         for key in self.models:
@@ -2745,6 +2743,9 @@ class MultiModelManager:
                 continue
             # Skip short names (already added)
             if self.default_model and key == self.default_model.split("/")[-1]:
+                continue
+            # Skip URLs - they are download sources, not model identifiers
+            if key.startswith("http://") or key.startswith("https://"):
                 continue
             models.append(ModelInfo(id=key))
         
@@ -3818,8 +3819,11 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
         print(f"diffusers not available: {diffusers_error}, trying stable-diffusion-cpp-python...")
     except Exception as e:
         # Other error with diffusers - record and try sd.cpp
+        import traceback
         diffusers_error = str(e)
-        print(f"diffusers error: {diffusers_error}, trying stable-diffusion-cpp-python...")
+        print(f"diffusers error: {diffusers_error}")
+        print(f"Traceback: {traceback.format_exc()}")
+        print(f"Trying stable-diffusion-cpp-python...")
     
     # Try stable-diffusion-cpp-python (sd.cpp) as fallback
     # First, check all available image models to find one loaded via sd.cpp
