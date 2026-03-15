@@ -3802,8 +3802,13 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                 if cached_path:
                     model_path = cached_path
                     print(f"Using cached model: {model_path}")
-            
-            if model_path is None and os.path.isfile(model_to_use):
+                else:
+                    # Not cached - download it
+                    print(f"Downloading model: {model_to_use}")
+                    cache_dir = get_model_cache_dir()
+                    model_path = download_model(model_to_use, cache_dir)
+                    print(f"Downloaded to: {model_path}")
+            elif os.path.isfile(model_to_use):
                 model_path = model_to_use
             
             if model_path is None:
