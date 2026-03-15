@@ -34,6 +34,7 @@ transformers>=4.35.0
 accelerate>=0.24.0
 diffusers>=0.25.0  # For Stable Diffusion image generation
 safetensors>=0.4.0  # Required by diffusers
+stable-diffusion-cpp-python>=0.4.0  # For Vulkan/AMD image generation
 
 # System resource detection
 psutil>=5.9.0
