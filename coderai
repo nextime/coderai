@@ -4808,6 +4808,16 @@ def main():
     
     # Detect available backends
     available = detect_available_backends()
+    
+    # Check if any model is GGUF and backend is nvidia/cuda - in that case, vulkan uses CUDA
+    if model_names:
+        first_model = model_names[0]
+        is_gguf_model = first_model.endswith('.gguf') or 'gguf' in first_model.lower()
+        if is_gguf_model and args.backend in ('nvidia', 'cuda'):
+            # When using nvidia/cuda backend with GGUF, vulkan actually uses CUDA
+            if 'vulkan' in available and available['vulkan']:
+                print("\nNote: GGUF model with nvidia backend - vulkan backend will use CUDA")
+    
     print("\nAvailable backends:")
     for name, available_flag in available.items():
         status = "✓" if available_flag else "✗"
