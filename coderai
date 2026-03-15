@@ -5323,7 +5323,7 @@ def main():
             is_gguf = model_name.endswith('.gguf') or 'gguf' in model_name.lower()
             
             if is_gguf:
-                # Load GGUF image model using llama.cpp
+                # GGUF for image - use stable-diffusion-cpp-python
                 print(f"Detected GGUF image model, loading with llama.cpp...")
                 try:
                     from llama_cpp import Llama
@@ -5879,7 +5879,7 @@ def main():
             is_gguf = model_name.endswith('.gguf') or 'gguf' in model_name.lower()
             
             if is_gguf:
-                # Load GGUF image model using llama.cpp
+                # GGUF for image - use stable-diffusion-cpp-python
                 print(f"Detected GGUF image model, loading with llama.cpp...")
                 try:
                     from llama_cpp import Llama
