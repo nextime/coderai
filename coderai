@@ -1584,9 +1584,8 @@ class VulkanBackend(ModelBackend):
             if self.force_cuda:
                 print("DEBUG: Forcing CUDA backend for llama-cpp-python...")
                 # Disable Vulkan to ensure CUDA is used (llama-cpp with both CUDA+Vulkan needs this)
-                os.environ['GGML_DISABLE_VULKAN'] = '1'
-                os.environ['GGML_VULKAN_DEVICE'] = ''  # Clear any Vulkan device selection
-                print(f"DEBUG: Set GGML_DISABLE_VULKAN=1 and GGML_VULKAN_DEVICE='' to force CUDA")
+                os.environ['VK_ICD_FILENAMES'] = '/dev/null'  # Disable Vulkan ICD
+                print(f"DEBUG: Set VK_ICD_FILENAMES=/dev/null to disable Vulkan and force CUDA")
                 # Ensure CUDA is used - set environment to prefer CUDA
                 if 'CUDA_VISIBLE_DEVICES' not in os.environ:
                     # Use all available CUDA devices
@@ -1971,11 +1970,9 @@ class VulkanBackend(ModelBackend):
     def cleanup(self) -> None:
         # When cleaning up a CUDA-forced model, restore Vulkan settings for future Vulkan models
         if self.force_cuda:
-            # Unset the CUDA-forcing environment variables so Vulkan models can work
-            if 'GGML_DISABLE_VULKAN' in os.environ:
-                del os.environ['GGML_DISABLE_VULKAN']
-            if 'GGML_VULKAN_DEVICE' in os.environ:
-                del os.environ['GGML_VULKAN_DEVICE']
+            # Unset the CUDA-forcing environment variable so Vulkan models can work
+            if 'VK_ICD_FILENAMES' in os.environ:
+                del os.environ['VK_ICD_FILENAMES']
             print("DEBUG: Cleanup - restored Vulkan environment for future models")
         if self.model is not None:
             del self.model
