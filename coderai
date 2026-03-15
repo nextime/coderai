@@ -3342,16 +3342,19 @@ async def create_image_generation(request: ImageGenerationRequest):
         main_model = getattr(global_args, 'model', None)
         if main_model and isinstance(main_model, list) and len(main_model) > 0:
             image_model = main_model[0]
-            print(f"Using main --model as image model fallback: {image_model}")
         elif main_model:
             image_model = main_model
-            print(f"Using main --model as image model fallback: {image_model}")
+        
+        # Check if main model is a GGUF file - can't use for image generation
+        if image_model and ('.gguf' in image_model.lower() or 'gguf' in image_model.lower()):
+            print(f"Note: Main model is a GGUF file (for text), not suitable for image generation")
+            image_model = None  # Can't use GGUF for images
     
     # If still no image model configured, return an error
     if not image_model:
         raise HTTPException(
             status_code=400,
-            detail="Image generation not configured. Use --image-model or --model to specify a model."
+            detail="Image generation not configured. Use --image-model to specify a model."
         )
     
     # Determine model to use
