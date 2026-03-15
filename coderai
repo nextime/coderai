@@ -2470,9 +2470,9 @@ class MultiModelManager:
                 except:
                     pass
                 
-                # Add a small delay to allow VRAM to be freed
+                # Add a longer delay to allow VRAM to be freed (Vulkan needs more time)
                 import time
-                time.sleep(1)
+                time.sleep(3)
                 
                 # Now try to reload the default model
                 try:
