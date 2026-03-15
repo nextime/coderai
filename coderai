@@ -2507,6 +2507,22 @@ class MultiModelManager:
         # we should try to load it on-demand (swap from current model)
         # Only for text models (not audio/image/tts which have their own handling)
         
+        # First, cleanup any image models to free VRAM for text model
+        for key in list(self.models.keys()):
+            if key.startswith("image:"):
+                model_to_cleanup = self.models.get(key)
+                if model_to_cleanup is not None:
+                    print(f"Unloading image model '{key}' from VRAM to make room for text model")
+                    try:
+                        if hasattr(model_to_cleanup, 'cleanup') and callable(getattr(model_to_cleanup, 'cleanup')):
+                            model_to_cleanup.cleanup()
+                        elif hasattr(model_to_cleanup, 'model') and model_to_cleanup.model is not None:
+                            if hasattr(model_to_cleanup.model, 'cleanup'):
+                                model_to_cleanup.model.cleanup()
+                    except Exception as e:
+                        print(f"Warning during cleanup of '{key}': {e}")
+                    del self.models[key]
+        
         # Check if requested model is in our config (means it was registered but not loaded)
         if self.load_mode == "ondemand" and requested_model in self.config:
             # This is a text model that's registered but not loaded
@@ -2561,6 +2577,22 @@ class MultiModelManager:
         
         # Also check if the model matches by short name (e.g., "Phi-3" matches "microsoft/Phi-3-mini-4k-instruct")
         if self.load_mode == "ondemand":
+            # First, cleanup any image models to free VRAM for text model
+            for key in list(self.models.keys()):
+                if key.startswith("image:"):
+                    model_to_cleanup = self.models.get(key)
+                    if model_to_cleanup is not None:
+                        print(f"Unloading image model '{key}' from VRAM to make room for text model")
+                        try:
+                            if hasattr(model_to_cleanup, 'cleanup') and callable(getattr(model_to_cleanup, 'cleanup')):
+                                model_to_cleanup.cleanup()
+                            elif hasattr(model_to_cleanup, 'model') and model_to_cleanup.model is not None:
+                                if hasattr(model_to_cleanup.model, 'cleanup'):
+                                    model_to_cleanup.model.cleanup()
+                        except Exception as e:
+                            print(f"Warning during cleanup of '{key}': {e}")
+                        del self.models[key]
+            
             for model_name in self.config.keys():
                 # Only check text models (not audio:, image:, tts: prefixes)
                 if ":" not in model_name:
