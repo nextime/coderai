@@ -201,7 +201,53 @@ options:
   --vulkan-device N     Vulkan GPU device ID to use (Vulkan only, default: 0)
   --vulkan-single-gpu   Force Vulkan to use only the specified GPU (prevents layer distribution across multiple GPUs)
   --vulkan-list-devices List available Vulkan GPU devices and exit
+  --reply-filters      Enable filtering of model replies. Can be repeated. See "Reply Filters" section for details.
 ```
+
+### Reply Filters
+
+The `--reply-filters` option controls filtering of model responses. By default, no filtering is applied. Filters can be specified in multiple ways:
+
+**Filter Types:**
+- `malformed` - Filter out malformed SEARCH/REPLACE blocks
+- `tool_calls` - Strip tool call format tags from output
+- `all` - Enable all filters
+
+**Syntax:**
+
+```bash
+# No filtering (default)
+coderai
+
+# Comma-separated - apply to all models
+coderai --reply-filters malformed,tool_calls
+
+# Apply to all text models or all image models
+coderai --reply-filters text:malformed
+coderai --reply-filters image:tool_calls
+
+# Apply to SPECIFIC model
+coderai --reply-filters text:llama-3.1:malformed
+coderai --reply-filters image:sd-xl:tool_calls
+
+# Different filters for different models (multiple --reply-filters)
+coderai --reply-filters text:llama-3.1:malformed --reply-filters text:phi-3:tool_calls --reply-filters image:sd-xl:all
+
+# Apply all filters to specific model
+coderai --reply-filters text:llama-3.1:all
+```
+
+**Filter Syntax Reference:**
+
+| Syntax | Applies To |
+|--------|------------|
+| `all` | All models, all filters |
+| `malformed` | All models, malformed filter |
+| `tool_calls` | All models, tool_calls filter |
+| `text:malformed` | All text models, malformed filter |
+| `image:tool_calls` | All image models, tool_calls filter |
+| `text:model_name:malformed` | Specific text model, malformed filter |
+| `image:model_name:tool_calls` | Specific image model, tool_calls filter |
 
 ### Backend Selection
 

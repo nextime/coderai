@@ -509,7 +509,10 @@ class ToolCallParser:
     
     def _filter_malformed_content(self, text: str) -> str:
         """Filter out malformed SEARCH/REPLACE blocks - delegates to standalone function."""
-        return filter_malformed_content(text)
+        # Only filter if --reply-filters is set for text models (generic)
+        if check_reply_filter('malformed', 'text'):
+            return filter_malformed_content(text)
+        return text
     
     def extract_tool_calls(self, text: str, available_tools: List[Tool]) -> Optional[List[Dict]]:
         """Extract tool calls from model output."""
@@ -2893,6 +2896,87 @@ model_manager = ModelManager()
 # Global args for access in endpoints
 global_args = None
 
+
+def check_reply_filter(filter_type: str, model_type: str = "text", model_name: str = None) -> bool:
+    """
+    Check if a specific reply filter is enabled.
+    
+    Args:
+        filter_type: The filter to check ('malformed', 'tool_calls', 'all')
+        model_type: The model type ('text', 'image', etc.)
+        model_name: The specific model name (optional) - e.g., 'llama-3.1', 'sd-xl'
+    
+    Returns:
+        True if the filter should be applied, False otherwise.
+    
+    Syntax:
+        # Apply to all models
+        --reply-filters all
+        
+        # Apply to all text or all image models
+        --reply-filters text:malformed
+        --reply-filters image:tool_calls
+        
+        # Apply to specific model
+        --reply-filters text:llama-3.1:malformed
+        --reply-filters image:sd-xl:tool_calls
+        
+        # Comma-separated for multiple filters on same target
+        --reply-filters text:malformed,tool_calls
+        --reply-filters text:llama-3.1:malformed,tool_calls
+    """
+    reply_filters = getattr(global_args, 'reply_filters', []) or []
+    
+    for filter_spec in reply_filters:
+        # Handle comma-separated values: "malformed,tool_calls" or "text:malformed,tool_calls"
+        if ',' in filter_spec:
+            # Check each comma-separated part
+            for f in filter_spec.split(','):
+                f = f.strip()
+                if f and check_single_filter(f, filter_type, model_type, model_name):
+                    return True
+            continue
+        
+        # Check single filter spec
+        if check_single_filter(filter_spec, filter_type, model_type, model_name):
+            return True
+    
+    return False
+
+
+def check_single_filter(filter_spec: str, filter_type: str, model_type: str, model_name: str = None) -> bool:
+    """
+    Check a single filter specification against the model.
+    """
+    # Handle model-specific filters: "text:malformed", "text:model_name:malformed", "image:sd-xl:tool_calls"
+    if ':' in filter_spec:
+        parts = filter_spec.split(':')
+        spec_model_type = parts[0]
+        
+        # Check if this filter spec matches our model type
+        if spec_model_type != model_type and spec_model_type != '*':
+            return False
+        
+        # If there's a model name in the spec, check for exact match or wildcard
+        if len(parts) > 2:
+            # Format: text:model_name:filter or image:model_name:filter
+            spec_model_name = parts[1]
+            spec_filter = parts[2]
+            
+            # Check model name matches (wildcard support)
+            if spec_model_name != '*' and spec_model_name != model_name:
+                return False
+            
+            # Check filter matches
+            return spec_filter == 'all' or spec_filter == filter_type
+        else:
+            # Format: text:malformed (no specific model, applies to all of this type)
+            spec_filter = parts[1]
+            return spec_filter == 'all' or spec_filter == filter_type
+    else:
+        # Simple filter: "malformed" or "all" - applies to all models
+        return filter_spec == 'all' or filter_spec == filter_type
+
 # Global system prompt (set via --system-prompt flag)
 # None = don't inject, True = use default, string = use custom text
 global_system_prompt = None
@@ -4660,11 +4744,14 @@ async def stream_chat_response(
             tools=tools,
         ):
             chunk_count += 1
-            # Filter malformed content from each chunk
-            filtered_chunk = filter_malformed_content(chunk)
+            # Filter malformed content from each chunk (only if --reply-filters is set)
+            filtered_chunk = chunk
+            if check_reply_filter('malformed', 'text', model_name):
+                filtered_chunk = filter_malformed_content(filtered_chunk)
             
-            # Always filter out tool call format - some may slip through even without tools
-            filtered_chunk = tool_parser.strip_tool_calls_from_content(filtered_chunk)
+            # Filter out tool call format - only if --reply-filters is set
+            if check_reply_filter('tool_calls', 'text', model_name):
+                filtered_chunk = tool_parser.strip_tool_calls_from_content(filtered_chunk)
             
             # Pass through all content including whitespace - it's essential for message composition
             generated_text += filtered_chunk
@@ -4781,8 +4868,9 @@ async def generate_chat_response(
             tools=tools,
         )
         
-        # Filter out malformed content from generated text
-        generated_text = filter_malformed_content(generated_text)
+        # Filter out malformed content from generated text (only if --reply-filters is set)
+        if check_reply_filter('malformed', 'text', model_name):
+            generated_text = filter_malformed_content(generated_text)
         
         response_message = {
             "role": "assistant",
@@ -4804,9 +4892,12 @@ async def generate_chat_response(
                 tool_objects.append(Tool(type=t.get("type", "function"), function=tool_func))
             tool_calls = tool_parser.extract_tool_calls(generated_text, tool_objects)
             if tool_calls:
-                # Strip tool call format from content so user doesn't see raw tags
-                clean_content = tool_parser.strip_tool_calls_from_content(generated_text)
-                response_message["content"] = clean_content if clean_content.strip() else None
+                # Strip tool call format from content so user doesn't see raw tags (only if --reply-filters is set)
+                if check_reply_filter('tool_calls', 'text', model_name):
+                    clean_content = tool_parser.strip_tool_calls_from_content(generated_text)
+                    response_message["content"] = clean_content if clean_content.strip() else None
+                else:
+                    response_message["content"] = generated_text if generated_text.strip() else None
                 response_message["tool_calls"] = tool_calls
                 finish_reason = "tool_calls"
         
@@ -5332,6 +5423,12 @@ def parse_args():
         type=str,
         default=None,
         help="Remove a specific cached model by name or hash (partial match)",
+    )
+    parser.add_argument(
+        "--reply-filters",
+        action="append",
+        default=[],
+        help="Enable filtering of model replies. Use --reply-filters malformed,tool_calls or --reply-filters text:malformed --reply-filters image:tool_calls for model-specific filters.",
     )
     parser.add_argument(
         "--debug",
