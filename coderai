@@ -1580,19 +1580,10 @@ class VulkanBackend(ModelBackend):
         
         try:
             # If force_cuda is set, configure environment for CUDA
-            # CRITICAL: Must set these BEFORE loading the model since llama-cpp reads them at import time
+            # Note: Vulkan environment variables should be set from launching script
+            # if needed to force CUDA. Here we just ensure CUDA_VISIBLE_DEVICES is set.
             if self.force_cuda:
                 print("DEBUG: Forcing CUDA backend for llama-cpp-python...")
-                # Disable Vulkan to ensure CUDA is used (llama-cpp with both CUDA+Vulkan needs this)
-                # For both stable-diffusion-cpp-python and llama-cpp-python
-                os.environ['GGML_VK_VISIBLE_DEVICES'] = ''
-                os.environ['GGML_VULKAN_DEVICE'] = ''
-                # Additional variables for llama-cpp-python
-                os.environ['VK_ICD_FILENAMES'] = '/dev/null'
-                os.environ['VK_DRIVER_FILES'] = '/dev/null'
-                os.environ['VK_LOADER_DRIVERS_DISABLE'] = '*'
-                os.environ['VK_LOADER_LAYERS_DISABLE'] = '~all~'
-                print(f"DEBUG: Set Vulkan disable env vars to force CUDA")
                 # Ensure CUDA is used - set environment to prefer CUDA
                 if 'CUDA_VISIBLE_DEVICES' not in os.environ:
                     # Use all available CUDA devices
@@ -1975,15 +1966,7 @@ class VulkanBackend(ModelBackend):
         return self.model_name or "unknown"
     
     def cleanup(self) -> None:
-        # When cleaning up a CUDA-forced model, restore Vulkan settings for future Vulkan models
-        if self.force_cuda:
-            # Unset all CUDA-forcing environment variables so Vulkan models can work
-            for var in ['GGML_VK_VISIBLE_DEVICES', 'GGML_VULKAN_DEVICE', 
-                        'VK_ICD_FILENAMES', 'VK_DRIVER_FILES',
-                        'VK_LOADER_DRIVERS_DISABLE', 'VK_LOADER_LAYERS_DISABLE']:
-                if var in os.environ:
-                    del os.environ[var]
-            print("DEBUG: Cleanup - restored Vulkan environment for future models")
+        # Vulkan environment variables should be managed from launching script
         if self.model is not None:
             del self.model
             self.model = None
