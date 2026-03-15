@@ -3278,8 +3278,13 @@ async def create_image_generation(request: ImageGenerationRequest):
         )
     
     # Determine model to use
+    # Priority: 1) model specified in request, 2) default image model from --image-model
     model_to_use = request.model
-    if model_to_use.startswith("image:"):
+    if not model_to_use or model_to_use == "image":
+        # No model specified in request, use default
+        model_to_use = image_model
+    elif model_to_use.startswith("image:"):
+        # Legacy format - strip prefix and use default
         model_to_use = image_model
     
     # Track errors for proper fallback chain
