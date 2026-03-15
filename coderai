@@ -3675,6 +3675,8 @@ async def create_image_generation(request: ImageGenerationRequest):
                 
                 if use_cuda:
                     print(f"Using CUDA backend for sd.cpp image generation")
+                    # Disable Vulkan to force CUDA only
+                    os.environ['VK_ICD_FILENAMES'] = '/dev/null'
                 else:
                     print(f"Using Vulkan backend for sd.cpp image generation")
                 
