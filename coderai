@@ -3587,14 +3587,6 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
     
     # If still no image model configured, return an error
     if not image_model:
-        # Try to get capabilities of requested model for better error message
-        requested = request.model if request.model else "default"
-        caps = detect_model_capabilities(requested)
-        if caps.text_generation and not caps.image_generation:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Model '{requested}' is a text generation model (capabilities: {caps}). Use --image-model to specify an image generation model like 'stable-diffusion-xl'."
-            )
         raise HTTPException(
             status_code=400,
             detail="Image generation not configured. Use --image-model to specify a model."
@@ -3836,7 +3828,6 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                     model_path=model_path,
                     vae_path=None,
                     n_threads=4,
-                    n_gpu_layers=-1,  # All layers to GPU
                 )
                 
                 print(f"Using stable-diffusion-cpp-python for image generation")
@@ -5166,6 +5157,9 @@ def main():
     
     # Load the main model (only if specified)
     if model_names:
+        # Enable verbose mode when debug is set (for better troubleshooting output from llama-cpp)
+        verbose = args.debug if hasattr(args, 'debug') else False
+        
         load_kwargs = {
             'offload_dir': args.offload_dir,
             'load_in_4bit': args.load_in_4bit,
@@ -5178,6 +5172,7 @@ def main():
             'n_ctx': args.n_ctx,
             'main_gpu': args.vulkan_device,
             'single_gpu': args.vulkan_single_gpu,
+            'verbose': verbose,
         }
         
         # Load the first model
