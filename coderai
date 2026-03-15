@@ -2514,7 +2514,15 @@ class MultiModelManager:
                 # Unload the current model from VRAM
                 current_model = self.models[self.current_model_key]
                 print(f"ON-DEMAND SWAP: Unloading model '{self.current_model_key}' from VRAM to load '{requested_model}'")
-                current_model.cleanup()
+                try:
+                    if hasattr(current_model, 'cleanup') and callable(getattr(current_model, 'cleanup')):
+                        current_model.cleanup()
+                    elif hasattr(current_model, 'model') and current_model.model is not None:
+                        # Handle ModelManager objects
+                        if hasattr(current_model.model, 'cleanup'):
+                            current_model.model.cleanup()
+                except Exception as e:
+                    print(f"ON-DEMAND SWAP: Warning during cleanup of '{self.current_model_key}': {e}")
                 del self.models[self.current_model_key]
             
             # Load the new model on-demand
@@ -2562,7 +2570,15 @@ class MultiModelManager:
                                 # Unload the current model from VRAM
                                 current_model = self.models[self.current_model_key]
                                 print(f"ON-DEMAND SWAP: Unloading model '{self.current_model_key}' from VRAM to load '{model_name}'")
-                                current_model.cleanup()
+                                try:
+                                    if hasattr(current_model, 'cleanup') and callable(getattr(current_model, 'cleanup')):
+                                        current_model.cleanup()
+                                    elif hasattr(current_model, 'model') and current_model.model is not None:
+                                        # Handle ModelManager objects
+                                        if hasattr(current_model.model, 'cleanup'):
+                                            current_model.model.cleanup()
+                                except Exception as e:
+                                    print(f"ON-DEMAND SWAP: Warning during cleanup of '{self.current_model_key}': {e}")
                                 del self.models[self.current_model_key]
                             
                             # Load the new model on-demand
@@ -2713,8 +2729,22 @@ class MultiModelManager:
     
     def cleanup(self):
         """Cleanup all models."""
-        for model in self.models.values():
-            model.cleanup()
+        for key, model in self.models.items():
+            try:
+                if hasattr(model, 'cleanup') and callable(getattr(model, 'cleanup')):
+                    model.cleanup()
+                elif hasattr(model, 'model') and model.model is not None:
+                    # Handle ModelManager objects
+                    if hasattr(model.model, 'cleanup'):
+                        model.model.cleanup()
+                    elif hasattr(model.model, 'model'):
+                        # Nested model (e.g., StableDiffusion wrapper)
+                        if model.model.model is not None:
+                            del model.model.model
+                # Remove from dict
+                del self.models[key]
+            except Exception as e:
+                print(f"Warning: Failed to cleanup model '{key}': {e}")
         self.models.clear()
 # Global multi-model manager
 multi_model_manager = MultiModelManager()
