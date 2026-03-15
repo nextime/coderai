@@ -1584,8 +1584,15 @@ class VulkanBackend(ModelBackend):
             if self.force_cuda:
                 print("DEBUG: Forcing CUDA backend for llama-cpp-python...")
                 # Disable Vulkan to ensure CUDA is used (llama-cpp with both CUDA+Vulkan needs this)
-                os.environ['VK_ICD_FILENAMES'] = '/dev/null'  # Disable Vulkan ICD
-                print(f"DEBUG: Set VK_ICD_FILENAMES=/dev/null to disable Vulkan and force CUDA")
+                # For both stable-diffusion-cpp-python and llama-cpp-python
+                os.environ['GGML_VK_VISIBLE_DEVICES'] = ''
+                os.environ['GGML_VULKAN_DEVICE'] = ''
+                # Additional variables for llama-cpp-python
+                os.environ['VK_ICD_FILENAMES'] = '/dev/null'
+                os.environ['VK_DRIVER_FILES'] = '/dev/null'
+                os.environ['VK_LOADER_DRIVERS_DISABLE'] = '*'
+                os.environ['VK_LOADER_LAYERS_DISABLE'] = '~all~'
+                print(f"DEBUG: Set Vulkan disable env vars to force CUDA")
                 # Ensure CUDA is used - set environment to prefer CUDA
                 if 'CUDA_VISIBLE_DEVICES' not in os.environ:
                     # Use all available CUDA devices
@@ -1970,9 +1977,12 @@ class VulkanBackend(ModelBackend):
     def cleanup(self) -> None:
         # When cleaning up a CUDA-forced model, restore Vulkan settings for future Vulkan models
         if self.force_cuda:
-            # Unset the CUDA-forcing environment variable so Vulkan models can work
-            if 'VK_ICD_FILENAMES' in os.environ:
-                del os.environ['VK_ICD_FILENAMES']
+            # Unset all CUDA-forcing environment variables so Vulkan models can work
+            for var in ['GGML_VK_VISIBLE_DEVICES', 'GGML_VULKAN_DEVICE', 
+                        'VK_ICD_FILENAMES', 'VK_DRIVER_FILES',
+                        'VK_LOADER_DRIVERS_DISABLE', 'VK_LOADER_LAYERS_DISABLE']:
+                if var in os.environ:
+                    del os.environ[var]
             print("DEBUG: Cleanup - restored Vulkan environment for future models")
         if self.model is not None:
             del self.model
