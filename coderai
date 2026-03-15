@@ -3478,7 +3478,7 @@ async def create_image_generation(request: ImageGenerationRequest):
                 if potential_model is not None:
                     # Check if it's a stable-diffusion-cpp model
                     try:
-                        from stable_diffusion_cpp import StableDiffusion
+                        from stable_diffusion_cpp_python import StableDiffusion
                         if isinstance(potential_model, StableDiffusion):
                             sd_model = potential_model
                             print(f"Found stable-diffusion-cpp model with key: {key}")
@@ -3491,7 +3491,7 @@ async def create_image_generation(request: ImageGenerationRequest):
     if sd_model is not None:
         # Check if it's a stable-diffusion-cpp model (has generate method from sd.cpp)
         try:
-            from stable_diffusion_cpp import StableDiffusion
+            from stable_diffusion_cpp_python import StableDiffusion
             if isinstance(sd_model, StableDiffusion):
                 print(f"Using stable-diffusion-cpp-python for image generation")
                 # Use sd.cpp for generation
@@ -3555,7 +3555,7 @@ async def create_image_generation(request: ImageGenerationRequest):
         # No sd.cpp model pre-loaded, try to load dynamically
         print("No pre-loaded sd.cpp model found, trying to load...")
         try:
-            from stable_diffusion_cpp import StableDiffusion
+            from stable_diffusion_cpp_python import StableDiffusion
             
             # Check if model_to_use is a URL and get cached path
             model_path = None
@@ -5144,7 +5144,7 @@ def main():
                                     print(f"Trying stable-diffusion-cpp-python fallback...")
                                     # Try stable-diffusion-cpp-python as fallback
                                     try:
-                                        from stable_diffusion_cpp import StableDiffusion
+                                        from stable_diffusion_cpp_python import StableDiffusion
                                         
                                         # Initialize model_key to None first so Python knows it exists
                                         model_key = None
@@ -5690,7 +5690,7 @@ def main():
                                     print(f"Trying stable-diffusion-cpp-python fallback...")
                                     # Try stable-diffusion-cpp-python as fallback
                                     try:
-                                        from stable_diffusion_cpp import StableDiffusion
+                                        from stable_diffusion_cpp_python import StableDiffusion
                                         
                                         # Initialize model_key to avoid unbound variable error
                                         model_key = None
