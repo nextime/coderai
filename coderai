@@ -3665,34 +3665,25 @@ async def create_image_generation(request: ImageGenerationRequest):
                 sd_cpp_error = "Could not resolve model path"
             else:
                 # Load sd.cpp model
-                # Determine backend to use
+                # Determine backend to use based on CLI args
                 backend = getattr(global_args, 'backend', 'auto')
                 image_backend = getattr(global_args, 'image_backend', 'auto')
                 
-                # Use CUDA if available, otherwise Vulkan
-                use_cuda = False
-                try:
-                    import torch
-                    use_cuda = torch.cuda.is_available()
-                except ImportError:
-                    pass
+                # Use CUDA only if explicitly requested via --backend nvidia or --image-backend nvidia
+                use_cuda = (backend == 'nvidia' or backend == 'cuda' or 
+                           image_backend == 'nvidia' or image_backend == 'cuda')
                 
                 if use_cuda:
                     print(f"Using CUDA backend for sd.cpp image generation")
-                    sd_model = StableDiffusion(
-                        model_path=model_path,
-                        vae_path=None,
-                        n_threads=4,
-                        n_gpu_layers=-1,  # All layers to GPU
-                    )
                 else:
                     print(f"Using Vulkan backend for sd.cpp image generation")
-                    sd_model = StableDiffusion(
-                        model_path=model_path,
-                        vae_path=None,
-                        n_threads=4,
-                        n_gpu_layers=-1,  # All layers to GPU
-                    )
+                
+                sd_model = StableDiffusion(
+                    model_path=model_path,
+                    vae_path=None,
+                    n_threads=4,
+                    n_gpu_layers=-1,  # All layers to GPU
+                )
                 
                 print(f"Using stable-diffusion-cpp-python for image generation")
                 
