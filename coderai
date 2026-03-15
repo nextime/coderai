@@ -1233,7 +1233,7 @@ class NvidiaBackend(ModelBackend):
 class VulkanBackend(ModelBackend):
     """Backend for Vulkan (AMD GPUs) using llama-cpp-python with GGUF models."""
     
-    def __init__(self):
+    def __init__(self, original_backend: str = None):
         self.model = None
         self.model_name = None
         self.n_gpu_layers = -1  # Offload all layers to GPU by default
@@ -1241,6 +1241,9 @@ class VulkanBackend(ModelBackend):
         self.verbose = True
         self.main_gpu = 0  # Default to first GPU
         self.chat_template = None  # Detected chat template name
+        self.force_cuda = original_backend in ("nvidia", "cuda")  # Force CUDA if original was nvidia
+        if self.force_cuda:
+            print("DEBUG: VulkanBackend will use CUDA backend (forced by original backend)")
         self._detect_chat_template()
     
     def _detect_chat_template(self):
@@ -1496,6 +1499,25 @@ class VulkanBackend(ModelBackend):
                 tensor_split = None
         
         try:
+            # If force_cuda is set, configure environment for CUDA
+            if self.force_cuda:
+                print("DEBUG: Forcing CUDA backend for llama-cpp-python...")
+                # Ensure CUDA is used - set environment to prefer CUDA
+                if 'CUDA_VISIBLE_DEVICES' not in os.environ:
+                    # Use all available CUDA devices
+                    import subprocess
+                    try:
+                        result = subprocess.run(['nvidia-smi', '-L'], capture_output=True, text=True)
+                        if result.returncode == 0:
+                            gpu_count = len([l for l in result.stdout.split('\n') if 'GPU' in l])
+                            os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(str(i) for i in range(gpu_count))
+                            print(f"DEBUG: Set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
+                    except Exception as e:
+                        print(f"Warning: Could not detect GPU count: {e}")
+                        os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+                # Print CUDA info
+                print(f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}")
+            
             llama_kwargs = {
                 'model_path': model_path,
                 'n_gpu_layers': n_gpu_layers,
@@ -1509,16 +1531,24 @@ class VulkanBackend(ModelBackend):
             
             self.model = Llama(**llama_kwargs)
             self.model_name = model_name
-            print("\nModel loaded successfully with Vulkan!")
+            backend_name = "CUDA" if self.force_cuda else "Vulkan"
+            print(f"\nModel loaded successfully with {backend_name}!")
             
             # Detect the chat template after model load
             self._finalize_chat_template_detection()
             print(f"DEBUG: Chat template: {self.chat_template}")
         except Exception as e:
-            print(f"Error loading model with Vulkan: {e}")
-            print("Make sure Vulkan drivers are installed:")
-            print("  Debian/Ubuntu: sudo apt install libvulkan-dev vulkan-tools")
-            print("  Fedora: sudo dnf install vulkan-loader-devel vulkan-tools")
+            backend_name = "CUDA" if self.force_cuda else "Vulkan"
+            print(f"Error loading model with {backend_name}: {e}")
+            if self.force_cuda:
+                print("Make sure CUDA is available:")
+                print("  - Install llama-cpp-python with CUDA support: pip install llama-cpp-python[cuda]")
+                print("  - Ensure NVIDIA drivers are installed")
+                print("  - Check nvidia-smi output")
+            else:
+                print("Make sure Vulkan drivers are installed:")
+                print("  Debian/Ubuntu: sudo apt install libvulkan-dev vulkan-tools")
+                print("  Fedora: sudo dnf install vulkan-loader-devel vulkan-tools")
             raise
     
     def format_messages(self, messages: List[ChatMessage]) -> str:
@@ -1829,8 +1859,10 @@ class ModelManager:
                 print("For Vulkan, install llama-cpp-python with Vulkan support.")
                 raise RuntimeError("No suitable backend found")
         
-        # If GGUF file and backend is nvidia/cuda, use llama-cpp-python (vulkan backend)
+        # If GGUF file and backend is nvidia/cuda, use llama-cpp-python with CUDA backend
+        original_backend = None
         if is_gguf and backend_type in ("nvidia", "cuda"):
+            original_backend = backend_type
             print(f"GGUF model detected, using llama-cpp-python ({backend_type} backend)")
             backend_type = "vulkan"  # Use llama-cpp-python for GGUF
         
@@ -1844,7 +1876,7 @@ class ModelManager:
         elif backend_type == "vulkan":
             if not available.get('vulkan'):
                 raise RuntimeError("Vulkan backend requested but llama-cpp-python not available")
-            self.backend = VulkanBackend()
+            self.backend = VulkanBackend(original_backend=original_backend)
         else:
             raise ValueError(f"Unknown backend: {backend_type}")
         
