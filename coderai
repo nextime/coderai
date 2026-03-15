@@ -2459,6 +2459,21 @@ class MultiModelManager:
                             except Exception as e:
                                 print(f"Warning during cleanup of '{key}': {e}")
                         del self.models[key]
+                
+                # Force garbage collection and clear GPU cache
+                import gc
+                gc.collect()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except:
+                    pass
+                
+                # Add a small delay to allow VRAM to be freed
+                import time
+                time.sleep(1)
+                
                 # Now try to reload the default model
                 try:
                     from llama_cpp import Llama
@@ -2588,6 +2603,20 @@ class MultiModelManager:
                     except Exception as e:
                         print(f"Warning during cleanup of '{key}': {e}")
                     del self.models[key]
+        
+        # Force garbage collection and clear GPU cache
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except:
+            pass
+        
+        # Add a small delay to allow VRAM to be freed
+        import time
+        time.sleep(1)
         
         # Check if requested model is already loaded - if so, reuse it
         if requested_model in self.models:
