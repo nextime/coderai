@@ -3741,18 +3741,29 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
         if pipeline is None:
             print(f"Loading Stable Diffusion model: {model_to_use}")
             
+            # Determine precision from CLI argument
+            precision = getattr(global_args, 'image_precision', 'f32') or 'f32'
+            precision_map = {
+                'bf16': torch.bfloat16,
+                'f32': torch.float32,
+                'f16': torch.float16,
+                'f8': torch.float8_e4m3fn,
+            }
+            torch_dtype = precision_map.get(precision, torch.float32)
+            print(f"Using precision: {precision} ({torch_dtype})")
+            
             # Try to load as Stable Diffusion XL first
             try:
                 pipeline = StableDiffusionXLPipeline.from_pretrained(
                     model_to_use,
-                    torch_dtype=torch.float32,
+                    torch_dtype=torch_dtype,
                     use_safetensors=True,
                 )
             except Exception:
                 # Try generic diffusion pipeline
                 pipeline = DiffusionPipeline.from_pretrained(
                     model_to_use,
-                    torch_dtype=torch.float32,
+                    torch_dtype=torch_dtype,
                     use_safetensors=True,
                 )
             
@@ -3765,6 +3776,11 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
             # Enable attention slicing for lower memory usage
             if torch.cuda.is_available():
                 pipeline.enable_attention_slicing()
+            
+            # Enable VAE tiling if requested (for lower VRAM usage)
+            if getattr(global_args, 'vae_tiling', False):
+                print("Enabling VAE tiling for lower VRAM usage...")
+                pipeline.enable_vae_tiling()
             
             multi_model_manager.add_model(model_key, pipeline)
         
@@ -5086,6 +5102,13 @@ def parse_args():
         type=float,
         default=1.0,
         help="CFG scale for image generation (default: 1.0 for Z-Image Turbo).",
+    )
+    parser.add_argument(
+        "--image-precision",
+        type=str,
+        default="f32",
+        choices=["bf16", "f32", "f16", "f8"],
+        help="Model precision for image generation (default: f32). bf16 recommended for modern GPUs.",
     )
     parser.add_argument(
         "--image-seed",
