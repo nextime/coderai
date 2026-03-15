@@ -3745,14 +3745,14 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
             try:
                 pipeline = StableDiffusionXLPipeline.from_pretrained(
                     model_to_use,
-                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                    torch_dtype=torch.float32,
                     use_safetensors=True,
                 )
             except Exception:
                 # Try generic diffusion pipeline
                 pipeline = DiffusionPipeline.from_pretrained(
                     model_to_use,
-                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                    torch_dtype=torch.float32,
                     use_safetensors=True,
                 )
             
@@ -5854,7 +5854,7 @@ def main():
                     try:
                         pipeline = StableDiffusionXLPipeline.from_pretrained(
                             model_name,
-                            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                            torch_dtype=torch.float32,
                             use_safetensors=True,
                         )
                     except Exception as e:
@@ -5862,7 +5862,7 @@ def main():
                         # Try generic diffusion pipeline
                         pipeline = DiffusionPipeline.from_pretrained(
                             model_name,
-                            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                            torch_dtype=torch.float32,
                             use_safetensors=True,
                         )
                     
@@ -6459,14 +6459,14 @@ def main():
                     try:
                         pipeline = StableDiffusionXLPipeline.from_pretrained(
                             model_name,
-                            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                            torch_dtype=torch.float32,
                             use_safetensors=True,
                         )
                     except Exception as e:
                         print(f"SDXL failed, trying generic pipeline: {e}")
                         pipeline = DiffusionPipeline.from_pretrained(
                             model_name,
-                            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                            torch_dtype=torch.float32,
                             use_safetensors=True,
                         )
                     
