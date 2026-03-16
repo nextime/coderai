@@ -19,7 +19,45 @@ import uuid
 import re
 import time
 from difflib import get_close_matches
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
+
+
+def extract_reasoning_content(text: str, model_family: str = None) -> Tuple[str, str]:
+    """Extract reasoning/thinking content from model output.
+    
+    Returns tuple of (reasoning_content, clean_text).
+    """
+    reasoning_content = ""
+    clean_text = text
+    
+    # Define reasoning patterns for different model families
+    patterns = [
+        (r'<thought>(.*?)</thought>', 'qwen'),
+        (r'<think>(.*?)</think>', 'qwen'),
+        (r'<thought>(.*?)</thought>', 'deepseek'),
+        (r'<thought>(.*?)</thought>', 'llama3'),
+        (r'<thought>(.*?)</thought>', 'mistral'),
+        (r'<thought>(.*?)</thought>', 'gemma'),
+        (r'<\|im_start\|>assistant\n<thought>(.*?)</thought>', 'hermes'),
+        (r'<thought>(.*?)</thought>', 'generic'),
+    ]
+    
+    for pattern, _ in patterns:
+        try:
+            matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
+            if matches:
+                reasoning_content = '\n'.join([m.strip() for m in matches if m.strip()])
+                clean_text = re.sub(pattern, '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+                break
+        except:
+            continue
+    
+    # Cleanup
+    for p in [r'<thought>.*?</thought>', r'<think>.*?</think>']:
+        clean_text = re.sub(p, '', clean_text, flags=re.DOTALL | re.IGNORECASE)
+    
+    return reasoning_content, clean_text
+
 
 # Try to import litellm for response formatting
 # Fall back to plain dicts if litellm is not available or doesn't export these

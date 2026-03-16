@@ -3667,6 +3667,106 @@ def check_hf_chat_template(model_type: str = "text", model_name: str = None) -> 
 # None = don't inject, True = use default, string = use custom text
 global_system_prompt = None
 
+
+def get_model_family(model_name: str) -> str:
+    """Detect model family from model name."""
+    model_lower = model_name.lower()
+    
+    if 'qwen' in model_lower:
+        return 'qwen'
+    elif 'deepseek' in model_lower:
+        return 'deepseek'
+    elif 'llama-3' in model_lower or 'llama3' in model_lower or 'meta-llama-3' in model_lower:
+        return 'llama3'
+    elif 'llama' in model_lower or 'meta-llama' in model_lower:
+        return 'llama'
+    elif 'mistral' in model_lower or 'mixtral' in model_lower:
+        return 'mistral'
+    elif 'gemma' in model_lower:
+        return 'gemma'
+    elif 'yi' in model_lower:
+        return 'yi'
+    elif 'hermes' in model_lower:
+        return 'hermes'
+    else:
+        return 'unknown'
+
+
+def get_reasoning_stop_tokens(model_family: str) -> tuple:
+    """Get stop tokens for reasoning mode based on model family.
+    
+    Returns tuple of (start_token, end_token, additional_stops)
+    """
+    if model_family == 'qwen':
+        # Qwen uses <|im_start|> format with </tool_call> for thinking
+        return (
+            "<|im_start|>assistant\n",
+            "<|im_end|>",
+            ["<|im_end|>", "<|endoftext|>"]
+        )
+    elif model_family == 'deepseek':
+        return (
+            "<｜Assistant｜>",
+            "<｜endofassistant｜>",
+            ["<｜endofassistant｜>", "<｜User｜>", "<｜endoftext｜>"]
+        )
+    elif model_family == 'llama3':
+        return (
+            "<|start_header_id|>assistant<|end_header_id|>\n\n<thought>\n",
+            "</thought>",
+            ["</thought>", "<|eot_id|>", "<|end_of_text|>"]
+        )
+    elif model_family == 'llama':
+        return (
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+            "<|eot_id|>",
+            ["<|eot_id|>", "<|end_of_text|>"]
+        )
+    elif model_family == 'mistral':
+        return (
+            "[/INST] <thought>\n",
+            "</thought>",
+            ["</thought>", "</INST>", "[INST]"]
+        )
+    elif model_family == 'gemma':
+        return (
+            "<start_of_turn>model\n<thought>\n",
+            "</thought>",
+            ["</thought>", "<end_of_turn>", "<start_of_turn>"]
+        )
+    elif model_family == 'yi' or model_family == 'hermes':
+        return (
+            "<|im_start|>assistant\n",
+            "<|im_end|>",
+            ["<|im_end|>", "<|endoftext|>"]
+        )
+    else:
+        # Default fallback - try common tokens
+        return (
+            "<|im_start|>assistant\n",
+            "<|im_end|>",
+            ["<|im_end|>", "<|endoftext|>"]
+        )
+
+
+def get_reasoning_system_prompt(model_family: str) -> str:
+    """Get system prompt injection for forcing reasoning on non-native models."""
+    
+    if model_family == 'qwen':
+        return "You must reason step-by-step inside <thought> tags before every response."
+    elif model_family == 'deepseek':
+        return "You must reason step-by-step inside <0x00></think> tags before every response."
+    elif model_family in ('llama3', 'llama'):
+        return "You must reason step-by-step inside <thought> tags before every response."
+    elif model_family == 'mistral':
+        return "You must reason step-by-step inside <thought> tags before every response."
+    elif model_family == 'gemma':
+        return "You must reason step-by-step inside <thought> tags before every response. Use <start_of_turn>model for your response."
+    elif model_family in ('yi', 'hermes'):
+        return "You must reason step-by-step inside <|im_start|>assistant tags before every response."
+    else:
+        return "You must reason step-by-step before every response."
+
 # Global debug flag
 global_debug = False
 global_file_path = None
@@ -5419,31 +5519,57 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             messages = [ChatMessage(role="system", content=system_text)] + list(messages)
     
     # Enable thinking/reasoning mode if requested via API parameter OR CLI flag
-    force_reasoning = getattr(global_args, 'force_reasoning', False) if global_args else False
-    enable_thinking = getattr(request, 'enable_thinking', False) or force_reasoning
-    if enable_thinking:
-        from codai.models.templates import AgenticTemplateManager
-        template_manager = AgenticTemplateManager(request.model)
-        # Get the current system prompt if exists
-        system_content = None
-        for msg in messages:
-            if msg.role == "system":
-                system_content = msg.content
-                break
-        if system_content:
-            # Inject agentic instructions
-            system_content = template_manager.get_agent_system_prompt(system_content)
+    force_reasoning_mode = getattr(global_args, 'force_reasoning', None) if global_args else None
+    enable_thinking_api = getattr(request, 'enable_thinking', False)
+    
+    # Determine if reasoning should be enabled
+    # Force reasoning if: API param is true OR CLI flag is set (not None)
+    reasoning_enabled = enable_thinking_api or (force_reasoning_mode is not None)
+    
+    # Get model family for reasoning tokens
+    model_family = get_model_family(request.model)
+    
+    # Determine what to do: stop, inject, or both
+    if reasoning_enabled:
+        # CLI flag takes precedence if set, otherwise check API param
+        if force_reasoning_mode:
+            reasoning_action = force_reasoning_mode  # "stop", "inject", or "both"
         else:
-            system_content = template_manager.get_agent_system_prompt("You are a helpful assistant.")
-        # Update or add system message
-        system_found = False
-        for i, msg in enumerate(messages):
-            if msg.role == "system":
-                messages[i] = ChatMessage(role="system", content=system_content)
-                system_found = True
-                break
-        if not system_found:
-            messages = [ChatMessage(role="system", content=system_content)] + list(messages)
+            reasoning_action = "inject"  # Default to inject if only API param is set
+        
+        # Handle inject (system prompt injection)
+        if reasoning_action in ("inject", "both"):
+            from codai.models.templates import AgenticTemplateManager
+            template_manager = AgenticTemplateManager(request.model)
+            # Get the current system prompt if exists
+            system_content = None
+            for msg in messages:
+                if msg.role == "system":
+                    system_content = msg.content
+                    break
+            if system_content:
+                # Inject agentic instructions
+                system_content = template_manager.get_agent_system_prompt(system_content)
+            else:
+                system_content = template_manager.get_agent_system_prompt("You are a helpful assistant.")
+            # Update or add system message
+            system_found = False
+            for i, msg in enumerate(messages):
+                if msg.role == "system":
+                    messages[i] = ChatMessage(role="system", content=system_content)
+                    system_found = True
+                    break
+            if not system_found:
+                messages = [ChatMessage(role="system", content=system_content)] + list(messages)
+        
+        # Handle stop tokens - add to stop_sequences for generation
+        if reasoning_action in ("stop", "both"):
+            _, _, additional_stops = get_reasoning_stop_tokens(model_family)
+            # Add model-specific stop tokens to the existing stop sequences
+            for stop_token in additional_stops:
+                if stop_token not in stop_sequences:
+                    stop_sequences.append(stop_token)
+            print(f"DEBUG: Added reasoning stop tokens for model family '{model_family}': {additional_stops}")
     
     # Format messages with tools if provided
     if request.tools:
@@ -6475,8 +6601,11 @@ def parse_args():
     )
     parser.add_argument(
         "--force-reasoning",
-        action="store_true",
-        help="Force reasoning/thinking mode for models that support it (e.g., Qwen3, DeepSeek R1). Enables extraction of reasoning content.",
+        nargs="?",
+        const="both",
+        default=None,
+        choices=["both", "stop", "inject"],
+        help="Force reasoning/thinking mode. Values: 'stop' (add stop tokens), 'inject' (add system prompt), 'both' (default, does both). Use for models like Qwen3, DeepSeek R1, Llama3.1, etc.",
     )
     return parser.parse_args()
 def main():
