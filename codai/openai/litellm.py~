@@ -81,7 +81,7 @@ class LiteLLMBackend:
         self.model = model
         # Use provided API key, or generate a fake one if not provided
         # This allows litellm to proceed without requiring an API key
-        self.api_key = api_key if api_key else "sk-fakekey"
+        self.api_key = api_key if api_key else "fake-key-for-local-testing"
         self.base_url = base_url or api_base  # Use either base_url or api_base
         self.context_window = context_window
         self.model_manager = model_manager
@@ -426,16 +426,6 @@ class LiteLLMBackend:
         if 'huggingface' in use_model.lower():
             litellm.api_key = "sk-fakekey"
             print("DEBUG litellm: HuggingFace model - using fake key")
-        
-        # Debug: show api_key and api_base being used
-        try:
-            import sys
-            if 'coderai' in sys.modules:
-                from coderai import global_debug
-                if global_debug:
-                    print(f"DEBUG litellm: api_key={litellm.api_key}, api_base={self.base_url}, model={use_model}")
-        except:
-            pass
         
         # Convert messages to litellm format
         litellm_messages = self._convert_messages(messages)
