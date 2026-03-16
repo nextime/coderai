@@ -12,6 +12,7 @@ from .parser import (
     GrokParser,
     PhiParser,
     ApexBig50Parser,
+    OpenAIFormatter,
 )
 
 from .templates import AgenticTemplateManager
@@ -29,5 +30,6 @@ __all__ = [
     'GrokParser',
     'PhiParser',
     'ApexBig50Parser',
+    'OpenAIFormatter',
     'AgenticTemplateManager',
 ]
