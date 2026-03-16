@@ -99,58 +99,71 @@ class BaseParser:
         return text.strip()
 
 # 1. QWEN PARSER (Instruct & Coder Style)
+# 1. QWEN PARSER (Instruct & Coder Style)
 class QwenParser(BaseParser):
     @validate_tool_output
     def parse(self, text: str) -> List[Dict]:
+        # 1. IMMEDIATE REPETITION GUARD
+        # If the model is looping the same tag, we only care about the first one.
+        if text.count('<tool') > 1:
+            # Split by the start tag and take the first actual content block
+            parts = re.split(r'<(?:tool|tool_call)', text, flags=re.IGNORECASE)
+            # Reconstruct just the first potential call
+            text = f"<tool{parts[1]}" if len(parts) > 1 else text
+
         results = []
-        
-        # 1. Pre-cleaning (Remove thinking and special tokens)
-        # Some Qwen variants use <|thought|> or <think>
-        clean_text = re.sub(r'<\|.*?\|>|<(?:thought|think)>.*?</(?:thought|think)>', '', text, flags=re.DOTALL | re.IGNORECASE)
-        
-        # 2. MATCH BOTH <tool> AND <tool_call>
-        # This regex finds any JSON-like content between tags named 'tool' or 'tool_call'
-        tag_pattern = r'<(?:tool|tool_call)>(.*?)(?:</(?:tool|tool_call)>|$)'
+
+        # 2. Pre-cleaning (Think tags, system markers, and special tokens)
+        clean_text = re.sub(r'<\|.*?\|>|<(?:thought|think)>.*?((?:</(?:thought|think)>)|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
+
+        # 3. FLEXIBLE TAG MATCHING
+        # Matches <tool>, <tool_call>, or even just { "name": ... } if tags are missing
+        tag_pattern = r'<(?:tool|tool_call|function_call)>(.*?)(?:</(?:tool|tool_call|function_call)>|$)'
         matches = re.findall(tag_pattern, clean_text, re.DOTALL | re.IGNORECASE)
-        
+
+        # If no tags found but text looks like JSON, try the whole text
+        if not matches and '{' in clean_text and '"name"' in clean_text:
+            matches = [clean_text]
+
         for block in matches:
             block = block.strip()
-            if not block:
-                continue
-                
-            # Attempt to parse as JSON (handles markdown code blocks inside tags)
+            if not block: continue
+
+            # Clean Markdown & detect partial JSON
             json_str = re.sub(r'```(?:json)?\s*(.*?)\s*```', r'\1', block, flags=re.DOTALL).strip()
             
+            # Attempt recovery of unclosed JSON (very common in 4-bit)
+            if json_str.startswith('{') and not json_str.endswith('}'):
+                json_str += '}' 
+
             try:
                 data = json.loads(json_str)
-                # Ensure it follows the expected tool-calling schema
                 if 'name' in data:
-                    results.append(self._to_oa(data['name'], data.get('arguments', {})))
+                    results.append(self._to_oa(data['name'], data.get('arguments', {} or data.get('parameters', {}))))
+                    break # STOP after the first valid tool call to break the loop
             except json.JSONDecodeError:
-                # Fallback: Try a 'lazy' find for the first '{' and last '}'
-                try:
-                    start = json_str.find('{')
-                    end = json_str.rfind('}')
-                    if start != -1 and end != -1:
-                        data = json.loads(json_str[start:end+1])
-                        results.append(self._to_oa(data['name'], data.get('arguments', {})))
-                except:
-                    continue
-        
-        # 3. CODER STYLE FALLBACK (<function=name><parameter=key>value</parameter></function>)
+                # FAILING JSON: Attempt regex extraction for name/args
+                name_match = re.search(r'"name":\s*"([^"]+)"', json_str)
+                if name_match:
+                    # Very basic fallback for arguments if JSON is totally mangled
+                    results.append(self._to_oa(name_match.group(1), {}))
+                    break
+
+        # 4. CODER STYLE FALLBACK
         if not results:
             results = self._parse_coder_style(clean_text)
-            
+
         return results
 
     def _parse_coder_style(self, text: str):
-        # Specific fix for Coder style: <function=name> or <tool=name>
         found = []
-        pattern = r'<(?:function|tool)=([^>]+)>(.*?)(?:</(?:function|tool)>|$)'
-        for name, body in re.findall(pattern, text, re.DOTALL):
+        # Support <tool=name>, <function=name>, or <call=name>
+        pattern = r'<(?:function|tool|call)=([^>]+)>(.*?)(?:</(?:function|tool|call|tool_call)>|$)'
+        for name, body in re.findall(pattern, text, re.DOTALL | re.IGNORECASE):
             params = re.findall(r'<parameter=([^>]+)>(.*?)</parameter>', body, re.DOTALL)
             args = {k.strip(): self._relaxed_val(v) for k, v in params}
             found.append(self._to_oa(name.strip(), args))
+            if found: break # Circuit breaker
         return found
 
     def _relaxed_val(self, val):

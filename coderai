@@ -333,6 +333,7 @@ class ChatCompletionRequest(BaseModel):
     stop: Optional[Union[str, List[str]]] = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    repeat_penalty: float = 1.0
     tools: Optional[List[Tool]] = None
     tool_choice: Optional[Union[str, Dict]] = "auto"
     # Extra fields that clients may send but we ignore
@@ -354,6 +355,7 @@ class CompletionRequest(BaseModel):
     stop: Optional[Union[str, List[str]]] = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    repeat_penalty: float = 1.0
     # Extra fields that clients may send but we ignore
     seed: Optional[int] = None
     logprobs: Optional[bool] = None
