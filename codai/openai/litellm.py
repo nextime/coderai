@@ -12,6 +12,13 @@ from typing import List, Dict, Any, Optional, AsyncGenerator, Union
 
 try:
     import litellm
+    
+    # Register 'coderai' as an alias for the 'openai' provider
+    # This allows LiteLLM to use its internal HTTP handler for custom providers
+    # by mapping them to the 'openai' provider behavior
+    litellm.custom_provider_map = [
+        {"provider": "coderai", "custom_handler": "openai"}
+    ]
     from litellm import acompletion, completion
     from litellm.exceptions import (
         AuthenticationError,
@@ -101,16 +108,16 @@ class LiteLLMBackend:
         """
         Normalize model name for litellm.
         
-        Always formats as: openai/{provider}/{model}
+        Always formats as: coderai/{provider}/{model}
         - If provider is detected from known patterns, use it
-        - If model has / (e.g. HuggingFace org/model), detect or default to huggingface
+        - If model has / (e.g. org/model), use the org name as provider
         - If provider unknown, use "coderai" as default
         
         Args:
             model: Original model name (may be an alias)
             
         Returns:
-            Normalized model name: openai/{provider}/{model}
+            Normalized model name: coderai/{provider}/{model}
         """
         print(f"DEBUG litellm: normalize_model_name input: {model}")
         
@@ -128,16 +135,16 @@ class LiteLLMBackend:
             parts = resolved_model.split('/')
             prefix = parts[0].lower()
             if prefix in known_providers:
-                # Valid provider, reformat as openai/{provider}/{model}
+                # Valid provider, reformat as coderai/{provider}/{model}
                 model_part = '/'.join(parts[1:])
-                result = f"openai/{prefix}/{model_part}"
+                result = f"coderai/{prefix}/{model_part}"
                 print(f"DEBUG litellm: Known provider '{prefix}', returning: {result}")
                 return result
             # Otherwise, treat the first part as the org/provider name (not default to huggingface)
             # This allows custom model paths like TeichAI/model-name to work correctly
             org_name = parts[0]
             model_part = '/'.join(parts[1:])
-            result = f"openai/{org_name}/{model_part}"
+            result = f"coderai/{org_name}/{model_part}"
             print(f"DEBUG litellm: Custom org/model, returning: {result}")
             return result
         
@@ -181,12 +188,12 @@ class LiteLLMBackend:
         # Check for known patterns
         for pattern, provider in provider_map.items():
             if model_lower.startswith(pattern):
-                result = f"openai/{provider}/{resolved_model}"
+                result = f"coderai/{provider}/{resolved_model}"
                 print(f"DEBUG litellm: Detected provider '{provider}', returning: {result}")
                 return result
         
         # Default: use "coderai" as provider for unknown models
-        result = f"openai/coderai/{resolved_model}"
+        result = f"coderai/coderai/{resolved_model}"
         print(f"DEBUG litellm: Unknown provider, using 'coderai', returning: {result}")
         return result
     
