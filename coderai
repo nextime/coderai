@@ -27,6 +27,9 @@ from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, Field, validator, field_validator, ConfigDict
 from pydantic_core import PydanticCustomError
 from threading import Thread
+
+# Import codai module for enhanced tool call parsing
+from codai import ModelParserDispatcher
 # Per-model semaphores for request concurrency control
 model_semaphores: dict = {}
 load_mode = {"mode": "ondemand"}  # Track load mode globally
@@ -756,6 +759,94 @@ class ToolCallParser:
         # Don't strip whitespace - spaces and newlines are valid content
         
         return text
+
+# =============================================================================
+# Model Parser Dispatcher Wrapper - integrates model_parser module
+# =============================================================================
+
+class ModelParserAdapter:
+    """Adapter class that wraps ModelParserDispatcher to provide ToolCallParser interface.
+    
+    This allows seamless integration of the model_parser module while maintaining
+    compatibility with the existing coderai codebase.
+    """
+    
+    def __init__(self, model_name: str = None, tools_schema: Dict = None):
+        self._model_name = model_name
+        self._tools_schema = tools_schema or {}
+        self._dispatcher = ModelParserDispatcher(model_name=model_name, tools_schema=self._tools_schema)
+    
+    def set_model_name(self, model_name: str) -> None:
+        """Set the model name for model-specific parsing."""
+        self._model_name = model_name
+        # Recreate dispatcher with new model name
+        self._dispatcher = ModelParserDispatcher(model_name=model_name, tools_schema=self._tools_schema)
+    
+    def extract_tool_calls(self, text: str, available_tools: List[Tool]) -> Optional[List[Dict]]:
+        """Extract tool calls from model output using model-specific parsing."""
+        if not text:
+            return None
+        
+        # Convert available_tools to the format expected by ModelParserDispatcher
+        tools_dict = {}
+        for tool in available_tools:
+            if hasattr(tool, 'function') and tool.function:
+                func = tool.function
+                tools_dict[func.name] = {
+                    'description': func.description or '',
+                    'parameters': func.parameters or {}
+                }
+        
+        # Update dispatcher tools if changed
+        if tools_dict != self._tools_schema:
+            self._tools_schema = tools_dict
+            self._dispatcher.set_tools(tools_dict)
+        
+        # Use the dispatcher to parse tool calls
+        tool_calls = self._dispatcher.parse(text)
+        
+        if tool_calls:
+            # Add unique IDs to each tool call
+            import uuid
+            for tc in tool_calls:
+                if 'id' not in tc:
+                    tc['id'] = f"call_{uuid.uuid4().hex[:16]}"
+                if 'type' not in tc:
+                    tc['type'] = 'function'
+            return tool_calls
+        
+        return None
+    
+    def strip_tool_calls_from_content(self, text: str) -> str:
+        """Remove tool call format from text after extracting tool calls."""
+        if not text:
+            return text
+        
+        # Remove <tool>...</tool> and <function>...</function> patterns
+        text = re.sub(r'<tool>.*?</tool>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<function>.*?</function>', '', text, flags=re.DOTALL)
+        
+        # Remove JSON format with greedy matching: <tool>{...}</tool>
+        text = re.sub(r'<tool>\{.*?\}</tool>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<function>\{.*?\}</function>', '', text, flags=re.DOTALL)
+        
+        # More aggressive pattern
+        text = re.sub(r'<tool>[\s\S]*?</tool>', '', text)
+        text = re.sub(r'<function>[\s\S]*?</function>', '', text)
+        
+        # Remove common tool name tags
+        for tool_name in ['read', 'write', 'exec', 'browser', 'message', 'web_search', 'web_fetch', 
+                         'memory_search', 'memory_get', 'sessions_list', 'sessions_send', 'tts', 'canvas', 'nodes',
+                         'read_file', 'write_file', 'exec', 'process', 'browser', 'message', 'web_search', 'web_fetch',
+                         'tts', 'canvas', 'nodes', 'agents_list', 'sessions_list', 'sessions_history', 'sessions_spawn',
+                         'subagents', 'session_status', 'memory_search', 'memory_get']:
+            text = re.sub(rf'<{tool_name}>[\s\S]*?</{tool_name}>', '', text)
+        
+        # Clean up excessive newlines
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        return text
+
 def format_tools_for_prompt(tools: List[Tool], messages: List[ChatMessage]) -> List[ChatMessage]:
     """Format tools into the system message or add a tool description."""
     if not tools:
@@ -2384,7 +2475,7 @@ class ModelManager:
     def __init__(self):
         self.backend: Optional[ModelBackend] = None
         self.backend_type: Optional[str] = None
-        self.tool_parser = ToolCallParser()
+        self.tool_parser = ModelParserAdapter()
     
     def _aggressive_vram_cleanup(self, model_manager):
         """
@@ -2508,9 +2599,7 @@ class ModelManager:
         
         # Load the model
         self.backend.load_model(model_name, **kwargs)
-        self.tool_parser = ToolCallParser()
-        # Set model name on tool parser for model-specific parsing (e.g., Qwen)
-        self.tool_parser.set_model_name(model_name)
+        self.tool_parser = ModelParserAdapter(model_name=model_name)
         
     def format_messages(self, messages: List[ChatMessage]) -> str:
         """Format messages into a prompt string."""
@@ -2799,7 +2888,7 @@ class MultiModelManager:
         self.tts_model: Optional[str] = None
         self.image_models: List[str] = []  # List of image model names
         self.vision_models: List[str] = []  # List of vision (image/video to text) model names
-        self.tool_parser = ToolCallParser()
+        self.tool_parser = ModelParserAdapter()
         self.current_model_key: Optional[str] = None
         # Configuration for each model type
         self.config: Dict[str, Dict] = {}
@@ -5109,7 +5198,7 @@ async def chat_completions(request: ChatCompletionRequest):
         messages = format_tools_for_prompt(request.tools, messages)
     
     # Get the tool_parser from the current manager
-    tool_parser = current_manager.tool_parser if hasattr(current_manager, 'tool_parser') else ToolCallParser()
+    tool_parser = current_manager.tool_parser if hasattr(current_manager, 'tool_parser') else ModelParserAdapter()
     
     # Prepare stop sequences
     stop_sequences = []
