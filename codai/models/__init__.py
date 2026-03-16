@@ -1,5 +1,5 @@
-# codai module - AI model parsing utilities
-from .models.parser import (
+# codai.models - Model parsing and templates
+from .parser import (
     ModelParserDispatcher,
     BaseParser,
     QwenParser,
@@ -14,7 +14,7 @@ from .models.parser import (
     ApexBig50Parser,
 )
 
-from .models.templates import AgenticTemplateManager
+from .templates import AgenticTemplateManager
 
 __all__ = [
     'ModelParserDispatcher',
