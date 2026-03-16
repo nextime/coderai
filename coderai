@@ -5175,7 +5175,7 @@ async def chat_completions(request: ChatCompletionRequest):
     
     if parser_type == 'litellm':
         # Use LiteLLM backend
-        from codai.litellm_backend import get_litellm_backend, LITELLM_AVAILABLE
+        from codai.openai.litellm import get_litellm_backend, LITELLM_AVAILABLE
         
         if not LITELLM_AVAILABLE:
             raise HTTPException(
