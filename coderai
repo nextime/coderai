@@ -5186,7 +5186,8 @@ async def chat_completions(request: ChatCompletionRequest):
         # Get or create litellm backend
         litellm_backend = get_litellm_backend(
             model=request.model,
-            context_window=8192  # Default, can be made configurable
+            context_window=8192,  # Default, can be made configurable
+            model_manager=multi_model_manager  # Pass for alias resolution
         )
         
         # Convert messages to dict format
