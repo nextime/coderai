@@ -29,8 +29,7 @@ from pydantic_core import PydanticCustomError
 from threading import Thread
 
 # Import codai module for enhanced tool call parsing
-from codai.models import ModelParserDispatcher
-from codai.models.parsers import OpenAIFormatter
+from codai.models import ModelParserDispatcher, OpenAIFormatter
 # Per-model semaphores for request concurrency control
 model_semaphores: dict = {}
 load_mode = {"mode": "ondemand"}  # Track load mode globally
