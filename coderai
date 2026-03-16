@@ -5418,8 +5418,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             # Insert system message at the beginning
             messages = [ChatMessage(role="system", content=system_text)] + list(messages)
     
-    # Enable thinking/reasoning mode if requested
-    if getattr(request, 'enable_thinking', False):
+    # Enable thinking/reasoning mode if requested via API parameter OR CLI flag
+    force_reasoning = getattr(global_args, 'force_reasoning', False) if global_args else False
+    enable_thinking = getattr(request, 'enable_thinking', False) or force_reasoning
+    if enable_thinking:
         from codai.models.templates import AgenticTemplateManager
         template_manager = AgenticTemplateManager(request.model)
         # Get the current system prompt if exists
@@ -6470,6 +6472,11 @@ def parse_args():
         default="auto",
         choices=["auto", "litellm"],
         help="Tool call parser to use: 'auto' for internal parser, 'litellm' for LiteLLM's parser. Default: auto",
+    )
+    parser.add_argument(
+        "--force-reasoning",
+        action="store_true",
+        help="Force reasoning/thinking mode for models that support it (e.g., Qwen3, DeepSeek R1). Enables extraction of reasoning content.",
     )
     return parser.parse_args()
 def main():
