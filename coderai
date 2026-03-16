@@ -5475,13 +5475,31 @@ async def stream_chat_response(
             from typing import cast
             tool_objects = []
             for t in tools:
-                tool_func = ToolFunction(
-                    name=t["function"]["name"],
-                    description=t["function"].get("description"),
-                    parameters=t["function"].get("parameters")
-                )
-                tool_objects.append(Tool(type=t.get("type", "function"), function=tool_func))
-            tool_calls = tool_parser.extract_tool_calls(generated_text, tool_objects)
+                try:
+                    # Handle both dict and pydantic model formats
+                    if isinstance(t, dict):
+                        func_data = t.get("function", {})
+                        tool_func = ToolFunction(
+                            name=func_data.get("name", ""),
+                            description=func_data.get("description"),
+                            parameters=func_data.get("parameters")
+                        )
+                    else:
+                        # Pydantic model
+                        tool_func = ToolFunction(
+                            name=t.function.name if hasattr(t.function, 'name') else str(t.function),
+                            description=t.function.description if hasattr(t.function, 'description') else None,
+                            parameters=t.function.parameters if hasattr(t.function, 'parameters') else None
+                        )
+                    tool_objects.append(Tool(type=t.get("type", "function") if isinstance(t, dict) else t.type, function=tool_func))
+                except Exception as e:
+                    print(f"DEBUG: Error converting tool: {e}, tool type: {type(t)}")
+                    continue
+            try:
+                tool_calls = tool_parser.extract_tool_calls(generated_text, tool_objects)
+            except Exception as e:
+                print(f"DEBUG: Error extracting tool calls: {e}")
+                tool_calls = None
             if tool_calls:
                 # In debug mode, dump tool calls
                 if global_debug:
@@ -5646,13 +5664,31 @@ async def generate_chat_response(
             # Convert tools back to Tool objects for parsing
             tool_objects = []
             for t in tools:
-                tool_func = ToolFunction(
-                    name=t["function"]["name"],
-                    description=t["function"].get("description"),
-                    parameters=t["function"].get("parameters")
-                )
-                tool_objects.append(Tool(type=t.get("type", "function"), function=tool_func))
-            tool_calls = tool_parser.extract_tool_calls(generated_text, tool_objects)
+                try:
+                    # Handle both dict and pydantic model formats
+                    if isinstance(t, dict):
+                        func_data = t.get("function", {})
+                        tool_func = ToolFunction(
+                            name=func_data.get("name", ""),
+                            description=func_data.get("description"),
+                            parameters=func_data.get("parameters")
+                        )
+                    else:
+                        # Pydantic model
+                        tool_func = ToolFunction(
+                            name=t.function.name if hasattr(t.function, 'name') else str(t.function),
+                            description=t.function.description if hasattr(t.function, 'description') else None,
+                            parameters=t.function.parameters if hasattr(t.function, 'parameters') else None
+                        )
+                    tool_objects.append(Tool(type=t.get("type", "function") if isinstance(t, dict) else t.type, function=tool_func))
+                except Exception as e:
+                    print(f"DEBUG: Error converting tool: {e}, tool type: {type(t)}")
+                    continue
+            try:
+                tool_calls = tool_parser.extract_tool_calls(generated_text, tool_objects)
+            except Exception as e:
+                print(f"DEBUG: Error extracting tool calls: {e}")
+                tool_calls = None
             if tool_calls:
                 # Strip tool call format from content so user doesn't see raw tags (only if --reply-filters is set)
                 if check_reply_filter('tool_calls', 'text', model_name):
