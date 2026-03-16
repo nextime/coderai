@@ -110,10 +110,20 @@ class LiteLLMBackend:
         resolved_model = self._resolve_model_alias(model)
         print(f"DEBUG litellm: After alias resolution: {resolved_model}")
         
-        # If already has a provider prefix (contains /), return as-is
+        # If already has a provider prefix (contains /), check if it's valid
         if '/' in resolved_model:
-            print(f"DEBUG litellm: Model has provider prefix, returning: {resolved_model}")
-            return resolved_model
+            # Check if the prefix is a known litellm provider
+            known_providers = ['openai', 'anthropic', 'gemini', 'meta', 'mistral', 'cohere', 
+                             'ai21', 'bedrock', 'azure', 'ollama', 'huggingface', 'deepseek', 
+                             'qwen', 'sagemaker', 'vertex', 'aiplatform', 'vllm', 'tgi']
+            prefix = resolved_model.split('/')[0].lower()
+            if prefix in known_providers:
+                print(f"DEBUG litellm: Known provider prefix, returning: {resolved_model}")
+                return resolved_model
+            # Otherwise, it's likely a HuggingFace org/model path, add huggingface prefix
+            result = f"huggingface/{resolved_model}"
+            print(f"DEBUG litellm: HuggingFace org/model detected, adding huggingface prefix: {result}")
+            return result
         
         # Common model name patterns and their providers
         provider_map = {
