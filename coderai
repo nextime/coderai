@@ -1424,9 +1424,9 @@ class VulkanBackend(ModelBackend):
                 # Also handle cached files with hash prefix: hash_modelname.gguf -> modelname
                 model_base = model_file.replace('.gguf', '')
                 
-                # Remove hash prefix (40 hex chars followed by underscore) - find last underscore if starts with hex
-                if len(model_base) > 40 and model_base[:40].isalnum():
-                    model_base = model_base[41:]  # Skip hash + underscore
+                # Remove hash prefix (64 hex chars for SHA-256 followed by underscore)
+                if len(model_base) > 64 and model_base[:64].isalnum():
+                    model_base = model_base[65:]  # Skip hash + underscore
                 
                 # Remove common quantization suffixes
                 for suffix in ['_q4_k_m', '_q4_k', '_q5_k', '_q5_k_m', '_q8_0', '_f16', '_q4_0', '_q3_k_m', '_q2_k']:
@@ -2939,7 +2939,7 @@ class MultiModelManager:
             print(f"ON-DEMAND SWAP: Loading model '{requested_model}' into VRAM")
             
             # Get the backend type for this model
-            backend_type = self.model_backend_types.get(requested_model, "auto")
+            backend_type = getattr(self, 'model_backend_types', {}).get(requested_model, "auto")
             
             # Get config for this model
             model_config = self.config.get(requested_model, {})
@@ -3011,7 +3011,7 @@ class MultiModelManager:
                             print(f"ON-DEMAND SWAP: Loading model '{model_name}' into VRAM")
                             
                             # Get the backend type for this model
-                            backend_type = self.model_backend_types.get(model_name, "auto")
+                            backend_type = getattr(self, 'model_backend_types', {}).get(model_name, "auto")
                             
                             # Get config for this model
                             model_config = self.config.get(model_name, {})
