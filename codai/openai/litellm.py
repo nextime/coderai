@@ -751,15 +751,12 @@ default_litellm_backend: Optional[LiteLLMBackend] = None
 # Turn on litellm debug mode if global debug is enabled
 def _setup_litellm_debug():
     """Turn on litellm debug mode if global debug is enabled."""
-    global global_debug
     try:
-        # Import global_args from coderai
         import sys
-        import os
-        # Try to get global_args from the coderai module
+        # Check if global_debug is True in coderai module at runtime
         if 'coderai' in sys.modules:
-            from coderai import global_debug as coderai_debug
-            if coderai_debug:
+            from coderai import global_debug
+            if global_debug:
                 import litellm
                 litellm._turn_on_debug()
                 print("DEBUG litellm: Debug mode enabled")
