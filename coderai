@@ -2225,6 +2225,7 @@ class VulkanBackend(ModelBackend):
         use_manual = self.chat_template in ("unknown", "jinja_fallback", None)
         # With tools, use manual for non-default templates but let llama.cpp handle "default" (embedded GGUF template)
         use_manual = use_manual or (tools is not None and self.chat_template != "default")
+        use_manual = use_manual or (tools is not None)  # Force manual when tools present to avoid Jinja errors
         # Also use manual when we have a known template but no HuggingFace tokenizer (except for embedded "default")
         use_manual = use_manual or (self.chat_template is not None and self.chat_template != "default" and self.hf_tokenizer is None)
         use_hf = self.hf_tokenizer is not None
@@ -2315,6 +2316,7 @@ class VulkanBackend(ModelBackend):
         use_manual = self.chat_template in ("unknown", "jinja_fallback", None)
         # With tools, use manual for non-default templates but let llama.cpp handle "default" (embedded GGUF template)
         use_manual = use_manual or (tools is not None and self.chat_template != "default")
+        use_manual = use_manual or (tools is not None)  # Force manual when tools present to avoid Jinja errors
         # Also use manual when we have a known template but no HuggingFace tokenizer (except for embedded "default")
         use_manual = use_manual or (self.chat_template is not None and self.chat_template != "default" and self.hf_tokenizer is None)
         use_hf = self.hf_tokenizer is not None
