@@ -4976,7 +4976,13 @@ async def stream_chat_response(
             print(f"\n{'='*80}")
             print(f"=== FULL GENERATED TEXT (DEBUG) ===")
             print(f"{'='*80}")
+            # Show both raw (actual) content and escaped representation
+            print(f"--- RAW CONTENT (actual newlines shown as lines) ---")
+            print(generated_text)
+            print(f"--- END RAW CONTENT ---")
+            print(f"--- ESCAPED CONTENT (repr() - shows \\n for newlines) ---")
             print(repr(generated_text))
+            print(f"--- END ESCAPED CONTENT ---")
             print(f"{'='*80}\n")
         
         # Check for tool calls in complete output (for API response format)
