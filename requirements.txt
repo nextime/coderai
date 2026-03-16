@@ -44,6 +44,9 @@ procname>=0.3.0
 faster-whisper>=0.10.0  # For NVIDIA/CUDA whisper transcription
 whispercpp>=1.0.0  # Alternative whisper library (works without PyTorch)
 
+# LiteLLM for standardized API responses
+litellm>=1.40.0
+
 # Optional: for better performance
 # bitsandbytes>=0.41.0  # for 4-bit/8-bit quantization
 # sentencepiece>=0.1.99  # for some tokenizers

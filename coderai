@@ -6287,6 +6287,13 @@ def parse_args():
         default=None,
         help="Path to store generated files (images, audio). If specified, files will be saved here and served over web.",
     )
+    parser.add_argument(
+        "--parser",
+        type=str,
+        default="auto",
+        choices=["auto", "litellm"],
+        help="Tool call parser to use: 'auto' for internal parser, 'litellm' for LiteLLM's parser. Default: auto",
+    )
     return parser.parse_args()
 def main():
     """Main entry point."""
