@@ -404,12 +404,6 @@ class LiteLLMBackend:
         # Store tool_parser for post-processing
         self.tool_parser = tool_parser
         
-        # For HuggingFace models, set a fake API key to skip auth
-        # The key must be in "sk-fakekey" format for litellm to accept it
-        if use_model and 'huggingface' in use_model.lower():
-            litellm.api_key = "sk-fakekey"
-            print("DEBUG litellm: HuggingFace model - using fake key")
-        
         # Convert tools to coderai schema format if tools provided
         if tools:
             self.tools_schema = {}
@@ -423,6 +417,12 @@ class LiteLLMBackend:
         
         # Prepare the model - normalize name for litellm
         use_model = self.normalize_model_name(model or self.model)
+        
+        # For HuggingFace models, set a fake API key to skip auth
+        # The key must be in "sk-fakekey" format for litellm to accept it
+        if 'huggingface' in use_model.lower():
+            litellm.api_key = "sk-fakekey"
+            print("DEBUG litellm: HuggingFace model - using fake key")
         
         # Convert messages to litellm format
         litellm_messages = self._convert_messages(messages)
