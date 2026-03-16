@@ -5230,6 +5230,35 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             port = getattr(global_args, 'port', 11434) if global_args else 11434
             api_base = f"http://{client_host}:{port}/v1"
             print(f"DEBUG: Using api_base for Ollama: {api_base}")
+        else:
+            # For non-Ollama models, use the server's own URL as base
+            # This allows LiteLLM to make requests to the local server
+            if http_request:
+                # Get the host from the request headers
+                host_header = http_request.headers.get('host', '')
+                if host_header:
+                    # Strip port if present to reconstruct clean URL
+                    if ':' in host_header:
+                        client_host = host_header.split(':')[0]
+                        # Keep the port from the request for consistency
+                        server_port = host_header.split(':')[1] if len(host_header.split(':')) > 1 else str(getattr(global_args, 'port', 6745))
+                    else:
+                        client_host = host_header
+                        server_port = str(getattr(global_args, 'port', 6745))
+                else:
+                    # Fallback to client host if no Host header
+                    client_host = http_request.client.host if http_request.client else "127.0.0.1"
+                    server_port = str(getattr(global_args, 'port', 6745))
+            else:
+                # Fallback if no http_request
+                client_host = "127.0.0.1"
+                server_port = str(getattr(global_args, 'port', 6745))
+            
+            # Determine protocol (http or https)
+            use_https = getattr(global_args, 'https', False) or getattr(global_args, 'pubkey', None)
+            protocol = "https" if use_https else "http"
+            api_base = f"{protocol}://{client_host}:{server_port}/v1"
+            print(f"DEBUG: Using api_base for local server: {api_base}")
         
         # Get or create litellm backend
         litellm_backend = get_litellm_backend(
