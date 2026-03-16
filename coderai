@@ -2017,10 +2017,13 @@ class VulkanBackend(ModelBackend):
         messages = cleaned_messages
         
         # Check if we should use manual formatting based on detected template
-        # Always use manual formatting when tools are present, since Jinja templates often fail with tool messages
-        # Also use manual formatting when we have a known template but no HuggingFace tokenizer
         # NOTE: "default" means llama.cpp detected an embedded template - let llama.cpp handle it via create_chat_completion
-        use_manual = self.chat_template in ("unknown", "jinja_fallback", None) or tools is not None
+        # For other templates (unknown, jinja_fallback, None), or when tools are present with non-default templates,
+        # use manual formatting since Jinja templates often fail with tool messages
+        use_manual = self.chat_template in ("unknown", "jinja_fallback", None)
+        # With tools, use manual for non-default templates but let llama.cpp handle "default" (embedded GGUF template)
+        use_manual = use_manual or (tools is not None and self.chat_template != "default")
+        # Also use manual when we have a known template but no HuggingFace tokenizer (except for embedded "default")
         use_manual = use_manual or (self.chat_template is not None and self.chat_template != "default" and self.hf_tokenizer is None)
         use_hf = self.hf_tokenizer is not None
         
@@ -2091,10 +2094,13 @@ class VulkanBackend(ModelBackend):
         messages = cleaned_messages
         
         # Check if we should use manual formatting based on detected template
-        # Always use manual formatting when tools are present, since Jinja templates often fail with tool messages
-        # Also use manual formatting when we have a known template but no HuggingFace tokenizer
         # NOTE: "default" means llama.cpp detected an embedded template - let llama.cpp handle it via create_chat_completion
-        use_manual = self.chat_template in ("unknown", "jinja_fallback", None) or tools is not None
+        # For other templates (unknown, jinja_fallback, None), or when tools are present with non-default templates,
+        # use manual formatting since Jinja templates often fail with tool messages
+        use_manual = self.chat_template in ("unknown", "jinja_fallback", None)
+        # With tools, use manual for non-default templates but let llama.cpp handle "default" (embedded GGUF template)
+        use_manual = use_manual or (tools is not None and self.chat_template != "default")
+        # Also use manual when we have a known template but no HuggingFace tokenizer (except for embedded "default")
         use_manual = use_manual or (self.chat_template is not None and self.chat_template != "default" and self.hf_tokenizer is None)
         use_hf = self.hf_tokenizer is not None
         
