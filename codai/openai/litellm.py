@@ -81,6 +81,8 @@ class LiteLLMBackend:
         self.base_url = base_url
         self.context_window = context_window
         self.model_manager = model_manager
+        self.tool_parser = None  # Coderai's tool parser for post-processing
+        self.tools_schema = {}  # Tools schema for coderai parser
         
         # Configure litellm
         if base_url:
@@ -371,6 +373,7 @@ class LiteLLMBackend:
         tools: Optional[List[Dict]] = None,
         tool_choice: Optional[Union[str, Dict]] = "auto",
         stream: bool = False,
+        tool_parser=None,  # Add coderai's tool parser for post-processing
         **kwargs
     ) -> Union[Dict, AsyncGenerator]:
         """
@@ -386,12 +389,27 @@ class LiteLLMBackend:
             tools: Tool definitions
             tool_choice: Tool choice mode
             stream: Whether to stream the response
+            tool_parser: Optional coderai tool parser for post-processing tool calls
             
         Returns:
             Response dict or async generator for streaming
         """
         if not LITELLM_AVAILABLE:
             raise RuntimeError("litellm is not installed. Run: pip install litellm")
+        
+        # Store tool_parser for post-processing
+        self.tool_parser = tool_parser
+        
+        # Convert tools to coderai schema format if tools provided
+        if tools:
+            self.tools_schema = {}
+            for tool in tools:
+                if isinstance(tool, dict) and 'function' in tool:
+                    func = tool.get('function', {})
+                    self.tools_schema[func.get('name', '')] = {
+                        'description': func.get('description', ''),
+                        'parameters': func.get('parameters', {})
+                    }
         
         # Prepare the model - normalize name for litellm
         use_model = self.normalize_model_name(model or self.model)
@@ -487,7 +505,29 @@ class LiteLLMBackend:
         
         if tool_calls:
             result["choices"][0]["message"]["tool_calls"] = tool_calls
-            
+        
+        # Use coderai's tool parser for post-processing if available
+        if self.tool_parser and content:
+            # Try to extract tool calls using coderai's parser
+            try:
+                # Convert tools to the format expected by coderai parser
+                tools_schema = {}
+                if hasattr(self, 'tools_schema') and self.tools_schema:
+                    tools_schema = self.tools_schema
+                
+                # Use coderai parser to extract tool calls from content
+                parsed_tool_calls = self.tool_parser.extract_tool_calls(content, tools_schema) if hasattr(self.tool_parser, 'extract_tool_calls') else None
+                
+                if parsed_tool_calls:
+                    # Replace tool calls with coderai-parsed versions
+                    result["choices"][0]["message"]["tool_calls"] = parsed_tool_calls
+                    # Strip tool tags from content
+                    if hasattr(self.tool_parser, 'strip_tool_calls_from_content'):
+                        clean_content = self.tool_parser.strip_tool_calls_from_content(content)
+                        result["choices"][0]["message"]["content"] = clean_content
+            except Exception as e:
+                print(f"DEBUG litellm: Coderai parser post-processing error: {e}")
+        
         return result
     
     async def _stream_response(self, completion_args: Dict) -> AsyncGenerator:
@@ -546,7 +586,33 @@ class LiteLLMBackend:
             
         if tool_calls:
             result["choices"][0]["delta"]["tool_calls"] = tool_calls
-            
+        
+        # Accumulate content for coderai parser post-processing at end of stream
+        if content:
+            if not hasattr(self, '_accumulated_content'):
+                self._accumulated_content = ""
+            self._accumulated_content += content
+        
+        # Use coderai's tool parser for post-processing if available and this is final chunk
+        if self.tool_parser and hasattr(self, '_accumulated_content') and self._accumulated_content:
+            if finish_reason == 'stop':
+                try:
+                    # Use coderai parser to extract tool calls from accumulated content
+                    tools_schema = getattr(self, 'tools_schema', {})
+                    if hasattr(self.tool_parser, 'extract_tool_calls'):
+                        parsed_tool_calls = self.tool_parser.extract_tool_calls(self._accumulated_content, tools_schema)
+                        if parsed_tool_calls:
+                            # Add tool calls to final chunk
+                            result["choices"][0]["delta"]["tool_calls"] = parsed_tool_calls
+                            # Strip tool tags from content
+                            if hasattr(self.tool_parser, 'strip_tool_calls_from_content'):
+                                clean_content = self.tool_parser.strip_tool_calls_from_content(self._accumulated_content)
+                                result["choices"][0]["delta"]["content"] = clean_content
+                            # Clear accumulated content after processing
+                            self._accumulated_content = ""
+                except Exception as e:
+                    print(f"DEBUG litellm: Coderai parser stream post-processing error: {e}")
+        
         return result
     
     def _handle_error(self, exception: Exception) -> Dict:

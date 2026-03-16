@@ -5190,6 +5190,9 @@ async def chat_completions(request: ChatCompletionRequest):
             model_manager=multi_model_manager  # Pass for alias resolution
         )
         
+        # Get the tool_parser from multi_model_manager for model-specific parsing
+        tool_parser = multi_model_manager.tool_parser if hasattr(multi_model_manager, 'tool_parser') else None
+        
         # Convert messages to dict format
         messages_dict = []
         for msg in request.messages:
@@ -5223,6 +5226,7 @@ async def chat_completions(request: ChatCompletionRequest):
                             tools=tools_dict,
                             tool_choice=request.tool_choice,
                             stream=True,
+                            tool_parser=tool_parser,
                         ):
                             # Add rate limit headers
                             headers = {}
@@ -5265,6 +5269,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     tools=tools_dict,
                     tool_choice=request.tool_choice,
                     stream=False,
+                    tool_parser=tool_parser,
                 )
                 
                 # Handle Qwen tool calls
