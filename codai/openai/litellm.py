@@ -92,17 +92,16 @@ class LiteLLMBackend:
         """
         Normalize model name for litellm.
         
-        LiteLLM requires model names in format "provider/model" e.g., "openai/gpt-3.5-turbo".
-        If no provider is specified, add a default provider based on common patterns.
-        
-        Also handles model aliases (default, image, etc.) by resolving them to
-        the actual model name from the model manager.
+        Always formats as: openai/{provider}/{model}
+        - If provider is detected from known patterns, use it
+        - If model has / (e.g. HuggingFace org/model), detect or default to huggingface
+        - If provider unknown, use "coderai" as default
         
         Args:
             model: Original model name (may be an alias)
             
         Returns:
-            Normalized model name with provider prefix
+            Normalized model name: openai/{provider}/{model}
         """
         print(f"DEBUG litellm: normalize_model_name input: {model}")
         
@@ -110,54 +109,59 @@ class LiteLLMBackend:
         resolved_model = self._resolve_model_alias(model)
         print(f"DEBUG litellm: After alias resolution: {resolved_model}")
         
-        # If already has a provider prefix (contains /), check if it's valid
+        # Known litellm providers
+        known_providers = ['openai', 'anthropic', 'gemini', 'meta', 'mistral', 'cohere', 
+                         'ai21', 'bedrock', 'azure', 'ollama', 'huggingface', 'deepseek', 
+                         'qwen', 'sagemaker', 'vertex', 'aiplatform', 'vllm', 'tgi']
+        
+        # Check if there's an existing provider prefix (contains /)
         if '/' in resolved_model:
-            # Check if the prefix is a known litellm provider
-            known_providers = ['openai', 'anthropic', 'gemini', 'meta', 'mistral', 'cohere', 
-                             'ai21', 'bedrock', 'azure', 'ollama', 'huggingface', 'deepseek', 
-                             'qwen', 'sagemaker', 'vertex', 'aiplatform', 'vllm', 'tgi']
-            prefix = resolved_model.split('/')[0].lower()
+            parts = resolved_model.split('/')
+            prefix = parts[0].lower()
             if prefix in known_providers:
-                print(f"DEBUG litellm: Known provider prefix, returning: {resolved_model}")
-                return resolved_model
-            # Otherwise, it's likely a HuggingFace org/model path, add huggingface prefix
-            result = f"huggingface/{resolved_model}"
-            print(f"DEBUG litellm: HuggingFace org/model detected, adding huggingface prefix: {result}")
+                # Valid provider, reformat as openai/{provider}/{model}
+                model_part = '/'.join(parts[1:])
+                result = f"openai/{prefix}/{model_part}"
+                print(f"DEBUG litellm: Known provider '{prefix}', returning: {result}")
+                return result
+            # Otherwise, it's likely a HuggingFace org/model path
+            result = f"openai/huggingface/{resolved_model}"
+            print(f"DEBUG litellm: HuggingFace org/model, returning: {result}")
             return result
         
-        # Common model name patterns and their providers
+        # No provider prefix - detect provider from model name pattern
         provider_map = {
             # OpenAI models
-            'gpt-': 'openai/',
-            'gpt3': 'openai/',
-            'gpt4': 'openai/',
+            'gpt-': 'openai',
+            'gpt3': 'openai',
+            'gpt4': 'openai',
             # Anthropic models
-            'claude': 'anthropic/',
+            'claude': 'anthropic',
             # Google models
-            'gemini': 'gemini/',
-            'palm': 'gemini/',
+            'gemini': 'gemini',
+            'palm': 'gemini',
             # Meta/Llama models
-            'llama': 'meta/',
-            'llama2': 'meta/',
-            'llama3': 'meta/',
-            'mistral': 'mistral/',
+            'llama': 'meta',
+            'llama2': 'meta',
+            'llama3': 'meta',
             # Mistral models
+            'mistral': 'mistral',
             # AWS models
-            'amazon': 'bedrock/',
+            'amazon': 'bedrock',
             # Azure models
-            'azure': 'azure/',
+            'azure': 'azure',
             # Cohere models
-            'cohere': 'cohere/',
+            'cohere': 'cohere',
             # AI21 models
-            'ai21': 'ai21/',
+            'ai21': 'ai21',
             # Local/Ollama models
-            'ollama': 'ollama/',
+            'ollama': 'ollama',
             # HuggingFace models
-            'hf': 'huggingface/',
+            'hf': 'huggingface',
             # DeepSeek models
-            'deepseek': 'deepseek/',
+            'deepseek': 'deepseek',
             # Qwen models
-            'qwen': 'qwen/',
+            'qwen': 'qwen',
         }
         
         model_lower = resolved_model.lower()
@@ -165,11 +169,13 @@ class LiteLLMBackend:
         # Check for known patterns
         for pattern, provider in provider_map.items():
             if model_lower.startswith(pattern):
-                return f"{provider}{resolved_model}"
+                result = f"openai/{provider}/{resolved_model}"
+                print(f"DEBUG litellm: Detected provider '{provider}', returning: {result}")
+                return result
         
-        # Default: assume OpenAI-compatible local model
-        result = f"openai/{resolved_model}"
-        print(f"DEBUG litellm: Using default provider, returning: {result}")
+        # Default: use "coderai" as provider for unknown models
+        result = f"openai/coderai/{resolved_model}"
+        print(f"DEBUG litellm: Unknown provider, using 'coderai', returning: {result}")
         return result
     
     def _resolve_model_alias(self, model: str) -> str:
