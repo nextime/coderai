@@ -1369,14 +1369,15 @@ class VulkanBackend(ModelBackend):
             print(f"DEBUG: Could not initialize chat template detection: {e}")
             self.chat_template = None
     
-    def _load_huggingface_tokenizer(self):
-        """Load HuggingFace tokenizer for apply_chat_template support."""
+    def _load_huggingface_tokenizer(self, template_name: str = None):
+        """Load HuggingFace tokenizer for apply_chat_template support.
+        
+        Args:
+            template_name: Optional specific template to use (e.g., 'llama3', 'chatml'). 
+                          If None, will auto-detect from tokenizer.
+        """
         if self.hf_tokenizer is not None:
             return  # Already loaded
-        
-        hf_chat_template = getattr(global_args, 'hf_chat_template', False)
-        if not hf_chat_template:
-            return
         
         model_path = getattr(self, 'model_name', None)
         if not model_path:
@@ -1385,6 +1386,13 @@ class VulkanBackend(ModelBackend):
         
         try:
             from transformers import AutoTokenizer
+            
+            # If a specific template is provided, we can use it directly without loading tokenizer
+            if template_name:
+                self.chat_template = template_name
+                print(f"DEBUG: Using specified chat template: {template_name}")
+                # Still need to load tokenizer to get the actual template
+                # but we can use the specified template name
             
             # Try to determine the model identifier
             # If model_path is a GGUF file, try to find the corresponding HF model
@@ -1400,7 +1408,8 @@ class VulkanBackend(ModelBackend):
                     # Load from local directory
                     self.hf_tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
                     print(f"DEBUG: Loaded HuggingFace tokenizer from local: {model_dir}")
-                    self.chat_template = "hf_local"
+                    if not template_name:
+                        self.chat_template = "hf_local"
                     return
                 
                 # Try to infer model name from file name
@@ -1414,7 +1423,8 @@ class VulkanBackend(ModelBackend):
                 try:
                     self.hf_tokenizer = AutoTokenizer.from_pretrained(model_base, trust_remote_code=True)
                     print(f"DEBUG: Loaded HuggingFace tokenizer from hub: {model_base}")
-                    self.chat_template = "hf_hub"
+                    if not template_name:
+                        self.chat_template = "hf_hub"
                     return
                 except Exception as hub_err:
                     print(f"DEBUG: Could not load tokenizer from hub ({model_base}): {hub_err}")
@@ -1422,9 +1432,10 @@ class VulkanBackend(ModelBackend):
                 # Not a GGUF file, try to load directly
                 self.hf_tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
                 print(f"DEBUG: Loaded HuggingFace tokenizer from: {model_path}")
-                self.chat_template = "hf"
+                if not template_name:
+                    self.chat_template = "hf"
                 return
-                
+                    
         except ImportError as e:
             print(f"DEBUG: transformers not installed, cannot use HuggingFace chat template: {e}")
             self.chat_template = None
@@ -1443,8 +1454,9 @@ class VulkanBackend(ModelBackend):
         if model_name.startswith("image:"):
             model_type = "image"
         
-        if check_hf_chat_template(model_type, model_name):
-            self._load_huggingface_tokenizer()
+        should_use, template_name = check_hf_chat_template(model_type, model_name)
+        if should_use:
+            self._load_huggingface_tokenizer(template_name)
             return
         
         try:
@@ -3120,66 +3132,87 @@ def check_single_filter(filter_spec: str, filter_type: str, model_type: str, mod
         return filter_spec == 'all' or filter_spec == filter_type
 
 
-def check_hf_chat_template(model_type: str = "text", model_name: str = None) -> bool:
+def check_hf_chat_template(model_type: str = "text", model_name: str = None) -> tuple:
     """
     Check if HuggingFace chat template should be used for the model.
+    Returns a tuple (should_use, template_name) where template_name is the template to use or None for auto-detect.
     
     Args:
         model_type: The model type ('text', 'image', etc.)
         model_name: The specific model name (optional)
     
     Returns:
-        True if HF chat template should be used, False otherwise.
+        Tuple of (should_use: bool, template_name: str or None)
+        template_name is None means auto-detect from tokenizer
     
     Syntax:
         # Auto-detect and apply to all text models
         --hf-chat-template auto
         
-        # Apply to all text models
+        # Apply to all text models with auto-detect
         --hf-chat-template text
         
-        # Apply to specific model
+        # Apply to specific model with auto-detect
         --hf-chat-template text:llama-3.1
-        --hf-chat-template image:sd-xl
         
-        # Multiple models
-        --hf-chat-template text:llama-3.1 --hf-chat-template text:phi-3
+        # Apply to specific model with specific template
+        --hf-chat-template "llama-3.1:llama3"
+        --hf-chat-template "phi-3:chatml"
+        
+        # Image models
+        --hf-chat-template image:sd-xl
+        --hf-chat-template "sd-xl:sdxl"
     """
     hf_chat_template = getattr(global_args, 'hf_chat_template', []) or []
     
     # If empty list, HF chat template is not enabled
     if not hf_chat_template:
-        return False
+        return (False, None)
     
     for spec in hf_chat_template:
         # Handle auto-detect - try to load HF tokenizer and auto-detect template
         if spec == 'auto' or spec == '':
             # Applies to all models when using 'auto'
-            return True
+            return (True, None)
         
-        if ':' in spec:
-            # Format: text:model_name or image:model_name
-            parts = spec.split(':')
-            spec_model_type = parts[0]
-            spec_model_name = parts[1] if len(parts) > 1 else None
+        # Check if this spec has a template specified after the model name
+        # Format: "model_name:template_name" or "type:model_name:template_name"
+        parts = spec.split(':')
+        
+        if len(parts) == 1:
+            # Just a type or single value
+            spec_val = parts[0]
+            if spec_val == model_type or spec_val == '*':
+                return (True, None)
+            # Check if it matches the model name directly (when model_type is part of the name)
+            if model_name and (spec_val in model_name or model_name in spec_val):
+                return (True, None)
+        elif len(parts) == 2:
+            # Format: "type:model_name" or "model_name:template"
+            spec_type = parts[0]
+            spec_model = parts[1]
             
-            # Check if model type matches
-            if spec_model_type != model_type and spec_model_type != '*':
-                continue
+            # Check if it's "text" or "image" type
+            if spec_type in ('text', 'image', '*'):
+                if spec_type == model_type or spec_type == '*':
+                    # Check if model name matches
+                    if spec_model == model_name or spec_model == '*':
+                        return (True, None)
+            else:
+                # It's "model_name:template" format
+                if model_name and (spec_model in model_name or model_name in spec_model):
+                    return (True, spec_type)  # spec_type is actually the template!
+        elif len(parts) == 3:
+            # Format: "type:model_name:template"
+            spec_type = parts[0]
+            spec_model = parts[1]
+            spec_template = parts[2]
             
-            # If no specific model name, applies to all of this type
-            if spec_model_name is None or spec_model_name == '':
-                return True
-            
-            # If specific model name, check for match
-            if spec_model_name == model_name:
-                return True
-        else:
-            # Just a type like "text" or "image" - applies to all of that type
-            if spec == model_type or spec == '*':
-                return True
+            if spec_type == model_type or spec_type == '*':
+                if spec_model == model_name or spec_model == '*':
+                    return (True, spec_template)
     
-    return False
+    return (False, None)
 
 # Global system prompt (set via --system-prompt flag)
 # None = don't inject, True = use default, string = use custom text
