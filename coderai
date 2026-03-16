@@ -2622,6 +2622,15 @@ class MultiModelManager:
         self.current_model_key: Optional[str] = None
         # Configuration for each model type
         self.config: Dict[str, Dict] = {}
+        # Load mode settings
+        self.load_mode: str = "ondemand"  # "ondemand", "loadall", "loadswap"
+        self.active_in_vram: Optional[str] = None  # Which model is currently in VRAM
+        # Model aliases: alias -> actual model name mapping
+        self.model_aliases: Dict[str, str] = {}
+        # Whisper server manager
+        self.whisper_server: Optional[WhisperServerManager] = None
+        # Track backend type for each model (needed for on-demand loading)
+        self.model_backend_types: Dict[str, str] = {}
     
     def _aggressive_vram_cleanup(self, model_manager):
         """
