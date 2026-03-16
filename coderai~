@@ -3501,51 +3501,6 @@ model_manager = ModelManager()
 # Global args for access in endpoints
 global_args = None
 
-# Global force reasoning list - models to force thinking mode for
-global_force_reasoning = []
-
-
-def check_force_reasoning(model_name: str = None) -> bool:
-    """
-    Check if thinking/reasoning should be forced for a specific model.
-    
-    Args:
-        model_name: The model name to check (optional - uses global_args if not provided)
-    
-    Returns:
-        True if reasoning should be forced for this model
-    
-    Usage:
-        # From CLI: --force-reasoning qwen3 qwq deepseek-r1
-        # Will match if model name contains any of these strings (case-insensitive)
-    """
-    global global_force_reasoning, global_args
-    
-    # Get force_reasoning list from args if not already stored globally
-    if not global_force_reasoning and global_args:
-        global_force_reasoning = getattr(global_args, 'force_reasoning', []) or []
-    
-    if not global_force_reasoning:
-        return False
-    
-    # If model_name not provided, try to get from global_args
-    if model_name is None and global_args:
-        model_name = getattr(global_args, 'model', None)
-        if isinstance(model_name, list) and model_name:
-            model_name = model_name[0]
-    
-    if not model_name:
-        return False
-    
-    model_name_lower = model_name.lower()
-    
-    # Check if any force_reasoning pattern matches the model name
-    for pattern in global_force_reasoning:
-        if pattern.lower() in model_name_lower:
-            return True
-    
-    return False
-
 
 def check_reply_filter(filter_type: str, model_type: str = "text", model_name: str = None) -> bool:
     """
@@ -5719,32 +5674,23 @@ async def stream_chat_response(
             # Explicitly flush to ensure data is sent immediately
             await asyncio.sleep(0)
         
-         print(f"DEBUG: stream_chat_response completed, {chunk_count} chunks, generated_text length: {len(generated_text)}")
-         if not generated_text.strip():
-             print(f"DEBUG: Warning - no content generated!")
-         
-         # In debug mode, dump the full generated text
-         if global_debug:
-             print(f"\n{'='*80}")
-             print(f"=== FULL GENERATED TEXT (DEBUG) ===")
-             print(f"{'='*80}")
-             # Show both raw (actual) content and escaped representation
-             print(f"--- RAW CONTENT (actual newlines shown as lines) ---")
-             print(generated_text)
-             print(f"--- END RAW CONTENT ---")
-             print(f"--- ESCAPED CONTENT (repr() - shows \\n for newlines) ---")
-             print(repr(generated_text))
-             print(f"--- END ESCAPED CONTENT ---")
-             print(f"{'='*80}\n")
-         
-         # Extract reasoning content if using QwenParser and reasoning is forced
-         reasoning_content = ""
-         if check_force_reasoning(model_name) and hasattr(tool_parser, 'reasoning_content'):
-             reasoning_content = tool_parser.reasoning_content
-             # Prepend reasoning content to generated text if we have reasoning content
-             if reasoning_content:
-                 generated_text = reasoning_content + "\n\n" + generated_text
-                 print(f"DEBUG: Prepended reasoning content (length: {len(reasoning_content)}) to generated text")
+        print(f"DEBUG: stream_chat_response completed, {chunk_count} chunks, generated_text length: {len(generated_text)}")
+        if not generated_text.strip():
+            print(f"DEBUG: Warning - no content generated!")
+        
+        # In debug mode, dump the full generated text
+        if global_debug:
+            print(f"\n{'='*80}")
+            print(f"=== FULL GENERATED TEXT (DEBUG) ===")
+            print(f"{'='*80}")
+            # Show both raw (actual) content and escaped representation
+            print(f"--- RAW CONTENT (actual newlines shown as lines) ---")
+            print(generated_text)
+            print(f"--- END RAW CONTENT ---")
+            print(f"--- ESCAPED CONTENT (repr() - shows \\n for newlines) ---")
+            print(repr(generated_text))
+            print(f"--- END ESCAPED CONTENT ---")
+            print(f"{'='*80}\n")
         
         # Check for tool calls in complete output (for API response format)
         if tools:
@@ -5908,13 +5854,8 @@ async def generate_chat_response(
         
         response_message = {
             "role": "assistant",
+            "content": generated_text,
         }
-        
-        # Add reasoning content if available
-        if check_force_reasoning(model_name) and hasattr(tool_parser, 'reasoning_content'):
-            reasoning_content = tool_parser.reasoning_content
-            if reasoning_content:
-                response_message["reasoning"] = reasoning_content
         
         finish_reason = "stop"
         
@@ -6495,13 +6436,6 @@ def parse_args():
         type=str,
         default=None,
         help="Path to store generated files (images, audio). If specified, files will be saved here and served over web.",
-    )
-    parser.add_argument(
-        "--force-reasoning",
-        type=str,
-        nargs="+",
-        default=[],
-        help="Force thinking/reasoning mode for specific models. Usage: --force-reasoning qwen3 qwq deepseek-r1"
     )
     parser.add_argument(
         "--parser",

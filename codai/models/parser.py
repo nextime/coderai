@@ -117,6 +117,10 @@ class BaseParser:
 # 1. QWEN PARSER (Instruct & Coder Style)
 # 1. QWEN PARSER (Instruct & Coder Style)
 class QwenParser(BaseParser):
+    def __init__(self, tools: Dict[str, Any] = None):
+        super().__init__(tools)
+        self.reasoning_content = ""
+        
     @validate_tool_output
     def parse(self, text: str) -> List[Dict]:
         # 1. IMMEDIATE REPETITION GUARD
@@ -129,8 +133,32 @@ class QwenParser(BaseParser):
 
         results = []
 
-        # 2. Pre-cleaning (Think tags, system markers, and special tokens)
-        clean_text = re.sub(r'<\|.*?\|>|<(?:thought|think)>.*?((?:</(?:thought|think)>)|$)', '', text, flags=re.DOTALL | re.IGNORECASE)
+        # 2. Pre-cleaning (Extract thinking/reasoning content, then remove for tool parsing)
+        # Extract thinking content before removing it
+        # Enhanced pattern to capture various thinking tag formats
+        thinking_pattern = r'<\|.*?\|>|<(?:thought|think)>.*?((?:</(?:thought|think)>)|$)|<\|begin.*?\|><\|end.*?\|>'
+        thinking_matches = re.findall(thinking_pattern, text, flags=re.DOTALL | re.IGNORECASE)
+        if thinking_matches:
+            # Extract the actual thinking content from matches
+            thinking_content_parts = []
+            for match in thinking_matches:
+                if isinstance(match, tuple):
+                    # Handle tuple matches from regex groups
+                    if match[0]:  # First group contains the content
+                        thinking_content_parts.append(match[0])
+                    elif len(match) > 1 and match[1]:  # Second group might contain content
+                        thinking_content_parts.append(match[1])
+                else:
+                    # Direct string match
+                    thinking_content_parts.append(match)
+            
+            # Join all thinking matches with newlines, filtering out empty strings
+            self.reasoning_content = '\n'.join([part.strip() for part in thinking_content_parts if part and part.strip()])
+        else:
+            self.reasoning_content = ""
+            
+        # Remove thinking tags from text for tool call parsing
+        clean_text = re.sub(thinking_pattern, '', text, flags=re.DOTALL | re.IGNORECASE)
 
         # 3. FLEXIBLE TAG MATCHING
         # Matches <tool>, <tool_call>, or even just { "name": ... } if tags are missing
@@ -480,7 +508,7 @@ class OpenAIFormatter:
         self.model_name = model_name
         self.id = f"chatcmpl-{uuid.uuid4()}"
 
-    def format_full(self, text, prompt_tokens, completion_tokens, tool_calls=None):
+    def format_full(self, text, prompt_tokens, completion_tokens, tool_calls=None, reasoning=None):
         """Standard Response (Non-Streaming)"""
         if LITELLM_AVAILABLE and all([ModelResponse, Choices, Message, Usage]):
             try:
@@ -508,6 +536,8 @@ class OpenAIFormatter:
             "role": "assistant",
             "content": text if not tool_calls else None,
         }
+        if reasoning:
+            message["reasoning"] = reasoning
         if tool_calls:
             message["tool_calls"] = tool_calls
         
