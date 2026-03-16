@@ -77,7 +77,9 @@ class LiteLLMBackend:
             model_manager: Reference to MultiModelManager for resolving aliases
         """
         self.model = model
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        # Use provided API key, or generate a fake one if not provided
+        # This allows litellm to proceed without requiring an API key
+        self.api_key = api_key if api_key else "fake-key-for-local-testing"
         self.base_url = base_url
         self.context_window = context_window
         self.model_manager = model_manager
