@@ -19,6 +19,13 @@ try:
     litellm.custom_provider_map = [
         {"provider": "coderai", "custom_handler": litellm.openai}
     ]
+    
+    # Register 'coderai' as an alias for the 'openai' provider
+    # This allows LiteLLM to use its internal HTTP handler for custom providers
+    # by mapping them to the 'openai' provider behavior
+    litellm.custom_provider_map = [
+        {"provider": "coderai", "custom_handler": litellm.openai}
+    ]
     from litellm import acompletion, completion
     from litellm.exceptions import (
         AuthenticationError,
