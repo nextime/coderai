@@ -1384,6 +1384,13 @@ class VulkanBackend(ModelBackend):
             print("DEBUG: No model name available for HuggingFace tokenizer")
             return
         
+        # If model_path is a URL, try to get the cached local path first
+        if model_path.startswith('http://') or model_path.startswith('https://'):
+            cached_path = get_cached_model_path(model_path)
+            if cached_path and os.path.exists(cached_path):
+                model_path = cached_path
+                print(f"DEBUG: Using cached model path for HF tokenizer: {model_path}")
+        
         try:
             from transformers import AutoTokenizer
             
