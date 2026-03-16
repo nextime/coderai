@@ -5271,13 +5271,87 @@ async def stream_chat_response(
                         "index": 0,
                         "delta": {"tool_calls": tool_calls},
                         "finish_reason": "tool_calls",
+                        "logprobs": None,
+                        "native_finish_reason": "tool_calls",
                     }],
                 }
                 yield f"data: {json.dumps(data)}\n\n"
             else:
-                yield f"data: {json.dumps({'choices': [{'finish_reason': 'stop'}]})}\n\n"
+                # Calculate token counts for usage in final chunk
+                prompt_text = "\n".join([m.get("content", "") for m in messages])
+                prompt_tokens = len(prompt_text.split())
+                completion_tokens = len(generated_text.split()) if generated_text else 0
+                
+                # Build complete final chunk with all OpenAI fields
+                final_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "logprobs": None,
+                        "native_finish_reason": "stop",
+                    }],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens,
+                        "prompt_tokens_details": {
+                            "cached_tokens": 0,
+                            "audio_tokens": 0,
+                        },
+                        "completion_tokens_details": {
+                            "reasoning_tokens": 0,
+                            "audio_tokens": 0,
+                        },
+                    },
+                    "provider": {
+                        "provider_name": "coderai",
+                        "provider_id": "coderai",
+                    },
+                    "system_fingerprint": None,
+                }
+                yield f"data: {json.dumps(final_chunk)}\n\n"
         else:
-            yield f"data: {json.dumps({'choices': [{'finish_reason': 'stop'}]})}\n\n"
+            # Calculate token counts for usage in final chunk
+            prompt_text = "\n".join([m.get("content", "") for m in messages])
+            prompt_tokens = len(prompt_text.split())
+            completion_tokens = len(generated_text.split()) if generated_text else 0
+            
+            # Build complete final chunk with all OpenAI fields
+            final_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "logprobs": None,
+                    "native_finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 0,
+                        "audio_tokens": 0,
+                    },
+                    "completion_tokens_details": {
+                        "reasoning_tokens": 0,
+                        "audio_tokens": 0,
+                    },
+                },
+                "provider": {
+                    "provider_name": "coderai",
+                    "provider_id": "coderai",
+                },
+                "system_fingerprint": None,
+            }
+            yield f"data: {json.dumps(final_chunk)}\n\n"
         
         yield "data: [DONE]\n\n"
     except Exception as e:
@@ -5362,21 +5436,55 @@ async def generate_chat_response(
         prompt_tokens = len(prompt_text.split())
         completion_tokens = len(generated_text.split()) if generated_text else 0
         
+        # Build complete OpenAI-compatible response with all standard fields
+        # Provider info
+        provider = {
+            "provider_name": "coderai",
+            "provider_id": "coderai",
+        }
+        
+        # Build choices with all OpenAI fields
+        choice = {
+            "index": 0,
+            "message": response_message,
+            "finish_reason": finish_reason,
+        }
+        
+        # Add logprobs (null since we don't have token-level probabilities)
+        choice["logprobs"] = None
+        
+        # Add native_finish_reason (same as finish_reason for our purposes)
+        choice["native_finish_reason"] = finish_reason
+        
+        # Build detailed usage information
+        usage_details = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        
+        # Add prompt_tokens_details (breakdown of prompt tokens)
+        usage_details["prompt_tokens_details"] = {
+            "cached_tokens": 0,
+            "audio_tokens": 0,
+        }
+        
+        # Add completion_tokens_details (breakdown of completion tokens)
+        usage_details["completion_tokens_details"] = {
+            "reasoning_tokens": 0,
+            "audio_tokens": 0,
+        }
+        
         return {
             "id": completion_id,
             "object": "chat.completion",
             "created": created,
             "model": model_name,
-            "choices": [{
-                "index": 0,
-                "message": response_message,
-                "finish_reason": finish_reason,
-            }],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
+            "choices": [choice],
+            "usage": usage_details,
+            # Additional OpenAI-compatible fields
+            "provider": provider,
+            "system_fingerprint": None,
         }
     except Exception as e:
         print(f"Error during generation: {e}")
