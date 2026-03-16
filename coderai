@@ -23,7 +23,7 @@ from typing import AsyncGenerator, Dict, List, Optional, Union
 
 import psutil
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from pydantic import BaseModel, Field, validator, field_validator, ConfigDict
 from pydantic_core import PydanticCustomError
 from threading import Thread
@@ -5292,7 +5292,6 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         try:
             if request.stream:
                 # Streaming response
-                from fastapi.responses import StreamingResponse
                 
                 async def generate():
                     try:
@@ -5373,8 +5372,6 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                         completion_tokens=response.get('usage', {}).get('completion_tokens', 0)
                     )
                 
-                from fastapi.responses import JSONResponse
-                return JSONResponse(content=response, headers=headers)
                 
         except Exception as e:
             # Handle litellm errors
