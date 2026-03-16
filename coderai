@@ -822,6 +822,10 @@ class ModelParserAdapter:
         if not text:
             return text
         
+        # Remove Qwen format: <tool=func_name>...</tool_call> and <tool=func_name>...</tool>
+        text = re.sub(r'<tool=[^>]+>.*?</tool_call>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<tool=[^>]+>.*?</tool>', '', text, flags=re.DOTALL)
+        
         # Remove <tool>...</tool> and <function>...</function> patterns
         text = re.sub(r'<tool>.*?</tool>', '', text, flags=re.DOTALL)
         text = re.sub(r'<function>.*?</function>', '', text, flags=re.DOTALL)
