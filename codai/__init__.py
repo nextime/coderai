@@ -17,12 +17,6 @@ from .models.parser import (
 from .models.templates import AgenticTemplateManager
 
 # OpenAI-compatible backends
-from .openai.litellm import (
-    LiteLLMBackend,
-    get_litellm_backend,
-    set_litellm_backend,
-    LITELLM_AVAILABLE,
-)
 
 __all__ = [
     'ModelParserDispatcher',
@@ -38,8 +32,4 @@ __all__ = [
     'PhiParser',
     'ApexBig50Parser',
     'AgenticTemplateManager',
-    'LiteLLMBackend',
-    'get_litellm_backend',
-    'set_litellm_backend',
-    'LITELLM_AVAILABLE',
 ]
