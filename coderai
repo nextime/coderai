@@ -1489,33 +1489,23 @@ class VulkanBackend(ModelBackend):
                 elif 'mistral' in model_base_lower or 'mixtral' in model_base_lower:
                     known_templates_to_try = ['mistral', None]
                 
-                # Try each known template
+                # Try each known template - directly use the template name without loading tokenizer
+                # This is the key fix: instead of trying to load more non-existent tokenizers,
+                # directly set the chat_template to the known template name
                 for template_name in known_templates_to_try:
                     if template_name is None:
-                        # No more templates to try, use manual formatting
+                        # No more templates to try, use manual formatting with generic format
+                        self.chat_template = "chatml"  # Use ChatML as generic fallback
+                        print(f"DEBUG: No known templates worked, using generic ChatML format")
                         break
-                    try:
-                        # Try to get the chat template from transformers
-                        from transformers import AutoTokenizer
-                        # Try loading tokenizer with the base model name
-                        self.hf_tokenizer = AutoTokenizer.from_pretrained(model_base, trust_remote_code=True)
-                        # Check if the tokenizer has the chat template
-                        if hasattr(self.hf_tokenizer, 'chat_template') and self.hf_tokenizer.chat_template:
-                            # Try to apply the template to see if it works
-                            test_messages = [{"role": "user", "content": "test"}]
-                            try:
-                                self.hf_tokenizer.apply_chat_template(test_messages, tokenize=False)
-                                print(f"DEBUG: Using known template '{template_name}' for model '{model_base}'")
-                                self.chat_template = template_name
-                                tokenizer_loaded = True
-                                break
-                            except Exception:
-                                # Template doesn't work, continue to next
-                                pass
-                    except Exception:
-                        continue
+                    # Directly use this known template name - no need to load tokenizer
+                    # The manual formatting will use <|im_start|> tags which work for most models
+                    self.chat_template = template_name
+                    print(f"DEBUG: Using known template '{template_name}' for model family detection")
+                    # Successfully set template - don't try to load tokenizer
+                    break
                 
-                if tokenizer_loaded:
+                if self.chat_template:
                     return
                 
                 # All attempts failed - warn but continue without template
@@ -2028,7 +2018,9 @@ class VulkanBackend(ModelBackend):
         
         # Check if we should use manual formatting based on detected template
         # Always use manual formatting when tools are present, since Jinja templates often fail with tool messages
+        # Also use manual formatting when we have a known template but no HuggingFace tokenizer
         use_manual = self.chat_template in ("unknown", "jinja_fallback", None) or tools is not None
+        use_manual = use_manual or (self.chat_template is not None and self.hf_tokenizer is None)
         use_hf = self.hf_tokenizer is not None
         
         if use_hf:
@@ -2099,7 +2091,9 @@ class VulkanBackend(ModelBackend):
         
         # Check if we should use manual formatting based on detected template
         # Always use manual formatting when tools are present, since Jinja templates often fail with tool messages
+        # Also use manual formatting when we have a known template but no HuggingFace tokenizer
         use_manual = self.chat_template in ("unknown", "jinja_fallback", None) or tools is not None
+        use_manual = use_manual or (self.chat_template is not None and self.hf_tokenizer is None)
         use_hf = self.hf_tokenizer is not None
         
         if use_hf:
