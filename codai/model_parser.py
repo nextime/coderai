@@ -98,6 +98,8 @@ class QwenParser(BaseParser):
         
         # Clean text first
         clean_text = re.sub(r'<\|.*?\|>', '', text)
+        print(f"DEBUG QwenParser: Input text length = {len(text)}")
+        print(f"DEBUG QwenParser: Cleaned text: {repr(clean_text[:200])}")
         # Use raw string for regex with special tokens
         think_pattern = r'<think>.*?</think>'
         clean_text = re.sub(think_pattern, '', clean_text, flags=re.DOTALL)
