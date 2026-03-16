@@ -80,7 +80,14 @@ class BaseParser:
                 args = json.loads(args)
             except:
                 args = {}
-        return {"name": name, "arguments": args}
+        # Return in OpenAI format with 'function' key
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(args) if isinstance(args, dict) else args
+            }
+        }
 
 
 # 1. QWEN PARSER (Instruct & Coder Style)
