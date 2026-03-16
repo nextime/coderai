@@ -5167,7 +5167,7 @@ async def create_speech(request: TTSRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"TTS error: {str(e)}")
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
+async def chat_completions(request: ChatCompletionRequest, http_request: Request = None):
     """Chat completions endpoint with streaming and tool support."""
     
     # Check if we should use litellm backend
@@ -5183,9 +5183,30 @@ async def chat_completions(request: ChatCompletionRequest):
                 detail="LiteLLM is not installed. Run: pip install litellm"
             )
         
+        # Check for API key in request - litellm requires an API key
+        # If not provided, use a fake key to allow the request to proceed
+        api_key = None
+        
+        # Try to get API key from request body
+        if hasattr(request, 'api_key') and request.api_key:
+            api_key = request.api_key
+        
+        # If no API key in body, try to get from Authorization header
+        if not api_key:
+            auth_header = http_request.headers.get('Authorization', '') if http_request else ''
+            if auth_header.startswith('Bearer '):
+                api_key = auth_header[7:]  # Extract token after 'Bearer '
+        
+        # If still no API key, use a fake key to allow litellm to proceed
+        # litellm will then fail with the actual provider error if needed
+        if not api_key:
+            api_key = "fake-key-for-local-testing"
+            print("DEBUG: No API key provided, using fake key for litellm")
+        
         # Get or create litellm backend
         litellm_backend = get_litellm_backend(
             model=request.model,
+            api_key=api_key,
             context_window=8192,  # Default, can be made configurable
             model_manager=multi_model_manager  # Pass for alias resolution
         )
