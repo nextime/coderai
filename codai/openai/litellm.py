@@ -81,7 +81,7 @@ class LiteLLMBackend:
         self.model = model
         # Use provided API key, or generate a fake one if not provided
         # This allows litellm to proceed without requiring an API key
-        self.api_key = api_key if api_key else "fake-key-for-local-testing"
+        self.api_key = api_key if api_key else "sk-fakekey"
         self.base_url = base_url or api_base  # Use either base_url or api_base
         self.context_window = context_window
         self.model_manager = model_manager
