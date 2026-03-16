@@ -2682,9 +2682,9 @@ class MultiModelManager:
                             self._aggressive_vram_cleanup(model_to_cleanup)
                         del self.models[key]
                 
-                # Add a longer delay to allow VRAM to be freed (Vulkan needs more time)
+                # Add delay to allow VRAM to be freed
                 import time
-                time.sleep(5)
+                time.sleep(2)
                 
                 # Now try to reload the default model
                 try:
@@ -2821,7 +2821,7 @@ class MultiModelManager:
         
         # Add a longer delay to allow VRAM to be freed (Vulkan needs more time)
         import time
-        time.sleep(5)
+        time.sleep(2)
         
         # Check if requested model is already loaded - if so, reuse it
         if requested_model in self.models:
