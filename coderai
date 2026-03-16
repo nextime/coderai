@@ -1468,6 +1468,56 @@ class VulkanBackend(ModelBackend):
                 if tokenizer_loaded:
                     return
                 
+                # If HF tokenizer loading failed, try to use known template names based on model name
+                # This helps when we can't find the tokenizer but know the model family
+                model_base_lower = model_base.lower()
+                
+                # Check if this looks like a Qwen model
+                known_templates_to_try = []
+                if 'qwen' in model_base_lower:
+                    # Try known Qwen template names in order of specificity
+                    if 'qwen3.5' in model_base_lower or 'qwen3' in model_base_lower:
+                        known_templates_to_try = ['qwen3', 'qwen', None]  # None means use manual formatting
+                    elif 'qwen2' in model_base_lower:
+                        known_templates_to_try = ['qwen2', 'qwen', None]
+                    else:
+                        known_templates_to_try = ['qwen', None]
+                elif 'llama' in model_base_lower:
+                    known_templates_to_try = ['llama3', 'llama', None]
+                elif 'phi' in model_base_lower:
+                    known_templates_to_try = ['phi', None]
+                elif 'mistral' in model_base_lower or 'mixtral' in model_base_lower:
+                    known_templates_to_try = ['mistral', None]
+                
+                # Try each known template
+                for template_name in known_templates_to_try:
+                    if template_name is None:
+                        # No more templates to try, use manual formatting
+                        break
+                    try:
+                        # Try to get the chat template from transformers
+                        from transformers import AutoTokenizer
+                        # Try loading tokenizer with the base model name
+                        self.hf_tokenizer = AutoTokenizer.from_pretrained(model_base, trust_remote_code=True)
+                        # Check if the tokenizer has the chat template
+                        if hasattr(self.hf_tokenizer, 'chat_template') and self.hf_tokenizer.chat_template:
+                            # Try to apply the template to see if it works
+                            test_messages = [{"role": "user", "content": "test"}]
+                            try:
+                                self.hf_tokenizer.apply_chat_template(test_messages, tokenize=False)
+                                print(f"DEBUG: Using known template '{template_name}' for model '{model_base}'")
+                                self.chat_template = template_name
+                                tokenizer_loaded = True
+                                break
+                            except Exception:
+                                # Template doesn't work, continue to next
+                                pass
+                    except Exception:
+                        continue
+                
+                if tokenizer_loaded:
+                    return
+                
                 # All attempts failed - warn but continue without template
                 print(f"Warning: Could not load HuggingFace tokenizer for any variant of '{model_base}'")
                 print(f"Warning: Will not use apply_chat_template - model will use manual formatting")
