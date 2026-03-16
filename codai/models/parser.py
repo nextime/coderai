@@ -89,73 +89,74 @@ class BaseParser:
             }
         }
 
+    def _clean_json_string(self, text: str) -> str:
+        """Clean JSON string by removing markdown code fences and extra whitespace."""
+        # Remove markdown code fences
+        text = re.sub(r'^```json\s*', '', text.strip())
+        text = re.sub(r'^```\s*', '', text)
+        text = re.sub(r'\s*```$', '', text)
+        # Remove any leading/trailing whitespace
+        return text.strip()
 
-# 1. QWEN PARSER (Instruct & Coder Style)
 class QwenParser(BaseParser):
     @validate_tool_output
     def parse(self, text: str) -> List[Dict]:
         results = []
         
-        # Clean text first
-        clean_text = re.sub(r'<\|.*?\|>', '', text)
-        print(f"DEBUG QwenParser: Input text length = {len(text)}")
-        print(f"DEBUG QwenParser: Cleaned text: {repr(clean_text[:200])}")
-        # Use raw string for regex with special tokens
-        think_pattern = r'<think>.*?</think>'
-        clean_text = re.sub(think_pattern, '', clean_text, flags=re.DOTALL)
+        # Remove thinking blocks if present
+        think_pattern = r'<\/?think>(.*?)<\/?think>'
+        clean_text = re.sub(think_pattern, '', text, flags=re.DOTALL)
         
-        # INSTRUCT STYLE: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
-        instruct_matches = re.findall(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', clean_text, re.DOTALL)
-        for match in instruct_matches:
-            try:
-                data = json.loads(match.strip())
-                if 'name' in data and 'arguments' in data:
-                    results.append(self._to_oa(data['name'], data['arguments']))
-            except:
+        # 1. Qwen format: <tool=func_name> or <tool=func_name/>
+        # Match <tool=func_name>...</tool> or <tool=func_name/>
+        qwen_blocks = re.findall(r'<tool=([^>]+)>\s*(.*?)\s*</tool>', clean_text, re.DOTALL)
+        for func_name, body in qwen_blocks:
+            if not func_name.strip():
                 continue
+            params = re.findall(r'<parameter=([^>]+)>(.*?)</parameter>', body, re.DOTALL)
+            args = {}
+            for k, v in params:
+                val = v.strip()
+                try:
+                    args[k.strip()] = json.loads(val)
+                except:
+                    args[k.strip()] = val
+            results.append(self._to_oa(func_name.strip(), args))
         
-        # CODER STYLE: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
-        # Also handle: <tool=func_name><parameter=key>value</parameter></tool_call>
+        # 2. Try Instruct Style (JSON) first
+        # Matches <tool_call> or ]~b] regardless of case/hyphens
+        json_blocks = re.findall(r'<(?:tool[_-]?call|function_call|call)>(.*?)</(?:tool[_-]?call|function_call|call)>', clean_text, re.IGNORECASE | re.DOTALL)
+        
+        for block in json_blocks:
+            try:
+                content = self._clean_json_string(block)
+                data = json.loads(content)
+                if 'name' in data:
+                    results.append(self._to_oa(data['name'], data.get('arguments', {})))
+            except json.JSONDecodeError:
+                continue
+
+        # 3. Fallback: Coder Style / Parameter Tags
         if not results:
-            # Try with <tool_call> wrapper first
-            coder_blocks = re.findall(r'<tool_call>\s*(.*?)\s*</tool_call>', clean_text, re.DOTALL)
-            if not coder_blocks:
-                # Try direct <tool=func_name> format (with </tool> or </tool_call> closing)
-                coder_blocks = re.findall(r'(<tool=[^>]+>.*?</tool_call>)', clean_text, re.DOTALL)
-            if not coder_blocks:
-                coder_blocks = re.findall(r'(<tool=[^>]+>.*?</tool>)', clean_text, re.DOTALL)
-            if not coder_blocks:
-                # Try <function=func_name> format without wrapper
-                coder_blocks = re.findall(r'(<function=.*?</function>)', clean_text, re.DOTALL)
+            tag_pattern = r'<(?:tool|function)=([^>]+)>(.*?)(?:</(?:tool|function|tool_call)>|$)'
+            matches = re.finditer(tag_pattern, clean_text, re.DOTALL | re.IGNORECASE)
             
-            for block in coder_blocks:
-                # Try to extract function name from different formats
-                func_name = None
+            for match in matches:
+                func_name = match.group(1).strip()
+                body = match.group(2)
                 
-                # Format 1: <function=name>...</function>
-                func_name_match = re.search(r'<function=([^>]+)>', block)
-                if func_name_match:
-                    func_name = func_name_match.group(1).strip()
+                params = re.findall(r'<parameter=([^>]+)>(.*?)</parameter>', body, re.DOTALL)
+                args = {}
+                for k, v in params:
+                    val = v.strip()
+                    try:
+                        args[k.strip()] = json.loads(val)
+                    except:
+                        args[k.strip()] = val
+                results.append(self._to_oa(func_name, args))
                 
-                # Format 2: <tool=name>...</tool>
-                if not func_name:
-                    func_name_match = re.search(r'<tool=([^>]+)>', block)
-                    if func_name_match:
-                        func_name = func_name_match.group(1).strip()
-                
-                if func_name:
-                    params = re.findall(r'<parameter=([^>]+)>(.*?)</parameter>', block, re.DOTALL)
-                    arguments = {}
-                    for k, v in params:
-                        key = k.strip()
-                        val = v.strip()
-                        try:
-                            arguments[key] = json.loads(val)
-                        except:
-                            arguments[key] = val
-                    results.append(self._to_oa(func_name, arguments))
-        
         return results
+
 
 
 # 2. DEEPSEEK PARSER
