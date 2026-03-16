@@ -133,9 +133,12 @@ class LiteLLMBackend:
                 result = f"openai/{prefix}/{model_part}"
                 print(f"DEBUG litellm: Known provider '{prefix}', returning: {result}")
                 return result
-            # Otherwise, it's likely a HuggingFace org/model path
-            result = f"openai/huggingface/{resolved_model}"
-            print(f"DEBUG litellm: HuggingFace org/model, returning: {result}")
+            # Otherwise, treat the first part as the org/provider name (not default to huggingface)
+            # This allows custom model paths like TeichAI/model-name to work correctly
+            org_name = parts[0]
+            model_part = '/'.join(parts[1:])
+            result = f"openai/{org_name}/{model_part}"
+            print(f"DEBUG litellm: Custom org/model, returning: {result}")
             return result
         
         # No provider prefix - detect provider from model name pattern
