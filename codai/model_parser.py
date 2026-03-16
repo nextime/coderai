@@ -118,7 +118,9 @@ class QwenParser(BaseParser):
             # Try with <tool_call> wrapper first
             coder_blocks = re.findall(r'<tool_call>\s*(.*?)\s*</tool_call>', clean_text, re.DOTALL)
             if not coder_blocks:
-                # Try direct <tool=func_name> format
+                # Try direct <tool=func_name> format (with </tool> or </tool_call> closing)
+                coder_blocks = re.findall(r'(<tool=[^>]+>.*?</tool_call>)', clean_text, re.DOTALL)
+            if not coder_blocks:
                 coder_blocks = re.findall(r'(<tool=[^>]+>.*?</tool>)', clean_text, re.DOTALL)
             if not coder_blocks:
                 # Try <function=func_name> format without wrapper
