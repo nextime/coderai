@@ -113,15 +113,33 @@ class QwenParser(BaseParser):
                 continue
         
         # CODER STYLE: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
+        # Also handle: <tool=func_name><parameter=key>value</parameter></tool_call>
         if not results:
+            # Try with <tool_call> wrapper first
             coder_blocks = re.findall(r'<tool_call>\s*(.*?)\s*</tool_call>', clean_text, re.DOTALL)
             if not coder_blocks:
+                # Try direct <tool=func_name> format
+                coder_blocks = re.findall(r'(<tool=[^>]+>.*?</tool>)', clean_text, re.DOTALL)
+            if not coder_blocks:
+                # Try <function=func_name> format without wrapper
                 coder_blocks = re.findall(r'(<function=.*?</function>)', clean_text, re.DOTALL)
             
             for block in coder_blocks:
+                # Try to extract function name from different formats
+                func_name = None
+                
+                # Format 1: <function=name>...</function>
                 func_name_match = re.search(r'<function=([^>]+)>', block)
                 if func_name_match:
                     func_name = func_name_match.group(1).strip()
+                
+                # Format 2: <tool=name>...</tool>
+                if not func_name:
+                    func_name_match = re.search(r'<tool=([^>]+)>', block)
+                    if func_name_match:
+                        func_name = func_name_match.group(1).strip()
+                
+                if func_name:
                     params = re.findall(r'<parameter=([^>]+)>(.*?)</parameter>', block, re.DOTALL)
                     arguments = {}
                     for k, v in params:
