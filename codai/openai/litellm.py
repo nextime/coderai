@@ -404,11 +404,11 @@ class LiteLLMBackend:
         # Store tool_parser for post-processing
         self.tool_parser = tool_parser
         
-        # For HuggingFace models, set API key to None to skip auth
-        # This allows using HF inference endpoints without authentication
+        # For HuggingFace models, set a fake API key to skip auth
+        # This allows using HF inference endpoints without a real API key
         if use_model and 'huggingface' in use_model.lower():
-            litellm.api_key = None
-            print("DEBUG litellm: HuggingFace model - skipping API key")
+            litellm.api_key = "fake-hf-key"
+            print("DEBUG litellm: HuggingFace model - using fake key")
         
         # Convert tools to coderai schema format if tools provided
         if tools:
