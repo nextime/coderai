@@ -21,21 +21,21 @@ try:
         ContextWindowExceededError,
     )
     LITELLM_AVAILABLE = True
+    
+    # Map litellm exceptions to OpenAI error codes
+    ERROR_CODE_MAP = {
+        AuthenticationError: {"code": 401, "type": "invalid_api_key"},
+        BadRequestError: {"code": 400, "type": "invalid_request_error"},
+        RateLimitError: {"code": 429, "type": "rate_limit_error"},
+        ServiceUnavailableError: {"code": 503, "type": "service_unavailable"},
+        ContextWindowExceededError: {"code": 400, "type": "context_window_exceeded"},
+    }
 except ImportError:
     LITELLM_AVAILABLE = False
     litellm = None
     completion = None
     acompletion = None
-
-
-# Map litellm exceptions to OpenAI error codes
-ERROR_CODE_MAP = {
-    AuthenticationError: {"code": 401, "type": "invalid_api_key"},
-    BadRequestError: {"code": 400, "type": "invalid_request_error"},
-    RateLimitError: {"code": 429, "type": "rate_limit_error"},
-    ServiceUnavailableError: {"code": 503, "type": "service_unavailable"},
-    ContextWindowExceededError: {"code": 400, "type": "context_window_exceeded"},
-}
+    ERROR_CODE_MAP = {}
 
 
 def get_error_response(status_code: int, message: str, error_type: str = "internal_error") -> Dict:
