@@ -1995,10 +1995,23 @@ class VulkanBackend(ModelBackend):
     
     def generate_chat(self, messages: List[Dict], max_tokens: Optional[int] = None,
                       temperature: float = 0.7, top_p: float = 1.0,
-                      stop: Optional[List[str]] = None, tools: Optional[List] = None) -> str:
+                      stop: Optional[List[str]] = None, tools: Optional[List] = None,
+                      response_format: Optional[Dict] = None) -> str:
         """Generate chat completion using llama-cpp's create_chat_completion."""
         if max_tokens is None:
             max_tokens = 512
+        
+        # Handle response_format - extract type if provided
+        # llama.cpp supports response_format={'type': 'json_object'} for JSON mode
+        response_format_param = None
+        if response_format:
+            if isinstance(response_format, dict):
+                response_format_type = response_format.get('type', '')
+                if response_format_type == 'json_object' or response_format_type == 'json':
+                    response_format_param = {"type": "json_object"}
+            elif isinstance(response_format, str):
+                if response_format == 'json_object' or response_format == 'json':
+                    response_format_param = {"type": "json_object"}
         
         # CRITICAL: Ensure NO message has None content - Jinja templates fail on None
         # This is a safety check in case messages bypass the main endpoint validation
@@ -2053,6 +2066,7 @@ class VulkanBackend(ModelBackend):
                 top_p=top_p,
                 stop=stop or [],
                 tools=tools,
+                response_format=response_format_param,
             )
             content = response["choices"][0]["message"].get("content", "")
             print(f"DEBUG: generate_chat returned content length: {len(content) if content else 0}")
@@ -2068,10 +2082,22 @@ class VulkanBackend(ModelBackend):
     
     async def generate_chat_stream(self, messages: List[Dict], max_tokens: Optional[int] = None,
                                     temperature: float = 0.7, top_p: float = 1.0,
-                                    stop: Optional[List[str]] = None, tools: Optional[List] = None) -> AsyncGenerator[str, None]:
+                                    stop: Optional[List[str]] = None, tools: Optional[List] = None,
+                                    response_format: Optional[Dict] = None) -> AsyncGenerator[str, None]:
         """Generate chat completion streaming using llama-cpp."""
         if max_tokens is None:
             max_tokens = 512
+        
+        # Handle response_format - extract type if provided
+        response_format_param = None
+        if response_format:
+            if isinstance(response_format, dict):
+                response_format_type = response_format.get('type', '')
+                if response_format_type == 'json_object' or response_format_type == 'json':
+                    response_format_param = {"type": "json_object"}
+            elif isinstance(response_format, str):
+                if response_format == 'json_object' or response_format == 'json':
+                    response_format_param = {"type": "json_object"}
         
         total_content = ""
         chunk_count = 0
@@ -2139,6 +2165,7 @@ class VulkanBackend(ModelBackend):
                 stop=stop or [],
                 tools=tools,
                 stream=True,
+                response_format=response_format_param,
             )
             print(f"DEBUG: generate_chat_stream: Got stream object: {type(stream)}")
             chunks = []
@@ -2401,13 +2428,14 @@ class ModelManager:
     
     def generate_chat(self, messages: List[Dict], max_tokens: Optional[int] = None,
                       temperature: float = 0.7, top_p: float = 1.0,
-                      stop: Optional[List[str]] = None, tools: Optional[List] = None) -> str:
+                      stop: Optional[List[str]] = None, tools: Optional[List] = None,
+                      response_format: Optional[Dict] = None) -> str:
         """Generate chat completion non-streaming."""
         if self.backend is None:
             raise RuntimeError("No model loaded")
         # Use generate_chat if available (Vulkan backend), otherwise format and use generate
         if hasattr(self.backend, 'generate_chat'):
-            return self.backend.generate_chat(messages, max_tokens, temperature, top_p, stop, tools)
+            return self.backend.generate_chat(messages, max_tokens, temperature, top_p, stop, tools, response_format)
         else:
             # Fallback for NVIDIA backend
             prompt = self.format_messages([ChatMessage(**m) for m in messages])
@@ -2424,13 +2452,14 @@ class ModelManager:
     
     async def generate_chat_stream(self, messages: List[Dict], max_tokens: Optional[int] = None,
                                     temperature: float = 0.7, top_p: float = 1.0,
-                                    stop: Optional[List[str]] = None, tools: Optional[List] = None) -> AsyncGenerator[str, None]:
+                                    stop: Optional[List[str]] = None, tools: Optional[List] = None,
+                                    response_format: Optional[Dict] = None) -> AsyncGenerator[str, None]:
         """Generate chat completion streaming."""
         if self.backend is None:
             raise RuntimeError("No model loaded")
         # Use generate_chat_stream if available (Vulkan backend), otherwise format and use generate_stream
         if hasattr(self.backend, 'generate_chat_stream'):
-            async for chunk in self.backend.generate_chat_stream(messages, max_tokens, temperature, top_p, stop, tools):
+            async for chunk in self.backend.generate_chat_stream(messages, max_tokens, temperature, top_p, stop, tools, response_format):
                 yield chunk
         else:
             # Fallback for NVIDIA backend
@@ -5067,6 +5096,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 tools_dict,
                 current_manager,
                 tool_parser,
+                request.response_format,
             ),
             media_type="text/event-stream",
         )
@@ -5081,6 +5111,7 @@ async def chat_completions(request: ChatCompletionRequest):
             tools_dict,
             current_manager,
             tool_parser,
+            request.response_format,
         )
 
 async def stream_chat_response(
@@ -5093,6 +5124,7 @@ async def stream_chat_response(
     tools: Optional[List[Dict]],
     current_manager: ModelManager,
     tool_parser: ToolCallParser,
+    response_format: Optional[Dict] = None,
 ) -> AsyncGenerator[str, None]:
     """Stream chat completion response with queue notifications."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -5200,6 +5232,7 @@ async def stream_chat_response(
             top_p=top_p,
             stop=stop,
             tools=tools,
+            response_format=response_format,
         ):
             chunk_count += 1
             # Filter malformed content from each chunk (only if --reply-filters is set)
@@ -5390,6 +5423,7 @@ async def generate_chat_response(
     tools: Optional[List[Dict]],
     current_manager: ModelManager,
     tool_parser: ToolCallParser,
+    response_format: Optional[Dict] = None,
 ) -> Dict:
     """Generate non-streaming chat completion response."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -5404,6 +5438,7 @@ async def generate_chat_response(
             top_p=top_p,
             stop=stop,
             tools=tools,
+            response_format=response_format,
         )
         
         # Filter out malformed content from generated text (only if --reply-filters is set)
