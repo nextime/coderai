@@ -4,38 +4,48 @@ import uuid
 # Try to import litellm for response formatting
 # Fall back to plain dicts if litellm is not available or doesn't export these
 try:
-    from litellm import ModelResponse, ChatCompletionChunk
+    from litellm import ModelResponse, ChatCompletionChunk, Choices, StreamingChoices, Delta, Message, Usage
     LITELLM_AVAILABLE = True
 except ImportError:
     LITELLM_AVAILABLE = False
     ModelResponse = None
     ChatCompletionChunk = None
+    Choices = None
+    StreamingChoices = None
+    Delta = None
+    Message = None
+    Usage = None
 
 
 class OpenAIFormatter:
-    """Formatter for standardizing chat completion responses in OpenAI format.
-    
-    This class provides final sanitization of responses before sending them
-    to clients. It processes the output of the internal parser and formats
-    them into proper OpenAI-compatible responses.
-    """
-    
-    def __init__(self, model_name: str):
+    def __init__(self, model_name):
         self.model_name = model_name
         self.id = f"chatcmpl-{uuid.uuid4()}"
-    
-    def format_full(self, text: str, prompt_tokens: int, completion_tokens: int, tool_calls=None) -> dict:
-        """Format a standard (non-streaming) response.
+
+    def format_full(self, text, prompt_tokens, completion_tokens, tool_calls=None):
+        """Standard Response (Non-Streaming)"""
+        if LITELLM_AVAILABLE and all([ModelResponse, Choices, Message, Usage]):
+            try:
+                return ModelResponse(
+                    id=self.id,
+                    model=self.model_name,
+                    object="chat.completion",
+                    created=int(time.time()),
+                    choices=[Choices(
+                        finish_reason="tool_calls" if tool_calls else "stop",
+                        index=0,
+                        message=Message(content=text if not tool_calls else None, role="assistant", tool_calls=tool_calls)
+                    )],
+                    usage=Usage(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=prompt_tokens + completion_tokens
+                    )
+                ).model_dump()
+            except Exception:
+                pass
         
-        Args:
-            text: The generated text content
-            prompt_tokens: Number of tokens in the prompt
-            completion_tokens: Number of tokens in the completion
-            tool_calls: Optional list of tool calls to include
-            
-        Returns:
-            Dictionary representation of the response
-        """
+        # Fallback to plain dict if litellm fails
         message = {
             "role": "assistant",
             "content": text if not tool_calls else None,
@@ -65,18 +75,27 @@ class OpenAIFormatter:
                 "provider_id": "coderai",
             },
         }
-    
-    def format_chunk(self, delta_text: str, is_final: bool = False, usage: dict = None) -> dict:
-        """Format a streaming chunk response.
+
+    def format_chunk(self, delta_text, is_final=False, usage=None):
+        """Streaming Chunk (Used in a Generator)"""
+        if LITELLM_AVAILABLE and all([ChatCompletionChunk, StreamingChoices, Delta, (Usage if usage else True)]):
+            try:
+                return ChatCompletionChunk(
+                    id=self.id,
+                    model=self.model_name,
+                    object="chat.completion.chunk",
+                    created=int(time.time()),
+                    choices=[StreamingChoices(
+                        finish_reason="stop" if is_final else None,
+                        index=0,
+                        delta=Delta(content=delta_text, role="assistant")
+                    )],
+                    usage=Usage(**usage) if (usage and Usage) else None
+                ).model_dump()
+            except Exception:
+                pass
         
-        Args:
-            delta_text: The incremental text content for this chunk
-            is_final: Whether this is the final chunk
-            usage: Optional usage information (typically only sent on final chunk)
-            
-        Returns:
-            Dictionary representation of the chunk
-        """
+        # Fallback to plain dict if litellm fails
         delta = {
             "content": delta_text,
             "role": "assistant",
@@ -100,107 +119,7 @@ class OpenAIFormatter:
             chunk["usage"] = usage
             
         return chunk
-    
+
     def format_final_chunk(self, usage: dict = None) -> dict:
-        """Format the final streaming chunk with usage information.
-        
-        Args:
-            usage: Usage statistics dictionary with prompt_tokens, completion_tokens, total_tokens
-            
-        Returns:
-            Dictionary representation of the final chunk
-        """
-        delta = {
-            "content": None,
-            "role": "assistant",
-        }
-        
-        choice = {
-            "index": 0,
-            "delta": delta,
-            "finish_reason": "stop",
-        }
-        
-        chunk = {
-            "id": self.id,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": self.model_name,
-            "choices": [choice],
-        }
-        
-        if usage:
-            chunk["usage"] = usage
-            
-        return chunk
-    
-    def format_litellm_full(self, text: str, prompt_tokens: int, completion_tokens: int, tool_calls=None) -> dict:
-        """Format using litellm's ModelResponse if available.
-        
-        Args:
-            text: The generated text content
-            prompt_tokens: Number of tokens in the prompt
-            completion_tokens: Number of tokens in the completion
-            tool_calls: Optional list of tool calls to include
-            
-        Returns:
-            Dictionary representation of ModelResponse
-        """
-        if not LITELLM_AVAILABLE or ModelResponse is None:
-            return self.format_full(text, prompt_tokens, completion_tokens, tool_calls)
-        
-        try:
-            from litellm import Choices, Message, Usage
-            
-            return ModelResponse(
-                id=self.id,
-                model=self.model_name,
-                object="chat.completion",
-                created=int(time.time()),
-                choices=[Choices(
-                    finish_reason="tool_calls" if tool_calls else "stop",
-                    index=0,
-                    message=Message(content=text if not tool_calls else None, role="assistant", tool_calls=tool_calls)
-                )],
-                usage=Usage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=prompt_tokens + completion_tokens
-                )
-            ).model_dump()
-        except Exception:
-            # Fall back to plain dict if litellm fails
-            return self.format_full(text, prompt_tokens, completion_tokens, tool_calls)
-    
-    def format_litellm_chunk(self, delta_text: str, is_final: bool = False, usage: dict = None) -> dict:
-        """Format streaming chunk using litellm's ChatCompletionChunk if available.
-        
-        Args:
-            delta_text: The incremental text content for this chunk
-            is_final: Whether this is the final chunk
-            usage: Optional usage information (typically only sent on final chunk)
-            
-        Returns:
-            Dictionary representation of ChatCompletionChunk
-        """
-        if not LITELLM_AVAILABLE or ChatCompletionChunk is None:
-            return self.format_chunk(delta_text, is_final, usage)
-        
-        try:
-            from litellm import StreamingChoices, Delta, Usage
-            
-            return ChatCompletionChunk(
-                id=self.id,
-                model=self.model_name,
-                object="chat.completion.chunk",
-                created=int(time.time()),
-                choices=[StreamingChoices(
-                    finish_reason="stop" if is_final else None,
-                    index=0,
-                    delta=Delta(content=delta_text, role="assistant")
-                )],
-                usage=Usage(**usage) if usage else None
-            ).model_dump()
-        except Exception:
-            # Fall back to plain dict if litellm fails
-            return self.format_chunk(delta_text, is_final, usage)
+        """Format the final streaming chunk with usage information."""
+        return self.format_chunk("", is_final=True, usage=usage)
