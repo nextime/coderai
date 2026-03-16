@@ -428,14 +428,8 @@ class LiteLLMBackend:
             print("DEBUG litellm: HuggingFace model - using fake key")
         
         # Debug: show api_key and api_base being used
-        try:
-            import sys
-            if 'coderai' in sys.modules:
-                from coderai import global_debug
-                if global_debug:
-                    print(f"DEBUG litellm: api_key={litellm.api_key}, api_base={self.base_url}, model={use_model}")
-        except:
-            pass
+        # Always show this debug info to help diagnose litellm configuration
+        print(f"DEBUG litellm: api_key={litellm.api_key}, api_base={self.base_url}, model={use_model}")
         
         # Convert messages to litellm format
         litellm_messages = self._convert_messages(messages)
