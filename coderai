@@ -5561,15 +5561,23 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     break
             if not system_found:
                 messages = [ChatMessage(role="system", content=system_content)] + list(messages)
-        
-        # Handle stop tokens - add to stop_sequences for generation
-        if reasoning_action in ("stop", "both"):
-            _, _, additional_stops = get_reasoning_stop_tokens(model_family)
-            # Add model-specific stop tokens to the existing stop sequences
-            for stop_token in additional_stops:
-                if stop_token not in stop_sequences:
-                    stop_sequences.append(stop_token)
-            print(f"DEBUG: Added reasoning stop tokens for model family '{model_family}': {additional_stops}")
+    
+    # Prepare stop sequences (before reasoning block to avoid UnboundLocalError)
+    stop_sequences = []
+    if request.stop:
+        if isinstance(request.stop, str):
+            stop_sequences = [request.stop]
+        else:
+            stop_sequences = request.stop
+    
+    # Handle stop tokens - add to stop_sequences for generation
+    if reasoning_enabled and reasoning_action in ("stop", "both"):
+        _, _, additional_stops = get_reasoning_stop_tokens(model_family)
+        # Add model-specific stop tokens to the existing stop sequences
+        for stop_token in additional_stops:
+            if stop_token not in stop_sequences:
+                stop_sequences.append(stop_token)
+        print(f"DEBUG: Added reasoning stop tokens for model family '{model_family}': {additional_stops}")
     
     # Format messages with tools if provided
     if request.tools:
@@ -5577,14 +5585,6 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     
     # Get the tool_parser from the current manager
     tool_parser = current_manager.tool_parser if hasattr(current_manager, 'tool_parser') else ModelParserAdapter()
-    
-    # Prepare stop sequences
-    stop_sequences = []
-    if request.stop:
-        if isinstance(request.stop, str):
-            stop_sequences = [request.stop]
-        else:
-            stop_sequences = request.stop
     
     # Convert messages to dict format for chat completion
     messages_dict = []
