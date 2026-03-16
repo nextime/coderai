@@ -1421,7 +1421,13 @@ class VulkanBackend(ModelBackend):
                 
                 # Try to infer model name from file name
                 # Common patterns: llama-3.1-8b-instruct-q4_k_m.gguf -> llama-3.1-8b-instruct
+                # Also handle cached files with hash prefix: hash_modelname.gguf -> modelname
                 model_base = model_file.replace('.gguf', '')
+                
+                # Remove hash prefix (40 hex chars followed by underscore)
+                import re
+                model_base = re.sub(r'^[0-9a-f]{40}_', '', model_base)
+                
                 # Remove common quantization suffixes
                 for suffix in ['_q4_k_m', '_q4_k', '_q5_k', '_q5_k_m', '_q8_0', '_f16', '_q4_0', '_q3_k_m', '_q2_k']:
                     model_base = model_base.replace(suffix, '')
