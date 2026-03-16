@@ -123,3 +123,12 @@ class OpenAIFormatter:
     def format_final_chunk(self, usage: dict = None) -> dict:
         """Format the final streaming chunk with usage information."""
         return self.format_chunk("", is_final=True, usage=usage)
+
+    # Backward compatibility methods
+    def format_litellm_full(self, text: str, prompt_tokens: int, completion_tokens: int, tool_calls=None) -> dict:
+        """Backward compatibility method - calls format_full."""
+        return self.format_full(text, prompt_tokens, completion_tokens, tool_calls)
+
+    def format_litellm_chunk(self, delta_text: str, is_final: bool = False, usage: dict = None) -> dict:
+        """Backward compatibility method - calls format_chunk."""
+        return self.format_chunk(delta_text, is_final, usage)
