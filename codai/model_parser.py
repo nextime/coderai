@@ -341,48 +341,70 @@ class ModelParserDispatcher:
     def _get_parser(self) -> BaseParser:
         """Get the appropriate parser based on model name."""
         if not self.model_name:
-            return ApexBig50Parser(self.tools)
+            parser = ApexBig50Parser(self.tools)
+            print(f"DEBUG model_parser: model_name=None, selected parser: {type(parser).__name__}")
+            return parser
         
         model_lower = self.model_name.lower()
         
         # Qwen models
         if 'qwen' in model_lower:
-            return QwenParser(self.tools)
+            parser = QwenParser(self.tools)
+            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: QwenParser")
+            return parser
         
         # DeepSeek models
         if 'deepseek' in model_lower:
-            return DeepSeekParser(self.tools)
+            parser = DeepSeekParser(self.tools)
+            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: DeepSeekParser")
+            return parser
         
         # Llama models
         if 'llama' in model_lower:
-            return LlamaParser(self.tools)
+            parser = LlamaParser(self.tools)
+            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: LlamaParser")
+            return parser
         
         # Mistral models
         if 'mistral' in model_lower or 'mixtral' in model_lower:
-            return MistralParser(self.tools)
+            parser = MistralParser(self.tools)
+            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: MistralParser")
+            return parser
         
         # Claude models
         if 'claude' in model_lower:
-            return ClaudeParser(self.tools)
+            parser = ClaudeParser(self.tools)
+            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: ClaudeParser")
+            return parser
         
         # Command R models
         if 'command' in model_lower:
-            return CommandRParser(self.tools)
+            parser = CommandRParser(self.tools)
+            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: CommandRParser")
+            return parser
         
         # Gemma models
         if 'gemma' in model_lower:
-            return GemmaParser(self.tools)
+            parser = GemmaParser(self.tools)
+            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: GemmaParser")
+            return parser
         
         # Grok models
         if 'grok' in model_lower:
-            return GrokParser(self.tools)
+            parser = GrokParser(self.tools)
+            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: GrokParser")
+            return parser
         
         # Phi models
         if 'phi' in model_lower:
-            return PhiParser(self.tools)
+            parser = PhiParser(self.tools)
+            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: PhiParser")
+            return parser
         
         # Default: use catch-all parser
-        return ApexBig50Parser(self.tools)
+        parser = ApexBig50Parser(self.tools)
+        print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: ApexBig50Parser (default)")
+        return parser
     
     def parse(self, text: str) -> List[Dict]:
         """Parse tool calls from model output."""
