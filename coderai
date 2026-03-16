@@ -5203,10 +5203,39 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             api_key = "fake-key-for-local-testing"
             print("DEBUG: No API key provided, using fake key for litellm")
         
+        # Determine the base URL for litellm to connect to
+        # Use the server's host and port for local connections
+        api_base = None
+        
+        # Check if model starts with 'ollama:' - use local Ollama
+        if request.model and request.model.startswith('ollama:'):
+            # Get the host from the request headers
+            client_host = "127.0.0.1"
+            if http_request:
+                host_header = http_request.headers.get('host', '')
+                if host_header:
+                    # Strip port if present
+                    if ':' in host_header:
+                        client_host = host_header.split(':')[0]
+                        if client_host.replace('.', '').isdigit():
+                            # It's an IP, keep it
+                            pass
+                        else:
+                            # It's a hostname, use localhost
+                            client_host = "127.0.0.1"
+                    else:
+                        client_host = host_header
+            
+            # Get port from global_args or use default
+            port = getattr(global_args, 'port', 11434) if global_args else 11434
+            api_base = f"http://{client_host}:{port}/v1"
+            print(f"DEBUG: Using api_base for Ollama: {api_base}")
+        
         # Get or create litellm backend
         litellm_backend = get_litellm_backend(
             model=request.model,
             api_key=api_key,
+            api_base=api_base,
             context_window=8192,  # Default, can be made configurable
             model_manager=multi_model_manager  # Pass for alias resolution
         )

@@ -62,6 +62,7 @@ class LiteLLMBackend:
         model: str = "gpt-3.5-turbo",
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
+        api_base: Optional[str] = None,  # Add api_base parameter
         context_window: int = 4096,
         model_manager: Optional[Any] = None,
         **kwargs
@@ -73,6 +74,7 @@ class LiteLLMBackend:
             model: Model name to use (e.g., "gpt-3.5-turbo", "ollama/llama2")
             api_key: API key for the model provider
             base_url: Custom base URL for OpenAI-compatible APIs
+            api_base: API base URL (alternative to base_url, e.g., "http://localhost:11434/v1")
             context_window: Maximum context window size for rate limit headers
             model_manager: Reference to MultiModelManager for resolving aliases
         """
@@ -80,17 +82,17 @@ class LiteLLMBackend:
         # Use provided API key, or generate a fake one if not provided
         # This allows litellm to proceed without requiring an API key
         self.api_key = api_key if api_key else "fake-key-for-local-testing"
-        self.base_url = base_url
+        self.base_url = base_url or api_base  # Use either base_url or api_base
         self.context_window = context_window
         self.model_manager = model_manager
         self.tool_parser = None  # Coderai's tool parser for post-processing
         self.tools_schema = {}  # Tools schema for coderai parser
         
         # Configure litellm
-        if base_url:
-            litellm.base_url = base_url
-        if api_key:
-            litellm.api_key = api_key
+        if self.base_url:
+            litellm.base_url = self.base_url
+        if self.api_key:
+            litellm.api_key = self.api_key
     
     def normalize_model_name(self, model: str) -> str:
         """
@@ -741,6 +743,7 @@ def get_litellm_backend(
     model: str = "gpt-3.5-turbo",
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
+    api_base: Optional[str] = None,  # Add api_base parameter
     context_window: int = 4096,
     model_manager: Optional[Any] = None,
     **kwargs
@@ -754,6 +757,7 @@ def get_litellm_backend(
         model=model,
         api_key=api_key,
         base_url=base_url,
+        api_base=api_base,
         context_window=context_window,
         model_manager=model_manager,
         **kwargs
