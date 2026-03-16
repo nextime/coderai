@@ -342,6 +342,8 @@ class ChatCompletionRequest(BaseModel):
     top_logprobs: Optional[int] = None
     response_format: Optional[Dict] = None
     user: Optional[str] = None
+    # Enable thinking/reasoning mode for supported models
+    enable_thinking: Optional[bool] = False
     
     model_config = ConfigDict(extra="allow")  # Allow extra fields to prevent 422 errors
 class CompletionRequest(BaseModel):
@@ -5415,6 +5417,31 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 system_text = str(global_system_prompt)
             # Insert system message at the beginning
             messages = [ChatMessage(role="system", content=system_text)] + list(messages)
+    
+    # Enable thinking/reasoning mode if requested
+    if getattr(request, 'enable_thinking', False):
+        from codai.models.templates import AgenticTemplateManager
+        template_manager = AgenticTemplateManager(request.model)
+        # Get the current system prompt if exists
+        system_content = None
+        for msg in messages:
+            if msg.role == "system":
+                system_content = msg.content
+                break
+        if system_content:
+            # Inject agentic instructions
+            system_content = template_manager.get_agent_system_prompt(system_content)
+        else:
+            system_content = template_manager.get_agent_system_prompt("You are a helpful assistant.")
+        # Update or add system message
+        system_found = False
+        for i, msg in enumerate(messages):
+            if msg.role == "system":
+                messages[i] = ChatMessage(role="system", content=system_content)
+                system_found = True
+                break
+        if not system_found:
+            messages = [ChatMessage(role="system", content=system_content)] + list(messages)
     
     # Format messages with tools if provided
     if request.tools:
