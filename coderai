@@ -443,8 +443,100 @@ def filter_malformed_content(text: str) -> str:
 class ToolCallParser:
     """Parse model outputs to extract tool calls."""
     
-    def __init__(self, tokenizer=None):
+    def __init__(self, tokenizer=None, model_name: str = None):
         self.tokenizer = tokenizer
+        self.model_name = model_name
+    
+    def set_model_name(self, model_name: str):
+        """Set the model name for model-specific parsing."""
+        self.model_name = model_name
+    
+    def _is_qwen_model(self) -> bool:
+        """Check if the current model is a Qwen model."""
+        if not self.model_name:
+            return False
+        model_lower = self.model_name.lower()
+        return 'qwen' in model_lower or 'qwen2' in model_lower or 'qwen3' in model_lower
+    
+    def _parse_qwen_tool_calls(self, text: str) -> Optional[List[Dict]]:
+        """
+        Parse tool calls from Qwen model output.
+        
+        Supports:
+        1. Instruct-style: <tool_call>{...}</tool_call> with JSON inside
+        2. Coder-style: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
+        
+        Returns OpenAI-compatible tool_calls format.
+        """
+        import uuid
+        import json
+        import re
+        
+        # Clean the text first - remove thinking tags if present
+        clean_text = re.sub(r'<｜.*?｜>', '', text)
+        clean_text = re.sub(r'<think>.*?</think>', '', clean_text, flags=re.DOTALL)
+        clean_text = re.sub(r'<think>', '', clean_text)
+        clean_text = re.sub(r'</think>', '', clean_text)
+        clean_text = re.sub(r'<tool_call>\s*', '<tool_call>', clean_text)
+        clean_text = re.sub(r'\s*</tool_call>', '</tool_call>', clean_text)
+        
+        tool_calls = []
+        
+        # 1. Check for Instruct-style (JSON inside <tool_call> tags)
+        # Format: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+        instruct_matches = re.findall(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', clean_text, re.DOTALL)
+        for match in instruct_matches:
+            try:
+                data = json.loads(match.strip())
+                if 'name' in data and 'arguments' in data:
+                    tool_calls.append({
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "type": "function",
+                        "function": {
+                            "name": data.get("name"),
+                            "arguments": json.dumps(data.get("arguments", {})) if isinstance(data.get("arguments"), dict) else str(data.get("arguments", "{}"))
+                        }
+                    })
+            except json.JSONDecodeError:
+                continue
+        
+        # 2. Check for Coder-style (XML tags) if no Instruct calls were found or as additional
+        # Format: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
+        if not tool_calls:
+            # Find all tool_call blocks
+            coder_blocks = re.findall(r'<tool_call>\s*(.*?)\s*</tool_call>', clean_text, re.DOTALL)
+            
+            # Some Coder models might skip the outer <tool_call> wrapper and just use <function>
+            if not coder_blocks:
+                coder_blocks = re.findall(r'(<function=.*?</function>)', clean_text, re.DOTALL)
+                
+            for block in coder_blocks:
+                # Extract function name
+                func_name_match = re.search(r'<function=([^>]+)>', block)
+                if func_name_match:
+                    func_name = func_name_match.group(1).strip()
+                    # Find all parameters within this specific function block
+                    params = re.findall(r'<parameter=([^>]+)>(.*?)</parameter>', block, re.DOTALL)
+                    arguments = {}
+                    for k, v in params:
+                        key = k.strip()
+                        val = v.strip()
+                        # Try to parse as JSON, otherwise use raw string
+                        try:
+                            arguments[key] = json.loads(val)
+                        except (json.JSONDecodeError, TypeError):
+                            arguments[key] = val
+                    
+                    tool_calls.append({
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "type": "function",
+                        "function": {
+                            "name": func_name,
+                            "arguments": json.dumps(arguments)
+                        }
+                    })
+        
+        return tool_calls if tool_calls else None
     
     def _parse_nested_xml_tool(self, xml_content: str) -> Optional[Dict]:
         """Parse nested XML tool format like <tool><name>...</name><arguments>...</arguments></tool>."""
@@ -518,6 +610,12 @@ class ToolCallParser:
         """Extract tool calls from model output."""
         # First filter out malformed content
         text = self._filter_malformed_content(text)
+        
+        # For Qwen models, try Qwen-specific parsing first
+        if self._is_qwen_model():
+            qwen_tool_calls = self._parse_qwen_tool_calls(text)
+            if qwen_tool_calls:
+                return qwen_tool_calls
         
         tool_calls = []
         seen_signatures = set()  # Track seen tool calls to avoid duplicates
@@ -2411,6 +2509,8 @@ class ModelManager:
         # Load the model
         self.backend.load_model(model_name, **kwargs)
         self.tool_parser = ToolCallParser()
+        # Set model name on tool parser for model-specific parsing (e.g., Qwen)
+        self.tool_parser.set_model_name(model_name)
         
     def format_messages(self, messages: List[ChatMessage]) -> str:
         """Format messages into a prompt string."""
