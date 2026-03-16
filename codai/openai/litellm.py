@@ -104,11 +104,15 @@ class LiteLLMBackend:
         Returns:
             Normalized model name with provider prefix
         """
+        print(f"DEBUG litellm: normalize_model_name input: {model}")
+        
         # First, resolve alias to actual model name if we have a model manager
         resolved_model = self._resolve_model_alias(model)
+        print(f"DEBUG litellm: After alias resolution: {resolved_model}")
         
         # If already has a provider prefix (contains /), return as-is
         if '/' in resolved_model:
+            print(f"DEBUG litellm: Model has provider prefix, returning: {resolved_model}")
             return resolved_model
         
         # Common model name patterns and their providers
@@ -154,7 +158,9 @@ class LiteLLMBackend:
                 return f"{provider}{resolved_model}"
         
         # Default: assume OpenAI-compatible local model
-        return f"openai/{resolved_model}"
+        result = f"openai/{resolved_model}"
+        print(f"DEBUG litellm: Using default provider, returning: {result}")
+        return result
     
     def _resolve_model_alias(self, model: str) -> str:
         """
@@ -170,11 +176,13 @@ class LiteLLMBackend:
             Resolved actual model name
         """
         if not self.model_manager:
+            print(f"DEBUG litellm: No model_manager, returning model as-is: {model}")
             return model
         
         # Check if model is "default" or empty - use default_model
         if not model or model == "default":
             default_model = getattr(self.model_manager, 'default_model', None)
+            print(f"DEBUG litellm: Resolving 'default' alias to: {default_model}")
             if default_model:
                 return default_model
             return model
@@ -182,20 +190,21 @@ class LiteLLMBackend:
         # Check if model is "image" - get first image model
         if model == "image":
             image_models = getattr(self.model_manager, 'image_models', [])
-            if image_models:
-                return image_models[0]
-            return model
+            resolved = image_models[0] if image_models else model
+            print(f"DEBUG litellm: Resolving 'image' alias to: {resolved}")
+            return resolved
         
         # Check if model is "audio" - get first audio model
         if model == "audio":
             audio_models = getattr(self.model_manager, 'audio_models', [])
-            if audio_models:
-                return audio_models[0]
-            return model
+            resolved = audio_models[0] if audio_models else model
+            print(f"DEBUG litellm: Resolving 'audio' alias to: {resolved}")
+            return resolved
         
         # Check if model is "tts" - get tts model
         if model == "tts":
             tts_model = getattr(self.model_manager, 'tts_model', None)
+            print(f"DEBUG litellm: Resolving 'tts' alias to: {tts_model}")
             if tts_model:
                 return tts_model
             return model
@@ -203,8 +212,11 @@ class LiteLLMBackend:
         # Check custom aliases registered via --model-alias
         model_aliases = getattr(self.model_manager, 'model_aliases', {})
         if model in model_aliases:
-            return model_aliases[model]
+            resolved = model_aliases[model]
+            print(f"DEBUG litellm: Resolving alias '{model}' to: {resolved}")
+            return resolved
         
+        print(f"DEBUG litellm: Model '{model}' is not an alias, returning as-is")
         return model
             
     def _convert_messages(self, messages: List[Dict]) -> List[Dict]:
