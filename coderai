@@ -2578,6 +2578,78 @@ class MultiModelManager:
         self.current_model_key: Optional[str] = None
         # Configuration for each model type
         self.config: Dict[str, Dict] = {}
+    
+    def _aggressive_vram_cleanup(self, model_manager):
+        """
+        Aggressively cleanup VRAM when switching between different model types.
+        This is more thorough than a simple cleanup() call.
+        """
+        import gc
+        import time
+        
+        try:
+            import torch
+            
+            # First, try to move model to CPU if it has a model attribute
+            if hasattr(model_manager, 'model') and model_manager.model is not None:
+                model = model_manager.model
+                
+                # If it's a diffusers pipeline, try to move to CPU first
+                if hasattr(model, 'to'):
+                    try:
+                        model.to('cpu')
+                    except:
+                        pass
+                
+                # Delete the model
+                del model
+            
+            # Also handle backend directly if it's different
+            if hasattr(model_manager, 'backend') and model_manager.backend is not None:
+                backend = model_manager.backend
+                
+                if hasattr(backend, 'model') and backend.model is not None:
+                    model = backend.model
+                    if hasattr(model, 'to'):
+                        try:
+                            model.to('cpu')
+                        except:
+                            pass
+                    del model
+                
+                if hasattr(backend, 'pipeline') and backend.pipeline is not None:
+                    del backend.pipeline
+                
+                if hasattr(backend, 'vae') and backend.vae is not None:
+                    del backend.vae
+                
+                if hasattr(backend, 'text_encoder') and backend.text_encoder is not None:
+                    del backend.text_encoder
+                
+                if hasattr(backend, 'tokenizer') and backend.tokenizer is not None:
+                    del backend.tokenizer
+            
+            # Force multiple rounds of garbage collection
+            for _ in range(3):
+                gc.collect()
+            
+            # Clear PyTorch cache
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            
+            # Add delay to allow Vulkan to release memory
+            time.sleep(2)
+            
+        except Exception as e:
+            print(f"Warning during aggressive VRAM cleanup: {e}")
+        finally:
+            # Try to cleanup the model manager itself
+            try:
+                if hasattr(model_manager, 'cleanup'):
+                    model_manager.cleanup()
+            except:
+                pass
         # Load mode settings
         self.load_mode: str = "ondemand"  # "ondemand", "loadall", "loadswap"
         self.active_in_vram: Optional[str] = None  # Which model is currently in VRAM
