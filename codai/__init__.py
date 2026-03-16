@@ -16,6 +16,22 @@ from .models.parser import (
 
 from .models.templates import AgenticTemplateManager
 
+# LiteLLM backend (requires litellm package)
+try:
+    from .litellm_backend import (
+        LiteLLMBackend,
+        get_litellm_backend,
+        set_litellm_backend,
+        LITELLM_AVAILABLE,
+    )
+    _LITELLM_IMPORT_ERROR = None
+except ImportError as e:
+    _LITELLM_IMPORT_ERROR = str(e)
+    LiteLLMBackend = None
+    get_litellm_backend = None
+    set_litellm_backend = None
+    LITELLM_AVAILABLE = False
+
 __all__ = [
     'ModelParserDispatcher',
     'BaseParser',
@@ -30,4 +46,8 @@ __all__ = [
     'PhiParser',
     'ApexBig50Parser',
     'AgenticTemplateManager',
+    'LiteLLMBackend',
+    'get_litellm_backend',
+    'set_litellm_backend',
+    'LITELLM_AVAILABLE',
 ]

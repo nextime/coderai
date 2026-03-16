@@ -5169,6 +5169,139 @@ async def create_speech(request: TTSRequest):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     """Chat completions endpoint with streaming and tool support."""
+    
+    # Check if we should use litellm backend
+    parser_type = getattr(global_args, 'parser', 'auto') if global_args else 'auto'
+    
+    if parser_type == 'litellm':
+        # Use LiteLLM backend
+        from codai.litellm_backend import get_litellm_backend, LITELLM_AVAILABLE
+        
+        if not LITELLM_AVAILABLE:
+            raise HTTPException(
+                status_code=500,
+                detail="LiteLLM is not installed. Run: pip install litellm"
+            )
+        
+        # Get or create litellm backend
+        litellm_backend = get_litellm_backend(
+            model=request.model,
+            context_window=8192  # Default, can be made configurable
+        )
+        
+        # Convert messages to dict format
+        messages_dict = []
+        for msg in request.messages:
+            msg_dict = {"role": msg.role, "content": msg.content or ""}
+            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                msg_dict["tool_calls"] = msg.tool_calls
+            if hasattr(msg, 'tool_call_id') and msg.tool_call_id:
+                msg_dict["tool_call_id"] = msg.tool_call_id
+            messages_dict.append(msg_dict)
+        
+        # Prepare tools if provided
+        tools_dict = None
+        if request.tools:
+            tools_dict = request.tools
+        
+        # Generate response
+        try:
+            if request.stream:
+                # Streaming response
+                from fastapi.responses import StreamingResponse
+                
+                async def generate():
+                    try:
+                        async for chunk in await litellm_backend.chat_completion(
+                            messages=messages_dict,
+                            model=request.model,
+                            temperature=request.temperature,
+                            top_p=request.top_p,
+                            max_tokens=request.max_tokens,
+                            stop=request.stop,
+                            tools=tools_dict,
+                            tool_choice=request.tool_choice,
+                            stream=True,
+                        ):
+                            # Add rate limit headers
+                            headers = {}
+                            if 'usage' in chunk:
+                                headers = litellm_backend.get_rate_limit_headers(
+                                    prompt_tokens=chunk.get('usage', {}).get('prompt_tokens', 0),
+                                    completion_tokens=chunk.get('usage', {}).get('completion_tokens', 0)
+                                )
+                            
+                            # Handle Qwen tool calls if model is Qwen family
+                            if 'qwen' in request.model.lower():
+                                content = chunk.get('choices', [{}])[0].get('delta', {}).get('content', '')
+                                tool_calls = chunk.get('choices', [{}])[0].get('delta', {}).get('tool_calls', [])
+                                
+                                if not tool_calls and content:
+                                    # Try to parse tool calls from content
+                                    tool_calls = litellm_backend.parse_qwen_tool_calls(content)
+                                    if tool_calls:
+                                        # Strip tool tags from content
+                                        content = litellm_backend.strip_tool_tags(content)
+                                        chunk['choices'][0]['delta']['content'] = content
+                                        chunk['choices'][0]['delta']['tool_calls'] = tool_calls
+                            
+                            yield f"data: {json.dumps(chunk)}\n\n"
+                        
+                        yield "data: [DONE]\n\n"
+                    except Exception as e:
+                        yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'internal_error'}})}\n\n"
+                
+                return StreamingResponse(generate(), media_type="text/event-stream")
+            else:
+                # Non-streaming response
+                response = await litellm_backend.chat_completion(
+                    messages=messages_dict,
+                    model=request.model,
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    max_tokens=request.max_tokens,
+                    stop=request.stop,
+                    tools=tools_dict,
+                    tool_choice=request.tool_choice,
+                    stream=False,
+                )
+                
+                # Handle Qwen tool calls
+                if 'qwen' in request.model.lower() and 'choices' in response:
+                    msg = response['choices'][0].get('message', {})
+                    content = msg.get('content', '')
+                    tool_calls = msg.get('tool_calls', [])
+                    
+                    if not tool_calls and content:
+                        tool_calls = litellm_backend.parse_qwen_tool_calls(content)
+                        if tool_calls:
+                            msg['content'] = litellm_backend.strip_tool_tags(content)
+                            msg['tool_calls'] = tool_calls
+                            response['choices'][0]['message'] = msg
+                
+                # Add rate limit headers
+                headers = {}
+                if 'usage' in response:
+                    headers = litellm_backend.get_rate_limit_headers(
+                        prompt_tokens=response.get('usage', {}).get('prompt_tokens', 0),
+                        completion_tokens=response.get('usage', {}).get('completion_tokens', 0)
+                    )
+                
+                from fastapi.responses import JSONResponse
+                return JSONResponse(content=response, headers=headers)
+                
+        except Exception as e:
+            # Handle litellm errors
+            error_response = {
+                "error": {
+                    "message": str(e),
+                    "type": "internal_error",
+                    "code": 500
+                }
+            }
+            return JSONResponse(content=error_response, status_code=500)
+    
+    # Continue with original implementation for 'auto' parser
     # Get the model for this request
     requested_model = request.model
     
