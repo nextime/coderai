@@ -261,6 +261,9 @@ The `--hf-chat-template` option enables using HuggingFace's `apply_chat_template
 **Usage:**
 
 ```bash
+# Auto-detect and use HuggingFace chat template for all models
+coderai --hf-chat-template auto --model llama-3.1-8b-instruct-q4_k_m.gguf
+
 # Use HuggingFace chat template for ALL text models
 coderai --hf-chat-template text --model llama-3.1-8b-instruct-q4_k_m.gguf
 
@@ -271,20 +274,21 @@ coderai --hf-chat-template text:llama-3.1 --model llama-3.1-8b-instruct-q4_k_m.g
 coderai --hf-chat-template text:llama-3.1 --hf-chat-template text:phi-3 --model llama-3.1-8b-instruct-q4_k_m.gguf
 
 # Or with Vulkan backend
-coderai --backend vulkan --hf-chat-template text --model llama-3.1-8b-instruct-q4_k_m.gguf
+coderai --backend vulkan --hf-chat-template auto --model llama-3.1-8b-instruct-q4_k_m.gguf
 ```
 
 **Syntax:**
 
 | Syntax | Applies To |
 |--------|------------|
+| `--hf-chat-template auto` | Auto-detect and use HF template for all models |
 | `--hf-chat-template text` | All text models |
 | `--hf-chat-template image` | All image models |
 | `--hf-chat-template text:model_name` | Specific text model |
 | `--hf-chat-template image:model_name` | Specific image model |
 
 **How it works:**
-1. When `--hf-chat-template` is specified for a model, the server attempts to load a HuggingFace tokenizer
+1. When `--hf-chat-template` is specified (with `auto` or a model spec), the server attempts to load a HuggingFace tokenizer
 2. It first checks for a local `tokenizer_config.json` in the model directory
 3. If not found locally, it tries to infer the model name from the GGUF filename and load from HuggingFace Hub
 4. The tokenizer's `apply_chat_template` method is then used for formatting chat messages
