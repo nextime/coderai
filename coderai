@@ -1428,19 +1428,50 @@ class VulkanBackend(ModelBackend):
                 if len(model_base) > 64 and model_base[:64].isalnum():
                     model_base = model_base[65:]  # Skip hash + underscore
                 
-                # Remove common quantization suffixes
-                for suffix in ['_q4_k_m', '_q4_k', '_q5_k', '_q5_k_m', '_q8_0', '_f16', '_q4_0', '_q3_k_m', '_q2_k']:
+                # Remove common quantization suffixes (case-insensitive)
+                for suffix in ['_q4_k_m', '_q4_k', '_q5_k', '_q5_k_m', '_q8_0', '_f16', '_q4_0', '_q3_k_m', '_q2_k', '_Q4_K_M', '_Q4_K', '_Q5_K', '_Q5_K_M', '_Q8_0', '_F16', '_Q4_0', '_Q3_K_M', '_Q2_K']:
                     model_base = model_base.replace(suffix, '')
                 
                 # Try to load from HuggingFace hub
-                try:
-                    self.hf_tokenizer = AutoTokenizer.from_pretrained(model_base, trust_remote_code=True)
-                    print(f"DEBUG: Loaded HuggingFace tokenizer from hub: {model_base}")
-                    if not template_name:
-                        self.chat_template = "hf_hub"
+                # First try the cleaned model_base
+                model_names_to_try = [model_base]
+                
+                # Generate shorter versions of the model name for fallback
+                # E.g., Qwen3.5-27B-Uncensored-HauhauCS-Aggressive -> try shorter variants
+                parts = model_base.split('-')
+                if len(parts) > 1:
+                    # Try progressively shorter names by removing parts from the end
+                    for i in range(len(parts) - 1, 0, -1):
+                        shorter_name = '-'.join(parts[:i])
+                        if shorter_name and shorter_name != model_base:
+                            model_names_to_try.append(shorter_name)
+                
+                # Also try with just the first part (e.g., "Qwen" from "Qwen3.5-27B...")
+                if len(parts) > 1:
+                    model_names_to_try.append(parts[0])
+                
+                tokenizer_loaded = False
+                last_error = None
+                for model_id in model_names_to_try:
+                    try:
+                        self.hf_tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+                        print(f"DEBUG: Loaded HuggingFace tokenizer from hub: {model_id}")
+                        if not template_name:
+                            self.chat_template = "hf_hub"
+                        tokenizer_loaded = True
+                        break
+                    except Exception as fallback_err:
+                        last_error = fallback_err
+                        print(f"DEBUG: Could not load tokenizer from hub ({model_id}): {fallback_err}")
+                        continue
+                
+                if tokenizer_loaded:
                     return
-                except Exception as hub_err:
-                    print(f"DEBUG: Could not load tokenizer from hub ({model_base}): {hub_err}")
+                
+                # All attempts failed - warn but continue without template
+                print(f"Warning: Could not load HuggingFace tokenizer for any variant of '{model_base}'")
+                print(f"Warning: Will not use apply_chat_template - model will use manual formatting")
+                self.chat_template = None
             else:
                 # Not a GGUF file, try to load directly
                 self.hf_tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
