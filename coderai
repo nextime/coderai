@@ -2066,44 +2066,12 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             raw_prompt_for_generation = raw_prompt
             raw_stop_sequences = list(stop_sequences)  # Copy current stop sequences
             
-            # Debug: Check what's available in the backend
-            if global_debug:
-                print(f"RAW DEBUG: Checking backend for tokenizer...")
-                print(f"RAW DEBUG: current_manager type: {type(current_manager)}")
-                print(f"RAW DEBUG: current_manager.backend type: {type(current_manager.backend)}")
-                print(f"RAW DEBUG: current_manager.backend dir: {[a for a in dir(current_manager.backend) if not a.startswith('_')]}")
-            
-            # Check for tokenizer
-            if hasattr(current_manager.backend, 'tokenizer'):
-                tokenizer = current_manager.backend.tokenizer
-                if global_debug:
-                    print(f"RAW DEBUG: Found tokenizer: {tokenizer}")
-            else:
-                if global_debug:
-                    print(f"RAW DEBUG: No 'tokenizer' attribute found")
-                # Check for other common names
-                if hasattr(current_manager.backend, 'llm') and hasattr(current_manager.backend.llm, 'tokenizer'):
-                    tokenizer = current_manager.backend.llm.tokenizer
-                    if global_debug:
-                        print(f"RAW DEBUG: Found tokenizer via llm: {tokenizer}")
-                elif hasattr(current_manager, 'tokenizer'):
-                    tokenizer = current_manager.tokenizer
-                    if global_debug:
-                        print(f"RAW DEBUG: Found tokenizer in current_manager: {tokenizer}")
-                elif hasattr(model_manager, 'tokenizer'):
-                    tokenizer = model_manager.tokenizer
-                    if global_debug:
-                        print(f"RAW DEBUG: Found tokenizer in model_manager: {tokenizer}")
-                else:
-                    tokenizer = None
-                    if global_debug:
-                        print(f"RAW DEBUG: Still no tokenizer found")
-            
             # Add the close tag to stop sequences for first pass
             if close_tag not in raw_stop_sequences:
                 raw_stop_sequences.append(close_tag)
             
             if global_debug:
+                print(f"RAW: Using template_manager.format_for_raw_completion (no tokenizer needed)")
                 print(f"RAW: First pass will stop at: {close_tag}")
     
     # Prepare stop sequences
@@ -2214,35 +2182,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     
     # Check if we need to set up raw mode (if not already done in prompt handling)
     if "raw" in force_reasoning_args and not use_raw_mode:
-        # Set up raw mode using tokenizer
-        tokenizer = None
-        
-        # Debug: Check what's available in the backend
-        if global_debug:
-            print(f"RAW DEBUG [fallback]: Checking backend for tokenizer...")
-            print(f"RAW DEBUG [fallback]: current_manager type: {type(current_manager)}")
-            if hasattr(current_manager, 'backend'):
-                print(f"RAW DEBUG [fallback]: current_manager.backend type: {type(current_manager.backend)}")
-                print(f"RAW DEBUG [fallback]: current_manager.backend dir: {[a for a in dir(current_manager.backend) if not a.startswith('_')]}")
-        
-        if hasattr(current_manager, 'backend') and hasattr(current_manager.backend, 'tokenizer'):
-            tokenizer = current_manager.backend.tokenizer
-            if global_debug:
-                print(f"RAW DEBUG [fallback]: Found tokenizer in backend: {tokenizer}")
-        
-        # Also check model_manager (legacy)
-        if tokenizer is None and hasattr(model_manager, 'backend') and hasattr(model_manager.backend, 'tokenizer'):
-            tokenizer = model_manager.backend.tokenizer
-            if global_debug:
-                print(f"RAW DEBUG [fallback]: Found tokenizer in model_manager.backend: {tokenizer}")
-        
-        # Also check model_manager directly
-        if tokenizer is None and hasattr(model_manager, 'tokenizer'):
-            tokenizer = model_manager.tokenizer
-            if global_debug:
-                print(f"RAW DEBUG [fallback]: Found tokenizer in model_manager: {tokenizer}")
-        
-        if tokenizer is not None:
+        # Use template_manager.format_for_raw_completion which handles everything
+        if hasattr(template_manager, 'format_for_raw_completion'):
             # Extract system and user messages
             system_prompt = "You are a helpful assistant."
             user_message = ""
@@ -2252,24 +2193,20 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 elif msg.role == "user":
                     user_message = msg.content
             
-            # Get the prompt with generation prompt
-            try:
-                raw_prompt_for_generation = tokenizer.apply_chat_template(
-                    [{"role": "system", "content": system_prompt},
-                     {"role": "user", "content": user_message}],
-                    add_generation_prompt=True,
-                    tokenize=False
-                )
-            except Exception as e:
-                raw_prompt_for_generation = f"System: {system_prompt}\n\nUser: {user_message}\n\nAssistant:"
-            
-            # Get reasoning tag
-            thought_tag, close_tag, _ = get_reasoning_stop_tokens(model_family)
-            raw_prompt_for_generation += thought_tag + "Let me think about this step by step."
-            raw_stop_sequences = list(stop_sequences)
-            if close_tag not in raw_stop_sequences:
-                raw_stop_sequences.append(close_tag)
+            raw_prompt_for_generation, raw_stop_sequences = template_manager.format_for_raw_completion(
+                system_prompt=system_prompt,
+                user_message=user_message,
+                inject_system=True,
+                force_reasoning=True
+            )
             use_raw_mode = True
+            
+            if global_debug:
+                print(f"RAW: Using template_manager.format_for_raw_completion")
+                print(f"RAW: Prompt ends with: ...{raw_prompt_for_generation[-80:]}")
+        else:
+            if global_debug:
+                print(f"RAW: template_manager.format_for_raw_completion not available")
     
     # Get resolved model name for response (with coderai/ prefix and proper formatting)
     response_model_name = get_resolved_model_name(requested_model, current_manager)
