@@ -382,15 +382,38 @@ class VulkanBackend(ModelBackend):
         """Load a GGUF model.
         
         Args:
-            model_path: Path to the GGUF model file or HuggingFace model ID
+            model_path: Path to the GGUF model file, HuggingFace model ID, or URL
             model_type: Type of model (text, image, audio)
             **kwargs: Additional parameters
         """
         if not LLAMA_CPP_AVAILABLE:
             raise ImportError("llama-cpp-python is required for GGUF models. Install with: pip install llama-cpp-python")
         
-        # If it's a HuggingFace model ID, try to download
-        if not model_path.endswith('.gguf') and not os.path.exists(model_path):
+        # Check if this looks like a GGUF model repo (e.g., "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF")
+        is_gguf_repo = not model_path.endswith('.gguf') and not os.path.exists(model_path) and not model_path.startswith('http')
+        
+        if is_gguf_repo:
+            # Try to find GGUF files in the repository
+            try:
+                from huggingface_hub import list_repo_files, hf_hub_download
+                print(f"DEBUG: Searching for GGUF files in {model_path}...")
+                files = list(list_repo_files(model_path, repo_type="model"))
+                gguf_files = [f for f in files if f.lower().endswith('.gguf')]
+                
+                if gguf_files:
+                    # Prefer Q4_K_M or Q4_K quantizations, otherwise use first available
+                    preferred = [f for f in gguf_files if 'q4_k_m' in f.lower() or 'q4_k' in f.lower()]
+                    selected = preferred[0] if preferred else gguf_files[0]
+                    print(f"DEBUG: Found GGUF files: {gguf_files}")
+                    print(f"DEBUG: Selected: {selected}")
+                    model_path = hf_hub_download(repo_id=model_path, filename=selected, cache_dir=kwargs.get('cache_dir'))
+                    print(f"DEBUG: Downloaded: {model_path}")
+                else:
+                    print(f"Warning: No GGUF files found in {model_path}, trying direct download...")
+            except Exception as e:
+                print(f"Warning: Could not search HuggingFace repo: {e}")
+        # If it's a HuggingFace model ID (not ending in .gguf), try to download
+        elif not model_path.endswith('.gguf') and not os.path.exists(model_path):
             # Try to get from HuggingFace
             try:
                 from huggingface_hub import hf_hub_download
