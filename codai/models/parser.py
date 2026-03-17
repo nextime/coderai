@@ -427,6 +427,25 @@ class ApexBig50Parser(BaseParser):
                         params = dict(re.findall(r'<(?:parameter|arg|argument)=(.*?)>(.*?)</(?:parameter|arg|argument)>', match, re.DOTALL))
                         results.append(self._to_oa(fn.group(1).strip(), params))
 
+        # NEW: Custom XML format with <action>, <object>, <properties> tags
+        # Example: <tool><action>search</action><object>financial_data</object><properties>...</properties></tool>
+        custom_xml_pattern = r'<tool>\s*<action>(.*?)</action>\s*<object>(.*?)</object>\s*<properties>(.*?)</properties>\s*</tool>'
+        for match in re.findall(custom_xml_pattern, text, re.DOTALL | re.IGNORECASE):
+            action, obj, props_xml = match
+            # Try to parse the properties as JSON
+            try:
+                props = json.loads(props_xml.strip())
+            except:
+                # Fallback: extract key-value pairs from XML properties
+                props = {}
+                for prop_match in re.findall(r'<(\w+)>(.*?)</\1>', props_xml, re.DOTALL):
+                    k, v = prop_match
+                    props[k] = v.strip()
+            # Use 'action' as the tool name
+            tool_name = action.strip()
+            if tool_name:
+                results.append(self._to_oa(tool_name, props))
+
         # Markdown patterns
         md_patterns = [
             r'```json\s*([\[\{].*?[\]\}])\s*```',
@@ -921,6 +940,8 @@ class ModelParserAdapter:
         if not text:
             return text
         
+        # Custom XML format: <tool><action>...</action><object>...</object><properties>...</properties></tool>
+        text = re.sub(r'<tool>\s*<action>.*?</action>\s*<object>.*?</object>\s*<properties>.*?</properties>\s*</tool>', '', text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r'<tool=[^>]+>.*?</tool_call>', '', text, flags=re.DOTALL)
         text = re.sub(r'<tool=[^>]+>.*?</tool>', '', text, flags=re.DOTALL)
         text = re.sub(r'<tool>.*?</tool>', '', text, flags=re.DOTALL)
