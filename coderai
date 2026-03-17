@@ -2066,6 +2066,39 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             raw_prompt_for_generation = raw_prompt
             raw_stop_sequences = list(stop_sequences)  # Copy current stop sequences
             
+            # Debug: Check what's available in the backend
+            if global_debug:
+                print(f"RAW DEBUG: Checking backend for tokenizer...")
+                print(f"RAW DEBUG: current_manager type: {type(current_manager)}")
+                print(f"RAW DEBUG: current_manager.backend type: {type(current_manager.backend)}")
+                print(f"RAW DEBUG: current_manager.backend dir: {[a for a in dir(current_manager.backend) if not a.startswith('_')]}")
+            
+            # Check for tokenizer
+            if hasattr(current_manager.backend, 'tokenizer'):
+                tokenizer = current_manager.backend.tokenizer
+                if global_debug:
+                    print(f"RAW DEBUG: Found tokenizer: {tokenizer}")
+            else:
+                if global_debug:
+                    print(f"RAW DEBUG: No 'tokenizer' attribute found")
+                # Check for other common names
+                if hasattr(current_manager.backend, 'llm') and hasattr(current_manager.backend.llm, 'tokenizer'):
+                    tokenizer = current_manager.backend.llm.tokenizer
+                    if global_debug:
+                        print(f"RAW DEBUG: Found tokenizer via llm: {tokenizer}")
+                elif hasattr(current_manager, 'tokenizer'):
+                    tokenizer = current_manager.tokenizer
+                    if global_debug:
+                        print(f"RAW DEBUG: Found tokenizer in current_manager: {tokenizer}")
+                elif hasattr(model_manager, 'tokenizer'):
+                    tokenizer = model_manager.tokenizer
+                    if global_debug:
+                        print(f"RAW DEBUG: Found tokenizer in model_manager: {tokenizer}")
+                else:
+                    tokenizer = None
+                    if global_debug:
+                        print(f"RAW DEBUG: Still no tokenizer found")
+            
             # Add the close tag to stop sequences for first pass
             if close_tag not in raw_stop_sequences:
                 raw_stop_sequences.append(close_tag)
@@ -2183,8 +2216,31 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     if "raw" in force_reasoning_args and not use_raw_mode:
         # Set up raw mode using tokenizer
         tokenizer = None
+        
+        # Debug: Check what's available in the backend
+        if global_debug:
+            print(f"RAW DEBUG [fallback]: Checking backend for tokenizer...")
+            print(f"RAW DEBUG [fallback]: current_manager type: {type(current_manager)}")
+            if hasattr(current_manager, 'backend'):
+                print(f"RAW DEBUG [fallback]: current_manager.backend type: {type(current_manager.backend)}")
+                print(f"RAW DEBUG [fallback]: current_manager.backend dir: {[a for a in dir(current_manager.backend) if not a.startswith('_')]}")
+        
         if hasattr(current_manager, 'backend') and hasattr(current_manager.backend, 'tokenizer'):
             tokenizer = current_manager.backend.tokenizer
+            if global_debug:
+                print(f"RAW DEBUG [fallback]: Found tokenizer in backend: {tokenizer}")
+        
+        # Also check model_manager (legacy)
+        if tokenizer is None and hasattr(model_manager, 'backend') and hasattr(model_manager.backend, 'tokenizer'):
+            tokenizer = model_manager.backend.tokenizer
+            if global_debug:
+                print(f"RAW DEBUG [fallback]: Found tokenizer in model_manager.backend: {tokenizer}")
+        
+        # Also check model_manager directly
+        if tokenizer is None and hasattr(model_manager, 'tokenizer'):
+            tokenizer = model_manager.tokenizer
+            if global_debug:
+                print(f"RAW DEBUG [fallback]: Found tokenizer in model_manager: {tokenizer}")
         
         if tokenizer is not None:
             # Extract system and user messages
