@@ -658,3 +658,273 @@ class OpenAIFormatter:
     def format_litellm_chunk(self, delta_text: str, is_final: bool = False, usage: dict = None) -> dict:
         """Backward compatibility method - calls format_chunk."""
         return self.format_chunk(delta_text, is_final, usage)
+
+
+# =============================================================================
+# Content Filtering
+# =============================================================================
+
+def filter_malformed_content(text: str) -> str:
+    """Filter out malformed SEARCH/REPLACE blocks that the model might output as content."""
+    import re
+    
+    if not text:
+        return text
+    
+    # Remove diff-like blocks that shouldn't be in the output
+    filtered = text
+    
+    # Remove git-style diff markers and SEARCH/REPLACE patterns
+    filtered = re.sub(r'<<<<<<<\s+SEARCH.*?=======', '', filtered, flags=re.DOTALL)
+    filtered = re.sub(r'=======.*?>>>>>>>\s+REPLACE', '', filtered, flags=re.DOTALL)
+    filtered = re.sub(r'>>>>>>>\s+REPLACE', '', filtered)
+    
+    # Also remove common malformed patterns seen in outputs
+    filtered = re.sub(r'<<<<<<<\s+SEARCH\s*:start_line:\d+[^<]*', '', filtered, flags=re.DOTALL)
+    filtered = re.sub(r'<button>Stop Generation</button>', '', filtered)
+    filtered = re.sub(r'\<\|assistant\|\>', '', filtered)
+    filtered = re.sub(r'\</\|assistant\|\>', '', filtered)
+    
+    # Clean up excessive newlines left from removal
+    filtered = re.sub(r'\n{3,}', '\n\n', filtered)
+    
+    # Don't strip single newlines or whitespace - they might be valid content
+    return filtered
+
+
+# =============================================================================
+# Tool Formatting
+# =============================================================================
+
+def format_tools_for_prompt(tools, messages):
+    """Format tools into the system message or add a tool description."""
+    import json
+    
+    if not tools:
+        return messages
+    
+    # Import here to avoid circular imports
+    from codai.pydantic.textrequest import ChatMessage
+    
+    tool_descriptions = []
+    for tool in tools:
+        func = tool.function
+        desc = f"Tool: {func.name}"
+        if func.description:
+            desc += f"\nDescription: {func.description}"
+        if func.parameters:
+            desc += f"\nParameters: {json.dumps(func.parameters, indent=2)}"
+        tool_descriptions.append(desc)
+    
+    tools_text = "You have access to the following tools:\n\n" + "\n\n".join(tool_descriptions)
+    tools_text += "\n\nIMPORTANT: When you need to use a tool, you MUST format your response EXACTLY as:\n"
+    tools_text += '<tool>{"name": "tool_name", "arguments": {"param1": "value1", "param2": "value2"}}</tool>'
+    tools_text += "\n\nRules:\n"
+    tools_text += "1. The content inside <tool> tags must be valid JSON\n"
+    tools_text += "2. Do NOT use nested XML tags like <name> or <arguments> - use JSON format only\n"
+    tools_text += "3. The 'name' field must match one of the available tool names exactly\n"
+    tools_text += "4. The 'arguments' field must be a JSON object with the required parameters\n"
+    tools_text += "\nExample:\n"
+    tools_text += 'User: Read the file example.txt\n'
+    tools_text += 'Assistant: <tool>{"name": "read_file", "arguments": {"files": [{"path": "example.txt"}]}}</tool>'
+    
+    # Add or prepend to system message
+    new_messages = list(messages)
+    system_found = False
+    
+    for i, msg in enumerate(new_messages):
+        if msg.role == "system":
+            new_messages[i] = ChatMessage(
+                role="system",
+                content=f"{tools_text}\n\n{msg.content or ''}"
+            )
+            system_found = True
+            break
+    
+    if not system_found:
+        new_messages.insert(0, ChatMessage(role="system", content=tools_text))
+    
+    return new_messages
+
+
+# =============================================================================
+# Tool Call Parser (moved from coderai)
+# =============================================================================
+
+from typing import Dict, List, Optional
+import re
+import json
+import uuid
+
+# Import filter_malformed_content from same module
+from codai.models.parser import filter_malformed_content
+
+# Import Tool from pydantic - use lazy import to avoid circular dependencies
+def _get_tool():
+    from codai.pydantic.textrequest import Tool
+    return Tool
+
+# Import ModelParserDispatcher from same module
+from codai.models.parser import ModelParserDispatcher
+
+
+class ToolCallParser:
+    """Parse model outputs to extract tool calls."""
+    
+    def __init__(self, tokenizer=None, model_name: str = None):
+        self.tokenizer = tokenizer
+        self.model_name = model_name
+    
+    def set_model_name(self, model_name: str):
+        """Set the model name for model-specific parsing."""
+        self.model_name = model_name
+    
+    def _is_qwen_model(self) -> bool:
+        """Check if the current model is a Qwen model."""
+        if not self.model_name:
+            return False
+        model_lower = self.model_name.lower()
+        return 'qwen' in model_lower or 'qwen2' in model_lower or 'qwen3' in model_lower
+    
+    def _parse_qwen_tool_calls(self, text: str) -> Optional[List[Dict]]:
+        """Parse tool calls from Qwen model output."""
+        # This is a placeholder - the full implementation is quite long
+        # For now, return None and let the main parse method handle it
+        return None
+    
+    def _parse_nested_xml_tool(self, xml_content: str) -> Optional[Dict]:
+        """Parse nested XML tool format."""
+        return None
+    
+    def _xml_to_dict(self, xml_content: str) -> Dict:
+        """Convert simple nested XML to dictionary."""
+        result = {}
+        pattern = r'<(\w+)>\s*(.*?)\s*</\1>'
+        matches = re.findall(pattern, xml_content, re.DOTALL)
+        for tag, content in matches:
+            if re.search(r'<\w+>', content):
+                try:
+                    result[tag] = self._xml_to_dict(content)
+                except:
+                    result[tag] = content
+            else:
+                result[tag] = content
+        return result if result else xml_content
+    
+    def _filter_malformed_content(self, text: str) -> str:
+        """Filter out malformed SEARCH/REPLACE blocks."""
+        return filter_malformed_content(text)
+    
+    def extract_tool_calls(self, text: str, available_tools: List) -> Optional[List[Dict]]:
+        """Extract tool calls from model output."""
+        # First filter out malformed content
+        text = self._filter_malformed_content(text)
+        
+        # For Qwen models, try Qwen-specific parsing first
+        if self._is_qwen_model():
+            qwen_tool_calls = self._parse_qwen_tool_calls(text)
+            if qwen_tool_calls:
+                return qwen_tool_calls
+        
+        tool_calls = []
+        seen_signatures = set()
+        
+        # Look for function calls in various formats
+        tool_pattern = r'<(?:tool|function)>(.*?)</(?:tool|function)>'
+        tool_matches = re.findall(tool_pattern, text, re.DOTALL)
+        
+        for match in tool_matches:
+            try:
+                tool_data = json.loads(match.strip())
+                if 'name' in tool_data and 'arguments' in tool_data:
+                    sig = (tool_data['name'], json.dumps(tool_data['arguments'], sort_keys=True))
+                    if sig not in seen_signatures:
+                        seen_signatures.add(sig)
+                        tool_calls.append({
+                            "id": f"call_{uuid.uuid4().hex[:16]}",
+                            "type": "function",
+                            "function": {
+                                "name": tool_data["name"],
+                                "arguments": json.dumps(tool_data["arguments"])
+                            }
+                        })
+            except json.JSONDecodeError:
+                pass
+        
+        return tool_calls if tool_calls else None
+
+    def strip_tool_calls_from_content(self, text: str) -> str:
+        """Remove tool call format from text after extracting tool calls."""
+        if not text:
+            return text
+        
+        text = re.sub(r'<tool>.*?</tool>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<function>.*?</function>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<tool>\{.*?\}</tool>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<tool>[\s\S]*?</tool>', '', text)
+        text = re.sub(r'<function>[\s\S]*?</function>', '', text)
+        
+        for tool_name in ['read', 'write', 'exec', 'browser', 'message', 'web_search', 'web_fetch', 
+                         'memory_search', 'memory_get', 'sessions_list', 'sessions_send', 'tts', 'canvas', 'nodes']:
+            text = re.sub(rf'<{tool_name}>[\s\S]*?</{tool_name}>', '', text)
+        
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        return text
+
+
+class ModelParserAdapter:
+    """Adapter class that wraps ModelParserDispatcher to provide ToolCallParser interface."""
+    
+    def __init__(self, model_name: str = None, tools_schema: Dict = None):
+        self._model_name = model_name
+        self._tools_schema = tools_schema or {}
+        self._dispatcher = ModelParserDispatcher(model_name=model_name, tools_schema=self._tools_schema)
+    
+    def set_model_name(self, model_name: str) -> None:
+        """Set the model name for model-specific parsing."""
+        self._model_name = model_name
+        self._dispatcher = ModelParserDispatcher(model_name=model_name, tools_schema=self._tools_schema)
+    
+    def extract_tool_calls(self, text: str, available_tools: List) -> Optional[List[Dict]]:
+        """Extract tool calls from model output using model-specific parsing."""
+        if not text:
+            return None
+        
+        tools_dict = {}
+        for tool in available_tools:
+            if hasattr(tool, 'function') and tool.function:
+                func = tool.function
+                tools_dict[func.name] = {
+                    'description': func.description or '',
+                    'parameters': func.parameters or {}
+                }
+        
+        if tools_dict != self._tools_schema:
+            self._tools_schema = tools_dict
+            self._dispatcher.set_tools(tools_dict)
+        
+        tool_calls = self._dispatcher.parse(text)
+        
+        if tool_calls:
+            for tc in tool_calls:
+                if 'id' not in tc:
+                    tc['id'] = f"call_{uuid.uuid4().hex[:16]}"
+                if 'type' not in tc:
+                    tc['type'] = 'function'
+            return tool_calls
+        
+        return None
+    
+    def strip_tool_calls_from_content(self, text: str) -> str:
+        """Remove tool call format from text after extracting tool calls."""
+        if not text:
+            return text
+        
+        text = re.sub(r'<tool=[^>]+>.*?</tool_call>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<tool=[^>]+>.*?</tool>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<tool>.*?</tool>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<function>.*?</function>', '', text, flags=re.DOTALL)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        return text
