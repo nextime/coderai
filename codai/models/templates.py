@@ -102,6 +102,10 @@ class AgenticTemplateManager:
             "\n\nCRITICAL: You are an agent with access to tools. "
             f"Use the {thought_tag} tag to reason step-by-step "
             "before providing a tool call. If you have enough info, provide the final answer."
+            " CRITICAL: You must always close your reasoning with "
+            f"{thought_tag} "
+            "before opening any tool tags like <tool> or <tool_call>. "
+            "Failure to close reasoning will result in malformed output."
         )
         return f"{base_prompt}{agent_addon}"
 

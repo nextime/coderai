@@ -2313,11 +2313,31 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         reasoning_text = ""
         final_text = first_pass_result
         
+        # Define tool tags that indicate end of reasoning
+        tool_tags = ["<tool_call>", "<tool>", "<|tool_call|", "<|tool|", "<function="]
+        
         if close_tag and close_tag in first_pass_result:
             # Split at close tag
             parts = first_pass_result.split(close_tag, 1)
             reasoning_text = parts[0]
             final_text = parts[1] if len(parts) > 1 else ""
+        else:
+            # Try to find tool tags as fallback stop markers
+            earliest_tool_idx = len(first_pass_result)
+            earliest_tool_tag = None
+            for tag in tool_tags:
+                idx = first_pass_result.find(tag)
+                if idx != -1 and idx < earliest_tool_idx:
+                    earliest_tool_idx = idx
+                    earliest_tool_tag = tag
+            
+            if earliest_tool_tag:
+                # Split at tool tag
+                if global_debug:
+                    print(f"RAW: No close tag found, using tool tag '{earliest_tool_tag}' as fallback")
+                parts = first_pass_result.split(earliest_tool_tag, 1)
+                reasoning_text = parts[0]
+                final_text = earliest_tool_tag + (parts[1] if len(parts) > 1 else "")
         
         if global_debug:
             print(f"RAW: Extracted reasoning: {reasoning_text[:100]}...")
