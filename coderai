@@ -1977,12 +1977,6 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     # Enable thinking/reasoning mode if requested via API parameter OR CLI flag
     force_reasoning_args = getattr(global_args, 'force_reasoning', None) if global_args else None
     
-    # Check if --force-all is set
-    force_all = getattr(global_args, 'force_all', False) if global_args else False
-    if force_all:
-        # --force-all is equivalent to chat,inject,prompt,mock,raw,twopass
-        force_reasoning_args = ['chat', 'inject', 'prompt', 'mock', 'raw', 'twopass']
-    
     enable_thinking_api = getattr(request, 'enable_thinking', False)
     
     # Parse force_reasoning: can be list (from CLI) or string (legacy)
@@ -1994,6 +1988,9 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             force_reasoning_args = ["stop"]
         elif force_reasoning_args == "inject":
             force_reasoning_args = ["inject"]
+        elif force_reasoning_args == "all":
+            # 'all' enables all reasoning methods
+            force_reasoning_args = ["chat", "inject", "prompt", "mock", "raw", "twopass"]
         else:
             force_reasoning_args = []
     elif not force_reasoning_args:
@@ -3556,19 +3553,14 @@ def parse_args():
             raise argparse.ArgumentTypeError(f"Invalid choices: {invalid}. Valid options: {valid}")
         # Expand 'all' to all options
         if 'all' in options:
-            options = ['chat', 'stop', 'inject', 'prompt']
+            options = ['chat', 'inject', 'prompt', 'mock', 'raw', 'twopass']
         return options
     
     parser.add_argument(
         "--force-reasoning",
         type=reasoning_choices,
         default=None,
-        help="Force reasoning. Options: 'chat' (API), 'stop' (tokens), 'inject' (sys prompt), 'prompt' (seeding), 'twopass' (2 calls), 'mock' (fake stats), 'raw' (raw completion), 'all'. Combine: --force-reasoning chat,inject. See also --force-all.",
-    )
-    parser.add_argument(
-        "--force-all",
-        action="store_true",
-        help="Enable all force reasoning options: chat,inject,prompt,mock,raw,twopass. Equivalent to --force-reasoning chat,inject,prompt,mock,raw,twopass",
+        help="Force reasoning. Options: 'chat' (API), 'stop' (tokens), 'inject' (sys prompt), 'prompt' (seeding), 'twopass' (2 calls), 'mock' (fake stats), 'raw' (raw completion), 'all' (all options). Combine: --force-reasoning chat,inject.",
     )
     return parser.parse_args()
 def main():
