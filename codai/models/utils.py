@@ -117,13 +117,18 @@ def get_resolved_model_name(requested_model: str, current_manager = None) -> str
     # Try to get from current manager if available
     if current_manager is not None:
         # Check if the model is loaded in the manager
-        if hasattr(current_manager, 'models'):
+        if hasattr(current_manager, 'models') and current_manager.models:
+            # If requested_model is "default" or empty, get the first loaded model
+            if requested_model in ("default", "", None) or not requested_model:
+                # Try default_model first
+                if hasattr(current_manager, 'default_model') and current_manager.default_model:
+                    return current_manager.default_model
+                # Otherwise return the first model in the dict
+                return list(current_manager.models.keys())[0]
+            # Check if the model is loaded in the manager
             for key, model in current_manager.models.items():
                 if requested_model == key or requested_model in key:
                     return key
-        if hasattr(current_manager, 'default_model'):
-            if requested_model == "default":
-                return current_manager.default_model
     
     # Check if it's a HuggingFace model ID - if so, return as-is
     if '/' in requested_model:
