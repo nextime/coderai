@@ -13,7 +13,7 @@ from codai.models.parser import ModelParserAdapter
 from codai.backends import detect_available_backends
 from codai.backends.cuda import NvidiaBackend
 from codai.backends.vulkan import VulkanBackend
-from codai.models.cache import get_cached_model_path, download_model
+from codai.models.cache import get_cached_model_path, download_model, get_model_cache_dir
 from codai.pydantic.textrequest import ModelInfo
 
 

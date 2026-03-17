@@ -1,4 +1,8 @@
-"""Backend detection module."""
+"""Backend detection and management module."""
+
+from codai.backends.base import ModelBackend
+from codai.backends.cuda import NvidiaBackend
+from codai.backends.vulkan import VulkanBackend
 
 
 def detect_available_backends():

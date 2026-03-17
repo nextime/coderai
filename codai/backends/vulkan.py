@@ -1,65 +1,734 @@
-"""Vulkan backend using llama.cpp."""
+# AI.PROMPT: Add Vulkan backend support for AMD GPUs using llama-cpp-python
+# This backend handles GGUF models on AMD GPUs via Vulkan
 
-from typing import Optional, List, Dict
+import os
+import json
+from typing import AsyncIterator, Optional, Union, List, Dict, Any
+from pathlib import Path
 
 from codai.backends.base import ModelBackend
+from codai.models.utils import (
+    check_hf_chat_template,
+    get_model_family,
+    get_reasoning_stop_tokens
+)
+from codai.models.cache import get_cached_model_path
+
+try:
+    from llama_cpp import Llama
+    from llama_cpp.llama_chat_format import ChatFormatterResponse
+    LLAMA_CPP_AVAILABLE = True
+except ImportError:
+    LLAMA_CPP_AVAILABLE = False
+    Llama = None
+    ChatFormatterResponse = None
 
 
 class VulkanBackend(ModelBackend):
-    """Backend for Vulkan GPU inference using llama.cpp."""
+    """Backend for Vulkan (AMD GPUs) using llama-cpp-python with GGUF models."""
     
     def __init__(self, original_backend: str = None):
         self.model = None
         self.model_name = None
-        self.device = None
-        self.n_gpu_layers = -1
+        self.n_gpu_layers = -1  # Offload all layers to GPU by default
         self.n_ctx = 2048
         self.verbose = True
-        self.main_gpu = 0
-        self.chat_template = None
-        self.hf_tokenizer = None
-        self.force_cuda = original_backend in ("nvidia", "cuda")
+        self.main_gpu = 0  # Default to first GPU
+        self.chat_template = None  # Detected chat template name
+        self.hf_tokenizer = None  # HuggingFace tokenizer for apply_chat_template
+        self.force_cuda = original_backend in ("nvidia", "cuda")  # Force CUDA if original was nvidia
         if self.force_cuda:
             print("DEBUG: GGUF model will use CUDA backend (forced by --backend nvidia)")
+        self._detect_chat_template()
     
-    def load_model(self, model_name: str, **kwargs) -> None:
-        """Load the model."""
-        pass
+    def _detect_chat_template(self):
+        """Detect the chat template used by the model."""
+        try:
+            # Try to get the chat template from the model
+            # llama.cpp models have a chat_template attribute
+            from llama_cpp.llama_chat_format import ChatFormatterResponse
+            # We'll detect it when the model is loaded
+            self.chat_template = "unknown"
+            print("DEBUG: Chat template detection will happen after model load")
+        except Exception as e:
+            print(f"DEBUG: Could not initialize chat template detection: {e}")
+            self.chat_template = None
     
-    def generate(self, prompt: str, max_tokens: Optional[int] = None, 
-                 temperature: float = 0.7, top_p: float = 1.0,
-                 stop: Optional[list] = None) -> str:
-        """Generate text non-streaming."""
-        pass
+    def _load_huggingface_tokenizer(self, template_name: str = None):
+        """Load HuggingFace tokenizer for apply_chat_template support.
+        
+        Args:
+            template_name: Optional specific template to use (e.g., 'llama3', 'chatml'). 
+                          If None, will auto-detect from tokenizer.
+        """
+        if self.hf_tokenizer is not None:
+            return  # Already loaded
+        
+        model_path = getattr(self, 'model_name', None)
+        if not model_path:
+            print("DEBUG: No model name available for HuggingFace tokenizer")
+            return
+        
+        # If model_path is a URL, try to get the cached local path first
+        if model_path.startswith('http://') or model_path.startswith('https://'):
+            cached_path = get_cached_model_path(model_path)
+            if cached_path and os.path.exists(cached_path):
+                model_path = cached_path
+                print(f"DEBUG: Using cached model path for HF tokenizer: {model_path}")
+        
+        try:
+            from transformers import AutoTokenizer
+            
+            # If a specific template is provided, we can use it directly without loading tokenizer
+            if template_name:
+                self.chat_template = template_name
+                print(f"DEBUG: Using specified chat template: {template_name}")
+                # Still need to load tokenizer to get the actual template
+                # but we can use the specified template name
+            
+            # Try to determine the model identifier
+            # If model_path is a GGUF file, try to find the corresponding HF model
+            if model_path.endswith('.gguf'):
+                # Try to extract model name from path
+                # Common patterns: .../models/llama-3.1-8b-instruct-q4_k_m.gguf
+                model_dir = os.path.dirname(model_path)
+                model_file = os.path.basename(model_path)
+                
+                # Try to find a tokenizer config in the model directory
+                tokenizer_config_path = os.path.join(model_dir, 'tokenizer_config.json')
+                if os.path.exists(tokenizer_config_path):
+                    # Load from local directory
+                    self.hf_tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+                    print(f"DEBUG: Loaded HuggingFace tokenizer from local: {model_dir}")
+                    if not template_name:
+                        self.chat_template = "hf_local"
+                    return
+                
+                # Try to infer model name from file name
+                # Common patterns: llama-3.1-8b-instruct-q4_k_m.gguf -> llama-3.1-8b-instruct
+                # Also handle cached files with hash prefix: hash_modelname.gguf -> modelname
+                model_base = model_file.replace('.gguf', '')
+                
+                # Remove hash prefix (64 hex chars for SHA-256 followed by underscore)
+                if len(model_base) > 64 and model_base[:64].isalnum():
+                    model_base = model_base[65:]  # Skip hash + underscore
+                
+                # Remove common quantization suffixes (case-insensitive)
+                for suffix in ['_q4_k_m', '_q4_k', '_q5_k', '_q5_k_m', '_q8_0', '_f16', '_q4_0', '_q3_k_m', '_q2_k', '_Q4_K_M', '_Q4_K', '_Q5_K', '_Q5_K_M', '_Q8_0', '_F16', '_Q4_0', '_Q3_K_M', '_Q2_K']:
+                    model_base = model_base.replace(suffix, '')
+                
+                # Try to load from HuggingFace hub
+                # First try the cleaned model_base
+                model_names_to_try = [model_base]
+                
+                # Generate shorter versions of the model name for fallback
+                # E.g., Qwen3.5-27B-Uncensored-HauhauCS-Aggressive -> try shorter variants
+                parts = model_base.split('-')
+                if len(parts) > 1:
+                    # Try progressively shorter names by removing parts from the end
+                    for i in range(len(parts) - 1, 0, -1):
+                        shorter_name = '-'.join(parts[:i])
+                        if shorter_name and shorter_name != model_base:
+                            model_names_to_try.append(shorter_name)
+                
+                # Also try with just the first part (e.g., "Qwen" from "Qwen3.5-27B...")
+                if len(parts) > 1:
+                    model_names_to_try.append(parts[0])
+                
+                tokenizer_loaded = False
+                last_error = None
+                for model_id in model_names_to_try:
+                    try:
+                        self.hf_tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+                        print(f"DEBUG: Loaded HuggingFace tokenizer from hub: {model_id}")
+                        if not template_name:
+                            self.chat_template = "hf_hub"
+                        tokenizer_loaded = True
+                        break
+                    except Exception as fallback_err:
+                        last_error = fallback_err
+                        print(f"DEBUG: Could not load tokenizer from hub ({model_id}): {fallback_err}")
+                        continue
+                
+                if tokenizer_loaded:
+                    return
+                
+                # If HF tokenizer loading failed, try to use known template names based on model name
+                # This helps when we can't find the tokenizer but know the model family
+                model_base_lower = model_base.lower()
+                
+                # Check if this looks like a Qwen model
+                known_templates_to_try = []
+                if 'qwen' in model_base_lower:
+                    # Try known Qwen template names in order of specificity
+                    if 'qwen3.5' in model_base_lower or 'qwen3' in model_base_lower:
+                        known_templates_to_try = ['qwen3', 'qwen', None]  # None means use manual formatting
+                    elif 'qwen2' in model_base_lower:
+                        known_templates_to_try = ['qwen2', 'qwen', None]
+                    else:
+                        known_templates_to_try = ['qwen', None]
+                elif 'llama' in model_base_lower:
+                    known_templates_to_try = ['llama3', 'llama', None]
+                elif 'phi' in model_base_lower:
+                    known_templates_to_try = ['phi', None]
+                elif 'mistral' in model_base_lower or 'mixtral' in model_base_lower:
+                    known_templates_to_try = ['mistral', None]
+                
+                # Try each known template - directly use the template name without loading tokenizer
+                # This is the key fix: instead of trying to load more non-existent tokenizers,
+                # directly set the chat_template to the known template name
+                for template_name in known_templates_to_try:
+                    if template_name is None:
+                        # No more templates to try, use manual formatting with generic format
+                        self.chat_template = "chatml"  # Use ChatML as generic fallback
+                        print(f"DEBUG: No known templates worked, using generic ChatML format")
+                        break
+                    # Directly use this known template name - no need to load tokenizer
+                    # The manual formatting will use <|im_start|> tags which work for most models
+                    self.chat_template = template_name
+                    print(f"DEBUG: Using known template '{template_name}' for model family detection")
+                    # Successfully set template - don't try to load tokenizer
+                    break
+                
+                if self.chat_template:
+                    return
+                
+                # All attempts failed - warn but continue without template
+                print(f"Warning: Could not load HuggingFace tokenizer for any variant of '{model_base}'")
+                print(f"Warning: Will not use apply_chat_template - model will use manual formatting")
+                self.chat_template = None
+            else:
+                # Not a GGUF file, try to load directly
+                self.hf_tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                print(f"DEBUG: Loaded HuggingFace tokenizer from: {model_path}")
+                if not template_name:
+                    self.chat_template = "hf"
+                return
+                    
+        except ImportError as e:
+            print(f"DEBUG: transformers not installed, cannot use HuggingFace chat template: {e}")
+            self.chat_template = None
+        except Exception as e:
+            print(f"DEBUG: Failed to load HuggingFace tokenizer: {e}")
+            self.chat_template = None
     
-    def generate_chat(self, messages: List[Dict], max_tokens: Optional[int] = None,
-                      temperature: float = 0.7, top_p: float = 1.0,
-                      stop: Optional[List[str]] = None, tools: Optional[List] = None,
-                      response_format: Optional[Dict] = None) -> str:
-        """Generate chat completion non-streaming."""
-        pass
+    def _finalize_chat_template_detection(self):
+        """Finalize chat template detection after model is loaded."""
+        # Check if we should use HuggingFace tokenizer for chat template
+        # Try to get model info
+        model_name = getattr(self, 'model_name', None) or "unknown"
+        
+        # Determine model type - text models use GGUF, images would be different
+        model_type = "text"
+        if model_name.startswith("image:"):
+            model_type = "image"
+        
+        should_use, template_name = check_hf_chat_template(model_type, model_name)
+
+        # If the model is a text model, try to load the HuggingFace tokenizer
+        # for apply_chat_template support
+        if model_type == "text" and not self.hf_tokenizer:
+            self._load_huggingface_tokenizer(template_name)
     
-    async def generate_chat_stream(self, messages: List[Dict], max_tokens: Optional[int] = None,
-                                    temperature: float = 0.7, top_p: float = 1.0,
-                                    stop: Optional[List[str]] = None, tools: Optional[List] = None,
-                                    response_format: Optional[Dict] = None):
-        """Generate chat completion streaming."""
-        pass
+    def _apply_chat_template(self, messages: List[Dict[str, str]], add_generation_prompt: bool = True) -> str:
+        """Apply chat template to messages.
+        
+        Tries multiple methods in order:
+        1. HuggingFace tokenizer's apply_chat_template
+        2. Manual template application based on detected template name
+        3. Generic ChatML format as fallback
+        """
+        # First try HuggingFace tokenizer
+        if self.hf_tokenizer:
+            try:
+                # Check if tokenizer has apply_chat_template
+                if hasattr(self.hf_tokenizer, 'apply_chat_template'):
+                    # Use the tokenizer's chat template
+                    # For ChatML/Others: add_generation_prompt=True adds the assistant token
+                    # For Llama3: adds the correct prefix
+                    rendered = self.hf_tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=add_generation_prompt
+                    )
+                    print(f"DEBUG: Applied HuggingFace chat template")
+                    return rendered
+            except Exception as e:
+                print(f"DEBUG: HuggingFace apply_chat_template failed: {e}")
+        
+        # Try llama.cpp's built-in chat template
+        if hasattr(self, 'model') and self.model is not None:
+            try:
+                if hasattr(self.model, 'chat'):
+                    # Get the chat template from llama.cpp
+                    # This works for models that have chat templates defined
+                    from llama_cpp.llama_chat_format import ChatCompletionMessage
+                    
+                    # Try to use the model's chat handler
+                    # llama.cpp's create_chat_completion handles templates internally
+                    # But we need raw text for streaming
+                    pass  # Fall through to manual
+            except Exception as e:
+                print(f"DEBUG: llama.cpp chat handling failed: {e}")
+        
+        # Manual template application based on detected template
+        template_name = self.chat_template or "chatml"
+        
+        # Format messages based on template name
+        if template_name in ("llama3", "llama-3", "llama-3.1"):
+            return self._format_llama3(messages, add_generation_prompt)
+        elif template_name in ("qwen2", "qwen2.5", "qwen3"):
+            return self._format_qwen(messages, add_generation_prompt)
+        elif template_name == "chatml":
+            return self._format_chatml(messages, add_generation_prompt)
+        elif template_name in ("mistral", "mixtral"):
+            return self._format_mistral(messages, add_generation_prompt)
+        else:
+            # Default to ChatML format
+            return self._format_chatml(messages, add_generation_prompt)
     
-    def generate_stream(self, prompt: str, max_tokens: Optional[int] = None,
-                        temperature: float = 0.7, top_p: float = 1.0,
-                        stop: Optional[list] = None):
-        """Generate text in streaming fashion."""
-        pass
+    def _format_llama3(self, messages: List[Dict[str, str]], add_generation_prompt: bool = True) -> str:
+        """Format messages for Llama 3.x models."""
+        result = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                result.append(f"<|start_header_id|>system<|end_header_id|>\n\n{content}<|eot_id|>")
+            elif role == "user":
+                result.append(f"<|start_header_id|>user<|end_header_id|>\n\n{content}<|eot_id|>")
+            elif role == "assistant":
+                result.append(f"<|start_header_id|>assistant<|end_header_id|>\n\n{content}<|eot_id|>")
+        
+        if add_generation_prompt:
+            result.append(f"<|start_header_id|>assistant<|end_header_id|>\n\n")
+        
+        return "".join(result)
     
-    def format_messages(self, messages) -> str:
-        """Format messages into a prompt string."""
-        pass
+    def _format_qwen(self, messages: List[Dict[str, str]], add_generation_prompt: bool = True) -> str:
+        """Format messages for Qwen models."""
+        result = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                result.append(f"<|im_start|>system\n{content}<|im_end|>")
+            elif role == "user":
+                result.append(f"<|im_start|>user\n{content}<|im_end|>")
+            elif role == "assistant":
+                result.append(f"<|im_start|>assistant\n{content}<|im_end|>")
+        
+        if add_generation_prompt:
+            result.append(f"<|im_start|>assistant\n")
+        
+        return "".join(result)
     
-    def get_model_name(self) -> str:
-        """Return the loaded model name."""
-        return self.model_name
+    def _format_chatml(self, messages: List[Dict[str, str]], add_generation_prompt: bool = True) -> str:
+        """Format messages using ChatML format."""
+        result = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                result.append(f"<|im_start|>system\n{content}<|im_end|>")
+            elif role == "user":
+                result.append(f"<|im_start|>user\n{content}<|im_end|>")
+            elif role == "assistant":
+                result.append(f"<|im_start|>assistant\n{content}<|im_end|>")
+        
+        if add_generation_prompt:
+            result.append(f"<|im_start|>assistant\n")
+        
+        return "".join(result)
     
-    def cleanup(self) -> None:
-        """Cleanup resources."""
-        pass
+    def _format_mistral(self, messages: List[Dict[str, str]], add_generation_prompt: bool = True) -> str:
+        """Format messages for Mistral/Mixtral models."""
+        result = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                result.append(f"[INST] <<SYS>>\n{content}\n<</SYS>>\n\n")
+            elif role == "user":
+                result.append(f"[INST]{content}[/INST]")
+            elif role == "assistant":
+                result.append(f"{content}")
+        
+        # Mistral uses a different format - the last user message has [/INST]
+        # and we add the assistant prefix if generation prompt is needed
+        if add_generation_prompt:
+            # Find the last user message and add the assistant prefix after it
+            # Actually, let's reformat more carefully
+            pass  # Fall through to simpler format
+        
+        # Simpler approach: join with newlines
+        formatted = ""
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                formatted += f"<<SYS>>\n{content}\n<</SYS>>\n\n"
+            elif role == "user":
+                formatted += f"[INST] {content} [/INST]"
+            elif role == "assistant":
+                formatted += f" {content}"
+        
+        if add_generation_prompt:
+            formatted += " "
+        
+        return formatted
+    
+    async def load_model(self, model_path: str, model_type: str = "text", **kwargs) -> bool:
+        """Load a GGUF model.
+        
+        Args:
+            model_path: Path to the GGUF model file or HuggingFace model ID
+            model_type: Type of model (text, image, audio)
+            **kwargs: Additional parameters
+            
+        Returns:
+            True if model loaded successfully
+        """
+        if not LLAMA_CPP_AVAILABLE:
+            raise ImportError("llama-cpp-python is required for GGUF models. Install with: pip install llama-cpp-python")
+        
+        # If it's a HuggingFace model ID, try to download
+        if not model_path.endswith('.gguf') and not os.path.exists(model_path):
+            # Try to get from HuggingFace
+            try:
+                from huggingface_hub import hf_hub_download
+                # Download the GGUF file
+                model_path = hf_hub_download(repo_id=model_path, filename="*.gguf", cache_dir=kwargs.get('cache_dir'))
+            except Exception as e:
+                print(f"Warning: Could not download from HuggingFace: {e}")
+                # Try as-is
+        
+        # If it's a URL, download it
+        if model_path.startswith('http://') or model_path.startswith('https://'):
+            cached_path = get_cached_model_path(model_path)
+            if cached_path:
+                model_path = cached_path
+            else:
+                raise ValueError(f"Could not cache model from URL: {model_path}")
+        
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+        
+        self.model_name = model_path
+        
+        # Determine model type
+        is_image = model_type == "image" or model_path.startswith("image:")
+        
+        # Configure GPU layers
+        n_gpu_layers = kwargs.get('n_gpu_layers', -1)
+        if n_gpu_layers != -1:
+            self.n_gpu_layers = n_gpu_layers
+        
+        # Configure context size
+        n_ctx = kwargs.get('n_ctx', 2048)
+        self.n_ctx = n_ctx
+        
+        # Set verbose
+        self.verbose = kwargs.get('verbose', True)
+        
+        # Set main GPU
+        self.main_gpu = kwargs.get('main_gpu', 0)
+        
+        # Build kwargs for Llama constructor
+        llama_kwargs = {
+            'model_path': model_path,
+            'n_gpu_layers': self.n_gpu_layers,
+            'n_ctx': self.n_ctx,
+            'verbose': self.verbose,
+            'main_gpu': self.main_gpu,
+        }
+        
+        # Add optional parameters
+        if 'n_threads' in kwargs:
+            llama_kwargs['n_threads'] = kwargs['n_threads']
+        if 'n_threads_batch' in kwargs:
+            llama_kwargs['n_threads_batch'] = kwargs['n_threads_batch']
+        if 'rope_freq_base' in kwargs:
+            llama_kwargs['rope_freq_base'] = kwargs['rope_freq_base']
+        if 'rope_freq_scale' in kwargs:
+            llama_kwargs['rope_freq_scale'] = kwargs['rope_freq_scale']
+        
+        # Force CUDA if requested
+        if self.force_cuda:
+            # Set environment variable to force CUDA
+            os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+            # llama-cpp-python will use CUDA when available
+        
+        try:
+            self.model = Llama(**llama_kwargs)
+            
+            # Try to detect and set up chat template
+            self._finalize_chat_template_detection()
+            
+            print(f"DEBUG: VulkanBackend loaded model: {model_path}")
+            print(f"DEBUG: n_gpu_layers={self.n_gpu_layers}, n_ctx={self.n_ctx}")
+            print(f"DEBUG: chat_template={self.chat_template}")
+            
+            return True
+        except Exception as e:
+            print(f"Error loading GGUF model: {e}")
+            raise
+    
+    async def generate(
+        self,
+        prompt: str,
+        **kwargs
+    ) -> str:
+        """Generate text from prompt.
+        
+        Args:
+            prompt: Input prompt (or messages for chat)
+            **kwargs: Generation parameters
+            
+        Returns:
+            Generated text
+        """
+        if self.model is None:
+            raise RuntimeError("Model not loaded")
+        
+        # Check if prompt looks like messages (list of dicts)
+        if isinstance(prompt, list):
+            prompt = self._apply_chat_template(prompt, add_generation_prompt=True)
+        
+        # Set defaults
+        max_tokens = kwargs.get('max_tokens', 256)
+        temperature = kwargs.get('temperature', 0.7)
+        top_p = kwargs.get('top_p', 0.9)
+        top_k = kwargs.get('top_k', 40)
+        repeat_penalty = kwargs.get('repeat_penalty', 1.1)
+        stream = kwargs.get('stream', False)
+        
+        # Get stop strings
+        stop = kwargs.get('stop', None)
+        if stop is None:
+            # Get default stop tokens based on template
+            stop = get_reasoning_stop_tokens(self.chat_template)
+        
+        try:
+            if stream:
+                # Collect all chunks
+                chunks = []
+                async for chunk in self.generate_stream(prompt, **kwargs):
+                    chunks.append(chunk)
+                return "".join(chunks)
+            else:
+                result = self.model.create_completion(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repeat_penalty=repeat_penalty,
+                    stop=stop,
+                )
+                return result['choices'][0]['text']
+        except Exception as e:
+            print(f"Error during generation: {e}")
+            raise
+    
+    async def generate_stream(
+        self,
+        prompt: str,
+        **kwargs
+    ) -> AsyncIterator[str]:
+        """Generate text with streaming.
+        
+        Args:
+            prompt: Input prompt (or messages for chat)
+            **kwargs: Generation parameters
+            
+        Yields:
+            Generated text chunks
+        """
+        if self.model is None:
+            raise RuntimeError("Model not loaded")
+        
+        # Check if prompt looks like messages (list of dicts)
+        if isinstance(prompt, list):
+            prompt = self._apply_chat_template(prompt, add_generation_prompt=True)
+        
+        # Set defaults
+        max_tokens = kwargs.get('max_tokens', 256)
+        temperature = kwargs.get('temperature', 0.7)
+        top_p = kwargs.get('top_p', 0.9)
+        top_k = kwargs.get('top_k', 40)
+        repeat_penalty = kwargs.get('repeat_penalty', 1.1)
+        
+        # Get stop strings
+        stop = kwargs.get('stop', None)
+        if stop is None:
+            # Get default stop tokens based on template
+            stop = get_reasoning_stop_tokens(self.chat_template)
+        
+        try:
+            # For chat, we need to extract just the new text from each chunk
+            # The first chunk will have the full prompt + first token
+            # Subsequent chunks only have new tokens
+            
+            first_chunk = True
+            prompt_len = len(prompt) if isinstance(prompt, str) else 0
+            
+            for chunk in self.model.create_completion(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repeat_penalty=repeat_penalty,
+                stop=stop,
+                stream=True,
+            ):
+                text = chunk['choices'][0].get('text', '')
+                
+                if first_chunk:
+                    # Skip the prompt text on first chunk
+                    # The first chunk includes the full prompt plus the first new token
+                    if text and len(text) > prompt_len:
+                        # Extract just the new part
+                        new_text = text[prompt_len:]
+                        if new_text:
+                            yield new_text
+                    first_chunk = False
+                else:
+                    # Subsequent chunks only have new tokens
+                    if text:
+                        yield text
+                
+                # Check for stop
+                if chunk['choices'][0].get('finish_reason'):
+                    break
+                    
+        except Exception as e:
+            print(f"Error during streaming generation: {e}")
+            raise
+    
+    async def chat(
+        self,
+        messages: List[Dict[str, str]],
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Chat completion.
+        
+        Args:
+            messages: List of message dicts with 'role' and 'content'
+            **kwargs: Generation parameters
+            
+        Returns:
+            Response dict with 'content' and metadata
+        """
+        if self.model is None:
+            raise RuntimeError("Model not loaded")
+        
+        # Apply chat template
+        prompt = self._apply_chat_template(messages, add_generation_prompt=True)
+        
+        # Generate
+        max_tokens = kwargs.get('max_tokens', 256)
+        temperature = kwargs.get('temperature', 0.7)
+        top_p = kwargs.get('top_p', 0.9)
+        repeat_penalty = kwargs.get('repeat_penalty', 1.1)
+        
+        stop = kwargs.get('stop', None)
+        if stop is None:
+            stop = get_reasoning_stop_tokens(self.chat_template)
+        
+        stream = kwargs.get('stream', False)
+        
+        if stream:
+            # Return iterator for streaming
+            async def generate_stream():
+                first_chunk = True
+                prompt_len = len(prompt)
+                
+                for chunk in self.model.create_completion(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    repeat_penalty=repeat_penalty,
+                    stop=stop,
+                    stream=True,
+                ):
+                    text = chunk['choices'][0].get('text', '')
+                    
+                    if first_chunk:
+                        if text and len(text) > prompt_len:
+                            new_text = text[prompt_len:]
+                            if new_text:
+                                yield new_text
+                        first_chunk = False
+                    else:
+                        if text:
+                            yield text
+                    
+                    if chunk['choices'][0].get('finish_reason'):
+                        break
+            
+            return {"stream": generate_stream(), "content": ""}
+        else:
+            result = self.model.create_completion(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                repeat_penalty=repeat_penalty,
+                stop=stop,
+            )
+            
+            content = result['choices'][0]['text']
+            
+            return {
+                "content": content,
+                "usage": result.get('usage', {}),
+                "model": self.model_name,
+            }
+    
+    async def embed(self, text: str) -> List[float]:
+        """Generate embeddings.
+        
+        Args:
+            text: Input text
+            
+        Returns:
+            Embedding vector
+        """
+        if self.model is None:
+            raise RuntimeError("Model not loaded")
+        
+        try:
+            result = self.model.create_embedding(text)
+            return result['data'][0]['embedding']
+        except Exception as e:
+            print(f"Error generating embeddings: {e}")
+            raise
+    
+    def unload_model(self):
+        """Unload the model from memory."""
+        if self.model is not None:
+            del self.model
+            self.model = None
+            self.model_name = None
+            print("DEBUG: VulkanBackend unloaded model")
+    
+    @property
+    def is_loaded(self) -> bool:
+        """Check if model is loaded."""
+        return self.model is not None
+    
+    def get_model_info(self) -> Dict[str, Any]:
+        """Get information about the loaded model."""
+        if self.model is None:
+            return {"loaded": False}
+        
+        return {
+            "loaded": True,
+            "model_name": self.model_name,
+            "chat_template": self.chat_template,
+            "n_ctx": self.n_ctx,
+            "n_gpu_layers": self.n_gpu_layers,
+        }

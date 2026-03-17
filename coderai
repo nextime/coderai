@@ -30,6 +30,11 @@ from threading import Thread
 
 # Import codai module for enhanced tool call parsing
 from codai.models import ModelParserDispatcher, OpenAIFormatter
+
+# Import from codai modules for use in this file
+from codai.models.manager import ModelManager, WhisperServerManager, MultiModelManager
+from codai.queue.manager import QueueManager, queue_manager
+from codai.backends import NvidiaBackend, VulkanBackend, detect_available_backends
 # Per-model semaphores for request concurrency control
 model_semaphores: dict = {}
 load_mode = {"mode": "ondemand"}  # Track load mode globally
