@@ -146,9 +146,8 @@ class VulkanBackend(ModelBackend):
                         tokenizer_loaded = True
                         break
                     except Exception as fallback_err:
-                        last_error = fallback_err
-                        print(f"DEBUG: Could not load tokenizer from hub ({model_id}): {fallback_err}")
-                        continue
+                        # Silently skip failed tokenizer loads - we'll use manual formatting
+                        pass
                 
                 if tokenizer_loaded:
                     return
