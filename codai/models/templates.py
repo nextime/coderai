@@ -232,28 +232,53 @@ class AgenticTemplateManager:
             
         return prompt
     
-    def format_for_raw_completion(self, system_prompt: str, user_message: str) -> Tuple[str, List[str]]:
+    def format_for_raw_completion(self, system_prompt: str, user_message: str, 
+                                inject_system: bool = True,
+                                force_reasoning: bool = True) -> Tuple[str, List[str]]:
         """
         Format prompt for raw completion (bypassing chat API).
-        
-        This uses Prompt Seeding to force reasoning by ending with the thought tag.
-        Returns both the formatted prompt and appropriate stop tokens.
         
         Args:
             system_prompt: System instructions
             user_message: User message/query
+            inject_system: If True, injects agentic system instructions
+            force_reasoning: If True, seeds prompt with thought tag to force reasoning
             
         Returns:
             Tuple of (formatted_prompt, stop_tokens)
         """
-        prompt = self.force_reasoning_prompt(system_prompt, user_message)
+        effective_system = system_prompt
+        
+        # Inject system prompt if requested
+        if inject_system:
+            effective_system = self.get_agent_system_prompt(system_prompt)
+        
+        if force_reasoning:
+            # Use prompt seeding to force reasoning
+            prompt = self.force_reasoning_prompt(effective_system, user_message)
+        else:
+            # Use simple concatenation without seeding
+            template = self.REASONING_PREFIXES.get(
+                self.family_key, 
+                self.REASONING_PREFIXES["generic"]
+            )
+            # Remove the thought tag at the end
+            template = template.replace("{sys}", "{sys}").replace("{user}", "{user}")
+            prompt = template.format(sys=effective_system, user=user_message)
+            # Remove trailing thought tag
+            thought_tag = self.THOUGHT_TAGS.get(self.family_key, "<think>")
+            if prompt.endswith(thought_tag + "\n"):
+                prompt = prompt[:-len(thought_tag + "\n")]
+        
         stop_tokens = self.get_stop_tokens()
         
         return prompt, stop_tokens
 
 
 # Convenience function for quick prompting
-def create_reasoning_prompt(model_name: str, system_prompt: str, user_question: str) -> Tuple[str, List[str]]:
+def create_reasoning_prompt(model_name: str, system_prompt: str, user_question: str,
+                            inject_system: bool = True,
+                            force_reasoning: bool = True) -> Tuple[str, List[str]]:
     """
     Convenience function to create a forced reasoning prompt.
     
@@ -261,9 +286,25 @@ def create_reasoning_prompt(model_name: str, system_prompt: str, user_question: 
         model_name: Name of the model (e.g., "qwen3", "llama3", "deepseek")
         system_prompt: System instructions
         user_question: User question
+        inject_system: If True, injects agentic system instructions
+        force_reasoning: If True, seeds prompt with thought tag to force reasoning
         
     Returns:
         Tuple of (formatted_prompt, stop_tokens)
+        
+    Examples:
+        # Full injection + seeding (default)
+        prompt, stops = create_reasoning_prompt("qwen3", "You are helpful.", "Hi!")
+        
+        # System prompt only, no seeding
+        prompt, stops = create_reasoning_prompt("qwen3", "You are helpful.", "Hi!", 
+                                               inject_system=True, force_reasoning=False)
+        
+        # Seeding only, no system injection
+        prompt, stops = create_reasoning_prompt("qwen3", "You are helpful.", "Hi!", 
+                                               inject_system=False, force_reasoning=True)
     """
     manager = AgenticTemplateManager(model_name)
-    return manager.format_for_raw_completion(system_prompt, user_question)
+    return manager.format_for_raw_completion(system_prompt, user_question, 
+                                            inject_system=inject_system,
+                                            force_reasoning=force_reasoning)
