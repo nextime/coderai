@@ -398,6 +398,31 @@ class MultiModelManager:
         """Return the first image model or None."""
         return self.image_models[0] if self.image_models else None
     
+    def cleanup(self):
+        """Cleanup all models and resources."""
+        # Cleanup all model managers
+        for key, manager in self.models.items():
+            try:
+                if hasattr(manager, 'cleanup'):
+                    manager.cleanup()
+            except Exception as e:
+                print(f"Warning: Error cleaning up model {key}: {e}")
+        self.models.clear()
+        
+        # Cleanup whisper server
+        if self.whisper_server:
+            try:
+                self.whisper_server.stop()
+            except Exception as e:
+                print(f"Warning: Error cleaning up whisper server: {e}")
+        
+        # Clear all model lists
+        self.default_model = None
+        self.audio_models.clear()
+        self.image_models.clear()
+        self.vision_models.clear()
+        self.tts_model = None
+    
     def _aggressive_vram_cleanup(self, model_manager):
         """Aggressively cleanup VRAM when switching between different model types."""
         try:
