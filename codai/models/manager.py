@@ -1,57 +1,626 @@
-"""Model manager module."""
+"""Model manager module - contains ModelManager, WhisperServerManager, and MultiModelManager classes."""
 
 from typing import Optional, Dict, Any, List
+import subprocess
+import signal
+import requests
+import time
+import threading
+import gc
+
+# Import needed classes from other codai modules
+from codai.models.parser import ModelParserAdapter
+from codai.backends import detect_available_backends
+from codai.backends.cuda import NvidiaBackend
+from codai.backends.vulkan import VulkanBackend
+from codai.models.cache import get_cached_model_path, download_model
+from codai.pydantic.textrequest import ModelInfo
 
 
 class ModelManager:
-    """Manager for loading and handling models."""
+    """Manages the loaded model and tokenizer."""
     
-    def __init__(self):
-        self.models = {}
+    def __init__(self, backend=None, backend_type=None):
+        self.backend = backend
+        self.backend_type = backend_type
+        self.tool_parser = ModelParserAdapter()
     
-    def load_model(self, model_name: str, **kwargs):
-        """Load a model."""
-        pass
+    def _aggressive_vram_cleanup(self, model_manager):
+        """
+        Aggressively cleanup VRAM when switching between different model types.
+        """
+        try:
+            import torch
+            
+            # First, try to move model to CPU if it has a model attribute
+            if hasattr(model_manager, 'model') and model_manager.model is not None:
+                model = model_manager.model
+                if hasattr(model, 'to'):
+                    try:
+                        model.to('cpu')
+                    except:
+                        pass
+                del model
+            
+            # Also handle backend directly if it's different
+            if hasattr(model_manager, 'backend') and model_manager.backend is not None:
+                backend = model_manager.backend
+                
+                if hasattr(backend, 'model') and backend.model is not None:
+                    model = backend.model
+                    if hasattr(model, 'to'):
+                        try:
+                            model.to('cpu')
+                        except:
+                            pass
+                    del model
+                
+                if hasattr(backend, 'pipeline') and backend.pipeline is not None:
+                    del backend.pipeline
+                
+                if hasattr(backend, 'vae') and backend.vae is not None:
+                    del backend.vae
+                
+                if hasattr(backend, 'text_encoder') and backend.text_encoder is not None:
+                    del backend.text_encoder
+                
+                if hasattr(backend, 'tokenizer') and backend.tokenizer is not None:
+                    del backend.tokenizer
+            
+            # Force multiple rounds of garbage collection
+            for _ in range(3):
+                gc.collect()
+            
+            # Clear PyTorch cache
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            
+            # Add delay to allow Vulkan to release memory
+            time.sleep(2)
+            
+        except Exception as e:
+            print(f"Warning during aggressive VRAM cleanup: {e}")
+        finally:
+            # Try to cleanup the model manager itself
+            try:
+                if hasattr(model_manager, 'cleanup'):
+                    model_manager.cleanup()
+            except:
+                pass
+        
+    def load_model(self, model_name: str, backend_type: str = "auto", **kwargs):
+        """Load the model with the specified backend."""
+        available = detect_available_backends()
+        
+        # Check if model is a GGUF file
+        is_gguf = model_name.endswith('.gguf') or 'gguf' in model_name.lower()
+        
+        # Determine backend
+        if backend_type == "auto":
+            if available.get('nvidia'):
+                backend_type = "nvidia"
+                print("Auto-detected NVIDIA backend")
+            elif available.get('vulkan'):
+                backend_type = "vulkan"
+                print("Auto-detected Vulkan backend")
+            else:
+                print("Warning: No GPU backend detected.")
+                backend_type = "cpu"
+        
+        # If GGUF file and backend is nvidia/cuda, use llama-cpp-python with CUDA backend
+        original_backend = None
+        if is_gguf and backend_type in ("nvidia", "cuda"):
+            original_backend = backend_type
+            print(f"GGUF model detected, using llama-cpp-python (original backend: {original_backend})")
+            backend_type = "vulkan"
+        
+        self.backend_type = backend_type
+        
+        # Create appropriate backend
+        if backend_type == "nvidia":
+            if not available.get('nvidia'):
+                raise RuntimeError("NVIDIA backend requested but PyTorch/CUDA not available")
+            self.backend = NvidiaBackend()
+        elif backend_type == "vulkan":
+            if not available.get('vulkan'):
+                raise RuntimeError("Vulkan backend requested but llama-cpp-python not available")
+            self.backend = VulkanBackend(original_backend=original_backend)
+        else:
+            raise ValueError(f"Unknown backend: {backend_type}")
+        
+        # Load the model
+        self.backend.load_model(model_name, **kwargs)
+        self.tool_parser = ModelParserAdapter(model_name=model_name)
+        
+    def format_messages(self, messages):
+        """Format messages into a prompt string."""
+        if self.backend is None:
+            raise RuntimeError("No model loaded")
+        return self.backend.format_messages(messages)
     
-    def unload_model(self, model_name: str):
-        """Unload a model."""
-        pass
+    def generate(self, prompt: str, max_tokens: Optional[int] = None,
+                 temperature: float = 0.7, top_p: float = 1.0,
+                 stop: Optional[List[str]] = None):
+        """Generate text non-streaming."""
+        if self.backend is None:
+            raise RuntimeError("No model loaded")
+        return self.backend.generate(prompt, max_tokens, temperature, top_p, stop)
     
-    def get_model(self, model_name: str):
-        """Get a loaded model."""
-        pass
+    def generate_chat(self, messages: List[Dict], max_tokens: Optional[int] = None,
+                      temperature: float = 0.7, top_p: float = 1.0,
+                      stop: Optional[List[str]] = None, tools: Optional[List] = None,
+                      response_format: Optional[Dict] = None):
+        """Generate chat completion non-streaming."""
+        if self.backend is None:
+            raise RuntimeError("No model loaded")
+        # Use generate_chat if available (Vulkan backend), otherwise format and use generate
+        if hasattr(self.backend, 'generate_chat'):
+            return self.backend.generate_chat(messages, max_tokens, temperature, top_p, stop, tools, response_format)
+        else:
+            # Fallback for NVIDIA backend
+            from codai.pydantic.textrequest import ChatMessage
+            prompt = self.format_messages([ChatMessage(**m) for m in messages])
+            return self.backend.generate(prompt, max_tokens, temperature, top_p, stop)
+    
+    async def generate_stream(self, prompt: str, max_tokens: Optional[int] = None,
+                              temperature: float = 0.7, top_p: float = 1.0,
+                              stop: Optional[List[str]] = None):
+        """Generate text in streaming fashion."""
+        if self.backend is None:
+            raise RuntimeError("No model loaded")
+        async for chunk in self.backend.generate_stream(prompt, max_tokens, temperature, top_p, stop):
+            yield chunk
+    
+    async def generate_chat_stream(self, messages: List[Dict], max_tokens: Optional[int] = None,
+                                    temperature: float = 0.7, top_p: float = 1.0,
+                                    stop: Optional[List[str]] = None, tools: Optional[List] = None,
+                                    response_format: Optional[Dict] = None):
+        """Generate chat completion streaming."""
+        if self.backend is None:
+            raise RuntimeError("No model loaded")
+        # Use generate_chat_stream if available (Vulkan backend), otherwise format and use generate_stream
+        if hasattr(self.backend, 'generate_chat_stream'):
+            async for chunk in self.backend.generate_chat_stream(messages, max_tokens, temperature, top_p, stop, tools, response_format):
+                yield chunk
+        else:
+            # Fallback for NVIDIA backend
+            from codai.pydantic.textrequest import ChatMessage
+            prompt = self.format_messages([ChatMessage(**m) for m in messages])
+            async for chunk in self.backend.generate_stream(prompt, max_tokens, temperature, top_p, stop):
+                yield chunk
+    
+    @property
+    def model_name(self) -> str:
+        if self.backend is None:
+            return "unknown"
+        return self.backend.get_model_name()
+    
+    @property
+    def model(self):
+        if self.backend is None:
+            return None
+        return self.backend
+    
+    @property
+    def tokenizer(self):
+        # Only NVIDIA backend has a tokenizer
+        if isinstance(self.backend, NvidiaBackend):
+            return self.backend.tokenizer
+        return None
+    
+    def cleanup(self):
+        if self.backend is not None:
+            self.backend.cleanup()
+            self.backend = None
 
 
 class WhisperServerManager:
-    """Manager for Whisper transcription server."""
+    """Manages whisper-server subprocess for audio transcription."""
     
-    def __init__(self):
-        self.model = None
+    def __init__(self, server_path: str = None, port: int = 8744):
+        self.server_path = server_path
+        self.port = port
+        self.process = None
+        self.current_model = None
+        self.base_url = f"http://127.0.0.1:{port}"
+        self.lock = threading.Lock()
+        
+        # Check if port is available
+        if not self._is_port_available(port):
+            for new_port in range(port + 1, port + 100):
+                if self._is_port_available(new_port):
+                    self.port = new_port
+                    self.base_url = f"http://127.0.0.1:{new_port}"
+                    print(f"Port {port} in use, using port {new_port} instead")
+                    break
     
-    def load_model(self, model_name: str):
-        """Load Whisper model."""
-        pass
+    def _is_port_available(self, port: int) -> bool:
+        """Check if a port is available."""
+        import socket
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('127.0.0.1', port))
+                return True
+        except OSError:
+            return False
     
-    def transcribe(self, audio_data: bytes) -> str:
-        """Transcribe audio data."""
-        pass
+    def is_running(self) -> bool:
+        """Check if whisper-server is running."""
+        if self.process is None:
+            return False
+        return self.process.poll() is None
+    
+    def start(self, model_path: str = None, gpu_device: int = 0):
+        """Start whisper-server with the specified model."""
+        with self.lock:
+            if self.is_running():
+                self.stop()
+            
+            if not self.server_path:
+                print("Error: whisper-server path not set")
+                return ""
+            
+            # Handle URL models
+            actual_model_path = model_path
+            if model_path and (model_path.startswith('http://') or model_path.startswith('https://')):
+                cached_path = get_cached_model_path(model_path)
+                if cached_path:
+                    actual_model_path = cached_path
+                    print(f"Using cached model: {actual_model_path}")
+                else:
+                    cache_dir = get_model_cache_dir()
+                    print(f"Downloading model: {model_path}")
+                    actual_model_path = download_model(model_path, cache_dir)
+                    print(f"Downloaded model to: {actual_model_path}")
+            
+            cmd = [self.server_path]
+            if actual_model_path:
+                cmd.extend(["-m", actual_model_path])
+            cmd.extend(["-dev", str(gpu_device)])
+            cmd.append("--convert")
+            cmd.extend(["--host", "127.0.0.1"])
+            cmd.extend(["--port", str(self.port)])
+            
+            print(f"Starting whisper-server: {' '.join(cmd)}")
+            
+            try:
+                self.process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    preexec_fn=lambda: signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                )
+                self.current_model = actual_model_path
+                
+                if self._wait_for_server(30):
+                    print(f"whisper-server started on {self.base_url}")
+                    return actual_model_path
+                else:
+                    print("Error: whisper-server failed to start")
+                    self.stop()
+                    return ""
+            except Exception as e:
+                print(f"Error starting whisper-server: {e}")
+                return ""
+    
+    def stop(self):
+        """Stop whisper-server."""
+        with self.lock:
+            if self.process:
+                try:
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self.process.kill()
+                        self.process.wait()
+                except Exception as e:
+                    print(f"Error stopping whisper-server: {e}")
+                self.process = None
+                self.current_model = None
+    
+    def transcribe(self, audio_data: bytes, language: str = None, prompt: str = None):
+        """Send transcription request to whisper-server."""
+        if not self.is_running():
+            return {"error": "whisper-server not running"}
+        
+        try:
+            files = {"file": ("audio.wav", audio_data, "audio/wav")}
+            data = {}
+            if language:
+                data["language"] = language
+            if prompt:
+                data["prompt"] = prompt
+            
+            response = requests.post(
+                f"{self.base_url}/inference",
+                files=files,
+                data=data,
+                timeout=300
+            )
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return {"error": f"Server error: {response.status_code}", "detail": response.text}
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def _wait_for_server(self, timeout: int = 30) -> bool:
+        """Wait for whisper-server to be ready."""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                response = requests.get(f"{self.base_url}/health", timeout=2)
+                if response.status_code == 200:
+                    return True
+            except:
+                pass
+            time.sleep(0.5)
+        return False
+    
+    def get_status(self) -> dict:
+        """Get whisper-server status."""
+        return {
+            "running": self.is_running(),
+            "model": self.current_model,
+            "url": self.base_url
+        }
 
 
 class MultiModelManager:
-    """Manager for multiple models."""
+    """
+    Manages multiple models: main text model, audio transcription, and image generation.
+    """
     
     def __init__(self):
-        self.models = {}
-        self.active_models = {}
+        self.models: Dict[str, ModelManager] = {}
+        self.default_model: Optional[str] = None
+        self.audio_models: List[str] = []
+        self.tts_model: Optional[str] = None
+        self.image_models: List[str] = []
+        self.vision_models: List[str] = []
+        self.tool_parser = ModelParserAdapter()
+        self.current_model_key: Optional[str] = None
+        self.config: Dict[str, Dict] = {}
+        self.load_mode: str = "ondemand"
+        self.active_in_vram: Optional[str] = None
+        self.model_aliases: Dict[str, str] = {}
+        self.whisper_server: Optional[WhisperServerManager] = None
+        self.model_backend_types: Dict[str, str] = {}
     
-    def load_model(self, model_name: str, **kwargs):
-        """Load a model."""
-        pass
+    def _aggressive_vram_cleanup(self, model_manager):
+        """Aggressively cleanup VRAM when switching between different model types."""
+        try:
+            import torch
+            
+            if hasattr(model_manager, 'model') and model_manager.model is not None:
+                model = model_manager.model
+                if hasattr(model, 'to'):
+                    try:
+                        model.to('cpu')
+                    except:
+                        pass
+                del model
+            
+            if hasattr(model_manager, 'backend') and model_manager.backend is not None:
+                backend = model_manager.backend
+                
+                if hasattr(backend, 'model') and backend.model is not None:
+                    model = backend.model
+                    if hasattr(model, 'to'):
+                        try:
+                            model.to('cpu')
+                        except:
+                            pass
+                    del model
+                
+                if hasattr(backend, 'pipeline') and backend.pipeline is not None:
+                    del backend.pipeline
+                
+                if hasattr(backend, 'vae') and backend.vae is not None:
+                    del backend.vae
+                
+                if hasattr(backend, 'text_encoder') and backend.text_encoder is not None:
+                    del backend.text_encoder
+                
+                if hasattr(backend, 'tokenizer') and backend.tokenizer is not None:
+                    del backend.tokenizer
+            
+            for _ in range(3):
+                gc.collect()
+            
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            
+            time.sleep(2)
+            
+        except Exception as e:
+            print(f"Warning during aggressive VRAM cleanup: {e}")
+        finally:
+            try:
+                if hasattr(model_manager, 'cleanup'):
+                    model_manager.cleanup()
+            except:
+                pass
     
-    def unload_model(self, model_name: str):
-        """Unload a model."""
-        pass
+    def set_load_mode(self, mode: str):
+        """Set the load mode: 'ondemand', 'loadall', or 'loadswap'."""
+        self.load_mode = mode
     
-    def generate(self, model_name: str, prompt: str, **kwargs):
-        """Generate text with a model."""
-        pass
+    def set_default_model(self, model_name: str, config: Dict = None, backend_type: str = "auto"):
+        """Set the default/main text model."""
+        self.default_model = model_name
+        self.config[model_name] = config or {}
+        self.model_backend_types[model_name] = backend_type
+    
+    def set_audio_model(self, model_name: str, config: Dict = None):
+        """Add an audio transcription model."""
+        if model_name not in self.audio_models:
+            self.audio_models.append(model_name)
+        self.config[f"audio:{model_name}"] = config or {}
+    
+    def set_tts_model(self, model_name: str, config: Dict = None):
+        """Set the text-to-speech model."""
+        self.tts_model = model_name
+        self.config[f"tts:{model_name}"] = config or {}
+    
+    def set_image_model(self, model_name: str, config: Dict = None):
+        """Add an image generation model."""
+        if model_name not in self.image_models:
+            self.image_models.append(model_name)
+        self.config[f"image:{model_name}"] = config or {}
+    
+    def set_vision_model(self, model_name: str, config: Dict = None):
+        """Add a vision model."""
+        if model_name not in self.vision_models:
+            self.vision_models.append(model_name)
+        self.config[f"vision:{model_name}"] = config or {}
+    
+    def set_model_alias(self, alias: str, model_name: str):
+        """Register an alias for a model."""
+        self.model_aliases[alias] = model_name
+    
+    def get_model_for_request(self, requested_model: str):
+        """Get the appropriate model manager for a request based on model name."""
+        global global_args
+        
+        # Resolve custom aliases first
+        if requested_model in self.model_aliases:
+            requested_model = self.model_aliases[requested_model]
+        
+        # Handle empty or "default" model names
+        if not requested_model or requested_model == "default":
+            if self.default_model and self.default_model in self.models:
+                self.current_model_key = self.default_model
+                return self.models[self.default_model]
+            return None
+        
+        # Handle "audio" alias
+        if requested_model == "audio":
+            if self.audio_models:
+                first_audio = self.audio_models[0]
+                key = f"audio:{first_audio}"
+                if key in self.models:
+                    self.current_model_key = key
+                    return self.models[key]
+            return None
+        
+        # Handle "image" alias
+        if requested_model == "image":
+            if self.image_models:
+                first_image = self.image_models[0]
+                key = f"image:{first_image}"
+                if key in self.models:
+                    self.current_model_key = key
+                    return self.models[key]
+            return None
+        
+        # Handle "tts" alias
+        if requested_model == "tts":
+            if self.tts_model:
+                key = f"tts:{self.tts_model}"
+                if key in self.models:
+                    self.current_model_key = key
+                    return self.models[key]
+            return None
+        
+        # Handle prefixed models
+        if requested_model.startswith("audio:"):
+            audio_name = requested_model[6:]
+            key = f"audio:{audio_name}"
+            if key in self.models:
+                self.current_model_key = key
+                return self.models[key]
+            return None
+        
+        if requested_model.startswith("tts:"):
+            tts_name = requested_model[4:]
+            key = f"tts:{tts_name}"
+            if key in self.models:
+                self.current_model_key = key
+                return self.models[key]
+            return None
+        
+        if requested_model.startswith("vision:") or requested_model.startswith("image:"):
+            if requested_model.startswith("vision:"):
+                image_name = requested_model[7:]
+            else:
+                image_name = requested_model[6:]
+            key = f"image:{image_name}"
+            if key in self.models:
+                self.current_model_key = key
+                return self.models[key]
+            return None
+        
+        # Check if it's the default model
+        if self.default_model and (requested_model == self.default_model or 
+                                    requested_model.endswith(self.default_model.split("/")[-1])):
+            self.current_model_key = self.default_model
+            return self.models.get(self.default_model)
+        
+        # Check if any loaded model matches
+        for key, model in self.models.items():
+            if requested_model in key or key.endswith(requested_model.split("/")[-1]):
+                self.current_model_key = key
+                return model
+        
+        return None
+    
+    def add_model(self, key: str, manager: ModelManager):
+        """Add a model manager for a specific key."""
+        self.models[key] = manager
+    
+    def get_model(self, key: str) -> Optional[ModelManager]:
+        """Get a model manager by key."""
+        return self.models.get(key)
+    
+    def get_current_model(self) -> Optional[ModelManager]:
+        """Get the currently active model."""
+        if self.current_model_key:
+            return self.models.get(self.current_model_key)
+        if self.default_model:
+            return self.models.get(self.default_model)
+        return None
+    
+    def list_models(self) -> List[ModelInfo]:
+        """List all available models."""
+        models = []
+        
+        # Add default model(s)
+        if self.default_model:
+            model_id = self.default_model
+            if not (model_id.startswith("http://") or model_id.startswith("https://")):
+                short_name = self.default_model.split("/")[-1] if "/" in self.default_model else self.default_model
+                if short_name != self.default_model:
+                    models.append(ModelInfo(id=short_name))
+                models.append(ModelInfo(id=model_id))
+                models.append(ModelInfo(id="default"))
+        
+        # Add aliases for first/default models
+        if self.audio_models:
+            models.append(ModelInfo(id="audio"))
+            for audio_id in self.audio_models:
+                models.append(ModelInfo(id=f"audio:{audio_id}"))
+        
+        if self.tts_model:
+            models.append(ModelInfo(id="tts"))
+            models.append(ModelInfo(id=f"tts:{self.tts_model}"))
+        
+        if self.image_models:
+            models.append(ModelInfo(id="image"))
+            for image_id in self.image_models:
+                models.append(ModelInfo(id=f"image:{image_id}"))
+        
+        if self.vision_models:
+            models.append(ModelInfo(id="vision"))
+            for vision_id in self.vision_models:
+                models.append(ModelInfo(id=f"vision:{vision_id}"))
+        
+        # Add any custom aliases
+        for alias in self.model_aliases:
+            models.append(ModelInfo(id=alias))
+        
+        return models
