@@ -2300,6 +2300,14 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         if global_debug:
             print(f"RAW: First pass result: ...{first_pass_result[-200:]}")
         
+        # Dump first pass result if --dump is enabled
+        if global_dump:
+            print(f"\n{'='*80}")
+            print(f"=== RAW MODE: FIRST PASS RESULT (DUMP) ===")
+            print(f"{'='*80}")
+            print(first_pass_result)
+            print(f"{'='*80}\n")
+        
         # Extract reasoning (everything up to the close tag)
         thought_tag, close_tag, _ = get_reasoning_stop_tokens(model_family)
         reasoning_text = ""
@@ -2314,6 +2322,18 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         if global_debug:
             print(f"RAW: Extracted reasoning: {reasoning_text[:100]}...")
             print(f"RAW: Final text before cleanup: {final_text[:100]}...")
+        
+        # Dump extraction details if --dump is enabled
+        if global_dump:
+            print(f"\n{'='*80}")
+            print(f"=== RAW MODE: EXTRACTION (DUMP) ===")
+            print(f"{'='*80}")
+            print(f"Close tag used: {close_tag}")
+            print(f"\n--- REASONING TEXT ---")
+            print(reasoning_text)
+            print(f"\n--- FINAL TEXT (before cleanup) ---")
+            print(final_text)
+            print(f"{'='*80}\n")
         
         # Clean up control tokens from final text
         final_text = cleanup_control_tokens(final_text)
