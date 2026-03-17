@@ -524,17 +524,32 @@ class VulkanBackend(ModelBackend):
     def generate(
         self,
         prompt: str,
-        **kwargs
+        max_tokens: Optional[int] = None,
+        temperature: float = 0.7,
+        top_p: float = 1.0,
+        stop: Optional[List[str]] = None
     ) -> str:
-        """Generate text from prompt.
+        """Generate text non-streaming.
         
         Args:
             prompt: Input prompt (or messages for chat)
-            **kwargs: Generation parameters
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling
+            stop: Stop sequences
             
         Returns:
             Generated text
         """
+        kwargs = {}
+        if max_tokens is not None:
+            kwargs['max_tokens'] = max_tokens
+        if temperature is not None:
+            kwargs['temperature'] = temperature
+        if top_p is not None:
+            kwargs['top_p'] = top_p
+        if stop is not None:
+            kwargs['stop'] = stop
         if self.model is None:
             raise RuntimeError("Model not loaded")
         
