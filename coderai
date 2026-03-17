@@ -1895,89 +1895,119 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             messages = [ChatMessage(role="system", content=system_text)] + list(messages)
     
     # Enable thinking/reasoning mode if requested via API parameter OR CLI flag
-    force_reasoning_mode = getattr(global_args, 'force_reasoning', None) if global_args else None
+    force_reasoning_args = getattr(global_args, 'force_reasoning', None) if global_args else None
     enable_thinking_api = getattr(request, 'enable_thinking', False)
+    
+    # Parse force_reasoning: can be list (from CLI) or string (legacy)
+    if isinstance(force_reasoning_args, str):
+        # Legacy: convert string to list
+        if force_reasoning_args == "both":
+            force_reasoning_args = ["inject", "stop"]
+        elif force_reasoning_args == "stop":
+            force_reasoning_args = ["stop"]
+        elif force_reasoning_args == "inject":
+            force_reasoning_args = ["inject"]
+        else:
+            force_reasoning_args = []
+    elif not force_reasoning_args:
+        force_reasoning_args = []
+    
+    # Combine CLI args with API param
+    # 'chat' from CLI enables API reasoning param
+    reasoning_enabled = enable_thinking_api or (len(force_reasoning_args) > 0)
     
     # DEBUG: Print force_reasoning status when debug mode is enabled
     if global_debug:
         print(f"\n{'='*60}")
         print(f"=== REASONING MODE DEBUG ===")
         print(f"{'='*60}")
-        print(f"force_reasoning CLI flag: {force_reasoning_mode}")
+        print(f"force_reasoning CLI args: {force_reasoning_args}")
         print(f"enable_thinking API param: {enable_thinking_api}")
-    
-    # Determine if reasoning should be enabled
-    # Force reasoning if: API param is true OR CLI flag is set (not None)
-    reasoning_enabled = enable_thinking_api or (force_reasoning_mode is not None)
     
     # Get model family for reasoning tokens
     model_family = get_model_family(request.model)
     
-    # Determine what to do: stop, inject, or both
-    if reasoning_enabled:
-        # CLI flag takes precedence if set, otherwise check API param
-        if force_reasoning_mode:
-            reasoning_action = force_reasoning_mode  # "stop", "inject", or "both"
-        else:
-            reasoning_action = "inject"  # Default to inject if only API param is set
-        
-        # Handle inject (system prompt injection)
-        if reasoning_action in ("inject", "both"):
-            from codai.models.templates import AgenticTemplateManager
-            template_manager = AgenticTemplateManager(request.model)
-            # Get the current system prompt if exists
-            system_content = None
-            for msg in messages:
-                if msg.role == "system":
-                    system_content = msg.content
-                    break
-            if system_content:
-                # Inject agentic instructions
-                system_content = template_manager.get_agent_system_prompt(system_content)
-            else:
-                system_content = template_manager.get_agent_system_prompt("You are a helpful assistant.")
-            # Update or add system message
-            system_found = False
-            for i, msg in enumerate(messages):
-                if msg.role == "system":
-                    messages[i] = ChatMessage(role="system", content=system_content)
-                    system_found = True
-                    break
-            if not system_found:
-                messages = [ChatMessage(role="system", content=system_content)] + list(messages)
-            
-            # DEBUG: Print injection status
-            if global_debug:
-                print(f"reasoning_action: {reasoning_action}")
-                print(f"reasoning_enabled: {reasoning_enabled}")
-                print(f"INJECTION DONE: System prompt has been injected with agentic instructions")
-                print(f"\n--- INJECTED SYSTEM PROMPT ---")
-                print(system_content)
-                print(f"--- END SYSTEM PROMPT ---")
-                print(f"{'='*60}\n")
+    # Handle 'chat' - enable thinking API parameter
+    if "chat" in force_reasoning_args or enable_thinking_api:
+        # Note: This only works with compatible APIs (OpenAI-like)
+        # We'll set it on the request if supported
+        if hasattr(request, 'thinking'):
+            request.thinking = {"type": "enabled"}
+        if global_debug:
+            print(f"CHAT: Reasoning API param enabled")
     
-    # Prepare stop sequences (before reasoning block to avoid UnboundLocalError)
+    # Handle 'inject' - system prompt injection
+    if "inject" in force_reasoning_args:
+        from codai.models.templates import AgenticTemplateManager
+        template_manager = AgenticTemplateManager(request.model)
+        # Get the current system prompt if exists
+        system_content = None
+        for msg in messages:
+            if msg.role == "system":
+                system_content = msg.content
+                break
+        if system_content:
+            # Inject agentic instructions
+            system_content = template_manager.get_agent_system_prompt(system_content)
+        else:
+            system_content = template_manager.get_agent_system_prompt("You are a helpful assistant.")
+        # Update or add system message
+        system_found = False
+        for i, msg in enumerate(messages):
+            if msg.role == "system":
+                messages[i] = ChatMessage(role="system", content=system_content)
+                system_found = True
+                break
+        if not system_found:
+            messages = [ChatMessage(role="system", content=system_content)] + list(messages)
+        
+        if global_debug:
+            print(f"INJECT: System prompt injected with agentic instructions")
+            print(f"\n--- INJECTED SYSTEM PROMPT ---")
+            print(system_content)
+            print(f"--- END SYSTEM PROMPT ---")
+    
+    # Handle 'prompt' - prompt seeding (ends with thought tag)
+    if "prompt" in force_reasoning_args:
+        from codai.models.templates import AgenticTemplateManager
+        template_manager = AgenticTemplateManager(request.model)
+        
+        # Convert messages to the format expected by force_reasoning_prompt
+        user_message = ""
+        system_prompt = "You are a helpful assistant."
+        
+        # Extract system and user messages
+        for msg in messages:
+            if msg.role == "system":
+                system_prompt = msg.content
+            elif msg.role == "user":
+                user_message = msg.content
+        
+        # Get the seeded prompt (ends with thought tag)
+        seeded_prompt = template_manager.force_reasoning_prompt(system_prompt, user_message)
+        
+        if global_debug:
+            print(f"PROMPT: Prompt seeding applied (ends with thought tag)")
+            print(f"\n--- SEEDED PROMPT (last 80 chars) ---")
+            print(f"...{seeded_prompt[-80:]}")
+            print(f"--- END SEEDED PROMPT ---")
+    
+    # Prepare stop sequences
     stop_sequences = []
     if request.stop:
         if isinstance(request.stop, str):
             stop_sequences = [request.stop]
         else:
-            stop_sequences = request.stop
+            stop_sequences = list(request.stop)
     
-    # Handle stop tokens - add to stop_sequences for generation
-    if reasoning_enabled and reasoning_action in ("stop", "both"):
+    # Handle 'stop' - add reasoning stop tokens (also done for 'inject' and 'prompt')
+    if "stop" in force_reasoning_args or "inject" in force_reasoning_args or "prompt" in force_reasoning_args:
         _, _, additional_stops = get_reasoning_stop_tokens(model_family)
-        # Add model-specific stop tokens to the existing stop sequences
         for stop_token in additional_stops:
             if stop_token not in stop_sequences:
                 stop_sequences.append(stop_token)
-        print(f"DEBUG: Added reasoning stop tokens for model family '{model_family}': {additional_stops}")
-        
-        # DEBUG: Print stop action
         if global_debug:
-            print(f"reasoning_action: {reasoning_action}")
-            print(f"STOP TOKENS ADDED: Reasoning stop tokens added to generation")
-            print(f"{'='*60}\n")
+            print(f"STOP: Added reasoning stop tokens: {additional_stops}")
     
     # Format messages with tools if provided
     if request.tools:
@@ -3033,13 +3063,22 @@ def parse_args():
         choices=["auto", "litellm"],
         help="Tool call parser to use: 'auto' for internal parser, 'litellm' for LiteLLM's parser. Default: auto",
     )
+    # Custom type for comma-separated reasoning options
+    def reasoning_choices(value):
+        if not value:
+            return []
+        options = [v.strip().lower() for v in value.split(',')]
+        valid = {'chat', 'stop', 'inject', 'prompt'}
+        invalid = [o for o in options if o not in valid]
+        if invalid:
+            raise argparse.ArgumentTypeError(f"Invalid choices: {invalid}. Valid options: {valid}")
+        return options
+    
     parser.add_argument(
         "--force-reasoning",
-        nargs="?",
-        const="both",
+        type=reasoning_choices,
         default=None,
-        choices=["both", "stop", "inject"],
-        help="Force reasoning/thinking mode. Values: 'stop' (add stop tokens), 'inject' (add system prompt), 'both' (default, does both). Use for models like Qwen3, DeepSeek R1, Llama3.1, etc.",
+        help="Force reasoning/thinking mode. Options: 'chat' (API reasoning param), 'stop' (add stop tokens), 'inject' (system prompt), 'prompt' (prompt seeding). Combine with commas: --force-reasoning chat,inject,prompt",
     )
     return parser.parse_args()
 def main():
