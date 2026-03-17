@@ -2110,8 +2110,9 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         if global_debug:
             print(f"STOP: Added reasoning stop tokens: {additional_stops}")
     
-    # Format messages with tools if provided
-    if request.tools:
+    # Format messages with tools if provided - BUT SKIP for raw mode
+    # (raw mode handles tools separately via format_for_raw_completion)
+    if request.tools and "raw" not in force_reasoning_args:
         messages = format_tools_for_prompt(request.tools, messages)
     
     # Get the tool_parser from the current manager
@@ -2214,7 +2215,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 system_prompt=system_prompt,
                 user_message=user_message,
                 inject_system=True,
-                force_reasoning=True
+                force_reasoning=True,
+                tools=request.tools  # Pass tools for family-specific formatting
             )
             use_raw_mode = True
             
@@ -2413,7 +2415,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         # But only if we DON'T already have real reasoning from extraction
         has_real_reasoning = reasoning_text and len(reasoning_text.strip()) > 10
         
-        if "mock" in force_reasoning_args and formatted_response and not has_real_reasoning:
+        if force_reasoning_args and "mock" in force_reasoning_args and formatted_response and not has_real_reasoning:
             # Add fake reasoning tokens to trigger VSCode plugin stats
             mock_reasoning_tokens = 50
             
@@ -2490,6 +2492,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             current_manager,
             tool_parser,
             request.response_format,
+            force_reasoning_args,
         )
 
 async def stream_chat_response(
@@ -2816,6 +2819,7 @@ async def generate_chat_response(
     current_manager: ModelManager,
     tool_parser: ToolCallParser,
     response_format: Optional[Dict] = None,
+    force_reasoning_args: Optional[List[str]] = None,
 ) -> Dict:
     """Generate non-streaming chat completion response."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -2932,7 +2936,7 @@ async def generate_chat_response(
             if "message" in choice:
                 existing_reasoning = choice["message"].get("reasoning")
         
-        if "mock" in force_reasoning_args and formatted_response and not existing_reasoning:
+        if force_reasoning_args and "mock" in force_reasoning_args and formatted_response and not existing_reasoning:
             # Add fake reasoning tokens to trigger VSCode plugin stats
             mock_reasoning_tokens = 50
             

@@ -1,9 +1,8 @@
 """
-Agentic Template Manager - Automates prompt injection for agentic behavior.
-Supports the 'Big 10' with specific triggers for tool-calling.
+Agentic Template Manager for forcing reasoning in LLM agents.
 
-Uses Prompt Seeding technique to force reasoning in LLM models:
-- Ends prompt with thought tag (<think>, <thought>, Thought:) to force reasoning
+Provides:
+- Prompt Seeding: Ends prompts with thought tags (<minimax:tool_call>, <thought>, Thought:) to force reasoning
 - Uses raw completion instead of chat API to bypass validation
 - Provides family-specific stop tokens for reasoning extraction
 """
@@ -47,6 +46,60 @@ class AgenticTemplateManager:
         "phi3": ["<|end|>", "<|assistant|>"],
         "yi": ["</think>", "<|im_end|>", "<|endoftext|>"],
         "generic": ["</think>", "</thought>", "Thought:"]
+    }
+    
+    # Tool call tags for each model family - uses native format each model was trained on
+    TOOL_CALL_TAGS = {
+        "qwen": {
+            "start": "<|tool_call|>",
+            "end": "<|tool_call_end|>",
+            "json_format": "<|tool_call|>{\"name\": \"tool_name\", \"arguments\": {}}"
+        },
+        "deepseek": {
+            "start": "<tool_call>",
+            "end": "</tool_call>",
+            "json_format": "<tool_call>{\"name\": \"tool_name\", \"arguments\": {}}</tool_call>"
+        },
+        "llama3": {
+            "start": "<tool_call>",
+            "end": "</tool_call>",
+            "json_format": "<tool_call>{\"name\": \"tool_name\", \"arguments\": {}}</tool_call>"
+        },
+        "mistral": {
+            "start": "Action:",
+            "end": None,
+            "json_format": "Action: tool_name\nAction Input: {}"
+        },
+        "anthropic": {
+            "start": "<tool_call>",
+            "end": "</tool_call>",
+            "json_format": "<tool_call>{\"name\": \"tool_name\", \"arguments\": {}}</tool_call>"
+        },
+        "gemma": {
+            "start": "<tool_call>",
+            "end": "</tool_call>",
+            "json_format": "<tool_call>{\"name\": \"tool_name\", \"arguments\": {}}</tool_call>"
+        },
+        "phi3": {
+            "start": "<|tool_call|>",
+            "end": "<|tool_call_end|>",
+            "json_format": "<|tool_call|>{\"name\": \"tool_name\", \"arguments\": {}}"
+        },
+        "yi": {
+            "start": "<|tool_call|>",
+            "end": "<|tool_call_end|>",
+            "json_format": "<|tool_call|>{\"name\": \"tool_name\", \"arguments\": {}}"
+        },
+        "cohere": {
+            "start": "<tool_call>",
+            "end": "</tool_call>",
+            "json_format": "<tool_call>{\"name\": \"tool_name\", \"arguments\": {}}</tool_call>"
+        },
+        "generic": {
+            "start": "<tool_call>",
+            "end": "</tool_call>",
+            "json_format": "<tool_call>{\"name\": \"tool_name\", \"arguments\": {}}</tool_call>"
+        }
     }
     
     # Original FAMILIES config for backward compatibility
@@ -250,7 +303,8 @@ class AgenticTemplateManager:
     
     def format_for_raw_completion(self, system_prompt: str, user_message: str, 
                                 inject_system: bool = True,
-                                force_reasoning: bool = True) -> Tuple[str, List[str]]:
+                                force_reasoning: bool = True,
+                                tools: Optional[List[Dict]] = None) -> Tuple[str, List[str]]:
         """
         Format prompt for raw completion (bypassing chat API).
         
@@ -259,15 +313,44 @@ class AgenticTemplateManager:
             user_message: User message/query
             inject_system: If True, injects agentic system instructions
             force_reasoning: If True, seeds prompt with thought tag to force reasoning
+            tools: Optional list of tool definitions to include in the prompt
             
         Returns:
             Tuple of (formatted_prompt, stop_tokens)
         """
         effective_system = system_prompt
         
+        # Check if there's a custom system prompt (not just default)
+        has_custom_system = system_prompt and len(system_prompt.strip()) > 0 and system_prompt.strip() not in ("You are a helpful assistant.", "You are a helpful AI assistant.", "")
+        
+        # Get tool call tags for this model family
+        tool_tags = self.TOOL_CALL_TAGS.get(self.family_key, self.TOOL_CALL_TAGS["generic"])
+        
+        # Add tool descriptions to system prompt if tools are provided AND no custom system prompt exists
+        # (don't override client's custom system prompt with tool instructions)
+        if tools and not has_custom_system:
+            import json
+            tool_descriptions = []
+            for tool in tools:
+                func = tool.get('function', {})
+                name = func.get('name', 'unknown')
+                desc = f"Tool: {name}"
+                if func.get('description'):
+                    desc += f"\nDescription: {func['description']}"
+                if func.get('parameters'):
+                    desc += f"\nParameters: {json.dumps(func['parameters'], indent=2)}"
+                tool_descriptions.append(desc)
+            
+            tools_text = "You have access to the following tools:\n\n" + "\n\n".join(tool_descriptions)
+            tools_text += f"\n\nIMPORTANT: When you need to use a tool, you MUST format your response EXACTLY as:\n"
+            tools_text += tool_tags["json_format"]
+            
+            # Prepend tools to system prompt
+            effective_system = f"{tools_text}\n\n{effective_system}" if effective_system else tools_text
+        
         # Inject system prompt if requested
         if inject_system:
-            effective_system = self.get_agent_system_prompt(system_prompt)
+            effective_system = self.get_agent_system_prompt(effective_system)
         
         if force_reasoning:
             # Use prompt seeding to force reasoning
@@ -321,6 +404,6 @@ def create_reasoning_prompt(model_name: str, system_prompt: str, user_question: 
                                                inject_system=False, force_reasoning=True)
     """
     manager = AgenticTemplateManager(model_name)
-    return manager.format_for_raw_completion(system_prompt, user_question, 
+    return manager.format_for_raw_completion(system_prompt, user_message, 
                                             inject_system=inject_system,
                                             force_reasoning=force_reasoning)
