@@ -23,16 +23,16 @@ class AgenticTemplateManager:
     # Family-specific prefixes for Prompt Seeding (force reasoning start)
     # These templates end with the thought tag to force the model to start reasoning
     REASONING_PREFIXES = {
-        "qwen": "<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n<think> \n",
-        "deepseek": "<|begin_of_sentence|><|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n<think> \n",
+        "qwen": "<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        "deepseek": "<|begin_of_sentence|><|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n<think>\n",
         "llama3": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{sys}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n<thought>\n",
         "mistral": "[INST] {sys}\n\n{user} [/INST] Thought:\n",
         "anthropic": "\n\nSystem: {sys}\n\nHuman: {user}\n\nAssistant: <thinking>\n",
         "command-r": "<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>{sys}<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>{user}<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|><thought>\n",
         "gemma": "<bos><start_of_turn>user\n{sys}\n\n{user}<end_of_turn>\n<start_of_turn>model\n<thought>\n",
         "phi3": "<|system|>\n{sys}<|end|>\n<|user|>\n{user}<|end|>\n<|assistant|>\n<|thought|>\n",
-        "yi": "<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n<think> \n",
-        "generic": "System: {sys}\nUser: {user}\nAssistant: <think> \n"
+        "yi": "<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        "generic": "System: {sys}\nUser: {user}\nAssistant: <think>\n"
     }
     
     # Stop tokens for each family (used to stop reasoning generation)
@@ -147,16 +147,16 @@ class AgenticTemplateManager:
     
     # Map family keys to their thought tags for extraction
     THOUGHT_TAGS = {
-        "qwen": "<think> ",
-        "deepseek": "<think> ",
+        "qwen": "<think>",
+        "deepseek": "<think>",
         "llama3": "<thought>",
         "mistral": "Thought:",
         "anthropic": "<thinking>",
         "gemma": "<thought>",
         "phi3": "<|thought|>",
-        "yi": "</think> ",
+        "yi": "</think>",
         "cohere": "<thought>",
-        "generic": "<think> "
+        "generic": "<think>"
     }
     
     # Closing tags for each family
