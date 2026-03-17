@@ -1999,6 +1999,9 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         # Get the seeded prompt (ends with thought tag)
         seeded_prompt = template_manager.force_reasoning_prompt(system_prompt, user_message)
         
+        # Replace messages with the seeded prompt (as a single user message for raw completion)
+        messages = [ChatMessage(role="user", content=seeded_prompt)]
+        
         if global_debug:
             print(f"PROMPT: Prompt seeding applied (ends with thought tag)")
             print(f"\n--- SEEDED PROMPT (last 80 chars) ---")
