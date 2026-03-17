@@ -2008,71 +2008,9 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             print(f"...{seeded_prompt[-80:]}")
             print(f"--- END SEEDED PROMPT ---")
     
-    # Handle 'raw' - use tokenizer's apply_chat_template for raw completion
-    # This bypasses the chat API middleware and uses the model's native template
-    if "raw" in force_reasoning_args:
-        # Get the tokenizer from the backend
-        tokenizer = None
-        if hasattr(current_manager, 'backend') and hasattr(current_manager.backend, 'tokenizer'):
-            tokenizer = current_manager.backend.tokenizer
-        
-        if tokenizer is None:
-            print("WARNING: No tokenizer available for raw mode, falling back to prompt mode")
-        else:
-            # Extract system and user messages for template
-            system_prompt = "You are a helpful assistant."
-            user_message = ""
-            for msg in messages:
-                if msg.role == "system":
-                    system_prompt = msg.content
-                elif msg.role == "user":
-                    # Get the last user message
-                    user_message = msg.content
-            
-            # Convert messages to dict format for apply_chat_template
-            chat_messages = []
-            if system_prompt:
-                chat_messages.append({"role": "system", "content": system_prompt})
-            if user_message:
-                chat_messages.append({"role": "user", "content": user_message})
-            
-            # Get the prompt with generation prompt (forces model to start responding)
-            try:
-                raw_prompt = tokenizer.apply_chat_template(
-                    chat_messages,
-                    add_generation_prompt=True,
-                    tokenize=False
-                )
-            except Exception as e:
-                print(f"WARNING: apply_chat_template failed: {e}, falling back")
-                raw_prompt = f"System: {system_prompt}\n\nUser: {user_message}\n\nAssistant:"
-            
-            # Get the reasoning tag for this model family
-            thought_tag, close_tag, _ = get_reasoning_stop_tokens(model_family)
-            
-            # Append the reasoning tag with commitment sentence
-            # This is what forces the model to start reasoning
-            commitment = "Let me think about this step by step."
-            raw_prompt = raw_prompt + thought_tag + commitment
-            
-            if global_debug:
-                print(f"RAW: Using raw completion with tokenizer apply_chat_template")
-                print(f"\n--- RAW PROMPT (last 120 chars) ---")
-                print(f"...{raw_prompt[-120:]}")
-                print(f"--- END RAW PROMPT ---")
-            
-            # Mark that we're using raw mode so generate() is called instead of generate_chat()
-            use_raw_mode = True
-            raw_prompt_for_generation = raw_prompt
-            raw_stop_sequences = list(stop_sequences)  # Copy current stop sequences
-            
-            # Add the close tag to stop sequences for first pass
-            if close_tag not in raw_stop_sequences:
-                raw_stop_sequences.append(close_tag)
-            
-            if global_debug:
-                print(f"RAW: Using template_manager.format_for_raw_completion (no tokenizer needed)")
-                print(f"RAW: First pass will stop at: {close_tag}")
+    # Handle 'raw' - use template_manager.format_for_raw_completion for raw completion
+    # This bypasses the chat API and uses the model's native template with reasoning seed
+    # The template_manager.format_for_raw_completion will be called in the block below
     
     # Prepare stop sequences
     stop_sequences = []
