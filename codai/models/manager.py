@@ -381,11 +381,7 @@ class MultiModelManager:
         self.tts_model: Optional[str] = None
         self.image_models: List[str] = []
         self.vision_models: List[str] = []
-    
-    @property
-    def image_model(self) -> Optional[str]:
-        """Return the first image model or None."""
-        return self.image_models[0] if self.image_models else None
+        self.config: Dict = {}  # Store model configurations
         self.tool_parser = ModelParserAdapter()
         self.current_model_key: Optional[str] = None
         self.config: Dict[str, Dict] = {}
