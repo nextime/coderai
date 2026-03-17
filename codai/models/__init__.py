@@ -13,6 +13,8 @@ from .parser import (
     PhiParser,
     ApexBig50Parser,
     OpenAIFormatter,
+    ToolCallParser,
+    ModelParserAdapter,
 )
 
 from .templates import AgenticTemplateManager
@@ -31,5 +33,7 @@ __all__ = [
     'PhiParser',
     'ApexBig50Parser',
     'OpenAIFormatter',
+    'ToolCallParser',
+    'ModelParserAdapter',
     'AgenticTemplateManager',
 ]
