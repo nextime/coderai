@@ -2170,52 +2170,50 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             })
     
     # Handle raw mode - use generate() instead of generate_chat() for raw prompt completion
-    use_raw_mode = False
-    raw_prompt_for_generation = None
-    raw_stop_sequences = None
+    # Note: These may have been set earlier in the prompt handling section
+    # Initialize only if not already set
+    if 'use_raw_mode' not in locals():
+        use_raw_mode = False
+    if 'raw_prompt_for_generation' not in locals():
+        raw_prompt_for_generation = None
+    if 'raw_stop_sequences' not in locals():
+        raw_stop_sequences = None
     
-    # Check if we set raw mode in the prompt handling section above
-    # The variables should already be set if raw was in force_reasoning_args
-    if "raw" in force_reasoning_args:
-        # Raw mode was already set up in the prompt handling section
-        # Just verify the variables exist
-        try:
-            _ = raw_prompt_for_generation
-            _ = raw_stop_sequences
-        except NameError:
-            # Variables not set - try to get tokenizer again
-            tokenizer = None
-            if hasattr(current_manager, 'backend') and hasattr(current_manager.backend, 'tokenizer'):
-                tokenizer = current_manager.backend.tokenizer
+    # Check if we need to set up raw mode (if not already done in prompt handling)
+    if "raw" in force_reasoning_args and not use_raw_mode:
+        # Set up raw mode using tokenizer
+        tokenizer = None
+        if hasattr(current_manager, 'backend') and hasattr(current_manager.backend, 'tokenizer'):
+            tokenizer = current_manager.backend.tokenizer
+        
+        if tokenizer is not None:
+            # Extract system and user messages
+            system_prompt = "You are a helpful assistant."
+            user_message = ""
+            for msg in messages:
+                if msg.role == "system":
+                    system_prompt = msg.content
+                elif msg.role == "user":
+                    user_message = msg.content
             
-            if tokenizer is not None:
-                # Extract system and user messages
-                system_prompt = "You are a helpful assistant."
-                user_message = ""
-                for msg in messages:
-                    if msg.role == "system":
-                        system_prompt = msg.content
-                    elif msg.role == "user":
-                        user_message = msg.content
-                
-                # Get the prompt with generation prompt
-                try:
-                    raw_prompt_for_generation = tokenizer.apply_chat_template(
-                        [{"role": "system", "content": system_prompt},
-                         {"role": "user", "content": user_message}],
-                        add_generation_prompt=True,
-                        tokenize=False
-                    )
-                except Exception as e:
-                    raw_prompt_for_generation = f"System: {system_prompt}\n\nUser: {user_message}\n\nAssistant:"
-                
-                # Get reasoning tag
-                thought_tag, close_tag, _ = get_reasoning_stop_tokens(model_family)
-                raw_prompt_for_generation += thought_tag + "Let me think about this step by step."
-                raw_stop_sequences = list(stop_sequences)
-                if close_tag not in raw_stop_sequences:
-                    raw_stop_sequences.append(close_tag)
-                use_raw_mode = True
+            # Get the prompt with generation prompt
+            try:
+                raw_prompt_for_generation = tokenizer.apply_chat_template(
+                    [{"role": "system", "content": system_prompt},
+                     {"role": "user", "content": user_message}],
+                    add_generation_prompt=True,
+                    tokenize=False
+                )
+            except Exception as e:
+                raw_prompt_for_generation = f"System: {system_prompt}\n\nUser: {user_message}\n\nAssistant:"
+            
+            # Get reasoning tag
+            thought_tag, close_tag, _ = get_reasoning_stop_tokens(model_family)
+            raw_prompt_for_generation += thought_tag + "Let me think about this step by step."
+            raw_stop_sequences = list(stop_sequences)
+            if close_tag not in raw_stop_sequences:
+                raw_stop_sequences.append(close_tag)
+            use_raw_mode = True
     
     # Get resolved model name for response (with coderai/ prefix and proper formatting)
     response_model_name = get_resolved_model_name(requested_model, current_manager)
