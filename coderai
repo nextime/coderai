@@ -5791,6 +5791,28 @@ async def stream_chat_response(
     
     try:
         chunk_count = 0
+        
+        # Debug: Print what is being passed to the model
+        if global_debug:
+            print(f"\n{'='*80}")
+            print(f"=== MODEL INPUT (DEBUG) ===")
+            print(f"{'='*80}")
+            print(f"Model: {model_name}")
+            print(f"Max tokens: {max_tokens}")
+            print(f"Temperature: {temperature}")
+            print(f"Top P: {top_p}")
+            print(f"Stop sequences: {stop}")
+            print(f"Tools: {tools is not None}")
+            print(f"Response format: {response_format}")
+            print(f"\n--- Messages ---")
+            for i, msg in enumerate(messages):
+                role = msg.get('role', 'unknown')
+                content = msg.get('content', '')
+                if content and len(content) > 500:
+                    content = content[:500] + "... [truncated]"
+                print(f"[{i}] {role}: {repr(content)}")
+            print(f"{'='*80}\n")
+        
         # Use generate_chat_stream for proper chat template handling
         async for chunk in current_manager.generate_chat_stream(
             messages=messages,
@@ -5990,6 +6012,27 @@ async def generate_chat_response(
     """Generate non-streaming chat completion response."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
+    
+    # Debug: Print what is being passed to the model
+    if global_debug:
+        print(f"\n{'='*80}")
+        print(f"=== MODEL INPUT (DEBUG) ===")
+        print(f"{'='*80}")
+        print(f"Model: {model_name}")
+        print(f"Max tokens: {max_tokens}")
+        print(f"Temperature: {temperature}")
+        print(f"Top P: {top_p}")
+        print(f"Stop sequences: {stop}")
+        print(f"Tools: {tools is not None}")
+        print(f"Response format: {response_format}")
+        print(f"\n--- Messages ---")
+        for i, msg in enumerate(messages):
+            role = msg.get('role', 'unknown')
+            content = msg.get('content', '')
+            if content and len(content) > 500:
+                content = content[:500] + "... [truncated]"
+            print(f"[{i}] {role}: {repr(content)}")
+        print(f"{'='*80}\n")
     
     try:
         # Use generate_chat for proper chat template handling
