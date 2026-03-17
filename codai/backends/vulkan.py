@@ -248,7 +248,15 @@ class VulkanBackend(ModelBackend):
         2. HuggingFace tokenizer's apply_chat_template
         3. Manual template application based on detected template name
         4. Generic ChatML format as fallback
+        
+        Args:
+            messages: List of message dicts or ChatMessage objects
+            add_generation_prompt: Whether to add generation prompt
         """
+        # Convert ChatMessage objects to dicts if needed
+        if messages and hasattr(messages[0], 'model_dump'):
+            # It's a Pydantic model
+            messages = [msg.model_dump() if hasattr(msg, 'model_dump') else {"role": msg.role, "content": msg.content} for msg in messages]
         # First try GGUF model's built-in template
         if hasattr(self, 'model') and self.model is not None:
             try:
