@@ -2410,7 +2410,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             print(f"RAW: Passed through formatter, got: {formatted_response.get('choices', [{}])[0].get('message', {}).get('content', '')[:100]}...")
         
         # Add mock reasoning stats if 'mock' is in force_reasoning_args
-        if "mock" in force_reasoning_args and formatted_response:
+        # But only if we DON'T already have real reasoning from extraction
+        has_real_reasoning = reasoning_text and len(reasoning_text.strip()) > 10
+        
+        if "mock" in force_reasoning_args and formatted_response and not has_real_reasoning:
             # Add fake reasoning tokens to trigger VSCode plugin stats
             mock_reasoning_tokens = 50
             
@@ -2427,6 +2430,18 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 choice = formatted_response["choices"][0]
                 if "message" in choice and "reasoning" not in choice["message"]:
                     choice["message"]["reasoning"] = "Processing task in optimized mode..."
+        elif has_real_reasoning and formatted_response:
+            # We have real reasoning from extraction - add it to the message
+            if "choices" in formatted_response and formatted_response["choices"]:
+                choice = formatted_response["choices"][0]
+                if "message" in choice:
+                    choice["message"]["reasoning"] = reasoning_text.strip()
+                    # Also update usage with actual reasoning tokens
+                    if "usage" in formatted_response:
+                        reasoning_tokens = len(reasoning_text.strip().split())
+                        formatted_response["usage"]["completion_tokens_details"] = {
+                            "reasoning_tokens": reasoning_tokens
+                        }
         
         # Dump parsed output if enabled
         if global_dump:
@@ -2909,10 +2924,15 @@ async def generate_chat_response(
         )
         
         # Add mock reasoning stats if 'mock' is in force_reasoning_args
-        force_reasoning_args = getattr(global_args, 'force_reasoning', None) if global_args else None
-        if isinstance(force_reasoning_args, str):
-            force_reasoning_args = [force_reasoning_args]
-        if force_reasoning_args and "mock" in force_reasoning_args and formatted_response:
+        # But only if we don't already have real reasoning in the response
+        # Check if reasoning already exists in the message
+        existing_reasoning = None
+        if "choices" in formatted_response and formatted_response["choices"]:
+            choice = formatted_response["choices"][0]
+            if "message" in choice:
+                existing_reasoning = choice["message"].get("reasoning")
+        
+        if "mock" in force_reasoning_args and formatted_response and not existing_reasoning:
             # Add fake reasoning tokens to trigger VSCode plugin stats
             mock_reasoning_tokens = 50
             
