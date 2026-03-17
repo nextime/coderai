@@ -378,16 +378,13 @@ class VulkanBackend(ModelBackend):
         
         return formatted
     
-    async def load_model(self, model_path: str, model_type: str = "text", **kwargs) -> bool:
+    def load_model(self, model_path: str, model_type: str = "text", **kwargs) -> None:
         """Load a GGUF model.
         
         Args:
             model_path: Path to the GGUF model file or HuggingFace model ID
             model_type: Type of model (text, image, audio)
             **kwargs: Additional parameters
-            
-        Returns:
-            True if model loaded successfully
         """
         if not LLAMA_CPP_AVAILABLE:
             raise ImportError("llama-cpp-python is required for GGUF models. Install with: pip install llama-cpp-python")
@@ -468,13 +465,11 @@ class VulkanBackend(ModelBackend):
             print(f"DEBUG: VulkanBackend loaded model: {model_path}")
             print(f"DEBUG: n_gpu_layers={self.n_gpu_layers}, n_ctx={self.n_ctx}")
             print(f"DEBUG: chat_template={self.chat_template}")
-            
-            return True
         except Exception as e:
             print(f"Error loading GGUF model: {e}")
             raise
     
-    async def generate(
+    def generate(
         self,
         prompt: str,
         **kwargs
@@ -510,23 +505,16 @@ class VulkanBackend(ModelBackend):
             stop = get_reasoning_stop_tokens(self.chat_template)
         
         try:
-            if stream:
-                # Collect all chunks
-                chunks = []
-                async for chunk in self.generate_stream(prompt, **kwargs):
-                    chunks.append(chunk)
-                return "".join(chunks)
-            else:
-                result = self.model.create_completion(
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    repeat_penalty=repeat_penalty,
-                    stop=stop,
-                )
-                return result['choices'][0]['text']
+            result = self.model.create_completion(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repeat_penalty=repeat_penalty,
+                stop=stop,
+            )
+            return result['choices'][0]['text']
         except Exception as e:
             print(f"Error during generation: {e}")
             raise
@@ -607,7 +595,7 @@ class VulkanBackend(ModelBackend):
             print(f"Error during streaming generation: {e}")
             raise
     
-    async def chat(
+    def chat(
         self,
         messages: List[Dict[str, str]],
         **kwargs
