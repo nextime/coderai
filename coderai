@@ -1946,7 +1946,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             print(f"CHAT: Reasoning API param enabled")
     
     # Handle 'inject' - system prompt injection
-    if "inject" in force_reasoning_args:
+    # Skip for 'raw' mode since it handles everything separately
+    if "raw" not in force_reasoning_args and "inject" in force_reasoning_args:
         from codai.models.templates import AgenticTemplateManager
         template_manager = AgenticTemplateManager(request.model)
         
@@ -1981,7 +1982,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             print(f"--- END SYSTEM PROMPT ---")
     
     # Handle 'prompt' - prompt seeding (ends with thought tag)
-    if "prompt" in force_reasoning_args:
+    # Note: 'prompt' and 'raw' are mutually exclusive - raw bypasses this
+    if "prompt" in force_reasoning_args and "raw" not in force_reasoning_args:
         from codai.models.templates import AgenticTemplateManager
         template_manager = AgenticTemplateManager(request.model)
         
@@ -2021,7 +2023,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             stop_sequences = list(request.stop)
     
     # Handle 'stop' - add reasoning stop tokens (also done for 'inject' and 'prompt')
-    if "stop" in force_reasoning_args or "inject" in force_reasoning_args or "prompt" in force_reasoning_args:
+    # Skip for 'raw' mode since it handles stop tokens separately
+    if "raw" not in force_reasoning_args and ("stop" in force_reasoning_args or "inject" in force_reasoning_args or "prompt" in force_reasoning_args):
         _, _, additional_stops = get_reasoning_stop_tokens(model_family)
         for stop_token in additional_stops:
             if stop_token not in stop_sequences:
