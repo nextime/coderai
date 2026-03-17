@@ -381,15 +381,22 @@ class MultiModelManager:
         self.tts_model: Optional[str] = None
         self.image_models: List[str] = []
         self.vision_models: List[str] = []
-        self.config: Dict = {}  # Store model configurations
+        self.config: Dict[str, Dict] = {}  # Store model configurations
         self.tool_parser = ModelParserAdapter()
         self.current_model_key: Optional[str] = None
-        self.config: Dict[str, Dict] = {}
+        self.config: Dict[str, Dict] = {}  # Store model configurations
+        self.tool_parser = ModelParserAdapter()
+        self.current_model_key: Optional[str] = None
         self.load_mode: str = "ondemand"
         self.active_in_vram: Optional[str] = None
         self.model_aliases: Dict[str, str] = {}
         self.whisper_server: Optional[WhisperServerManager] = None
         self.model_backend_types: Dict[str, str] = {}
+    
+    @property
+    def image_model(self) -> Optional[str]:
+        """Return the first image model or None."""
+        return self.image_models[0] if self.image_models else None
     
     def _aggressive_vram_cleanup(self, model_manager):
         """Aggressively cleanup VRAM when switching between different model types."""
