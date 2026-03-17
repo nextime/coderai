@@ -3068,17 +3068,20 @@ def parse_args():
         if not value:
             return []
         options = [v.strip().lower() for v in value.split(',')]
-        valid = {'chat', 'stop', 'inject', 'prompt'}
+        valid = {'chat', 'stop', 'inject', 'prompt', 'all'}
         invalid = [o for o in options if o not in valid]
         if invalid:
             raise argparse.ArgumentTypeError(f"Invalid choices: {invalid}. Valid options: {valid}")
+        # Expand 'all' to all options
+        if 'all' in options:
+            options = ['chat', 'stop', 'inject', 'prompt']
         return options
     
     parser.add_argument(
         "--force-reasoning",
         type=reasoning_choices,
         default=None,
-        help="Force reasoning/thinking mode. Options: 'chat' (API reasoning param), 'stop' (add stop tokens), 'inject' (system prompt), 'prompt' (prompt seeding). Combine with commas: --force-reasoning chat,inject,prompt",
+        help="Force reasoning/thinking mode. Options: 'chat' (API reasoning), 'stop' (stop tokens), 'inject' (system prompt), 'prompt' (prompt seeding), 'all' (all features). Combine: --force-reasoning chat,inject",
     )
     return parser.parse_args()
 def main():
