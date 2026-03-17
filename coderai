@@ -1949,6 +1949,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     if "inject" in force_reasoning_args:
         from codai.models.templates import AgenticTemplateManager
         template_manager = AgenticTemplateManager(request.model)
+        
+        # Use reasoning tag (]]) when prompt is also selected for consistency
+        use_reasoning_tag = "prompt" in force_reasoning_args
+        
         # Get the current system prompt if exists
         system_content = None
         for msg in messages:
@@ -1957,9 +1961,9 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 break
         if system_content:
             # Inject agentic instructions
-            system_content = template_manager.get_agent_system_prompt(system_content)
+            system_content = template_manager.get_agent_system_prompt(system_content, use_reasoning_tag=use_reasoning_tag)
         else:
-            system_content = template_manager.get_agent_system_prompt("You are a helpful assistant.")
+            system_content = template_manager.get_agent_system_prompt("You are a helpful assistant.", use_reasoning_tag=use_reasoning_tag)
         # Update or add system message
         system_found = False
         for i, msg in enumerate(messages):

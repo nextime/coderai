@@ -84,11 +84,23 @@ class AgenticTemplateManager:
             if k in self.model_name: return v
         return "openai" if "gpt" in self.model_name else "qwen"
 
-    def get_agent_system_prompt(self, base_prompt: str) -> str:
-        """Injects agentic instructions specific to the model's strengths."""
+    def get_agent_system_prompt(self, base_prompt: str, use_reasoning_tag: bool = False) -> str:
+        """Injects agentic instructions specific to the model's strengths.
+        
+        Args:
+            base_prompt: The base system prompt
+            use_reasoning_tag: If True, use the reasoning tag (</think>) for consistency with prompt seeding.
+                             If False, use the model's preferred thought tag (e.g., <|thought|>).
+        """
+        # Use reasoning tag for consistency with prompt seeding, or model's preferred tag
+        if use_reasoning_tag:
+            thought_tag = self.THOUGHT_TAGS.get(self.family_key, "</think>")
+        else:
+            thought_tag = self.config.get('thought_tag', 'Thought:')
+        
         agent_addon = (
             "\n\nCRITICAL: You are an agent with access to tools. "
-            f"Use the {self.config.get('thought_tag', 'Thought:')} tag to reason step-by-step "
+            f"Use the {thought_tag} tag to reason step-by-step "
             "before providing a tool call. If you have enough info, provide the final answer."
         )
         return f"{base_prompt}{agent_addon}"
