@@ -3668,6 +3668,45 @@ def check_hf_chat_template(model_type: str = "text", model_name: str = None) -> 
 global_system_prompt = None
 
 
+def get_resolved_model_name(requested_model: str, current_manager = None) -> str:
+    """
+    Get the actual model name to return in the response.
+    
+    - If the requested model is an alias (like "default"), resolve to actual model name
+    - For URL models, extract just the filename
+    - Add "coderai/" as the provider prefix
+    """
+    import os
+    
+    # First try to get from model manager if available
+    if current_manager is not None:
+        actual_model = current_manager.model_name
+        if actual_model and actual_model != "unknown":
+            model_name = actual_model
+        else:
+            model_name = requested_model
+    else:
+        model_name = requested_model
+    
+    # Handle URL models - extract just the filename
+    if model_name.startswith('http://') or model_name.startswith('https://'):
+        # Extract filename from URL
+        url_path = model_name.split('?')[0]  # Remove query params
+        filename = os.path.basename(url_path)
+        if filename:
+            model_name = filename
+    
+    # Handle local file paths - extract just the filename
+    elif os.path.isfile(model_name):
+        model_name = os.path.basename(model_name)
+    
+    # Add coderai/ prefix for the response
+    if not model_name.startswith("coderai/"):
+        model_name = f"coderai/{model_name}"
+    
+    return model_name
+
+
 def get_model_family(model_name: str) -> str:
     """Detect model family from model name."""
     model_lower = model_name.lower()
@@ -5651,11 +5690,15 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 }
             })
     
+    # Get resolved model name for response (with coderai/ prefix and proper formatting)
+    response_model_name = get_resolved_model_name(requested_model, current_manager)
+    print(f"DEBUG: Requested model: {requested_model}, Resolved model for response: {response_model_name}")
+    
     if request.stream:
         return StreamingResponse(
             stream_chat_response(
                 messages_dict,
-                request.model,
+                response_model_name,
                 request.max_tokens,
                 request.temperature,
                 request.top_p,
@@ -5670,7 +5713,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     else:
         return await generate_chat_response(
             messages_dict,
-            request.model,
+            response_model_name,
             request.max_tokens,
             request.temperature,
             request.top_p,
