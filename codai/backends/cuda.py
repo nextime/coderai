@@ -30,6 +30,7 @@ class NvidiaBackend(ModelBackend):
         except ImportError:
             self.flash_attn_available = False
         
+        # Always print the status when model is loaded (for visibility)
         if self.use_flash_attn:
             if self.flash_attn_available:
                 print("Flash Attention 2: Available and enabled")
@@ -38,6 +39,12 @@ class NvidiaBackend(ModelBackend):
                 print("Install with: pip install flash-attn --no-build-isolation")
                 print("Falling back to standard attention")
                 self.use_flash_attn = False
+        else:
+            # Print availability status even when not requested (for transparency)
+            if self.flash_attn_available:
+                print("Flash Attention 2: Available (not enabled)")
+            else:
+                print("Flash Attention 2: Not available")
     
     def _detect_device(self) -> str:
         """Auto-detect available GPU or fall back to CPU."""

@@ -1898,6 +1898,14 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     force_reasoning_mode = getattr(global_args, 'force_reasoning', None) if global_args else None
     enable_thinking_api = getattr(request, 'enable_thinking', False)
     
+    # DEBUG: Print force_reasoning status when debug mode is enabled
+    if global_debug:
+        print(f"\n{'='*60}")
+        print(f"=== REASONING MODE DEBUG ===")
+        print(f"{'='*60}")
+        print(f"force_reasoning CLI flag: {force_reasoning_mode}")
+        print(f"enable_thinking API param: {enable_thinking_api}")
+    
     # Determine if reasoning should be enabled
     # Force reasoning if: API param is true OR CLI flag is set (not None)
     reasoning_enabled = enable_thinking_api or (force_reasoning_mode is not None)
@@ -1937,6 +1945,16 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     break
             if not system_found:
                 messages = [ChatMessage(role="system", content=system_content)] + list(messages)
+            
+            # DEBUG: Print injection status
+            if global_debug:
+                print(f"reasoning_action: {reasoning_action}")
+                print(f"reasoning_enabled: {reasoning_enabled}")
+                print(f"INJECTION DONE: System prompt has been injected with agentic instructions")
+                print(f"\n--- INJECTED SYSTEM PROMPT ---")
+                print(system_content)
+                print(f"--- END SYSTEM PROMPT ---")
+                print(f"{'='*60}\n")
     
     # Prepare stop sequences (before reasoning block to avoid UnboundLocalError)
     stop_sequences = []
@@ -1954,6 +1972,12 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             if stop_token not in stop_sequences:
                 stop_sequences.append(stop_token)
         print(f"DEBUG: Added reasoning stop tokens for model family '{model_family}': {additional_stops}")
+        
+        # DEBUG: Print stop action
+        if global_debug:
+            print(f"reasoning_action: {reasoning_action}")
+            print(f"STOP TOKENS ADDED: Reasoning stop tokens added to generation")
+            print(f"{'='*60}\n")
     
     # Format messages with tools if provided
     if request.tools:
