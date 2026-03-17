@@ -407,8 +407,9 @@ class ApexBig50Parser(BaseParser):
         results = []
         
         # XML patterns
+        # Note: <tool> (without _call) is also matched here
         xml_patterns = [
-            r'<(?:tool_call|function_call|tool_use)>(.*?)</(?:tool_call|function_call|tool_use)>',
+            r'<(?:tool|tool_call|function_call|tool_use)>(.*?)</(?:tool|tool_call|function_call|tool_use)>',
             r'\[TOOL_CALLS\](.*?)\[/TOOL_CALLS\]'
         ]
         for p in xml_patterns:
