@@ -103,6 +103,77 @@ def filter_malformed_content(text: str) -> str:
     
     # Don't strip single newlines or whitespace - they might be valid content
     return filtered
+
+
+def cleanup_control_tokens(text: str) -> str:
+    """
+    Clean up leading/trailing control tokens from model output.
+    
+    Removes tokens like <|im_end|>, <|im_start|>, 'assistant', etc. that might
+    appear at the start or end of the response after reasoning extraction.
+    """
+    if not text:
+        return text
+    
+    cleaned = text
+    
+    # List of control tokens to strip from start/end
+    control_tokens = [
+        '<|im_end|>',
+        '<|im_start|>',
+        '<|endoftext|>',
+        '<|end_of_text|>',
+        '<|eot_id|>',
+        '<|eom_id|>',
+        'assistant',
+        'Assistant',
+        'ASSISTANT',
+        '<|assistant|>',
+        '<|model|>',
+        '<|python|>',
+        '<|javascript|>',
+        '<|html|>',
+        '\n\nassistant',
+        '\nAssistant',
+    ]
+    
+    # Strip from start - keep trying until no more tokens at start
+    changed = True
+    while changed:
+        changed = False
+        for token in control_tokens:
+            if cleaned.startswith(token):
+                cleaned = cleaned[len(token):]
+                changed = True
+            elif cleaned.startswith('\n' + token):
+                cleaned = cleaned[len('\n' + token):]
+                changed = True
+            elif cleaned.startswith(' ' + token):
+                cleaned = cleaned[len(' ' + token):]
+                changed = True
+    
+    # Strip from end - keep trying until no more tokens at end
+    changed = True
+    while changed:
+        changed = False
+        for token in control_tokens:
+            if cleaned.endswith(token):
+                cleaned = cleaned[:-len(token)]
+                changed = True
+            elif cleaned.endswith('\n' + token):
+                cleaned = cleaned[:-len('\n' + token)]
+                changed = True
+            elif cleaned.endswith(' ' + token):
+                cleaned = cleaned[:-len(' ' + token)]
+                changed = True
+    
+    # Clean up any resulting double newlines
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    
+    # Strip leading/trailing whitespace
+    cleaned = cleaned.strip()
+    
+    return cleaned
 # =============================================================================
 # Tool Parsing
 # =============================================================================
@@ -2242,7 +2313,13 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         
         if global_debug:
             print(f"RAW: Extracted reasoning: {reasoning_text[:100]}...")
-            print(f"RAW: Final text: {final_text[:100]}...")
+            print(f"RAW: Final text before cleanup: {final_text[:100]}...")
+        
+        # Clean up control tokens from final text
+        final_text = cleanup_control_tokens(final_text)
+        
+        if global_debug:
+            print(f"RAW: Final text after cleanup: {final_text[:100]}...")
         
         # If we have reasoning, continue with second pass to get more complete answer
         # Build the full prompt with reasoning included
@@ -2262,7 +2339,15 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 top_p=request.top_p,
                 stop=stop_sequences,
             )
+            # Clean up the second pass result
+            second_pass_result = cleanup_control_tokens(second_pass_result)
             generated_text = reasoning_text + (close_tag or "") + second_pass_result
+        
+        # Additional cleanup of the full generated text
+        generated_text = cleanup_control_tokens(generated_text)
+        
+        if global_debug:
+            print(f"RAW: Generated text after cleanup: {generated_text[:100]}...")
         
         # Build response similar to generate_chat_response
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -2313,6 +2398,25 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 prompt_tokens=response.get('usage', {}).get('prompt_tokens', 0),
                 completion_tokens=response.get('usage', {}).get('completion_tokens', 0)
             ) if hasattr(current_manager.backend, 'get_rate_limit_headers') else {}
+        
+        # Add mock reasoning stats if 'mock' is in force_reasoning_args
+        if "mock" in force_reasoning_args and response:
+            # Add fake reasoning tokens to trigger VSCode plugin stats
+            mock_reasoning_tokens = 50
+            
+            # Update usage
+            if "usage" in response:
+                response["usage"]["completion_tokens"] += mock_reasoning_tokens
+                response["usage"]["total_tokens"] += mock_reasoning_tokens
+                response["usage"]["completion_tokens_details"] = {
+                    "reasoning_tokens": mock_reasoning_tokens
+                }
+            
+            # Add reasoning to message if not present
+            if "choices" in response and response["choices"]:
+                choice = response["choices"][0]
+                if "message" in choice and "reasoning" not in choice["message"]:
+                    choice["message"]["reasoning"] = "Processing task in optimized mode..."
         
         return JSONResponse(content=response, headers=headers)
     
