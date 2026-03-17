@@ -926,6 +926,11 @@ class ModelParserAdapter:
         
         tool_calls = self._dispatcher.parse(text)
         
+        # Fallback: if no tool calls found, try using ToolCallParser
+        if not tool_calls:
+            tool_call_parser = ToolCallParser(model_name=self._model_name)
+            tool_calls = tool_call_parser.extract_tool_calls(text, available_tools)
+        
         if tool_calls:
             for tc in tool_calls:
                 if 'id' not in tc:
