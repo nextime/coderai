@@ -2429,18 +2429,21 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     print(f"DEBUG: Error converting tool in raw mode: {e}, tool type: {type(t)}")
                     continue
         
-        # Step 1: Use ModelParserAdapter to extract tool calls from generated text
+        # Step 1: Use ModelParserAdapter to extract tool calls from final_text (NOT generated_text which includes reasoning)
+        # This fixes Bug 2 and Bug 3: reasoning was appearing in both content AND reasoning fields
+        # because the parser was receiving the full generated_text including reasoning
         extracted_tool_calls = None
-        clean_text = generated_text
+        clean_text = final_text  # Use final_text (after reasoning) instead of generated_text (which includes reasoning)
         if tools_list:
             adapter = ModelParserAdapter(model_name=response_model_name)
-            extracted_tool_calls = adapter.extract_tool_calls(generated_text, tools_list)
+            # Extract tool calls from final_text only (after reasoning is done)
+            extracted_tool_calls = adapter.extract_tool_calls(final_text, tools_list)
             
             if extracted_tool_calls:
                 # Strip tool calls from the text
-                clean_text = adapter.strip_tool_calls_from_content(generated_text)
+                clean_text = adapter.strip_tool_calls_from_content(final_text)
                 if global_debug:
-                    print(f"RAW: Extracted {len(extracted_tool_calls)} tool calls from generated text")
+                    print(f"RAW: Extracted {len(extracted_tool_calls)} tool calls from final_text (after reasoning)")
         
         # Estimate token counts
         prompt_tokens = len(raw_prompt_for_generation.split())
