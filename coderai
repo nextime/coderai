@@ -200,6 +200,7 @@ global_system_prompt = None
 
 # Global debug flag
 global_debug = False
+global_dump = False
 global_file_path = None
 
 # =============================================================================
@@ -2480,6 +2481,14 @@ async def generate_chat_response(
         # Always filter out malformed content
         generated_text = filter_malformed_content(generated_text)
         
+        # Dump raw output if enabled
+        if global_dump:
+            print(f"\n{'='*80}")
+            print(f"=== RAW MODEL OUTPUT (DUMP) ===")
+            print(f"{'='*80}")
+            print(generated_text)
+            print(f"{'='*80}\n")
+        
         response_message = {
             "role": "assistant",
             "content": generated_text,
@@ -2531,12 +2540,23 @@ async def generate_chat_response(
         
         # Use OpenAIFormatter for final sanitization
         formatter = OpenAIFormatter(model_name)
-        return formatter.format_litellm_full(
+        formatted_response = formatter.format_litellm_full(
             text=response_message.get("content", ""),
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             tool_calls=response_message.get("tool_calls")
         )
+        
+        # Dump parsed output if enabled
+        if global_dump:
+            import json
+            print(f"\n{'='*80}")
+            print(f"=== PARSED OUTPUT (DUMP) ===")
+            print(f"{'='*80}")
+            print(json.dumps(formatted_response, indent=2))
+            print(f"{'='*80}\n")
+        
+        return formatted_response
     except Exception as e:
         print(f"Error during generation: {e}")
         raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
@@ -3051,6 +3071,11 @@ def parse_args():
         help="Enable debug mode - dumps full request/response to stdout for troubleshooting",
     )
     parser.add_argument(
+        "--dump",
+        action="store_true",
+        help="Dump model output: raw output, parsed output, and litellm debug info",
+    )
+    parser.add_argument(
         "--file-path",
         type=str,
         default=None,
@@ -3086,7 +3111,7 @@ def parse_args():
     return parser.parse_args()
 def main():
     """Main entry point."""
-    global global_system_prompt, model_manager, multi_model_manager, global_debug, global_args, global_file_path
+    global global_system_prompt, model_manager, multi_model_manager, global_debug, global_dump, global_args, global_file_path
     
     # Suppress unraisable exceptions from LlamaModel.__del__
     import sys
@@ -3113,6 +3138,10 @@ def main():
     
     # Set global debug flag
     global_debug = args.debug
+    # Set global dump flag (enables debug as well for litellm output)
+    global_dump = args.dump
+    if global_dump:
+        global_debug = True
     # Set global file path for storing generated files
     global_file_path = args.file_path
     if global_debug:
