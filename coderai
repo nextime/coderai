@@ -35,6 +35,11 @@ from codai.models import ModelParserDispatcher, OpenAIFormatter
 from codai.models.manager import ModelManager, WhisperServerManager, MultiModelManager
 from codai.queue.manager import QueueManager, queue_manager
 from codai.backends import NvidiaBackend, VulkanBackend, detect_available_backends
+from codai.models.capabilities import ModelCapabilities, detect_model_capabilities
+from codai.models.cache import (
+    get_model_cache_dir, get_all_cache_dirs, get_cached_model_path,
+    is_huggingface_model_id, download_huggingface_model, download_model
+)
 # Per-model semaphores for request concurrency control
 model_semaphores: dict = {}
 load_mode = {"mode": "ondemand"}  # Track load mode globally
