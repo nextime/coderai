@@ -277,9 +277,9 @@ class NvidiaBackend(ModelBackend):
                     print("Warning: bitsandbytes not installed. Quantization disabled.")
         
         if self.device == "cuda":
-            load_kwargs['torch_dtype'] = torch.float16
+            load_kwargs['dtype'] = torch.float16
         else:
-            load_kwargs['torch_dtype'] = torch.float32
+            load_kwargs['dtype'] = torch.float32
         
         if offload_dir:
             os.makedirs(offload_dir, exist_ok=True)
