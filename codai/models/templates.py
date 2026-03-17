@@ -1,17 +1,55 @@
 """
 Agentic Template Manager - Automates prompt injection for agentic behavior.
 Supports the 'Big 10' with specific triggers for tool-calling.
+
+Uses Prompt Seeding technique to force reasoning in LLM models:
+- Ends prompt with thought tag (<think>, <thought>, Thought:) to force reasoning
+- Uses raw completion instead of chat API to bypass validation
+- Provides family-specific stop tokens for reasoning extraction
 """
 
 import re
+from typing import Optional, Dict, List, Tuple
 
 
 class AgenticTemplateManager:
     """
     Automates prompt injection to force models into an Agentic 'Thought-Action' loop.
     Supports the 'Big 10' with specific triggers for tool-calling.
+    
+    Uses Prompt Seeding to force reasoning by ending prompts with thought tags.
     """
     
+    # Family-specific prefixes for Prompt Seeding (force reasoning start)
+    # These templates end with the thought tag to force the model to start reasoning
+    REASONING_PREFIXES = {
+        "qwen": "<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        "deepseek": "<|begin_of_sentence|><|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        "llama3": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{sys}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n<thought>\n",
+        "mistral": "[INST] {sys}\n\n{user} [/INST] Thought:\n",
+        "anthropic": "\n\nSystem: {sys}\n\nHuman: {user}\n\nAssistant: <thinking>\n",
+        "command-r": "<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>{sys}<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>{user}<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|><thought>\n",
+        "gemma": "<bos><start_of_turn>user\n{sys}\n\n{user}<end_of_turn>\n<start_of_turn>model\n<thought>\n",
+        "phi3": "<|system|>\n{sys}<|end|>\n<|user|>\n{user}<|end|>\n<|assistant|>\n<|thought|>\n",
+        "yi": "<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        "generic": "System: {sys}\nUser: {user}\nAssistant: <think>\n"
+    }
+    
+    # Stop tokens for each family (used to stop reasoning generation)
+    REASONING_STOP_TOKENS = {
+        "qwen": ["</think>", "<|im_end|>", "<|endoftext|>"],
+        "deepseek": ["</think>", "<|im_end|>", "<|endoftext|>"],
+        "llama3": ["</thought>", "<|eot_id|>", "<|end_of_text|>"],
+        "mistral": ["\nAction:", "\nObservation:"],
+        "anthropic": ["</thinking>", "\n\nHuman:"],
+        "command-r": ["</thought>", "<|END_OF_TURN_TOKEN|>"],
+        "gemma": ["</thought>", "<end_of_turn>"],
+        "phi3": ["<|end|>", "<|assistant|>"],
+        "yi": ["</think>", "<|im_end|>", "<|endoftext|>"],
+        "generic": ["</think>", "</thought>", "Thought:"]
+    }
+    
+    # Original FAMILIES config for backward compatibility
     FAMILIES = {
         "qwen": {"name": "Qwen", "prefix": "<|im_start|>", "suffix": "<|im_end|>\n", "thought_tag": "<|thought|>", "call_tag": "<tool_call>"},
         "llama3": {"name": "Llama-3", "prefix": "<|start_header_id|>", "suffix": "<|end_header_id|>\n\n", "thought_tag": "<thought>", "call_tag": "<tool_call>"},
@@ -32,9 +70,15 @@ class AgenticTemplateManager:
 
     def _detect_family(self):
         mapping = {
-            "qwen": "qwen", "llama-3": "llama3", "deepseek": "deepseek",
-            "mistral": "mistral", "mixtral": "mistral", "claude": "anthropic",
-            "gemma": "gemma", "phi-3": "phi3", "command": "cohere", "yi": "yi"
+            "qwen": "qwen", 
+            "llama": "llama3",  # Match llama, llama3, llama-3
+            "deepseek": "deepseek",
+            "mistral": "mistral", "mixtral": "mistral", 
+            "claude": "anthropic",
+            "gemma": "gemma", 
+            "phi": "phi3",  # Match phi, phi3, phi-3
+            "command": "cohere", 
+            "yi": "yi"
         }
         for k, v in mapping.items():
             if k in self.model_name: return v
@@ -49,6 +93,115 @@ class AgenticTemplateManager:
         )
         return f"{base_prompt}{agent_addon}"
 
+    def force_reasoning_prompt(self, system_prompt: str, user_question: str) -> str:
+        """
+        Constructs a raw prompt that forces the model to start in a reasoning state.
+        
+        Uses Prompt Seeding: ends the prompt exactly where we want the model to start -
+        at the opening thought tag (<think>, <thought>, Thought:).
+        
+        This "token hijacking" corners the model's next token prediction to generate
+        logical reasoning steps.
+        
+        Args:
+            system_prompt: The system instructions
+            user_question: The user's question/query
+            
+        Returns:
+            Formatted prompt string ending with thought tag to force reasoning
+        """
+        # Get the family-specific template (fallback to generic)
+        template = self.REASONING_PREFIXES.get(
+            self.family_key, 
+            self.REASONING_PREFIXES["generic"]
+        )
+        
+        return template.format(sys=system_prompt, user=user_question)
+    
+    def get_stop_tokens(self) -> List[str]:
+        """
+        Get the appropriate stop tokens for this model family.
+        
+        These tokens are used to stop reasoning generation and can be used
+        to parse the reasoning from the final response.
+        
+        Returns:
+            List of stop token strings
+        """
+        return self.REASONING_STOP_TOKENS.get(
+            self.family_key,
+            self.REASONING_STOP_TOKENS["generic"]
+        )
+    
+    # Map family keys to their thought tags for extraction
+    THOUGHT_TAGS = {
+        "qwen": "<think>",
+        "deepseek": "<think>",
+        "llama3": "<thought>",
+        "mistral": "Thought:",
+        "anthropic": "<thinking>",
+        "gemma": "<thought>",
+        "phi3": "<|thought|>",
+        "yi": "</think>",
+        "cohere": "<thought>",
+        "generic": "<think>"
+    }
+    
+    # Closing tags for each family
+    CLOSE_TAGS = {
+        "qwen": "</think>",
+        "deepseek": "</think>",
+        "llama3": "</thought>",
+        "mistral": None,  # Ends at Action: or newline
+        "anthropic": "</thinking>",
+        "gemma": "</thought>",
+        "phi3": "<|end|>",
+        "yi": "</think>",
+        "cohere": "</thought>",
+        "generic": "</think>"
+    }
+    
+    def extract_reasoning(self, response: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Extract reasoning (thought) and final answer from a response.
+        
+        Args:
+            response: The raw model response containing reasoning and answer
+            
+        Returns:
+            Tuple of (reasoning, final_answer). Either or both may be None.
+        """
+        thought_tag = self.THOUGHT_TAGS.get(self.family_key, "<think>")
+        close_tag = self.CLOSE_TAGS.get(self.family_key)
+        
+        # Try to extract reasoning
+        reasoning = None
+        final_answer = response
+        
+        if thought_tag in response:
+            start_idx = response.find(thought_tag)
+            if close_tag and close_tag in response:
+                end_idx = response.find(close_tag, start_idx)
+                if end_idx > start_idx:
+                    reasoning = response[start_idx + len(thought_tag):end_idx].strip()
+                    final_answer = response[end_idx + len(close_tag):].strip()
+            elif self.family_key == "mistral":
+                # For Mistral-style, reasoning ends at Action: or newline
+                rest = response[start_idx + len(thought_tag):]
+                action_idx = rest.find("\nAction:")
+                if action_idx >= 0:
+                    reasoning = rest[:action_idx].strip()
+                    final_answer = rest[action_idx:].strip()
+                else:
+                    reasoning = rest.strip()
+                    final_answer = ""
+            else:
+                # No clear closing tag, take everything after thought tag
+                reasoning = response[start_idx + len(thought_tag):].strip()
+                final_answer = ""
+        
+        return reasoning, final_answer
+    
     def format_for_inference(self, messages: list) -> str:
         """Constructs the prompt string and forces the 'Thought' start."""
         if self.family_key == "openai": return messages
@@ -78,3 +231,39 @@ class AgenticTemplateManager:
             prompt += f"{f.get('bot', 'Assistant: ')}{thought_trigger}"
             
         return prompt
+    
+    def format_for_raw_completion(self, system_prompt: str, user_message: str) -> Tuple[str, List[str]]:
+        """
+        Format prompt for raw completion (bypassing chat API).
+        
+        This uses Prompt Seeding to force reasoning by ending with the thought tag.
+        Returns both the formatted prompt and appropriate stop tokens.
+        
+        Args:
+            system_prompt: System instructions
+            user_message: User message/query
+            
+        Returns:
+            Tuple of (formatted_prompt, stop_tokens)
+        """
+        prompt = self.force_reasoning_prompt(system_prompt, user_message)
+        stop_tokens = self.get_stop_tokens()
+        
+        return prompt, stop_tokens
+
+
+# Convenience function for quick prompting
+def create_reasoning_prompt(model_name: str, system_prompt: str, user_question: str) -> Tuple[str, List[str]]:
+    """
+    Convenience function to create a forced reasoning prompt.
+    
+    Args:
+        model_name: Name of the model (e.g., "qwen3", "llama3", "deepseek")
+        system_prompt: System instructions
+        user_question: User question
+        
+    Returns:
+        Tuple of (formatted_prompt, stop_tokens)
+    """
+    manager = AgenticTemplateManager(model_name)
+    return manager.format_for_raw_completion(system_prompt, user_question)
