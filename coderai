@@ -2123,6 +2123,11 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     
     # Check if we need to set up raw mode (if not already done in prompt handling)
     if "raw" in force_reasoning_args and not use_raw_mode:
+        # Create template_manager if not already created
+        if 'template_manager' not in locals():
+            from codai.models.templates import AgenticTemplateManager
+            template_manager = AgenticTemplateManager(request.model)
+        
         # Use template_manager.format_for_raw_completion which handles everything
         if hasattr(template_manager, 'format_for_raw_completion'):
             # Extract system and user messages
