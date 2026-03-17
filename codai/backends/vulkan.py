@@ -732,3 +732,17 @@ class VulkanBackend(ModelBackend):
             "n_ctx": self.n_ctx,
             "n_gpu_layers": self.n_gpu_layers,
         }
+
+    def get_model_name(self) -> str:
+        """Return the loaded model name."""
+        return self.model_name or "unknown"
+
+    def format_messages(self, messages) -> str:
+        """Format messages into a prompt string using chat template."""
+        if isinstance(messages, list):
+            return self._apply_chat_template(messages, add_generation_prompt=True)
+        return str(messages)
+
+    def cleanup(self) -> None:
+        """Cleanup resources."""
+        self.unload_model()
