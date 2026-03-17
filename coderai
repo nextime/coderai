@@ -2007,6 +2007,13 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         for stop_token in additional_stops:
             if stop_token not in stop_sequences:
                 stop_sequences.append(stop_token)
+        
+        # When using prompt seeding, also add ]]> to force stopping after reasoning
+        if "prompt" in force_reasoning_args:
+            # Add common reasoning end tags based on model family
+            if "</think>" not in stop_sequences:
+                stop_sequences.append("</think>")
+        
         if global_debug:
             print(f"STOP: Added reasoning stop tokens: {additional_stops}")
     
@@ -2546,6 +2553,28 @@ async def generate_chat_response(
             completion_tokens=completion_tokens,
             tool_calls=response_message.get("tool_calls")
         )
+        
+        # Add mock reasoning stats if 'mock' is in force_reasoning_args
+        force_reasoning_args = getattr(global_args, 'force_reasoning', None) if global_args else None
+        if isinstance(force_reasoning_args, str):
+            force_reasoning_args = [force_reasoning_args]
+        if force_reasoning_args and "mock" in force_reasoning_args and formatted_response:
+            # Add fake reasoning tokens to trigger VSCode plugin stats
+            mock_reasoning_tokens = 50
+            
+            # Update usage
+            if "usage" in formatted_response:
+                formatted_response["usage"]["completion_tokens"] += mock_reasoning_tokens
+                formatted_response["usage"]["total_tokens"] += mock_reasoning_tokens
+                formatted_response["usage"]["completion_tokens_details"] = {
+                    "reasoning_tokens": mock_reasoning_tokens
+                }
+            
+            # Add reasoning to message if not present
+            if "choices" in formatted_response and formatted_response["choices"]:
+                choice = formatted_response["choices"][0]
+                if "message" in choice and "reasoning" not in choice["message"]:
+                    choice["message"]["reasoning"] = "Processing task in optimized mode..."
         
         # Dump parsed output if enabled
         if global_dump:
@@ -3093,7 +3122,7 @@ def parse_args():
         if not value:
             return []
         options = [v.strip().lower() for v in value.split(',')]
-        valid = {'chat', 'stop', 'inject', 'prompt', 'all'}
+        valid = {'chat', 'stop', 'inject', 'prompt', 'all', 'twopass', 'mock'}
         invalid = [o for o in options if o not in valid]
         if invalid:
             raise argparse.ArgumentTypeError(f"Invalid choices: {invalid}. Valid options: {valid}")
@@ -3106,7 +3135,7 @@ def parse_args():
         "--force-reasoning",
         type=reasoning_choices,
         default=None,
-        help="Force reasoning/thinking mode. Options: 'chat' (API reasoning), 'stop' (stop tokens), 'inject' (system prompt), 'prompt' (prompt seeding), 'all' (all features). Combine: --force-reasoning chat,inject",
+        help="Force reasoning. Options: 'chat' (API), 'stop' (tokens), 'inject' (sys prompt), 'prompt' (seeding), 'twopass' (2 calls), 'mock' (fake stats), 'all'. Combine: --force-reasoning chat,inject",
     )
     return parser.parse_args()
 def main():
