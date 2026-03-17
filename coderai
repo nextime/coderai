@@ -2349,76 +2349,63 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         if global_debug:
             print(f"RAW: Generated text after cleanup: {generated_text[:100]}...")
         
-        # Build response similar to generate_chat_response
-        completion_id = f"chatcmpl-{uuid.uuid4().hex}"
-        created = int(time.time())
+        # Pass through the formatter/parser (same as regular mode)
+        # This handles tool extraction and OpenAI compatibility
+        from codai.models.parser import OpenAIFormatter
+        formatter = OpenAIFormatter(response_model_name)
         
-        # Filter content
-        generated_text = filter_malformed_content(generated_text)
+        # Estimate token counts
+        prompt_tokens = len(raw_prompt_for_generation.split())
+        completion_tokens = len(generated_text.split()) if generated_text else 0
         
-        if global_dump:
-            print(f"\n{'='*80}")
-            print(f"=== RAW MODE OUTPUT ===")
-            print(f"{'='*80}")
-            print(generated_text)
-            print(f"{'='*80}\n")
+        # Format through the parser
+        formatted_response = formatter.format_litellm_full(
+            text=generated_text,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            tool_calls=None  # Raw mode doesn't have tool calls from generation
+        )
         
-        response_message = {
-            "role": "assistant",
-            "content": generated_text,
-        }
-        
-        finish_reason = "stop"
-        
-        # Estimate tokens (rough approximation)
-        prompt_tokens = len(raw_prompt_for_generation.split()) 
-        completion_tokens = len(generated_text.split())
-        
-        response = {
-            "id": completion_id,
-            "object": "chat.completion",
-            "created": created,
-            "model": response_model_name,
-            "choices": [{
-                "index": 0,
-                "message": response_message,
-                "finish_reason": finish_reason,
-            }],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
-        }
-        
-        # Add rate limit headers
-        headers = {}
-        if 'usage' in response:
-            headers = current_manager.backend.get_rate_limit_headers(
-                prompt_tokens=response.get('usage', {}).get('prompt_tokens', 0),
-                completion_tokens=response.get('usage', {}).get('completion_tokens', 0)
-            ) if hasattr(current_manager.backend, 'get_rate_limit_headers') else {}
+        if global_debug:
+            print(f"RAW: Passed through formatter, got: {formatted_response.get('choices', [{}])[0].get('message', {}).get('content', '')[:100]}...")
         
         # Add mock reasoning stats if 'mock' is in force_reasoning_args
-        if "mock" in force_reasoning_args and response:
+        if "mock" in force_reasoning_args and formatted_response:
             # Add fake reasoning tokens to trigger VSCode plugin stats
             mock_reasoning_tokens = 50
             
             # Update usage
-            if "usage" in response:
-                response["usage"]["completion_tokens"] += mock_reasoning_tokens
-                response["usage"]["total_tokens"] += mock_reasoning_tokens
-                response["usage"]["completion_tokens_details"] = {
+            if "usage" in formatted_response:
+                formatted_response["usage"]["completion_tokens"] += mock_reasoning_tokens
+                formatted_response["usage"]["total_tokens"] += mock_reasoning_tokens
+                formatted_response["usage"]["completion_tokens_details"] = {
                     "reasoning_tokens": mock_reasoning_tokens
                 }
             
             # Add reasoning to message if not present
-            if "choices" in response and response["choices"]:
-                choice = response["choices"][0]
+            if "choices" in formatted_response and formatted_response["choices"]:
+                choice = formatted_response["choices"][0]
                 if "message" in choice and "reasoning" not in choice["message"]:
                     choice["message"]["reasoning"] = "Processing task in optimized mode..."
         
-        return JSONResponse(content=response, headers=headers)
+        # Dump parsed output if enabled
+        if global_dump:
+            import json
+            print(f"\n{'='*80}")
+            print(f"=== RAW MODE PARSED OUTPUT (DUMP) ===")
+            print(f"{'='*80}")
+            print(json.dumps(formatted_response, indent=2))
+            print(f"{'='*80}\n")
+        
+        # Add rate limit headers
+        headers = {}
+        if 'usage' in formatted_response:
+            headers = current_manager.backend.get_rate_limit_headers(
+                prompt_tokens=formatted_response.get('usage', {}).get('prompt_tokens', 0),
+                completion_tokens=formatted_response.get('usage', {}).get('completion_tokens', 0)
+            ) if hasattr(current_manager.backend, 'get_rate_limit_headers') else {}
+        
+        return JSONResponse(content=formatted_response, headers=headers)
     
     if request.stream:
         return StreamingResponse(
