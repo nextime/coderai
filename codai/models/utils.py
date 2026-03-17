@@ -118,12 +118,16 @@ def get_resolved_model_name(requested_model: str, current_manager = None) -> str
     if current_manager is not None:
         # Check if the model is loaded in the manager
         if hasattr(current_manager, 'models') and current_manager.models:
-            # If requested_model is "default" or empty, get the first loaded model
+            # If requested_model is "default" or empty, get the actual loaded model (not "default")
             if requested_model in ("default", "", None) or not requested_model:
                 # Try default_model first
-                if hasattr(current_manager, 'default_model') and current_manager.default_model:
+                if hasattr(current_manager, 'default_model') and current_manager.default_model and current_manager.default_model != "default":
                     return current_manager.default_model
-                # Otherwise return the first model in the dict
+                # Otherwise return the first model that is not "default"
+                for key in current_manager.models.keys():
+                    if key != "default":
+                        return key
+                # Fallback to first model if all are "default"
                 return list(current_manager.models.keys())[0]
             # Check if the model is loaded in the manager
             for key, model in current_manager.models.items():
