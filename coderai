@@ -1882,18 +1882,26 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     # Inject system prompt if --system-prompt flag was provided
     messages = request.messages
     if global_system_prompt is not None:
+        # Get the custom system prompt text
+        if global_system_prompt is True:
+            # Default system prompt
+            system_addon = "You are a helpful assistant."
+        else:
+            # Custom system prompt provided as argument
+            system_addon = str(global_system_prompt)
+        
         # Check if there's already a system message
-        has_system = any(msg.role == "system" for msg in messages)
-        if not has_system:
-            # Use default or custom system prompt
-            if global_system_prompt is True:
-                # Default system prompt
-                system_text = "You are a helpful assistant."
-            else:
-                # Custom system prompt provided as argument
-                system_text = str(global_system_prompt)
-            # Insert system message at the beginning
-            messages = [ChatMessage(role="system", content=system_text)] + list(messages)
+        system_found = False
+        for i, msg in enumerate(messages):
+            if msg.role == "system":
+                # Chain the custom system prompt at the START of existing system message
+                messages[i] = ChatMessage(role="system", content=system_addon + "\n\n" + msg.content)
+                system_found = True
+                break
+        
+        if not system_found:
+            # No existing system message, use the custom one
+            messages = [ChatMessage(role="system", content=system_addon)] + list(messages)
     
     # Enable thinking/reasoning mode if requested via API parameter OR CLI flag
     force_reasoning_args = getattr(global_args, 'force_reasoning', None) if global_args else None
