@@ -128,7 +128,16 @@ class AgenticTemplateManager:
             self.REASONING_PREFIXES["generic"]
         )
         
-        return template.format(sys=system_prompt, user=user_question)
+        # Format the base template
+        prompt = template.format(sys=system_prompt, user=user_question)
+        
+        # Get the thought tag for this family
+        thought_tag = self.THOUGHT_TAGS.get(self.family_key, "<think>")
+        
+        # Add "The user requested" after the thought tag to guide reasoning
+        prompt += f"The user requested: {user_question}\n"
+        
+        return prompt
     
     def get_stop_tokens(self) -> List[str]:
         """
