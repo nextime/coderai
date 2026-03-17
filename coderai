@@ -2392,20 +2392,60 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             print(f"RAW: Generated text after cleanup: {generated_text[:100]}...")
         
         # Pass through the formatter/parser (same as regular mode)
-        # This handles tool extraction and OpenAI compatibility
-        from codai.models.parser import OpenAIFormatter
-        formatter = OpenAIFormatter(response_model_name)
+        # Pipeline: Model output -> Extract reasoning (if raw mode) -> ModelParserAdapter (extract tools) -> OpenAIFormatter (final format)
+        from codai.models.parser import OpenAIFormatter, ModelParserAdapter
+        
+        # Convert request tools for ModelParserAdapter
+        tools_list = None
+        if request.tools:
+            from codai.pydantic.textrequest import Tool, ToolFunction
+            tools_list = []
+            for t in request.tools:
+                try:
+                    # Handle both dict and pydantic model formats
+                    if isinstance(t, dict):
+                        func_data = t.get("function", {})
+                        tool_func = ToolFunction(
+                            name=func_data.get("name", ""),
+                            description=func_data.get("description"),
+                            parameters=func_data.get("parameters")
+                        )
+                    else:
+                        # Pydantic model
+                        tool_func = ToolFunction(
+                            name=t.function.name if hasattr(t.function, 'name') else str(t.function),
+                            description=t.function.description if hasattr(t.function, 'description') else None,
+                            parameters=t.function.parameters if hasattr(t.function, 'parameters') else None
+                        )
+                    tools_list.append(Tool(type=t.get("type", "function") if isinstance(t, dict) else t.type, function=tool_func))
+                except Exception as e:
+                    print(f"DEBUG: Error converting tool in raw mode: {e}, tool type: {type(t)}")
+                    continue
+        
+        # Step 1: Use ModelParserAdapter to extract tool calls from generated text
+        extracted_tool_calls = None
+        clean_text = generated_text
+        if tools_list:
+            adapter = ModelParserAdapter(model_name=response_model_name)
+            extracted_tool_calls = adapter.extract_tool_calls(generated_text, tools_list)
+            
+            if extracted_tool_calls:
+                # Strip tool calls from the text
+                clean_text = adapter.strip_tool_calls_from_content(generated_text)
+                if global_debug:
+                    print(f"RAW: Extracted {len(extracted_tool_calls)} tool calls from generated text")
         
         # Estimate token counts
         prompt_tokens = len(raw_prompt_for_generation.split())
-        completion_tokens = len(generated_text.split()) if generated_text else 0
+        completion_tokens = len(clean_text.split()) if clean_text else 0
         
-        # Format through the parser
-        formatted_response = formatter.format_litellm_full(
-            text=generated_text,
+        # Step 2: Use OpenAIFormatter for final formatting
+        formatter = OpenAIFormatter(response_model_name)
+        formatted_response = formatter.format_full(
+            text=clean_text,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            tool_calls=None  # Raw mode doesn't have tool calls from generation
+            tool_calls=extracted_tool_calls
         )
         
         if global_debug:
