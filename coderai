@@ -2361,7 +2361,7 @@ def parse_args():
     return parser.parse_args()
 def main():
     """Main entry point."""
-    global global_system_prompt, model_manager, multi_model_manager, global_debug, global_args, global_file_path
+    global global_system_prompt, model_manager, multi_model_manager, queue_manager, global_debug, global_args, global_file_path
     
     # Suppress unraisable exceptions from LlamaModel.__del__
     import sys
@@ -2626,6 +2626,13 @@ def main():
         status = "✓" if available_flag else "✗"
         print(f"  [{status}] {name}")
     print("")
+    
+    # Initialize model managers
+    multi_model_manager = MultiModelManager()
+    # Global model manager (for backward compatibility)
+    model_manager = ModelManager()
+    # Global queue manager
+    queue_manager = QueueManager()
     
     # Load the main model (only if specified)
     if model_names:
