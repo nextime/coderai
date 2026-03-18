@@ -157,6 +157,7 @@ class Config:
     confirm_all: bool = True  # Confirm before executing tools by default
     confirm_commands: Dict[str, bool] = None  # Per-command confirmation settings
     debug: bool = False  # Show debug output including raw tool calls
+    dump: bool = False  # Show dump output: tools schema, raw response, parsed tool calls
     max_context: int = 32768  # Maximum context size in tokens
     no_prompt: bool = False  # Don't send system prompt
     no_tools: bool = False   # Don't send tool definitions
@@ -574,6 +575,12 @@ class CoderClient:
         if not self.config.no_tools:
             payload["tools"] = self.tool_executor.tools
             payload["tool_choice"] = "auto"
+            
+            # Dump tools schema if enabled
+            if self.config.dump:
+                print(f"\n{Colors.CYAN}=== DUMP: TOOLS SCHEMA ==={Colors.RESET}")
+                print(json.dumps(self.tool_executor.tools, indent=2))
+                print(f"{Colors.CYAN}=== END DUMP ==={Colors.RESET}\n")
         
         try:
             response = requests.post(
@@ -885,8 +892,20 @@ class CoderClient:
         sys.stdout.write('\n')
         sys.stdout.flush()
         
+        # Dump raw response if enabled
+        if self.config.dump:
+            print(f"\n{Colors.CYAN}=== DUMP: RAW RESPONSE ==={Colors.RESET}")
+            print(full_content)
+            print(f"{Colors.CYAN}=== END DUMP ==={Colors.RESET}\n")
+        
         # Parse tool calls from full content after streaming
         tool_calls = parse_tool_calls_from_content(full_content)
+        
+        # Dump output if enabled
+        if self.config.dump:
+            print(f"\n{Colors.CYAN}=== DUMP: PARSED TOOL CALLS ==={Colors.RESET}")
+            print(json.dumps(tool_calls, indent=2))
+            print(f"{Colors.CYAN}=== END DUMP ==={Colors.RESET}\n")
         
         # Execute tool calls if any
         if tool_calls:
@@ -990,6 +1009,18 @@ class CoderClient:
         content = message.get('content', '')
         tool_calls = message.get('tool_calls', [])
         
+        # Dump raw response if enabled
+        if self.config.dump:
+            print(f"\n{Colors.CYAN}=== DUMP: RAW RESPONSE ==={Colors.RESET}")
+            print(json.dumps(data, indent=2))
+            print(f"{Colors.CYAN}=== END DUMP ==={Colors.RESET}\n")
+        
+        # Dump parsed tool calls if enabled
+        if self.config.dump and tool_calls:
+            print(f"\n{Colors.CYAN}=== DUMP: PARSED TOOL CALLS ==={Colors.RESET}")
+            print(json.dumps(tool_calls, indent=2))
+            print(f"{Colors.CYAN}=== END DUMP ==={Colors.RESET}\n")
+        
         if content:
             print(content)
         
@@ -1058,6 +1089,12 @@ class CoderClient:
         if not self.config.no_tools:
             payload["tools"] = self.tool_executor.tools
             payload["tool_choice"] = "auto"
+            
+            # Dump tools schema if enabled
+            if self.config.dump:
+                print(f"\n{Colors.CYAN}=== DUMP: TOOLS SCHEMA (FOLLOW-UP) ==={Colors.RESET}")
+                print(json.dumps(self.tool_executor.tools, indent=2))
+                print(f"{Colors.CYAN}=== END DUMP ==={Colors.RESET}\n")
         
         response = requests.post(
             f"{self.config.api_url}/chat/completions",
@@ -1442,6 +1479,12 @@ Examples:
     )
     
     parser.add_argument(
+        '--dump',
+        action='store_true',
+        help='Show dump output: tools schema, raw response, and parsed tool calls'
+    )
+    
+    parser.add_argument(
         '--no-tools',
         action='store_true',
         dest='no_tools',
@@ -1509,6 +1552,9 @@ Examples:
         config.timeout = args.timeout
     if args.debug:
         config.debug = True
+    
+    if args.dump:
+        config.dump = True
     if args.max_context:
         config.max_context = args.max_context
     if args.no_prompt:
