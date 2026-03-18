@@ -1,0 +1,59 @@
+# GBNF Grammar for Tool Call Generation
+# This grammar constrains the model to produce valid JSON tool calls
+# Supports multiple tool call formats:
+# 1. XML-style: <tool>{"name": "...", "arguments": {...}}</tool>
+# 2. JSON array: [{"name": "...", "arguments": {...}}]
+# 3. JSON object: {"name": "...", "arguments": {...}}
+
+root ::= tool-call
+
+# Main tool call - accepts XML-wrapped JSON or direct JSON
+tool-call ::= (xml-wrapper-json | json-array | json-object) ws*
+
+# XML-style: <tool>{"name": "...", "arguments": {...}}</tool>
+xml-wrapper-json ::= "<tool>" ws* json-object ws* "</tool>"
+
+# JSON array format: [{"name": "...", "arguments": {...}}, ...]
+json-array ::= "[" ws* json-object (ws* "," ws* json-object)* ws* "]"
+
+# JSON object format: {"name": "...", "arguments": {...}}
+json-object ::= "{" ws* string ws* ":" ws* value ws* ("," ws* string ws* ":" ws* value)* ws* "}"
+
+# Tool call entry
+tool-call-entry ::= "{" ws* "\"name\"" ws* ":" ws* string ws* "," ws* "\"arguments\"" ws* ":" ws* arguments-object ws* "}"
+
+# Arguments object
+arguments-object ::= "{" ws* (string ws* ":" ws* arg-value ws* ("," ws* string ws* ":" ws* arg-value ws*)*)? ws* "}"
+
+# String (JSON string with escapes)
+string ::= "\"" (escaped-char | [^"\\])* "\""
+
+# Escaped character
+escaped-char ::= "\\" (["\\/bfnrt] | "u" hex hex hex hex)
+
+# Hex digit
+hex ::= [0-9A-Fa-f]
+
+# Value (any JSON value)
+value ::= string | number | boolean | null | json-object | json-array
+
+# Argument value (restricted set for tool arguments)
+arg-value ::= string | number | boolean | null | arg-object | arg-array
+
+# Argument object
+arg-object ::= "{" ws* (string ws* ":" ws* arg-value ws* ("," ws* string ws* ":" ws* arg-value ws*)*)? ws* "}"
+
+# Argument array
+arg-array ::= "[" ws* (arg-value ws* ("," ws* arg-value ws*)*)? ws* "]"
+
+# Number (integer or float)
+number ::= "-"? [0-9]+ ("." [0-9]+)? (("e" | "E") ("+" | "-")? [0-9]+)?
+
+# Boolean
+boolean ::= "true" | "false"
+
+# Null
+null ::= "null"
+
+# Whitespace (optional)
+ws ::= [ \t\n\r]*

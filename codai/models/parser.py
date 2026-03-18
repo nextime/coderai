@@ -25,42 +25,55 @@ from typing import Dict, List, Any, Optional, Tuple
 def extract_reasoning_content(text: str, model_family: str = None) -> Tuple[str, str]:
     """Extract reasoning/thinking content from model output.
     
+    Uses pre-compiled REASONING_PATTERNS and protects code blocks from
+    false positive matches.
+    
     Returns tuple of (reasoning_content, clean_text).
     The reasoning_content will have any tool call tags stripped out.
     """
     reasoning_content = ""
     clean_text = text
     
-    # Define reasoning patterns for different model families
-    patterns = [
-        (r'<thought>(.*?)</thought>', 'qwen'),
-        (r'<think>(.*?)</think>', 'qwen'),
-        (r'<thought>(.*?)</thought>', 'deepseek'),
-        (r'<thought>(.*?)</thought>', 'llama3'),
-        (r'<thought>(.*?)</thought>', 'mistral'),
-        (r'<thought>(.*?)</thought>', 'gemma'),
-        (r'<\|im_start\|>assistant\n<thought>(.*?)</thought>', 'hermes'),
-        (r'<thought>(.*?)</thought>', 'generic'),
-    ]
+    # Protect code blocks from being matched as reasoning tags
+    code_blocks = []
+    protected_text = text
     
-    for pattern, _ in patterns:
+    # Protect ```code blocks```
+    for match in re.finditer(r'```[\s\S]*?```', text):
+        placeholder = f"__CODE_BLOCK_{len(code_blocks)}__"
+        code_blocks.append(match.group(0))
+        protected_text = protected_text.replace(match.group(0), placeholder)
+    
+    # Protect `inline code`
+    for match in re.finditer(r'`[^`\n]+`', protected_text):
+        placeholder = f"__INLINE_CODE_{len(code_blocks)}__"
+        code_blocks.append(match.group(0))
+        protected_text = protected_text.replace(match.group(0), placeholder)
+    
+    # Use pre-compiled patterns on protected text (no code blocks to false-match)
+    for pattern, _ in REASONING_PATTERNS:
         try:
-            matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
+            matches = pattern.findall(protected_text)
             if matches:
                 reasoning_content = '\n'.join([m.strip() for m in matches if m.strip()])
-                clean_text = re.sub(pattern, '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+                clean_text = pattern.sub('', protected_text).strip()
                 break
         except:
             continue
     
-    # Cleanup
-    for p in [r'<thought>.*?</thought>', r'<think>.*?</think>']:
-        clean_text = re.sub(p, '', clean_text, flags=re.DOTALL | re.IGNORECASE)
+    # Cleanup with pre-compiled patterns
+    for p in REASONING_CLEANUP_PATTERNS:
+        clean_text = p.sub('', clean_text)
+    
+    # Restore code blocks in clean_text
+    for i, block in enumerate(code_blocks):
+        clean_text = clean_text.replace(f"__CODE_BLOCK_{i}__", block)
+        clean_text = clean_text.replace(f"__INLINE_CODE_{i}__", block)
     
     # FIX: If reasoning contains tool call tags, split at the first tool tag
     # The tool call part should NOT be in reasoning - it should be left in clean_text for tool extraction
     if reasoning_content:
-        tool_tag_patterns = ["<tool_call>", "<tool>", "<|tool_call|", "<function="]
+        tool_tag_patterns = ["<tool_call>", "<tool>", "<|tool_call|>", "<function="]
         earliest_tool_idx = len(reasoning_content)
         earliest_tool_tag = None
         for tag in tool_tag_patterns:
@@ -79,6 +92,90 @@ def extract_reasoning_content(text: str, model_family: str = None) -> Tuple[str,
     
     return reasoning_content, clean_text
 
+
+# =============================================================================
+# Pre-compiled Regex Patterns for Performance
+# =============================================================================
+# These patterns are compiled once at module load time for better performance
+
+# Reasoning extraction patterns
+REASONING_PATTERNS = [
+    (re.compile(r'<\|begin_of_text\|>.*?<thinking>(.*?)</thinking>', re.DOTALL | re.IGNORECASE), 'qwen'),
+    (re.compile(r'<thinking>(.*?)</thinking>', re.DOTALL | re.IGNORECASE), 'qwen2'),
+    (re.compile(r'<think>(.*?)</think>', re.DOTALL | re.IGNORECASE), 'deepseek'),
+    (re.compile(r'<thought>(.*?)</thought>', re.DOTALL | re.IGNORECASE), 'llama3'),
+    (re.compile(r'<\|im_start\|>assistant\n<thought>(.*?)</thought>', re.DOTALL | re.IGNORECASE), 'hermes'),
+]
+
+# Cleanup patterns for reasoning extraction
+REASONING_CLEANUP_PATTERNS = [
+    re.compile(r'<thought>.*?</thought>', re.DOTALL | re.IGNORECASE),
+    re.compile(r'<think>.*?</think>', re.DOTALL | re.IGNORECASE),
+]
+
+# Tool call XML patterns - pre-compiled for performance
+# These are the core patterns used in _parse_xml_style_tool_calls()
+TOOL_PATTERNS = {
+    # Basic pattern: <tool><name>...</name><arguments>...</arguments></tool>
+    'basic': re.compile(r'<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>', re.DOTALL | re.IGNORECASE),
+    # Pattern with <action> and <parameters>
+    'action': re.compile(r'<tool>\s*<action>(.*?)</action>\s*<parameters>(.*?)</parameters>\s*</tool>', re.DOTALL | re.IGNORECASE),
+    # Pattern with tool_call wrapper
+    'tool_call_basic': re.compile(r'<tool>\s*(\w+)\s*</tool>\s*<tool_call>\s*(.+?)\s*(?:</tool_call>|$)', re.DOTALL | re.IGNORECASE),
+    # Nested in tool_call: <tool_call><tool><name>...</name><arguments>...</arguments></tool></tool_call>
+    'nested': re.compile(r'<tool_call>\s*<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>\s*</tool_call>', re.DOTALL | re.IGNORECASE),
+    # Nested with <function> tag
+    'nested_function': re.compile(r'<tool_call>\s*<tool>\s*<function>(.*?)</function>\s*<parameters>(.*?)</parameters>\s*</tool>\s*</tool_call>', re.DOTALL | re.IGNORECASE),
+    # Standalone with <function>
+    'standalone_function': re.compile(r'<tool>\s*<function>(.*?)</function>\s*<parameters>(.*?)</parameters>\s*</tool>', re.DOTALL | re.IGNORECASE),
+    # Standalone with <parameters> instead of <arguments>
+    'standalone_params': re.compile(r'<tool>\s*<name>(.*?)</name>\s*<parameters>(.*?)</parameters>\s*</tool>', re.DOTALL | re.IGNORECASE),
+    # Nested with <parameters>
+    'nested_params': re.compile(r'<tool_call>\s*<tool>\s*<name>(.*?)</name>\s*<parameters>(.*?)</parameters>\s*</tool>\s*</tool_call>', re.DOTALL | re.IGNORECASE),
+    # Multi-tool wrapper
+    'multi': re.compile(r'<tool_call>\s*(<tool>.*?</tool>)\s*</tool_call>', re.DOTALL | re.IGNORECASE),
+    # Nested tool where tool name IS the tag: <tool_call><tool><toolname>...</toolname></tool></tool_call>
+    'nested_tool': re.compile(r'<tool_call>\s*<tool>\s*<(\w+)>\s*(.*?)</\1>\s*</tool>\s*</tool_call>', re.DOTALL | re.IGNORECASE),
+    # Standalone nested tool: <tool><toolname>...</toolname></tool>
+    'standalone_nested': re.compile(r'<tool>\s*<(\w+)>\s*(.*?)</\1>\s*</tool>', re.DOTALL | re.IGNORECASE),
+    # Short format: <tool>TOOL_NAME>JSON</tool>
+    'short': re.compile(r'<tool>(\w+)>(\{.*?\})</tool>', re.DOTALL),
+    # JSON in tool: <tool>{"name": ...}</tool>
+    'json_in_tool': re.compile(r'<tool>\s*(\{.*?\})\s*</tool>', re.DOTALL),
+    # Short with tool_call wrapper
+    'short2': re.compile(r'<tool_call>\s*<tool>(\w+)>\s*(\{.*?\})\s*</tool>\s*</tool_call>', re.DOTALL),
+    # Multi-tools in tool_call
+    'multi_tools': re.compile(r'<tool_call>\s*(<tool>.*?</tool>)\s*(?:<tool_call>\s*(<tool>.*?</tool>)\s*)?</tool_call>', re.DOTALL | re.IGNORECASE),
+    # Multi-line standalone
+    'multiline_standalone': re.compile(r'<tool>\s*<name>\s*(.*?)\s*</name>\s*<arguments>\s*(.*?)\s*</arguments>\s*</tool>', re.DOTALL | re.IGNORECASE),
+    # Multi-line wrapper
+    'multiline': re.compile(r'<tool_call>\s*(.*?)\s*</tool_call>', re.DOTALL | re.IGNORECASE),
+}
+
+# XML to dict pattern
+RE_XML_TO_DICT = re.compile(r'<(\w+)>\s*(.*?)\s*</\1>')
+RE_XML_NESTED = re.compile(r'<\w+>')
+
+# Content filtering patterns - pre-compiled
+MALFORMED_PATTERNS = [
+    re.compile(r'<<<<<<<\s+SEARCH.*?=======', re.DOTALL),
+    re.compile(r'=======.*?>>>>>>>\s+REPLACE', re.DOTALL),
+    re.compile(r'>>>>>>>\s+REPLACE'),
+    re.compile(r'<<<<<<<\s+SEARCH\s*:start_line:\d+[^<]*', re.DOTALL),
+    re.compile(r'<button>Stop Generation</button>'),
+    re.compile(r'\<\|assistant\|\>'),
+    re.compile(r'\</\|assistant\|\>'),
+    re.compile(r'\n{3,}'),
+]
+
+# Tool call stripping patterns - pre-compiled
+STRIP_TOOL_PATTERNS = [
+    re.compile(r'<tool>.*?</tool>', re.DOTALL),
+    re.compile(r'<function>.*?</function>', re.DOTALL),
+    re.compile(r'<tool>\{.*?\}</tool>', re.DOTALL),
+    re.compile(r'<tool>[\s\S]*?</tool>'),
+    re.compile(r'<function>[\s\S]*?</function>'),
+]
 
 # Try to import litellm for response formatting
 # Fall back to plain dicts if litellm is not available or doesn't export these
@@ -811,33 +908,25 @@ class OpenAIFormatter:
 # =============================================================================
 
 def filter_malformed_content(text: str) -> str:
-    """Filter out malformed SEARCH/REPLACE blocks that the model might output as content."""
-    import re
+    """Filter out malformed SEARCH/REPLACE blocks that the model might output as content.
     
+    Uses pre-compiled MALFORMED_PATTERNS for efficiency.
+    """
     if not text:
         return text
     
     # Apply repetition filtering first
     text = filter_repetition(text)
     
-    # Remove diff-like blocks that shouldn't be in the output
+    # Apply all pre-compiled malformed content patterns
     filtered = text
+    for pattern in MALFORMED_PATTERNS:
+        # The last pattern (\n{3,}) replaces with \n\n, others replace with ''
+        if pattern.pattern == r'\n{3,}':
+            filtered = pattern.sub('\n\n', filtered)
+        else:
+            filtered = pattern.sub('', filtered)
     
-    # Remove git-style diff markers and SEARCH/REPLACE patterns
-    filtered = re.sub(r'<<<<<<<\s+SEARCH.*?=======', '', filtered, flags=re.DOTALL)
-    filtered = re.sub(r'=======.*?>>>>>>>\s+REPLACE', '', filtered, flags=re.DOTALL)
-    filtered = re.sub(r'>>>>>>>\s+REPLACE', '', filtered)
-    
-    # Also remove common malformed patterns seen in outputs
-    filtered = re.sub(r'<<<<<<<\s+SEARCH\s*:start_line:\d+[^<]*', '', filtered, flags=re.DOTALL)
-    filtered = re.sub(r'<button>Stop Generation</button>', '', filtered)
-    filtered = re.sub(r'\<\|assistant\|\>', '', filtered)
-    filtered = re.sub(r'\</\|assistant\|\>', '', filtered)
-    
-    # Clean up excessive newlines left from removal
-    filtered = re.sub(r'\n{3,}', '\n\n', filtered)
-    
-    # Don't strip single newlines or whitespace - they might be valid content
     return filtered
 
 
@@ -922,22 +1011,21 @@ def filter_repetition(text: str, min_repeat_count: int = 3, ngram_sizes: tuple =
             repeat_count = 1
             
             # Count consecutive repetitions
-            check_idx = i
-            while check_idx + ngram_size * (repeat_count + 1) <= len(words):
-                # Check if next n-gram matches
+            # FIX: Use a simple next_start pointer that advances by ngram_size
+            # each time a match is found, instead of the buggy double-advance formula
+            next_start = i + ngram_size
+            while next_start + ngram_size <= len(words):
+                # Check if the n-gram at next_start matches
                 next_ngram = []
                 for j in range(ngram_size):
-                    idx = check_idx + ngram_size * (repeat_count + 1) + j
-                    if idx >= len(words):
-                        break
-                    w = words[idx].strip()
+                    w = words[next_start + j].strip()
                     if not w:
                         break
                     next_ngram.append(w)
                 
                 if next_ngram == ngram_parts:
                     repeat_count += 1
-                    check_idx = check_idx + ngram_size
+                    next_start += ngram_size
                 else:
                     break
             
@@ -1100,497 +1188,137 @@ class ToolCallParser:
         self.tokenizer = tokenizer
         self.model_name = model_name
         
+    @staticmethod
+    def _parse_args(args_str: str) -> dict:
+        """Parse arguments string as JSON, falling back to XML key-value extraction."""
+        args_str = args_str.strip() if args_str else ''
+        if not args_str:
+            return {}
+        try:
+            return json.loads(args_str)
+        except json.JSONDecodeError:
+            # Fallback: extract key-value pairs from nested XML tags
+            args = {}
+            for match in RE_XML_TO_DICT.findall(args_str):
+                k, v = match
+                v = v.strip()
+                try:
+                    args[k] = json.loads(v)
+                except (json.JSONDecodeError, ValueError):
+                    args[k] = v
+            return args
+
+    @staticmethod
+    def _make_tool_call(name: str, args: dict) -> Dict:
+        """Create a tool call dict in OpenAI format."""
+        return {
+            "id": f"call_{uuid.uuid4().hex[:16]}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(args)
+            }
+        }
+
     def _parse_xml_style_tool_calls(self, text: str) -> List[Dict]:
-        """Parse XML-style tool calls like <tool><name>...</name><arguments>...</arguments></tool>."""
+        """Parse XML-style tool calls using pre-compiled TOOL_PATTERNS.
+        
+        Consolidated from ~20 separate pattern blocks into a single method
+        that iterates over pre-compiled patterns. Eliminates duplicate patterns
+        (e.g., pattern == pattern_standalone_args_xml, pattern_nested == pattern_nested_args_xml).
+        """
         tool_calls = []
         
-        # Pattern for <tool><name>...</name><arguments>...</arguments></tool>
-        pattern = r'<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>'
-        matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
+        # --- Two-group patterns: (name, args_str) ---
+        # Each yields tool name and arguments string
+        two_group_patterns = [
+            # <tool><name>...</name><arguments>...</arguments></tool>
+            TOOL_PATTERNS['basic'],
+            # <tool><action>...</action><parameters>...</parameters></tool>
+            TOOL_PATTERNS['action'],
+            # <tool>name</tool><tool_call>JSON</tool_call>
+            TOOL_PATTERNS['tool_call_basic'],
+            # <tool_call><tool><name>...</name><arguments>...</arguments></tool></tool_call>
+            TOOL_PATTERNS['nested'],
+            # <tool_call><tool><function>...</function><parameters>...</parameters></tool></tool_call>
+            TOOL_PATTERNS['nested_function'],
+            # <tool><function>...</function><parameters>...</parameters></tool>
+            TOOL_PATTERNS['standalone_function'],
+            # <tool><name>...</name><parameters>...</parameters></tool>
+            TOOL_PATTERNS['standalone_params'],
+            # <tool_call><tool><name>...</name><parameters>...</parameters></tool></tool_call>
+            TOOL_PATTERNS['nested_params'],
+            # <tool>TOOL_NAME>JSON</tool>
+            TOOL_PATTERNS['short'],
+            # <tool_call><tool>TOOL_NAME>JSON</tool></tool_call>
+            TOOL_PATTERNS['short2'],
+        ]
         
-        for name, args_str in matches:
-            name = name.strip()
-            if not name:
-                continue
-                
-            # Try to parse arguments as JSON
-            try:
-                args = json.loads(args_str.strip()) if args_str.strip() else {}
-            except json.JSONDecodeError:
-                # If not valid JSON, treat as empty object
-                args = {}
-                
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:16]}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(args)
-                }
-            })
-        
-        # NEW: Pattern for <tool><action>...</action><parameters>...</parameters></tool>
-        # Example: <tool><action>search</action><parameters>{"query": "Apple AAPL Q4"}</parameters></tool>
-        pattern_action = r'<tool>\s*<action>(.*?)</action>\s*<parameters>(.*?)</parameters>\s*</tool>'
-        matches_action = re.findall(pattern_action, text, re.DOTALL | re.IGNORECASE)
-        
-        for name, args_str in matches_action:
-            name = name.strip()
-            if not name:
-                continue
-                
-            # Try to parse arguments as JSON
-            try:
-                args = json.loads(args_str.strip()) if args_str.strip() else {}
-            except json.JSONDecodeError:
-                # If not valid JSON, try to extract key-value pairs from XML
-                args = {}
-                # Try to parse as key-value pairs
-                try:
-                    for match in re.findall(r'<(\w+)>(.*?)</\1>', args_str, re.DOTALL):
-                        k, v = match
-                        args[k] = v.strip()
-                except:
-                    pass
-            
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:16]}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(args)
-                }
-            })
-        
-        # NEW: Pattern for <tool>name</tool><tool_call>JSON</tool_call> format
-        # Example: <tool>search</tool><tool_call>{"query": "Apple AAPL Q4"}</tool_call>
-        # Also handles case where both are opening tags: <tool_call>...</tool_call>
-        pattern2 = r'<tool>\s*(\w+)\s*</tool>\s*<tool_call>\s*(.+?)\s*(?:</tool_call>|$)'
-        matches2 = re.findall(pattern2, text, re.DOTALL | re.IGNORECASE)
-        
-        for name, args_str in matches2:
-            name = name.strip()
-            if not name:
-                continue
-            
-            # Try to parse arguments as JSON
-            try:
-                args = json.loads(args_str.strip()) if args_str.strip() else {}
-            except json.JSONDecodeError:
-                # If not valid JSON, treat as empty object
-                args = {}
-            
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:16]}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(args)
-                }
-            })
-        
-        # NEW: Pattern for <tool_call><tool><name>...</name><arguments>...</arguments></tool></tool_call>
-        # Example: <tool_call><tool><name>search</name><arguments>{"query": "test"}</arguments></tool></tool_call>
-        pattern_nested = r'<tool_call>\s*<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>\s*</tool_call>'
-        matches_nested = re.findall(pattern_nested, text, re.DOTALL | re.IGNORECASE)
-        
-        for name, args_str in matches_nested:
-            name = name.strip()
-            if not name:
-                continue
-            
-            # Try to parse arguments as JSON
-            try:
-                args = json.loads(args_str.strip()) if args_str.strip() else {}
-            except json.JSONDecodeError:
-                # If not valid JSON, treat as empty object
-                args = {}
-            
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:16]}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(args)
-                }
-            })
-        
-        # NEW: Pattern for <tool_call><tool><function>...</function><parameters>...</parameters></tool></tool_call>
-        # Example: <tool_call><tool><function>get_financial_data</function><parameters>{"ticker": "AAPL"}</parameters></tool></tool_call>
-        pattern_function = r'<tool_call>\s*<tool>\s*<function>(.*?)</function>\s*<parameters>(.*?)</parameters>\s*</tool>\s*</tool_call>'
-        matches_function = re.findall(pattern_function, text, re.DOTALL | re.IGNORECASE)
-        
-        for name, args_str in matches_function:
-            name = name.strip()
-            if not name:
-                continue
-            
-            # Try to parse arguments as JSON
-            try:
-                args = json.loads(args_str.strip()) if args_str.strip() else {}
-            except json.JSONDecodeError:
-                # If not valid JSON, treat as empty object
-                args = {}
-            
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:16]}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(args)
-                }
-            })
-        
-        # NEW: Pattern for standalone <tool><function>...</function><parameters>...</parameters></tool> (without wrapper)
-        pattern_standalone_func = r'<tool>\s*<function>(.*?)</function>\s*<parameters>(.*?)</parameters>\s*</tool>'
-        matches_standalone = re.findall(pattern_standalone_func, text, re.DOTALL | re.IGNORECASE)
-        
-        for name, args_str in matches_standalone:
-            name = name.strip()
-            if not name:
-                continue
-            
-            try:
-                args = json.loads(args_str.strip()) if args_str.strip() else {}
-            except json.JSONDecodeError:
-                args = {}
-            
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:16]}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(args)
-                }
-            })
-        
-        # NEW: Pattern for <tool_call><tool><name>...</name><parameters><key>value</key></parameters></tool></tool_call>
-        # Example: <tool_call><tool><name>search</name><parameters><query>test</query></parameters></tool></tool_call>
-        pattern_nested_params = r'<tool_call>\s*<tool>\s*<name>(.*?)</name>\s*<parameters>(.*?)</parameters>\s*</tool>\s*</tool_call>'
-        matches_nested_params = re.findall(pattern_nested_params, text, re.DOTALL | re.IGNORECASE)
-        
-        for name, params_xml in matches_nested_params:
-            name = name.strip()
-            if not name:
-                continue
-            
-            # Try to parse as JSON first
-            try:
-                args = json.loads(params_xml.strip()) if params_xml.strip() else {}
-            except json.JSONDecodeError:
-                # Fallback: extract key-value pairs from nested XML tags
-                args = {}
-                for match in re.findall(r'<(\w+)>(.*?)</\1>', params_xml, re.DOTALL):
-                    k, v = match
-                    args[k] = v.strip()
-            
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:16]}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(args)
-                }
-            })
-        
-        # NEW: Pattern for standalone <tool><name>...</name><parameters><key>value</key></parameters></tool>
-        pattern_standalone_params = r'<tool>\s*<name>(.*?)</name>\s*<parameters>(.*?)</parameters>\s*</tool>'
-        matches_standalone_params = re.findall(pattern_standalone_params, text, re.DOTALL | re.IGNORECASE)
-        
-        for name, params_xml in matches_standalone_params:
-            name = name.strip()
-            if not name:
-                continue
-            
-            try:
-                args = json.loads(params_xml.strip()) if params_xml.strip() else {}
-            except json.JSONDecodeError:
-                args = {}
-                for match in re.findall(r'<(\w+)>(.*?)</\1>', params_xml, re.DOTALL):
-                    k, v = match
-                    args[k] = v.strip()
-            
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:16]}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(args)
-                }
-            })
-        
-        # NEW: Pattern for <tool><name>...</name><arguments><key>value</key></arguments></tool>
-        # This handles nested XML arguments inside <arguments> tag
-        # Example: <tool><name>execute_command</name><arguments><command>find ...</command></arguments></tool>
-        pattern_standalone_args_xml = r'<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>'
-        matches_standalone_args_xml = re.findall(pattern_standalone_args_xml, text, re.DOTALL | re.IGNORECASE)
-        
-        for name, args_xml in matches_standalone_args_xml:
-            name = name.strip()
-            if not name:
-                continue
-            
-            # Try to parse as JSON first
-            try:
-                args = json.loads(args_xml.strip()) if args_xml.strip() else {}
-            except json.JSONDecodeError:
-                # Fallback: extract key-value pairs from nested XML tags inside arguments
-                args = {}
-                for match in re.findall(r'<(\w+)>(.*?)</\1>', args_xml, re.DOTALL):
-                    k, v = match
-                    args[k] = v.strip()
-            
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:16]}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(args)
-                }
-            })
-        
-        # NEW: Pattern for <tool_call><tool><name>...</name><arguments><key>value</key></arguments></tool></tool_call>
-        # Handles nested XML arguments inside arguments tag with tool_call wrapper
-        pattern_nested_args_xml = r'<tool_call>\s*<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>\s*</tool_call>'
-        matches_nested_args_xml = re.findall(pattern_nested_args_xml, text, re.DOTALL | re.IGNORECASE)
-        
-        for name, args_xml in matches_nested_args_xml:
-            name = name.strip()
-            if not name:
-                continue
-            
-            # Try to parse as JSON first
-            try:
-                args = json.loads(args_xml.strip()) if args_xml.strip() else {}
-            except json.JSONDecodeError:
-                # Fallback: extract key-value pairs from nested XML tags
-                args = {}
-                for match in re.findall(r'<(\w+)>(.*?)</\1>', args_xml, re.DOTALL):
-                    k, v = match
-                    args[k] = v.strip()
-            
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:16]}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(args)
-                }
-            })
-        
-        # NEW: Pattern for multiple tool calls in <tool_call> wrapper
-        # Example: <tool_call><tool>...</tool><tool>...</tool></tool_call>
-        pattern_multi = r'<tool_call>\s*(<tool>.*?</tool>)\s*</tool_call>'
-        matches_multi = re.findall(pattern_multi, text, re.DOTALL | re.IGNORECASE)
-        
-        for tool_block in matches_multi:
-            # Extract individual tool calls from within the tool_call wrapper
-            inner_pattern = r'<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>'
-            inner_matches = re.findall(inner_pattern, tool_block, re.DOTALL | re.IGNORECASE)
-            
-            for name, args_str in inner_matches:
+        for pattern in two_group_patterns:
+            for name, args_str in pattern.findall(text):
                 name = name.strip()
                 if not name:
                     continue
-                
-                try:
-                    args = json.loads(args_str.strip()) if args_str.strip() else {}
-                except json.JSONDecodeError:
-                    args = {}
-                
-                tool_calls.append({
-                    "id": f"call_{uuid.uuid4().hex[:16]}",
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": json.dumps(args)
-                    }
-                })
+                args = self._parse_args(args_str)
+                tool_calls.append(self._make_tool_call(name, args))
         
-        # NEW: Pattern for nested tool format where tool name IS the tag itself
-        # Example: <tool_call><tool><list_files><path>.</path><recursive>true</recursive></list_files></tool></tool_call>
-        # The tool name (<list_files>) is the tag, and arguments are nested child tags
-        pattern_nested_tool = r'<tool_call>\s*<tool>\s*<(\w+)>\s*(.*?)</\1>\s*</tool>\s*</tool_call>'
-        matches_nested_tool = re.findall(pattern_nested_tool, text, re.DOTALL | re.IGNORECASE)
-        
-        for tool_name, args_xml in matches_nested_tool:
+        # --- Nested tool name-as-tag patterns: (tool_name, args_xml) ---
+        # <tool_call><tool><toolname>...</toolname></tool></tool_call>
+        for tool_name, args_xml in TOOL_PATTERNS['nested_tool'].findall(text):
             tool_name = tool_name.strip()
             if not tool_name:
                 continue
-            
-            # Parse nested XML arguments into a dict
-            args = {}
-            for match in re.findall(r'<(\w+)>(.*?)</\1>', args_xml, re.DOTALL):
-                k, v = match
-                # Try to parse value as JSON for proper types (bool, int, etc.)
-                try:
-                    parsed_v = json.loads(v.strip())
-                    args[k] = parsed_v
-                except (json.JSONDecodeError, ValueError):
-                    # Keep as string
-                    args[k] = v.strip()
-            
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:16]}",
-                "type": "function",
-                "function": {
-                    "name": tool_name,
-                    "arguments": json.dumps(args)
-                }
-            })
+            args = self._parse_args(args_xml)
+            tool_calls.append(self._make_tool_call(tool_name, args))
         
-        # NEW: Pattern for standalone nested tool (without outer tool_call wrapper)
-        # Example: <tool><list_files><path>.</path><recursive>true</recursive></list_files></tool>
-        pattern_standalone_nested = r'<tool>\s*<(\w+)>\s*(.*?)</\1>\s*</tool>'
-        matches_standalone_nested = re.findall(pattern_standalone_nested, text, re.DOTALL | re.IGNORECASE)
-        
-        for tool_name, args_xml in matches_standalone_nested:
+        # <tool><toolname>...</toolname></tool> (standalone)
+        for tool_name, args_xml in TOOL_PATTERNS['standalone_nested'].findall(text):
             tool_name = tool_name.strip()
             if not tool_name:
                 continue
-            
-            # Skip if this matches other known patterns (avoid duplicates)
-            if tool_name in ['name', 'arguments', 'parameters', 'action', 'function']:
+            # Skip structural tag names to avoid duplicates
+            if tool_name in ('name', 'arguments', 'parameters', 'action', 'function'):
                 continue
-            
-            # Parse nested XML arguments into a dict
-            args = {}
-            for match in re.findall(r'<(\w+)>(.*?)</\1>', args_xml, re.DOTALL):
-                k, v = match
-                try:
-                    parsed_v = json.loads(v.strip())
-                    args[k] = parsed_v
-                except (json.JSONDecodeError, ValueError):
-                    args[k] = v.strip()
-            
-            # Only add if we actually parsed some arguments
-            if args:
-                tool_calls.append({
-                    "id": f"call_{uuid.uuid4().hex[:16]}",
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": json.dumps(args)
-                    }
-                })
+            args = self._parse_args(args_xml)
+            if args:  # Only add if we parsed some arguments
+                tool_calls.append(self._make_tool_call(tool_name, args))
         
-        # NEW: Pattern for short format <tool>TOOL_NAME>JSON</tool>
-        # Example: <tool>financial_data_fetcher>{"ticker": "AAPL", "period": "Q4"}</tool>
-        pattern_short = r'<tool>(\w+)>(\{.*?\})</tool>'
-        matches_short = re.findall(pattern_short, text, re.DOTALL)
-        
-        for name, args_str in matches_short:
-            name = name.strip()
-            if not name:
-                continue
-            try:
-                args = json.loads(args_str.strip()) if args_str.strip() else {}
-            except json.JSONDecodeError:
-                args = {}
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:16]}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(args)
-                }
-            })
-        
-        # NEW: Pattern for <tool>{JSON}</tool> format
-        # Example: <tool>{"name": "web_search", "arguments": {"query": "test"}}</tool>
-        pattern_json_in_tool = r'<tool>\s*(\{.*?\})\s*</tool>'
-        matches_json_in_tool = re.findall(pattern_json_in_tool, text, re.DOTALL)
-        
-        for json_str in matches_json_in_tool:
+        # --- JSON-in-tool pattern: <tool>{JSON}</tool> ---
+        for json_str in TOOL_PATTERNS['json_in_tool'].findall(text):
             try:
                 data = json.loads(json_str.strip())
                 name = data.get('name') or data.get('function')
                 args = data.get('arguments') or data.get('args') or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except:
+                        args = {}
                 if name:
-                    tool_calls.append({
-                        "id": f"call_{uuid.uuid4().hex[:16]}",
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": json.dumps(args)
-                        }
-                    })
+                    tool_calls.append(self._make_tool_call(name, args))
             except json.JSONDecodeError:
                 pass
         
-        # NEW: Pattern for <tool_call><tool>TOOL_NAME>JSON</tool></tool_call>
-        # Example: <tool_call><tool>financial_data_fetcher>{"ticker": "MSFT"}</tool></tool_call>
-        pattern_short2 = r'<tool_call>\s*<tool>(\w+)>\s*(\{.*?\})\s*</tool>\s*</tool_call>'
-        matches_short2 = re.findall(pattern_short2, text, re.DOTALL)
-        
-        for name, args_str in matches_short2:
-            name = name.strip()
-            if not name:
-                continue
-            try:
-                args = json.loads(args_str.strip()) if args_str.strip() else {}
-            except json.JSONDecodeError:
-                args = {}
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:16]}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(args)
-                }
-            })
-        
-        # NEW: Pattern for nested tool_call with multiple tool blocks inside
-        # Example: <tool_call><tool><name>search</name><arguments>{...}</arguments></tool><tool><name>search</name><arguments>{...}</arguments></tool></tool_call>
-        # Also handles case where there's a nested <tool_call> before second tool
-        pattern_multi_tools = r'<tool_call>\s*(<tool>.*?</tool>)\s*(?:<tool_call>\s*(<tool>.*?</tool>)\s*)?</tool_call>'
-        matches_multi_tools = re.findall(pattern_multi_tools, text, re.DOTALL | re.IGNORECASE)
-        
-        for tool_block1, tool_block2 in matches_multi_tools:
-            # Parse first tool block
-            inner_pattern = r'<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>'
-            inner_matches = re.findall(inner_pattern, tool_block1, re.DOTALL | re.IGNORECASE)
-            
-            for name, args_str in inner_matches:
+        # --- Multi-tool wrapper: <tool_call><tool>...</tool></tool_call> ---
+        for tool_block in TOOL_PATTERNS['multi'].findall(text):
+            for name, args_str in TOOL_PATTERNS['basic'].findall(tool_block):
                 name = name.strip()
                 if not name:
                     continue
-                
-                try:
-                    args = json.loads(args_str.strip()) if args_str.strip() else {}
-                except json.JSONDecodeError:
-                    args = {}
-                
-                tool_calls.append({
-                    "id": f"call_{uuid.uuid4().hex[:16]}",
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": json.dumps(args)
-                    }
-                })
-            
-            # Parse second tool block if present
-            if tool_block2:
-                inner_matches2 = re.findall(inner_pattern, tool_block2, re.DOTALL | re.IGNORECASE)
-                for name, args_str in inner_matches2:
+                args = self._parse_args(args_str)
+                tool_calls.append(self._make_tool_call(name, args))
+        
+        # --- Multi-tools with optional second block ---
+        for tool_block1, tool_block2 in TOOL_PATTERNS['multi_tools'].findall(text):
+            for block in (tool_block1, tool_block2):
+                if not block:
+                    continue
+                for name, args_str in TOOL_PATTERNS['basic'].findall(block):
                     name = name.strip()
                     if not name:
                         continue
-                    
-                    try:
-                        args = json.loads(args_str.strip()) if args_str.strip() else {}
-                    except json.JSONDecodeError:
-                        args = {}
-                    
-                    tool_calls.append({
-                        "id": f"call_{uuid.uuid4().hex[:16]}",
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": json.dumps(args)
-                        }
-                    })
+                    args = self._parse_args(args_str)
+                    tool_calls.append(self._make_tool_call(name, args))
         
         # Deduplicate tool calls based on name and arguments
         seen = set()
@@ -1613,35 +1341,16 @@ class ToolCallParser:
     def _parse_multiline_tool_calls(self, text: str) -> List[Dict]:
         """Parse multi-line tool_call format with newlines between tags.
         
-        This handles format like:
-        <tool_call>
-        <tool>
-        <name>search</name>
-        <arguments>
-        {"query": "Apple AAPL Q4 2023"}
-        </arguments>
-        </tool>
-        <tool>
-        <name>search</name>
-        <arguments>
-        {"query": "Microsoft MSFT Q4 2023"}
-        </arguments>
-        </tool>
-        </tool_call>
+        Uses pre-compiled TOOL_PATTERNS['multiline'] and TOOL_PATTERNS['multiline_standalone'].
         """
         tool_calls = []
         
-        # Pattern for multi-line tool_call with separate tool blocks
-        # This pattern is more lenient with whitespace and newlines
-        pattern_multiline = r'<tool_call>\s*(.*?)\s*</tool_call>'
-        matches = re.findall(pattern_multiline, text, re.DOTALL | re.IGNORECASE)
-        
-        for match in matches:
+        # Use pre-compiled multiline wrapper pattern
+        for match in TOOL_PATTERNS['multiline'].findall(text):
             # Find each <tool> block within the tool_call
             tool_blocks = re.findall(r'<tool>\s*(.*?)\s*</tool>', match, re.DOTALL | re.IGNORECASE)
             
             for tool_block in tool_blocks:
-                # Extract name
                 name_match = re.search(r'<name>\s*(.*?)\s*</name>', tool_block, re.DOTALL | re.IGNORECASE)
                 if not name_match:
                     continue
@@ -1653,65 +1362,22 @@ class ToolCallParser:
                 # Extract arguments - could be JSON or XML-style
                 args_match = re.search(r'<arguments>\s*(.*?)\s*</arguments>', tool_block, re.DOTALL | re.IGNORECASE)
                 if not args_match:
-                    # Try <parameters> as alternative
                     args_match = re.search(r'<parameters>\s*(.*?)\s*</parameters>', tool_block, re.DOTALL | re.IGNORECASE)
                 
                 if args_match:
-                    args_str = args_match.group(1).strip()
-                    try:
-                        args = json.loads(args_str) if args_str else {}
-                    except json.JSONDecodeError:
-                        # Try cleaning up the JSON string
-                        cleaned = args_str.replace('\n', ' ').replace('\r', '')
-                        try:
-                            args = json.loads(cleaned)
-                        except:
-                            # Try extracting key-value pairs from XML
-                            args = {}
-                            for k, v in re.findall(r'<(\w+)>\s*(.*?)\s*</\1>', args_str, re.DOTALL):
-                                args[k] = v.strip()
+                    args = self._parse_args(args_match.group(1))
                 else:
                     args = {}
                 
-                tool_calls.append({
-                    "id": f"call_{uuid.uuid4().hex[:16]}",
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": json.dumps(args)
-                    }
-                })
+                tool_calls.append(self._make_tool_call(name, args))
         
-        # Also try simpler pattern for standalone multi-line tools
-        # <tool>
-        # <name>search</name>
-        # <arguments>{...}</arguments>
-        # </tool>
-        standalone_pattern = r'<tool>\s*<name>\s*(.*?)\s*</name>\s*<arguments>\s*(.*?)\s*</arguments>\s*</tool>'
-        standalone_matches = re.findall(standalone_pattern, text, re.DOTALL | re.IGNORECASE)
-        
-        for name, args_str in standalone_matches:
+        # Use pre-compiled multiline standalone pattern
+        for name, args_str in TOOL_PATTERNS['multiline_standalone'].findall(text):
             name = name.strip()
             if not name:
                 continue
-            
-            try:
-                args = json.loads(args_str.strip()) if args_str.strip() else {}
-            except json.JSONDecodeError:
-                cleaned = args_str.replace('\n', ' ').replace('\r', '')
-                try:
-                    args = json.loads(cleaned)
-                except:
-                    args = {}
-            
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:16]}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(args)
-                }
-            })
+            args = self._parse_args(args_str)
+            tool_calls.append(self._make_tool_call(name, args))
         
         return tool_calls
     
@@ -1737,12 +1403,11 @@ class ToolCallParser:
         return None
     
     def _xml_to_dict(self, xml_content: str) -> Dict:
-        """Convert simple nested XML to dictionary."""
+        """Convert simple nested XML to dictionary. Uses pre-compiled RE_XML_TO_DICT."""
         result = {}
-        pattern = r'<(\w+)>\s*(.*?)\s*</\1>'
-        matches = re.findall(pattern, xml_content, re.DOTALL)
+        matches = RE_XML_TO_DICT.findall(xml_content)
         for tag, content in matches:
-            if re.search(r'<\w+>', content):
+            if RE_XML_NESTED.search(content):
                 try:
                     result[tag] = self._xml_to_dict(content)
                 except:
@@ -1821,17 +1486,15 @@ class ToolCallParser:
         return tool_calls if tool_calls else None
 
     def strip_tool_calls_from_content(self, text: str) -> str:
-        """Remove tool call format from text after extracting tool calls."""
+        """Remove tool call format from text after extracting tool calls.
+        Uses pre-compiled STRIP_TOOL_PATTERNS for efficiency."""
         if not text:
             return text
         
-        text = re.sub(r'<tool>.*?</tool>', '', text, flags=re.DOTALL)
-        text = re.sub(r'<function>.*?</function>', '', text, flags=re.DOTALL)
-        text = re.sub(r'<tool>\{.*?\}</tool>', '', text, flags=re.DOTALL)
-        text = re.sub(r'<tool>[\s\S]*?</tool>', '', text)
-        text = re.sub(r'<function>[\s\S]*?</function>', '', text)
+        for pattern in STRIP_TOOL_PATTERNS:
+            text = pattern.sub('', text)
         
-        for tool_name in ['read', 'write', 'exec', 'browser', 'message', 'web_search', 'web_fetch', 
+        for tool_name in ['read', 'write', 'exec', 'browser', 'message', 'web_search', 'web_fetch',
                          'memory_search', 'memory_get', 'sessions_list', 'sessions_send', 'tts', 'canvas', 'nodes']:
             text = re.sub(rf'<{tool_name}>[\s\S]*?</{tool_name}>', '', text)
         

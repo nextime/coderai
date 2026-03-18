@@ -13,6 +13,14 @@ from codai.models.utils import (
     get_reasoning_stop_tokens
 )
 from codai.models.cache import get_cached_model_path
+from codai.models.grammar import get_tool_call_grammar, is_grammar_available
+
+# Import global flag from coderai (will be None if not running as server)
+try:
+    import coderai
+    _grammar_guided_gen = getattr(coderai, 'grammar_guided_gen', False)
+except (ImportError, AttributeError):
+    _grammar_guided_gen = False
 
 try:
     from llama_cpp import Llama
@@ -527,7 +535,8 @@ class VulkanBackend(ModelBackend):
         max_tokens: Optional[int] = None,
         temperature: float = 0.7,
         top_p: float = 1.0,
-        stop: Optional[List[str]] = None
+        stop: Optional[List[str]] = None,
+        grammar: Optional[str] = None
     ) -> str:
         """Generate text non-streaming.
         
@@ -537,6 +546,7 @@ class VulkanBackend(ModelBackend):
             temperature: Sampling temperature
             top_p: Top-p sampling
             stop: Stop sequences
+            grammar: Optional GBNF grammar string for constrained generation
             
         Returns:
             Generated text
@@ -571,6 +581,17 @@ class VulkanBackend(ModelBackend):
             # Get default stop tokens based on template
             stop = get_reasoning_stop_tokens(self.chat_template)
         
+        # Check for grammar-guided generation
+        use_grammar = grammar
+        if use_grammar is None:
+            # Check global flag
+            try:
+                import coderai
+                if getattr(coderai, 'grammar_guided_gen', False):
+                    use_grammar = get_tool_call_grammar()
+            except (ImportError, AttributeError):
+                pass
+        
         try:
             result = self.model.create_completion(
                 prompt=prompt,
@@ -580,9 +601,27 @@ class VulkanBackend(ModelBackend):
                 top_k=top_k,
                 repeat_penalty=repeat_penalty,
                 stop=stop,
+                grammar=use_grammar,
             )
             return result['choices'][0]['text']
         except Exception as e:
+            # If grammar generation fails, fall back to normal generation
+            if use_grammar:
+                print(f"Warning: Grammar-guided generation failed: {e}, falling back to normal generation")
+                try:
+                    result = self.model.create_completion(
+                        prompt=prompt,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        repeat_penalty=repeat_penalty,
+                        stop=stop,
+                    )
+                    return result['choices'][0]['text']
+                except Exception as e2:
+                    print(f"Error during fallback generation: {e2}")
+                    raise
             print(f"Error during generation: {e}")
             raise
     
@@ -613,12 +652,24 @@ class VulkanBackend(ModelBackend):
         top_p = kwargs.get('top_p', 0.9)
         top_k = kwargs.get('top_k', 40)
         repeat_penalty = kwargs.get('repeat_penalty', 1.1)
+        grammar = kwargs.get('grammar', None)
         
         # Get stop strings
         stop = kwargs.get('stop', None)
         if stop is None:
             # Get default stop tokens based on template
             stop = get_reasoning_stop_tokens(self.chat_template)
+        
+        # Check for grammar-guided generation
+        use_grammar = grammar
+        if use_grammar is None:
+            # Check global flag
+            try:
+                import coderai
+                if getattr(coderai, 'grammar_guided_gen', False):
+                    use_grammar = get_tool_call_grammar()
+            except (ImportError, AttributeError):
+                pass
         
         try:
             # For chat, we need to extract just the new text from each chunk
@@ -637,6 +688,7 @@ class VulkanBackend(ModelBackend):
                 repeat_penalty=repeat_penalty,
                 stop=stop,
                 stream=True,
+                grammar=use_grammar,
             ):
                 text = chunk['choices'][0].get('text', '')
                 
@@ -659,8 +711,43 @@ class VulkanBackend(ModelBackend):
                     break
                     
         except Exception as e:
-            print(f"Error during streaming generation: {e}")
-            raise
+            # If grammar generation fails, fall back to normal generation
+            if use_grammar:
+                print(f"Warning: Grammar-guided streaming generation failed: {e}, falling back to normal generation")
+                try:
+                    first_chunk = True
+                    prompt_len = len(prompt) if isinstance(prompt, str) else 0
+                    
+                    for chunk in self.model.create_completion(
+                        prompt=prompt,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        repeat_penalty=repeat_penalty,
+                        stop=stop,
+                        stream=True,
+                    ):
+                        text = chunk['choices'][0].get('text', '')
+                        
+                        if first_chunk:
+                            if text and len(text) > prompt_len:
+                                new_text = text[prompt_len:]
+                                if new_text:
+                                    yield new_text
+                            first_chunk = False
+                        else:
+                            if text:
+                                yield text
+                        
+                        if chunk['choices'][0].get('finish_reason'):
+                            break
+                except Exception as e2:
+                    print(f"Error during fallback streaming generation: {e2}")
+                    raise
+            else:
+                print(f"Error during streaming generation: {e}")
+                raise
     
     def chat(
         self,

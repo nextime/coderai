@@ -304,7 +304,8 @@ class AgenticTemplateManager:
     def format_for_raw_completion(self, system_prompt: str, user_message: str, 
                                 inject_system: bool = True,
                                 force_reasoning: bool = True,
-                                tools: Optional[List[Dict]] = None) -> Tuple[str, List[str]]:
+                                tools: Optional[List[Dict]] = None,
+                                tools_closer_prompt: bool = False) -> Tuple[str, List[str]]:
         """
         Format prompt for raw completion (bypassing chat API).
         
@@ -314,6 +315,8 @@ class AgenticTemplateManager:
             inject_system: If True, injects agentic system instructions
             force_reasoning: If True, seeds prompt with thought tag to force reasoning
             tools: Optional list of tool definitions to include in the prompt
+            tools_closer_prompt: If True, place tools right before the user's message
+                                instead of in the system prompt (prompt distillation)
             
         Returns:
             Tuple of (formatted_prompt, stop_tokens)
@@ -326,8 +329,8 @@ class AgenticTemplateManager:
         # Get tool call tags for this model family
         tool_tags = self.TOOL_CALL_TAGS.get(self.family_key, self.TOOL_CALL_TAGS["generic"])
         
-        # Add tool descriptions to system prompt if tools are provided AND no custom system prompt exists
-        # (don't override client's custom system prompt with tool instructions)
+        # Build tools text if tools are provided
+        tools_text = None
         if tools and not has_custom_system:
             import json
             tool_descriptions = []
@@ -344,9 +347,16 @@ class AgenticTemplateManager:
             tools_text = "You have access to the following tools:\n\n" + "\n\n".join(tool_descriptions)
             tools_text += f"\n\nIMPORTANT: When you need to use a tool, you MUST format your response EXACTLY as:\n"
             tools_text += tool_tags["json_format"]
-            
-            # Prepend tools to system prompt
-            effective_system = f"{tools_text}\n\n{effective_system}" if effective_system else tools_text
+        
+        # Handle tools placement based on tools_closer_prompt flag
+        if tools_text:
+            if tools_closer_prompt:
+                # Prompt distillation: place tools right before the user message
+                # Don't add tools to system prompt
+                pass
+            else:
+                # Traditional behavior: prepend tools to system prompt
+                effective_system = f"{tools_text}\n\n{effective_system}" if effective_system else tools_text
         
         # Inject system prompt if requested
         if inject_system:
@@ -368,6 +378,42 @@ class AgenticTemplateManager:
             thought_tag = self.THOUGHT_TAGS.get(self.family_key, "<think>")
             if prompt.endswith(thought_tag + "\n"):
                 prompt = prompt[:-len(thought_tag + "\n")]
+        
+        # If tools_closer_prompt is enabled and we have tools, insert them before user message
+        if tools_closer_prompt and tools_text:
+            # Find the position right before the user's message and insert tools there
+            # The template format is: {sys}\nuser\n{user} or similar
+            # We need to find where user message starts and insert tools there
+            
+            # For reasoning prefix templates, tools are inserted after system and before user content
+            # Format: <system>\n\nAvailable tools: <tools>\n\nUser: <message>
+            
+            # Find the user message part in the prompt and insert tools before it
+            user_marker = None
+            
+            # Try different common user message markers based on template family
+            if self.family_key in ("qwen", "llama3", "deepseek", "yi"):
+                user_marker = "<|im_start|>user"
+            elif self.family_key == "phi3":
+                user_marker = "<|user|>"
+            elif self.family_key == "gemma":
+                user_marker = "<start_of_turn>user"
+            elif self.family_key == "mistral":
+                user_marker = "[INST]"
+            elif self.family_key == "anthropic":
+                user_marker = "\n\nHuman:"
+            elif self.family_key == "command-r":
+                user_marker = "<|START_OF_TURN_TOKEN|><|USER_TOKEN|>"
+            else:
+                # Generic: look for "User:" or "\nUser\n" or similar
+                user_marker = "\nUser:"
+            
+            # Find where user message starts
+            user_pos = prompt.find(user_marker)
+            if user_pos != -1:
+                # Insert tools right before user message
+                tools_section = f"\n\nAvailable tools: {tools_text}\n"
+                prompt = prompt[:user_pos] + tools_section + prompt[user_pos:]
         
         stop_tokens = self.get_stop_tokens()
         

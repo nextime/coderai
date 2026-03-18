@@ -10,6 +10,22 @@ from codai.backends.base import ModelBackend
 from codai.models.capabilities import detect_model_capabilities
 from codai.pydantic.textrequest import ChatMessage
 
+# Try to import outlines for grammar-guided generation
+try:
+    from outlines import models, generate
+    OUTLINES_AVAILABLE = True
+except ImportError:
+    OUTLINES_AVAILABLE = False
+    models = None
+    generate = None
+
+# Import global flag from coderai (will be None if not running as server)
+try:
+    import coderai
+    _grammar_guided_gen = getattr(coderai, 'grammar_guided_gen', False)
+except (ImportError, AttributeError):
+    _grammar_guided_gen = False
+
 
 class NvidiaBackend(ModelBackend):
     """Backend for NVIDIA GPUs using HuggingFace Transformers."""
@@ -406,8 +422,82 @@ class NvidiaBackend(ModelBackend):
     
     def generate(self, prompt: str, max_tokens: Optional[int] = None,
                  temperature: float = 0.7, top_p: float = 1.0,
-                 stop: Optional[List[str]] = None) -> str:
-        """Generate text non-streaming."""
+                 stop: Optional[List[str]] = None,
+                 grammar: Optional[str] = None) -> str:
+        """Generate text non-streaming.
+        
+        Args:
+            prompt: Input prompt
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling
+            stop: Stop sequences
+            grammar: Optional regex pattern for constrained generation (outlines)
+        """
+        import torch
+        from transformers import LogitsProcessor, LogitsProcessorList
+        
+        # Check for grammar-guided generation using outlines
+        use_grammar = grammar
+        if use_grammar is None:
+            # Check global flag
+            try:
+                import coderai
+                if getattr(coderai, 'grammar_guided_gen', False):
+                    if not OUTLINES_AVAILABLE:
+                        print("Warning: outlines not installed. Run: pip install outlines")
+                        use_grammar = None
+                    else:
+                        # Use a regex pattern for tool calls
+                        use_grammar = r'<tool>.*?</tool>|\{.*?"name".*?"arguments".*?\}|\[.*?"name".*?"arguments".*?\]'
+            except (ImportError, AttributeError):
+                pass
+        
+        # If outlines is available and grammar is enabled, use outlines
+        if use_grammar and OUTLINES_AVAILABLE:
+            try:
+                return self._generate_with_outlines(prompt, max_tokens, temperature, top_p, stop, use_grammar)
+            except Exception as e:
+                print(f"Warning: Outlines generation failed: {e}, falling back to normal generation")
+                # Fall through to normal generation
+        
+        # Normal generation without grammar
+        return self._generate_normal(prompt, max_tokens, temperature, top_p, stop)
+    
+    def _generate_with_outlines(self, prompt: str, max_tokens: Optional[int],
+                                 temperature: float, top_p: float,
+                                 stop: Optional[List[str]],
+                                 pattern: str) -> str:
+        """Generate text using outlines library for grammar-guided generation."""
+        if max_tokens is None:
+            max_tokens = 512
+        
+        # Create outlines model from the loaded model
+        model = models.Transformers(self.model, self.tokenizer)
+        
+        # Create regex generator
+        regex_generator = generate.regex(model, pattern=pattern)
+        
+        # Generate with outlines
+        # Note: outlines uses its own sampling parameters
+        result = regex_generator(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature if temperature > 0 else 0.7,
+        )
+        
+        # Extract the generated text (outlines returns the full output)
+        if isinstance(result, str):
+            # Remove the prompt from the result
+            if result.startswith(prompt):
+                result = result[len(prompt):]
+            return result
+        return str(result)
+    
+    def _generate_normal(self, prompt: str, max_tokens: Optional[int],
+                        temperature: float, top_p: float,
+                        stop: Optional[List[str]]) -> str:
+        """Normal generation without grammar constraints."""
         import torch
         from transformers import LogitsProcessor, LogitsProcessorList
         
@@ -469,8 +559,83 @@ class NvidiaBackend(ModelBackend):
     
     async def generate_stream(self, prompt: str, max_tokens: Optional[int] = None,
                               temperature: float = 0.7, top_p: float = 1.0,
-                              stop: Optional[List[str]] = None):
-        """Generate text in streaming fashion."""
+                              stop: Optional[List[str]] = None,
+                              grammar: Optional[str] = None):
+        """Generate text in streaming fashion.
+        
+        Args:
+            prompt: Input prompt
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling
+            stop: Stop sequences
+            grammar: Optional regex pattern for constrained generation (outlines)
+        """
+        # Check for grammar-guided generation using outlines
+        use_grammar = grammar
+        if use_grammar is None:
+            # Check global flag
+            try:
+                import coderai
+                if getattr(coderai, 'grammar_guided_gen', False):
+                    if not OUTLINES_AVAILABLE:
+                        print("Warning: outlines not installed. Run: pip install outlines")
+                        use_grammar = None
+                    else:
+                        # Use a regex pattern for tool calls
+                        use_grammar = r'<tool>.*?</tool>|\{.*?"name".*?"arguments".*?\}|\[.*?"name".*?"arguments".*?\]'
+            except (ImportError, AttributeError):
+                pass
+        
+        # If outlines is available and grammar is enabled, use outlines
+        if use_grammar and OUTLINES_AVAILABLE:
+            try:
+                async for chunk in self._generate_stream_outlines(prompt, max_tokens, temperature, top_p, stop, use_grammar):
+                    yield chunk
+                return
+            except Exception as e:
+                print(f"Warning: Outlines streaming generation failed: {e}, falling back to normal generation")
+                # Fall through to normal generation
+        
+        # Normal streaming generation without grammar
+        async for chunk in self._generate_stream_normal(prompt, max_tokens, temperature, top_p, stop):
+            yield chunk
+    
+    async def _generate_stream_outlines(self, prompt: str, max_tokens: Optional[int],
+                                        temperature: float, top_p: float,
+                                        stop: Optional[List[str]],
+                                        pattern: str):
+        """Generate text using outlines library in streaming mode."""
+        if max_tokens is None:
+            max_tokens = 512
+        
+        # Create outlines model from the loaded model
+        model = models.Transformers(self.model, self.tokenizer)
+        
+        # Create regex generator
+        regex_generator = generate.regex(model, pattern=pattern)
+        
+        # Generate with outlines (outlines doesn't support true streaming, so we yield the result)
+        result = regex_generator(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature if temperature > 0 else 0.7,
+        )
+        
+        # Extract the generated text (outlines returns the full output)
+        if isinstance(result, str):
+            # Remove the prompt from the result
+            if result.startswith(prompt):
+                result = result[len(prompt):]
+            # Yield the entire result as a single chunk (outlines doesn't support true streaming)
+            yield result
+        else:
+            yield str(result)
+    
+    async def _generate_stream_normal(self, prompt: str, max_tokens: Optional[int],
+                                     temperature: float, top_p: float,
+                                     stop: Optional[List[str]]):
+        """Normal streaming generation without grammar constraints."""
         import torch
         from transformers import TextIteratorStreamer, LogitsProcessor, LogitsProcessorList, StoppingCriteria, StoppingCriteriaList
         

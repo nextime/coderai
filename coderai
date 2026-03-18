@@ -30,7 +30,7 @@ from threading import Thread
 
 # Import codai module for enhanced tool call parsing
 from codai.models import ModelParserDispatcher, OpenAIFormatter, ToolCallParser, ModelParserAdapter
-from codai.models.parser import filter_repetition
+from codai.models.parser import filter_repetition, MALFORMED_PATTERNS as _MALFORMED_PATTERNS
 
 # Import from codai modules for use in this file
 from codai.models.manager import ModelManager, WhisperServerManager, MultiModelManager
@@ -81,29 +81,57 @@ queue_flags = {"model_1": False, "image_1": False, "audio_1": False, "tts_1": Fa
 # =============================================================================
 
 def filter_malformed_content(text: str) -> str:
-    """Filter out malformed SEARCH/REPLACE blocks that the model might output as content."""
+    """Filter out malformed SEARCH/REPLACE blocks that the model might output as content.
+    
+    Uses pre-compiled _MALFORMED_PATTERNS from codai.models.parser for efficiency.
+    """
     if not text:
         return text
     
-    # Remove diff-like blocks that shouldn't be in the output
+    # Apply all pre-compiled malformed content patterns
     filtered = text
+    for pattern in _MALFORMED_PATTERNS:
+        # The last pattern (\n{3,}) replaces with \n\n, others replace with ''
+        if pattern.pattern == r'\n{3,}':
+            filtered = pattern.sub('\n\n', filtered)
+        else:
+            filtered = pattern.sub('', filtered)
     
-    # Remove git-style diff markers and SEARCH/REPLACE patterns
-    filtered = re.sub(r'<<<<<<<\s+SEARCH.*?=======', '', filtered, flags=re.DOTALL)
-    filtered = re.sub(r'=======.*?>>>>>>>\s+REPLACE', '', filtered, flags=re.DOTALL)
-    filtered = re.sub(r'>>>>>>>\s+REPLACE', '', filtered)
-    
-    # Also remove common malformed patterns seen in outputs
-    filtered = re.sub(r'<<<<<<<\s+SEARCH\s*:start_line:\d+[^<]*', '', filtered, flags=re.DOTALL)
-    filtered = re.sub(r'<button>Stop Generation</button>', '', filtered)
-    filtered = re.sub(r'\<\|assistant\|\>', '', filtered)
-    filtered = re.sub(r'\</\|assistant\|\>', '', filtered)
-    
-    # Clean up excessive newlines left from removal
-    filtered = re.sub(r'\n{3,}', '\n\n', filtered)
-    
-    # Don't strip single newlines or whitespace - they might be valid content
     return filtered
+
+
+# Pre-compiled pattern for cleanup_control_tokens newline cleanup
+_RE_TRIPLE_NEWLINE = re.compile(r'\n{3,}')
+
+# Control tokens to strip - defined once at module level
+_CONTROL_TOKENS = [
+    '<|im_end|>',
+    '<|im_start|>',
+    '<|endoftext|>',
+    '<|end_of_text|>',
+    '<|eot_id|>',
+    '<|eom_id|>',
+    '<|assistant|>',
+    '<|model|>',
+    '<|python|>',
+    '<|javascript|>',
+    '<|html|>',
+    '\n\nassistant',
+    '\nAssistant',
+    'ASSISTANT',
+    'Assistant',
+    'assistant',
+]
+
+# Build expanded token set for O(1) lookup (includes \n and space prefixed variants)
+_CONTROL_TOKENS_START = set()
+_CONTROL_TOKENS_END = set()
+for _t in _CONTROL_TOKENS:
+    _CONTROL_TOKENS_START.update([_t, '\n' + _t, ' ' + _t])
+    _CONTROL_TOKENS_END.update([_t, '\n' + _t, ' ' + _t])
+# Sort by length descending so longer tokens match first (avoids partial matches)
+_CONTROL_TOKENS_START_SORTED = sorted(_CONTROL_TOKENS_START, key=len, reverse=True)
+_CONTROL_TOKENS_END_SORTED = sorted(_CONTROL_TOKENS_END, key=len, reverse=True)
 
 
 def cleanup_control_tokens(text: str) -> str:
@@ -112,64 +140,39 @@ def cleanup_control_tokens(text: str) -> str:
     
     Removes tokens like <|im_end|>, <|im_start|>, 'assistant', etc. that might
     appear at the start or end of the response after reasoning extraction.
+    
+    Uses module-level sorted token lists for efficient matching.
+    Tokens are sorted by length (longest first) to prevent partial matches
+    like 'assistant' matching before '<|assistant|>'.
     """
     if not text:
         return text
     
     cleaned = text
     
-    # List of control tokens to strip from start/end
-    control_tokens = [
-        '<|im_end|>',
-        '<|im_start|>',
-        '<|endoftext|>',
-        '<|end_of_text|>',
-        '<|eot_id|>',
-        '<|eom_id|>',
-        'assistant',
-        'Assistant',
-        'ASSISTANT',
-        '<|assistant|>',
-        '<|model|>',
-        '<|python|>',
-        '<|javascript|>',
-        '<|html|>',
-        '\n\nassistant',
-        '\nAssistant',
-    ]
-    
     # Strip from start - keep trying until no more tokens at start
+    # Max iterations bounded by text length / min token length
     changed = True
     while changed:
         changed = False
-        for token in control_tokens:
+        for token in _CONTROL_TOKENS_START_SORTED:
             if cleaned.startswith(token):
                 cleaned = cleaned[len(token):]
                 changed = True
-            elif cleaned.startswith('\n' + token):
-                cleaned = cleaned[len('\n' + token):]
-                changed = True
-            elif cleaned.startswith(' ' + token):
-                cleaned = cleaned[len(' ' + token):]
-                changed = True
+                break  # Restart from longest token after each removal
     
     # Strip from end - keep trying until no more tokens at end
     changed = True
     while changed:
         changed = False
-        for token in control_tokens:
+        for token in _CONTROL_TOKENS_END_SORTED:
             if cleaned.endswith(token):
                 cleaned = cleaned[:-len(token)]
                 changed = True
-            elif cleaned.endswith('\n' + token):
-                cleaned = cleaned[:-len('\n' + token)]
-                changed = True
-            elif cleaned.endswith(' ' + token):
-                cleaned = cleaned[:-len(' ' + token)]
-                changed = True
+                break  # Restart from longest token after each removal
     
-    # Clean up any resulting double newlines
-    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    # Clean up any resulting triple+ newlines (pre-compiled pattern)
+    cleaned = _RE_TRIPLE_NEWLINE.sub('\n\n', cleaned)
     
     # Strip leading/trailing whitespace
     cleaned = cleaned.strip()
@@ -183,8 +186,18 @@ def cleanup_control_tokens(text: str) -> str:
 # Model Parser Dispatcher Wrapper - integrates model_parser module
 # =============================================================================
 
-def format_tools_for_prompt(tools: List[Tool], messages: List[ChatMessage]) -> List[ChatMessage]:
-    """Format tools into the system message or add a tool description."""
+def format_tools_for_prompt(tools: List[Tool], messages: List[ChatMessage], tools_closer_prompt: bool = False) -> List[ChatMessage]:
+    """Format tools into the system message or add a tool description.
+    
+    Args:
+        tools: List of Tool objects
+        messages: List of ChatMessage objects
+        tools_closer_prompt: If True, place tools right before the user's latest message
+                           instead of in the system prompt (prompt distillation)
+    
+    Returns:
+        Modified list of ChatMessage objects
+    """
     if not tools:
         return messages
     
@@ -212,19 +225,47 @@ def format_tools_for_prompt(tools: List[Tool], messages: List[ChatMessage]) -> L
     
     # Add or prepend to system message
     new_messages = list(messages)
-    system_found = False
     
-    for i, msg in enumerate(new_messages):
-        if msg.role == "system":
-            new_messages[i] = ChatMessage(
-                role="system",
-                content=f"{tools_text}\n\n{msg.content or ''}"
-            )
-            system_found = True
-            break
-    
-    if not system_found:
-        new_messages.insert(0, ChatMessage(role="system", content=tools_text))
+    if tools_closer_prompt:
+        # Prompt distillation: insert tools right before the LAST user message
+        # Find the last user message and insert tools before it
+        last_user_idx = None
+        for i, msg in enumerate(new_messages):
+            if msg.role == "user":
+                last_user_idx = i
+        
+        if last_user_idx is not None:
+            # Insert a tool context message before the last user message
+            tools_message = ChatMessage(role="system", content=f"Available tools:\n{tools_text}")
+            new_messages.insert(last_user_idx, tools_message)
+        else:
+            # No user message found, fall back to system message
+            system_found = False
+            for i, msg in enumerate(new_messages):
+                if msg.role == "system":
+                    new_messages[i] = ChatMessage(
+                        role="system",
+                        content=f"{tools_text}\n\n{msg.content or ''}"
+                    )
+                    system_found = True
+                    break
+            if not system_found:
+                new_messages.insert(0, ChatMessage(role="system", content=tools_text))
+    else:
+        # Traditional behavior: prepend tools to system message
+        system_found = False
+        
+        for i, msg in enumerate(new_messages):
+            if msg.role == "system":
+                new_messages[i] = ChatMessage(
+                    role="system",
+                    content=f"{tools_text}\n\n{msg.content or ''}"
+                )
+                system_found = True
+                break
+        
+        if not system_found:
+            new_messages.insert(0, ChatMessage(role="system", content=tools_text))
     
     return new_messages
 # =============================================================================
@@ -265,9 +306,18 @@ model_manager = ModelManager()
 global_args = None
 
 
+# Global grammar-guided generation flag
+grammar_guided_gen = False
+
+
 # Global system prompt (set via --system-prompt flag)
 # None = don't inject, True = use default, string = use custom text
 global_system_prompt = None
+
+# Global tools-closer-prompt flag (set via --tools-closer-prompt flag)
+# When True, tool definitions are placed right before the user's latest request
+# instead of in the system prompt (prompt distillation)
+global_tools_closer_prompt = False
 
 
 # Global debug flag
@@ -2179,8 +2229,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     
     # Format messages with tools if provided - BUT SKIP for raw mode
     # (raw mode handles tools separately via format_for_raw_completion)
+    # Get tools_closer_prompt from global args
+    tools_closer = getattr(global_args, 'tools_closer_prompt', False) if global_args else False
     if request.tools and "raw" not in force_reasoning_args:
-        messages = format_tools_for_prompt(request.tools, messages)
+        messages = format_tools_for_prompt(request.tools, messages, tools_closer_prompt=tools_closer)
     
     # Get the tool_parser from the current manager
     tool_parser = current_manager.tool_parser if hasattr(current_manager, 'tool_parser') else ModelParserAdapter()
@@ -2283,7 +2335,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 user_message=user_message,
                 inject_system=True,
                 force_reasoning=True,
-                tools=request.tools  # Pass tools for family-specific formatting
+                tools=request.tools,  # Pass tools for family-specific formatting
+                tools_closer_prompt=tools_closer  # Pass tools-closer-prompt flag
             )
             use_raw_mode = True
             
@@ -2973,14 +3026,14 @@ async def stream_chat_response(
             response_format=response_format,
         ):
             chunk_count += 1
-            # Always filter malformed content
+            # Always filter malformed content (regex-based, works per-chunk)
             filtered_chunk = filter_malformed_content(chunk)
             
-            # Apply repetition filtering to prevent infinite loops
-            filtered_chunk = filter_repetition(filtered_chunk)
-            
-            # Always filter out tool call format
-            filtered_chunk = tool_parser.strip_tool_calls_from_content(filtered_chunk)
+            # NOTE: filter_repetition() and strip_tool_calls_from_content() are NOT applied
+            # per-chunk because they need the full accumulated text to work correctly:
+            # - filter_repetition() needs enough context (6+ words) to detect n-gram repetitions
+            # - strip_tool_calls_from_content() needs complete XML tags that span multiple chunks
+            # Both are applied to the complete generated_text after streaming completes.
             
             # Pass through all content including whitespace - it's essential for message composition
             generated_text += filtered_chunk
@@ -3884,6 +3937,19 @@ def parse_args():
         default=None,
         help="Force reasoning. Options: 'chat' (API), 'stop' (tokens), 'inject' (sys prompt), 'prompt' (seeding), 'twopass' (2 calls), 'mock' (fake stats), 'raw' (raw completion), 'all' (all options). Combine: --force-reasoning chat,inject.",
     )
+    parser.add_argument(
+        "--grammar-guided-gen",
+        "--ggg",
+        action="store_true",
+        default=False,
+        help="Enable grammar-guided generation to reduce model hallucinations when using tools. Uses GBNF grammar for Vulkan backend and outlines for CUDA backend.",
+    )
+    parser.add_argument(
+        "--tools-closer-prompt",
+        action="store_true",
+        default=False,
+        help="Enable prompt distillation: place tool definitions right before the user's latest request instead of in the system prompt. This can improve tool call accuracy.",
+    )
     return parser.parse_args()
 def main():
     """Main entry point."""
@@ -3909,8 +3975,20 @@ def main():
     # Store args globally for access in endpoints
     global_args = args
     
+    # Set global grammar-guided-gen flag
+    global grammar_guided_gen
+    grammar_guided_gen = args.grammar_guided_gen
+    if grammar_guided_gen:
+        print("Grammar-guided generation enabled (--grammar-guided-gen)")
+    
     # Set global system prompt from --system-prompt flag
     global_system_prompt = args.system_prompt
+    
+    # Set global tools-closer-prompt flag
+    global global_tools_closer_prompt
+    global_tools_closer_prompt = args.tools_closer_prompt
+    if global_tools_closer_prompt:
+        print("Tools closer prompt enabled (--tools-closer-prompt)")
     
     # Set global debug flag
     global_debug = args.debug
