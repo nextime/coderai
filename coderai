@@ -2232,7 +2232,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 print(f"RAW: template_manager.format_for_raw_completion not available")
     
     # Get resolved model name for response (with coderai/ prefix and proper formatting)
-    response_model_name = get_resolved_model_name(requested_model, current_manager)
+    # Use multi_model_manager to get the actual loaded models, not the individual model manager
+    response_model_name = get_resolved_model_name(requested_model, multi_model_manager)
     print(f"DEBUG: Requested model: {requested_model}, Resolved model for response: {response_model_name}")
     
     # Handle raw mode - two pass: first capture reasoning, then get final answer
