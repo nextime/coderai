@@ -2389,8 +2389,17 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     print(f"{'='*80}\n")
                 
                 # Try to extract tool calls from the second pass result
+                # If second pass is empty, try the reasoning text as fallback
                 extracted_tool_calls = None
-                if request.tools:
+                text_for_tool_extraction = second_pass_result
+                
+                # If second pass is empty or just whitespace, try reasoning text
+                if not text_for_tool_extraction or not text_for_tool_extraction.strip():
+                    if global_debug:
+                        print(f"DEBUG: Second pass result is empty, trying reasoning text")
+                    text_for_tool_extraction = reasoning_text
+                
+                if request.tools and text_for_tool_extraction:
                     # Convert tools for ModelParserAdapter
                     from codai.pydantic.textrequest import Tool, ToolFunction
                     from codai.models.parser import ModelParserAdapter
@@ -2418,7 +2427,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     
                     if tools_list:
                         adapter = ModelParserAdapter(model_name=response_model_name)
-                        extracted_tool_calls = adapter.extract_tool_calls(second_pass_result, tools_list)
+                        extracted_tool_calls = adapter.extract_tool_calls(text_for_tool_extraction, tools_list)
                         
                         if global_debug and extracted_tool_calls:
                             print(f"\n{'='*80}")
