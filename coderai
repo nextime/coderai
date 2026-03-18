@@ -2014,6 +2014,17 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     # Get model family for reasoning tokens
     model_family = get_model_family(request.model)
     
+    # Check if model is qwen3 and force_reasoning is enabled
+    is_qwen3 = 'qwen3' in model_family.lower() if model_family else False
+    use_qwen3_penalties = is_qwen3 and force_reasoning_args
+    
+    # System prompt addon for qwen3 with force_reasoning
+    qwen3_system_addon = ""
+    if use_qwen3_penalties:
+        qwen3_system_addon = "\n\nCRITICAL: Do not repeat tool calls. If a tool fails with an [ERROR], do not retry the exact same parameters. Propose a different approach or ask for clarification."
+        if global_debug:
+            print(f"QWEEN3: Adding penalties and system addon for qwen3 with force_reasoning")
+    
     # Handle 'chat' - enable thinking API parameter
     if "chat" in force_reasoning_args or enable_thinking_api:
         # Note: This only works with compatible APIs (OpenAI-like)
@@ -2075,6 +2086,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 system_prompt = msg.content
             elif msg.role == "user":
                 user_message = msg.content
+        
+        # Add qwen3 system addon if applicable
+        if qwen3_system_addon:
+            system_prompt = system_prompt + qwen3_system_addon
         
         # Get the seeded prompt (ends with thought tag)
         seeded_prompt = template_manager.force_reasoning_prompt(system_prompt, user_message)
@@ -2245,6 +2260,15 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             print(f"RAW: Starting two-pass generation")
             print(f"RAW: First pass prompt: ...{raw_prompt_for_generation[-100:]}")
         
+        # Build extra params for qwen3
+        extra_params = {}
+        if use_qwen3_penalties:
+            extra_params = {
+                'repeat_penalty': 1.15,
+                'presence_penalty': 1.5,
+                'frequency_penalty': 0.5,
+            }
+        
         if request.stream:
             # For streaming, we need to handle it differently
             # First pass: generate until reasoning close tag (stream it)
@@ -2261,6 +2285,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                         temperature=request.temperature,
                         top_p=request.top_p,
                         stop=raw_stop_sequences,
+                        **extra_params,
                     ):
                         reasoning_text += chunk
                         yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk}, 'finish_reason': None}]})}\n\n"
@@ -2276,6 +2301,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                         temperature=request.temperature,
                         top_p=request.top_p,
                         stop=raw_stop_sequences,
+                        **extra_params,
                     )
                     yield f"data: {json.dumps({'choices': [{'delta': {'content': first_pass_result}, 'finish_reason': None}]})}\n\n"
                 
@@ -2291,6 +2317,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     temperature=request.temperature,
                     top_p=request.top_p,
                     stop=stop_sequences,
+                    **extra_params,
                 )
                 
                 yield f"data: {json.dumps({'choices': [{'delta': {'content': second_pass_result}, 'finish_reason': 'stop'}]})}\n\n"
@@ -2306,6 +2333,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             temperature=request.temperature,
             top_p=request.top_p,
             stop=raw_stop_sequences,
+            **extra_params,
         )
         
         if global_debug:
@@ -2389,6 +2417,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 temperature=request.temperature,
                 top_p=request.top_p,
                 stop=stop_sequences,
+                **extra_params,
             )
             # Clean up the second pass result
             second_pass_result = cleanup_control_tokens(second_pass_result)
