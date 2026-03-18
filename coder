@@ -785,6 +785,27 @@ class CoderClient:
                     }
                 })
             
+            # Format 3: Generic <tool_call><tool><name>...</name><arguments>JSON</arguments></tool></tool_call>
+            # Also handles incomplete closing tags like <tool_call> without </tool_call>
+            generic_pattern = r'<tool_call>\s*<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>\s*(?:</tool_call>)?'
+            for match in re.finditer(generic_pattern, text, re.DOTALL | re.IGNORECASE):
+                name = match.group(1).strip()
+                args_str = match.group(2).strip()
+                if not name:
+                    continue
+                try:
+                    args = json.loads(args_str) if args_str else {}
+                except json.JSONDecodeError:
+                    args = {}
+                parsed.append({
+                    'id': f'call_{len(parsed)}',
+                    'type': 'function',
+                    'function': {
+                        'name': name,
+                        'arguments': json.dumps(args)
+                    }
+                })
+            
             return parsed
         
         # Process streaming response line by line
