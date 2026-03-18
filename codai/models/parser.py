@@ -175,7 +175,16 @@ def repair_broken_tool_calls(text: str) -> str:
     Converts to valid format:
     - <tool>{"name": "tool_name", "arguments": {"param": "value", ...}}</tool>
     """
-    if not text or not any(tag in text.lower() for tag in ['<tool>', '<tool_call>', '<function']):
+    if not text:
+        return text
+    
+    text_lower = text.lower()
+    # Check for any tool-related tags OR known tool names used as tags
+    known_tool_tags = ['<tool>', '<tool_call>', '<function', '<fetch_instructions>', '<list_files>',
+                       '<read_file>', '<write_file>', '<search_files>', '<execute_command>',
+                       '<ask_followup_question>', '<attempt_completion>', '<browser_action>',
+                       '<new_task>', '<switch_mode>', '<update_todo_list>']
+    if not any(tag in text_lower for tag in known_tool_tags):
         return text
     
     # Pattern -1: Fix <tool_call> wrapper format (convert to <tool> for consistency)
@@ -209,7 +218,7 @@ def repair_broken_tool_calls(text: str) -> str:
             re.DOTALL | re.IGNORECASE
         )
         
-        def fix_wrong_wrapper(match):
+        def fix_wrong_wrapper(match, _tool_name=tool_name):
             params_content = match.group(1)
             # Extract all key-value pairs
             params = {}
@@ -221,9 +230,9 @@ def repair_broken_tool_calls(text: str) -> str:
                 params[param_name] = val
             
             if params:
-                return f'<tool>{{"name": "{tool_name}", "arguments": {json.dumps(params)}}}</tool>'
+                return f'<tool>{{"name": "{_tool_name}", "arguments": {json.dumps(params)}}}</tool>'
             else:
-                return f'<tool>{{"name": "{tool_name}", "arguments": {{}}}}</tool>'
+                return f'<tool>{{"name": "{_tool_name}", "arguments": {{}}}}</tool>'
         
         text = pattern_wrong_wrapper.sub(fix_wrong_wrapper, text)
     
@@ -282,6 +291,40 @@ def repair_broken_tool_calls(text: str) -> str:
             return f'<tool>{{"name": "{tool_name}", "arguments": {{}}}}</tool>'
     
     text = pattern0.sub(replacer0, text)
+    
+    # Pattern 0a: <tool><TOOL_NAME><PARAM_NAME>value</PARAM_NAME></TOOL_NAME></tool>
+    # Format with closing tag for tool name: <tool><list_files><path>.</path></list_files></tool>
+    pattern0a = re.compile(
+        r'<tool>\s*<(\w+)>\s*((?:<\w+>[^<]*</\w+>\s*)+)\s*</\1>\s*</tool>',
+        re.DOTALL | re.IGNORECASE
+    )
+    
+    def replacer0a(match):
+        tool_name = match.group(1)
+        params_content = match.group(2)
+        
+        # Skip if this looks like a structural tag (not a real tool)
+        if tool_name.lower() in ['name', 'arguments', 'parameters', 'function', 'action', 'tool', 'tool_call']:
+            return match.group(0)
+        
+        # Extract all key-value pairs from simple XML tags
+        simple_params = re.findall(r'<(\w+)>([^<]*)</\1>', params_content, re.DOTALL)
+        params = {}
+        for param_name, value in simple_params:
+            if param_name.lower() in ['name', 'arguments', 'parameters', 'function', 'action', 'tool', 'tool_call']:
+                continue
+            try:
+                val = json.loads(value.strip())
+            except:
+                val = value.strip()
+            params[param_name] = val
+        
+        if params:
+            return f'<tool>{{"name": "{tool_name}", "arguments": {json.dumps(params)}}}</tool>'
+        else:
+            return f'<tool>{{"name": "{tool_name}", "arguments": {{}}}}</tool>'
+    
+    text = pattern0a.sub(replacer0a, text)
     
     # Pattern 0b: <tool><TOOL_NAME><PARAM_NAME>value</PARAM_NAME></tool>
     # Even simpler format without parameter= prefix: <tool><list_files><path>.</path></tool>
@@ -406,6 +449,75 @@ def repair_broken_tool_calls(text: str) -> str:
         return f'<tool>{{"name": "{tool_name}", "arguments": {json.dumps(args)}}}</tool>'
     
     text = pattern3.sub(replacer3, text)
+    
+    # Pattern 4: <tool><function>TOOL_NAME</function><parameters>...</parameters></tool>
+    # This is a common hallucination where the model uses <function> for the name
+    # and <parameters> for the args, but the parameters are XML not JSON
+    # The standalone_function TOOL_PATTERN already handles this for extraction,
+    # but we need to ensure the parameters XML gets properly converted
+    pattern4 = re.compile(
+        r'<tool>\s*<function>\s*(\w+)\s*</function>\s*<parameters>\s*((?:<\w+>[^<]*</\w+>\s*)*)\s*</parameters>\s*</tool>',
+        re.DOTALL | re.IGNORECASE
+    )
+    
+    def replacer4(match):
+        tool_name = match.group(1)
+        params_content = match.group(2).strip()
+        
+        # Extract all key-value pairs from XML tags
+        params = {}
+        for param_name, value in re.findall(r'<(\w+)>([^<]*)</\1>', params_content, re.DOTALL):
+            try:
+                val = json.loads(value.strip())
+            except:
+                val = value.strip()
+            params[param_name] = val
+        
+        if params:
+            return f'<tool>{{"name": "{tool_name}", "arguments": {json.dumps(params)}}}</tool>'
+        else:
+            return f'<tool>{{"name": "{tool_name}", "arguments": {{}}}}</tool>'
+    
+    text = pattern4.sub(replacer4, text)
+    
+    # Post-processing: Fill in missing required parameters with defaults
+    # This handles cases where the model produces a valid tool call but omits required params
+    _default_required_params = {
+        'list_files': {'path': '.'},
+        'search_files': {'path': '.'},
+        'read_file': {},
+    }
+    
+    def _fill_missing_params(match):
+        """Fill in missing required parameters in JSON tool calls."""
+        json_str = match.group(1)
+        try:
+            data = json.loads(json_str)
+            tool_name = data.get('name', '')
+            args = data.get('arguments', {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except:
+                    args = {}
+            
+            # Fill in missing required params
+            if tool_name in _default_required_params:
+                defaults = _default_required_params[tool_name]
+                for key, default_val in defaults.items():
+                    if key not in args:
+                        args[key] = default_val
+                        print(f"DEBUG repair: Added missing required param '{key}' = {default_val!r} for tool '{tool_name}'")
+                data['arguments'] = args
+            
+            return f'<tool>{json.dumps(data)}</tool>'
+        except:
+            return match.group(0)
+    
+    # Apply to all <tool>{JSON}</tool> patterns
+    text = re.sub(r'<tool>(\{[^}]*\})</tool>', _fill_missing_params, text, flags=re.DOTALL)
+    # Also handle multi-line JSON
+    text = re.sub(r'<tool>(\{.*?\})</tool>', _fill_missing_params, text, flags=re.DOTALL)
     
     return text
 
