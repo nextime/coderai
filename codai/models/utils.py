@@ -105,6 +105,8 @@ def get_resolved_model_name(requested_model: str, current_manager = None) -> str
     
     Handles aliases and ensures the correct model identifier is returned.
     """
+    print(f"DEBUG resolve: START - requested={requested_model}, has manager={current_manager is not None}")
+    
     global_args = get_global_args()
     
     # Get model aliases from args if available
@@ -112,10 +114,12 @@ def get_resolved_model_name(requested_model: str, current_manager = None) -> str
     
     # If it's an alias, return the resolved name
     if requested_model in model_aliases:
+        print(f"DEBUG resolve: found alias: {model_aliases[requested_model]}")
         return model_aliases[requested_model]
     
     # Try to get from current manager if available
     if current_manager is not None:
+        print(f"DEBUG resolve: has models={hasattr(current_manager, 'models')}")
         # Check if the model is loaded in the manager
         if hasattr(current_manager, 'models') and current_manager.models:
             # If requested_model is "default" or empty, get the actual loaded model
