@@ -2007,6 +2007,9 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         print(f"{'='*60}")
         print(f"force_reasoning CLI args: {force_reasoning_args}")
         print(f"enable_thinking API param: {enable_thinking_api}")
+        # Debug stop sequences if available
+        if 'raw_stop_sequences' in locals():
+            print(f"stop argument for chat call: {raw_stop_sequences}")
     
     # Get model family for reasoning tokens
     model_family = get_model_family(request.model)
