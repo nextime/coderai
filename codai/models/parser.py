@@ -1096,6 +1096,65 @@ class ToolCallParser:
                 }
             })
         
+        # NEW: Pattern for <tool><name>...</name><arguments><key>value</key></arguments></tool>
+        # This handles nested XML arguments inside <arguments> tag
+        # Example: <tool><name>execute_command</name><arguments><command>find ...</command></arguments></tool>
+        pattern_standalone_args_xml = r'<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>'
+        matches_standalone_args_xml = re.findall(pattern_standalone_args_xml, text, re.DOTALL | re.IGNORECASE)
+        
+        for name, args_xml in matches_standalone_args_xml:
+            name = name.strip()
+            if not name:
+                continue
+            
+            # Try to parse as JSON first
+            try:
+                args = json.loads(args_xml.strip()) if args_xml.strip() else {}
+            except json.JSONDecodeError:
+                # Fallback: extract key-value pairs from nested XML tags inside arguments
+                args = {}
+                for match in re.findall(r'<(\w+)>(.*?)</\1>', args_xml, re.DOTALL):
+                    k, v = match
+                    args[k] = v.strip()
+            
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:16]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args)
+                }
+            })
+        
+        # NEW: Pattern for <tool_call><tool><name>...</name><arguments><key>value</key></arguments></tool></tool_call>
+        # Handles nested XML arguments inside arguments tag with tool_call wrapper
+        pattern_nested_args_xml = r'<tool_call>\s*<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>\s*</tool_call>'
+        matches_nested_args_xml = re.findall(pattern_nested_args_xml, text, re.DOTALL | re.IGNORECASE)
+        
+        for name, args_xml in matches_nested_args_xml:
+            name = name.strip()
+            if not name:
+                continue
+            
+            # Try to parse as JSON first
+            try:
+                args = json.loads(args_xml.strip()) if args_xml.strip() else {}
+            except json.JSONDecodeError:
+                # Fallback: extract key-value pairs from nested XML tags
+                args = {}
+                for match in re.findall(r'<(\w+)>(.*?)</\1>', args_xml, re.DOTALL):
+                    k, v = match
+                    args[k] = v.strip()
+            
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:16]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args)
+                }
+            })
+        
         # NEW: Pattern for multiple tool calls in <tool_call> wrapper
         # Example: <tool_call><tool>...</tool><tool>...</tool></tool_call>
         pattern_multi = r'<tool_call>\s*(<tool>.*?</tool>)\s*</tool_call>'
