@@ -482,6 +482,21 @@ class ApexBig50Parser(BaseParser):
                 args = json_args.strip()
             results.append(self._to_oa(tool_name, args))
 
+        # NEW: <tool_call><tool><name>...</name><param>...</param></tool></tool_call> format
+        nested_tool_pattern = r'<tool_call>\s*<tool>\s*<name>(.*?)</name>\s*<param>(.*?)</param>\s*</tool>\s*</tool_call>'
+        for match in re.findall(nested_tool_pattern, text, re.DOTALL | re.IGNORECASE):
+            tool_name, params_content = match
+            tool_name = tool_name.strip()
+            if not tool_name:
+                continue
+            # Try to parse params as JSON
+            try:
+                args = json.loads(params_content.strip())
+            except:
+                # Fallback: treat as a simple string argument
+                args = params_content.strip()
+            results.append(self._to_oa(tool_name, args))
+
         # Markdown patterns
         md_patterns = [
             r'```json\s*([\[\{].*?[\]\}])\s*```',
