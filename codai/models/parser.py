@@ -1112,7 +1112,75 @@ class ToolCallParser:
                     }
                 })
         
-        return tool_calls
+        # NEW: Pattern for nested tool_call with multiple tool blocks inside
+        # Example: <tool_call><tool><name>search</name><arguments>{...}</arguments></tool><tool><name>search</name><arguments>{...}</arguments></tool></tool_call>
+        # Also handles case where there's a nested <tool_call> before second tool
+        pattern_multi_tools = r'<tool_call>\s*(<tool>.*?</tool>)\s*(?:<tool_call>\s*(<tool>.*?</tool>)\s*)?</tool_call>'
+        matches_multi_tools = re.findall(pattern_multi_tools, text, re.DOTALL | re.IGNORECASE)
+        
+        for tool_block1, tool_block2 in matches_multi_tools:
+            # Parse first tool block
+            inner_pattern = r'<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>'
+            inner_matches = re.findall(inner_pattern, tool_block1, re.DOTALL | re.IGNORECASE)
+            
+            for name, args_str in inner_matches:
+                name = name.strip()
+                if not name:
+                    continue
+                
+                try:
+                    args = json.loads(args_str.strip()) if args_str.strip() else {}
+                except json.JSONDecodeError:
+                    args = {}
+                
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:16]}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args)
+                    }
+                })
+            
+            # Parse second tool block if present
+            if tool_block2:
+                inner_matches2 = re.findall(inner_pattern, tool_block2, re.DOTALL | re.IGNORECASE)
+                for name, args_str in inner_matches2:
+                    name = name.strip()
+                    if not name:
+                        continue
+                    
+                    try:
+                        args = json.loads(args_str.strip()) if args_str.strip() else {}
+                    except json.JSONDecodeError:
+                        args = {}
+                    
+                    tool_calls.append({
+                        "id": f"call_{uuid.uuid4().hex[:16]}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(args)
+                        }
+                    })
+        
+        # Deduplicate tool calls based on name and arguments
+        seen = set()
+        unique_tool_calls = []
+        for tc in tool_calls:
+            name = tc.get('function', {}).get('name', '')
+            args = tc.get('function', {}).get('arguments', '')
+            
+            # Skip empty tool calls (no name or empty arguments)
+            if not name or args == '{}':
+                continue
+                
+            signature = (name, args)
+            if signature not in seen:
+                seen.add(signature)
+                unique_tool_calls.append(tc)
+        
+        return unique_tool_calls
     
     def set_model_name(self, model_name: str):
         """Set the model name for model-specific parsing."""
