@@ -2462,8 +2462,16 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         
         if global_debug:
             if formatted_response and isinstance(formatted_response, dict):
-                content = formatted_response.get('choices', [{}])[0].get('message', {}).get('content', '') if formatted_response.get('choices') else ''
-                print(f"RAW: Passed through formatter, got: {content[:100]}...")
+                try:
+                    choices = formatted_response.get('choices', [])
+                    if choices and len(choices) > 0:
+                        message = choices[0].get('message', {}) if isinstance(choices[0], dict) else {}
+                        content = message.get('content', '') if isinstance(message, dict) else ''
+                        print(f"RAW: Passed through formatter, got: {str(content)[:100]}...")
+                    else:
+                        print(f"RAW: WARNING - formatter returned empty choices!")
+                except Exception as e:
+                    print(f"RAW: ERROR accessing formatter response: {e}")
             else:
                 print(f"RAW: WARNING - formatter returned None or invalid response!")
         
