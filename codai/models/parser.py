@@ -859,6 +859,37 @@ class ToolCallParser:
     def __init__(self, tokenizer=None, model_name: str = None):
         self.tokenizer = tokenizer
         self.model_name = model_name
+        
+    def _parse_xml_style_tool_calls(self, text: str) -> List[Dict]:
+        """Parse XML-style tool calls like <tool><name>...</name><arguments>...</arguments></tool>."""
+        tool_calls = []
+        
+        # Pattern for <tool><name>...</name><arguments>...</arguments></tool>
+        pattern = r'<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>'
+        matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
+        
+        for name, args_str in matches:
+            name = name.strip()
+            if not name:
+                continue
+                
+            # Try to parse arguments as JSON
+            try:
+                args = json.loads(args_str.strip()) if args_str.strip() else {}
+            except json.JSONDecodeError:
+                # If not valid JSON, treat as empty object
+                args = {}
+                
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:16]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args)
+                }
+            })
+        
+        return tool_calls
     
     def set_model_name(self, model_name: str):
         """Set the model name for model-specific parsing."""
@@ -935,6 +966,12 @@ class ToolCallParser:
                         })
             except json.JSONDecodeError:
                 pass
+        
+        # If no tool calls found yet, try XML-style parsing as fallback
+        if not tool_calls:
+            xml_tool_calls = self._parse_xml_style_tool_calls(text)
+            if xml_tool_calls:
+                tool_calls.extend(xml_tool_calls)
         
         return tool_calls if tool_calls else None
 
