@@ -15,14 +15,20 @@ class ModelBackend(ABC):
     @abstractmethod
     def generate(self, prompt: str, max_tokens: Optional[int] = None, 
                  temperature: float = 0.7, top_p: float = 1.0,
-                 stop: Optional[List[str]] = None) -> str:
+                 stop: Optional[List[str]] = None,
+                 repeat_penalty: float = 1.0,
+                 presence_penalty: float = 0.0,
+                 frequency_penalty: float = 0.0) -> str:
         """Generate text non-streaming."""
         pass
     
     @abstractmethod
     def generate_stream(self, prompt: str, max_tokens: Optional[int] = None,
                         temperature: float = 0.7, top_p: float = 1.0,
-                        stop: Optional[List[str]] = None) -> AsyncGenerator[str, None]:
+                        stop: Optional[List[str]] = None,
+                        repeat_penalty: float = 1.0,
+                        presence_penalty: float = 0.0,
+                        frequency_penalty: float = 0.0) -> AsyncGenerator[str, None]:
         """Generate text in streaming fashion."""
         pass
     
