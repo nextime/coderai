@@ -142,11 +142,12 @@ class ModelManager:
     
     def generate(self, prompt: str, max_tokens: Optional[int] = None,
                  temperature: float = 0.7, top_p: float = 1.0,
-                 stop: Optional[List[str]] = None):
+                 stop: Optional[List[str]] = None, **kwargs):
         """Generate text non-streaming."""
         if self.backend is None:
             raise RuntimeError("No model loaded")
         return self.backend.generate(prompt, max_tokens, temperature, top_p, stop)
+
     
     def generate_chat(self, messages: List[Dict], max_tokens: Optional[int] = None,
                       temperature: float = 0.7, top_p: float = 1.0,
