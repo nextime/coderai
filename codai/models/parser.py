@@ -156,6 +156,186 @@ TOOL_PATTERNS = {
 RE_XML_TO_DICT = re.compile(r'<(\w+)>\s*(.*?)\s*</\1>')
 RE_XML_NESTED = re.compile(r'<\w+>')
 
+# =============================================================================
+# Broken Tool Call Repair Patterns
+# =============================================================================
+# These patterns handle common hallucinated formats the model produces
+
+def repair_broken_tool_calls(text: str) -> str:
+    """
+    Repair broken tool call formats that the model hallucinates.
+    
+    Common broken patterns:
+    - <tool><tool_name><param>value</param></tool_name></tool>
+    - <tool><tool_name><param1>value1</param1><param2>value2</param2></tool_name></tool>
+    - <tool><tool_name><param>value</param></tool> (missing </tool_name>)
+    
+    Converts to valid format:
+    - <tool>{"name": "tool_name", "arguments": {"param": "value", ...}}</tool>
+    """
+    if not text or '<tool>' not in text.lower():
+        return text
+    
+    # Pattern 0: <tool><TOOL_NAME><PARAM>value</PARAM></tool>
+    # This handles the most common broken format WITHOUT closing tag for tool name
+    # Example: <tool><list_files><path>.</path><recursive>true</recursive></tool>
+    pattern0 = re.compile(
+        r'<tool>\s*<(\w+)>\s*((?:<(?:parameter|param|arg|argument|property|key)[^>]*>[^<]*</(?:parameter|param|arg|argument|property|key)>\s*)+)\s*</tool>',
+        re.DOTALL | re.IGNORECASE
+    )
+    
+    def replacer0(match):
+        tool_name = match.group(1)
+        params_content = match.group(2)
+        # Extract all parameter name/value pairs
+        param_pattern = re.compile(r'<(?:parameter|param|arg|argument|property|key)[^>]*>([^<]*)</(?:parameter|param|arg|argument|property|key)>', re.IGNORECASE)
+        params = {}
+        
+        # Try to find the parameter names from the tags
+        param_name_pattern = re.compile(r'<((?:parameter|param|arg|argument|property|key)[^>]*)>([^<]*)</\1>', re.IGNORECASE)
+        for name_match, value_match in param_name_pattern.findall(params_content):
+            # Extract the actual parameter name (strip prefix like 'parameter=')
+            param_name = name_match.replace('parameter=', '').replace('param=', '').replace('arg=', '').strip()
+            if param_name and param_name not in ['parameter', 'param', 'arg', 'argument', 'property', 'key']:
+                try:
+                    val = json.loads(value_match.strip())
+                except:
+                    val = value_match.strip()
+                params[param_name] = val
+        
+        if params:
+            return f'<tool>{{"name": "{tool_name}", "arguments": {json.dumps(params)}}}</tool>'
+        else:
+            return f'<tool>{{"name": "{tool_name}", "arguments": {{}}}}</tool>'
+    
+    text = pattern0.sub(replacer0, text)
+    
+    # Pattern 0b: <tool><TOOL_NAME><PARAM_NAME>value</PARAM_NAME></tool>
+    # Even simpler format without parameter= prefix: <tool><list_files><path>.</path></tool>
+    pattern0b = re.compile(
+        r'<tool>\s*<(\w+)>\s*((?:<\w+>[^<]*</\w+>\s*)+)\s*</tool>',
+        re.DOTALL | re.IGNORECASE
+    )
+    
+    def replacer0b(match):
+        tool_name = match.group(1)
+        params_content = match.group(2)
+        
+        # Skip if this looks like a structural tag (not a real tool)
+        if tool_name.lower() in ['name', 'arguments', 'parameters', 'function', 'action', 'tool', 'tool_call']:
+            return match.group(0)
+        
+        # Extract all key-value pairs from simple XML tags
+        simple_params = re.findall(r'<(\w+)>([^<]*)</\1>', params_content, re.DOTALL)
+        params = {}
+        for param_name, value in simple_params:
+            # Skip structural tag names
+            if param_name.lower() in ['name', 'arguments', 'parameters', 'function', 'action', 'tool', 'tool_call']:
+                continue
+            # Try to parse as JSON, otherwise use as string
+            try:
+                val = json.loads(value.strip())
+            except:
+                val = value.strip()
+            params[param_name] = val
+        
+        if params:
+            return f'<tool>{{"name": "{tool_name}", "arguments": {json.dumps(params)}}}</tool>'
+        else:
+            return f'<tool>{{"name": "{tool_name}", "arguments": {{}}}}</tool>'
+    
+    text = pattern0b.sub(replacer0b, text)
+    
+    # Pattern 1: <tool><TOOL_NAME><PARAM>value</PARAM></TOOL_NAME></tool>
+    # This is another common hallucination with closing tag for tool name
+    pattern1 = re.compile(
+        r'<tool>\s*<(\w+)>\s*(<(?:parameter|param|arg|argument|property|key)[^>]*>([^<]*)</(?:parameter|param|arg|argument|property|key)>\s*)+</\1>\s*</tool>',
+        re.DOTALL | re.IGNORECASE
+    )
+    
+    def replacer1(match):
+        tool_name = match.group(1)
+        # Extract all parameter name/value pairs
+        param_pattern = re.compile(r'<(?:parameter|param|arg|argument|property|key)[^>]*>([^<]*)</(?:parameter|param|arg|argument|property|key)>', re.IGNORECASE)
+        params = {}
+        for pmatch in param_pattern.findall(match.group(0)):
+            # Try to parse as JSON, otherwise use as string
+            try:
+                val = json.loads(pmatch.strip())
+            except:
+                val = pmatch.strip()
+            # Use a generic parameter name if we can't determine it
+            param_idx = len(params)
+            params[f"param_{param_idx}"] = val
+        
+        # Also try to find the parameter names from the tags
+        param_name_pattern = re.compile(r'<((?:parameter|param|arg|argument|property|key)[^>]*)>([^<]*)</\1>', re.IGNORECASE)
+        named_params = {}
+        for name_match, value_match in param_name_pattern.findall(match.group(0)):
+            # Extract the actual parameter name (strip prefix like 'parameter=')
+            param_name = name_match.replace('parameter=', '').replace('param=', '').replace('arg=', '').strip()
+            if param_name and param_name not in ['parameter', 'param', 'arg', 'argument', 'property', 'key']:
+                try:
+                    val = json.loads(value_match.strip())
+                except:
+                    val = value_match.strip()
+                named_params[param_name] = val
+        
+        # Merge: named params override indexed params
+        if named_params:
+            params = named_params
+        
+        if params:
+            return f'<tool>{{"name": "{tool_name}", "arguments": {json.dumps(params)}}}</tool>'
+        else:
+            return f'<tool>{{"name": "{tool_name}", "arguments": {{}}}}</tool>'
+    
+    text = pattern1.sub(replacer1, text)
+    
+    # Pattern 2: <tool><TOOL_NAME>value</TOOL_NAME></tool> - tool name as tag with direct value
+    pattern2 = re.compile(
+        r'<tool>\s*<(\w+)>\s*([^<]+)\s*</\1>\s*</tool>',
+        re.DOTALL | re.IGNORECASE
+    )
+    
+    def replacer2(match):
+        tool_name = match.group(1)
+        value = match.group(2).strip()
+        # Try to parse value as JSON
+        try:
+            args = json.loads(value)
+        except:
+            args = {"value": value}
+        return f'<tool>{{"name": "{tool_name}", "arguments": {json.dumps(args)}}}</tool>'
+    
+    text = pattern2.sub(replacer2, text)
+    
+    # Pattern 3: Fix <tool><name>TOOL_NAME</name>...<arguments>...</arguments></tool> missing closing
+    # This handles incomplete tool calls that were cut off
+    pattern3 = re.compile(
+        r'<tool>\s*<name>\s*(\w+)\s*</name>\s*<arguments>([^<]*(?:<[^/][^>]*>[^<]*</[^>]*>[^<]*)*)</arguments>\s*</tool>',
+        re.DOTALL | re.IGNORECASE
+    )
+    
+    def replacer3(match):
+        tool_name = match.group(1)
+        args_str = match.group(2).strip()
+        # Try to extract JSON from arguments section
+        try:
+            # Look for JSON-like structure
+            json_match = re.search(r'\{[^{}]*\}', args_str)
+            if json_match:
+                args = json.loads(json_match.group(0))
+            else:
+                args = {}
+        except:
+            args = {}
+        return f'<tool>{{"name": "{tool_name}", "arguments": {json.dumps(args)}}}</tool>'
+    
+    text = pattern3.sub(replacer3, text)
+    
+    return text
+
 # Content filtering patterns - pre-compiled
 MALFORMED_PATTERNS = [
     re.compile(r'<<<<<<<\s+SEARCH.*?=======', re.DOTALL),
@@ -279,6 +459,10 @@ class QwenParser(BaseParser):
         
     @validate_tool_output
     def parse(self, text: str) -> List[Dict]:
+        # REPAIR: Fix broken tool call formats that the model hallucinates
+        # This handles cases like <tool><tool_name><param>value</param></tool_name></tool>
+        text = repair_broken_tool_calls(text)
+        
         # 0. PRE-VALIDATION: Check if text looks like reasoning output
         # If text contains thinking/reasoning tags, extract only the content after them
         # This prevents parsing partial tool calls from reasoning blocks
@@ -1429,6 +1613,10 @@ class ToolCallParser:
         # First filter out malformed content
         text = self._filter_malformed_content(text)
         
+        # REPAIR: Fix broken tool call formats that the model hallucinates
+        # This handles cases like <tool><tool_name><param>value</param></tool_name></tool>
+        text = repair_broken_tool_calls(text)
+        
         # For Qwen models, try Qwen-specific parsing first
         if self._is_qwen_model():
             qwen_tool_calls = self._parse_qwen_tool_calls(text)
@@ -1520,6 +1708,10 @@ class ModelParserAdapter:
         """Extract tool calls from model output using model-specific parsing."""
         if not text:
             return None
+        
+        # REPAIR: Fix broken tool call formats that the model hallucinates
+        # This handles cases like <tool><tool_name><param>value</param></tool_name></tool>
+        text = repair_broken_tool_calls(text)
         
         tools_dict = {}
         for tool in available_tools:
