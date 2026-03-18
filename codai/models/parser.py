@@ -889,6 +889,39 @@ class ToolCallParser:
                 }
             })
         
+        # NEW: Pattern for <tool><action>...</action><parameters>...</parameters></tool>
+        # Example: <tool><action>search</action><parameters>{"query": "Apple AAPL Q4"}</parameters></tool>
+        pattern_action = r'<tool>\s*<action>(.*?)</action>\s*<parameters>(.*?)</parameters>\s*</tool>'
+        matches_action = re.findall(pattern_action, text, re.DOTALL | re.IGNORECASE)
+        
+        for name, args_str in matches_action:
+            name = name.strip()
+            if not name:
+                continue
+                
+            # Try to parse arguments as JSON
+            try:
+                args = json.loads(args_str.strip()) if args_str.strip() else {}
+            except json.JSONDecodeError:
+                # If not valid JSON, try to extract key-value pairs from XML
+                args = {}
+                # Try to parse as key-value pairs
+                try:
+                    for match in re.findall(r'<(\w+)>(.*?)</\1>', args_str, re.DOTALL):
+                        k, v = match
+                        args[k] = v.strip()
+                except:
+                    pass
+            
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:16]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args)
+                }
+            })
+        
         # NEW: Pattern for <tool>name</tool><tool_call>JSON</tool_call> format
         # Example: <tool>search</tool><tool_call>{"query": "Apple AAPL Q4"}</tool_call>
         # Also handles case where both are opening tags: <tool_call>...</tool_call>
