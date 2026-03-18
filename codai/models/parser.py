@@ -1112,6 +1112,50 @@ class ToolCallParser:
                     }
                 })
         
+        # NEW: Pattern for short format <tool>TOOL_NAME>JSON</tool>
+        # Example: <tool>financial_data_fetcher>{"ticker": "AAPL", "period": "Q4"}</tool>
+        pattern_short = r'<tool>(\w+)>(\{.*?\})</tool>'
+        matches_short = re.findall(pattern_short, text, re.DOTALL)
+        
+        for name, args_str in matches_short:
+            name = name.strip()
+            if not name:
+                continue
+            try:
+                args = json.loads(args_str.strip()) if args_str.strip() else {}
+            except json.JSONDecodeError:
+                args = {}
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:16]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args)
+                }
+            })
+        
+        # NEW: Pattern for <tool_call><tool>TOOL_NAME>JSON</tool></tool_call>
+        # Example: <tool_call><tool>financial_data_fetcher>{"ticker": "MSFT"}</tool></tool_call>
+        pattern_short2 = r'<tool_call>\s*<tool>(\w+)>\s*(\{.*?\})\s*</tool>\s*</tool_call>'
+        matches_short2 = re.findall(pattern_short2, text, re.DOTALL)
+        
+        for name, args_str in matches_short2:
+            name = name.strip()
+            if not name:
+                continue
+            try:
+                args = json.loads(args_str.strip()) if args_str.strip() else {}
+            except json.JSONDecodeError:
+                args = {}
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:16]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args)
+                }
+            })
+        
         # NEW: Pattern for nested tool_call with multiple tool blocks inside
         # Example: <tool_call><tool><name>search</name><arguments>{...}</arguments></tool><tool><name>search</name><arguments>{...}</arguments></tool></tool_call>
         # Also handles case where there's a nested <tool_call> before second tool
