@@ -26,9 +26,6 @@ from datetime import datetime
 
 import requests
 
-# Import FuzzyToolBreaker for circuit breaker functionality
-from codai.models.utils import FuzzyToolBreaker
-
 
 # ANSI color codes
 class Colors:
@@ -541,8 +538,6 @@ class CoderClient:
         self.session_manager = session_manager
         self.session_name: Optional[str] = None
         self.input_history: List[str] = []  # Track user inputs for readline
-        # Initialize circuit breaker for detecting repetitive tool calls
-        self.tool_breaker = FuzzyToolBreaker(threshold=2, debug=self.config.debug)
     
     def chat(self, message: str, stream: bool = True) -> str:
         """Send a message to the API and get response."""
@@ -1000,26 +995,20 @@ class CoderClient:
                 # Show tool call with colors: yellow "Calling tool:", red tool name, white args
                 print(f"\n{Colors.YELLOW}Calling tool:{Colors.RESET} {Colors.RED}{tool_name}{Colors.RESET} -> {args_str}")
                 
-                # Check circuit breaker first
-                should_stop, stop_message = self.tool_breaker.check(tool_name, arguments)
-                if should_stop:
-                    print(f"{Colors.RED}{stop_message}{Colors.RESET}")
-                    result = {"error": stop_message, "stopped_by_breaker": True}
-                else:
-                    # Check if confirmation is needed
-                    needs_confirm = self.config.confirm_all
-                    if tool_name in self.config.confirm_commands:
-                        needs_confirm = self.config.confirm_commands[tool_name]
-                    
-                    if needs_confirm:
-                        confirm = input(f"{Colors.YELLOW}Execute? (y/N): {Colors.RESET}").strip().lower()
-                        if confirm not in ('y', 'yes'):
-                            result = {"error": "User declined execution", "declined": True}
-                            print(f"{Colors.YELLOW}Skipped{Colors.RESET}")
-                        else:
-                            result = self.tool_executor.execute(tool_name, arguments)
+                # Check if confirmation is needed
+                needs_confirm = self.config.confirm_all
+                if tool_name in self.config.confirm_commands:
+                    needs_confirm = self.config.confirm_commands[tool_name]
+                
+                if needs_confirm:
+                    confirm = input(f"{Colors.YELLOW}Execute? (y/N): {Colors.RESET}").strip().lower()
+                    if confirm not in ('y', 'yes'):
+                        result = {"error": "User declined execution", "declined": True}
+                        print(f"{Colors.YELLOW}Skipped{Colors.RESET}")
                     else:
                         result = self.tool_executor.execute(tool_name, arguments)
+                else:
+                    result = self.tool_executor.execute(tool_name, arguments)
                 
                 # Show result summary
                 if "error" in result:
@@ -1109,15 +1098,8 @@ class CoderClient:
                 except json.JSONDecodeError:
                     arguments = {}
                 
-                # Check circuit breaker first
-                should_stop, stop_message = self.tool_breaker.check(tool_name, arguments)
-                if should_stop:
-                    print(f"{Colors.RED}{stop_message}{Colors.RESET}")
-                    result = {"error": stop_message, "stopped_by_breaker": True}
-                else:
-                    print(f"  → {tool_name}({arguments})")
-                    result = self.tool_executor.execute(tool_name, arguments)
-                
+                print(f"  → {tool_name}({arguments})")
+                result = self.tool_executor.execute(tool_name, arguments)
                 tool_results.append({
                     "tool_call_id": tc['id'],
                     "role": "tool",
