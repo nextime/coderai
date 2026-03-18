@@ -466,6 +466,22 @@ class ApexBig50Parser(BaseParser):
             if tool_name:
                 results.append(self._to_oa(tool_name, props))
 
+        # NEW: <tool>name</tool>json format
+        # Example: <tool>yahoo_finance_api</tool>[{"symbol": "AAPL", ...}]
+        tool_json_pattern = r'<tool>(.*?)</tool>\s*(\[.*?\])'
+        for match in re.findall(tool_json_pattern, text, re.DOTALL | re.IGNORECASE):
+            tool_name, json_args = match
+            tool_name = tool_name.strip()
+            if not tool_name:
+                continue
+            # Try to parse the JSON arguments
+            try:
+                args = json.loads(json_args.strip())
+            except:
+                # If JSON parsing fails, use the raw string as argument
+                args = json_args.strip()
+            results.append(self._to_oa(tool_name, args))
+
         # Markdown patterns
         md_patterns = [
             r'```json\s*([\[\{].*?[\]\}])\s*```',
