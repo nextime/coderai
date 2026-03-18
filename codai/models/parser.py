@@ -169,12 +169,85 @@ def repair_broken_tool_calls(text: str) -> str:
     - <tool><tool_name><param>value</param></tool_name></tool>
     - <tool><tool_name><param1>value1</param1><param2>value2</param2></tool_name></tool>
     - <tool><tool_name><param>value</param></tool> (missing </tool_name>)
+    - <tool_call><tool_name></tool_name> (missing parameters)
+    - <wrong_tag><tool_name></wrong_tag> (wrong wrapper tag)
     
     Converts to valid format:
     - <tool>{"name": "tool_name", "arguments": {"param": "value", ...}}</tool>
     """
-    if not text or '<tool>' not in text.lower():
+    if not text or not any(tag in text.lower() for tag in ['<tool>', '<tool_call>', '<function']):
         return text
+    
+    # Pattern -1: Fix <tool_call> wrapper format (convert to <tool> for consistency)
+    # Example: <tool_call><list_files></list_files> -> <tool><list_files></list_files></tool>
+    # Also handles: <tool_call><tool><name>x</name></tool></tool_call> style
+    pattern_wrapper = re.compile(
+        r'<tool_call>\s*(<[^/][^>]*>.*?</[^>]+>)\s*</tool_call>',
+        re.DOTALL | re.IGNORECASE
+    )
+    
+    def fix_wrapper(match):
+        inner_content = match.group(1).strip()
+        # If inner content already has <tool> wrapper, keep it as-is
+        if inner_content.startswith('<tool>'):
+            return inner_content
+        # Otherwise wrap in <tool> tags
+        return f'<tool>{inner_content}</tool>'
+    
+    text = pattern_wrapper.sub(fix_wrapper, text)
+    
+    # Pattern -2: Handle wrong wrapper tags like <fetch_instructions>, <list_files> used as wrappers
+    # Example: <fetch_instructions><task>read_file</task><file_path>x</file_path></fetch_instructions>
+    # This should become: <tool>{"name": "fetch_instructions", "arguments": {"task": "read_file", "file_path": "x"}}</tool>
+    known_tools = ['read_file', 'write_file', 'list_files', 'search_files', 'execute_command',
+                   'fetch_instructions', 'ask_followup_question', 'attempt_completion',
+                   'browser_action', 'new_task', 'switch_mode', 'update_todo_list']
+    
+    for tool_name in known_tools:
+        pattern_wrong_wrapper = re.compile(
+            rf'<{tool_name}>\s*((?:<\w+>[^<]*</\w+>\s*)+)\s*</{tool_name}>',
+            re.DOTALL | re.IGNORECASE
+        )
+        
+        def fix_wrong_wrapper(match):
+            params_content = match.group(1)
+            # Extract all key-value pairs
+            params = {}
+            for param_name, value in re.findall(r'<(\w+)>([^<]*)</\1>', params_content, re.DOTALL):
+                try:
+                    val = json.loads(value.strip())
+                except:
+                    val = value.strip()
+                params[param_name] = val
+            
+            if params:
+                return f'<tool>{{"name": "{tool_name}", "arguments": {json.dumps(params)}}}</tool>'
+            else:
+                return f'<tool>{{"name": "{tool_name}", "arguments": {{}}}}</tool>'
+        
+        text = pattern_wrong_wrapper.sub(fix_wrong_wrapper, text)
+    
+    # Pattern -3: Handle incomplete tool calls with missing parameters
+    # Example: <tool><list_files></list_files> or <tool_call><list_files></list_files>
+    # Try to infer common parameters from context
+    pattern_incomplete = re.compile(
+        r'<tool>\s*<(\w+)>\s*</\1>\s*</tool>',
+        re.DOTALL | re.IGNORECASE
+    )
+    
+    def fix_incomplete(match):
+        tool_name = match.group(1)
+        # Provide default parameters for common tools
+        default_params = {
+            'list_files': {'path': '.', 'recursive': False},
+            'read_file': {'files': [{'path': 'README.md'}]},
+            'search_files': {'path': '.', 'regex': '.*', 'file_pattern': None},
+        }
+        
+        params = default_params.get(tool_name, {})
+        return f'<tool>{{"name": "{tool_name}", "arguments": {json.dumps(params)}}}</tool>'
+    
+    text = pattern_incomplete.sub(fix_incomplete, text)
     
     # Pattern 0: <tool><TOOL_NAME><PARAM>value</PARAM></tool>
     # This handles the most common broken format WITHOUT closing tag for tool name
