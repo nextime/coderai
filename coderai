@@ -2277,6 +2277,9 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 thought_tag, close_tag, _ = get_reasoning_stop_tokens(model_family)
                 reasoning_text = ""
                 
+                if global_debug:
+                    print(f"DEBUG: raw_stream_generate started, stream=True")
+                
                 # Use the backend's async generate if available
                 if hasattr(current_manager.backend, 'generate_stream'):
                     async for chunk in current_manager.backend.generate_stream(
@@ -2311,6 +2314,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 
                 # Second pass: get the rest
                 full_prompt = raw_prompt_for_generation + reasoning_text + (close_tag or "")
+                
+                if global_debug:
+                    print(f"DEBUG: raw_stream_generate second pass, full_prompt length: {len(full_prompt)}")
+                
                 second_pass_result = current_manager.generate(
                     prompt=full_prompt,
                     max_tokens=request.max_tokens or 2048,
@@ -2320,7 +2327,70 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     **extra_params,
                 )
                 
-                yield f"data: {json.dumps({'choices': [{'delta': {'content': second_pass_result}, 'finish_reason': 'stop'}]})}\n\n"
+                # In debug mode, dump the full generated text (second pass result)
+                if global_debug:
+                    print(f"\n{'='*80}")
+                    print(f"=== RAW STREAM: FULL GENERATED TEXT (DEBUG) ===")
+                    print(f"{'='*80}")
+                    print(f"--- SECOND PASS RESULT ---")
+                    print(second_pass_result)
+                    print(f"--- END SECOND PASS RESULT ---")
+                    print(f"{'='*80}\n")
+                    
+                    # Also dump the reasoning text from first pass
+                    print(f"\n{'='*80}")
+                    print(f"=== RAW STREAM: REASONING TEXT (DEBUG) ===")
+                    print(f"{'='*80}")
+                    print(reasoning_text)
+                    print(f"{'='*80}\n")
+                
+                # Try to extract tool calls from the second pass result
+                extracted_tool_calls = None
+                if request.tools:
+                    # Convert tools for ModelParserAdapter
+                    from codai.pydantic.textrequest import Tool, ToolFunction
+                    from codai.models.parser import ModelParserAdapter
+                    
+                    tools_list = []
+                    for t in request.tools:
+                        try:
+                            if isinstance(t, dict):
+                                func_data = t.get("function", {})
+                                tool_func = ToolFunction(
+                                    name=func_data.get("name", ""),
+                                    description=func_data.get("description"),
+                                    parameters=func_data.get("parameters")
+                                )
+                            else:
+                                tool_func = ToolFunction(
+                                    name=t.function.name if hasattr(t.function, 'name') else str(t.function),
+                                    description=t.function.description if hasattr(t.function, 'description') else None,
+                                    parameters=t.function.parameters if hasattr(t.function, 'parameters') else None
+                                )
+                            tools_list.append(Tool(type=t.get("type", "function") if isinstance(t, dict) else t.type, function=tool_func))
+                        except Exception as e:
+                            print(f"DEBUG: Error converting tool in raw stream: {e}")
+                            continue
+                    
+                    if tools_list:
+                        adapter = ModelParserAdapter(model_name=response_model_name)
+                        extracted_tool_calls = adapter.extract_tool_calls(second_pass_result, tools_list)
+                        
+                        if global_debug and extracted_tool_calls:
+                            print(f"\n{'='*80}")
+                            print(f"=== RAW STREAM: EXTRACTED TOOL CALLS (DEBUG) ===")
+                            print(f"{'='*80}")
+                            print(json.dumps(extracted_tool_calls, indent=2))
+                            print(f"{'='*80}\n")
+                        elif global_debug:
+                            print(f"DEBUG: No tool calls found in raw stream")
+                
+                if extracted_tool_calls:
+                    # Yield tool calls instead of content
+                    yield f"data: {json.dumps({'choices': [{'delta': {'tool_calls': extracted_tool_calls}, 'finish_reason': 'tool_calls'}]})}\n\n"
+                else:
+                    # No tool calls, yield the content as usual
+                    yield f"data: {json.dumps({'choices': [{'delta': {'content': second_pass_result}, 'finish_reason': 'stop'}]})}\n\n"
                 yield "data: [DONE]\n\n"
             
             return StreamingResponse(raw_stream_generate(), media_type="text/event-stream")
