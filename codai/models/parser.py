@@ -889,6 +889,33 @@ class ToolCallParser:
                 }
             })
         
+        # NEW: Pattern for <tool>name</tool><tool_call>JSON</tool_call> format
+        # Example: <tool>search</tool><tool_call>{"query": "Apple AAPL Q4"}</tool_call>
+        # Also handles case where both are opening tags: <tool_call>...</tool_call>
+        pattern2 = r'<tool>\s*(\w+)\s*</tool>\s*<tool_call>\s*(.+?)\s*(?:</tool_call>|$)'
+        matches2 = re.findall(pattern2, text, re.DOTALL | re.IGNORECASE)
+        
+        for name, args_str in matches2:
+            name = name.strip()
+            if not name:
+                continue
+            
+            # Try to parse arguments as JSON
+            try:
+                args = json.loads(args_str.strip()) if args_str.strip() else {}
+            except json.JSONDecodeError:
+                # If not valid JSON, treat as empty object
+                args = {}
+            
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:16]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args)
+                }
+            })
+        
         return tool_calls
     
     def set_model_name(self, model_name: str):
