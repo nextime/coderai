@@ -1273,6 +1273,28 @@ class ToolCallParser:
                 }
             })
         
+        # NEW: Pattern for <tool>{JSON}</tool> format
+        # Example: <tool>{"name": "web_search", "arguments": {"query": "test"}}</tool>
+        pattern_json_in_tool = r'<tool>\s*(\{.*?\})\s*</tool>'
+        matches_json_in_tool = re.findall(pattern_json_in_tool, text, re.DOTALL)
+        
+        for json_str in matches_json_in_tool:
+            try:
+                data = json.loads(json_str.strip())
+                name = data.get('name') or data.get('function')
+                args = data.get('arguments') or data.get('args') or {}
+                if name:
+                    tool_calls.append({
+                        "id": f"call_{uuid.uuid4().hex[:16]}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(args)
+                        }
+                    })
+            except json.JSONDecodeError:
+                pass
+        
         # NEW: Pattern for <tool_call><tool>TOOL_NAME>JSON</tool></tool_call>
         # Example: <tool_call><tool>financial_data_fetcher>{"ticker": "MSFT"}</tool></tool_call>
         pattern_short2 = r'<tool_call>\s*<tool>(\w+)>\s*(\{.*?\})\s*</tool>\s*</tool_call>'
