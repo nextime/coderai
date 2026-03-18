@@ -333,15 +333,31 @@ class AgenticTemplateManager:
         tools_text = None
         if tools and not has_custom_system:
             import json
+            from codai.pydantic.textrequest import Tool as PydanticTool
             tool_descriptions = []
             for tool in tools:
-                func = tool.get('function', {})
-                name = func.get('name', 'unknown')
-                desc = f"Tool: {name}"
-                if func.get('description'):
-                    desc += f"\nDescription: {func['description']}"
-                if func.get('parameters'):
-                    desc += f"\nParameters: {json.dumps(func['parameters'], indent=2)}"
+                # Handle both dict format and Pydantic model format
+                if isinstance(tool, dict):
+                    func = tool.get('function', {})
+                    name = func.get('name', 'unknown') if isinstance(func, dict) else 'unknown'
+                    desc = f"Tool: {name}"
+                    if func.get('description'):
+                        desc += f"\nDescription: {func['description']}"
+                    if func.get('parameters'):
+                        desc += f"\nParameters: {json.dumps(func['parameters'], indent=2)}"
+                elif isinstance(tool, PydanticTool):
+                    # Handle Pydantic Tool model
+                    func = tool.function
+                    name = func.name
+                    desc = f"Tool: {name}"
+                    if func.description:
+                        desc += f"\nDescription: {func.description}"
+                    if func.parameters:
+                        desc += f"\nParameters: {json.dumps(func.parameters, indent=2)}"
+                else:
+                    # Fallback for unknown format
+                    name = getattr(getattr(tool, 'function', None), 'name', 'unknown') if hasattr(tool, 'function') else 'unknown'
+                    desc = f"Tool: {name}"
                 tool_descriptions.append(desc)
             
             tools_text = "You have access to the following tools:\n\n" + "\n\n".join(tool_descriptions)
