@@ -246,6 +246,25 @@ class QwenParser(BaseParser):
             args = {k.strip(): self._relaxed_val(v) for k, v in params}
             found.append(self._to_oa(name.strip(), args))
             if found: break # Circuit breaker
+        
+        # NEW: Support <tool_call><tool><action>name</action><parameters>...</parameters></tool></tool_call>
+        if not found:
+            custom_pattern = r'<tool_call>\s*<tool>\s*<action>(.*?)</action>\s*<parameters>(.*?)</parameters>\s*</tool>\s*</tool_call>'
+            for match in re.findall(custom_pattern, text, re.DOTALL | re.IGNORECASE):
+                action, params_xml = match
+                # Try to parse params as JSON
+                try:
+                    params = json.loads(params_xml.strip())
+                except:
+                    # Fallback: extract key-value pairs
+                    params = {}
+                    for prop_match in re.findall(r'<(\w+)>(.*?)</\1>', params_xml, re.DOTALL):
+                        k, v = prop_match
+                        params[k] = v.strip()
+                if action.strip():
+                    found.append(self._to_oa(action.strip(), params))
+                if found: break  # Circuit breaker
+        
         return found
 
     def _relaxed_val(self, val):
