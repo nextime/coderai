@@ -345,12 +345,56 @@ async def log_requests(request: Request, call_next):
                 parsed = json.loads(body_str)
                 print(f"\n--- PARSED JSON STRUCTURE ---")
                 print(f"Keys: {list(parsed.keys())}")
+                
+                # Display model settings
+                print(f"\n--- MODEL SETTINGS ---")
+                model_settings = ['model', 'temperature', 'top_p', 'n', 'max_tokens', 'stream', 'stop', 
+                                 'presence_penalty', 'frequency_penalty', 'repeat_penalty',
+                                 'tool_choice', 'response_format', 'user', 'enable_thinking']
+                for setting in model_settings:
+                    if setting in parsed:
+                        value = parsed[setting]
+                        # Truncate long values for display
+                        if isinstance(value, str) and len(value) > 100:
+                            value = value[:100] + "..."
+                        elif isinstance(value, list) and len(value) > 10:
+                            value = value[:10] + [f"... ({len(value)-10} more)"]
+                        print(f"  {setting}: {value}")
+                print(f"--- END MODEL SETTINGS ---")
+                
                 if 'messages' in parsed and isinstance(parsed['messages'], list):
-                    print(f"Number of messages: {len(parsed['messages'])}")
+                    print(f"\n--- MESSAGES ({len(parsed['messages'])} total) ---")
                     for i, msg in enumerate(parsed['messages']):
                         role = msg.get('role', 'unknown')
-                        content_preview = str(msg.get('content', ''))[:50].replace('\n', ' ')
-                        print(f"  [{i}] {role}: {content_preview}...")
+                        content = msg.get('content', '')
+                        # Show preview of content
+                        if isinstance(content, str):
+                            content_preview = content[:80].replace('\n', ' ')
+                            if len(content) > 80:
+                                content_preview += "..."
+                        else:
+                            content_preview = str(content)[:80]
+                        print(f"  [{i}] {role}: {content_preview}")
+                        # Show tool_calls if present
+                        if 'tool_calls' in msg and msg['tool_calls']:
+                            print(f"       + tool_calls: {len(msg['tool_calls'])} call(s)")
+                        # Show if there's reasoning
+                        if 'reasoning' in msg and msg['reasoning']:
+                            print(f"       + reasoning: {str(msg['reasoning'])[:50]}...")
+                print(f"--- END MESSAGES ---")
+                
+                # Display tools if present
+                if 'tools' in parsed and parsed['tools']:
+                    print(f"\n--- TOOLS ({len(parsed['tools'])} total) ---")
+                    for i, tool in enumerate(parsed['tools']):
+                        if isinstance(tool, dict):
+                            func = tool.get('function', {})
+                            name = func.get('name', 'unknown')
+                            desc = func.get('description', '')
+                            if desc and len(desc) > 60:
+                                desc = desc[:60] + "..."
+                            print(f"  [{i}] {name}: {desc}")
+                
                 print(f"--- END PARSED JSON ---")
             except json.JSONDecodeError as e:
                 print(f"\n*** JSON Parse Error: {e} ***")
