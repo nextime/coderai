@@ -15,6 +15,8 @@ from .parser import (
     OpenAIFormatter,
     ToolCallParser,
     ModelParserAdapter,
+    filter_repetition,
+    validate_json_complete,
 )
 
 from .templates import AgenticTemplateManager
@@ -36,4 +38,6 @@ __all__ = [
     'ToolCallParser',
     'ModelParserAdapter',
     'AgenticTemplateManager',
+    'filter_repetition',
+    'validate_json_complete',
 ]

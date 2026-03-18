@@ -30,6 +30,7 @@ from threading import Thread
 
 # Import codai module for enhanced tool call parsing
 from codai.models import ModelParserDispatcher, OpenAIFormatter, ToolCallParser, ModelParserAdapter
+from codai.models.parser import filter_repetition
 
 # Import from codai modules for use in this file
 from codai.models.manager import ModelManager, WhisperServerManager, MultiModelManager
@@ -2380,6 +2381,30 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     **extra_params,
                 )
                 
+                # FIX: Apply repetition filtering to both reasoning and final text
+                reasoning_text = filter_repetition(reasoning_text)
+                second_pass_result = filter_repetition(second_pass_result)
+                
+                # FIX: If reasoning contains tool call tags, split at the first tool tag
+                # The tool call part should NOT be in reasoning - it should be left for tool extraction
+                tool_tag_patterns = ["<tool_call>", "<tool>", "<|tool_call|", "<function="]
+                earliest_tool_idx = len(reasoning_text)
+                earliest_tool_tag = None
+                for tag in tool_tag_patterns:
+                    idx = reasoning_text.find(tag)
+                    if idx != -1 and idx < earliest_tool_idx:
+                        earliest_tool_idx = idx
+                        earliest_tool_tag = tag
+                
+                if earliest_tool_tag:
+                    # Split: everything before the tool tag is reasoning, everything from the tag onwards goes to second_pass_result
+                    tool_part = reasoning_text[earliest_tool_idx:]
+                    reasoning_text = reasoning_text[:earliest_tool_idx].strip()
+                    # Prepend the tool part to second_pass_result so it can be extracted as a tool call
+                    second_pass_result = tool_part + second_pass_result
+                    if global_debug:
+                        print(f"DEBUG: Moved tool call from reasoning to second_pass_result: {tool_part[:100]}...")
+                
                 # In debug mode, dump the full generated text (second pass result)
                 if global_debug:
                     print(f"\n{'='*80}")
@@ -2397,21 +2422,17 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     print(reasoning_text)
                     print(f"{'='*80}\n")
                 
-                # Try to extract tool calls from the second pass result
-                # If second pass is empty, try the reasoning text as fallback
+                # Try to extract tool calls from the second pass result ONLY
+                # FIX: Do NOT fall back to reasoning text - tool calls should only come from final response
                 extracted_tool_calls = None
                 text_for_tool_extraction = second_pass_result
                 
-                # If second pass is empty or just whitespace, try reasoning text
-                if not text_for_tool_extraction or not text_for_tool_extraction.strip():
-                    if global_debug:
-                        print(f"DEBUG: Second pass result is empty, trying reasoning text")
-                        print(f"DEBUG: Reasoning text length: {len(reasoning_text)}")
-                        print(f"DEBUG: Reasoning text preview: {reasoning_text[:200] if reasoning_text else 'empty'}")
-                    text_for_tool_extraction = reasoning_text
-                
+                # CRITICAL: Only extract from second pass, never from reasoning
+                # Reasoning may contain partial/incomplete tool calls that confuse the parser
                 if global_debug:
-                    print(f"DEBUG: Final text for tool extraction: {text_for_tool_extraction[:200] if text_for_tool_extraction else 'empty'}")
+                    print(f"DEBUG: Tool extraction - using second_pass_result only")
+                    print(f"DEBUG: Second pass result length: {len(second_pass_result) if second_pass_result else 0}")
+                    print(f"DEBUG: Reasoning text length: {len(reasoning_text) if reasoning_text else 0}")
                 
                 if request.tools and text_for_tool_extraction:
                     # Convert tools for ModelParserAdapter
@@ -2442,6 +2463,23 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     if tools_list:
                         adapter = ModelParserAdapter(model_name=response_model_name)
                         extracted_tool_calls = adapter.extract_tool_calls(text_for_tool_extraction, tools_list)
+                        
+                        # FIX: Validate extracted tool calls have valid JSON
+                        if extracted_tool_calls:
+                            from codai.models.parser import validate_json_complete
+                            validated_calls = []
+                            for tc in extracted_tool_calls:
+                                args = tc.get('function', {}).get('arguments', '{}')
+                                if isinstance(args, str) and validate_json_complete(args):
+                                    validated_calls.append(tc)
+                                elif isinstance(args, dict):
+                                    # Dict is already valid
+                                    validated_calls.append(tc)
+                            
+                            if len(validated_calls) != len(extracted_tool_calls):
+                                if global_debug:
+                                    print(f"DEBUG: Filtered out {len(extracted_tool_calls) - len(validated_calls)} invalid tool calls")
+                            extracted_tool_calls = validated_calls if validated_calls else None
                         
                         if global_debug and extracted_tool_calls:
                             print(f"\n{'='*80}")
@@ -2534,6 +2572,30 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         # Clean up control tokens from final text
         final_text = cleanup_control_tokens(final_text)
         
+        # FIX: Apply repetition filtering to reasoning and final text
+        reasoning_text = filter_repetition(reasoning_text)
+        final_text = filter_repetition(final_text)
+        
+        # FIX: If reasoning contains tool call tags, split at the first tool tag
+        # The tool call part should NOT be in reasoning - it should be left for tool extraction in final_text
+        tool_tag_patterns = ["<tool_call>", "<tool>", "<|tool_call|", "<function="]
+        earliest_tool_idx = len(reasoning_text)
+        earliest_tool_tag = None
+        for tag in tool_tag_patterns:
+            idx = reasoning_text.find(tag)
+            if idx != -1 and idx < earliest_tool_idx:
+                earliest_tool_idx = idx
+                earliest_tool_tag = tag
+        
+        if earliest_tool_tag:
+            # Split: everything before the tool tag is reasoning, everything from the tag onwards goes to final_text
+            tool_part = reasoning_text[earliest_tool_idx:]
+            reasoning_text = reasoning_text[:earliest_tool_idx].strip()
+            # Prepend the tool part to final_text so it can be extracted as a tool call
+            final_text = tool_part + final_text
+            if global_debug:
+                print(f"RAW: Moved tool call from reasoning to final_text: {tool_part[:100]}...")
+        
         if global_debug:
             print(f"RAW: Final text after cleanup: {final_text[:100]}...")
         
@@ -2606,6 +2668,22 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             adapter = ModelParserAdapter(model_name=response_model_name)
             # Extract tool calls from final_text only (after reasoning is done)
             extracted_tool_calls = adapter.extract_tool_calls(final_text, tools_list)
+            
+            # FIX: Validate extracted tool calls have valid JSON
+            if extracted_tool_calls:
+                from codai.models.parser import validate_json_complete
+                validated_calls = []
+                for tc in extracted_tool_calls:
+                    args = tc.get('function', {}).get('arguments', '{}')
+                    if isinstance(args, str) and validate_json_complete(args):
+                        validated_calls.append(tc)
+                    elif isinstance(args, dict):
+                        # Dict is already valid
+                        validated_calls.append(tc)
+                
+                if len(validated_calls) != len(extracted_tool_calls):
+                    print(f"DEBUG: Filtered out {len(extracted_tool_calls) - len(validated_calls)} invalid tool calls in non-streaming")
+                extracted_tool_calls = validated_calls if validated_calls else None
             
             if extracted_tool_calls:
                 # Strip tool calls from the text
@@ -2898,6 +2976,9 @@ async def stream_chat_response(
             # Always filter malformed content
             filtered_chunk = filter_malformed_content(chunk)
             
+            # Apply repetition filtering to prevent infinite loops
+            filtered_chunk = filter_repetition(filtered_chunk)
+            
             # Always filter out tool call format
             filtered_chunk = tool_parser.strip_tool_calls_from_content(filtered_chunk)
             
@@ -2965,6 +3046,20 @@ async def stream_chat_response(
                     continue
             try:
                 tool_calls = tool_parser.extract_tool_calls(generated_text, tool_objects)
+                
+                # FIX: Validate extracted tool calls have valid JSON (stream_chat_response)
+                if tool_calls:
+                    from codai.models.parser import validate_json_complete
+                    validated_calls = []
+                    for tc in tool_calls:
+                        args = tc.get('function', {}).get('arguments', '{}')
+                        if isinstance(args, str) and validate_json_complete(args):
+                            validated_calls.append(tc)
+                        elif isinstance(args, dict):
+                            validated_calls.append(tc)
+                    if len(validated_calls) != len(tool_calls):
+                        print(f"DEBUG: Filtered out {len(tool_calls) - len(validated_calls)} invalid tool calls in stream_chat_response")
+                    tool_calls = validated_calls if validated_calls else None
             except Exception as e:
                 print(f"DEBUG: Error extracting tool calls: {e}")
                 tool_calls = None
@@ -3118,6 +3213,9 @@ async def generate_chat_response(
         # Always filter out malformed content
         generated_text = filter_malformed_content(generated_text)
         
+        # Apply repetition filtering to prevent infinite loops
+        generated_text = filter_repetition(generated_text)
+        
         # Dump raw output if enabled
         if global_dump:
             print(f"\n{'='*80}")
@@ -3160,6 +3258,20 @@ async def generate_chat_response(
                     continue
             try:
                 tool_calls = tool_parser.extract_tool_calls(generated_text, tool_objects)
+                
+                # FIX: Validate extracted tool calls have valid JSON (generate_chat_response)
+                if tool_calls:
+                    from codai.models.parser import validate_json_complete
+                    validated_calls = []
+                    for tc in tool_calls:
+                        args = tc.get('function', {}).get('arguments', '{}')
+                        if isinstance(args, str) and validate_json_complete(args):
+                            validated_calls.append(tc)
+                        elif isinstance(args, dict):
+                            validated_calls.append(tc)
+                    if len(validated_calls) != len(tool_calls):
+                        print(f"DEBUG: Filtered out {len(tool_calls) - len(validated_calls)} invalid tool calls in generate_chat_response")
+                    tool_calls = validated_calls if validated_calls else None
             except Exception as e:
                 print(f"DEBUG: Error extracting tool calls: {e}")
                 tool_calls = None

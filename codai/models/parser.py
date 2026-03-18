@@ -26,6 +26,7 @@ def extract_reasoning_content(text: str, model_family: str = None) -> Tuple[str,
     """Extract reasoning/thinking content from model output.
     
     Returns tuple of (reasoning_content, clean_text).
+    The reasoning_content will have any tool call tags stripped out.
     """
     reasoning_content = ""
     clean_text = text
@@ -55,6 +56,26 @@ def extract_reasoning_content(text: str, model_family: str = None) -> Tuple[str,
     # Cleanup
     for p in [r'<thought>.*?</thought>', r'<think>.*?</think>']:
         clean_text = re.sub(p, '', clean_text, flags=re.DOTALL | re.IGNORECASE)
+    
+    # FIX: If reasoning contains tool call tags, split at the first tool tag
+    # The tool call part should NOT be in reasoning - it should be left in clean_text for tool extraction
+    if reasoning_content:
+        tool_tag_patterns = ["<tool_call>", "<tool>", "<|tool_call|", "<function="]
+        earliest_tool_idx = len(reasoning_content)
+        earliest_tool_tag = None
+        for tag in tool_tag_patterns:
+            idx = reasoning_content.find(tag)
+            if idx != -1 and idx < earliest_tool_idx:
+                earliest_tool_idx = idx
+                earliest_tool_tag = tag
+        
+        if earliest_tool_tag:
+            # Split: everything before the tool tag is reasoning, tool part goes back to clean_text
+            tool_part = reasoning_content[earliest_tool_idx:]
+            reasoning_content = reasoning_content[:earliest_tool_idx].strip()
+            # Prepend the tool part to clean_text so it can be extracted as a tool call
+            clean_text = tool_part + " " + clean_text
+            clean_text = clean_text.strip()
     
     return reasoning_content, clean_text
 
@@ -161,6 +182,24 @@ class QwenParser(BaseParser):
         
     @validate_tool_output
     def parse(self, text: str) -> List[Dict]:
+        # 0. PRE-VALIDATION: Check if text looks like reasoning output
+        # If text contains thinking/reasoning tags, extract only the content after them
+        # This prevents parsing partial tool calls from reasoning blocks
+        thinking_pattern = r'<\|.*?\|>|<(?:thought|think)>.*?((?:</(?:thought|think)>)|$)|<\|begin.*?\|><\|end.*?\|>'
+        has_thinking = re.search(thinking_pattern, text, flags=re.IGNORECASE)
+        
+        # If text has thinking tags, check if there's actual content after them
+        if has_thinking:
+            # Find the last thinking tag position
+            thinking_matches = list(re.finditer(thinking_pattern, text, flags=re.DOTALL | re.IGNORECASE))
+            if thinking_matches:
+                last_think_end = thinking_matches[-1].end()
+                content_after_thinking = text[last_think_end:].strip()
+                # If there's no meaningful content after thinking, return empty
+                if not content_after_thinking or len(content_after_thinking) < 5:
+                    print(f"DEBUG QwenParser: Text appears to be reasoning only, no content after thinking tags")
+                    return []
+        
         # 1. IMMEDIATE REPETITION GUARD
         # If the model is looping the same tag, we only care about the first one.
         if text.count('<tool') > 1:
@@ -218,6 +257,11 @@ class QwenParser(BaseParser):
             if json_str.startswith('{') and not json_str.endswith('}'):
                 json_str += '}' 
 
+            # Validate JSON is complete before accepting
+            if not validate_json_complete(json_str):
+                print(f"DEBUG QwenParser: JSON appears incomplete, skipping: {json_str[:50]}...")
+                continue
+            
             try:
                 data = json.loads(json_str)
                 if 'name' in data:
@@ -773,6 +817,9 @@ def filter_malformed_content(text: str) -> str:
     if not text:
         return text
     
+    # Apply repetition filtering first
+    text = filter_repetition(text)
+    
     # Remove diff-like blocks that shouldn't be in the output
     filtered = text
     
@@ -792,6 +839,182 @@ def filter_malformed_content(text: str) -> str:
     
     # Don't strip single newlines or whitespace - they might be valid content
     return filtered
+
+
+def filter_repetition(text: str, min_repeat_count: int = 3, ngram_sizes: tuple = (2, 3)) -> str:
+    """
+    Detect and remove n-gram repetition from text.
+    
+    This function looks for sequences of 2-3 words that are repeated 3 or more times
+    consecutively (like "does does does" or "the the the the") and removes the duplicates.
+    
+    Args:
+        text: The input text to filter
+        min_repeat_count: Minimum number of repetitions to trigger removal (default: 3)
+        ngram_sizes: Tuple of n-gram sizes to check (default: (2, 3))
+    
+    Returns:
+        Text with repetition removed
+    """
+    if not text or len(text) < 10:
+        return text
+    
+    import re
+    
+    # Split into words while preserving whitespace for reconstruction
+    # Use a regex that captures words and the whitespace between them
+    parts = re.split(r'(\s+)', text)
+    words = []
+    for i, part in enumerate(parts):
+        if i % 2 == 0:
+            # Even indices are text content
+            words.append(part)
+        else:
+            # Odd indices are whitespace - attach to previous word
+            if words:
+                words[-1] = words[-1] + part
+    
+    if not words:
+        return text
+    
+    # Convert to list of (word, is_word) tuples to track what to keep
+    result = []
+    i = 0
+    
+    while i < len(words):
+        word = words[i]
+        
+        # Check if this is a word (contains non-whitespace)
+        is_word = bool(word.strip())
+        
+        if not is_word:
+            # Keep whitespace as-is
+            result.append(word)
+            i += 1
+            continue
+        
+        # Try each n-gram size
+        found_repetition = False
+        for ngram_size in ngram_sizes:
+            if i + ngram_size * min_repeat_count > len(words):
+                continue
+            
+            # Build the n-gram sequence to check
+            ngram_parts = []
+            valid = True
+            for j in range(ngram_size):
+                idx = i + j
+                if idx >= len(words):
+                    valid = False
+                    break
+                # Get the word part only (strip whitespace)
+                w = words[idx].strip()
+                if not w:
+                    valid = False
+                    break
+                ngram_parts.append(w)
+            
+            if not valid or len(ngram_parts) != ngram_size:
+                continue
+            
+            # Check if this n-gram repeats
+            ngram_str = ' '.join(ngram_parts)
+            repeat_count = 1
+            
+            # Count consecutive repetitions
+            check_idx = i
+            while check_idx + ngram_size * (repeat_count + 1) <= len(words):
+                # Check if next n-gram matches
+                next_ngram = []
+                for j in range(ngram_size):
+                    idx = check_idx + ngram_size * (repeat_count + 1) + j
+                    if idx >= len(words):
+                        break
+                    w = words[idx].strip()
+                    if not w:
+                        break
+                    next_ngram.append(w)
+                
+                if next_ngram == ngram_parts:
+                    repeat_count += 1
+                    check_idx = check_idx + ngram_size
+                else:
+                    break
+            
+            # If we found enough repetitions, remove duplicates
+            if repeat_count >= min_repeat_count:
+                # Keep only the first occurrence
+                for j in range(ngram_size):
+                    result.append(words[i + j])
+                
+                # Skip all the repeated n-grams
+                i += ngram_size * repeat_count
+                found_repetition = True
+                break
+        
+        if not found_repetition:
+            result.append(word)
+            i += 1
+    
+    return ''.join(result)
+
+
+def validate_json_complete(json_str: str) -> bool:
+    """
+    Validate that a JSON string is complete (not truncated).
+    
+    Checks for:
+    - Balanced braces and brackets
+    - No unclosed strings
+    - Valid structure
+    
+    Args:
+        json_str: The JSON string to validate
+    
+    Returns:
+        True if JSON appears complete, False if it appears truncated
+    """
+    if not json_str:
+        return False
+    
+    json_str = json_str.strip()
+    
+    # Check if it starts with { or [
+    if not (json_str.startswith('{') or json_str.startswith('[')):
+        return False
+    
+    # Try to parse it
+    try:
+        json.loads(json_str)
+        return True
+    except json.JSONDecodeError as e:
+        # Check if the error is due to truncation vs. syntax error
+        error_msg = str(e)
+        
+        # Common truncation errors
+        if 'Expecting' in error_msg and ('property name' in error_msg or 'value' in error_msg or 'string' in error_msg):
+            # This is likely truncated - we got cut off in the middle
+            return False
+        
+        # If we have a valid start but missing end, it's truncated
+        if json_str.endswith(',') or json_str.endswith(':'):
+            return False
+        
+        # Check for unclosed braces/brackets
+        open_braces = json_str.count('{')
+        close_braces = json_str.count('}')
+        open_brackets = json_str.count('[')
+        close_brackets = json_str.count(']')
+        
+        if open_braces > close_braces or open_brackets > close_brackets:
+            return False
+        
+        # Try again - if it still fails, it's a syntax error
+        try:
+            json.loads(json_str)
+            return True
+        except:
+            return False
 
 
 # =============================================================================
