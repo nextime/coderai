@@ -542,7 +542,7 @@ class CoderClient:
         self.session_name: Optional[str] = None
         self.input_history: List[str] = []  # Track user inputs for readline
         # Initialize circuit breaker for detecting repetitive tool calls
-        self.tool_breaker = FuzzyToolBreaker(threshold=2)
+        self.tool_breaker = FuzzyToolBreaker(threshold=2, debug=self.config.debug)
     
     def chat(self, message: str, stream: bool = True) -> str:
         """Send a message to the API and get response."""

@@ -301,8 +301,9 @@ class FuzzyToolBreaker:
     repeatedly trying the same failing tool call.
     """
     
-    def __init__(self, threshold=2):
+    def __init__(self, threshold=2, debug=False):
         self.threshold = threshold
+        self.debug = debug
         self.history = {}  # Key: (tool_name, normalized_args_hash) -> Count
 
     def _normalize(self, data):
@@ -339,6 +340,9 @@ class FuzzyToolBreaker:
         key = (tool_name, call_hash)
         self.history[key] = self.history.get(key, 0) + 1
         count = self.history[key]
+
+        if self.debug:
+            print(f"DEBUG FuzzyToolBreaker: {tool_name}({arguments}) -> count={count}, threshold={self.threshold}")
 
         if count > self.threshold:
             return True, (
