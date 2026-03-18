@@ -420,13 +420,15 @@ class PhiParser(BaseParser):
 
 
 # 10. APEX BIG 50 (Catch-All Parser)
+# Note: Most XML parsing is delegated to ToolCallParser as fallback.
+# This parser keeps unique patterns that ToolCallParser doesn't handle.
 class ApexBig50Parser(BaseParser):
     @validate_tool_output
     def parse(self, text: str) -> List[Dict]:
         results = []
         
-        # XML patterns
-        # Note: <tool> (without _call) is also matched here
+        # XML patterns - basic JSON-in-XML
+        # Note: Complex nested XML patterns are handled by ToolCallParser fallback
         xml_patterns = [
             r'<(?:tool|tool_call|function_call|tool_use)>(.*?)</(?:tool|tool_call|function_call|tool_use)>',
             r'\[TOOL_CALLS\](.*?)\[/TOOL_CALLS\]'
@@ -447,72 +449,7 @@ class ApexBig50Parser(BaseParser):
                         params = dict(re.findall(r'<(?:parameter|arg|argument)=(.*?)>(.*?)</(?:parameter|arg|argument)>', match, re.DOTALL))
                         results.append(self._to_oa(fn.group(1).strip(), params))
 
-        # NEW: Custom XML format with <action>, <object>, <properties> tags
-        # Example: <tool><action>search</action><object>financial_data</object><properties>...</properties></tool>
-        custom_xml_pattern = r'<tool>\s*<action>(.*?)</action>\s*<object>(.*?)</object>\s*<properties>(.*?)</properties>\s*</tool>'
-        for match in re.findall(custom_xml_pattern, text, re.DOTALL | re.IGNORECASE):
-            action, obj, props_xml = match
-            # Try to parse the properties as JSON
-            try:
-                props = json.loads(props_xml.strip())
-            except:
-                # Fallback: extract key-value pairs from XML properties
-                props = {}
-                for prop_match in re.findall(r'<(\w+)>(.*?)</\1>', props_xml, re.DOTALL):
-                    k, v = prop_match
-                    props[k] = v.strip()
-            # Use 'action' as the tool name
-            tool_name = action.strip()
-            if tool_name:
-                results.append(self._to_oa(tool_name, props))
-
-        # NEW: <tool>name</tool>json format
-        # Example: <tool>yahoo_finance_api</tool>[{"symbol": "AAPL", ...}]
-        tool_json_pattern = r'<tool>(.*?)</tool>\s*(\[.*?\])'
-        for match in re.findall(tool_json_pattern, text, re.DOTALL | re.IGNORECASE):
-            tool_name, json_args = match
-            tool_name = tool_name.strip()
-            if not tool_name:
-                continue
-            # Try to parse the JSON arguments
-            try:
-                args = json.loads(json_args.strip())
-            except:
-                # If JSON parsing fails, use the raw string as argument
-                args = json_args.strip()
-            results.append(self._to_oa(tool_name, args))
-
-        # NEW: <tool_call><tool><name>...</name><param>...</param></tool></tool_call> format
-        nested_tool_pattern = r'<tool_call>\s*<tool>\s*<name>(.*?)</name>\s*<param>(.*?)</param>\s*</tool>\s*</tool_call>'
-        for match in re.findall(nested_tool_pattern, text, re.DOTALL | re.IGNORECASE):
-            tool_name, params_content = match
-            tool_name = tool_name.strip()
-            if not tool_name:
-                continue
-            # Try to parse params as JSON
-            try:
-                args = json.loads(params_content.strip())
-            except:
-                # Fallback: treat as a simple string argument
-                args = params_content.strip()
-            results.append(self._to_oa(tool_name, args))
-
-        # NEW: <tool_call><tool><name>...</name><arguments>...</arguments></tool></tool_call> format
-        nested_tool_args_pattern = r'<tool_call>\s*<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>\s*</tool_call>'
-        for match in re.findall(nested_tool_args_pattern, text, re.DOTALL | re.IGNORECASE):
-            tool_name, args_content = match
-            tool_name = tool_name.strip()
-            if not tool_name:
-                continue
-            # Try to parse arguments as JSON
-            try:
-                args = json.loads(args_content.strip())
-            except:
-                # Fallback: treat as a simple string argument
-                args = args_content.strip()
-            results.append(self._to_oa(tool_name, args))
-
-        # Markdown patterns
+        # Markdown JSON patterns (unique to ApexBig50 - ToolCallParser doesn't handle this)
         md_patterns = [
             r'```json\s*([\[\{].*?[\]\}])\s*```',
         ]
@@ -528,64 +465,7 @@ class ApexBig50Parser(BaseParser):
                 except:
                     pass
 
-        # NEW: <tool_call><tool><name>...</name><arguments>...</arguments></tool></tool_call> format
-        nested_tool_call_pattern = r'<tool_call>\s*<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>\s*</tool_call>'
-        for match in re.findall(nested_tool_call_pattern, text, re.DOTALL | re.IGNORECASE):
-            tool_name, args_content = match
-            tool_name = tool_name.strip()
-            if not tool_name:
-                continue
-            # Try to parse arguments as JSON
-            try:
-                args = json.loads(args_content.strip())
-            except:
-                # Fallback: treat as a simple string argument
-                args = args_content.strip()
-            results.append(self._to_oa(tool_name, args))
-
-        # NEW: Multiple tool calls in <tool_call> wrapper
-        multi_tool_pattern = r'<tool_call>\s*(<tool>.*?</tool>)\s*</tool_call>'
-        for tool_block in re.findall(multi_tool_pattern, text, re.DOTALL | re.IGNORECASE):
-            inner_pattern = r'<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>'
-            for inner_match in re.findall(inner_pattern, tool_block, re.DOTALL | re.IGNORECASE):
-                tool_name, args_content = inner_match
-                tool_name = tool_name.strip()
-                if not tool_name:
-                    continue
-                try:
-                    args = json.loads(args_content.strip())
-                except:
-                    args = args_content.strip()
-                results.append(self._to_oa(tool_name, args))
-        
-        # NEW: Handle <function> and <parameters> tags (alternative to <name>/<arguments>)
-        # Pattern: <tool_call><tool><function>name</function><parameters>{"key": "value"}</parameters></tool></tool_call>
-        func_params_pattern = r'<tool_call>\s*<tool>\s*<function>(.*?)</function>\s*<parameters>(.*?)</parameters>\s*</tool>\s*</tool_call>'
-        for match in re.findall(func_params_pattern, text, re.DOTALL | re.IGNORECASE):
-            tool_name, params_content = match
-            tool_name = tool_name.strip()
-            if not tool_name:
-                continue
-            try:
-                args = json.loads(params_content.strip())
-            except:
-                args = params_content.strip()
-            results.append(self._to_oa(tool_name, args))
-        
-        # NEW: Standalone <tool><function>...</function><parameters>...</parameters></tool> without wrapper
-        standalone_func_pattern = r'<tool>\s*<function>(.*?)</function>\s*<parameters>(.*?)</parameters>\s*</tool>'
-        for match in re.findall(standalone_func_pattern, text, re.DOTALL | re.IGNORECASE):
-            tool_name, params_content = match
-            tool_name = tool_name.strip()
-            if not tool_name:
-                continue
-            try:
-                args = json.loads(params_content.strip())
-            except:
-                args = params_content.strip()
-            results.append(self._to_oa(tool_name, args))
-
-        # React pattern
+        # React pattern (unique to ApexBig50)
         react_matches = re.findall(r'Action:\s*(.*?)\nAction Input:\s*(\{.*?\})', text, re.DOTALL)
         for name, args_raw in react_matches:
             try:
