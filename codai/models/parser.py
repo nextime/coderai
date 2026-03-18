@@ -933,6 +933,10 @@ class ToolCallParser:
     
     def extract_tool_calls(self, text: str, available_tools: List) -> Optional[List[Dict]]:
         """Extract tool calls from model output."""
+        # Debug logging for ToolCallParser
+        print(f"DEBUG ToolCallParser: Called with text (first 200 chars): {repr(text[:200] if len(text) > 200 else text)}")
+        print(f"DEBUG ToolCallParser: available_tools count: {len(available_tools) if available_tools else 0}")
+        
         # First filter out malformed content
         text = self._filter_malformed_content(text)
         
@@ -940,6 +944,7 @@ class ToolCallParser:
         if self._is_qwen_model():
             qwen_tool_calls = self._parse_qwen_tool_calls(text)
             if qwen_tool_calls:
+                print(f"DEBUG ToolCallParser: Qwen parsing found {len(qwen_tool_calls)} tool calls")
                 return qwen_tool_calls
         
         tool_calls = []
@@ -971,7 +976,16 @@ class ToolCallParser:
         if not tool_calls:
             xml_tool_calls = self._parse_xml_style_tool_calls(text)
             if xml_tool_calls:
+                print(f"DEBUG ToolCallParser: XML-style parsing found {len(xml_tool_calls)} tool calls")
                 tool_calls.extend(xml_tool_calls)
+        
+        # Debug output for results
+        if tool_calls:
+            print(f"DEBUG ToolCallParser: Returning {len(tool_calls)} tool calls")
+            for i, tc in enumerate(tool_calls):
+                print(f"DEBUG ToolCallParser:   [{i}] {tc.get('function', {}).get('name', 'unknown')}: {tc.get('function', {}).get('arguments', {})}")
+        else:
+            print(f"DEBUG ToolCallParser: No tool calls found, returning None")
         
         return tool_calls if tool_calls else None
 
