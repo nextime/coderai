@@ -15,6 +15,7 @@ from .models.parser import (
 )
 
 from .models.templates import AgenticTemplateManager
+from .models.utils import FuzzyToolBreaker
 
 __all__ = [
     'ModelParserDispatcher',
@@ -30,4 +31,5 @@ __all__ = [
     'PhiParser',
     'ApexBig50Parser',
     'AgenticTemplateManager',
+    'FuzzyToolBreaker',
 ]

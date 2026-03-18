@@ -14,6 +14,7 @@ from codai.backends import detect_available_backends
 from codai.backends.cuda import NvidiaBackend
 from codai.backends.vulkan import VulkanBackend
 from codai.models.cache import get_cached_model_path, download_model, get_model_cache_dir
+from codai.models.utils import FuzzyToolBreaker
 from codai.pydantic.textrequest import ModelInfo
 
 
@@ -392,6 +393,7 @@ class MultiModelManager:
         self.model_aliases: Dict[str, str] = {}
         self.whisper_server: Optional[WhisperServerManager] = None
         self.model_backend_types: Dict[str, str] = {}
+        self.tool_breaker = FuzzyToolBreaker(threshold=3)  # Circuit breaker for repetitive tool calls
     
     @property
     def image_model(self) -> Optional[str]:
