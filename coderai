@@ -2251,7 +2251,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 
                 # Use the backend's async generate if available
                 if hasattr(current_manager.backend, 'generate_stream'):
-                    async for chunk in await current_manager.backend.generate_stream(
+                    async for chunk in current_manager.backend.generate_stream(
                         prompt=raw_prompt_for_generation,
                         max_tokens=request.max_tokens or 2048,
                         temperature=request.temperature,
