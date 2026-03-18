@@ -234,6 +234,14 @@ class QwenParser(BaseParser):
         # 4. CODER STYLE FALLBACK
         if not results:
             results = self._parse_coder_style(clean_text)
+        
+        # 5. Fallback: if no tool calls found, try using ToolCallParser
+        if not results:
+            tool_call_parser = ToolCallParser()
+            fallback_calls = tool_call_parser.extract_tool_calls(text, [])
+            if fallback_calls:
+                print(f"DEBUG QwenParser: ToolCallParser fallback found {len(fallback_calls)} tool calls")
+                results.extend(fallback_calls)
 
         return results
 
@@ -287,6 +295,14 @@ class DeepSeekParser(BaseParser):
             except:
                 continue
         
+        # Fallback: if no tool calls found, try using ToolCallParser
+        if not results:
+            tool_call_parser = ToolCallParser()
+            fallback_calls = tool_call_parser.extract_tool_calls(text, [])
+            if fallback_calls:
+                print(f"DEBUG DeepSeekParser: ToolCallParser fallback found {len(fallback_calls)} tool calls")
+                results.extend(fallback_calls)
+        
         return results
 
 
@@ -305,6 +321,14 @@ class LlamaParser(BaseParser):
             except:
                 continue
         
+        # Fallback: if no tool calls found, try using ToolCallParser
+        if not results:
+            tool_call_parser = ToolCallParser()
+            fallback_calls = tool_call_parser.extract_tool_calls(text, [])
+            if fallback_calls:
+                print(f"DEBUG LlamaParser: ToolCallParser fallback found {len(fallback_calls)} tool calls")
+                results.extend(fallback_calls)
+        
         return results
 
 
@@ -322,6 +346,14 @@ class MistralParser(BaseParser):
                     results.append(self._to_oa(c["name"], c["arguments"]))
             except:
                 pass
+        
+        # Fallback: if no tool calls found, try using ToolCallParser
+        if not results:
+            tool_call_parser = ToolCallParser()
+            fallback_calls = tool_call_parser.extract_tool_calls(text, [])
+            if fallback_calls:
+                print(f"DEBUG MistralParser: ToolCallParser fallback found {len(fallback_calls)} tool calls")
+                results.extend(fallback_calls)
         
         return results
 
@@ -343,6 +375,14 @@ class ClaudeParser(BaseParser):
                     args = args_match.group(1) if args_match else {}
                 results.append(self._to_oa(name_match.group(1), args))
         
+        # Fallback: if no tool calls found, try using ToolCallParser
+        if not results:
+            tool_call_parser = ToolCallParser()
+            fallback_calls = tool_call_parser.extract_tool_calls(text, [])
+            if fallback_calls:
+                print(f"DEBUG ClaudeParser: ToolCallParser fallback found {len(fallback_calls)} tool calls")
+                results.extend(fallback_calls)
+        
         return results
 
 
@@ -359,6 +399,14 @@ class CommandRParser(BaseParser):
                 results.append(self._to_oa(action.group(1).strip(), json.loads(args.group(1))))
             except:
                 pass
+        
+        # Fallback: if no tool calls found, try using ToolCallParser
+        if not results:
+            tool_call_parser = ToolCallParser()
+            fallback_calls = tool_call_parser.extract_tool_calls(text, [])
+            if fallback_calls:
+                print(f"DEBUG CommandRParser: ToolCallParser fallback found {len(fallback_calls)} tool calls")
+                results.extend(fallback_calls)
         
         return results
 
@@ -377,6 +425,14 @@ class GemmaParser(BaseParser):
             except:
                 pass
         
+        # Fallback: if no tool calls found, try using ToolCallParser
+        if not results:
+            tool_call_parser = ToolCallParser()
+            fallback_calls = tool_call_parser.extract_tool_calls(text, [])
+            if fallback_calls:
+                print(f"DEBUG GemmaParser: ToolCallParser fallback found {len(fallback_calls)} tool calls")
+                results.extend(fallback_calls)
+        
         return results
 
 
@@ -393,6 +449,14 @@ class GrokParser(BaseParser):
                     results.append(self._to_oa(c["name"], c["arguments"]))
         except:
             pass
+        
+        # Fallback: if no tool calls found, try using ToolCallParser
+        if not results:
+            tool_call_parser = ToolCallParser()
+            fallback_calls = tool_call_parser.extract_tool_calls(text, [])
+            if fallback_calls:
+                print(f"DEBUG GrokParser: ToolCallParser fallback found {len(fallback_calls)} tool calls")
+                results.extend(fallback_calls)
         
         return results
 
@@ -415,6 +479,14 @@ class PhiParser(BaseParser):
         # Fallback to Llama-style markdown
         if not results:
             results = LlamaParser(self.tools).parse(text)
+        
+        # Fallback: if still no tool calls found, try using ToolCallParser
+        if not results:
+            tool_call_parser = ToolCallParser()
+            fallback_calls = tool_call_parser.extract_tool_calls(text, [])
+            if fallback_calls:
+                print(f"DEBUG PhiParser: ToolCallParser fallback found {len(fallback_calls)} tool calls")
+                results.extend(fallback_calls)
         
         return results
 
@@ -472,6 +544,14 @@ class ApexBig50Parser(BaseParser):
                 results.append(self._to_oa(name.strip(), json.loads(args_raw.strip())))
             except:
                 pass
+
+        # Fallback: if no tool calls found, try using ToolCallParser
+        if not results:
+            tool_call_parser = ToolCallParser()
+            fallback_calls = tool_call_parser.extract_tool_calls(text, [])
+            if fallback_calls:
+                print(f"DEBUG ApexBig50Parser: ToolCallParser fallback found {len(fallback_calls)} tool calls")
+                results.extend(fallback_calls)
 
         return results
 
@@ -1225,6 +1305,111 @@ class ToolCallParser:
                 unique_tool_calls.append(tc)
         
         return unique_tool_calls
+
+    def _parse_multiline_tool_calls(self, text: str) -> List[Dict]:
+        """Parse multi-line tool_call format with newlines between tags.
+        
+        This handles format like:
+        <tool_call>
+        <tool>
+        <name>search</name>
+        <arguments>
+        {"query": "Apple AAPL Q4 2023"}
+        </arguments>
+        </tool>
+        <tool>
+        <name>search</name>
+        <arguments>
+        {"query": "Microsoft MSFT Q4 2023"}
+        </arguments>
+        </tool>
+        </tool_call>
+        """
+        tool_calls = []
+        
+        # Pattern for multi-line tool_call with separate tool blocks
+        # This pattern is more lenient with whitespace and newlines
+        pattern_multiline = r'<tool_call>\s*(.*?)\s*</tool_call>'
+        matches = re.findall(pattern_multiline, text, re.DOTALL | re.IGNORECASE)
+        
+        for match in matches:
+            # Find each <tool> block within the tool_call
+            tool_blocks = re.findall(r'<tool>\s*(.*?)\s*</tool>', match, re.DOTALL | re.IGNORECASE)
+            
+            for tool_block in tool_blocks:
+                # Extract name
+                name_match = re.search(r'<name>\s*(.*?)\s*</name>', tool_block, re.DOTALL | re.IGNORECASE)
+                if not name_match:
+                    continue
+                
+                name = name_match.group(1).strip()
+                if not name:
+                    continue
+                
+                # Extract arguments - could be JSON or XML-style
+                args_match = re.search(r'<arguments>\s*(.*?)\s*</arguments>', tool_block, re.DOTALL | re.IGNORECASE)
+                if not args_match:
+                    # Try <parameters> as alternative
+                    args_match = re.search(r'<parameters>\s*(.*?)\s*</parameters>', tool_block, re.DOTALL | re.IGNORECASE)
+                
+                if args_match:
+                    args_str = args_match.group(1).strip()
+                    try:
+                        args = json.loads(args_str) if args_str else {}
+                    except json.JSONDecodeError:
+                        # Try cleaning up the JSON string
+                        cleaned = args_str.replace('\n', ' ').replace('\r', '')
+                        try:
+                            args = json.loads(cleaned)
+                        except:
+                            # Try extracting key-value pairs from XML
+                            args = {}
+                            for k, v in re.findall(r'<(\w+)>\s*(.*?)\s*</\1>', args_str, re.DOTALL):
+                                args[k] = v.strip()
+                else:
+                    args = {}
+                
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:16]}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args)
+                    }
+                })
+        
+        # Also try simpler pattern for standalone multi-line tools
+        # <tool>
+        # <name>search</name>
+        # <arguments>{...}</arguments>
+        # </tool>
+        standalone_pattern = r'<tool>\s*<name>\s*(.*?)\s*</name>\s*<arguments>\s*(.*?)\s*</arguments>\s*</tool>'
+        standalone_matches = re.findall(standalone_pattern, text, re.DOTALL | re.IGNORECASE)
+        
+        for name, args_str in standalone_matches:
+            name = name.strip()
+            if not name:
+                continue
+            
+            try:
+                args = json.loads(args_str.strip()) if args_str.strip() else {}
+            except json.JSONDecodeError:
+                cleaned = args_str.replace('\n', ' ').replace('\r', '')
+                try:
+                    args = json.loads(cleaned)
+                except:
+                    args = {}
+            
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:16]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args)
+                }
+            })
+        
+        return tool_calls
     
     def set_model_name(self, model_name: str):
         """Set the model name for model-specific parsing."""
@@ -1313,6 +1498,13 @@ class ToolCallParser:
             if xml_tool_calls:
                 print(f"DEBUG ToolCallParser: XML-style parsing found {len(xml_tool_calls)} tool calls")
                 tool_calls.extend(xml_tool_calls)
+        
+        # If still no tool calls, try multi-line format parsing
+        if not tool_calls:
+            multiline_tool_calls = self._parse_multiline_tool_calls(text)
+            if multiline_tool_calls:
+                print(f"DEBUG ToolCallParser: Multi-line parsing found {len(multiline_tool_calls)} tool calls")
+                tool_calls.extend(multiline_tool_calls)
         
         # Debug output for results
         if tool_calls:

@@ -2335,13 +2335,22 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                         **extra_params,
                     ):
                         reasoning_text += chunk
+                        
+                        # Debug: log first pass chunks
+                        if global_debug:
+                            print(f"DEBUG FIRST PASS: chunk length={len(chunk)}, total reasoning so far={len(reasoning_text)}")
+                        
                         yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk}, 'finish_reason': None}]})}\n\n"
                         
                         # Check if we hit the close tag
                         if close_tag and close_tag in reasoning_text:
+                            if global_debug:
+                                print(f"DEBUG: Close tag detected in first pass, reasoning length={len(reasoning_text)}")
                             break
                 else:
                     # Fallback: non-streaming
+                    if global_debug:
+                        print(f"DEBUG: Using non-streaming fallback for first pass")
                     first_pass_result = current_manager.generate(
                         prompt=raw_prompt_for_generation,
                         max_tokens=request.max_tokens or 2048,
@@ -2397,7 +2406,12 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 if not text_for_tool_extraction or not text_for_tool_extraction.strip():
                     if global_debug:
                         print(f"DEBUG: Second pass result is empty, trying reasoning text")
+                        print(f"DEBUG: Reasoning text length: {len(reasoning_text)}")
+                        print(f"DEBUG: Reasoning text preview: {reasoning_text[:200] if reasoning_text else 'empty'}")
                     text_for_tool_extraction = reasoning_text
+                
+                if global_debug:
+                    print(f"DEBUG: Final text for tool extraction: {text_for_tool_extraction[:200] if text_for_tool_extraction else 'empty'}")
                 
                 if request.tools and text_for_tool_extraction:
                     # Convert tools for ModelParserAdapter
