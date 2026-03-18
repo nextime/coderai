@@ -586,8 +586,8 @@ class OpenAIFormatter:
                         total_tokens=prompt_tokens + completion_tokens
                     )
                 ).model_dump()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"DEBUG formatter: litellm fallback failed: {e}")
         
         # Fallback to plain dict if litellm fails
         message = {

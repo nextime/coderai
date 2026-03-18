@@ -2456,7 +2456,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         )
         
         if global_debug:
-            print(f"RAW: Passed through formatter, got: {formatted_response.get('choices', [{}])[0].get('message', {}).get('content', '')[:100]}...")
+            if formatted_response:
+                print(f"RAW: Passed through formatter, got: {formatted_response.get('choices', [{}])[0].get('message', {}).get('content', '')[:100]}...")
+            else:
+                print(f"RAW: WARNING - formatter returned None!")
         
         # Add mock reasoning stats if 'mock' is in force_reasoning_args
         # But only if we DON'T already have real reasoning from extraction
