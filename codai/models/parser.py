@@ -1045,6 +1045,73 @@ class ToolCallParser:
                     }
                 })
         
+        # NEW: Pattern for nested tool format where tool name IS the tag itself
+        # Example: <tool_call><tool><list_files><path>.</path><recursive>true</recursive></list_files></tool></tool_call>
+        # The tool name (<list_files>) is the tag, and arguments are nested child tags
+        pattern_nested_tool = r'<tool_call>\s*<tool>\s*<(\w+)>\s*(.*?)</\1>\s*</tool>\s*</tool_call>'
+        matches_nested_tool = re.findall(pattern_nested_tool, text, re.DOTALL | re.IGNORECASE)
+        
+        for tool_name, args_xml in matches_nested_tool:
+            tool_name = tool_name.strip()
+            if not tool_name:
+                continue
+            
+            # Parse nested XML arguments into a dict
+            args = {}
+            for match in re.findall(r'<(\w+)>(.*?)</\1>', args_xml, re.DOTALL):
+                k, v = match
+                # Try to parse value as JSON for proper types (bool, int, etc.)
+                try:
+                    parsed_v = json.loads(v.strip())
+                    args[k] = parsed_v
+                except (json.JSONDecodeError, ValueError):
+                    # Keep as string
+                    args[k] = v.strip()
+            
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:16]}",
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(args)
+                }
+            })
+        
+        # NEW: Pattern for standalone nested tool (without outer tool_call wrapper)
+        # Example: <tool><list_files><path>.</path><recursive>true</recursive></list_files></tool>
+        pattern_standalone_nested = r'<tool>\s*<(\w+)>\s*(.*?)</\1>\s*</tool>'
+        matches_standalone_nested = re.findall(pattern_standalone_nested, text, re.DOTALL | re.IGNORECASE)
+        
+        for tool_name, args_xml in matches_standalone_nested:
+            tool_name = tool_name.strip()
+            if not tool_name:
+                continue
+            
+            # Skip if this matches other known patterns (avoid duplicates)
+            if tool_name in ['name', 'arguments', 'parameters', 'action', 'function']:
+                continue
+            
+            # Parse nested XML arguments into a dict
+            args = {}
+            for match in re.findall(r'<(\w+)>(.*?)</\1>', args_xml, re.DOTALL):
+                k, v = match
+                try:
+                    parsed_v = json.loads(v.strip())
+                    args[k] = parsed_v
+                except (json.JSONDecodeError, ValueError):
+                    args[k] = v.strip()
+            
+            # Only add if we actually parsed some arguments
+            if args:
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:16]}",
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(args)
+                    }
+                })
+        
         return tool_calls
     
     def set_model_name(self, model_name: str):
@@ -1224,6 +1291,13 @@ class ModelParserAdapter:
         text = re.sub(r'<tool=[^>]+>.*?</tool>', '', text, flags=re.DOTALL)
         text = re.sub(r'<tool>.*?</tool>', '', text, flags=re.DOTALL)
         text = re.sub(r'<function>.*?</function>', '', text, flags=re.DOTALL)
+        
+        # NEW: Remove nested tool format where tool name is the tag
+        # Pattern: <tool_call><tool><toolname>...</toolname></tool></tool_call>
+        text = re.sub(r'<tool_call>\s*<tool>\s*<\w+>.*?</\w+>\s*</tool>\s*</tool_call>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        # Pattern: <tool><toolname>...</toolname></tool>
+        text = re.sub(r'<tool>\s*<\w+>.*?</\w+>\s*</tool>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        
         text = re.sub(r'\n{3,}', '\n\n', text)
         
         return text
