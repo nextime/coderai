@@ -2246,6 +2246,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             # For streaming, we need to handle it differently
             # First pass: generate until reasoning close tag (stream it)
             async def raw_stream_generate():
+                import json  # Local import for nested function
                 thought_tag, close_tag, _ = get_reasoning_stop_tokens(model_family)
                 reasoning_text = ""
                 
