@@ -961,6 +961,61 @@ class ToolCallParser:
                 }
             })
         
+        # NEW: Pattern for <tool_call><tool><name>...</name><parameters><key>value</key></parameters></tool></tool_call>
+        # Example: <tool_call><tool><name>search</name><parameters><query>test</query></parameters></tool></tool_call>
+        pattern_nested_params = r'<tool_call>\s*<tool>\s*<name>(.*?)</name>\s*<parameters>(.*?)</parameters>\s*</tool>\s*</tool_call>'
+        matches_nested_params = re.findall(pattern_nested_params, text, re.DOTALL | re.IGNORECASE)
+        
+        for name, params_xml in matches_nested_params:
+            name = name.strip()
+            if not name:
+                continue
+            
+            # Try to parse as JSON first
+            try:
+                args = json.loads(params_xml.strip()) if params_xml.strip() else {}
+            except json.JSONDecodeError:
+                # Fallback: extract key-value pairs from nested XML tags
+                args = {}
+                for match in re.findall(r'<(\w+)>(.*?)</\1>', params_xml, re.DOTALL):
+                    k, v = match
+                    args[k] = v.strip()
+            
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:16]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args)
+                }
+            })
+        
+        # NEW: Pattern for standalone <tool><name>...</name><parameters><key>value</key></parameters></tool>
+        pattern_standalone_params = r'<tool>\s*<name>(.*?)</name>\s*<parameters>(.*?)</parameters>\s*</tool>'
+        matches_standalone_params = re.findall(pattern_standalone_params, text, re.DOTALL | re.IGNORECASE)
+        
+        for name, params_xml in matches_standalone_params:
+            name = name.strip()
+            if not name:
+                continue
+            
+            try:
+                args = json.loads(params_xml.strip()) if params_xml.strip() else {}
+            except json.JSONDecodeError:
+                args = {}
+                for match in re.findall(r'<(\w+)>(.*?)</\1>', params_xml, re.DOTALL):
+                    k, v = match
+                    args[k] = v.strip()
+            
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:16]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args)
+                }
+            })
+        
         # NEW: Pattern for multiple tool calls in <tool_call> wrapper
         # Example: <tool_call><tool>...</tool><tool>...</tool></tool_call>
         pattern_multi = r'<tool_call>\s*(<tool>.*?</tool>)\s*</tool_call>'
