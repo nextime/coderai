@@ -121,16 +121,22 @@ def get_resolved_model_name(requested_model: str, current_manager = None) -> str
             # If requested_model is "default" or empty, get the actual loaded model
             if requested_model in ("default", "", None) or not requested_model:
                 # Try default_model first
-                if hasattr(current_manager, 'default_model') and current_manager.default_model and current_manager.default_model != "default":
-                    return current_manager.default_model
+                default_model = getattr(current_manager, 'default_model', None)
+                print(f"DEBUG resolve: default_model = {default_model}, models = {list(current_manager.models.keys())}")
+                if default_model and default_model != "default":
+                    print(f"DEBUG resolve: returning default_model: {default_model}")
+                    return default_model
                 # Otherwise return the first model that is not a special key (default, image:, audio:)
                 for key in current_manager.models.keys():
                     # Skip special model keys
                     if key in ("default", "image", "audio") or key.startswith("image:") or key.startswith("audio:"):
                         continue
+                    print(f"DEBUG resolve: returning first non-special key: {key}")
                     return key
                 # Fallback to first model if all are special keys
-                return list(current_manager.models.keys())[0]
+                fallback = list(current_manager.models.keys())[0]
+                print(f"DEBUG resolve: fallback to first: {fallback}")
+                return fallback
             # Check if the model is loaded in the manager
             for key, model in current_manager.models.items():
                 if requested_model == key or requested_model in key:
