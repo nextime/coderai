@@ -2449,18 +2449,23 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         
         # Step 2: Use OpenAIFormatter for final formatting
         formatter = OpenAIFormatter(response_model_name)
-        formatted_response = formatter.format_full(
-            text=clean_text,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            tool_calls=extracted_tool_calls
-        )
+        try:
+            formatted_response = formatter.format_full(
+                text=clean_text,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                tool_calls=extracted_tool_calls
+            )
+        except Exception as e:
+            print(f"RAW: ERROR in formatter.format_full: {e}")
+            formatted_response = None
         
         if global_debug:
-            if formatted_response:
-                print(f"RAW: Passed through formatter, got: {formatted_response.get('choices', [{}])[0].get('message', {}).get('content', '')[:100]}...")
+            if formatted_response and isinstance(formatted_response, dict):
+                content = formatted_response.get('choices', [{}])[0].get('message', {}).get('content', '') if formatted_response.get('choices') else ''
+                print(f"RAW: Passed through formatter, got: {content[:100]}...")
             else:
-                print(f"RAW: WARNING - formatter returned None!")
+                print(f"RAW: WARNING - formatter returned None or invalid response!")
         
         # Add mock reasoning stats if 'mock' is in force_reasoning_args
         # But only if we DON'T already have real reasoning from extraction
@@ -2507,11 +2512,34 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         
         # Add rate limit headers
         headers = {}
-        if 'usage' in formatted_response:
+        if formatted_response and 'usage' in formatted_response:
             headers = current_manager.backend.get_rate_limit_headers(
                 prompt_tokens=formatted_response.get('usage', {}).get('prompt_tokens', 0),
                 completion_tokens=formatted_response.get('usage', {}).get('completion_tokens', 0)
             ) if hasattr(current_manager.backend, 'get_rate_limit_headers') else {}
+        
+        # Ensure we have a valid response to return
+        if not formatted_response:
+            # Create a minimal fallback response
+            formatted_response = {
+                "id": f"chatcmpl-{uuid.uuid4().hex}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": response_model_name,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": clean_text or ""
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens
+                }
+            }
         
         return JSONResponse(content=formatted_response, headers=headers)
     

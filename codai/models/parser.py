@@ -528,6 +528,36 @@ class ApexBig50Parser(BaseParser):
                 except:
                     pass
 
+        # NEW: <tool_call><tool><name>...</name><arguments>...</arguments></tool></tool_call> format
+        nested_tool_call_pattern = r'<tool_call>\s*<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>\s*</tool_call>'
+        for match in re.findall(nested_tool_call_pattern, text, re.DOTALL | re.IGNORECASE):
+            tool_name, args_content = match
+            tool_name = tool_name.strip()
+            if not tool_name:
+                continue
+            # Try to parse arguments as JSON
+            try:
+                args = json.loads(args_content.strip())
+            except:
+                # Fallback: treat as a simple string argument
+                args = args_content.strip()
+            results.append(self._to_oa(tool_name, args))
+
+        # NEW: Multiple tool calls in <tool_call> wrapper
+        multi_tool_pattern = r'<tool_call>\s*(<tool>.*?</tool>)\s*</tool_call>'
+        for tool_block in re.findall(multi_tool_pattern, text, re.DOTALL | re.IGNORECASE):
+            inner_pattern = r'<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>'
+            for inner_match in re.findall(inner_pattern, tool_block, re.DOTALL | re.IGNORECASE):
+                tool_name, args_content = inner_match
+                tool_name = tool_name.strip()
+                if not tool_name:
+                    continue
+                try:
+                    args = json.loads(args_content.strip())
+                except:
+                    args = args_content.strip()
+                results.append(self._to_oa(tool_name, args))
+
         # React pattern
         react_matches = re.findall(r'Action:\s*(.*?)\nAction Input:\s*(\{.*?\})', text, re.DOTALL)
         for name, args_raw in react_matches:
@@ -948,6 +978,61 @@ class ToolCallParser:
                     "arguments": json.dumps(args)
                 }
             })
+        
+        # NEW: Pattern for <tool_call><tool><name>...</name><arguments>...</arguments></tool></tool_call>
+        # Example: <tool_call><tool><name>search</name><arguments>{"query": "test"}</arguments></tool></tool_call>
+        pattern_nested = r'<tool_call>\s*<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>\s*</tool_call>'
+        matches_nested = re.findall(pattern_nested, text, re.DOTALL | re.IGNORECASE)
+        
+        for name, args_str in matches_nested:
+            name = name.strip()
+            if not name:
+                continue
+            
+            # Try to parse arguments as JSON
+            try:
+                args = json.loads(args_str.strip()) if args_str.strip() else {}
+            except json.JSONDecodeError:
+                # If not valid JSON, treat as empty object
+                args = {}
+            
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:16]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args)
+                }
+            })
+        
+        # NEW: Pattern for multiple tool calls in <tool_call> wrapper
+        # Example: <tool_call><tool>...</tool><tool>...</tool></tool_call>
+        pattern_multi = r'<tool_call>\s*(<tool>.*?</tool>)\s*</tool_call>'
+        matches_multi = re.findall(pattern_multi, text, re.DOTALL | re.IGNORECASE)
+        
+        for tool_block in matches_multi:
+            # Extract individual tool calls from within the tool_call wrapper
+            inner_pattern = r'<tool>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool>'
+            inner_matches = re.findall(inner_pattern, tool_block, re.DOTALL | re.IGNORECASE)
+            
+            for name, args_str in inner_matches:
+                name = name.strip()
+                if not name:
+                    continue
+                
+                try:
+                    args = json.loads(args_str.strip()) if args_str.strip() else {}
+                except json.JSONDecodeError:
+                    args = {}
+                
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:16]}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args)
+                    }
+                })
         
         return tool_calls
     
