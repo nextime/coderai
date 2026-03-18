@@ -557,6 +557,33 @@ class ApexBig50Parser(BaseParser):
                 except:
                     args = args_content.strip()
                 results.append(self._to_oa(tool_name, args))
+        
+        # NEW: Handle <function> and <parameters> tags (alternative to <name>/<arguments>)
+        # Pattern: <tool_call><tool><function>name</function><parameters>{"key": "value"}</parameters></tool></tool_call>
+        func_params_pattern = r'<tool_call>\s*<tool>\s*<function>(.*?)</function>\s*<parameters>(.*?)</parameters>\s*</tool>\s*</tool_call>'
+        for match in re.findall(func_params_pattern, text, re.DOTALL | re.IGNORECASE):
+            tool_name, params_content = match
+            tool_name = tool_name.strip()
+            if not tool_name:
+                continue
+            try:
+                args = json.loads(params_content.strip())
+            except:
+                args = params_content.strip()
+            results.append(self._to_oa(tool_name, args))
+        
+        # NEW: Standalone <tool><function>...</function><parameters>...</parameters></tool> without wrapper
+        standalone_func_pattern = r'<tool>\s*<function>(.*?)</function>\s*<parameters>(.*?)</parameters>\s*</tool>'
+        for match in re.findall(standalone_func_pattern, text, re.DOTALL | re.IGNORECASE):
+            tool_name, params_content = match
+            tool_name = tool_name.strip()
+            if not tool_name:
+                continue
+            try:
+                args = json.loads(params_content.strip())
+            except:
+                args = params_content.strip()
+            results.append(self._to_oa(tool_name, args))
 
         # React pattern
         react_matches = re.findall(r'Action:\s*(.*?)\nAction Input:\s*(\{.*?\})', text, re.DOTALL)
@@ -994,6 +1021,55 @@ class ToolCallParser:
                 args = json.loads(args_str.strip()) if args_str.strip() else {}
             except json.JSONDecodeError:
                 # If not valid JSON, treat as empty object
+                args = {}
+            
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:16]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args)
+                }
+            })
+        
+        # NEW: Pattern for <tool_call><tool><function>...</function><parameters>...</parameters></tool></tool_call>
+        # Example: <tool_call><tool><function>get_financial_data</function><parameters>{"ticker": "AAPL"}</parameters></tool></tool_call>
+        pattern_function = r'<tool_call>\s*<tool>\s*<function>(.*?)</function>\s*<parameters>(.*?)</parameters>\s*</tool>\s*</tool_call>'
+        matches_function = re.findall(pattern_function, text, re.DOTALL | re.IGNORECASE)
+        
+        for name, args_str in matches_function:
+            name = name.strip()
+            if not name:
+                continue
+            
+            # Try to parse arguments as JSON
+            try:
+                args = json.loads(args_str.strip()) if args_str.strip() else {}
+            except json.JSONDecodeError:
+                # If not valid JSON, treat as empty object
+                args = {}
+            
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:16]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args)
+                }
+            })
+        
+        # NEW: Pattern for standalone <tool><function>...</function><parameters>...</parameters></tool> (without wrapper)
+        pattern_standalone_func = r'<tool>\s*<function>(.*?)</function>\s*<parameters>(.*?)</parameters>\s*</tool>'
+        matches_standalone = re.findall(pattern_standalone_func, text, re.DOTALL | re.IGNORECASE)
+        
+        for name, args_str in matches_standalone:
+            name = name.strip()
+            if not name:
+                continue
+            
+            try:
+                args = json.loads(args_str.strip()) if args_str.strip() else {}
+            except json.JSONDecodeError:
                 args = {}
             
             tool_calls.append({
