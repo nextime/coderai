@@ -676,27 +676,49 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                     if len(parts) >= 2:
                         repo_id = f"{parts[0]}/{parts[1]}"
                         
-                        # First check if there's a cached GGUF file for this model
-                        # Try common GGUF file patterns
-                        files = list_repo_files(repo_id)
-                        gguf_files = [f for f in files if f.endswith('.gguf')]
-                        
-                        if gguf_files:
-                            # Try to find a cached version first
-                            for gguf_file in gguf_files:
+                        # First check if there's ANY cached file for this model (more flexible)
+                        try:
+                            files = list_repo_files(repo_id)
+                            # Check for any cached file from this repo
+                            for file in files:
                                 # Construct potential URL and check cache
-                                potential_url = f"https://huggingface.co/{repo_id}/resolve/main/{gguf_file}"
+                                potential_url = f"https://huggingface.co/{repo_id}/resolve/main/{file}"
                                 cached = multi_model_manager.get_cached_model_path(potential_url)
                                 if cached:
                                     model_path = cached
-                                    print(f"Using cached GGUF model: {model_path}")
+                                    print(f"Using cached model from HF repo: {model_path}")
                                     break
+                        except Exception as list_error:
+                            print(f"Could not list repo files: {list_error}")
+                            files = []
+                        
+                        # If no cached file found, try to find a cached GGUF file specifically
+                        if not model_path:
+                            # Try common GGUF file patterns
+                            gguf_files = [f for f in files if f.endswith('.gguf')]
                             
-                            # If not cached, download the first GGUF file
-                            if not model_path:
-                                print(f"Downloading GGUF model from HF: {gguf_files[0]}")
-                                model_path = hf_hub_download(repo_id=repo_id, filename=gguf_files[0])
-                                print(f"Downloaded to: {model_path}")
+                            if gguf_files:
+                                # Try to find a cached version first
+                                for gguf_file in gguf_files:
+                                    # Construct potential URL and check cache
+                                    potential_url = f"https://huggingface.co/{repo_id}/resolve/main/{gguf_file}"
+                                    cached = multi_model_manager.get_cached_model_path(potential_url)
+                                    if cached:
+                                        model_path = cached
+                                        print(f"Using cached GGUF model: {model_path}")
+                                        break
+                                
+                                # If not cached, download the first GGUF file
+                                if not model_path:
+                                    print(f"Downloading GGUF model from HF: {gguf_files[0]}")
+                                    model_path = hf_hub_download(repo_id=repo_id, filename=gguf_files[0])
+                                    print(f"Downloaded to: {model_path}")
+                            else:
+                                # No GGUF files found, try to download the first file as fallback
+                                if files:
+                                    print(f"No GGUF files found, trying to download first file: {files[0]}")
+                                    model_path = hf_hub_download(repo_id=repo_id, filename=files[0])
+                                    print(f"Downloaded to: {model_path}")
                 except Exception as e:
                     print(f"Could not resolve as HuggingFace model: {e}")
             
