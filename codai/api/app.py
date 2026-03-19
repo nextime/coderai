@@ -69,6 +69,7 @@ app = FastAPI(
 from codai.api.transcriptions import router as transcriptions_router
 from codai.api.images import router as images_router
 from codai.api.tts import router as tts_router
+from codai.api.text import router as text_router
 
 # Import and add middleware
 from codai.api.log import log_requests
@@ -78,6 +79,7 @@ app.middleware("http")(log_requests)
 app.include_router(transcriptions_router)
 app.include_router(images_router)
 app.include_router(tts_router)
+app.include_router(text_router)
 
 
 @app.get("/v1/models", response_model=ModelList)
