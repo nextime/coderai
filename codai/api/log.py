@@ -7,8 +7,9 @@ from fastapi import Request
 
 async def log_requests(request: Request, call_next):
     """Log all incoming requests for debugging."""
-    # Import global debug flag from app
-    from codai.api.app import global_debug
+    # Import global debug flag from state
+    from codai.api.state import get_global_debug
+    global_debug = get_global_debug()
     
     if request.url.path in ["/v1/chat/completions", "/v1/completions"]:
         body = b""
