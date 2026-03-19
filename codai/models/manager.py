@@ -711,6 +711,91 @@ class MultiModelManager:
         # Model not found - try to load it as a new model
         return self._load_model_by_name(requested_model)
     
+    def resolve_model_name(self, requested_model: str) -> Optional[str]:
+        """
+        Resolve a model name to its canonical form.
+        
+        Handles:
+        - Aliases ("default", "image", "audio", "tts")
+        - Custom aliases from model_aliases dict
+        - Prefixed models ("image:", "audio:", "tts:", "vision:")
+        - Default model resolution
+        
+        Returns the canonical model name/path, or None if not resolvable.
+        """
+        # Handle None or empty
+        if not requested_model:
+            return self.default_model
+        
+        # Resolve custom aliases first
+        if requested_model in self.model_aliases:
+            requested_model = self.model_aliases[requested_model]
+        
+        # Handle "default" alias
+        if requested_model == "default":
+            return self.default_model
+        
+        # Handle "audio" alias
+        if requested_model == "audio":
+            return f"audio:{self.audio_models[0]}" if self.audio_models else None
+        
+        # Handle "image" alias
+        if requested_model == "image":
+            return f"image:{self.image_models[0]}" if self.image_models else None
+        
+        # Handle "tts" alias
+        if requested_model == "tts":
+            return f"tts:{self.tts_model}" if self.tts_model else None
+        
+        # Handle "vision" alias
+        if requested_model == "vision":
+            return f"image:{self.vision_models[0]}" if self.vision_models else None
+        
+        # Handle prefixed models - normalize them
+        if requested_model.startswith("audio:"):
+            return requested_model
+        if requested_model.startswith("tts:"):
+            return requested_model
+        if requested_model.startswith("image:") or requested_model.startswith("vision:"):
+            # Normalize vision: to image:
+            if requested_model.startswith("vision:"):
+                return f"image:{requested_model[7:]}"
+            return requested_model
+        
+        # Check if it matches the default model (with or without path)
+        if self.default_model:
+            if requested_model == self.default_model:
+                return self.default_model
+            # Check if it's a short name match
+            if requested_model.endswith(self.default_model.split("/")[-1]) or \
+               self.default_model.endswith(requested_model.split("/")[-1]):
+                return self.default_model
+        
+        # Check if it matches any loaded model key
+        for key in self.models.keys():
+            if requested_model in key or key.endswith(requested_model.split("/")[-1]):
+                return key
+        
+        # Return as-is if no resolution
+        return requested_model
+    
+    def get_currently_loaded_model_name(self) -> Optional[str]:
+        """
+        Get the canonical name of the model currently loaded in VRAM.
+        
+        Returns the model key from self.models if any model is loaded,
+        or None if no models are loaded.
+        """
+        if not self.models:
+            return None
+        
+        # If we have a tracked current model, return it
+        if self.current_model_key and self.current_model_key in self.models:
+            return self.current_model_key
+        
+        # Otherwise return the first loaded model (there should only be one in ondemand mode)
+        return list(self.models.keys())[0] if self.models else None
+    
     def unload_all_models(self):
         """
         Fully unload ALL models from VRAM. Used in ondemand mode when switching

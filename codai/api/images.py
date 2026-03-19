@@ -278,15 +278,30 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
         from codai.models.manager import model_manager
         has_any_model = len(multi_model_manager.models) > 0 or model_manager.backend is not None
         
-        if has_any_model and pipeline is None:
-            # The image model we need is NOT loaded - unload everything
-            print(f"In ondemand mode - fully unloading current model(s) before loading image model '{model_to_use}'...")
-            multi_model_manager.unload_all_models()
-            if model_manager.backend is not None:
-                try:
-                    model_manager.cleanup()
-                except:
-                    pass
+        if has_any_model:
+            # Resolve both the requested image model and currently loaded model to their canonical names
+            requested_canonical = multi_model_manager.resolve_model_name(f"image:{model_to_use}")
+            loaded_canonical = multi_model_manager.get_currently_loaded_model_name()
+            
+            # Also check legacy model_manager
+            if not loaded_canonical and model_manager.backend is not None:
+                loaded_canonical = "legacy_model_manager"
+            
+            # Compare: if they're different models (even if both are image models), unload first
+            already_loaded = (requested_canonical and loaded_canonical and 
+                            requested_canonical == loaded_canonical)
+            
+            if not already_loaded:
+                print(f"In ondemand mode - model switch detected:")
+                print(f"  Requested: 'image:{model_to_use}' (resolved to: '{requested_canonical}')")
+                print(f"  Loaded: '{loaded_canonical}'")
+                print(f"  -> Fully unloading current model(s) before loading new model...")
+                multi_model_manager.unload_all_models()
+                if model_manager.backend is not None:
+                    try:
+                        model_manager.cleanup()
+                    except:
+                        pass
         
         # Try diffusers first
         try:
@@ -539,18 +554,34 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
     
     # If no cached image model found, need to load one - first cleanup any existing models
     if sd_model is None:
-        # In ondemand mode, fully unload everything before loading sd.cpp model
+        # In ondemand mode, check if we need to unload before loading sd.cpp model
         from codai.models.manager import model_manager
         has_any_model = len(multi_model_manager.models) > 0 or model_manager.backend is not None
         
         if mode == "ondemand" and has_any_model:
-            print(f"In ondemand mode - fully unloading current model(s) before loading sd.cpp image model...")
-            multi_model_manager.unload_all_models()
-            if model_manager.backend is not None:
-                try:
-                    model_manager.cleanup()
-                except:
-                    pass
+            # Resolve both the requested image model and currently loaded model to their canonical names
+            requested_canonical = multi_model_manager.resolve_model_name(f"image:{model_to_use}")
+            loaded_canonical = multi_model_manager.get_currently_loaded_model_name()
+            
+            # Also check legacy model_manager
+            if not loaded_canonical and model_manager.backend is not None:
+                loaded_canonical = "legacy_model_manager"
+            
+            # Compare: if they're different models, unload first
+            already_loaded = (requested_canonical and loaded_canonical and 
+                            requested_canonical == loaded_canonical)
+            
+            if not already_loaded:
+                print(f"In ondemand mode - model switch detected:")
+                print(f"  Requested: 'image:{model_to_use}' (resolved to: '{requested_canonical}')")
+                print(f"  Loaded: '{loaded_canonical}'")
+                print(f"  -> Fully unloading current model(s) before loading sd.cpp model...")
+                multi_model_manager.unload_all_models()
+                if model_manager.backend is not None:
+                    try:
+                        model_manager.cleanup()
+                    except:
+                        pass
     
     if sd_model is not None:
         # Check if it's a stable-diffusion-cpp model (has generate method from sd.cpp)

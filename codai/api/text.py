@@ -305,19 +305,23 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         has_any_model = len(multi_model_manager.models) > 0 or model_manager.backend is not None
         
         if has_any_model:
-            # Check if the requested model is already loaded (no need to unload)
-            already_loaded = False
-            if requested_model and requested_model in multi_model_manager.models:
-                already_loaded = True
-            elif multi_model_manager.default_model and (
-                not requested_model or requested_model == "default" or 
-                requested_model == multi_model_manager.default_model
-            ):
-                if multi_model_manager.default_model in multi_model_manager.models:
-                    already_loaded = True
+            # Resolve both the requested model and currently loaded model to their canonical names
+            requested_canonical = multi_model_manager.resolve_model_name(requested_model)
+            loaded_canonical = multi_model_manager.get_currently_loaded_model_name()
+            
+            # Also check legacy model_manager
+            if not loaded_canonical and model_manager.backend is not None:
+                loaded_canonical = "legacy_model_manager"
+            
+            # Compare: if they're different models (even if same type), unload first
+            already_loaded = (requested_canonical and loaded_canonical and 
+                            requested_canonical == loaded_canonical)
             
             if not already_loaded:
-                print(f"In ondemand mode - fully unloading current model(s) before loading text model '{requested_model}'...")
+                print(f"In ondemand mode - model switch detected:")
+                print(f"  Requested: '{requested_model}' (resolved to: '{requested_canonical}')")
+                print(f"  Loaded: '{loaded_canonical}'")
+                print(f"  -> Fully unloading current model(s) before loading new model...")
                 
                 # Use centralized unload method
                 multi_model_manager.unload_all_models()
@@ -1732,18 +1736,23 @@ async def completions(request: CompletionRequest):
         has_any_model = len(multi_model_manager.models) > 0 or model_manager.backend is not None
         
         if has_any_model:
-            already_loaded = False
-            if requested_model and requested_model in multi_model_manager.models:
-                already_loaded = True
-            elif multi_model_manager.default_model and (
-                not requested_model or requested_model == "default" or 
-                requested_model == multi_model_manager.default_model
-            ):
-                if multi_model_manager.default_model in multi_model_manager.models:
-                    already_loaded = True
+            # Resolve both the requested model and currently loaded model to their canonical names
+            requested_canonical = multi_model_manager.resolve_model_name(requested_model)
+            loaded_canonical = multi_model_manager.get_currently_loaded_model_name()
+            
+            # Also check legacy model_manager
+            if not loaded_canonical and model_manager.backend is not None:
+                loaded_canonical = "legacy_model_manager"
+            
+            # Compare: if they're different models (even if same type), unload first
+            already_loaded = (requested_canonical and loaded_canonical and 
+                            requested_canonical == loaded_canonical)
             
             if not already_loaded:
-                print(f"In ondemand mode - fully unloading current model(s) before loading text model '{requested_model}'...")
+                print(f"In ondemand mode - model switch detected:")
+                print(f"  Requested: '{requested_model}' (resolved to: '{requested_canonical}')")
+                print(f"  Loaded: '{loaded_canonical}'")
+                print(f"  -> Fully unloading current model(s) before loading new model...")
                 multi_model_manager.unload_all_models()
                 if model_manager.backend is not None:
                     try:
