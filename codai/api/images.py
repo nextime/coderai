@@ -178,6 +178,265 @@ def set_queue_flags(flags):
     queue_flags = flags
 
 
+def _is_gguf_model(model_name: str) -> bool:
+    """Check if a model name/path indicates a GGUF model."""
+    if not model_name:
+        return False
+    return (model_name.endswith('.gguf') or 
+            'gguf' in model_name.lower() or
+            (model_name.startswith('http') and '.gguf' in model_name))
+
+
+def _load_diffusers_pipeline(model_name: str, global_args):
+    """
+    Try to load a model using the diffusers library.
+    
+    Returns the loaded pipeline or None if diffusers can't handle this model.
+    Raises Exception if loading fails for other reasons.
+    """
+    from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline, DiffusionPipeline
+    import torch
+    
+    # Determine precision from CLI argument (--image-precision)
+    precision = getattr(global_args, 'image_precision', 'f32') or 'f32'
+    precision_map = {
+        'bf16': torch.bfloat16,
+        'f32': torch.float32,
+        'f16': torch.float16,
+    }
+    if hasattr(torch, 'float8_e4m3fn'):
+        precision_map['f8'] = torch.float8_e4m3fn
+    dtype = precision_map.get(precision, torch.float32)
+    print(f"Using precision: {precision} ({dtype})")
+    
+    # Check if CPU offload is requested via CLI
+    use_sequential_offload = getattr(global_args, 'image_cpu_offload', False)
+    
+    # Track loading attempts for OOM handling
+    pipeline = None
+    load_attempt = 0
+    max_attempts = 3
+    
+    while pipeline is None and load_attempt < max_attempts:
+        try:
+            load_attempt += 1
+            print(f"Loading attempt {load_attempt}/{max_attempts}...")
+            
+            # Try to load as Stable Diffusion XL first, then generic DiffusionPipeline
+            try:
+                pipeline = StableDiffusionXLPipeline.from_pretrained(
+                    model_name,
+                    torch_dtype=dtype,
+                    use_safetensors=True,
+                )
+            except Exception:
+                # Try generic diffusion pipeline (supports custom pipelines like ZImagePipeline)
+                pipeline = DiffusionPipeline.from_pretrained(
+                    model_name,
+                    torch_dtype=dtype,
+                    use_safetensors=True,
+                )
+            
+            # Apply memory optimizations based on attempt
+            if torch.cuda.is_available():
+                if load_attempt >= 2:
+                    # Second attempt: enable attention slicing
+                    print("Enabling attention slicing for lower VRAM usage...")
+                    if hasattr(pipeline, 'enable_attention_slicing'):
+                        pipeline.enable_attention_slicing()
+                
+                if load_attempt >= 3 or use_sequential_offload:
+                    # Third attempt or offload requested: enable sequential CPU offload
+                    print("Enabling sequential CPU offload for lower VRAM usage...")
+                    if hasattr(pipeline, 'enable_sequential_cpu_offload'):
+                        pipeline.enable_sequential_cpu_offload()
+                else:
+                    # First attempt: try regular GPU
+                    pipeline = pipeline.to("cuda")
+            else:
+                pipeline = pipeline.to("cpu")
+            
+        except Exception as load_error:
+            error_msg = str(load_error).lower()
+            is_oom = any(x in error_msg for x in ['out of memory', 'oom', 'cuda error', 'cudamalloc'])
+            
+            if is_oom and load_attempt < max_attempts:
+                print(f"OOM during model loading: {load_error}")
+                print(f"Retrying with more aggressive memory optimization...")
+                pipeline = None  # Reset for retry
+            else:
+                print(f"Failed to load model (attempt {load_attempt}): {load_error}")
+                if load_attempt >= max_attempts:
+                    raise
+                pipeline = None
+    
+    return pipeline
+
+
+def _generate_with_diffusers(pipeline, request, global_args, http_request=None):
+    """Generate images using a diffusers pipeline."""
+    import torch
+    import numpy as np
+    import time as time_module
+    
+    # Determine size
+    width, height = 1024, 1024
+    if request.size:
+        parts = request.size.split("x")
+        if len(parts) == 2:
+            try:
+                width = int(parts[0])
+                height = int(parts[1])
+            except ValueError:
+                pass
+    
+    # Check for nan/inf in dimensions
+    if width != width or width == float('inf'):
+        width = 512
+    if height != height or height == float('inf'):
+        height = 512
+    
+    # Enable memory optimizations
+    try:
+        if hasattr(pipeline, 'enable_attention_slicing'):
+            pipeline.enable_attention_slicing(slice_size="auto")
+        if hasattr(pipeline, 'enable_vae_slicing'):
+            pipeline.enable_vae_slicing()
+    except Exception as e:
+        print(f"Warning: Could not enable memory optimizations: {e}")
+    
+    # Get timestamp BEFORE calling diffusers
+    timestamp = int(time_module.time())
+    
+    # Generate images
+    seed = request.seed if request.seed is not None else getattr(global_args, 'image_seed', None)
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=pipeline.device).manual_seed(seed)
+    
+    # Quality: "standard" or "hd"
+    quality = request.quality or "standard"
+    
+    # Use request parameters if provided, otherwise fall back to quality-based defaults
+    num_steps = request.steps if request.steps else (30 if quality == "standard" else 50)
+    cfg_scale = request.guidance_scale if request.guidance_scale else (
+        getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0
+    )
+    
+    # Generate
+    result = pipeline(
+        prompt=request.prompt,
+        negative_prompt=None,
+        num_images_per_prompt=request.n,
+        height=height,
+        width=width,
+        generator=generator,
+        guidance_scale=cfg_scale,
+        num_inference_steps=num_steps,
+    )
+    
+    # Extract images
+    images = []
+    try:
+        result_images = result.images
+    except Exception as img_err:
+        print(f"Warning: Could not access result.images: {img_err}")
+        result_images = getattr(result, 'image', None) or getattr(result, 'output', None)
+        if result_images is None:
+            raise Exception(f"Could not extract images from diffusers result: {img_err}")
+    
+    for img in result_images:
+        # Debug: print image type and value range
+        print(f"DEBUG: Image type: {type(img)}")
+        if isinstance(img, np.ndarray):
+            print(f"DEBUG: Image shape: {img.shape}, dtype: {img.dtype}, min: {img.min()}, max: {img.max()}")
+            img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
+            img = np.clip(img, 0.0, 1.0)
+            print(f"DEBUG: After NaN handling - min: {img.min()}, max: {img.max()}")
+        
+        img_data = save_image_response(img, request.response_format, http_request)
+        images.append(img_data)
+    
+    return {
+        "created": timestamp,
+        "data": images
+    }
+
+
+async def _generate_with_sdcpp(sd_model, request, global_args, http_request=None):
+    """Generate images using stable-diffusion-cpp-python."""
+    import time
+    
+    # Parse size
+    width, height = 512, 512
+    if request.size:
+        parts = request.size.split("x")
+        if len(parts) == 2:
+            try:
+                width = int(parts[0])
+                height = int(parts[1])
+            except ValueError:
+                pass
+    
+    # Use default steps for fast generation
+    steps = 4
+    
+    # Use request seed if provided, otherwise use CLI default seed
+    seed = request.seed if request.seed is not None else getattr(global_args, 'image_seed', None)
+    
+    result = await asyncio.to_thread(
+        sd_model.generate_image,
+        prompt=request.prompt,
+        negative_prompt='',
+        width=width,
+        height=height,
+        cfg_scale=get_cfg_scale(),
+        sample_steps=steps,
+        seed=seed if seed is not None else 42,
+        batch_count=request.n if request.n else 1,
+    )
+    
+    # Small delay to let Vulkan driver settle after generation
+    time.sleep(0.1)
+    
+    # Convert results to response format
+    images = []
+    for img in result:
+        img_data = save_image_response(img, http_request=http_request)
+        images.append(img_data)
+    
+    return {
+        "created": int(time.time()),
+        "data": images
+    }
+
+
+def _load_sdcpp_model(model_path: str, global_args):
+    """
+    Try to load a model using stable-diffusion-cpp-python.
+    
+    Returns the loaded StableDiffusion model or None.
+    """
+    from stable_diffusion_cpp import StableDiffusion
+    
+    print(f"Loading sd.cpp model from: {model_path}")
+    
+    # Build sd.cpp constructor args from config
+    kwargs = {
+        'model_path': model_path,
+    }
+    
+    # Add optional paths from CLI args
+    if global_args:
+        if hasattr(global_args, 'vae_path') and global_args.vae_path:
+            kwargs['vae_path'] = global_args.vae_path
+        if hasattr(global_args, 'llm_path') and global_args.llm_path:
+            kwargs['lora_model_dir'] = global_args.llm_path
+    
+    sd_model = StableDiffusion(**kwargs)
+    return sd_model
+
+
 # =============================================================================
 # Router and Endpoints
 # =============================================================================
@@ -225,518 +484,136 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
             )
     
     async with semaphore:
-        image_model = multi_model_manager.image_model
-    
-    # If no image model configured, try to use main --model as fallback
-    if not image_model:
-        # Try to get the main model from args
-        main_model = getattr(global_args, 'model', None)
-        if main_model and isinstance(main_model, list) and len(main_model) > 0:
-            image_model = main_model[0]
-        elif main_model:
-            image_model = main_model
+        # =====================================================================
+        # Step 1: Ask the manager to resolve the model and manage VRAM
+        # =====================================================================
+        model_info = multi_model_manager.request_model(
+            requested_model=request.model,
+            model_type="image"
+        )
         
-        # Check if main model is a GGUF file - can't use for image generation
-        if image_model and ('.gguf' in image_model.lower() or 'gguf' in image_model.lower()):
-            print(f"Note: Main model is a GGUF file (for text), not suitable for image generation")
-            image_model = None  # Can't use GGUF for images
-    
-    # If still no image model configured, return an error
-    if not image_model:
+        model_name = model_info['model_name']
+        model_key = model_info['model_key']
+        pipeline = model_info['model_object']
+        
+        # If no image model configured, try to use main --model as fallback
+        if not model_name:
+            main_model = getattr(global_args, 'model', None)
+            if main_model and isinstance(main_model, list) and len(main_model) > 0:
+                model_name = main_model[0]
+            elif main_model:
+                model_name = main_model
+            
+            # Check if main model is a GGUF file - can't use for image generation
+            if model_name and _is_gguf_model(model_name):
+                print(f"Note: Main model is a GGUF file (for text), not suitable for image generation")
+                model_name = None
+            
+            if model_name:
+                model_key = f"image:{model_name}"
+        
+        # If still no image model configured, return an error
+        if not model_name:
+            raise HTTPException(
+                status_code=400,
+                detail="Image generation not configured. Use --image-model to specify a model."
+            )
+        
+        # =====================================================================
+        # Step 2: Check if model is a sd.cpp StableDiffusion instance
+        # =====================================================================
+        is_sdcpp = False
+        if pipeline is not None:
+            try:
+                from stable_diffusion_cpp import StableDiffusion
+                if isinstance(pipeline, StableDiffusion):
+                    is_sdcpp = True
+            except ImportError:
+                pass
+        
+        # =====================================================================
+        # Step 3: If already loaded, generate with appropriate backend
+        # =====================================================================
+        if pipeline is not None:
+            if is_sdcpp:
+                print(f"Using cached sd.cpp model for generation")
+                return await _generate_with_sdcpp(pipeline, request, global_args, http_request)
+            else:
+                # Assume it's a diffusers pipeline
+                print(f"Using cached diffusers pipeline for generation")
+                return _generate_with_diffusers(pipeline, request, global_args, http_request)
+        
+        # =====================================================================
+        # Step 4: Model not loaded - try to load it
+        # =====================================================================
+        is_gguf = _is_gguf_model(model_name)
+        diffusers_error = None
+        sdcpp_error = None
+        
+        # Try diffusers first (for non-GGUF models)
+        if not is_gguf:
+            try:
+                print(f"Loading diffusers model: {model_name}")
+                pipeline = _load_diffusers_pipeline(model_name, global_args)
+                
+                if pipeline is not None:
+                    # Cache the loaded pipeline in the manager
+                    multi_model_manager.add_model(model_key, pipeline)
+                    multi_model_manager.current_model_key = model_key
+                    print(f"Loaded diffusers model: {model_name}")
+                    
+                    return _generate_with_diffusers(pipeline, request, global_args, http_request)
+                    
+            except ImportError as e:
+                diffusers_error = str(e)
+                print(f"diffusers not available: {diffusers_error}")
+            except Exception as e:
+                import traceback
+                diffusers_error = str(e)
+                print(f"diffusers error: {diffusers_error}")
+                print(f"Traceback: {traceback.format_exc()}")
+        
+        # Try stable-diffusion-cpp-python (for GGUF models or as fallback)
+        try:
+            # For GGUF models or URLs, resolve the model path through the cache
+            resolved_path = model_name
+            if is_gguf or model_name.startswith('http://') or model_name.startswith('https://'):
+                resolved_path = multi_model_manager.load_model(model_name)
+                if not resolved_path:
+                    raise Exception(f"Failed to resolve model path: {model_name}")
+            
+            # Only use sd.cpp if we have a local file path
+            if resolved_path and os.path.isfile(resolved_path):
+                sd_model = _load_sdcpp_model(resolved_path, global_args)
+                
+                if sd_model is not None:
+                    # Cache the loaded model in the manager
+                    multi_model_manager.add_model(model_key, sd_model)
+                    multi_model_manager.current_model_key = model_key
+                    print(f"Loaded sd.cpp model: {model_name}")
+                    
+                    return await _generate_with_sdcpp(sd_model, request, global_args, http_request)
+            else:
+                sdcpp_error = f"Model '{model_name}' is not a local file, cannot use sd.cpp"
+                print(sdcpp_error)
+                
+        except ImportError as e:
+            sdcpp_error = str(e)
+            print(f"stable-diffusion-cpp-python not available: {sdcpp_error}")
+        except Exception as e:
+            sdcpp_error = str(e)
+            print(f"sd.cpp error: {sdcpp_error}")
+        
+        # =====================================================================
+        # Step 5: Both backends failed - return error
+        # =====================================================================
+        error_details = []
+        if diffusers_error:
+            error_details.append(f"diffusers: {diffusers_error}")
+        if sdcpp_error:
+            error_details.append(f"sd.cpp: {sdcpp_error}")
+        
         raise HTTPException(
             status_code=400,
-            detail="Image generation not configured. Use --image-model to specify a model."
+            detail=f"Failed to load image model '{model_name}'. Errors: {'; '.join(error_details) if error_details else 'No compatible backend found'}"
         )
-    
-    # Determine model to use
-    # Priority: 1) model specified in request, 2) default image model from --image-model
-    model_to_use = request.model
-    if not model_to_use or model_to_use == "image":
-        # No model specified in request, use default
-        model_to_use = image_model
-    elif model_to_use.startswith("image:"):
-        # Legacy format - strip prefix and use default
-        model_to_use = image_model
-    else:
-        # Check if model_to_use is a valid model (URL, file, or known model)
-        # If not, fallback to the configured image model to avoid HF resolution errors
-        if image_model:
-            is_url = model_to_use.startswith('http://') or model_to_use.startswith('https://')
-            is_file = os.path.isfile(model_to_use) if model_to_use else False
-            if not is_url and not is_file:
-                # Unknown model name - use default instead of trying to resolve as HF
-                print(f"Warning: Unknown model '{model_to_use}' in image generation request, using configured --image-model")
-                model_to_use = image_model
-    
-    # Check if model is loaded
-    model_key = f"image:{model_to_use}"
-    pipeline = multi_model_manager.get_model(model_key)
-    
-    # In ondemand mode, if ANY model is loaded in VRAM and it's different from what we need,
-    # fully unload it first to free VRAM
-    if mode == "ondemand":
-        from codai.models.manager import model_manager
-        has_any_model = len(multi_model_manager.models) > 0 or model_manager.backend is not None
-        
-        if has_any_model:
-            # Resolve both the requested image model and currently loaded model to their canonical names
-            requested_canonical = multi_model_manager.resolve_model_name(f"image:{model_to_use}")
-            loaded_canonical = multi_model_manager.get_currently_loaded_model_name()
-            
-            # Also check legacy model_manager
-            if not loaded_canonical and model_manager.backend is not None:
-                loaded_canonical = "legacy_model_manager"
-            
-            # Compare: if they're different models (even if both are image models), unload first
-            already_loaded = (requested_canonical and loaded_canonical and 
-                            requested_canonical == loaded_canonical)
-            
-            if not already_loaded:
-                print(f"In ondemand mode - model switch detected:")
-                print(f"  Requested: 'image:{model_to_use}' (resolved to: '{requested_canonical}')")
-                print(f"  Loaded: '{loaded_canonical}'")
-                print(f"  -> Fully unloading current model(s) before loading new model...")
-                multi_model_manager.unload_all_models()
-                if model_manager.backend is not None:
-                    try:
-                        model_manager.cleanup()
-                    except:
-                        pass
-        
-        # Try diffusers first
-        try:
-            from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline, DiffusionPipeline
-            import torch
-            
-            # Check if model is XL
-            is_xl = "xl" in model_to_use.lower() or "sdxl" in model_to_use.lower()
-            
-            # Check if it's a GGUF model - skip diffusers for those
-            is_gguf_model = (model_to_use.endswith('.gguf') or 'gguf' in model_to_use.lower() or
-                            (model_to_use.startswith('http') and '.gguf' in model_to_use))
-            
-            if is_gguf_model:
-                print(f"GGUF model detected ({model_to_use}), skipping diffusers, using stable-diffusion-cpp...")
-                raise Exception("GGUF model - use stable-diffusion-cpp instead")
-            
-            print(f"Loading diffusers model: {model_to_use}")
-            
-            # Determine precision from CLI argument (--image-precision)
-            precision = getattr(global_args, 'image_precision', 'f32') or 'f32'
-            precision_map = {
-                'bf16': torch.bfloat16,
-                'f32': torch.float32,
-                'f16': torch.float16,
-            }
-            if hasattr(torch, 'float8_e4m3fn'):
-                precision_map['f8'] = torch.float8_e4m3fn
-            dtype = precision_map.get(precision, torch.float32)
-            print(f"Using precision: {precision} ({dtype})")
-            
-            # Check if CPU offload is requested via CLI
-            use_sequential_offload = getattr(global_args, 'image_cpu_offload', False)
-            
-            # Track loading attempts for OOM handling
-            load_attempt = 0
-            max_attempts = 3
-            
-            while pipeline is None and load_attempt < max_attempts:
-                try:
-                    load_attempt += 1
-                    print(f"Loading attempt {load_attempt}/{max_attempts}...")
-                    
-                    # Try to load as Stable Diffusion XL first, then generic DiffusionPipeline
-                    try:
-                        pipeline = StableDiffusionXLPipeline.from_pretrained(
-                            model_to_use,
-                            torch_dtype=dtype,
-                            use_safetensors=True,
-                        )
-                    except Exception:
-                        # Try generic diffusion pipeline (supports custom pipelines like ZImagePipeline)
-                        pipeline = DiffusionPipeline.from_pretrained(
-                            model_to_use,
-                            torch_dtype=dtype,
-                            use_safetensors=True,
-                        )
-                    
-                    # Apply memory optimizations based on attempt
-                    if torch.cuda.is_available():
-                        if load_attempt >= 2:
-                            # Second attempt: enable attention slicing
-                            print("Enabling attention slicing for lower VRAM usage...")
-                            if hasattr(pipeline, 'enable_attention_slicing'):
-                                pipeline.enable_attention_slicing()
-                        
-                        if load_attempt >= 3 or use_sequential_offload:
-                            # Third attempt or offload requested: enable sequential CPU offload
-                            print("Enabling sequential CPU offload for lower VRAM usage...")
-                            if hasattr(pipeline, 'enable_sequential_cpu_offload'):
-                                pipeline.enable_sequential_cpu_offload()
-                        else:
-                            # First attempt: try regular GPU
-                            pipeline = pipeline.to("cuda")
-                    else:
-                        pipeline = pipeline.to("cpu")
-                    
-                except Exception as load_error:
-                    error_msg = str(load_error).lower()
-                    is_oom = any(x in error_msg for x in ['out of memory', 'oom', 'cuda error', 'cudamalloc'])
-                    
-                    if is_oom and load_attempt < max_attempts:
-                        print(f"OOM during model loading: {load_error}")
-                        print(f"Retrying with more aggressive memory optimization...")
-                        pipeline = None  # Reset for retry
-                    else:
-                        print(f"Failed to load model (attempt {load_attempt}): {load_error}")
-                        if load_attempt >= max_attempts:
-                            raise
-                        pipeline = None
-            
-            # Cache the model
-            if pipeline is not None:
-                multi_model_manager.add_model(model_key, pipeline)
-                print(f"Loaded diffusers model: {model_to_use}")
-            
-        except ImportError as e:
-            # diffusers not installed
-            diffusers_error = str(e)
-            print(f"diffusers not available: {diffusers_error}")
-        except Exception as e:
-            import traceback
-            diffusers_error = str(e)
-            print(f"diffusers error: {diffusers_error}")
-            print(f"Traceback: {traceback.format_exc()}")
-    
-    # Try diffusers if available
-    if pipeline is not None:
-        try:
-            # Determine size
-            width, height = 1024, 1024
-            if request.size:
-                parts = request.size.split("x")
-                if len(parts) == 2:
-                    try:
-                        width = int(parts[0])
-                        height = int(parts[1])
-                    except ValueError:
-                        pass
-            
-            # Check for nan/inf in dimensions
-            if width != width or width == float('inf'):  # NaN or inf check
-                width = 512
-            if height != height or height == float('inf'):  # NaN or inf check
-                height = 512
-            
-            # Import torch for generation
-            import torch
-            
-            # Ensure model is on correct device
-            backend = getattr(global_args, 'backend', 'auto')
-            image_backend = getattr(global_args, 'image_backend', 'auto')
-            use_vulkan = (backend == 'vulkan') or (image_backend == 'vulkan') or (image_backend == 'auto' and backend == 'auto')
-            
-            if use_vulkan and not torch.cuda.is_available():
-                # CPU mode - try to reduce memory usage
-                try:
-                    if hasattr(pipeline, 'enable_attention_slicing'):
-                        pipeline.enable_attention_slicing(slice_size="auto")
-                    if hasattr(pipeline, 'enable_vae_slicing'):
-                        pipeline.enable_vae_slicing()
-                except Exception as e:
-                    print(f"Warning: Could not enable memory optimizations: {e}")
-            elif torch.cuda.is_available():
-                # Try to enable memory optimizations for CUDA
-                try:
-                    if hasattr(pipeline, 'enable_attention_slicing'):
-                        pipeline.enable_attention_slicing(slice_size="auto")
-                    if hasattr(pipeline, 'enable_vae_slicing'):
-                        pipeline.enable_vae_slicing()
-                except Exception as e:
-                    print(f"Warning: Could not enable CUDA memory optimizations: {e}")
-            
-            # Get timestamp BEFORE calling diffusers (to avoid scope issues)
-            import time as time_module
-            timestamp = int(time_module.time())
-            
-            # Generate images
-            # Use request seed if provided, otherwise use CLI default seed
-            seed = request.seed if request.seed is not None else getattr(global_args, 'image_seed', None)
-            generator = None
-            if seed is not None:
-                generator = torch.Generator(device=pipeline.device).manual_seed(seed)
-            
-            # Quality: "standard" or "hd"
-            quality = request.quality or "standard"
-            
-            # Use request parameters if provided, otherwise fall back to quality-based defaults
-            num_steps = request.steps if request.steps else (30 if quality == "standard" else 50)
-            cfg_scale = request.guidance_scale if request.guidance_scale else (
-                getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0
-            )
-            
-            # Generate
-            result = pipeline(
-                prompt=request.prompt,
-                negative_prompt=None,
-                num_images_per_prompt=request.n,
-                height=height,
-                width=width,
-                generator=generator,
-                guidance_scale=cfg_scale,
-                num_inference_steps=num_steps,
-            )
-            
-            # Extract images
-            images = []
-            try:
-                result_images = result.images
-            except Exception as img_err:
-                print(f"Warning: Could not access result.images: {img_err}")
-                # Try alternative: result might have 'image' or 'output'
-                result_images = getattr(result, 'image', None) or getattr(result, 'output', None)
-                if result_images is None:
-                    raise Exception(f"Could not extract images from diffusers result: {img_err}")
-            
-            for img in result_images:
-                # Convert to base64
-                import numpy as np
-                
-                # Debug: print image type and value range
-                print(f"DEBUG: Image type: {type(img)}")
-                if isinstance(img, np.ndarray):
-                    print(f"DEBUG: Image shape: {img.shape}, dtype: {img.dtype}, min: {img.min()}, max: {img.max()}")
-                    # Handle NaN/Inf values in image data - convert to valid values
-                    # Replace NaN and Inf with valid values
-                    img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
-                    # Clip to valid range [0, 1]
-                    img = np.clip(img, 0.0, 1.0)
-                    print(f"DEBUG: After NaN handling - min: {img.min()}, max: {img.max()}")
-                
-                # Use helper function to save and get response
-                img_data = save_image_response(img, request.response_format, http_request)
-                images.append(img_data)
-            
-            return {
-                "created": timestamp,
-                "data": images
-            }
-            
-        except ImportError as e:
-            # diffusers/torch not installed - record error and try sd.cpp
-            diffusers_error = str(e)
-            print(f"diffusers not available: {diffusers_error}, trying stable-diffusion-cpp-python...")
-        except Exception as e:
-            # Other error with diffusers - record and try sd.cpp
-            import traceback
-            diffusers_error = str(e)
-            print(f"diffusers error: {diffusers_error}")
-            print(f"Traceback: {traceback.format_exc()}")
-            print(f"Trying stable-diffusion-cpp-python...")
-    
-    # Try stable-diffusion-cpp-python (sd.cpp) as fallback when diffusers fails
-    # sd.cpp works with GGUF models, but some HF models may be GGUF even without "gguf" in name
-    # Let sd.cpp attempt loading and fail gracefully if it's not compatible
-
-    # Try stable-diffusion-cpp-python (sd.cpp) as fallback
-    # First, check all available image models to find one loaded via sd.cpp
-    # Always check for cached models - allows dynamically loaded models to be reused across requests
-    sd_model = None
-    for key in multi_model_manager.models:
-        if key.startswith("image:"):
-            potential_model = multi_model_manager.get_model(key)
-            if potential_model is not None:
-                # Check if it's a stable-diffusion-cpp model
-                try:
-                    from stable_diffusion_cpp import StableDiffusion
-                    if isinstance(potential_model, StableDiffusion):
-                        sd_model = potential_model
-                        print(f"Found cached stable-diffusion-cpp model with key: {key}")
-                        break
-                except ImportError:
-                    pass
-
-    # If no cached image model found, need to load one - first cleanup any existing models
-    if sd_model is None:
-        # In ondemand mode, check if we need to unload before loading sd.cpp model
-        from codai.models.manager import model_manager
-        has_any_model = len(multi_model_manager.models) > 0 or model_manager.backend is not None
-
-        if mode == "ondemand" and has_any_model:
-            # Resolve both the requested image model and currently loaded model to their canonical names
-            requested_canonical = multi_model_manager.resolve_model_name(f"image:{model_to_use}")
-            loaded_canonical = multi_model_manager.get_currently_loaded_model_name()
-
-            # Also check legacy model_manager
-            if not loaded_canonical and model_manager.backend is not None:
-                loaded_canonical = "legacy_model_manager"
-
-            # Compare: if they're different models, unload first
-            already_loaded = (requested_canonical and loaded_canonical and
-                            requested_canonical == loaded_canonical)
-
-            if not already_loaded:
-                print(f"In ondemand mode - model switch detected:")
-                print(f"  Requested: 'image:{model_to_use}' (resolved to: '{requested_canonical}')")
-                print(f"  Loaded: '{loaded_canonical}'")
-                print(f"  -> Fully unloading current model(s) before loading sd.cpp model...")
-                multi_model_manager.unload_all_models()
-                if model_manager.backend is not None:
-                    try:
-                        model_manager.cleanup()
-                    except:
-                        pass
-    
-    if sd_model is not None:
-        # Check if it's a stable-diffusion-cpp model (has generate method from sd.cpp)
-        try:
-            from stable_diffusion_cpp import StableDiffusion
-            if isinstance(sd_model, StableDiffusion):
-                print(f"Using stable-diffusion-cpp-python for image generation")
-                # Use sd.cpp for generation
-                # Parse size
-                width, height = 512, 512
-                if request.size:
-                    parts = request.size.split("x")
-                    if len(parts) == 2:
-                        try:
-                            width = int(parts[0])
-                            height = int(parts[1])
-                        except ValueError:
-                            pass
-                
-                # Use default steps for Z-Image Turbo (very fast)
-                steps = 4  # Default for fast generation
-                
-                # Generate images using sd.cpp (run in thread to not block event loop)
-                # Use request seed if provided, otherwise use CLI default seed
-                seed = request.seed if request.seed is not None else getattr(global_args, 'image_seed', None)
-                
-                result = await asyncio.to_thread(
-                    sd_model.generate_image,
-                    prompt=request.prompt,
-                    negative_prompt='',
-                    width=width,
-                    height=height,
-                    cfg_scale=get_cfg_scale(),
-                    sample_steps=steps,
-                    seed=seed if seed is not None else 42,
-                    batch_count=request.n if request.n else 1,
-                )
-                
-                # Small delay to let Vulkan driver settle after generation
-                import time
-                time.sleep(0.1)
-                
-                # Convert results to response format
-                images = []
-                
-                for img in result:
-                    # Use helper function to save and get response
-                    img_data = save_image_response(img, http_request=http_request)
-                    images.append(img_data)
-                
-                return {
-                    "created": int(time.time()),
-                    "data": images
-                }
-        except ImportError as e:
-            # stable-diffusion-cpp not available
-            sd_cpp_error = str(e)
-            print(f"stable-diffusion-cpp-python not available: {sd_cpp_error}")
-        except Exception as e:
-            print(f"sd.cpp generation error: {e}")
-            sd_cpp_error = str(e)
-    else:
-        # No sd.cpp model pre-loaded, try to load dynamically
-        print("No pre-loaded sd.cpp model found, trying to load...")
-        try:
-            from stable_diffusion_cpp import StableDiffusion
-
-            # Use model manager to resolve and load the model
-            model_path = multi_model_manager.load_model(model_to_use)
-
-            # For diffusers models, model_path will be the identifier string
-            # For GGUF models, it will be the file path
-            if model_path is not None and not os.path.isfile(model_path):
-                # This is a diffusers model identifier (not a file path)
-                # Skip sd.cpp and let diffusers handle it
-                print(f"Model '{model_path}' is handled by diffusers library, skipping sd.cpp")
-                model_path = None
-
-            if model_path is not None:
-                # Check if it's a stable-diffusion-cpp model (has generate method from sd.cpp)
-                try:
-                    from stable_diffusion_cpp import StableDiffusion
-                    if isinstance(sd_model, StableDiffusion):
-                        print(f"Using stable-diffusion-cpp-python for image generation")
-                        # Use sd.cpp for generation
-                        # Parse size
-                        width, height = 512, 512
-                        if request.size:
-                            parts = request.size.split("x")
-                            if len(parts) == 2:
-                                try:
-                                    width = int(parts[0])
-                                    height = int(parts[1])
-                                except ValueError:
-                                    pass
-
-                        # Use default steps for Z-Image Turbo (very fast)
-                        steps = 4  # Default for fast generation
-
-                        # Generate images using sd.cpp (run in thread to not block event loop)
-                        # Use request seed if provided, otherwise use CLI default seed
-                        seed = request.seed if request.seed is not None else getattr(global_args, 'image_seed', None)
-
-                        result = await asyncio.to_thread(
-                            sd_model.generate_image,
-                            prompt=request.prompt,
-                            negative_prompt='',
-                            width=width,
-                            height=height,
-                            cfg_scale=get_cfg_scale(),
-                            sample_steps=steps,
-                            seed=seed if seed is not None else 42,
-                            batch_count=request.n if request.n else 1,
-                        )
-
-                        # Small delay to let Vulkan driver settle after generation
-                        import time
-                        time.sleep(0.1)
-
-                        # Convert results to response format
-                        images = []
-
-                        for img in result:
-                            # Use helper function to save and get response
-                            img_data = save_image_response(img, http_request=http_request)
-                            images.append(img_data)
-
-                        return {
-                            "created": int(time.time()),
-                            "data": images
-                        }
-                except ImportError as e:
-                    # stable-diffusion-cpp not available
-                    sd_cpp_error = str(e)
-                    print(f"stable-diffusion-cpp-python not available: {sd_cpp_error}")
-                except Exception as e:
-                    print(f"sd.cpp generation error: {e}")
-                    sd_cpp_error = str(e)
-            else:
-                # model_path is None - likely a diffusers model handled above
-                print("Model handled by diffusers library")
-                sd_cpp_error = "Model handled by diffusers"
-        except ImportError as e:
-            sd_cpp_error = str(e)
-            print(f"stable-diffusion-cpp-python not available: {sd_cpp_error}")
-        except Exception as e:
-            sd_cpp_error = str(e)
-            print(f"sd.cpp error: {sd_cpp_error}")
-    
-    # Both backends failed - return error with installation instructions
-    raise HTTPException(
-        status_code=400,
-        detail=f"Model '{model_to_use}' does not support image generation"
-    )

@@ -54,51 +54,21 @@ async def create_transcription(
             raise HTTPException(status_code=500, detail=result["error"])
         return {"text": result.get("text", "")}
     
-    audio_model = multi_model_manager.audio_models[0] if multi_model_manager.audio_models else None
-    if not audio_model:
+    # Use the manager to resolve the model and manage VRAM
+    model_info = multi_model_manager.request_model(
+        requested_model=model,
+        model_type="audio"
+    )
+    
+    model_name = model_info['model_name']
+    model_key = model_info['model_key']
+    whisper_model = model_info['model_object']
+    
+    if not model_name:
         raise HTTPException(
             status_code=400,
             detail="Audio transcription not configured. Use --audio-model or --whisper-server."
         )
-    
-    # Get load mode to determine if we need to unload other models first
-    from codai.api.state import get_load_mode
-    from codai.models.manager import model_manager
-    load_mode = get_load_mode()
-    
-    # In ondemand mode, if ANY model is loaded and it's different from what we need, unload first
-    if load_mode == "ondemand":
-        has_any_model = len(multi_model_manager.models) > 0 or model_manager.backend is not None
-        
-        if has_any_model:
-            # Resolve both the requested audio model and currently loaded model to their canonical names
-            requested_canonical = multi_model_manager.resolve_model_name(f"audio:{audio_model}")
-            loaded_canonical = multi_model_manager.get_currently_loaded_model_name()
-            
-            # Also check legacy model_manager
-            if not loaded_canonical and model_manager.backend is not None:
-                loaded_canonical = "legacy_model_manager"
-            
-            # Compare: if they're different models, unload first
-            already_loaded = (requested_canonical and loaded_canonical and 
-                            requested_canonical == loaded_canonical)
-            
-            if not already_loaded:
-                print(f"In ondemand mode - model switch detected:")
-                print(f"  Requested: 'audio:{audio_model}' (resolved to: '{requested_canonical}')")
-                print(f"  Loaded: '{loaded_canonical}'")
-                print(f"  -> Fully unloading current model(s) before loading audio model...")
-                multi_model_manager.unload_all_models()
-                if model_manager.backend is not None:
-                    try:
-                        model_manager.cleanup()
-                    except:
-                        pass
-    
-    # Determine model to use
-    model_to_use = model
-    if model_to_use.startswith("whisper:") or model_to_use.startswith("audio:"):
-        model_to_use = audio_model
     
     # Read the uploaded file
     file_content = await file.read()
@@ -113,26 +83,23 @@ async def create_transcription(
         try:
             from faster_whisper import WhisperModel
             
-            # Determine model key
-            model_key = f"audio:{model_to_use}"
-            whisper_model = multi_model_manager.get_model(model_key)
-            
             if whisper_model is None:
-                print(f"Loading faster-whisper model: {model_to_use}")
+                print(f"Loading faster-whisper model: {model_name}")
                 
                 # Determine compute type - always use int8 for CPU
                 compute_type = "int8"
                 
                 # Load the model
                 whisper_model = WhisperModel(
-                    model_to_use,
+                    model_name,
                     device="cpu",  # Always use CPU - faster-whisper CUDA doesn't work with AMD
                     compute_type=compute_type,
                 )
                 
                 # Cache the model
                 multi_model_manager.add_model(model_key, whisper_model)
-                print(f"Loaded faster-whisper model: {model_to_use}")
+                multi_model_manager.current_model_key = model_key
+                print(f"Loaded faster-whisper model: {model_name}")
             
             # Run transcription
             segments, info = whisper_model.transcribe(
@@ -160,24 +127,21 @@ async def create_transcription(
         try:
             import whispercpp
             
-            # Determine model key
-            model_key = f"audio:{model_to_use}"
-            whisper_model = multi_model_manager.get_model(model_key)
-            
             if whisper_model is None:
-                print(f"Loading whispercpp model: {model_to_use}")
+                print(f"Loading whispercpp model: {model_name}")
                 
                 # Check if it's a built-in model name
-                if model_to_use in ['tiny.en', 'tiny', 'base.en', 'base', 'small.en', 'small', 'medium.en', 'medium', 'large-v1', 'large']:
+                if model_name in ['tiny.en', 'tiny', 'base.en', 'base', 'small.en', 'small', 'medium.en', 'medium', 'large-v1', 'large']:
                     # It's a built-in model name
-                    whisper_model = whispercpp.Whisper.from_pretrained(model_to_use)
+                    whisper_model = whispercpp.Whisper.from_pretrained(model_name)
                 else:
                     # It's a path to a GGUF file
-                    whisper_model = whispercpp.Whisper.from_pretrained(model_to_use)
+                    whisper_model = whispercpp.Whisper.from_pretrained(model_name)
                 
                 # Cache the model
                 multi_model_manager.add_model(model_key, whisper_model)
-                print(f"Loaded whispercpp model: {model_to_use}")
+                multi_model_manager.current_model_key = model_key
+                print(f"Loaded whispercpp model: {model_name}")
             
             # Run transcription
             result = whisper_model.transcribe(tmp_path)

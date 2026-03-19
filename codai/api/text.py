@@ -295,46 +295,13 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     # Get the model for this request
     requested_model = request.model
     
-    # Get load mode to determine if we need to unload other models first
-    from codai.api.state import get_load_mode
-    load_mode = get_load_mode()
+    # Use the manager to resolve the model and manage VRAM (handles ondemand unloading)
+    model_info = multi_model_manager.request_model(
+        requested_model=requested_model,
+        model_type="text"
+    )
     
-    # In ondemand mode (no --load-all or --loadswap), if ANY model is loaded in VRAM
-    # and it's different from what we need, fully unload it first to free VRAM
-    if load_mode == "ondemand":
-        has_any_model = len(multi_model_manager.models) > 0 or model_manager.backend is not None
-        
-        if has_any_model:
-            # Resolve both the requested model and currently loaded model to their canonical names
-            requested_canonical = multi_model_manager.resolve_model_name(requested_model)
-            loaded_canonical = multi_model_manager.get_currently_loaded_model_name()
-            
-            # Also check legacy model_manager
-            if not loaded_canonical and model_manager.backend is not None:
-                loaded_canonical = "legacy_model_manager"
-            
-            # Compare: if they're different models (even if same type), unload first
-            already_loaded = (requested_canonical and loaded_canonical and 
-                            requested_canonical == loaded_canonical)
-            
-            if not already_loaded:
-                print(f"In ondemand mode - model switch detected:")
-                print(f"  Requested: '{requested_model}' (resolved to: '{requested_canonical}')")
-                print(f"  Loaded: '{loaded_canonical}'")
-                print(f"  -> Fully unloading current model(s) before loading new model...")
-                
-                # Use centralized unload method
-                multi_model_manager.unload_all_models()
-                
-                # Also cleanup legacy model_manager
-                if model_manager.backend is not None:
-                    print("Unloading legacy model_manager from VRAM...")
-                    try:
-                        model_manager.cleanup()
-                    except Exception as e:
-                        print(f"Warning during legacy model cleanup: {e}")
-    
-    # Try to get the appropriate model
+    # Try to get the appropriate model (request_model handles VRAM cleanup)
     mm = multi_model_manager.get_model_for_request(requested_model)
     
     if mm is None:
@@ -1727,40 +1694,13 @@ async def completions(request: CompletionRequest):
     # Get the model for this request
     requested_model = request.model
     
-    # Get load mode to determine if we need to unload other models first
-    from codai.api.state import get_load_mode
-    load_mode = get_load_mode()
+    # Use the manager to resolve the model and manage VRAM (handles ondemand unloading)
+    model_info = multi_model_manager.request_model(
+        requested_model=requested_model,
+        model_type="text"
+    )
     
-    # In ondemand mode, if ANY model is loaded and it's different from what we need, unload first
-    if load_mode == "ondemand":
-        has_any_model = len(multi_model_manager.models) > 0 or model_manager.backend is not None
-        
-        if has_any_model:
-            # Resolve both the requested model and currently loaded model to their canonical names
-            requested_canonical = multi_model_manager.resolve_model_name(requested_model)
-            loaded_canonical = multi_model_manager.get_currently_loaded_model_name()
-            
-            # Also check legacy model_manager
-            if not loaded_canonical and model_manager.backend is not None:
-                loaded_canonical = "legacy_model_manager"
-            
-            # Compare: if they're different models (even if same type), unload first
-            already_loaded = (requested_canonical and loaded_canonical and 
-                            requested_canonical == loaded_canonical)
-            
-            if not already_loaded:
-                print(f"In ondemand mode - model switch detected:")
-                print(f"  Requested: '{requested_model}' (resolved to: '{requested_canonical}')")
-                print(f"  Loaded: '{loaded_canonical}'")
-                print(f"  -> Fully unloading current model(s) before loading new model...")
-                multi_model_manager.unload_all_models()
-                if model_manager.backend is not None:
-                    try:
-                        model_manager.cleanup()
-                    except:
-                        pass
-    
-    # Try to get the appropriate model
+    # Try to get the appropriate model (request_model handles VRAM cleanup)
     mm = multi_model_manager.get_model_for_request(requested_model)
     
     if mm is None:

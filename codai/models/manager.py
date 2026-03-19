@@ -883,6 +883,133 @@ class MultiModelManager:
         return load_model(model_path, cache_dir, file_pattern)
 
     
+    def request_model(self, requested_model: str, model_type: str = None) -> Dict[str, Any]:
+        """
+        Central method for API modules to request a model.
+        
+        Handles:
+        1. Alias resolution (e.g., "image" -> "Tongyi-MAI/Z-Image-Turbo")
+        2. VRAM management (unloading previous models in ondemand mode)
+        3. Checking if model is already loaded
+        
+        Args:
+            requested_model: The model name/alias from the API request
+            model_type: The type of model being requested ("image", "text", "audio", "tts", "vision")
+                       Used to resolve empty/None model names to the appropriate default.
+        
+        Returns:
+            Dict with:
+                - 'model_key': The key used to store/retrieve the model in self.models
+                - 'model_name': The resolved model name/path/HF ID
+                - 'model_object': The loaded model object if already loaded, None otherwise
+                - 'config': The stored configuration for this model
+                - 'already_loaded': True if the model is already loaded in VRAM
+        """
+        from codai.api.state import get_load_mode
+        mode = get_load_mode()
+        
+        # Step 1: Resolve the model name from aliases
+        resolved_name = None
+        model_key = None
+        
+        # If no model specified, use the default for the given type
+        if not requested_model or requested_model == model_type:
+            if model_type == "image":
+                resolved_name = self.image_models[0] if self.image_models else None
+            elif model_type == "audio":
+                resolved_name = self.audio_models[0] if self.audio_models else None
+            elif model_type == "tts":
+                resolved_name = self.tts_model
+            elif model_type == "vision":
+                resolved_name = self.vision_models[0] if self.vision_models else None
+            else:
+                resolved_name = self.default_model
+        else:
+            # Resolve custom aliases
+            if requested_model in self.model_aliases:
+                requested_model = self.model_aliases[requested_model]
+            
+            # Handle "default" alias
+            if requested_model == "default":
+                resolved_name = self.default_model
+            # Handle type-specific aliases
+            elif requested_model == "image":
+                resolved_name = self.image_models[0] if self.image_models else None
+            elif requested_model == "audio":
+                resolved_name = self.audio_models[0] if self.audio_models else None
+            elif requested_model == "tts":
+                resolved_name = self.tts_model
+            elif requested_model == "vision":
+                resolved_name = self.vision_models[0] if self.vision_models else None
+            # Handle prefixed models (e.g., "image:model_name")
+            elif requested_model.startswith("image:"):
+                resolved_name = requested_model[6:]
+            elif requested_model.startswith("audio:"):
+                resolved_name = requested_model[6:]
+            elif requested_model.startswith("tts:"):
+                resolved_name = requested_model[4:]
+            elif requested_model.startswith("vision:"):
+                resolved_name = requested_model[7:]
+            else:
+                resolved_name = requested_model
+        
+        if not resolved_name:
+            return {
+                'model_key': None,
+                'model_name': None,
+                'model_object': None,
+                'config': {},
+                'already_loaded': False,
+            }
+        
+        # Step 2: Build the model key (prefixed with type)
+        if model_type and model_type != "text":
+            model_key = f"{model_type}:{resolved_name}"
+        else:
+            model_key = resolved_name
+        
+        # Step 3: Check if already loaded
+        existing_model = self.models.get(model_key)
+        if existing_model is not None:
+            self.current_model_key = model_key
+            return {
+                'model_key': model_key,
+                'model_name': resolved_name,
+                'model_object': existing_model,
+                'config': self.config.get(model_key, {}),
+                'already_loaded': True,
+            }
+        
+        # Step 4: In ondemand mode, unload any currently loaded model
+        if mode == "ondemand":
+            has_any_model = len(self.models) > 0 or model_manager.backend is not None
+            
+            if has_any_model:
+                loaded_canonical = self.get_currently_loaded_model_name()
+                if not loaded_canonical and model_manager.backend is not None:
+                    loaded_canonical = "legacy_model_manager"
+                
+                if loaded_canonical and loaded_canonical != model_key:
+                    print(f"Ondemand mode - model switch detected:")
+                    print(f"  Requested: '{model_key}' (resolved: '{resolved_name}')")
+                    print(f"  Currently loaded: '{loaded_canonical}'")
+                    print(f"  -> Unloading current model(s) before loading new model...")
+                    self.unload_all_models()
+                    if model_manager.backend is not None:
+                        try:
+                            model_manager.cleanup()
+                        except:
+                            pass
+        
+        # Step 5: Return info for the caller to load the model
+        return {
+            'model_key': model_key,
+            'model_name': resolved_name,
+            'model_object': None,
+            'config': self.config.get(model_key, {}),
+            'already_loaded': False,
+        }
+    
     def unload_all_models(self):
         """
         Fully unload ALL models from VRAM. Used in ondemand mode when switching

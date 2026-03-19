@@ -16,18 +16,6 @@ from codai.models.manager import multi_model_manager
 global_args = None
 
 
-def get_cached_model_path(url: str) -> str:
-    """Get cached model path if available."""
-    from codai.models.cache import get_cached_model_path as cache_get_cached_model_path
-    return cache_get_cached_model_path(url)
-
-
-def get_model_cache_dir() -> str:
-    """Get model cache directory."""
-    from codai.models.cache import get_model_cache_dir
-    return get_model_cache_dir()
-
-
 def set_global_args(args):
     """Set global args from coderai."""
     global global_args
@@ -65,80 +53,46 @@ async def create_speech(request: TTSRequest):
     Supports:
     - Kokoro TTS models (when --tts-model is specified)
     """
-    tts_model = multi_model_manager.tts_model
+    # Use the manager to resolve the model and manage VRAM
+    model_info = multi_model_manager.request_model(
+        requested_model=request.model,
+        model_type="tts"
+    )
+    
+    model_name = model_info['model_name']
+    model_key = model_info['model_key']
+    kokoro_model = model_info['model_object']
     
     # If no TTS model configured, return an error
-    if not tts_model:
+    if not model_name:
         raise HTTPException(
             status_code=400,
             detail="TTS not configured. Use --tts-model to specify a model."
         )
     
-    # Get load mode to determine if we need to unload other models first
-    from codai.api.state import get_load_mode
-    from codai.models.manager import model_manager
-    load_mode = get_load_mode()
-    
-    # In ondemand mode, if ANY model is loaded and it's different from what we need, unload first
-    if load_mode == "ondemand":
-        has_any_model = len(multi_model_manager.models) > 0 or model_manager.backend is not None
-        
-        if has_any_model:
-            # Resolve both the requested TTS model and currently loaded model to their canonical names
-            requested_canonical = multi_model_manager.resolve_model_name(f"tts:{tts_model}")
-            loaded_canonical = multi_model_manager.get_currently_loaded_model_name()
-            
-            # Also check legacy model_manager
-            if not loaded_canonical and model_manager.backend is not None:
-                loaded_canonical = "legacy_model_manager"
-            
-            # Compare: if they're different models, unload first
-            already_loaded = (requested_canonical and loaded_canonical and 
-                            requested_canonical == loaded_canonical)
-            
-            if not already_loaded:
-                print(f"In ondemand mode - model switch detected:")
-                print(f"  Requested: 'tts:{tts_model}' (resolved to: '{requested_canonical}')")
-                print(f"  Loaded: '{loaded_canonical}'")
-                print(f"  -> Fully unloading current model(s) before loading TTS model...")
-                multi_model_manager.unload_all_models()
-                if model_manager.backend is not None:
-                    try:
-                        model_manager.cleanup()
-                    except:
-                        pass
-    
-    # Determine model to use
-    model_to_use = request.model
-    if model_to_use.startswith("tts:"):
-        model_to_use = tts_model
-    
     # Try to use kokoro if available
     try:
         from kokoro import Kokoro
         
-        # Determine model key
-        model_key = f"tts:{model_to_use}"
-        kokoro_model = multi_model_manager.get_model(model_key)
-        
         if kokoro_model is None:
-            print(f"Loading Kokoro TTS model: {model_to_use}")
+            print(f"Loading Kokoro TTS model: {model_name}")
             
-            # Check if model_to_use is a URL - download it (with caching)
+            # Check if model_name is a URL - download it (with caching)
             model_path = None
-            if model_to_use.startswith('http://') or model_to_use.startswith('https://'):
-                print(f"Loading model from URL: {model_to_use}")
+            if model_name.startswith('http://') or model_name.startswith('https://'):
+                print(f"Loading model from URL: {model_name}")
                 from codai.models.cache import load_model
-                model_path = load_model(model_to_use)
+                model_path = load_model(model_name)
                 if not model_path:
-                    raise Exception(f"Failed to load model from {model_to_use}")
+                    raise Exception(f"Failed to load model from {model_name}")
             else:
                 # Use local path or model name
-                model_path = model_to_use
+                model_path = model_name
             
             # Load the Kokoro model
-            kokoro_model = Kokoro(model_path if model_path else model_to_use)
+            kokoro_model = Kokoro(model_path if model_path else model_name)
             multi_model_manager.add_model(model_key, kokoro_model)
+            multi_model_manager.current_model_key = model_key
         
         # Generate speech
         voice = request.voice or "af_sarah"
