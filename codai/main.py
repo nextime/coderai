@@ -164,16 +164,21 @@ def main():
         if not all_files:
             print("\nNo cached models found.")
             sys.exit(0)
-        
+
+        # Print individual files
+        for cache_name, filename, size in all_files:
+            size_mb = size / (1024 * 1024)
+            print(f"  [{cache_name}] {filename} ({size_mb:.1f} MB)")
+
         # Calculate totals
         total_size = sum(size for _, _, size in all_files)
-        
+
         print(f"\n=== Summary ===")
         print(f"Total: {len(all_files)} files, {total_size / (1024*1024*1024):.2f} GB")
         print("\nCache locations:")
         for cache_name, cache_dir in caches.items():
             print(f"  {cache_name}: {cache_dir}")
-        
+
         sys.exit(0)
     
     # Handle --remove-all-models
