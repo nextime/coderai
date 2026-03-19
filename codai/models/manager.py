@@ -528,6 +528,8 @@ class MultiModelManager:
                     kwargs['offload_dir'] = global_args.offload_dir
                 if hasattr(global_args, 'ram'):
                     kwargs['ram'] = global_args.ram
+                if hasattr(global_args, 'flash_attn'):
+                    kwargs['flash_attn'] = global_args.flash_attn
             
             print(f"Loading default model on demand: {self.default_model}")
             model_manager.load_model(self.default_model, backend_type=backend_type, **kwargs)
@@ -575,6 +577,8 @@ class MultiModelManager:
                     kwargs['offload_dir'] = global_args.offload_dir
                 if hasattr(global_args, 'ram'):
                     kwargs['ram'] = global_args.ram
+                if hasattr(global_args, 'flash_attn'):
+                    kwargs['flash_attn'] = global_args.flash_attn
             
             print(f"Loading model on demand: {model_name}")
             model_manager.load_model(model_name, backend_type=backend_type, **kwargs)
