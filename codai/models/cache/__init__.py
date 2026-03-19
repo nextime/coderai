@@ -254,6 +254,64 @@ def remove_cached_model(match_term: str) -> List[Tuple[str, str, int]]:
     return removed
 
 
+def list_cached_models_info() -> dict:
+    """
+    List cached models with proper model-level information.
+
+    Returns:
+        Dict with cache information containing:
+        - 'coderai': List of (filename, size_mb) tuples for GGUF files
+        - 'huggingface': List of (repo_id, size_gb, revision_count) tuples for HF models
+        - 'total_models': Total number of models
+        - 'total_size_gb': Total size in GB
+    """
+    caches = get_all_cache_dirs()
+    result = {
+        'coderai': [],
+        'huggingface': [],
+        'total_models': 0,
+        'total_size_gb': 0.0
+    }
+
+    # List CoderAI GGUF files
+    coderai_dir = caches.get('coderai')
+    if coderai_dir and os.path.exists(coderai_dir):
+        files = [f for f in os.listdir(coderai_dir) if os.path.isfile(os.path.join(coderai_dir, f))]
+        for filename in sorted(files):
+            filepath = os.path.join(coderai_dir, filename)
+            size = os.path.getsize(filepath)
+            size_mb = size / (1024 * 1024)
+            result['coderai'].append((filename, size_mb))
+            result['total_size_gb'] += size_mb / 1024  # Convert MB to GB
+        result['total_models'] += len(files)
+
+    # List HuggingFace models using HF API
+    hf_dir = caches.get('huggingface')
+    if hf_dir and os.path.exists(hf_dir):
+        try:
+            from huggingface_hub import scan_cache_dir
+            cache_info = scan_cache_dir(hf_dir)
+
+            for repo in sorted(cache_info.repos, key=lambda x: x.repo_id):
+                # Calculate total size for this repo
+                repo_size = sum(revision.size_on_disk for revision in repo.revisions)
+                size_gb = repo_size / (1024 * 1024 * 1024)
+                revision_count = len(repo.revisions)
+
+                result['huggingface'].append((repo.repo_id, size_gb, revision_count))
+                result['total_models'] += 1
+                result['total_size_gb'] += size_gb
+
+        except ImportError:
+            # huggingface_hub not available
+            pass
+        except Exception as e:
+            # Error listing HF cache
+            pass
+
+    return result
+
+
 def remove_all_cached_models() -> int:
     """
     Remove all cached models.
