@@ -1073,13 +1073,18 @@ class ModelParserDispatcher:
     def __init__(self, model_name: str = None, tools_schema: Dict[str, Any] = None):
         self.model_name = model_name
         self.tools = tools_schema or {}
+        # Only log parser selection when a model name is provided (actual use)
+        # Skip logging during initialization with model_name=None
+        self._log_selection = model_name is not None
         self.parser = self._get_parser()
+        self._log_selection = True  # Enable logging for subsequent calls
     
     def _get_parser(self) -> BaseParser:
         """Get the appropriate parser based on model name."""
         if not self.model_name:
             parser = ApexBig50Parser(self.tools)
-            print(f"DEBUG model_parser: model_name=None, selected parser: {type(parser).__name__}")
+            # Only log if we're being used for parsing, not during init
+            # (self._log_selection is False during __init__ when model_name=None)
             return parser
         
         model_lower = self.model_name.lower()
@@ -1087,60 +1092,70 @@ class ModelParserDispatcher:
         # Qwen models
         if 'qwen' in model_lower:
             parser = QwenParser(self.tools)
-            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: QwenParser")
+            if self._log_selection:
+                print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: QwenParser")
             return parser
         
         # DeepSeek models
         if 'deepseek' in model_lower:
             parser = DeepSeekParser(self.tools)
-            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: DeepSeekParser")
+            if self._log_selection:
+                print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: DeepSeekParser")
             return parser
         
         # Llama models
         if 'llama' in model_lower:
             parser = LlamaParser(self.tools)
-            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: LlamaParser")
+            if self._log_selection:
+                print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: LlamaParser")
             return parser
         
         # Mistral models
         if 'mistral' in model_lower or 'mixtral' in model_lower:
             parser = MistralParser(self.tools)
-            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: MistralParser")
+            if self._log_selection:
+                print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: MistralParser")
             return parser
         
         # Claude models
         if 'claude' in model_lower:
             parser = ClaudeParser(self.tools)
-            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: ClaudeParser")
+            if self._log_selection:
+                print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: ClaudeParser")
             return parser
         
         # Command R models
         if 'command' in model_lower:
             parser = CommandRParser(self.tools)
-            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: CommandRParser")
+            if self._log_selection:
+                print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: CommandRParser")
             return parser
         
         # Gemma models
         if 'gemma' in model_lower:
             parser = GemmaParser(self.tools)
-            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: GemmaParser")
+            if self._log_selection:
+                print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: GemmaParser")
             return parser
         
         # Grok models
         if 'grok' in model_lower:
             parser = GrokParser(self.tools)
-            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: GrokParser")
+            if self._log_selection:
+                print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: GrokParser")
             return parser
         
         # Phi models
         if 'phi' in model_lower:
             parser = PhiParser(self.tools)
-            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: PhiParser")
+            if self._log_selection:
+                print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: PhiParser")
             return parser
         
         # Default: use catch-all parser
         parser = ApexBig50Parser(self.tools)
-        print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: ApexBig50Parser (default)")
+        if self._log_selection:
+            print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: ApexBig50Parser (default)")
         return parser
     
     def parse(self, text: str) -> List[Dict]:
@@ -2004,11 +2019,19 @@ class ModelParserAdapter:
     def __init__(self, model_name: str = None, tools_schema: Dict = None):
         self._model_name = model_name
         self._tools_schema = tools_schema or {}
-        self._dispatcher = ModelParserDispatcher(model_name=model_name, tools_schema=self._tools_schema)
+        # Defer dispatcher creation - it will be created on first use or when model_name is set
+        self._dispatcher = None
+    
+    def _ensure_dispatcher(self) -> ModelParserDispatcher:
+        """Ensure dispatcher is created with current model_name."""
+        if self._dispatcher is None or (self._model_name and self._dispatcher.model_name != self._model_name):
+            self._dispatcher = ModelParserDispatcher(model_name=self._model_name, tools_schema=self._tools_schema)
+        return self._dispatcher
     
     def set_model_name(self, model_name: str) -> None:
         """Set the model name for model-specific parsing."""
         self._model_name = model_name
+        # Force dispatcher recreation on next use
         self._dispatcher = ModelParserDispatcher(model_name=model_name, tools_schema=self._tools_schema)
     
     def extract_tool_calls(self, text: str, available_tools: List) -> Optional[List[Dict]]:
@@ -2029,11 +2052,13 @@ class ModelParserAdapter:
                     'parameters': func.parameters or {}
                 }
         
+        # Ensure dispatcher is created and update tools if needed
+        dispatcher = self._ensure_dispatcher()
         if tools_dict != self._tools_schema:
             self._tools_schema = tools_dict
-            self._dispatcher.set_tools(tools_dict)
+            dispatcher.set_tools(tools_dict)
         
-        tool_calls = self._dispatcher.parse(text)
+        tool_calls = dispatcher.parse(text)
         
         # Fallback: if no tool calls found, try using ToolCallParser
         if not tool_calls:
