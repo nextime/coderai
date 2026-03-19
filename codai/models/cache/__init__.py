@@ -198,6 +198,8 @@ def load_model(model_path: str, cache_dir: Optional[str] = None, file_pattern: s
     return download_model(model_path, cache_dir, file_pattern)
 
 
+
+
 def download_model(model_path: str, cache_dir: Optional[str] = None, file_pattern: str = '.gguf') -> Optional[str]:
     """
     Download a model from URL or HuggingFace. Works with both URLs and model IDs.

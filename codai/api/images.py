@@ -13,7 +13,6 @@ from PIL import Image
 
 # Import from codai modules
 from codai.models.manager import multi_model_manager
-from codai.models.cache import resolve_and_load_model
 from codai.pydantic.imagerequest import ImageGenerationRequest
 from codai.api.state import get_load_mode
 
@@ -654,9 +653,11 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
         try:
             from stable_diffusion_cpp import StableDiffusion
 
-            # Use centralized model resolution
-            model_path = resolve_and_load_model(model_to_use, model_type='image')
+            # Use model manager to resolve and load the model
+            model_path = multi_model_manager.load_model(model_to_use)
 
+            # For diffusers models, model_path will be the identifier string
+            # For GGUF models, it will be the file path
             if model_path is not None and not os.path.isfile(model_path):
                 # This is a diffusers model identifier (not a file path)
                 # Skip sd.cpp and let diffusers handle it
