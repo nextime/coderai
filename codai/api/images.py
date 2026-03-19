@@ -701,129 +701,101 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                     print(f"Could not resolve as HuggingFace model: {e}")
             
             if model_path is None:
-                print("Warning: Could not resolve sd.cpp model path")
-                sd_cpp_error = "Could not resolve model path"
-            else:
-                # Load sd.cpp model
-                # Determine backend to use based on CLI args
-                backend = getattr(global_args, 'backend', 'auto')
-                image_backend = getattr(global_args, 'image_backend', 'auto')
-                
-                # Use CUDA only if explicitly requested via --backend nvidia or --image-backend nvidia
-                use_cuda = (backend == 'nvidia' or backend == 'cuda' or 
-                           image_backend == 'nvidia' or image_backend == 'cuda')
-                
-                if use_cuda:
-                    print(f"Using CUDA backend for sd.cpp image generation")
+                print("Warning: Could not resolve sd.cpp model path via HuggingFace GGUF resolution")
+                # Fallback: try to use the model name as a direct path (for local models or if HF resolution failed)
+                print(f"Fallback: attempting to use '{model_to_use}' as direct model path")
+                if os.path.isfile(model_to_use):
+                    model_path = model_to_use
+                    print(f"Using local file: {model_path}")
                 else:
-                    print(f"Using Vulkan backend for sd.cpp image generation")
-                
-                # Build kwargs for stable-diffusion-cpp with CLI args
-                sd_kwargs = {'diffusion_model_path': model_path}
-                
-                # Add VAE path from CLI args if provided
-                vae_path = getattr(global_args, 'vae_path', None)
-                if vae_path:
-                    # Check if it's a URL and download if needed
-                    if vae_path.startswith('http://') or vae_path.startswith('https://'):
-                        cached = multi_model_manager.get_cached_model_path(vae_path)
-                        if cached:
-                            sd_kwargs['vae_path'] = cached
-                            print(f"Using cached VAE model: {cached}")
-                        else:
-                            cache_dir = multi_model_manager.get_model_cache_dir()
-                            sd_kwargs['vae_path'] = multi_model_manager.download_model(vae_path, cache_dir)
+                    # Not a local file, check if it might be a cached model under a different name
+                    cached_path = multi_model_manager.get_cached_model_path(model_to_use)
+                    if cached_path:
+                        model_path = cached_path
+                        print(f"Using cached model: {model_path}")
                     else:
-                        sd_kwargs['vae_path'] = vae_path
-                
-                # Add LLM/CLIP path from CLI args if provided
-                llm_path = getattr(global_args, 'llm_path', None)
-                if llm_path:
-                    if llm_path.startswith('http://') or llm_path.startswith('https://'):
-                        cached = multi_model_manager.get_cached_model_path(llm_path)
-                        if cached:
-                            sd_kwargs['llm_path'] = cached
-                            print(f"Using cached LLM model: {cached}")
-                        else:
-                            cache_dir = multi_model_manager.get_model_cache_dir()
-                            sd_kwargs['llm_path'] = multi_model_manager.download_model(llm_path, cache_dir)
-                    else:
-                        sd_kwargs['llm_path'] = llm_path
-                
-                # Add T5XXL path from CLI args if provided
-                t5xxl_path = getattr(global_args, 't5xxl_path', None)
-                if t5xxl_path:
-                    if t5xxl_path.startswith('http://') or t5xxl_path.startswith('https://'):
-                        cached = multi_model_manager.get_cached_model_path(t5xxl_path)
-                        if cached:
-                            sd_kwargs['t5xxl_path'] = cached
-                            print(f"Using cached T5XXL model: {cached}")
-                        else:
-                            cache_dir = multi_model_manager.get_model_cache_dir()
-                            sd_kwargs['t5xxl_path'] = multi_model_manager.download_model(t5xxl_path, cache_dir)
-                    else:
-                        sd_kwargs['t5xxl_path'] = t5xxl_path
-                
-                # Add clip_on_cpu if specified
-                if getattr(global_args, 'clip_on_cpu', False):
-                    sd_kwargs['keep_clip_on_cpu'] = True
-                    print(f"DEBUG: Running CLIP on CPU to save VRAM (keep_clip_on_cpu=True)")
-                
-                # Use all available CPU cores
-                import psutil
-                sd_kwargs['n_threads'] = psutil.cpu_count()
-                
-                sd_model = StableDiffusion(**sd_kwargs)
-                
-                # Cache the model for reuse on subsequent requests
-                cache_key = f"image:{model_path}"
-                multi_model_manager.add_model(cache_key, sd_model)
-                print(f"Using stable-diffusion-cpp-python for image generation")
-                
-                # Generate images
-                width, height = 512, 512
-                if request.size:
-                    parts = request.size.split("x")
-                    if len(parts) == 2:
+                        # Last resort: try to download it as if it were a URL
+                        print(f"Attempting to download '{model_to_use}' as model URL")
                         try:
-                            width = int(parts[0])
-                            height = int(parts[1])
-                        except ValueError:
-                            pass
+                            cache_dir = multi_model_manager.get_model_cache_dir()
+                            model_path = multi_model_manager.download_model(model_to_use, cache_dir)
+                            print(f"Downloaded to: {model_path}")
+                        except Exception as download_error:
+                            print(f"Download failed: {download_error}")
+                            model_path = None
                 
-                steps = 4
-                
-                # Use request seed if provided, otherwise use CLI default seed
-                seed = request.seed if request.seed is not None else getattr(global_args, 'image_seed', None)
-                
-                result = await asyncio.to_thread(
-                    sd_model.generate_image,
-                    prompt=request.prompt,
-                    negative_prompt='',
-                    width=width,
-                    height=height,
-                    cfg_scale=get_cfg_scale(),
-                    sample_steps=steps,
-                    seed=seed if seed is not None else 42,
-                    batch_count=request.n if request.n else 1,
-                )
-                
-                # Small delay to let Vulkan driver settle after generation
-                import time
-                time.sleep(0.1)
-                
-                # Convert results to response format
-                images = []
-                
-                for img in result:
-                    # Use helper function to save and get response
-                    img_data = save_image_response(img, http_request=http_request)
-                    images.append(img_data)
-                
-                return {
-                    "created": int(time.time()),
-                    "data": images
-                }
+                if model_path is None:
+                    print("Error: Could not resolve sd.cpp model path through any method")
+                    sd_cpp_error = "Could not resolve model path"
+                else:
+                    # Load sd.cpp model (continue below)
+                    pass
+            
+            # Load sd.cpp model if we have a valid path
+            if model_path is not None:
+                # Check if it's a stable-diffusion-cpp model (has generate method from sd.cpp)
+                try:
+                    from stable_diffusion_cpp import StableDiffusion
+                    if isinstance(sd_model, StableDiffusion):
+                        print(f"Using stable-diffusion-cpp-python for image generation")
+                        # Use sd.cpp for generation
+                        # Parse size
+                        width, height = 512, 512
+                        if request.size:
+                            parts = request.size.split("x")
+                            if len(parts) == 2:
+                                try:
+                                    width = int(parts[0])
+                                    height = int(parts[1])
+                                except ValueError:
+                                    pass
+                        
+                        # Use default steps for Z-Image Turbo (very fast)
+                        steps = 4  # Default for fast generation
+                        
+                        # Generate images using sd.cpp (run in thread to not block event loop)
+                        # Use request seed if provided, otherwise use CLI default seed
+                        seed = request.seed if request.seed is not None else getattr(global_args, 'image_seed', None)
+                        
+                        result = await asyncio.to_thread(
+                            sd_model.generate_image,
+                            prompt=request.prompt,
+                            negative_prompt='',
+                            width=width,
+                            height=height,
+                            cfg_scale=get_cfg_scale(),
+                            sample_steps=steps,
+                            seed=seed if seed is not None else 42,
+                            batch_count=request.n if request.n else 1,
+                        )
+                        
+                        # Small delay to let Vulkan driver settle after generation
+                        import time
+                        time.sleep(0.1)
+                        
+                        # Convert results to response format
+                        images = []
+                        
+                        for img in result:
+                            # Use helper function to save and get response
+                            img_data = save_image_response(img, http_request=http_request)
+                            images.append(img_data)
+                        
+                        return {
+                            "created": int(time.time()),
+                            "data": images
+                        }
+                except ImportError as e:
+                    # stable-diffusion-cpp not available
+                    sd_cpp_error = str(e)
+                    print(f"stable-diffusion-cpp-python not available: {sd_cpp_error}")
+                except Exception as e:
+                    print(f"sd.cpp generation error: {e}")
+                    sd_cpp_error = str(e)
+            else:
+                # model_path is None after all fallback attempts
+                print("Error: Could not resolve sd.cpp model path through any method")
+                sd_cpp_error = "Could not resolve model path"
         except ImportError as e:
             sd_cpp_error = str(e)
             print(f"stable-diffusion-cpp-python not available: {sd_cpp_error}")
