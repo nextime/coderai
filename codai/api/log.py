@@ -2,6 +2,7 @@
 Request logging middleware for the codai API.
 """
 
+import json
 from fastapi import Request
 
 
@@ -20,7 +21,24 @@ async def log_requests(request: Request, call_next):
             
             # In debug mode, dump the full request
             if global_debug:
-                print(f"DEBUG: Request body: {body_str[:500]}...")
+                print(f"\n{'='*80}")
+                print(f"=== FULL REQUEST DEBUG ===")
+                print(f"{'='*80}")
+                print(f"Method: {request.method}")
+                print(f"URL: {request.url}")
+                print(f"Headers:")
+                for k, v in request.headers.items():
+                    print(f"  {k}: {v}")
+                print(f"\n--- Body ---")
+                # Print full body without truncation
+                try:
+                    # Try to pretty-print JSON
+                    parsed = json.loads(body_str)
+                    print(json.dumps(parsed, indent=2))
+                except:
+                    # If not JSON, print as-is
+                    print(body_str)
+                print(f"{'='*80}\n")
         except Exception as e:
             print(f"Error reading request body: {e}")
         
