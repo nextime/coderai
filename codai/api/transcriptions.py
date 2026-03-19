@@ -54,7 +54,7 @@ async def create_transcription(
             raise HTTPException(status_code=500, detail=result["error"])
         return {"text": result.get("text", "")}
     
-    audio_model = multi_model_manager.audio_model
+    audio_model = multi_model_manager.audio_models[0] if multi_model_manager.audio_models else None
     if not audio_model:
         raise HTTPException(
             status_code=400,
