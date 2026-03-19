@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException, Request
 from codai.models.manager import ModelManager, WhisperServerManager, MultiModelManager, model_manager, multi_model_manager
 from codai.queue.manager import QueueManager, queue_manager
 from codai.pydantic.textrequest import ChatCompletionRequest, ToolFunction, Tool
-from codai.models.parser import filter_malformed_content, filter_repetition, OpenAIFormatter, ModelParserAdapter, ToolCallParser
+from codai.models.parser import filter_malformed_content, filter_repetition, format_tools_for_prompt, cleanup_control_tokens, OpenAIFormatter, ModelParserAdapter, ToolCallParser
 
 # Import global state from state module
 from codai.api.state import (
