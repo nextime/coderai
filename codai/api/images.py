@@ -504,12 +504,17 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                 # Convert to base64
                 import numpy as np
                 
-                # Handle NaN/Inf values in image data - convert to valid values
+                # Debug: print image type and value range
+                print(f"DEBUG: Image type: {type(img)}")
                 if isinstance(img, np.ndarray):
+                    print(f"DEBUG: Image shape: {img.shape}, dtype: {img.dtype}, min: {img.min()}, max: {img.max()}")
+                    # Handle NaN/Inf values in image data - convert to valid values
+                    # This fixes RuntimeWarning about invalid values in cast
                     # Replace NaN and Inf with valid values
-                    img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
+                    img = np.nan_to_num(img, nan=0.5, posinf=1.0, neginf=0.0)  # Use 0.5 for NaN (gray, not black)
                     # Clip to valid range [0, 1]
                     img = np.clip(img, 0.0, 1.0)
+                    print(f"DEBUG: After NaN handling - min: {img.min()}, max: {img.max()}")
                 
                 # Use helper function to save and get response
                 img_data = save_image_response(img, request.response_format, http_request)
