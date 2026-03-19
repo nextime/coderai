@@ -363,11 +363,17 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     
     # DEBUG: Print force_reasoning status when debug mode is enabled
     if get_global_debug():
+        # Get ggg and tools_closer_prompt from global_args
+        ggg_enabled = getattr(global_args, 'grammar_guided_gen', False) if global_args else False
+        tools_closer = getattr(global_args, 'tools_closer_prompt', False) if global_args else False
+        
         print(f"\n{'='*60}")
         print(f"=== REASONING MODE DEBUG ===")
         print(f"{'='*60}")
         print(f"force_reasoning CLI args: {force_reasoning_args}")
         print(f"enable_thinking API param: {enable_thinking_api}")
+        print(f"ggg (grammar-guided-gen) CLI flag: {ggg_enabled}")
+        print(f"tools-closer-prompt CLI flag: {tools_closer}")
         # Debug stop sequences if available
         if 'raw_stop_sequences' in locals():
             print(f"stop argument for chat call: {raw_stop_sequences}")
