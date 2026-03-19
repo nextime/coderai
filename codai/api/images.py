@@ -311,108 +311,98 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
         
         # Try diffusers first
         try:
-            from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline
+            from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline, DiffusionPipeline
             import torch
             
             # Check if model is XL
             is_xl = "xl" in model_to_use.lower() or "sdxl" in model_to_use.lower()
             
+            # Check if it's a GGUF model - skip diffusers for those
+            is_gguf_model = (model_to_use.endswith('.gguf') or 'gguf' in model_to_use.lower() or
+                            (model_to_use.startswith('http') and '.gguf' in model_to_use))
+            
+            if is_gguf_model:
+                print(f"GGUF model detected ({model_to_use}), skipping diffusers, using stable-diffusion-cpp...")
+                raise Exception("GGUF model - use stable-diffusion-cpp instead")
+            
             print(f"Loading diffusers model: {model_to_use}")
             
-            # Determine compute type
-            if torch.cuda.is_available():
-                dtype = torch.float16
-            else:
-                dtype = torch.float32
+            # Determine precision from CLI argument (--image-precision)
+            precision = getattr(global_args, 'image_precision', 'f32') or 'f32'
+            precision_map = {
+                'bf16': torch.bfloat16,
+                'f32': torch.float32,
+                'f16': torch.float16,
+            }
+            if hasattr(torch, 'float8_e4m3fn'):
+                precision_map['f8'] = torch.float8_e4m3fn
+            dtype = precision_map.get(precision, torch.float32)
+            print(f"Using precision: {precision} ({dtype})")
             
-            # Try to load the model
-            load_error = None
-            try:
-                # Use DiffusionPipeline which auto-detects the correct pipeline class from model_index.json
-                # This supports custom pipelines like ZImagePipeline (DiT-based) which use 'transformer' instead of 'unet'
-                from diffusers import DiffusionPipeline
-                
-                print(f"Loading diffusers model: {model_to_use}")
-                
-                # Determine compute type
-                if torch.cuda.is_available():
-                    dtype = torch.float16
-                else:
-                    dtype = torch.float32
-                
-                # Use DiffusionPipeline for auto-detection of pipeline class
-                pipeline = DiffusionPipeline.from_pretrained(
-                    model_to_use,
-                    torch_dtype=dtype,
-                )
-            except Exception as load_error:
-                # Try with revised model resolution for custom models
-                print(f"Warning: First model load attempt failed: {load_error}")
-                print("Trying alternative loading method...")
-                
-                # Check if it's a missing component error (incomplete model)
-                if "expected" in str(load_error) and "but only" in str(load_error):
-                    # This is an incomplete model - don't keep retrying the same thing
-                    print(f"Error: Model '{model_to_use}' is incomplete or missing required components (unet, image_encoder, etc.)")
-                    print("This model cannot be loaded with diffusers. Trying stable-diffusion-cpp-python instead...")
-                    # Skip the retry attempts and go directly to sd.cpp
-                    raise Exception(f"Incomplete model: {load_error}")
-                
-                # Try with default resolution
+            # Check if CPU offload is requested via CLI
+            use_sequential_offload = getattr(global_args, 'image_cpu_offload', False)
+            
+            # Track loading attempts for OOM handling
+            load_attempt = 0
+            max_attempts = 3
+            
+            while pipeline is None and load_attempt < max_attempts:
                 try:
-                    from diffusers import DiffusionPipeline
-                    if is_xl:
+                    load_attempt += 1
+                    print(f"Loading attempt {load_attempt}/{max_attempts}...")
+                    
+                    # Try to load as Stable Diffusion XL first, then generic DiffusionPipeline
+                    try:
                         pipeline = StableDiffusionXLPipeline.from_pretrained(
                             model_to_use,
                             torch_dtype=dtype,
+                            use_safetensors=True,
                         )
-                    else:
-                        # Fall back to DiffusionPipeline for custom pipelines
+                    except Exception:
+                        # Try generic diffusion pipeline (supports custom pipelines like ZImagePipeline)
                         pipeline = DiffusionPipeline.from_pretrained(
                             model_to_use,
                             torch_dtype=dtype,
+                            use_safetensors=True,
                         )
-                except Exception as retry_error:
-                    # If it still fails, try DiffusionPipeline (for custom pipelines like ZImagePipeline)
-                    print(f"Warning: Retry failed: {retry_error}, trying DiffusionPipeline for custom pipelines...")
-                    from diffusers import DiffusionPipeline
-                    if is_xl:
-                        pipeline = StableDiffusionXLPipeline.from_pretrained(
-                            model_to_use,
-                            torch_dtype=dtype,
-                            safety_checker=None,
-                        )
+                    
+                    # Apply memory optimizations based on attempt
+                    if torch.cuda.is_available():
+                        if load_attempt >= 2:
+                            # Second attempt: enable attention slicing
+                            print("Enabling attention slicing for lower VRAM usage...")
+                            if hasattr(pipeline, 'enable_attention_slicing'):
+                                pipeline.enable_attention_slicing()
+                        
+                        if load_attempt >= 3 or use_sequential_offload:
+                            # Third attempt or offload requested: enable sequential CPU offload
+                            print("Enabling sequential CPU offload for lower VRAM usage...")
+                            if hasattr(pipeline, 'enable_sequential_cpu_offload'):
+                                pipeline.enable_sequential_cpu_offload()
+                        else:
+                            # First attempt: try regular GPU
+                            pipeline = pipeline.to("cuda")
                     else:
-                        pipeline = DiffusionPipeline.from_pretrained(
-                            model_to_use,
-                            torch_dtype=dtype,
-                            safety_checker=None,
-                        )
-            
-            # Determine device
-            backend = getattr(global_args, 'backend', 'auto')
-            image_backend = getattr(global_args, 'image_backend', 'auto')
-            use_vulkan = (backend == 'vulkan') or (image_backend == 'vulkan') or (image_backend == 'auto' and backend == 'auto')
-            
-            if use_vulkan and not torch.cuda.is_available():
-                # Vulkan/CPU mode
-                try:
-                    pipeline.to("cpu")
-                    # Enable CPU offload if available
-                    if hasattr(pipeline, 'enable_attention_slicing'):
-                        pipeline.enable_attention_slicing()
-                except Exception as e:
-                    print(f"Warning: Could not move to CPU: {e}")
-            elif torch.cuda.is_available():
-                # CUDA mode
-                try:
-                    pipeline.to("cuda")
-                except Exception as e:
-                    print(f"Warning: Could not move to CUDA: {e}")
+                        pipeline = pipeline.to("cpu")
+                    
+                except Exception as load_error:
+                    error_msg = str(load_error).lower()
+                    is_oom = any(x in error_msg for x in ['out of memory', 'oom', 'cuda error', 'cudamalloc'])
+                    
+                    if is_oom and load_attempt < max_attempts:
+                        print(f"OOM during model loading: {load_error}")
+                        print(f"Retrying with more aggressive memory optimization...")
+                        pipeline = None  # Reset for retry
+                    else:
+                        print(f"Failed to load model (attempt {load_attempt}): {load_error}")
+                        if load_attempt >= max_attempts:
+                            raise
+                        pipeline = None
             
             # Cache the model
-            multi_model_manager.add_model(model_key, pipeline)
-            print(f"Loaded diffusers model: {model_to_use}")
+            if pipeline is not None:
+                multi_model_manager.add_model(model_key, pipeline)
+                print(f"Loaded diffusers model: {model_to_use}")
             
         except ImportError as e:
             # diffusers not installed
