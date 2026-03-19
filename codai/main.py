@@ -25,7 +25,7 @@ def main():
     
     args = parse_args()
 
-    # Handle --list-cached-models early (before heavy imports)
+    # Handle early exit options (before heavy imports)
     if args.list_cached_models:
         print("\n=== Listing Cached Models ===")
 
@@ -70,6 +70,34 @@ def main():
         for cache_name, cache_dir in caches.items():
             print(f"  {cache_name}: {cache_dir}")
 
+        sys.exit(0)
+
+    # Handle --remove-all-models early
+    if args.remove_all_models:
+        print("\n=== Removing All Cached Models ===")
+
+        from codai.models.cache import remove_all_cached_models
+
+        total_removed = remove_all_cached_models()
+
+        print(f"\n=== Removed {total_removed} item(s) from all caches ===")
+        sys.exit(0)
+
+    # Handle --remove-model early
+    if args.remove_model:
+        print(f"\n=== Removing Cached Model Matching: {args.remove_model} ===")
+
+        from codai.models.cache import remove_cached_model
+
+        removed = remove_cached_model(args.remove_model)
+
+        if not removed:
+            print(f"No cached models found matching: {args.remove_model}")
+            print(f"\nUse --list-cached-models to see available models.")
+            sys.exit(0)
+
+        total_size = sum(size for _, _, size in removed)
+        print(f"\nRemoved {len(removed)} cached model file(s), freeing {total_size / (1024*1024):.1f} MB")
         sys.exit(0)
 
     # Import globals from codai modules (only after early exits)
@@ -171,106 +199,6 @@ def main():
                 print("Could not run vulkaninfo. Make sure vulkan-tools is installed.")
         except Exception as e:
             print(f"Error listing devices: {e}")
-        sys.exit(0)
-    
-
-    
-    # Handle --remove-all-models
-    if args.remove_all_models:
-        print("\n=== Removing All Cached Models ===")
-        
-        import shutil
-        caches = get_all_cache_dirs()
-        
-        if not caches:
-            print("No cache directories found.")
-            sys.exit(0)
-        
-        total_removed = 0
-        for cache_name, cache_dir in caches.items():
-            if not os.path.exists(cache_dir):
-                continue
-                
-            files = os.listdir(cache_dir)
-            if not files:
-                continue
-            
-            print(f"\nRemoving from {cache_name} cache ({cache_dir})...")
-            print(f"  Found {len(files)} file(s). Deleting...")
-            
-            # For diffusers, remove entire directory tree
-            if cache_name == 'diffusers':
-                for item in os.listdir(cache_dir):
-                    item_path = os.path.join(cache_dir, item)
-                    if os.path.isdir(item_path):
-                        shutil.rmtree(item_path)
-                    else:
-                        os.remove(item_path)
-                    print(f"  Deleted: {item}")
-                    total_removed += 1
-            else:
-                for f in files:
-                    filepath = os.path.join(cache_dir, f)
-                    os.remove(filepath)
-                    print(f"  Deleted: {f}")
-                    total_removed += 1
-        
-        print(f"\n=== Removed {total_removed} item(s) from all caches ===")
-        sys.exit(0)
-    
-    # Handle --remove-model
-    if args.remove_model:
-        print(f"\n=== Removing Cached Model Matching: {args.remove_model} ===")
-        
-        import shutil
-        caches = get_all_cache_dirs()
-        
-        if not caches:
-            print("No cache directories found.")
-            sys.exit(0)
-        
-        all_matching = []
-        for cache_name, cache_dir in caches.items():
-            if not os.path.exists(cache_dir):
-                continue
-            
-            # For diffusers and huggingface, search recursively
-            if cache_name in ('diffusers', 'huggingface'):
-                for root, dirs, files in os.walk(cache_dir):
-                    for f in files:
-                        if args.remove_model.lower() in f.lower():
-                            filepath = os.path.join(root, f)
-                            rel_path = os.path.relpath(filepath, cache_dir)
-                            size = os.path.getsize(filepath)
-                            all_matching.append((cache_name, rel_path, filepath, size))
-            else:
-                files = os.listdir(cache_dir)
-                for f in files:
-                    if args.remove_model.lower() in f.lower():
-                        filepath = os.path.join(cache_dir, f)
-                        if os.path.isfile(filepath):
-                            size = os.path.getsize(filepath)
-                            all_matching.append((cache_name, f, filepath, size))
-        
-        if not all_matching:
-            print(f"No cached models found matching: {args.remove_model}")
-            print(f"\nUse --list-cached-models to see available models.")
-            sys.exit(0)
-        
-        print(f"\nFound {len(all_matching)} matching file(s):")
-        for cache_name, filename, filepath, size in all_matching:
-            print(f"  [{cache_name}] {filename} ({size / (1024*1024):.1f} MB)")
-        
-        # Confirm before deleting
-        print(f"\nDeleting {len(all_matching)} file(s)...")
-        for cache_name, filename, filepath, size in all_matching:
-            try:
-                os.remove(filepath)
-                print(f"  Deleted: [{cache_name}] {filename}")
-            except Exception as e:
-                print(f"  Failed to delete {filename}: {e}")
-        
-        print(f"\nRemoved {len(all_matching)} cached model file(s).")
         sys.exit(0)
     
     # Get model names from args - support multiple models

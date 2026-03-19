@@ -207,31 +207,58 @@ def list_cached_models() -> Tuple[List[Tuple[str, str, int]], int]:
 def remove_cached_model(match_term: str) -> List[Tuple[str, str, int]]:
     """
     Remove cached models matching the given term.
-    
+
     Args:
         match_term: String to match against cached model names
-        
+
     Returns:
         List of (cache_name, filename, size) for removed files
     """
     import shutil
-    
+
     caches = get_all_cache_dirs()
     all_matching = []
-    
+
     for cache_name, cache_dir in caches.items():
         if not os.path.exists(cache_dir):
             continue
-            
+
         # For diffusers and huggingface, search recursively
         if cache_name in ('diffusers', 'huggingface'):
-            for root, dirs, files in os.walk(cache_dir):
-                for f in files:
-                    if match_term.lower() in f.lower():
-                        filepath = os.path.join(root, f)
-                        rel_path = os.path.relpath(filepath, cache_dir)
-                        size = os.path.getsize(filepath)
-                        all_matching.append((cache_name, rel_path, filepath, size))
+            # First, try to match by repo ID for HuggingFace models
+            if cache_name == 'huggingface':
+                try:
+                    from huggingface_hub import scan_cache_dir
+                    cache_info = scan_cache_dir(cache_dir)
+
+                    # Check if match_term matches any repo_id
+                    for repo in cache_info.repos:
+                        if match_term.lower() in repo.repo_id.lower():
+                            # Found matching repo, add all its files
+                            for revision in repo.revisions:
+                                for file_info in revision.files:
+                                    filepath = os.path.join(cache_dir, file_info.file_path)
+                                    if os.path.exists(filepath):
+                                        size = os.path.getsize(filepath)
+                                        rel_path = file_info.file_path
+                                        all_matching.append((cache_name, rel_path, filepath, size))
+                            break  # Only match one repo per search term
+                except ImportError:
+                    # huggingface_hub not available, fall back to filename search
+                    pass
+                except Exception:
+                    # Error scanning HF cache, fall back to filename search
+                    pass
+
+            # Fall back to filename search for both diffusers and huggingface
+            if not all_matching:  # Only if we didn't find repo matches
+                for root, dirs, files in os.walk(cache_dir):
+                    for f in files:
+                        if match_term.lower() in f.lower():
+                            filepath = os.path.join(root, f)
+                            rel_path = os.path.relpath(filepath, cache_dir)
+                            size = os.path.getsize(filepath)
+                            all_matching.append((cache_name, rel_path, filepath, size))
         else:
             files = os.listdir(cache_dir)
             for f in files:
@@ -240,7 +267,7 @@ def remove_cached_model(match_term: str) -> List[Tuple[str, str, int]]:
                     if os.path.isfile(filepath):
                         size = os.path.getsize(filepath)
                         all_matching.append((cache_name, f, filepath, size))
-    
+
     # Remove matching files
     removed = []
     for cache_name, filename, filepath, size in all_matching:
@@ -250,7 +277,7 @@ def remove_cached_model(match_term: str) -> List[Tuple[str, str, int]]:
             print(f"  Deleted: [{cache_name}] {filename}")
         except Exception as e:
             print(f"  Error deleting [{cache_name}] {filename}: {e}")
-    
+
     return removed
 
 
