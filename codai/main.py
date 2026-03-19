@@ -36,7 +36,7 @@ def main():
         set_load_mode,
         set_grammar_guided_gen,
     )
-    from codai.models.manager import ModelManager, MultiModelManager
+    from codai.models.manager import ModelManager, MultiModelManager, model_manager, multi_model_manager
     from codai.backends import detect_available_backends
     from codai.models.cache import (
         get_all_cache_dirs,
@@ -326,11 +326,8 @@ def main():
     
     print(f"Using backend: {backend}")
     
-    # Initialize model manager based on backend
-    model_manager = ModelManager(backend=backend)
-    
-    # Initialize multi-model manager
-    multi_model_manager = MultiModelManager(model_manager)
+    # Set the backend for the model manager
+    model_manager.backend_type = backend
     
     # Store references globally for API endpoints
     from codai.api import app as fastapi_app
