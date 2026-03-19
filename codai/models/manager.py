@@ -782,19 +782,37 @@ class MultiModelManager:
     def get_currently_loaded_model_name(self) -> Optional[str]:
         """
         Get the canonical name of the model currently loaded in VRAM.
-        
+
         Returns the model key from self.models if any model is loaded,
         or None if no models are loaded.
         """
         if not self.models:
             return None
-        
+
         # If we have a tracked current model, return it
         if self.current_model_key and self.current_model_key in self.models:
             return self.current_model_key
-        
+
         # Otherwise return the first loaded model (there should only be one in ondemand mode)
         return list(self.models.keys())[0] if self.models else None
+
+    def get_cached_model_path(self, url: str) -> Optional[str]:
+        """
+        Check if a model URL is already cached.
+
+        This is a proxy method to the cache module function.
+        Returns the cached path if the model is cached, None otherwise.
+        """
+        return get_cached_model_path(url)
+
+    def get_model_cache_dir(self) -> str:
+        """
+        Get the model cache directory.
+
+        This is a proxy method to the cache module function.
+        Returns the path to the model cache directory.
+        """
+        return get_model_cache_dir()
     
     def unload_all_models(self):
         """
