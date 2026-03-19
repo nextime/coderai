@@ -299,63 +299,36 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     from codai.api.state import get_load_mode
     load_mode = get_load_mode()
     
-    # Check if there's an image model already loaded in VRAM
-    current_image_model = None
-    for key in multi_model_manager.models.keys():
-        if key.startswith("image:"):
-            current_image_model = key
-            break
-    
-    # Check if legacy model_manager has a model loaded
-    has_legacy_model = model_manager.backend is not None
-    
-    # In ondemand mode, if any model (text, image, etc.) is already loaded and we're requesting a different model,
-    # we should unload the current model first to free VRAM
-    needs_full_unload = (load_mode == "ondemand" and (current_image_model is not None or has_legacy_model))
-    
-    # If we're requesting a text model and there's an image model loaded, unload it first
-    if needs_full_unload:
-        print(f"In ondemand mode - fully unloading current model before loading text model...")
+    # In ondemand mode (no --load-all or --loadswap), if ANY model is loaded in VRAM
+    # and it's different from what we need, fully unload it first to free VRAM
+    if load_mode == "ondemand":
+        has_any_model = len(multi_model_manager.models) > 0 or model_manager.backend is not None
         
-        # Full cleanup: remove all models from VRAM
-        for key in list(multi_model_manager.models.keys()):
-            model_to_cleanup = multi_model_manager.models.get(key)
-            if model_to_cleanup is not None:
-                print(f"Unloading '{key}' from VRAM...")
-                try:
-                    if hasattr(model_to_cleanup, 'cleanup') and callable(getattr(model_to_cleanup, 'cleanup')):
-                        model_to_cleanup.cleanup()
-                except Exception as e:
-                    print(f"Warning during cleanup of '{key}': {e}")
-                del multi_model_manager.models[key]
-        
-        # Also cleanup legacy model_manager
-        if model_manager.backend is not None:
-            print("Unloading legacy model_manager from VRAM...")
-            try:
-                if hasattr(model_manager.backend, 'unload'):
-                    model_manager.backend.unload()
-                elif hasattr(model_manager.backend, 'cleanup'):
-                    model_manager.backend.cleanup()
-            except Exception as e:
-                print(f"Warning during legacy model cleanup: {e}")
-            model_manager.backend = None
-        
-        # Force garbage collection and clear CUDA cache
-        import gc
-        gc.collect()
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-                print("CUDA cache cleared")
-        except:
-            pass
-        
-        # Add delay to let VRAM settle
-        import time
-        time.sleep(1)
+        if has_any_model:
+            # Check if the requested model is already loaded (no need to unload)
+            already_loaded = False
+            if requested_model and requested_model in multi_model_manager.models:
+                already_loaded = True
+            elif multi_model_manager.default_model and (
+                not requested_model or requested_model == "default" or 
+                requested_model == multi_model_manager.default_model
+            ):
+                if multi_model_manager.default_model in multi_model_manager.models:
+                    already_loaded = True
+            
+            if not already_loaded:
+                print(f"In ondemand mode - fully unloading current model(s) before loading text model '{requested_model}'...")
+                
+                # Use centralized unload method
+                multi_model_manager.unload_all_models()
+                
+                # Also cleanup legacy model_manager
+                if model_manager.backend is not None:
+                    print("Unloading legacy model_manager from VRAM...")
+                    try:
+                        model_manager.cleanup()
+                    except Exception as e:
+                        print(f"Warning during legacy model cleanup: {e}")
     
     # Try to get the appropriate model
     mm = multi_model_manager.get_model_for_request(requested_model)
@@ -1754,53 +1727,29 @@ async def completions(request: CompletionRequest):
     from codai.api.state import get_load_mode
     load_mode = get_load_mode()
     
-    # Check if there's an image model already loaded in VRAM
-    current_image_model = None
-    for key in multi_model_manager.models.keys():
-        if key.startswith("image:"):
-            current_image_model = key
-            break
-    
-    # In ondemand mode, if any model is already loaded, unload it first
-    needs_full_unload = (load_mode == "ondemand" and current_image_model is not None)
-    
-    if needs_full_unload:
-        print(f"In ondemand mode - fully unloading current model before loading text model...")
+    # In ondemand mode, if ANY model is loaded and it's different from what we need, unload first
+    if load_mode == "ondemand":
+        has_any_model = len(multi_model_manager.models) > 0 or model_manager.backend is not None
         
-        # Full cleanup
-        for key in list(multi_model_manager.models.keys()):
-            model_to_cleanup = multi_model_manager.models.get(key)
-            if model_to_cleanup is not None:
-                print(f"Unloading '{key}' from VRAM...")
-                try:
-                    if hasattr(model_to_cleanup, 'cleanup') and callable(getattr(model_to_cleanup, 'cleanup')):
-                        model_to_cleanup.cleanup()
-                except Exception as e:
-                    print(f"Warning during cleanup of '{key}': {e}")
-                del multi_model_manager.models[key]
-        
-        # Also cleanup legacy model_manager
-        if model_manager.backend is not None:
-            print("Unloading legacy model_manager from VRAM...")
-            try:
-                if hasattr(model_manager.backend, 'unload'):
-                    model_manager.backend.unload()
-                elif hasattr(model_manager.backend, 'cleanup'):
-                    model_manager.backend.cleanup()
-            except:
-                pass
-            model_manager.backend = None
-        
-        # Force garbage collection and clear CUDA cache
-        import gc
-        gc.collect()
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-        except:
-            pass
+        if has_any_model:
+            already_loaded = False
+            if requested_model and requested_model in multi_model_manager.models:
+                already_loaded = True
+            elif multi_model_manager.default_model and (
+                not requested_model or requested_model == "default" or 
+                requested_model == multi_model_manager.default_model
+            ):
+                if multi_model_manager.default_model in multi_model_manager.models:
+                    already_loaded = True
+            
+            if not already_loaded:
+                print(f"In ondemand mode - fully unloading current model(s) before loading text model '{requested_model}'...")
+                multi_model_manager.unload_all_models()
+                if model_manager.backend is not None:
+                    try:
+                        model_manager.cleanup()
+                    except:
+                        pass
     
     # Try to get the appropriate model
     mm = multi_model_manager.get_model_for_request(requested_model)

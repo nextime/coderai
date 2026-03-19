@@ -711,6 +711,78 @@ class MultiModelManager:
         # Model not found - try to load it as a new model
         return self._load_model_by_name(requested_model)
     
+    def unload_all_models(self):
+        """
+        Fully unload ALL models from VRAM. Used in ondemand mode when switching
+        between different model types (e.g., text -> image or image -> text).
+        
+        This handles all model types:
+        - ModelManager instances (have cleanup() method)
+        - Diffusers pipelines (need to be moved to CPU and deleted)
+        - stable-diffusion-cpp StableDiffusion instances
+        - Any other model objects
+        """
+        print("=== FULL VRAM CLEANUP: Unloading all models ===")
+        
+        for key in list(self.models.keys()):
+            model_obj = self.models.get(key)
+            if model_obj is None:
+                continue
+            
+            print(f"Unloading '{key}' from VRAM...")
+            try:
+                # Method 1: ModelManager with cleanup()
+                if hasattr(model_obj, 'cleanup') and callable(getattr(model_obj, 'cleanup')):
+                    model_obj.cleanup()
+                # Method 2: Diffusers pipeline (has 'to' method to move to CPU)
+                elif hasattr(model_obj, 'to') and callable(getattr(model_obj, 'to')):
+                    try:
+                        model_obj.to('cpu')
+                    except:
+                        pass
+                    del model_obj
+                # Method 3: Object with 'model' attribute (e.g., wrapper)
+                elif hasattr(model_obj, 'model') and model_obj.model is not None:
+                    if hasattr(model_obj.model, 'cleanup'):
+                        model_obj.model.cleanup()
+                    elif hasattr(model_obj.model, 'to'):
+                        try:
+                            model_obj.model.to('cpu')
+                        except:
+                            pass
+                    del model_obj
+                # Method 4: Just delete it
+                else:
+                    del model_obj
+            except Exception as e:
+                print(f"Warning during cleanup of '{key}': {e}")
+            
+            # Remove from dict
+            if key in self.models:
+                del self.models[key]
+        
+        # Reset tracking state
+        self.current_model_key = None
+        self.active_in_vram = None
+        
+        # Force garbage collection
+        for _ in range(3):
+            gc.collect()
+        
+        # Clear CUDA cache if available
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                print("CUDA cache cleared")
+        except:
+            pass
+        
+        # Small delay to let GPU memory settle
+        time.sleep(1)
+        print("=== FULL VRAM CLEANUP: Complete ===")
+    
     def add_model(self, key: str, manager: ModelManager):
         """Add a model manager for a specific key."""
         self.models[key] = manager
