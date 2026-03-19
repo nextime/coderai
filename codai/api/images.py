@@ -260,6 +260,41 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
     
     # Try to load if not cached
     if pipeline is None:
+        # FIRST: Clean up any loaded text models to free VRAM
+        # This must happen BEFORE attempting to load any new model
+        print("Cleaning up text models to free VRAM for image generation...")
+        for key in list(multi_model_manager.models.keys()):
+            if key.startswith("image:"):
+                continue
+            # Unload any other model (text, audio, etc.) to free VRAM
+            model_to_cleanup = multi_model_manager.models.get(key)
+            if model_to_cleanup is not None:
+                print(f"Unloading '{key}' from VRAM to make room for image model")
+                try:
+                    if hasattr(model_to_cleanup, 'cleanup') and callable(getattr(model_to_cleanup, 'cleanup')):
+                        model_to_cleanup.cleanup()
+                    elif hasattr(model_to_cleanup, 'model') and model_to_cleanup.model is not None:
+                        if hasattr(model_to_cleanup.model, 'cleanup'):
+                            model_to_cleanup.model.cleanup()
+                except Exception as e:
+                    print(f"Warning during cleanup of '{key}': {e}")
+                del multi_model_manager.models[key]
+        
+        # Also try to unload the main model_manager backend if it's loaded
+        try:
+            from codai.models.manager import model_manager
+            if model_manager.backend is not None:
+                print("Unloading main model from VRAM...")
+                if hasattr(model_manager.backend, 'unload'):
+                    model_manager.backend.unload()
+                elif hasattr(model_manager.backend, 'model') and model_manager.backend.model is not None:
+                    if hasattr(model_manager.backend.model, 'unload'):
+                        model_manager.backend.model.unload()
+                # Reset backend to None
+                model_manager.backend = None
+        except Exception as e:
+            print(f"Warning during main model cleanup: {e}")
+        
         # Try diffusers first
         try:
             from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline
