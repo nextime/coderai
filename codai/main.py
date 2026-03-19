@@ -50,6 +50,7 @@ def main():
     
     # Import global setters from text module
     from codai.api.text import (
+        set_global_args,
         set_global_debug,
         set_global_system_prompt,
         set_global_tools_closer_prompt,
