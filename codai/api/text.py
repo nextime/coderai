@@ -41,6 +41,8 @@ def set_global_args(args):
     """Set global args from coderai."""
     global global_args
     global_args = args
+    # Also set in the state module so other modules can access it
+    _set_global_args(args)
 
 
 def set_global_debug(debug: bool):
