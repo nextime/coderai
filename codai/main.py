@@ -233,18 +233,29 @@ def main():
         sys.exit(1)
     
     # Determine load mode
-    # Default is to preload (loadall) unless --nopreload is specified
-    load_mode = "loadall"  # Default: preload models
+    # Default is ondemand: pre-load only the first model, unload/load on switch
+    # --loadswap: load first in VRAM, others in CPU RAM, swap on switch
+    # --loadall: try to load all models in VRAM, offload to CPU RAM if fails
+    # --nopreload: skip pre-loading in any mode, load on first request
+    load_mode = "ondemand"  # Default: on-demand loading
     if args.loadall:
         load_mode = "loadall"
     elif args.loadswap:
         load_mode = "loadswap"
-    elif args.nopreload:
-        load_mode = "ondemand"
+    
+    nopreload = args.nopreload
     
     set_load_mode(load_mode)
+    multi_model_manager.set_load_mode(load_mode)
+    
     if load_mode == "ondemand":
-        print("Load mode: ondemand (load model on first request)")
+        print("Load mode: ondemand (pre-load first model, unload/load on switch)")
+    elif load_mode == "loadswap":
+        print("Load mode: loadswap (first model in VRAM, others in CPU RAM, swap on switch)")
+    elif load_mode == "loadall":
+        print("Load mode: loadall (load all models, offload to CPU RAM if VRAM full)")
+    if nopreload:
+        print("  --nopreload: models will load on first request instead of at startup")
     
     # Initialize model manager
     print("\n=== Initializing Model Manager ===")
@@ -278,28 +289,87 @@ def main():
     
     # Load main text model(s)
     if model_names:
-        print(f"\nLoading main text model(s): {model_names}")
+        print(f"\nMain text model(s): {model_names}")
         
-        # Register models with multi_model_manager
+        # Register models with multi_model_manager (set_default_model also resolves/caches)
         for idx, model_name in enumerate(model_names):
             multi_model_manager.set_default_model(model_name, {
                 'ctx': get_ctx_by_index(args.n_ctx, idx, 0),
             })
         
-        # Load first model (unless nopreload mode)
-        if load_mode == "loadall":
+        # Pre-load models at startup (unless --nopreload)
+        if nopreload:
+            print(f"  --nopreload: text model(s) will load on first request")
+        elif load_mode == "ondemand":
+            # Ondemand: pre-load only the first model into VRAM
             try:
-                print(f"Loading model: {model_names[0]}...")
+                print(f"Preloading first model into VRAM: {model_names[0]}...")
                 mm = multi_model_manager._load_default_model()
                 if mm is not None and mm.backend is not None:
+                    multi_model_manager.active_in_vram = multi_model_manager.default_model
                     print(f"Model loaded successfully: {model_names[0]}")
                 else:
                     print(f"Warning: Model {model_names[0]} failed to load")
             except Exception as e:
-                print(f"Warning: Failed to load model: {e}")
+                print(f"Warning: Failed to preload model: {e}")
                 print(f"Model will load on first request")
-        else:
-            print(f"Load mode: ondemand (model will load on first request)")
+        elif load_mode == "loadswap":
+            # Loadswap: load first model into VRAM, others into CPU RAM
+            try:
+                print(f"Preloading first model into VRAM: {model_names[0]}...")
+                mm = multi_model_manager._load_default_model()
+                if mm is not None and mm.backend is not None:
+                    multi_model_manager.active_in_vram = multi_model_manager.default_model
+                    print(f"Model loaded successfully (VRAM): {model_names[0]}")
+                else:
+                    print(f"Warning: Model {model_names[0]} failed to load")
+            except Exception as e:
+                print(f"Warning: Failed to preload model: {e}")
+            
+            # Load remaining text models into CPU RAM
+            for idx, model_name in enumerate(model_names[1:], 1):
+                try:
+                    print(f"Preloading model into CPU RAM: {model_name}...")
+                    mm2 = multi_model_manager._load_model_by_name(model_name)
+                    if mm2 is not None:
+                        # Move to CPU immediately (it was loaded into VRAM by default)
+                        multi_model_manager._move_model_to_cpu(model_name)
+                        print(f"Model loaded successfully (CPU RAM): {model_name}")
+                    else:
+                        print(f"Warning: Model {model_name} failed to load")
+                except Exception as e:
+                    print(f"Warning: Failed to preload model {model_name}: {e}")
+        elif load_mode == "loadall":
+            # Loadall: try to load all models into VRAM, offload to CPU RAM if fails
+            for idx, model_name in enumerate(model_names):
+                try:
+                    if idx == 0:
+                        print(f"Preloading model into VRAM: {model_name}...")
+                        mm = multi_model_manager._load_default_model()
+                    else:
+                        print(f"Preloading model into VRAM: {model_name}...")
+                        mm = multi_model_manager._load_model_by_name(model_name)
+                    
+                    if mm is not None and (not hasattr(mm, 'backend') or mm.backend is not None):
+                        if idx == 0:
+                            multi_model_manager.active_in_vram = multi_model_manager.default_model
+                        print(f"Model loaded successfully (VRAM): {model_name}")
+                    else:
+                        print(f"Warning: Model {model_name} failed to load")
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    is_oom = any(x in error_msg for x in ['out of memory', 'oom', 'cuda error'])
+                    if is_oom:
+                        print(f"VRAM full for {model_name}, offloading to CPU RAM...")
+                        try:
+                            mm = multi_model_manager._load_model_by_name(model_name)
+                            if mm is not None:
+                                multi_model_manager._move_model_to_cpu(model_name)
+                                print(f"Model loaded successfully (CPU RAM): {model_name}")
+                        except Exception as e2:
+                            print(f"Warning: Failed to load model {model_name} even to CPU: {e2}")
+                    else:
+                        print(f"Warning: Failed to preload model {model_name}: {e}")
     
     # Set up audio model if specified
     if audio_models:

@@ -374,7 +374,7 @@ class MultiModelManager:
     """
     
     def __init__(self):
-        self.models: Dict[str, ModelManager] = {}
+        self.models: Dict[str, Any] = {}  # Can hold ModelManager, diffusers pipelines, sd.cpp models, etc.
         self.default_model: Optional[str] = None
         self.audio_models: List[str] = []
         self.tts_model: Optional[str] = None
@@ -883,14 +883,127 @@ class MultiModelManager:
         return load_model(model_path, cache_dir, file_pattern)
 
     
+    def _move_model_to_cpu(self, model_key: str):
+        """
+        Move a model from VRAM to CPU RAM (for loadswap mode).
+        
+        The model stays in self.models but is moved to CPU so it doesn't
+        consume VRAM. It can be moved back to VRAM later.
+        """
+        model_obj = self.models.get(model_key)
+        if model_obj is None:
+            return
+        
+        print(f"Moving model '{model_key}' from VRAM to CPU RAM...")
+        
+        try:
+            import torch
+            
+            # Case 1: ModelManager with a backend
+            if isinstance(model_obj, ModelManager) and model_obj.backend is not None:
+                backend = model_obj.backend
+                if hasattr(backend, 'model') and backend.model is not None:
+                    if hasattr(backend.model, 'to'):
+                        try:
+                            backend.model.to('cpu')
+                            print(f"  Moved backend model to CPU")
+                        except Exception as e:
+                            print(f"  Warning: Could not move backend model to CPU: {e}")
+                    # For llama-cpp-python models, we can't move to CPU easily
+                    # They stay in memory but we track them
+            
+            # Case 2: Diffusers pipeline (has 'to' method)
+            elif hasattr(model_obj, 'to') and callable(getattr(model_obj, 'to')):
+                try:
+                    model_obj.to('cpu')
+                    print(f"  Moved diffusers pipeline to CPU")
+                except Exception as e:
+                    print(f"  Warning: Could not move pipeline to CPU: {e}")
+            
+            # Case 3: Object with a model attribute
+            elif hasattr(model_obj, 'model') and model_obj.model is not None:
+                if hasattr(model_obj.model, 'to'):
+                    try:
+                        model_obj.model.to('cpu')
+                        print(f"  Moved inner model to CPU")
+                    except Exception as e:
+                        print(f"  Warning: Could not move inner model to CPU: {e}")
+            
+            # Clear CUDA cache after moving to CPU
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            
+            gc.collect()
+            
+        except ImportError:
+            print(f"  Warning: torch not available, cannot move model to CPU")
+        except Exception as e:
+            print(f"  Warning during CPU offload of '{model_key}': {e}")
+    
+    def _move_model_to_vram(self, model_key: str):
+        """
+        Move a model from CPU RAM back to VRAM (for loadswap mode).
+        """
+        model_obj = self.models.get(model_key)
+        if model_obj is None:
+            return
+        
+        print(f"Moving model '{model_key}' from CPU RAM to VRAM...")
+        
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            
+            # Case 1: ModelManager with a backend
+            if isinstance(model_obj, ModelManager) and model_obj.backend is not None:
+                backend = model_obj.backend
+                if hasattr(backend, 'model') and backend.model is not None:
+                    if hasattr(backend.model, 'to'):
+                        try:
+                            backend.model.to(device)
+                            print(f"  Moved backend model to {device}")
+                        except Exception as e:
+                            print(f"  Warning: Could not move backend model to {device}: {e}")
+            
+            # Case 2: Diffusers pipeline
+            elif hasattr(model_obj, 'to') and callable(getattr(model_obj, 'to')):
+                try:
+                    model_obj.to(device)
+                    print(f"  Moved diffusers pipeline to {device}")
+                except Exception as e:
+                    print(f"  Warning: Could not move pipeline to {device}: {e}")
+            
+            # Case 3: Object with a model attribute
+            elif hasattr(model_obj, 'model') and model_obj.model is not None:
+                if hasattr(model_obj.model, 'to'):
+                    try:
+                        model_obj.model.to(device)
+                        print(f"  Moved inner model to {device}")
+                    except Exception as e:
+                        print(f"  Warning: Could not move inner model to {device}: {e}")
+            
+        except ImportError:
+            print(f"  Warning: torch not available, cannot move model to VRAM")
+        except Exception as e:
+            print(f"  Warning during VRAM load of '{model_key}': {e}")
+
     def request_model(self, requested_model: str, model_type: str = None) -> Dict[str, Any]:
         """
         Central method for API modules to request a model.
         
-        Handles:
-        1. Alias resolution (e.g., "image" -> "Tongyi-MAI/Z-Image-Turbo")
-        2. VRAM management (unloading previous models in ondemand mode)
-        3. Checking if model is already loaded
+        Handles three load modes:
+        
+        **loadall**: All models are pre-loaded at startup. Just return the
+        already-loaded model. No VRAM management needed.
+        
+        **loadswap**: All models stay loaded (in CPU RAM or VRAM). When a
+        different model is requested, the current VRAM model is moved to CPU
+        RAM and the requested model is moved from CPU RAM to VRAM.
+        
+        **ondemand** (default when no flag specified): Only one model in memory
+        at a time. When a different model is requested, the current model is
+        fully unloaded (deleted) and the new one is loaded from scratch.
         
         Args:
             requested_model: The model name/alias from the API request
@@ -903,7 +1016,7 @@ class MultiModelManager:
                 - 'model_name': The resolved model name/path/HF ID
                 - 'model_object': The loaded model object if already loaded, None otherwise
                 - 'config': The stored configuration for this model
-                - 'already_loaded': True if the model is already loaded in VRAM
+                - 'already_loaded': True if the model is already loaded and ready in VRAM
         """
         from codai.api.state import get_load_mode
         mode = get_load_mode()
@@ -968,10 +1081,107 @@ class MultiModelManager:
         else:
             model_key = resolved_name
         
-        # Step 3: Check if already loaded
+        # Step 3: Check if already loaded in self.models
         existing_model = self.models.get(model_key)
+        
+        # =====================================================================
+        # LOADALL MODE: All models should be pre-loaded. Just return it.
+        # =====================================================================
+        if mode == "loadall":
+            if existing_model is not None:
+                self.current_model_key = model_key
+                self.active_in_vram = model_key
+                return {
+                    'model_key': model_key,
+                    'model_name': resolved_name,
+                    'model_object': existing_model,
+                    'config': self.config.get(model_key, {}),
+                    'already_loaded': True,
+                }
+            # Model not loaded yet in loadall mode - caller needs to load it
+            # (this happens for models not pre-loaded at startup, e.g., image models)
+            print(f"Loadall mode: Model '{model_key}' not pre-loaded, will load now")
+            return {
+                'model_key': model_key,
+                'model_name': resolved_name,
+                'model_object': None,
+                'config': self.config.get(model_key, {}),
+                'already_loaded': False,
+            }
+        
+        # =====================================================================
+        # LOADSWAP MODE: Keep all models in memory. Swap active model between
+        # VRAM and CPU RAM. Only the active model should be in VRAM.
+        # =====================================================================
+        if mode == "loadswap":
+            if existing_model is not None:
+                # Model is loaded (either in VRAM or CPU RAM)
+                if self.active_in_vram == model_key:
+                    # Already the active model in VRAM
+                    self.current_model_key = model_key
+                    return {
+                        'model_key': model_key,
+                        'model_name': resolved_name,
+                        'model_object': existing_model,
+                        'config': self.config.get(model_key, {}),
+                        'already_loaded': True,
+                    }
+                else:
+                    # Model is in CPU RAM - need to swap
+                    # First, move current VRAM model to CPU
+                    if self.active_in_vram and self.active_in_vram in self.models:
+                        print(f"Loadswap: Moving '{self.active_in_vram}' from VRAM to CPU RAM")
+                        self._move_model_to_cpu(self.active_in_vram)
+                    
+                    # Also check the legacy model_manager singleton
+                    from codai.models.manager import model_manager as _legacy_mm
+                    if _legacy_mm.backend is not None and self.active_in_vram is None:
+                        print(f"Loadswap: Moving legacy model_manager model to CPU")
+                        self._move_model_to_cpu_legacy(_legacy_mm)
+                    
+                    # Now move the requested model to VRAM
+                    print(f"Loadswap: Moving '{model_key}' from CPU RAM to VRAM")
+                    self._move_model_to_vram(model_key)
+                    self.active_in_vram = model_key
+                    self.current_model_key = model_key
+                    
+                    return {
+                        'model_key': model_key,
+                        'model_name': resolved_name,
+                        'model_object': existing_model,
+                        'config': self.config.get(model_key, {}),
+                        'already_loaded': True,
+                    }
+            else:
+                # Model not loaded at all - move current VRAM model to CPU first
+                if self.active_in_vram and self.active_in_vram in self.models:
+                    print(f"Loadswap: Moving '{self.active_in_vram}' from VRAM to CPU RAM")
+                    self._move_model_to_cpu(self.active_in_vram)
+                
+                # Also check the legacy model_manager singleton
+                from codai.models.manager import model_manager as _legacy_mm
+                if _legacy_mm.backend is not None and self.active_in_vram is None:
+                    print(f"Loadswap: Moving legacy model_manager model to CPU")
+                    self._move_model_to_cpu_legacy(_legacy_mm)
+                
+                # Caller needs to load the model fresh (into VRAM)
+                self.active_in_vram = model_key  # Will be set once loaded
+                return {
+                    'model_key': model_key,
+                    'model_name': resolved_name,
+                    'model_object': None,
+                    'config': self.config.get(model_key, {}),
+                    'already_loaded': False,
+                }
+        
+        # =====================================================================
+        # ONDEMAND MODE (default): Only one model in memory at a time.
+        # Fully unload the current model before loading the new one.
+        # =====================================================================
         if existing_model is not None:
+            # Already loaded and it's the only model - return it
             self.current_model_key = model_key
+            self.active_in_vram = model_key
             return {
                 'model_key': model_key,
                 'model_name': resolved_name,
@@ -980,28 +1190,35 @@ class MultiModelManager:
                 'already_loaded': True,
             }
         
-        # Step 4: In ondemand mode, unload any currently loaded model
-        if mode == "ondemand":
-            has_any_model = len(self.models) > 0 or model_manager.backend is not None
-            
-            if has_any_model:
-                loaded_canonical = self.get_currently_loaded_model_name()
-                if not loaded_canonical and model_manager.backend is not None:
-                    loaded_canonical = "legacy_model_manager"
-                
-                if loaded_canonical and loaded_canonical != model_key:
-                    print(f"Ondemand mode - model switch detected:")
-                    print(f"  Requested: '{model_key}' (resolved: '{resolved_name}')")
-                    print(f"  Currently loaded: '{loaded_canonical}'")
-                    print(f"  -> Unloading current model(s) before loading new model...")
-                    self.unload_all_models()
-                    if model_manager.backend is not None:
-                        try:
-                            model_manager.cleanup()
-                        except:
-                            pass
+        # Model not loaded - need to unload whatever is currently loaded
+        # Check if there's anything to unload
+        has_models_in_multi = len(self.models) > 0
         
-        # Step 5: Return info for the caller to load the model
+        # Also check the legacy model_manager singleton
+        from codai.models.manager import model_manager as _legacy_mm
+        has_legacy_model = _legacy_mm.backend is not None
+        
+        if has_models_in_multi or has_legacy_model:
+            loaded_canonical = self.get_currently_loaded_model_name()
+            if not loaded_canonical and has_legacy_model:
+                loaded_canonical = "legacy_model_manager"
+            
+            if loaded_canonical and loaded_canonical != model_key:
+                print(f"Ondemand mode - model switch detected:")
+                print(f"  Requested: '{model_key}' (resolved: '{resolved_name}')")
+                print(f"  Currently loaded: '{loaded_canonical}'")
+                print(f"  -> Unloading current model(s) before loading new model...")
+                self.unload_all_models()
+                
+                # Also cleanup the legacy singleton if it has a model
+                if has_legacy_model:
+                    try:
+                        print(f"  -> Cleaning up legacy model_manager...")
+                        _legacy_mm.cleanup()
+                    except Exception as e:
+                        print(f"  Warning: Error cleaning up legacy model_manager: {e}")
+        
+        # Return info for the caller to load the model
         return {
             'model_key': model_key,
             'model_name': resolved_name,
@@ -1009,6 +1226,26 @@ class MultiModelManager:
             'config': self.config.get(model_key, {}),
             'already_loaded': False,
         }
+    
+    def _move_model_to_cpu_legacy(self, legacy_mm):
+        """Move the legacy model_manager's model to CPU (for loadswap mode)."""
+        try:
+            import torch
+            if legacy_mm.backend is not None:
+                if hasattr(legacy_mm.backend, 'model') and legacy_mm.backend.model is not None:
+                    if hasattr(legacy_mm.backend.model, 'to'):
+                        try:
+                            legacy_mm.backend.model.to('cpu')
+                            print(f"  Moved legacy model_manager model to CPU")
+                        except Exception as e:
+                            print(f"  Warning: Could not move legacy model to CPU: {e}")
+            
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            gc.collect()
+        except Exception as e:
+            print(f"  Warning during legacy model CPU offload: {e}")
     
     def unload_all_models(self):
         """
@@ -1082,9 +1319,10 @@ class MultiModelManager:
         time.sleep(1)
         print("=== FULL VRAM CLEANUP: Complete ===")
     
-    def add_model(self, key: str, manager: ModelManager):
-        """Add a model manager for a specific key."""
+    def add_model(self, key: str, manager):
+        """Add a model (ModelManager, diffusers pipeline, sd.cpp model, etc.) for a specific key."""
         self.models[key] = manager
+        self.active_in_vram = key
     
     def get_model(self, key: str) -> Optional[ModelManager]:
         """Get a model manager by key."""

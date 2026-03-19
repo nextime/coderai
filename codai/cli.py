@@ -280,17 +280,17 @@ def parse_args():
     parser.add_argument(
         "--loadall",
         action="store_true",
-        help="Pre-load all models (main, audio, image) at startup instead of on-demand",
+        help="Load all models at startup. Tries VRAM first, offloads to CPU RAM if VRAM is full.",
     )
     parser.add_argument(
         "--loadswap",
         action="store_true",
-        help="Keep all models loaded, swapping active model between VRAM and RAM (only active model in VRAM)",
+        help="Load first model in VRAM, others in CPU RAM. Swap active model between VRAM and CPU RAM on switch.",
     )
     parser.add_argument(
         "--nopreload",
         action="store_true",
-        help="Disable model preloading. Models will load on first request instead of at startup",
+        help="Skip model pre-loading at startup. Models will load on first request using the active mode strategy (ondemand/loadswap/loadall).",
     )
     parser.add_argument(
         "--audio-ctx",
