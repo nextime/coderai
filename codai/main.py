@@ -454,6 +454,120 @@ def main():
             multi_model_manager.set_model_alias(alias, model)
             print(f"  {alias} -> {model}")
     
+    # =========================================================================
+    # Pre-load non-text models for loadall and loadswap modes
+    # (Text models are already handled above)
+    # =========================================================================
+    if not nopreload and load_mode in ("loadall", "loadswap"):
+        # Collect all non-text models that need pre-loading
+        # For loadall: load all into VRAM (offload to CPU if OOM)
+        # For loadswap: first model in VRAM (already done for text), rest in CPU RAM
+        
+        # Determine if the first text model is already in VRAM
+        first_model_loaded = multi_model_manager.active_in_vram is not None
+        
+        # Pre-load image models
+        if image_models:
+            print(f"\n=== Pre-loading image model(s) ===")
+            for idx, img_m in enumerate(image_models):
+                model_key = f"image:{img_m}"
+                if model_key in multi_model_manager.models:
+                    continue  # Already loaded
+                
+                try:
+                    from codai.api.images import _load_diffusers_pipeline, _is_gguf_model, _load_sdcpp_model
+                    
+                    if load_mode == "loadall":
+                        # Try to load into VRAM
+                        print(f"Preloading image model into VRAM: {img_m}...")
+                        if _is_gguf_model(img_m):
+                            resolved_path = multi_model_manager.load_model(img_m)
+                            if resolved_path and os.path.isfile(resolved_path):
+                                sd_model = _load_sdcpp_model(resolved_path, args)
+                                if sd_model:
+                                    multi_model_manager.add_model(model_key, sd_model)
+                                    print(f"Image model loaded (VRAM, sd.cpp): {img_m}")
+                        else:
+                            try:
+                                pipeline = _load_diffusers_pipeline(img_m, args)
+                                if pipeline:
+                                    multi_model_manager.add_model(model_key, pipeline)
+                                    print(f"Image model loaded (VRAM, diffusers): {img_m}")
+                            except Exception as e:
+                                error_msg = str(e).lower()
+                                is_oom = any(x in error_msg for x in ['out of memory', 'oom', 'cuda error'])
+                                if is_oom:
+                                    print(f"VRAM full for image model {img_m}, will load on demand")
+                                else:
+                                    print(f"Warning: Failed to preload image model {img_m}: {e}")
+                    
+                    elif load_mode == "loadswap":
+                        # Load into VRAM then move to CPU (unless it's the first model overall)
+                        if not first_model_loaded:
+                            # No model in VRAM yet, load this one into VRAM
+                            print(f"Preloading image model into VRAM: {img_m}...")
+                            if _is_gguf_model(img_m):
+                                resolved_path = multi_model_manager.load_model(img_m)
+                                if resolved_path and os.path.isfile(resolved_path):
+                                    sd_model = _load_sdcpp_model(resolved_path, args)
+                                    if sd_model:
+                                        multi_model_manager.add_model(model_key, sd_model)
+                                        first_model_loaded = True
+                                        print(f"Image model loaded (VRAM): {img_m}")
+                            else:
+                                try:
+                                    pipeline = _load_diffusers_pipeline(img_m, args)
+                                    if pipeline:
+                                        multi_model_manager.add_model(model_key, pipeline)
+                                        first_model_loaded = True
+                                        print(f"Image model loaded (VRAM): {img_m}")
+                                except Exception as e:
+                                    print(f"Warning: Failed to preload image model {img_m}: {e}")
+                        else:
+                            # First model already in VRAM, load this to VRAM then move to CPU
+                            print(f"Preloading image model into CPU RAM: {img_m}...")
+                            # Move current VRAM model to CPU temporarily
+                            current_vram = multi_model_manager.active_in_vram
+                            if current_vram and current_vram in multi_model_manager.models:
+                                multi_model_manager._move_model_to_cpu(current_vram)
+                            
+                            try:
+                                if _is_gguf_model(img_m):
+                                    resolved_path = multi_model_manager.load_model(img_m)
+                                    if resolved_path and os.path.isfile(resolved_path):
+                                        sd_model = _load_sdcpp_model(resolved_path, args)
+                                        if sd_model:
+                                            multi_model_manager.add_model(model_key, sd_model)
+                                            multi_model_manager._move_model_to_cpu(model_key)
+                                            print(f"Image model loaded (CPU RAM): {img_m}")
+                                else:
+                                    pipeline = _load_diffusers_pipeline(img_m, args)
+                                    if pipeline:
+                                        multi_model_manager.add_model(model_key, pipeline)
+                                        multi_model_manager._move_model_to_cpu(model_key)
+                                        print(f"Image model loaded (CPU RAM): {img_m}")
+                            except Exception as e:
+                                print(f"Warning: Failed to preload image model {img_m}: {e}")
+                            
+                            # Move original model back to VRAM
+                            if current_vram and current_vram in multi_model_manager.models:
+                                multi_model_manager._move_model_to_vram(current_vram)
+                                multi_model_manager.active_in_vram = current_vram
+                
+                except ImportError as e:
+                    print(f"Warning: Cannot preload image model {img_m} (missing dependency): {e}")
+                except Exception as e:
+                    print(f"Warning: Failed to preload image model {img_m}: {e}")
+        
+        # Note: Audio models (faster-whisper) and TTS models (kokoro) are loaded
+        # by their respective API modules on first request, as they use specialized
+        # loading mechanisms. The model files are already cached by set_audio_model()
+        # and set_tts_model() above.
+        if audio_models:
+            print(f"\nAudio model(s) registered and cached, will load into memory on first request")
+        if args.tts_model:
+            print(f"TTS model registered and cached, will load into memory on first request")
+    
     # Start the server
     import uvicorn
     print(f"\nStarting server on http://{args.host}:{args.port}")
