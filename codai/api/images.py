@@ -428,7 +428,7 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
     if pipeline is not None:
         try:
             # Determine size
-            width, height = 512, 512
+            width, height = 1024, 1024
             if request.size:
                 parts = request.size.split("x")
                 if len(parts) == 2:
@@ -523,9 +523,8 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                 if isinstance(img, np.ndarray):
                     print(f"DEBUG: Image shape: {img.shape}, dtype: {img.dtype}, min: {img.min()}, max: {img.max()}")
                     # Handle NaN/Inf values in image data - convert to valid values
-                    # This fixes RuntimeWarning about invalid values in cast
                     # Replace NaN and Inf with valid values
-                    img = np.nan_to_num(img, nan=0.5, posinf=1.0, neginf=0.0)  # Use 0.5 for NaN (gray, not black)
+                    img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
                     # Clip to valid range [0, 1]
                     img = np.clip(img, 0.0, 1.0)
                     print(f"DEBUG: After NaN handling - min: {img.min()}, max: {img.max()}")
