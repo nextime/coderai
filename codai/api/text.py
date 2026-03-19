@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException, Request
 from codai.models.manager import ModelManager, WhisperServerManager, MultiModelManager, model_manager, multi_model_manager
 from codai.queue.manager import QueueManager, queue_manager
 from codai.pydantic.textrequest import ChatCompletionRequest, ToolFunction, Tool
-from codai.models.parser import filter_malformed_content, filter_repetition, OpenAIFormatter, ModelParserAdapter
+from codai.models.parser import filter_malformed_content, filter_repetition, OpenAIFormatter, ModelParserAdapter, ToolCallParser
 
 
 # Global reference to be set by coderai
