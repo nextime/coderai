@@ -13,6 +13,7 @@ from PIL import Image
 
 # Import from codai modules
 from codai.models.manager import multi_model_manager
+from codai.models.cache import get_cached_model_path
 from codai.pydantic.imagerequest import ImageGenerationRequest
 from codai.api.state import get_load_mode
 
@@ -657,15 +658,15 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
             # Also handle HuggingFace model IDs that need to be resolved
             model_path = None
             if model_to_use.startswith('http://') or model_to_use.startswith('https://'):
-                cached_path = multi_model_manager.get_cached_model_path(model_to_use)
+                cached_path = get_cached_model_path(model_to_use)
                 if cached_path:
                     model_path = cached_path
                     print(f"Using cached model: {model_path}")
                 else:
                     # Not cached - download it
                     print(f"Downloading model: {model_to_use}")
-                    cache_dir = multi_model_manager.get_model_cache_dir()
-                    model_path = multi_model_manager.download_model(model_to_use, cache_dir)
+                    from codai.models.cache import load_model
+                    model_path = load_model(model_to_use)
                     print(f"Downloaded to: {model_path}")
             elif os.path.isfile(model_to_use):
                 model_path = model_to_use
@@ -687,7 +688,7 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                             for file in files:
                                 # Construct potential URL and check cache
                                 potential_url = f"https://huggingface.co/{repo_id}/resolve/main/{file}"
-                                cached = multi_model_manager.get_cached_model_path(potential_url)
+                                cached = get_cached_model_path(potential_url)
                                 if cached:
                                     model_path = cached
                                     print(f"Using cached model from HF repo: {model_path}")
@@ -706,7 +707,7 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                                 for gguf_file in gguf_files:
                                     # Construct potential URL and check cache
                                     potential_url = f"https://huggingface.co/{repo_id}/resolve/main/{gguf_file}"
-                                    cached = multi_model_manager.get_cached_model_path(potential_url)
+                                    cached = get_cached_model_path(potential_url)
                                     if cached:
                                         model_path = cached
                                         print(f"Using cached GGUF model: {model_path}")
@@ -735,7 +736,7 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                     print(f"Using local file: {model_path}")
                 else:
                     # Not a local file, check if it might be a cached model under a different name
-                    cached_path = multi_model_manager.get_cached_model_path(model_to_use)
+                    cached_path = get_cached_model_path(model_to_use)
                     if cached_path:
                         model_path = cached_path
                         print(f"Using cached model: {model_path}")
@@ -743,8 +744,8 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                         # Last resort: try to download it as if it were a URL
                         print(f"Attempting to download '{model_to_use}' as model URL")
                         try:
-                            cache_dir = multi_model_manager.get_model_cache_dir()
-                            model_path = multi_model_manager.download_model(model_to_use, cache_dir)
+                            from codai.models.cache import load_model
+                            model_path = load_model(model_to_use)
                             print(f"Downloaded to: {model_path}")
                         except Exception as download_error:
                             print(f"Download failed: {download_error}")

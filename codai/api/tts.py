@@ -18,14 +18,14 @@ global_args = None
 
 def get_cached_model_path(url: str) -> str:
     """Get cached model path if available."""
-    from codai.models.manager import multi_model_manager
-    return multi_model_manager.get_cached_model_path(url)
+    from codai.models.cache import get_cached_model_path as cache_get_cached_model_path
+    return cache_get_cached_model_path(url)
 
 
 def get_model_cache_dir() -> str:
     """Get model cache directory."""
-    from codai.models.manager import multi_model_manager
-    return multi_model_manager.get_model_cache_dir()
+    from codai.models.cache import get_model_cache_dir
+    return get_model_cache_dir()
 
 
 def set_global_args(args):
@@ -127,53 +127,11 @@ async def create_speech(request: TTSRequest):
             # Check if model_to_use is a URL - download it (with caching)
             model_path = None
             if model_to_use.startswith('http://') or model_to_use.startswith('https://'):
-                # Check cache first
-                cached_path = get_cached_model_path(model_to_use)
-                if cached_path:
-                    model_path = cached_path
-                    print(f"Using cached model: {model_path}")
-                else:
-                    print(f"Downloading model from URL: {model_to_use}")
-                    try:
-                        import requests
-                        import hashlib
-                        
-                        # Get cache directory
-                        cache_dir = get_model_cache_dir()
-                        
-                        # Extract filename from URL
-                        url_path = model_to_use.split('?')[0]
-                        filename = os.path.basename(url_path)
-                        
-                        if not filename.endswith('.pt') and not filename.endswith('.bin'):
-                            filename = "kokoro-model.pt"
-                        
-                        # Create safe filename in cache
-                        url_hash = hashlib.sha256(model_to_use.encode()).hexdigest()
-                        cached_filename = f"{url_hash}_{filename}"
-                        model_path = os.path.join(cache_dir, cached_filename)
-                        
-                        # Download to cache
-                        response = requests.get(model_to_use, stream=True)
-                        response.raise_for_status()
-                        
-                        total_size = int(response.headers.get('content-length', 0))
-                        downloaded = 0
-                        
-                        with open(model_path, 'wb') as f:
-                            for chunk in response.iter_content(chunk_size=8192*1024):
-                                if chunk:
-                                    f.write(chunk)
-                                    downloaded += len(chunk)
-                                    if total_size > 0:
-                                        percent = (downloaded / total_size) * 100
-                                        print(f"Downloaded: {percent:.1f}%", end='\r')
-                        
-                        print(f"\nDownloaded and cached to: {model_path}")
-                        
-                    except Exception as e:
-                        print(f"Error downloading model: {e}")
-                        raise
+                print(f"Loading model from URL: {model_to_use}")
+                from codai.models.cache import load_model
+                model_path = load_model(model_to_use)
+                if not model_path:
+                    raise Exception(f"Failed to load model from {model_to_use}")
             else:
                 # Use local path or model name
                 model_path = model_to_use
