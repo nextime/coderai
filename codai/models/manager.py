@@ -1,6 +1,7 @@
 """Model manager module - contains ModelManager, WhisperServerManager, and MultiModelManager classes."""
 
 from typing import Optional, Dict, Any, List
+import os
 import subprocess
 import signal
 import requests
@@ -379,9 +380,6 @@ class MultiModelManager:
         self.tts_model: Optional[str] = None
         self.image_models: List[str] = []
         self.vision_models: List[str] = []
-        self.config: Dict[str, Dict] = {}  # Store model configurations
-        self.tool_parser = ModelParserAdapter()
-        self.current_model_key: Optional[str] = None
         self.config: Dict[str, Dict] = {}  # Store model configurations
         self.tool_parser = ModelParserAdapter()
         self.current_model_key: Optional[str] = None
