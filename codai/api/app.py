@@ -13,11 +13,34 @@ from fastapi.responses import FileResponse, JSONResponse
 from codai.pydantic.textrequest import ModelList
 from codai.models.manager import model_manager, multi_model_manager
 
+# Import global state functions - re-export for backward compatibility
+from codai.api.state import (
+    get_load_mode,
+    set_load_mode,
+    get_global_args,
+    set_global_args,
+    set_global_file_path,
+    get_global_debug,
+    set_global_debug,
+)
 
-# Global references to be set by coderai
-# These will be imported/assigned after the app is created
+# Aliases for backward compatibility
 global_debug = False
 global_file_path = None
+
+
+def set_global_debug_wrapper(debug: bool):
+    """Set the global debug flag."""
+    global global_debug
+    global_debug = debug
+    set_global_debug(debug)
+
+
+def set_global_file_path_wrapper(path: str):
+    """Set the global file path."""
+    global global_file_path
+    global_file_path = path
+    set_global_file_path(path)
 
 
 @asynccontextmanager
@@ -73,30 +96,3 @@ async def get_file(filename: str):
         if os.path.exists(file_path):
             return FileResponse(file_path)
     raise HTTPException(status_code=404, detail="File not found")
-
-
-def set_global_debug(debug: bool):
-    """Set the global debug flag."""
-    global global_debug
-    global_debug = debug
-
-
-def set_global_file_path(path: str):
-    """Set the global file path."""
-    global global_file_path
-    global_file_path = path
-
-
-# Load mode - will be set by coderai
-_load_mode = {"mode": "ondemand"}
-
-
-def get_load_mode():
-    """Get the current load mode."""
-    return _load_mode.get("mode", "ondemand")
-
-
-def set_load_mode(mode: str):
-    """Set the load mode from coderai."""
-    global _load_mode
-    _load_mode = mode

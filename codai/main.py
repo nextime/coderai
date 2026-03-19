@@ -27,7 +27,15 @@ def main():
     
     # Import globals from codai modules
     from codai.api import app
-    from codai.api.app import set_global_args
+    from codai.api.state import (
+        set_global_args,
+        set_global_debug,
+        set_global_system_prompt,
+        set_global_tools_closer_prompt,
+        set_global_file_path,
+        set_load_mode,
+        set_grammar_guided_gen,
+    )
     from codai.models.manager import ModelManager, MultiModelManager
     from codai.backends import detect_available_backends
     from codai.models.cache import (
@@ -79,7 +87,6 @@ def main():
     
     # Set global file path for storing generated files
     global_file_path = args.file_path
-    from codai.api.app import set_global_file_path
     set_global_file_path(global_file_path)
     
     if global_debug:

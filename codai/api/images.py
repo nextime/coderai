@@ -14,7 +14,7 @@ from PIL import Image
 # Import from codai modules
 from codai.models.manager import multi_model_manager
 from codai.pydantic.imagerequest import ImageGenerationRequest
-from codai.api.app import get_load_mode
+from codai.api.state import get_load_mode
 
 
 # Global reference to be set by coderai
