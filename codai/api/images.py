@@ -102,18 +102,31 @@ def save_image_response(img, request_format="base64", http_request=None):
             # Use server host from request headers (what client used to connect)
             if http_request:
                 # Get the Host header - this is what the client used to reach the server
+                # The Host header typically includes the port, e.g., "192.168.1.1:6745"
                 client_host = http_request.headers.get('host', '')
                 if not client_host:
                     # Fallback to client IP if no Host header
                     client_host = http_request.client.host if http_request.client else '127.0.0.1'
-                # Strip port if present in Host header
-                if ':' in client_host and not client_host.replace(':', '').isdigit():
-                    client_host = client_host.split(':')[0]
+                
+                # Strip port from host if present (Host header includes port like "192.168.1.1:6745")
+                if ':' in client_host:
+                    # Check if the part after : is a port number
+                    parts = client_host.split(':')
+                    if len(parts) == 2 and parts[1].isdigit():
+                        # It's a port number, strip it
+                        client_host = parts[0]
+                    elif len(parts) > 2:
+                        # IPv6 or other format, take last part as port check
+                        last_part = parts[-1]
+                        if last_part.isdigit():
+                            client_host = ':'.join(parts[:-1])
+                
                 # Check if HTTPS is enabled
                 use_https = getattr(global_args, 'https', False) or getattr(global_args, 'pubkey', None)
                 protocol = "https" if use_https else "http"
                 port = getattr(global_args, 'port', 8000)
                 base_url = f"{protocol}://{client_host}:{port}"
+                print(f"DEBUG: client_host={client_host}, port={port}, base_url={base_url}")
             else:
                 base_url = "http://127.0.0.1:8000"
         else:

@@ -92,9 +92,11 @@ async def list_models():
 @app.get("/v1/files/{filename}")
 async def get_file(filename: str):
     """Serve uploaded/generated files."""
+    print(f"DEBUG get_file: filename={filename}, global_file_path={global_file_path}")
     if global_file_path:
         import os
         file_path = os.path.join(global_file_path, filename)
+        print(f"DEBUG get_file: full path={file_path}, exists={os.path.exists(file_path)}")
         if os.path.exists(file_path):
             return FileResponse(file_path)
     raise HTTPException(status_code=404, detail="File not found")
