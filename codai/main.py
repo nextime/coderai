@@ -128,53 +128,73 @@ def main():
     # Handle --list-cached-models
     if args.list_cached_models:
         print("\n=== Listing Cached Models ===")
-        
+
         caches = get_all_cache_dirs()
         if not caches:
             print("No model cache directories found.")
             sys.exit(0)
-        
-        all_files = []
-        for cache_name, cache_dir in caches.items():
-            print(f"\n--- {cache_name.upper()} Cache ({cache_dir}) ---")
-            if not os.path.exists(cache_dir):
-                print(f"  (directory does not exist)")
-                continue
-                
-            files = os.listdir(cache_dir)
-            if not files:
-                print(f"  No cached files.")
-                continue
-            
-            # For diffusers and huggingface, show directory structure
-            if cache_name in ('diffusers', 'huggingface'):
-                for root, dirs, files in os.walk(cache_dir):
-                    for f in files:
-                        filepath = os.path.join(root, f)
-                        rel_path = os.path.relpath(filepath, cache_dir)
-                        size = os.path.getsize(filepath)
-                        all_files.append((cache_name, rel_path, size))
+
+        total_models = 0
+        total_size = 0
+
+        # Show CoderAI GGUF cache
+        coderai_dir = caches.get('coderai')
+        if coderai_dir and os.path.exists(coderai_dir):
+            print(f"\n--- CODERAI GGUF Cache ({coderai_dir}) ---")
+            files = [f for f in os.listdir(coderai_dir) if os.path.isfile(os.path.join(coderai_dir, f))]
+            if files:
+                for filename in sorted(files):
+                    filepath = os.path.join(coderai_dir, filename)
+                    size = os.path.getsize(filepath)
+                    size_mb = size / (1024 * 1024)
+                    total_size += size
+                    print(f"  {filename} ({size_mb:.1f} MB)")
+                total_models += len(files)
             else:
-                for f in files:
-                    filepath = os.path.join(cache_dir, f)
-                    if os.path.isfile(filepath):
-                        size = os.path.getsize(filepath)
-                        all_files.append((cache_name, f, size))
-        
-        if not all_files:
-            print("\nNo cached models found.")
-            sys.exit(0)
+                print("  No cached GGUF files.")
+        else:
+            print(f"\n--- CODERAI GGUF Cache ---")
+            print("  (directory not found)")
 
-        # Print individual files
-        for cache_name, filename, size in all_files:
-            size_mb = size / (1024 * 1024)
-            print(f"  [{cache_name}] {filename} ({size_mb:.1f} MB)")
+        # Show HuggingFace cached models using HF API
+        hf_dir = caches.get('huggingface')
+        if hf_dir and os.path.exists(hf_dir):
+            print(f"\n--- HUGGINGFACE Models Cache ({hf_dir}) ---")
+            try:
+                from huggingface_hub import scan_cache_dir
+                cache_info = scan_cache_dir(hf_dir)
 
-        # Calculate totals
-        total_size = sum(size for _, _, size in all_files)
+                if cache_info.repos:
+                    for repo in sorted(cache_info.repos, key=lambda x: x.repo_id):
+                        # Calculate total size for this repo
+                        repo_size = sum(
+                            revision.size_on_disk
+                            for revision in repo.revisions
+                        )
+                        size_gb = repo_size / (1024 * 1024 * 1024)
+                        total_size += repo_size
+                        total_models += 1
 
+                        # Get latest revision info
+                        latest_rev = max(repo.revisions, key=lambda x: x.last_modified)
+                        print(f"  {repo.repo_id} ({size_gb:.2f} GB)")
+                        print(f"    └─ {len(repo.revisions)} revision(s), latest: {latest_rev.commit_hash[:8]}")
+                else:
+                    print("  No cached HuggingFace models.")
+            except ImportError:
+                print("  (huggingface_hub not available for detailed listing)")
+                # Fallback: just show directory exists
+                print(f"  Cache directory exists at: {hf_dir}")
+            except Exception as e:
+                print(f"  Error listing HuggingFace cache: {e}")
+        else:
+            print(f"\n--- HUGGINGFACE Models Cache ---")
+            print("  (directory not found)")
+
+        # Show summary
         print(f"\n=== Summary ===")
-        print(f"Total: {len(all_files)} files, {total_size / (1024*1024*1024):.2f} GB")
+        print(f"Total cached models: {total_models}")
+        print(f"Total disk usage: {total_size / (1024*1024*1024):.2f} GB")
         print("\nCache locations:")
         for cache_name, cache_dir in caches.items():
             print(f"  {cache_name}: {cache_dir}")
