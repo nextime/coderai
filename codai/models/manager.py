@@ -13,7 +13,7 @@ from codai.models.parser import ModelParserAdapter
 from codai.backends import detect_available_backends
 from codai.backends.cuda import NvidiaBackend
 from codai.backends.vulkan import VulkanBackend
-from codai.models.cache import get_cached_model_path, download_model, get_model_cache_dir
+from codai.models.cache import load_model
 from codai.models.utils import FuzzyToolBreaker
 from codai.pydantic.textrequest import ModelInfo
 
@@ -258,24 +258,20 @@ class WhisperServerManager:
         with self.lock:
             if self.is_running():
                 self.stop()
-            
+
             if not self.server_path:
                 print("Error: whisper-server path not set")
                 return ""
-            
-            # Handle URL models
+
+            # Handle URL models - use centralized cache loading
             actual_model_path = model_path
             if model_path and (model_path.startswith('http://') or model_path.startswith('https://')):
-                cached_path = get_cached_model_path(model_path)
-                if cached_path:
-                    actual_model_path = cached_path
-                    print(f"Using cached model: {actual_model_path}")
-                else:
-                    cache_dir = get_model_cache_dir()
-                    print(f"Downloading model: {model_path}")
-                    actual_model_path = download_model(model_path, cache_dir)
-                    print(f"Downloaded model to: {actual_model_path}")
-            
+                print(f"Loading model: {model_path}")
+                actual_model_path = load_model(model_path)
+                if not actual_model_path:
+                    print(f"Failed to load model: {model_path}")
+                    return ""
+
             cmd = [self.server_path]
             if actual_model_path:
                 cmd.extend(["-m", actual_model_path])
@@ -283,9 +279,9 @@ class WhisperServerManager:
             cmd.append("--convert")
             cmd.extend(["--host", "127.0.0.1"])
             cmd.extend(["--port", str(self.port)])
-            
+
             print(f"Starting whisper-server: {' '.join(cmd)}")
-            
+
             try:
                 self.process = subprocess.Popen(
                     cmd,
@@ -294,7 +290,7 @@ class WhisperServerManager:
                     preexec_fn=lambda: signal.signal(signal.SIGTERM, signal.SIG_DFL)
                 )
                 self.current_model = actual_model_path
-                
+
                 if self._wait_for_server(30):
                     print(f"whisper-server started on {self.base_url}")
                     return actual_model_path
@@ -796,23 +792,6 @@ class MultiModelManager:
         # Otherwise return the first loaded model (there should only be one in ondemand mode)
         return list(self.models.keys())[0] if self.models else None
 
-    def get_cached_model_path(self, url: str) -> Optional[str]:
-        """
-        Check if a model URL is already cached.
-
-        This is a proxy method to the cache module function.
-        Returns the cached path if the model is cached, None otherwise.
-        """
-        return get_cached_model_path(url)
-
-    def get_model_cache_dir(self) -> str:
-        """
-        Get the model cache directory.
-
-        This is a proxy method to the cache module function.
-        Returns the path to the model cache directory.
-        """
-        return get_model_cache_dir()
     
     def unload_all_models(self):
         """

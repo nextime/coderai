@@ -147,6 +147,29 @@ def download_huggingface_model(model_id: str, cache_dir: Optional[str] = None, f
         return None
 
 
+def load_model(model_path: str, cache_dir: Optional[str] = None, file_pattern: str = '.gguf') -> Optional[str]:
+    """
+    Load a model - check cache first, download if needed. Works with URLs and HF model IDs.
+
+    This is the main entry point for model loading that handles caching transparently.
+
+    Args:
+        model_path: URL or HuggingFace model ID (e.g., 'TheBloke/Llama-2-7B-GGUF')
+        cache_dir: Specific cache directory (auto-detected if None)
+        file_pattern: File pattern for HF downloads (default: '.gguf')
+
+    Returns:
+        Path to cached/downloaded model, or None on failure
+    """
+    # First check if already cached
+    cached_path = get_cached_model_path(model_path)
+    if cached_path:
+        return cached_path
+
+    # Not cached - need to download
+    return download_model(model_path, cache_dir, file_pattern)
+
+
 def download_model(model_path: str, cache_dir: Optional[str] = None, file_pattern: str = '.gguf') -> Optional[str]:
     """
     Download a model from URL or HuggingFace. Works with both URLs and model IDs.
@@ -157,7 +180,7 @@ def download_model(model_path: str, cache_dir: Optional[str] = None, file_patter
         file_pattern: File pattern to download for HF models (default: '.gguf')
 
     Returns:
-        Path to downloaded/cached model, or None on failure
+        Path to downloaded model, or None on failure
     """
     # Check if it's a HuggingFace model ID
     if is_huggingface_model_id(model_path):
@@ -200,7 +223,7 @@ def download_model(model_path: str, cache_dir: Optional[str] = None, file_patter
         cached_filename = f"{url_hash}_{filename}"
         cached_path = os.path.join(cache_dir, cached_filename)
 
-        # Check if already cached
+        # Check if already cached (double-check)
         if os.path.exists(cached_path):
             print(f"Using cached model: {cached_path}")
             return cached_path
@@ -446,3 +469,19 @@ def remove_all_cached_models() -> int:
                     total_removed += 1
     
     return total_removed
+
+
+# Export all public functions
+__all__ = [
+    'get_model_cache_dir',
+    'get_all_cache_dirs',
+    'get_cached_model_path',
+    'is_huggingface_model_id',
+    'download_huggingface_model',
+    'load_model',
+    'download_model',
+    'list_cached_models',
+    'remove_cached_model',
+    'list_cached_models_info',
+    'remove_all_cached_models',
+]
