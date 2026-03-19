@@ -660,3 +660,12 @@ class MultiModelManager:
             models.append(ModelInfo(id=alias))
         
         return models
+
+
+# =============================================================================
+# Singleton Instances
+# =============================================================================
+
+# Global singleton instances for convenience
+model_manager = ModelManager()
+multi_model_manager = MultiModelManager()

@@ -1,4 +1,11 @@
 # codai.models - Model parsing and templates
+from .manager import (
+    ModelManager,
+    WhisperServerManager,
+    MultiModelManager,
+    model_manager,
+    multi_model_manager,
+)
 from .parser import (
     ModelParserDispatcher,
     BaseParser,
@@ -16,12 +23,20 @@ from .parser import (
     ToolCallParser,
     ModelParserAdapter,
     filter_repetition,
+    filter_malformed_content,
+    cleanup_control_tokens,
     validate_json_complete,
+    format_tools_for_prompt,
 )
 
 from .templates import AgenticTemplateManager
 
 __all__ = [
+    'ModelManager',
+    'WhisperServerManager',
+    'MultiModelManager',
+    'model_manager',
+    'multi_model_manager',
     'ModelParserDispatcher',
     'BaseParser',
     'QwenParser',
@@ -39,5 +54,8 @@ __all__ = [
     'ModelParserAdapter',
     'AgenticTemplateManager',
     'filter_repetition',
+    'filter_malformed_content',
+    'cleanup_control_tokens',
     'validate_json_complete',
+    'format_tools_for_prompt',
 ]

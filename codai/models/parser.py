@@ -1299,6 +1299,90 @@ def filter_malformed_content(text: str) -> str:
     return filtered
 
 
+# =============================================================================
+# Control Token Cleanup
+# =============================================================================
+
+# Pre-compiled pattern for cleanup_control_tokens newline cleanup
+_RE_TRIPLE_NEWLINE = re.compile(r'\n{3,}')
+
+# Control tokens to strip - defined once at module level
+_CONTROL_TOKENS = [
+    '<|im_end|>',
+    '<|im_start|>',
+    '<|endoftext|>',
+    '<|end_of_text|>',
+    '<|eot_id|>',
+    '<|eom_id|>',
+    '<|assistant|>',
+    '<|model|>',
+    '<|python|>',
+    '<|javascript|>',
+    '<|html|>',
+    '\n\nassistant',
+    '\nAssistant',
+    'ASSISTANT',
+    'Assistant',
+    'assistant',
+]
+
+# Build expanded token set for O(1) lookup (includes \n and space prefixed variants)
+_CONTROL_TOKENS_START = set()
+_CONTROL_TOKENS_END = set()
+for _t in _CONTROL_TOKENS:
+    _CONTROL_TOKENS_START.update([_t, '\n' + _t, ' ' + _t])
+    _CONTROL_TOKENS_END.update([_t, '\n' + _t, ' ' + _t])
+# Sort by length descending so longer tokens match first (avoids partial matches)
+_CONTROL_TOKENS_START_SORTED = sorted(_CONTROL_TOKENS_START, key=len, reverse=True)
+_CONTROL_TOKENS_END_SORTED = sorted(_CONTROL_TOKENS_END, key=len, reverse=True)
+
+
+def cleanup_control_tokens(text: str) -> str:
+    """
+    Clean up leading/trailing control tokens from model output.
+    
+    Removes tokens like <|im_end|>, <|im_start|>, 'assistant', etc. that might
+    appear at the start or end of the response after reasoning extraction.
+    
+    Uses module-level sorted token lists for efficient matching.
+    Tokens are sorted by length (longest first) to prevent partial matches
+    like 'assistant' matching before '<|assistant|>'.
+    """
+    if not text:
+        return text
+    
+    cleaned = text
+    
+    # Strip from start - keep trying until no more tokens at start
+    # Max iterations bounded by text length / min token length
+    changed = True
+    while changed:
+        changed = False
+        for token in _CONTROL_TOKENS_START_SORTED:
+            if cleaned.startswith(token):
+                cleaned = cleaned[len(token):]
+                changed = True
+                break  # Restart from longest token after each removal
+    
+    # Strip from end - keep trying until no more tokens at end
+    changed = True
+    while changed:
+        changed = False
+        for token in _CONTROL_TOKENS_END_SORTED:
+            if cleaned.endswith(token):
+                cleaned = cleaned[:-len(token)]
+                changed = True
+                break  # Restart from longest token after each removal
+    
+    # Clean up any resulting triple+ newlines (pre-compiled pattern)
+    cleaned = _RE_TRIPLE_NEWLINE.sub('\n\n', cleaned)
+    
+    # Strip leading/trailing whitespace
+    cleaned = cleaned.strip()
+    
+    return cleaned
+
+
 def filter_repetition(text: str, min_repeat_count: int = 3, ngram_sizes: tuple = (2, 3)) -> str:
     """
     Detect and remove n-gram repetition from text.
@@ -1478,8 +1562,18 @@ def validate_json_complete(json_str: str) -> bool:
 # Tool Formatting
 # =============================================================================
 
-def format_tools_for_prompt(tools, messages):
-    """Format tools into the system message or add a tool description."""
+def format_tools_for_prompt(tools, messages, tools_closer_prompt: bool = False):
+    """Format tools into the system message or add a tool description.
+    
+    Args:
+        tools: List of Tool objects
+        messages: List of ChatMessage objects
+        tools_closer_prompt: If True, place tools right before the user's latest message
+                           instead of in the system prompt (prompt distillation)
+    
+    Returns:
+        Modified list of ChatMessage objects
+    """
     import json
     
     if not tools:
@@ -1512,19 +1606,47 @@ def format_tools_for_prompt(tools, messages):
     
     # Add or prepend to system message
     new_messages = list(messages)
-    system_found = False
     
-    for i, msg in enumerate(new_messages):
-        if msg.role == "system":
-            new_messages[i] = ChatMessage(
-                role="system",
-                content=f"{tools_text}\n\n{msg.content or ''}"
-            )
-            system_found = True
-            break
-    
-    if not system_found:
-        new_messages.insert(0, ChatMessage(role="system", content=tools_text))
+    if tools_closer_prompt:
+        # Prompt distillation: insert tools right before the LAST user message
+        # Find the last user message and insert tools before it
+        last_user_idx = None
+        for i, msg in enumerate(new_messages):
+            if msg.role == "user":
+                last_user_idx = i
+        
+        if last_user_idx is not None:
+            # Insert a tool context message before the last user message
+            tools_message = ChatMessage(role="system", content=f"Available tools:\n{tools_text}")
+            new_messages.insert(last_user_idx, tools_message)
+        else:
+            # No user message found, fall back to system message
+            system_found = False
+            for i, msg in enumerate(new_messages):
+                if msg.role == "system":
+                    new_messages[i] = ChatMessage(
+                        role="system",
+                        content=f"{tools_text}\n\n{msg.content or ''}"
+                    )
+                    system_found = True
+                    break
+            if not system_found:
+                new_messages.insert(0, ChatMessage(role="system", content=tools_text))
+    else:
+        # Traditional behavior: prepend tools to system message
+        system_found = False
+        
+        for i, msg in enumerate(new_messages):
+            if msg.role == "system":
+                new_messages[i] = ChatMessage(
+                    role="system",
+                    content=f"{tools_text}\n\n{msg.content or ''}"
+                )
+                system_found = True
+                break
+        
+        if not system_found:
+            new_messages.insert(0, ChatMessage(role="system", content=tools_text))
     
     return new_messages
 
