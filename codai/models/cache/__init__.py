@@ -329,14 +329,21 @@ def remove_cached_model(match_term: str) -> List[Tuple[str, str, int]]:
                     # Check if match_term matches any repo_id
                     for repo in cache_info.repos:
                         if match_term.lower() in repo.repo_id.lower():
-                            # Found matching repo, add all its files
-                            for revision in repo.revisions:
-                                for file_info in revision.files:
-                                    filepath = os.path.join(cache_dir, file_info.file_path)
-                                    if os.path.exists(filepath):
-                                        size = os.path.getsize(filepath)
-                                        rel_path = file_info.file_path
-                                        all_matching.append((cache_name, rel_path, filepath, size))
+                            # Found matching repo - remove the entire repo directory
+                            # This is more thorough than removing individual files
+                            repo_dir = os.path.join(cache_dir, f"models--{repo.repo_id.replace('/', '--')}")
+                            if os.path.exists(repo_dir):
+                                # Calculate total size of all files in the repo
+                                total_size = 0
+                                for root, dirs, files in os.walk(repo_dir):
+                                    for f in files:
+                                        filepath = os.path.join(root, f)
+                                        try:
+                                            total_size += os.path.getsize(filepath)
+                                        except OSError:
+                                            pass
+                                # Add the entire directory for removal
+                                all_matching.append((cache_name, f"models--{repo.repo_id.replace('/', '--')}", repo_dir, total_size))
                             break  # Only match one repo per search term
                 except ImportError:
                     # huggingface_hub not available, fall back to filename search
@@ -363,13 +370,19 @@ def remove_cached_model(match_term: str) -> List[Tuple[str, str, int]]:
                         size = os.path.getsize(filepath)
                         all_matching.append((cache_name, f, filepath, size))
 
-    # Remove matching files
+    # Remove matching files/directories
     removed = []
     for cache_name, filename, filepath, size in all_matching:
         try:
-            os.remove(filepath)
+            if os.path.isdir(filepath):
+                # Remove entire directory tree
+                shutil.rmtree(filepath)
+                print(f"  Deleted: [{cache_name}] {filename}/ (directory)")
+            else:
+                # Remove single file
+                os.remove(filepath)
+                print(f"  Deleted: [{cache_name}] {filename}")
             removed.append((cache_name, filename, size))
-            print(f"  Deleted: [{cache_name}] {filename}")
         except Exception as e:
             print(f"  Error deleting [{cache_name}] {filename}: {e}")
 
