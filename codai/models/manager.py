@@ -492,6 +492,103 @@ class MultiModelManager:
         self.config[model_name] = config or {}
         self.model_backend_types[model_name] = backend_type
     
+    def _load_default_model(self):
+        """Load the default model on demand."""
+        if not self.default_model:
+            return None
+        
+        # Check if already loaded
+        if self.default_model in self.models:
+            return self.models[self.default_model]
+        
+        # Get config and backend type
+        config = self.config.get(self.default_model, {})
+        backend_type = self.model_backend_types.get(self.default_model, "auto")
+        
+        # Get global args for additional parameters
+        try:
+            from codai.api.state import get_global_args
+            global_args = get_global_args()
+        except:
+            global_args = None
+        
+        # Create new model manager and load the model
+        model_manager = ModelManager()
+        
+        try:
+            # Build kwargs from config
+            kwargs = {}
+            if 'ctx' in config:
+                kwargs['ctx'] = config['ctx']
+            if global_args:
+                if hasattr(global_args, 'n_gpu_layers'):
+                    kwargs['n_gpu_layers'] = global_args.n_gpu_layers
+                if hasattr(global_args, 'offload_dir'):
+                    kwargs['offload_dir'] = global_args.offload_dir
+                if hasattr(global_args, 'ram'):
+                    kwargs['ram'] = global_args.ram
+            
+            print(f"Loading default model on demand: {self.default_model}")
+            model_manager.load_model(self.default_model, backend_type=backend_type, **kwargs)
+            
+            # Add to models dict
+            self.models[self.default_model] = model_manager
+            self.current_model_key = self.default_model
+            
+            print(f"Model loaded successfully: {self.default_model}")
+            return model_manager
+            
+        except Exception as e:
+            print(f"Error loading model {self.default_model}: {e}")
+            return None
+    
+    def _load_model_by_name(self, model_name: str):
+        """Load a model by name on demand."""
+        # Check if already loaded
+        if model_name in self.models:
+            return self.models[model_name]
+        
+        # Check if it's registered in config
+        config = self.config.get(model_name, {})
+        backend_type = self.model_backend_types.get(model_name, "auto")
+        
+        # Get global args for additional parameters
+        try:
+            from codai.api.state import get_global_args
+            global_args = get_global_args()
+        except:
+            global_args = None
+        
+        # Create new model manager and load the model
+        model_manager = ModelManager()
+        
+        try:
+            # Build kwargs from config
+            kwargs = {}
+            if 'ctx' in config:
+                kwargs['ctx'] = config['ctx']
+            if global_args:
+                if hasattr(global_args, 'n_gpu_layers'):
+                    kwargs['n_gpu_layers'] = global_args.n_gpu_layers
+                if hasattr(global_args, 'offload_dir'):
+                    kwargs['offload_dir'] = global_args.offload_dir
+                if hasattr(global_args, 'ram'):
+                    kwargs['ram'] = global_args.ram
+            
+            print(f"Loading model on demand: {model_name}")
+            model_manager.load_model(model_name, backend_type=backend_type, **kwargs)
+            
+            # Add to models dict
+            self.models[model_name] = model_manager
+            self.current_model_key = model_name
+            
+            print(f"Model loaded successfully: {model_name}")
+            return model_manager
+            
+        except Exception as e:
+            print(f"Error loading model {model_name}: {e}")
+            return None
+    
     def set_audio_model(self, model_name: str, config: Dict = None):
         """Add an audio transcription model."""
         if model_name not in self.audio_models:
@@ -529,9 +626,13 @@ class MultiModelManager:
         
         # Handle empty or "default" model names
         if not requested_model or requested_model == "default":
-            if self.default_model and self.default_model in self.models:
-                self.current_model_key = self.default_model
-                return self.models[self.default_model]
+            if self.default_model:
+                # Check if already loaded
+                if self.default_model in self.models:
+                    self.current_model_key = self.default_model
+                    return self.models[self.default_model]
+                # Model not loaded yet - try to load it
+                return self._load_default_model()
             return None
         
         # Handle "audio" alias
@@ -594,8 +695,12 @@ class MultiModelManager:
         # Check if it's the default model
         if self.default_model and (requested_model == self.default_model or 
                                     requested_model.endswith(self.default_model.split("/")[-1])):
-            self.current_model_key = self.default_model
-            return self.models.get(self.default_model)
+            # Check if already loaded
+            if self.default_model in self.models:
+                self.current_model_key = self.default_model
+                return self.models[self.default_model]
+            # Try to load the default model
+            return self._load_default_model()
         
         # Check if any loaded model matches
         for key, model in self.models.items():
@@ -603,7 +708,8 @@ class MultiModelManager:
                 self.current_model_key = key
                 return model
         
-        return None
+        # Model not found - try to load it as a new model
+        return self._load_model_by_name(requested_model)
     
     def add_model(self, key: str, manager: ModelManager):
         """Add a model manager for a specific key."""
