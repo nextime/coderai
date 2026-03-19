@@ -13,7 +13,7 @@ from PIL import Image
 
 # Import from codai modules
 from codai.models.manager import multi_model_manager
-from codai.models.cache import get_cached_model_path
+from codai.models.cache import resolve_and_load_model
 from codai.pydantic.imagerequest import ImageGenerationRequest
 from codai.api.state import get_load_mode
 
@@ -653,122 +653,16 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
         print("No pre-loaded sd.cpp model found, trying to load...")
         try:
             from stable_diffusion_cpp import StableDiffusion
-            
-            # Check if model_to_use is a URL and get cached path
-            # Also handle HuggingFace model IDs that need to be resolved
-            model_path = None
-            if model_to_use.startswith('http://') or model_to_use.startswith('https://'):
-                cached_path = get_cached_model_path(model_to_use)
-                if cached_path:
-                    model_path = cached_path
-                    print(f"Using cached model: {model_path}")
-                else:
-                    # Not cached - download it
-                    print(f"Downloading model: {model_to_use}")
-                    from codai.models.cache import load_model
-                    model_path = load_model(model_to_use)
-                    print(f"Downloaded to: {model_path}")
-            elif os.path.isfile(model_to_use):
-                model_path = model_to_use
-            else:
-                # Check if this is a likely diffusers model (not GGUF)
-                # If it doesn't contain 'gguf' and we're in image generation context,
-                # it's probably a diffusers model that should be handled by the diffusers library
-                is_likely_diffusers = ('gguf' not in model_to_use.lower() and
-                                     not model_to_use.endswith('.gguf'))
 
-                if is_likely_diffusers:
-                    print(f"Model '{model_to_use}' appears to be a diffusers model (not GGUF), skipping sd.cpp resolution")
-                    print("This model should be handled by the diffusers library above")
-                    model_path = None
-                else:
-                    # Try to resolve as HuggingFace GGUF model ID
-                    print(f"Trying to resolve as HuggingFace GGUF model ID: {model_to_use}")
-                    try:
-                        from huggingface_hub import hf_hub_download, list_repo_files
+            # Use centralized model resolution
+            model_path = resolve_and_load_model(model_to_use, model_type='image')
 
-                        # Parse model name (format: "org/model" or "org/model/filename.gguf")
-                        parts = model_to_use.split('/')
-                        if len(parts) >= 2:
-                            repo_id = f"{parts[0]}/{parts[1]}"
+            if model_path is not None and not os.path.isfile(model_path):
+                # This is a diffusers model identifier (not a file path)
+                # Skip sd.cpp and let diffusers handle it
+                print(f"Model '{model_path}' is handled by diffusers library, skipping sd.cpp")
+                model_path = None
 
-                            # First check if there's ANY cached file for this model (more flexible)
-                            try:
-                                files = list_repo_files(repo_id)
-                                # Check for any cached file from this repo
-                                for file in files:
-                                    # Construct potential URL and check cache
-                                    potential_url = f"https://huggingface.co/{repo_id}/resolve/main/{file}"
-                                    cached = get_cached_model_path(potential_url)
-                                    if cached:
-                                        model_path = cached
-                                        print(f"Using cached model from HF repo: {model_path}")
-                                        break
-                            except Exception as list_error:
-                                print(f"Could not list repo files: {list_error}")
-                                files = []
-
-                            # If no cached file found, try to find a cached GGUF file specifically
-                            if not model_path:
-                                # Try common GGUF file patterns
-                                gguf_files = [f for f in files if f.endswith('.gguf')]
-
-                                if gguf_files:
-                                    # Try to find a cached version first
-                                    for gguf_file in gguf_files:
-                                        # Construct potential URL and check cache
-                                        potential_url = f"https://huggingface.co/{repo_id}/resolve/main/{gguf_file}"
-                                        cached = get_cached_model_path(potential_url)
-                                        if cached:
-                                            model_path = cached
-                                            print(f"Using cached GGUF model: {model_path}")
-                                            break
-
-                                    # If not cached, download the first GGUF file
-                                    if not model_path:
-                                        print(f"Downloading GGUF model from HF: {gguf_files[0]}")
-                                        model_path = hf_hub_download(repo_id=repo_id, filename=gguf_files[0])
-                                        print(f"Downloaded to: {model_path}")
-                                else:
-                                    # No GGUF files found - this is not a GGUF model
-                                    print(f"No GGUF files found in {repo_id} - this is not a GGUF model")
-                                    model_path = None
-                    except Exception as e:
-                        print(f"Could not resolve as HuggingFace GGUF model: {e}")
-                        model_path = None
-            
-            if model_path is None:
-                print("Warning: Could not resolve sd.cpp model path via HuggingFace GGUF resolution")
-                # Fallback: try to use the model name as a direct path (for local models or if HF resolution failed)
-                print(f"Fallback: attempting to use '{model_to_use}' as direct model path")
-                if os.path.isfile(model_to_use):
-                    model_path = model_to_use
-                    print(f"Using local file: {model_path}")
-                else:
-                    # Not a local file, check if it might be a cached model under a different name
-                    cached_path = get_cached_model_path(model_to_use)
-                    if cached_path:
-                        model_path = cached_path
-                        print(f"Using cached model: {model_path}")
-                    else:
-                        # Last resort: try to download it as if it were a URL
-                        print(f"Attempting to download '{model_to_use}' as model URL")
-                        try:
-                            from codai.models.cache import load_model
-                            model_path = load_model(model_to_use)
-                            print(f"Downloaded to: {model_path}")
-                        except Exception as download_error:
-                            print(f"Download failed: {download_error}")
-                            model_path = None
-                
-                if model_path is None:
-                    print("Error: Could not resolve sd.cpp model path through any method")
-                    sd_cpp_error = "Could not resolve model path"
-                else:
-                    # Load sd.cpp model (continue below)
-                    pass
-            
-            # Load sd.cpp model if we have a valid path
             if model_path is not None:
                 # Check if it's a stable-diffusion-cpp model (has generate method from sd.cpp)
                 try:
@@ -786,14 +680,14 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                                     height = int(parts[1])
                                 except ValueError:
                                     pass
-                        
+
                         # Use default steps for Z-Image Turbo (very fast)
                         steps = 4  # Default for fast generation
-                        
+
                         # Generate images using sd.cpp (run in thread to not block event loop)
                         # Use request seed if provided, otherwise use CLI default seed
                         seed = request.seed if request.seed is not None else getattr(global_args, 'image_seed', None)
-                        
+
                         result = await asyncio.to_thread(
                             sd_model.generate_image,
                             prompt=request.prompt,
@@ -805,19 +699,19 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                             seed=seed if seed is not None else 42,
                             batch_count=request.n if request.n else 1,
                         )
-                        
+
                         # Small delay to let Vulkan driver settle after generation
                         import time
                         time.sleep(0.1)
-                        
+
                         # Convert results to response format
                         images = []
-                        
+
                         for img in result:
                             # Use helper function to save and get response
                             img_data = save_image_response(img, http_request=http_request)
                             images.append(img_data)
-                        
+
                         return {
                             "created": int(time.time()),
                             "data": images
@@ -830,9 +724,9 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                     print(f"sd.cpp generation error: {e}")
                     sd_cpp_error = str(e)
             else:
-                # model_path is None after all fallback attempts
-                print("Error: Could not resolve sd.cpp model path through any method")
-                sd_cpp_error = "Could not resolve model path"
+                # model_path is None - likely a diffusers model handled above
+                print("Model handled by diffusers library")
+                sd_cpp_error = "Model handled by diffusers"
         except ImportError as e:
             sd_cpp_error = str(e)
             print(f"stable-diffusion-cpp-python not available: {sd_cpp_error}")
