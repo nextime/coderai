@@ -293,16 +293,18 @@ def main():
         sys.exit(1)
     
     # Determine load mode
-    load_mode = None
+    # Default is to preload (loadall) unless --nopreload is specified
+    load_mode = "loadall"  # Default: preload models
     if args.loadall:
         load_mode = "loadall"
     elif args.loadswap:
         load_mode = "loadswap"
     elif args.nopreload:
-        load_mode = "nopreload"
+        load_mode = "ondemand"
     
-    if load_mode:
-        set_load_mode(load_mode)
+    set_load_mode(load_mode)
+    if load_mode == "ondemand":
+        print("Load mode: ondemand (load model on first request)")
     
     # Initialize model manager
     print("\n=== Initializing Model Manager ===")
@@ -344,16 +346,20 @@ def main():
                 'ctx': get_ctx_by_index(args.n_ctx, idx, 0),
             })
         
-        # Load first model
-        try:
-            mm = multi_model_manager.get_model_for_request(model_names[0])
-            if mm is not None:
-                print(f"Model loaded successfully: {model_names[0]}")
-            else:
-                print(f"Warning: Model {model_names[0]} not loaded (will load on first request)")
-        except Exception as e:
-            print(f"Warning: Failed to load model: {e}")
-            print(f"Model will load on first request")
+        # Load first model (unless nopreload mode)
+        if load_mode == "loadall":
+            try:
+                print(f"Loading model: {model_names[0]}...")
+                mm = multi_model_manager._load_default_model()
+                if mm is not None and mm.backend is not None:
+                    print(f"Model loaded successfully: {model_names[0]}")
+                else:
+                    print(f"Warning: Model {model_names[0]} failed to load")
+            except Exception as e:
+                print(f"Warning: Failed to load model: {e}")
+                print(f"Model will load on first request")
+        else:
+            print(f"Load mode: ondemand (model will load on first request)")
     
     # Set up audio model if specified
     if audio_models:
