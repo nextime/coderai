@@ -98,6 +98,7 @@ def save_image_response(img, request_format="base64", http_request=None):
         # Add URL to response
         # Determine base URL based on --url argument
         url_setting = getattr(global_args, 'url', 'auto') if global_args else 'auto'
+        print(f"DEBUG: global_args={global_args}, url_setting={url_setting}")
         if url_setting == 'auto':
             # Use server host from request headers (what client used to connect)
             if http_request:
