@@ -90,6 +90,10 @@ def main():
     global_file_path = args.file_path
     set_global_file_path(global_file_path)
     
+    # Also set file path for images module
+    from codai.api.images import set_global_file_path as set_images_file_path
+    set_images_file_path(global_file_path)
+    
     if global_debug:
         # Print the full command line that was used to invoke codai
         import shlex
