@@ -30,22 +30,26 @@ def get_all_cache_dirs() -> dict:
     """Get all model cache directories."""
     caches = {}
     cache_home = os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache'))
-    
+
     # Coderai GGUF cache
     coderai_cache = os.path.join(cache_home, 'coderai', 'models')
     if os.path.exists(coderai_cache):
         caches['coderai'] = coderai_cache
-    
+
     # HuggingFace cache (for .safetensors, PyTorch models, etc.)
+    # Check both the main directory and the hub subdirectory
     hf_cache = os.path.join(cache_home, 'huggingface')
-    if os.path.exists(hf_cache):
+    hf_hub_cache = os.path.join(hf_cache, 'hub')
+    if os.path.exists(hf_hub_cache):
+        caches['huggingface'] = hf_hub_cache  # Use hub directory if it exists
+    elif os.path.exists(hf_cache):
         caches['huggingface'] = hf_cache
-    
+
     # Local diffusers cache (often stored locally by apps)
     local_diffusers = os.path.expanduser('~/.cache/diffusers')
     if os.path.exists(local_diffusers):
         caches['diffusers'] = local_diffusers
-    
+
     return caches
 
 
