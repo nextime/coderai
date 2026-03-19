@@ -21,7 +21,9 @@ from codai.api.state import (
     set_global_args as _set_global_args,
     get_global_debug,
     set_global_debug as _set_global_debug,
+    get_global_system_prompt,
     set_global_system_prompt as _set_global_system_prompt,
+    get_global_tools_closer_prompt,
     set_global_tools_closer_prompt as _set_global_tools_closer_prompt,
     get_grammar_guided_gen,
     set_grammar_guided_gen as _set_grammar_guided_gen,
@@ -308,6 +310,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     
     # Inject system prompt if --system-prompt flag was provided
     messages = request.messages
+    global_system_prompt = get_global_system_prompt()
     if global_system_prompt is not None:
         # Get the custom system prompt text
         if global_system_prompt is True:
