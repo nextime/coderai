@@ -314,8 +314,8 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
             # Try to load the model
             load_error = None
             try:
-                # Use DiffusionPipeline.from_pretrained which auto-detects the correct pipeline class
-                # from model_index.json (supports custom pipelines like ZImagePipeline)
+                # Use DiffusionPipeline which auto-detects the correct pipeline class from model_index.json
+                # This supports custom pipelines like ZImagePipeline (DiT-based) which use 'transformer' instead of 'unet'
                 from diffusers import DiffusionPipeline
                 
                 print(f"Loading diffusers model: {model_to_use}")
@@ -353,13 +353,15 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                             torch_dtype=dtype,
                         )
                     else:
+                        # Fall back to DiffusionPipeline for custom pipelines
                         pipeline = DiffusionPipeline.from_pretrained(
                             model_to_use,
                             torch_dtype=dtype,
                         )
                 except Exception as retry_error:
-                    # If it still fails, try without safety checker
-                    print(f"Warning: Retry failed: {retry_error}, trying without safety checker...")
+                    # If it still fails, try DiffusionPipeline (for custom pipelines like ZImagePipeline)
+                    print(f"Warning: Retry failed: {retry_error}, trying DiffusionPipeline for custom pipelines...")
+                    from diffusers import DiffusionPipeline
                     if is_xl:
                         pipeline = StableDiffusionXLPipeline.from_pretrained(
                             model_to_use,
