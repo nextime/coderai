@@ -534,64 +534,58 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
             print(f"Traceback: {traceback.format_exc()}")
             print(f"Trying stable-diffusion-cpp-python...")
     
-    # Try stable-diffusion-cpp-python (sd.cpp) as fallback - ONLY for GGUF models
-    # sd.cpp only works with GGUF models, not diffusers models
-    is_potential_gguf_model = (model_to_use.endswith('.gguf') or 'gguf' in model_to_use.lower() or
-                              (model_to_use.startswith('http') and '.gguf' in model_to_use) or
-                              (not model_to_use.startswith('http') and '/' in model_to_use))  # HF model IDs might be GGUF
+    # Try stable-diffusion-cpp-python (sd.cpp) as fallback when diffusers fails
+    # sd.cpp works with GGUF models, but some HF models may be GGUF even without "gguf" in name
+    # Let sd.cpp attempt loading and fail gracefully if it's not compatible
 
-    if not is_potential_gguf_model:
-        print(f"Model '{model_to_use}' is not a GGUF model (sd.cpp only supports GGUF), skipping sd.cpp fallback")
-        sd_model = None
-    else:
-        # Try stable-diffusion-cpp-python (sd.cpp) as fallback for GGUF models
-        # First, check all available image models to find one loaded via sd.cpp
-        # Always check for cached models - allows dynamically loaded models to be reused across requests
-        sd_model = None
-        for key in multi_model_manager.models:
-            if key.startswith("image:"):
-                potential_model = multi_model_manager.get_model(key)
-                if potential_model is not None:
-                    # Check if it's a stable-diffusion-cpp model
+    # Try stable-diffusion-cpp-python (sd.cpp) as fallback
+    # First, check all available image models to find one loaded via sd.cpp
+    # Always check for cached models - allows dynamically loaded models to be reused across requests
+    sd_model = None
+    for key in multi_model_manager.models:
+        if key.startswith("image:"):
+            potential_model = multi_model_manager.get_model(key)
+            if potential_model is not None:
+                # Check if it's a stable-diffusion-cpp model
+                try:
+                    from stable_diffusion_cpp import StableDiffusion
+                    if isinstance(potential_model, StableDiffusion):
+                        sd_model = potential_model
+                        print(f"Found cached stable-diffusion-cpp model with key: {key}")
+                        break
+                except ImportError:
+                    pass
+
+    # If no cached image model found, need to load one - first cleanup any existing models
+    if sd_model is None:
+        # In ondemand mode, check if we need to unload before loading sd.cpp model
+        from codai.models.manager import model_manager
+        has_any_model = len(multi_model_manager.models) > 0 or model_manager.backend is not None
+
+        if mode == "ondemand" and has_any_model:
+            # Resolve both the requested image model and currently loaded model to their canonical names
+            requested_canonical = multi_model_manager.resolve_model_name(f"image:{model_to_use}")
+            loaded_canonical = multi_model_manager.get_currently_loaded_model_name()
+
+            # Also check legacy model_manager
+            if not loaded_canonical and model_manager.backend is not None:
+                loaded_canonical = "legacy_model_manager"
+
+            # Compare: if they're different models, unload first
+            already_loaded = (requested_canonical and loaded_canonical and
+                            requested_canonical == loaded_canonical)
+
+            if not already_loaded:
+                print(f"In ondemand mode - model switch detected:")
+                print(f"  Requested: 'image:{model_to_use}' (resolved to: '{requested_canonical}')")
+                print(f"  Loaded: '{loaded_canonical}'")
+                print(f"  -> Fully unloading current model(s) before loading sd.cpp model...")
+                multi_model_manager.unload_all_models()
+                if model_manager.backend is not None:
                     try:
-                        from stable_diffusion_cpp import StableDiffusion
-                        if isinstance(potential_model, StableDiffusion):
-                            sd_model = potential_model
-                            print(f"Found cached stable-diffusion-cpp model with key: {key}")
-                            break
-                    except ImportError:
+                        model_manager.cleanup()
+                    except:
                         pass
-
-        # If no cached image model found, need to load one - first cleanup any existing models
-        if sd_model is None:
-            # In ondemand mode, check if we need to unload before loading sd.cpp model
-            from codai.models.manager import model_manager
-            has_any_model = len(multi_model_manager.models) > 0 or model_manager.backend is not None
-
-            if mode == "ondemand" and has_any_model:
-                # Resolve both the requested image model and currently loaded model to their canonical names
-                requested_canonical = multi_model_manager.resolve_model_name(f"image:{model_to_use}")
-                loaded_canonical = multi_model_manager.get_currently_loaded_model_name()
-
-                # Also check legacy model_manager
-                if not loaded_canonical and model_manager.backend is not None:
-                    loaded_canonical = "legacy_model_manager"
-
-                # Compare: if they're different models, unload first
-                already_loaded = (requested_canonical and loaded_canonical and
-                                requested_canonical == loaded_canonical)
-
-                if not already_loaded:
-                    print(f"In ondemand mode - model switch detected:")
-                    print(f"  Requested: 'image:{model_to_use}' (resolved to: '{requested_canonical}')")
-                    print(f"  Loaded: '{loaded_canonical}'")
-                    print(f"  -> Fully unloading current model(s) before loading sd.cpp model...")
-                    multi_model_manager.unload_all_models()
-                    if model_manager.backend is not None:
-                        try:
-                            model_manager.cleanup()
-                        except:
-                            pass
     
     if sd_model is not None:
         # Check if it's a stable-diffusion-cpp model (has generate method from sd.cpp)
