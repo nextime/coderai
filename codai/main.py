@@ -340,7 +340,7 @@ def main():
         
         # Register models with multi_model_manager
         for idx, model_name in enumerate(model_names):
-            multi_model_manager.set_model(model_name, {
+            multi_model_manager.set_default_model(model_name, {
                 'ctx': get_ctx_by_index(args.n_ctx, idx, 0),
             })
         
