@@ -45,10 +45,7 @@ def main():
         download_model,
     )
     
-    # Store args globally for access in endpoints
-    set_global_args(args)
-    
-    # Import global setters from text module
+    # Import global setters from text module FIRST (before calling them)
     from codai.api.text import (
         set_global_args,
         set_global_debug,
@@ -56,6 +53,9 @@ def main():
         set_global_tools_closer_prompt,
     )
     from codai.api.app import set_load_mode
+    
+    # Store args globally for access in endpoints (both state and text.py)
+    set_global_args(args)
     
     # Set global variables
     global global_system_prompt, global_tools_closer_prompt, global_debug, global_dump, global_file_path, grammar_guided_gen
