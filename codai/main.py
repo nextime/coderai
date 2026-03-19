@@ -60,7 +60,7 @@ def main():
     global global_system_prompt, global_tools_closer_prompt, global_debug, global_dump, global_file_path, grammar_guided_gen
     
     # Set global grammar-guided-gen flag
-    from codai.models.grammar import set_grammar_guided_gen
+    from codai.api.state import set_grammar_guided_gen
     grammar_guided_gen = args.grammar_guided_gen
     if grammar_guided_gen:
         print("Grammar-guided generation enabled (--grammar-guided-gen)")
