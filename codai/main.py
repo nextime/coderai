@@ -365,6 +365,40 @@ def main():
                 'offload': args.audio_offload,
             })
     
+    # Set up whisper-server if specified
+    if args.whisper_server:
+        print(f"\nWhisper server: {args.whisper_server}")
+        print(f"  Port: {args.whisper_server_port}")
+        
+        # Import WhisperServerManager
+        from codai.models.manager import WhisperServerManager
+        
+        # Check if whisper-server is already running
+        if multi_model_manager.whisper_server is None:
+            whisper_server_mgr = WhisperServerManager(
+                server_path=args.whisper_server,
+                port=args.whisper_server_port
+            )
+            multi_model_manager.whisper_server = whisper_server_mgr
+        else:
+            whisper_server_mgr = multi_model_manager.whisper_server
+            print("Whisper server already running, using existing instance")
+        
+        # Start whisper-server if we have audio_models configured
+        if audio_models:
+            model_to_use = audio_models[0] if audio_models else None
+            gpu_device = getattr(args, 'audio_vulkan_device', 0) or 0
+            print(f"DEBUG: Starting whisper-server with gpu_device={gpu_device}")
+            actual_model_path = whisper_server_mgr.start(model_path=model_to_use, gpu_device=gpu_device)
+            if actual_model_path:
+                # Update audio_models in multi_model_manager to store the actual path (not the URL)
+                if model_to_use != actual_model_path:
+                    if multi_model_manager.audio_models and multi_model_manager.audio_models[0] == model_to_use:
+                        multi_model_manager.audio_models[0] = actual_model_path
+                print(f"Whisper server started with model: {actual_model_path}")
+            else:
+                print("Warning: Failed to start whisper-server, falling back to other backends")
+    
     # Set up image model if specified
     if image_models:
         print(f"\nImage generation model(s): {image_models}")
