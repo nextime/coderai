@@ -296,6 +296,14 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                 print(f"Warning: First model load attempt failed: {load_error}")
                 print("Trying alternative loading method...")
                 
+                # Check if it's a missing component error (incomplete model)
+                if "expected" in str(load_error) and "but only" in str(load_error):
+                    # This is an incomplete model - don't keep retrying the same thing
+                    print(f"Error: Model '{model_to_use}' is incomplete or missing required components (unet, image_encoder, etc.)")
+                    print("This model cannot be loaded with diffusers. Trying stable-diffusion-cpp-python instead...")
+                    # Skip the retry attempts and go directly to sd.cpp
+                    raise Exception(f"Incomplete model: {load_error}")
+                
                 # Try with default resolution
                 try:
                     if is_xl:
