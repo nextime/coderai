@@ -16,13 +16,19 @@ from codai.queue.manager import QueueManager, queue_manager
 from codai.pydantic.textrequest import ChatCompletionRequest, ToolFunction, Tool
 from codai.models.parser import filter_malformed_content, filter_repetition, OpenAIFormatter, ModelParserAdapter, ToolCallParser
 
+# Import global state from state module
+from codai.api.state import (
+    set_global_args as _set_global_args,
+    get_global_debug,
+    set_global_debug as _set_global_debug,
+    set_global_system_prompt as _set_global_system_prompt,
+    set_global_tools_closer_prompt as _set_global_tools_closer_prompt,
+    get_grammar_guided_gen,
+    set_grammar_guided_gen as _set_grammar_guided_gen,
+)
 
 # Global reference to be set by coderai
 global_args = None
-global_debug = False
-global_system_prompt = None
-global_tools_closer_prompt = False
-grammar_guided_gen = False
 
 
 # =============================================================================
@@ -36,27 +42,23 @@ def set_global_args(args):
 
 
 def set_global_debug(debug: bool):
-    """Set the global debug flag."""
-    global global_debug
-    global_debug = debug
+    """Set the global debug flag (via state module)."""
+    _set_global_debug(debug)
 
 
 def set_global_system_prompt(prompt):
-    """Set the global system prompt."""
-    global global_system_prompt
-    global_system_prompt = prompt
+    """Set the global system prompt (via state module)."""
+    _set_global_system_prompt(prompt)
 
 
 def set_global_tools_closer_prompt(tools_closer: bool):
-    """Set the global tools-closer-prompt flag."""
-    global global_tools_closer_prompt
-    global_tools_closer_prompt = tools_closer
+    """Set the global tools-closer-prompt flag (via state module)."""
+    _set_global_tools_closer_prompt(tools_closer)
 
 
 def set_grammar_guided_gen(enabled: bool):
-    """Set the grammar-guided generation flag."""
-    global grammar_guided_gen
-    grammar_guided_gen = enabled
+    """Set the grammar-guided generation flag (via state module)."""
+    _set_grammar_guided_gen(enabled)
 
 
 # =============================================================================
@@ -357,7 +359,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     reasoning_enabled = enable_thinking_api or (len(force_reasoning_args) > 0)
     
     # DEBUG: Print force_reasoning status when debug mode is enabled
-    if global_debug:
+    if get_global_debug():
         print(f"\n{'='*60}")
         print(f"=== REASONING MODE DEBUG ===")
         print(f"{'='*60}")
@@ -379,7 +381,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     qwen3_system_addon = ""
     if use_qwen3_penalties:
         qwen3_system_addon = "\n\nCRITICAL: Do not repeat tool calls. If a tool fails with an [ERROR], do not retry the exact same parameters. Propose a different approach or ask for clarification."
-        if global_debug:
+        if get_global_debug():
             print(f"QWEEN3: Adding penalties and system addon for qwen3 with force_reasoning")
     
     # Handle 'chat' - enable thinking API parameter
@@ -388,7 +390,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     if "chat" in force_reasoning_args or enable_thinking_api:
         if hasattr(request, 'thinking'):
             request.thinking = {"type": "enabled"}
-        if global_debug:
+        if get_global_debug():
             print(f"CHAT: Reasoning API param enabled")
     
     # Handle 'inject' - system prompt injection
@@ -422,7 +424,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         if not system_found:
             messages = [ChatMessage(role="system", content=system_content)] + list(messages)
         
-        if global_debug:
+        if get_global_debug():
             print(f"INJECT: System prompt injected with agentic instructions")
             print(f"\n--- INJECTED SYSTEM PROMPT ---")
             print(system_content)
@@ -456,7 +458,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         from codai.pydantic.textrequest import ChatMessage
         messages = [ChatMessage(role="user", content=seeded_prompt)]
         
-        if global_debug:
+        if get_global_debug():
             print(f"PROMPT: Prompt seeding applied (ends with thought tag)")
             print(f"\n--- SEEDED PROMPT (last 80 chars) ---")
             print(f"...{seeded_prompt[-80:]}")
@@ -488,7 +490,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             if "</think>" not in stop_sequences:
                 stop_sequences.append("</think>\n")
         
-        if global_debug:
+        if get_global_debug():
             print(f"STOP: Added reasoning stop tokens: {additional_stops}")
     
     # Format messages with tools if provided - BUT SKIP for raw mode
@@ -604,11 +606,11 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             )
             use_raw_mode = True
             
-            if global_debug:
+            if get_global_debug():
                 print(f"RAW: Using template_manager.format_for_raw_completion")
                 print(f"RAW: Prompt ends with: ...{raw_prompt_for_generation[-80:]}")
         else:
-            if global_debug:
+            if get_global_debug():
                 print(f"RAW: template_manager.format_for_raw_completion not available")
     
     # Get resolved model name for response (with coderai/ prefix and proper formatting)
@@ -618,7 +620,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     
     # Handle raw mode - two pass: first capture reasoning, then get final answer
     if use_raw_mode and raw_prompt_for_generation:
-        if global_debug:
+        if get_global_debug():
             print(f"RAW: Starting two-pass generation")
             print(f"RAW: First pass prompt: ...{raw_prompt_for_generation[-100:]}")
         
@@ -639,7 +641,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 thought_tag, close_tag, _ = get_reasoning_stop_tokens(model_family)
                 reasoning_text = ""
                 
-                if global_debug:
+                if get_global_debug():
                     print(f"DEBUG: raw_stream_generate started, stream=True")
                 
                 # Use the backend's async generate if available
@@ -655,19 +657,19 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                         reasoning_text += chunk
                         
                         # Debug: log first pass chunks
-                        if global_debug:
+                        if get_global_debug():
                             print(f"DEBUG FIRST PASS: chunk length={len(chunk)}, total reasoning so far={len(reasoning_text)}")
                         
                         yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk}, 'finish_reason': None}]})}\n\n"
                         
                         # Check if we hit the close tag
                         if close_tag and close_tag in reasoning_text:
-                            if global_debug:
+                            if get_global_debug():
                                 print(f"DEBUG: Close tag detected in first pass, reasoning length={len(reasoning_text)}")
                             break
                 else:
                     # Fallback: non-streaming
-                    if global_debug:
+                    if get_global_debug():
                         print(f"DEBUG: Using non-streaming fallback for first pass")
                     first_pass_result = current_manager.generate(
                         prompt=raw_prompt_for_generation,
@@ -686,7 +688,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 # Second pass: get the rest
                 full_prompt = raw_prompt_for_generation + reasoning_text + (close_tag or "")
                 
-                if global_debug:
+                if get_global_debug():
                     print(f"DEBUG: raw_stream_generate second pass, full_prompt length: {len(full_prompt)}")
                 
                 second_pass_result = current_manager.generate(
@@ -719,11 +721,11 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     reasoning_text = reasoning_text[:earliest_tool_idx].strip()
                     # Prepend the tool part to second_pass_result so it can be extracted as a tool call
                     second_pass_result = tool_part + second_pass_result
-                    if global_debug:
+                    if get_global_debug():
                         print(f"DEBUG: Moved tool call from reasoning to second_pass_result: {tool_part[:100]}...")
                 
                 # In debug mode, dump the full generated text (second pass result)
-                if global_debug:
+                if get_global_debug():
                     print(f"\n{'='*80}")
                     print(f"=== RAW STREAM: FULL GENERATED TEXT (DEBUG) ===")
                     print(f"{'='*80}")
@@ -746,7 +748,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 
                 # CRITICAL: Only extract from second pass, never from reasoning
                 # Reasoning may contain partial/incomplete tool calls that confuse the parser
-                if global_debug:
+                if get_global_debug():
                     print(f"DEBUG: Tool extraction - using second_pass_result only")
                     print(f"DEBUG: Second pass result length: {len(second_pass_result) if second_pass_result else 0}")
                     print(f"DEBUG: Reasoning text length: {len(reasoning_text) if reasoning_text else 0}")
@@ -794,7 +796,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                                     validated_calls.append(tc)
                             
                             if len(validated_calls) != len(extracted_tool_calls):
-                                if global_debug:
+                                if get_global_debug():
                                     print(f"DEBUG: Filtered out {len(extracted_tool_calls) - len(validated_calls)} invalid tool calls")
                             extracted_tool_calls = validated_calls if validated_calls else None
                         
@@ -804,7 +806,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                             print(f"{'='*80}")
                             print(json.dumps(extracted_tool_calls, indent=2))
                             print(f"{'='*80}\n")
-                        elif global_debug:
+                        elif get_global_debug():
                             print(f"DEBUG: No tool calls found in raw stream")
                 
                 if extracted_tool_calls:
@@ -829,7 +831,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             **extra_params,
         )
         
-        if global_debug:
+        if get_global_debug():
             print(f"RAW: First pass result: ...{first_pass_result[-200:]}")
         
         # Dump first pass result if --dump is enabled
@@ -866,13 +868,13 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             
             if earliest_tool_tag:
                 # Split at tool tag
-                if global_debug:
+                if get_global_debug():
                     print(f"RAW: No close tag found, using tool tag '{earliest_tool_tag}' as fallback")
                 parts = first_pass_result.split(earliest_tool_tag, 1)
                 reasoning_text = parts[0]
                 final_text = earliest_tool_tag + (parts[1] if len(parts) > 1 else "")
         
-        if global_debug:
+        if get_global_debug():
             print(f"RAW: Extracted reasoning: {reasoning_text[:100]}...")
             print(f"RAW: Final text before cleanup: {final_text[:100]}...")
         
@@ -912,10 +914,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             reasoning_text = reasoning_text[:earliest_tool_idx].strip()
             # Prepend the tool part to final_text so it can be extracted as a tool call
             final_text = tool_part + final_text
-            if global_debug:
+            if get_global_debug():
                 print(f"RAW: Moved tool call from reasoning to final_text: {tool_part[:100]}...")
         
-        if global_debug:
+        if get_global_debug():
             print(f"RAW: Final text after cleanup: {final_text[:100]}...")
         
         # If we have reasoning, continue with second pass to get more complete answer
@@ -944,7 +946,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         # Additional cleanup of the full generated text
         generated_text = cleanup_control_tokens(generated_text)
         
-        if global_debug:
+        if get_global_debug():
             print(f"RAW: Generated text after cleanup: {generated_text[:100]}...")
         
         # Pass through the formatter/parser (same as regular mode)
@@ -1007,7 +1009,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             if extracted_tool_calls:
                 # Strip tool calls from the text
                 clean_text = adapter.strip_tool_calls_from_content(final_text)
-                if global_debug:
+                if get_global_debug():
                     print(f"RAW: Extracted {len(extracted_tool_calls)} tool calls from final_text (after reasoning)")
         
         # Estimate token counts
@@ -1027,7 +1029,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             print(f"RAW: ERROR in formatter.format_full: {e}")
             formatted_response = None
         
-        if global_debug:
+        if get_global_debug():
             if formatted_response and isinstance(formatted_response, dict):
                 try:
                     choices = formatted_response.get('choices', [])
@@ -1263,7 +1265,7 @@ async def stream_chat_response(
         chunk_count = 0
         
         # Debug: Print what is being passed to the model
-        if global_debug:
+        if get_global_debug():
             print(f"\n{'='*80}")
             print(f"=== MODEL INPUT (DEBUG) ===")
             print(f"{'='*80}")
@@ -1326,7 +1328,7 @@ async def stream_chat_response(
             print(f"DEBUG: Warning - no content generated!")
         
         # In debug mode, dump the full generated text
-        if global_debug:
+        if get_global_debug():
             print(f"\n{'='*80}")
             print(f"=== FULL GENERATED TEXT (DEBUG) ===")
             print(f"{'='*80}")
@@ -1386,7 +1388,7 @@ async def stream_chat_response(
                 tool_calls = None
             if tool_calls:
                 # In debug mode, dump tool calls
-                if global_debug:
+                if get_global_debug():
                     print(f"\n{'='*80}")
                     print(f"=== EXTRACTED TOOL CALLS (DEBUG) ===")
                     print(f"{'='*80}")
@@ -1500,7 +1502,7 @@ async def generate_chat_response(
     created = int(time.time())
     
     # Debug: Print what is being passed to the model
-    if global_debug:
+    if get_global_debug():
         print(f"\n{'='*80}")
         print(f"=== MODEL INPUT (DEBUG) ===")
         print(f"{'='*80}")
