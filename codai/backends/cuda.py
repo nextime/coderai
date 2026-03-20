@@ -185,6 +185,9 @@ class NvidiaBackend(ModelBackend):
     
     def _get_vram_percentages_for_strategy(self, strategy: str, is_moe: bool, total_vram_gb: float) -> list:
         """Get VRAM percentage steps based on offload strategy."""
+        if strategy == "none":
+            print(f"  Offload strategy 'none': disabling CPU offload and VRAM auto-detection")
+            return None  # Signal to skip offloading entirely
         if strategy == "conservative":
             print(f"  Using conservative offload strategy")
             if is_moe:
@@ -221,8 +224,14 @@ class NvidiaBackend(ModelBackend):
                     return [0.93, 0.85, 0.75, 0.65, 0.50, 0.35, 0.20, 0.0]
     
     def _get_vram_percentages_for_gpu(self, model_name: str = "", strategy: str = "auto", max_gpu_percent: float = None) -> list:
-        """Get VRAM percentage steps based on GPU memory size."""
+        """Get VRAM percentage steps based on GPU memory size.
+        
+        Returns None when strategy is 'none' (no offloading).
+        """
         import torch
+        
+        if strategy == "none":
+            return None  # Signal to skip offloading entirely
         
         if not torch.cuda.is_available():
             return [0.0]
@@ -397,41 +406,60 @@ class NvidiaBackend(ModelBackend):
         
         model = None
         vram_percentages = self._get_vram_percentages_for_gpu(model_name, offload_strategy, max_gpu_percent)
-        first_vram_pct = vram_percentages[0] if vram_percentages else 0.93
         
-        for vram_pct in vram_percentages:
-            if self.device != "cuda":
-                load_kwargs['device_map'] = None
-                print("Loading model in CPU-only mode...")
-                model = self._try_load_model(model_name, load_kwargs, self.device)
-                if model is not None:
-                    break
+        # --offload-strategy none: load directly on GPU without offloading or VRAM limits
+        if vram_percentages is None:
+            cuda_device = self._derive_cuda_device()
+            print(f"\nOffload strategy 'none': loading model directly on {cuda_device} (no CPU offload, no VRAM limits)")
+            load_kwargs['device_map'] = cuda_device
+            load_kwargs['low_cpu_mem_usage'] = True
+            load_kwargs['torch_dtype'] = "auto"
+            # Remove dtype set earlier since torch_dtype=auto takes precedence
+            load_kwargs.pop('dtype', None)
             
-            if vram_pct > 0:
-                max_memory = self._get_gpu_memory_map_with_limit(vram_pct)
-                load_kwargs['max_memory'] = max_memory
-                load_kwargs['device_map'] = 'auto'
-                print(f"\nTrying with GPU limit: {vram_pct*100:.0f}% VRAM")
+            try:
+                model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+            except Exception as e:
+                raise RuntimeError(
+                    f"--offload-strategy none: Failed to load model entirely on GPU ({cuda_device}). "
+                    f"The model may be too large for available VRAM. Error: {e}"
+                )
+        else:
+            first_vram_pct = vram_percentages[0] if vram_percentages else 0.93
+            
+            for vram_pct in vram_percentages:
+                if self.device != "cuda":
+                    load_kwargs['device_map'] = None
+                    print("Loading model in CPU-only mode...")
+                    model = self._try_load_model(model_name, load_kwargs, self.device)
+                    if model is not None:
+                        break
                 
-                model = self._try_load_model(model_name, load_kwargs, self.device)
-                
-                if model is not None:
-                    print(f"  ✓ Model loaded successfully with {vram_pct*100:.0f}% GPU VRAM limit")
-                    if vram_pct < first_vram_pct:
-                        print(f"  (Reduced from {first_vram_pct*100:.0f}% due to memory constraints)")
-                    break
+                if vram_pct > 0:
+                    max_memory = self._get_gpu_memory_map_with_limit(vram_pct)
+                    load_kwargs['max_memory'] = max_memory
+                    load_kwargs['device_map'] = 'auto'
+                    print(f"\nTrying with GPU limit: {vram_pct*100:.0f}% VRAM")
+                    
+                    model = self._try_load_model(model_name, load_kwargs, self.device)
+                    
+                    if model is not None:
+                        print(f"  ✓ Model loaded successfully with {vram_pct*100:.0f}% GPU VRAM limit")
+                        if vram_pct < first_vram_pct:
+                            print(f"  (Reduced from {first_vram_pct*100:.0f}% due to memory constraints)")
+                        break
+                    else:
+                        print(f"  ✗ Out of memory with {vram_pct*100:.0f}% GPU VRAM, trying lower limit...")
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                 else:
-                    print(f"  ✗ Out of memory with {vram_pct*100:.0f}% GPU VRAM, trying lower limit...")
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-            else:
-                print("\nFalling back to CPU-only mode...")
-                load_kwargs['max_memory'] = {0: 0, 'cpu': int((manual_ram_gb or 48) * 1e9)}
-                load_kwargs['device_map'] = 'auto'
-                model = self._try_load_model(model_name, load_kwargs, "cpu")
-                if model is not None:
-                    print("  ✓ Model loaded successfully on CPU")
-                    break
+                    print("\nFalling back to CPU-only mode...")
+                    load_kwargs['max_memory'] = {0: 0, 'cpu': int((manual_ram_gb or 48) * 1e9)}
+                    load_kwargs['device_map'] = 'auto'
+                    model = self._try_load_model(model_name, load_kwargs, "cpu")
+                    if model is not None:
+                        print("  ✓ Model loaded successfully on CPU")
+                        break
         
         if model is None:
             raise RuntimeError("Failed to load model: Out of memory even with minimum GPU usage")

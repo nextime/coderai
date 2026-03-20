@@ -104,35 +104,10 @@ def main():
     if args.download_model:
         print(f"\n=== Downloading Model: {args.download_model} ===")
 
-        from codai.models.cache import download_model, is_huggingface_model_id
+        from codai.models.cache import download_model
 
-        model_id = args.download_model
-        file_pattern = args.download_file_pattern
-        
         try:
-            # For HuggingFace model IDs, try pattern-based download first
-            if is_huggingface_model_id(model_id):
-                # If file pattern specified, use it
-                if file_pattern:
-                    print(f"File pattern: {file_pattern}")
-                    cached_path = download_model(model_id, file_pattern=file_pattern)
-                else:
-                    # Try common patterns: GGUF first, then full repo download
-                    print("Trying GGUF download first...")
-                    cached_path = download_model(model_id, file_pattern='.gguf')
-                    
-                    if not cached_path:
-                        # No GGUF files - download entire repo (for transformers/diffusers models)
-                        print("No GGUF files found, downloading full HuggingFace repo...")
-                        try:
-                            from huggingface_hub import snapshot_download
-                            cached_path = snapshot_download(model_id)
-                        except Exception as e:
-                            print(f"Error downloading full repo: {e}")
-                            cached_path = None
-            else:
-                # URL or local path
-                cached_path = download_model(model_id, file_pattern=file_pattern or '.gguf')
+            cached_path = download_model(args.download_model)
 
             if cached_path:
                 print(f"\n=== Model downloaded successfully ===")
@@ -186,19 +161,6 @@ def main():
     grammar_guided_gen = args.grammar_guided_gen
     if grammar_guided_gen:
         print("Grammar-guided generation enabled (--grammar-guided-gen)")
-    
-    # Print --offload-strategy none status
-    if args.offload_strategy == "none":
-        print("Offload strategy 'none': CPU offloading and VRAM auto-detection disabled")
-        print("  Model will be loaded directly on GPU without memory limits")
-    
-    # Print --no-ram mode status
-    if args.no_ram:
-        print("No-RAM mode enabled (--no-ram): maximizing VRAM usage, no CPU RAM spilling")
-        print("  llama-cpp-python: n_gpu_layers=-1, use_mmap=False, --n-ctx ignored")
-        print("  HuggingFace: device_map=cuda, low_cpu_mem_usage=True, torch_dtype=auto")
-        print("  Diffusers: forced full GPU loading")
-        print("  sd.cpp: maximizing GPU offload")
     
     # Set global system prompt from --system-prompt flag
     global_system_prompt = args.system_prompt

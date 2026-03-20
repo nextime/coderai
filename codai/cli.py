@@ -117,9 +117,9 @@ def parse_args():
     parser.add_argument(
         "--offload-strategy",
         type=str,
-        choices=["auto", "conservative", "balanced", "aggressive", "sequential"],
+        choices=["auto", "conservative", "balanced", "aggressive", "sequential", "none"],
         default="auto",
-        help="Offload strategy for NVIDIA backend (default: auto)",
+        help="Offload strategy for NVIDIA backend (default: auto). Use 'none' to disable CPU offloading and VRAM auto-detection entirely.",
     )
     parser.add_argument(
         "--max-gpu-percent",
