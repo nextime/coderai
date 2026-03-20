@@ -104,21 +104,40 @@ def main():
     if args.download_model:
         print(f"\n=== Downloading Model: {args.download_model} ===")
 
-        from codai.models.cache import download_model
+        from codai.models.cache import download_model, is_huggingface_model_id
+        from huggingface_hub import list_repo_files
 
         # Determine file pattern for HF downloads
         file_pattern = args.download_file_pattern
         if file_pattern is None:
-            # Auto-detect based on model type hints
             model_id = args.download_model
-            if '/' in model_id and not model_id.startswith('http'):
-                # Likely a HuggingFace model ID - default to GGUF for text models
-                file_pattern = '.gguf'
+            if is_huggingface_model_id(model_id):
+                # It's a HuggingFace model ID - try to detect available files
+                print("Scanning HuggingFace repo for available files...")
+                try:
+                    files = list(list_repo_files(model_id))
+                    print(f"Found {len(files)} files in repo")
+                    
+                    # Try common patterns in order of preference
+                    patterns = ['.gguf', '.safetensors', '.bin', '.pt', '.pth']
+                    for pattern in patterns:
+                        matching = [f for f in files if f.endswith(pattern)]
+                        if matching:
+                            file_pattern = pattern
+                            print(f"Auto-detected file pattern: {file_pattern} (found {len(matching)} file(s))")
+                            break
+                    
+                    if not file_pattern:
+                        print("Warning: Could not auto-detect file pattern, using .gguf")
+                        file_pattern = '.gguf'
+                except Exception as e:
+                    print(f"Warning: Could not list repo files: {e}")
+                    file_pattern = '.gguf'
             else:
                 # URL or local - no pattern needed
                 file_pattern = ''
-
-        print(f"File pattern: {file_pattern if file_pattern else '(auto-detect)'}")
+        else:
+            print(f"File pattern: {file_pattern}")
 
         try:
             cached_path = download_model(args.download_model, file_pattern=file_pattern)
