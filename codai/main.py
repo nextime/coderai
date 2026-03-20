@@ -104,10 +104,35 @@ def main():
     if args.download_model:
         print(f"\n=== Downloading Model: {args.download_model} ===")
 
-        from codai.models.cache import download_model
+        from codai.models.cache import download_model, is_huggingface_model_id
 
+        model_id = args.download_model
+        file_pattern = args.download_file_pattern
+        
         try:
-            cached_path = download_model(args.download_model)
+            # For HuggingFace model IDs, try pattern-based download first
+            if is_huggingface_model_id(model_id):
+                # If file pattern specified, use it
+                if file_pattern:
+                    print(f"File pattern: {file_pattern}")
+                    cached_path = download_model(model_id, file_pattern=file_pattern)
+                else:
+                    # Try common patterns: GGUF first, then full repo download
+                    print("Trying GGUF download first...")
+                    cached_path = download_model(model_id, file_pattern='.gguf')
+                    
+                    if not cached_path:
+                        # No GGUF files - download entire repo (for transformers/diffusers models)
+                        print("No GGUF files found, downloading full HuggingFace repo...")
+                        try:
+                            from huggingface_hub import snapshot_download
+                            cached_path = snapshot_download(model_id)
+                        except Exception as e:
+                            print(f"Error downloading full repo: {e}")
+                            cached_path = None
+            else:
+                # URL or local path
+                cached_path = download_model(model_id, file_pattern=file_pattern or '.gguf')
 
             if cached_path:
                 print(f"\n=== Model downloaded successfully ===")
