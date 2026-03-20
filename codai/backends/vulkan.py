@@ -476,14 +476,33 @@ class VulkanBackend(ModelBackend):
         # Determine model type
         is_image = model_type == "image" or model_path.startswith("image:")
         
+        # Check for --no-ram mode from global args
+        no_ram = kwargs.get('no_ram', False)
+        if not no_ram:
+            try:
+                from codai.api.state import get_global_args
+                _global_args = get_global_args()
+                if _global_args and getattr(_global_args, 'no_ram', False):
+                    no_ram = True
+            except Exception:
+                pass
+        
         # Configure GPU layers
         n_gpu_layers = kwargs.get('n_gpu_layers', -1)
-        if n_gpu_layers != -1:
+        if no_ram:
+            # --no-ram: force all layers on GPU
+            self.n_gpu_layers = -1
+        elif n_gpu_layers != -1:
             self.n_gpu_layers = n_gpu_layers
         
         # Configure context size
-        n_ctx = kwargs.get('n_ctx', 2048)
-        self.n_ctx = n_ctx
+        if no_ram:
+            # --no-ram: ignore --n-ctx, let the model use its own default
+            self.n_ctx = 0  # 0 means use model's built-in default in llama.cpp
+            print("DEBUG: --no-ram mode: ignoring --n-ctx, using model default context size")
+        else:
+            n_ctx = kwargs.get('n_ctx', 2048)
+            self.n_ctx = n_ctx
         
         # Set verbose
         self.verbose = kwargs.get('verbose', True)
@@ -499,6 +518,11 @@ class VulkanBackend(ModelBackend):
             'verbose': self.verbose,
             'main_gpu': self.main_gpu,
         }
+        
+        # --no-ram: disable mmap to prevent CPU RAM usage for memory-mapped files
+        if no_ram:
+            llama_kwargs['use_mmap'] = False
+            print("DEBUG: --no-ram mode: use_mmap=False, n_gpu_layers=-1")
         
         # Add optional parameters
         if 'n_threads' in kwargs:
@@ -523,7 +547,7 @@ class VulkanBackend(ModelBackend):
             self._finalize_chat_template_detection()
             
             print(f"DEBUG: VulkanBackend loaded model: {model_path}")
-            print(f"DEBUG: n_gpu_layers={self.n_gpu_layers}, n_ctx={self.n_ctx}")
+            print(f"DEBUG: n_gpu_layers={self.n_gpu_layers}, n_ctx={self.n_ctx}, no_ram={no_ram}")
             print(f"DEBUG: chat_template={self.chat_template}")
         except Exception as e:
             print(f"Error loading GGUF model: {e}")

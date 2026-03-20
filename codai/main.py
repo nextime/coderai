@@ -187,6 +187,14 @@ def main():
     if grammar_guided_gen:
         print("Grammar-guided generation enabled (--grammar-guided-gen)")
     
+    # Print --no-ram mode status
+    if args.no_ram:
+        print("No-RAM mode enabled (--no-ram): maximizing VRAM usage, no CPU RAM spilling")
+        print("  llama-cpp-python: n_gpu_layers=-1, use_mmap=False, --n-ctx ignored")
+        print("  HuggingFace: device_map=cuda, low_cpu_mem_usage=True, torch_dtype=auto")
+        print("  Diffusers: forced full GPU loading")
+        print("  sd.cpp: maximizing GPU offload")
+    
     # Set global system prompt from --system-prompt flag
     global_system_prompt = args.system_prompt
     set_global_system_prompt(global_system_prompt)

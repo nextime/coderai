@@ -254,6 +254,24 @@ class NvidiaBackend(ModelBackend):
         
         return self._get_vram_percentages_for_strategy(strategy, is_moe, total_vram_gb)
     
+    def _derive_cuda_device(self) -> str:
+        """Derive the CUDA device string from global args.
+        
+        Checks --vulkan-device (reused as generic GPU device ID) to determine
+        which CUDA device to target. Defaults to 'cuda:0'.
+        """
+        try:
+            from codai.api.state import get_global_args
+            _global_args = get_global_args()
+            if _global_args:
+                # Use vulkan-device as a generic GPU device selector
+                device_id = getattr(_global_args, 'vulkan_device', 0)
+                if device_id is not None and device_id != 0:
+                    return f"cuda:{device_id}"
+        except Exception:
+            pass
+        return "cuda:0"
+    
     def load_model(self, model_name: str, **kwargs) -> None:
         """Load the model using HuggingFace Transformers with automatic OOM handling."""
         import torch
@@ -266,6 +284,17 @@ class NvidiaBackend(ModelBackend):
         flash_attn = kwargs.get('flash_attn', False)
         offload_strategy = kwargs.get('offload_strategy', 'auto')
         max_gpu_percent = kwargs.get('max_gpu_percent', None)
+        
+        # Check for --no-ram mode
+        no_ram = kwargs.get('no_ram', False)
+        if not no_ram:
+            try:
+                from codai.api.state import get_global_args
+                _global_args = get_global_args()
+                if _global_args and getattr(_global_args, 'no_ram', False):
+                    no_ram = True
+            except Exception:
+                pass
         
         self._pending_ram_gb = manual_ram_gb
         
@@ -285,6 +314,60 @@ class NvidiaBackend(ModelBackend):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
+        # =====================================================================
+        # --no-ram mode: maximize VRAM, no CPU RAM spilling
+        # =====================================================================
+        if no_ram and self.device == "cuda":
+            cuda_device = self._derive_cuda_device()
+            print(f"--no-ram mode: loading model directly on {cuda_device}")
+            print(f"  device_map={cuda_device}, low_cpu_mem_usage=True, torch_dtype=auto")
+            
+            load_kwargs = {
+                'trust_remote_code': True,
+                'device_map': cuda_device,
+                'low_cpu_mem_usage': True,
+                'torch_dtype': "auto",
+            }
+            
+            if self.use_flash_attn and self.flash_attn_available:
+                load_kwargs['attn_implementation'] = "flash_attention_2"
+                print("  Using Flash Attention 2")
+            
+            # Still allow quantization in no-ram mode (reduces VRAM usage)
+            if load_in_4bit or load_in_8bit:
+                if 'qwen3.5' in model_name.lower() and ('a3b' in model_name.lower() or 'moe' in model_name.lower()):
+                    print(f"  Warning: {model_name} does not support bitsandbytes quantization")
+                else:
+                    try:
+                        import bitsandbytes as bnb
+                        print(f"  Using {4 if load_in_4bit else 8}-bit quantization")
+                        load_kwargs['load_in_4bit'] = load_in_4bit
+                        load_kwargs['load_in_8bit'] = load_in_8bit
+                    except ImportError:
+                        print("  Warning: bitsandbytes not installed. Quantization disabled.")
+            
+            try:
+                model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+                self.model = model
+                self.model.eval()
+                self.model_name = model_name
+                
+                print(f"\n--no-ram: Model loaded successfully on {cuda_device}")
+                print(f"Model device: {next(self.model.parameters()).device}")
+                
+                caps = detect_model_capabilities(model_name)
+                print(f"Model capabilities: {caps}")
+                return
+            except Exception as e:
+                print(f"--no-ram: Failed to load model on {cuda_device}: {e}")
+                raise RuntimeError(
+                    f"--no-ram: Failed to load model entirely on GPU ({cuda_device}). "
+                    f"The model may be too large for available VRAM. Error: {e}"
+                )
+        
+        # =====================================================================
+        # Standard loading path (with OOM fallback)
+        # =====================================================================
         load_kwargs = {'trust_remote_code': True}
         
         if load_in_4bit or load_in_8bit:

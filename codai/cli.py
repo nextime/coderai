@@ -433,4 +433,14 @@ def parse_args():
         default=False,
         help="Enable prompt distillation: place tool definitions right before the user's latest request instead of in the system prompt. This can improve tool call accuracy.",
     )
+    parser.add_argument(
+        "--no-ram",
+        action="store_true",
+        default=False,
+        help="Force model loading to maximize VRAM usage without CPU RAM spilling. "
+             "For llama-cpp-python: sets n_gpu_layers=-1, use_mmap=False, ignores --n-ctx. "
+             "For HuggingFace transformers: sets device_map='cuda:0', low_cpu_mem_usage=True, torch_dtype='auto'. "
+             "For diffusers: forces full GPU loading without CPU offload. "
+             "For sd.cpp: maximizes GPU layer offloading.",
+    )
     return parser.parse_args()

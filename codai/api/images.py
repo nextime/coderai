@@ -187,6 +187,24 @@ def _is_gguf_model(model_name: str) -> bool:
             (model_name.startswith('http') and '.gguf' in model_name))
 
 
+def _derive_diffusers_device(global_args) -> str:
+    """Derive the CUDA device string for diffusers from global args.
+    
+    Checks --image-vulkan-device then --vulkan-device to determine
+    which CUDA device to target. Defaults to 'cuda:0'.
+    """
+    if global_args:
+        # Check image-specific device first
+        image_device = getattr(global_args, 'image_vulkan_device', None)
+        if image_device is not None:
+            return f"cuda:{image_device}"
+        # Fall back to general device
+        device_id = getattr(global_args, 'vulkan_device', 0)
+        if device_id is not None and device_id != 0:
+            return f"cuda:{device_id}"
+    return "cuda:0"
+
+
 def _load_diffusers_pipeline(model_name: str, global_args):
     """
     Try to load a model using the diffusers library.
@@ -196,6 +214,9 @@ def _load_diffusers_pipeline(model_name: str, global_args):
     """
     from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline, DiffusionPipeline
     import torch
+    
+    # Check for --no-ram mode
+    no_ram = getattr(global_args, 'no_ram', False) if global_args else False
     
     # Determine precision from CLI argument (--image-precision)
     precision = getattr(global_args, 'image_precision', 'f32') or 'f32'
@@ -207,11 +228,55 @@ def _load_diffusers_pipeline(model_name: str, global_args):
     if hasattr(torch, 'float8_e4m3fn'):
         precision_map['f8'] = torch.float8_e4m3fn
     dtype = precision_map.get(precision, torch.float32)
-    print(f"Using precision: {precision} ({dtype})")
+    
+    # --no-ram mode: override dtype to auto-select best for GPU
+    if no_ram:
+        dtype = torch.float16  # Use fp16 to maximize VRAM efficiency
+        print(f"--no-ram mode: Using precision fp16 for maximum VRAM efficiency")
+    else:
+        print(f"Using precision: {precision} ({dtype})")
     
     # Check if CPU offload is requested via CLI
     use_sequential_offload = getattr(global_args, 'image_cpu_offload', False)
     
+    # --no-ram mode: never use CPU offload
+    if no_ram and use_sequential_offload:
+        print("--no-ram mode: ignoring --image-cpu-offload, forcing full GPU loading")
+        use_sequential_offload = False
+    
+    # =====================================================================
+    # --no-ram mode: load directly on GPU, no CPU RAM fallback
+    # =====================================================================
+    if no_ram and torch.cuda.is_available():
+        cuda_device = _derive_diffusers_device(global_args)
+        print(f"--no-ram mode: loading diffusers model directly on {cuda_device}")
+        
+        try:
+            try:
+                pipeline = StableDiffusionXLPipeline.from_pretrained(
+                    model_name,
+                    torch_dtype=dtype,
+                    use_safetensors=True,
+                )
+            except Exception:
+                pipeline = DiffusionPipeline.from_pretrained(
+                    model_name,
+                    torch_dtype=dtype,
+                    use_safetensors=True,
+                )
+            
+            pipeline = pipeline.to(cuda_device)
+            print(f"--no-ram: Diffusers model loaded on {cuda_device}")
+            return pipeline
+        except Exception as e:
+            raise RuntimeError(
+                f"--no-ram: Failed to load diffusers model entirely on GPU ({cuda_device}). "
+                f"The model may be too large for available VRAM. Error: {e}"
+            )
+    
+    # =====================================================================
+    # Standard loading path (with OOM fallback)
+    # =====================================================================
     # Track loading attempts for OOM handling
     pipeline = None
     load_attempt = 0
@@ -419,6 +484,9 @@ def _load_sdcpp_model(model_path: str, global_args):
     """
     from stable_diffusion_cpp import StableDiffusion
     
+    # Check for --no-ram mode
+    no_ram = getattr(global_args, 'no_ram', False) if global_args else False
+    
     print(f"Loading sd.cpp model from: {model_path}")
     
     # Build sd.cpp constructor args from config
@@ -432,6 +500,15 @@ def _load_sdcpp_model(model_path: str, global_args):
             kwargs['vae_path'] = global_args.vae_path
         if hasattr(global_args, 'llm_path') and global_args.llm_path:
             kwargs['lora_model_dir'] = global_args.llm_path
+    
+    # --no-ram mode: maximize GPU offloading for sd.cpp
+    if no_ram:
+        # stable-diffusion-cpp-python supports n_threads and gpu-related params
+        # Force full GPU offload by keeping all operations on GPU
+        kwargs['keep_clip_on_cpu'] = False  # Don't offload CLIP to CPU
+        kwargs['keep_control_net_cpu'] = False  # Don't offload ControlNet to CPU
+        kwargs['keep_vae_on_cpu'] = False  # Don't offload VAE to CPU
+        print("--no-ram mode: sd.cpp maximizing GPU usage (no CPU offload for CLIP/VAE/ControlNet)")
     
     sd_model = StableDiffusion(**kwargs)
     return sd_model
