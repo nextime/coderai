@@ -303,6 +303,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         model_type="text"
     )
     
+    # Check if the model was rejected as not allowed
+    if model_info.get('error'):
+        raise HTTPException(status_code=404, detail=model_info['error'])
+    
     # Try to get the appropriate model (request_model handles VRAM cleanup)
     mm = multi_model_manager.get_model_for_request(requested_model)
     
@@ -1701,6 +1705,10 @@ async def completions(request: CompletionRequest):
         requested_model=requested_model,
         model_type="text"
     )
+    
+    # Check if the model was rejected as not allowed
+    if model_info.get('error'):
+        raise HTTPException(status_code=404, detail=model_info['error'])
     
     # Try to get the appropriate model (request_model handles VRAM cleanup)
     mm = multi_model_manager.get_model_for_request(requested_model)

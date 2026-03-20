@@ -492,6 +492,10 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
             model_type="image"
         )
         
+        # Check if the model was rejected as not allowed
+        if model_info.get('error'):
+            raise HTTPException(status_code=404, detail=model_info['error'])
+        
         model_name = model_info['model_name']
         model_key = model_info['model_key']
         pipeline = model_info['model_object']

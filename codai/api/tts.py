@@ -59,6 +59,10 @@ async def create_speech(request: TTSRequest):
         model_type="tts"
     )
     
+    # Check if the model was rejected as not allowed
+    if model_info.get('error'):
+        raise HTTPException(status_code=404, detail=model_info['error'])
+    
     model_name = model_info['model_name']
     model_key = model_info['model_key']
     kokoro_model = model_info['model_object']

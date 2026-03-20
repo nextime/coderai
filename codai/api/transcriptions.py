@@ -60,6 +60,10 @@ async def create_transcription(
         model_type="audio"
     )
     
+    # Check if the model was rejected as not allowed
+    if model_info.get('error'):
+        raise HTTPException(status_code=404, detail=model_info['error'])
+    
     model_name = model_info['model_name']
     model_key = model_info['model_key']
     whisper_model = model_info['model_object']
