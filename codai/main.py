@@ -106,13 +106,8 @@ def main():
 
         from codai.models.cache import download_model
 
-        # Use provided file pattern or default to .gguf
-        file_pattern = args.download_file_pattern if args.download_file_pattern else '.gguf'
-        if args.download_file_pattern:
-            print(f"File pattern: {file_pattern}")
-
         try:
-            cached_path = download_model(args.download_model, file_pattern=file_pattern)
+            cached_path = download_model(args.download_model)
 
             if cached_path:
                 print(f"\n=== Model downloaded successfully ===")
