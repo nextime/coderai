@@ -100,6 +100,40 @@ def main():
         print(f"\nRemoved {len(removed)} cached model file(s), freeing {total_size / (1024*1024):.1f} MB")
         sys.exit(0)
 
+    # Handle --download-model early (before heavy imports)
+    if args.download_model:
+        print(f"\n=== Downloading Model: {args.download_model} ===")
+
+        from codai.models.cache import download_model
+
+        # Determine file pattern for HF downloads
+        file_pattern = args.download_file_pattern
+        if file_pattern is None:
+            # Auto-detect based on model type hints
+            model_id = args.download_model
+            if '/' in model_id and not model_id.startswith('http'):
+                # Likely a HuggingFace model ID - default to GGUF for text models
+                file_pattern = '.gguf'
+            else:
+                # URL or local - no pattern needed
+                file_pattern = ''
+
+        print(f"File pattern: {file_pattern if file_pattern else '(auto-detect)'}")
+
+        try:
+            cached_path = download_model(args.download_model, file_pattern=file_pattern)
+
+            if cached_path:
+                print(f"\n=== Model downloaded successfully ===")
+                print(f"Cached at: {cached_path}")
+                sys.exit(0)
+            else:
+                print(f"\n=== Failed to download model ===")
+                sys.exit(1)
+        except Exception as e:
+            print(f"\n=== Error downloading model: {e} ===")
+            sys.exit(1)
+
     # Import globals from codai modules (only after early exits)
     from codai.api import app
     from codai.api.state import (

@@ -366,6 +366,18 @@ def parse_args():
         help="Remove a specific cached model by name or hash (partial match)",
     )
     parser.add_argument(
+        "--download-model",
+        type=str,
+        default=None,
+        help="Download a model to cache (URL or HuggingFace model ID) and exit. Example: --download-model Qwen/Qwen3-8B-Instruct-2507-Q3_K_S",
+    )
+    parser.add_argument(
+        "--download-file-pattern",
+        type=str,
+        default=None,
+        help="File pattern for HuggingFace model downloads (e.g., .gguf, .safetensors). Default: .gguf for text models",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug mode - dumps full request/response to stdout for troubleshooting",
