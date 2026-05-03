@@ -73,6 +73,10 @@ fi
 echo -e "${YELLOW}Activating virtual environment...${NC}"
 source "$VENV_DIR/bin/activate"
 
+# Force pip to use this venv and install packages
+export PIP_NO_INPUT=1
+export PIP_REQUIRE_VIRTUALENV=1
+
 # Upgrade pip
 echo -e "${YELLOW}Upgrading pip...${NC}"
 pip install --upgrade pip
@@ -380,17 +384,46 @@ elif [ "$BACKEND" = "all" ]; then
     # Install base requirements
     echo -e "${YELLOW}Installing base requirements...${NC}"
     pip install --upgrade pip
-    pip install -r requirements.txt
+    
+    # Install requirements with error handling for problematic packages
+    echo -e "${YELLOW}Installing core dependencies...${NC}"
+    pip install -r requirements.txt || {
+        echo -e "${YELLOW}Some packages failed to install, trying individually...${NC}"
+        
+        # Install core packages that should always work
+        pip install fastapi uvicorn pydantic requests python-multipart psutil || {
+            echo -e "${RED}Failed to install core dependencies${NC}"
+            exit 1
+        }
+        
+        # Try optional packages individually
+        echo -e "${YELLOW}Installing optional packages...${NC}"
+        pip install transformers accelerate diffusers safetensors || echo -e "${YELLOW}Warning: Some ML packages failed${NC}"
+        pip install faster-whisper || echo -e "${YELLOW}Warning: faster-whisper failed${NC}"
+        pip install whispercpp || echo -e "${YELLOW}Warning: whispercpp failed${NC}"
+        pip install litellm || echo -e "${YELLOW}Warning: litellm failed${NC}"
+        
+        # Try procname (may fail on Python 3.13)
+        pip install procname || echo -e "${YELLOW}Warning: procname failed (optional)${NC}"
+        
+        # Try stable-diffusion-cpp-python (requires CMake)
+        pip install stable-diffusion-cpp-python || echo -e "${YELLOW}Warning: stable-diffusion-cpp-python failed (optional)${NC}"
+    }
     
     # Install PyTorch with CUDA support (for nvidia backend)
     echo -e "${YELLOW}Installing PyTorch with CUDA support (NVIDIA backend)...${NC}"
-    pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0" || {
-        echo -e "${YELLOW}Warning: PyTorch with CUDA failed, will try CPU version${NC}"
-        pip install torch torchvision torchaudio
+    pip install torch torchvision torchaudio || {
+        echo -e "${YELLOW}Warning: PyTorch installation failed, will try CPU version${NC}"
+        pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu || {
+            echo -e "${RED}Failed to install PyTorch${NC}"
+            exit 1
+        }
     }
     
     echo -e "${YELLOW}Installing NVIDIA-specific requirements...${NC}"
-    pip install -r requirements-nvidia.txt || true
+    pip install -r requirements-nvidia.txt || {
+        echo -e "${YELLOW}Warning: Some NVIDIA packages failed to install${NC}"
+    }
     
     # Check for Vulkan development libraries
     VULKAN_AVAILABLE=false
@@ -455,13 +488,15 @@ elif [ "$BACKEND" = "all" ]; then
     
     # Install Vulkan-specific requirements
     echo -e "${YELLOW}Installing Vulkan-specific requirements...${NC}"
-    pip install -r requirements-vulkan.txt || true
+    pip install -r requirements-vulkan.txt || {
+        echo -e "${YELLOW}Warning: Some Vulkan packages failed to install${NC}"
+    }
     
     # Try to install stable-diffusion-cpp-python with OpenCL
     if [ "$OPENCL_AVAILABLE" = true ]; then
         echo -e "${YELLOW}Installing stable-diffusion-cpp-python with OpenCL support...${NC}"
         pip install stable-diffusion-cpp-python || {
-            echo -e "${YELLOW}Warning: stable-diffusion-cpp-python not available${NC}"
+            echo -e "${YELLOW}Warning: stable-diffusion-cpp-python not available (requires CMake and build tools)${NC}"
         }
     else
         echo -e "${YELLOW}Skipping OpenCL (stable-diffusion-cpp-python) - OpenCL not available${NC}"
@@ -469,7 +504,15 @@ elif [ "$BACKEND" = "all" ]; then
     
     # Install additional requirements
     echo -e "${YELLOW}Installing additional requirements...${NC}"
-    pip install numpy pillow || true
+    pip install numpy pillow || {
+        echo -e "${YELLOW}Warning: Some additional packages failed${NC}"
+    }
+    
+    # Try procname (optional, may fail on Python 3.13)
+    echo -e "${YELLOW}Installing procname (optional)...${NC}"
+    pip install procname || {
+        echo -e "${YELLOW}Note: procname failed to install (optional package, not critical)${NC}"
+    }
     
     echo ""
     echo -e "${GREEN}========================================${NC}"
