@@ -27,7 +27,9 @@ python-multipart>=0.0.6  # for multipart form data parsing
 # torchaudio==2.0.0
 
 # For CPU only:
-torch==2.0.0
+torch>=2.5.0
+torchvision
+torchaudio
 
 # ML dependencies
 transformers>=4.35.0
