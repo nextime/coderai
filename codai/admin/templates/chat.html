@@ -1,0 +1,172 @@
+{% extends "base.html" %}
+
+{% block title %}Chat - CoderAI{% endblock %}
+
+{% block content %}
+<div class="chat-container">
+    <div class="chat-header">
+        <div class="chat-title">
+            <h2>Chat</h2>
+        </div>
+        <div class="chat-controls">
+            <select id="model-selector" class="form-control">
+                <option value="">Select a model...</option>
+            </select>
+            <button class="btn btn-secondary" onclick="newChat()">New Chat</button>
+        </div>
+    </div>
+    
+    <div class="chat-messages" id="chat-messages">
+        <div class="welcome-message">
+            <h3>Welcome to CoderAI Chat</h3>
+            <p>Select a model and start chatting</p>
+        </div>
+    </div>
+    
+    <div class="chat-input-container">
+        <form id="chat-form" class="chat-input-form">
+            <textarea id="chat-input" class="chat-input" 
+                      placeholder="Type your message..." 
+                      rows="3"></textarea>
+            <button type="submit" class="btn btn-primary" id="send-btn">Send</button>
+        </form>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let currentModel = null;
+let messages = [];
+
+async function loadModels() {
+    try {
+        const response = await fetch('/v1/models');
+        const data = await response.json();
+        
+        const selector = document.getElementById('model-selector');
+        selector.innerHTML = '<option value="">Select a model...</option>';
+        
+        data.data.forEach(model => {
+            const option = document.createElement('option');
+            option.value = model.id;
+            option.textContent = model.id;
+            selector.appendChild(option);
+        });
+    } catch (error) {
+        console.error('Failed to load models:', error);
+    }
+}
+
+document.getElementById('model-selector').addEventListener('change', (e) => {
+    currentModel = e.target.value;
+});
+
+function newChat() {
+    messages = [];
+    document.getElementById('chat-messages').innerHTML = `
+        <div class="welcome-message">
+            <h3>New Chat Started</h3>
+            <p>Select a model and start chatting</p>
+        </div>
+    `;
+}
+
+function addMessage(role, content) {
+    const messagesDiv = document.getElementById('chat-messages');
+    
+    // Remove welcome message if present
+    const welcome = messagesDiv.querySelector('.welcome-message');
+    if (welcome) {
+        welcome.remove();
+    }
+    
+    const messageDiv = document.createElement('div');
+    messageDiv.className = `message message-${role}`;
+    
+    const avatar = document.createElement('div');
+    avatar.className = 'message-avatar';
+    avatar.textContent = role === 'user' ? '👤' : '🤖';
+    
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'message-content';
+    contentDiv.textContent = content;
+    
+    messageDiv.appendChild(avatar);
+    messageDiv.appendChild(contentDiv);
+    messagesDiv.appendChild(messageDiv);
+    
+    // Scroll to bottom
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+document.getElementById('chat-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    
+    if (!currentModel) {
+        alert('Please select a model first');
+        return;
+    }
+    
+    const input = document.getElementById('chat-input');
+    const message = input.value.trim();
+    
+    if (!message) {
+        return;
+    }
+    
+    // Add user message
+    addMessage('user', message);
+    messages.push({ role: 'user', content: message });
+    
+    // Clear input
+    input.value = '';
+    
+    // Disable send button
+    const sendBtn = document.getElementById('send-btn');
+    sendBtn.disabled = true;
+    sendBtn.textContent = 'Sending...';
+    
+    try {
+        const response = await fetch('/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                model: currentModel,
+                messages: messages,
+                stream: false
+            })
+        });
+        
+        if (!response.ok) {
+            throw new Error('Request failed');
+        }
+        
+        const data = await response.json();
+        const assistantMessage = data.choices[0].message.content;
+        
+        addMessage('assistant', assistantMessage);
+        messages.push({ role: 'assistant', content: assistantMessage });
+        
+    } catch (error) {
+        addMessage('assistant', 'Error: ' + error.message);
+    } finally {
+        sendBtn.disabled = false;
+        sendBtn.textContent = 'Send';
+    }
+});
+
+// Handle Enter key (Shift+Enter for new line)
+document.getElementById('chat-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        document.getElementById('chat-form').dispatchEvent(new Event('submit'));
+    }
+});
+
+// Load models on page load
+loadModels();
+</script>
+{% endblock %}

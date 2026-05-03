@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+
+{% block title %}Login - CoderAI{% endblock %}
+
+{% block content %}
+<div class="login-container">
+    <div class="login-box">
+        <div class="login-header">
+            <h1>CoderAI</h1>
+            <p>Admin Dashboard</p>
+        </div>
+        
+        {% if error %}
+        <div class="alert alert-error">
+            {{ error }}
+        </div>
+        {% endif %}
+        
+        <form method="post" action="/login" class="login-form">
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" required autofocus>
+            </div>
+            
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+            
+            <button type="submit" class="btn btn-primary btn-block">Login</button>
+        </form>
+        
+        <div class="login-footer">
+            <p class="text-muted">Default credentials: admin / admin</p>
+        </div>
+    </div>
+</div>
+{% endblock %}

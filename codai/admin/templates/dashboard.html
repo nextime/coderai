@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - CoderAI{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Overview</h1>
+    <div class="header-actions">
+        <button class="btn btn-secondary" onclick="reloadConfig()">Reload Config</button>
+    </div>
+</div>
+
+<div class="dashboard-grid">
+    <div class="card">
+        <h3>System Status</h3>
+        <div class="status-grid">
+            <div class="status-item">
+                <span class="label">Backend:</span>
+                <span class="value" id="backend">Loading...</span>
+            </div>
+            <div class="status-item">
+                <span class="label">GPU:</span>
+                <span class="value" id="gpu">Loading...</span>
+            </div>
+            <div class="status-item">
+                <span class="label">Uptime:</span>
+                <span class="value" id="uptime">Loading...</span>
+            </div>
+            <div class="status-item">
+                <span class="label">Status:</span>
+                <span class="value status-ok" id="status">OK</span>
+            </div>
+        </div>
+    </div>
+    
+    <div class="card">
+        <h3>Active Models</h3>
+        <div id="active-models">
+            <p class="text-muted">No models loaded</p>
+        </div>
+        {% if is_admin %}
+        <a href="/admin/models" class="btn btn-primary btn-sm">Manage Models</a>
+        {% endif %}
+    </div>
+    
+    <div class="card">
+        <h3>Request Stats</h3>
+        <div class="stats-grid">
+            <div class="stat-item">
+                <div class="stat-value" id="total-requests">0</div>
+                <div class="stat-label">Total Requests</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="active-requests">0</div>
+                <div class="stat-label">Active</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="queued-requests">0</div>
+                <div class="stat-label">Queued</div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="card">
+        <h3>VRAM Usage</h3>
+        <div class="progress-bar">
+            <div class="progress-fill" id="vram-progress" style="width: 0%"></div>
+        </div>
+        <p class="text-muted" id="vram-text">0 GB / 0 GB (0%)</p>
+    </div>
+</div>
+
+<div class="card">
+    <h3>Recent Activity</h3>
+    <div class="table-responsive">
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Model</th>
+                    <th>Type</th>
+                    <th>Status</th>
+                    <th>Duration</th>
+                </tr>
+            </thead>
+            <tbody id="activity-table">
+                <tr>
+                    <td colspan="5" class="text-center text-muted">No recent activity</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadStatus() {
+    try {
+        const response = await fetch('/admin/api/status');
+        const data = await response.json();
+        
+        document.getElementById('backend').textContent = data.backend || 'auto';
+        document.getElementById('uptime').textContent = data.uptime || '0h 0m';
+        document.getElementById('status').textContent = data.status === 'ok' ? 'OK' : 'Error';
+        
+        // Update models loaded count
+        if (data.models_loaded > 0) {
+            document.getElementById('active-models').innerHTML = 
+                `<p>${data.models_loaded} model(s) loaded</p>`;
+        }
+    } catch (error) {
+        console.error('Failed to load status:', error);
+    }
+}
+
+async function reloadConfig() {
+    if (confirm('Reload configuration from disk? This will not restart the server.')) {
+        try {
+            const response = await fetch('/admin/api/system/reload', { method: 'POST' });
+            if (response.ok) {
+                alert('Configuration reloaded successfully');
+                loadStatus();
+            } else {
+                alert('Failed to reload configuration');
+            }
+        } catch (error) {
+            alert('Error: ' + error.message);
+        }
+    }
+}
+
+// Load status on page load
+loadStatus();
+
+// Refresh status every 5 seconds
+setInterval(loadStatus, 5000);
+</script>
+{% endblock %}

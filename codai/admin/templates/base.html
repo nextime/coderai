@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}CoderAI Admin{% endblock %}</title>
+    <link rel="stylesheet" href="/static/admin/style.css">
+</head>
+<body>
+    {% if username %}
+    <div class="layout">
+        <aside class="sidebar">
+            <div class="logo">
+                <h1>CoderAI</h1>
+            </div>
+            <nav class="nav">
+                <a href="/admin" class="nav-item {% if request.url.path == '/admin' %}active{% endif %}">
+                    <span class="icon">📊</span>
+                    <span>Overview</span>
+                </a>
+                {% if is_admin %}
+                <a href="/admin/models" class="nav-item {% if '/models' in request.url.path %}active{% endif %}">
+                    <span class="icon">🤖</span>
+                    <span>Models</span>
+                </a>
+                <a href="/admin/tokens" class="nav-item {% if '/tokens' in request.url.path %}active{% endif %}">
+                    <span class="icon">🔑</span>
+                    <span>API Tokens</span>
+                </a>
+                <a href="/admin/users" class="nav-item {% if '/users' in request.url.path %}active{% endif %}">
+                    <span class="icon">👥</span>
+                    <span>Users</span>
+                </a>
+                {% endif %}
+                <a href="/chat" class="nav-item {% if '/chat' in request.url.path %}active{% endif %}">
+                    <span class="icon">💬</span>
+                    <span>Chat</span>
+                </a>
+            </nav>
+            <div class="sidebar-footer">
+                <div class="user-info">
+                    <span class="icon">👤</span>
+                    <span>{{ username }}</span>
+                </div>
+                <a href="/logout" class="logout-btn">Logout</a>
+            </div>
+        </aside>
+        <main class="main-content">
+            <div class="content-wrapper">
+                {% block content %}{% endblock %}
+            </div>
+        </main>
+    </div>
+    {% else %}
+    <div class="content-wrapper">
+        {% block content %}{% endblock %}
+    </div>
+    {% endif %}
+    
+    {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,215 @@
+{% extends "base.html" %}
+
+{% block title %}Models - CoderAI{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Models</h1>
+    <div class="header-actions">
+        <button class="btn btn-primary" onclick="showDownloadModal()">Download Model</button>
+    </div>
+</div>
+
+<div class="tabs">
+    <button class="tab-btn active" onclick="showTab('local')">Local Models</button>
+    <button class="tab-btn" onclick="showTab('search')">Search HuggingFace</button>
+    <button class="tab-btn" onclick="showTab('config')">Configuration</button>
+</div>
+
+<div id="tab-local" class="tab-content active">
+    <div class="card">
+        <h3>Text Models</h3>
+        <div id="text-models-list">
+            <p class="text-muted">No text models configured</p>
+        </div>
+    </div>
+    
+    <div class="card">
+        <h3>Image Models</h3>
+        <div id="image-models-list">
+            <p class="text-muted">No image models configured</p>
+        </div>
+    </div>
+    
+    <div class="card">
+        <h3>Audio Models</h3>
+        <div id="audio-models-list">
+            <p class="text-muted">No audio models configured</p>
+        </div>
+    </div>
+    
+    <div class="card">
+        <h3>GGUF Models</h3>
+        <div id="gguf-models-list">
+            <p class="text-muted">No GGUF models configured</p>
+        </div>
+    </div>
+</div>
+
+<div id="tab-search" class="tab-content">
+    <div class="card">
+        <h3>Search HuggingFace Models</h3>
+        <div class="search-form">
+            <input type="text" id="search-query" placeholder="Search models..." class="form-control">
+            <div class="filter-group">
+                <label>
+                    <input type="checkbox" id="filter-gguf" checked>
+                    GGUF only
+                </label>
+                <label>
+                    <input type="checkbox" id="filter-text" checked>
+                    Text models
+                </label>
+                <label>
+                    <input type="checkbox" id="filter-image">
+                    Image models
+                </label>
+            </div>
+            <button class="btn btn-primary" onclick="searchModels()">Search</button>
+        </div>
+        
+        <div id="search-results" class="search-results">
+            <p class="text-muted">Enter a search query to find models</p>
+        </div>
+    </div>
+</div>
+
+<div id="tab-config" class="tab-content">
+    <div class="card">
+        <h3>Model Loading Configuration</h3>
+        <form id="config-form" class="form">
+            <div class="form-group">
+                <label for="load-mode">Load Mode</label>
+                <select id="load-mode" name="load_mode" class="form-control">
+                    <option value="ondemand">On Demand (default)</option>
+                    <option value="loadall">Load All</option>
+                    <option value="loadswap">Load & Swap</option>
+                </select>
+                <small class="form-text">
+                    On Demand: Load one model at a time<br>
+                    Load All: Try to load all models in VRAM<br>
+                    Load & Swap: Keep models in RAM, swap to VRAM as needed
+                </small>
+            </div>
+            
+            <div class="form-group">
+                <label>Models to Load at Startup</label>
+                <div id="loaded-models-list">
+                    <p class="text-muted">No models selected</p>
+                </div>
+            </div>
+            
+            <div class="form-group">
+                <label>Models to Pre-load (RAM)</label>
+                <div id="preload-models-list">
+                    <p class="text-muted">No models selected</p>
+                </div>
+            </div>
+            
+            <button type="submit" class="btn btn-primary">Save Configuration</button>
+        </form>
+    </div>
+</div>
+
+<!-- Download Modal -->
+<div id="download-modal" class="modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h2>Download Model</h2>
+            <button class="modal-close" onclick="hideDownloadModal()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <form id="download-form">
+                <div class="form-group">
+                    <label for="model-id">Model ID or URL</label>
+                    <input type="text" id="model-id" class="form-control" 
+                           placeholder="e.g., TheBloke/Llama-2-7B-GGUF" required>
+                    <small class="form-text">HuggingFace model ID or direct URL</small>
+                </div>
+                
+                <div class="form-group">
+                    <label for="file-pattern">File Pattern (optional)</label>
+                    <input type="text" id="file-pattern" class="form-control" 
+                           placeholder=".gguf">
+                    <small class="form-text">Filter files to download (e.g., .gguf, .safetensors)</small>
+                </div>
+                
+                <div class="form-actions">
+                    <button type="submit" class="btn btn-primary">Download</button>
+                    <button type="button" class="btn btn-secondary" onclick="hideDownloadModal()">Cancel</button>
+                </div>
+            </form>
+            <div id="download-progress" class="download-progress" style="display: none;">
+                <p>Downloading...</p>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="download-progress-bar"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function showTab(tabName) {
+    document.querySelectorAll('.tab-content').forEach(tab => {
+        tab.classList.remove('active');
+    });
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.classList.remove('active');
+    });
+    
+    document.getElementById('tab-' + tabName).classList.add('active');
+    event.target.classList.add('active');
+}
+
+function showDownloadModal() {
+    document.getElementById('download-modal').style.display = 'flex';
+}
+
+function hideDownloadModal() {
+    document.getElementById('download-modal').style.display = 'none';
+}
+
+async function searchModels() {
+    const query = document.getElementById('search-query').value;
+    const resultsDiv = document.getElementById('search-results');
+    
+    if (!query) {
+        resultsDiv.innerHTML = '<p class="text-muted">Enter a search query</p>';
+        return;
+    }
+    
+    resultsDiv.innerHTML = '<p>Searching...</p>';
+    
+    // TODO: Implement actual HuggingFace API search
+    setTimeout(() => {
+        resultsDiv.innerHTML = '<p class="text-muted">Search functionality coming soon</p>';
+    }, 1000);
+}
+
+document.getElementById('download-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    
+    const modelId = document.getElementById('model-id').value;
+    const filePattern = document.getElementById('file-pattern').value;
+    
+    document.getElementById('download-progress').style.display = 'block';
+    
+    // TODO: Implement actual download
+    setTimeout(() => {
+        alert('Download functionality coming soon');
+        hideDownloadModal();
+        document.getElementById('download-progress').style.display = 'none';
+    }, 1000);
+});
+
+// Load models on page load
+async function loadModels() {
+    // TODO: Implement loading models from API
+}
+
+loadModels();
+</script>
+{% endblock %}

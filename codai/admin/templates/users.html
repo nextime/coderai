@@ -1,0 +1,144 @@
+{% extends "base.html" %}
+
+{% block title %}Users - CoderAI{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Users</h1>
+    <div class="header-actions">
+        <button class="btn btn-primary" onclick="showCreateUserModal()">Create User</button>
+    </div>
+</div>
+
+<div class="card">
+    <div class="table-responsive">
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>Username</th>
+                    <th>Role</th>
+                    <th>Created</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for user in users %}
+                <tr>
+                    <td>{{ user.username }}</td>
+                    <td>
+                        <span class="badge {% if user.role == 'admin' %}badge-primary{% else %}badge-secondary{% endif %}">
+                            {{ user.role }}
+                        </span>
+                    </td>
+                    <td>{{ user.created_at[:10] }}</td>
+                    <td>
+                        {% if user.username != username %}
+                        <button class="btn btn-danger btn-sm" onclick="deleteUser({{ user.id }}, '{{ user.username }}')">Delete</button>
+                        {% else %}
+                        <a href="/admin/change-password" class="btn btn-secondary btn-sm">Change Password</a>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- Create User Modal -->
+<div id="create-user-modal" class="modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h2>Create User</h2>
+            <button class="modal-close" onclick="hideCreateUserModal()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <form id="create-user-form">
+                <div class="form-group">
+                    <label for="new-username">Username</label>
+                    <input type="text" id="new-username" class="form-control" required>
+                </div>
+                
+                <div class="form-group">
+                    <label for="new-password">Password</label>
+                    <input type="password" id="new-password" class="form-control" required minlength="8">
+                    <small class="form-text">Minimum 8 characters</small>
+                </div>
+                
+                <div class="form-group">
+                    <label for="new-role">Role</label>
+                    <select id="new-role" class="form-control">
+                        <option value="user">User</option>
+                        <option value="admin">Admin</option>
+                    </select>
+                </div>
+                
+                <div class="form-actions">
+                    <button type="submit" class="btn btn-primary">Create User</button>
+                    <button type="button" class="btn btn-secondary" onclick="hideCreateUserModal()">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function showCreateUserModal() {
+    document.getElementById('create-user-modal').style.display = 'flex';
+}
+
+function hideCreateUserModal() {
+    document.getElementById('create-user-modal').style.display = 'none';
+    document.getElementById('create-user-form').reset();
+}
+
+document.getElementById('create-user-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    
+    const username = document.getElementById('new-username').value;
+    const password = document.getElementById('new-password').value;
+    const role = document.getElementById('new-role').value;
+    
+    try {
+        const response = await fetch('/admin/api/users', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password, role })
+        });
+        
+        if (response.ok) {
+            hideCreateUserModal();
+            location.reload();
+        } else {
+            const error = await response.json();
+            alert('Failed to create user: ' + (error.detail || 'Unknown error'));
+        }
+    } catch (error) {
+        alert('Error: ' + error.message);
+    }
+});
+
+async function deleteUser(userId, username) {
+    if (!confirm(`Are you sure you want to delete user "${username}"?`)) {
+        return;
+    }
+    
+    try {
+        const response = await fetch(`/admin/api/users/${userId}`, {
+            method: 'DELETE'
+        });
+        
+        if (response.ok) {
+            location.reload();
+        } else {
+            const error = await response.json();
+            alert('Failed to delete user: ' + (error.detail || 'Unknown error'));
+        }
+    } catch (error) {
+        alert('Error: ' + error.message);
+    }
+}
+</script>
+{% endblock %}
