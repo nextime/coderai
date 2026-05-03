@@ -36,11 +36,11 @@ transformers>=4.35.0
 accelerate>=0.24.0
 diffusers>=0.25.0  # For Stable Diffusion image generation
 safetensors>=0.4.0  # Required by diffusers
-stable-diffusion-cpp-python>=0.4.0  # For Vulkan/AMD image generation
+stable-diffusion-cpp-python  # For Vulkan/AMD image generation (no version pin for Python 3.13 compat)
 
 # System resource detection
 psutil>=5.9.0
-procname>=0.3.0
+procname  # Process naming (no version pin for Python 3.13 compatibility)
 
 # Optional: Audio transcription dependencies
 faster-whisper>=0.10.0  # For NVIDIA/CUDA whisper transcription
