@@ -592,7 +592,7 @@ elif [ "$BACKEND" = "all" ]; then
         echo ""
         echo -e "${YELLOW}Installing Flash Attention 2...${NC}"
         echo -e "${YELLOW}This may take several minutes and requires CUDA 11.6+${NC}"
-        MAX_JOBS=5 NVCC_THREADS=2 pip install flash-attn --no-build-isolation || {
+        MAX_JOBS=6 pip install flash-attn --no-build-isolation || {
             echo -e "${RED}Warning: Flash Attention 2 installation failed${NC}"
             echo -e "${YELLOW}Requirements: CUDA 11.6+, Linux, Ampere/Ada/Hopper GPU${NC}"
             echo -e "${YELLOW}Continuing without Flash Attention...${NC}"

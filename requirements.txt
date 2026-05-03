@@ -36,15 +36,15 @@ transformers>=4.35.0
 accelerate>=0.24.0
 diffusers>=0.25.0  # For Stable Diffusion image generation
 safetensors>=0.4.0  # Required by diffusers
-stable-diffusion-cpp-python  # For Vulkan/AMD image generation (no version pin for Python 3.13 compat)
+# stable-diffusion-cpp-python is installed by build.sh with CMAKE_ARGS to fix the libwebm submodule issue
 
 # System resource detection
 psutil>=5.9.0
-procname  # Process naming (no version pin for Python 3.13 compatibility)
+setproctitle>=1.1  # Process naming (replaces procname, Python 3.13 compatible)
 
 # Optional: Audio transcription dependencies
 faster-whisper>=0.10.0  # For NVIDIA/CUDA whisper transcription
-whispercpp>=0.0.6  # Alternative whisper library (works without PyTorch)
+whispercpp>=0.0.17  # Alternative whisper library (works without PyTorch)
 
 # LiteLLM for standardized API responses
 litellm>=1.40.0

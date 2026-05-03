@@ -15,7 +15,7 @@ psutil>=5.9.0
 
 # Optional: Audio transcription dependencies
 faster-whisper>=0.10.0  # For NVIDIA/CUDA whisper transcription
-whispercpp>=1.0.0  # Alternative whisper library (works without PyTorch)
+whispercpp>=0.0.17  # Alternative whisper library (works without PyTorch)
 
 # Optional: for better performance with NVIDIA GPUs
 bitsandbytes>=0.41.0

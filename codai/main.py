@@ -18,10 +18,10 @@ def main():
         original_unraisablehook(unraisable)
     sys.unraisablehook = suppress_llama_del_errors
     
-    # Optional: set process name if procname is available
+    # Optional: set process name if setproctitle is available
     try:
-        import procname
-        procname.setprocname("codai")
+        import setproctitle
+        setproctitle.setproctitle("codai")
     except ImportError:
         pass
     
