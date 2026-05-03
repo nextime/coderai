@@ -270,7 +270,6 @@ async def api_delete_user(
     username: str = Depends(require_admin)
 ):
     """Delete a user."""
-    # Find user by ID
     users = session_manager._load_auth_data().get("users", [])
     user = next((u for u in users if u["id"] == user_id), None)
     
@@ -282,3 +281,164 @@ async def api_delete_user(
         raise HTTPException(status_code=400, detail="Cannot delete user")
     
     return {"success": True}
+
+
+# --- Token management endpoints ---
+
+@router.get("/admin/api/tokens", response_model=list)
+async def api_list_tokens(username: str = Depends(require_admin)):
+    """List all API tokens."""
+    auth_data = session_manager._load_auth_data()
+    tokens = []
+    for token in auth_data.get("tokens", []):
+        tokens.append({
+            "id": token["id"],
+            "name": token["name"],
+            "token": token["token"],
+            "provider": token["provider"],
+            "created_at": token["created_at"],
+            "last_used": token.get("last_used")
+        })
+    return tokens
+
+
+@router.post("/admin/api/tokens")
+async def api_create_token(request: Request, username: str = Depends(require_admin)):
+    """Create a new API token."""
+    data = await request.json()
+    name = data.get("name")
+    provider = data.get("provider", "openai")
+    
+    if not name:
+        raise HTTPException(status_code=400, detail="Token name is required")
+    
+    auth_data = session_manager._load_auth_data()
+    
+    # Generate token
+    token_id = len(auth_data.get("tokens", [])) + 1
+    import secrets
+    new_token = {
+        "id": token_id,
+        "name": name,
+        "token": f"sk-coderai-{secrets.token_hex(32)}",
+        "provider": provider,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "last_used": None
+    }
+    
+    auth_data.setdefault("tokens", []).append(new_token)
+    session_manager._save_auth_data(auth_data)
+    
+    return {
+        "token": new_token["token"],
+        "id": new_token["id"],
+        "name": new_token["name"],
+        "provider": new_token["provider"]
+    }
+
+
+@router.delete("/admin/api/tokens/{token_id}")
+async def api_delete_token(token_id: int, username: str = Depends(require_admin)):
+    """Delete an API token."""
+    auth_data = session_manager._load_auth_data()
+    tokens = auth_data.get("tokens", [])
+    
+    new_tokens = [t for t in tokens if t["id"] != token_id]
+    if len(new_tokens) == len(tokens):
+        raise HTTPException(status_code=404, detail="Token not found")
+    
+    auth_data["tokens"] = new_tokens
+    session_manager._save_auth_data(auth_data)
+    
+    return {"success": True}
+
+
+# --- Models management endpoints ---
+
+@router.get("/admin/api/models")
+async def api_list_models(username: str = Depends(require_admin)):
+    """List all configured models with details."""
+    models_data = session_manager._load_auth_data()  # TODO: move to ModelManager
+    # For now, load from models file directly
+    models_path = Path.cwd() / "codai" / "admin" / "templates"  # hack
+    # Actually use config_mgr
+    pass
+
+
+@router.post("/admin/api/model-download")
+async def api_download_model(
+    request: Request,
+    username: str = Depends(require_admin)
+):
+    """Download a model from HuggingFace."""
+    data = await request.json()
+    model_id = data.get("model_id")
+    file_pattern = data.get("file_pattern")
+    
+    if not model_id:
+        raise HTTPException(status_code=400, detail="Model ID required")
+    
+    from codai.models.cache import download_model, is_huggingface_model_id
+    
+    try:
+        if is_huggingface_model_id(model_id):
+            if file_pattern:
+                cached = download_model(model_id, file_pattern=file_pattern)
+            else:
+                cached = download_model(model_id, file_pattern='.gguf')
+                if not cached:
+                    # Download full repo
+                    from huggingface_hub import snapshot_download
+                    cached = snapshot_download(model_id)
+        else:
+            cached = download_model(model_id, file_pattern=file_pattern or '.gguf')
+        
+        if cached:
+            return {"success": True, "path": cached}
+        else:
+            raise HTTPException(status_code=500, detail="Download failed")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+@router.delete("/admin/api/models/{model_identifier}")
+async def api_delete_model(
+    model_identifier: str,
+    username: str = Depends(require_admin)
+):
+    """Remove a model from local cache."""
+    from codai.models.cache import remove_cached_model
+    
+    try:
+        removed = remove_cached_model(model_identifier)
+        if not removed:
+            raise HTTPException(status_code=404, detail="Model not found")
+        return {"success": True, "removed_count": len(removed)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- System endpoints ---
+
+@router.post("/admin/api/system/reload")
+async def api_reload_config(username: str = Depends(require_admin)):
+    """Reload configuration from disk."""
+    try:
+        from fastapi import Request
+        # config_mgr is stored in app state
+        request = Request({})
+        config = request.app.state.config_mgr.reload()
+        return {
+            "success": True,
+            "message": "Configuration reloaded",
+            "config": {
+                "loaded": config.models.loaded,
+                "preload": config.models.preload,
+                "load_mode": config.models.default_load_mode
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+from datetime import datetime

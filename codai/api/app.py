@@ -70,16 +70,25 @@ from codai.api.transcriptions import router as transcriptions_router
 from codai.api.images import router as images_router
 from codai.api.tts import router as tts_router
 from codai.api.text import router as text_router
+from codai.admin.routes import router as admin_router
 
 # Import and add middleware
 from codai.api.log import log_requests
 app.middleware("http")(log_requests)
+
+# Mount static files for admin dashboard
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
+admin_static_dir = Path(__file__).parent.parent / "admin" / "static"
+if admin_static_dir.exists():
+    app.mount("/static/admin", StaticFiles(directory=str(admin_static_dir)), name="admin_static")
 
 # Include routers from submodules
 app.include_router(transcriptions_router)
 app.include_router(images_router)
 app.include_router(tts_router)
 app.include_router(text_router)
+app.include_router(admin_router)
 
 
 @app.get("/v1/models", response_model=ModelList)
