@@ -1,7 +1,8 @@
 #!/bin/bash
 # Build script for CoderAI - Supports NVIDIA (CUDA), Vulkan, OpenCL, and CPU backends
-# Usage: ./build.sh [nvidia|vulkan|vulkan-nvidia|cuda|opencl|all]
+# Usage: ./build.sh [nvidia|vulkan|vulkan-nvidia|cuda|opencl|all] [--flash]
 # Default: all (installs all backends)
+# --flash: Enable and install Flash Attention 2 (for NVIDIA GPUs)
 
 set -e
 
@@ -12,25 +13,40 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Determine backend
+# Determine backend and flags
 BACKEND="${1:-all}"
+FLASH=false
+
+# Check for --flash flag in any position
+for arg in "$@"; do
+    case $arg in
+        --flash) FLASH=true;;
+    esac
+done
+
 BACKEND=$(echo "$BACKEND" | tr '[:upper:]' '[:lower:]')
 
 if [[ "$BACKEND" != "nvidia" && "$BACKEND" != "vulkan" && "$BACKEND" != "vulkan-nvidia" && "$BACKEND" != "cuda" && "$BACKEND" != "opencl" && "$BACKEND" != "all" ]]; then
     echo -e "${RED}Error: Invalid backend '$BACKEND'${NC}"
-    echo "Usage: ./build.sh [nvidia|vulkan|vulkan-nvidia|cuda|opencl|all]"
+    echo "Usage: ./build.sh [nvidia|vulkan|vulkan-nvidia|cuda|opencl|all] [--flash]"
     echo "  nvidia       - Use PyTorch with CUDA for NVIDIA GPUs"
     echo "  vulkan      - Use llama-cpp-python with Vulkan for AMD GPUs"
     echo "  vulkan-nvidia - Use llama-cpp-python with Vulkan for NVIDIA GPU only"
     echo "  cuda        - Use llama-cpp-python with CUDA for NVIDIA GPUs"
     echo "  opencl      - Use stable-diffusion-cpp-python with OpenCL"
     echo "  all         - Install all backends (nvidia, cuda, vulkan, opencl, cpu) - DEFAULT"
+    echo ""
+    echo "Options:"
+    echo "  --flash     - Install Flash Attention 2 for faster inference (NVIDIA only)"
     exit 1
 fi
 
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}  CoderAI Build Script${NC}"
 echo -e "${BLUE}  Backend: ${GREEN}$BACKEND${NC}"
+if [ "$FLASH" = true ]; then
+    echo -e "${BLUE}  Flash Attention 2: ${GREEN}ENABLED${NC}"
+fi
 echo -e "${BLUE}========================================${NC}"
 echo ""
 
@@ -91,8 +107,37 @@ if [ "$BACKEND" = "nvidia" ]; then
     pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0"
     
     echo -e "${YELLOW}Installing NVIDIA-specific requirements...${NC}"
-    pip install -r requirements-nvidia.txt
+    pip install -r requirements-nvidia.txt || {
+        echo -e "${YELLOW}Warning: Some NVIDIA packages failed to install${NC}"
+    }
     
+    # Install Flash Attention 2 if requested
+    if [ "$FLASH" = true ]; then
+        echo ""
+        echo -e "${YELLOW}Installing Flash Attention 2...${NC}"
+        echo -e "${YELLOW}This may take several minutes and requires CUDA 11.6+${NC}"
+        pip install flash-attn --no-build-isolation || {
+            echo -e "${RED}Warning: Flash Attention 2 installation failed${NC}"
+            echo -e "${YELLOW}Requirements: CUDA 11.6+, Linux, Ampere/Ada/Hopper GPU${NC}"
+            echo -e "${YELLOW}Continuing without Flash Attention...${NC}"
+        }
+    fi
+    
+    echo ""
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}  NVIDIA/CUDA build complete!${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo ""
+    echo "Usage:"
+    echo "  source $VENV_DIR/bin/activate"
+    echo "  python coderai --model <huggingface-model-name>"
+    if [ "$FLASH" = true ]; then
+        echo ""
+        echo "Flash Attention 2 enabled - use --flash-attn flag when running"
+    fi
+    echo ""
+    echo "Example:"
+    echo "  python coderai --model microsoft/DialoGPT-medium"
     echo ""
     echo -e "${GREEN}========================================${NC}"
     echo -e "${GREEN}  NVIDIA/CUDA build complete!${NC}"
@@ -514,6 +559,21 @@ elif [ "$BACKEND" = "all" ]; then
         echo -e "${YELLOW}Note: procname failed to install (optional package, not critical)${NC}"
     }
     
+    # Install Flash Attention 2 if requested and CUDA is available
+    if [ "$FLASH" = true ] && [ "$CUDA_AVAILABLE" = true ]; then
+        echo ""
+        echo -e "${YELLOW}Installing Flash Attention 2...${NC}"
+        echo -e "${YELLOW}This may take several minutes and requires CUDA 11.6+${NC}"
+        pip install flash-attn --no-build-isolation || {
+            echo -e "${RED}Warning: Flash Attention 2 installation failed${NC}"
+            echo -e "${YELLOW}Requirements: CUDA 11.6+, Linux, Ampere/Ada/Hopper GPU${NC}"
+            echo -e "${YELLOW}Continuing without Flash Attention...${NC}"
+        }
+    elif [ "$FLASH" = true ]; then
+        echo -e "${YELLOW}Warning: Flash Attention 2 requires CUDA backend${NC}"
+        echo -e "${YELLOW}Skipping Flash Attention installation${NC}"
+    fi
+    
     echo ""
     echo -e "${GREEN}========================================${NC}"
     echo -e "${GREEN}  ALL backends build complete!${NC}"
@@ -525,12 +585,19 @@ elif [ "$BACKEND" = "all" ]; then
     [ "$VULKAN_AVAILABLE" = true ] && echo "  ✓ Vulkan (llama-cpp-python)"
     [ "$OPENCL_AVAILABLE" = true ] && echo "  ✓ OpenCL (stable-diffusion-cpp-python)"
     echo "  ✓ CPU (fallback for all)"
+    if [ "$FLASH" = true ] && [ "$CUDA_AVAILABLE" = true ]; then
+        echo ""
+        echo "  ✓ Flash Attention 2 (NVIDIA)"
+    fi
     echo ""
     echo "Usage:"
     echo "  source $VENV_DIR/bin/activate"
     echo ""
     echo "  # For text models with NVIDIA:"
     echo "  python coderai --model <model> --backend nvidia"
+    if [ "$FLASH" = true ]; then
+        echo "  python coderai --model <model> --backend nvidia --flash-attn"
+    fi
     echo ""
     echo "  # For GGUF models with CUDA:"
     echo "  python coderai --model <gguf-model> --backend vulkan"
