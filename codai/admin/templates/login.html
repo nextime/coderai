@@ -1,38 +1,47 @@
-{% extends "base.html" %}
-
-{% block title %}Login - CoderAI{% endblock %}
-
-{% block content %}
-<div class="login-container">
-    <div class="login-box">
-        <div class="login-header">
-            <h1>CoderAI</h1>
-            <p>Admin Dashboard</p>
-        </div>
-        
-        {% if error %}
-        <div class="alert alert-error">
-            {{ error }}
-        </div>
-        {% endif %}
-        
-        <form method="post" action="/login" class="login-form">
-            <div class="form-group">
-                <label for="username">Username</label>
-                <input type="text" id="username" name="username" required autofocus>
-            </div>
-            
-            <div class="form-group">
-                <label for="password">Password</label>
-                <input type="password" id="password" name="password" required>
-            </div>
-            
-            <button type="submit" class="btn btn-primary btn-block">Login</button>
-        </form>
-        
-        <div class="login-footer">
-            <p class="text-muted">Default credentials: admin / admin</p>
-        </div>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign in — CoderAI</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/admin/style.css">
+</head>
+<body>
+<div class="login-wrap">
+  <div class="login-card">
+    <div class="login-logo">
+      <div class="login-mark">AI</div>
+      <div class="login-logo-text">
+        <h1>CoderAI</h1>
+        <p>Local AI Server</p>
+      </div>
     </div>
+
+    {% if error %}
+    <div class="alert alert-error" style="margin-bottom:1.25rem">{{ error }}</div>
+    {% endif %}
+
+    <form method="post" action="/login">
+      <div class="form-row">
+        <label class="form-label" for="username">Username</label>
+        <input class="form-input" type="text" id="username" name="username"
+               placeholder="admin" required autofocus autocomplete="username">
+      </div>
+      <div class="form-row">
+        <label class="form-label" for="password">Password</label>
+        <input class="form-input" type="password" id="password" name="password"
+               placeholder="••••••••" required autocomplete="current-password">
+      </div>
+      <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center;margin-top:.875rem;padding:.5625rem">
+        Sign in
+      </button>
+    </form>
+
+    <div class="login-footer">default: admin / admin</div>
+  </div>
 </div>
-{% endblock %}
+</body>
+</html>

@@ -1,172 +1,122 @@
 {% extends "base.html" %}
-
-{% block title %}Chat - CoderAI{% endblock %}
+{% block title %}Chat — CoderAI{% endblock %}
+{% block wrapper_class %}{% endblock %}
 
 {% block content %}
-<div class="chat-container">
-    <div class="chat-header">
-        <div class="chat-title">
-            <h2>Chat</h2>
-        </div>
-        <div class="chat-controls">
-            <select id="model-selector" class="form-control">
-                <option value="">Select a model...</option>
-            </select>
-            <button class="btn btn-secondary" onclick="newChat()">New Chat</button>
-        </div>
+<div class="chat-wrap" style="margin:0 1.5rem 1rem;border-radius:8px">
+  <div class="chat-bar">
+    <h2>Chat</h2>
+    <div class="chat-controls">
+      <select id="model-sel" class="form-input" style="font-size:13px;padding:.3rem .625rem;min-width:200px">
+        <option value="">Select model…</option>
+      </select>
+      <button class="btn btn-ghost btn-sm" onclick="newChat()">Clear</button>
     </div>
-    
-    <div class="chat-messages" id="chat-messages">
-        <div class="welcome-message">
-            <h3>Welcome to CoderAI Chat</h3>
-            <p>Select a model and start chatting</p>
-        </div>
+  </div>
+
+  <div class="chat-messages" id="chat-msgs">
+    <div class="chat-empty">
+      <h3>CoderAI Chat</h3>
+      <p>Select a model and start typing</p>
     </div>
-    
-    <div class="chat-input-container">
-        <form id="chat-form" class="chat-input-form">
-            <textarea id="chat-input" class="chat-input" 
-                      placeholder="Type your message..." 
-                      rows="3"></textarea>
-            <button type="submit" class="btn btn-primary" id="send-btn">Send</button>
-        </form>
+  </div>
+
+  <div class="chat-foot">
+    <div id="typing" style="font-size:11px;color:var(--text-3);height:14px;margin-bottom:.3rem;font-family:var(--mono)"></div>
+    <div class="chat-input-row">
+      <textarea id="chat-in" class="chat-textarea" placeholder="Send a message…" rows="1"></textarea>
+      <button class="btn btn-primary" id="send-btn" onclick="send()" style="padding:.5rem .75rem;align-self:flex-end">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:13px;height:13px"><line x1="14" y1="2" x2="7" y2="9"/><polygon points="14 2 10 14 7 9 2 6 14 2"/></svg>
+      </button>
     </div>
+    <div class="chat-hint">Enter to send · Shift+Enter for newline</div>
+  </div>
 </div>
 {% endblock %}
 
 {% block scripts %}
 <script>
-let currentModel = null;
-let messages = [];
+let history = [];
+let busy = false;
 
 async function loadModels() {
-    try {
-        const response = await fetch('/v1/models');
-        const data = await response.json();
-        
-        const selector = document.getElementById('model-selector');
-        selector.innerHTML = '<option value="">Select a model...</option>';
-        
-        data.data.forEach(model => {
-            const option = document.createElement('option');
-            option.value = model.id;
-            option.textContent = model.id;
-            selector.appendChild(option);
-        });
-    } catch (error) {
-        console.error('Failed to load models:', error);
-    }
+  try {
+    const d = await fetch('/v1/models').then(r => r.json());
+    const sel = document.getElementById('model-sel');
+    sel.innerHTML = '<option value="">Select model…</option>';
+    (d.data || []).forEach(m => {
+      const o = document.createElement('option');
+      o.value = o.textContent = m.id;
+      sel.appendChild(o);
+    });
+  } catch {}
 }
-
-document.getElementById('model-selector').addEventListener('change', (e) => {
-    currentModel = e.target.value;
-});
 
 function newChat() {
-    messages = [];
-    document.getElementById('chat-messages').innerHTML = `
-        <div class="welcome-message">
-            <h3>New Chat Started</h3>
-            <p>Select a model and start chatting</p>
-        </div>
-    `;
+  history = [];
+  document.getElementById('chat-msgs').innerHTML = '<div class="chat-empty"><h3>New conversation</h3><p>Start typing below</p></div>';
 }
 
-function addMessage(role, content) {
-    const messagesDiv = document.getElementById('chat-messages');
-    
-    // Remove welcome message if present
-    const welcome = messagesDiv.querySelector('.welcome-message');
-    if (welcome) {
-        welcome.remove();
-    }
-    
-    const messageDiv = document.createElement('div');
-    messageDiv.className = `message message-${role}`;
-    
-    const avatar = document.createElement('div');
-    avatar.className = 'message-avatar';
-    avatar.textContent = role === 'user' ? '👤' : '🤖';
-    
-    const contentDiv = document.createElement('div');
-    contentDiv.className = 'message-content';
-    contentDiv.textContent = content;
-    
-    messageDiv.appendChild(avatar);
-    messageDiv.appendChild(contentDiv);
-    messagesDiv.appendChild(messageDiv);
-    
-    // Scroll to bottom
-    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+function addMsg(role, text) {
+  const wrap = document.getElementById('chat-msgs');
+  wrap.querySelector('.chat-empty')?.remove();
+  const t = new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+  const d = document.createElement('div');
+  d.className = 'msg ' + role;
+  d.innerHTML = `
+    <div class="msg-av ${role === 'user' ? 'user' : 'ai'}">${role === 'user' ? 'YOU' : 'AI'}</div>
+    <div class="msg-body">
+      <div class="msg-meta">${role === 'user' ? 'You' : 'Assistant'} · ${t}</div>
+      <div class="msg-text">${String(text).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>')}</div>
+    </div>`;
+  wrap.appendChild(d);
+  wrap.scrollTop = wrap.scrollHeight;
 }
 
-document.getElementById('chat-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    
-    if (!currentModel) {
-        alert('Please select a model first');
-        return;
-    }
-    
-    const input = document.getElementById('chat-input');
-    const message = input.value.trim();
-    
-    if (!message) {
-        return;
-    }
-    
-    // Add user message
-    addMessage('user', message);
-    messages.push({ role: 'user', content: message });
-    
-    // Clear input
-    input.value = '';
-    
-    // Disable send button
-    const sendBtn = document.getElementById('send-btn');
-    sendBtn.disabled = true;
-    sendBtn.textContent = 'Sending...';
-    
-    try {
-        const response = await fetch('/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                model: currentModel,
-                messages: messages,
-                stream: false
-            })
-        });
-        
-        if (!response.ok) {
-            throw new Error('Request failed');
-        }
-        
-        const data = await response.json();
-        const assistantMessage = data.choices[0].message.content;
-        
-        addMessage('assistant', assistantMessage);
-        messages.push({ role: 'assistant', content: assistantMessage });
-        
-    } catch (error) {
-        addMessage('assistant', 'Error: ' + error.message);
-    } finally {
-        sendBtn.disabled = false;
-        sendBtn.textContent = 'Send';
-    }
+async function send() {
+  if (busy) return;
+  const model = document.getElementById('model-sel').value;
+  if (!model) { document.getElementById('model-sel').focus(); return; }
+  const input = document.getElementById('chat-in');
+  const text = input.value.trim();
+  if (!text) return;
+
+  addMsg('user', text);
+  history.push({role:'user', content:text});
+  input.value = '';
+  input.style.height = 'auto';
+
+  busy = true;
+  document.getElementById('send-btn').disabled = true;
+  document.getElementById('typing').textContent = 'Assistant is typing…';
+
+  try {
+    const r = await fetch('/v1/chat/completions', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({model, messages: history, stream:false})
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    const reply = d.choices[0].message.content;
+    addMsg('assistant', reply);
+    history.push({role:'assistant', content:reply});
+  } catch (e) {
+    addMsg('assistant', 'Error: ' + e.message);
+  } finally {
+    busy = false;
+    document.getElementById('send-btn').disabled = false;
+    document.getElementById('typing').textContent = '';
+  }
+}
+
+document.getElementById('chat-in').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+document.getElementById('chat-in').addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 140) + 'px';
 });
 
-// Handle Enter key (Shift+Enter for new line)
-document.getElementById('chat-input').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        document.getElementById('chat-form').dispatchEvent(new Event('submit'));
-    }
-});
-
-// Load models on page load
 loadModels();
 </script>
 {% endblock %}

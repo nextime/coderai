@@ -1,215 +1,1144 @@
 {% extends "base.html" %}
+{% block title %}Models — CoderAI{% endblock %}
 
-{% block title %}Models - CoderAI{% endblock %}
+{% block head %}
+<style>
+/* chips */
+.chip{display:inline-flex;align-items:center;padding:.2rem .55rem;border-radius:20px;cursor:pointer;background:var(--raised);border:1px solid var(--border);font-size:11px;font-weight:500;user-select:none;white-space:nowrap;transition:background .1s,border-color .1s,color .1s}
+.chip:hover{border-color:var(--border-2)}
+.chip.on{background:var(--accent-s);border-color:rgba(99,102,241,.35);color:#A5B4FC}
+.chip-row{display:flex;flex-wrap:wrap;gap:.3rem;align-items:center}
+/* gguf 3-way toggle */
+.tog-grp{display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.tog-btn{border:none!important;border-radius:0!important;background:var(--raised)!important;color:var(--text-2)!important;font-size:11px!important;padding:.25rem .65rem!important;cursor:pointer;font-weight:500;transition:all .1s}
+.tog-btn:hover{color:var(--text)!important}
+.tog-btn.on{background:var(--accent-s)!important;color:#A5B4FC!important}
+.tog-btn+.tog-btn{border-left:1px solid var(--border)!important}
+/* filter label */
+.fl{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-2);white-space:nowrap}
+/* info drawer */
+#info-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:200}
+#info-drawer{position:fixed;top:0;right:0;width:540px;max-width:96vw;height:100vh;background:var(--bg);border-left:1px solid var(--border);z-index:201;overflow-y:auto;transform:translateX(100%);transition:transform .22s cubic-bezier(.4,0,.2,1)}
+#info-drawer.open{transform:translateX(0)}
+#info-sticky{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--border);z-index:1;padding:1rem 1.25rem;display:flex;align-items:center;gap:.75rem}
+#info-title{font-weight:600;font-size:14px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+</style>
+{% endblock %}
 
 {% block content %}
 <div class="page-header">
+  <div>
     <h1>Models</h1>
-    <div class="header-actions">
-        <button class="btn btn-primary" onclick="showDownloadModal()">Download Model</button>
-    </div>
+    <p>Configure and download AI models</p>
+  </div>
+  <div class="header-actions">
+    <button class="btn btn-secondary" onclick="openModal('upload-modal')">Upload GGUF</button>
+    <button class="btn btn-primary" onclick="openModal('dl-modal')">Download model</button>
+  </div>
 </div>
 
 <div class="tabs">
-    <button class="tab-btn active" onclick="showTab('local')">Local Models</button>
-    <button class="tab-btn" onclick="showTab('search')">Search HuggingFace</button>
-    <button class="tab-btn" onclick="showTab('config')">Configuration</button>
+  <button class="tab active" onclick="switchTab('local', this)">Local models</button>
+  <button class="tab" onclick="switchTab('search', this)">Find on HuggingFace</button>
 </div>
 
-<div id="tab-local" class="tab-content active">
-    <div class="card">
-        <h3>Text Models</h3>
-        <div id="text-models-list">
-            <p class="text-muted">No text models configured</p>
-        </div>
-    </div>
-    
-    <div class="card">
-        <h3>Image Models</h3>
-        <div id="image-models-list">
-            <p class="text-muted">No image models configured</p>
-        </div>
-    </div>
-    
-    <div class="card">
-        <h3>Audio Models</h3>
-        <div id="audio-models-list">
-            <p class="text-muted">No audio models configured</p>
-        </div>
-    </div>
-    
-    <div class="card">
-        <h3>GGUF Models</h3>
-        <div id="gguf-models-list">
-            <p class="text-muted">No GGUF models configured</p>
-        </div>
-    </div>
+<!-- active downloads strip (all tabs) -->
+<div id="dl-strip" style="display:none;background:var(--raised);border:1px solid var(--border);border-radius:8px;margin-bottom:1rem;padding:.5rem .875rem">
+  <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-2);margin-bottom:.4rem">Active downloads</div>
+  <div id="dl-strip-list"></div>
 </div>
 
-<div id="tab-search" class="tab-content">
-    <div class="card">
-        <h3>Search HuggingFace Models</h3>
-        <div class="search-form">
-            <input type="text" id="search-query" placeholder="Search models..." class="form-control">
-            <div class="filter-group">
-                <label>
-                    <input type="checkbox" id="filter-gguf" checked>
-                    GGUF only
-                </label>
-                <label>
-                    <input type="checkbox" id="filter-text" checked>
-                    Text models
-                </label>
-                <label>
-                    <input type="checkbox" id="filter-image">
-                    Image models
-                </label>
-            </div>
-            <button class="btn btn-primary" onclick="searchModels()">Search</button>
-        </div>
-        
-        <div id="search-results" class="search-results">
-            <p class="text-muted">Enter a search query to find models</p>
-        </div>
+<!-- LOCAL -->
+<div id="tab-local" class="tab-panel active">
+
+  <!-- cache stats -->
+  <div class="card">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem;margin-bottom:1rem">
+      <div class="card-title" style="margin:0">Storage</div>
+      <div style="display:flex;gap:.35rem;flex-wrap:wrap">
+        <button class="btn btn-ghost btn-sm" onclick="refreshLocal()">↺ Refresh</button>
+        <button class="btn btn-danger btn-sm" onclick="clearCacheConfirm('hf')">Clear HF</button>
+        <button class="btn btn-danger btn-sm" onclick="clearCacheConfirm('gguf')">Clear GGUF</button>
+        <button class="btn btn-danger btn-sm" onclick="clearCacheConfirm('all')">Clear all</button>
+      </div>
     </div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:.75rem" id="cache-stats-row">
+      <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:.75rem 1rem">
+        <div class="fl">HuggingFace</div>
+        <div id="stat-hf-size" style="font-size:1.2rem;font-weight:600;margin:.3rem 0">—</div>
+        <div id="stat-hf-count" class="muted small">— models</div>
+        <div id="stat-hf-free" class="muted small" style="margin-top:.25rem">— free</div>
+      </div>
+      <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:.75rem 1rem">
+        <div class="fl">GGUF cache</div>
+        <div id="stat-gguf-size" style="font-size:1.2rem;font-weight:600;margin:.3rem 0">—</div>
+        <div id="stat-gguf-count" class="muted small">— files</div>
+        <div id="stat-gguf-free" class="muted small" style="margin-top:.25rem">— free</div>
+      </div>
+      <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:.75rem 1rem">
+        <div class="fl">Total used</div>
+        <div id="stat-total-size" style="font-size:1.2rem;font-weight:600;margin:.3rem 0">—</div>
+        <div class="muted small">on disk</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- HF models -->
+  <div class="card">
+    <div class="card-title">HuggingFace models <span id="hf-model-badge" class="muted small"></span></div>
+    <div id="hf-models-list"><span class="muted small">Loading…</span></div>
+  </div>
+
+  <!-- GGUF files -->
+  <div class="card mb-0">
+    <div class="card-title">GGUF files <span id="gguf-file-badge" class="muted small"></span></div>
+    <div id="gguf-models-list"><span class="muted small">Loading…</span></div>
+  </div>
 </div>
 
-<div id="tab-config" class="tab-content">
-    <div class="card">
-        <h3>Model Loading Configuration</h3>
-        <form id="config-form" class="form">
-            <div class="form-group">
-                <label for="load-mode">Load Mode</label>
-                <select id="load-mode" name="load_mode" class="form-control">
-                    <option value="ondemand">On Demand (default)</option>
-                    <option value="loadall">Load All</option>
-                    <option value="loadswap">Load & Swap</option>
-                </select>
-                <small class="form-text">
-                    On Demand: Load one model at a time<br>
-                    Load All: Try to load all models in VRAM<br>
-                    Load & Swap: Keep models in RAM, swap to VRAM as needed
-                </small>
-            </div>
-            
-            <div class="form-group">
-                <label>Models to Load at Startup</label>
-                <div id="loaded-models-list">
-                    <p class="text-muted">No models selected</p>
-                </div>
-            </div>
-            
-            <div class="form-group">
-                <label>Models to Pre-load (RAM)</label>
-                <div id="preload-models-list">
-                    <p class="text-muted">No models selected</p>
-                </div>
-            </div>
-            
-            <button type="submit" class="btn btn-primary">Save Configuration</button>
-        </form>
+<!-- SEARCH -->
+<div id="tab-search" class="tab-panel">
+  <div class="card">
+    <div class="card-title">Search HuggingFace</div>
+
+    <!-- query row -->
+    <div class="search-bar" style="margin-bottom:.75rem">
+      <input type="text" id="search-q" class="form-input" placeholder="Search models (e.g. llama, mistral, qwen…)">
+      <button class="btn btn-secondary" onclick="doSearch()">Search</button>
     </div>
+
+    <!-- filter row 1: toggles + dropdowns -->
+    <div style="display:flex;flex-wrap:wrap;gap:.625rem;align-items:center;margin-bottom:.625rem">
+      <div style="display:flex;align-items:center;gap:.35rem">
+        <span class="fl">Format</span>
+        <div class="tog-grp">
+          <button class="tog-btn on" data-val="gguf">GGUF</button>
+          <button class="tog-btn" data-val="all">All</button>
+          <button class="tog-btn" data-val="no-gguf">No GGUF</button>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:.35rem">
+        <span class="fl">Type</span>
+        <select id="filter-pipeline" class="form-input" style="padding:.25rem .4rem;font-size:12px">
+          <option value="">All</option>
+          <option value="text-generation">Text generation</option>
+          <option value="text2text-generation">Text-to-text</option>
+          <option value="text-to-image">Text-to-image</option>
+          <option value="image-to-text">Image-to-text</option>
+          <option value="automatic-speech-recognition">Speech recog.</option>
+          <option value="text-to-speech">TTS</option>
+          <option value="feature-extraction">Embeddings</option>
+        </select>
+      </div>
+      <div style="display:flex;align-items:center;gap:.35rem">
+        <span class="fl">Arch</span>
+        <select id="filter-arch" class="form-input" style="padding:.25rem .4rem;font-size:12px">
+          <option value="">Any</option>
+          <option value="moe">MoE</option>
+          <option value="lora">LoRA</option>
+        </select>
+      </div>
+      <div style="display:flex;align-items:center;gap:.35rem">
+        <span class="fl">Sort</span>
+        <select id="filter-sort" class="form-input" style="padding:.25rem .4rem;font-size:12px">
+          <option value="downloads">Most downloaded</option>
+          <option value="likes">Most liked</option>
+          <option value="lastModified">Recently updated</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- filter row 2: size chips -->
+    <div style="display:flex;align-items:flex-start;gap:.5rem;margin-bottom:.5rem">
+      <span class="fl" style="padding-top:.25rem;min-width:32px">Size</span>
+      <div class="chip-row" id="size-chips">
+        <span class="chip" data-val="0.5b">0.5B</span>
+        <span class="chip" data-val="1b">1B</span>
+        <span class="chip" data-val="1.5b">1.5B</span>
+        <span class="chip" data-val="3b">3B</span>
+        <span class="chip" data-val="4b">4B</span>
+        <span class="chip" data-val="7b">7B</span>
+        <span class="chip" data-val="8b">8B</span>
+        <span class="chip" data-val="9b">9B</span>
+        <span class="chip" data-val="12b">12B</span>
+        <span class="chip" data-val="13b">13B</span>
+        <span class="chip" data-val="14b">14B</span>
+        <span class="chip" data-val="22b">22B</span>
+        <span class="chip" data-val="27b">27B</span>
+        <span class="chip" data-val="32b">32B</span>
+        <span class="chip" data-val="34b">34B</span>
+        <span class="chip" data-val="40b">40B</span>
+        <span class="chip" data-val="70b">70B</span>
+        <span class="chip" data-val="72b">72B</span>
+        <span class="chip" data-val="90b">90B</span>
+        <span class="chip" data-val="123b">123B</span>
+        <span class="chip" data-val="235b">235B</span>
+        <span class="chip" data-val="671b">671B</span>
+      </div>
+    </div>
+
+    <!-- filter row 3: quant chips (file-level filter) -->
+    <div style="display:flex;align-items:flex-start;gap:.5rem;margin-bottom:1rem">
+      <span class="fl" style="padding-top:.25rem;min-width:32px">Quant</span>
+      <div class="chip-row" id="quant-chips">
+        <span class="chip" data-val="Q2_K">Q2_K</span>
+        <span class="chip" data-val="Q3_K_M">Q3_K_M</span>
+        <span class="chip" data-val="Q4_K_S">Q4_K_S</span>
+        <span class="chip" data-val="Q4_K_M">Q4_K_M ★</span>
+        <span class="chip" data-val="Q5_K_S">Q5_K_S</span>
+        <span class="chip" data-val="Q5_K_M">Q5_K_M</span>
+        <span class="chip" data-val="Q6_K">Q6_K</span>
+        <span class="chip" data-val="Q8_0">Q8_0</span>
+        <span class="chip" data-val="F16">F16</span>
+        <span class="chip" data-val="IQ4_XS">IQ4_XS</span>
+        <span class="chip" data-val="IQ3_XXS">IQ3_XXS</span>
+        <span class="chip" data-val="IQ2_XXS">IQ2_XXS</span>
+      </div>
+    </div>
+
+    <div id="search-results"><span class="muted small">Enter a query above to search</span></div>
+  </div>
 </div>
 
-<!-- Download Modal -->
-<div id="download-modal" class="modal">
-    <div class="modal-content">
-        <div class="modal-header">
-            <h2>Download Model</h2>
-            <button class="modal-close" onclick="hideDownloadModal()">&times;</button>
-        </div>
-        <div class="modal-body">
-            <form id="download-form">
-                <div class="form-group">
-                    <label for="model-id">Model ID or URL</label>
-                    <input type="text" id="model-id" class="form-control" 
-                           placeholder="e.g., TheBloke/Llama-2-7B-GGUF" required>
-                    <small class="form-text">HuggingFace model ID or direct URL</small>
-                </div>
-                
-                <div class="form-group">
-                    <label for="file-pattern">File Pattern (optional)</label>
-                    <input type="text" id="file-pattern" class="form-control" 
-                           placeholder=".gguf">
-                    <small class="form-text">Filter files to download (e.g., .gguf, .safetensors)</small>
-                </div>
-                
-                <div class="form-actions">
-                    <button type="submit" class="btn btn-primary">Download</button>
-                    <button type="button" class="btn btn-secondary" onclick="hideDownloadModal()">Cancel</button>
-                </div>
-            </form>
-            <div id="download-progress" class="download-progress" style="display: none;">
-                <p>Downloading...</p>
-                <div class="progress-bar">
-                    <div class="progress-fill" id="download-progress-bar"></div>
-                </div>
-            </div>
-        </div>
+
+<!-- Download modal -->
+<div id="dl-modal" class="modal">
+  <div class="modal-box">
+    <div class="modal-head">
+      <span class="modal-title">Download model</span>
+      <button class="modal-close" onclick="closeModal('dl-modal')">×</button>
     </div>
+    <div class="modal-body">
+      <div id="dl-form">
+        <div class="form-row">
+          <label class="form-label">HuggingFace repo ID or URL</label>
+          <input type="text" id="dl-id" class="form-input" placeholder="e.g. bartowski/Llama-3.1-8B-Instruct-GGUF">
+        </div>
+        <!-- GGUF mode: specific file or pattern -->
+        <div id="dl-pattern-row" class="form-row">
+          <label class="form-label">File / pattern</label>
+          <input type="text" id="dl-pattern" class="form-input" placeholder=".gguf">
+          <span class="form-hint" id="dl-hint">Exact filename (e.g. <code>model-Q4_K_M.gguf</code>) or pattern (<code>.gguf</code>). Leave blank to download the first .gguf found.</span>
+        </div>
+        <!-- Snapshot mode: full repo via HF API -->
+        <div id="dl-snapshot-note" class="alert alert-info" style="display:none">
+          Will download the full repository using the HuggingFace snapshot API. This is the correct method for safetensors / non-GGUF models. Large repos may take a while.
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-primary" onclick="startDownload()">Download</button>
+          <button class="btn btn-ghost" onclick="closeModal('dl-modal')">Close</button>
+        </div>
+      </div>
+      <div id="dl-progress" style="display:none;padding:.25rem 0">
+        <div id="dl-filename" style="font-size:13px;font-weight:500;margin-bottom:.5rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Preparing…</div>
+        <div class="progress" style="margin-top:0;margin-bottom:.35rem;height:5px;background:var(--border-2)"><div id="dl-bar" class="progress-fill" style="width:0%;height:100%"></div></div>
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-2);margin-bottom:.75rem">
+          <span id="dl-bytes">—</span>
+          <span id="dl-speed">—</span>
+          <span id="dl-eta">—</span>
+          <span id="dl-pct">0%</span>
+        </div>
+        <div id="dl-log" style="display:none;background:var(--raised);border-radius:6px;padding:.4rem .6rem;font-size:11px;font-family:monospace;color:var(--text-2);max-height:72px;overflow-y:auto"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Upload modal -->
+<div id="upload-modal" class="modal">
+  <div class="modal-box">
+    <div class="modal-head">
+      <span class="modal-title">Upload GGUF model</span>
+      <button class="modal-close" onclick="closeModal('upload-modal')">×</button>
+    </div>
+    <div class="modal-body">
+      <div id="upload-form">
+        <div class="form-row">
+          <label class="form-label">Select GGUF file</label>
+          <input type="file" id="upload-file" class="form-input" accept=".gguf">
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-primary" onclick="startUpload()">Upload</button>
+          <button class="btn btn-ghost" onclick="closeModal('upload-modal')">Close</button>
+        </div>
+      </div>
+      <div id="upload-progress" style="display:none;padding:.25rem 0">
+        <div id="upload-filename" style="font-size:13px;font-weight:500;margin-bottom:.5rem">Uploading…</div>
+        <div class="progress" style="margin-top:0;margin-bottom:.35rem;height:5px;background:var(--border-2)"><div id="upload-bar" class="progress-fill" style="width:0%;height:100%"></div></div>
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-2)">
+          <span id="upload-pct">0%</span>
+          <span id="upload-status">—</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Model configuration modal -->
+<div id="cfg-modal" class="modal">
+  <div class="modal-box" style="max-width:600px;max-height:92vh;overflow-y:auto">
+    <div class="modal-head" style="position:sticky;top:0;background:var(--card);z-index:1;border-bottom:1px solid var(--border)">
+      <span class="modal-title" id="cfg-modal-title">Configure model</span>
+      <button class="modal-close" onclick="closeModal('cfg-modal')">×</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="cfg-path">
+      <input type="hidden" id="cfg-orig-type">
+
+      <!-- identity -->
+      <div class="form-row">
+        <label class="form-label">Model ID / path</label>
+        <div id="cfg-id-label" style="font-size:12px;font-family:monospace;color:var(--text-2);word-break:break-all;padding:.3rem 0"></div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Type</label>
+          <select id="cfg-type" class="form-input">
+            <option value="text_models">Text (LLM)</option>
+            <option value="image_models">Image generation</option>
+            <option value="audio_models">Audio</option>
+            <option value="tts_models">TTS</option>
+            <option value="vision_models">Vision</option>
+          </select>
+        </div>
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Alias <span class="muted">(optional)</span></label>
+          <input type="text" id="cfg-alias" class="form-input" placeholder="Friendly name">
+        </div>
+      </div>
+
+      <!-- backend -->
+      <div class="card-title" style="margin-top:1.25rem">Backend</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Compute backend</label>
+          <select id="cfg-backend" class="form-input">
+            <option value="auto">Auto-detect</option>
+            <option value="nvidia">NVIDIA (CUDA)</option>
+            <option value="vulkan">Vulkan</option>
+            <option value="opencl">OpenCL</option>
+            <option value="cpu">CPU only</option>
+          </select>
+        </div>
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Load mode</label>
+          <select id="cfg-load-mode" class="form-input">
+            <option value="load">Load (pre-load in VRAM)</option>
+            <option value="on-request">On-request (load when needed)</option>
+          </select>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem;margin-top:.75rem">
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Used VRAM <span class="muted">(GB)</span></label>
+          <input type="number" id="cfg-used-vram" class="form-input" min="0" step="0.1" placeholder="auto-estimate">
+          <span class="form-hint" id="cfg-used-vram-hint" style="font-size:11px;color:var(--text-3)"></span>
+        </div>
+      </div>
+
+      <!-- inference -->
+      <div class="card-title" style="margin-top:1.25rem">Inference</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
+        <div class="form-row" style="margin:0">
+          <label class="form-label">GPU layers <span class="muted">(-1 = all)</span></label>
+          <input type="number" id="cfg-gpu-layers" class="form-input" min="-1" value="-1">
+        </div>
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Context size</label>
+          <input type="number" id="cfg-n-ctx" class="form-input" min="128" step="128" value="2048">
+        </div>
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Max GPU % <span class="muted">(optional)</span></label>
+          <input type="number" id="cfg-max-gpu" class="form-input" min="1" max="100" placeholder="e.g. 90">
+        </div>
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Manual RAM GB <span class="muted">(optional)</span></label>
+          <input type="number" id="cfg-ram-gb" class="form-input" min="0" step="0.5" placeholder="auto">
+        </div>
+      </div>
+      <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-top:.75rem">
+        <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-4bit"> 4-bit quantization</label>
+        <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-8bit"> 8-bit quantization</label>
+        <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-flash"> Flash Attention 2</label>
+        <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-noram"> No RAM fallback</label>
+      </div>
+
+      <!-- offload -->
+      <div class="card-title" style="margin-top:1.25rem">Offload</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Strategy</label>
+          <select id="cfg-offload-strategy" class="form-input">
+            <option value="auto">Auto</option>
+            <option value="cpu">CPU RAM</option>
+            <option value="disk">Disk</option>
+            <option value="none">None</option>
+          </select>
+        </div>
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Offload directory</label>
+          <input type="text" id="cfg-offload-dir" class="form-input" placeholder="./offload">
+        </div>
+      </div>
+
+      <!-- generation -->
+      <div class="card-title" style="margin-top:1.25rem">Generation</div>
+      <div class="form-row">
+        <label class="form-label">System prompt <span class="muted">(optional)</span></label>
+        <textarea id="cfg-sysprompt" class="form-input" rows="3"
+          placeholder="You are a helpful assistant…"
+          style="resize:vertical;font-family:var(--font-mono,monospace);font-size:12px;line-height:1.5"></textarea>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Chat template parser</label>
+          <select id="cfg-parser" class="form-input">
+            <option value="auto">Auto-detect</option>
+            <option value="llama">Llama</option>
+            <option value="mistral">Mistral</option>
+            <option value="chatml">ChatML</option>
+            <option value="phi">Phi</option>
+            <option value="gemma">Gemma</option>
+            <option value="qwen">Qwen</option>
+          </select>
+        </div>
+      </div>
+      <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-top:.75rem">
+        <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-tools"> Tools closer prompt</label>
+        <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-grammar"> Grammar-guided generation</label>
+      </div>
+
+      <div class="form-actions" style="margin-top:1.5rem">
+        <button class="btn btn-primary" onclick="saveModelConfig()">Save</button>
+        <button class="btn btn-ghost" onclick="closeModal('cfg-modal')">Cancel</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Model info drawer -->
+<div id="info-overlay" onclick="closeInfo()"></div>
+<div id="info-drawer">
+  <div id="info-sticky">
+    <div id="info-title">—</div>
+    <button class="btn btn-ghost btn-sm" onclick="closeInfo()">✕</button>
+  </div>
+  <div id="info-body" style="padding:1.25rem 1.5rem"></div>
 </div>
 {% endblock %}
 
 {% block scripts %}
 <script>
-function showTab(tabName) {
-    document.querySelectorAll('.tab-content').forEach(tab => {
-        tab.classList.remove('active');
-    });
-    document.querySelectorAll('.tab-btn').forEach(btn => {
-        btn.classList.remove('active');
-    });
-    
-    document.getElementById('tab-' + tabName).classList.add('active');
-    event.target.classList.add('active');
-}
+/* ── helpers ─────────────────────────────────────────── */
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function fmtNum(n){if(!n)return'0';return n>=1e6?(n/1e6).toFixed(1)+'M':n>=1000?(n/1000).toFixed(1)+'k':String(n)}
+function fmtGB(gb){if(!gb)return'—';return gb>=1?gb.toFixed(1)+' GB':(gb*1024).toFixed(0)+' MB'}
+function fmtDate(s){try{return new Date(s).toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'})}catch{return s}}
 
-function showDownloadModal() {
-    document.getElementById('download-modal').style.display = 'flex';
+/* ── tab / modal ─────────────────────────────────────── */
+function switchTab(name,btn){
+  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+  btn.classList.add('active');
 }
+function openModal(id){document.getElementById(id).classList.add('show')}
+function closeModal(id){document.getElementById(id).classList.remove('show')}
 
-function hideDownloadModal() {
-    document.getElementById('download-modal').style.display = 'none';
-}
-
-async function searchModels() {
-    const query = document.getElementById('search-query').value;
-    const resultsDiv = document.getElementById('search-results');
-    
-    if (!query) {
-        resultsDiv.innerHTML = '<p class="text-muted">Enter a search query</p>';
-        return;
-    }
-    
-    resultsDiv.innerHTML = '<p>Searching...</p>';
-    
-    // TODO: Implement actual HuggingFace API search
-    setTimeout(() => {
-        resultsDiv.innerHTML = '<p class="text-muted">Search functionality coming soon</p>';
-    }, 1000);
-}
-
-document.getElementById('download-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    
-    const modelId = document.getElementById('model-id').value;
-    const filePattern = document.getElementById('file-pattern').value;
-    
-    document.getElementById('download-progress').style.display = 'block';
-    
-    // TODO: Implement actual download
-    setTimeout(() => {
-        alert('Download functionality coming soon');
-        hideDownloadModal();
-        document.getElementById('download-progress').style.display = 'none';
-    }, 1000);
+/* ── GGUF format toggle ──────────────────────────────── */
+let _ggufMode = 'gguf';
+document.querySelectorAll('.tog-btn').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    document.querySelectorAll('.tog-btn').forEach(b=>b.classList.remove('on'));
+    btn.classList.add('on');
+    _ggufMode = btn.dataset.val;
+  });
 });
 
-// Load models on page load
-async function loadModels() {
-    // TODO: Implement loading models from API
+/* ── chip toggles ────────────────────────────────────── */
+document.querySelectorAll('.chip').forEach(c=>{
+  c.addEventListener('click',()=>c.classList.toggle('on'));
+});
+function getChips(id){return[...document.querySelectorAll('#'+id+' .chip.on')].map(c=>c.dataset.val)}
+
+/* ── search ──────────────────────────────────────────── */
+let _results   = [];
+let _filesCache = {};
+let _activeQuants = new Set();
+
+document.getElementById('search-q').addEventListener('keydown',e=>{if(e.key==='Enter')doSearch()});
+
+async function doSearch(){
+  const q   = document.getElementById('search-q').value.trim();
+  const out = document.getElementById('search-results');
+  const pipeline = document.getElementById('filter-pipeline').value;
+  const arch     = document.getElementById('filter-arch').value;
+  const sort     = document.getElementById('filter-sort').value;
+  const sizes    = getChips('size-chips').join(',');
+  _activeQuants  = new Set(getChips('quant-chips').map(v=>v.toUpperCase().split(' ')[0])); // strip ★
+
+  _filesCache = {};
+  _results    = [];
+  out.innerHTML = '<span class="muted small">Searching HuggingFace…</span>';
+
+  const params = new URLSearchParams({q:q||' ', gguf_mode:_ggufMode, sort});
+  if(pipeline) params.append('pipeline_tag', pipeline);
+  if(sizes)    params.append('sizes', sizes);
+  if(arch)     params.append('arch', arch);
+
+  try{
+    const r = await fetch('/admin/api/hf-search?'+params);
+    if(!r.ok){const e=await r.json();throw new Error(e.detail||r.statusText)}
+    _results = await r.json();
+    if(!_results.length){out.innerHTML='<span class="muted small">No results. Try different keywords or fewer filters.</span>';return}
+    out.innerHTML = _results.map((m,i)=>`
+      <div style="padding:.75rem 0;border-bottom:1px solid var(--border)">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:.5rem">
+          <div style="min-width:0;flex:1">
+            <div style="font-weight:500;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+                 title="${esc(m.id)}">${esc(m.id)}</div>
+            <div style="font-size:11px;color:var(--text-3);margin-top:.25rem;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
+              ${m.pipeline_tag?`<span class="badge badge-user">${esc(m.pipeline_tag)}</span>`:''}
+              <span>↓ ${fmtNum(m.downloads)}</span>
+              <span>♥ ${fmtNum(m.likes)}</span>
+            </div>
+          </div>
+          <div style="display:flex;gap:.3rem;flex-shrink:0">
+            <button class="btn btn-ghost btn-sm" onclick="openInfo(${i})">Info</button>
+            <button class="btn btn-ghost btn-sm" onclick="toggleFiles(${i})">▾ Files</button>
+            <button class="btn btn-secondary btn-sm" onclick="dlFromResult(${i})">Download</button>
+          </div>
+        </div>
+        <div id="fp-${i}" style="display:none;margin-top:.625rem;padding:.5rem .625rem;background:var(--raised);border-radius:6px">
+          <span class="muted small">Loading…</span>
+        </div>
+      </div>`).join('');
+  }catch(e){
+    out.innerHTML='<span class="muted small">Error: '+esc(e.message)+'</span>';
+  }
 }
 
-loadModels();
+function dlFromResult(i){
+  const m = _results[i];
+  if(looksLikeGguf(m.id, '')){
+    const selQuants = [..._activeQuants];
+    const pattern = selQuants.length===1 ? selQuants[0]+'.gguf' : '.gguf';
+    openDownloadFor(m.id, pattern);
+  } else {
+    openDownloadFor(m.id, '');  // triggers snapshot download
+  }
+}
+
+/* ── files panel ─────────────────────────────────────── */
+async function toggleFiles(i){
+  const panel = document.getElementById('fp-'+i);
+  if(panel.style.display!=='none'){panel.style.display='none';return}
+  panel.style.display='block';
+  const modelId = _results[i].id;
+  if(_filesCache[modelId]){renderFiles(panel,modelId,_filesCache[modelId]);return}
+  panel.innerHTML='<span class="muted small">Fetching file list…</span>';
+  try{
+    const r = await fetch('/admin/api/hf-model-files?model_id='+encodeURIComponent(modelId));
+    if(!r.ok)throw new Error((await r.json()).detail||r.statusText);
+    const files = await r.json();
+    _filesCache[modelId]=files;
+    renderFiles(panel,modelId,files);
+  }catch(e){panel.innerHTML='<span class="muted small">Error: '+esc(e.message)+'</span>'}
+}
+
+function renderFiles(panel,modelId,files){
+  const shown = _activeQuants.size>0
+    ? files.filter(f=>{
+        const q=(f.quant||'').toUpperCase();
+        return _activeQuants.has(q)||[..._activeQuants].some(aq=>f.name.toUpperCase().includes(aq));
+      })
+    : files;
+  if(!shown.length){
+    panel.innerHTML=`<span class="muted small">${_activeQuants.size?'No matching quant files — deselect quant chips to see all.':'No GGUF files found.'}</span>`;
+    return;
+  }
+  panel.innerHTML=
+    '<table style="width:100%;border-collapse:collapse;font-size:12px">'+
+    '<thead><tr style="color:var(--text-3);font-size:10px;text-transform:uppercase;letter-spacing:.04em">'+
+    '<th style="text-align:left;padding:.2rem .25rem">File</th>'+
+    '<th style="text-align:center;padding:.2rem .25rem">Quant</th>'+
+    '<th style="text-align:right;padding:.2rem .25rem">Size</th>'+
+    '<th style="text-align:right;padding:.2rem .25rem">≈ VRAM</th>'+
+    '<th></th></tr></thead><tbody>'+
+    shown.map(f=>
+      '<tr style="border-top:1px solid var(--border)">'+
+      `<td style="padding:.3rem .25rem;font-family:monospace;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(f.name)}">${esc(f.name)}</td>`+
+      `<td style="text-align:center;padding:.3rem .25rem">${f.quant?'<span class="badge badge-admin">'+esc(f.quant)+'</span>':''}</td>`+
+      `<td style="text-align:right;padding:.3rem .25rem;white-space:nowrap;color:var(--text-2)">${fmtGB(f.size_gb)}</td>`+
+      `<td style="text-align:right;padding:.3rem .25rem;white-space:nowrap;color:var(--text-3)">${f.vram_gb?'~'+fmtGB(f.vram_gb):''}</td>`+
+      `<td style="padding:.3rem .25rem;text-align:right"><button class="btn btn-secondary btn-sm" onclick="openDownloadFor('${esc(modelId)}','${esc(f.name)}')">↓</button></td>`+
+      '</tr>'
+    ).join('')+
+    '</tbody></table>';
+}
+
+/* ── info drawer ─────────────────────────────────────── */
+function openInfo(i){
+  const m = _results[i];
+  document.getElementById('info-title').textContent = m.id;
+  document.getElementById('info-body').innerHTML = '<span class="muted small">Loading…</span>';
+  document.getElementById('info-overlay').style.display='block';
+  document.getElementById('info-drawer').classList.add('open');
+  document.body.style.overflow='hidden';
+  loadInfo(m.id);
+}
+function closeInfo(){
+  document.getElementById('info-overlay').style.display='none';
+  document.getElementById('info-drawer').classList.remove('open');
+  document.body.style.overflow='';
+}
+
+async function loadInfo(modelId){
+  try{
+    const r = await fetch('/admin/api/hf-model-info?model_id='+encodeURIComponent(modelId));
+    if(!r.ok)throw new Error((await r.json()).detail||r.statusText);
+    renderInfo(await r.json());
+  }catch(e){
+    document.getElementById('info-body').innerHTML='<span class="muted small">Error: '+esc(e.message)+'</span>';
+  }
+}
+
+function renderInfo(d){
+  const escId = esc(d.id);
+  let html=`
+    <div style="display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:1.25rem">
+      <a href="https://huggingface.co/${escId}" target="_blank" class="btn btn-ghost btn-sm">HuggingFace ↗</a>
+      <button class="btn btn-secondary btn-sm" onclick="openDownloadFor('${escId}','${d.gguf_files&&d.gguf_files.length?'.gguf':''}')">Download repo</button>
+      ${d.gated?'<span class="badge badge-admin" style="align-self:center">Gated</span>':''}
+      ${d.private?'<span class="badge badge-user" style="align-self:center">Private</span>':''}
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:.625rem 1.25rem;font-size:13px;margin-bottom:1.25rem">
+      ${d.pipeline_tag?`<div><div class="fl" style="margin-bottom:.2rem">Type</div>${esc(d.pipeline_tag)}</div>`:''}
+      ${d.params_label?`<div><div class="fl" style="margin-bottom:.2rem">Parameters</div>${esc(d.params_label)}</div>`:''}
+      <div><div class="fl" style="margin-bottom:.2rem">Downloads</div>↓ ${fmtNum(d.downloads)}</div>
+      <div><div class="fl" style="margin-bottom:.2rem">Likes</div>♥ ${fmtNum(d.likes)}</div>
+      ${d.license?`<div><div class="fl" style="margin-bottom:.2rem">License</div>${esc(d.license)}</div>`:''}
+      ${d.last_modified?`<div><div class="fl" style="margin-bottom:.2rem">Updated</div>${fmtDate(d.last_modified)}</div>`:''}
+      ${d.author?`<div><div class="fl" style="margin-bottom:.2rem">Author</div>${esc(d.author)}</div>`:''}
+      ${d.file_count?`<div><div class="fl" style="margin-bottom:.2rem">Files in repo</div>${d.file_count}</div>`:''}
+      ${d.base_model?`<div style="grid-column:span 2"><div class="fl" style="margin-bottom:.2rem">Base model</div><code style="font-size:11px">${esc(d.base_model)}</code></div>`:''}
+      ${d.language&&d.language.length?`<div style="grid-column:span 2"><div class="fl" style="margin-bottom:.2rem">Languages</div>${d.language.slice(0,8).map(esc).join(', ')}</div>`:''}
+    </div>`;
+
+  const relevantTags = (d.tags||[]).filter(t=>!['transformers','safetensors','gguf','pytorch','jax'].includes(t));
+  if(relevantTags.length){
+    html+=`<div style="margin-bottom:1.25rem">
+      <div class="fl" style="margin-bottom:.4rem">Tags</div>
+      ${relevantTags.slice(0,30).map(t=>`<span class="badge badge-user" style="margin:.1rem">${esc(t)}</span>`).join('')}
+    </div>`;
+  }
+
+  if(d.gguf_files&&d.gguf_files.length){
+    html+=`<div class="card-title">GGUF files (${d.gguf_files.length})</div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead><tr style="color:var(--text-3);font-size:10px;text-transform:uppercase;letter-spacing:.04em">
+        <th style="text-align:left;padding:.25rem .25rem">File</th>
+        <th style="text-align:center;padding:.25rem .25rem">Quant</th>
+        <th style="text-align:right;padding:.25rem .25rem">Size</th>
+        <th style="text-align:right;padding:.25rem .25rem">≈ VRAM</th>
+        <th></th>
+      </tr></thead><tbody>
+      ${d.gguf_files.map(f=>`
+        <tr style="border-top:1px solid var(--border)">
+          <td style="padding:.35rem .25rem;font-family:monospace;font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(f.name)}">${esc(f.name)}</td>
+          <td style="text-align:center;padding:.35rem .25rem">${f.quant?`<span class="badge badge-admin">${esc(f.quant)}</span>`:''}</td>
+          <td style="text-align:right;padding:.35rem .25rem;white-space:nowrap;color:var(--text-2)">${fmtGB(f.size_gb)}</td>
+          <td style="text-align:right;padding:.35rem .25rem;white-space:nowrap;color:var(--text-3)">${f.vram_gb?'~'+fmtGB(f.vram_gb):''}</td>
+          <td style="padding:.35rem .25rem;text-align:right"><button class="btn btn-secondary btn-sm" onclick="openDownloadFor('${escId}','${esc(f.name)}')">↓</button></td>
+        </tr>`).join('')}
+      </tbody>
+    </table>`;
+  } else {
+    html+=`<div class="muted small">No GGUF files in this repo.</div>`;
+  }
+
+  document.getElementById('info-title').textContent = d.id;
+  document.getElementById('info-body').innerHTML = html;
+}
+
+/* ── download modal ──────────────────────────────────── */
+function looksLikeGguf(modelId, filePattern){
+  if(filePattern && filePattern.toLowerCase().includes('.gguf')) return true;
+  if(_ggufMode==='gguf') return true;
+  if(modelId.toLowerCase().includes('gguf')) return true;
+  return false;
+}
+
+function openDownloadFor(modelId, filePattern){
+  document.getElementById('dl-id').value = modelId;
+  const isGguf = looksLikeGguf(modelId, filePattern);
+  if(isGguf){
+    document.getElementById('dl-pattern-row').style.display = 'block';
+    document.getElementById('dl-snapshot-note').style.display = 'none';
+    document.getElementById('dl-pattern').value = filePattern || '.gguf';
+  } else {
+    document.getElementById('dl-pattern-row').style.display = 'none';
+    document.getElementById('dl-snapshot-note').style.display = 'flex';
+    document.getElementById('dl-pattern').value = '';
+  }
+  openModal('dl-modal');
+}
+
+/* progress helpers */
+function fmtBytes(n){if(!n&&n!==0)return'—';if(n>=1e9)return(n/1e9).toFixed(2)+' GB';if(n>=1e6)return(n/1e6).toFixed(1)+' MB';if(n>=1e3)return(n/1e3).toFixed(0)+' KB';return n+' B'}
+function fmtRate(bps){return bps?(fmtBytes(bps)+'/s'):''}
+function fmtEta(s){if(s===null||s===undefined)return'';s=Math.round(s);if(s<60)return s+'s left';const m=Math.floor(s/60),ss=s%60;if(m<60)return m+':'+String(ss).padStart(2,'0')+' left';return Math.floor(m/60)+'h '+(m%60)+'m left'}
+
+let _dlEs = null;
+let _dlDone = false;
+
+function _dlReset(){
+  const bar = document.getElementById('dl-bar');
+  bar.style.transition = 'none';
+  bar.style.width = '0%';
+  document.getElementById('dl-filename').textContent='Preparing…';
+  document.getElementById('dl-bytes').textContent='—';
+  document.getElementById('dl-speed').textContent='—';
+  document.getElementById('dl-eta').textContent='—';
+  document.getElementById('dl-pct').textContent='0%';
+  document.getElementById('dl-log').style.display='none';
+  document.getElementById('dl-log').innerHTML='';
+  requestAnimationFrame(()=>{ bar.style.transition=''; });
+}
+
+function _dlLog(msg){
+  const el=document.getElementById('dl-log');
+  el.style.display='block';
+  const d=document.createElement('div');
+  d.textContent=msg;
+  el.appendChild(d);
+  el.scrollTop=el.scrollHeight;
+}
+
+function showDownloadError(msg){
+  if(_dlEs){_dlEs.close();_dlEs=null}
+  document.getElementById('dl-form').style.display='block';
+  document.getElementById('dl-progress').style.display='none';
+  alert('Download error: '+msg);
+}
+
+function handleProgressEvent(evt){
+  if(evt.type==='start'){
+    document.getElementById('dl-filename').textContent=evt.filename||'Downloading…';
+    document.getElementById('dl-bytes').textContent='0 / '+fmtBytes(evt.total);
+    document.getElementById('dl-bar').style.width='0%';
+  }else if(evt.type==='progress'){
+    const pct=evt.percent||0;
+    document.getElementById('dl-bar').style.width=pct+'%';
+    document.getElementById('dl-pct').textContent=pct.toFixed(1)+'%';
+    document.getElementById('dl-bytes').textContent=fmtBytes(evt.downloaded)+' / '+fmtBytes(evt.total);
+    document.getElementById('dl-speed').textContent=fmtRate(evt.rate);
+    document.getElementById('dl-eta').textContent=fmtEta(evt.eta);
+    if(evt.filename) document.getElementById('dl-filename').textContent=evt.filename;
+  }else if(evt.type==='info'){
+    _dlLog(evt.message);
+  }else if(evt.type==='done'){
+    _dlDone=true;
+    if(_dlEs){_dlEs.close();_dlEs=null}
+    document.getElementById('dl-bar').style.width='100%';
+    document.getElementById('dl-pct').textContent='100%';
+    document.getElementById('dl-filename').textContent='Download complete!';
+    refreshLocal();
+    setTimeout(()=>{
+      closeModal('dl-modal');
+      document.getElementById('dl-form').style.display='block';
+      document.getElementById('dl-progress').style.display='none';
+      _dlReset();
+    },1800);
+  }else if(evt.type==='error'){
+    _dlDone=true;
+    showDownloadError(evt.message);
+  }
+  // keepalive: ignore
+}
+
+async function startDownload(){
+  const id=document.getElementById('dl-id').value.trim();
+  if(!id){document.getElementById('dl-id').focus();return}
+  _dlDone=false;
+  _dlReset();
+  document.getElementById('dl-form').style.display='none';
+  document.getElementById('dl-progress').style.display='block';
+  try{
+    const r=await fetch('/admin/api/model-download',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model_id:id,file_pattern:document.getElementById('dl-pattern').value||null})
+    });
+    if(!r.ok){const e=await r.json();showDownloadError(e.detail||'Request failed');return}
+    const {session_id}=await r.json();
+    _dlEs=new EventSource('/admin/api/download-stream/'+session_id);
+    _dlEs.onmessage=function(e){
+      try{handleProgressEvent(JSON.parse(e.data))}catch{}
+    };
+    _dlEs.onerror=function(){
+      if(_dlDone) return;
+      if(_dlEs&&_dlEs.readyState===EventSource.CLOSED) return;
+      showDownloadError('Connection to download stream lost');
+    };
+  }catch(e){showDownloadError(e.message)}
+}
+
+/* ── active downloads strip ──────────────────────────── */
+let _pollTimer = null;
+
+async function pollDownloads(){
+  try{
+    const r = await fetch('/admin/api/downloads');
+    if(!r.ok) return;
+    const all = await r.json();
+    const active = all.filter(d=>d.status!=='done'&&d.status!=='error');
+    const strip = document.getElementById('dl-strip');
+    const list  = document.getElementById('dl-strip-list');
+    if(!active.length){ strip.style.display='none'; return; }
+    strip.style.display='block';
+    list.innerHTML = active.map(d=>{
+      const pct = d.percent||0;
+      const name = d.filename||d.model_id||'';
+      const spd  = d.rate?fmtRate(d.rate):'';
+      const eta  = d.eta!=null?fmtEta(d.eta):'';
+      return `<div style="display:flex;align-items:center;gap:.75rem;padding:.2rem 0">
+        <div style="flex:1;min-width:0">
+          <div style="font-size:12px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(d.model_id)}</div>
+          <div style="font-size:11px;color:var(--text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(name)}</div>
+          <div class="progress" style="margin-top:.3rem;margin-bottom:0;height:3px"><div class="progress-fill" style="width:${pct}%"></div></div>
+        </div>
+        <div style="font-size:11px;color:var(--text-2);text-align:right;white-space:nowrap;flex-shrink:0">
+          <div>${pct.toFixed(1)}%</div>
+          ${spd?`<div>${esc(spd)}</div>`:''}
+          ${eta?`<div class="muted">${esc(eta)}</div>`:''}
+        </div>
+      </div>`;
+    }).join('<div style="border-top:1px solid var(--border);margin:.3rem 0"></div>');
+  }catch{}
+}
+
+function startPolling(){
+  if(_pollTimer) return;
+  _pollTimer = setInterval(pollDownloads, 2000);
+  pollDownloads();
+}
+
+startPolling();
+
+/* ── cache stats & local models ──────────────────────── */
+async function loadCacheStats(){
+  try{
+    const r = await fetch('/admin/api/cache-stats');
+    if(!r.ok) return;
+    const s = await r.json();
+    document.getElementById('stat-hf-size').textContent  = fmtBytes(s.hf_bytes);
+    document.getElementById('stat-hf-count').textContent = s.hf_models+' model'+(s.hf_models!==1?'s':'');
+    document.getElementById('stat-hf-free').textContent = s.hf_disk_free_bytes!=null ? fmtBytes(s.hf_disk_free_bytes)+' free' : '—';
+    document.getElementById('stat-gguf-size').textContent = fmtBytes(s.gguf_bytes);
+    document.getElementById('stat-gguf-count').textContent = s.gguf_files+' file'+(s.gguf_files!==1?'s':'');
+    document.getElementById('stat-gguf-free').textContent = s.gguf_disk_free_bytes!=null ? fmtBytes(s.gguf_disk_free_bytes)+' free' : '—';
+    document.getElementById('stat-total-size').textContent = fmtBytes((s.hf_bytes||0)+(s.gguf_bytes||0));
+  }catch{}
+}
+
+let _localModels = [];
+
+async function loadCachedModels(){
+  _localModels = [];
+  const hfEl   = document.getElementById('hf-models-list');
+  const ggufEl = document.getElementById('gguf-models-list');
+  hfEl.innerHTML = ggufEl.innerHTML = '<span class="muted small">Loading…</span>';
+  try{
+    const r = await fetch('/admin/api/cached-models');
+    if(!r.ok) throw new Error((await r.json()).detail||r.statusText);
+    const d = await r.json();
+
+    // HF models
+    const hf = d.hf||[];
+    document.getElementById('hf-model-badge').textContent = hf.length ? `(${hf.length})` : '';
+    if(!hf.length){
+      hfEl.innerHTML = '<span class="muted small">No HuggingFace models cached.</span>';
+    }else{
+      const rows = hf.map(m=>{
+        const idx = _localModels.length;
+        _localModels.push({label:m.id, path:m.id, cacheType:'hf', size_gb:m.size_gb||0,
+          defaultType:m.model_type||'text_models', settings:m.settings||{}, in_config:m.in_config});
+        const loaded = _loadedKeys.has(m.id) || [..._loadedKeys].some(k=>k.endsWith(':'+m.id)||k===m.id);
+        return `<tr style="border-top:1px solid var(--border)">
+          <td style="padding:.4rem .25rem;font-family:monospace;font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(m.id)}">${esc(m.id)}</td>
+          <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${fmtGB(m.size_gb)}</td>
+          <td style="text-align:right;padding:.4rem .25rem;color:var(--text-2)">${m.file_count}</td>
+          <td style="text-align:center;padding:.4rem .25rem">${m.in_config?'<span class="badge badge-ok">enabled</span>':'<span class="muted small">—</span>'}</td>
+          <td style="padding:.4rem .25rem;text-align:right;white-space:nowrap">
+            ${m.in_config?(loaded
+              ?`<button class="btn btn-ghost btn-sm" onclick="unloadModel(${idx})">Unload</button>`
+              :`<button class="btn btn-primary btn-sm" onclick="loadModel(${idx})">Load now</button>`):''}
+            <button class="btn btn-secondary btn-sm" onclick="openCfgModal(${idx})">${m.in_config?'Configure':'Add to CoderAI'}</button>
+            ${m.in_config?`<button class="btn btn-ghost btn-sm" onclick="disableModel(${idx})">Remove</button>`:''}
+            <button class="btn btn-danger btn-sm" onclick="deleteModelConfirm(${idx})">Delete</button>
+          </td>
+        </tr>`;
+      });
+      hfEl.innerHTML = '<table style="width:100%;border-collapse:collapse;font-size:13px">'+
+        '<thead><tr style="color:var(--text-2);font-size:10px;text-transform:uppercase;letter-spacing:.05em">'+
+        '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Model</th>'+
+        '<th style="text-align:right;padding:.3rem .25rem;font-weight:700">Size</th>'+
+        '<th style="text-align:right;padding:.3rem .25rem;font-weight:700">Files</th>'+
+        '<th style="text-align:center;padding:.3rem .25rem;font-weight:700">Config</th>'+
+        '<th></th></tr></thead><tbody>'+rows.join('')+'</tbody></table>';
+    }
+
+    // GGUF files
+    const gguf = d.gguf||[];
+    document.getElementById('gguf-file-badge').textContent = gguf.length ? `(${gguf.length})` : '';
+    if(!gguf.length){
+      ggufEl.innerHTML = '<span class="muted small">No GGUF files cached.</span>';
+    }else{
+      const rows = gguf.map(f=>{
+        const idx = _localModels.length;
+        _localModels.push({label:f.filename, path:f.path, cacheType:'gguf', size_gb:f.size_gb||0,
+          defaultType:f.model_type||'text_models', settings:f.settings||{}, in_config:f.in_config});
+        const loaded = _loadedKeys.has(f.path) || _loadedKeys.has(f.filename) || [..._loadedKeys].some(k=>k.endsWith(':'+f.path)||k.endsWith(':'+f.filename));
+        return `<tr style="border-top:1px solid var(--border)">
+          <td style="padding:.4rem .25rem;font-family:monospace;font-size:11px;max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(f.filename)}">${esc(f.filename)}</td>
+          <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${fmtGB(f.size_gb)}</td>
+          <td style="text-align:center;padding:.4rem .25rem">${f.in_config?'<span class="badge badge-ok">enabled</span>':'<span class="muted small">—</span>'}</td>
+          <td style="padding:.4rem .25rem;text-align:right;white-space:nowrap">
+            ${f.in_config?(loaded
+              ?`<button class="btn btn-ghost btn-sm" onclick="unloadModel(${idx})">Unload</button>`
+              :`<button class="btn btn-primary btn-sm" onclick="loadModel(${idx})">Load now</button>`):''}
+            <button class="btn btn-secondary btn-sm" onclick="openCfgModal(${idx})">${f.in_config?'Configure':'Add to CoderAI'}</button>
+            ${f.in_config?`<button class="btn btn-ghost btn-sm" onclick="disableModel(${idx})">Remove</button>`:''}
+            <button class="btn btn-danger btn-sm" onclick="deleteModelConfirm(${idx})">Delete</button>
+          </td>
+        </tr>`;
+      });
+      ggufEl.innerHTML = '<table style="width:100%;border-collapse:collapse;font-size:13px">'+
+        '<thead><tr style="color:var(--text-2);font-size:10px;text-transform:uppercase;letter-spacing:.05em">'+
+        '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">File</th>'+
+        '<th style="text-align:right;padding:.3rem .25rem;font-weight:700">Size</th>'+
+        '<th style="text-align:center;padding:.3rem .25rem;font-weight:700">Config</th>'+
+        '<th></th></tr></thead><tbody>'+rows.join('')+'</tbody></table>';
+    }
+  }catch(e){
+    hfEl.innerHTML = ggufEl.innerHTML = `<span class="muted small">Error: ${esc(e.message)}</span>`;
+  }
+}
+
+let _loadedKeys = new Set();
+
+async function refreshLoadedStatus(){
+  try{
+    const r = await fetch('/admin/api/model-loaded-status');
+    if(r.ok){ const d = await r.json(); _loadedKeys = new Set(d.loaded||[]); }
+  }catch{}
+}
+
+async function refreshLocal(){
+  await refreshLoadedStatus();
+  loadCacheStats();
+  loadCachedModels();
+}
+
+refreshLocal();
+
+async function clearCacheConfirm(type){
+  const labels = {hf:'HuggingFace', gguf:'GGUF', all:'ALL'};
+  if(!confirm(`Delete ${labels[type]} model cache? This cannot be undone.`)) return;
+  try{
+    const r = await fetch('/admin/api/cache?cache_type='+type, {method:'DELETE'});
+    const d = await r.json();
+    if(d.success){
+      refreshLocal();
+      alert(`Cache cleared. Freed ${fmtBytes(d.freed_bytes||0)}.`);
+    }else alert('Error clearing cache');
+  }catch(e){alert('Error: '+e.message)}
+}
+
+async function deleteModelConfirm(idx){
+  const m = _localModels[idx];
+  if(!confirm(`Delete "${m.label}" from local cache? This cannot be undone.`)) return;
+  const idForUrl = m.cacheType === 'hf' ? m.path : m.label;
+  try{
+    const r = await fetch('/admin/api/cached-models/'+encodeURIComponent(idForUrl)+'?cache_type='+m.cacheType, {method:'DELETE'});
+    const d = await r.json();
+    if(d.success) refreshLocal();
+    else alert('Error: '+(d.detail||'Unknown'));
+  }catch(e){alert('Error: '+e.message)}
+}
+
+function openCfgModal(idx){
+  const m = _localModels[idx];
+  const s = m.settings || {};
+  document.getElementById('cfg-modal-title').textContent = m.in_config ? 'Configure model' : 'Add to CoderAI';
+  document.getElementById('cfg-id-label').textContent = m.label;
+  document.getElementById('cfg-path').value = m.path;
+  document.getElementById('cfg-orig-type').value = m.defaultType;
+  // Map legacy gguf_models to text_models
+  const rawType = s.model_type || m.defaultType;
+  document.getElementById('cfg-type').value = rawType === 'gguf_models' ? 'text_models' : rawType;
+  document.getElementById('cfg-alias').value = s.alias || '';
+  document.getElementById('cfg-backend').value = s.backend || 'auto';
+  document.getElementById('cfg-load-mode').value = s.load_mode || 'on-request';
+  // Used VRAM
+  const usedVram = s.used_vram_gb != null ? s.used_vram_gb : null;
+  document.getElementById('cfg-used-vram').value = usedVram != null ? usedVram : '';
+  // Show estimate hint from file size (GGUF: ~1.1x file size; HF: from size_gb)
+  const estVram = _estimateVram(m);
+  document.getElementById('cfg-used-vram-hint').textContent = estVram ? `Estimated: ~${estVram.toFixed(1)} GB` : '';
+  document.getElementById('cfg-gpu-layers').value = s.n_gpu_layers !== undefined ? s.n_gpu_layers : -1;
+  document.getElementById('cfg-n-ctx').value = s.n_ctx || 2048;
+  document.getElementById('cfg-max-gpu').value = s.max_gpu_percent != null ? s.max_gpu_percent : '';
+  document.getElementById('cfg-ram-gb').value = s.manual_ram_gb != null ? s.manual_ram_gb : '';
+  document.getElementById('cfg-4bit').checked = !!s.load_in_4bit;
+  document.getElementById('cfg-8bit').checked = !!s.load_in_8bit;
+  document.getElementById('cfg-flash').checked = !!s.flash_attention;
+  document.getElementById('cfg-noram').checked = !!s.no_ram;
+  document.getElementById('cfg-offload-strategy').value = s.offload_strategy || 'auto';
+  document.getElementById('cfg-offload-dir').value = s.offload_dir || './offload';
+  document.getElementById('cfg-sysprompt').value = s.system_prompt || '';
+  document.getElementById('cfg-parser').value = s.parser || 'auto';
+  document.getElementById('cfg-tools').checked = !!s.tools_closer_prompt;
+  document.getElementById('cfg-grammar').checked = !!s.grammar_guided;
+  openModal('cfg-modal');
+}
+
+function _estimateVram(m) {
+  // Estimate VRAM from file size: GGUF ~1.1x, HF safetensors ~1.2x
+  if (m.size_gb) return m.size_gb * (m.cacheType === 'gguf' ? 1.1 : 1.2);
+  return null;
+}
+
+async function saveModelConfig(){
+  const path = document.getElementById('cfg-path').value;
+  const maxGpu = parseFloat(document.getElementById('cfg-max-gpu').value);
+  const ramGb  = parseFloat(document.getElementById('cfg-ram-gb').value);
+  const usedVram = parseFloat(document.getElementById('cfg-used-vram').value);
+  const data = {
+    path,
+    model_type:        document.getElementById('cfg-type').value,
+    alias:             document.getElementById('cfg-alias').value.trim() || null,
+    backend:           document.getElementById('cfg-backend').value,
+    load_mode:         document.getElementById('cfg-load-mode').value,
+    used_vram_gb:      isNaN(usedVram) ? null : usedVram,
+    n_gpu_layers:      parseInt(document.getElementById('cfg-gpu-layers').value) || -1,
+    n_ctx:             parseInt(document.getElementById('cfg-n-ctx').value) || 2048,
+    max_gpu_percent:   isNaN(maxGpu) ? null : maxGpu,
+    manual_ram_gb:     isNaN(ramGb) ? null : ramGb,
+    load_in_4bit:      document.getElementById('cfg-4bit').checked,
+    load_in_8bit:      document.getElementById('cfg-8bit').checked,
+    flash_attention:   document.getElementById('cfg-flash').checked,
+    no_ram:            document.getElementById('cfg-noram').checked,
+    offload_strategy:  document.getElementById('cfg-offload-strategy').value,
+    offload_dir:       document.getElementById('cfg-offload-dir').value.trim() || './offload',
+    system_prompt:     document.getElementById('cfg-sysprompt').value.trim() || null,
+    parser:            document.getElementById('cfg-parser').value,
+    tools_closer_prompt: document.getElementById('cfg-tools').checked,
+    grammar_guided:    document.getElementById('cfg-grammar').checked,
+  };
+  try{
+    const r = await fetch('/admin/api/model-configure',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(data)
+    });
+    const d = await r.json();
+    if(d.success){ closeModal('cfg-modal'); loadCachedModels(); }
+    else alert('Error: '+(d.detail||'Unknown'));
+  }catch(e){ alert('Error: '+e.message); }
+}
+
+async function loadModel(idx){
+  const m = _localModels[idx];
+  // Find the button and show loading state
+  const btn = document.querySelector(`button[onclick="loadModel(${idx})"]`);
+  if(btn){ btn.disabled = true; btn.textContent = 'Loading…'; }
+  try{
+    const r = await fetch('/admin/api/model-load',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path: m.path})
+    });
+    const d = await r.json();
+    if(d.success) refreshLocal();
+    else{ if(btn){ btn.disabled=false; btn.textContent='Load now'; } alert('Error: '+(d.detail||'Unknown')); }
+  }catch(e){ if(btn){ btn.disabled=false; btn.textContent='Load now'; } alert('Error: '+e.message); }
+}
+
+async function unloadModel(idx){
+  const m = _localModels[idx];
+  try{
+    const r = await fetch('/admin/api/model-unload',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path: m.path})
+    });
+    const d = await r.json();
+    if(d.success) refreshLocal();
+    else alert('Error: '+(d.detail||'Unknown'));
+  }catch(e){ alert('Error: '+e.message); }
+}
+
+async function disableModel(idx){
+  const m = _localModels[idx];
+  if(!confirm('Remove this model from CoderAI config? It will stay in the local cache.')) return;
+  try{
+    const r = await fetch('/admin/api/model-disable',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path: m.path})
+    });
+    const d = await r.json();
+    if(d.success) loadCachedModels();
+    else alert('Error: '+(d.detail||'Unknown'));
+  }catch(e){ alert('Error: '+e.message); }
+}
+
+async function startUpload(){
+  const fileInput = document.getElementById('upload-file');
+  const file = fileInput.files[0];
+  if(!file){ alert('Please select a file'); return; }
+  if(!file.name.endsWith('.gguf')){ alert('Only .gguf files are supported'); return; }
+
+  document.getElementById('upload-form').style.display='none';
+  document.getElementById('upload-progress').style.display='block';
+  document.getElementById('upload-filename').textContent = file.name;
+
+  const chunkSize = 512 * 1024; // 512KB
+  const totalChunks = Math.ceil(file.size / chunkSize);
+  const uploadId = Date.now() + '_' + file.name;
+
+  for(let i=0; i<totalChunks; i++){
+    const start = i * chunkSize;
+    const end = Math.min(start + chunkSize, file.size);
+    const chunk = file.slice(start, end);
+
+    const formData = new FormData();
+    formData.append('chunk', chunk);
+    formData.append('filename', file.name);
+    formData.append('chunk_index', i);
+    formData.append('total_chunks', totalChunks);
+    formData.append('upload_id', uploadId);
+
+    try{
+      const r = await fetch('/admin/api/model-upload',{method:'POST', body:formData});
+      const d = await r.json();
+      if(!d.success){ alert('Upload failed: '+(d.detail||'Unknown')); return; }
+
+      const pct = Math.round((i+1)/totalChunks*100);
+      document.getElementById('upload-bar').style.width = pct+'%';
+      document.getElementById('upload-pct').textContent = pct+'%';
+      document.getElementById('upload-status').textContent = `Chunk ${i+1}/${totalChunks}`;
+
+      if(d.complete){
+        document.getElementById('upload-status').textContent = 'Complete!';
+        setTimeout(()=>{
+          closeModal('upload-modal');
+          document.getElementById('upload-form').style.display='block';
+          document.getElementById('upload-progress').style.display='none';
+          fileInput.value='';
+          refreshLocal();
+        }, 1500);
+        return;
+      }
+    }catch(e){ alert('Upload error: '+e.message); return; }
+  }
+}
 </script>
 {% endblock %}

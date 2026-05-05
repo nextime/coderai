@@ -476,41 +476,56 @@ async def _generate_with_sdcpp(sd_model, request, global_args, http_request=None
     }
 
 
-def _load_sdcpp_model(model_path: str, global_args):
+def _load_sdcpp_model(model_path: str, global_args, model_config: dict = None):
     """
     Try to load a model using stable-diffusion-cpp-python.
     
     Returns the loaded StableDiffusion model or None.
     """
     from stable_diffusion_cpp import StableDiffusion
-    
+
     # Check for --no-ram mode
     no_ram = getattr(global_args, 'no_ram', False) if global_args else False
-    
+
     print(f"Loading sd.cpp model from: {model_path}")
-    
+
     # Build sd.cpp constructor args from config
     kwargs = {
         'model_path': model_path,
+        'offload_params_to_cpu': False,  # Use GPU by default
+        'keep_clip_on_cpu': False,
+        'keep_control_net_on_cpu': False,
+        'keep_vae_on_cpu': False,
     }
-    
+
     # Add optional paths from CLI args
     if global_args:
         if hasattr(global_args, 'vae_path') and global_args.vae_path:
             kwargs['vae_path'] = global_args.vae_path
         if hasattr(global_args, 'llm_path') and global_args.llm_path:
             kwargs['lora_model_dir'] = global_args.llm_path
-    
-    # --no-ram mode: maximize GPU offloading for sd.cpp
+
+    # If backend is explicitly cpu, offload to CPU
+    backend = (model_config or {}).get('backend', 'auto') if model_config else 'auto'
+    if backend == 'cpu':
+        kwargs['offload_params_to_cpu'] = True
+        kwargs['keep_clip_on_cpu'] = True
+        kwargs['keep_vae_on_cpu'] = True
+
     if no_ram:
-        # stable-diffusion-cpp-python supports n_threads and gpu-related params
-        # Force full GPU offload by keeping all operations on GPU
-        kwargs['keep_clip_on_cpu'] = False  # Don't offload CLIP to CPU
-        kwargs['keep_control_net_cpu'] = False  # Don't offload ControlNet to CPU
-        kwargs['keep_vae_on_cpu'] = False  # Don't offload VAE to CPU
         print("--no-ram mode: sd.cpp maximizing GPU usage (no CPU offload for CLIP/VAE/ControlNet)")
-    
-    sd_model = StableDiffusion(**kwargs)
+
+    try:
+        sd_model = StableDiffusion(**kwargs)
+    except Exception as e:
+        if 'cpu' not in str(backend) and ('memory' in str(e).lower() or 'cuda' in str(e).lower() or 'out of' in str(e).lower()):
+            print(f"GPU load failed ({e}), retrying with CPU offload...")
+            kwargs['offload_params_to_cpu'] = True
+            kwargs['keep_clip_on_cpu'] = True
+            kwargs['keep_vae_on_cpu'] = True
+            sd_model = StableDiffusion(**kwargs)
+        else:
+            raise
     return sd_model
 
 
@@ -665,7 +680,8 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
             
             # Only use sd.cpp if we have a local file path
             if resolved_path and os.path.isfile(resolved_path):
-                sd_model = _load_sdcpp_model(resolved_path, global_args)
+                cfg = multi_model_manager.config.get(model_key) or multi_model_manager.config.get(model_name) or {}
+                sd_model = _load_sdcpp_model(resolved_path, global_args, model_config=cfg)
                 
                 if sd_model is not None:
                     # Cache the loaded model in the manager

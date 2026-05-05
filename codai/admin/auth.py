@@ -65,23 +65,37 @@ class SessionManager:
         self.config_dir = config_dir
         self.secret = get_or_create_secret(config_dir)
         self.session_timeout = timedelta(minutes=session_timeout_minutes)
+        self._lock = __import__('threading').Lock()
     
     def _load_auth_data(self) -> Dict[str, Any]:
         """Load auth.json data."""
         auth_path = self.config_dir / "auth.json"
         if auth_path.exists():
-            with open(auth_path, 'r') as f:
-                return json.load(f)
+            try:
+                with open(auth_path, 'r') as f:
+                    content = f.read()
+                if content.strip():
+                    return json.loads(content)
+            except (json.JSONDecodeError, OSError):
+                pass
         return {"users": [], "tokens": [], "sessions": {}}
     
     def _save_auth_data(self, auth_data: Dict[str, Any]):
-        """Save auth.json data."""
+        """Save auth.json data atomically."""
         auth_path = self.config_dir / "auth.json"
-        # Atomic write
-        temp_path = auth_path.with_suffix('.tmp')
-        with open(temp_path, 'w') as f:
-            json.dump(auth_data, f, indent=2)
-        temp_path.replace(auth_path)
+        with self._lock:
+            import os, tempfile
+            fd, tmp = tempfile.mkstemp(dir=str(self.config_dir), suffix='.tmp')
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    json.dump(auth_data, f, indent=2)
+                os.replace(tmp, str(auth_path))
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
     
     def create_session(self, username: str) -> str:
         """Create a new session for a user.

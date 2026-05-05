@@ -91,6 +91,16 @@ app.include_router(text_router)
 app.include_router(admin_router)
 
 
+@app.exception_handler(401)
+async def unauthorized_redirect(request: Request, exc: HTTPException):
+    """Redirect browser clients to login page on 401; return JSON for API clients."""
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept:
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url="/login", status_code=302)
+    return JSONResponse(status_code=401, content={"detail": exc.detail})
+
+
 @app.get("/v1/models", response_model=ModelList)
 async def list_models():
     """List available models."""

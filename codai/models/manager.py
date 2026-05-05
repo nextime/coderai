@@ -384,7 +384,8 @@ class MultiModelManager:
         self.tool_parser = ModelParserAdapter()
         self.current_model_key: Optional[str] = None
         self.load_mode: str = "ondemand"
-        self.active_in_vram: Optional[str] = None
+        self.active_in_vram: Optional[str] = None  # most-recently-used model key
+        self.models_in_vram: set = set()  # all models currently in VRAM
         self.model_aliases: Dict[str, str] = {}
         self.whisper_server: Optional[WhisperServerManager] = None
         self.model_backend_types: Dict[str, str] = {}
@@ -675,9 +676,7 @@ class MultiModelManager:
     def get_all_allowed_identifiers(self) -> set:
         """
         Return the set of all model names, aliases, and identifiers that are
-        valid for API requests.  This includes every identifier that
-        ``list_models()`` would return as well as the raw model paths/names
-        registered via the command line.
+        valid for API requests.
         """
         allowed = set()
 
@@ -718,6 +717,25 @@ class MultiModelManager:
         # Custom aliases
         for alias in self.model_aliases:
             allowed.add(alias)
+
+        # Also include all models from config (covers configured-but-not-yet-loaded models)
+        try:
+            from codai.admin.routes import config_manager
+            if config_manager is not None:
+                md = config_manager.models_data
+                for cat in ("text_models", "image_models", "audio_models",
+                            "gguf_models", "tts_models", "vision_models"):
+                    for m in md.get(cat, []):
+                        mid = (m if isinstance(m, str) else
+                               m.get("alias") or m.get("path") or m.get("id") or "")
+                        raw = (m if isinstance(m, str) else m.get("path") or m.get("id") or "")
+                        for val in (mid, raw):
+                            if val:
+                                allowed.add(val)
+                                short = val.split("/")[-1] if "/" in val else val
+                                allowed.add(short)
+        except Exception:
+            pass
 
         return allowed
 
@@ -1112,22 +1130,76 @@ class MultiModelManager:
         except Exception as e:
             print(f"  Warning during VRAM load of '{model_key}': {e}")
 
+    def _get_free_vram_gb(self) -> float:
+        """Return estimated free VRAM in GB, or a large number if unavailable."""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free, total = torch.cuda.mem_get_info()
+                return free / 1e9
+        except Exception:
+            pass
+        return 999.0  # Unknown — assume enough
+
+    def _get_model_used_vram_gb(self, model_key: str) -> float:
+        """Return the configured used_vram_gb for a model, or 0 if unknown."""
+        cfg = self.config.get(model_key, {})
+        return float(cfg.get("used_vram_gb") or 0)
+
+    def _evict_models_for_vram(self, needed_gb: float):
+        """Unload loaded models (LRU first) until we have at least needed_gb free VRAM."""
+        if needed_gb <= 0:
+            return
+
+        def _evict_key(key):
+            model_obj = self.models.pop(key, None)
+            self.models_in_vram.discard(key)
+            if model_obj is not None:
+                try:
+                    if hasattr(model_obj, 'cleanup'):
+                        model_obj.cleanup()
+                    elif hasattr(model_obj, 'to'):
+                        model_obj.to('cpu')
+                except Exception as e:
+                    print(f"  Warning during eviction of '{key}': {e}")
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        # First pass: evict non-active models in LRU order
+        for key in list(self.models.keys()):
+            if key == self.active_in_vram:
+                continue
+            if self._get_free_vram_gb() >= needed_gb:
+                break
+            print(f"On-request VRAM eviction: unloading '{key}' to free VRAM")
+            _evict_key(key)
+
+        # Second pass: evict active model if still not enough
+        if self._get_free_vram_gb() < needed_gb and self.active_in_vram and self.active_in_vram in self.models:
+            print(f"On-request VRAM eviction: unloading active model '{self.active_in_vram}' to free VRAM")
+            _evict_key(self.active_in_vram)
+            self.active_in_vram = None
+
     def request_model(self, requested_model: str, model_type: str = None) -> Dict[str, Any]:
         """
         Central method for API modules to request a model.
         
-        Handles three load modes:
+        Handles per-model load modes:
         
-        **loadall**: All models are pre-loaded at startup. Just return the
-        already-loaded model. No VRAM management needed.
+        **load**: Model is pre-loaded at startup and stays in VRAM.
         
-        **loadswap**: All models stay loaded (in CPU RAM or VRAM). When a
-        different model is requested, the current VRAM model is moved to CPU
-        RAM and the requested model is moved from CPU RAM to VRAM.
+        **on-request**: Model is loaded when first needed. Before loading,
+        checks free VRAM against the model's used_vram_gb config. If not
+        enough VRAM, evicts other loaded models until there is enough, then
+        loads the model.
         
-        **ondemand** (default when no flag specified): Only one model in memory
-        at a time. When a different model is requested, the current model is
-        fully unloaded (deleted) and the new one is loaded from scratch.
+        Legacy global modes (ondemand/loadall/loadswap) are still supported
+        for backward compatibility.
         
         Args:
             requested_model: The model name/alias from the API request
@@ -1226,7 +1298,63 @@ class MultiModelManager:
         
         # Step 3: Check if already loaded in self.models
         existing_model = self.models.get(model_key)
-        
+
+        # =====================================================================
+        # PER-MODEL LOAD MODE: Check per-model config first.
+        # Per-model "load" = pre-loaded (treat as loadall for this model).
+        # Per-model "on-request" = load when needed with VRAM management.
+        # =====================================================================
+        per_model_cfg = self.config.get(model_key, {})
+        per_model_load_mode = per_model_cfg.get("load_mode")  # "load" | "on-request" | None
+
+        if per_model_load_mode == "on-request":
+            if existing_model is not None:
+                # Already loaded — just return it
+                self.current_model_key = model_key
+                self.active_in_vram = model_key
+                self.models_in_vram.add(model_key)
+                return {
+                    'model_key': model_key,
+                    'model_name': resolved_name,
+                    'model_object': existing_model,
+                    'config': per_model_cfg,
+                    'already_loaded': True,
+                }
+            # Not loaded — check VRAM and evict if needed
+            needed_gb = self._get_model_used_vram_gb(model_key)
+            if needed_gb > 0:
+                free_gb = self._get_free_vram_gb()
+                if free_gb < needed_gb:
+                    print(f"On-request: need {needed_gb:.1f} GB VRAM, have {free_gb:.1f} GB free — evicting models")
+                    self._evict_models_for_vram(needed_gb)
+            return {
+                'model_key': model_key,
+                'model_name': resolved_name,
+                'model_object': None,
+                'config': per_model_cfg,
+                'already_loaded': False,
+            }
+
+        if per_model_load_mode == "load":
+            # Pre-loaded model — just return it (or signal caller to load it)
+            if existing_model is not None:
+                self.current_model_key = model_key
+                self.active_in_vram = model_key
+                return {
+                    'model_key': model_key,
+                    'model_name': resolved_name,
+                    'model_object': existing_model,
+                    'config': per_model_cfg,
+                    'already_loaded': True,
+                }
+            return {
+                'model_key': model_key,
+                'model_name': resolved_name,
+                'model_object': None,
+                'config': per_model_cfg,
+                'already_loaded': False,
+            }
+
         # =====================================================================
         # LOADALL MODE: All models should be pre-loaded. Just return it.
         # =====================================================================
@@ -1443,6 +1571,7 @@ class MultiModelManager:
         # Reset tracking state
         self.current_model_key = None
         self.active_in_vram = None
+        self.models_in_vram = set()
         
         # Force garbage collection
         for _ in range(3):
@@ -1466,6 +1595,7 @@ class MultiModelManager:
         """Add a model (ModelManager, diffusers pipeline, sd.cpp model, etc.) for a specific key."""
         self.models[key] = manager
         self.active_in_vram = key
+        self.models_in_vram.add(key)
     
     def get_model(self, key: str) -> Optional[ModelManager]:
         """Get a model manager by key."""
@@ -1480,43 +1610,77 @@ class MultiModelManager:
         return None
     
     def list_models(self) -> List[ModelInfo]:
-        """List all available models."""
+        """List all available models (configured + runtime aliases)."""
         models = []
-        
-        # Add default model(s)
-        if self.default_model:
+        seen_ids: set = set()
+
+        def _add(model_id: str):
+            if model_id not in seen_ids:
+                seen_ids.add(model_id)
+                models.append(ModelInfo(id=model_id))
+
+        # --- Models from config (the authoritative source) ---
+        try:
+            from codai.admin.routes import config_manager
+            if config_manager is not None:
+                md = config_manager.models_data
+                for cat in ("text_models", "vision_models", "image_models",
+                            "audio_models", "tts_models", "gguf_models"):
+                    for m in md.get(cat, []):
+                        if isinstance(m, str):
+                            mid = m
+                        else:
+                            mid = m.get("alias") or m.get("path") or m.get("id") or ""
+                            # Also expose the raw path/id
+                            raw = m.get("path") or m.get("id") or ""
+                            if raw and raw != mid:
+                                _add(raw)
+                                # Short name
+                                short = raw.split("/")[-1] if "/" in raw else raw
+                                if short != raw:
+                                    _add(short)
+                        if mid:
+                            _add(mid)
+                            short = mid.split("/")[-1] if "/" in mid else mid
+                            if short != mid:
+                                _add(short)
+        except Exception:
+            pass
+
+        # --- Fallback: runtime default_model (if config_manager unavailable) ---
+        if not models and self.default_model:
             model_id = self.default_model
             if not (model_id.startswith("http://") or model_id.startswith("https://")):
-                short_name = self.default_model.split("/")[-1] if "/" in self.default_model else self.default_model
-                if short_name != self.default_model:
-                    models.append(ModelInfo(id=short_name))
-                models.append(ModelInfo(id=model_id))
-                models.append(ModelInfo(id="default"))
-        
-        # Add aliases for first/default models
+                short_name = model_id.split("/")[-1] if "/" in model_id else model_id
+                if short_name != model_id:
+                    _add(short_name)
+                _add(model_id)
+                _add("default")
+
+        # --- Runtime-registered non-text models (image, audio, tts, vision) ---
         if self.audio_models:
-            models.append(ModelInfo(id="audio"))
+            _add("audio")
             for audio_id in self.audio_models:
-                models.append(ModelInfo(id=f"audio:{audio_id}"))
-        
+                _add(f"audio:{audio_id}")
+
         if self.tts_model:
-            models.append(ModelInfo(id="tts"))
-            models.append(ModelInfo(id=f"tts:{self.tts_model}"))
-        
+            _add("tts")
+            _add(f"tts:{self.tts_model}")
+
         if self.image_models:
-            models.append(ModelInfo(id="image"))
+            _add("image")
             for image_id in self.image_models:
-                models.append(ModelInfo(id=f"image:{image_id}"))
-        
+                _add(f"image:{image_id}")
+
         if self.vision_models:
-            models.append(ModelInfo(id="vision"))
+            _add("vision")
             for vision_id in self.vision_models:
-                models.append(ModelInfo(id=f"vision:{vision_id}"))
-        
-        # Add any custom aliases
+                _add(f"vision:{vision_id}")
+
+        # --- Custom aliases ---
         for alias in self.model_aliases:
-            models.append(ModelInfo(id=alias))
-        
+            _add(alias)
+
         return models
 
 

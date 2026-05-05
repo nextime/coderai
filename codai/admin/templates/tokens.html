@@ -1,195 +1,140 @@
 {% extends "base.html" %}
-
-{% block title %}API Tokens - CoderAI{% endblock %}
+{% block title %}Tokens — CoderAI{% endblock %}
 
 {% block content %}
 <div class="page-header">
+  <div>
     <h1>API Tokens</h1>
-    <div class="header-actions">
-        <button class="btn btn-primary" onclick="showCreateTokenModal()">Create Token</button>
-    </div>
+    <p>Access tokens for API clients</p>
+  </div>
+  <div class="header-actions">
+    <button class="btn btn-primary" onclick="openModal('create-modal')">New token</button>
+  </div>
 </div>
 
-<div class="card">
-    <div class="table-responsive">
-        <table class="table">
-            <thead>
-                <tr>
-                    <th>Name</th>
-                    <th>Token</th>
-                    <th>Provider</th>
-                    <th>Created</th>
-                    <th>Last Used</th>
-                    <th>Actions</th>
-                </tr>
-            </thead>
-            <tbody id="tokens-table">
-                <tr>
-                    <td colspan="6" class="text-center text-muted">No tokens created</td>
-                </tr>
-            </tbody>
-        </table>
-    </div>
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr><th>Name</th><th>Token</th><th>Format</th><th>Created</th><th>Last used</th><th></th></tr>
+    </thead>
+    <tbody id="tokens-body">
+      <tr class="empty-row"><td colspan="6">No tokens — create one to get started</td></tr>
+    </tbody>
+  </table>
 </div>
 
-<!-- Create Token Modal -->
-<div id="create-token-modal" class="modal">
-    <div class="modal-content">
-        <div class="modal-header">
-            <h2>Create API Token</h2>
-            <button class="modal-close" onclick="hideCreateTokenModal()">&times;</button>
-        </div>
-        <div class="modal-body">
-            <form id="create-token-form">
-                <div class="form-group">
-                    <label for="token-name">Token Name</label>
-                    <input type="text" id="token-name" class="form-control" 
-                           placeholder="e.g., Production API" required>
-                    <small class="form-text">A descriptive name for this token</small>
-                </div>
-                
-                <div class="form-group">
-                    <label for="token-provider">Provider Format</label>
-                    <select id="token-provider" class="form-control">
-                        <option value="openai">OpenAI (sk-...)</option>
-                        <option value="anthropic">Anthropic (sk-ant-...)</option>
-                        <option value="custom">Custom</option>
-                    </select>
-                </div>
-                
-                <div class="form-actions">
-                    <button type="submit" class="btn btn-primary">Create Token</button>
-                    <button type="button" class="btn btn-secondary" onclick="hideCreateTokenModal()">Cancel</button>
-                </div>
-            </form>
-        </div>
+<div id="create-modal" class="modal">
+  <div class="modal-box">
+    <div class="modal-head">
+      <span class="modal-title">New API token</span>
+      <button class="modal-close" onclick="closeModal('create-modal')">×</button>
     </div>
+    <div class="modal-body">
+      <div class="form-row">
+        <label class="form-label">Name</label>
+        <input type="text" id="t-name" class="form-input" placeholder="e.g. My App">
+        <span class="form-hint">A label to identify this token</span>
+      </div>
+      <div class="form-row">
+        <label class="form-label">Format</label>
+        <select id="t-provider" class="form-input">
+          <option value="openai">OpenAI (sk-coderai-…)</option>
+          <option value="anthropic">Anthropic</option>
+          <option value="custom">Custom</option>
+        </select>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-primary" onclick="createToken()">Generate</button>
+        <button class="btn btn-ghost" onclick="closeModal('create-modal')">Cancel</button>
+      </div>
+    </div>
+  </div>
 </div>
 
-<!-- Show Token Modal -->
-<div id="show-token-modal" class="modal">
-    <div class="modal-content">
-        <div class="modal-header">
-            <h2>Token Created</h2>
-            <button class="modal-close" onclick="hideShowTokenModal()">&times;</button>
-        </div>
-        <div class="modal-body">
-            <div class="alert alert-warning">
-                <strong>Important:</strong> Copy this token now. You won't be able to see it again!
-            </div>
-            
-            <div class="token-display">
-                <code id="new-token-value"></code>
-                <button class="btn btn-secondary btn-sm" onclick="copyToken()">Copy</button>
-            </div>
-            
-            <div class="form-actions">
-                <button class="btn btn-primary" onclick="hideShowTokenModal()">Done</button>
-            </div>
-        </div>
+<div id="show-modal" class="modal">
+  <div class="modal-box">
+    <div class="modal-head">
+      <span class="modal-title">Token created</span>
+      <button class="modal-close" onclick="closeModal('show-modal')">×</button>
     </div>
+    <div class="modal-body">
+      <div class="alert alert-warning">Copy this now — it won't be shown again.</div>
+      <div class="token-box">
+        <code id="new-token"></code>
+        <button class="btn btn-ghost btn-sm" id="copy-btn" onclick="copyToken()">Copy</button>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-primary" onclick="closeModal('show-modal')">Done</button>
+      </div>
+    </div>
+  </div>
 </div>
 {% endblock %}
 
 {% block scripts %}
 <script>
-function showCreateTokenModal() {
-    document.getElementById('create-token-modal').style.display = 'flex';
-}
-
-function hideCreateTokenModal() {
-    document.getElementById('create-token-modal').style.display = 'none';
-    document.getElementById('create-token-form').reset();
-}
-
-function showShowTokenModal(token) {
-    document.getElementById('new-token-value').textContent = token;
-    document.getElementById('show-token-modal').style.display = 'flex';
-}
-
-function hideShowTokenModal() {
-    document.getElementById('show-token-modal').style.display = 'none';
+function openModal(id) { document.getElementById(id).classList.add('show'); }
+function closeModal(id) {
+  document.getElementById(id).classList.remove('show');
+  if (id === 'create-modal') document.getElementById('t-name').value = '';
 }
 
 function copyToken() {
-    const token = document.getElementById('new-token-value').textContent;
-    navigator.clipboard.writeText(token).then(() => {
-        alert('Token copied to clipboard');
-    });
+  navigator.clipboard.writeText(document.getElementById('new-token').textContent).then(() => {
+    const btn = document.getElementById('copy-btn');
+    btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = 'Copy', 2000);
+  });
 }
+
+function fmt(s) {
+  try { return new Date(s).toLocaleDateString(undefined, {month:'short',day:'numeric',year:'numeric'}); } catch { return s; }
+}
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
 async function loadTokens() {
-    try {
-        const response = await fetch('/admin/api/tokens');
-        const tokens = await response.json();
-        
-        const tbody = document.getElementById('tokens-table');
-        if (tokens.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">No tokens created</td></tr>';
-            return;
-        }
-        
-        tbody.innerHTML = tokens.map(token => `
-            <tr>
-                <td>${token.name}</td>
-                <td><code>${token.token.substring(0, 20)}...</code></td>
-                <td>${token.provider}</td>
-                <td>${new Date(token.created_at).toLocaleDateString()}</td>
-                <td>${token.last_used ? new Date(token.last_used).toLocaleDateString() : 'Never'}</td>
-                <td>
-                    <button class="btn btn-danger btn-sm" onclick="deleteToken(${token.id})">Delete</button>
-                </td>
-            </tr>
-        `).join('');
-    } catch (error) {
-        console.error('Failed to load tokens:', error);
+  try {
+    const tokens = await fetch('/admin/api/tokens').then(r => r.json());
+    const tbody = document.getElementById('tokens-body');
+    if (!tokens.length) {
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="6">No tokens — create one to get started</td></tr>';
+      return;
     }
+    tbody.innerHTML = tokens.map(t => `
+      <tr>
+        <td class="td-name">${esc(t.name)}</td>
+        <td><code>${esc(t.token.substring(0,28))}…</code></td>
+        <td><span class="badge badge-user">${esc(t.provider)}</span></td>
+        <td class="mono small dim">${fmt(t.created_at)}</td>
+        <td class="dim small">${t.last_used ? fmt(t.last_used) : 'Never'}</td>
+        <td style="text-align:right"><button class="btn btn-danger btn-sm" onclick="delToken(${t.id})">Delete</button></td>
+      </tr>`).join('');
+  } catch {}
 }
 
-document.getElementById('create-token-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    
-    const name = document.getElementById('token-name').value;
-    const provider = document.getElementById('token-provider').value;
-    
-    try {
-        const response = await fetch('/admin/api/tokens', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, provider })
-        });
-        
-        if (response.ok) {
-            const data = await response.json();
-            hideCreateTokenModal();
-            showShowTokenModal(data.token);
-            loadTokens();
-        } else {
-            alert('Failed to create token');
-        }
-    } catch (error) {
-        alert('Error: ' + error.message);
+async function createToken() {
+  const name = document.getElementById('t-name').value.trim();
+  if (!name) { document.getElementById('t-name').focus(); return; }
+  try {
+    const r = await fetch('/admin/api/tokens', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, provider: document.getElementById('t-provider').value})
+    });
+    if (r.ok) {
+      const d = await r.json();
+      closeModal('create-modal');
+      document.getElementById('new-token').textContent = d.token;
+      openModal('show-modal');
+      loadTokens();
+    } else {
+      const e = await r.json(); alert(e.detail || 'Failed');
     }
-});
+  } catch (e) { alert(e.message); }
+}
 
-async function deleteToken(tokenId) {
-    if (!confirm('Are you sure you want to delete this token? This cannot be undone.')) {
-        return;
-    }
-    
-    try {
-        const response = await fetch(`/admin/api/tokens/${tokenId}`, {
-            method: 'DELETE'
-        });
-        
-        if (response.ok) {
-            loadTokens();
-        } else {
-            alert('Failed to delete token');
-        }
-    } catch (error) {
-        alert('Error: ' + error.message);
-    }
+async function delToken(id) {
+  if (!confirm('Delete this token? Clients using it will lose access immediately.')) return;
+  const r = await fetch('/admin/api/tokens/'+id, {method:'DELETE'});
+  if (r.ok) loadTokens(); else alert('Failed to delete');
 }
 
 loadTokens();

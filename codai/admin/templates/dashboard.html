@@ -1,139 +1,109 @@
 {% extends "base.html" %}
-
-{% block title %}Dashboard - CoderAI{% endblock %}
+{% block title %}Overview — CoderAI{% endblock %}
 
 {% block content %}
 <div class="page-header">
+  <div>
     <h1>Overview</h1>
-    <div class="header-actions">
-        <button class="btn btn-secondary" onclick="reloadConfig()">Reload Config</button>
-    </div>
+    <p>System status</p>
+  </div>
+  <div class="header-actions">
+    <span class="live" id="live-label">Live</span>
+  </div>
 </div>
 
-<div class="dashboard-grid">
-    <div class="card">
-        <h3>System Status</h3>
-        <div class="status-grid">
-            <div class="status-item">
-                <span class="label">Backend:</span>
-                <span class="value" id="backend">Loading...</span>
-            </div>
-            <div class="status-item">
-                <span class="label">GPU:</span>
-                <span class="value" id="gpu">Loading...</span>
-            </div>
-            <div class="status-item">
-                <span class="label">Uptime:</span>
-                <span class="value" id="uptime">Loading...</span>
-            </div>
-            <div class="status-item">
-                <span class="label">Status:</span>
-                <span class="value status-ok" id="status">OK</span>
-            </div>
-        </div>
+<div class="stat-grid">
+  <div class="stat">
+    <div class="stat-label">Status</div>
+    <div class="stat-value small" id="sys-status" style="font-size:1.125rem">—</div>
+    <div class="stat-sub" id="sys-backend">loading…</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Models Loaded</div>
+    <div class="stat-value" id="models-count">—</div>
+    <div class="stat-sub" id="models-mode">—</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Requests</div>
+    <div class="stat-value" id="req-total">0</div>
+    <div class="stat-sub"><span id="req-active">0</span> active</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">VRAM</div>
+    <div class="stat-value" id="vram-pct">—</div>
+    <div class="progress" style="margin-top:.625rem">
+      <div class="progress-fill" id="vram-bar" style="width:0%"></div>
     </div>
-    
-    <div class="card">
-        <h3>Active Models</h3>
-        <div id="active-models">
-            <p class="text-muted">No models loaded</p>
-        </div>
-        {% if is_admin %}
-        <a href="/admin/models" class="btn btn-primary btn-sm">Manage Models</a>
-        {% endif %}
+    <div class="progress-labels">
+      <span id="vram-used">—</span><span id="vram-total">—</span>
     </div>
-    
-    <div class="card">
-        <h3>Request Stats</h3>
-        <div class="stats-grid">
-            <div class="stat-item">
-                <div class="stat-value" id="total-requests">0</div>
-                <div class="stat-label">Total Requests</div>
-            </div>
-            <div class="stat-item">
-                <div class="stat-value" id="active-requests">0</div>
-                <div class="stat-label">Active</div>
-            </div>
-            <div class="stat-item">
-                <div class="stat-value" id="queued-requests">0</div>
-                <div class="stat-label">Queued</div>
-            </div>
-        </div>
-    </div>
-    
-    <div class="card">
-        <h3>VRAM Usage</h3>
-        <div class="progress-bar">
-            <div class="progress-fill" id="vram-progress" style="width: 0%"></div>
-        </div>
-        <p class="text-muted" id="vram-text">0 GB / 0 GB (0%)</p>
-    </div>
+  </div>
 </div>
 
-<div class="card">
-    <h3>Recent Activity</h3>
-    <div class="table-responsive">
-        <table class="table">
-            <thead>
-                <tr>
-                    <th>Time</th>
-                    <th>Model</th>
-                    <th>Type</th>
-                    <th>Status</th>
-                    <th>Duration</th>
-                </tr>
-            </thead>
-            <tbody id="activity-table">
-                <tr>
-                    <td colspan="5" class="text-center text-muted">No recent activity</td>
-                </tr>
-            </tbody>
-        </table>
-    </div>
+<div class="card" style="margin-bottom:1rem">
+  <div class="card-title">Models</div>
+  <div id="active-models"><span class="muted small">No models loaded</span></div>
+  {% if is_admin %}
+  <div style="margin-top:.875rem">
+    <a href="/admin/models" class="btn btn-ghost btn-sm">Manage models</a>
+  </div>
+  {% endif %}
+</div>
+
+<div class="card mb-0">
+  <div class="card-title">Recent Activity</div>
+  <div class="table-wrap" style="border:none">
+    <table>
+      <thead><tr><th>Time</th><th>Model</th><th>Type</th><th>Status</th><th>Duration</th></tr></thead>
+      <tbody id="activity-body">
+        <tr class="empty-row"><td colspan="5">No recent activity</td></tr>
+      </tbody>
+    </table>
+  </div>
 </div>
 {% endblock %}
 
 {% block scripts %}
 <script>
-async function loadStatus() {
-    try {
-        const response = await fetch('/admin/api/status');
-        const data = await response.json();
-        
-        document.getElementById('backend').textContent = data.backend || 'auto';
-        document.getElementById('uptime').textContent = data.uptime || '0h 0m';
-        document.getElementById('status').textContent = data.status === 'ok' ? 'OK' : 'Error';
-        
-        // Update models loaded count
-        if (data.models_loaded > 0) {
-            document.getElementById('active-models').innerHTML = 
-                `<p>${data.models_loaded} model(s) loaded</p>`;
-        }
-    } catch (error) {
-        console.error('Failed to load status:', error);
+async function poll() {
+  try {
+    const d = await fetch('/admin/api/status').then(r => r.json());
+    const ok = d.status === 'ok';
+    document.getElementById('sys-status').textContent = ok ? 'Online' : 'Error';
+    document.getElementById('sys-status').className = 'stat-value small ' + (ok ? 'text-green' : 'text-red');
+    document.getElementById('sys-backend').textContent = d.backend || d.load_mode || '—';
+    document.getElementById('models-count').textContent = d.models_loaded ?? '—';
+    document.getElementById('models-mode').textContent = d.load_mode ? d.load_mode + ' mode' : '';
+
+    const loaded = d.loaded_models || [];
+    const enabled = d.enabled_models || [];
+    const loadedSet = new Set(loaded);
+    const notLoaded = enabled.filter(m => !loadedSet.has(m));
+    let html = '';
+    if(loaded.length) html += loaded.map(m => `<span class="badge badge-admin" style="margin:.125rem" title="Loaded">● ${m}</span>`).join('');
+    if(notLoaded.length) html += notLoaded.map(m => `<span class="badge" style="margin:.125rem;opacity:.55" title="Enabled, not loaded">○ ${m}</span>`).join('');
+    document.getElementById('active-models').innerHTML = html || '<span class="muted small">No models loaded</span>';
+
+    if (d.vram) {
+      const pct = Math.round(d.vram.used / d.vram.total * 100);
+      document.getElementById('vram-pct').textContent = pct + '%';
+      document.getElementById('vram-bar').style.width = pct + '%';
+      document.getElementById('vram-used').textContent = d.vram.used.toFixed(1) + ' GB';
+      document.getElementById('vram-total').textContent = d.vram.total.toFixed(1) + ' GB';
+    } else {
+      document.getElementById('vram-pct').textContent = 'N/A';
     }
-}
 
-async function reloadConfig() {
-    if (confirm('Reload configuration from disk? This will not restart the server.')) {
-        try {
-            const response = await fetch('/admin/api/system/reload', { method: 'POST' });
-            if (response.ok) {
-                alert('Configuration reloaded successfully');
-                loadStatus();
-            } else {
-                alert('Failed to reload configuration');
-            }
-        } catch (error) {
-            alert('Error: ' + error.message);
-        }
+    if (d.requests) {
+      document.getElementById('req-total').textContent = d.requests.total ?? 0;
+      document.getElementById('req-active').textContent = d.requests.active ?? 0;
     }
+  } catch {
+    document.getElementById('sys-status').textContent = 'Offline';
+    document.getElementById('sys-status').className = 'stat-value small text-red';
+  }
 }
-
-// Load status on page load
-loadStatus();
-
-// Refresh status every 5 seconds
-setInterval(loadStatus, 5000);
+poll();
+setInterval(poll, 7000);
 </script>
 {% endblock %}

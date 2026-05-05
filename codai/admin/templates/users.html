@@ -1,144 +1,111 @@
 {% extends "base.html" %}
-
-{% block title %}Users - CoderAI{% endblock %}
+{% block title %}Users — CoderAI{% endblock %}
 
 {% block content %}
 <div class="page-header">
+  <div>
     <h1>Users</h1>
-    <div class="header-actions">
-        <button class="btn btn-primary" onclick="showCreateUserModal()">Create User</button>
-    </div>
+    <p>{{ users|length }} account{{ 's' if users|length != 1 else '' }}</p>
+  </div>
+  <div class="header-actions">
+    <button class="btn btn-primary" onclick="openModal('add-modal')">Add user</button>
+  </div>
 </div>
 
-<div class="card">
-    <div class="table-responsive">
-        <table class="table">
-            <thead>
-                <tr>
-                    <th>Username</th>
-                    <th>Role</th>
-                    <th>Created</th>
-                    <th>Actions</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for user in users %}
-                <tr>
-                    <td>{{ user.username }}</td>
-                    <td>
-                        <span class="badge {% if user.role == 'admin' %}badge-primary{% else %}badge-secondary{% endif %}">
-                            {{ user.role }}
-                        </span>
-                    </td>
-                    <td>{{ user.created_at[:10] }}</td>
-                    <td>
-                        {% if user.username != username %}
-                        <button class="btn btn-danger btn-sm" onclick="deleteUser({{ user.id }}, '{{ user.username }}')">Delete</button>
-                        {% else %}
-                        <a href="/admin/change-password" class="btn btn-secondary btn-sm">Change Password</a>
-                        {% endif %}
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </div>
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr><th>User</th><th>Role</th><th>Created</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for user in users %}
+      <tr>
+        <td class="td-name">
+          {{ user.username }}
+          {% if user.username == username %}<span class="badge badge-user" style="margin-left:.375rem">you</span>{% endif %}
+        </td>
+        <td><span class="badge {% if user.role == 'admin' %}badge-admin{% else %}badge-user{% endif %}">{{ user.role }}</span></td>
+        <td class="mono small dim">{{ user.created_at[:10] }}</td>
+        <td style="text-align:right">
+          {% if user.username == username %}
+          <a href="/admin/change-password" class="btn btn-ghost btn-sm">Change password</a>
+          {% else %}
+          <button class="btn btn-danger btn-sm" onclick="delUser({{ user.id }}, '{{ user.username }}')">Delete</button>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr class="empty-row"><td colspan="4">No users found</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
 </div>
 
-<!-- Create User Modal -->
-<div id="create-user-modal" class="modal">
-    <div class="modal-content">
-        <div class="modal-header">
-            <h2>Create User</h2>
-            <button class="modal-close" onclick="hideCreateUserModal()">&times;</button>
-        </div>
-        <div class="modal-body">
-            <form id="create-user-form">
-                <div class="form-group">
-                    <label for="new-username">Username</label>
-                    <input type="text" id="new-username" class="form-control" required>
-                </div>
-                
-                <div class="form-group">
-                    <label for="new-password">Password</label>
-                    <input type="password" id="new-password" class="form-control" required minlength="8">
-                    <small class="form-text">Minimum 8 characters</small>
-                </div>
-                
-                <div class="form-group">
-                    <label for="new-role">Role</label>
-                    <select id="new-role" class="form-control">
-                        <option value="user">User</option>
-                        <option value="admin">Admin</option>
-                    </select>
-                </div>
-                
-                <div class="form-actions">
-                    <button type="submit" class="btn btn-primary">Create User</button>
-                    <button type="button" class="btn btn-secondary" onclick="hideCreateUserModal()">Cancel</button>
-                </div>
-            </form>
-        </div>
+<div id="add-modal" class="modal">
+  <div class="modal-box">
+    <div class="modal-head">
+      <span class="modal-title">Add user</span>
+      <button class="modal-close" onclick="closeModal('add-modal')">×</button>
     </div>
+    <div class="modal-body">
+      <div id="add-err" class="alert alert-error" style="display:none"></div>
+      <div class="form-row">
+        <label class="form-label">Username</label>
+        <input type="text" id="new-uname" class="form-input" placeholder="username" autocomplete="off">
+      </div>
+      <div class="form-row">
+        <label class="form-label">Password</label>
+        <input type="password" id="new-pwd" class="form-input" placeholder="••••••••" autocomplete="new-password">
+        <span class="form-hint">Minimum 8 characters</span>
+      </div>
+      <div class="form-row">
+        <label class="form-label">Role</label>
+        <select id="new-role" class="form-input">
+          <option value="user">User</option>
+          <option value="admin">Admin</option>
+        </select>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-primary" onclick="addUser()">Create</button>
+        <button class="btn btn-ghost" onclick="closeModal('add-modal')">Cancel</button>
+      </div>
+    </div>
+  </div>
 </div>
 {% endblock %}
 
 {% block scripts %}
 <script>
-function showCreateUserModal() {
-    document.getElementById('create-user-modal').style.display = 'flex';
+function openModal(id) { document.getElementById(id).classList.add('show'); }
+function closeModal(id) {
+  document.getElementById(id).classList.remove('show');
+  document.getElementById('add-err').style.display = 'none';
+  document.getElementById('new-uname').value = '';
+  document.getElementById('new-pwd').value = '';
 }
 
-function hideCreateUserModal() {
-    document.getElementById('create-user-modal').style.display = 'none';
-    document.getElementById('create-user-form').reset();
+async function addUser() {
+  const uname = document.getElementById('new-uname').value.trim();
+  const pwd = document.getElementById('new-pwd').value;
+  const errEl = document.getElementById('add-err');
+  errEl.style.display = 'none';
+  if (!uname) { errEl.textContent = 'Username required'; errEl.style.display = 'flex'; return; }
+  if (pwd.length < 8) { errEl.textContent = 'Password must be at least 8 characters'; errEl.style.display = 'flex'; return; }
+  try {
+    const r = await fetch('/admin/api/users', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({username: uname, password: pwd, role: document.getElementById('new-role').value})
+    });
+    if (r.ok) { location.reload(); }
+    else { const e = await r.json(); errEl.textContent = e.detail || 'Failed'; errEl.style.display = 'flex'; }
+  } catch (e) { errEl.textContent = e.message; errEl.style.display = 'flex'; }
 }
 
-document.getElementById('create-user-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    
-    const username = document.getElementById('new-username').value;
-    const password = document.getElementById('new-password').value;
-    const role = document.getElementById('new-role').value;
-    
-    try {
-        const response = await fetch('/admin/api/users', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username, password, role })
-        });
-        
-        if (response.ok) {
-            hideCreateUserModal();
-            location.reload();
-        } else {
-            const error = await response.json();
-            alert('Failed to create user: ' + (error.detail || 'Unknown error'));
-        }
-    } catch (error) {
-        alert('Error: ' + error.message);
-    }
-});
-
-async function deleteUser(userId, username) {
-    if (!confirm(`Are you sure you want to delete user "${username}"?`)) {
-        return;
-    }
-    
-    try {
-        const response = await fetch(`/admin/api/users/${userId}`, {
-            method: 'DELETE'
-        });
-        
-        if (response.ok) {
-            location.reload();
-        } else {
-            const error = await response.json();
-            alert('Failed to delete user: ' + (error.detail || 'Unknown error'));
-        }
-    } catch (error) {
-        alert('Error: ' + error.message);
-    }
+async function delUser(id, name) {
+  if (!confirm('Delete user "' + name + '"?')) return;
+  const r = await fetch('/admin/api/users/'+id, {method:'DELETE'});
+  if (r.ok) location.reload();
+  else { const e = await r.json(); alert(e.detail || 'Failed'); }
 }
 </script>
 {% endblock %}

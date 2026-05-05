@@ -123,12 +123,13 @@ def setup_default_config(config_dir: Path):
     # Default auth.json with admin / admin
     from pathlib import Path
     import secrets
-    from argon2 import PasswordHasher
-    if hasattr(argon2, 'PasswordHasher'):
-        ph = argon2.PasswordHasher()
+    try:
+        from argon2 import PasswordHasher
+        ph = PasswordHasher()
         default_admin_hash = ph.hash("admin")
-    else:
-        default_admin_hash = "argon2id$v=19$m=65536,t=3,p=4$...admin_hash_placeholder"
+    except ImportError:
+        from codai.admin.auth import hash_password
+        default_admin_hash = hash_password("admin")
     
     default_auth = {
         "users": [{

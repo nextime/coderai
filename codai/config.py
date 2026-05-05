@@ -29,12 +29,54 @@ class BackendConfig:
 class ModelsConfig:
     """Models configuration."""
     default_load_mode: str = "ondemand"
+    hf_cache_dir: Optional[str] = None
+    gguf_cache_dir: Optional[str] = None
 
 
 @dataclass
 class OffloadConfig:
     """Offload configuration."""
     directory: str = "./offload"
+    strategy: str = "auto"
+    max_gpu_percent: Optional[float] = None
+    no_ram: bool = False
+    load_in_4bit: bool = False
+    load_in_8bit: bool = False
+    manual_ram_gb: Optional[float] = None
+    flash_attention: bool = False
+
+
+@dataclass
+class VulkanConfig:
+    """Vulkan backend configuration."""
+    n_gpu_layers: int = -1
+    n_ctx: int = 2048
+    device_id: int = 0
+    single_gpu: bool = False
+
+
+@dataclass
+class ImageConfig:
+    """Image generation configuration."""
+    llm_path: Optional[str] = None
+    vae_path: Optional[str] = None
+    sample_method: str = "res_multistep"
+    steps: int = 4
+    width: int = 512
+    height: int = 512
+    cfg_scale: float = 1.0
+    precision: str = "f32"
+    cpu_offload: bool = False
+    seed: Optional[int] = None
+    vae_tiling: bool = False
+    clip_on_cpu: bool = False
+
+
+@dataclass
+class WhisperConfig:
+    """Whisper ASR configuration."""
+    server_path: Optional[str] = None
+    server_port: int = 8744
 
 
 @dataclass
@@ -45,6 +87,9 @@ class Config:
     backend: BackendConfig = field(default_factory=BackendConfig)
     models: ModelsConfig = field(default_factory=ModelsConfig)
     offload: OffloadConfig = field(default_factory=OffloadConfig)
+    vulkan: VulkanConfig = field(default_factory=VulkanConfig)
+    image: ImageConfig = field(default_factory=ImageConfig)
+    whisper: WhisperConfig = field(default_factory=WhisperConfig)
     system_prompt: Optional[str] = None
     tools_closer_prompt: bool = False
     grammar_guided: bool = False
@@ -140,7 +185,8 @@ class ConfigManager:
                 ph = PasswordHasher()
                 default_admin_hash = ph.hash("admin")
             except ImportError:
-                default_admin_hash = "argon2id$v=19$m=65536,t=3,p=4$...admin_hash_placeholder"
+                from codai.admin.auth import hash_password
+                default_admin_hash = hash_password("admin")
             
             default_auth = {
                 "users": [{
@@ -182,6 +228,9 @@ class ConfigManager:
                 backend=BackendConfig(**config_data.get("backend", {})),
                 models=ModelsConfig(**config_data.get("models", {})),
                 offload=OffloadConfig(**config_data.get("offload", {})),
+                vulkan=VulkanConfig(**config_data.get("vulkan", {})),
+                image=ImageConfig(**config_data.get("image", {})),
+                whisper=WhisperConfig(**config_data.get("whisper", {})),
                 system_prompt=config_data.get("system_prompt"),
                 tools_closer_prompt=config_data.get("tools_closer_prompt", False),
                 grammar_guided=config_data.get("grammar_guided", False),
@@ -242,10 +291,43 @@ class ConfigManager:
                 "tts_backend": self.config.backend.tts_backend
             },
             "models": {
-                "default_load_mode": self.config.models.default_load_mode
+                "default_load_mode": self.config.models.default_load_mode,
+                "hf_cache_dir": self.config.models.hf_cache_dir,
+                "gguf_cache_dir": self.config.models.gguf_cache_dir,
             },
             "offload": {
-                "directory": self.config.offload.directory
+                "directory": self.config.offload.directory,
+                "strategy": self.config.offload.strategy,
+                "max_gpu_percent": self.config.offload.max_gpu_percent,
+                "no_ram": self.config.offload.no_ram,
+                "load_in_4bit": self.config.offload.load_in_4bit,
+                "load_in_8bit": self.config.offload.load_in_8bit,
+                "manual_ram_gb": self.config.offload.manual_ram_gb,
+                "flash_attention": self.config.offload.flash_attention
+            },
+            "vulkan": {
+                "n_gpu_layers": self.config.vulkan.n_gpu_layers,
+                "n_ctx": self.config.vulkan.n_ctx,
+                "device_id": self.config.vulkan.device_id,
+                "single_gpu": self.config.vulkan.single_gpu
+            },
+            "image": {
+                "llm_path": self.config.image.llm_path,
+                "vae_path": self.config.image.vae_path,
+                "sample_method": self.config.image.sample_method,
+                "steps": self.config.image.steps,
+                "width": self.config.image.width,
+                "height": self.config.image.height,
+                "cfg_scale": self.config.image.cfg_scale,
+                "precision": self.config.image.precision,
+                "cpu_offload": self.config.image.cpu_offload,
+                "seed": self.config.image.seed,
+                "vae_tiling": self.config.image.vae_tiling,
+                "clip_on_cpu": self.config.image.clip_on_cpu
+            },
+            "whisper": {
+                "server_path": self.config.whisper.server_path,
+                "server_port": self.config.whisper.server_port
             },
             "system_prompt": self.config.system_prompt,
             "tools_closer_prompt": self.config.tools_closer_prompt,
@@ -255,7 +337,7 @@ class ConfigManager:
             "reasoning_options": self.config.reasoning_options,
             "parser": self.config.parser
         }
-        
+
         with open(self.config_path, 'w') as f:
             json.dump(config_dict, f, indent=2)
     

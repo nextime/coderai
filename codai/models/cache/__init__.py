@@ -30,9 +30,11 @@ import time
 
 def get_model_cache_dir() -> str:
     """Get or create the model cache directory."""
-    # Use XDG_CACHE_HOME if set, otherwise use ~/.cache/coderai
-    cache_home = os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache'))
-    cache_dir = os.path.join(cache_home, 'coderai', 'models')
+    if os.environ.get('CODERAI_CACHE_DIR'):
+        cache_dir = os.environ['CODERAI_CACHE_DIR']
+    else:
+        cache_home = os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache'))
+        cache_dir = os.path.join(cache_home, 'coderai', 'models')
     pathlib.Path(cache_dir).mkdir(parents=True, exist_ok=True)
     return cache_dir
 
@@ -43,20 +45,24 @@ def get_all_cache_dirs() -> dict:
     cache_home = os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache'))
 
     # Coderai GGUF cache
-    coderai_cache = os.path.join(cache_home, 'coderai', 'models')
+    coderai_cache = get_model_cache_dir()
     if os.path.exists(coderai_cache):
         caches['coderai'] = coderai_cache
 
-    # HuggingFace cache (for .safetensors, PyTorch models, etc.)
-    # Check both the main directory and the hub subdirectory
-    hf_cache = os.path.join(cache_home, 'huggingface')
-    hf_hub_cache = os.path.join(hf_cache, 'hub')
-    if os.path.exists(hf_hub_cache):
-        caches['huggingface'] = hf_hub_cache  # Use hub directory if it exists
-    elif os.path.exists(hf_cache):
-        caches['huggingface'] = hf_cache
+    # HuggingFace cache — respect HF_HOME override
+    hf_home = os.environ.get('HF_HOME') or os.environ.get('HUGGINGFACE_HUB_CACHE')
+    if hf_home:
+        hf_hub_cache = os.path.join(hf_home, 'hub') if not hf_home.endswith('hub') else hf_home
+        caches['huggingface'] = hf_hub_cache if os.path.exists(hf_hub_cache) else hf_home
+    else:
+        hf_cache = os.path.join(cache_home, 'huggingface')
+        hf_hub_cache = os.path.join(hf_cache, 'hub')
+        if os.path.exists(hf_hub_cache):
+            caches['huggingface'] = hf_hub_cache
+        elif os.path.exists(hf_cache):
+            caches['huggingface'] = hf_cache
 
-    # Local diffusers cache (often stored locally by apps)
+    # Local diffusers cache
     local_diffusers = os.path.expanduser('~/.cache/diffusers')
     if os.path.exists(local_diffusers):
         caches['diffusers'] = local_diffusers

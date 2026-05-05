@@ -5,7 +5,7 @@ import os
 # Import configuration from codai modules
 from codai.cli import parse_args
 from codai.config import ConfigManager
-from codai.admin.routes import init_session_manager
+from codai.admin.routes import init_session_manager, set_config_manager
 
 
 def main():
@@ -31,10 +31,18 @@ def main():
     config_dir = args.config
     config_mgr = ConfigManager(config_dir)
     config = config_mgr.load()
+
+    # Apply cache directory overrides from config before any cache module is used
+    if config.models.hf_cache_dir:
+        os.environ['HF_HOME'] = config.models.hf_cache_dir
+        os.environ['HUGGINGFACE_HUB_CACHE'] = config.models.hf_cache_dir
+    if config.models.gguf_cache_dir:
+        os.environ['CODERAI_CACHE_DIR'] = config.models.gguf_cache_dir
     
-    # Initialize admin session manager
+    # Initialize admin session manager and expose config to admin routes
     from pathlib import Path
     init_session_manager(Path(config_dir))
+    set_config_manager(config_mgr)
     
     # Handle early exit options (before heavy imports)
     if args.list_cached_models:
@@ -294,106 +302,128 @@ def main():
             kwargs['n_gpu_layers'] = model_cfg.get('n_gpu_layers', -1)
         return kwargs
     
-    # Load text models (main LLM)
+    # =========================================================================
+    # Register and optionally pre-load all configured models
+    # Models with load_mode == "load" are pre-loaded at startup.
+    # Models with load_mode == "on-request" (default) are loaded on demand.
+    # =========================================================================
+
+    def _model_id(m):
+        """Return the model path/id from a config entry (dict or str)."""
+        if isinstance(m, str):
+            return m
+        return m.get("path") or m.get("id") or ""
+
+    def _model_cfg(m, mtype):
+        cfg = build_kwargs_from_config(m, mtype) if isinstance(m, dict) else {}
+        if isinstance(m, dict):
+            for k in ("load_mode", "used_vram_gb", "alias"):
+                if k in m:
+                    cfg[k] = m[k]
+        return cfg
+
+    # Text models
     text_models = models_config.get("text_models", [])
-    text_model_names = [m["id"] for m in text_models if m.get("enabled", True)]
-    
+    # Also include legacy gguf_models entries (treated as text)
+    text_models = text_models + models_config.get("gguf_models", [])
+    text_model_names = [_model_id(m) for m in text_models if _model_id(m)]
+
     if text_model_names:
-        print(f"\nMain text model(s): {text_model_names}")
-        for idx, model_name in enumerate(text_models):
-            multi_model_manager.set_default_model(
-                model_name["id"],
-                config=build_kwargs_from_config(model_name, "text"),
-                backend_type=model_name.get("backend", "auto")
-            )
-    
-    # Load preload list
-    preload_list = models_config.get("preload", [])
-    loaded_list = models_config.get("loaded", [])
-    
-    # Determine which models to preload at startup
-    # loaded: models to load into VRAM (or CPU for loadswap) immediately
-    # preload: models to keep in CPU RAM for fast swapping
-    nopreload = False  # Config-based loading, no CLI preload skip
-    
-    # Pre-load models at startup based on config
-    if not nopreload and load_mode in ("loadall", "loadswap"):
-        all_startup_models = loaded_list + preload_list
-    elif not nopreload and load_mode == "ondemand":
-        all_startup_models = loaded_list[:1] if loaded_list else []
-    else:
-        all_startup_models = []
-    
-    # Pre-load process
-    if text_model_names:
-        first_text = text_models[0]["id"] if text_models else None
-        
-        if not nopreload and load_mode == "ondemand" and first_text:
-            # Preload first model into VRAM
-            try:
-                print(f"Preloading first model into VRAM: {first_text}...")
-                mm = multi_model_manager._load_default_model()
-                if mm is not None and mm.backend is not None:
-                    multi_model_manager.active_in_vram = multi_model_manager.default_model
-                    print(f"Model loaded successfully: {first_text}")
-                else:
-                    print(f"Warning: Model {first_text} failed to load")
-            except Exception as e:
-                print(f"Warning: Failed to preload model: {e}")
-                print(f"Model will load on first request")
-    
-    # Load audio models (registered, load on first request)
+        print(f"\nText model(s): {text_model_names}")
+        for i, m in enumerate(text_models):
+            mid = _model_id(m)
+            if not mid:
+                continue
+            cfg = _model_cfg(m, "text")
+            if i == 0:
+                # Only the first text model becomes the default
+                multi_model_manager.set_default_model(
+                    mid, config=cfg,
+                    backend_type=m.get("backend", "auto") if isinstance(m, dict) else "auto"
+                )
+            else:
+                # Additional text models: register config only, no default override
+                multi_model_manager.config[mid] = cfg
+                multi_model_manager.model_backend_types[mid] = (
+                    m.get("backend", "auto") if isinstance(m, dict) else "auto"
+                )
+
+    # Audio models
     audio_models = models_config.get("audio_models", [])
-    for audio_m in audio_models:
-        if audio_m.get("enabled", True):
-            multi_model_manager.set_audio_model(
-                audio_m["id"],
-                config=build_kwargs_from_config(audio_m, "audio")
-            )
-    
-    # Load image models
+    for m in audio_models:
+        mid = _model_id(m)
+        if mid:
+            multi_model_manager.set_audio_model(mid, config=_model_cfg(m, "audio"))
+
+    # Image models
     image_models = models_config.get("image_models", [])
-    for img_m in image_models:
-        if img_m.get("enabled", True):
-            multi_model_manager.set_image_model(
-                img_m["id"],
-                config=build_kwargs_from_config(img_m, "image")
-            )
-    
-    # Load vision models
+    for m in image_models:
+        mid = _model_id(m)
+        if mid:
+            multi_model_manager.set_image_model(mid, config=_model_cfg(m, "image"))
+
+    # Vision models
     vision_models = models_config.get("vision_models", [])
-    for vis_m in vision_models:
-        if vis_m.get("enabled", True):
-            multi_model_manager.set_vision_model(
-                vis_m["id"],
-                config=build_kwargs_from_config(vis_m, "vision")
-            )
-    
-    # Load TTS model
-    tts_model = models_config.get("tts_models", [])
-    if tts_model:
-        for tts_m in tts_model:
-            if tts_m.get("enabled", True):
-                multi_model_manager.set_tts_model(tts_m["id"], {})
-    
+    for m in vision_models:
+        mid = _model_id(m)
+        if mid:
+            multi_model_manager.set_vision_model(mid, config=_model_cfg(m, "vision"))
+
+    # TTS models
+    tts_models = models_config.get("tts_models", [])
+    for m in tts_models:
+        mid = _model_id(m)
+        if mid:
+            multi_model_manager.set_tts_model(mid, config=_model_cfg(m, "tts") if isinstance(m, dict) else {})
+
     # Register aliases
     aliases = models_config.get("aliases", {})
     for alias, model in aliases.items():
         multi_model_manager.set_model_alias(alias, model)
+
+    # Pre-load models marked as load_mode == "load" across ALL types
+    all_model_entries = (
+        [("text", m) for m in text_models] +
+        [("audio", m) for m in audio_models] +
+        [("image", m) for m in image_models] +
+        [("vision", m) for m in vision_models] +
+        [("tts", m) for m in tts_models]
+    )
+    for mtype, m in all_model_entries:
+        mid = _model_id(m)
+        if not mid:
+            continue
+        per_load_mode = m.get("load_mode", "on-request") if isinstance(m, dict) else "on-request"
+        if per_load_mode != "load":
+            print(f"  '{mid}' — on-request (will load when needed)")
+            continue
+        print(f"  Pre-loading '{mid}' (load mode)...")
+        try:
+            if mtype == "text":
+                mm = multi_model_manager._load_model_by_name(mid)
+                if mm is not None and mm.backend is not None:
+                    multi_model_manager.active_in_vram = mid
+                    print(f"  Loaded: {mid}")
+                else:
+                    print(f"  Warning: {mid} failed to load")
+            # image/audio/vision/tts pre-loading is handled by their respective
+            # API modules on first request; we just log intent here.
+            else:
+                print(f"  Note: pre-loading for {mtype} models happens on first request")
+        except Exception as e:
+            print(f"  Warning: failed to pre-load '{mid}': {e}")
+
+
     
     # Print startup summary
     print(f"\nBackend: {backend}")
-    print(f"Load mode: {load_mode}")
-    
     available_models = multi_model_manager.list_models()
-    print(f"\nAvailable models: {[m.id for m in available_models]}")
-    
-    # Register custom aliases from config
+    print(f"Available models: {[m.id for m in available_models]}")
     if aliases:
-        print(f"\nModel aliases:")
+        print("Model aliases:")
         for alias, target in aliases.items():
             print(f"  {alias} -> {target}")
-    
+
     # Set global args for backward compatibility with existing code
     class ArgsCompat:
         pass
@@ -438,10 +468,10 @@ def main():
     global_args.force_reasoning = config.reasoning_options
     global_args.model = text_model_names
     global_args.language_model = text_model_names
-    global_args.image_model = [m["id"] for m in image_models if m.get("enabled")]
-    global_args.audio_model = [m["id"] for m in audio_models if m.get("enabled")]
-    global_args.vision_model = [m["id"] for m in vision_models if m.get("enabled")]
-    global_args.tts_model = tts_model[0]["id"] if tts_model else None
+    global_args.image_model = [_model_id(m) for m in image_models]
+    global_args.audio_model = [_model_id(m) for m in audio_models]
+    global_args.vision_model = [_model_id(m) for m in vision_models]
+    global_args.tts_model = _model_id(tts_models[0]) if tts_models else None
     global_args.model_aliases = [(k, v) for k, v in aliases.items()]
     global_args.whisper_server = config.whisper.server_path
     global_args.whisper_server_port = config.whisper.server_port
@@ -458,86 +488,46 @@ def main():
     global_args.vulkan_list_devices = False
     global_args.loadall = False
     global_args.loadswap = False
-    global_args.nopreload = nopreload
-    
+    global_args.nopreload = False
+
     set_global_args(global_args)
     set_global_args_text(global_args)
     set_load_mode_app(load_mode)
-    
+
     # Set image module global args
     from codai.api.images import set_global_args as set_images_global_args
     set_images_global_args(global_args)
-    
-    # Vulkan list devices
-    if args.vulkan_list_devices:
-        print("\nListing Vulkan devices...")
+
+    # Pre-load image models marked as load_mode == "load"
+    for m in image_models:
+        mid = _model_id(m)
+        if not mid:
+            continue
+        per_load_mode = m.get("load_mode", "on-request") if isinstance(m, dict) else "on-request"
+        if per_load_mode != "load":
+            continue
+        model_key = f"image:{mid}"
+        if model_key in multi_model_manager.models:
+            continue
         try:
-            import subprocess
-            result = subprocess.run(['vulkaninfo', '--summary'], capture_output=True, text=True)
-            if result.returncode == 0:
-                print(result.stdout)
+            from codai.api.images import _load_diffusers_pipeline, _is_gguf_model, _load_sdcpp_model
+            print(f"Pre-loading image model '{mid}' (load mode)...")
+            if _is_gguf_model(mid):
+                resolved_path = multi_model_manager.load_model(mid)
+                if resolved_path and os.path.isfile(resolved_path):
+                    sd_model = _load_sdcpp_model(resolved_path, global_args)
+                    if sd_model:
+                        multi_model_manager.add_model(model_key, sd_model)
+                        print(f"  Image model loaded: {mid}")
             else:
-                print("Could not run vulkaninfo.")
+                pipeline = _load_diffusers_pipeline(mid, global_args)
+                if pipeline:
+                    multi_model_manager.add_model(model_key, pipeline)
+                    print(f"  Image model loaded: {mid}")
         except Exception as e:
-            print(f"Error: {e}")
-        sys.exit(0)
-    
-    # Startup: Preload configured models (non-text) for loadall/loadswap
-    if not nopreload and load_mode in ("loadall", "loadswap"):
-        first_loaded = multi_model_manager.active_in_vram is not None
-        
-        if image_models:
-            print(f"\n=== Pre-loading image model(s) ===")
-            for img_m in image_models:
-                if not img_m.get("enabled", True):
-                    continue
-                model_key = f"image:{img_m['id']}"
-                if model_key in multi_model_manager.models:
-                    continue
-                try:
-                    from codai.api.images import _load_diffusers_pipeline, _is_gguf_model, _load_sdcpp_model
-                    if load_mode == "loadall":
-                        print(f"Preloading image model into VRAM: {img_m['id']}...")
-                        if _is_gguf_model(img_m['id']):
-                            resolved_path = multi_model_manager.load_model(img_m['id'])
-                            if resolved_path and os.path.isfile(resolved_path):
-                                sd_model = _load_sdcpp_model(resolved_path, global_args)
-                                if sd_model:
-                                    multi_model_manager.add_model(model_key, sd_model)
-                                    print(f"Image model loaded (VRAM): {img_m['id']}")
-                        else:
-                            try:
-                                pipeline = _load_diffusers_pipeline(img_m['id'], global_args)
-                                if pipeline:
-                                    multi_model_manager.add_model(model_key, pipeline)
-                                    print(f"Image model loaded (VRAM): {img_m['id']}")
-                            except Exception as e:
-                                em = str(e).lower()
-                                if any(x in em for x in ['out of memory', 'oom', 'cuda error']):
-                                    print(f"VRAM full for {img_m['id']}, will load on demand")
-                                else:
-                                    print(f"Warning: {e}")
-                    elif load_mode == "loadswap" and not first_loaded:
-                        print(f"Preloading image model: {img_m['id']}...")
-                        if _is_gguf_model(img_m['id']):
-                            resolved_path = multi_model_manager.load_model(img_m['id'])
-                            if resolved_path and os.path.isfile(resolved_path):
-                                sd_model = _load_sdcpp_model(resolved_path, global_args)
-                                if sd_model:
-                                    multi_model_manager.add_model(model_key, sd_model)
-                                    first_loaded = True
-                                    print(f"Image model loaded: {img_m['id']}")
-                        else:
-                            try:
-                                pipeline = _load_diffusers_pipeline(img_m['id'], global_args)
-                                if pipeline:
-                                    multi_model_manager.add_model(model_key, pipeline)
-                                    first_loaded = True
-                                    print(f"Image model loaded: {img_m['id']}")
-                            except Exception as e:
-                                print(f"Warning: {e}")
-                except Exception as e:
-                    print(f"Warning: {e}")
+            print(f"  Warning: failed to pre-load image model '{mid}': {e}")
+
+
     
     # Start the server
     import uvicorn

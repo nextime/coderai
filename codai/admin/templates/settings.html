@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+{% block title %}Settings — CoderAI{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Settings</h1>
+    <p>Server configuration — restart CoderAI to apply changes</p>
+  </div>
+  <div class="header-actions">
+    <span id="save-status" class="muted small" style="margin-right:.5rem"></span>
+    <button class="btn btn-primary" onclick="saveSettings()">Save changes</button>
+  </div>
+</div>
+
+<div id="settings-alert" style="display:none"></div>
+
+<!-- Server -->
+<div class="card mb-0">
+  <div class="card-title">Server</div>
+  <div style="display:grid;grid-template-columns:1fr 160px;gap:1rem;align-items:start">
+    <div class="form-row" style="margin:0">
+      <label class="form-label">Listen host</label>
+      <input type="text" id="s-host" class="form-input" placeholder="0.0.0.0">
+      <span class="form-hint">IP address or hostname to bind to (0.0.0.0 = all interfaces)</span>
+    </div>
+    <div class="form-row" style="margin:0">
+      <label class="form-label">Port</label>
+      <input type="number" id="s-port" class="form-input" placeholder="8000" min="1" max="65535">
+    </div>
+  </div>
+  <div class="form-row" style="margin-top:1rem;margin-bottom:.25rem">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-https" onchange="toggleHttps()">
+      <span style="font-size:13px;font-weight:500">Enable HTTPS</span>
+    </label>
+  </div>
+  <div id="https-fields" style="display:none;margin-top:.75rem">
+    <div class="form-row">
+      <label class="form-label">SSL key path <span class="muted">(leave blank to auto-generate)</span></label>
+      <input type="text" id="s-key" class="form-input" placeholder="/path/to/key.pem">
+    </div>
+    <div class="form-row" style="margin:0">
+      <label class="form-label">SSL certificate path</label>
+      <input type="text" id="s-cert" class="form-input" placeholder="/path/to/cert.pem">
+    </div>
+  </div>
+</div>
+
+<!-- Storage -->
+<div class="card mb-0" style="margin-top:1rem">
+  <div class="card-title">Storage</div>
+  <div class="form-row">
+    <label class="form-label">HuggingFace cache directory <span class="muted">(leave blank for default ~/.cache/huggingface)</span></label>
+    <input type="text" id="s-hf-cache" class="form-input" placeholder="e.g. /data/models/huggingface">
+  </div>
+  <div class="form-row" style="margin:0">
+    <label class="form-label">GGUF cache directory <span class="muted">(leave blank for default ~/.cache/coderai/models)</span></label>
+    <input type="text" id="s-gguf-cache" class="form-input" placeholder="e.g. /data/models/gguf">
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function toggleHttps(){
+  document.getElementById('https-fields').style.display =
+    document.getElementById('s-https').checked ? 'block' : 'none';
+}
+
+function showAlert(type, msg){
+  const el = document.getElementById('settings-alert');
+  el.className = 'alert alert-' + (type === 'error' ? 'error' : 'info');
+  el.textContent = msg;
+  el.style.display = 'flex';
+  if(type !== 'error') setTimeout(()=>{ el.style.display='none'; }, 4000);
+}
+
+async function loadSettings(){
+  try{
+    const d = await fetch('/admin/api/settings').then(r=>r.json());
+    document.getElementById('s-host').value  = d.server?.host ?? '0.0.0.0';
+    document.getElementById('s-port').value  = d.server?.port ?? 8000;
+    document.getElementById('s-https').checked = !!d.server?.https;
+    document.getElementById('s-key').value   = d.server?.https_key_path ?? '';
+    document.getElementById('s-cert').value  = d.server?.https_cert_path ?? '';
+    document.getElementById('s-hf-cache').value   = d.models?.hf_cache_dir ?? '';
+    document.getElementById('s-gguf-cache').value = d.models?.gguf_cache_dir ?? '';
+    toggleHttps();
+  }catch(e){ showAlert('error','Failed to load settings: '+e.message); }
+}
+
+async function saveSettings(){
+  const strOrNull = id => document.getElementById(id).value.trim() || null;
+  const data = {
+    server:{
+      host: document.getElementById('s-host').value.trim() || '0.0.0.0',
+      port: parseInt(document.getElementById('s-port').value) || 8000,
+      https: document.getElementById('s-https').checked,
+      https_key_path:  strOrNull('s-key'),
+      https_cert_path: strOrNull('s-cert'),
+    },
+    models:{
+      hf_cache_dir:   strOrNull('s-hf-cache'),
+      gguf_cache_dir: strOrNull('s-gguf-cache'),
+    }
+  };
+  try{
+    const r = await fetch('/admin/api/settings',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(data)
+    });
+    if(r.ok) showAlert('info','Settings saved. Restart CoderAI to apply.');
+    else{ const e=await r.json(); showAlert('error', e.detail||'Save failed'); }
+  }catch(e){ showAlert('error','Error: '+e.message); }
+}
+
+loadSettings();
+</script>
+{% endblock %}

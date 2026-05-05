@@ -31,3 +31,8 @@ llama-cpp-python>=0.2.0
 # Requires specific CUDA versions and may need manual installation
 # Install with: pip install flash-attn --no-build-isolation
 # flash-attn>=2.5.0
+
+# Optional: fast path for linear attention models (RWKV, Mamba, etc.)
+causal-conv1d
+# flash-linear-attention requires CUDA and must be installed from source:
+# pip install git+https://github.com/fla-org/flash-linear-attention --no-build-isolation

@@ -1,62 +1,54 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}CoderAI Admin{% endblock %}</title>
-    <link rel="stylesheet" href="/static/admin/style.css">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}CoderAI{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/admin/style.css">
+  {% block head %}{% endblock %}
 </head>
 <body>
-    {% if username %}
-    <div class="layout">
-        <aside class="sidebar">
-            <div class="logo">
-                <h1>CoderAI</h1>
-            </div>
-            <nav class="nav">
-                <a href="/admin" class="nav-item {% if request.url.path == '/admin' %}active{% endif %}">
-                    <span class="icon">📊</span>
-                    <span>Overview</span>
-                </a>
-                {% if is_admin %}
-                <a href="/admin/models" class="nav-item {% if '/models' in request.url.path %}active{% endif %}">
-                    <span class="icon">🤖</span>
-                    <span>Models</span>
-                </a>
-                <a href="/admin/tokens" class="nav-item {% if '/tokens' in request.url.path %}active{% endif %}">
-                    <span class="icon">🔑</span>
-                    <span>API Tokens</span>
-                </a>
-                <a href="/admin/users" class="nav-item {% if '/users' in request.url.path %}active{% endif %}">
-                    <span class="icon">👥</span>
-                    <span>Users</span>
-                </a>
-                {% endif %}
-                <a href="/chat" class="nav-item {% if '/chat' in request.url.path %}active{% endif %}">
-                    <span class="icon">💬</span>
-                    <span>Chat</span>
-                </a>
-            </nav>
-            <div class="sidebar-footer">
-                <div class="user-info">
-                    <span class="icon">👤</span>
-                    <span>{{ username }}</span>
-                </div>
-                <a href="/logout" class="logout-btn">Logout</a>
-            </div>
-        </aside>
-        <main class="main-content">
-            <div class="content-wrapper">
-                {% block content %}{% endblock %}
-            </div>
-        </main>
+
+{% if username %}
+<nav class="topnav">
+  <div class="topnav-inner">
+    <div class="topnav-left">
+      <a href="/admin" class="nav-logo">
+        <div class="nav-logo-mark">AI</div>
+        <span class="nav-logo-name">CoderAI</span>
+      </a>
+      <div class="nav-links">
+        <a href="/admin" class="nav-link {% if request.url.path == '/admin' %}active{% endif %}">Overview</a>
+        <a href="/chat" class="nav-link {% if request.url.path == '/chat' %}active{% endif %}">Chat</a>
+        {% if is_admin|default(false) %}
+        <a href="/admin/models" class="nav-link {% if '/models' in request.url.path %}active{% endif %}">Models</a>
+        <a href="/admin/tokens" class="nav-link {% if '/tokens' in request.url.path %}active{% endif %}">Tokens</a>
+        <a href="/admin/users" class="nav-link {% if '/users' in request.url.path %}active{% endif %}">Users</a>
+        <a href="/admin/settings" class="nav-link {% if '/settings' in request.url.path %}active{% endif %}">Settings</a>
+        {% endif %}
+      </div>
     </div>
-    {% else %}
-    <div class="content-wrapper">
-        {% block content %}{% endblock %}
+    <div class="topnav-right">
+      <span class="nav-username">{{ username }}</span>
+      <div class="nav-sep"></div>
+      <a href="/logout" class="nav-logout">Sign out</a>
     </div>
-    {% endif %}
-    
-    {% block scripts %}{% endblock %}
+  </div>
+</nav>
+<main class="main">
+{% endif %}
+
+<div class="{% block wrapper_class %}container{% endblock %}">
+  {% block content %}{% endblock %}
+</div>
+
+{% if username %}
+</main>
+{% endif %}
+
+{% block scripts %}{% endblock %}
 </body>
 </html>

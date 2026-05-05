@@ -209,17 +209,20 @@ elif [ "$BACKEND" = "vulkan" ]; then
         echo -e "${GREEN}✓ Found Vulkan shader compiler: $GLSLC_CMD${NC}"
     fi
     
-    # Build with Vulkan support
+    # Build with Vulkan support (add CUDA too if available)
     echo -e "${YELLOW}Building llama-cpp-python with Vulkan support...${NC}"
-    CMAKE_ARGS="-DGGML_VULKAN=ON" pip install --upgrade llama-cpp-python --no-cache-dir || {
+    _LLAMA_CMAKE="-DGGML_VULKAN=ON"
+    if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
+        _LLAMA_CMAKE="$_LLAMA_CMAKE -DGGML_CUDA=ON"
+        echo -e "${GREEN}  ✓ Also enabling CUDA support (NVIDIA detected)${NC}"
+    fi
+    CMAKE_ARGS="$_LLAMA_CMAKE" pip install --upgrade llama-cpp-python --no-cache-dir || {
         echo -e "${RED}Build failed!${NC}"
         exit 1
     }
     
     echo -e "${YELLOW}Installing Vulkan-specific requirements...${NC}"
     pip install -r requirements-vulkan.txt
-    
-    # Build whispercpp Python package with Vulkan support for GPU-accelerated audio transcription
     echo -e "${YELLOW}Building whispercpp with Vulkan support for GPU-accelerated transcription...${NC}"
     
     # First, uninstall any existing whispercpp (pip version doesn't have Vulkan)
@@ -318,11 +321,16 @@ elif [ "$BACKEND" = "vulkan-nvidia" ]; then
         echo -e "${GREEN}✓ Found Vulkan shader compiler: $GLSLC_CMD${NC}"
     fi
     
-    # Build with Vulkan support
+    # Build with Vulkan support (add CUDA too if available)
     # Note: llama.cpp doesn't have a compile-time option to disable specific GPUs
     # The device selection happens at runtime via environment variables
     echo -e "${YELLOW}Building llama-cpp-python with Vulkan support...${NC}"
-    CMAKE_ARGS="-DGGML_VULKAN=ON" pip install --upgrade llama-cpp-python --no-cache-dir || {
+    _LLAMA_CMAKE="-DGGML_VULKAN=ON"
+    if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
+        _LLAMA_CMAKE="$_LLAMA_CMAKE -DGGML_CUDA=ON"
+        echo -e "${GREEN}  ✓ Also enabling CUDA support (NVIDIA detected)${NC}"
+    fi
+    CMAKE_ARGS="$_LLAMA_CMAKE" pip install --upgrade llama-cpp-python --no-cache-dir || {
         echo -e "${RED}Build failed!${NC}"
         exit 1
     }
@@ -378,10 +386,15 @@ elif [ "$BACKEND" = "cuda" ]; then
         echo -e "${GREEN}✓ Found CUDA at /usr/local/cuda${NC}"
     fi
     
-    # Build llama-cpp-python with CUDA support
+    # Build llama-cpp-python with CUDA support (add Vulkan too if available)
     echo -e "${YELLOW}Building llama-cpp-python with CUDA support...${NC}"
     echo -e "${YELLOW}This may take several minutes...${NC}"
-    CMAKE_ARGS="-DGGML_CUDA=ON" pip install --upgrade llama-cpp-python --no-cache-dir || {
+    _LLAMA_CMAKE="-DGGML_CUDA=ON"
+    if pkg-config --exists vulkan 2>/dev/null; then
+        _LLAMA_CMAKE="$_LLAMA_CMAKE -DGGML_VULKAN=ON"
+        echo -e "${GREEN}  ✓ Also enabling Vulkan support (Vulkan detected)${NC}"
+    fi
+    CMAKE_ARGS="$_LLAMA_CMAKE" pip install --upgrade llama-cpp-python --no-cache-dir || {
         echo ""
         echo -e "${RED}Build failed!${NC}"
         echo -e "${YELLOW}Make sure CUDA toolkit is installed:${NC}"
