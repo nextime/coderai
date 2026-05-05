@@ -139,7 +139,20 @@ if [ "$BACKEND" = "nvidia" ]; then
     pip install -r requirements-nvidia.txt || {
         echo -e "${YELLOW}Warning: Some NVIDIA packages failed to install${NC}"
     }
-    
+
+    # Extended modality dependencies (video/audio/embeddings/upscaling)
+    echo -e "${YELLOW}Installing extended modality dependencies...${NC}"
+    pip install "imageio[ffmpeg]" scipy soundfile sentence-transformers \
+        openai-whisper argostranslate edge-tts kokoro-tts timm || {
+        echo -e "${YELLOW}Warning: Some optional modality packages failed${NC}"
+    }
+    pip install realesrgan basicsr || {
+        echo -e "${YELLOW}Warning: realesrgan/basicsr failed (image upscaling optional)${NC}"
+    }
+    pip install audiocraft 2>/dev/null || {
+        echo -e "${YELLOW}Note: audiocraft not installed (audio generation with MusicGen optional)${NC}"
+    }
+
     # Install Flash Attention 2 if requested
     if [ "$FLASH" = true ]; then
         echo ""
@@ -510,7 +523,22 @@ elif [ "$BACKEND" = "all" ]; then
     pip install -r requirements-nvidia.txt || {
         echo -e "${YELLOW}Warning: Some NVIDIA packages failed to install${NC}"
     }
-    
+
+    # Extended modality dependencies (video/audio/embeddings/upscaling)
+    echo -e "${YELLOW}Installing extended modality dependencies...${NC}"
+    pip install "imageio[ffmpeg]" scipy soundfile sentence-transformers \
+        openai-whisper argostranslate edge-tts kokoro-tts timm || {
+        echo -e "${YELLOW}Warning: Some optional modality packages failed${NC}"
+    }
+    pip install realesrgan basicsr || {
+        echo -e "${YELLOW}Warning: realesrgan/basicsr failed (image upscaling optional)${NC}"
+    }
+    # audiocraft (MusicGen/AudioGen) — Meta package, may fail on some Python versions
+    pip install audiocraft 2>/dev/null || {
+        echo -e "${YELLOW}Note: audiocraft not installed (audio generation with MusicGen optional)${NC}"
+        echo -e "${YELLOW}      Install manually: pip install audiocraft${NC}"
+    }
+
     # Check for Vulkan development libraries
     VULKAN_AVAILABLE=false
     if pkg-config --exists vulkan 2>/dev/null; then

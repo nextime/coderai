@@ -376,6 +376,27 @@ def main():
         if mid:
             multi_model_manager.set_tts_model(mid, config=_model_cfg(m, "tts") if isinstance(m, dict) else {})
 
+    # Video generation models
+    video_models = models_config.get("video_models", [])
+    for m in video_models:
+        mid = _model_id(m)
+        if mid:
+            multi_model_manager.set_video_model(mid, config=_model_cfg(m, "video") if isinstance(m, dict) else {})
+
+    # Audio generation models (MusicGen, AudioLDM2, …)
+    audio_gen_models = models_config.get("audio_gen_models", [])
+    for m in audio_gen_models:
+        mid = _model_id(m)
+        if mid:
+            multi_model_manager.set_audio_gen_model(mid, config=_model_cfg(m, "audio_gen") if isinstance(m, dict) else {})
+
+    # Embedding models
+    embedding_models = models_config.get("embedding_models", [])
+    for m in embedding_models:
+        mid = _model_id(m)
+        if mid:
+            multi_model_manager.set_embedding_model(mid, config=_model_cfg(m, "embedding") if isinstance(m, dict) else {})
+
     # Register aliases
     aliases = models_config.get("aliases", {})
     for alias, model in aliases.items():
@@ -387,7 +408,10 @@ def main():
         [("audio", m) for m in audio_models] +
         [("image", m) for m in image_models] +
         [("vision", m) for m in vision_models] +
-        [("tts", m) for m in tts_models]
+        [("tts", m) for m in tts_models] +
+        [("video", m) for m in video_models] +
+        [("audio_gen", m) for m in audio_gen_models] +
+        [("embedding", m) for m in embedding_models]
     )
     for mtype, m in all_model_entries:
         mid = _model_id(m)
@@ -497,6 +521,22 @@ def main():
     # Set image module global args
     from codai.api.images import set_global_args as set_images_global_args
     set_images_global_args(global_args)
+
+    # Set video module global args
+    from codai.api.video import set_global_args as set_video_global_args, set_global_file_path as set_video_file_path
+    set_video_global_args(global_args)
+    if global_file_path:
+        set_video_file_path(global_file_path)
+
+    # Set audio_gen module global args
+    from codai.api.audio_gen import set_global_args as set_audiogen_global_args, set_global_file_path as set_audiogen_file_path
+    set_audiogen_global_args(global_args)
+    if global_file_path:
+        set_audiogen_file_path(global_file_path)
+
+    # Set embeddings module global args
+    from codai.api.embeddings import set_global_args as set_embed_global_args
+    set_embed_global_args(global_args)
 
     # Pre-load image models marked as load_mode == "load"
     for m in image_models:

@@ -252,7 +252,8 @@ async def api_status(username: str = Depends(require_auth)):
     try:
         if config_manager:
             md = config_manager.models_data
-            for cat in ("text_models", "image_models", "audio_models", "vision_models", "tts_models"):
+            for cat in ("text_models", "image_models", "audio_models", "vision_models", "tts_models",
+                        "video_models", "audio_gen_models", "embedding_models"):
                 for m in md.get(cat, []):
                     mid = (m.get("path") or m.get("id") or m) if isinstance(m, dict) else m
                     if mid and mid not in enabled_models:
@@ -712,7 +713,8 @@ def _scan_caches() -> dict:
     if config_manager:
         md = config_manager.models_data
         for cat in ("text_models", "image_models", "audio_models",
-                    "gguf_models", "tts_models", "vision_models"):
+                    "gguf_models", "tts_models", "vision_models", "video_models",
+                    "audio_gen_models", "embedding_models"):
             for m in md.get(cat, []):
                 if isinstance(m, str):
                     p = m
@@ -1011,7 +1013,8 @@ async def api_model_enable(request: Request, username: str = Depends(require_adm
     data = await request.json()
     path = data.get("path") or data.get("model_id", "")
     model_type = data.get("model_type", "text_models")
-    valid = {"text_models", "image_models", "audio_models", "gguf_models", "tts_models", "vision_models"}
+    valid = {"text_models", "image_models", "audio_models", "gguf_models", "tts_models", "vision_models",
+             "video_models", "audio_gen_models", "embedding_models"}
     if model_type not in valid:
         raise HTTPException(status_code=400, detail=f"model_type must be one of {valid}")
     lst = config_manager.models_data.setdefault(model_type, [])
@@ -1030,7 +1033,8 @@ async def api_model_disable(request: Request, username: str = Depends(require_ad
     path = data.get("path") or data.get("model_id", "")
     changed = False
     for cat in ("text_models", "image_models", "audio_models",
-                "gguf_models", "tts_models", "vision_models"):
+                "gguf_models", "tts_models", "vision_models", "video_models",
+                "audio_gen_models", "embedding_models"):
         lst = config_manager.models_data.get(cat, [])
         new_lst = [m for m in lst
                    if (m if isinstance(m, str) else m.get("path", m.get("id", ""))) != path]
@@ -1063,7 +1067,10 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
     if config_manager:
         md = config_manager.models_data
         for cat, mtype in (("image_models", "image"), ("audio_models", "audio"),
-                           ("vision_models", "vision"), ("tts_models", "tts")):
+                           ("vision_models", "vision"), ("tts_models", "tts"),
+                           ("video_models", "video"),
+                           ("audio_gen_models", "audio_gen"),
+                           ("embedding_models", "embedding")):
             for m in md.get(cat, []):
                 mid = m if isinstance(m, str) else m.get("path") or m.get("id") or ""
                 if mid == path:
@@ -1158,7 +1165,8 @@ async def api_model_configure(request: Request, username: str = Depends(require_
     # Treat legacy gguf_models as text_models (GGUF is a format, not a type)
     if model_type == "gguf_models":
         model_type = "text_models"
-    valid = {"text_models", "image_models", "audio_models", "tts_models", "vision_models"}
+    valid = {"text_models", "image_models", "audio_models", "tts_models", "vision_models", "video_models",
+             "audio_gen_models", "embedding_models"}
     if not path:
         raise HTTPException(status_code=400, detail="path is required")
     if model_type not in valid:

@@ -16,6 +16,21 @@ psutil>=5.9.0
 # Optional: Audio transcription dependencies
 faster-whisper>=0.10.0  # For NVIDIA/CUDA whisper transcription
 whispercpp>=0.0.17  # Alternative whisper library (works without PyTorch)
+openai-whisper>=20231117       # Whisper for subtitle generation
+
+# Image/video/audio utilities
+Pillow>=10.0.0
+numpy>=1.24.0
+imageio[ffmpeg]>=2.33.0       # frame I/O + ffmpeg bridge for video generation
+scipy>=1.11.0
+sentence-transformers>=2.7.0  # /v1/embeddings
+argostranslate>=1.9.0          # subtitle translation
+edge-tts>=6.1.9                # TTS dubbing (primary)
+kokoro-tts>=0.9.0              # TTS dubbing (fallback)
+soundfile>=0.12.0
+realesrgan>=0.3.0
+basicsr>=1.4.2
+timm>=0.9.0
 
 # Optional: for better performance with NVIDIA GPUs
 bitsandbytes>=0.41.0

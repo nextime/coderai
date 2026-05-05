@@ -380,6 +380,9 @@ class MultiModelManager:
         self.tts_model: Optional[str] = None
         self.image_models: List[str] = []
         self.vision_models: List[str] = []
+        self.video_models: List[str] = []       # video generation models (t2v / i2v / v2v)
+        self.audio_gen_models: List[str] = []   # music / sfx generation (MusicGen, AudioLDM2…)
+        self.embedding_models: List[str] = []   # text / multimodal embeddings
         self.config: Dict[str, Dict] = {}  # Store model configurations
         self.tool_parser = ModelParserAdapter()
         self.current_model_key: Optional[str] = None
@@ -660,15 +663,34 @@ class MultiModelManager:
             self.vision_models.append(model_name)
         self.config[f"vision:{model_name}"] = config or {}
 
-        # Download/cache the model at startup if it's a URL or HF ID
         resolved_model = self.load_model(model_name)
         if resolved_model != model_name:
-            # Model was downloaded/cached, update the stored name
             idx = self.vision_models.index(model_name)
             self.vision_models[idx] = resolved_model
             self.config[f"vision:{resolved_model}"] = self.config.pop(f"vision:{model_name}")
             print(f"Vision model '{model_name}' cached as: {resolved_model}")
-    
+
+    def set_video_model(self, model_name: str, config: Dict = None):
+        """Add a video generation model (t2v / i2v / v2v)."""
+        if model_name not in self.video_models:
+            self.video_models.append(model_name)
+        self.config[f"video:{model_name}"] = config or {}
+        print(f"Registered video model: {model_name}")
+
+    def set_audio_gen_model(self, model_name: str, config: Dict = None):
+        """Add a music/audio generation model (MusicGen, AudioLDM2, …)."""
+        if model_name not in self.audio_gen_models:
+            self.audio_gen_models.append(model_name)
+        self.config[f"audio_gen:{model_name}"] = config or {}
+        print(f"Registered audio-gen model: {model_name}")
+
+    def set_embedding_model(self, model_name: str, config: Dict = None):
+        """Add a text/image embedding model."""
+        if model_name not in self.embedding_models:
+            self.embedding_models.append(model_name)
+        self.config[f"embedding:{model_name}"] = config or {}
+        print(f"Registered embedding model: {model_name}")
+
     def set_model_alias(self, alias: str, model_name: str):
         """Register an alias for a model."""
         self.model_aliases[alias] = model_name
@@ -714,6 +736,27 @@ class MultiModelManager:
                 allowed.add(m)
                 allowed.add(f"vision:{m}")
 
+        # Video models
+        if self.video_models:
+            allowed.add("video")
+            for m in self.video_models:
+                allowed.add(m)
+                allowed.add(f"video:{m}")
+
+        # Audio generation models
+        if self.audio_gen_models:
+            allowed.add("audio_gen")
+            for m in self.audio_gen_models:
+                allowed.add(m)
+                allowed.add(f"audio_gen:{m}")
+
+        # Embedding models
+        if self.embedding_models:
+            allowed.add("embedding")
+            for m in self.embedding_models:
+                allowed.add(m)
+                allowed.add(f"embedding:{m}")
+
         # Custom aliases
         for alias in self.model_aliases:
             allowed.add(alias)
@@ -724,7 +767,8 @@ class MultiModelManager:
             if config_manager is not None:
                 md = config_manager.models_data
                 for cat in ("text_models", "image_models", "audio_models",
-                            "gguf_models", "tts_models", "vision_models"):
+                            "gguf_models", "tts_models", "vision_models",
+                            "video_models", "audio_gen_models", "embedding_models"):
                     for m in md.get(cat, []):
                         mid = (m if isinstance(m, str) else
                                m.get("alias") or m.get("path") or m.get("id") or "")
@@ -924,11 +968,17 @@ class MultiModelManager:
         # Handle "vision" alias
         if requested_model == "vision":
             return f"image:{self.vision_models[0]}" if self.vision_models else None
-        
+
+        # Handle "video" alias
+        if requested_model == "video":
+            return f"video:{self.video_models[0]}" if self.video_models else None
+
         # Handle prefixed models - normalize them
         if requested_model.startswith("audio:"):
             return requested_model
         if requested_model.startswith("tts:"):
+            return requested_model
+        if requested_model.startswith("video:"):
             return requested_model
         if requested_model.startswith("image:") or requested_model.startswith("vision:"):
             # Normalize vision: to image:
@@ -1231,13 +1281,19 @@ class MultiModelManager:
                 resolved_name = self.tts_model
             elif model_type == "vision":
                 resolved_name = self.vision_models[0] if self.vision_models else None
+            elif model_type == "video":
+                resolved_name = self.video_models[0] if self.video_models else None
+            elif model_type == "audio_gen":
+                resolved_name = self.audio_gen_models[0] if self.audio_gen_models else None
+            elif model_type == "embedding":
+                resolved_name = self.embedding_models[0] if self.embedding_models else None
             else:
                 resolved_name = self.default_model
         else:
             # Resolve custom aliases
             if requested_model in self.model_aliases:
                 requested_model = self.model_aliases[requested_model]
-            
+
             # Handle "default" alias
             if requested_model == "default":
                 resolved_name = self.default_model
@@ -1250,6 +1306,12 @@ class MultiModelManager:
                 resolved_name = self.tts_model
             elif requested_model == "vision":
                 resolved_name = self.vision_models[0] if self.vision_models else None
+            elif requested_model == "video":
+                resolved_name = self.video_models[0] if self.video_models else None
+            elif requested_model == "audio_gen":
+                resolved_name = self.audio_gen_models[0] if self.audio_gen_models else None
+            elif requested_model == "embedding":
+                resolved_name = self.embedding_models[0] if self.embedding_models else None
             # Handle prefixed models (e.g., "image:model_name")
             elif requested_model.startswith("image:"):
                 resolved_name = requested_model[6:]
@@ -1259,6 +1321,12 @@ class MultiModelManager:
                 resolved_name = requested_model[4:]
             elif requested_model.startswith("vision:"):
                 resolved_name = requested_model[7:]
+            elif requested_model.startswith("video:"):
+                resolved_name = requested_model[6:]
+            elif requested_model.startswith("audio_gen:"):
+                resolved_name = requested_model[10:]
+            elif requested_model.startswith("embedding:"):
+                resolved_name = requested_model[10:]
             else:
                 resolved_name = requested_model
         
@@ -1610,14 +1678,35 @@ class MultiModelManager:
         return None
     
     def list_models(self) -> List[ModelInfo]:
-        """List all available models (configured + runtime aliases)."""
+        """List all available models (configured + runtime aliases) with type/capability metadata."""
+        from codai.models.capabilities import detect_model_capabilities
+
         models = []
         seen_ids: set = set()
 
-        def _add(model_id: str):
-            if model_id not in seen_ids:
-                seen_ids.add(model_id)
-                models.append(ModelInfo(id=model_id))
+        CAT_TYPE = {
+            "text_models": "text",
+            "gguf_models": "text",
+            "vision_models": "vision",
+            "image_models": "image",
+            "audio_models": "audio",
+            "tts_models": "tts",
+            "video_models": "video",
+            "audio_gen_models": "audio_gen",
+            "embedding_models": "embedding",
+        }
+
+        def _add(model_id: str, model_type: str = None):
+            if model_id in seen_ids:
+                return
+            seen_ids.add(model_id)
+            caps = detect_model_capabilities(model_id)
+            resolved_type = model_type or (caps.to_list()[0].split("_")[0] if caps.to_list() else "text")
+            models.append(ModelInfo(
+                id=model_id,
+                type=resolved_type,
+                capabilities=caps.to_list(),
+            ))
 
         # --- Models from config (the authoritative source) ---
         try:
@@ -1625,57 +1714,72 @@ class MultiModelManager:
             if config_manager is not None:
                 md = config_manager.models_data
                 for cat in ("text_models", "vision_models", "image_models",
-                            "audio_models", "tts_models", "gguf_models"):
+                            "audio_models", "tts_models", "gguf_models",
+                            "video_models", "audio_gen_models", "embedding_models"):
+                    mtype = CAT_TYPE.get(cat, "text")
                     for m in md.get(cat, []):
                         if isinstance(m, str):
                             mid = m
                         else:
                             mid = m.get("alias") or m.get("path") or m.get("id") or ""
-                            # Also expose the raw path/id
                             raw = m.get("path") or m.get("id") or ""
                             if raw and raw != mid:
-                                _add(raw)
-                                # Short name
+                                _add(raw, mtype)
                                 short = raw.split("/")[-1] if "/" in raw else raw
                                 if short != raw:
-                                    _add(short)
+                                    _add(short, mtype)
                         if mid:
-                            _add(mid)
+                            _add(mid, mtype)
                             short = mid.split("/")[-1] if "/" in mid else mid
                             if short != mid:
-                                _add(short)
+                                _add(short, mtype)
         except Exception:
             pass
 
-        # --- Fallback: runtime default_model (if config_manager unavailable) ---
+        # --- Fallback: runtime default_model ---
         if not models and self.default_model:
             model_id = self.default_model
             if not (model_id.startswith("http://") or model_id.startswith("https://")):
                 short_name = model_id.split("/")[-1] if "/" in model_id else model_id
                 if short_name != model_id:
-                    _add(short_name)
-                _add(model_id)
-                _add("default")
+                    _add(short_name, "text")
+                _add(model_id, "text")
+                _add("default", "text")
 
-        # --- Runtime-registered non-text models (image, audio, tts, vision) ---
+        # --- Runtime-registered non-text models ---
         if self.audio_models:
-            _add("audio")
-            for audio_id in self.audio_models:
-                _add(f"audio:{audio_id}")
+            _add("audio", "audio")
+            for m in self.audio_models:
+                _add(f"audio:{m}", "audio")
 
         if self.tts_model:
-            _add("tts")
-            _add(f"tts:{self.tts_model}")
+            _add("tts", "tts")
+            _add(f"tts:{self.tts_model}", "tts")
 
         if self.image_models:
-            _add("image")
-            for image_id in self.image_models:
-                _add(f"image:{image_id}")
+            _add("image", "image")
+            for m in self.image_models:
+                _add(f"image:{m}", "image")
 
         if self.vision_models:
-            _add("vision")
-            for vision_id in self.vision_models:
-                _add(f"vision:{vision_id}")
+            _add("vision", "vision")
+            for m in self.vision_models:
+                _add(f"vision:{m}", "vision")
+
+        if self.video_models:
+            _add("video", "video")
+            for m in self.video_models:
+                _add(f"video:{m}", "video")
+
+        if self.audio_gen_models:
+            _add("audio_gen", "audio_gen")
+            for m in self.audio_gen_models:
+                _add(f"audio_gen:{m}", "audio_gen")
+
+        if self.embedding_models:
+            _add("embedding", "embedding")
+            for m in self.embedding_models:
+                _add(f"embedding:{m}", "embedding")
 
         # --- Custom aliases ---
         for alias in self.model_aliases:

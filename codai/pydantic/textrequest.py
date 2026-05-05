@@ -103,6 +103,8 @@ class ModelInfo(BaseModel):
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "huggingface"
+    type: Optional[str] = None          # e.g. "text", "image", "video", "audio", "tts", "vision", "embedding"
+    capabilities: Optional[List[str]] = None  # list of capability strings
 
 
 class ModelList(BaseModel):

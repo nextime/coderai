@@ -10,14 +10,15 @@ class ImageGenerationRequest(BaseModel):
     prompt: str
     n: int = 1
     size: Optional[str] = "1024x1024"
-    steps: Optional[int] = None  # Number of inference steps (overrides quality-based default)
-    guidance_scale: Optional[float] = None  # CFG scale (overrides quality-based default)
+    steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
     quality: Optional[str] = "standard"
     style: Optional[str] = None
     response_format: Optional[str] = "url"
     seed: Optional[int] = None
     user: Optional[str] = None
-    
+    disable_safety_checker: Optional[bool] = False
+
     model_config = ConfigDict(extra="allow")
 
 

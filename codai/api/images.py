@@ -6,10 +6,13 @@ import asyncio
 import base64
 import io
 import os
+import time
 import uuid
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from PIL import Image
+from pydantic import BaseModel
 
 # Import from codai modules
 from codai.models.manager import multi_model_manager
@@ -205,6 +208,33 @@ def _derive_diffusers_device(global_args) -> str:
     return "cuda:0"
 
 
+def _disable_safety_checker(pipe):
+    """Null out every safety gate a diffusers pipeline may have.
+
+    Works on SD 1.x/2.x (safety_checker + feature_extractor),
+    SDXL/Flux/video pipelines (no safety_checker but may have safety_concept),
+    and any future pipeline that gains one. Safe to call on pipelines that
+    never had any of these attributes.
+    """
+    if hasattr(pipe, 'safety_checker') and pipe.safety_checker is not None:
+        pipe.safety_checker = None
+    if hasattr(pipe, 'feature_extractor') and pipe.feature_extractor is not None:
+        # Keep the extractor object but disconnect it from the checker so
+        # it cannot produce a blocking signal.
+        try:
+            pipe.feature_extractor = None
+        except Exception:
+            pass
+    if hasattr(pipe, 'safety_concept'):
+        pipe.safety_concept = None
+    if hasattr(pipe, 'requires_safety_checker'):
+        try:
+            pipe.requires_safety_checker = False
+        except Exception:
+            pass
+    return pipe
+
+
 def _load_diffusers_pipeline(model_name: str, global_args):
     """
     Try to load a model using the diffusers library.
@@ -343,7 +373,10 @@ def _generate_with_diffusers(pipeline, request, global_args, http_request=None):
     import torch
     import numpy as np
     import time as time_module
-    
+
+    if getattr(request, 'disable_safety_checker', False):
+        _disable_safety_checker(pipeline)
+
     # Determine size
     width, height = 1024, 1024
     if request.size:
@@ -714,3 +747,518 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
             status_code=400,
             detail=f"Failed to load image model '{model_name}'. Errors: {'; '.join(error_details) if error_details else 'No compatible backend found'}"
         )
+
+
+# =============================================================================
+# Image-to-Image Endpoint  (POST /v1/images/edits)
+# OpenAI-compatible: accepts image + prompt, returns edited image
+# =============================================================================
+
+class ImageEditRequest(BaseModel):
+    model: str
+    prompt: str
+    image: str              # base64-encoded PNG or "data:image/...;base64,..."
+    mask: Optional[str] = None   # optional inpaint mask (base64 PNG)
+    n: int = 1
+    size: Optional[str] = "1024x1024"
+    response_format: Optional[str] = "url"
+    strength: Optional[float] = 0.75    # denoising strength (0=keep original, 1=ignore)
+    steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    seed: Optional[int] = None
+    quality: Optional[str] = "standard"
+    user: Optional[str] = None
+
+    class Config:
+        extra = "allow"
+
+
+def _decode_b64_image(data: str):
+    """Decode base64 image string to PIL Image."""
+    from PIL import Image as PILImage
+    if data.startswith("data:"):
+        _, encoded = data.split(",", 1)
+        raw = base64.b64decode(encoded)
+    else:
+        raw = base64.b64decode(data)
+    return PILImage.open(io.BytesIO(raw)).convert("RGB")
+
+
+def _load_img2img_pipeline(model_name: str, global_args):
+    """Load a diffusers img2img pipeline."""
+    import torch
+    from diffusers import (
+        StableDiffusionImg2ImgPipeline,
+        StableDiffusionXLImg2ImgPipeline,
+        DiffusionPipeline,
+    )
+
+    device = _derive_diffusers_device(global_args)
+    precision = getattr(global_args, 'image_precision', 'bf16') if global_args else 'bf16'
+    dtype_map = {'bf16': torch.bfloat16, 'f16': torch.float16, 'f32': torch.float32}
+    torch_dtype = dtype_map.get(precision, torch.bfloat16)
+
+    name_lower = model_name.lower()
+    if 'xl' in name_lower or 'sdxl' in name_lower or 'flux' in name_lower:
+        PipeClass = StableDiffusionXLImg2ImgPipeline
+    elif 'stable-diffusion' in name_lower or 'sd' in name_lower:
+        PipeClass = StableDiffusionImg2ImgPipeline
+    else:
+        PipeClass = DiffusionPipeline   # generic fallback
+
+    for attempt in range(3):
+        try:
+            pipe = PipeClass.from_pretrained(model_name, torch_dtype=torch_dtype)
+            pipe = pipe.to(device)
+            if attempt >= 1:
+                pipe.enable_attention_slicing()
+            if attempt >= 2:
+                pipe.enable_sequential_cpu_offload()
+            return pipe
+        except RuntimeError as e:
+            if 'out of memory' in str(e).lower() and attempt < 2:
+                import gc, torch
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+            raise
+
+
+@router.post("/v1/images/edits")
+async def create_image_edit(request: ImageEditRequest, http_request: Request = None):
+    """
+    Image-to-image editing endpoint (OpenAI-compatible).
+    Accepts a base64-encoded source image and returns an edited image.
+    """
+    global global_args
+
+    if not request.image:
+        raise HTTPException(status_code=400, detail="image is required")
+
+    model_info = multi_model_manager.request_model(request.model, model_type="image")
+    model_name = model_info.get('model_name')
+    if not model_name:
+        err = model_info.get('error', f"Model '{request.model}' not found or not registered")
+        raise HTTPException(status_code=404, detail=err)
+
+    model_key = f"img2img:{model_name}"
+    pipe = multi_model_manager.models.get(model_key)
+
+    if pipe is None:
+        try:
+            pipe = await asyncio.get_event_loop().run_in_executor(
+                None, _load_img2img_pipeline, model_name, global_args
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to load img2img model: {e}")
+        multi_model_manager.models[model_key] = pipe
+
+    try:
+        import torch
+        source_img = _decode_b64_image(request.image)
+
+        width, height = source_img.size
+        if request.size:
+            parts = request.size.split("x")
+            if len(parts) == 2:
+                try:
+                    width, height = int(parts[0]), int(parts[1])
+                    source_img = source_img.resize((width, height))
+                except ValueError:
+                    pass
+
+        seed = request.seed or getattr(global_args, 'image_seed', None)
+        generator = torch.Generator(device=pipe.device).manual_seed(seed) if seed else None
+        quality = request.quality or "standard"
+        num_steps = request.steps or (30 if quality == "standard" else 50)
+        cfg_scale = request.guidance_scale or (getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0)
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: pipe(
+                prompt=request.prompt,
+                image=source_img,
+                strength=request.strength,
+                num_inference_steps=num_steps,
+                guidance_scale=cfg_scale,
+                num_images_per_prompt=request.n,
+                generator=generator,
+            )
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Image editing failed: {e}")
+
+    images = []
+    for img in result.images:
+        img_data = save_image_response(img, request.response_format, http_request)
+        images.append(img_data)
+
+    return {"created": int(time.time()), "data": images}
+
+
+
+
+# =============================================================================
+# Inpainting Endpoint  (POST /v1/images/inpaint)
+# =============================================================================
+
+class ImageInpaintRequest(BaseModel):
+    model: str
+    prompt: str
+    image: str              # base64 source image
+    mask: str               # base64 mask (white = inpaint region)
+    n: int = 1
+    size: Optional[str] = "1024x1024"
+    response_format: Optional[str] = "url"
+    steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    strength: Optional[float] = 0.99
+    seed: Optional[int] = None
+    quality: Optional[str] = "standard"
+
+    class Config:
+        extra = "allow"
+
+
+def _load_inpaint_pipeline(model_name: str, global_args):
+    import torch
+    from diffusers import (
+        StableDiffusionInpaintPipeline,
+        StableDiffusionXLInpaintPipeline,
+        DiffusionPipeline,
+    )
+    device = _derive_diffusers_device(global_args)
+    precision = getattr(global_args, 'image_precision', 'bf16') if global_args else 'bf16'
+    dtype_map = {'bf16': torch.bfloat16, 'f16': torch.float16, 'f32': torch.float32}
+    torch_dtype = dtype_map.get(precision, torch.bfloat16)
+    n = model_name.lower()
+    if 'xl' in n or 'sdxl' in n:
+        PClass = StableDiffusionXLInpaintPipeline
+    elif 'stable-diffusion' in n or 'inpaint' in n:
+        PClass = StableDiffusionInpaintPipeline
+    else:
+        PClass = DiffusionPipeline
+    for attempt in range(3):
+        try:
+            pipe = PClass.from_pretrained(model_name, torch_dtype=torch_dtype)
+            pipe = pipe.to(device)
+            if attempt >= 1:
+                pipe.enable_attention_slicing()
+            if attempt >= 2:
+                pipe.enable_sequential_cpu_offload()
+            return pipe
+        except RuntimeError as e:
+            if 'out of memory' in str(e).lower() and attempt < 2:
+                import gc, torch
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+            raise
+
+
+@router.post("/v1/images/inpaint")
+async def create_image_inpaint(request: ImageInpaintRequest, http_request: Request = None):
+    """Inpaint a masked region of an image (OpenAI-compatible extension)."""
+    global global_args
+    if not request.image or not request.mask:
+        raise HTTPException(status_code=400, detail="image and mask are required")
+    model_info = multi_model_manager.request_model(request.model, model_type="image")
+    model_name = model_info.get('model_name')
+    if not model_name:
+        raise HTTPException(status_code=404, detail=model_info.get('error', 'Model not found'))
+    model_key = f"inpaint:{model_name}"
+    pipe = multi_model_manager.models.get(model_key)
+    if pipe is None:
+        try:
+            pipe = await asyncio.get_event_loop().run_in_executor(
+                None, _load_inpaint_pipeline, model_name, global_args)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to load inpaint model: {e}")
+        multi_model_manager.models[model_key] = pipe
+    try:
+        import torch
+        source_img = _decode_b64_image(request.image)
+        mask_img = _decode_b64_image(request.mask).convert("L")  # greyscale mask
+        if request.size:
+            parts = request.size.split("x")
+            if len(parts) == 2:
+                try:
+                    w, h = int(parts[0]), int(parts[1])
+                    source_img = source_img.resize((w, h))
+                    mask_img = mask_img.resize((w, h))
+                except ValueError:
+                    pass
+        seed = request.seed or getattr(global_args, 'image_seed', None)
+        generator = torch.Generator(device=pipe.device).manual_seed(seed) if seed else None
+        quality = request.quality or "standard"
+        num_steps = request.steps or (30 if quality == "standard" else 50)
+        cfg_scale = request.guidance_scale or (getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0)
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: pipe(
+                prompt=request.prompt,
+                image=source_img,
+                mask_image=mask_img,
+                strength=request.strength,
+                num_inference_steps=num_steps,
+                guidance_scale=cfg_scale,
+                num_images_per_prompt=request.n,
+                generator=generator,
+            )
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Inpainting failed: {e}")
+    images = [save_image_response(img, request.response_format, http_request) for img in result.images]
+    return {"created": int(time.time()), "data": images}
+
+
+# =============================================================================
+# Image Upscale Endpoint  (POST /v1/images/upscale)
+# =============================================================================
+
+class ImageUpscaleRequest(BaseModel):
+    model: str
+    image: str
+    scale: Optional[int] = 4
+    response_format: Optional[str] = "url"
+    class Config:
+        extra = "allow"
+
+
+def _load_upscaler(model_name: str, global_args):
+    device = _derive_diffusers_device(global_args)
+    n = model_name.lower()
+    try:
+        from diffusers import StableDiffusionUpscalePipeline
+        if 'upscal' in n or 'esrgan' in n:
+            pipe = StableDiffusionUpscalePipeline.from_pretrained(model_name)
+            return ('diffusers', pipe.to(device))
+    except Exception:
+        pass
+    # Try basicsr / Real-ESRGAN
+    try:
+        from basicsr.archs.rrdbnet_arch import RRDBNet
+        from realesrgan import RealESRGANer
+        model_obj = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                            num_block=23, num_grow_ch=32, scale=4)
+        upsampler = RealESRGANer(scale=4, model_path=model_name,
+                                  model=model_obj, device=device)
+        return ('realesrgan', upsampler)
+    except Exception:
+        pass
+    # Fallback: PIL LANCZOS
+    return ('pil', None)
+
+
+def _run_upscale(upscaler, image_bytes: bytes, scale: int):
+    from PIL import Image as PILImage
+    import numpy as np, io as _io
+    img = PILImage.open(_io.BytesIO(image_bytes)).convert("RGB")
+    backend, model = upscaler
+    if backend == 'realesrgan':
+        out_arr, _ = model.enhance(np.array(img), outscale=scale)
+        return PILImage.fromarray(out_arr)
+    if backend == 'diffusers':
+        result = model(prompt="", image=img, num_inference_steps=20)
+        return result.images[0]
+    # PIL fallback
+    w, h = img.size
+    return img.resize((w * scale, h * scale), PILImage.LANCZOS)
+
+
+@router.post("/v1/images/upscale")
+async def create_image_upscale(request: ImageUpscaleRequest, http_request: Request = None):
+    """Upscale an image using Real-ESRGAN or PIL LANCZOS fallback."""
+    global global_args
+    model_info = multi_model_manager.request_model(request.model, model_type="image")
+    model_name = model_info.get('model_name') or request.model
+    model_key = f"upscale:{model_name}"
+    upscaler = multi_model_manager.models.get(model_key)
+    if upscaler is None:
+        try:
+            upscaler = await asyncio.get_event_loop().run_in_executor(
+                None, _load_upscaler, model_name, global_args)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to load upscaler: {e}")
+        multi_model_manager.models[model_key] = upscaler
+    raw = base64.b64decode(request.image.split(',', 1)[-1] if ',' in request.image else request.image)
+    try:
+        out_img = await asyncio.get_event_loop().run_in_executor(
+            None, _run_upscale, upscaler, raw, request.scale or 4)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upscaling failed: {e}")
+    result = save_image_response(out_img, request.response_format, http_request)
+    return {"created": int(time.time()), "data": [result]}
+
+
+# =============================================================================
+# Depth Estimation Endpoint  (POST /v1/images/depth)
+# =============================================================================
+
+class ImageDepthRequest(BaseModel):
+    model: str
+    image: str
+    response_format: Optional[str] = "url"
+    class Config:
+        extra = "allow"
+
+
+def _load_depth_model(model_name: str, global_args):
+    device = _derive_diffusers_device(global_args)
+    try:
+        from transformers import pipeline as hf_pipeline
+        pipe = hf_pipeline("depth-estimation", model=model_name, device=device)
+        return ('transformers', pipe)
+    except Exception:
+        pass
+    try:
+        import torch, timm
+        model = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
+        model.eval().to(device)
+        return ('midas', (model, device))
+    except Exception as e:
+        raise RuntimeError(f"Cannot load depth model: {e}")
+
+
+def _run_depth(depth_model, image_bytes: bytes):
+    from PIL import Image as PILImage
+    import numpy as np, io as _io
+    img = PILImage.open(_io.BytesIO(image_bytes)).convert("RGB")
+    backend, model = depth_model
+    if backend == 'transformers':
+        result = model(img)
+        depth_arr = np.array(result['depth'])
+    else:
+        import torch
+        model_obj, device = model
+        transforms = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
+        inp = transforms(np.array(img)).to(device)
+        with torch.no_grad():
+            depth_arr = model_obj(inp).squeeze().cpu().numpy()
+    # Normalise to 0-255
+    d_min, d_max = depth_arr.min(), depth_arr.max()
+    if d_max > d_min:
+        depth_arr = ((depth_arr - d_min) / (d_max - d_min) * 255).astype(np.uint8)
+    else:
+        depth_arr = depth_arr.astype(np.uint8)
+    return PILImage.fromarray(depth_arr)
+
+
+@router.post("/v1/images/depth")
+async def create_image_depth(request: ImageDepthRequest, http_request: Request = None):
+    """Estimate depth map from an image."""
+    global global_args
+    model_name = request.model
+    model_key = f"depth:{model_name}"
+    depth_model = multi_model_manager.models.get(model_key)
+    if depth_model is None:
+        try:
+            depth_model = await asyncio.get_event_loop().run_in_executor(
+                None, _load_depth_model, model_name, global_args)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to load depth model: {e}")
+        multi_model_manager.models[model_key] = depth_model
+    raw = base64.b64decode(request.image.split(',', 1)[-1] if ',' in request.image else request.image)
+    try:
+        depth_img = await asyncio.get_event_loop().run_in_executor(
+            None, _run_depth, depth_model, raw)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Depth estimation failed: {e}")
+    result = save_image_response(depth_img, request.response_format, http_request)
+    return {"created": int(time.time()), "data": [result]}
+
+
+# =============================================================================
+# Segmentation Endpoint  (POST /v1/images/segment)
+# =============================================================================
+
+class ImageSegmentRequest(BaseModel):
+    model: str
+    image: str
+    points: Optional[list] = None   # [[x,y], ...] positive prompt points for SAM
+    boxes: Optional[list] = None    # [[x1,y1,x2,y2], ...] box prompts
+    response_format: Optional[str] = "url"
+    class Config:
+        extra = "allow"
+
+
+def _load_segmentation_model(model_name: str, global_args):
+    device = _derive_diffusers_device(global_args)
+    try:
+        from transformers import SamModel, SamProcessor
+        import torch
+        model = SamModel.from_pretrained(model_name).to(device)
+        processor = SamProcessor.from_pretrained(model_name)
+        return ('sam', (model, processor, device))
+    except Exception:
+        pass
+    try:
+        from transformers import pipeline as hf_pipeline
+        pipe = hf_pipeline("image-segmentation", model=model_name, device=device)
+        return ('transformers', pipe)
+    except Exception as e:
+        raise RuntimeError(f"Cannot load segmentation model: {e}")
+
+
+def _run_segmentation(seg_model, image_bytes: bytes, points, boxes):
+    from PIL import Image as PILImage
+    import numpy as np, io as _io
+    img = PILImage.open(_io.BytesIO(image_bytes)).convert("RGB")
+    backend, model_data = seg_model
+
+    if backend == 'sam':
+        import torch
+        sam_model, processor, device = model_data
+        input_points = [points] if points else None
+        input_boxes = [boxes] if boxes else None
+        inputs = processor(img, input_points=input_points,
+                           input_boxes=input_boxes, return_tensors='pt')
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = sam_model(**inputs)
+        masks = processor.image_processor.post_process_masks(
+            outputs.pred_masks.cpu(),
+            inputs['original_sizes'].cpu(),
+            inputs['reshaped_input_sizes'].cpu()
+        )[0]
+        # Take best mask, overlay on image
+        mask_np = masks[0, 0].numpy().astype(np.uint8) * 255
+        overlay = np.array(img.copy())
+        overlay[mask_np == 0] = overlay[mask_np == 0] // 2
+        return PILImage.fromarray(overlay)
+
+    else:  # transformers generic
+        results = model_data(img)
+        # Draw first segment mask
+        out = np.array(img)
+        if results:
+            mask = np.array(results[0]['mask'])
+            out[mask == 0] = out[mask == 0] // 2
+        return PILImage.fromarray(out)
+
+
+@router.post("/v1/images/segment")
+async def create_image_segment(request: ImageSegmentRequest, http_request: Request = None):
+    """Segment objects in an image using SAM or similar models."""
+    global global_args
+    model_name = request.model
+    model_key = f"segment:{model_name}"
+    seg_model = multi_model_manager.models.get(model_key)
+    if seg_model is None:
+        try:
+            seg_model = await asyncio.get_event_loop().run_in_executor(
+                None, _load_segmentation_model, model_name, global_args)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to load segmentation model: {e}")
+        multi_model_manager.models[model_key] = seg_model
+    raw = base64.b64decode(request.image.split(',', 1)[-1] if ',' in request.image else request.image)
+    try:
+        seg_img = await asyncio.get_event_loop().run_in_executor(
+            None, _run_segmentation, seg_model, raw,
+            request.points, request.boxes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Segmentation failed: {e}")
+    result = save_image_response(seg_img, request.response_format, http_request)
+    return {"created": int(time.time()), "data": [result]}

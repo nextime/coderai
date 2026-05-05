@@ -70,6 +70,9 @@ from codai.api.transcriptions import router as transcriptions_router
 from codai.api.images import router as images_router
 from codai.api.tts import router as tts_router
 from codai.api.text import router as text_router
+from codai.api.video import router as video_router
+from codai.api.audio_gen import router as audio_gen_router
+from codai.api.embeddings import router as embeddings_router
 from codai.admin.routes import router as admin_router
 
 # Import and add middleware
@@ -88,6 +91,9 @@ app.include_router(transcriptions_router)
 app.include_router(images_router)
 app.include_router(tts_router)
 app.include_router(text_router)
+app.include_router(video_router)
+app.include_router(audio_gen_router)
+app.include_router(embeddings_router)
 app.include_router(admin_router)
 
 

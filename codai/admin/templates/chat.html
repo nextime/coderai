@@ -1,121 +1,1424 @@
 {% extends "base.html" %}
-{% block title %}Chat — CoderAI{% endblock %}
+{% block title %}Studio — CoderAI{% endblock %}
 {% block wrapper_class %}{% endblock %}
 
+{% block head %}
+<style>
+/* ── Layout ─────────────────────────────────────────────────────── */
+.studio { display:flex; height:calc(100vh - 56px); overflow:hidden; }
+
+/* Sidebar */
+.sidebar {
+  width:220px; min-width:180px; background:var(--surface-1);
+  border-right:1px solid var(--border); display:flex; flex-direction:column;
+  overflow:hidden; flex-shrink:0;
+}
+.sidebar-hd { padding:.6rem 1rem .15rem; font-size:10px; font-weight:700;
+  color:var(--text-3); letter-spacing:.07em; text-transform:uppercase; }
+.model-list { flex:1; overflow-y:auto; padding:.2rem .4rem .5rem; }
+.model-item {
+  display:flex; align-items:center; gap:.4rem; padding:.4rem .55rem;
+  border-radius:6px; cursor:pointer; font-size:12px; color:var(--text-2);
+  transition:background .1s;
+}
+.model-item:hover { background:var(--surface-2); }
+.model-item.active { background:var(--accent-dim,#1d3354); color:var(--accent,#4e9cf5); font-weight:500; }
+.mbadge {
+  font-size:9px; font-weight:700; padding:1px 5px; border-radius:20px;
+  letter-spacing:.03em; text-transform:uppercase; flex-shrink:0;
+}
+.mb-text    { background:#1d3250; color:#7aaef7; }
+.mb-vision  { background:#1a2e3a; color:#5ed3f5; }
+.mb-image   { background:#1d3520; color:#6ecf7e; }
+.mb-video   { background:#301a40; color:#c07af5; }
+.mb-audio   { background:#3a2510; color:#f0a844; }
+.mb-tts     { background:#2d2010; color:#f0c060; }
+.mb-audiogen{ background:#1a2535; color:#70b8f5; }
+.mb-embed   { background:#1e2e1e; color:#88c888; }
+
+/* Main */
+.studio-main { flex:1; display:flex; flex-direction:column; overflow:hidden; }
+
+/* Two-level tab bar */
+.tabbar1 {
+  display:flex; gap:.2rem; padding:.45rem .6rem .3rem;
+  border-bottom:1px solid var(--border); background:var(--surface-0); flex-shrink:0;
+  overflow-x:auto;
+}
+.tabbar2 {
+  display:none; gap:.15rem; padding:.3rem .6rem;
+  border-bottom:1px solid var(--border); background:var(--surface-1); flex-shrink:0;
+  overflow-x:auto;
+}
+.tabbar2.visible { display:flex; }
+.t1btn, .t2btn {
+  padding:.28rem .65rem; border-radius:5px; font-size:12px; font-weight:500;
+  cursor:pointer; border:1px solid transparent; color:var(--text-3);
+  background:transparent; transition:all .1s; white-space:nowrap; flex-shrink:0;
+}
+.t1btn:hover, .t2btn:hover { background:var(--surface-2); color:var(--text-1); }
+.t1btn.active { background:var(--accent,#4e9cf5); color:#fff; }
+.t2btn.active { background:var(--surface-3,#333); color:var(--text-1); border-color:var(--border); }
+.t1btn.hidden, .t2btn.hidden { display:none; }
+
+/* Panels */
+.panel { flex:1; display:none; flex-direction:column; overflow:hidden; }
+.panel.active { display:flex; }
+
+/* ── Chat ─────────────────────────────────────────────────────── */
+.chat-msgs { flex:1; overflow-y:auto; padding:1rem 1.25rem; display:flex; flex-direction:column; gap:.75rem; }
+.chat-empty { margin:auto; text-align:center; color:var(--text-3); }
+.chat-empty h3 { font-size:1rem; margin-bottom:.25rem; }
+.msg { display:flex; gap:.75rem; }
+.msg.user { flex-direction:row-reverse; }
+.av { width:28px; height:28px; border-radius:50%; display:flex; align-items:center;
+  justify-content:center; font-size:9px; font-weight:700; flex-shrink:0; }
+.av.user { background:var(--accent,#4e9cf5); color:#fff; }
+.av.ai   { background:var(--surface-3,#2a2a2a); color:var(--text-2); }
+.msg-body { max-width:70%; }
+.msg.user .msg-body { text-align:right; }
+.msg-meta { font-size:10px; color:var(--text-3); margin-bottom:.2rem; }
+.msg-text { background:var(--surface-2); padding:.5rem .75rem; border-radius:8px;
+  font-size:13px; line-height:1.55; white-space:pre-wrap; word-break:break-word; }
+.msg.user .msg-text { background:var(--accent-dim,#1d3354); }
+.msg-img { max-width:280px; border-radius:8px; margin-top:.3rem; cursor:pointer; }
+.chat-foot { flex-shrink:0; padding:.5rem .75rem .75rem; border-top:1px solid var(--border); }
+.attach-bar { display:flex; align-items:center; gap:.5rem; margin-bottom:.3rem; }
+.attach-thumb { width:36px; height:36px; border-radius:4px; object-fit:cover; }
+.chat-row { display:flex; gap:.5rem; align-items:flex-end; }
+.chat-ta { flex:1; resize:none; border-radius:6px; border:1px solid var(--border);
+  background:var(--surface-2); color:var(--text-1); padding:.45rem .7rem;
+  font-size:13px; font-family:inherit; outline:none; min-height:36px; max-height:140px; }
+.chat-hint { font-size:10px; color:var(--text-3); margin-top:.2rem; text-align:right; }
+
+/* ── Shared panel helpers ─────────────────────────────────────── */
+.gen-wrap { flex:1; display:flex; overflow:hidden; }
+.gen-ctrl { width:290px; padding:.9rem 1rem; overflow-y:auto; border-right:1px solid var(--border);
+  background:var(--surface-1); display:flex; flex-direction:column; gap:.65rem; flex-shrink:0; }
+.gen-out { flex:1; display:flex; align-items:center; justify-content:center;
+  overflow:auto; padding:1.2rem; background:var(--surface-0); }
+.gen-out-inner { display:flex; flex-direction:column; align-items:center; gap:.6rem; width:100%; max-width:960px; }
+.gen-empty { color:var(--text-3); text-align:center; font-size:13px; }
+.out-img { max-width:100%; max-height:calc(100vh - 200px); border-radius:8px; cursor:pointer; }
+.out-video { max-width:100%; max-height:calc(100vh - 200px); border-radius:8px; }
+.out-audio { width:100%; }
+.fl { font-size:11px; font-weight:600; color:var(--text-2); margin-bottom:.15rem; display:block; }
+.progress { font-size:11px; color:var(--text-3); min-height:14px; }
+.fi, .fs, .fselect { background:var(--surface-2); border:1px solid var(--border); border-radius:5px;
+  color:var(--text-1); padding:.38rem .6rem; font-size:13px; font-family:inherit;
+  outline:none; width:100%; box-sizing:border-box; }
+.fs { resize:vertical; min-height:70px; }
+.fselect { appearance:auto; }
+.g2 { display:grid; grid-template-columns:1fr 1fr; gap:.5rem; }
+.g3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:.5rem; }
+.frow { display:flex; flex-direction:column; gap:.15rem; }
+.char-refs { display:flex; flex-wrap:wrap; gap:.3rem; margin-top:.25rem; }
+.char-thumb { width:44px; height:44px; object-fit:cover; border-radius:4px; }
+/* download link styled as button */
+a.dl { display:inline-block; margin-top:.4rem; }
+
+/* ── Pipeline ─────────────────────────────────────────────────── */
+.pipe-panel { flex:1; overflow-y:auto; padding:1.2rem; display:flex; flex-direction:column; gap:1.2rem; }
+.pipe-card { background:var(--surface-1); border:1px solid var(--border); border-radius:8px; padding:1rem; }
+.pipe-title { font-weight:600; font-size:13px; margin-bottom:.75rem; }
+.pipe-steps { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; font-size:12px; color:var(--text-3); }
+.pipe-step { background:var(--surface-2); border-radius:5px; padding:.25rem .6rem; color:var(--text-2); }
+.pipe-arrow { color:var(--text-3); }
+</style>
+{% endblock %}
+
 {% block content %}
-<div class="chat-wrap" style="margin:0 1.5rem 1rem;border-radius:8px">
-  <div class="chat-bar">
-    <h2>Chat</h2>
-    <div class="chat-controls">
-      <select id="model-sel" class="form-input" style="font-size:13px;padding:.3rem .625rem;min-width:200px">
-        <option value="">Select model…</option>
-      </select>
-      <button class="btn btn-ghost btn-sm" onclick="newChat()">Clear</button>
-    </div>
-  </div>
+<div class="studio">
 
-  <div class="chat-messages" id="chat-msgs">
-    <div class="chat-empty">
-      <h3>CoderAI Chat</h3>
-      <p>Select a model and start typing</p>
-    </div>
-  </div>
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-hd">Models</div>
+    <div class="model-list" id="model-list"><div class="muted small" style="padding:.5rem .6rem">Loading…</div></div>
+  </aside>
 
-  <div class="chat-foot">
-    <div id="typing" style="font-size:11px;color:var(--text-3);height:14px;margin-bottom:.3rem;font-family:var(--mono)"></div>
-    <div class="chat-input-row">
-      <textarea id="chat-in" class="chat-textarea" placeholder="Send a message…" rows="1"></textarea>
-      <button class="btn btn-primary" id="send-btn" onclick="send()" style="padding:.5rem .75rem;align-self:flex-end">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:13px;height:13px"><line x1="14" y1="2" x2="7" y2="9"/><polygon points="14 2 10 14 7 9 2 6 14 2"/></svg>
-      </button>
+  <div class="studio-main">
+
+    <!-- Level-1 tabs (category) -->
+    <div class="tabbar1" id="tabbar1">
+      <button class="t1btn active" data-cat="chat"    onclick="selectCat('chat')">Chat</button>
+      <button class="t1btn hidden"  data-cat="image"   onclick="selectCat('image')">Image</button>
+      <button class="t1btn hidden"  data-cat="video"   onclick="selectCat('video')">Video</button>
+      <button class="t1btn hidden"  data-cat="audio"   onclick="selectCat('audio')">Audio</button>
+      <button class="t1btn hidden"  data-cat="pipe"    onclick="selectCat('pipe')">Pipelines</button>
+      <button class="t1btn hidden"  data-cat="embed"   onclick="selectCat('embed')">Embed</button>
     </div>
-    <div class="chat-hint">Enter to send · Shift+Enter for newline</div>
-  </div>
-</div>
+
+    <!-- Level-2 tabs (sub-mode) -->
+    <div class="tabbar2" id="tabbar2">
+      <!-- Image sub-tabs -->
+      <button class="t2btn hidden" data-sub="img-gen"    onclick="selectSub('img-gen')">Generate</button>
+      <button class="t2btn hidden" data-sub="img-edit"   onclick="selectSub('img-edit')">Edit (i2i)</button>
+      <button class="t2btn hidden" data-sub="img-inpaint" onclick="selectSub('img-inpaint')">Inpaint</button>
+      <button class="t2btn hidden" data-sub="img-upscale" onclick="selectSub('img-upscale')">Upscale</button>
+      <button class="t2btn hidden" data-sub="img-depth"  onclick="selectSub('img-depth')">Depth</button>
+      <button class="t2btn hidden" data-sub="img-seg"    onclick="selectSub('img-seg')">Segment</button>
+      <!-- Video sub-tabs -->
+      <button class="t2btn hidden" data-sub="vid-t2v"   onclick="selectSub('vid-t2v')">Text→Video</button>
+      <button class="t2btn hidden" data-sub="vid-i2v"   onclick="selectSub('vid-i2v')">Image→Video</button>
+      <button class="t2btn hidden" data-sub="vid-v2v"   onclick="selectSub('vid-v2v')">Vid→Vid</button>
+      <button class="t2btn hidden" data-sub="vid-ti2v"  onclick="selectSub('vid-ti2v')">Ti2V</button>
+      <button class="t2btn hidden" data-sub="vid-interp" onclick="selectSub('vid-interp')">Interpolate</button>
+      <button class="t2btn hidden" data-sub="vid-sub"   onclick="selectSub('vid-sub')">Subtitles</button>
+      <button class="t2btn hidden" data-sub="vid-dub"   onclick="selectSub('vid-dub')">Dub</button>
+      <button class="t2btn hidden" data-sub="vid-up"    onclick="selectSub('vid-up')">Upscale</button>
+      <!-- Audio sub-tabs -->
+      <button class="t2btn hidden" data-sub="aud-gen"   onclick="selectSub('aud-gen')">Generate Music/SFX</button>
+      <button class="t2btn hidden" data-sub="aud-tts"   onclick="selectSub('aud-tts')">TTS</button>
+      <button class="t2btn hidden" data-sub="aud-stt"   onclick="selectSub('aud-stt')">Transcribe</button>
+    </div>
+
+    <!-- ═══════════════ CHAT ═══════════════ -->
+    <div class="panel active" id="panel-chat">
+      <div class="chat-msgs" id="chat-msgs">
+        <div class="chat-empty"><h3>CoderAI Studio</h3><p>Select a model from the sidebar</p></div>
+      </div>
+      <div class="chat-foot">
+        <div class="attach-bar" id="attach-bar" style="display:none">
+          <img id="attach-thumb" class="attach-thumb" src="" alt="">
+          <span style="font-size:11px;color:var(--text-3)" id="attach-name"></span>
+          <button class="btn btn-ghost btn-sm" onclick="clearAttach()" style="margin-left:auto">✕</button>
+        </div>
+        <div id="typing" style="font-size:11px;color:var(--text-3);height:14px;margin-bottom:.2rem;font-family:var(--mono)"></div>
+        <div class="chat-row">
+          <label id="attach-btn" style="display:none;cursor:pointer;align-self:flex-end;padding:.35rem" title="Attach image">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" style="width:15px;height:15px"><path d="M2 10l4-4 3 3 2-2 3 3"/><rect x="1" y="1" width="14" height="14" rx="2"/></svg>
+            <input type="file" accept="image/*" id="vision-input" style="display:none" onchange="attachImg(this)">
+          </label>
+          <textarea id="chat-in" class="chat-ta" placeholder="Send a message…" rows="1"></textarea>
+          <button class="btn btn-primary" id="send-btn" onclick="sendChat()" style="padding:.45rem .7rem;align-self:flex-end">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:13px;height:13px"><line x1="14" y1="2" x2="7" y2="9"/><polygon points="14 2 10 14 7 9 2 6 14 2"/></svg>
+          </button>
+        </div>
+        <div class="chat-hint">Enter to send · Shift+Enter for newline</div>
+      </div>
+    </div>
+
+    <!-- ═══════════════ IMAGE ═══════════════ -->
+
+    <!-- Generate -->
+    <div class="panel" id="panel-img-gen">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="frow"><label class="fl">Prompt</label><textarea id="ig-prompt" class="fs" placeholder="Describe the image…" rows="4"></textarea></div>
+          <div class="frow"><label class="fl">Negative prompt</label><textarea id="ig-neg" class="fs" placeholder="Things to avoid…" rows="2"></textarea></div>
+          <div class="g2">
+            <div class="frow"><label class="fl">Width</label><input type="number" id="ig-w" class="fi" value="1024" step="64"></div>
+            <div class="frow"><label class="fl">Height</label><input type="number" id="ig-h" class="fi" value="1024" step="64"></div>
+          </div>
+          <div class="g2">
+            <div class="frow"><label class="fl">Steps</label><input type="number" id="ig-steps" class="fi" value="30" min="1"></div>
+            <div class="frow"><label class="fl">CFG</label><input type="number" id="ig-cfg" class="fi" value="7.5" step="0.5"></div>
+          </div>
+          <div class="frow"><label class="fl">Seed</label><input type="number" id="ig-seed" class="fi" placeholder="random"></div>
+          <div class="frow"><label class="fl">Count (n)</label><input type="number" id="ig-n" class="fi" value="1" min="1" max="8"></div>
+          <div class="frow"><label class="fl" title="Removes the model's built-in safety checker. Only use with uncensored/NSFW fine-tunes.">Disable safety filter</label><input type="checkbox" id="ig-nosafe"></div>
+          <button class="btn btn-primary" onclick="genImage()">Generate</button>
+          <div class="progress" id="ig-prog"></div>
+        </div>
+        <div class="gen-out" id="ig-out"><div class="gen-empty">Image will appear here</div></div>
+      </div>
+    </div>
+
+    <!-- Edit (i2i) -->
+    <div class="panel" id="panel-img-edit">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="frow"><label class="fl">Source image</label><input type="file" id="ie-src" accept="image/*" class="fi"></div>
+          <div class="frow"><label class="fl">Prompt</label><textarea id="ie-prompt" class="fs" rows="4" placeholder="Describe the desired change…"></textarea></div>
+          <div class="frow"><label class="fl">Strength <span id="ie-sv">0.75</span></label>
+            <input type="range" id="ie-str" min="0" max="1" step="0.05" value="0.75" oninput="$('ie-sv').textContent=this.value" style="width:100%"></div>
+          <div class="g2">
+            <div class="frow"><label class="fl">Steps</label><input type="number" id="ie-steps" class="fi" value="30"></div>
+            <div class="frow"><label class="fl">CFG</label><input type="number" id="ie-cfg" class="fi" value="7.5" step="0.5"></div>
+          </div>
+          <div class="frow"><label class="fl">Seed</label><input type="number" id="ie-seed" class="fi" placeholder="random"></div>
+          <button class="btn btn-primary" onclick="genEdit()">Edit Image</button>
+          <div class="progress" id="ie-prog"></div>
+        </div>
+        <div class="gen-out" id="ie-out"><div class="gen-empty">Edited image will appear here</div></div>
+      </div>
+    </div>
+
+    <!-- Inpaint -->
+    <div class="panel" id="panel-img-inpaint">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="frow"><label class="fl">Source image</label><input type="file" id="ip-src" accept="image/*" class="fi"></div>
+          <div class="frow"><label class="fl">Mask image <span style="font-weight:400">(white = fill area)</span></label><input type="file" id="ip-mask" accept="image/*" class="fi"></div>
+          <div class="frow"><label class="fl">Prompt</label><textarea id="ip-prompt" class="fs" rows="4" placeholder="What to fill the masked area with…"></textarea></div>
+          <div class="g2">
+            <div class="frow"><label class="fl">Steps</label><input type="number" id="ip-steps" class="fi" value="30"></div>
+            <div class="frow"><label class="fl">CFG</label><input type="number" id="ip-cfg" class="fi" value="7.5" step="0.5"></div>
+          </div>
+          <div class="frow"><label class="fl">Strength <span id="ip-sv">0.99</span></label>
+            <input type="range" id="ip-str" min="0" max="1" step="0.05" value="0.99" oninput="$('ip-sv').textContent=this.value" style="width:100%"></div>
+          <div class="frow"><label class="fl">Seed</label><input type="number" id="ip-seed" class="fi" placeholder="random"></div>
+          <button class="btn btn-primary" onclick="genInpaint()">Inpaint</button>
+          <div class="progress" id="ip-prog"></div>
+        </div>
+        <div class="gen-out" id="ip-out"><div class="gen-empty">Result will appear here</div></div>
+      </div>
+    </div>
+
+    <!-- Upscale image -->
+    <div class="panel" id="panel-img-upscale">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="frow"><label class="fl">Source image</label><input type="file" id="iu-src" accept="image/*" class="fi"></div>
+          <div class="frow"><label class="fl">Scale factor</label>
+            <select id="iu-scale" class="fselect"><option value="2">2×</option><option value="4" selected>4×</option><option value="8">8×</option></select>
+          </div>
+          <button class="btn btn-primary" onclick="genImgUpscale()">Upscale</button>
+          <div class="progress" id="iu-prog"></div>
+        </div>
+        <div class="gen-out" id="iu-out"><div class="gen-empty">Upscaled image will appear here</div></div>
+      </div>
+    </div>
+
+    <!-- Depth -->
+    <div class="panel" id="panel-img-depth">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="frow"><label class="fl">Source image</label><input type="file" id="id-src" accept="image/*" class="fi"></div>
+          <button class="btn btn-primary" onclick="genDepth()">Estimate Depth</button>
+          <div class="progress" id="id-prog"></div>
+        </div>
+        <div class="gen-out" id="id-out"><div class="gen-empty">Depth map will appear here</div></div>
+      </div>
+    </div>
+
+    <!-- Segment -->
+    <div class="panel" id="panel-img-seg">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="frow"><label class="fl">Source image</label><input type="file" id="is-src" accept="image/*" class="fi"></div>
+          <div class="frow"><label class="fl">Point prompts (optional)</label>
+            <input type="text" id="is-pts" class="fi" placeholder='[[x,y], [x,y]]'></div>
+          <div class="frow"><label class="fl">Box prompts (optional)</label>
+            <input type="text" id="is-boxes" class="fi" placeholder='[[x1,y1,x2,y2]]'></div>
+          <button class="btn btn-primary" onclick="genSegment()">Segment</button>
+          <div class="progress" id="is-prog"></div>
+        </div>
+        <div class="gen-out" id="is-out"><div class="gen-empty">Segmented image will appear here</div></div>
+      </div>
+    </div>
+
+    <!-- ═══════════════ VIDEO ═══════════════ -->
+
+    <!-- T2V -->
+    <div class="panel" id="panel-vid-t2v"><div class="gen-wrap">
+      <div class="gen-ctrl" id="vid-shared-ctrl-t2v">
+        {# vid_ctrl and vid_postproc are injected by JS below #}
+        <button class="btn btn-primary" onclick="genVideo('t2v')">Generate Video</button>
+        <div class="progress" id="vt-prog"></div>
+      </div>
+      <div class="gen-out" id="vt-out"><div class="gen-empty">Video will appear here</div></div>
+    </div></div>
+
+    <!-- I2V -->
+    <div class="panel" id="panel-vid-i2v"><div class="gen-wrap">
+      <div class="gen-ctrl">
+        <div class="frow"><label class="fl">Source image</label><input type="file" id="vi-src" accept="image/*" class="fi"></div>
+        <div class="frow"><label class="fl">Motion prompt (optional)</label><textarea id="vi-prompt" class="fs" rows="2" placeholder="How should the image animate?"></textarea></div>
+        <div class="g2">
+          <div class="frow"><label class="fl">Frames</label><input type="number" id="vi-frames" class="fi" value="16"></div>
+          <div class="frow"><label class="fl">FPS</label><input type="number" id="vi-fps" class="fi" value="8"></div>
+        </div>
+        <div class="g2">
+          <div class="frow"><label class="fl">Steps</label><input type="number" id="vi-steps" class="fi" value="25"></div>
+          <div class="frow"><label class="fl">Guidance</label><input type="number" id="vi-cfg" class="fi" value="7.5" step="0.5"></div>
+        </div>
+        <div class="frow"><label class="fl">Seed</label><input type="number" id="vi-seed" class="fi" placeholder="random"></div>
+        <button class="btn btn-primary" onclick="genVideo('i2v')">Animate</button>
+        <div class="progress" id="vi-prog"></div>
+      </div>
+      <div class="gen-out" id="vi-out"><div class="gen-empty">Animated video will appear here</div></div>
+    </div></div>
+
+    <!-- V2V -->
+    <div class="panel" id="panel-vid-v2v"><div class="gen-wrap">
+      <div class="gen-ctrl">
+        <div class="frow"><label class="fl">Source video</label><input type="file" id="vv-src" accept="video/*" class="fi"></div>
+        <div class="frow"><label class="fl">Prompt</label><textarea id="vv-prompt" class="fs" rows="3" placeholder="Describe the transformation…"></textarea></div>
+        <div class="frow"><label class="fl">Strength <span id="vv-sv">0.70</span></label>
+          <input type="range" id="vv-str" min="0" max="1" step="0.05" value="0.70" oninput="$('vv-sv').textContent=(+this.value).toFixed(2)" style="width:100%"></div>
+        <div class="g2">
+          <div class="frow"><label class="fl">Steps</label><input type="number" id="vv-steps" class="fi" value="25"></div>
+          <div class="frow"><label class="fl">Guidance</label><input type="number" id="vv-cfg" class="fi" value="7.5" step="0.5"></div>
+        </div>
+        <div class="frow"><label class="fl">Seed</label><input type="number" id="vv-seed" class="fi" placeholder="random"></div>
+        <button class="btn btn-primary" onclick="genVideo('v2v')">Transform</button>
+        <div class="progress" id="vv-prog"></div>
+      </div>
+      <div class="gen-out" id="vv-out"><div class="gen-empty">Transformed video will appear here</div></div>
+    </div></div>
+
+    <!-- Ti2V: Text + Image → Video -->
+    <div class="panel" id="panel-vid-ti2v"><div class="gen-wrap">
+      <div class="gen-ctrl">
+        <div class="frow"><label class="fl">Initial image</label><input type="file" id="ti-init" accept="image/*" class="fi"></div>
+        <div class="frow"><label class="fl">End image (optional — for frame interpolation)</label><input type="file" id="ti-end" accept="image/*" class="fi"></div>
+        <div class="frow"><label class="fl">Prompt</label><textarea id="ti-prompt" class="fs" rows="3" placeholder="Describe the video motion / story…"></textarea></div>
+        <div class="frow"><label class="fl">Negative prompt</label><textarea id="ti-neg" class="fs" rows="2" placeholder="Things to avoid…"></textarea></div>
+        <div class="g2">
+          <div class="frow"><label class="fl">Width</label><input type="number" id="ti-w" class="fi" value="512" step="64"></div>
+          <div class="frow"><label class="fl">Height</label><input type="number" id="ti-h" class="fi" value="512" step="64"></div>
+        </div>
+        <div class="g2">
+          <div class="frow"><label class="fl">Frames</label><input type="number" id="ti-frames" class="fi" value="16"></div>
+          <div class="frow"><label class="fl">FPS</label><input type="number" id="ti-fps" class="fi" value="8"></div>
+        </div>
+        <div class="g2">
+          <div class="frow"><label class="fl">Steps</label><input type="number" id="ti-steps" class="fi" value="25"></div>
+          <div class="frow"><label class="fl">Guidance</label><input type="number" id="ti-cfg" class="fi" value="7.5" step="0.5"></div>
+        </div>
+        <div class="frow"><label class="fl">Camera motion</label>
+          <select id="ti-cam" class="fselect">
+            <option value="">None</option>
+            <option value="zoom-in">Zoom in</option><option value="zoom-out">Zoom out</option>
+            <option value="pan-left">Pan left</option><option value="pan-right">Pan right</option>
+            <option value="tilt-up">Tilt up</option><option value="tilt-down">Tilt down</option>
+            <option value="rotate">Rotate</option>
+          </select>
+        </div>
+        <div class="frow"><label class="fl">Seed</label><input type="number" id="ti-seed" class="fi" placeholder="random"></div>
+        <div class="frow"><label class="fl" title="Removes the model's built-in safety checker. Only use with uncensored/NSFW fine-tunes.">Disable safety filter</label><input type="checkbox" id="ti-nosafe"></div>
+        <!-- Character consistency -->
+        <details style="margin-top:.25rem">
+          <summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-2)">Character consistency</summary>
+          <div style="margin-top:.5rem;display:flex;flex-direction:column;gap:.4rem">
+            <div class="frow">
+              <label class="fl">Reference images</label>
+              <input type="file" id="ti-char" accept="image/*" multiple class="fi" onchange="addCharRefs('ti',this)">
+            </div>
+            <div class="char-refs" id="ti-char-thumbs"></div>
+            <div class="frow"><label class="fl">Strength <span id="ti-cs">0.80</span></label>
+              <input type="range" id="ti-cstr" min="0" max="1" step="0.05" value="0.8" oninput="$('ti-cs').textContent=(+this.value).toFixed(2)" style="width:100%"></div>
+          </div>
+        </details>
+        <!-- Audio -->
+        <details style="margin-top:.25rem">
+          <summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-2)">Add audio</summary>
+          <div style="margin-top:.5rem;display:flex;flex-direction:column;gap:.4rem">
+            <div class="frow"><label class="fl">Audio type</label>
+              <select id="ti-atype" class="fselect">
+                <option value="">None</option>
+                <option value="music">Music</option><option value="sfx">SFX</option>
+                <option value="speech">Speech / TTS</option><option value="ambient">Ambient</option>
+              </select>
+            </div>
+            <div class="frow"><label class="fl">Audio prompt</label><textarea id="ti-aprompt" class="fs" rows="2" placeholder="e.g. epic orchestral soundtrack"></textarea></div>
+            <div class="frow"><label class="fl">TTS text (for speech)</label><textarea id="ti-ttstext" class="fs" rows="2"></textarea></div>
+            <div class="g2">
+              <div class="frow"><label class="fl">TTS voice</label><input id="ti-voice" class="fi" placeholder="af_sky"></div>
+              <div class="frow"><label class="fl">Speed</label><input type="number" id="ti-speed" class="fi" value="1.0" step="0.1" min="0.5"></div>
+            </div>
+            <label style="font-size:12px;display:flex;align-items:center;gap:.4rem;cursor:pointer">
+              <input type="checkbox" id="ti-lipsync"> Lip-sync to speech
+            </label>
+          </div>
+        </details>
+        <!-- Subtitles -->
+        <details style="margin-top:.25rem">
+          <summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-2)">Subtitles</summary>
+          <div style="margin-top:.5rem;display:flex;flex-direction:column;gap:.4rem">
+            <label style="font-size:12px;display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="ti-gensub"> Generate subtitles</label>
+            <label style="font-size:12px;display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="ti-burnsub"> Burn subtitles into video</label>
+            <label style="font-size:12px;display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="ti-transsub"> Translate subtitles</label>
+            <div class="frow"><label class="fl">Target language</label><input id="ti-sublang" class="fi" placeholder="es, fr, de, it…"></div>
+          </div>
+        </details>
+        <!-- Post-processing -->
+        <details style="margin-top:.25rem">
+          <summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-2)">Post-processing</summary>
+          <div style="margin-top:.5rem;display:flex;flex-direction:column;gap:.4rem">
+            <label style="font-size:12px;display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="ti-upscale"> Upscale output</label>
+            <div class="frow"><label class="fl">Upscale factor</label>
+              <select id="ti-upfact" class="fselect"><option value="2">2×</option><option value="4">4×</option></select>
+            </div>
+            <label style="font-size:12px;display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="ti-interp"> Frame interpolation</label>
+            <div class="frow"><label class="fl">FPS multiplier</label>
+              <select id="ti-fmult" class="fselect"><option value="2">2×</option><option value="4">4×</option></select>
+            </div>
+          </div>
+        </details>
+        <button class="btn btn-primary" onclick="genTi2V()" style="margin-top:.25rem">Generate</button>
+        <div class="progress" id="ti-prog"></div>
+      </div>
+      <div class="gen-out" id="ti-out"><div class="gen-empty">Video will appear here</div></div>
+    </div></div>
+
+    <!-- Interpolate -->
+    <div class="panel" id="panel-vid-interp"><div class="gen-wrap">
+      <div class="gen-ctrl">
+        <div class="frow"><label class="fl">Source video (or use frame images below)</label><input type="file" id="vc-src" accept="video/*" class="fi"></div>
+        <div class="frow"><label class="fl">— OR — First frame</label><input type="file" id="vc-init" accept="image/*" class="fi"></div>
+        <div class="frow"><label class="fl">Last frame</label><input type="file" id="vc-end" accept="image/*" class="fi"></div>
+        <div class="frow"><label class="fl">FPS multiplier</label>
+          <select id="vc-mult" class="fselect"><option value="2">2×</option><option value="4">4×</option><option value="8">8×</option></select>
+        </div>
+        <button class="btn btn-primary" onclick="genInterp()">Interpolate</button>
+        <div class="progress" id="vc-prog"></div>
+      </div>
+      <div class="gen-out" id="vc-out"><div class="gen-empty">Interpolated video will appear here</div></div>
+    </div></div>
+
+    <!-- Subtitles -->
+    <div class="panel" id="panel-vid-sub"><div class="gen-wrap">
+      <div class="gen-ctrl">
+        <div class="frow"><label class="fl">Source video</label><input type="file" id="vs-src" accept="video/*" class="fi"></div>
+        <div class="frow"><label class="fl">Language hint</label><input id="vs-lang" class="fi" placeholder="en, fr, de… (auto-detect if blank)"></div>
+        <div class="frow"><label class="fl">Output format</label>
+          <select id="vs-fmt" class="fselect"><option value="srt">SRT text</option><option value="burned_video">Burn into video</option></select>
+        </div>
+        <label style="font-size:12px;display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="vs-translate"> Translate subtitles</label>
+        <div class="frow"><label class="fl">Target language</label><input id="vs-tlang" class="fi" placeholder="es, fr, de…"></div>
+        <button class="btn btn-primary" onclick="genSubtitles()">Generate Subtitles</button>
+        <div class="progress" id="vs-prog"></div>
+      </div>
+      <div class="gen-out" id="vs-out"><div class="gen-empty">Result will appear here</div></div>
+    </div></div>
+
+    <!-- Dub -->
+    <div class="panel" id="panel-vid-dub"><div class="gen-wrap">
+      <div class="gen-ctrl">
+        <div class="frow"><label class="fl">Source video</label><input type="file" id="vd-src" accept="video/*" class="fi"></div>
+        <div class="g2">
+          <div class="frow"><label class="fl">Source lang</label><input id="vd-slang" class="fi" placeholder="en"></div>
+          <div class="frow"><label class="fl">Target lang</label><input id="vd-tlang" class="fi" placeholder="es, fr, de…"></div>
+        </div>
+        <label style="font-size:12px;display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="vd-burn"> Burn subtitles into result</label>
+        <button class="btn btn-primary" onclick="genDub()">Dub Video</button>
+        <div class="progress" id="vd-prog"></div>
+      </div>
+      <div class="gen-out" id="vd-out"><div class="gen-empty">Dubbed video will appear here</div></div>
+    </div></div>
+
+    <!-- Video upscale -->
+    <div class="panel" id="panel-vid-up"><div class="gen-wrap">
+      <div class="gen-ctrl">
+        <div class="frow"><label class="fl">Source video</label><input type="file" id="vu-src" accept="video/*" class="fi"></div>
+        <div class="frow"><label class="fl">Scale factor</label>
+          <select id="vu-scale" class="fselect"><option value="2">2×</option><option value="4">4×</option></select>
+        </div>
+        <button class="btn btn-primary" onclick="genVidUpscale()">Upscale</button>
+        <div class="progress" id="vu-prog"></div>
+      </div>
+      <div class="gen-out" id="vu-out"><div class="gen-empty">Upscaled video will appear here</div></div>
+    </div></div>
+
+    <!-- ═══════════════ AUDIO ═══════════════ -->
+
+    <!-- Music/SFX generation -->
+    <div class="panel" id="panel-aud-gen">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="frow"><label class="fl">Prompt</label><textarea id="ag-prompt" class="fs" rows="4" placeholder="e.g. upbeat electronic dance music with synth bass…"></textarea></div>
+          <div class="g2">
+            <div class="frow"><label class="fl">Duration (sec)</label><input type="number" id="ag-dur" class="fi" value="10" min="1" max="300"></div>
+            <div class="frow"><label class="fl">Temperature</label><input type="number" id="ag-temp" class="fi" value="1.0" step="0.1" min="0.1"></div>
+          </div>
+          <div class="frow"><label class="fl">Melody reference (optional)</label><input type="file" id="ag-melody" accept="audio/*" class="fi"></div>
+          <div class="frow"><label class="fl">Seed</label><input type="number" id="ag-seed" class="fi" placeholder="random"></div>
+          <button class="btn btn-primary" onclick="genAudio()">Generate</button>
+          <div class="progress" id="ag-prog"></div>
+        </div>
+        <div class="gen-out" id="ag-out"><div class="gen-empty">Generated audio will appear here</div></div>
+      </div>
+    </div>
+
+    <!-- TTS -->
+    <div class="panel" id="panel-aud-tts">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="frow"><label class="fl">Text to speak</label><textarea id="at-text" class="fs" rows="6" placeholder="Enter text…"></textarea></div>
+          <div class="g2">
+            <div class="frow"><label class="fl">Voice</label><input id="at-voice" class="fi" placeholder="af_sky, en-US-Jenny…"></div>
+            <div class="frow"><label class="fl">Speed</label><input type="number" id="at-speed" class="fi" value="1.0" step="0.1"></div>
+          </div>
+          <button class="btn btn-primary" onclick="genTTS()">Synthesize</button>
+          <div class="progress" id="at-prog"></div>
+        </div>
+        <div class="gen-out" id="at-out"><div class="gen-empty">Audio will appear here</div></div>
+      </div>
+    </div>
+
+    <!-- STT -->
+    <div class="panel" id="panel-aud-stt">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="frow"><label class="fl">Audio / video file</label><input type="file" id="as-file" accept="audio/*,video/*" class="fi"></div>
+          <div class="g2">
+            <div class="frow"><label class="fl">Language</label><input id="as-lang" class="fi" placeholder="en, fr…"></div>
+            <div class="frow"><label class="fl">Hint</label><input id="as-prompt" class="fi" placeholder="context hint…"></div>
+          </div>
+          <button class="btn btn-primary" onclick="genSTT()">Transcribe</button>
+          <div class="progress" id="as-prog"></div>
+        </div>
+        <div class="gen-out" id="as-out">
+          <div class="gen-out-inner"><div class="gen-empty">Transcript will appear here</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════ PIPELINES ═══════════════ -->
+    <div class="panel" id="panel-pipe">
+      <div class="pipe-panel">
+
+        <div class="pipe-card">
+          <div class="pipe-title">Image → Video Pipeline</div>
+          <div class="pipe-steps">
+            <span class="pipe-step">1. Generate image</span><span class="pipe-arrow">→</span>
+            <span class="pipe-step">2. Animate to video</span><span class="pipe-arrow">→</span>
+            <span class="pipe-step">3. (Optional) Add audio</span>
+          </div>
+          <div style="margin-top:.75rem;display:flex;flex-direction:column;gap:.5rem">
+            <div class="frow"><label class="fl">Text prompt</label><textarea id="pp1-prompt" class="fs" rows="3" placeholder="Describe the scene…"></textarea></div>
+            <div class="g2">
+              <div class="frow"><label class="fl">Image model</label><input id="pp1-imodel" class="fi" placeholder="model id"></div>
+              <div class="frow"><label class="fl">Video model</label><input id="pp1-vmodel" class="fi" placeholder="model id"></div>
+            </div>
+            <div class="g2">
+              <div class="frow"><label class="fl">Frames</label><input type="number" id="pp1-frames" class="fi" value="16"></div>
+              <div class="frow"><label class="fl">FPS</label><input type="number" id="pp1-fps" class="fi" value="8"></div>
+            </div>
+            <button class="btn btn-primary" onclick="runPipeline1()">Run Pipeline</button>
+            <div class="progress" id="pp1-prog"></div>
+            <div id="pp1-out"></div>
+          </div>
+        </div>
+
+        <div class="pipe-card">
+          <div class="pipe-title">Video → Dub + Subtitle Pipeline</div>
+          <div class="pipe-steps">
+            <span class="pipe-step">1. Transcribe</span><span class="pipe-arrow">→</span>
+            <span class="pipe-step">2. Translate</span><span class="pipe-arrow">→</span>
+            <span class="pipe-step">3. TTS dub</span><span class="pipe-arrow">→</span>
+            <span class="pipe-step">4. Burn subtitles</span>
+          </div>
+          <div style="margin-top:.75rem;display:flex;flex-direction:column;gap:.5rem">
+            <div class="frow"><label class="fl">Source video</label><input type="file" id="pp2-src" accept="video/*" class="fi"></div>
+            <div class="g2">
+              <div class="frow"><label class="fl">Source language</label><input id="pp2-slang" class="fi" placeholder="en"></div>
+              <div class="frow"><label class="fl">Target language</label><input id="pp2-tlang" class="fi" placeholder="es, fr, de…"></div>
+            </div>
+            <div class="frow"><label class="fl">Transcription model</label><input id="pp2-model" class="fi" placeholder="whisper model id"></div>
+            <button class="btn btn-primary" onclick="runPipeline2()">Run Pipeline</button>
+            <div class="progress" id="pp2-prog"></div>
+            <div id="pp2-out"></div>
+          </div>
+        </div>
+
+        <div class="pipe-card">
+          <div class="pipe-title">Full Story Pipeline</div>
+          <div class="pipe-steps">
+            <span class="pipe-step">1. LLM generates script</span><span class="pipe-arrow">→</span>
+            <span class="pipe-step">2. Image gen per scene</span><span class="pipe-arrow">→</span>
+            <span class="pipe-step">3. Animate each scene</span><span class="pipe-arrow">→</span>
+            <span class="pipe-step">4. TTS narration</span><span class="pipe-arrow">→</span>
+            <span class="pipe-step">5. Merge</span>
+          </div>
+          <div style="margin-top:.75rem;display:flex;flex-direction:column;gap:.5rem">
+            <div class="frow"><label class="fl">Story idea</label><textarea id="pp3-story" class="fs" rows="3" placeholder="A knight fights a dragon at sunset…"></textarea></div>
+            <div class="g3">
+              <div class="frow"><label class="fl">Text model</label><input id="pp3-tmodel" class="fi" placeholder="llm id"></div>
+              <div class="frow"><label class="fl">Image model</label><input id="pp3-imodel" class="fi" placeholder="sd id"></div>
+              <div class="frow"><label class="fl">Video model</label><input id="pp3-vmodel" class="fi" placeholder="video id"></div>
+            </div>
+            <div class="frow"><label class="fl">TTS model</label><input id="pp3-amodel" class="fi" placeholder="tts id"></div>
+            <button class="btn btn-primary" onclick="runPipeline3()">Run Full Pipeline</button>
+            <div class="progress" id="pp3-prog"></div>
+            <div id="pp3-out"></div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ═══════════════ EMBEDDINGS ═══════════════ -->
+    <div class="panel" id="panel-embed">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="frow"><label class="fl">Text(s) — one per line</label><textarea id="em-text" class="fs" rows="6" placeholder="Enter text to embed…"></textarea></div>
+          <div class="frow"><label class="fl">Encoding</label>
+            <select id="em-enc" class="fselect"><option value="float">Float array</option><option value="base64">Base64</option></select>
+          </div>
+          <div class="frow"><label class="fl">Dimensions (truncate, optional)</label><input type="number" id="em-dims" class="fi" placeholder="all"></div>
+          <button class="btn btn-primary" onclick="genEmbeddings()">Embed</button>
+          <div class="progress" id="em-prog"></div>
+        </div>
+        <div class="gen-out" id="em-out"><div class="gen-empty">Embedding vectors will appear here</div></div>
+      </div>
+    </div>
+
+  </div><!-- studio-main -->
+</div><!-- studio -->
 {% endblock %}
 
 {% block scripts %}
 <script>
-let history = [];
-let busy = false;
+// ─────────────────────────────────────────────────────────────────
+//  State
+// ─────────────────────────────────────────────────────────────────
+let models = [], activeModel = null, chatHistory = [], chatBusy = false, attachedImage = null;
+let charRefs = {};   // prefix → list of base64 strings
 
+const $ = id => document.getElementById(id);
+const val = id => ($(id) ? $(id).value : '');
+const ival = id => parseInt(val(id)) || 0;
+const fval = id => parseFloat(val(id)) || 0;
+const chk = id => ($(id) ? $(id).checked : false);
+
+// Capability → which level-1 tab
+const CAP_CAT = {
+  text_generation:'chat', image_to_text:'chat',
+  image_generation:'image', image_to_image:'image', inpainting:'image',
+  image_upscaling:'image', depth_estimation:'image', image_segmentation:'image',
+  video_generation:'video', image_to_video:'video', video_to_video:'video',
+  video_interpolation:'video', video_upscaling:'video',
+  text_to_speech:'audio', speech_to_text:'audio', subtitle_generation:'video',
+  audio_generation:'audio',
+  embeddings:'embed',
+};
+// Capability → which level-2 sub-tab
+const CAP_SUB = {
+  image_generation:'img-gen', image_to_image:'img-edit', inpainting:'img-inpaint',
+  image_upscaling:'img-upscale', depth_estimation:'img-depth', image_segmentation:'img-seg',
+  video_generation:'vid-t2v', image_to_video:'vid-i2v', video_to_video:'vid-v2v',
+  video_interpolation:'vid-interp', video_upscaling:'vid-up',
+  subtitle_generation:'vid-sub',
+  text_to_speech:'aud-tts', speech_to_text:'aud-stt',
+  audio_generation:'aud-gen',
+};
+// Sub-tab → parent category
+const SUB_CAT = {
+  'img-gen':'image','img-edit':'image','img-inpaint':'image','img-upscale':'image','img-depth':'image','img-seg':'image',
+  'vid-t2v':'video','vid-i2v':'video','vid-v2v':'video','vid-ti2v':'video','vid-interp':'video',
+  'vid-sub':'video','vid-dub':'video','vid-up':'video',
+  'aud-gen':'audio','aud-tts':'audio','aud-stt':'audio',
+};
+// Video models also enable ti2v and dub
+const VIDEO_EXTRA_SUBS = ['vid-ti2v', 'vid-dub'];
+
+// ─────────────────────────────────────────────────────────────────
+//  Boot
+// ─────────────────────────────────────────────────────────────────
 async function loadModels() {
   try {
     const d = await fetch('/v1/models').then(r => r.json());
-    const sel = document.getElementById('model-sel');
-    sel.innerHTML = '<option value="">Select model…</option>';
-    (d.data || []).forEach(m => {
-      const o = document.createElement('option');
-      o.value = o.textContent = m.id;
-      sel.appendChild(o);
-    });
-  } catch {}
+    models = d.data || [];
+    renderSidebar();
+    if (models.length) selectModel(models[0]);
+  } catch(e) {
+    $('model-list').innerHTML = '<div class="muted small" style="padding:.5rem .6rem">Failed to load models</div>';
+  }
 }
 
-function newChat() {
-  history = [];
-  document.getElementById('chat-msgs').innerHTML = '<div class="chat-empty"><h3>New conversation</h3><p>Start typing below</p></div>';
+const BADGE = {text:'mb-text',vision:'mb-vision',image:'mb-image',video:'mb-video',
+               audio:'mb-audio',tts:'mb-tts',audio_gen:'mb-audiogen',embedding:'mb-embed'};
+const BLABEL = {text:'LLM',vision:'VLM',image:'IMG',video:'VID',audio:'STT',
+                tts:'TTS',audio_gen:'MUS',embedding:'EMB'};
+
+function renderSidebar() {
+  const el = $('model-list');
+  if (!models.length) { el.innerHTML='<div class="muted small" style="padding:.5rem .6rem">No models</div>'; return; }
+  el.innerHTML = models.map(m => {
+    const t = m.type || 'text';
+    const safe = JSON.stringify(m).replace(/"/g,'&quot;');
+    return `<div class="model-item" data-id="${m.id}" onclick="selectModel(${safe})">
+      <span class="mbadge ${BADGE[t]||'mb-text'}">${BLABEL[t]||t}</span>
+      <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px" title="${m.id}">${m.id.split('/').pop()}</span>
+    </div>`;
+  }).join('');
 }
 
-function addMsg(role, text) {
-  const wrap = document.getElementById('chat-msgs');
+function selectModel(m) {
+  activeModel = m;
+  document.querySelectorAll('.model-item').forEach(el =>
+    el.classList.toggle('active', el.dataset.id === m.id));
+  chatHistory = []; attachedImage = null; updateAttachBar();
+  $('chat-msgs').innerHTML = `<div class="chat-empty"><h3>${m.id.split('/').pop()}</h3><p>Start below</p></div>`;
+  updateTabs(m);
+}
+
+function updateTabs(m) {
+  const caps = m.capabilities || [];
+  const type = m.type || 'text';
+  const enabledCats = new Set();
+  const enabledSubs = new Set();
+
+  // Always available
+  if (caps.includes('text_generation') || caps.includes('image_to_text')) {
+    enabledCats.add('chat');
+  }
+
+  caps.forEach(c => {
+    const cat = CAP_CAT[c]; if (cat) enabledCats.add(cat);
+    const sub = CAP_SUB[c]; if (sub) enabledSubs.add(sub);
+  });
+
+  // Video models also get ti2v and dub
+  if (enabledCats.has('video') || type === 'video') {
+    VIDEO_EXTRA_SUBS.forEach(s => enabledSubs.add(s));
+    enabledCats.add('video');
+  }
+
+  // Pipelines available if at least 2 different types are loaded in the server
+  // (always show, user can fill in model IDs manually)
+  enabledCats.add('pipe');
+
+  // Show/hide level-1 tabs
+  document.querySelectorAll('.t1btn').forEach(btn => {
+    btn.classList.toggle('hidden', !enabledCats.has(btn.dataset.cat));
+  });
+  // Show/hide level-2 tabs
+  document.querySelectorAll('.t2btn').forEach(btn => {
+    btn.classList.toggle('hidden', !enabledSubs.has(btn.dataset.sub));
+  });
+  // Vision attach button
+  $('attach-btn').style.display = caps.includes('image_to_text') ? '' : 'none';
+
+  // Switch to first available cat
+  const firstCat = document.querySelector('.t1btn:not(.hidden)');
+  if (firstCat) selectCat(firstCat.dataset.cat);
+}
+
+function selectCat(cat) {
+  document.querySelectorAll('.t1btn').forEach(b => b.classList.toggle('active', b.dataset.cat === cat));
+  // Show tabbar2 only for image/video/audio
+  const hasL2 = ['image','video','audio'].includes(cat);
+  $('tabbar2').classList.toggle('visible', hasL2);
+  if (!hasL2) {
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    const panel = $('panel-' + cat);
+    if (panel) panel.classList.add('active');
+    return;
+  }
+  // Activate first visible sub-tab in this category
+  const firstSub = document.querySelector(`.t2btn:not(.hidden)[data-sub^="${cat.substring(0,3)}"], .t2btn:not(.hidden)[data-sub^="${cat === 'audio' ? 'aud' : cat === 'video' ? 'vid' : 'img'}"]`);
+  if (firstSub) selectSub(firstSub.dataset.sub);
+}
+
+function selectSub(sub) {
+  document.querySelectorAll('.t2btn').forEach(b => b.classList.toggle('active', b.dataset.sub === sub));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  const panel = $('panel-' + sub);
+  if (panel) panel.classList.add('active');
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Chat
+// ─────────────────────────────────────────────────────────────────
+function addMsg(role, text, imgSrc) {
+  const wrap = $('chat-msgs');
   wrap.querySelector('.chat-empty')?.remove();
   const t = new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
   const d = document.createElement('div');
   d.className = 'msg ' + role;
-  d.innerHTML = `
-    <div class="msg-av ${role === 'user' ? 'user' : 'ai'}">${role === 'user' ? 'YOU' : 'AI'}</div>
+  const name = role === 'user' ? 'You' : (activeModel?.id?.split('/').pop() || 'AI');
+  d.innerHTML = `<div class="av ${role==='user'?'user':'ai'}">${role==='user'?'YOU':'AI'}</div>
     <div class="msg-body">
-      <div class="msg-meta">${role === 'user' ? 'You' : 'Assistant'} · ${t}</div>
+      <div class="msg-meta">${name} · ${t}</div>
+      ${imgSrc ? `<img src="${imgSrc}" class="msg-img" onclick="window.open(this.src)">` : ''}
       <div class="msg-text">${String(text).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>')}</div>
     </div>`;
   wrap.appendChild(d);
   wrap.scrollTop = wrap.scrollHeight;
 }
 
-async function send() {
-  if (busy) return;
-  const model = document.getElementById('model-sel').value;
-  if (!model) { document.getElementById('model-sel').focus(); return; }
-  const input = document.getElementById('chat-in');
-  const text = input.value.trim();
-  if (!text) return;
+function attachImg(input) {
+  const f = input.files[0]; if (!f) return;
+  const r = new FileReader();
+  r.onload = e => {
+    attachedImage = e.target.result;
+    $('attach-thumb').src = attachedImage;
+    $('attach-name').textContent = f.name;
+    updateAttachBar();
+  };
+  r.readAsDataURL(f);
+}
+function clearAttach() { attachedImage = null; updateAttachBar(); }
+function updateAttachBar() { $('attach-bar').style.display = attachedImage ? 'flex' : 'none'; }
 
-  addMsg('user', text);
-  history.push({role:'user', content:text});
-  input.value = '';
-  input.style.height = 'auto';
-
-  busy = true;
-  document.getElementById('send-btn').disabled = true;
-  document.getElementById('typing').textContent = 'Assistant is typing…';
-
+async function sendChat() {
+  if (chatBusy || !activeModel) return;
+  const input = $('chat-in');
+  const text = input.value.trim(); if (!text) return;
+  addMsg('user', text, attachedImage);
+  let content = text;
+  if (attachedImage && (activeModel.capabilities||[]).includes('image_to_text')) {
+    content = [{type:'image_url',image_url:{url:attachedImage}},{type:'text',text}];
+  }
+  chatHistory.push({role:'user',content});
+  input.value = ''; input.style.height = 'auto';
+  attachedImage = null; updateAttachBar();
+  chatBusy = true; $('send-btn').disabled = true;
+  $('typing').textContent = 'Thinking…';
   try {
-    const r = await fetch('/v1/chat/completions', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({model, messages: history, stream:false})
+    const r = await fetch('/v1/chat/completions',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model:activeModel.id,messages:chatHistory,stream:false})
     });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
+    if (!r.ok) throw new Error('HTTP '+r.status+': '+await r.text());
     const d = await r.json();
     const reply = d.choices[0].message.content;
-    addMsg('assistant', reply);
-    history.push({role:'assistant', content:reply});
-  } catch (e) {
-    addMsg('assistant', 'Error: ' + e.message);
-  } finally {
-    busy = false;
-    document.getElementById('send-btn').disabled = false;
-    document.getElementById('typing').textContent = '';
-  }
+    addMsg('assistant',reply);
+    chatHistory.push({role:'assistant',content:reply});
+  } catch(e) { addMsg('assistant','Error: '+e.message); }
+  finally { chatBusy=false; $('send-btn').disabled=false; $('typing').textContent=''; }
 }
 
-document.getElementById('chat-in').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
-});
-document.getElementById('chat-in').addEventListener('input', function() {
-  this.style.height = 'auto';
-  this.style.height = Math.min(this.scrollHeight, 140) + 'px';
-});
+$('chat-in').addEventListener('keydown', e => { if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat();} });
+$('chat-in').addEventListener('input', function(){ this.style.height='auto'; this.style.height=Math.min(this.scrollHeight,140)+'px'; });
+
+// ─────────────────────────────────────────────────────────────────
+//  Utilities
+// ─────────────────────────────────────────────────────────────────
+function fileToB64(file) {
+  return new Promise((res,rej) => {
+    const r = new FileReader();
+    r.onload = e => res(e.target.result);
+    r.onerror = rej;
+    r.readAsDataURL(file);
+  });
+}
+function fileOrNull(id) { const f=$(id); return f&&f.files[0] ? f.files[0] : null; }
+async function b64OrNull(id) { const f=fileOrNull(id); return f ? await fileToB64(f) : null; }
+
+function showImg(outId, src, prog) {
+  $(outId).innerHTML = `<div class="gen-out-inner">
+    <img class="out-img" src="${src}" onclick="window.open(this.src)">
+    <a href="${src}" download class="btn btn-ghost btn-sm dl">Download</a>
+  </div>`;
+  if(prog) $(prog).textContent='Done ✓';
+}
+function showVideo(outId, src, prog) {
+  $(outId).innerHTML = `<div class="gen-out-inner">
+    <video class="out-video" controls src="${src}"></video>
+    <a href="${src}" download class="btn btn-ghost btn-sm dl">Download</a>
+  </div>`;
+  if(prog) $(prog).textContent='Done ✓';
+}
+function showAudio(outId, src, prog, ext) {
+  $(outId).innerHTML = `<div class="gen-out-inner" style="width:100%">
+    <audio class="out-audio" controls src="${src}"></audio>
+    <a href="${src}" download="audio.${ext||'wav'}" class="btn btn-ghost btn-sm dl">Download</a>
+  </div>`;
+  if(prog) $(prog).textContent='Done ✓';
+}
+function imgSrc(d) { return d.url || (d.b64_json ? 'data:image/png;base64,'+d.b64_json : null); }
+function vidSrc(d) { return d.url || (d.b64_mp4 ? 'data:video/mp4;base64,'+d.b64_mp4 : null); }
+function audSrc(d) {
+  if (d.url) return d.url;
+  for (const k of Object.keys(d)) { if(k.startsWith('b64_')) return 'data:audio/'+k.slice(4)+';base64,'+d[k]; }
+  return null;
+}
+
+async function post(path, body) {
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+async function postForm(path, fd) {
+  const r = await fetch(path, {method:'POST', body:fd});
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// Character reference helpers
+function addCharRefs(prefix, input) {
+  if (!charRefs[prefix]) charRefs[prefix] = [];
+  const thumbs = $(prefix+'-char-thumbs');
+  Array.from(input.files).forEach(f => {
+    const reader = new FileReader();
+    reader.onload = e => {
+      charRefs[prefix].push(e.target.result);
+      const img = document.createElement('img');
+      img.src = e.target.result; img.className='char-thumb';
+      thumbs.appendChild(img);
+    };
+    reader.readAsDataURL(f);
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Image Generation
+// ─────────────────────────────────────────────────────────────────
+async function genImage() {
+  if (!activeModel) return;
+  $('ig-prog').textContent='Generating…';
+  try {
+    const d = await post('/v1/images/generations', {
+      model:activeModel.id, prompt:val('ig-prompt'),
+      size:val('ig-w')+'x'+val('ig-h'),
+      steps:ival('ig-steps'), guidance_scale:fval('ig-cfg'),
+      n:ival('ig-n')||1,
+      ...(val('ig-seed') ? {seed:ival('ig-seed')} : {}),
+      ...(val('ig-neg') ? {negative_prompt:val('ig-neg')} : {}),
+      disable_safety_checker: chk('ig-nosafe'),
+      response_format:'url',
+    });
+    const imgs = d.data.map(imgSrc).filter(Boolean);
+    $('ig-out').innerHTML = `<div class="gen-out-inner">${
+      imgs.map(s=>`<img class="out-img" src="${s}" onclick="window.open(this.src)">`).join('')
+    }<a href="${imgs[0]}" download class="btn btn-ghost btn-sm dl">Download first</a></div>`;
+    $('ig-prog').textContent='Done ✓';
+  } catch(e) { $('ig-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Image Edit (i2i)
+// ─────────────────────────────────────────────────────────────────
+async function genEdit() {
+  if (!activeModel) return;
+  const img = await b64OrNull('ie-src');
+  if (!img) { $('ie-prog').textContent='Select a source image.'; return; }
+  $('ie-prog').textContent='Editing…';
+  try {
+    const d = await post('/v1/images/edits', {
+      model:activeModel.id, prompt:val('ie-prompt'), image:img,
+      strength:fval('ie-str'), steps:ival('ie-steps'), guidance_scale:fval('ie-cfg'),
+      ...(val('ie-seed') ? {seed:ival('ie-seed')} : {}), response_format:'url',
+    });
+    showImg('ie-out', imgSrc(d.data[0]), 'ie-prog');
+  } catch(e) { $('ie-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Inpaint
+// ─────────────────────────────────────────────────────────────────
+async function genInpaint() {
+  if (!activeModel) return;
+  const [img, mask] = await Promise.all([b64OrNull('ip-src'), b64OrNull('ip-mask')]);
+  if (!img||!mask) { $('ip-prog').textContent='Select source image and mask.'; return; }
+  $('ip-prog').textContent='Inpainting…';
+  try {
+    const d = await post('/v1/images/inpaint', {
+      model:activeModel.id, prompt:val('ip-prompt'), image:img, mask,
+      strength:fval('ip-str'), steps:ival('ip-steps'), guidance_scale:fval('ip-cfg'),
+      ...(val('ip-seed') ? {seed:ival('ip-seed')} : {}), response_format:'url',
+    });
+    showImg('ip-out', imgSrc(d.data[0]), 'ip-prog');
+  } catch(e) { $('ip-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Image Upscale
+// ─────────────────────────────────────────────────────────────────
+async function genImgUpscale() {
+  if (!activeModel) return;
+  const img = await b64OrNull('iu-src');
+  if (!img) { $('iu-prog').textContent='Select an image.'; return; }
+  $('iu-prog').textContent='Upscaling…';
+  try {
+    const d = await post('/v1/images/upscale', {model:activeModel.id, image:img, scale:ival('iu-scale'), response_format:'url'});
+    showImg('iu-out', imgSrc(d.data[0]), 'iu-prog');
+  } catch(e) { $('iu-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Depth
+// ─────────────────────────────────────────────────────────────────
+async function genDepth() {
+  if (!activeModel) return;
+  const img = await b64OrNull('id-src');
+  if (!img) { $('id-prog').textContent='Select an image.'; return; }
+  $('id-prog').textContent='Estimating depth…';
+  try {
+    const d = await post('/v1/images/depth', {model:activeModel.id, image:img, response_format:'url'});
+    showImg('id-out', imgSrc(d.data[0]), 'id-prog');
+  } catch(e) { $('id-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Segment
+// ─────────────────────────────────────────────────────────────────
+async function genSegment() {
+  if (!activeModel) return;
+  const img = await b64OrNull('is-src');
+  if (!img) { $('is-prog').textContent='Select an image.'; return; }
+  $('is-prog').textContent='Segmenting…';
+  const pts = val('is-pts') ? JSON.parse(val('is-pts')) : null;
+  const boxes = val('is-boxes') ? JSON.parse(val('is-boxes')) : null;
+  try {
+    const d = await post('/v1/images/segment', {model:activeModel.id, image:img, points:pts, boxes, response_format:'url'});
+    showImg('is-out', imgSrc(d.data[0]), 'is-prog');
+  } catch(e) { $('is-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Video Generation (t2v / i2v / v2v)
+// ─────────────────────────────────────────────────────────────────
+async function genVideo(mode) {
+  if (!activeModel) return;
+  const progMap = {t2v:'vt-prog', i2v:'vi-prog', v2v:'vv-prog'};
+  const outMap  = {t2v:'vt-out',  i2v:'vi-out',  v2v:'vv-out'};
+  const prog = progMap[mode], outId = outMap[mode];
+  $(prog).textContent='Generating… (this may take several minutes)';
+  const body = {model:activeModel.id, mode};
+  if (mode==='t2v') {
+    body.prompt=val('vt-prompt'); body.negative_prompt=val('vt-neg');
+    body.width=ival('vt-w')||512; body.height=ival('vt-h')||512;
+    body.num_frames=ival('vt-frames')||16; body.fps=ival('vt-fps')||8;
+    body.num_inference_steps=ival('vt-steps')||25; body.guidance_scale=fval('vt-cfg')||7.5;
+    if (val('vt-seed')) body.seed=ival('vt-seed');
+    body.disable_safety_checker=chk('vt-nosafe');
+  } else if (mode==='i2v') {
+    const img = await b64OrNull('vi-src');
+    if (!img) { $(prog).textContent='Select a source image.'; return; }
+    body.init_image=img; body.prompt=val('vi-prompt')||'animate this image';
+    body.num_frames=ival('vi-frames')||16; body.fps=ival('vi-fps')||8;
+    body.num_inference_steps=ival('vi-steps')||25; body.guidance_scale=fval('vi-cfg')||7.5;
+    if (val('vi-seed')) body.seed=ival('vi-seed');
+    body.disable_safety_checker=chk('vt-nosafe');
+  } else {
+    const vid = await b64OrNull('vv-src');
+    if (!vid) { $(prog).textContent='Select a source video.'; return; }
+    body.video=vid; body.prompt=val('vv-prompt'); body.strength=fval('vv-str');
+    body.num_inference_steps=ival('vv-steps')||25; body.guidance_scale=fval('vv-cfg')||7.5;
+    if (val('vv-seed')) body.seed=ival('vv-seed');
+    body.disable_safety_checker=chk('vt-nosafe');
+  }
+  try {
+    const d = await post('/v1/video/generations', body);
+    showVideo(outId, vidSrc(d.data[0]), prog);
+  } catch(e) { $(prog).textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Ti2V  (text + init image + end image)
+// ─────────────────────────────────────────────────────────────────
+async function genTi2V() {
+  if (!activeModel) return;
+  $('ti-prog').textContent='Generating… (may take several minutes)';
+  const [initImg, endImg] = await Promise.all([b64OrNull('ti-init'), b64OrNull('ti-end')]);
+  if (!initImg) { $('ti-prog').textContent='Select an initial image.'; return; }
+
+  const body = {
+    model:activeModel.id,
+    mode: endImg ? 'interp' : (val('ti-prompt') ? 'ti2v' : 'i2v'),
+    prompt:val('ti-prompt'), negative_prompt:val('ti-neg'),
+    init_image:initImg, end_image:endImg||undefined,
+    width:ival('ti-w')||512, height:ival('ti-h')||512,
+    num_frames:ival('ti-frames')||16, fps:ival('ti-fps')||8,
+    num_inference_steps:ival('ti-steps')||25, guidance_scale:fval('ti-cfg')||7.5,
+    camera_motion:val('ti-cam')||undefined,
+    ...(val('ti-seed') ? {seed:ival('ti-seed')} : {}),
+    // Character
+    character_references:charRefs['ti']?.length ? charRefs['ti'] : undefined,
+    character_strength:fval('ti-cstr')||0.8,
+    // Audio
+    add_audio:!!val('ti-atype'),
+    audio_type:val('ti-atype')||undefined,
+    audio_prompt:val('ti-aprompt')||undefined,
+    tts_text:val('ti-ttstext')||undefined,
+    tts_voice:val('ti-voice')||undefined,
+    tts_speed:fval('ti-speed')||1.0,
+    lip_sync:chk('ti-lipsync'),
+    // Subtitles
+    generate_subtitles:chk('ti-gensub'),
+    burn_subtitles:chk('ti-burnsub'),
+    translate_subtitles:chk('ti-transsub'),
+    subtitle_target_lang:val('ti-sublang')||undefined,
+    // Post
+    upscale_output:chk('ti-upscale'),
+    upscale_factor:ival('ti-upfact')||2,
+    interpolate_output:chk('ti-interp'),
+    fps_multiplier:ival('ti-fmult')||2,
+    // Safety
+    disable_safety_checker:chk('ti-nosafe'),
+  };
+
+  try {
+    const d = await post('/v1/video/generations', body);
+    showVideo('ti-out', vidSrc(d.data[0]), 'ti-prog');
+  } catch(e) { $('ti-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Frame Interpolation
+// ─────────────────────────────────────────────────────────────────
+async function genInterp() {
+  if (!activeModel) return;
+  $('vc-prog').textContent='Interpolating…';
+  const [vid, init, end] = await Promise.all([b64OrNull('vc-src'), b64OrNull('vc-init'), b64OrNull('vc-end')]);
+  const body = {model:activeModel.id, fps_multiplier:ival('vc-mult')||2};
+  if (vid) body.video=vid;
+  else if (init && end) { body.init_image=init; body.end_image=end; }
+  else { $('vc-prog').textContent='Provide a video or both frame images.'; return; }
+  try {
+    const d = await post('/v1/video/interpolate', body);
+    showVideo('vc-out', vidSrc(d.data[0]), 'vc-prog');
+  } catch(e) { $('vc-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Subtitles
+// ─────────────────────────────────────────────────────────────────
+async function genSubtitles() {
+  if (!activeModel) return;
+  const vid = await b64OrNull('vs-src');
+  if (!vid) { $('vs-prog').textContent='Select a video.'; return; }
+  $('vs-prog').textContent='Generating subtitles…';
+  const burn = val('vs-fmt') === 'burned_video';
+  const body = {
+    model:activeModel.id, video:vid,
+    language:val('vs-lang')||undefined,
+    burn, format:val('vs-fmt'),
+    translate:chk('vs-translate'),
+    target_lang:val('vs-tlang')||undefined,
+  };
+  try {
+    const d = await post('/v1/video/subtitle', body);
+    const item = d.data[0];
+    if (item.url || item.b64_mp4) showVideo('vs-out', vidSrc(item), 'vs-prog');
+    else if (item.text) {
+      $('vs-out').innerHTML = `<div class="gen-out-inner" style="width:100%;text-align:left">
+        <pre style="white-space:pre-wrap;font-size:12px;background:var(--surface-2);padding:.75rem;border-radius:6px;width:100%;box-sizing:border-box">${item.text}</pre>
+        <button class="btn btn-ghost btn-sm" onclick="navigator.clipboard.writeText(${JSON.stringify(item.text)})">Copy</button>
+      </div>`;
+      $('vs-prog').textContent='Done ✓';
+    }
+  } catch(e) { $('vs-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Dub
+// ─────────────────────────────────────────────────────────────────
+async function genDub() {
+  if (!activeModel) return;
+  const vid = await b64OrNull('vd-src');
+  if (!vid) { $('vd-prog').textContent='Select a video.'; return; }
+  $('vd-prog').textContent='Dubbing…';
+  try {
+    const d = await post('/v1/video/dub', {
+      model:activeModel.id, video:vid,
+      source_lang:val('vd-slang')||undefined, target_lang:val('vd-tlang'),
+      burn_subtitles:chk('vd-burn'),
+    });
+    showVideo('vd-out', vidSrc(d.data[0]), 'vd-prog');
+  } catch(e) { $('vd-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Video upscale
+// ─────────────────────────────────────────────────────────────────
+async function genVidUpscale() {
+  if (!activeModel) return;
+  const vid = await b64OrNull('vu-src');
+  if (!vid) { $('vu-prog').textContent='Select a video.'; return; }
+  $('vu-prog').textContent='Upscaling…';
+  try {
+    const d = await post('/v1/video/upscale', {model:activeModel.id, video:vid, upscale_factor:ival('vu-scale')||2});
+    showVideo('vu-out', vidSrc(d.data[0]), 'vu-prog');
+  } catch(e) { $('vu-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  T2V controls helper (shared form – inline because Jinja include
+//  isn't available here)
+// ─────────────────────────────────────────────────────────────────
+// The T2V panel controls are already inlined in the HTML above (vid-t2v).
+// For the 3 shared controls we use ids like vt-prompt, vt-neg, vt-w, etc.
+
+// ─────────────────────────────────────────────────────────────────
+//  Audio Gen
+// ─────────────────────────────────────────────────────────────────
+async function genAudio() {
+  if (!activeModel) return;
+  $('ag-prog').textContent='Generating audio…';
+  const melody = await b64OrNull('ag-melody');
+  const body = {
+    model:activeModel.id, prompt:val('ag-prompt'),
+    duration:fval('ag-dur')||10, temperature:fval('ag-temp')||1.0,
+    ...(val('ag-seed') ? {seed:ival('ag-seed')} : {}),
+    ...(melody ? {melody} : {}),
+    response_format:'url',
+  };
+  try {
+    const d = await post('/v1/audio/generate', body);
+    const src = audSrc(d.data[0]);
+    showAudio('ag-out', src, 'ag-prog', 'wav');
+  } catch(e) { $('ag-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  TTS
+// ─────────────────────────────────────────────────────────────────
+async function genTTS() {
+  if (!activeModel) return;
+  $('at-prog').textContent='Synthesizing…';
+  try {
+    const r = await fetch('/v1/audio/speech', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model:activeModel.id, input:val('at-text'),
+        speed:fval('at-speed')||1.0, voice:val('at-voice')||undefined, response_format:'mp3'})
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const blob = await r.blob();
+    const src = URL.createObjectURL(blob);
+    showAudio('at-out', src, 'at-prog', 'mp3');
+  } catch(e) { $('at-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  STT
+// ─────────────────────────────────────────────────────────────────
+async function genSTT() {
+  if (!activeModel) return;
+  const f = fileOrNull('as-file');
+  if (!f) { $('as-prog').textContent='Select an audio file.'; return; }
+  $('as-prog').textContent='Transcribing…';
+  const fd = new FormData();
+  fd.append('file', f); fd.append('model', activeModel.id);
+  if (val('as-lang')) fd.append('language', val('as-lang'));
+  if (val('as-prompt')) fd.append('prompt', val('as-prompt'));
+  try {
+    const d = await postForm('/v1/audio/transcriptions', fd);
+    $('as-out').innerHTML = `<div class="gen-out-inner" style="width:100%;text-align:left">
+      <pre style="white-space:pre-wrap;font-size:13px;line-height:1.6;background:var(--surface-2);padding:.75rem;border-radius:6px;width:100%;box-sizing:border-box">${d.text || JSON.stringify(d,null,2)}</pre>
+      <button class="btn btn-ghost btn-sm" onclick="navigator.clipboard.writeText(${JSON.stringify(d.text||'')})">Copy</button>
+    </div>`;
+    $('as-prog').textContent='Done ✓';
+  } catch(e) { $('as-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Embeddings
+// ─────────────────────────────────────────────────────────────────
+async function genEmbeddings() {
+  if (!activeModel) return;
+  $('em-prog').textContent='Embedding…';
+  const lines = val('em-text').split('\n').filter(l => l.trim());
+  if (!lines.length) { $('em-prog').textContent='Enter some text.'; return; }
+  const input = lines.length === 1 ? lines[0] : lines;
+  try {
+    const d = await post('/v1/embeddings', {
+      model:activeModel.id, input,
+      encoding_format:val('em-enc'),
+      ...(val('em-dims') ? {dimensions:ival('em-dims')} : {}),
+    });
+    const preview = d.data.map((e,i) => {
+      const vec = Array.isArray(e.embedding)
+        ? '[' + e.embedding.slice(0,8).map(v=>v.toFixed(4)).join(', ') + ', …] dim=' + e.embedding.length
+        : e.embedding.substring(0,60)+'…';
+      return `<div style="margin-bottom:.4rem"><strong>${lines[i]?.substring(0,40)||i}</strong><br><code style="font-size:11px">${vec}</code></div>`;
+    }).join('');
+    $('em-out').innerHTML = `<div class="gen-out-inner" style="width:100%;text-align:left">${preview}</div>`;
+    $('em-prog').textContent='Done ✓';
+  } catch(e) { $('em-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Pipeline 1: Image → Video
+// ─────────────────────────────────────────────────────────────────
+async function runPipeline1() {
+  const prompt=val('pp1-prompt'), imodel=val('pp1-imodel'), vmodel=val('pp1-vmodel');
+  if (!prompt||!imodel||!vmodel) { $('pp1-prog').textContent='Fill in prompt + both model IDs.'; return; }
+  $('pp1-prog').textContent='Step 1/2: Generating image…';
+  try {
+    const id = await post('/v1/images/generations', {model:imodel, prompt, response_format:'url'});
+    const imgSrcUrl = imgSrc(id.data[0]);
+    $('pp1-prog').textContent='Step 2/2: Animating image…';
+    const vd = await post('/v1/video/generations', {
+      model:vmodel, mode:'i2v', init_image:imgSrcUrl,
+      prompt, num_frames:ival('pp1-frames')||16, fps:ival('pp1-fps')||8,
+    });
+    $('pp1-out').innerHTML=`<img class="out-img" src="${imgSrcUrl}" style="max-width:200px;border-radius:6px">`;
+    showVideo('pp1-out', vidSrc(vd.data[0]), 'pp1-prog');
+  } catch(e) { $('pp1-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Pipeline 2: Video → Dub + Subtitle
+// ─────────────────────────────────────────────────────────────────
+async function runPipeline2() {
+  const f = fileOrNull('pp2-src');
+  if (!f) { $('pp2-prog').textContent='Select a video.'; return; }
+  const model = val('pp2-model') || (activeModel ? activeModel.id : '');
+  $('pp2-prog').textContent='Dubbing + subtitling…';
+  try {
+    const vid = await fileToB64(f);
+    const d = await post('/v1/video/dub', {
+      model, video:vid,
+      source_lang:val('pp2-slang')||undefined,
+      target_lang:val('pp2-tlang'), burn_subtitles:true,
+    });
+    showVideo('pp2-out', vidSrc(d.data[0]), 'pp2-prog');
+  } catch(e) { $('pp2-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Pipeline 3: Full Story
+// ─────────────────────────────────────────────────────────────────
+async function runPipeline3() {
+  const story=val('pp3-story'), tmodel=val('pp3-tmodel'), imodel=val('pp3-imodel'), vmodel=val('pp3-vmodel');
+  if (!story||!tmodel||!imodel||!vmodel) { $('pp3-prog').textContent='Fill in story and all model IDs.'; return; }
+  $('pp3-prog').textContent='Step 1: Generating script with LLM…';
+  try {
+    // 1. LLM generates scene descriptions
+    const script = await post('/v1/chat/completions', {
+      model:tmodel,
+      messages:[{role:'user',content:`Write a 3-scene visual script for this story. For each scene write: SCENE X: [brief visual description]. Story: ${story}`}],
+      stream:false,
+    });
+    const scriptText = script.choices[0].message.content;
+    const scenes = scriptText.match(/SCENE \d+: [^\n]+/g) || [story];
+    $('pp3-prog').textContent=`Script: ${scenes.length} scenes. Generating images…`;
+
+    // 2. Generate image per scene
+    const imgUrls = [];
+    for (const scene of scenes.slice(0,3)) {
+      const desc = scene.replace(/SCENE \d+: /, '');
+      const id = await post('/v1/images/generations', {model:imodel, prompt:desc, response_format:'url'});
+      imgUrls.push(imgSrc(id.data[0]));
+    }
+
+    // 3. Animate first scene image to video
+    $('pp3-prog').textContent='Animating first scene…';
+    const vd = await post('/v1/video/generations', {
+      model:vmodel, mode:'i2v', init_image:imgUrls[0],
+      prompt:scenes[0]?.replace(/SCENE \d+: /,''),
+      num_frames:16, fps:8,
+    });
+
+    const imgs = imgUrls.map(s=>`<img src="${s}" style="max-width:120px;border-radius:4px">`).join('');
+    $('pp3-out').innerHTML=`<div>${imgs}</div>`;
+    showVideo('pp3-out', vidSrc(vd.data[0]), 'pp3-prog');
+    $('pp3-prog').textContent='Done ✓ (tip: animate remaining scenes manually)';
+  } catch(e) { $('pp3-prog').textContent='Error: '+e.message; }
+}
+
+// The T2V panel (vid-t2v) needs its own controls inlined since Jinja
+// fragment includes aren't available. Add them now:
+document.getElementById('panel-vid-t2v').innerHTML = `<div class="gen-wrap">
+  <div class="gen-ctrl">
+    <div class="frow"><label class="fl">Prompt</label><textarea id="vt-prompt" class="fs" rows="4" placeholder="Describe the video…"></textarea></div>
+    <div class="frow"><label class="fl">Negative prompt</label><textarea id="vt-neg" class="fs" rows="2" placeholder="Things to avoid…"></textarea></div>
+    <div class="g2">
+      <div class="frow"><label class="fl">Width</label><input type="number" id="vt-w" class="fi" value="512" step="64"></div>
+      <div class="frow"><label class="fl">Height</label><input type="number" id="vt-h" class="fi" value="512" step="64"></div>
+    </div>
+    <div class="g2">
+      <div class="frow"><label class="fl">Frames</label><input type="number" id="vt-frames" class="fi" value="16"></div>
+      <div class="frow"><label class="fl">FPS</label><input type="number" id="vt-fps" class="fi" value="8"></div>
+    </div>
+    <div class="g2">
+      <div class="frow"><label class="fl">Steps</label><input type="number" id="vt-steps" class="fi" value="25"></div>
+      <div class="frow"><label class="fl">Guidance</label><input type="number" id="vt-cfg" class="fi" value="7.5" step="0.5"></div>
+    </div>
+    <div class="frow"><label class="fl">Seed</label><input type="number" id="vt-seed" class="fi" placeholder="random"></div>
+    <div class="frow"><label class="fl" title="Removes the model's built-in safety checker. Only use with uncensored/NSFW fine-tunes.">Disable safety filter</label><input type="checkbox" id="vt-nosafe"></div>
+    <button class="btn btn-primary" onclick="genVideo('t2v')">Generate Video</button>
+    <div class="progress" id="vt-prog"></div>
+  </div>
+  <div class="gen-out" id="vt-out"><div class="gen-empty">Video will appear here</div></div>
+</div>`;
 
 loadModels();
 </script>

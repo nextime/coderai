@@ -49,6 +49,32 @@ whispercpp>=0.0.17  # Alternative whisper library (works without PyTorch)
 # LiteLLM for standardized API responses
 litellm>=1.40.0
 
+# Image/video processing utilities
+Pillow>=10.0.0
+numpy>=1.24.0
+imageio[ffmpeg]>=2.33.0       # frame I/O + ffmpeg bridge for video generation
+scipy>=1.11.0                  # audio/signal processing (wav export in audio_gen)
+
+# Embeddings
+sentence-transformers>=2.7.0  # /v1/embeddings with sentence-transformer models
+
+# Video/audio post-processing (all optional – features degrade gracefully if absent)
+openai-whisper>=20231117       # subtitle generation via Whisper transcription
+argostranslate>=1.9.0          # subtitle translation
+edge-tts>=6.1.9                # TTS for video dubbing (primary)
+kokoro-tts>=0.9.0              # TTS for video dubbing (fallback)
+soundfile>=0.12.0              # audio file I/O for kokoro TTS output
+
+# Image upscaling / restoration
+realesrgan>=0.3.0              # Real-ESRGAN upscaler
+basicsr>=1.4.2                 # backbone required by realesrgan
+timm>=0.9.0                    # vision model backbones (depth/segment endpoints)
+
+# Audio generation (optional – only needed for /v1/audio/generate)
+# audiocraft is Meta's MusicGen/AudioGen library; install separately if desired:
+#   pip install audiocraft
+# AudioLDM2 is available via diffusers (already listed above)
+
 # Optional: for better performance
 # bitsandbytes>=0.41.0  # for 4-bit/8-bit quantization
 # sentencepiece>=0.1.99  # for some tokenizers

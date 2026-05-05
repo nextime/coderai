@@ -1,0 +1,186 @@
+"""
+Audio generation endpoints for the codai API.
+Supports music, sound effects, and ambient audio via MusicGen, AudioLDM2, StableAudio, etc.
+POST /v1/audio/generate
+"""
+
+import asyncio
+import base64
+import io
+import os
+import time
+import uuid
+
+from fastapi import APIRouter, HTTPException, Request
+
+from codai.models.manager import multi_model_manager
+from codai.pydantic.audiogenrequest import AudioGenerationRequest, AudioGenerationResponse
+
+router = APIRouter()
+
+global_args = None
+global_file_path = None
+
+
+def set_global_args(args):
+    global global_args
+    global_args = args
+
+
+def set_global_file_path(path):
+    global global_file_path
+    global_file_path = path
+
+
+def _derive_device() -> str:
+    if global_args:
+        d = getattr(global_args, 'vulkan_device', None)
+        if d is not None:
+            return f"cuda:{d}"
+    return "cuda:0"
+
+
+def _save_audio_response(audio_data: bytes, ext: str, http_request: Request) -> dict:
+    filename = f"{uuid.uuid4().hex}.{ext}"
+    if global_file_path:
+        os.makedirs(global_file_path, exist_ok=True)
+        fpath = os.path.join(global_file_path, filename)
+        with open(fpath, 'wb') as f:
+            f.write(audio_data)
+        url_setting = getattr(global_args, 'url', 'auto') if global_args else 'auto'
+        if url_setting == 'auto':
+            host = http_request.headers.get('host', '127.0.0.1') if http_request else '127.0.0.1'
+            if ':' in host:
+                parts = host.split(':')
+                if len(parts) == 2 and parts[1].isdigit():
+                    host = parts[0]
+            use_https = getattr(global_args, 'https', False) if global_args else False
+            proto = 'https' if use_https else 'http'
+            port = getattr(global_args, 'port', 8000) if global_args else 8000
+            base_url = f"{proto}://{host}:{port}"
+        else:
+            base_url = url_setting.rstrip('/')
+        return {"url": f"{base_url}/v1/files/{filename}"}
+    else:
+        b64 = base64.b64encode(audio_data).decode()
+        return {f"b64_{ext}": b64}
+
+
+def _load_musicgen(model_name: str, device: str):
+    from audiocraft.models import MusicGen, AudioGen
+    name_lower = model_name.lower()
+    if 'audiogen' in name_lower:
+        model = AudioGen.get_pretrained(model_name)
+    else:
+        model = MusicGen.get_pretrained(model_name)
+    model.set_generation_params(duration=30)
+    return model
+
+
+def _load_audioldm(model_name: str, device: str):
+    import torch
+    from diffusers import AudioLDM2Pipeline
+    pipe = AudioLDM2Pipeline.from_pretrained(model_name, torch_dtype=torch.float16)
+    pipe = pipe.to(device)
+    return pipe
+
+
+def _detect_audio_gen_type(model_name: str) -> str:
+    n = model_name.lower()
+    if 'audioldm' in n or 'stable-audio' in n:
+        return 'audioldm'
+    if 'audiogen' in n:
+        return 'audiogen'
+    return 'musicgen'
+
+
+def _generate_audio(pipe, model_name: str, request: AudioGenerationRequest):
+    """Run generation and return (audio_bytes, ext)."""
+    import numpy as np, io as _io
+
+    model_type = _detect_audio_gen_type(model_name)
+
+    if model_type in ('musicgen', 'audiogen'):
+        pipe.set_generation_params(
+            duration=request.duration,
+            top_k=request.top_k,
+            top_p=request.top_p,
+            temperature=request.temperature,
+            cfg_coef=request.cfg_coef,
+        )
+        if request.melody and model_type == 'musicgen':
+            import torchaudio, torch
+            raw = _decode_b64_or_url(request.melody)
+            melody_wav, sr = torchaudio.load(_io.BytesIO(raw))
+            wav = pipe.generate_with_chroma([request.prompt], melody_wav.unsqueeze(0), sr)
+        else:
+            wav = pipe.generate([request.prompt])
+        audio_np = wav[0, 0].cpu().numpy()
+        sr = pipe.sample_rate
+
+    elif model_type == 'audioldm':
+        result = pipe(
+            request.prompt,
+            num_inference_steps=50,
+            audio_length_in_s=request.duration,
+        )
+        audio_np = result.audios[0]
+        sr = 16000
+
+    # Write to wav
+    import scipy.io.wavfile as wavfile
+    buf = _io.BytesIO()
+    audio_int16 = (audio_np * 32767).astype(np.int16)
+    wavfile.write(buf, sr, audio_int16)
+    return buf.getvalue(), 'wav'
+
+
+def _decode_b64_or_url(data: str) -> bytes:
+    if data.startswith("data:"):
+        _, enc = data.split(",", 1)
+        return base64.b64decode(enc)
+    if data.startswith("http"):
+        import urllib.request
+        with urllib.request.urlopen(data, timeout=30) as r:
+            return r.read()
+    return base64.b64decode(data)
+
+
+@router.post("/v1/audio/generate", response_model=AudioGenerationResponse)
+async def audio_generate(request: AudioGenerationRequest, http_request: Request = None):
+    """
+    Generate music, sound effects, or ambient audio.
+    Compatible models: MusicGen, AudioGen, AudioLDM2, StableAudio.
+    """
+    model_info = multi_model_manager.request_model(request.model, model_type="audio_gen")
+    model_name = model_info.get('model_name')
+    if not model_name:
+        err = model_info.get('error', f"Model '{request.model}' not found")
+        raise HTTPException(status_code=404, detail=err)
+
+    model_key = model_info['model_key']
+    pipe = model_info.get('model_object')
+
+    if pipe is None:
+        device = _derive_device()
+        model_type = _detect_audio_gen_type(model_name)
+        try:
+            if model_type in ('musicgen', 'audiogen'):
+                pipe = await asyncio.get_event_loop().run_in_executor(
+                    None, _load_musicgen, model_name, device)
+            else:
+                pipe = await asyncio.get_event_loop().run_in_executor(
+                    None, _load_audioldm, model_name, device)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to load audio gen model: {e}")
+        multi_model_manager.models[model_key] = pipe
+        multi_model_manager.current_model_key = model_key
+
+    try:
+        audio_bytes, ext = await asyncio.get_event_loop().run_in_executor(
+            None, _generate_audio, pipe, model_name, request)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Audio generation failed: {e}")
+
+    result = _save_audio_response(audio_bytes, ext, http_request)
+    return AudioGenerationResponse(created=int(time.time()), data=[result])
