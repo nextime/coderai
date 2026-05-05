@@ -1,3 +1,19 @@
+# CoderAI - OpenAI-compatible API server
+# Copyright (C) 2026 Stefy Lanza <stefy@nexlab.net>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 """
 Model Parser Dispatcher - Multi-Model Tool Call Parsing
 
@@ -1173,10 +1189,15 @@ class OpenAIFormatter:
         self.model_name = model_name
         self.id = f"chatcmpl-{uuid.uuid4()}"
 
-    def format_full(self, text, prompt_tokens, completion_tokens, tool_calls=None, reasoning=None):
+    def format_full(self, text, prompt_tokens, completion_tokens, tool_calls=None, reasoning=None, context_size=None):
         """Standard Response (Non-Streaming)"""
         if LITELLM_AVAILABLE and all([ModelResponse, Choices, Message, Usage]):
             try:
+                usage_dict = {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens
+                }
                 return ModelResponse(
                     id=self.id,
                     model=self.model_name,
@@ -1187,11 +1208,7 @@ class OpenAIFormatter:
                         index=0,
                         message=Message(content=text if not tool_calls else None, role="assistant", tool_calls=tool_calls)
                     )],
-                    usage=Usage(
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        total_tokens=prompt_tokens + completion_tokens
-                    )
+                    usage=Usage(**usage_dict)
                 ).model_dump()
             except Exception as e:
                 print(f"DEBUG formatter: litellm fallback failed: {e}")
@@ -1212,24 +1229,28 @@ class OpenAIFormatter:
             "finish_reason": "tool_calls" if tool_calls else "stop",
         }
         
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        if context_size is not None:
+            usage["context_size"] = context_size
+        
         return {
             "id": self.id,
             "object": "chat.completion",
             "created": int(time.time()),
             "model": self.model_name,
             "choices": [choice],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
+            "usage": usage,
             "provider": {
                 "provider_name": "coderai",
                 "provider_id": "coderai",
             },
         }
 
-    def format_chunk(self, delta_text, is_final=False, usage=None):
+    def format_chunk(self, delta_text, is_final=False, usage=None, context_size=None):
         """Streaming Chunk (Used in a Generator)"""
         if LITELLM_AVAILABLE and all([ChatCompletionChunk, StreamingChoices, Delta, (Usage if usage else True)]):
             try:
@@ -1270,21 +1291,23 @@ class OpenAIFormatter:
         
         if usage and is_final:
             chunk["usage"] = usage
+            if context_size is not None:
+                chunk["usage"]["context_size"] = context_size
             
         return chunk
 
-    def format_final_chunk(self, usage: dict = None) -> dict:
+    def format_final_chunk(self, usage: dict = None, context_size: int = None) -> dict:
         """Format the final streaming chunk with usage information."""
-        return self.format_chunk("", is_final=True, usage=usage)
+        return self.format_chunk("", is_final=True, usage=usage, context_size=context_size)
 
     # Backward compatibility methods
-    def format_litellm_full(self, text: str, prompt_tokens: int, completion_tokens: int, tool_calls=None) -> dict:
+    def format_litellm_full(self, text: str, prompt_tokens: int, completion_tokens: int, tool_calls=None, context_size=None) -> dict:
         """Backward compatibility method - calls format_full."""
-        return self.format_full(text, prompt_tokens, completion_tokens, tool_calls)
+        return self.format_full(text, prompt_tokens, completion_tokens, tool_calls, context_size=context_size)
 
-    def format_litellm_chunk(self, delta_text: str, is_final: bool = False, usage: dict = None) -> dict:
+    def format_litellm_chunk(self, delta_text: str, is_final: bool = False, usage: dict = None, context_size: int = None) -> dict:
         """Backward compatibility method - calls format_chunk."""
-        return self.format_chunk(delta_text, is_final, usage)
+        return self.format_chunk(delta_text, is_final, usage, context_size)
 
 
 # =============================================================================

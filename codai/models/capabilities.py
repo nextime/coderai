@@ -1,3 +1,19 @@
+# CoderAI - OpenAI-compatible API server
+# Copyright (C) 2026 Stefy Lanza <stefy@nexlab.net>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 """Model capabilities module."""
 
 from dataclasses import dataclass
@@ -61,6 +77,7 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
     """
     Detect model capabilities from the model name/ID.
     Heuristic only — actual capabilities depend on the checkpoint.
+    Returns all detected capabilities (multimodal models may have multiple).
     """
     caps = ModelCapabilities()
     if not model_name:
@@ -74,10 +91,12 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
                               'animatediff', 'text2video', 'modelscope-t2v',
                               'zeroscope', 'lavie']):
         caps.video_generation = True
+        caps.text_generation = True  # T2V models also do text
         return caps
 
     if any(x in n for x in ['wan2.1-t2v', 'wan-t2v']):
         caps.video_generation = True
+        caps.text_generation = True
         return caps
 
     # Image-to-video
@@ -86,12 +105,17 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
                               'wan2.1-i2v', 'wan-i2v', 'img2vid',
                               'image2video', 'motionctrl']):
         caps.image_to_video = True
+        caps.image_to_text = True  # I2V models process images
         return caps
 
     # Wan generic (detect sub-variant)
     if 'wan' in n and ('video' in n or 'diffuser' in n):
-        caps.image_to_video = True if 'i2v' in n else False
-        caps.video_generation = True if 'i2v' not in n else False
+        if 'i2v' in n:
+            caps.image_to_video = True
+            caps.image_to_text = True
+        else:
+            caps.video_generation = True
+            caps.text_generation = True
         return caps
 
     # Video interpolation
@@ -115,6 +139,7 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
     if any(x in n for x in ['musicgen', 'audiogen', 'audioldm', 'stable-audio',
                               'mustango', 'noise2music', 'jukebox', 'audiocraft']):
         caps.audio_generation = True
+        caps.text_generation = True  # T2A models process text
         return caps
 
     if any(x in n for x in ['demucs', 'spleeter', 'asteroid', 'open-unmix']):
@@ -130,11 +155,14 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
     if any(x in n for x in ['kokoro', 'xtts', 'bark', 'tortoise',
                               'speecht5', 'matcha-tts', 'voicebox']):
         caps.text_to_speech = True
+        caps.text_generation = True  # TTS models process text
         return caps
 
     # Lip sync / dubbing
     if any(x in n for x in ['wav2lip', 'sadtalker', 'dinet', 'videoretalking']):
         caps.lip_sync = True
+        caps.audio_generation = True
+        caps.video_generation = True
         return caps
 
     # ── Image: generation ────────────────────────────────────────────────────
@@ -142,11 +170,13 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
         caps.inpainting = True
         caps.image_generation = True
         caps.image_to_image = True
+        caps.text_generation = True  # T2I models process text
         return caps
 
     if 'controlnet' in n:
         caps.controlnet = True
         caps.image_generation = True
+        caps.text_generation = True
         return caps
 
     if any(x in n for x in ['stable-diffusion', 'sd15', 'sdxl', 'sd-xl',
@@ -156,31 +186,37 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
         caps.image_generation = True
         caps.image_to_image = True
         caps.inpainting = True    # most SD/SDXL/Flux support inpainting variant
+        caps.text_generation = True  # T2I models process text
         return caps
 
     # ── Image: analysis / processing ─────────────────────────────────────────
     if any(x in n for x in ['midas', 'dpt-depth', 'dpt-large', 'zoe-depth',
                               'depth-anything', 'marigold']):
         caps.depth_estimation = True
+        caps.image_to_text = True  # Image analysis models process images
         return caps
 
     if any(x in n for x in ['sam2', 'sam-', '-sam', 'segment-anything',
                               'mask-rcnn', 'fastsam']):
         caps.image_segmentation = True
+        caps.image_to_text = True
         return caps
 
     if any(x in n for x in ['real-esrgan', 'esrgan', 'swinir', 'edsr',
                               'bsrgan', 'hat-', 'dat-']):
         caps.image_upscaling = True
+        caps.image_to_image = True
         return caps
 
     if any(x in n for x in ['codeformer', 'gfpgan', 'restoreformer']):
         caps.face_restoration = True
         caps.image_upscaling = True
+        caps.image_to_image = True
         return caps
 
     if any(x in n for x in ['yolo', 'detr', 'owlvit', 'rtdetr', 'dino']):
         caps.object_detection = True
+        caps.image_to_text = True
         return caps
 
     # ── Vision / multimodal LLMs ─────────────────────────────────────────────
@@ -197,6 +233,7 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
                               'sentence-transformer', 'nomic-embed',
                               'instructor-', 'gte-', 'jina-embed']):
         caps.embeddings = True
+        caps.text_generation = True  # Embedding models process text
         return caps
 
     # ── GGUF quantised text models ───────────────────────────────────────────

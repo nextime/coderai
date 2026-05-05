@@ -1,23 +1,31 @@
 # CoderAI
 
-An OpenAI-compatible API server supporting multiple GPU backends: NVIDIA (CUDA), AMD (Vulkan), and Intel (Vulkan). Uses HuggingFace Transformers for NVIDIA GPUs and llama-cpp-python with Vulkan for AMD/Intel GPUs.
+An OpenAI-compatible API server with web administration dashboard, supporting multiple GPU backends: NVIDIA (CUDA), AMD (Vulkan), and Intel (Vulkan). Configuration-driven architecture with per-model settings and multi-modal support (text, image, audio, TTS).
 
 ## Features
 
-- **Multi-Backend Support**: 
-  - NVIDIA (CUDA) via PyTorch + Transformers
-  - AMD GPUs via llama-cpp-python + Vulkan
-  - Intel GPUs (iGPU/Arc) via llama-cpp-python + Vulkan
+### Core Capabilities
 - **OpenAI-Compatible API**: Drop-in replacement for OpenAI's API endpoints
-- **Memory-Aware Model Loading**: Automatically determines optimal loading strategy based on available VRAM and RAM (NVIDIA)
-- **Sequential Offloading**: Smart offload from VRAM → RAM → Disk when needed (NVIDIA)
-- **Multi-GPU Support**: Automatic distribution across multiple CUDA devices (NVIDIA)
-- **GPU Auto-Detection**: Automatically detects available backends
-- **Quantization Support**: 4-bit and 8-bit quantization via bitsandbytes (NVIDIA) or built-in GGUF quantization (Vulkan)
-- **Flash Attention 2**: Optional faster attention implementation for supported NVIDIA GPUs
-- **Streaming Responses**: Server-sent events for real-time token generation
-- **Tool Calling**: Support for function calling and tool use
-- **Multiple Endpoints**: `/v1/chat/completions`, `/v1/completions`, and `/v1/models`
+- **Web Admin Dashboard**: Modern UI for model management, user authentication, and API tokens
+- **Configuration-Based**: JSON config files for all settings - no complex CLI arguments
+- **Multi-Modal Support**: Text generation, image generation, audio transcription, text-to-speech
+- **Per-Model Configuration**: Individual settings for each model (GPU layers, quantization, context size)
+- **On-Demand Loading**: Models load automatically when requested, unload when idle
+
+### GPU Backend Support
+- **NVIDIA (CUDA)**: PyTorch + Transformers for HuggingFace models
+- **AMD GPUs**: llama-cpp-python + Vulkan for GGUF models
+- **Intel GPUs**: iGPU/Arc support via Vulkan
+- **Auto-Detection**: Automatically selects best available backend
+- **Multi-GPU**: Automatic distribution across multiple devices
+
+### Advanced Features
+- **Memory Management**: Smart VRAM → RAM → Disk offloading (NVIDIA)
+- **Quantization**: 4-bit/8-bit via bitsandbytes (NVIDIA) or GGUF quantization (Vulkan)
+- **Flash Attention 2**: Optional faster inference for supported NVIDIA GPUs
+- **Streaming**: Server-sent events for real-time token generation
+- **Tool Calling**: Function calling and tool use support
+- **Authentication**: Session-based auth with API token support
 
 ## Installation
 
@@ -44,19 +52,20 @@ The easiest way to install is using the provided build script:
 git clone git@git.nexlab.net:nexlab/coderai.git
 cd coderai
 
-# For NVIDIA GPUs (default)
-./build.sh nvidia
+# Install all backends (recommended)
+./build.sh all
 
-# For AMD or Intel GPUs with Vulkan support
-./build.sh vulkan
+# Or install specific backend:
+./build.sh nvidia   # NVIDIA GPUs only
+./build.sh vulkan   # AMD/Intel GPUs only
 ```
 
-**Note**: The `vulkan` option works for both AMD and Intel GPUs.
+**Note**: The `all` option installs support for all backends, allowing you to switch between them via configuration. The `vulkan` option works for both AMD and Intel GPUs.
 
 The build script will:
 - Create a virtual environment
 - Install the appropriate dependencies for your GPU
-- Set up the correct backend
+- Set up the correct backend(s)
 
 ### Manual Installation
 
@@ -155,216 +164,74 @@ pip install flash-attn --no-build-isolation
 
 ## Usage
 
-### Basic Usage
+### Quick Start
 
 ```bash
-# Activate the virtual environment created by build.sh
-source venv/bin/activate
+# Activate the virtual environment
+source venv_all/bin/activate  # or venv/bin/activate
 
-# Run with NVIDIA backend (HuggingFace models)
-python coderai --model microsoft/DialoGPT-medium --backend nvidia
+# Start the server (uses default config at ~/.coderai/)
+python coderai
 
-# Run with Vulkan backend (GGUF models)
-python coderai --model ./phi-3-mini-4k-instruct-q4_k_m.gguf --backend vulkan
+# Or specify a custom config directory
+python coderai --config /path/to/config
 
-# The server will start on http://0.0.0.0:8000 by default
+# Enable debug mode for troubleshooting
+python coderai --debug
 ```
+
+The server will start on `http://0.0.0.0:8000` by default.
+
+### Access Points
+
+- **Admin Dashboard**: http://localhost:8000/admin
+- **Chat Interface**: http://localhost:8000/chat
+- **API Endpoints**: http://localhost:8000/v1/*
+- **API Documentation**: http://localhost:8000/docs
+
+### First Login
+
+Default credentials (you'll be prompted to change the password):
+- **Username**: `admin`
+- **Password**: `admin`
+
+### Configuration Files
+
+CoderAI uses JSON configuration files stored in `~/.coderai/` (or custom directory via `--config`):
+
+```
+~/.coderai/
+├── config.json       # Server, backend, and global settings
+├── models.json       # Model registry and per-model configurations
+├── auth.json         # Users, API tokens, and sessions
+└── secret_key        # Session signing key (auto-generated)
+```
+
+These files are automatically created with sensible defaults on first run.
 
 ### Command-Line Options
 
 ```
-usage: coderai [-h] [--model MODEL] [--backend {auto,nvidia,vulkan}] [--host HOST]
-               [--port PORT] [--offload-dir OFFLOAD_DIR] [--load-in-4bit]
-               [--load-in-8bit] [--ram RAM] [--flash-attn] [--n-gpu-layers N]
-               [--n-ctx N]
+usage: coderai [-h] [--config CONFIG] [--debug] [--dump]
+               [--list-cached-models] [--remove-all-models]
+               [--remove-model REMOVE_MODEL] [--download-model DOWNLOAD_MODEL]
+               [--download-file-pattern DOWNLOAD_FILE_PATTERN]
+               [--vulkan-list-devices]
 
 OpenAI-compatible API server supporting NVIDIA (CUDA) and Vulkan backends
 
 options:
   -h, --help            show this help message and exit
-  --model MODEL         Model name or path. For NVIDIA: HuggingFace model.
-                        For Vulkan: GGUF file path or HF repo
-  --backend {auto,nvidia,vulkan}
-                        Backend to use: auto (detect), nvidia (CUDA), or
-                        vulkan (AMD/Intel GPUs via Vulkan)
-  --host HOST           Host to bind to (default: 0.0.0.0)
-  --port PORT           Port to bind to (default: 8000)
-  --offload-dir OFFLOAD_DIR
-                        Directory for disk offload (NVIDIA only, default: ./offload)
-  --load-in-4bit        Load model in 4-bit precision (NVIDIA only, requires bitsandbytes)
-  --load-in-8bit        Load model in 8-bit precision (NVIDIA only, requires bitsandbytes)
-  --ram RAM             Manually specify available RAM in GB (NVIDIA only)
-  --flash-attn          Use Flash Attention 2 (NVIDIA only, requires flash-attn)
-  --n-gpu-layers N      Number of layers to offload to GPU (Vulkan only,
-                        default: -1 = all layers)
-  --n-ctx N             Context window size (Vulkan only, default: 2048)
-  --vulkan-device N     Vulkan GPU device ID to use (Vulkan only, default: 0)
-  --vulkan-single-gpu   Force Vulkan to use only the specified GPU (prevents layer distribution across multiple GPUs)
+  --config CONFIG       Configuration directory (default: ~/.coderai/)
+  --debug               Enable debug mode - dumps full request/response to stdout
+  --dump                Dump model output: raw output, parsed output, and debug info
+  --list-cached-models  List all cached models in the model cache directory
+  --remove-all-models   Remove all cached models from the model cache directory
+  --remove-model NAME   Remove a specific cached model by name or hash
+  --download-model ID   Download a model to cache (URL or HuggingFace model ID)
+  --download-file-pattern PATTERN
+                        File pattern for HuggingFace downloads (e.g., .gguf, .safetensors)
   --vulkan-list-devices List available Vulkan GPU devices and exit
-  --reply-filters      Enable filtering of model replies. Can be repeated. See "Reply Filters" section for details.
-  --hf-chat-template  Use HuggingFace transformers apply_chat_template. Can be repeated. See "HuggingFace Chat Template" section for details.
-```
-
-### Reply Filters
-
-The `--reply-filters` option controls filtering of model responses. By default, no filtering is applied. Filters can be specified in multiple ways:
-
-**Filter Types:**
-- `malformed` - Filter out malformed SEARCH/REPLACE blocks
-- `tool_calls` - Strip tool call format tags from output
-- `all` - Enable all filters
-
-**Syntax:**
-
-```bash
-# No filtering (default)
-coderai
-
-# Comma-separated - apply to all models
-coderai --reply-filters malformed,tool_calls
-
-# Apply to all text models or all image models
-coderai --reply-filters text:malformed
-coderai --reply-filters image:tool_calls
-
-# Apply to SPECIFIC model
-coderai --reply-filters text:llama-3.1:malformed
-coderai --reply-filters image:sd-xl:tool_calls
-
-# Different filters for different models (multiple --reply-filters)
-coderai --reply-filters text:llama-3.1:malformed --reply-filters text:phi-3:tool_calls --reply-filters image:sd-xl:all
-
-# Apply all filters to specific model
-coderai --reply-filters text:llama-3.1:all
-```
-
-**Filter Syntax Reference:**
-
-| Syntax | Applies To |
-|--------|------------|
-| `all` | All models, all filters |
-| `malformed` | All models, malformed filter |
-| `tool_calls` | All models, tool_calls filter |
-| `text:malformed` | All text models, malformed filter |
-| `image:tool_calls` | All image models, tool_calls filter |
-| `text:model_name:malformed` | Specific text model, malformed filter |
-| `image:model_name:tool_calls` | Specific image model, tool_calls filter |
-
-### HuggingFace Chat Template
-
-The `--hf-chat-template` option enables using HuggingFace's `apply_chat_template` from the transformers library for GGUF models instead of llama.cpp's built-in chat template handling. This provides more consistent chat template formatting that matches HuggingFace models.
-
-**Requirements:**
-- `transformers` library must be installed
-- The model must be available on HuggingFace Hub or have a `tokenizer_config.json` in the same directory as the GGUF file
-
-**Usage:**
-
-```bash
-# Auto-detect and use HuggingFace chat template for all models
-coderai --hf-chat-template auto --model llama-3.1-8b-instruct-q4_k_m.gguf
-
-# Auto-detect for all text models
-coderai --hf-chat-template text --model llama-3.1-8b-instruct-q4_k_m.gguf
-
-# Use SPECIFIC template for a specific model
-coderai --hf-chat-template "llama-3.1:llama3" --model llama-3.1-8b-instruct-q4_k_m.gguf
-
-# Different templates for different models
-coderai --hf-chat-template "llama-3.1:llama3" --hf-chat-template "phi-3:chatml"
-
-# Or with Vulkan backend
-coderai --backend vulkan --hf-chat-template auto --model llama-3.1-8b-instruct-q4_k_m.gguf
-```
-
-**Syntax:**
-
-| Syntax | Applies To |
-|--------|------------|
-| `--hf-chat-template auto` | Auto-detect and use HF template for all models |
-| `--hf-chat-template text` | All text models (auto-detect template) |
-| `--hf-chat-template text:model_name` | Specific model (auto-detect template) |
-| `--hf-chat-template "model_name:template"` | Specific model with specific template |
-
-**Template Examples:**
-- `llama3` - Meta's Llama 3 chat format
-- `chatml` - ChatML format
-- `qwen` - Qwen chat format
-- `phi` - Microsoft Phi chat format
-
-**How it works:**
-1. When `--hf-chat-template` is specified, the server attempts to load a HuggingFace tokenizer
-2. If a template is specified (e.g., `"llama-3.1:llama3"`), it uses that template directly
-3. If no template specified, it auto-detects from the tokenizer (local or HuggingFace Hub)
-4. The tokenizer's `apply_chat_template` method is used for formatting chat messages
-
-### Backend Selection
-
-The `--backend` option controls which backend to use:
-
-- **`auto`** (default): Automatically detects available backends, preferring NVIDIA if available
-- **`nvidia`**: Use PyTorch + Transformers with CUDA (for NVIDIA GPUs)
-- **`vulkan`**: Use llama-cpp-python with Vulkan (for AMD and Intel GPUs)
-
-### Model Formats by Backend
-
-#### NVIDIA Backend
-Uses HuggingFace Transformers format:
-```bash
-python coderai --model microsoft/DialoGPT-medium --backend nvidia
-python coderai --model meta-llama/Llama-2-7b-chat-hf --backend nvidia
-```
-
-#### Vulkan Backend
-Uses GGUF format (can be local files or downloaded from HuggingFace):
-```bash
-# Local GGUF file
-python coderai --model ./phi-3-mini-4k-instruct-q4_k_m.gguf --backend vulkan
-
-# Download from HuggingFace (auto-selects GGUF file)
-python coderai --model microsoft/Phi-3-mini-4k-instruct-gguf --backend vulkan
-
-# Specific GGUF file from repo
-python coderai --model TheBloke/Llama-2-7B-GGUF/llama-2-7b.Q4_K_M.gguf --backend vulkan
-```
-
-**Finding GGUF models:**
-- Search on HuggingFace: https://huggingface.co/models?search=gguf
-- Popular collections: TheBloke, unsloth, bartowski
-- Recommended quantization: Q4_K_M for best speed/quality balance
-
-### Examples
-
-#### Run with 4-bit Quantization (Low VRAM)
-
-```bash
-python coderai --model meta-llama/Llama-2-7b-chat-hf --load-in-4bit
-```
-
-#### Run with Custom Offload Directory
-
-```bash
-python coderai --model bigscience/bloom-7b1 --offload-dir /path/to/fast/storage
-```
-
-#### Run on Specific Host/Port
-
-```bash
-python coderai --model microsoft/DialoGPT-medium --host 127.0.0.1 --port 8080
-```
-
-#### Specify Available RAM Manually
-
-Useful for containerized environments where auto-detection may not work:
-
-```bash
-python coderai --model meta-llama/Llama-2-13b-chat-hf --ram 32
-```
-
-#### Enable Flash Attention 2
-
-```bash
-python coderai --model meta-llama/Llama-2-7b-chat-hf --flash-attn
 ```
 
 ## API Documentation
@@ -460,7 +327,197 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-## Configuration for Different Setups
+## Configuration
+
+### Configuration Files
+
+All settings are managed through JSON files in the configuration directory (`~/.coderai/` by default):
+
+#### config.json - Server and Backend Settings
+
+```json
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "https": false,
+    "https_key_path": null,
+    "https_cert_path": null
+  },
+  "backend": {
+    "type": "auto",
+    "image_backend": "auto",
+    "audio_backend": "auto",
+    "tts_backend": "auto"
+  },
+  "models": {
+    "default_load_mode": "ondemand",
+    "hf_cache_dir": null,
+    "gguf_cache_dir": null
+  },
+  "offload": {
+    "directory": "./offload",
+    "strategy": "auto",
+    "max_gpu_percent": null,
+    "no_ram": false,
+    "load_in_4bit": false,
+    "load_in_8bit": false,
+    "manual_ram_gb": null,
+    "flash_attention": false
+  },
+  "vulkan": {
+    "n_gpu_layers": -1,
+    "n_ctx": 2048,
+    "device_id": 0,
+    "single_gpu": false
+  },
+  "image": {
+    "steps": 4,
+    "width": 512,
+    "height": 512,
+    "cfg_scale": 1.0,
+    "precision": "f32",
+    "cpu_offload": false
+  },
+  "whisper": {
+    "server_path": null,
+    "server_port": 8744
+  }
+}
+```
+
+#### models.json - Model Registry
+
+```json
+{
+  "text_models": [
+    {
+      "id": "microsoft/DialoGPT-medium",
+      "backend": "nvidia",
+      "context_size": 2048,
+      "n_gpu_layers": -1,
+      "load_in_4bit": false,
+      "load_in_8bit": false,
+      "flash_attention": false,
+      "enabled": true
+    },
+    {
+      "id": "phi-3-mini-4k-instruct-q4_k_m.gguf",
+      "backend": "vulkan",
+      "context_size": 4096,
+      "n_gpu_layers": -1,
+      "enabled": true
+    }
+  ],
+  "image_models": [
+    {
+      "id": "stable-diffusion-xl-base-1.0",
+      "backend": "nvidia",
+      "steps": 4,
+      "width": 512,
+      "height": 512,
+      "cfg_scale": 1.0,
+      "enabled": true
+    }
+  ],
+  "audio_models": [],
+  "vision_models": [],
+  "tts_models": [],
+  "loaded": [],
+  "preload": [],
+  "aliases": {
+    "default": "microsoft/DialoGPT-medium"
+  }
+}
+```
+
+#### auth.json - Users and API Tokens
+
+```json
+{
+  "users": [
+    {
+      "id": "admin",
+      "username": "admin",
+      "password_hash": "$argon2id$...",
+      "role": "admin",
+      "created_at": "2026-05-05T00:00:00Z"
+    }
+  ],
+  "tokens": [
+    {
+      "id": "tok_abc123",
+      "token": "sk-coderai-abc123...",
+      "name": "Production API",
+      "created_at": "2026-05-05T00:00:00Z",
+      "last_used": null
+    }
+  ],
+  "sessions": {}
+}
+```
+
+### Managing Configuration
+
+#### Via Web Dashboard
+
+The easiest way to manage configuration is through the web dashboard at `http://localhost:8000/admin`:
+
+- **Models**: Add, remove, enable/disable models; configure per-model settings
+- **Users**: Create users, change passwords, manage roles
+- **Tokens**: Generate API tokens for programmatic access
+- **Settings**: Adjust server, backend, and global settings
+
+#### Via Configuration Files
+
+You can also edit the JSON files directly. Changes take effect after restarting the server or using the reload endpoint:
+
+```bash
+curl -X POST http://localhost:8000/admin/api/system/reload
+```
+
+### Per-Model Configuration
+
+Each model can have its own settings that override global defaults:
+
+**Text Models (NVIDIA backend):**
+- `backend`: "nvidia" or "vulkan"
+- `context_size`: Context window size
+- `n_gpu_layers`: Number of layers on GPU (-1 = all)
+- `load_in_4bit`: Enable 4-bit quantization
+- `load_in_8bit`: Enable 8-bit quantization
+- `flash_attention`: Enable Flash Attention 2
+
+**Text Models (Vulkan backend):**
+- `backend`: "vulkan"
+- `context_size`: Context window size
+- `n_gpu_layers`: Number of layers on GPU (-1 = all)
+
+**Image Models:**
+- `backend`: "nvidia" or "vulkan"
+- `steps`: Number of diffusion steps
+- `width`: Image width
+- `height`: Image height
+- `cfg_scale`: Classifier-free guidance scale
+- `precision`: "f32" or "f16"
+
+### Backend Selection
+
+Backends can be configured globally in `config.json` or per-model in `models.json`:
+
+- **`auto`**: Automatically detect and use best available backend
+- **`nvidia`**: Use CUDA backend (PyTorch + Transformers)
+- **`vulkan`**: Use Vulkan backend (llama-cpp-python)
+
+### Model Loading Modes
+
+Configure in `config.json` under `models.default_load_mode`:
+
+- **`ondemand`** (default): Load models when first requested, unload when idle
+- **`preload`**: Load models listed in `models.json` → `preload` array at startup
+- **`lazy`**: Never preload, always load on-demand
+
+## Backend-Specific Setup
 
 ### NVIDIA (CUDA)
 
@@ -471,12 +528,24 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 # Or manually install CUDA-enabled PyTorch
 pip install "torch>=2.0.0" "torchvision>=0.15.0" "torchaudio>=2.0.0"
 pip install -r requirements-nvidia.txt
+```
 
-# Run with GPU acceleration
-python coderai --model meta-llama/Llama-2-7b-chat-hf --backend nvidia
-
-# Optional: Enable Flash Attention 2 for faster inference
-python coderai --model meta-llama/Llama-2-7b-chat-hf --backend nvidia --flash-attn
+**Configuration in models.json:**
+```json
+{
+  "text_models": [
+    {
+      "id": "meta-llama/Llama-2-7b-chat-hf",
+      "backend": "nvidia",
+      "context_size": 4096,
+      "n_gpu_layers": -1,
+      "load_in_4bit": false,
+      "load_in_8bit": false,
+      "flash_attention": false,
+      "enabled": true
+    }
+  ]
+}
 ```
 
 ### AMD and Intel (Vulkan)
@@ -491,21 +560,6 @@ sudo dnf install vulkan-loader-devel vulkan-tools mesa-vulkan-drivers intel-gpu-
 
 # Using build script
 ./build.sh vulkan
-
-# Run with GGUF model
-python coderai --model ./phi-3-mini-4k-instruct-q4_k_m.gguf --backend vulkan
-
-# Or download automatically from HuggingFace
-python coderai --model TheBloke/Llama-2-7B-GGUF --backend vulkan
-
-# Control GPU layer offloading (default: -1 = all layers)
-python coderai --model model.gguf --backend vulkan --n-gpu-layers 35
-
-# Adjust context window (default: 2048)
-python coderai --model model.gguf --backend vulkan --n-ctx 4096
-
-# Select specific GPU device (if you have multiple GPUs - e.g., NVIDIA + AMD + Intel)
-python coderai --model model.gguf --backend vulkan --vulkan-device 1
 
 # List available Vulkan GPU devices
 python coderai --vulkan-list-devices
@@ -527,6 +581,33 @@ python coderai --vulkan-list-devices
 - Recommended for Intel iGPUs: `Q4_K_M` quantized models under 2GB file size
 - Intel Arc GPUs work well with the same settings as AMD GPUs
 
+**Configuration in models.json:**
+```json
+{
+  "text_models": [
+    {
+      "id": "phi-3-mini-4k-instruct-q4_k_m.gguf",
+      "backend": "vulkan",
+      "context_size": 4096,
+      "n_gpu_layers": -1,
+      "enabled": true
+    }
+  ]
+}
+```
+
+**Vulkan Configuration in config.json:**
+```json
+{
+  "vulkan": {
+    "n_gpu_layers": -1,
+    "n_ctx": 2048,
+    "device_id": 0,
+    "single_gpu": false
+  }
+}
+```
+
 ### CPU-Only
 
 While not recommended for performance, you can run on CPU:
@@ -535,11 +616,21 @@ While not recommended for performance, you can run on CPU:
 # NVIDIA backend on CPU
 pip install "torch>=2.0.0" --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements-nvidia.txt
-python coderai --model microsoft/DialoGPT-medium --backend nvidia
 
 # Or Vulkan backend on CPU (llama-cpp supports CPU fallback)
 CMAKE_ARGS="-DGGML_VULKAN=OFF" pip install llama-cpp-python
-python coderai --model model.gguf --backend vulkan
+```
+
+Configure in `config.json`:
+```json
+{
+  "backend": {
+    "type": "nvidia"
+  },
+  "vulkan": {
+    "n_gpu_layers": 0
+  }
+}
 ```
 
 ### ROCm Alternative (deprecated)
@@ -548,54 +639,65 @@ While the Vulkan backend is now recommended for AMD GPUs, ROCm support is still 
 
 ### Low VRAM Configuration
 
-For GPUs with limited VRAM (4-8GB):
+For GPUs with limited VRAM (4-8GB), configure in `config.json` or per-model in `models.json`:
 
-```bash
-# Option 1: Use 4-bit quantization
-python coderai --model meta-llama/Llama-2-7b-chat-hf --load-in-4bit
+**Global configuration (config.json):**
+```json
+{
+  "offload": {
+    "load_in_4bit": true,
+    "directory": "/path/to/fast/storage"
+  }
+}
+```
 
-# Option 2: Use 8-bit quantization
-python coderai --model meta-llama/Llama-2-13b-chat-hf --load-in-8bit
-
-# Option 3: Enable disk offload for very large models
-python coderai --model bigscience/bloom-7b1 --offload-dir /path/to/fast/storage
+**Per-model configuration (models.json):**
+```json
+{
+  "text_models": [
+    {
+      "id": "meta-llama/Llama-2-7b-chat-hf",
+      "backend": "nvidia",
+      "load_in_4bit": true,
+      "enabled": true
+    }
+  ]
+}
 ```
 
 ### Using Vulkan with Multiple GPUs (NVIDIA + AMD)
 
-If your system has both NVIDIA and AMD GPUs, llama.cpp's Vulkan backend will automatically distribute layers across all visible GPUs for performance. To force Vulkan to use **only** the AMD GPU and prevent VRAM allocation on the NVIDIA GPU:
+If your system has both NVIDIA and AMD GPUs, llama.cpp's Vulkan backend will automatically distribute layers across all visible GPUs for performance. To force Vulkan to use **only** the AMD GPU and prevent VRAM allocation on the NVIDIA GPU, configure in `config.json`:
 
-**Method 1: Use `--vulkan-single-gpu` flag (Recommended)**
-```bash
-# Force all layers onto the specified GPU device only
-# For example, to use only device 1 (AMD GPU):
-python coderai --model model.gguf --backend vulkan --vulkan-device 1 --vulkan-single-gpu --port 6744
-
-# This creates a tensor_split that puts 0% on other GPUs and 100% on the selected GPU
+**Configuration in config.json:**
+```json
+{
+  "vulkan": {
+    "device_id": 1,
+    "single_gpu": true
+  }
+}
 ```
 
-**Method 2: Use environment variable to select specific Vulkan device**
+**Alternative: Environment variables**
 ```bash
 # List available Vulkan devices first
 python coderai --vulkan-list-devices
 
 # Then use VK_DEVICE_SELECT_DEVICE to force a specific device
 # For example, if device 1 is your AMD GPU:
-VK_DEVICE_SELECT_DEVICE=1 python coderai --model model.gguf --backend vulkan --vulkan-device 0 --port 6744
-```
+VK_DEVICE_SELECT_DEVICE=1 python coderai
 
-**Method 3: Hide NVIDIA GPU from CUDA (prevents any CUDA usage)**
-```bash
-# Make NVIDIA GPU invisible to CUDA/Vulkan
-CUDA_VISIBLE_DEVICES="" python coderai --model model.gguf --backend vulkan --vulkan-device 0 --port 6744
+# Or hide NVIDIA GPU from CUDA (prevents any CUDA usage)
+CUDA_VISIBLE_DEVICES="" python coderai
 ```
 
 **Understanding the Issue:**
-When you have multiple Vulkan-compatible GPUs, llama.cpp automatically distributes model layers across them (shown in logs as "layer X assigned to device VulkanY"). The `--vulkan-single-gpu` flag prevents this by using the `tensor_split` parameter with a value of `[0.0, 1.0]` (or similar depending on device count), which tells llama.cpp to put 0% of layers on some GPUs and 100% on the selected GPU.
+When you have multiple Vulkan-compatible GPUs, llama.cpp automatically distributes model layers across them (shown in logs as "layer X assigned to device VulkanY"). The `single_gpu: true` setting prevents this by using the `tensor_split` parameter with a value of `[0.0, 1.0]` (or similar depending on device count), which tells llama.cpp to put 0% of layers on some GPUs and 100% on the selected GPU.
 
 **Notes:**
-- The `--vulkan-device` argument maps to `main_gpu` in llama-cpp-python
-- The `--vulkan-single-gpu` flag builds a `tensor_split` array to force single GPU usage
+- The `device_id` setting maps to `main_gpu` in llama-cpp-python
+- The `single_gpu` flag builds a `tensor_split` array to force single GPU usage
 - Vulkan enumerates all GPUs in your system, so device IDs may differ from CUDA device IDs
 - The `vulkaninfo` command shows all GPUs visible to Vulkan
 
@@ -608,7 +710,7 @@ Multiple GPUs are automatically detected and utilized. The model will be distrib
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 # Run - model will be distributed across all visible GPUs
-python coderai --model meta-llama/Llama-2-70b-chat-hf --load-in-8bit
+python coderai
 ```
 
 ## Model Recommendations

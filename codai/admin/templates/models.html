@@ -179,7 +179,30 @@
       </div>
     </div>
 
-    <!-- filter row 3: quant chips (file-level filter) -->
+    <!-- filter row 3: capability chips -->
+    <div style="display:flex;align-items:flex-start;gap:.5rem;margin-bottom:.625rem">
+      <span class="fl" style="padding-top:.25rem;min-width:32px">Cap.</span>
+      <div class="chip-row" id="cap-chips">
+        <span class="chip" data-val="text_generation">Text</span>
+        <span class="chip" data-val="image_generation">T2I</span>
+        <span class="chip" data-val="image_to_text">I2T</span>
+        <span class="chip" data-val="video_generation">T2V</span>
+        <span class="chip" data-val="image_to_video">I2V</span>
+        <span class="chip" data-val="audio_generation">T2A</span>
+        <span class="chip" data-val="speech_to_text">STT</span>
+        <span class="chip" data-val="text_to_speech">TTS</span>
+        <span class="chip" data-val="embeddings">Embed</span>
+        <span class="chip" data-val="function-calling">Tool calling</span>
+        <span class="chip" data-val="vision">Vision</span>
+        <span class="chip" data-val="reasoning">Reasoning</span>
+        <span class="chip" data-val="code">Code</span>
+        <span class="chip" data-val="multilingual">Multilingual</span>
+        <span class="chip" data-val="roleplay">Roleplay</span>
+        <span class="chip" data-val="math">Math</span>
+      </div>
+    </div>
+
+    <!-- filter row 4: quant chips (file-level filter) -->
     <div style="display:flex;align-items:flex-start;gap:.5rem;margin-bottom:1rem">
       <span class="fl" style="padding-top:.25rem;min-width:32px">Quant</span>
       <div class="chip-row" id="quant-chips">
@@ -440,6 +463,21 @@ function fmtNum(n){if(!n)return'0';return n>=1e6?(n/1e6).toFixed(1)+'M':n>=1000?
 function fmtGB(gb){if(!gb)return'—';return gb>=1?gb.toFixed(1)+' GB':(gb*1024).toFixed(0)+' MB'}
 function fmtDate(s){try{return new Date(s).toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'})}catch{return s}}
 
+function fmtCapabilities(caps){
+  if(!caps||!caps.length)return'';
+  const labels={
+    text_generation:'Text',image_generation:'T2I',image_to_text:'I2T',
+    video_generation:'T2V',image_to_video:'I2V',audio_generation:'T2A',
+    speech_to_text:'STT',text_to_speech:'TTS',embeddings:'Embed',
+    image_to_image:'I2I',video_to_video:'V2V',audio_to_audio:'A2A',
+    inpainting:'Inpaint',controlnet:'ControlNet',depth_estimation:'Depth',
+    image_segmentation:'Segment',image_upscaling:'Upscale',face_restoration:'Face',
+    object_detection:'Detect',video_interpolation:'Interp',video_upscaling:'V-Upscale',
+    lip_sync:'Lip-sync',subtitle_generation:'Subs',video_dubbing:'Dub'
+  };
+  return caps.slice(0,5).map(c=>`<span class="badge badge-user" style="font-size:10px;padding:.15rem .35rem">${esc(labels[c]||c)}</span>`).join(' ');
+}
+
 /* ── tab / modal ─────────────────────────────────────── */
 function switchTab(name,btn){
   document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
@@ -449,6 +487,19 @@ function switchTab(name,btn){
 }
 function openModal(id){document.getElementById(id).classList.add('show')}
 function closeModal(id){document.getElementById(id).classList.remove('show')}
+
+/* ── Global settings ─────────────────────────────────── */
+let _defaultOffloadDir = './offload';
+
+async function loadGlobalSettings(){
+  try{
+    const r = await fetch('/admin/api/settings');
+    if(r.ok){
+      const d = await r.json();
+      _defaultOffloadDir = d.offload?.directory || './offload';
+    }
+  }catch{}
+}
 
 /* ── GGUF format toggle ──────────────────────────────── */
 let _ggufMode = 'gguf';
@@ -471,6 +522,18 @@ let _results   = [];
 let _filesCache = {};
 let _activeQuants = new Set();
 
+function estimateModelSize(modelId){
+  const id = modelId.toLowerCase();
+  // Extract parameter count (e.g., 7b, 13b, 70b)
+  const match = id.match(/(\d+\.?\d*)b/);
+  if(!match) return 8; // default guess
+  const params = parseFloat(match[1]);
+  // Rough estimate: Q4 ≈ 0.5GB per B params, Q8 ≈ 1GB per B, FP16 ≈ 2GB per B
+  if(id.includes('q4') || id.includes('4bit')) return params * 0.5;
+  if(id.includes('q8') || id.includes('8bit')) return params * 1.0;
+  return params * 2; // assume FP16
+}
+
 document.getElementById('search-q').addEventListener('keydown',e=>{if(e.key==='Enter')doSearch()});
 
 async function doSearch(){
@@ -482,6 +545,10 @@ async function doSearch(){
   const sizes    = getChips('size-chips').join(',');
   _activeQuants  = new Set(getChips('quant-chips').map(v=>v.toUpperCase().split(' ')[0])); // strip ★
 
+  // Get selected capability filters (from our custom chips)
+  const selectedCaps = getChips('cap-chips');
+  const capFilters = selectedCaps.filter(c=>!['function-calling','vision','reasoning','code','multilingual','roleplay','math'].includes(c));
+
   _filesCache = {};
   _results    = [];
   out.innerHTML = '<span class="muted small">Searching HuggingFace…</span>';
@@ -490,20 +557,43 @@ async function doSearch(){
   if(pipeline) params.append('pipeline_tag', pipeline);
   if(sizes)    params.append('sizes', sizes);
   if(arch)     params.append('arch', arch);
+  const caps = getChips('cap-chips');
+  if(caps.length) params.append('capabilities', caps.join(','));
 
   try{
     const r = await fetch('/admin/api/hf-search?'+params);
     if(!r.ok){const e=await r.json();throw new Error(e.detail||r.statusText)}
     _results = await r.json();
+    
+    // Client-side filter by detected capabilities if any custom caps selected
+    if(capFilters.length > 0){
+      _results = _results.filter(m=>{
+        const modelCaps = m.capabilities || [];
+        return capFilters.some(cf=>modelCaps.includes(cf));
+      });
+    }
+    
     if(!_results.length){out.innerHTML='<span class="muted small">No results. Try different keywords or fewer filters.</span>';return}
-    out.innerHTML = _results.map((m,i)=>`
+    
+    const vramAvail = _results[0]?.vram_available;
+    
+    out.innerHTML = _results.map((m,i)=>{
+      let vramDot = '';
+      if(vramAvail){
+        const estSize = estimateModelSize(m.id);
+        const color = estSize <= vramAvail*0.8 ? '#10b981' : estSize <= vramAvail*0.95 ? '#f59e0b' : '#ef4444';
+        vramDot = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${color};margin-right:.35rem" title="Est. ${estSize}GB / ${vramAvail}GB available"></span>`;
+      }
+      const capBadges = fmtCapabilities(m.capabilities||[]);
+      return `
       <div style="padding:.75rem 0;border-bottom:1px solid var(--border)">
         <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:.5rem">
           <div style="min-width:0;flex:1">
-            <div style="font-weight:500;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-                 title="${esc(m.id)}">${esc(m.id)}</div>
+            <div style="font-weight:500;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center"
+                 title="${esc(m.id)}">${vramDot}${esc(m.id)}</div>
             <div style="font-size:11px;color:var(--text-3);margin-top:.25rem;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
               ${m.pipeline_tag?`<span class="badge badge-user">${esc(m.pipeline_tag)}</span>`:''}
+              ${capBadges}
               <span>↓ ${fmtNum(m.downloads)}</span>
               <span>♥ ${fmtNum(m.likes)}</span>
             </div>
@@ -517,7 +607,8 @@ async function doSearch(){
         <div id="fp-${i}" style="display:none;margin-top:.625rem;padding:.5rem .625rem;background:var(--raised);border-radius:6px">
           <span class="muted small">Loading…</span>
         </div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
   }catch(e){
     out.innerHTML='<span class="muted small">Error: '+esc(e.message)+'</span>';
   }
@@ -869,10 +960,12 @@ async function loadCachedModels(){
         _localModels.push({label:m.id, path:m.id, cacheType:'hf', size_gb:m.size_gb||0,
           defaultType:m.model_type||'text_models', settings:m.settings||{}, in_config:m.in_config});
         const loaded = _loadedKeys.has(m.id) || [..._loadedKeys].some(k=>k.endsWith(':'+m.id)||k===m.id);
+        const capBadges = fmtCapabilities(m.capabilities||[]);
         return `<tr style="border-top:1px solid var(--border)">
           <td style="padding:.4rem .25rem;font-family:monospace;font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(m.id)}">${esc(m.id)}</td>
           <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${fmtGB(m.size_gb)}</td>
           <td style="text-align:right;padding:.4rem .25rem;color:var(--text-2)">${m.file_count}</td>
+          <td style="padding:.4rem .25rem;font-size:11px">${capBadges||'<span class="muted small">—</span>'}</td>
           <td style="text-align:center;padding:.4rem .25rem">${m.in_config?'<span class="badge badge-ok">enabled</span>':'<span class="muted small">—</span>'}</td>
           <td style="padding:.4rem .25rem;text-align:right;white-space:nowrap">
             ${m.in_config?(loaded
@@ -889,6 +982,7 @@ async function loadCachedModels(){
         '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Model</th>'+
         '<th style="text-align:right;padding:.3rem .25rem;font-weight:700">Size</th>'+
         '<th style="text-align:right;padding:.3rem .25rem;font-weight:700">Files</th>'+
+        '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Capabilities</th>'+
         '<th style="text-align:center;padding:.3rem .25rem;font-weight:700">Config</th>'+
         '<th></th></tr></thead><tbody>'+rows.join('')+'</tbody></table>';
     }
@@ -904,9 +998,11 @@ async function loadCachedModels(){
         _localModels.push({label:f.filename, path:f.path, cacheType:'gguf', size_gb:f.size_gb||0,
           defaultType:f.model_type||'text_models', settings:f.settings||{}, in_config:f.in_config});
         const loaded = _loadedKeys.has(f.path) || _loadedKeys.has(f.filename) || [..._loadedKeys].some(k=>k.endsWith(':'+f.path)||k.endsWith(':'+f.filename));
+        const capBadges = fmtCapabilities(f.capabilities||[]);
         return `<tr style="border-top:1px solid var(--border)">
           <td style="padding:.4rem .25rem;font-family:monospace;font-size:11px;max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(f.filename)}">${esc(f.filename)}</td>
           <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${fmtGB(f.size_gb)}</td>
+          <td style="padding:.4rem .25rem;font-size:11px">${capBadges||'<span class="muted small">—</span>'}</td>
           <td style="text-align:center;padding:.4rem .25rem">${f.in_config?'<span class="badge badge-ok">enabled</span>':'<span class="muted small">—</span>'}</td>
           <td style="padding:.4rem .25rem;text-align:right;white-space:nowrap">
             ${f.in_config?(loaded
@@ -922,6 +1018,7 @@ async function loadCachedModels(){
         '<thead><tr style="color:var(--text-2);font-size:10px;text-transform:uppercase;letter-spacing:.05em">'+
         '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">File</th>'+
         '<th style="text-align:right;padding:.3rem .25rem;font-weight:700">Size</th>'+
+        '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Capabilities</th>'+
         '<th style="text-align:center;padding:.3rem .25rem;font-weight:700">Config</th>'+
         '<th></th></tr></thead><tbody>'+rows.join('')+'</tbody></table>';
     }
@@ -945,6 +1042,7 @@ async function refreshLocal(){
   loadCachedModels();
 }
 
+loadGlobalSettings();
 refreshLocal();
 
 async function clearCacheConfirm(type){
@@ -1000,7 +1098,7 @@ function openCfgModal(idx){
   document.getElementById('cfg-flash').checked = !!s.flash_attention;
   document.getElementById('cfg-noram').checked = !!s.no_ram;
   document.getElementById('cfg-offload-strategy').value = s.offload_strategy || 'auto';
-  document.getElementById('cfg-offload-dir').value = s.offload_dir || './offload';
+  document.getElementById('cfg-offload-dir').value = s.offload_dir || _defaultOffloadDir;
   document.getElementById('cfg-sysprompt').value = s.system_prompt || '';
   document.getElementById('cfg-parser').value = s.parser || 'auto';
   document.getElementById('cfg-tools').checked = !!s.tools_closer_prompt;

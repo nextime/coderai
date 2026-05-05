@@ -54,9 +54,14 @@
     <label class="form-label">HuggingFace cache directory <span class="muted">(leave blank for default ~/.cache/huggingface)</span></label>
     <input type="text" id="s-hf-cache" class="form-input" placeholder="e.g. /data/models/huggingface">
   </div>
-  <div class="form-row" style="margin:0">
+  <div class="form-row">
     <label class="form-label">GGUF cache directory <span class="muted">(leave blank for default ~/.cache/coderai/models)</span></label>
     <input type="text" id="s-gguf-cache" class="form-input" placeholder="e.g. /data/models/gguf">
+  </div>
+  <div class="form-row" style="margin:0">
+    <label class="form-label">Default offload directory <span class="muted">(default: ./offload)</span></label>
+    <input type="text" id="s-offload-dir" class="form-input" placeholder="./offload">
+    <span class="form-hint">Models will inherit this as default when configured</span>
   </div>
 </div>
 {% endblock %}
@@ -86,6 +91,7 @@ async function loadSettings(){
     document.getElementById('s-cert').value  = d.server?.https_cert_path ?? '';
     document.getElementById('s-hf-cache').value   = d.models?.hf_cache_dir ?? '';
     document.getElementById('s-gguf-cache').value = d.models?.gguf_cache_dir ?? '';
+    document.getElementById('s-offload-dir').value = d.offload?.directory ?? './offload';
     toggleHttps();
   }catch(e){ showAlert('error','Failed to load settings: '+e.message); }
 }
@@ -103,6 +109,9 @@ async function saveSettings(){
     models:{
       hf_cache_dir:   strOrNull('s-hf-cache'),
       gguf_cache_dir: strOrNull('s-gguf-cache'),
+    },
+    offload:{
+      directory: document.getElementById('s-offload-dir').value.trim() || './offload',
     }
   };
   try{

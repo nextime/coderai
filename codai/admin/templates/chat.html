@@ -729,10 +729,23 @@ function renderSidebar() {
   if (!models.length) { el.innerHTML='<div class="muted small" style="padding:.5rem .6rem">No models</div>'; return; }
   el.innerHTML = models.map(m => {
     const t = m.type || 'text';
+    const caps = m.capabilities || [];
     const safe = JSON.stringify(m).replace(/"/g,'&quot;');
+    
+    // Show multimodal badge if model has multiple capabilities
+    const capLabels = {
+      text_generation:'T',image_generation:'I',image_to_text:'V',
+      video_generation:'Vid',audio_generation:'A',speech_to_text:'STT',
+      text_to_speech:'TTS',embeddings:'E'
+    };
+    const mainCaps = caps.filter(c=>capLabels[c]).slice(0,3);
+    const capBadges = mainCaps.length > 1 
+      ? `<span style="font-size:9px;color:var(--text-3);margin-left:.25rem">${mainCaps.map(c=>capLabels[c]).join('+')}</span>`
+      : '';
+    
     return `<div class="model-item" data-id="${m.id}" onclick="selectModel(${safe})">
       <span class="mbadge ${BADGE[t]||'mb-text'}">${BLABEL[t]||t}</span>
-      <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px" title="${m.id}">${m.id.split('/').pop()}</span>
+      <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px" title="${m.id}">${m.id.split('/').pop()}${capBadges}</span>
     </div>`;
   }).join('');
 }

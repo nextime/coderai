@@ -98,6 +98,25 @@ async function poll() {
       document.getElementById('req-total').textContent = d.requests.total ?? 0;
       document.getElementById('req-active').textContent = d.requests.active ?? 0;
     }
+
+    const rows = d.recent_activity || [];
+    const tbody = document.getElementById('activity-body');
+    if (rows.length === 0) {
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="5">No recent activity</td></tr>';
+    } else {
+      tbody.innerHTML = rows.map(r => {
+        const t = new Date(r.time * 1000).toLocaleTimeString();
+        const ok = r.status >= 200 && r.status < 300;
+        const badge = ok ? 'badge-admin' : 'badge-danger';
+        return `<tr>
+          <td>${t}</td>
+          <td class="small">${r.model}</td>
+          <td>${r.type}</td>
+          <td><span class="badge ${badge}">${r.status}</span></td>
+          <td>${r.duration}s</td>
+        </tr>`;
+      }).join('');
+    }
   } catch {
     document.getElementById('sys-status').textContent = 'Offline';
     document.getElementById('sys-status').className = 'stat-value small text-red';

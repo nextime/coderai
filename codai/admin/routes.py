@@ -1,3 +1,19 @@
+# CoderAI - OpenAI-compatible API server
+# Copyright (C) 2026 Stefy Lanza <stefy@nexlab.net>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 """Admin dashboard routes."""
 from pathlib import Path
 from typing import Optional
@@ -261,6 +277,14 @@ async def api_status(username: str = Depends(require_auth)):
     except Exception:
         pass
 
+    # Recent activity
+    recent_activity = []
+    try:
+        from codai.api.log import get_recent_activity
+        recent_activity = get_recent_activity()
+    except Exception:
+        pass
+
     return {
         "status": "ok",
         "backend": backend,
@@ -270,6 +294,7 @@ async def api_status(username: str = Depends(require_auth)):
         "enabled_models": enabled_models,
         "vram": vram,
         "requests": {"total": req_total, "active": req_active},
+        "recent_activity": recent_activity,
     }
 
 
@@ -706,6 +731,7 @@ def _scan_caches() -> dict:
     result: dict = {"hf": [], "gguf": []}
 
     from codai.models.cache import get_all_cache_dirs, get_model_cache_dir
+    from codai.models.capabilities import detect_model_capabilities
     caches = get_all_cache_dirs()
 
     # Collect configured models: key (path/id) → (settings_dict, model_type)
@@ -748,6 +774,7 @@ def _scan_caches() -> dict:
                             cfg = (configured_settings.get(fpath)
                                    or configured_settings.get(fname)
                                    or ({}, None))
+                            caps = detect_model_capabilities(fname)
                             result["gguf"].append({
                                 "filename": fname,
                                 "path": fpath,
@@ -756,10 +783,12 @@ def _scan_caches() -> dict:
                                 "in_config": fpath in configured_settings or fname in configured_settings,
                                 "model_type": cfg[1] if cfg[1] and cfg[1] != "gguf_models" else "text_models",
                                 "settings": cfg[0] if isinstance(cfg[0], dict) else {},
+                                "capabilities": caps.to_list(),
                             })
                     continue  # skip adding to hf list
 
                 cfg = configured_settings.get(repo.repo_id, ({}, None))
+                caps = detect_model_capabilities(repo.repo_id)
                 result["hf"].append({
                     "id": repo.repo_id,
                     "size_gb": round(size_bytes / 1e9, 2),
@@ -770,6 +799,7 @@ def _scan_caches() -> dict:
                     "in_config": repo.repo_id in configured_settings,
                     "model_type": cfg[1] if cfg[1] and cfg[1] != "gguf_models" else "text_models",
                     "settings": cfg[0] if isinstance(cfg[0], dict) else {},
+                    "capabilities": caps.to_list(),
                 })
         except Exception as e:
             result["hf_error"] = str(e)
@@ -784,6 +814,7 @@ def _scan_caches() -> dict:
                 cfg = (configured_settings.get(fpath)
                        or configured_settings.get(fname)
                        or ({}, None))
+                caps = detect_model_capabilities(fname)
                 result["gguf"].append({
                     "filename": fname,
                     "path": fpath,
@@ -792,6 +823,7 @@ def _scan_caches() -> dict:
                     "in_config": fpath in configured_settings or fname in configured_settings,
                     "model_type": cfg[1] if cfg[1] and cfg[1] != "gguf_models" else "text_models",
                     "settings": cfg[0] if isinstance(cfg[0], dict) else {},
+                    "capabilities": caps.to_list(),
                 })
 
     # Add configured GGUF models not yet in the list (e.g., HF repo IDs or external paths)
@@ -806,6 +838,7 @@ def _scan_caches() -> dict:
             size_bytes = 0
             if os.path.isfile(path):
                 size_bytes = os.path.getsize(path)
+            caps = detect_model_capabilities(path)
             result["gguf"].append({
                 "filename": os.path.basename(path) if '/' in path else path,
                 "path": path,
@@ -814,6 +847,7 @@ def _scan_caches() -> dict:
                 "in_config": True,
                 "model_type": mtype if mtype and mtype != "gguf_models" else "text_models",
                 "settings": settings if isinstance(settings, dict) else {},
+                "capabilities": caps.to_list(),
             })
 
     return result
@@ -1384,6 +1418,7 @@ async def api_hf_search(
     sort: str = "downloads",
     sizes: str = "",            # comma-separated e.g. "7b,70b"
     arch: str = "",
+    capabilities: str = "",     # comma-separated e.g. "function-calling,vision"
     username: str = Depends(require_admin),
 ):
     """Proxy HuggingFace model search; supports multiple sizes via parallel requests."""
@@ -1391,6 +1426,7 @@ async def api_hf_search(
     import urllib.request
     import urllib.parse
     import json as _json
+    from codai.models.capabilities import detect_model_capabilities
 
     if sort not in ("downloads", "likes", "lastModified", "createdAt"):
         sort = "downloads"
@@ -1403,6 +1439,11 @@ async def api_hf_search(
         filter_pairs.append(("filter", pipeline_tag))
     if arch == "lora":
         filter_pairs.append(("filter", "lora"))
+    
+    # Capability filters
+    cap_list = [c.strip() for c in capabilities.split(",") if c.strip()]
+    for cap in cap_list:
+        filter_pairs.append(("filter", cap))
 
     # Base search keywords
     base_parts = [q.strip()] if q.strip() else []
@@ -1452,12 +1493,24 @@ async def api_hf_search(
         if gguf_mode == "no-gguf":
             merged = [m for m in merged if "gguf" not in (m.get("modelId") or m.get("id", "")).lower()]
 
+        # Get VRAM info
+        vram_gb = None
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free, total = torch.cuda.mem_get_info()
+                vram_gb = round(free / 1e9, 2)
+        except Exception:
+            pass
+
         return [
             {
                 "id": m.get("modelId") or m.get("id", ""),
                 "downloads": m.get("downloads", 0),
                 "likes": m.get("likes", 0),
                 "pipeline_tag": m.get("pipeline_tag", ""),
+                "vram_available": vram_gb,
+                "capabilities": detect_model_capabilities(m.get("modelId") or m.get("id", "")).to_list(),
             }
             for m in merged[:20]
         ]

@@ -1,56 +1,90 @@
+# CoderAI - OpenAI-compatible API server
+# Copyright (C) 2026 Stefy Lanza <stefy@nexlab.net>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 """
 Request logging middleware for the codai API.
 """
 
 import json
+import time
+from collections import deque
 from fastapi import Request
+
+# In-memory ring buffer of recent API requests (max 50)
+_activity: deque = deque(maxlen=50)
+
+
+def get_recent_activity():
+    return list(_activity)
+
+
+_TRACKED_PATHS = {
+    "/v1/chat/completions": "chat",
+    "/v1/completions": "completion",
+    "/v1/images/generations": "image",
+    "/v1/audio/speech": "tts",
+    "/v1/audio/transcriptions": "transcription",
+    "/v1/embeddings": "embedding",
+}
 
 
 async def log_requests(request: Request, call_next):
     """Log all incoming requests for debugging."""
-    # Import global debug flag from state
     from codai.api.state import get_global_debug
     global_debug = get_global_debug()
-    
-    if request.url.path in ["/v1/chat/completions", "/v1/completions"]:
+
+    path = request.url.path
+    tracked = path in _TRACKED_PATHS
+
+    if tracked or path in ["/v1/chat/completions", "/v1/completions"]:
         body = b""
         body_str = ""
+        model = "—"
         try:
             body = await request.body()
             body_str = body.decode('utf-8')
-            
-            # In debug mode, dump the full request
+            parsed = json.loads(body_str)
+            model = parsed.get("model", "—")
+
             if global_debug:
                 print(f"\n{'='*80}")
                 print(f"=== FULL REQUEST DEBUG ===")
-                print(f"{'='*80}")
-                print(f"Method: {request.method}")
-                print(f"URL: {request.url}")
-                print(f"Headers:")
-                for k, v in request.headers.items():
-                    print(f"  {k}: {v}")
-                print(f"\n--- Body ---")
-                # Print full body without truncation
-                try:
-                    # Try to pretty-print JSON
-                    parsed = json.loads(body_str)
-                    print(json.dumps(parsed, indent=2))
-                except:
-                    # If not JSON, print as-is
-                    print(body_str)
+                print(f"Method: {request.method}  URL: {request.url}")
+                print(json.dumps(parsed, indent=2))
                 print(f"{'='*80}\n")
         except Exception as e:
-            print(f"Error reading request body: {e}")
-        
-        # Call the next middleware/handler
+            if global_debug:
+                print(f"Error reading request body: {e}")
+
+        t0 = time.time()
         response = await call_next(request)
-        
-        # Log response status
+        duration = time.time() - t0
+
+        if tracked:
+            _activity.appendleft({
+                "time": int(t0),
+                "model": model,
+                "type": _TRACKED_PATHS[path],
+                "status": response.status_code,
+                "duration": round(duration, 2),
+            })
+
         if global_debug:
             print(f"DEBUG: Response status: {response.status_code}")
-        
+
         return response
     else:
-        # For non-chat endpoints, just pass through
-        response = await call_next(request)
-        return response
+        return await call_next(request)

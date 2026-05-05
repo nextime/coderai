@@ -1,3 +1,19 @@
+# CoderAI - OpenAI-compatible API server
+# Copyright (C) 2026 Stefy Lanza <stefy@nexlab.net>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 """
 Text generation endpoints for the codai API.
 """
@@ -1037,6 +1053,9 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         prompt_tokens = len(raw_prompt_for_generation.split())
         completion_tokens = len(clean_text.split()) if clean_text else 0
         
+        # Get context size
+        context_size = current_manager.get_context_size()
+        
         # Step 2: Use OpenAIFormatter for final formatting
         formatter = OpenAIFormatter(response_model_name)
         try:
@@ -1044,7 +1063,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 text=clean_text,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
-                tool_calls=extracted_tool_calls
+                tool_calls=extracted_tool_calls,
+                context_size=context_size
             )
         except Exception as e:
             print(f"RAW: ERROR in formatter.format_full: {e}")
@@ -1135,7 +1155,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 "usage": {
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
-                    "total_tokens": prompt_tokens + completion_tokens
+                    "total_tokens": prompt_tokens + completion_tokens,
+                    "context_size": context_size
                 }
             }
         
@@ -1437,6 +1458,9 @@ async def stream_chat_response(
                 prompt_tokens = len(prompt_text.split())
                 completion_tokens = len(generated_text.split()) if generated_text else 0
                 
+                # Get context size
+                context_size = current_manager.get_context_size()
+                
                 # Use OpenAIFormatter for final chunk sanitization
                 formatter = OpenAIFormatter(model_name)
                 usage_details = {
@@ -1444,13 +1468,16 @@ async def stream_chat_response(
                     "completion_tokens": completion_tokens,
                     "total_tokens": prompt_tokens + completion_tokens,
                 }
-                final_chunk = formatter.format_litellm_chunk("", is_final=True, usage=usage_details)
+                final_chunk = formatter.format_litellm_chunk("", is_final=True, usage=usage_details, context_size=context_size)
                 yield f"data: {json.dumps(final_chunk)}\n\n"
         else:
             # Calculate token counts for usage in final chunk
             prompt_text = "\n".join([m.get("content", "") for m in messages])
             prompt_tokens = len(prompt_text.split())
             completion_tokens = len(generated_text.split()) if generated_text else 0
+            
+            # Get context size
+            context_size = current_manager.get_context_size()
             
             # Build complete final chunk with all OpenAI fields
             final_chunk = {
@@ -1468,6 +1495,7 @@ async def stream_chat_response(
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                     "total_tokens": prompt_tokens + completion_tokens,
+                    "context_size": context_size,
                     "prompt_tokens_details": {
                         "cached_tokens": 0,
                         "audio_tokens": 0,
@@ -1633,13 +1661,17 @@ async def generate_chat_response(
         prompt_tokens = len(prompt_text.split())
         completion_tokens = len(generated_text.split()) if generated_text else 0
         
+        # Get context size
+        context_size = current_manager.get_context_size()
+        
         # Use OpenAIFormatter for final sanitization
         formatter = OpenAIFormatter(model_name)
         formatted_response = formatter.format_litellm_full(
             text=response_message.get("content", ""),
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            tool_calls=response_message.get("tool_calls")
+            tool_calls=response_message.get("tool_calls"),
+            context_size=context_size
         )
         
         # Add mock reasoning stats if 'mock' is in force_reasoning_args
@@ -1765,6 +1797,7 @@ async def stream_completion_response(
     """Stream legacy completion response."""
     completion_id = f"cmpl-{uuid.uuid4().hex}"
     created = int(time.time())
+    generated_text = ""
     
     try:
         async for chunk in current_manager.generate_stream(
@@ -1774,6 +1807,7 @@ async def stream_completion_response(
             top_p=top_p,
             stop=stop,
         ):
+            generated_text += chunk
             data = {
                 "id": completion_id,
                 "object": "text_completion",
@@ -1788,7 +1822,37 @@ async def stream_completion_response(
             }
             yield f"data: {json.dumps(data)}\n\n"
         
-        yield f"data: {json.dumps({'choices': [{'finish_reason': 'stop'}]})}\n\n"
+        # Calculate token counts
+        if current_manager.tokenizer:
+            prompt_tokens = len(current_manager.tokenizer.encode(prompt))
+            completion_tokens = len(current_manager.tokenizer.encode(generated_text))
+        else:
+            prompt_tokens = len(prompt.split())
+            completion_tokens = len(generated_text.split())
+        
+        # Get context size
+        context_size = current_manager.get_context_size()
+        
+        # Send final chunk with usage
+        final_chunk = {
+            "id": completion_id,
+            "object": "text_completion",
+            "created": created,
+            "model": model_name,
+            "choices": [{
+                "text": "",
+                "index": 0,
+                "logprobs": None,
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "context_size": context_size,
+            },
+        }
+        yield f"data: {json.dumps(final_chunk)}\n\n"
         yield "data: [DONE]\n\n"
     except Exception as e:
         print(f"Error during streaming completion: {e}")
@@ -1825,6 +1889,9 @@ async def generate_completion_response(
             prompt_tokens = len(prompt.split())
             completion_tokens = len(generated_text.split())
         
+        # Get context size
+        context_size = current_manager.get_context_size()
+        
         return {
             "id": completion_id,
             "object": "text_completion",
@@ -1840,6 +1907,7 @@ async def generate_completion_response(
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens,
+                "context_size": context_size,
             },
         }
     except Exception as e:

@@ -1,3 +1,19 @@
+# CoderAI - OpenAI-compatible API server
+# Copyright (C) 2026 Stefy Lanza <stefy@nexlab.net>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 """CUDA backend using HuggingFace Transformers."""
 
 import os
@@ -868,3 +884,13 @@ class NvidiaBackend(ModelBackend):
             self.tokenizer = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+    
+    def get_context_size(self) -> int:
+        """Return the model's context window size."""
+        if self.model is not None and hasattr(self.model, 'config'):
+            config = self.model.config
+            # Try different attribute names used by different models
+            for attr in ['max_position_embeddings', 'n_positions', 'max_seq_length', 'seq_length']:
+                if hasattr(config, attr):
+                    return getattr(config, attr)
+        return 2048  # Default fallback
