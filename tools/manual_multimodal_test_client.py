@@ -4,6 +4,7 @@ import argparse
 import base64
 import json
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 import requests
@@ -113,6 +114,7 @@ def build_request_spec(config: dict) -> dict:
 
     if mode == "transcription":
         audio_path = _require_file(config.get("audio_file"), "--audio-file")
+        file_stack = ExitStack()
         return {
             "method": "POST",
             "url": f"{config['url']}/v1/audio/transcriptions",
@@ -122,8 +124,9 @@ def build_request_spec(config: dict) -> dict:
                 "prompt": config["prompt"],
             },
             "files": {
-                "file": (audio_path.name, audio_path.read_bytes()),
+                "file": (audio_path.name, file_stack.enter_context(audio_path.open("rb"))),
             },
+            "_close": file_stack.close,
         }
 
     if mode == "audio-generation":
@@ -220,12 +223,28 @@ def _write_artifact(output_dir: Path, mode: str, payload: bytes) -> Path:
     return artifact_path
 
 
+def _stringify_chat_content(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") in {"text", "input_text"} and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            else:
+                parts.append(json.dumps(item, sort_keys=True) if isinstance(item, (dict, list)) else str(item))
+        return "\n".join(parts)
+    if isinstance(content, (dict, list)):
+        return json.dumps(content, sort_keys=True)
+    return str(content)
+
+
 def handle_response_payload(mode: str, response, output_dir: Path) -> dict:
     response.raise_for_status()
     payload = response.json()
 
     if mode in {"llm", "video-doubt", "music-audio-doubt"}:
-        text = payload["choices"][0]["message"]["content"]
+        text = _stringify_chat_content(payload["choices"][0]["message"]["content"])
         return {"text": text, "artifact_path": None, "payload": payload}
 
     if mode == "transcription":
@@ -249,5 +268,10 @@ def handle_response_payload(mode: str, response, output_dir: Path) -> dict:
 
 def execute_request(spec: dict):
     method = spec["method"]
-    kwargs = {key: value for key, value in spec.items() if key not in {"method", "url"}}
-    return requests.request(method=method, url=spec["url"], timeout=300, **kwargs)
+    cleanup = spec.get("_close")
+    kwargs = {key: value for key, value in spec.items() if key not in {"method", "url", "_close"}}
+    try:
+        return requests.request(method=method, url=spec["url"], timeout=300, **kwargs)
+    finally:
+        if cleanup is not None:
+            cleanup()

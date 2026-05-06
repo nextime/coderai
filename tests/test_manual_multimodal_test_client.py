@@ -169,18 +169,18 @@ def test_build_request_spec_for_transcription_uses_multipart_file(tmp_path):
 
     spec = build_request_spec(config)
 
-    assert spec == {
-        "method": "POST",
-        "url": "http://127.0.0.1:6745/v1/audio/transcriptions",
-        "headers": {"Accept": "application/json"},
-        "data": {
-            "model": "audio:test",
-            "prompt": "Transcribe carefully",
-        },
-        "files": {
-            "file": ("sample.wav", b"wav-bytes"),
-        },
+    assert spec["method"] == "POST"
+    assert spec["url"] == "http://127.0.0.1:6745/v1/audio/transcriptions"
+    assert spec["headers"] == {"Accept": "application/json"}
+    assert spec["data"] == {
+        "model": "audio:test",
+        "prompt": "Transcribe carefully",
     }
+    uploaded_name, uploaded_file = spec["files"]["file"]
+    assert uploaded_name == "sample.wav"
+    assert uploaded_file.read() == b"wav-bytes"
+    assert uploaded_file.closed is False
+    uploaded_file.close()
 
 
 def test_build_request_spec_for_audio_generation_uses_json_payload(tmp_path):
@@ -402,6 +402,27 @@ def test_task5_handle_response_payload_returns_llm_text_without_artifact(tmp_pat
     result = handle_response_payload("llm", response, tmp_path)
 
     assert result["text"] == "hello from model"
+    assert result["artifact_path"] is None
+    assert result["payload"] == payload
+
+
+def test_task5_handle_response_payload_flattens_structured_chat_content(tmp_path):
+    payload = {
+        "choices": [{
+            "message": {
+                "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "input_text", "text": "from model"},
+                    {"type": "tool_result", "value": 7},
+                ]
+            }
+        }]
+    }
+    response = DummyResponse(payload)
+
+    result = handle_response_payload("llm", response, tmp_path)
+
+    assert result["text"] == 'hello\nfrom model\n{"type": "tool_result", "value": 7}'
     assert result["artifact_path"] is None
     assert result["payload"] == payload
 
