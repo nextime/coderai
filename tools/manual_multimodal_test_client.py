@@ -53,6 +53,13 @@ MODE_DEFAULTS = {
 }
 
 
+SAMPLE_URLS = {
+    "samples/transcription.wav": "https://example.invalid/transcription.wav",
+    "samples/question-video.mp4": "https://example.invalid/question-video.mp4",
+    "samples/question-audio.wav": "https://example.invalid/question-audio.wav",
+}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manual multimodal smoke-test client")
     parser.add_argument("mode", nargs="?", choices=MODES)
@@ -93,6 +100,14 @@ def _require_file(path_value: str | None, flag_name: str) -> Path:
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}. Supply {flag_name}.")
     return path
+
+
+def download_default_sample(path: Path) -> Path:
+    return path
+
+
+def ensure_sample_file(path_value: str | None, flag_name: str) -> Path:
+    return _require_file(path_value, flag_name)
 
 
 def build_request_spec(config: dict) -> dict:
