@@ -1261,6 +1261,12 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         server_path = (data.get("server_path") or "").strip()
         if not server_path:
             raise HTTPException(status_code=400, detail="server_path is required")
+        model_source = (data.get("model_source") or "manual-path").strip() or "manual-path"
+        if model_source not in {"cached-gguf", "manual-path"}:
+            raise HTTPException(status_code=400, detail="model_source must be one of: cached-gguf, manual-path")
+        model_path = (data.get("model_path") or "").strip()
+        if not model_path:
+            raise HTTPException(status_code=400, detail=f"model_path is required for {model_source}")
         port = int(data.get("port", 8744))
         if port < 1 or port > 65535:
             raise HTTPException(status_code=400, detail="port must be between 1 and 65535")
@@ -1274,7 +1280,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
             "id": model_id,
             "backend": "whisper-server",
             "server_path": server_path,
-            "model_path": (data.get("model_path") or "").strip() or None,
+            "model_path": model_path,
             "port": port,
             "gpu_device": gpu_device,
             "load_mode": data.get("load_mode", "on-request"),

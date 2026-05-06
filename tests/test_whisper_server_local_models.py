@@ -132,6 +132,108 @@ def test_model_configure_rejects_duplicate_whisper_server_model_id(monkeypatch, 
     app.dependency_overrides.clear()
 
 
+def test_model_configure_accepts_cached_gguf_whisper_server_model(monkeypatch, tmp_path):
+    from codai.admin import routes
+    from codai.api.app import app
+
+    cfg = _build_config(tmp_path)
+    monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
+    app.dependency_overrides[routes.require_admin] = lambda: "admin"
+
+    client = TestClient(app)
+    response = client.post(
+        "/admin/api/model-configure",
+        json={
+            "model_id": "whisper-vulkan-base",
+            "model_type": "audio_models",
+            "backend": "whisper-server",
+            "model_source": "cached-gguf",
+            "server_path": "/usr/local/bin/whisper-server",
+            "model_path": "/models/base.en.gguf",
+            "port": 8744,
+            "gpu_device": 0,
+            "load_mode": "on-request",
+        },
+    )
+
+    assert response.status_code == 200
+    assert cfg.models_data["audio_models"] == [
+        {
+            "id": "whisper-vulkan-base",
+            "backend": "whisper-server",
+            "server_path": "/usr/local/bin/whisper-server",
+            "model_path": "/models/base.en.gguf",
+            "port": 8744,
+            "gpu_device": 0,
+            "load_mode": "on-request",
+            "model_type": "audio_models",
+            "model_types": ["audio_models"],
+        }
+    ]
+
+    app.dependency_overrides.clear()
+
+
+def test_model_configure_rejects_cached_gguf_whisper_server_without_model_path(monkeypatch, tmp_path):
+    from codai.admin import routes
+    from codai.api.app import app
+
+    cfg = _build_config(tmp_path)
+    monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
+    app.dependency_overrides[routes.require_admin] = lambda: "admin"
+
+    client = TestClient(app)
+    response = client.post(
+        "/admin/api/model-configure",
+        json={
+            "model_id": "whisper-vulkan-base",
+            "model_type": "audio_models",
+            "backend": "whisper-server",
+            "model_source": "cached-gguf",
+            "server_path": "/usr/local/bin/whisper-server",
+            "model_path": "",
+            "port": 8744,
+            "gpu_device": 0,
+            "load_mode": "on-request",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "model_path is required for cached-gguf"
+
+    app.dependency_overrides.clear()
+
+
+def test_model_configure_rejects_manual_path_whisper_server_without_model_path(monkeypatch, tmp_path):
+    from codai.admin import routes
+    from codai.api.app import app
+
+    cfg = _build_config(tmp_path)
+    monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
+    app.dependency_overrides[routes.require_admin] = lambda: "admin"
+
+    client = TestClient(app)
+    response = client.post(
+        "/admin/api/model-configure",
+        json={
+            "model_id": "whisper-vulkan-base",
+            "model_type": "audio_models",
+            "backend": "whisper-server",
+            "model_source": "manual-path",
+            "server_path": "/usr/local/bin/whisper-server",
+            "model_path": "",
+            "port": 8744,
+            "gpu_device": 0,
+            "load_mode": "on-request",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "model_path is required for manual-path"
+
+    app.dependency_overrides.clear()
+
+
 def test_model_load_and_unload_manage_whisper_server_runtime(monkeypatch):
     from codai.admin import routes
     from codai.api.app import app
