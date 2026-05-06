@@ -307,9 +307,25 @@ async def api_status(username: str = Depends(require_auth)):
     # Request stats from queue manager
     req_total = 0
     req_active = 0
+    req_waiting = 0
+    req_metrics = {
+        "max_parallel_requests": 0,
+        "queue_max_size": 0,
+        "active_by_model": {},
+        "waiting_by_model": {},
+    }
     try:
         from codai.queue.manager import queue_manager
-        req_active = 1 if queue_manager._processing else 0
+        metrics = queue_manager.get_metrics()
+        req_active = int(metrics.get("active", 0))
+        req_waiting = int(metrics.get("waiting", 0))
+        req_total = req_active + req_waiting
+        req_metrics = {
+            "max_parallel_requests": metrics.get("max_parallel_requests", 0),
+            "queue_max_size": metrics.get("queue_max_size", 0),
+            "active_by_model": metrics.get("active_by_model", {}),
+            "waiting_by_model": metrics.get("waiting_by_model", {}),
+        }
     except Exception:
         pass
 
@@ -364,7 +380,15 @@ async def api_status(username: str = Depends(require_auth)):
         "enabled_models": enabled_models,
         "vram": vram,
         "cuda": is_cuda,
-        "requests": {"total": req_total, "active": req_active},
+        "requests": {
+            "total": req_total,
+            "active": req_active,
+            "waiting": req_waiting,
+            "max_parallel_requests": req_metrics["max_parallel_requests"],
+            "queue_max_size": req_metrics["queue_max_size"],
+            "active_by_model": req_metrics["active_by_model"],
+            "waiting_by_model": req_metrics["waiting_by_model"],
+        },
         "recent_activity": recent_activity,
         "whisper_server": whisper_status,
     }
@@ -1423,6 +1447,7 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "https_key_path": c.server.https_key_path,
             "https_cert_path": c.server.https_cert_path,
             "queue_max_size": c.server.queue_max_size,
+            "max_parallel_requests": c.server.max_parallel_requests,
         },
         "backend": {
             "type": c.backend.type,
@@ -1478,6 +1503,10 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             c.server.queue_max_size = max(1, int(srv["queue_max_size"]))
             from codai.queue.manager import queue_manager
             queue_manager.max_size = c.server.queue_max_size
+        if "max_parallel_requests" in srv:
+            c.server.max_parallel_requests = int(srv["max_parallel_requests"])
+            from codai.queue.manager import queue_manager
+            queue_manager.max_parallel_requests = c.server.max_parallel_requests
 
     if "backend" in data:
         bk = data["backend"]

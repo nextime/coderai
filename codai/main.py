@@ -646,9 +646,10 @@ def main():
 
 
     
-    # Apply queue max size from config
+    # Apply queue scheduler settings from config
     from codai.queue.manager import queue_manager
     queue_manager.max_size = config.server.queue_max_size
+    queue_manager.max_parallel_requests = config.server.max_parallel_requests
 
     # Start the server
     import uvicorn

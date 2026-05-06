@@ -31,6 +31,7 @@ class ServerConfig:
     https_key_path: Optional[str] = None
     https_cert_path: Optional[str] = None
     queue_max_size: int = 6
+    max_parallel_requests: int = 2
 
 
 @dataclass
@@ -302,6 +303,7 @@ class ConfigManager:
                 "https_key_path": self.config.server.https_key_path,
                 "https_cert_path": self.config.server.https_cert_path,
                 "queue_max_size": self.config.server.queue_max_size,
+                "max_parallel_requests": self.config.server.max_parallel_requests,
             },
             "backend": {
                 "type": self.config.backend.type,

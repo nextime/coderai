@@ -274,6 +274,42 @@ async def _run_step(step: Dict, context: Dict, http_request) -> Dict:
     return _extract_output(step_type, result)
 
 
+def _infer_step_model_key(step: Dict) -> Optional[str]:
+    step_type = step.get('type')
+    params = step.get('params', {})
+
+    if step_type == 'stt':
+        model = params.get('model') or params.get('audio_model')
+        return f"audio:{model}" if model else None
+    if step_type == 'text_gen':
+        return params.get('model')
+    if step_type in {'image_gen', 'image_edit', 'image_upscale', 'image_depth', 'image_segment'}:
+        model = params.get('model')
+        return f"image:{model}" if model else None
+    if step_type in {'embed', 'embedding'}:
+        model = params.get('model')
+        return f"embedding:{model}" if model else None
+    if step_type in {'video_gen', 'video'}:
+        model = params.get('model')
+        return f"video:{model}" if model else None
+    return None
+
+
+async def _run_scheduled_step(step: Dict, context: Dict, http_request) -> Dict:
+    from codai.queue.manager import queue_manager
+
+    model_key = _infer_step_model_key(step)
+    if not model_key:
+        return await _run_step(step, context, http_request)
+
+    request_id = f"pipeline-step-{uuid.uuid4().hex[:8]}"
+    lease = await queue_manager.acquire(request_id, model_key)
+    try:
+        return await _run_step(step, context, http_request)
+    finally:
+        await queue_manager.release(lease)
+
+
 async def _execute_pipeline(pipeline_def: Dict, pipeline_input: str, http_request) -> Dict:
     """Execute all steps of a pipeline definition."""
     context = {'input': pipeline_input}
@@ -281,7 +317,7 @@ async def _execute_pipeline(pipeline_def: Dict, pipeline_input: str, http_reques
 
     for i, step in enumerate(pipeline_def.get('steps', [])):
         try:
-            out = await _run_step(step, context, http_request)
+            out = await _run_scheduled_step(step, context, http_request)
             context[f'step{i}'] = out
             steps_output.append({'step': i, 'type': step['type'],
                                   'label': step.get('label', step['type']), **out})
@@ -446,7 +482,7 @@ async def run_audio_understanding(request: AudioUnderstandRequest, http_request:
             'response_format': 'json',
         },
     }
-    stt_out = await _run_step(stt_step, {'input': request.input or ''}, http_request)
+    stt_out = await _run_scheduled_step(stt_step, {'input': request.input or ''}, http_request)
     transcript = stt_out.get('text') or stt_out.get('output') or ''
     steps.append({'step': 0, 'type': 'stt', 'label': 'Transcribe audio', **stt_out})
 
@@ -460,7 +496,7 @@ async def run_audio_understanding(request: AudioUnderstandRequest, http_request:
                 'prompt': f"{request.input or 'Summarize this audio transcript clearly.'}\n\nTranscript:\n{{{{step0.output}}}}",
             },
         }
-        text_out = await _run_step(text_step, {'input': request.input or '', 'step0': {'output': transcript, 'text': transcript}}, http_request)
+        text_out = await _run_scheduled_step(text_step, {'input': request.input or '', 'step0': {'output': transcript, 'text': transcript}}, http_request)
         summary = text_out.get('output')
         steps.append({'step': 1, 'type': 'text_gen', 'label': 'Reason over transcript', **text_out})
 
@@ -486,7 +522,7 @@ async def run_full_music_dub(request: AudioMusicDubRequest, http_request: Reques
             'response_format': 'json',
         },
     }
-    stt_out = await _run_step(stt_step, {'input': request.notes or ''}, http_request)
+    stt_out = await _run_scheduled_step(stt_step, {'input': request.notes or ''}, http_request)
     transcript = stt_out.get('text') or stt_out.get('output') or ''
     translated = transcript if not request.target_lang else f"[{request.target_lang}] {transcript}"
     steps = [

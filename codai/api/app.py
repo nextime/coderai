@@ -92,6 +92,8 @@ from codai.api.tts import router as tts_router
 from codai.api.text import router as text_router
 from codai.api.video import router as video_router
 from codai.api.audio_gen import router as audio_gen_router
+from codai.api.audio_stems import router as audio_stems_router
+from codai.api.audio_clean import router as audio_clean_router
 from codai.api.embeddings import router as embeddings_router
 from codai.api.pipelines import router as pipelines_router
 from codai.api.custom_pipelines import router as custom_pipelines_router

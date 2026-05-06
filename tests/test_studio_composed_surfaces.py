@@ -104,6 +104,35 @@ def test_audio_understanding_returns_transcript_only_without_text_model(monkeypa
     assert len(body["steps"]) == 1
 
 
+def test_audio_understanding_pipeline_steps_release_scheduler_slots(monkeypatch, studio_client):
+    from codai.api import custom_pipelines
+    from codai.queue.manager import queue_manager
+
+    observed = []
+
+    async def fake_run_step(step, context, http_request):
+        observed.append(queue_manager.get_metrics()["active"])
+        return {"output": step["type"], "text": step["type"]}
+
+    monkeypatch.setattr(custom_pipelines, "_run_step", fake_run_step)
+    queue_manager.reset_for_tests()
+    queue_manager.set_loaded_models({"audio:whisper-small", "qwen-text"})
+
+    response = studio_client.post(
+        "/v1/pipelines/audio-understand",
+        json={
+            "input": "Summarize",
+            "audio_model": "whisper-small",
+            "text_model": "qwen-text",
+            "audio": "ZmFrZQ==",
+        },
+    )
+
+    assert response.status_code == 200
+    assert observed == [1, 1]
+    assert queue_manager.get_metrics()["active"] == 0
+
+
 def test_audio_understanding_requires_audio_source(studio_client):
     response = studio_client.post(
         "/v1/pipelines/audio-understand",

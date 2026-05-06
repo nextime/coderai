@@ -427,6 +427,14 @@ class MultiModelManager:
     def image_model(self) -> Optional[str]:
         """Return the first image model or None."""
         return self.image_models[0] if self.image_models else None
+
+    def get_loaded_model_keys(self) -> set:
+        """Return the set of currently loaded model keys."""
+        return set(self.models.keys())
+
+    def has_loaded_model(self, model_key: str) -> bool:
+        """Return True when the given model key is currently loaded."""
+        return model_key in self.models
     
     def cleanup(self):
         """Cleanup all models and resources."""
