@@ -736,9 +736,9 @@ def test_models_template_truncates_configured_whisper_server_model_paths():
     template = Path("codai/admin/templates/models.html").read_text()
 
     assert '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Model path</th>' in template
-    assert 'max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' in template
+    assert 'max-width:160px;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;line-height:1.25;max-height:2.5em' in template
     assert 'title="${esc(m.model_path || \"—\")}"' in template
-    assert '>${esc(m.model_path || \"—\")}</td>' in template
+    assert '>${esc(m.model_path || "—")}</td>' in template
 
 
 def test_settings_template_no_longer_contains_whisper_server_section():
