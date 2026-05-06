@@ -232,7 +232,10 @@ These defaults should be easy to inspect and adjust inside the script.
 For file-backed defaults:
 - use predictable local sample asset paths
 - do not embed binary sample files into the script itself
-- if a default sample file is missing, fail with a clear message that tells the user which override flag to supply
+- keep the default sample paths stable and predictable, specifically under `samples/`
+- maintain a fixed internal manifest of vetted public sample URLs for any required default media files
+- when a required default sample file is missing, the client should first attempt to download it into the expected `samples/` path and only fail if that download attempt does not succeed
+- dynamic web search at runtime is out of scope; sample sourcing should remain deterministic and testable
 
 ## Output Handling
 
@@ -311,12 +314,13 @@ Recommended test coverage:
 - mode selection logic for CLI vs interactive fallback
 - default resolution per mode
 - override precedence for URL/token/model/prompt/file inputs
+- default sample auto-download behavior when expected media files are missing
 - request construction for each supported endpoint type
 - response parsing for:
   - plain text responses
   - generation responses returning URLs
   - generation responses returning base64 payloads
-- error handling for missing default files and malformed responses
+- error handling for failed default-sample downloads, missing override files, and malformed responses
 
 Use mocked HTTP responses rather than live network calls.
 
@@ -335,7 +339,7 @@ The implementation should not invent a new server contract. It should instead:
 Likely additions:
 - one standalone test client script in a project-appropriate scripts/tools location
 - one or more tests for that script
-- optional sample asset directory path references if the repo already has or will accept such test assets
+- internal sample-source manifest and download helper logic for `samples/transcription.wav`, `samples/question-video.mp4`, and `samples/question-audio.wav`
 
 Likely no server changes are required for the first version.
 
@@ -346,6 +350,7 @@ Likely no server changes are required for the first version.
 - It supports both direct mode invocation and interactive selection fallback.
 - Users can override endpoint URL, bearer token, model name, prompt, and file inputs.
 - Defaults are built in so the script remains usable with minimal arguments.
+- Required default media files continue to resolve to stable `samples/` paths and are auto-downloaded from fixed public URLs when absent.
 - Generation modes save artifacts locally and print the saved path.
 - Textual replies are printed to stdout whenever present.
 - `video-doubt` and `music-audio-doubt` must be implemented against proven existing backend request formats, not assumed new multimodal contracts.
