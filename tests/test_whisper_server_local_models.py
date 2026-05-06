@@ -270,6 +270,34 @@ def test_model_configure_defaults_missing_whisper_server_path_uses_shutil_which_
     app.dependency_overrides.clear()
 
 
+def test_model_configure_preserves_explicit_whisper_server_model_id_and_server_path_overrides(monkeypatch, tmp_path):
+    from codai.admin import routes
+
+    cfg = _build_config(tmp_path)
+    monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
+    monkeypatch.setattr(routes.shutil, "which", lambda _: "/opt/bin/whisper-server")
+    app, client = _build_admin_test_client(routes)
+    response = client.post(
+        "/admin/api/model-configure",
+        json={
+            "model_id": "custom-whisper-id",
+            "model_type": "audio_models",
+            "backend": "whisper-server",
+            "server_path": "/custom/bin/whisper-server",
+            "model_path": "/models/custom.gguf",
+            "port": 9123,
+            "gpu_device": 2,
+            "load_mode": "load",
+        },
+    )
+
+    assert response.status_code == 200
+    assert cfg.models_data["audio_models"][0]["id"] == "custom-whisper-id"
+    assert cfg.models_data["audio_models"][0]["server_path"] == "/custom/bin/whisper-server"
+
+    app.dependency_overrides.clear()
+
+
 def test_model_configure_accepts_cached_gguf_whisper_server_model(monkeypatch, tmp_path):
     from codai.admin import routes
 
@@ -630,10 +658,21 @@ def test_models_template_resets_whisper_server_builder_defaults_after_refresh_an
     template = Path("codai/admin/templates/models.html").read_text()
 
     assert "resetWhisperServerBuilderDefaults();" in template
-    assert "document.getElementById('ws-model-id').value = '';" in template
-    assert "document.getElementById('ws-server-path').value = '';" in template
-    assert "resetWhisperServerBuilderDefaults();\n    refreshLocal();" in template
+    assert "document.getElementById('ws-model-id').value = nextWhisperServerModelId();" in template
+    assert "document.getElementById('ws-server-path').value = defaultWhisperServerPath();" in template
+    assert "document.getElementById('ws-model-path').value = '';" in template
+    assert "document.getElementById('ws-model-source').value = 'cached-gguf';" in template
+    assert "document.getElementById('ws-gguf-select').value = d.model_path || '';" in template
+    assert "toggleWhisperModelSource();\n    refreshLocal();" in template
     assert "refreshLocal();" in template
+
+
+def test_models_template_prefill_uses_reset_defaults_before_selecting_gguf():
+    template = Path("codai/admin/templates/models.html").read_text()
+
+    assert "resetWhisperServerBuilderDefaults();" in template
+    assert "sourceSelect.value = 'cached-gguf';" in template
+    assert "ggufSelect.value = path;" in template
 
 
 def test_models_template_submits_whisper_server_source_and_resolved_gguf_path():

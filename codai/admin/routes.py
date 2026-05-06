@@ -1312,7 +1312,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
             entry["used_vram_gb"] = data["used_vram_gb"]
         config_manager.models_data.setdefault("audio_models", []).append(entry)
         config_manager.save_models()
-        return {"success": True}
+        return {"success": True, "model_id": model_id, "model_path": model_path, "server_path": server_path}
     path = data.get("path") or data.get("model_id", "")
     valid = {"text_models", "image_models", "audio_models", "tts_models", "vision_models", "video_models",
              "audio_gen_models", "embedding_models"}

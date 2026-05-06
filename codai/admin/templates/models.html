@@ -1038,6 +1038,7 @@ function prefillWhisperServerFromGguf(path){
   const sourceSelect = document.getElementById('ws-model-source');
   const ggufSelect = document.getElementById('ws-gguf-select');
   const builder = document.getElementById('ws-model-builder');
+  resetWhisperServerBuilderDefaults();
   if(sourceSelect){
     sourceSelect.value = 'cached-gguf';
   }
@@ -1419,9 +1420,16 @@ async function addWhisperServerModel(){
     });
     const d = await r.json();
     if(!r.ok) throw new Error(d.detail || 'Failed to add whisper-server model');
-    document.getElementById('ws-model-id').value = '';
-    document.getElementById('ws-server-path').value = '';
-    resetWhisperServerBuilderDefaults();
+    document.getElementById('ws-model-id').value = nextWhisperServerModelId();
+    document.getElementById('ws-server-path').value = defaultWhisperServerPath();
+    document.getElementById('ws-model-source').value = 'cached-gguf';
+    document.getElementById('ws-gguf-select').value = d.model_path || '';
+    document.getElementById('ws-model-path').value = '';
+    document.getElementById('ws-port').value = '8744';
+    document.getElementById('ws-gpu-device').value = '0';
+    document.getElementById('ws-load-mode').value = 'on-request';
+    document.getElementById('ws-used-vram').value = '';
+    toggleWhisperModelSource();
     refreshLocal();
   }catch(e){ alert('Error: '+e.message); }
 }
