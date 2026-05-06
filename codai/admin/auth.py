@@ -25,10 +25,23 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 
 SECRET_KEY_FILE = "secret_key"
+
+
+def utc_now() -> datetime:
+    """Return the current timezone-aware UTC datetime."""
+    return datetime.now(UTC)
+
+
+def parse_session_timestamp(timestamp: str) -> datetime:
+    """Parse persisted session timestamps, normalizing legacy naive values to UTC."""
+    parsed = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def get_or_create_secret(config_dir: Path) -> bytes:
@@ -107,10 +120,10 @@ def verify_password(password: str, password_hash: str) -> bool:
 class SessionManager:
     """Manages user sessions."""
     
-    def __init__(self, config_dir: Path, session_timeout_minutes: int = 120):
+    def __init__(self, config_dir: Path, session_timeout_days: int = 30):
         self.config_dir = config_dir
         self.secret = get_or_create_secret(config_dir)
-        self.session_timeout = timedelta(minutes=session_timeout_minutes)
+        self.session_timeout = timedelta(days=session_timeout_days)
         self._lock = threading.Lock()
     
     def _load_auth_data(self) -> Dict[str, Any]:
@@ -150,7 +163,7 @@ class SessionManager:
             Session ID cookie value
         """
         session_id = secrets.token_urlsafe(32)
-        expires_at = datetime.utcnow() + self.session_timeout
+        expires_at = utc_now() + self.session_timeout
         
         auth_data = self._load_auth_data()
         
@@ -158,7 +171,7 @@ class SessionManager:
         sessions = auth_data.get("sessions", {})
         sessions[session_id] = {
             "username": username,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": utc_now().isoformat(),
             "expires_at": expires_at.isoformat()
         }
         auth_data["sessions"] = sessions
@@ -198,8 +211,8 @@ class SessionManager:
             return None
         
         # Check expiration
-        expires_at = datetime.fromisoformat(session["expires_at"].replace('Z', '+00:00'))
-        if datetime.utcnow() > expires_at:
+        expires_at = parse_session_timestamp(session["expires_at"])
+        if utc_now() > expires_at:
             # Clean up expired session
             del sessions[session_id]
             auth_data["sessions"] = sessions
@@ -207,7 +220,7 @@ class SessionManager:
             return None
         
         # Extend session (sliding expiration)
-        new_expires = datetime.utcnow() + self.session_timeout
+        new_expires = utc_now() + self.session_timeout
         session["expires_at"] = new_expires.isoformat()
         auth_data["sessions"] = sessions
         self._save_auth_data(auth_data)
@@ -283,7 +296,7 @@ class SessionManager:
             if user["username"] == username:
                 user["password_hash"] = hash_password(new_password)
                 user["must_change_password"] = False
-                user["last_changed_at"] = datetime.utcnow().isoformat()
+                user["last_changed_at"] = utc_now().isoformat()
                 self._save_auth_data(auth_data)
                 return True
         
@@ -336,7 +349,7 @@ class SessionManager:
             "username": username,
             "password_hash": hash_password(password),
             "role": role,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": utc_now().isoformat(),
             "must_change_password": False
         }
         

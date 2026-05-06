@@ -150,7 +150,7 @@ async def login(
         httponly=True,
         secure=False,  # Set to True if using HTTPS
         samesite="strict",
-        max_age=7200  # 2 hours
+        max_age=30 * 24 * 60 * 60
     )
     return response
 
