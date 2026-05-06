@@ -202,7 +202,11 @@ async def admin_dashboard(request: Request, username: str = Depends(require_auth
 
 @router.get("/admin/models", response_class=HTMLResponse)
 async def models_page(request: Request, username: str = Depends(require_admin)):
-    return templates.TemplateResponse(request, "models.html", {"username": username, "is_admin": True})
+    return templates.TemplateResponse(request, "models.html", {
+        "username": username,
+        "is_admin": True,
+        "whisper_server_default_source": "cached-gguf",
+    })
 
 
 @router.get("/admin/tokens", response_class=HTMLResponse)
@@ -1261,7 +1265,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         server_path = (data.get("server_path") or "").strip()
         if not server_path:
             raise HTTPException(status_code=400, detail="server_path is required")
-        model_source = (data.get("model_source") or "manual-path").strip() or "manual-path"
+        model_source = (data.get("model_source") or "cached-gguf").strip() or "cached-gguf"
         if model_source not in {"cached-gguf", "manual-path"}:
             raise HTTPException(status_code=400, detail="model_source must be one of: cached-gguf, manual-path")
         model_path = (data.get("model_path") or "").strip()

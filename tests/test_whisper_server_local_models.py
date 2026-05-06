@@ -436,6 +436,16 @@ def test_models_template_defines_whisper_server_gguf_prefill_helpers():
     assert "prefillWhisperServerFromGguf(path)" in template
 
 
+def test_models_template_submits_whisper_server_source_and_resolved_gguf_path():
+    template = Path("codai/admin/templates/models.html").read_text()
+
+    assert "function getWhisperServerModelPath()" in template
+    assert "const sourceSelect = document.getElementById('ws-model-source');" in template
+    assert "const ggufSelect = document.getElementById('ws-gguf-select');" in template
+    assert "model_source: modelSource," in template
+    assert "model_path: getWhisperServerModelPath()," in template
+
+
 def test_models_template_adds_use_with_whisper_server_gguf_action():
     template = Path("codai/admin/templates/models.html").read_text()
 

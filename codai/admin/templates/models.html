@@ -102,8 +102,8 @@
       <input id="ws-model-id" class="form-input" placeholder="whisper-vulkan-base">
       <input id="ws-server-path" class="form-input" placeholder="/usr/local/bin/whisper-server">
       <select id="ws-model-source" class="form-input" onchange="toggleWhisperModelSource()">
-        <option value="cached-gguf">Downloaded GGUF</option>
-        <option value="manual-path">Manual path</option>
+        <option value="cached-gguf" {% if whisper_server_default_source == 'cached-gguf' %}selected{% endif %}>Downloaded GGUF</option>
+        <option value="manual-path" {% if whisper_server_default_source == 'manual-path' %}selected{% endif %}>Manual path</option>
       </select>
       <select id="ws-gguf-select" class="form-input">
         <option value="">Select downloaded GGUF</option>
@@ -1158,6 +1158,13 @@ function toggleWhisperModelSource(){
   modelPath.style.display = useCached ? 'none' : '';
 }
 
+function getWhisperServerModelPath(){
+  const modelSource = document.getElementById('ws-model-source').value;
+  return (modelSource === 'cached-gguf'
+    ? document.getElementById('ws-gguf-select').value
+    : document.getElementById('ws-model-path').value.trim()) || null;
+}
+
 let _loadedKeys = new Set();
 
 async function refreshLoadedStatus(){
@@ -1378,9 +1385,7 @@ async function addWhisperServerModel(){
     backend: 'whisper-server',
     model_source: modelSource,
     server_path: document.getElementById('ws-server-path').value.trim(),
-    model_path: (modelSource === 'cached-gguf'
-      ? document.getElementById('ws-gguf-select').value
-      : document.getElementById('ws-model-path').value.trim()) || null,
+    model_path: getWhisperServerModelPath(),
     port: parseInt(document.getElementById('ws-port').value, 10) || 8744,
     gpu_device: parseInt(document.getElementById('ws-gpu-device').value, 10) || 0,
     load_mode: document.getElementById('ws-load-mode').value,
