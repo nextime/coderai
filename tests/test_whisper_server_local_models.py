@@ -664,6 +664,15 @@ def test_models_template_adds_use_with_whisper_server_gguf_action():
     assert "prefillWhisperServerFromGguf('${esc(f.path)}')" not in template
 
 
+def test_models_template_truncates_configured_whisper_server_model_paths():
+    template = Path("codai/admin/templates/models.html").read_text()
+
+    assert '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Model path</th>' in template
+    assert 'max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' in template
+    assert 'title="${esc(m.model_path || \"—\")}"' in template
+    assert '>${esc(m.model_path || \"—\")}</td>' in template
+
+
 def test_settings_template_no_longer_contains_whisper_server_section():
     template = Path("codai/admin/templates/settings.html").read_text()
 

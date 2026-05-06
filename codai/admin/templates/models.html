@@ -997,7 +997,7 @@ function _renderWhisperServerRows(models){
     return `<tr style="border-top:1px solid var(--border)">
       <td style="padding:.4rem .25rem;font-family:monospace;font-size:12px">${esc(m.id)}</td>
       <td style="padding:.4rem .25rem"><span class="badge badge-ok">${esc(m.backend || 'whisper-server')}</span></td>
-      <td style="padding:.4rem .25rem;font-size:11px;color:var(--text-2)">${esc(m.model_path || '—')}</td>
+      <td style="padding:.4rem .25rem;font-size:11px;color:var(--text-2);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(m.model_path || "—")}">${esc(m.model_path || "—")}</td>
       <td style="padding:.4rem .25rem;font-size:11px;color:var(--text-2)">${m.port ?? '—'} / GPU ${m.gpu_device ?? 0}</td>
       <td style="padding:.4rem .25rem;font-size:11px;color:var(--text-2)">${esc(m.load_mode || 'on-request')}</td>
       <td style="padding:.4rem .25rem;text-align:center">${loaded?'<span class="badge badge-ok">loaded</span>':'<span class="muted small">idle</span>'}</td>
