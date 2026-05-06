@@ -202,11 +202,7 @@ async def admin_dashboard(request: Request, username: str = Depends(require_auth
 
 @router.get("/admin/models", response_class=HTMLResponse)
 async def models_page(request: Request, username: str = Depends(require_admin)):
-    return templates.TemplateResponse(request, "models.html", {
-        "username": username,
-        "is_admin": True,
-        "whisper_server_default_source": "cached-gguf",
-    })
+    return templates.TemplateResponse(request, "models.html", {"username": username, "is_admin": True})
 
 
 @router.get("/admin/tokens", response_class=HTMLResponse)

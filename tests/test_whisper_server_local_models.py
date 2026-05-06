@@ -174,6 +174,47 @@ def test_model_configure_accepts_cached_gguf_whisper_server_model(monkeypatch, t
     app.dependency_overrides.clear()
 
 
+def test_model_configure_defaults_missing_whisper_server_model_source_to_cached_gguf(monkeypatch, tmp_path):
+    from codai.admin import routes
+    from codai.api.app import app
+
+    cfg = _build_config(tmp_path)
+    monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
+    app.dependency_overrides[routes.require_admin] = lambda: "admin"
+
+    client = TestClient(app)
+    response = client.post(
+        "/admin/api/model-configure",
+        json={
+            "model_id": "whisper-vulkan-base",
+            "model_type": "audio_models",
+            "backend": "whisper-server",
+            "server_path": "/usr/local/bin/whisper-server",
+            "model_path": "/models/base.en.gguf",
+            "port": 8744,
+            "gpu_device": 0,
+            "load_mode": "on-request",
+        },
+    )
+
+    assert response.status_code == 200
+    assert cfg.models_data["audio_models"] == [
+        {
+            "id": "whisper-vulkan-base",
+            "backend": "whisper-server",
+            "server_path": "/usr/local/bin/whisper-server",
+            "model_path": "/models/base.en.gguf",
+            "port": 8744,
+            "gpu_device": 0,
+            "load_mode": "on-request",
+            "model_type": "audio_models",
+            "model_types": ["audio_models"],
+        }
+    ]
+
+    app.dependency_overrides.clear()
+
+
 def test_model_configure_rejects_cached_gguf_whisper_server_without_model_path(monkeypatch, tmp_path):
     from codai.admin import routes
     from codai.api.app import app
@@ -440,10 +481,20 @@ def test_models_template_submits_whisper_server_source_and_resolved_gguf_path():
     template = Path("codai/admin/templates/models.html").read_text()
 
     assert "function getWhisperServerModelPath()" in template
-    assert "const sourceSelect = document.getElementById('ws-model-source');" in template
-    assert "const ggufSelect = document.getElementById('ws-gguf-select');" in template
+    assert "const modelSource = document.getElementById('ws-model-source').value;" in template
+    assert "? document.getElementById('ws-gguf-select').value" in template
+    assert ": document.getElementById('ws-model-path').value.trim()) || null;" in template
     assert "model_source: modelSource," in template
     assert "model_path: getWhisperServerModelPath()," in template
+
+
+def test_models_template_uses_fixed_cached_gguf_default_without_route_context():
+    template = Path("codai/admin/templates/models.html").read_text()
+    routes_content = Path("codai/admin/routes.py").read_text()
+
+    assert '<option value="cached-gguf" selected>Downloaded GGUF</option>' in template
+    assert "whisper_server_default_source" not in template
+    assert "whisper_server_default_source" not in routes_content
 
 
 def test_models_template_adds_use_with_whisper_server_gguf_action():

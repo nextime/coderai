@@ -102,8 +102,8 @@
       <input id="ws-model-id" class="form-input" placeholder="whisper-vulkan-base">
       <input id="ws-server-path" class="form-input" placeholder="/usr/local/bin/whisper-server">
       <select id="ws-model-source" class="form-input" onchange="toggleWhisperModelSource()">
-        <option value="cached-gguf" {% if whisper_server_default_source == 'cached-gguf' %}selected{% endif %}>Downloaded GGUF</option>
-        <option value="manual-path" {% if whisper_server_default_source == 'manual-path' %}selected{% endif %}>Manual path</option>
+        <option value="cached-gguf" selected>Downloaded GGUF</option>
+        <option value="manual-path">Manual path</option>
       </select>
       <select id="ws-gguf-select" class="form-input">
         <option value="">Select downloaded GGUF</option>
