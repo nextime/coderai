@@ -148,6 +148,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
 @media (max-width: 720px) {
   .gen-wrap { flex-direction:column; }
   .gen-ctrl { width:100%; min-width:0; max-width:none; border-right:none; border-bottom:1px solid var(--border); }
+  .pipe-shell { grid-template-columns:1fr; }
 }
 
 /* ── Capability cards ─────────────────────────────────────────── */
@@ -217,6 +218,12 @@ a.dl { display:inline-block; margin-top:.4rem; }
 
 /* ── Pipeline ─────────────────────────────────────────────────── */
 .pipe-panel { flex:1; overflow-y:auto; padding:1.2rem; display:flex; flex-direction:column; gap:.6rem; }
+.pipe-toolbar { display:flex; align-items:center; justify-content:space-between; gap:.75rem; flex-wrap:wrap; }
+.pipe-shell { display:grid; grid-template-columns:minmax(280px,360px) minmax(0,1fr); gap:.9rem; align-items:start; }
+.pipe-list, .pipe-editor { display:flex; flex-direction:column; gap:.6rem; }
+.pipe-empty-state { border:1px dashed var(--border-2); border-radius:8px; padding:1rem; color:var(--text-2); background:var(--surface-1); }
+.pipe-list-card { background:var(--surface-1); border:1px solid var(--border); border-radius:8px; padding:.8rem .9rem; display:flex; flex-direction:column; gap:.45rem; cursor:pointer; }
+.pipe-list-card.active { border-color:var(--accent); box-shadow:0 0 0 1px rgba(99,102,241,.2); }
 .pipe-card { background:var(--surface-1); border:1px solid var(--border); border-radius:8px; overflow:hidden; }
 .pipe-card summary {
   list-style:none; padding:.8rem 1rem; cursor:pointer; display:flex; align-items:flex-start;
@@ -1358,36 +1365,44 @@ a.dl { display:inline-block; margin-top:.4rem; }
           </div>
         </details>
 
-    <!-- Custom pipeline builder + saved custom pipelines -->
-    <div id="custom-pipe-cards"></div>
-
-    <!-- Builder card (always open) -->
-    <details class="pipe-card" id="pipe-builder-card" open>
-      <summary>＋ Build New Pipeline
-        <span class="pipe-steps" style="margin:0;font-size:11px"><span class="pipe-step">Add steps</span><span class="pipe-arrow">→</span><span class="pipe-step">Configure</span><span class="pipe-arrow">→</span><span class="pipe-step">Save &amp; Run</span></span>
-      </summary>
-      <div class="pipe-card-body">
-        <div class="g2">
-          <div class="frow"><label class="fl">Pipeline name</label><input id="pb-name" class="fi" placeholder="My Pipeline"></div>
-          <div class="frow"><label class="fl">Description</label><input id="pb-desc" class="fi" placeholder="Optional"></div>
-        </div>
-        <div id="pb-steps" style="display:flex;flex-direction:column;gap:.4rem;margin:.25rem 0"></div>
-        <div style="display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.25rem">
-          <select id="pb-add-type" class="fselect" style="flex:1"></select>
-          <button class="btn btn-ghost btn-sm" onclick="pbAddStep()">＋ Add Step</button>
-        </div>
-        <div style="display:flex;gap:.4rem;margin-top:.5rem;flex-wrap:wrap">
-          <div class="frow" style="flex:1"><label class="fl">Pipeline input</label><input id="pb-input" class="fi" placeholder="Initial text/prompt passed as {{ '{{' }}input{{ '}}' }}"></div>
-        </div>
-        <div style="display:flex;gap:.4rem;margin-top:.5rem">
-          <button class="btn btn-primary" onclick="pbSaveAndRun()">Save &amp; Run</button>
-          <button class="btn btn-ghost btn-sm" onclick="pbSave()">Save only</button>
-          <button class="btn btn-ghost btn-sm" onclick="pbRun()">Run without saving</button>
-        </div>
-        <div class="progress" id="pb-prog"></div>
-        <div id="pb-out"></div>
+    <div class="pipe-toolbar">
+      <button class="btn btn-primary" onclick="createPipeline()">Create pipeline</button>
+      <div class="muted small" id="pipe-status">Loading pipelines…</div>
+    </div>
+    <div class="pipe-shell">
+      <div class="pipe-list" id="pipe-list"></div>
+      <div class="pipe-editor" id="pipe-editor">
+        <div class="pipe-empty-state" id="pipe-empty-state">No pipeline selected.</div>
+        <!-- Builder card (always open) -->
+        <details class="pipe-card" id="pipe-builder-card" open>
+          <summary>＋ Build New Pipeline
+            <span class="pipe-steps" style="margin:0;font-size:11px"><span class="pipe-step">Add steps</span><span class="pipe-arrow">→</span><span class="pipe-step">Configure</span><span class="pipe-arrow">→</span><span class="pipe-step">Save &amp; Run</span></span>
+          </summary>
+          <div class="pipe-card-body">
+            <div class="g2">
+              <div class="frow"><label class="fl">Pipeline name</label><input id="pb-name" class="fi" placeholder="My Pipeline"></div>
+              <div class="frow"><label class="fl">Description</label><input id="pb-desc" class="fi" placeholder="Optional"></div>
+            </div>
+            <div id="pb-steps" style="display:flex;flex-direction:column;gap:.4rem;margin:.25rem 0"></div>
+            <div style="display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.25rem">
+              <select id="pb-add-type" class="fselect" style="flex:1"></select>
+              <button class="btn btn-ghost btn-sm" onclick="pbAddStep()">＋ Add Step</button>
+            </div>
+            <div style="display:flex;gap:.4rem;margin-top:.5rem;flex-wrap:wrap">
+              <div class="frow" style="flex:1"><label class="fl">Pipeline input</label><input id="pb-input" class="fi" placeholder="Initial text/prompt passed as {{ '{{' }}input{{ '}}' }}"></div>
+            </div>
+            <div style="display:flex;gap:.4rem;margin-top:.5rem">
+              <button class="btn btn-primary" onclick="pbSaveAndRun()">Save &amp; Run</button>
+              <button class="btn btn-ghost btn-sm" onclick="pbSave()">Save only</button>
+              <button class="btn btn-ghost btn-sm" onclick="pbRun()">Run without saving</button>
+            </div>
+            <div class="progress" id="pb-prog"></div>
+            <div id="pb-out"></div>
+          </div>
+        </details>
+        <div id="custom-pipe-cards"></div>
       </div>
-    </details>
+    </div>
 
     </div><!-- pipe-panel -->
     </div><!-- panel-pipe -->
@@ -3792,6 +3807,7 @@ let _stepTypes = [];       // [{type, label, params:[...]}]
 let _pbSteps = [];         // current builder steps [{type, label, params:{}}]
 let _customPipelines = []; // saved custom pipelines
 let _editingPipelineId = null;
+const pipelineState = { items: [], selectedId: null };
 
 async function initPipelineBuilder() {
   try {
@@ -3801,43 +3817,100 @@ async function initPipelineBuilder() {
     ]);
     _stepTypes = typesRes.step_types || [];
     _customPipelines = pipesRes.pipelines || [];
+    pipelineState.items = _customPipelines;
+    if (pipelineState.selectedId && !pipelineState.items.some(p => p.id === pipelineState.selectedId)) {
+      pipelineState.selectedId = null;
+    }
 
-    // Populate step type selector
     const sel = $('pb-add-type');
     if (sel) sel.innerHTML = _stepTypes.map(t =>
       `<option value="${t.type}">${t.label}</option>`).join('');
 
+    renderPipelineList();
     renderCustomPipelineCards();
-  } catch(e) { console.warn('Pipeline builder init failed:', e); }
+  } catch(e) {
+    const status = $('pipe-status');
+    if (status) status.textContent = 'Pipeline loading failed.';
+    console.warn('Pipeline builder init failed:', e);
+  }
+}
+
+function renderPipelineList() {
+  const container = $('pipe-list');
+  const status = $('pipe-status');
+  if (!container) return;
+  const items = pipelineState.items || [];
+  if (!items.length) {
+    container.innerHTML = '<div class="pipe-empty-state">No saved pipelines yet. Create pipeline to start building one.</div>';
+    if (status) status.textContent = 'No saved pipelines yet.';
+    return;
+  }
+  if (status) status.textContent = `${items.length} pipeline${items.length === 1 ? '' : 's'} available`;
+  container.innerHTML = items.map(p => `
+    <button type="button" class="pipe-list-card ${pipelineState.selectedId === p.id ? 'active' : ''}" onclick="openPipeline('${p.id}')">
+      <div class="pipe-title">${escapeHtml(p.name || p.id)}</div>
+      <div class="pipe-summary">${escapeHtml(p.description || 'Custom multi-step pipeline for combining model and utility actions.')}</div>
+      <div class="pipe-tags"><span class="pipe-tag">${(p.steps || []).length} steps</span><span class="pipe-tag">custom</span></div>
+    </button>
+  `).join('');
 }
 
 function renderCustomPipelineCards() {
   const container = $('custom-pipe-cards');
+  const empty = $('pipe-empty-state');
   if (!container) return;
-  container.innerHTML = _customPipelines.map(p => `
-    <details class="pipe-card">
+  const selected = _customPipelines.find(p => p.id === pipelineState.selectedId);
+  if (!selected) {
+    container.innerHTML = '';
+    if (empty) empty.style.display = '';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  container.innerHTML = `
+    <details class="pipe-card" open>
       <summary>
         <div class="pipe-head">
-          <div class="pipe-title">${p.name || p.id}</div>
-          <div class="pipe-summary">${p.description || 'Custom multi-step pipeline for combining model and utility actions.'}</div>
+          <div class="pipe-title">${escapeHtml(selected.name || selected.id)}</div>
+          <div class="pipe-summary">${escapeHtml(selected.description || 'Custom multi-step pipeline for combining model and utility actions.')}</div>
           <div class="pipe-steps">
-            ${p.steps.map(s => `<span class="pipe-step">${s.label || s.type}</span>`).join('<span class="pipe-arrow">→</span>')}
+            ${(selected.steps || []).map(s => `<span class="pipe-step">${escapeHtml(s.label || s.type)}</span>`).join('<span class="pipe-arrow">→</span>')}
           </div>
-          <div class="pipe-tags"><span class="pipe-tag">custom</span><span class="pipe-tag">pipeline</span><span class="pipe-tag">${p.steps.length} steps</span></div>
+          <div class="pipe-tags"><span class="pipe-tag">custom</span><span class="pipe-tag">pipeline</span><span class="pipe-tag">${(selected.steps || []).length} steps</span></div>
         </div>
       </summary>
       <div class="pipe-card-body">
-        ${p.description ? `<p style="font-size:12px;color:var(--text-2);margin:0 0 .4rem">${p.description}</p>` : ''}
-        <div class="frow"><label class="fl">Input</label><input id="cpr-input-${p.id}" class="fi" placeholder="{{ '{{' }}input{{ '}}' }} value"></div>
+        ${selected.description ? `<p style="font-size:12px;color:var(--text-2);margin:0 0 .4rem">${escapeHtml(selected.description)}</p>` : ''}
+        <div class="frow"><label class="fl">Input</label><input id="cpr-input-${selected.id}" class="fi" placeholder="{{ '{{' }}input{{ '}}' }} value"></div>
         <div style="display:flex;gap:.4rem;margin-top:.4rem;flex-wrap:wrap">
-          <button class="btn btn-primary btn-sm" onclick="runCustomPipeline('${p.id}')">▶ Run</button>
-          <button class="btn btn-ghost btn-sm" onclick="editCustomPipeline('${p.id}')">✎ Edit</button>
-          <button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="deleteCustomPipeline('${p.id}')">✕ Delete</button>
+          <button class="btn btn-primary btn-sm" onclick="runCustomPipeline('${selected.id}')">▶ Run</button>
+          <button class="btn btn-ghost btn-sm" onclick="editCustomPipeline('${selected.id}')">✎ Edit</button>
+          <button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="deleteCustomPipeline('${selected.id}')">✕ Delete</button>
         </div>
-        <div class="progress" id="cpr-prog-${p.id}"></div>
-        <div id="cpr-out-${p.id}"></div>
+        <div class="progress" id="cpr-prog-${selected.id}"></div>
+        <div id="cpr-out-${selected.id}"></div>
       </div>
-    </details>`).join('');
+    </details>`;
+}
+
+function createPipeline() {
+  pipelineState.selectedId = null;
+  _editingPipelineId = null;
+  _pbSteps = [];
+  $('pb-name').value = '';
+  $('pb-desc').value = '';
+  $('pb-input').value = '';
+  $('pb-prog').textContent = 'Creating a new pipeline draft.';
+  renderBuilderSteps();
+  renderPipelineList();
+  renderCustomPipelineCards();
+  $('pipe-builder-card').open = true;
+  $('pipe-builder-card').scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+function openPipeline(id) {
+  pipelineState.selectedId = id;
+  renderPipelineList();
+  renderCustomPipelineCards();
 }
 
 function pbAddStep() {
@@ -3920,6 +3993,9 @@ async function pbSave() {
       _editingPipelineId = res.pipeline?.id;
     }
     _customPipelines = (await fetch('/v1/pipelines/custom').then(r => r.json())).pipelines || [];
+    pipelineState.items = _customPipelines;
+    pipelineState.selectedId = _editingPipelineId;
+    renderPipelineList();
     renderCustomPipelineCards();
     $('pb-prog').textContent = 'Saved ✓';
   } catch(e) { $('pb-prog').textContent = 'Error: '+e.message; }
@@ -3951,11 +4027,14 @@ async function runCustomPipeline(id) {
 function editCustomPipeline(id) {
   const p = _customPipelines.find(x => x.id === id);
   if (!p) return;
+  pipelineState.selectedId = id;
   _editingPipelineId = id;
   $('pb-name').value = p.name || '';
   $('pb-desc').value = p.description || '';
   _pbSteps = p.steps.map(s => ({...s, params:{...s.params}}));
   renderBuilderSteps();
+  renderPipelineList();
+  renderCustomPipelineCards();
   $('pipe-builder-card').open = true;
   $('pipe-builder-card').scrollIntoView({behavior:'smooth'});
   $('pb-prog').textContent = `Editing "${p.name}"`;
@@ -3966,7 +4045,10 @@ async function deleteCustomPipeline(id) {
   try {
     await fetch(`/v1/pipelines/custom/${id}`, {method:'DELETE'});
     _customPipelines = _customPipelines.filter(p => p.id !== id);
+    pipelineState.items = _customPipelines;
+    if (pipelineState.selectedId === id) pipelineState.selectedId = null;
     if (_editingPipelineId === id) { _editingPipelineId = null; _pbSteps = []; renderBuilderSteps(); }
+    renderPipelineList();
     renderCustomPipelineCards();
   } catch(e) { alert('Delete failed: '+e.message); }
 }

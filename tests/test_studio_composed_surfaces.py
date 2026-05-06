@@ -366,3 +366,20 @@ def test_studio_output_surfaces_capability_warnings():
     assert "cap-output-note" in text
     assert "renderCapabilityOutputNote" in text
     assert "renderOutputCapabilityNotes" in text
+
+
+def test_pipeline_tab_exposes_create_action_and_empty_state():
+    template_path = "/storage/coderai/.worktrees/web-admin-polish/codai/admin/templates/chat.html"
+    text = open(template_path, "r", encoding="utf-8").read()
+
+    assert "Create pipeline" in text
+    assert "pipe-empty-state" in text
+    assert "renderPipelineList" in text
+
+
+def test_pipeline_tab_exposes_editor_shell():
+    template_path = "/storage/coderai/.worktrees/web-admin-polish/codai/admin/templates/chat.html"
+    text = open(template_path, "r", encoding="utf-8").read()
+
+    assert "pipe-editor" in text
+    assert "openPipeline" in text
