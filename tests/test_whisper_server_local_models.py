@@ -1,11 +1,27 @@
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 
-def test_model_configure_persists_whisper_server_audio_model(monkeypatch, tmp_path):
-    from codai.admin import routes
-    from codai.api.app import app
+def _base_models_data():
+    return {
+        "text_models": [],
+        "image_models": [],
+        "audio_models": [],
+        "vision_models": [],
+        "tts_models": [],
+        "gguf_models": [],
+        "video_models": [],
+        "audio_gen_models": [],
+        "embedding_models": [],
+        "aliases": {},
+    }
+
+
+def _build_config(tmp_path):
     from codai.config import (
         BackendConfig,
         Config,
@@ -19,18 +35,7 @@ def test_model_configure_persists_whisper_server_audio_model(monkeypatch, tmp_pa
     )
 
     cfg = ConfigManager(str(tmp_path))
-    cfg.models_data = {
-        "text_models": [],
-        "image_models": [],
-        "audio_models": [],
-        "vision_models": [],
-        "tts_models": [],
-        "gguf_models": [],
-        "video_models": [],
-        "audio_gen_models": [],
-        "embedding_models": [],
-        "aliases": {},
-    }
+    cfg.models_data = _base_models_data()
     cfg.config = Config(
         version="1.0",
         server=ServerConfig(),
@@ -41,6 +46,14 @@ def test_model_configure_persists_whisper_server_audio_model(monkeypatch, tmp_pa
         image=ImageConfig(),
         whisper=WhisperConfig(),
     )
+    return cfg
+
+
+def test_model_configure_persists_whisper_server_audio_model(monkeypatch, tmp_path):
+    from codai.admin import routes
+    from codai.api.app import app
+
+    cfg = _build_config(tmp_path)
     monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
     app.dependency_overrides[routes.require_admin] = lambda: "admin"
 
@@ -82,51 +95,19 @@ def test_model_configure_persists_whisper_server_audio_model(monkeypatch, tmp_pa
 def test_model_configure_rejects_duplicate_whisper_server_model_id(monkeypatch, tmp_path):
     from codai.admin import routes
     from codai.api.app import app
-    from codai.config import (
-        BackendConfig,
-        Config,
-        ConfigManager,
-        ImageConfig,
-        ModelsConfig,
-        OffloadConfig,
-        ServerConfig,
-        VulkanConfig,
-        WhisperConfig,
-    )
 
-    cfg = ConfigManager(str(tmp_path))
-    cfg.models_data = {
-        "text_models": [],
-        "image_models": [],
-        "audio_models": [
-            {
-                "id": "whisper-vulkan-base",
-                "backend": "whisper-server",
-                "server_path": "/usr/local/bin/whisper-server",
-                "model_path": "/models/ggml-base.bin",
-                "port": 8744,
-                "gpu_device": 0,
-                "load_mode": "on-request",
-            }
-        ],
-        "vision_models": [],
-        "tts_models": [],
-        "gguf_models": [],
-        "video_models": [],
-        "audio_gen_models": [],
-        "embedding_models": [],
-        "aliases": {},
-    }
-    cfg.config = Config(
-        version="1.0",
-        server=ServerConfig(),
-        backend=BackendConfig(),
-        models=ModelsConfig(),
-        offload=OffloadConfig(),
-        vulkan=VulkanConfig(),
-        image=ImageConfig(),
-        whisper=WhisperConfig(),
-    )
+    cfg = _build_config(tmp_path)
+    cfg.models_data["audio_models"] = [
+        {
+            "id": "whisper-vulkan-base",
+            "backend": "whisper-server",
+            "server_path": "/usr/local/bin/whisper-server",
+            "model_path": "/models/ggml-base.bin",
+            "port": 8744,
+            "gpu_device": 0,
+            "load_mode": "on-request",
+        }
+    ]
     monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
     app.dependency_overrides[routes.require_admin] = lambda: "admin"
 
@@ -209,9 +190,6 @@ def test_model_load_and_unload_manage_whisper_server_runtime(monkeypatch):
 def test_transcription_requires_configured_whisper_server_model_id():
     import asyncio
 
-    import pytest
-    from fastapi import HTTPException
-
     from codai.api import transcriptions
     from codai.models.manager import multi_model_manager
 
@@ -240,3 +218,75 @@ def test_transcription_requires_configured_whisper_server_model_id():
 
     assert exc.value.status_code in {400, 404}
     assert "not configured" in str(exc.value.detail).lower() or "not available" in str(exc.value.detail).lower()
+
+
+def test_get_all_allowed_identifiers_includes_configured_whisper_server_id_without_legacy_alias(monkeypatch):
+    from codai.admin import routes
+    from codai.models.manager import MultiModelManager
+
+    manager = MultiModelManager()
+    manager.audio_models[:] = ["whisper-vulkan-base"]
+    monkeypatch.setattr(
+        routes,
+        "config_manager",
+        SimpleNamespace(
+            models_data={
+                "text_models": [],
+                "image_models": [],
+                "audio_models": [{"id": "whisper-vulkan-base", "backend": "whisper-server"}],
+                "vision_models": [],
+                "tts_models": [],
+                "gguf_models": [],
+                "video_models": [],
+                "audio_gen_models": [],
+                "embedding_models": [],
+                "aliases": {},
+            }
+        ),
+        raising=False,
+    )
+
+    allowed = manager.get_all_allowed_identifiers()
+
+    assert "whisper-vulkan-base" in allowed
+    assert "audio:whisper-vulkan-base" in allowed
+    assert "whisper-server" not in allowed
+
+
+def test_main_startup_registration_code_uses_entry_local_whisper_server_settings():
+    content = Path("codai/main.py").read_text()
+
+    assert 'm.get("backend") == "whisper-server"' in content
+    assert 'server_path=m.get("server_path", "")' in content
+    assert 'port=int(m.get("port", 8744))' in content
+    assert 'gpu_device=int(m.get("gpu_device", 0))' in content
+    assert 'config.whisper.server_path' not in content[content.index('audio_models = models_config.get("audio_models", [])'):content.index('# Image models')]
+
+
+def test_settings_api_does_not_return_whisper_fields(monkeypatch):
+    from codai.admin import routes
+    from codai.api.app import app
+    from codai.config import Config, ServerConfig, BackendConfig, ModelsConfig, OffloadConfig, VulkanConfig, ImageConfig, WhisperConfig
+
+    cfg = SimpleNamespace(
+        config=Config(
+            version="1.0",
+            server=ServerConfig(),
+            backend=BackendConfig(),
+            models=ModelsConfig(),
+            offload=OffloadConfig(),
+            vulkan=VulkanConfig(),
+            image=ImageConfig(),
+            whisper=WhisperConfig(server_path="/usr/local/bin/whisper-server", server_port=8744),
+        )
+    )
+    monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
+    app.dependency_overrides[routes.require_admin] = lambda: "admin"
+
+    client = TestClient(app)
+    response = client.get("/admin/api/settings")
+
+    assert response.status_code == 200
+    assert "whisper" not in response.json()
+
+    app.dependency_overrides.clear()

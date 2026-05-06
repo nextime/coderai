@@ -1357,10 +1357,6 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "device_id": c.vulkan.device_id,
             "single_gpu": c.vulkan.single_gpu,
         },
-        "whisper": {
-            "server_path": c.whisper.server_path,
-            "server_port": c.whisper.server_port,
-        },
         "system_prompt": c.system_prompt,
         "tools_closer_prompt": c.tools_closer_prompt,
         "grammar_guided": c.grammar_guided,
@@ -1419,11 +1415,6 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         c.vulkan.n_ctx = int(vk.get("n_ctx", c.vulkan.n_ctx))
         c.vulkan.device_id = int(vk.get("device_id", c.vulkan.device_id))
         c.vulkan.single_gpu = bool(vk.get("single_gpu", c.vulkan.single_gpu))
-
-    if "whisper" in data:
-        wh = data["whisper"]
-        c.whisper.server_path = wh.get("server_path") or None
-        c.whisper.server_port = int(wh.get("server_port", c.whisper.server_port))
 
     if "system_prompt" in data:
         c.system_prompt = data["system_prompt"] or None
