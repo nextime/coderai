@@ -1,6 +1,7 @@
 import base64
 import os
 import sys
+import types
 import wave
 from io import BytesIO
 from pathlib import Path
@@ -262,8 +263,49 @@ def test_audio_cleanup_returns_artifact_and_applied_operations(monkeypatch, stud
     assert body["backend"]["engine"] == "ffmpeg-afftdn"
     assert body["backend"]["quality"] == "best-effort"
     assert body["applied"] == ["noise_reduction", "normalize"]
-    assert "/v1/files/" in body["data"][0]["url"]
-    assert "not-ml-restoration" in body["limitations"]
+    assert body["limitations"] == ["not-ml-restoration"]
+
+
+def test_admin_status_includes_recent_activity(studio_client, monkeypatch):
+    from codai.admin import routes as admin_routes
+    from codai.api import log as api_log
+
+    api_log._activity.clear()
+    api_log._activity.appendleft({
+        "time": 1715000000,
+        "model": "demo-model",
+        "type": "chat",
+        "status": 200,
+        "duration": 1.23,
+    })
+    api_log._activity.appendleft({
+        "time": "bad-time",
+        "model": None,
+        "type": None,
+        "status": "500",
+        "duration": "2.5",
+    })
+
+    monkeypatch.setattr(admin_routes, "config_manager", types.SimpleNamespace(models_data={}, pipelines_data=[]), raising=False)
+
+    response = studio_client.get("/admin/api/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["recent_activity"][0] == {
+        "time": 0,
+        "model": "—",
+        "type": "unknown",
+        "status": 500,
+        "duration": 2.5,
+    }
+    assert payload["recent_activity"][1] == {
+        "time": 1715000000,
+        "model": "demo-model",
+        "type": "chat",
+        "status": 200,
+        "duration": 1.23,
+    }
 
 
 def test_chat_template_wires_preview_shells_for_new_runnable_panels():

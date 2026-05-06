@@ -356,7 +356,28 @@ async def api_status(username: str = Depends(require_auth)):
     recent_activity = []
     try:
         from codai.api.log import get_recent_activity
-        recent_activity = get_recent_activity()
+        for row in get_recent_activity():
+            if not isinstance(row, dict):
+                continue
+            try:
+                ts = int(row.get("time", 0) or 0)
+            except (TypeError, ValueError):
+                ts = 0
+            try:
+                status = int(row.get("status", 0) or 0)
+            except (TypeError, ValueError):
+                status = 0
+            try:
+                duration = round(float(row.get("duration", 0) or 0), 2)
+            except (TypeError, ValueError):
+                duration = 0.0
+            recent_activity.append({
+                "time": ts,
+                "model": str(row.get("model") or "—"),
+                "type": str(row.get("type") or "unknown"),
+                "status": status,
+                "duration": duration,
+            })
     except Exception:
         pass
 
