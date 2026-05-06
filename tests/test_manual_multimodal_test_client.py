@@ -1,8 +1,3 @@
-from pathlib import Path
-from types import SimpleNamespace
-
-import pytest
-
 from tools.manual_multimodal_test_client import build_parser, choose_mode_interactively, parse_args
 
 
