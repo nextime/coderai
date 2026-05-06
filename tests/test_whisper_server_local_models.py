@@ -428,6 +428,21 @@ def test_models_template_defines_whisper_server_source_toggle_behavior():
     assert "modelPath.style.display = useCached ? 'none' : '';" in template
 
 
+def test_models_template_defines_whisper_server_gguf_prefill_helpers():
+    template = Path("codai/admin/templates/models.html").read_text()
+
+    assert "function refreshWhisperGgufOptions()" in template
+    assert "function prefillWhisperServerFromGguf(path)" in template
+    assert "prefillWhisperServerFromGguf(path)" in template
+
+
+def test_models_template_adds_use_with_whisper_server_gguf_action():
+    template = Path("codai/admin/templates/models.html").read_text()
+
+    assert "Use with whisper-server" in template
+    assert "onclick=\"prefillWhisperServerFromGguf('${esc(f.path)}')\"" in template
+
+
 def test_settings_template_no_longer_contains_whisper_server_section():
     template = Path("codai/admin/templates/settings.html").read_text()
 

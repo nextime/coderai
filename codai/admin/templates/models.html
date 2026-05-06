@@ -970,6 +970,7 @@ async function loadCacheStats(){
 }
 
 let _localModels = [];
+let _ggufFiles = [];
 
 function _renderWhisperServerRows(models){
   if(!models.length) return '';
@@ -1020,6 +1021,34 @@ function _renderWhisperServerRows(models){
     '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Load mode</th>'+
     '<th style="text-align:center;padding:.3rem .25rem;font-weight:700">Status</th>'+
     '<th></th></tr></thead><tbody>'+rows.join('')+'</tbody></table></div>';
+}
+
+function refreshWhisperGgufOptions(){
+  const ggufSelect = document.getElementById('ws-gguf-select');
+  if(!ggufSelect) return;
+  const selectedValue = ggufSelect.value;
+  ggufSelect.innerHTML = '<option value="">Select downloaded GGUF</option>'+
+    _ggufFiles.map(f=>`<option value="${esc(f.path)}">${esc(f.filename)}</option>`).join('');
+  if(selectedValue && _ggufFiles.some(f => f.path === selectedValue)){
+    ggufSelect.value = selectedValue;
+  }
+}
+
+function prefillWhisperServerFromGguf(path){
+  const sourceSelect = document.getElementById('ws-model-source');
+  const ggufSelect = document.getElementById('ws-gguf-select');
+  const builder = document.getElementById('ws-model-builder');
+  if(sourceSelect){
+    sourceSelect.value = 'cached-gguf';
+  }
+  toggleWhisperModelSource();
+  refreshWhisperGgufOptions();
+  if(ggufSelect){
+    ggufSelect.value = path;
+  }
+  if(builder){
+    builder.scrollIntoView({behavior:'smooth', block:'start'});
+  }
 }
 
 async function loadCachedModels(){
@@ -1075,11 +1104,8 @@ async function loadCachedModels(){
 
     // GGUF files
     const gguf = d.gguf||[];
-    const ggufSelect = document.getElementById('ws-gguf-select');
-    if(ggufSelect){
-      ggufSelect.innerHTML = '<option value="">Select downloaded GGUF</option>'+
-        gguf.map(f=>`<option value="${esc(f.path)}">${esc(f.filename)}</option>`).join('');
-    }
+    _ggufFiles = gguf;
+    refreshWhisperGgufOptions();
     document.getElementById('gguf-file-badge').textContent = gguf.length ? `(${gguf.length})` : '';
     if(!gguf.length){
       ggufEl.innerHTML = '<span class="muted small">No GGUF files cached.</span>';
@@ -1100,6 +1126,7 @@ async function loadCachedModels(){
             ${f.in_config?(loaded
               ?`<button class="btn btn-ghost btn-sm" onclick="unloadModel(${idx})">Unload</button>`
               :`<button class="btn btn-primary btn-sm" onclick="loadModel(${idx})">Load now</button>`):''}
+            <button class="btn btn-secondary btn-sm" onclick="prefillWhisperServerFromGguf('${esc(f.path)}')">Use with whisper-server</button>
             <button class="btn btn-secondary btn-sm" onclick="openCfgModal(${idx})">${f.in_config?'Configure':'Add to CoderAI'}</button>
             ${f.in_config?`<button class="btn btn-ghost btn-sm" onclick="disableModel(${idx})">Remove</button>`:''}
             <button class="btn btn-danger btn-sm" onclick="deleteModelConfirm(${idx})">Delete</button>
