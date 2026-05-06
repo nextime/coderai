@@ -61,6 +61,8 @@ def _next_whisper_server_model_id(audio_models) -> str:
     for model in audio_models or []:
         if not isinstance(model, dict):
             continue
+        if model.get("backend") != "whisper-server":
+            continue
         match = re.fullmatch(r"whisper(\d+)", str(model.get("id") or "").strip())
         if match:
             used_suffixes.add(int(match.group(1)))
@@ -1295,7 +1297,11 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         if gpu_device < 0:
             raise HTTPException(status_code=400, detail="gpu_device must be >= 0")
         for existing in config_manager.models_data.get("audio_models", []):
-            if isinstance(existing, dict) and existing.get("id") == model_id:
+            if (
+                isinstance(existing, dict)
+                and existing.get("backend") == "whisper-server"
+                and existing.get("id") == model_id
+            ):
                 raise HTTPException(status_code=409, detail=f"whisper-server model '{model_id}' already exists")
         entry = {
             "id": model_id,

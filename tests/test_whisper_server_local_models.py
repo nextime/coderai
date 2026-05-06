@@ -211,7 +211,36 @@ def test_model_configure_defaults_missing_whisper_server_model_id_skips_non_whis
     )
 
     assert response.status_code == 200
-    assert cfg.models_data["audio_models"][-1]["id"] == "whisper1"
+    assert cfg.models_data["audio_models"][-1]["id"] == "whisper0"
+
+    app.dependency_overrides.clear()
+
+
+def test_model_configure_allows_whisper_server_id_coexistence_with_other_audio_backends(monkeypatch, tmp_path):
+    from codai.admin import routes
+
+    cfg = _build_config(tmp_path)
+    cfg.models_data["audio_models"] = [
+        {"id": "whisper0", "backend": "faster-whisper"},
+    ]
+    monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
+    app, client = _build_admin_test_client(routes)
+    response = client.post(
+        "/admin/api/model-configure",
+        json={
+            "model_id": "whisper0",
+            "backend": "whisper-server",
+            "server_path": "/usr/local/bin/whisper-server",
+            "model_path": "/models/ggml-base.bin",
+            "port": 8744,
+            "gpu_device": 0,
+            "load_mode": "on-request",
+        },
+    )
+
+    assert response.status_code == 200
+    assert [m["backend"] for m in cfg.models_data["audio_models"]] == ["faster-whisper", "whisper-server"]
+    assert cfg.models_data["audio_models"][-1]["id"] == "whisper0"
 
     app.dependency_overrides.clear()
 
