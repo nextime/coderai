@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import json
+import time
 from pathlib import Path
+
+import requests
 
 
 MODES = [
@@ -192,3 +197,57 @@ def choose_mode_interactively() -> str:
     if selected < 1 or selected > len(MODES):
         raise ValueError(f"Invalid mode selection: {raw}")
     return MODES[selected - 1]
+
+
+def _download_artifact(url: str) -> bytes:
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    return response.content
+
+
+def _artifact_suffix_for_mode(mode: str) -> str:
+    if mode == "audio-generation":
+        return ".wav"
+    if mode == "video-generation":
+        return ".mp4"
+    return ".bin"
+
+
+def _write_artifact(output_dir: Path, mode: str, payload: bytes) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = output_dir / f"{mode}-{int(time.time() * 1000)}{_artifact_suffix_for_mode(mode)}"
+    artifact_path.write_bytes(payload)
+    return artifact_path
+
+
+def handle_response_payload(mode: str, response, output_dir: Path) -> dict:
+    response.raise_for_status()
+    payload = response.json()
+
+    if mode in {"llm", "video-doubt", "music-audio-doubt"}:
+        text = payload["choices"][0]["message"]["content"]
+        return {"text": text, "artifact_path": None, "payload": payload}
+
+    if mode == "transcription":
+        text = payload.get("text") or payload.get("transcript") or json.dumps(payload)
+        return {"text": text, "artifact_path": None, "payload": payload}
+
+    if mode in {"audio-generation", "video-generation"}:
+        first = payload["data"][0]
+        text = first.get("text") or first.get("caption") or ""
+        if "url" in first:
+            artifact_bytes = _download_artifact(first["url"])
+        elif "b64_json" in first:
+            artifact_bytes = base64.b64decode(first["b64_json"])
+        else:
+            raise ValueError(f"No artifact found in generation response for mode: {mode}")
+        artifact_path = _write_artifact(output_dir, mode, artifact_bytes)
+        return {"text": text, "artifact_path": artifact_path, "payload": payload}
+
+    raise ValueError(f"Unsupported response mode: {mode}")
+
+
+def execute_request(spec: dict):
+    method = spec["method"]
+    kwargs = {key: value for key, value in spec.items() if key not in {"method", "url"}}
+    return requests.request(method, spec["url"], timeout=300, **kwargs)

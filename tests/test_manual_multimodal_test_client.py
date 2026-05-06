@@ -3,6 +3,7 @@ from tools.manual_multimodal_test_client import (
     build_request_spec,
     build_parser,
     choose_mode_interactively,
+    handle_response_payload,
     parse_args,
     resolve_mode_config,
 )
@@ -353,3 +354,53 @@ def test_build_request_spec_for_transcription_requires_existing_audio_file(tmp_p
 
     with pytest.raises(FileNotFoundError, match=rf"File not found: {missing_path}\. Supply --audio-file\."):
         build_request_spec(config)
+
+
+class DummyResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+        self.text = "payload-text"
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+def test_handle_response_payload_returns_llm_text_without_artifact(tmp_path):
+    response = DummyResponse({
+        "choices": [{"message": {"content": "hello from model"}}]
+    })
+
+    result = handle_response_payload("llm", response, tmp_path)
+
+    assert result["text"] == "hello from model"
+    assert result["artifact_path"] is None
+
+
+def test_handle_response_payload_downloads_url_artifact(monkeypatch, tmp_path):
+    response = DummyResponse({
+        "data": [{"url": "http://example.invalid/audio.wav"}]
+    })
+    monkeypatch.setattr(
+        "tools.manual_multimodal_test_client._download_artifact",
+        lambda url: b"wave-bytes",
+    )
+
+    result = handle_response_payload("audio-generation", response, tmp_path)
+
+    assert result["artifact_path"].suffix == ".wav"
+    assert result["artifact_path"].read_bytes() == b"wave-bytes"
+
+
+def test_handle_response_payload_decodes_base64_artifact(tmp_path):
+    response = DummyResponse({
+        "data": [{"b64_json": "aGVsbG8="}]
+    })
+
+    result = handle_response_payload("audio-generation", response, tmp_path)
+
+    assert result["artifact_path"].read_bytes() == b"hello"
