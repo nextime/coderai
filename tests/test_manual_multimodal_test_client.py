@@ -20,6 +20,10 @@ from tools.manual_multimodal_test_client import (
 import pytest
 
 
+class _MainExit(Exception):
+    pass
+
+
 def test_parse_args_accepts_direct_mode_and_global_overrides():
     args = parse_args([
         "llm",
@@ -73,6 +77,139 @@ def test_resolve_mode_config_uses_mode_defaults_when_overrides_absent(tmp_path):
     assert config["response_format"] == MODE_DEFAULTS["audio-generation"]["response_format"]
     assert config["output_dir"] == tmp_path
     assert "file" not in config
+
+
+def test_main_uses_fastapi_app_instance_for_state_and_server(monkeypatch):
+    import codai.main as main_module
+    from codai.api import app as app_module
+
+    fake_args = type("Args", (), {
+        "config": "/tmp/coderai-test",
+        "dump": False,
+        "debug": False,
+        "list_models": False,
+        "list_devices": False,
+        "list_cached_models": False,
+        "remove_all_models": False,
+        "remove_model": None,
+        "download_model": None,
+        "download_file_pattern": None,
+        "vulkan_list_devices": False,
+        "download_gguf": None,
+    })()
+    fake_server = type("ServerCfg", (), {
+        "host": "127.0.0.1",
+        "port": 8765,
+        "https": False,
+        "https_key_path": None,
+        "https_cert_path": None,
+        "queue_max_size": 1,
+        "max_parallel_requests": 1,
+    })()
+    fake_backend = type("BackendCfg", (), {"type": "vulkan"})()
+    fake_config = type("Config", (), {
+        "server": fake_server,
+        "backend": fake_backend,
+        "system_prompt": "",
+        "tools_closer_prompt": "",
+        "grammar_guided": False,
+        "file_path": "/tmp",
+        "models": type("ModelsCfg", (), {"load_mode": "ondemand", "default_load_mode": "ondemand", "hf_cache_dir": None, "gguf_cache_dir": None})(),
+        "offload": type("OffloadCfg", (), {
+            "directory": "/tmp",
+            "manual_ram_gb": None,
+            "strategy": "auto",
+            "no_ram": False,
+            "load_in_4bit": False,
+            "load_in_8bit": False,
+            "flash_attention": False,
+            "max_gpu_percent": None,
+        })(),
+        "image": type("ImageCfg", (), {
+            "sample_method": "res_multistep",
+            "steps": 4,
+            "width": 512,
+            "height": 512,
+            "cfg_scale": 1.0,
+            "precision": "f32",
+            "cpu_offload": False,
+            "seed": None,
+            "vae_tiling": False,
+            "clip_on_cpu": False,
+        })(),
+        "parser": None,
+        "hf_chat_templates": None,
+        "reasoning_options": None,
+        "whisper": type("WhisperCfg", (), {"server_path": None, "server_port": 8744})(),
+        "vulkan": type("VulkanCfg", (), {"n_gpu_layers": -1, "n_ctx": 2048, "device_id": 0, "single_gpu": False})(),
+        "nvidia": type("NvidiaCfg", (), {})(),
+    })()
+    fake_config_mgr = type("ConfigMgr", (), {
+        "models_data": {},
+        "pipelines_data": [],
+    })()
+
+    monkeypatch.setattr(main_module, "parse_args", lambda: fake_args)
+    monkeypatch.setattr(main_module, "ConfigManager", lambda path: type("CfgMgr", (), {
+        "load": lambda self: fake_config,
+        "models_data": {},
+        "pipelines_data": [],
+    })())
+    monkeypatch.setattr(main_module, "init_session_manager", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main_module, "set_config_manager", lambda mgr: None)
+    monkeypatch.setattr("codai.backends.detect_available_backends", lambda: {"vulkan": True})
+    monkeypatch.setattr("codai.api.state.set_global_args", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.state.set_global_debug", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.state.set_global_system_prompt", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr("codai.api.state.set_global_tools_closer_prompt", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr("codai.api.state.set_global_file_path", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.state.set_load_mode", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.state.set_grammar_guided_gen", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.text.set_global_args", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.text.set_global_debug", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.text.set_global_system_prompt", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.text.set_global_tools_closer_prompt", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.app.set_load_mode", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.app.set_global_file_path_wrapper", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.images.set_global_file_path", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.images.set_global_args", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.video.set_global_args", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.video.set_global_file_path", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.audio_gen.set_global_args", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.audio_gen.set_global_file_path", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.audio_stems.set_global_args", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.audio_stems.set_global_file_path", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.audio_clean.set_global_args", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.audio_clean.set_global_file_path", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.voice_clone.set_global_args", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.voice_clone.set_global_file_path", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.voice_convert.set_global_args", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.voice_convert.set_global_file_path", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.faceswap.set_global_args", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.faceswap.set_global_file_path", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.characters.set_global_args", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.api.embeddings.set_global_args", lambda *args, **kwargs: None)
+    monkeypatch.setattr("codai.models.manager.model_manager", type("MM", (), {"backend": None, "backend_type": None})())
+    monkeypatch.setattr("codai.models.manager.multi_model_manager", type("MMM", (), {"set_load_mode": lambda self, mode: None, "list_models": lambda self: []})())
+    monkeypatch.setattr("codai.queue.manager.queue_manager", type("Q", (), {"max_size": 0, "max_parallel_requests": 0})())
+
+    captured = {}
+
+    def fake_run(target, host, port, ssl_context=None):
+        captured["target"] = target
+        captured["host"] = host
+        captured["port"] = port
+        raise _MainExit()
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+
+    try:
+        main_module.main()
+    except _MainExit:
+        pass
+
+    assert captured["target"] is app_module.app
+    assert app_module.app.state.config is fake_config
 
 
 def test_resolve_mode_config_normalizes_url_and_uses_default_input_files(tmp_path):

@@ -178,7 +178,7 @@ def main():
     from codai.api.app import set_load_mode as set_load_mode_app
     
     # Store config reference globally for access
-    fastapi_app = app
+    fastapi_app = app.app
     fastapi_app.state.config_mgr = config_mgr
     fastapi_app.state.config = config
     
@@ -685,14 +685,14 @@ def main():
             except Exception as e:
                 print(f"Warning: Could not generate certificate: {e}")
                 print("Falling back to HTTP...")
-                uvicorn.run(app, host=config.server.host, port=config.server.port)
+                uvicorn.run(fastapi_app, host=config.server.host, port=config.server.port)
                 return
         
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_context.load_cert_chain(ssl_certfile, ssl_keyfile)
-        uvicorn.run(app, host=config.server.host, port=config.server.port, ssl_context=ssl_context)
+        uvicorn.run(fastapi_app, host=config.server.host, port=config.server.port, ssl_context=ssl_context)
     else:
-        uvicorn.run(app, host=config.server.host, port=config.server.port)
+        uvicorn.run(fastapi_app, host=config.server.host, port=config.server.port)
 
 
 if __name__ == "__main__":
