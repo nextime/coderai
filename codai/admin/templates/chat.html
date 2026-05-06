@@ -167,6 +167,14 @@ a.dl { display:inline-block; margin-top:.4rem; }
 .cap-chip.dim { opacity:.72; }
 .cap-missing, .cap-note { font-size:12px; color:var(--text-2); }
 .cap-note strong, .cap-missing strong { color:var(--text-1); }
+.cap-output-note {
+  width:100%; max-width:960px; border:1px solid rgba(245,158,11,.24); background:rgba(58,37,16,.72);
+  color:#f6d08a; border-radius:8px; padding:.75rem .9rem; display:flex; flex-direction:column; gap:.35rem;
+}
+.cap-output-note.unavailable {
+  border-color:rgba(248,113,113,.24); background:rgba(80,28,28,.62); color:#f3b2b2;
+}
+.cap-output-note ul { margin:0; padding-left:1.1rem; }
 .cap-toggle { font-size:12px; display:flex; align-items:center; gap:.4rem; cursor:pointer; color:var(--text-2); }
 .cap-toggle input { margin:0; }
 .cap-preserve-note {
@@ -1725,6 +1733,37 @@ function renderCapabilityCards() {
   renderAudioBackendHealth();
 }
 
+function renderCapabilityOutputNote(sub, outEl) {
+  if (!outEl) return;
+  const details = getCapabilityDetails(sub);
+  const noteId = `cap-output-note-${sub}`;
+  outEl.querySelector(`#${noteId}`)?.remove();
+  if (!details || details.availability === 'available') return;
+  const missing = [];
+  if (details.missingRequired.length) missing.push(...details.missingRequired.map(item => `Missing required: ${item}`));
+  if (details.missingOptional.length) missing.push(...details.missingOptional.map(item => `Limited without: ${item}`));
+  if (!missing.length && Array.isArray(details.notes)) missing.push(...details.notes);
+  const title = details.availability === 'unavailable' ? 'Feature unavailable' : 'Feature partially available';
+  const detailHtml = missing.length
+    ? `<ul>${missing.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`
+    : '<div>Some required pieces are missing for this surface.</div>';
+  outEl.insertAdjacentHTML('afterbegin', `
+    <div class="cap-output-note ${details.availability === 'unavailable' ? 'unavailable' : ''}" id="${noteId}">
+      <strong>${title}</strong>
+      ${detailHtml}
+    </div>
+  `);
+}
+
+function renderOutputCapabilityNotes() {
+  Object.keys(SUB_PANEL_ALIAS).forEach(sub => {
+    const panelId = SUB_PANEL_ALIAS[sub] || (`panel-${sub}`);
+    const panel = $(panelId);
+    const outEl = panel?.querySelector('.gen-out');
+    renderCapabilityOutputNote(sub, outEl);
+  });
+}
+
 function summarizeDiagnostics() {
   const subStates = currentTabState.subs || {};
   const details = Object.entries(SUB_CAPABILITY_RULES).map(([sub, rule]) => {
@@ -2348,6 +2387,7 @@ function updateTabs(m) {
   $('attach-btn').style.display = caps.has('image_to_text') ? '' : 'none';
   renderCapabilityCards();
   renderDiagnostics();
+  renderOutputCapabilityNotes();
   const activeCatBtn = document.querySelector('.t1btn.active');
   const nextCat = activeCatBtn?.dataset.cat || 'chat';
   selectCat(nextCat);
@@ -2387,6 +2427,8 @@ function selectSub(sub) {
   const panelId = SUB_PANEL_ALIAS[sub] || ('panel-' + sub);
   const panel = $(panelId);
   if (panel) panel.classList.add('active');
+  const outEl = panel?.querySelector('.gen-out');
+  if (outEl) renderCapabilityOutputNote(sub, outEl);
   // When switching to vid-faceswap, pre-select video mode
   if (sub === 'vid-faceswap') { const t = $('fs-type'); if (t) { t.value='video'; fsFaceSwapTypeChange(); } }
   if (sub === 'vid-outfit')   { const t = $('ot-type'); if (t) { t.value='video'; otOutfitTypeChange(); } }

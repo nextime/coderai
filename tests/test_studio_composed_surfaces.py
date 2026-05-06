@@ -357,3 +357,12 @@ def test_studio_generation_panel_uses_wider_control_column():
 
     assert ".gen-ctrl { width:min(380px,36vw); min-width:340px; max-width:420px;" in text
     assert "@media (max-width: 720px) {" in text
+
+
+def test_studio_output_surfaces_capability_warnings():
+    template_path = "/storage/coderai/.worktrees/web-admin-polish/codai/admin/templates/chat.html"
+    text = open(template_path, "r", encoding="utf-8").read()
+
+    assert "cap-output-note" in text
+    assert "renderCapabilityOutputNote" in text
+    assert "renderOutputCapabilityNotes" in text
