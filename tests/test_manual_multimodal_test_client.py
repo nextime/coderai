@@ -255,6 +255,9 @@ def test_build_request_spec_for_video_doubt_request_builder_uses_text_endpoint_w
     assert spec["json"]["model"] == "vision:test"
     assert str(video_path) in spec["json"]["messages"][0]["content"]
     assert "What happens in this clip?" in spec["json"]["messages"][0]["content"]
+    assert "local path reference only" in spec["json"]["messages"][0]["content"]
+    assert "may or may not support reasoning from that reference" in spec["json"]["messages"][0]["content"]
+    assert "acknowledge that limitation" in spec["json"]["messages"][0]["content"]
 
 
 def test_build_request_spec_for_music_audio_doubt_request_builder_uses_text_endpoint_with_audio_context(tmp_path):
@@ -278,6 +281,43 @@ def test_build_request_spec_for_music_audio_doubt_request_builder_uses_text_endp
     assert spec["json"]["model"] == "audio:test"
     assert str(audio_path) in spec["json"]["messages"][0]["content"]
     assert "Describe the music." in spec["json"]["messages"][0]["content"]
+    assert "local path reference only" in spec["json"]["messages"][0]["content"]
+    assert "may or may not support reasoning from that reference" in spec["json"]["messages"][0]["content"]
+    assert "acknowledge that limitation" in spec["json"]["messages"][0]["content"]
+
+
+def test_build_request_spec_for_video_doubt_request_builder_requires_video_file_flag(tmp_path):
+    config = {
+        "mode": "video-doubt",
+        "url": "http://127.0.0.1:6745",
+        "model": "vision:test",
+        "prompt": "What happens in this clip?",
+        "output_dir": tmp_path,
+        "token": None,
+        "audio_file": None,
+        "video_file": None,
+        "response_format": None,
+    }
+
+    with pytest.raises(FileNotFoundError, match=r"Missing required file\. Supply --video-file\."):
+        build_request_spec(config)
+
+
+def test_build_request_spec_for_music_audio_doubt_request_builder_requires_audio_file_flag(tmp_path):
+    config = {
+        "mode": "music-audio-doubt",
+        "url": "http://127.0.0.1:6745",
+        "model": "audio:test",
+        "prompt": "Describe the music.",
+        "output_dir": tmp_path,
+        "token": None,
+        "audio_file": None,
+        "video_file": None,
+        "response_format": None,
+    }
+
+    with pytest.raises(FileNotFoundError, match=r"Missing required file\. Supply --audio-file\."):
+        build_request_spec(config)
 
 
 def test_build_request_spec_for_transcription_requires_audio_file_flag(tmp_path):

@@ -150,7 +150,8 @@ def build_request_spec(config: dict) -> dict:
         content = (
             f"Video file: {video_path}\n"
             f"Question: {config['prompt']}\n"
-            "Answer based on the referenced video input if the model/backend supports it."
+            "This request provides a local path reference only; the backend/model may or may not support reasoning from that reference. "
+            "If you cannot access the referenced media, acknowledge that limitation in your answer."
         )
         return {
             "method": "POST",
@@ -167,7 +168,8 @@ def build_request_spec(config: dict) -> dict:
         content = (
             f"Audio file: {audio_path}\n"
             f"Question: {config['prompt']}\n"
-            "Answer based on the referenced audio input if the model/backend supports it."
+            "This request provides a local path reference only; the backend/model may or may not support reasoning from that reference. "
+            "If you cannot access the referenced media, acknowledge that limitation in your answer."
         )
         return {
             "method": "POST",
