@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from tools.manual_multimodal_test_client import (
     MODE_DEFAULTS,
     _download_artifact,
@@ -156,7 +158,7 @@ def test_ensure_sample_file_downloads_missing_managed_default(tmp_path, monkeypa
 
     monkeypatch.setattr(
         "tools.manual_multimodal_test_client.SAMPLE_URLS",
-        {managed_path.as_posix(): "https://example.invalid/question-audio.wav"},
+        {"samples/question-audio.wav": "https://example.invalid/question-audio.wav"},
     )
     monkeypatch.setattr(
         "tools.manual_multimodal_test_client.download_default_sample",
@@ -168,6 +170,62 @@ def test_ensure_sample_file_downloads_missing_managed_default(tmp_path, monkeypa
     assert result == managed_path
     assert downloaded == [managed_path]
     assert managed_path.read_bytes() == b"audio"
+
+
+def test_ensure_sample_file_downloads_missing_managed_default_for_equivalent_path(tmp_path, monkeypatch):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    managed_path = project_root / "samples" / "transcription.wav"
+    downloaded = []
+
+    def fake_download(path):
+        downloaded.append(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"wav")
+        return path
+
+    monkeypatch.setattr(
+        "tools.manual_multimodal_test_client.SAMPLE_URLS",
+        {"samples/transcription.wav": "https://example.invalid/transcription.wav"},
+    )
+    monkeypatch.chdir(project_root)
+    monkeypatch.setattr(
+        "tools.manual_multimodal_test_client.download_default_sample",
+        fake_download,
+    )
+
+    result = ensure_sample_file("./samples/transcription.wav", "--audio-file")
+
+    assert result == Path("samples/transcription.wav")
+    assert downloaded == [Path("samples/transcription.wav")]
+    assert managed_path.read_bytes() == b"wav"
+
+
+def test_ensure_sample_file_downloads_missing_managed_default_for_absolute_path(tmp_path, monkeypatch):
+    project_root = tmp_path / "project"
+    managed_path = project_root / "samples" / "transcription.wav"
+    downloaded = []
+
+    def fake_download(path):
+        downloaded.append(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"wav")
+        return path
+
+    monkeypatch.setattr(
+        "tools.manual_multimodal_test_client.SAMPLE_URLS",
+        {"samples/transcription.wav": "https://example.invalid/transcription.wav"},
+    )
+    monkeypatch.setattr(
+        "tools.manual_multimodal_test_client.download_default_sample",
+        fake_download,
+    )
+
+    result = ensure_sample_file(str(managed_path), "--audio-file")
+
+    assert result == managed_path
+    assert downloaded == [managed_path]
+    assert managed_path.read_bytes() == b"wav"
 
 
 def test_build_request_spec_for_llm_uses_chat_completions_payload(tmp_path):
@@ -250,7 +308,7 @@ def test_build_request_spec_for_transcription_downloads_missing_managed_default(
 
     monkeypatch.setattr(
         "tools.manual_multimodal_test_client.SAMPLE_URLS",
-        {managed_path.as_posix(): "https://example.invalid/transcription.wav"},
+        {"samples/transcription.wav": "https://example.invalid/transcription.wav"},
     )
     monkeypatch.setattr(
         "tools.manual_multimodal_test_client.download_default_sample",

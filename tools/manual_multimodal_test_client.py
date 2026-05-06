@@ -107,7 +107,12 @@ def download_default_sample(path: Path) -> Path:
 
 
 def _managed_sample_key(path: Path) -> str:
-    return path.as_posix()
+    path_parts = path.parts
+    try:
+        samples_index = path_parts.index("samples")
+    except ValueError:
+        return path.as_posix()
+    return Path(*path_parts[samples_index:]).as_posix()
 
 
 def ensure_sample_file(path_value: str | None, flag_name: str) -> Path:
