@@ -121,6 +121,11 @@ class ModelInfo(BaseModel):
     owned_by: str = "huggingface"
     type: Optional[str] = None          # e.g. "text", "image", "video", "audio", "tts", "vision", "embedding"
     capabilities: Optional[List[str]] = None  # list of capability strings
+    backend: Optional[str] = None
+    model_path: Optional[str] = None
+    port: Optional[int] = None
+    gpu_device: Optional[int] = None
+    load_mode: Optional[str] = None
 
 
 class ModelList(BaseModel):

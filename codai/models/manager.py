@@ -1744,16 +1744,22 @@ class MultiModelManager:
             "embedding_models": "embedding",
         }
 
-        def _add(model_id: str, model_type: str = None):
+        def _add(model_id: str, model_type: str = None, meta: Dict[str, Any] = None):
             if model_id in seen_ids:
                 return
             seen_ids.add(model_id)
             caps = detect_model_capabilities(model_id)
             resolved_type = model_type or (caps.to_list()[0].split("_")[0] if caps.to_list() else "text")
+            meta = meta or {}
             models.append(ModelInfo(
                 id=model_id,
                 type=resolved_type,
                 capabilities=caps.to_list(),
+                backend=meta.get("backend"),
+                model_path=meta.get("model_path"),
+                port=meta.get("port"),
+                gpu_device=meta.get("gpu_device"),
+                load_mode=meta.get("load_mode"),
             ))
 
         # --- Models from config (the authoritative source) ---
@@ -1772,15 +1778,15 @@ class MultiModelManager:
                             mid = m.get("alias") or m.get("path") or m.get("id") or ""
                             raw = m.get("path") or m.get("id") or ""
                             if raw and raw != mid:
-                                _add(raw, mtype)
+                                _add(raw, mtype, m)
                                 short = raw.split("/")[-1] if "/" in raw else raw
                                 if short != raw:
-                                    _add(short, mtype)
+                                    _add(short, mtype, m)
                         if mid:
-                            _add(mid, mtype)
+                            _add(mid, mtype, m if isinstance(m, dict) else None)
                             short = mid.split("/")[-1] if "/" in mid else mid
                             if short != mid:
-                                _add(short, mtype)
+                                _add(short, mtype, m if isinstance(m, dict) else None)
         except Exception:
             pass
 

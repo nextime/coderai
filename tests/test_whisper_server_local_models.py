@@ -290,3 +290,44 @@ def test_settings_api_does_not_return_whisper_fields(monkeypatch):
     assert "whisper" not in response.json()
 
     app.dependency_overrides.clear()
+
+
+def test_models_template_contains_whisper_server_add_model_form():
+    template = Path("codai/admin/templates/models.html").read_text()
+
+    assert "Whisper-server simulated models" in template
+    assert "Add model" in template
+    assert "ws-model-id" in template
+    assert "ws-server-path" in template
+
+
+def test_settings_template_no_longer_contains_whisper_server_section():
+    template = Path("codai/admin/templates/settings.html").read_text()
+
+    assert "Whisper Server" not in template
+    assert "wsStart" not in template
+    assert "wsStop" not in template
+
+
+def test_model_info_supports_whisper_server_metadata_fields():
+    content = Path("codai/pydantic/textrequest.py").read_text()
+
+    assert "backend: Optional[str] = None" in content
+    assert "model_path: Optional[str] = None" in content
+    assert "port: Optional[int] = None" in content
+    assert "gpu_device: Optional[int] = None" in content
+    assert "load_mode: Optional[str] = None" in content
+
+
+def test_removed_whisper_server_admin_routes_return_not_found(monkeypatch):
+    from codai.admin import routes
+    from codai.api.app import app
+
+    app.dependency_overrides[routes.require_admin] = lambda: "admin"
+    client = TestClient(app)
+
+    assert client.get("/admin/api/whisper-server/status").status_code == 404
+    assert client.post("/admin/api/whisper-server/start", json={}).status_code == 404
+    assert client.post("/admin/api/whisper-server/stop", json={}).status_code == 404
+
+    app.dependency_overrides.clear()
