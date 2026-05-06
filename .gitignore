@@ -23,3 +23,6 @@ test_*.py
 !tests/
 !tests/test_admin_auth.py
 !tests/test_whisper_server_local_models.py
+
+# Local git worktrees
+.worktrees/
