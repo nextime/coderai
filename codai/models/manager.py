@@ -413,6 +413,7 @@ class MultiModelManager:
         self.models_in_vram: set = set()  # all models currently in VRAM
         self.model_aliases: Dict[str, str] = {}
         self.whisper_server: Optional[WhisperServerManager] = None
+        self.whisper_servers: Dict[str, WhisperServerManager] = {}
         self.model_backend_types: Dict[str, str] = {}
         self.tool_breaker = FuzzyToolBreaker(threshold=3)  # Circuit breaker for repetitive tool calls
     
@@ -438,6 +439,12 @@ class MultiModelManager:
                 self.whisper_server.stop()
             except Exception as e:
                 print(f"Warning: Error cleaning up whisper server: {e}")
+        for manager in self.whisper_servers.values():
+            try:
+                manager.stop()
+            except Exception as e:
+                print(f"Warning: Error cleaning up whisper-server instance: {e}")
+        self.whisper_servers.clear()
         
         # Clear all model lists
         self.default_model = None
@@ -646,6 +653,10 @@ class MultiModelManager:
             self.audio_models.append(model_name)
         self.config[f"audio:{model_name}"] = config or {}
 
+        if isinstance(config, dict) and config.get("backend") == "whisper-server":
+            print(f"Registered whisper-server audio model: {model_name}")
+            return
+
         # Download/cache the model at startup if it's a URL or HF ID
         resolved_model = self.load_model(model_name)
         if resolved_model != model_name:
@@ -654,6 +665,21 @@ class MultiModelManager:
             self.audio_models[idx] = resolved_model
             self.config[f"audio:{resolved_model}"] = self.config.pop(f"audio:{model_name}")
             print(f"Audio model '{model_name}' cached as: {resolved_model}")
+
+    def register_whisper_server(self, model_id: str, server_path: str, model_path: str = None,
+                                 port: int = 8744, gpu_device: int = 0, config: Dict = None):
+        """Register a whisper-server instance as an audio model."""
+        wsm = WhisperServerManager(server_path=server_path, port=port)
+        wsm._model_path = model_path
+        wsm._gpu_device = gpu_device
+        self.whisper_servers[model_id] = wsm
+        if model_id not in self.audio_models:
+            self.audio_models.append(model_id)
+        cfg = config or {}
+        cfg.setdefault("load_mode", "on-request")
+        self.config[f"audio:{model_id}"] = cfg
+        print(f"Registered whisper-server audio model: {model_id} (server: {server_path})")
+        return wsm
     
     def set_tts_model(self, model_name: str, config: Dict = None):
         """Set the text-to-speech model and download/cache it if needed."""

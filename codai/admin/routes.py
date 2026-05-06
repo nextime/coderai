@@ -1123,6 +1123,17 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
                 raise RuntimeError("Model failed to load")
             multi_model_manager.models[result["model_key"] or path] = mm
             multi_model_manager.active_in_vram = result["model_key"] or path
+        elif model_type == "audio":
+            wsm = multi_model_manager.whisper_servers.get(path)
+            if wsm is not None:
+                started = wsm.start(getattr(wsm, "_model_path", None), gpu_device=getattr(wsm, "_gpu_device", 0))
+                if not wsm.is_running():
+                    raise RuntimeError("whisper-server failed to start")
+                model_key = f"audio:{path}"
+                multi_model_manager.models[model_key] = wsm
+                multi_model_manager.active_in_vram = model_key
+                multi_model_manager.models_in_vram.add(model_key)
+                return {"success": True, "already_loaded": False, "started_model": started}
         elif model_type == "image":
             from codai.api.images import _load_diffusers_pipeline, _is_gguf_model, _load_sdcpp_model
             from codai.api.state import get_global_args
@@ -1194,6 +1205,38 @@ async def api_model_configure(request: Request, username: str = Depends(require_
     if config_manager is None:
         raise HTTPException(status_code=503, detail="Config manager not initialized")
     data = await request.json()
+    if data.get("backend") == "whisper-server":
+        model_id = (data.get("model_id") or "").strip()
+        if not model_id:
+            raise HTTPException(status_code=400, detail="model_id is required")
+        server_path = (data.get("server_path") or "").strip()
+        if not server_path:
+            raise HTTPException(status_code=400, detail="server_path is required")
+        port = int(data.get("port", 8744))
+        if port < 1 or port > 65535:
+            raise HTTPException(status_code=400, detail="port must be between 1 and 65535")
+        gpu_device = int(data.get("gpu_device", 0))
+        if gpu_device < 0:
+            raise HTTPException(status_code=400, detail="gpu_device must be >= 0")
+        for existing in config_manager.models_data.get("audio_models", []):
+            if isinstance(existing, dict) and existing.get("id") == model_id:
+                raise HTTPException(status_code=409, detail=f"whisper-server model '{model_id}' already exists")
+        entry = {
+            "id": model_id,
+            "backend": "whisper-server",
+            "server_path": server_path,
+            "model_path": (data.get("model_path") or "").strip() or None,
+            "port": port,
+            "gpu_device": gpu_device,
+            "load_mode": data.get("load_mode", "on-request"),
+            "model_type": "audio_models",
+            "model_types": ["audio_models"],
+        }
+        if data.get("used_vram_gb") is not None:
+            entry["used_vram_gb"] = data["used_vram_gb"]
+        config_manager.models_data.setdefault("audio_models", []).append(entry)
+        config_manager.save_models()
+        return {"success": True}
     path = data.get("path") or data.get("model_id", "")
     model_type = data.get("model_type", "text_models")
     # Treat legacy gguf_models as text_models (GGUF is a format, not a type)

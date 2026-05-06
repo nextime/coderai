@@ -58,10 +58,23 @@ async def create_transcription(
     """
     Audio transcription endpoint (OpenAI-compatible).
     """
-    # Check if whisper-server is available FIRST
-    if multi_model_manager.whisper_server and multi_model_manager.whisper_server.is_running():
+    # Check if the requested model maps to a configured whisper-server instance first
+    whisper_server = multi_model_manager.whisper_servers.get(model)
+    if whisper_server is not None:
         file_content = await file.read()
-        result = multi_model_manager.whisper_server.transcribe(
+        if not whisper_server.is_running():
+            whisper_server.start(
+                getattr(whisper_server, "_model_path", None),
+                gpu_device=getattr(whisper_server, "_gpu_device", 0),
+            )
+            if whisper_server.is_running():
+                ws_key = f"audio:{model}"
+                multi_model_manager.models[ws_key] = whisper_server
+                multi_model_manager.active_in_vram = ws_key
+                multi_model_manager.models_in_vram.add(ws_key)
+        if not whisper_server.is_running():
+            raise HTTPException(status_code=500, detail="whisper-server failed to start")
+        result = whisper_server.transcribe(
             file_content,
             language=language,
             prompt=prompt
