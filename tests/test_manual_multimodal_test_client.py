@@ -380,6 +380,41 @@ def test_build_request_spec_for_transcription_downloads_missing_managed_default(
     uploaded_file.close()
 
 
+def test_build_request_spec_for_transcription_downloads_missing_default_audio(tmp_path, monkeypatch):
+    managed_path = tmp_path / "samples" / "transcription.wav"
+    calls = []
+    config = {
+        "mode": "transcription",
+        "url": "http://127.0.0.1:6745",
+        "model": "audio:test",
+        "prompt": "Transcribe carefully",
+        "output_dir": tmp_path,
+        "token": None,
+        "audio_file": str(managed_path),
+        "video_file": None,
+        "response_format": None,
+    }
+
+    def fake_ensure(path_value, flag_name):
+        calls.append((path_value, flag_name))
+        managed_path.parent.mkdir(parents=True, exist_ok=True)
+        managed_path.write_bytes(b"downloaded-audio")
+        return managed_path
+
+    monkeypatch.setattr(
+        "tools.manual_multimodal_test_client.ensure_sample_file",
+        fake_ensure,
+    )
+
+    spec = build_request_spec(config)
+
+    uploaded_name, uploaded_file = spec["files"]["file"]
+    assert calls == [(str(managed_path), "--audio-file")]
+    assert uploaded_name == "transcription.wav"
+    assert uploaded_file.read() == b"downloaded-audio"
+    uploaded_file.close()
+
+
 def test_build_request_spec_for_audio_generation_uses_json_payload(tmp_path):
     config = {
         "mode": "audio-generation",
@@ -458,6 +493,39 @@ def test_build_request_spec_for_video_doubt_request_builder_uses_text_endpoint_w
     assert "local path reference only" in spec["json"]["messages"][0]["content"]
     assert "may or may not support reasoning from that reference" in spec["json"]["messages"][0]["content"]
     assert "acknowledge that limitation" in spec["json"]["messages"][0]["content"]
+
+
+def test_build_request_spec_for_video_doubt_downloads_missing_default_video(tmp_path, monkeypatch):
+    managed_path = tmp_path / "samples" / "question-video.mp4"
+    calls = []
+    config = {
+        "mode": "video-doubt",
+        "url": "http://127.0.0.1:6745",
+        "model": "vision:test",
+        "prompt": "What happens in this clip?",
+        "output_dir": tmp_path,
+        "token": None,
+        "audio_file": None,
+        "video_file": str(managed_path),
+        "response_format": None,
+    }
+
+    def fake_ensure(path_value, flag_name):
+        calls.append((path_value, flag_name))
+        managed_path.parent.mkdir(parents=True, exist_ok=True)
+        managed_path.write_bytes(b"video-bytes")
+        return managed_path
+
+    monkeypatch.setattr(
+        "tools.manual_multimodal_test_client.ensure_sample_file",
+        fake_ensure,
+    )
+
+    spec = build_request_spec(config)
+
+    assert calls == [(str(managed_path), "--video-file")]
+    assert str(managed_path) in spec["json"]["messages"][0]["content"]
+    assert "What happens in this clip?" in spec["json"]["messages"][0]["content"]
 
 
 def test_build_request_spec_for_music_audio_doubt_request_builder_uses_text_endpoint_with_audio_context(tmp_path):
