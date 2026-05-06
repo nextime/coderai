@@ -106,8 +106,19 @@ def download_default_sample(path: Path) -> Path:
     return path
 
 
+def _managed_sample_key(path: Path) -> str:
+    return path.as_posix()
+
+
 def ensure_sample_file(path_value: str | None, flag_name: str) -> Path:
-    return _require_file(path_value, flag_name)
+    if not path_value:
+        raise FileNotFoundError(f"Missing required file. Supply {flag_name}.")
+    path = Path(path_value)
+    if path.exists():
+        return path
+    if _managed_sample_key(path) in SAMPLE_URLS:
+        return download_default_sample(path)
+    raise FileNotFoundError(f"File not found: {path}. Supply {flag_name}.")
 
 
 def build_request_spec(config: dict) -> dict:

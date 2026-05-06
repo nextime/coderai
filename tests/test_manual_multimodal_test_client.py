@@ -144,6 +144,32 @@ def test_ensure_sample_file_returns_existing_path_without_download(tmp_path, mon
     assert calls == []
 
 
+def test_ensure_sample_file_downloads_missing_managed_default(tmp_path, monkeypatch):
+    managed_path = tmp_path / "samples" / "question-audio.wav"
+    downloaded = []
+
+    def fake_download(path):
+        downloaded.append(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"audio")
+        return path
+
+    monkeypatch.setattr(
+        "tools.manual_multimodal_test_client.SAMPLE_URLS",
+        {managed_path.as_posix(): "https://example.invalid/question-audio.wav"},
+    )
+    monkeypatch.setattr(
+        "tools.manual_multimodal_test_client.download_default_sample",
+        fake_download,
+    )
+
+    result = ensure_sample_file(str(managed_path), "--audio-file")
+
+    assert result == managed_path
+    assert downloaded == [managed_path]
+    assert managed_path.read_bytes() == b"audio"
+
+
 def test_build_request_spec_for_llm_uses_chat_completions_payload(tmp_path):
     config = {
         "mode": "llm",
