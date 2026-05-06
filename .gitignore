@@ -20,3 +20,5 @@ debug.log
 
 # Test files
 test_*.py
+!tests/
+!tests/test_whisper_server_local_models.py

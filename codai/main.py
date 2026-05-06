@@ -370,16 +370,21 @@ def main():
         mid = _model_id(m)
         if not mid:
             continue
-        backend = m.get("backend", "") if isinstance(m, dict) else ""
-        if backend == "whisper-server":
-            # Register as a whisper-server instance
+        if isinstance(m, dict) and m.get("backend") == "whisper-server":
             cfg = _model_cfg(m, "audio")
+            cfg.update({
+                "backend": "whisper-server",
+                "server_path": m.get("server_path", ""),
+                "model_path": m.get("model_path") or None,
+                "port": int(m.get("port", 8744)),
+                "gpu_device": int(m.get("gpu_device", 0)),
+            })
             multi_model_manager.register_whisper_server(
                 model_id=mid,
-                server_path=m.get("server_path", config.whisper.server_path or ""),
+                server_path=m.get("server_path", ""),
                 model_path=m.get("model_path") or None,
-                port=int(m.get("port", config.whisper.server_port)),
-                gpu_device=int(m.get("gpu_device", config.vulkan.device_id)),
+                port=int(m.get("port", 8744)),
+                gpu_device=int(m.get("gpu_device", 0)),
                 config=cfg,
             )
         else:

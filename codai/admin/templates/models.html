@@ -95,17 +95,26 @@
     <div id="gguf-models-list"><span class="muted small">Loading…</span></div>
   </div>
 
-  <!-- Whisper Server -->
-  <div class="card mb-0" style="margin-top:1rem" id="ws-card">
-    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem">
-      <div>
-        <div class="card-title" style="margin:0">whisper-server <span class="muted" style="font-size:11px;font-weight:400">— native subprocess (AMD/Vulkan)</span></div>
-        <div id="ws-model-status" class="muted small" style="margin-top:.25rem">—</div>
-      </div>
-      <div style="display:flex;align-items:center;gap:.5rem">
-        <span id="ws-running-badge" style="font-size:12px;font-weight:500">—</span>
-        <a href="/admin/settings" class="btn btn-sm btn-ghost">Configure</a>
-      </div>
+  <div class="card mb-0" style="margin-top:1rem" id="ws-model-builder">
+    <div class="card-title">Whisper-server simulated models</div>
+    <p class="muted small" style="margin-top:0">Create local audio models backed by dedicated whisper-server subprocess configurations.</p>
+    <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem">
+      <input id="ws-model-id" class="form-input" placeholder="whisper-vulkan-base">
+      <input id="ws-server-path" class="form-input" placeholder="/usr/local/bin/whisper-server">
+      <input id="ws-model-path" class="form-input" placeholder="/models/ggml-base.bin">
+      <input id="ws-port" class="form-input" type="number" value="8744" min="1" max="65535">
+      <input id="ws-gpu-device" class="form-input" type="number" value="0" min="0">
+      <select id="ws-load-mode" class="form-input">
+        <option value="on-request">On request</option>
+        <option value="load">Load</option>
+      </select>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.75rem;margin-top:.75rem">
+      <input id="ws-used-vram" class="form-input" type="number" min="0" step="0.1" placeholder="Used VRAM (optional)">
+      <div></div>
+    </div>
+    <div class="form-actions" style="margin-top:.75rem">
+      <button class="btn btn-primary" onclick="addWhisperServerModel()">Add model</button>
     </div>
   </div>
 </div>
@@ -513,33 +522,6 @@ async function loadGlobalSettings(){
     if(r.ok){
       const d = await r.json();
       _defaultOffloadDir = d.offload?.directory || './offload';
-    }
-  }catch{}
-}
-
-async function loadWsStatus(){
-  try{
-    const s = await fetch('/admin/api/whisper-server/status').then(r=>r.json());
-    const card = document.getElementById('ws-card');
-    const badge = document.getElementById('ws-running-badge');
-    const modelEl = document.getElementById('ws-model-status');
-    const entries = Object.entries(s);
-    if(!entries.length){
-      card.style.display = 'none';
-      return;
-    }
-    card.style.display = '';
-    const running = entries.filter(([,v])=>v.running);
-    if(running.length){
-      badge.textContent = `● ${running.length}/${entries.length} running`;
-      badge.style.color = 'var(--green, #4ade80)';
-      card.style.borderColor = 'rgba(74,222,128,.3)';
-      modelEl.textContent = running.map(([id,v])=>`${id}: ${v.model||'?'} @ ${v.url}`).join(' | ');
-    } else {
-      badge.textContent = '○ stopped';
-      badge.style.color = 'var(--text-2)';
-      card.style.borderColor = '';
-      modelEl.textContent = entries.map(([id])=>id).join(', ') + ' — not started';
     }
   }catch{}
 }
@@ -982,6 +964,57 @@ async function loadCacheStats(){
 
 let _localModels = [];
 
+function _renderWhisperServerRows(models){
+  if(!models.length) return '';
+  const rows = models.map(m=>{
+    const idx = _localModels.length;
+    _localModels.push({
+      label:m.id,
+      path:m.id,
+      cacheType:'whisper-server',
+      size_gb:0,
+      defaultType:'audio_models',
+      settings:{
+        backend:m.backend || 'whisper-server',
+        load_mode:m.load_mode || 'on-request',
+        model_type:'audio_models',
+        model_path:m.model_path || '',
+        port:m.port,
+        gpu_device:m.gpu_device,
+      },
+      in_config:true,
+      capabilities:m.capabilities || ['speech_to_text']
+    });
+    const loaded = _loadedKeys.has(`audio:${m.id}`) || _loadedKeys.has(m.id);
+    return `<tr style="border-top:1px solid var(--border)">
+      <td style="padding:.4rem .25rem;font-family:monospace;font-size:12px">${esc(m.id)}</td>
+      <td style="padding:.4rem .25rem"><span class="badge badge-ok">${esc(m.backend || 'whisper-server')}</span></td>
+      <td style="padding:.4rem .25rem;font-size:11px;color:var(--text-2)">${esc(m.model_path || '—')}</td>
+      <td style="padding:.4rem .25rem;font-size:11px;color:var(--text-2)">${m.port ?? '—'} / GPU ${m.gpu_device ?? 0}</td>
+      <td style="padding:.4rem .25rem;font-size:11px;color:var(--text-2)">${esc(m.load_mode || 'on-request')}</td>
+      <td style="padding:.4rem .25rem;text-align:center">${loaded?'<span class="badge badge-ok">loaded</span>':'<span class="muted small">idle</span>'}</td>
+      <td style="padding:.4rem .25rem;text-align:right;white-space:nowrap">
+        ${loaded
+          ?`<button class="btn btn-ghost btn-sm" onclick="unloadModel(${idx})">Unload</button>`
+          :`<button class="btn btn-primary btn-sm" onclick="loadModel(${idx})">Load now</button>`}
+        <button class="btn btn-secondary btn-sm" onclick="openCfgModal(${idx})">Configure</button>
+        <button class="btn btn-ghost btn-sm" onclick="disableModel(${idx})">Remove</button>
+      </td>
+    </tr>`;
+  });
+  return '<div class="card" style="margin-top:1rem">'+
+    '<div class="card-title">Configured whisper-server models</div>'+
+    '<table style="width:100%;border-collapse:collapse;font-size:13px">'+
+    '<thead><tr style="color:var(--text-2);font-size:10px;text-transform:uppercase;letter-spacing:.05em">'+
+    '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Model</th>'+
+    '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Backend</th>'+
+    '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Model path</th>'+
+    '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Port / GPU</th>'+
+    '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Load mode</th>'+
+    '<th style="text-align:center;padding:.3rem .25rem;font-weight:700">Status</th>'+
+    '<th></th></tr></thead><tbody>'+rows.join('')+'</tbody></table></div>';
+}
+
 async function loadCachedModels(){
   _localModels = [];
   const hfEl   = document.getElementById('hf-models-list');
@@ -991,6 +1024,8 @@ async function loadCachedModels(){
     const r = await fetch('/admin/api/cached-models');
     if(!r.ok) throw new Error((await r.json()).detail||r.statusText);
     const d = await r.json();
+    const whisperModels = (await fetch('/admin/api/models').then(r=>r.ok?r.json():[]))
+      .filter(m => m.backend === 'whisper-server');
 
     // HF models
     const hf = d.hf||[];
@@ -1067,6 +1102,7 @@ async function loadCachedModels(){
         '<th style="text-align:center;padding:.3rem .25rem;font-weight:700">Config</th>'+
         '<th></th></tr></thead><tbody>'+rows.join('')+'</tbody></table>';
     }
+    ggufEl.insertAdjacentHTML('afterend', _renderWhisperServerRows(whisperModels));
   }catch(e){
     hfEl.innerHTML = ggufEl.innerHTML = `<span class="muted small">Error: ${esc(e.message)}</span>`;
   }
@@ -1089,8 +1125,6 @@ async function refreshLocal(){
 
 loadGlobalSettings();
 refreshLocal();
-loadWsStatus();
-setInterval(loadWsStatus, 5000);
 
 async function clearCacheConfirm(type){
   const labels = {hf:'HuggingFace', gguf:'GGUF', all:'ALL'};
@@ -1232,6 +1266,9 @@ function openCfgModal(idx){
   document.getElementById('cfg-parser').value = s.parser || 'auto';
   document.getElementById('cfg-tools').checked = !!s.tools_closer_prompt;
   document.getElementById('cfg-grammar').checked = !!s.grammar_guided;
+  if (m.cacheType === 'whisper-server') {
+    document.getElementById('cfg-backend').value = 'cpu';
+  }
   openModal('cfg-modal');
 }
 
@@ -1279,6 +1316,31 @@ async function saveModelConfig(){
     const d = await r.json();
     if(d.success){ closeModal('cfg-modal'); loadCachedModels(); }
     else alert('Error: '+(d.detail||'Unknown'));
+  }catch(e){ alert('Error: '+e.message); }
+}
+
+async function addWhisperServerModel(){
+  const usedVram = parseFloat(document.getElementById('ws-used-vram').value);
+  const payload = {
+    model_id: document.getElementById('ws-model-id').value.trim(),
+    model_type: 'audio_models',
+    backend: 'whisper-server',
+    server_path: document.getElementById('ws-server-path').value.trim(),
+    model_path: document.getElementById('ws-model-path').value.trim() || null,
+    port: parseInt(document.getElementById('ws-port').value, 10) || 8744,
+    gpu_device: parseInt(document.getElementById('ws-gpu-device').value, 10) || 0,
+    load_mode: document.getElementById('ws-load-mode').value,
+    used_vram_gb: Number.isNaN(usedVram) ? null : usedVram,
+  };
+  try{
+    const r = await fetch('/admin/api/model-configure', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.detail || 'Failed to add whisper-server model');
+    refreshLocal();
   }catch(e){ alert('Error: '+e.message); }
 }
 

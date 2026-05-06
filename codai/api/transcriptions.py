@@ -134,33 +134,30 @@ async def create_transcription(
     if len(file_content) > _MAX_AUDIO_BYTES:
         raise HTTPException(status_code=413, detail="Audio file too large (max 100 MB)")
 
-    # Check if the requested model is a whisper-server instance
-    wsm = multi_model_manager.whisper_servers.get(model)
-    if wsm is None and multi_model_manager.whisper_server is not None:
-        # Legacy single-instance fallback: use it if no specific match
-        if not multi_model_manager.whisper_servers:
-            wsm = multi_model_manager.whisper_server
-
-    if wsm is not None:
-        ws_key = f"audio:{model}" if model in multi_model_manager.whisper_servers else "audio:whisper-server"
-
-        # Let the VRAM manager evict other models if needed
+    # Check if the requested model maps to a configured whisper-server instance first
+    whisper_server = multi_model_manager.whisper_servers.get(model)
+    if whisper_server is not None:
         multi_model_manager.request_model(requested_model=model, model_type="audio")
-
-        # Start the subprocess if it isn't running (on-demand)
-        if not wsm.is_running():
-            wsm.start(getattr(wsm, '_model_path', None), gpu_device=getattr(wsm, '_gpu_device', 0))
-            if wsm.is_running():
-                multi_model_manager.models[ws_key] = wsm
+        if not whisper_server.is_running():
+            whisper_server.start(
+                getattr(whisper_server, "_model_path", None),
+                gpu_device=getattr(whisper_server, "_gpu_device", 0),
+            )
+            if whisper_server.is_running():
+                ws_key = f"audio:{model}"
+                multi_model_manager.models[ws_key] = whisper_server
                 multi_model_manager.active_in_vram = ws_key
                 multi_model_manager.models_in_vram.add(ws_key)
-
-        if wsm.is_running():
-            result = wsm.transcribe(file_content, language=language, prompt=prompt)
-            if "error" in result:
-                raise HTTPException(status_code=500, detail=result["error"])
-            return _format_response(response_format, result.get("text", ""), [])
-        # Fall through to Python backends if subprocess failed to start
+        if not whisper_server.is_running():
+            raise HTTPException(status_code=500, detail="whisper-server failed to start")
+        result = whisper_server.transcribe(
+            file_content,
+            language=language,
+            prompt=prompt
+        )
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        return _format_response(response_format, result.get("text", ""), [])
 
     # Use the manager to resolve the model and manage VRAM
     model_info = multi_model_manager.request_model(

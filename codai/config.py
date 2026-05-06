@@ -344,10 +344,6 @@ class ConfigManager:
                 "vae_tiling": self.config.image.vae_tiling,
                 "clip_on_cpu": self.config.image.clip_on_cpu
             },
-            "whisper": {
-                "server_path": self.config.whisper.server_path,
-                "server_port": self.config.whisper.server_port
-            },
             "system_prompt": self.config.system_prompt,
             "tools_closer_prompt": self.config.tools_closer_prompt,
             "grammar_guided": self.config.grammar_guided,

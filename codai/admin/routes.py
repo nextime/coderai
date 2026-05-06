@@ -1172,6 +1172,17 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
                 raise RuntimeError("Model failed to load")
             multi_model_manager.models[result["model_key"] or path] = mm
             multi_model_manager.active_in_vram = result["model_key"] or path
+        elif model_type == "audio":
+            wsm = multi_model_manager.whisper_servers.get(path)
+            if wsm is not None:
+                started = wsm.start(getattr(wsm, "_model_path", None), gpu_device=getattr(wsm, "_gpu_device", 0))
+                if not wsm.is_running():
+                    raise RuntimeError("whisper-server failed to start")
+                model_key = f"audio:{path}"
+                multi_model_manager.models[model_key] = wsm
+                multi_model_manager.active_in_vram = model_key
+                multi_model_manager.models_in_vram.add(model_key)
+                return {"success": True, "already_loaded": False, "started_model": started}
         elif model_type == "image":
             from codai.api.images import _load_diffusers_pipeline, _is_gguf_model, _load_sdcpp_model
             from codai.api.state import get_global_args
@@ -1243,6 +1254,38 @@ async def api_model_configure(request: Request, username: str = Depends(require_
     if config_manager is None:
         raise HTTPException(status_code=503, detail="Config manager not initialized")
     data = await request.json()
+    if data.get("backend") == "whisper-server":
+        model_id = (data.get("model_id") or "").strip()
+        if not model_id:
+            raise HTTPException(status_code=400, detail="model_id is required")
+        server_path = (data.get("server_path") or "").strip()
+        if not server_path:
+            raise HTTPException(status_code=400, detail="server_path is required")
+        port = int(data.get("port", 8744))
+        if port < 1 or port > 65535:
+            raise HTTPException(status_code=400, detail="port must be between 1 and 65535")
+        gpu_device = int(data.get("gpu_device", 0))
+        if gpu_device < 0:
+            raise HTTPException(status_code=400, detail="gpu_device must be >= 0")
+        for existing in config_manager.models_data.get("audio_models", []):
+            if isinstance(existing, dict) and existing.get("id") == model_id:
+                raise HTTPException(status_code=409, detail=f"whisper-server model '{model_id}' already exists")
+        entry = {
+            "id": model_id,
+            "backend": "whisper-server",
+            "server_path": server_path,
+            "model_path": (data.get("model_path") or "").strip() or None,
+            "port": port,
+            "gpu_device": gpu_device,
+            "load_mode": data.get("load_mode", "on-request"),
+            "model_type": "audio_models",
+            "model_types": ["audio_models"],
+        }
+        if data.get("used_vram_gb") is not None:
+            entry["used_vram_gb"] = data["used_vram_gb"]
+        config_manager.models_data.setdefault("audio_models", []).append(entry)
+        config_manager.save_models()
+        return {"success": True}
     path = data.get("path") or data.get("model_id", "")
     valid = {"text_models", "image_models", "audio_models", "tts_models", "vision_models", "video_models",
              "audio_gen_models", "embedding_models"}
@@ -1375,10 +1418,6 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "device_id": c.vulkan.device_id,
             "single_gpu": c.vulkan.single_gpu,
         },
-        "whisper": {
-            "server_path": c.whisper.server_path,
-            "server_port": c.whisper.server_port,
-        },
         "system_prompt": c.system_prompt,
         "tools_closer_prompt": c.tools_closer_prompt,
         "grammar_guided": c.grammar_guided,
@@ -1442,11 +1481,6 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         c.vulkan.device_id = int(vk.get("device_id", c.vulkan.device_id))
         c.vulkan.single_gpu = bool(vk.get("single_gpu", c.vulkan.single_gpu))
 
-    if "whisper" in data:
-        wh = data["whisper"]
-        c.whisper.server_path = wh.get("server_path") or None
-        c.whisper.server_port = int(wh.get("server_port", c.whisper.server_port))
-
     if "system_prompt" in data:
         c.system_prompt = data["system_prompt"] or None
     if "tools_closer_prompt" in data:
@@ -1458,83 +1492,6 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
 
     config_manager.save_config()
     return {"success": True}
-
-
-
-# --- Whisper-server management ---
-
-@router.get("/admin/api/whisper-server/status")
-async def api_whisper_server_status(username: str = Depends(require_admin)):
-    """Return status of all registered whisper-server instances."""
-    from codai.models.manager import multi_model_manager
-    if multi_model_manager.whisper_servers:
-        return {
-            mid: wsm.get_status()
-            for mid, wsm in multi_model_manager.whisper_servers.items()
-        }
-    # Legacy single-instance fallback
-    if multi_model_manager.whisper_server:
-        return {"whisper-server": multi_model_manager.whisper_server.get_status()}
-    return {}
-
-
-@router.post("/admin/api/whisper-server/start")
-async def api_whisper_server_start(request: Request, username: str = Depends(require_admin)):
-    """Start (or restart) a whisper-server instance by model_id."""
-    from codai.models.manager import multi_model_manager
-    data = await request.json()
-    model_id   = data.get("model_id", "whisper-server")
-    server_path = data.get("server_path", "")
-    model_path  = data.get("model_path") or None
-    port        = int(data.get("port", 8744))
-    gpu_device  = int(data.get("gpu_device", 0))
-
-    if not server_path:
-        raise HTTPException(status_code=400, detail="server_path required")
-
-    wsm = multi_model_manager.whisper_servers.get(model_id)
-    if wsm is None:
-        wsm = multi_model_manager.register_whisper_server(
-            model_id=model_id, server_path=server_path,
-            model_path=model_path, port=port, gpu_device=gpu_device,
-        )
-    else:
-        wsm.server_path = server_path
-        wsm.port = port
-        wsm.base_url = f"http://127.0.0.1:{port}"
-        wsm._model_path = model_path
-        wsm._gpu_device = gpu_device
-
-    result = wsm.start(model_path, gpu_device=gpu_device)
-    running = wsm.is_running()
-
-    if running:
-        ws_key = f"audio:{model_id}"
-        multi_model_manager.models[ws_key] = wsm
-        multi_model_manager.active_in_vram = ws_key
-        multi_model_manager.models_in_vram.add(ws_key)
-
-    return {"success": running, "running": running, "started_model": result}
-
-
-@router.post("/admin/api/whisper-server/stop")
-async def api_whisper_server_stop(request: Request, username: str = Depends(require_admin)):
-    """Stop a whisper-server instance by model_id."""
-    from codai.models.manager import multi_model_manager
-    data = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
-    model_id = data.get("model_id", "whisper-server")
-
-    wsm = multi_model_manager.whisper_servers.get(model_id) or multi_model_manager.whisper_server
-    if wsm:
-        wsm.stop()
-        ws_key = f"audio:{model_id}"
-        multi_model_manager.models.pop(ws_key, None)
-        multi_model_manager.models_in_vram.discard(ws_key)
-        if multi_model_manager.active_in_vram == ws_key:
-            multi_model_manager.active_in_vram = None
-    return {"success": True, "running": False}
-
-
 # --- HuggingFace model search proxy ---
 
 import re as _re

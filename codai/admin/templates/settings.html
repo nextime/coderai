@@ -69,48 +69,6 @@
     <span class="form-hint">Models will inherit this as default when configured</span>
   </div>
 </div>
-
-<!-- Whisper Server -->
-<div class="card mb-0" style="margin-top:1rem">
-  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem;margin-bottom:1rem">
-    <div class="card-title" style="margin:0">Whisper Server <span class="muted" style="font-size:11px;font-weight:400">(whisper.cpp native binary — recommended for AMD/Vulkan)</span></div>
-    <div style="display:flex;align-items:center;gap:.5rem">
-      <span id="ws-badge" class="muted small">—</span>
-      <button class="btn btn-sm btn-secondary" onclick="wsStart()">Start</button>
-      <button class="btn btn-sm btn-danger" onclick="wsStop()">Stop</button>
-    </div>
-  </div>
-  <div style="display:grid;grid-template-columns:1fr 160px;gap:1rem;align-items:start">
-    <div class="form-row" style="margin:0">
-      <label class="form-label">Model ID <span class="muted">(used in API calls, e.g. whisper-base)</span></label>
-      <input type="text" id="ws-id" class="form-input" placeholder="whisper-server">
-      <span class="form-hint">The name clients use in the <code>model</code> field of transcription requests</span>
-    </div>
-    <div class="form-row" style="margin:0">
-      <label class="form-label">Port</label>
-      <input type="number" id="ws-port" class="form-input" placeholder="8744" min="1024" max="65535">
-    </div>
-  </div>
-  <div style="display:grid;grid-template-columns:1fr 160px;gap:1rem;align-items:start;margin-top:1rem">
-    <div class="form-row" style="margin:0">
-      <label class="form-label">whisper-server binary path</label>
-      <input type="text" id="ws-path" class="form-input" placeholder="/usr/local/bin/whisper-server">
-    </div>
-    <div class="form-row" style="margin:0">
-      <label class="form-label">GPU device index</label>
-      <input type="number" id="ws-gpu" class="form-input" placeholder="0" min="0">
-    </div>
-  </div>
-  <div class="form-row" style="margin-top:1rem;margin-bottom:0">
-    <label class="form-label">Model path <span class="muted">(GGUF whisper model, e.g. ggml-base.bin)</span></label>
-    <input type="text" id="ws-model" class="form-input" placeholder="/path/to/ggml-base.bin">
-    <span class="form-hint">Configure multiple instances by adding entries to <code>models.json</code> with <code>"backend": "whisper-server"</code></span>
-  </div>
-  <p class="form-hint" style="margin-top:.75rem;margin-bottom:0">
-    When configured, the transcription endpoint uses this subprocess instead of the Python faster-whisper module.
-    Saves settings to <code>config.json</code> and takes effect immediately (no restart needed).
-  </p>
-</div>
 {% endblock %}
 
 {% block scripts %}
@@ -140,63 +98,8 @@ async function loadSettings(){
     document.getElementById('s-hf-cache').value   = d.models?.hf_cache_dir ?? '';
     document.getElementById('s-gguf-cache').value = d.models?.gguf_cache_dir ?? '';
     document.getElementById('s-offload-dir').value = d.offload?.directory ?? './offload';
-    document.getElementById('ws-path').value = d.whisper?.server_path ?? '';
-    document.getElementById('ws-port').value = d.whisper?.server_port ?? 8744;
     toggleHttps();
   }catch(e){ showAlert('error','Failed to load settings: '+e.message); }
-}
-
-async function loadWsStatus(){
-  try{
-    const s = await fetch('/admin/api/whisper-server/status').then(r=>r.json());
-    const badge = document.getElementById('ws-badge');
-    // s is now a dict of {model_id: {running, model, url}}
-    const entries = Object.entries(s);
-    if(!entries.length){
-      badge.textContent = '○ not configured';
-      badge.style.color = 'var(--text-2)';
-      return;
-    }
-    const running = entries.filter(([,v])=>v.running);
-    if(running.length){
-      badge.textContent = `● ${running.length} running`;
-      badge.style.color = 'var(--green, #4ade80)';
-    } else {
-      badge.textContent = '○ stopped';
-      badge.style.color = 'var(--text-2)';
-    }
-  }catch(e){}
-}
-
-async function wsStart(){
-  const path = document.getElementById('ws-path').value.trim();
-  if(!path){ showAlert('error','Binary path required'); return; }
-  try{
-    const r = await fetch('/admin/api/whisper-server/start',{
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({
-        model_id: document.getElementById('ws-id').value.trim() || 'whisper-server',
-        server_path: path,
-        model_path: document.getElementById('ws-model').value.trim() || null,
-        port: parseInt(document.getElementById('ws-port').value) || 8744,
-        gpu_device: parseInt(document.getElementById('ws-gpu').value) || 0,
-      })
-    });
-    const d = await r.json();
-    if(d.success) showAlert('info','whisper-server started');
-    else showAlert('error','Failed to start whisper-server');
-    loadWsStatus();
-  }catch(e){ showAlert('error','Error: '+e.message); }
-}
-
-async function wsStop(){
-  const modelId = document.getElementById('ws-id').value.trim() || 'whisper-server';
-  await fetch('/admin/api/whisper-server/stop',{
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({model_id: modelId})
-  });
-  showAlert('info','whisper-server stopped');
-  loadWsStatus();
 }
 
 async function saveSettings(){
@@ -216,11 +119,7 @@ async function saveSettings(){
     },
     offload:{
       directory: document.getElementById('s-offload-dir').value.trim() || './offload',
-    },
-    whisper:{
-      server_path: document.getElementById('ws-path').value.trim() || null,
-      server_port: parseInt(document.getElementById('ws-port').value) || 8744,
-    },
+    }
   };
   try{
     const r = await fetch('/admin/api/settings',{
@@ -233,7 +132,5 @@ async function saveSettings(){
 }
 
 loadSettings();
-loadWsStatus();
-setInterval(loadWsStatus, 5000);
 </script>
 {% endblock %}
