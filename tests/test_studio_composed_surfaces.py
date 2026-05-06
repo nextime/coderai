@@ -309,7 +309,7 @@ def test_admin_status_includes_recent_activity(studio_client, monkeypatch):
 
 
 def test_chat_template_wires_preview_shells_for_new_runnable_panels():
-    template_path = "/storage/coderai/codai/admin/templates/chat.html"
+    template_path = "/storage/coderai/.worktrees/web-admin-polish/codai/admin/templates/chat.html"
     text = open(template_path, "r", encoding="utf-8").read()
 
     assert "id=\"at-preview\"" in text
@@ -329,7 +329,7 @@ def test_chat_template_wires_preview_shells_for_new_runnable_panels():
 
 
 def test_chat_template_marks_full_quality_audio_panels_with_runtime_backend_metadata():
-    template_path = "/storage/coderai/codai/admin/templates/chat.html"
+    template_path = "/storage/coderai/.worktrees/web-admin-polish/codai/admin/templates/chat.html"
     text = open(template_path, "r", encoding="utf-8").read()
 
     assert "audioBackendHealth" in text
@@ -340,7 +340,7 @@ def test_chat_template_marks_full_quality_audio_panels_with_runtime_backend_meta
 
 
 def test_chat_template_exposes_ml_preview_and_artifact_markers():
-    template_path = "/storage/coderai/codai/admin/templates/chat.html"
+    template_path = "/storage/coderai/.worktrees/web-admin-polish/codai/admin/templates/chat.html"
     text = open(template_path, "r", encoding="utf-8").read()
 
     assert "buildStemPreviewData" in text
@@ -349,3 +349,11 @@ def test_chat_template_exposes_ml_preview_and_artifact_markers():
     assert "pushArtifactHistory({" in text
     assert "backend?.model" in text
     assert "translated_lyrics" in text
+
+
+def test_studio_generation_panel_uses_wider_control_column():
+    template_path = "/storage/coderai/.worktrees/web-admin-polish/codai/admin/templates/chat.html"
+    text = open(template_path, "r", encoding="utf-8").read()
+
+    assert ".gen-ctrl { width:min(380px,36vw); min-width:340px; max-width:420px;" in text
+    assert "@media (max-width: 720px) {" in text

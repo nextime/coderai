@@ -107,7 +107,7 @@
 
 /* ── Shared panel helpers ─────────────────────────────────────── */
 .gen-wrap { flex:1; display:flex; overflow:hidden; }
-.gen-ctrl { width:290px; padding:.9rem 1rem; overflow-y:auto; border-right:1px solid var(--border);
+.gen-ctrl { width:min(380px,36vw); min-width:340px; max-width:420px; padding:.9rem 1rem; overflow-y:auto; border-right:1px solid var(--border);
   background:var(--surface-1); display:flex; flex-direction:column; gap:.65rem; flex-shrink:0; }
 .gen-out { flex:1; display:flex; align-items:center; justify-content:center;
   overflow:auto; padding:1.2rem; background:var(--surface-0); }
@@ -140,6 +140,15 @@
 .webcam-box .webcam-controls { display:flex; gap:.4rem; flex-wrap:wrap; }
 /* download link styled as button */
 a.dl { display:inline-block; margin-top:.4rem; }
+
+@media (max-width: 900px) {
+  .gen-ctrl { width:min(360px,44vw); min-width:280px; }
+}
+
+@media (max-width: 720px) {
+  .gen-wrap { flex-direction:column; }
+  .gen-ctrl { width:100%; min-width:0; max-width:none; border-right:none; border-bottom:1px solid var(--border); }
+}
 
 /* ── Capability cards ─────────────────────────────────────────── */
 .cap-card {
