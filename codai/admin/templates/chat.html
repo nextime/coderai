@@ -148,7 +148,6 @@ a.dl { display:inline-block; margin-top:.4rem; }
 @media (max-width: 720px) {
   .gen-wrap { flex-direction:column; }
   .gen-ctrl { width:100%; min-width:0; max-width:none; border-right:none; border-bottom:1px solid var(--border); }
-  .pipe-shell { grid-template-columns:1fr; }
 }
 
 /* ── Capability cards ─────────────────────────────────────────── */
@@ -218,12 +217,6 @@ a.dl { display:inline-block; margin-top:.4rem; }
 
 /* ── Pipeline ─────────────────────────────────────────────────── */
 .pipe-panel { flex:1; overflow-y:auto; padding:1.2rem; display:flex; flex-direction:column; gap:.6rem; }
-.pipe-toolbar { display:flex; align-items:center; justify-content:space-between; gap:.75rem; flex-wrap:wrap; }
-.pipe-shell { display:grid; grid-template-columns:minmax(280px,360px) minmax(0,1fr); gap:.9rem; align-items:start; }
-.pipe-list, .pipe-editor { display:flex; flex-direction:column; gap:.6rem; }
-.pipe-empty-state { border:1px dashed var(--border-2); border-radius:8px; padding:1rem; color:var(--text-2); background:var(--surface-1); }
-.pipe-list-card { background:var(--surface-1); border:1px solid var(--border); border-radius:8px; padding:.8rem .9rem; display:flex; flex-direction:column; gap:.45rem; cursor:pointer; }
-.pipe-list-card.active { border-color:var(--accent); box-shadow:0 0 0 1px rgba(99,102,241,.2); }
 .pipe-card { background:var(--surface-1); border:1px solid var(--border); border-radius:8px; overflow:hidden; }
 .pipe-card summary {
   list-style:none; padding:.8rem 1rem; cursor:pointer; display:flex; align-items:flex-start;
@@ -1365,44 +1358,33 @@ a.dl { display:inline-block; margin-top:.4rem; }
           </div>
         </details>
 
-    <div class="pipe-toolbar">
-      <button class="btn btn-primary" onclick="createPipeline()">Create pipeline</button>
-      <div class="muted small" id="pipe-status">Loading pipelines…</div>
-    </div>
-    <div class="pipe-shell">
-      <div class="pipe-list" id="pipe-list"></div>
-      <div class="pipe-editor" id="pipe-editor">
-        <div class="pipe-empty-state" id="pipe-empty-state">No pipeline selected.</div>
-        <!-- Builder card (always open) -->
-        <details class="pipe-card" id="pipe-builder-card" open>
-          <summary>＋ Build New Pipeline
-            <span class="pipe-steps" style="margin:0;font-size:11px"><span class="pipe-step">Add steps</span><span class="pipe-arrow">→</span><span class="pipe-step">Configure</span><span class="pipe-arrow">→</span><span class="pipe-step">Save &amp; Run</span></span>
-          </summary>
-          <div class="pipe-card-body">
-            <div class="g2">
-              <div class="frow"><label class="fl">Pipeline name</label><input id="pb-name" class="fi" placeholder="My Pipeline"></div>
-              <div class="frow"><label class="fl">Description</label><input id="pb-desc" class="fi" placeholder="Optional"></div>
-            </div>
-            <div id="pb-steps" style="display:flex;flex-direction:column;gap:.4rem;margin:.25rem 0"></div>
-            <div style="display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.25rem">
-              <select id="pb-add-type" class="fselect" style="flex:1"></select>
-              <button class="btn btn-ghost btn-sm" onclick="pbAddStep()">＋ Add Step</button>
-            </div>
-            <div style="display:flex;gap:.4rem;margin-top:.5rem;flex-wrap:wrap">
-              <div class="frow" style="flex:1"><label class="fl">Pipeline input</label><input id="pb-input" class="fi" placeholder="Initial text/prompt passed as {{ '{{' }}input{{ '}}' }}"></div>
-            </div>
-            <div style="display:flex;gap:.4rem;margin-top:.5rem">
-              <button class="btn btn-primary" onclick="pbSaveAndRun()">Save &amp; Run</button>
-              <button class="btn btn-ghost btn-sm" onclick="pbSave()">Save only</button>
-              <button class="btn btn-ghost btn-sm" onclick="pbRun()">Run without saving</button>
-            </div>
-            <div class="progress" id="pb-prog"></div>
-            <div id="pb-out"></div>
-          </div>
-        </details>
-        <div id="custom-pipe-cards"></div>
+    <details class="pipe-card" id="pipe-builder-card" open>
+      <summary>＋ Build New Pipeline
+        <span class="pipe-steps" style="margin:0;font-size:11px"><span class="pipe-step">Add steps</span><span class="pipe-arrow">→</span><span class="pipe-step">Configure</span><span class="pipe-arrow">→</span><span class="pipe-step">Save &amp; Run</span></span>
+      </summary>
+      <div class="pipe-card-body">
+        <div class="g2">
+          <div class="frow"><label class="fl">Pipeline name</label><input id="pb-name" class="fi" placeholder="My Pipeline"></div>
+          <div class="frow"><label class="fl">Description</label><input id="pb-desc" class="fi" placeholder="Optional"></div>
+        </div>
+        <div id="pb-steps" style="display:flex;flex-direction:column;gap:.4rem;margin:.25rem 0"></div>
+        <div style="display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.25rem">
+          <select id="pb-add-type" class="fselect" style="flex:1"></select>
+          <button class="btn btn-ghost btn-sm" onclick="pbAddStep()">＋ Add Step</button>
+        </div>
+        <div style="display:flex;gap:.4rem;margin-top:.5rem;flex-wrap:wrap">
+          <div class="frow" style="flex:1"><label class="fl">Pipeline input</label><input id="pb-input" class="fi" placeholder="Initial text/prompt passed as {{ '{{' }}input{{ '}}' }}"></div>
+        </div>
+        <div style="display:flex;gap:.4rem;margin-top:.5rem">
+          <button class="btn btn-primary" onclick="pbSaveAndRun()">Save &amp; Run</button>
+          <button class="btn btn-ghost btn-sm" onclick="pbSave()">Save only</button>
+          <button class="btn btn-ghost btn-sm" onclick="pbRun()">Run without saving</button>
+        </div>
+        <div class="progress" id="pb-prog"></div>
+        <div id="pb-out"></div>
       </div>
-    </div>
+    </details>
+    <div id="custom-pipe-cards"></div>
 
     </div><!-- pipe-panel -->
     </div><!-- panel-pipe -->

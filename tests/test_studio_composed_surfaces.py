@@ -368,18 +368,31 @@ def test_studio_output_surfaces_capability_warnings():
     assert "renderOutputCapabilityNotes" in text
 
 
-def test_pipeline_tab_exposes_create_action_and_empty_state():
+def test_pipeline_tab_renders_builder_before_saved_custom_cards():
     template_path = "/storage/coderai/codai/admin/templates/chat.html"
     text = open(template_path, "r", encoding="utf-8").read()
 
-    assert "Create pipeline" in text
-    assert "pipe-empty-state" in text
-    assert "renderPipelineList" in text
+    builder_index = text.index('id="pipe-builder-card"')
+    custom_cards_index = text.index('id="custom-pipe-cards"')
+    assert builder_index < custom_cards_index
+    assert "＋ Build New Pipeline" in text
 
 
-def test_pipeline_tab_exposes_editor_shell():
+def test_pipeline_tab_drops_split_shell_layout():
     template_path = "/storage/coderai/codai/admin/templates/chat.html"
     text = open(template_path, "r", encoding="utf-8").read()
 
-    assert "pipe-editor" in text
-    assert "openPipeline" in text
+    assert 'class="pipe-shell"' not in text
+    assert 'class="pipe-list"' not in text
+    assert 'class="pipe-editor"' not in text
+    assert 'id="pipe-empty-state"' not in text
+
+
+def test_pipeline_tab_keeps_inline_saved_pipeline_cards():
+    template_path = "/storage/coderai/codai/admin/templates/chat.html"
+    text = open(template_path, "r", encoding="utf-8").read()
+
+    assert "renderCustomPipelineCards" in text
+    assert '<details class="pipe-card"' in text
+    assert "editCustomPipeline" in text
+    assert "deleteCustomPipeline" in text
