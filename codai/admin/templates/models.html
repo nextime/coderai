@@ -1421,6 +1421,7 @@ async function addWhisperServerModel(){
     if(!r.ok) throw new Error(d.detail || 'Failed to add whisper-server model');
     document.getElementById('ws-model-id').value = '';
     document.getElementById('ws-server-path').value = '';
+    resetWhisperServerBuilderDefaults();
     refreshLocal();
   }catch(e){ alert('Error: '+e.message); }
 }

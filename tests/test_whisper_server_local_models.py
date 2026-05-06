@@ -632,6 +632,7 @@ def test_models_template_resets_whisper_server_builder_defaults_after_refresh_an
     assert "resetWhisperServerBuilderDefaults();" in template
     assert "document.getElementById('ws-model-id').value = '';" in template
     assert "document.getElementById('ws-server-path').value = '';" in template
+    assert "resetWhisperServerBuilderDefaults();\n    refreshLocal();" in template
     assert "refreshLocal();" in template
 
 
