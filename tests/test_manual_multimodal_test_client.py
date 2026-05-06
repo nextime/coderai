@@ -48,15 +48,39 @@ def test_resolve_mode_config_uses_mode_defaults_when_overrides_absent(tmp_path):
     assert config["url"] == "http://127.0.0.1:6745"
     assert config["model"] == MODE_DEFAULTS["audio-generation"]["model"]
     assert config["prompt"] == MODE_DEFAULTS["audio-generation"]["prompt"]
+    assert config["response_format"] == MODE_DEFAULTS["audio-generation"]["response_format"]
     assert config["output_dir"] == tmp_path
+    assert "file" not in config
 
 
-def test_resolve_mode_config_prefers_explicit_model_prompt_and_url_overrides(tmp_path):
+def test_resolve_mode_config_normalizes_url_and_uses_default_input_files(tmp_path):
+    args = parse_args([
+        "transcription",
+        "--url", "http://127.0.0.1:6745/",
+        "--output-dir", str(tmp_path),
+    ])
+
+    config = resolve_mode_config(args, selected_mode="transcription")
+
+    assert config["url"] == "http://127.0.0.1:6745"
+    assert config["audio_file"] == MODE_DEFAULTS["transcription"]["audio_file"]
+
+
+def test_resolve_mode_config_uses_default_video_file_for_video_doubt(tmp_path):
+    args = parse_args(["video-doubt", "--output-dir", str(tmp_path)])
+
+    config = resolve_mode_config(args, selected_mode="video-doubt")
+
+    assert config["video_file"] == MODE_DEFAULTS["video-doubt"]["video_file"]
+
+
+def test_resolve_mode_config_prefers_explicit_model_prompt_url_and_response_format_overrides(tmp_path):
     args = parse_args([
         "video-generation",
-        "--url", "http://example.invalid:9999",
+        "--url", "http://example.invalid:9999/",
         "--model", "video:custom-model",
         "--prompt", "Custom prompt",
+        "--response-format", "b64_json",
         "--output-dir", str(tmp_path),
     ])
 
@@ -65,4 +89,5 @@ def test_resolve_mode_config_prefers_explicit_model_prompt_and_url_overrides(tmp
     assert config["url"] == "http://example.invalid:9999"
     assert config["model"] == "video:custom-model"
     assert config["prompt"] == "Custom prompt"
+    assert config["response_format"] == "b64_json"
     assert config["output_dir"] == tmp_path
