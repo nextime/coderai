@@ -275,3 +275,30 @@ def execute_request(spec: dict):
     finally:
         if cleanup is not None:
             cleanup()
+
+
+def execute_mode(args: argparse.Namespace, selected_mode: str) -> dict:
+    config = resolve_mode_config(args, selected_mode)
+    spec = build_request_spec(config)
+    response = execute_request(spec)
+    return handle_response_payload(selected_mode, response, config["output_dir"])
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    selected_mode = args.mode or choose_mode_interactively()
+    try:
+        result = execute_mode(args, selected_mode)
+    except Exception as exc:
+        print(f"ERROR [{selected_mode}]: {exc}")
+        return 1
+
+    if result.get("text"):
+        print(result["text"])
+    if result.get("artifact_path") is not None:
+        print(result["artifact_path"])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

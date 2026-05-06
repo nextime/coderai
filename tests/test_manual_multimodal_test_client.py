@@ -549,3 +549,37 @@ def test_task5_execute_request_filters_method_and_url_from_forwarded_kwargs(monk
     assert captured["kwargs"] == {"params": {"verbose": "1"}}
     assert "method" not in captured["kwargs"]
     assert "url" not in captured["kwargs"]
+
+
+def test_main_runs_selected_mode_and_prints_text(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr("tools.manual_multimodal_test_client.choose_mode_interactively", lambda: "llm")
+    monkeypatch.setattr(
+        "tools.manual_multimodal_test_client.execute_mode",
+        lambda args, selected_mode: {"text": "done", "artifact_path": None},
+    )
+
+    from tools.manual_multimodal_test_client import main
+
+    exit_code = main(["--output-dir", str(tmp_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "done" in captured.out
+
+
+def test_main_prints_artifact_path_when_present(monkeypatch, capsys, tmp_path):
+    artifact = tmp_path / "out.wav"
+    artifact.write_bytes(b"bytes")
+    monkeypatch.setattr(
+        "tools.manual_multimodal_test_client.execute_mode",
+        lambda args, selected_mode: {"text": "summary", "artifact_path": artifact},
+    )
+
+    from tools.manual_multimodal_test_client import main
+
+    exit_code = main(["audio-generation", "--output-dir", str(tmp_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "summary" in captured.out
+    assert str(artifact) in captured.out
