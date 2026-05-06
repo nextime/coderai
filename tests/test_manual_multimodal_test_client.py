@@ -234,7 +234,7 @@ def test_build_request_spec_for_video_generation_uses_json_payload(tmp_path):
     }
 
 
-def test_build_request_spec_for_video_doubt_uses_text_endpoint_with_video_context(tmp_path):
+def test_build_request_spec_for_video_doubt_request_builder_uses_text_endpoint_with_video_context(tmp_path):
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"video-bytes")
     config = {
@@ -257,7 +257,7 @@ def test_build_request_spec_for_video_doubt_uses_text_endpoint_with_video_contex
     assert "What happens in this clip?" in spec["json"]["messages"][0]["content"]
 
 
-def test_build_request_spec_for_music_audio_doubt_uses_text_endpoint_with_audio_context(tmp_path):
+def test_build_request_spec_for_music_audio_doubt_request_builder_uses_text_endpoint_with_audio_context(tmp_path):
     audio_path = tmp_path / "clip.wav"
     audio_path.write_bytes(b"audio-bytes")
     config = {
