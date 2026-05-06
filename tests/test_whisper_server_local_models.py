@@ -401,6 +401,17 @@ def test_models_template_contains_whisper_server_add_model_form():
     assert "Add model" in template
     assert "ws-model-id" in template
     assert "ws-server-path" in template
+    assert "Downloaded GGUF" in template
+    assert "Manual path" in template
+    assert "ws-model-source" in template
+    assert "ws-gguf-select" in template
+
+
+def test_models_template_preserves_whisper_server_manual_path_controls():
+    template = Path("codai/admin/templates/models.html").read_text()
+
+    assert "ws-model-path" in template
+    assert "Manual path" in template
 
 
 def test_settings_template_no_longer_contains_whisper_server_section():

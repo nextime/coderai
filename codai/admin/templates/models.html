@@ -101,7 +101,14 @@
     <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem">
       <input id="ws-model-id" class="form-input" placeholder="whisper-vulkan-base">
       <input id="ws-server-path" class="form-input" placeholder="/usr/local/bin/whisper-server">
-      <input id="ws-model-path" class="form-input" placeholder="/models/ggml-base.bin">
+      <select id="ws-model-source" class="form-input" onchange="toggleWhisperModelSource()">
+        <option value="cached-gguf">Downloaded GGUF</option>
+        <option value="manual-path">Manual path</option>
+      </select>
+      <select id="ws-gguf-select" class="form-input">
+        <option value="">Select downloaded GGUF</option>
+      </select>
+      <input id="ws-model-path" class="form-input" placeholder="Manual path: /models/ggml-base.bin" style="display:none">
       <input id="ws-port" class="form-input" type="number" value="8744" min="1" max="65535">
       <input id="ws-gpu-device" class="form-input" type="number" value="0" min="0">
       <select id="ws-load-mode" class="form-input">
@@ -1068,6 +1075,11 @@ async function loadCachedModels(){
 
     // GGUF files
     const gguf = d.gguf||[];
+    const ggufSelect = document.getElementById('ws-gguf-select');
+    if(ggufSelect){
+      ggufSelect.innerHTML = '<option value="">Select downloaded GGUF</option>'+
+        gguf.map(f=>`<option value="${esc(f.path)}">${esc(f.filename)}</option>`).join('');
+    }
     document.getElementById('gguf-file-badge').textContent = gguf.length ? `(${gguf.length})` : '';
     if(!gguf.length){
       ggufEl.innerHTML = '<span class="muted small">No GGUF files cached.</span>';
@@ -1106,6 +1118,16 @@ async function loadCachedModels(){
   }catch(e){
     hfEl.innerHTML = ggufEl.innerHTML = `<span class="muted small">Error: ${esc(e.message)}</span>`;
   }
+}
+
+function toggleWhisperModelSource(){
+  const source = document.getElementById('ws-model-source')?.value || 'cached-gguf';
+  const ggufSelect = document.getElementById('ws-gguf-select');
+  const modelPath = document.getElementById('ws-model-path');
+  if(!ggufSelect || !modelPath) return;
+  const useCached = source === 'cached-gguf';
+  ggufSelect.style.display = useCached ? '' : 'none';
+  modelPath.style.display = useCached ? 'none' : '';
 }
 
 let _loadedKeys = new Set();
@@ -1321,12 +1343,16 @@ async function saveModelConfig(){
 
 async function addWhisperServerModel(){
   const usedVram = parseFloat(document.getElementById('ws-used-vram').value);
+  const modelSource = document.getElementById('ws-model-source').value;
   const payload = {
     model_id: document.getElementById('ws-model-id').value.trim(),
     model_type: 'audio_models',
     backend: 'whisper-server',
+    model_source: modelSource,
     server_path: document.getElementById('ws-server-path').value.trim(),
-    model_path: document.getElementById('ws-model-path').value.trim() || null,
+    model_path: (modelSource === 'cached-gguf'
+      ? document.getElementById('ws-gguf-select').value
+      : document.getElementById('ws-model-path').value.trim()) || null,
     port: parseInt(document.getElementById('ws-port').value, 10) || 8744,
     gpu_device: parseInt(document.getElementById('ws-gpu-device').value, 10) || 0,
     load_mode: document.getElementById('ws-load-mode').value,
@@ -1343,6 +1369,8 @@ async function addWhisperServerModel(){
     refreshLocal();
   }catch(e){ alert('Error: '+e.message); }
 }
+
+toggleWhisperModelSource();
 
 async function loadModel(idx){
   const m = _localModels[idx];
