@@ -3789,7 +3789,6 @@ let _stepTypes = [];       // [{type, label, params:[...]}]
 let _pbSteps = [];         // current builder steps [{type, label, params:{}}]
 let _customPipelines = []; // saved custom pipelines
 let _editingPipelineId = null;
-const pipelineState = { items: [], selectedId: null };
 
 async function initPipelineBuilder() {
   try {
@@ -3799,83 +3798,47 @@ async function initPipelineBuilder() {
     ]);
     _stepTypes = typesRes.step_types || [];
     _customPipelines = pipesRes.pipelines || [];
-    pipelineState.items = _customPipelines;
-    if (pipelineState.selectedId && !pipelineState.items.some(p => p.id === pipelineState.selectedId)) {
-      pipelineState.selectedId = null;
-    }
 
     const sel = $('pb-add-type');
     if (sel) sel.innerHTML = _stepTypes.map(t =>
       `<option value="${t.type}">${t.label}</option>`).join('');
 
-    renderPipelineList();
     renderCustomPipelineCards();
   } catch(e) {
-    const status = $('pipe-status');
-    if (status) status.textContent = 'Pipeline loading failed.';
     console.warn('Pipeline builder init failed:', e);
   }
 }
 
-function renderPipelineList() {
-  const container = $('pipe-list');
-  const status = $('pipe-status');
-  if (!container) return;
-  const items = pipelineState.items || [];
-  if (!items.length) {
-    container.innerHTML = '<div class="pipe-empty-state">No saved pipelines yet. Create pipeline to start building one.</div>';
-    if (status) status.textContent = 'No saved pipelines yet.';
-    return;
-  }
-  if (status) status.textContent = `${items.length} pipeline${items.length === 1 ? '' : 's'} available`;
-  container.innerHTML = items.map(p => `
-    <button type="button" class="pipe-list-card ${pipelineState.selectedId === p.id ? 'active' : ''}" onclick="openPipeline('${p.id}')">
-      <div class="pipe-title">${escapeHtml(p.name || p.id)}</div>
-      <div class="pipe-summary">${escapeHtml(p.description || 'Custom multi-step pipeline for combining model and utility actions.')}</div>
-      <div class="pipe-tags"><span class="pipe-tag">${(p.steps || []).length} steps</span><span class="pipe-tag">custom</span></div>
-    </button>
-  `).join('');
-}
-
 function renderCustomPipelineCards() {
   const container = $('custom-pipe-cards');
-  const empty = $('pipe-empty-state');
   if (!container) return;
-  const selected = _customPipelines.find(p => p.id === pipelineState.selectedId);
-  if (!selected) {
-    container.innerHTML = '';
-    if (empty) empty.style.display = '';
-    return;
-  }
-  if (empty) empty.style.display = 'none';
-  container.innerHTML = `
-    <details class="pipe-card" open>
+  container.innerHTML = _customPipelines.map(p => `
+    <details class="pipe-card">
       <summary>
         <div class="pipe-head">
-          <div class="pipe-title">${escapeHtml(selected.name || selected.id)}</div>
-          <div class="pipe-summary">${escapeHtml(selected.description || 'Custom multi-step pipeline for combining model and utility actions.')}</div>
+          <div class="pipe-title">${escapeHtml(p.name || p.id)}</div>
+          <div class="pipe-summary">${escapeHtml(p.description || 'Custom multi-step pipeline for combining model and utility actions.')}</div>
           <div class="pipe-steps">
-            ${(selected.steps || []).map(s => `<span class="pipe-step">${escapeHtml(s.label || s.type)}</span>`).join('<span class="pipe-arrow">→</span>')}
+            ${(p.steps || []).map(s => `<span class="pipe-step">${escapeHtml(s.label || s.type)}</span>`).join('<span class="pipe-arrow">→</span>')}
           </div>
-          <div class="pipe-tags"><span class="pipe-tag">custom</span><span class="pipe-tag">pipeline</span><span class="pipe-tag">${(selected.steps || []).length} steps</span></div>
+          <div class="pipe-tags"><span class="pipe-tag">custom</span><span class="pipe-tag">pipeline</span><span class="pipe-tag">${(p.steps || []).length} steps</span></div>
         </div>
       </summary>
       <div class="pipe-card-body">
-        ${selected.description ? `<p style="font-size:12px;color:var(--text-2);margin:0 0 .4rem">${escapeHtml(selected.description)}</p>` : ''}
-        <div class="frow"><label class="fl">Input</label><input id="cpr-input-${selected.id}" class="fi" placeholder="{{ '{{' }}input{{ '}}' }} value"></div>
+        ${p.description ? `<p style="font-size:12px;color:var(--text-2);margin:0 0 .4rem">${escapeHtml(p.description)}</p>` : ''}
+        <div class="frow"><label class="fl">Input</label><input id="cpr-input-${p.id}" class="fi" placeholder="{{ '{{' }}input{{ '}}' }} value"></div>
         <div style="display:flex;gap:.4rem;margin-top:.4rem;flex-wrap:wrap">
-          <button class="btn btn-primary btn-sm" onclick="runCustomPipeline('${selected.id}')">▶ Run</button>
-          <button class="btn btn-ghost btn-sm" onclick="editCustomPipeline('${selected.id}')">✎ Edit</button>
-          <button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="deleteCustomPipeline('${selected.id}')">✕ Delete</button>
+          <button class="btn btn-primary btn-sm" onclick="runCustomPipeline('${p.id}')">▶ Run</button>
+          <button class="btn btn-ghost btn-sm" onclick="editCustomPipeline('${p.id}')">✎ Edit</button>
+          <button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="deleteCustomPipeline('${p.id}')">✕ Delete</button>
         </div>
-        <div class="progress" id="cpr-prog-${selected.id}"></div>
-        <div id="cpr-out-${selected.id}"></div>
+        <div class="progress" id="cpr-prog-${p.id}"></div>
+        <div id="cpr-out-${p.id}"></div>
       </div>
-    </details>`;
+    </details>`).join('');
 }
 
 function createPipeline() {
-  pipelineState.selectedId = null;
   _editingPipelineId = null;
   _pbSteps = [];
   $('pb-name').value = '';
@@ -3883,16 +3846,8 @@ function createPipeline() {
   $('pb-input').value = '';
   $('pb-prog').textContent = 'Creating a new pipeline draft.';
   renderBuilderSteps();
-  renderPipelineList();
-  renderCustomPipelineCards();
   $('pipe-builder-card').open = true;
   $('pipe-builder-card').scrollIntoView({behavior:'smooth', block:'start'});
-}
-
-function openPipeline(id) {
-  pipelineState.selectedId = id;
-  renderPipelineList();
-  renderCustomPipelineCards();
 }
 
 function pbAddStep() {
@@ -3975,9 +3930,6 @@ async function pbSave() {
       _editingPipelineId = res.pipeline?.id;
     }
     _customPipelines = (await fetch('/v1/pipelines/custom').then(r => r.json())).pipelines || [];
-    pipelineState.items = _customPipelines;
-    pipelineState.selectedId = _editingPipelineId;
-    renderPipelineList();
     renderCustomPipelineCards();
     $('pb-prog').textContent = 'Saved ✓';
   } catch(e) { $('pb-prog').textContent = 'Error: '+e.message; }
@@ -4009,13 +3961,11 @@ async function runCustomPipeline(id) {
 function editCustomPipeline(id) {
   const p = _customPipelines.find(x => x.id === id);
   if (!p) return;
-  pipelineState.selectedId = id;
   _editingPipelineId = id;
   $('pb-name').value = p.name || '';
   $('pb-desc').value = p.description || '';
   _pbSteps = p.steps.map(s => ({...s, params:{...s.params}}));
   renderBuilderSteps();
-  renderPipelineList();
   renderCustomPipelineCards();
   $('pipe-builder-card').open = true;
   $('pipe-builder-card').scrollIntoView({behavior:'smooth'});
@@ -4027,10 +3977,7 @@ async function deleteCustomPipeline(id) {
   try {
     await fetch(`/v1/pipelines/custom/${id}`, {method:'DELETE'});
     _customPipelines = _customPipelines.filter(p => p.id !== id);
-    pipelineState.items = _customPipelines;
-    if (pipelineState.selectedId === id) pipelineState.selectedId = null;
     if (_editingPipelineId === id) { _editingPipelineId = null; _pbSteps = []; renderBuilderSteps(); }
-    renderPipelineList();
     renderCustomPipelineCards();
   } catch(e) { alert('Delete failed: '+e.message); }
 }

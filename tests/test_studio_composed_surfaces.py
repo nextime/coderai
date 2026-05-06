@@ -388,6 +388,15 @@ def test_pipeline_tab_drops_split_shell_layout():
     assert 'id="pipe-empty-state"' not in text
 
 
+def test_pipeline_tab_drops_split_selection_helpers():
+    template_path = "/storage/coderai/codai/admin/templates/chat.html"
+    text = open(template_path, "r", encoding="utf-8").read()
+
+    assert "renderPipelineList" not in text
+    assert "pipelineState = {" not in text
+    assert "selectedId" not in text
+
+
 def test_pipeline_tab_keeps_inline_saved_pipeline_cards():
     template_path = "/storage/coderai/codai/admin/templates/chat.html"
     text = open(template_path, "r", encoding="utf-8").read()
