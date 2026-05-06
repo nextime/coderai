@@ -55,11 +55,25 @@
   padding:.28rem .65rem; border-radius:5px; font-size:12px; font-weight:500;
   cursor:pointer; border:1px solid transparent; color:var(--text-3);
   background:transparent; transition:all .1s; white-space:nowrap; flex-shrink:0;
+  display:inline-flex; align-items:center; gap:.35rem;
 }
 .t1btn:hover, .t2btn:hover { background:var(--surface-2); color:var(--text-1); }
 .t1btn.active { background:var(--accent,#4e9cf5); color:#fff; }
 .t2btn.active { background:var(--surface-3,#333); color:var(--text-1); border-color:var(--border); }
 .t1btn.hidden, .t2btn.hidden { display:none; }
+.t1btn.state-partial, .t2btn.state-partial { color:var(--text-2); }
+.t1btn.state-unavailable, .t2btn.state-unavailable { color:var(--text-3); opacity:.55; }
+.t1btn.state-unavailable:hover, .t2btn.state-unavailable:hover { color:var(--text-2); }
+.tab-status {
+  display:inline-flex; align-items:center; padding:1px 5px; border-radius:999px;
+  font-size:9px; font-weight:700; letter-spacing:.04em; text-transform:uppercase;
+  background:var(--surface-3,#333); color:var(--text-2);
+}
+.t1btn.state-partial .tab-status, .t2btn.state-partial .tab-status { background:#3a2510; color:#f0c060; }
+.t1btn.state-unavailable .tab-status, .t2btn.state-unavailable .tab-status { background:var(--surface-2); color:var(--text-3); }
+.t1btn.active .tab-status { background:rgba(255,255,255,.18); color:#fff; }
+.t2btn.active .tab-status { background:rgba(255,255,255,.08); color:var(--text-1); }
+.state-hidden { display:none !important; }
 
 /* Panels */
 .panel { flex:1; display:none; flex-direction:column; overflow:hidden; }
@@ -126,17 +140,81 @@
 /* download link styled as button */
 a.dl { display:inline-block; margin-top:.4rem; }
 
+/* ── Capability cards ─────────────────────────────────────────── */
+.cap-card {
+  border:1px solid var(--border); background:var(--surface-1); border-radius:8px;
+  padding:.75rem .9rem; margin-bottom:.75rem; display:flex; flex-direction:column; gap:.55rem;
+}
+.cap-card-top { display:flex; align-items:flex-start; justify-content:space-between; gap:.75rem; }
+.cap-card-title { font-size:13px; font-weight:600; color:var(--text-1); }
+.cap-card-summary { font-size:12px; line-height:1.45; color:var(--text-2); }
+.cap-meta { display:flex; flex-wrap:wrap; gap:.35rem; }
+.cap-chip {
+  font-size:10px; border-radius:999px; padding:.16rem .45rem;
+  background:var(--surface-2); color:var(--text-2); border:1px solid var(--border);
+}
+.cap-chip.warn { background:#3a2510; color:#f0c060; border-color:transparent; }
+.cap-chip.dim { opacity:.72; }
+.cap-missing, .cap-note { font-size:12px; color:var(--text-2); }
+.cap-note strong, .cap-missing strong { color:var(--text-1); }
+.cap-toggle { font-size:12px; display:flex; align-items:center; gap:.4rem; cursor:pointer; color:var(--text-2); }
+.cap-toggle input { margin:0; }
+.cap-preserve-note {
+  font-size:12px; line-height:1.45; color:var(--text-2); background:var(--surface-2);
+  border:1px solid var(--border); border-radius:6px; padding:.55rem .65rem;
+}
+.req-preview {
+  border:1px solid var(--border); border-radius:8px; background:var(--surface-2);
+  padding:.7rem; display:flex; flex-direction:column; gap:.55rem;
+}
+.req-preview-top { display:flex; align-items:flex-start; justify-content:space-between; gap:.6rem; }
+.req-preview-title { font-size:12px; font-weight:600; color:var(--text-1); }
+.req-preview-sub { font-size:11px; color:var(--text-3); margin-top:.15rem; }
+.req-preview-endpoint { font-family:var(--mono); font-size:11px; color:var(--text-2); word-break:break-all; }
+.req-preview-grid { display:grid; grid-template-columns:1fr 1fr; gap:.45rem; }
+.req-preview-field { border:1px solid var(--border); border-radius:6px; background:var(--surface-1); padding:.45rem .5rem; min-width:0; }
+.req-preview-label { font-size:10px; text-transform:uppercase; letter-spacing:.05em; color:var(--text-3); margin-bottom:.15rem; }
+.req-preview-value { font-size:12px; color:var(--text-1); word-break:break-word; }
+.req-preview-code { width:100%; box-sizing:border-box; min-height:180px; resize:vertical; font-family:var(--mono); font-size:11px; }
+.req-preview-actions { display:flex; gap:.4rem; flex-wrap:wrap; align-items:center; }
+.req-preview-status { font-size:11px; color:var(--text-3); min-height:14px; }
+
+/* ── Diagnostics / history ────────────────────────────────────── */
+.diag-card, .hist-card {
+  border:1px solid var(--border); background:var(--surface-1); border-radius:8px;
+  padding:.8rem .9rem; display:flex; flex-direction:column; gap:.6rem;
+}
+.diag-title, .hist-title { font-size:13px; font-weight:600; color:var(--text-1); }
+.diag-sub, .hist-empty, .hist-meta, .hist-summary { font-size:12px; color:var(--text-2); line-height:1.45; }
+.diag-groups, .hist-list { display:flex; flex-direction:column; gap:.5rem; }
+.diag-group { display:flex; flex-direction:column; gap:.3rem; }
+.diag-group-head { display:flex; align-items:center; justify-content:space-between; gap:.5rem; }
+.diag-group-label { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--text-3); }
+.diag-items, .hist-links, .hist-chips { display:flex; flex-wrap:wrap; gap:.35rem; }
+.diag-empty { font-size:11px; color:var(--text-3); }
+.hist-item { border:1px solid var(--border); border-radius:7px; background:var(--surface-2); padding:.65rem .7rem; display:flex; flex-direction:column; gap:.35rem; }
+.hist-top { display:flex; align-items:flex-start; justify-content:space-between; gap:.6rem; }
+.hist-name { font-size:12px; font-weight:600; color:var(--text-1); }
+.hist-link { font-size:11px; }
+
 /* ── Pipeline ─────────────────────────────────────────────────── */
 .pipe-panel { flex:1; overflow-y:auto; padding:1.2rem; display:flex; flex-direction:column; gap:.6rem; }
 .pipe-card { background:var(--surface-1); border:1px solid var(--border); border-radius:8px; overflow:hidden; }
-.pipe-card summary { list-style:none; padding:.75rem 1rem; cursor:pointer; display:flex; align-items:center; justify-content:space-between; font-weight:600; font-size:13px; user-select:none; }
+.pipe-card summary {
+  list-style:none; padding:.8rem 1rem; cursor:pointer; display:flex; align-items:flex-start;
+  justify-content:space-between; gap:.75rem; font-weight:600; font-size:13px; user-select:none; color:var(--text-1);
+}
 .pipe-card summary::-webkit-details-marker { display:none; }
-.pipe-card summary::after { content:'›'; font-size:16px; color:var(--text-2); transition:transform .2s; }
+.pipe-card summary::after { content:'›'; font-size:16px; color:var(--text-2); transition:transform .2s; margin-top:.1rem; }
 .pipe-card[open] summary::after { transform:rotate(90deg); }
 .pipe-card summary:hover { background:rgba(255,255,255,.03); }
 .pipe-card-body { padding:.75rem 1rem 1rem; border-top:1px solid var(--border); display:flex; flex-direction:column; gap:.5rem; }
-.pipe-title { font-weight:600; font-size:13px; }
-.pipe-steps { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; font-size:11px; color:var(--text-2); margin-bottom:.25rem; }
+.pipe-head { display:flex; flex-direction:column; gap:.45rem; min-width:0; flex:1; }
+.pipe-title { font-weight:600; font-size:13px; color:var(--text-1); }
+.pipe-summary { font-size:12px; color:var(--text-2); line-height:1.45; }
+.pipe-tags { display:flex; flex-wrap:wrap; gap:.35rem; }
+.pipe-tag { font-size:10px; padding:.16rem .45rem; border-radius:999px; background:var(--surface-2); color:var(--text-2); border:1px solid var(--border); }
+.pipe-steps { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; font-size:11px; color:var(--text-2); margin-bottom:.1rem; }
 .pipe-step { background:var(--surface-2); border-radius:5px; padding:.2rem .5rem; color:var(--text-2); }
 .pipe-arrow { color:var(--text-3); }
 .pb-step { background:var(--surface-2); border:1px solid var(--border); border-radius:6px; padding:.5rem .6rem; display:flex; flex-direction:column; gap:.3rem; }
@@ -162,44 +240,48 @@ a.dl { display:inline-block; margin-top:.4rem; }
 
     <!-- Level-1 tabs (category) -->
     <div class="tabbar1" id="tabbar1">
-      <button class="t1btn active" data-cat="chat"    onclick="selectCat('chat')">Chat</button>
-      <button class="t1btn hidden"  data-cat="image"   onclick="selectCat('image')">Image</button>
-      <button class="t1btn hidden"  data-cat="video"   onclick="selectCat('video')">Video</button>
-      <button class="t1btn hidden"  data-cat="audio"   onclick="selectCat('audio')">Audio</button>
-      <button class="t1btn hidden"  data-cat="pipe"    onclick="selectCat('pipe')">Pipelines</button>
-      <button class="t1btn hidden"  data-cat="embed"   onclick="selectCat('embed')">Embed</button>
+      <button class="t1btn active" data-cat="chat" onclick="selectCat('chat')">Chat <span class="tab-status" hidden></span></button>
+      <button class="t1btn" data-cat="image" onclick="selectCat('image')">Image <span class="tab-status" hidden></span></button>
+      <button class="t1btn" data-cat="video" onclick="selectCat('video')">Video <span class="tab-status" hidden></span></button>
+      <button class="t1btn" data-cat="audio" onclick="selectCat('audio')">Audio <span class="tab-status" hidden></span></button>
+      <button class="t1btn" data-cat="pipe" onclick="selectCat('pipe')">Pipelines <span class="tab-status" hidden></span></button>
+      <button class="t1btn" data-cat="embed" onclick="selectCat('embed')">Embed <span class="tab-status" hidden></span></button>
     </div>
 
     <!-- Level-2 tabs (sub-mode) -->
     <div class="tabbar2" id="tabbar2">
       <!-- Image sub-tabs -->
-      <button class="t2btn hidden" data-sub="img-gen"    onclick="selectSub('img-gen')">Generate</button>
-      <button class="t2btn hidden" data-sub="img-edit"   onclick="selectSub('img-edit')">Edit (i2i)</button>
-      <button class="t2btn hidden" data-sub="img-inpaint" onclick="selectSub('img-inpaint')">Inpaint</button>
-      <button class="t2btn hidden" data-sub="img-upscale" onclick="selectSub('img-upscale')">Upscale</button>
-      <button class="t2btn hidden" data-sub="img-depth"  onclick="selectSub('img-depth')">Depth</button>
-      <button class="t2btn hidden" data-sub="img-seg"    onclick="selectSub('img-seg')">Segment</button>
-      <button class="t2btn hidden" data-sub="img-faceswap" onclick="selectSub('img-faceswap')">Face Swap</button>
-      <button class="t2btn hidden" data-sub="img-deblur"  onclick="selectSub('img-deblur')">Deblur</button>
-      <button class="t2btn hidden" data-sub="img-unpix"   onclick="selectSub('img-unpix')">Unpixelate</button>
-      <button class="t2btn hidden" data-sub="img-outfit"  onclick="selectSub('img-outfit')">Outfit Change</button>
+      <button class="t2btn" data-sub="img-gen" onclick="selectSub('img-gen')">Generate <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="img-edit" onclick="selectSub('img-edit')">Edit (i2i) <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="img-inpaint" onclick="selectSub('img-inpaint')">Inpaint <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="img-upscale" onclick="selectSub('img-upscale')">Upscale <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="img-depth" onclick="selectSub('img-depth')">Depth <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="img-seg" onclick="selectSub('img-seg')">Segment <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="img-faceswap" onclick="selectSub('img-faceswap')">Face Swap <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="img-deblur" onclick="selectSub('img-deblur')">Deblur <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="img-unpix" onclick="selectSub('img-unpix')">Unpixelate <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="img-outfit" onclick="selectSub('img-outfit')">Outfit Change <span class="tab-status" hidden></span></button>
       <!-- Video sub-tabs -->
-      <button class="t2btn hidden" data-sub="vid-t2v"   onclick="selectSub('vid-t2v')">Text→Video</button>
-      <button class="t2btn hidden" data-sub="vid-i2v"   onclick="selectSub('vid-i2v')">Image→Video</button>
-      <button class="t2btn hidden" data-sub="vid-v2v"   onclick="selectSub('vid-v2v')">Vid→Vid</button>
-      <button class="t2btn hidden" data-sub="vid-ti2v"  onclick="selectSub('vid-ti2v')">Ti2V</button>
-      <button class="t2btn hidden" data-sub="vid-interp" onclick="selectSub('vid-interp')">Interpolate</button>
-      <button class="t2btn hidden" data-sub="vid-sub"   onclick="selectSub('vid-sub')">Subtitles</button>
-      <button class="t2btn hidden" data-sub="vid-dub"   onclick="selectSub('vid-dub')">Dub</button>
-      <button class="t2btn hidden" data-sub="vid-up"    onclick="selectSub('vid-up')">Upscale</button>
-      <button class="t2btn hidden" data-sub="vid-faceswap" onclick="selectSub('vid-faceswap')">Face Swap</button>
-      <button class="t2btn hidden" data-sub="vid-outfit"   onclick="selectSub('vid-outfit')">Outfit Change</button>
+      <button class="t2btn" data-sub="vid-t2v" onclick="selectSub('vid-t2v')">Text→Video <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="vid-i2v" onclick="selectSub('vid-i2v')">Image→Video <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="vid-v2v" onclick="selectSub('vid-v2v')">Vid→Vid <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="vid-ti2v" onclick="selectSub('vid-ti2v')">Ti2V <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="vid-interp" onclick="selectSub('vid-interp')">Interpolate <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="vid-sub" onclick="selectSub('vid-sub')">Subtitles <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="vid-dub" onclick="selectSub('vid-dub')">Dub <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="vid-up" onclick="selectSub('vid-up')">Upscale <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="vid-faceswap" onclick="selectSub('vid-faceswap')">Face Swap <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="vid-outfit" onclick="selectSub('vid-outfit')">Outfit Change <span class="tab-status" hidden></span></button>
       <!-- Audio sub-tabs -->
-      <button class="t2btn hidden" data-sub="aud-gen"   onclick="selectSub('aud-gen')">Generate Music/SFX</button>
-      <button class="t2btn hidden" data-sub="aud-tts"   onclick="selectSub('aud-tts')">TTS</button>
-      <button class="t2btn hidden" data-sub="aud-clone" onclick="selectSub('aud-clone')">Voice Clone</button>
-      <button class="t2btn hidden" data-sub="aud-convert" onclick="selectSub('aud-convert')">Voice Convert</button>
-      <button class="t2btn hidden" data-sub="aud-stt"   onclick="selectSub('aud-stt')">Transcribe</button>
+      <button class="t2btn" data-sub="aud-gen" onclick="selectSub('aud-gen')">Generate Music/SFX <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="aud-music-dub" onclick="selectSub('aud-music-dub')">Music Dub <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="aud-tts" onclick="selectSub('aud-tts')">TTS <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="aud-clone" onclick="selectSub('aud-clone')">Voice Clone <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="aud-convert" onclick="selectSub('aud-convert')">Voice Convert <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="aud-stt" onclick="selectSub('aud-stt')">Transcribe <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="aud-understand" onclick="selectSub('aud-understand')">Understand <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="aud-stems" onclick="selectSub('aud-stems')">Stems <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="aud-clean" onclick="selectSub('aud-clean')">Clean <span class="tab-status" hidden></span></button>
     </div>
 
     <!-- ═══════════════ CHAT ═══════════════ -->
@@ -650,12 +732,30 @@ a.dl { display:inline-block; margin-top:.4rem; }
     <!-- Dub -->
     <div class="panel" id="panel-vid-dub"><div class="gen-wrap">
       <div class="gen-ctrl">
+        <div class="cap-card" id="cap-vid-dub"></div>
+        <div class="cap-preserve-note" id="vd-preserve-note">Voice identity, timing, emotion, and singing preservation depend on model support and may fall back to a simpler dubbed track.</div>
         <div class="frow"><label class="fl">Source video</label><input type="file" id="vd-src" accept="video/*" class="fi"></div>
         <div class="g2">
           <div class="frow"><label class="fl">Source lang</label><input id="vd-slang" class="fi" placeholder="en"></div>
           <div class="frow"><label class="fl">Target lang</label><input id="vd-tlang" class="fi" placeholder="es, fr, de…"></div>
         </div>
-        <label style="font-size:12px;display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="vd-burn"> Burn subtitles into result</label>
+        <div class="g2">
+          <label class="cap-toggle"><input type="checkbox" id="vd-preserve-voice" checked> Preserve speaker identity</label>
+          <label class="cap-toggle"><input type="checkbox" id="vd-preserve-tone" checked> Preserve emotional tone</label>
+        </div>
+        <div class="g2">
+          <label class="cap-toggle"><input type="checkbox" id="vd-preserve-timing" checked> Preserve pacing / timing</label>
+          <label class="cap-toggle"><input type="checkbox" id="vd-preserve-singing"> Preserve singing style</label>
+        </div>
+        <label class="cap-toggle"><input type="checkbox" id="vd-lyrics"> Translate detected lyrics</label>
+        <div class="frow"><label class="fl">Fallback mode</label>
+          <select id="vd-track-mode" class="fselect">
+            <option value="speech-only">Replace spoken track only</option>
+            <option value="localized-mix">Rebuild localized track</option>
+          </select>
+        </div>
+        <label class="cap-toggle"><input type="checkbox" id="vd-burn"> Burn subtitles into result</label>
+        <div class="req-preview" id="vd-preview"></div>
         <button class="btn btn-primary" onclick="genDub()">Dub Video</button>
         <div class="progress" id="vd-prog"></div>
       </div>
@@ -681,6 +781,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
     <div class="panel" id="panel-aud-gen">
       <div class="gen-wrap">
         <div class="gen-ctrl">
+          <div class="cap-card" id="cap-aud-gen"></div>
           <div class="frow"><label class="fl">Prompt</label><textarea id="ag-prompt" class="fs" rows="4" placeholder="e.g. upbeat electronic dance music with synth bass…"></textarea></div>
           <div class="g2">
             <div class="frow"><label class="fl">Duration (sec)</label><input type="number" id="ag-dur" class="fi" value="10" min="1" max="300"></div>
@@ -692,6 +793,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
           </div>
           <div class="frow"><label class="fl">Melody reference (optional)</label><input type="file" id="ag-melody" accept="audio/*" class="fi"></div>
           <div class="frow"><label class="fl">Seed</label><input type="number" id="ag-seed" class="fi" placeholder="random"></div>
+          <div class="req-preview" id="ag-preview"></div>
           <button class="btn btn-primary" onclick="genAudio()">Generate</button>
           <div class="progress" id="ag-prog"></div>
         </div>
@@ -822,17 +924,124 @@ a.dl { display:inline-block; margin-top:.4rem; }
       </div>
     </div>
 
+    <!-- Music dubbing -->
+    <div class="panel" id="panel-aud-music-dub">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="cap-card" id="cap-aud-music-dub"></div>
+          <div class="frow"><label class="fl">Source song / vocal mix</label><input type="file" id="amd-file" accept="audio/*,video/*" class="fi"></div>
+          <div class="g2">
+            <div class="frow"><label class="fl">Source language</label><input id="amd-slang" class="fi" placeholder="auto, en, ja…"></div>
+            <div class="frow"><label class="fl">Target language</label><input id="amd-tlang" class="fi" placeholder="en, es, fr…"></div>
+          </div>
+          <div class="frow"><label class="fl">Notes</label><textarea id="amd-notes" class="fs" rows="3" placeholder="Explain whether the priority is lyric translation, singability, or preserving the original arrangement."></textarea></div>
+          <div class="cap-preserve-note">
+            <strong>Current studio behavior:</strong> there is no dedicated song-dubbing request path wired here. Use this panel to assess whether the selected model exposes enough speech, subtitle, or voice capabilities for a manual workflow.
+          </div>
+          <div class="cap-note"><strong>Fallback path:</strong> transcribe lyrics, translate them, then resynthesize guide vocals or use Voice Convert on isolated vocals before recombining outside this panel. Rhythm-safe lyric adaptation and automatic mix replacement are not exposed here.</div>
+          <div class="progress" id="amd-prog">No direct backend action from this panel.</div>
+        </div>
+        <div class="gen-out" id="amd-out">
+          <div class="gen-out-inner"><div class="gen-empty">Music dubbing is surfaced as planning guidance only until a dedicated backend route exists.</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Audio understanding -->
+    <div class="panel" id="panel-aud-understand">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="cap-card" id="cap-aud-understand"></div>
+          <div class="frow"><label class="fl">Source audio / video</label><input type="file" id="au-file" accept="audio/*,video/*" class="fi"></div>
+          <div class="frow"><label class="fl">Analysis goal</label><textarea id="au-goal" class="fs" rows="4" placeholder="Examples: summarize the meeting, extract speakers and topics, describe the soundscape, identify notable events."></textarea></div>
+          <div class="cap-preserve-note">
+            <strong>Current studio behavior:</strong> understanding depends on whether the active model can at least transcribe audio. Rich semantic answering over uploaded audio is not a separate API surface in this template.
+          </div>
+          <div class="cap-note"><strong>Fallback path:</strong> use Audio → Transcribe first, then send the transcript into Chat for summarization, extraction, or follow-up reasoning. If the model lacks speech-to-text, this remains unavailable here.</div>
+          <div class="progress" id="au-prog">Use Transcribe + Chat as the supported path.</div>
+        </div>
+        <div class="gen-out" id="au-out">
+          <div class="gen-out-inner"><div class="gen-empty">No standalone audio-understanding request is sent from this panel.</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Stem separation -->
+    <div class="panel" id="panel-aud-stems">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="cap-card" id="cap-aud-stems"></div>
+          <div class="frow"><label class="fl">Source mix</label><input type="file" id="ast-file" accept="audio/*,video/*" class="fi"></div>
+          <div class="frow"><label class="fl">Requested split</label>
+            <select id="ast-mode" class="fselect">
+              <option value="vocals-instrumental">Vocals / instrumental</option>
+              <option value="4-stem">4-stem band split</option>
+              <option value="drums-bass-other">Drums / bass / other</option>
+            </select>
+          </div>
+          <div class="cap-preserve-note">
+            <strong>Current studio behavior:</strong> no source-separation endpoint is wired into this page. This panel is an availability shell so users can see that stem workflows are recognized but not directly executable here.
+          </div>
+          <div class="cap-note"><strong>Relevant pipeline:</strong> if you need dubbed singing or cleanup, stem separation would normally happen before Voice Convert or remix assembly. That ordering is informational only in this UI.</div>
+          <div class="progress" id="ast-prog">Unavailable without a dedicated separation backend.</div>
+        </div>
+        <div class="gen-out" id="ast-out">
+          <div class="gen-out-inner"><div class="gen-empty">Stem files are not generated from this template today.</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Audio cleanup -->
+    <div class="panel" id="panel-aud-clean">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="cap-card" id="cap-aud-clean"></div>
+          <div class="frow"><label class="fl">Source recording</label><input type="file" id="ac-file" accept="audio/*,video/*" class="fi"></div>
+          <div class="g2">
+            <label class="cap-toggle"><input type="checkbox" id="ac-noise" checked> Reduce background noise</label>
+            <label class="cap-toggle"><input type="checkbox" id="ac-level"> Normalize levels</label>
+          </div>
+          <div class="g2">
+            <label class="cap-toggle"><input type="checkbox" id="ac-hum"> Remove hum</label>
+            <label class="cap-toggle"><input type="checkbox" id="ac-click"> Repair clicks</label>
+          </div>
+          <div class="cap-preserve-note">
+            <strong>Current studio behavior:</strong> cleanup and restoration are not exposed as native requests on this page. Some speech-to-text capable models can still help inspect a noisy recording by transcribing it first.
+          </div>
+          <div class="cap-note"><strong>Fallback path:</strong> use Transcribe to judge intelligibility, then perform denoise/restoration outside Studio before returning for transcription, dubbing, or voice conversion.</div>
+          <div class="progress" id="ac-prog">No cleanup request is sent from this panel.</div>
+        </div>
+        <div class="gen-out" id="ac-out">
+          <div class="gen-out-inner"><div class="gen-empty">Audio cleanup is presented as an unsupported surface with guidance only.</div></div>
+        </div>
+      </div>
+    </div>
+
     <!-- ═══════════════ PIPELINES ═══════════════ -->
     <div class="panel" id="panel-pipe">
       <div class="pipe-panel">
+        <div class="diag-card" id="studio-diagnostics">
+          <div class="diag-title">Diagnostics</div>
+          <div class="diag-sub">Evaluated from the current model type, declared capabilities, and existing Studio fallback rules.</div>
+          <div class="diag-groups" id="diag-groups"></div>
+        </div>
+        <div class="hist-card" id="studio-history">
+          <div class="hist-title">Session artifact history</div>
+          <div class="hist-list" id="artifact-history-list"></div>
+        </div>
 
         <details class="pipe-card">
-          <summary>Image → Video Pipeline
-            <span class="pipe-steps" style="margin:0;font-size:11px">
-              <span class="pipe-step">Generate image</span><span class="pipe-arrow">→</span>
-              <span class="pipe-step">Animate</span><span class="pipe-arrow">→</span>
-              <span class="pipe-step">Audio (opt)</span>
-            </span>
+          <summary>
+            <div class="pipe-head">
+              <div class="pipe-title">Image → Video Pipeline</div>
+              <div class="pipe-summary">Turn a text prompt into a generated still, animate it into motion, and optionally add soundtrack cues.</div>
+              <div class="pipe-steps">
+                <span class="pipe-step">Generate image</span><span class="pipe-arrow">→</span>
+                <span class="pipe-step">Animate</span><span class="pipe-arrow">→</span>
+                <span class="pipe-step">Audio (opt)</span>
+              </div>
+              <div class="pipe-tags"><span class="pipe-tag">image</span><span class="pipe-tag">video</span><span class="pipe-tag">soundtrack</span></div>
+            </div>
           </summary>
           <div class="pipe-card-body">
             <div class="frow"><label class="fl">Text prompt</label><textarea id="pp1-prompt" class="fs" rows="3" placeholder="Describe the scene…"></textarea></div>
@@ -889,13 +1098,18 @@ a.dl { display:inline-block; margin-top:.4rem; }
         </details>
 
         <details class="pipe-card">
-          <summary>Video → Dub + Subtitle
-            <span class="pipe-steps" style="margin:0;font-size:11px">
-              <span class="pipe-step">Transcribe</span><span class="pipe-arrow">→</span>
-              <span class="pipe-step">Translate</span><span class="pipe-arrow">→</span>
-              <span class="pipe-step">TTS dub</span><span class="pipe-arrow">→</span>
-              <span class="pipe-step">Burn subs</span>
-            </span>
+          <summary>
+            <div class="pipe-head">
+              <div class="pipe-title">Video → Dub + Subtitle</div>
+              <div class="pipe-summary">Transcribe spoken dialogue, translate it, synthesize replacement speech, and optionally burn subtitles into the localized video.</div>
+              <div class="pipe-steps">
+                <span class="pipe-step">Transcribe</span><span class="pipe-arrow">→</span>
+                <span class="pipe-step">Translate</span><span class="pipe-arrow">→</span>
+                <span class="pipe-step">TTS dub</span><span class="pipe-arrow">→</span>
+                <span class="pipe-step">Burn subs</span>
+              </div>
+              <div class="pipe-tags"><span class="pipe-tag">video</span><span class="pipe-tag">localization</span><span class="pipe-tag">subtitles</span></div>
+            </div>
           </summary>
           <div class="pipe-card-body">
             <div class="frow"><label class="fl">Source video</label><input type="file" id="pp2-src" accept="video/*" class="fi"></div>
@@ -913,13 +1127,18 @@ a.dl { display:inline-block; margin-top:.4rem; }
         </details>
 
         <details class="pipe-card">
-          <summary>Full Story
-            <span class="pipe-steps" style="margin:0;font-size:11px">
-              <span class="pipe-step">LLM script</span><span class="pipe-arrow">→</span>
-              <span class="pipe-step">Images</span><span class="pipe-arrow">→</span>
-              <span class="pipe-step">Video</span><span class="pipe-arrow">→</span>
-              <span class="pipe-step">TTS</span>
-            </span>
+          <summary>
+            <div class="pipe-head">
+              <div class="pipe-title">Full Story</div>
+              <div class="pipe-summary">Draft a narrated multi-scene story, generate matching visuals, animate them, and add spoken narration in one pass.</div>
+              <div class="pipe-steps">
+                <span class="pipe-step">LLM script</span><span class="pipe-arrow">→</span>
+                <span class="pipe-step">Images</span><span class="pipe-arrow">→</span>
+                <span class="pipe-step">Video</span><span class="pipe-arrow">→</span>
+                <span class="pipe-step">TTS</span>
+              </div>
+              <div class="pipe-tags"><span class="pipe-tag">storytelling</span><span class="pipe-tag">image</span><span class="pipe-tag">video</span><span class="pipe-tag">tts</span></div>
+            </div>
           </summary>
           <div class="pipe-card-body">
             <div class="frow"><label class="fl">Story idea</label><textarea id="pp3-story" class="fs" rows="3" placeholder="A knight fights a dragon at sunset…"></textarea></div>
@@ -943,12 +1162,17 @@ a.dl { display:inline-block; margin-top:.4rem; }
         </details>
 
         <details class="pipe-card">
-          <summary>Audio/Video Dub with Voice Clone
-            <span class="pipe-steps" style="margin:0;font-size:11px">
-              <span class="pipe-step">Transcribe</span><span class="pipe-arrow">→</span>
-              <span class="pipe-step">Clone voice</span><span class="pipe-arrow">→</span>
-              <span class="pipe-step">Replace audio</span>
-            </span>
+          <summary>
+            <div class="pipe-head">
+              <div class="pipe-title">Audio/Video Dub with Voice Clone</div>
+              <div class="pipe-summary">Create a dubbed replacement track while trying to preserve the original speaker identity through reference-based voice cloning.</div>
+              <div class="pipe-steps">
+                <span class="pipe-step">Transcribe</span><span class="pipe-arrow">→</span>
+                <span class="pipe-step">Clone voice</span><span class="pipe-arrow">→</span>
+                <span class="pipe-step">Replace audio</span>
+              </div>
+              <div class="pipe-tags"><span class="pipe-tag">voice clone</span><span class="pipe-tag">dub</span><span class="pipe-tag">video</span></div>
+            </div>
           </summary>
           <div class="pipe-card-body">
             <div class="frow"><label class="fl">Source video or audio</label><input type="file" id="pp4-src" accept="audio/*,video/*" class="fi"></div>
@@ -981,12 +1205,17 @@ a.dl { display:inline-block; margin-top:.4rem; }
         </details>
 
         <details class="pipe-card">
-          <summary>Face Swap
-            <span class="pipe-steps" style="margin:0;font-size:11px">
-              <span class="pipe-step">Source face</span><span class="pipe-arrow">→</span>
-              <span class="pipe-step">Target</span><span class="pipe-arrow">→</span>
-              <span class="pipe-step">Result</span>
-            </span>
+          <summary>
+            <div class="pipe-head">
+              <div class="pipe-title">Face Swap</div>
+              <div class="pipe-summary">Transfer a source face into a target image or video result while keeping the rest of the scene intact.</div>
+              <div class="pipe-steps">
+                <span class="pipe-step">Source face</span><span class="pipe-arrow">→</span>
+                <span class="pipe-step">Target</span><span class="pipe-arrow">→</span>
+                <span class="pipe-step">Result</span>
+              </div>
+              <div class="pipe-tags"><span class="pipe-tag">image</span><span class="pipe-tag">video</span><span class="pipe-tag">identity</span></div>
+            </div>
           </summary>
           <div class="pipe-card-body">
             <div class="frow"><label class="fl">Source face (upload or webcam)</label>
@@ -1015,12 +1244,17 @@ a.dl { display:inline-block; margin-top:.4rem; }
         </details>
 
         <details class="pipe-card">
-          <summary>Voice Clone (TTS)
-            <span class="pipe-steps" style="margin:0;font-size:11px">
-              <span class="pipe-step">Reference audio</span><span class="pipe-arrow">→</span>
-              <span class="pipe-step">Text</span><span class="pipe-arrow">→</span>
-              <span class="pipe-step">Cloned speech</span>
-            </span>
+          <summary>
+            <div class="pipe-head">
+              <div class="pipe-title">Voice Clone (TTS)</div>
+              <div class="pipe-summary">Synthesize fresh speech from text using a saved or uploaded voice reference as the target speaker style.</div>
+              <div class="pipe-steps">
+                <span class="pipe-step">Reference audio</span><span class="pipe-arrow">→</span>
+                <span class="pipe-step">Text</span><span class="pipe-arrow">→</span>
+                <span class="pipe-step">Cloned speech</span>
+              </div>
+              <div class="pipe-tags"><span class="pipe-tag">tts</span><span class="pipe-tag">voice clone</span><span class="pipe-tag">speech</span></div>
+            </div>
           </summary>
           <div class="pipe-card-body">
             <p style="font-size:12px;color:var(--text-2);margin:0 0 .4rem">Synthesize new speech in a cloned voice. Good for dubbing scripts.</p>
@@ -1047,12 +1281,17 @@ a.dl { display:inline-block; margin-top:.4rem; }
         </details>
 
         <details class="pipe-card">
-          <summary>Voice Convert (SVC)
-            <span class="pipe-steps" style="margin:0;font-size:11px">
-              <span class="pipe-step">Source audio</span><span class="pipe-arrow">→</span>
-              <span class="pipe-step">Target timbre</span><span class="pipe-arrow">→</span>
-              <span class="pipe-step">Converted audio</span>
-            </span>
+          <summary>
+            <div class="pipe-head">
+              <div class="pipe-title">Voice Convert (SVC)</div>
+              <div class="pipe-summary">Convert the source timbre to a new speaker while preserving pitch, rhythm, and musical phrasing for speech or singing.</div>
+              <div class="pipe-steps">
+                <span class="pipe-step">Source audio</span><span class="pipe-arrow">→</span>
+                <span class="pipe-step">Target timbre</span><span class="pipe-arrow">→</span>
+                <span class="pipe-step">Converted audio</span>
+              </div>
+              <div class="pipe-tags"><span class="pipe-tag">audio</span><span class="pipe-tag">conversion</span><span class="pipe-tag">singing</span></div>
+            </div>
           </summary>
           <div class="pipe-card-body">
             <p style="font-size:12px;color:var(--text-2);margin:0 0 .4rem">Convert timbre while preserving pitch, melody and expression. Use <strong>Singing mode</strong> for music.</p>
@@ -1150,6 +1389,8 @@ a.dl { display:inline-block; margin-top:.4rem; }
 let models = [], activeModel = null, chatHistory = [], chatBusy = false, attachedImage = null;
 let charSlots = {};        // prefix → [{name:'', images:[b64...]}]
 let _charProfiles = [];    // cached list from /v1/characters
+let artifactHistory = [];
+const ARTIFACT_HISTORY_LIMIT = 12;
 
 const $ = id => document.getElementById(id);
 const val = id => ($(id) ? $(id).value : '');
@@ -1183,7 +1424,7 @@ const SUB_CAT = {
   'img-gen':'image','img-edit':'image','img-inpaint':'image','img-upscale':'image','img-depth':'image','img-seg':'image','img-faceswap':'image','img-deblur':'image','img-unpix':'image','img-outfit':'image','img-outfit':'image',
   'vid-t2v':'video','vid-i2v':'video','vid-v2v':'video','vid-ti2v':'video','vid-interp':'video',
   'vid-sub':'video','vid-dub':'video','vid-up':'video','vid-faceswap':'video','vid-outfit':'video',
-  'aud-gen':'audio','aud-tts':'audio','aud-stt':'audio','aud-clone':'audio','aud-convert':'audio',
+  'aud-gen':'audio','aud-music-dub':'audio','aud-tts':'audio','aud-stt':'audio','aud-clone':'audio','aud-convert':'audio','aud-understand':'audio','aud-stems':'audio','aud-clean':'audio',
 };
 // Sub-tabs that share a panel with an image sub-tab (vid-X → panel-img-Y)
 const SUB_PANEL_ALIAS = {
@@ -1192,6 +1433,560 @@ const SUB_PANEL_ALIAS = {
 };
 // Video models also enable all video sub-tabs
 const VIDEO_EXTRA_SUBS = ['vid-ti2v', 'vid-dub', 'vid-v2v', 'vid-sub', 'vid-interp', 'vid-up', 'vid-faceswap', 'vid-outfit'];
+const TAB_STATE = {
+  available: { label:'', className:'' },
+  partial: { label:'Partial', className:'state-partial' },
+  unavailable: { label:'Unavailable', className:'state-unavailable' },
+};
+const STUDIO_CAPABILITIES = {
+  'vid-dub': {
+    category:'video',
+    label:'Video dubbing',
+    summary:'Translate spoken dialogue in a source video into another language and optionally burn subtitles into the result.',
+    requires:['speech_to_text','text_to_speech'],
+    optional:['subtitle_generation','video_to_video'],
+    notes:[
+      'Speaker matching and final lip-sync depend on the selected backend path.',
+      'Subtitle burn-in is strongest when subtitle generation is available.',
+      'Singing preservation remains limited unless the backend exposes a music-aware conversion path.'
+    ],
+    backendPath:'mixed',
+    io:'Input: source video. Output: dubbed video with optional subtitle burn-in.'
+  },
+  'aud-gen': {
+    category:'audio',
+    label:'Music / SFX generation',
+    summary:'Generate music beds, ambience, or sound effects directly from a text prompt, with optional melody guidance.',
+    requires:['audio_generation'],
+    optional:['speech_to_text'],
+    notes:[
+      'Melody reference improves control when the backend supports conditioning.',
+      'Use pipelines when you need composition plus later narration or localization steps.'
+    ],
+    backendPath:'direct',
+    io:'Input: prompt and optional melody reference. Output: generated audio clip.'
+  },
+  'aud-music-dub': {
+    category:'audio',
+    label:'Music dubbing',
+    summary:'Assess song and lyric-localization workflows without claiming a one-click music-dubbing backend path.',
+    requires:['speech_to_text','text_to_speech'],
+    optional:['audio_generation'],
+    notes:[
+      'Automatic lyric-to-lyric rewriting, singable translation, and final mix replacement are not wired in this template.',
+      'If vocals can be isolated externally, Voice Convert may still help preserve phrasing after translation.'
+    ],
+    backendPath:'guided fallback',
+    io:'Input: source song plus language goals. Output: workflow guidance only unless a future backend route is added.'
+  },
+  'aud-understand': {
+    category:'audio',
+    label:'Audio understanding',
+    summary:'Surface semantic audio analysis as a transcript-first workflow rather than a speculative new API call.',
+    requires:['speech_to_text'],
+    optional:['text_generation'],
+    notes:[
+      'The supported path is transcript extraction first, then reasoning in Chat.',
+      'Environmental sound labeling or event reasoning remains limited if the active model only exposes plain speech recognition.'
+    ],
+    backendPath:'transcribe → chat',
+    io:'Input: source audio or video. Output: transcript-backed understanding workflow.'
+  },
+  'aud-stems': {
+    category:'audio',
+    label:'Stem separation',
+    summary:'Show source-separation readiness while clearly marking that this Studio page does not expose a stem-splitting route.',
+    requires:['audio_generation'],
+    optional:['speech_to_text'],
+    notes:[
+      'Generation capability can support later recomposition, but it does not imply source separation support.',
+      'Use this as a planning surface for dubbing or remix workflows, not as a runnable endpoint.'
+    ],
+    backendPath:'unsupported shell',
+    io:'Input: mixed audio. Output: no direct split stems from this UI.'
+  },
+  'aud-clean': {
+    category:'audio',
+    label:'Audio cleanup',
+    summary:'Expose denoise and restoration as recognized needs while keeping unsupported repair operations honest.',
+    requires:['speech_to_text'],
+    optional:['audio_generation'],
+    notes:[
+      'Transcription can help judge intelligibility even when restoration is unavailable.',
+      'Noise removal, de-click, de-hum, and mastering remain external steps unless a dedicated cleanup backend is added.'
+    ],
+    backendPath:'inspection only',
+    io:'Input: noisy audio. Output: guidance and fallback recommendations only.'
+  }
+};
+const SUB_CAPABILITY_RULES = {
+  'img-gen': { category:'image', requiresAny:['image_generation'] },
+  'img-edit': { category:'image', requiresAny:['image_to_image'] },
+  'img-inpaint': { category:'image', requiresAny:['inpainting'] },
+  'img-upscale': { category:'image', optional:['image_upscaling'] },
+  'img-depth': { category:'image', requiresAny:['depth_estimation'] },
+  'img-seg': { category:'image', requiresAny:['image_segmentation'] },
+  'img-faceswap': { category:'image', optional:['image_to_image'] },
+  'img-deblur': { category:'image', optional:['image_to_image'] },
+  'img-unpix': { category:'image', optional:['image_to_image'] },
+  'img-outfit': { category:'image', optional:['image_to_image'] },
+  'vid-t2v': { category:'video', requiresAny:['video_generation'] },
+  'vid-i2v': { category:'video', requiresAny:['image_to_video'] },
+  'vid-v2v': { category:'video', optional:['video_to_video'], fallbackTypes:['video'] },
+  'vid-ti2v': { category:'video', optional:['video_generation','image_to_video'], fallbackTypes:['video'] },
+  'vid-interp': { category:'video', optional:['video_interpolation'], fallbackTypes:['video'] },
+  'vid-sub': { category:'video', optional:['subtitle_generation'], fallbackTypes:['video'] },
+  'vid-dub': { category:'video', optional:['subtitle_generation','speech_to_text','text_to_speech'], fallbackTypes:['video'] },
+  'vid-up': { category:'video', optional:['video_upscaling'], fallbackTypes:['video'] },
+  'vid-faceswap': { category:'video', optional:['video_to_video'], fallbackTypes:['video'] },
+  'vid-outfit': { category:'video', optional:['video_to_video'], fallbackTypes:['video'] },
+  'aud-gen': { category:'audio', requiresAny:['audio_generation'] },
+  'aud-music-dub': { category:'audio', optional:['speech_to_text','text_to_speech','audio_generation'] },
+  'aud-tts': { category:'audio', requiresAny:['text_to_speech'] },
+  'aud-clone': { category:'audio', optional:['text_to_speech','audio_generation'] },
+  'aud-convert': { category:'audio', optional:['speech_to_text','text_to_speech','audio_generation'] },
+  'aud-stt': { category:'audio', requiresAny:['speech_to_text'] },
+  'aud-understand': { category:'audio', optional:['speech_to_text','text_generation'], fallbackTypes:['audio','text','vision'] },
+  'aud-stems': { category:'audio', optional:['audio_generation'], fallbackTypes:['audio'] },
+  'aud-clean': { category:'audio', optional:['speech_to_text'], fallbackTypes:['audio'] },
+};
+const CATEGORY_TABS = ['chat', 'image', 'video', 'audio', 'pipe', 'embed'];
+const CATEGORY_SUBS = {
+  image: Object.keys(SUB_CAPABILITY_RULES).filter(sub => SUB_CAT[sub] === 'image'),
+  video: Object.keys(SUB_CAPABILITY_RULES).filter(sub => SUB_CAT[sub] === 'video'),
+  audio: Object.keys(SUB_CAPABILITY_RULES).filter(sub => SUB_CAT[sub] === 'audio'),
+};
+let currentTabState = { categories:{}, subs:{} };
+
+function capabilitySetForModel(m) {
+  return new Set((m?.capabilities || []).filter(Boolean));
+}
+
+function hasTypeFallback(rule, type) {
+  return Array.isArray(rule.fallbackTypes) && rule.fallbackTypes.includes(type);
+}
+
+function evaluateSubCapability(rule, caps, type) {
+  const required = rule.requiresAny || [];
+  const optional = rule.optional || [];
+  const hasRequired = required.some(cap => caps.has(cap));
+  const hasOptional = optional.some(cap => caps.has(cap));
+  const fallback = hasTypeFallback(rule, type);
+
+  if (hasRequired) return 'available';
+  if (!required.length && (hasOptional || fallback)) return 'partial';
+  if (required.length && (hasOptional || fallback)) return 'partial';
+  if (!required.length) return 'partial';
+  return 'unavailable';
+}
+
+function evaluateCategoryState(cat, subStates, caps, type) {
+  if (cat === 'chat') {
+    return (caps.has('text_generation') || caps.has('image_to_text') || type === 'text' || type === 'vision')
+      ? 'available'
+      : 'partial';
+  }
+  if (cat === 'pipe') return 'available';
+  if (cat === 'embed') return caps.has('embeddings') || type === 'embedding' ? 'available' : 'unavailable';
+  const states = (CATEGORY_SUBS[cat] || []).map(sub => subStates[sub]).filter(Boolean);
+  if (states.includes('available')) return 'available';
+  if (states.includes('partial')) return 'partial';
+  return 'unavailable';
+}
+
+function setTabVisualState(btn, state) {
+  if (!btn) return;
+  btn.classList.remove('state-partial', 'state-unavailable');
+  const def = TAB_STATE[state] || TAB_STATE.unavailable;
+  if (def.className) btn.classList.add(def.className);
+  const badge = btn.querySelector('.tab-status');
+  if (!badge) return;
+  if (def.label) {
+    badge.textContent = def.label;
+    badge.hidden = false;
+  } else {
+    badge.textContent = '';
+    badge.hidden = true;
+  }
+}
+
+function isSubVisibleForCategory(sub, cat) {
+  return SUB_CAT[sub] === cat;
+}
+
+function getFirstVisibleSub(cat) {
+  return document.querySelector(`.t2btn[data-sub][data-cat-visible="${cat}"]:not(.state-hidden)`);
+}
+
+function getSubtabState(sub) {
+  return currentTabState.subs[sub] || 'unavailable';
+}
+
+function getCapabilityDetails(sub) {
+  const def = STUDIO_CAPABILITIES[sub];
+  if (!def) return null;
+  const caps = capabilitySetForModel(activeModel);
+  const required = def.requires || [];
+  const optional = def.optional || [];
+  const missingRequired = required.filter(cap => !caps.has(cap));
+  const missingOptional = optional.filter(cap => !caps.has(cap));
+  const availability = getSubtabState(sub);
+  return {
+    ...def,
+    availability,
+    missingRequired,
+    missingOptional,
+  };
+}
+
+function renderCapabilityCard(sub) {
+  const shell = $(`cap-${sub}`);
+  if (!shell) return;
+  const details = getCapabilityDetails(sub);
+  if (!details) {
+    shell.style.display = 'none';
+    shell.innerHTML = '';
+    return;
+  }
+  shell.style.display = '';
+  const availabilityLabel = details.availability === 'available' ? 'Available' : details.availability === 'partial' ? 'Partial' : 'Unavailable';
+  const availabilityClass = details.availability === 'available' ? '' : details.availability === 'partial' ? ' warn' : ' dim';
+  const missingBits = [];
+  if (details.missingRequired.length) missingBits.push(`<div class="cap-missing"><strong>Missing required:</strong> ${details.missingRequired.join(', ')}</div>`);
+  if (details.missingOptional.length) missingBits.push(`<div class="cap-missing"><strong>Limited without:</strong> ${details.missingOptional.join(', ')}</div>`);
+  const notes = (details.notes || []).map(note => `<div class="cap-note">${note}</div>`).join('');
+  shell.innerHTML = `
+    <div class="cap-card-top">
+      <div>
+        <div class="cap-card-title">${details.label}</div>
+        <div class="cap-card-summary">${details.summary}</div>
+      </div>
+      <span class="cap-chip${availabilityClass}">${availabilityLabel}</span>
+    </div>
+    <div class="cap-meta">
+      <span class="cap-chip">${details.category}</span>
+      <span class="cap-chip">${details.backendPath}</span>
+      <span class="cap-chip">${details.io}</span>
+    </div>
+    ${missingBits.join('')}
+    ${notes}
+  `;
+}
+
+function renderCapabilityCards() {
+  Object.keys(STUDIO_CAPABILITIES).forEach(renderCapabilityCard);
+}
+
+function summarizeDiagnostics() {
+  const subStates = currentTabState.subs || {};
+  const details = Object.entries(SUB_CAPABILITY_RULES).map(([sub, rule]) => {
+    const def = STUDIO_CAPABILITIES[sub];
+    const state = subStates[sub] || 'unavailable';
+    const label = def?.label || document.querySelector(`.t2btn[data-sub="${sub}"]`)?.childNodes[0]?.textContent?.trim() || sub;
+    const fallbackOnly = state !== 'available' && !((rule.requiresAny || []).some(cap => capabilitySetForModel(activeModel).has(cap))) && hasTypeFallback(rule, activeModel?.type || 'text');
+    return { sub, state, label, fallbackOnly };
+  });
+  return {
+    available: details.filter(item => item.state === 'available'),
+    limited: details.filter(item => item.state === 'partial' && !item.fallbackOnly),
+    unavailable: details.filter(item => item.state === 'unavailable'),
+    fallbackOnly: details.filter(item => item.fallbackOnly),
+  };
+}
+
+function renderDiagnostics() {
+  const shell = $('diag-groups');
+  if (!shell) return;
+  if (!activeModel) {
+    shell.innerHTML = '<div class="diag-empty">Select a model to inspect Studio surfaces.</div>';
+    return;
+  }
+  const groups = summarizeDiagnostics();
+  const defs = [
+    { key:'available', label:'Available surfaces' },
+    { key:'limited', label:'Limited surfaces' },
+    { key:'unavailable', label:'Unavailable surfaces' },
+    { key:'fallbackOnly', label:'Fallback / pipeline-only' },
+  ];
+  shell.innerHTML = defs.map(def => {
+    const items = groups[def.key] || [];
+    return `
+      <div class="diag-group">
+        <div class="diag-group-head">
+          <div class="diag-group-label">${escapeHtml(def.label)}</div>
+          <span class="cap-chip">${items.length}</span>
+        </div>
+        ${items.length ? `<div class="diag-items">${items.map(item => `<span class="cap-chip">${escapeHtml(item.label)}</span>`).join('')}</div>` : '<div class="diag-empty">None</div>'}
+      </div>
+    `;
+  }).join('');
+}
+
+function compactSummary(value, max=140) {
+  const text = previewText(value, '').replace(/\s+/g, ' ').trim();
+  if (!text) return '—';
+  return text.length > max ? text.slice(0, max - 1) + '…' : text;
+}
+
+function pushArtifactHistory(entry) {
+  artifactHistory.unshift({
+    timestamp: new Date(),
+    ...entry,
+  });
+  artifactHistory = artifactHistory.slice(0, ARTIFACT_HISTORY_LIMIT);
+  renderArtifactHistory();
+}
+
+function renderArtifactHistory() {
+  const shell = $('artifact-history-list');
+  if (!shell) return;
+  if (!artifactHistory.length) {
+    shell.innerHTML = '<div class="hist-empty">Successful outputs from this session will appear here.</div>';
+    return;
+  }
+  shell.innerHTML = artifactHistory.map(item => {
+    const links = (item.links || []).filter(link => link?.href).map(link => `<a class="btn btn-ghost btn-sm hist-link" href="${escapeHtml(link.href)}" target="_blank" rel="noopener">${escapeHtml(link.label || 'Open')}</a>`).join('');
+    const chips = [item.family, item.model].filter(Boolean).map(value => `<span class="cap-chip">${escapeHtml(value)}</span>`).join('');
+    return `
+      <div class="hist-item">
+        <div class="hist-top">
+          <div>
+            <div class="hist-name">${escapeHtml(item.task)}</div>
+            <div class="hist-meta">${escapeHtml(item.timestamp.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}))}</div>
+          </div>
+          <div class="hist-links">${links}</div>
+        </div>
+        <div class="hist-chips">${chips}</div>
+        <div class="hist-summary">${escapeHtml(compactSummary(item.summary))}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+function buildDubHistorySummary(preview) {
+  const source = preview?.source_lang || 'auto';
+  const target = preview?.target_lang || 'unspecified';
+  return `Dub ${source} → ${target}${preview?.burn_subtitles ? ' with burned subtitles' : ''}`;
+}
+
+function buildImageHistorySummary(urls) {
+  return `${urls.length} image${urls.length === 1 ? '' : 's'} generated`;
+}
+
+function buildAudioHistorySummary(prompt, duration) {
+  const promptText = compactSummary(prompt, 90);
+  return `${duration || '—'}s clip · ${promptText}`;
+}
+
+function buildTTSHistorySummary(input, voice) {
+  return `${voice || 'default voice'} · ${compactSummary(input, 100)}`;
+}
+
+function buildSTTHistorySummary(text, fileName) {
+  return `${fileName || 'uploaded file'} · ${compactSummary(text, 100)}`;
+}
+
+function buildDubFamilyLabel() {
+  return val('vd-track-mode') === 'localized-mix' ? 'video dub / localized mix' : 'video dub / speech-only';
+}
+
+function buildDubLinks(item) {
+  const src = vidSrc(item);
+  return src ? [{ label:'Open', href:src }] : [];
+}
+
+function buildAudioLinks(item) {
+  const src = audSrc(item);
+  return src ? [{ label:'Open', href:src }] : [];
+}
+
+function buildImageLinks(urls) {
+  return (urls || []).filter(Boolean).slice(0, 2).map((href, index) => ({ label:index === 0 ? 'Open' : `Open ${index + 1}`, href }));
+}
+
+function buildDubPreferencePreview() {
+  return {
+    source_lang: val('vd-slang') || undefined,
+    target_lang: val('vd-tlang') || undefined,
+    burn_subtitles: chk('vd-burn'),
+    preserve_voice: chk('vd-preserve-voice'),
+    preserve_tone: chk('vd-preserve-tone'),
+    preserve_timing: chk('vd-preserve-timing'),
+    preserve_singing: chk('vd-preserve-singing'),
+    translate_lyrics: chk('vd-lyrics'),
+    track_mode: val('vd-track-mode') || 'speech-only',
+  };
+}
+
+function previewText(value, fallback='—') {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  return String(value);
+}
+
+function previewFileName(id) {
+  const file = fileOrNull(id);
+  return file ? file.name : 'none';
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
+}
+
+function previewExportBody(endpoint, body) {
+  const safe = Object.fromEntries(Object.entries(body).filter(([, value]) => value !== undefined));
+  return {
+    endpoint,
+    body: safe,
+    json: JSON.stringify(safe, null, 2),
+  };
+}
+
+function buildAudioPreviewData() {
+  return previewExportBody('/v1/audio/generate', {
+    model: activeModel?.id || '',
+    prompt: val('ag-prompt'),
+    duration: fval('ag-dur') || 10,
+    temperature: fval('ag-temp') || 1.0,
+    top_k: ival('ag-topk') || 250,
+    cfg_coef: fval('ag-cfg') || 3.0,
+    seed: val('ag-seed') ? ival('ag-seed') : undefined,
+    melody: fileOrNull('ag-melody') ? '<audio file data>' : undefined,
+    response_format: 'url',
+  });
+}
+
+function buildDubPreviewData() {
+  const preview = buildDubPreferencePreview();
+  return previewExportBody('/v1/video/dub', {
+    model: activeModel?.id || '',
+    video: fileOrNull('vd-src') ? '<video file data>' : undefined,
+    source_lang: preview.source_lang,
+    target_lang: preview.target_lang,
+    burn_subtitles: preview.burn_subtitles,
+  });
+}
+
+function buildCodeSnippet(kind, preview) {
+  if (kind === 'curl') {
+    return `curl -X POST http://localhost:8000${preview.endpoint} \\
+  -H "Content-Type: application/json" \\
+  -d '${preview.json.replace(/'/g, "'\\''")}'`;
+  }
+  if (kind === 'python') {
+    return `import requests\n\npayload = ${preview.json}\nresponse = requests.post(\n    "http://localhost:8000${preview.endpoint}",\n    json=payload,\n    timeout=300,\n)\nprint(response.json())`;
+  }
+  return `const payload = ${preview.json};\nconst response = await fetch("${preview.endpoint}", {\n  method: "POST",\n  headers: { "Content-Type": "application/json" },\n  body: JSON.stringify(payload),\n});\nconst data = await response.json();\nconsole.log(data);`;
+}
+
+function renderRequestPreview(panel, config) {
+  const shell = $(config.containerId);
+  if (!shell) return;
+  const preview = config.build();
+  const fields = config.fields.map(field => `
+    <div class="req-preview-field">
+      <div class="req-preview-label">${escapeHtml(field.label)}</div>
+      <div class="req-preview-value">${escapeHtml(previewText(field.value(preview)))}</div>
+    </div>
+  `).join('');
+  const snippet = buildCodeSnippet(config.snippet || 'curl', preview);
+  shell.innerHTML = `
+    <div class="req-preview-top">
+      <div>
+        <div class="req-preview-title">Request preview</div>
+        <div class="req-preview-sub">Read-only export derived from current form values.</div>
+      </div>
+      <div class="req-preview-endpoint">POST ${escapeHtml(preview.endpoint)}</div>
+    </div>
+    <div class="req-preview-grid">${fields}</div>
+    <div class="req-preview-actions">
+      <button type="button" class="btn btn-ghost btn-sm" data-preview-kind="curl">cURL</button>
+      <button type="button" class="btn btn-ghost btn-sm" data-preview-kind="python">Python</button>
+      <button type="button" class="btn btn-ghost btn-sm" data-preview-kind="javascript">JavaScript</button>
+      <button type="button" class="btn btn-ghost btn-sm" data-preview-copy>Copy</button>
+    </div>
+    <textarea class="fi req-preview-code" readonly>${escapeHtml(snippet)}</textarea>
+    <div class="req-preview-status"></div>
+  `;
+  const codeEl = shell.querySelector('.req-preview-code');
+  const statusEl = shell.querySelector('.req-preview-status');
+  shell.querySelectorAll('[data-preview-kind]').forEach(btn => {
+    btn.classList.toggle('btn-primary', btn.dataset.previewKind === (config.snippet || 'curl'));
+    btn.classList.toggle('btn-ghost', btn.dataset.previewKind !== (config.snippet || 'curl'));
+    btn.addEventListener('click', () => {
+      config.snippet = btn.dataset.previewKind;
+      renderRequestPreview(panel, config);
+    });
+  });
+  shell.querySelector('[data-preview-copy]')?.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(codeEl.value);
+      statusEl.textContent = 'Copied ✓';
+    } catch (e) {
+      statusEl.textContent = 'Copy failed';
+    }
+  });
+}
+
+const REQUEST_PREVIEW_CONFIG = {
+  'aud-gen': {
+    containerId:'ag-preview',
+    snippet:'curl',
+    build:buildAudioPreviewData,
+    fields:[
+      { label:'Model', value:preview => preview.body.model || 'none selected' },
+      { label:'Prompt', value:preview => preview.body.prompt || 'empty' },
+      { label:'Duration', value:preview => preview.body.duration },
+      { label:'Temperature', value:preview => preview.body.temperature },
+      { label:'Melody ref', value:() => previewFileName('ag-melody') },
+      { label:'Seed', value:preview => preview.body.seed ?? 'random' },
+    ],
+  },
+  'vid-dub': {
+    containerId:'vd-preview',
+    snippet:'curl',
+    build:buildDubPreviewData,
+    fields:[
+      { label:'Model', value:preview => preview.body.model || 'none selected' },
+      { label:'Video file', value:() => previewFileName('vd-src') },
+      { label:'Source lang', value:preview => preview.body.source_lang || 'auto' },
+      { label:'Target lang', value:preview => preview.body.target_lang || 'required at run time' },
+      { label:'Burn subtitles', value:preview => preview.body.burn_subtitles },
+      { label:'Track mode', value:() => val('vd-track-mode') || 'speech-only' },
+    ],
+  },
+};
+
+function updateRequestPreview(panel) {
+  const config = REQUEST_PREVIEW_CONFIG[panel];
+  if (!config) return;
+  renderRequestPreview(panel, config);
+}
+
+function initRequestPreviews() {
+  ['ag-prompt','ag-dur','ag-temp','ag-topk','ag-cfg','ag-melody','ag-seed','vd-src','vd-slang','vd-tlang','vd-track-mode','vd-burn','vd-preserve-voice','vd-preserve-tone','vd-preserve-timing','vd-preserve-singing','vd-lyrics']
+    .forEach(id => {
+      const el = $(id);
+      if (!el) return;
+      el.addEventListener('input', () => {
+        if (id.startsWith('ag-')) updateRequestPreview('aud-gen');
+        if (id.startsWith('vd-')) updateRequestPreview('vid-dub');
+      });
+      el.addEventListener('change', () => {
+        if (id.startsWith('ag-')) updateRequestPreview('aud-gen');
+        if (id.startsWith('vd-')) updateRequestPreview('vid-dub');
+      });
+    });
+  updateRequestPreview('aud-gen');
+  updateRequestPreview('vid-dub');
+  renderDiagnostics();
+  renderArtifactHistory();
+}
 
 // ─────────────────────────────────────────────────────────────────
 //  Boot
@@ -1244,6 +2039,8 @@ function selectModel(m) {
     el.classList.toggle('active', el.dataset.id === m.id));
   chatHistory = []; attachedImage = null; updateAttachBar();
   $('chat-msgs').innerHTML = `<div class="chat-empty"><h3>${m.id.split('/').pop()}</h3><p>Start below</p></div>`;
+  updateRequestPreview('aud-gen');
+  updateRequestPreview('vid-dub');
   // Update chat input placeholder to hint at routing for non-text models
   const PLACEHOLDER = {
     image: 'Describe an image to generate…',
@@ -1258,53 +2055,33 @@ function selectModel(m) {
 }
 
 function updateTabs(m) {
-  const caps = m.capabilities || [];
+  const caps = capabilitySetForModel(m);
   const type = m.type || 'text';
-  const enabledCats = new Set();
-  const enabledSubs = new Set();
-
-  // Always available
-  if (caps.includes('text_generation') || caps.includes('image_to_text')) {
-    enabledCats.add('chat');
-  }
-
-  caps.forEach(c => {
-    const cat = CAP_CAT[c]; if (cat) enabledCats.add(cat);
-    const sub = CAP_SUB[c]; if (sub) enabledSubs.add(sub);
+  const subStates = {};
+  Object.entries(SUB_CAPABILITY_RULES).forEach(([sub, rule]) => {
+    if (VIDEO_EXTRA_SUBS.includes(sub) && type === 'video' && !rule.fallbackTypes) {
+      rule = Object.assign({}, rule, { fallbackTypes:['video'] });
+    }
+    subStates[sub] = evaluateSubCapability(rule, caps, type);
   });
+  const categoryStates = {};
+  CATEGORY_TABS.forEach(cat => {
+    categoryStates[cat] = evaluateCategoryState(cat, subStates, caps, type);
+  });
+  currentTabState = { categories:categoryStates, subs:subStates };
 
-  // Video models also get ti2v and dub
-  if (enabledCats.has('video') || type === 'video') {
-    VIDEO_EXTRA_SUBS.forEach(s => enabledSubs.add(s));
-    enabledCats.add('video');
-  }
-
-  // Pipelines and voice clone always available
-  enabledCats.add('pipe');
-  enabledCats.add('audio');
-  enabledSubs.add('aud-clone');
-  enabledSubs.add('aud-convert');
-  enabledCats.add('image');
-  enabledSubs.add('img-upscale');
-  enabledSubs.add('img-faceswap');
-  enabledSubs.add('img-deblur');
-  enabledSubs.add('img-unpix');
-  enabledSubs.add('img-outfit');
-
-  // Show/hide level-1 tabs
   document.querySelectorAll('.t1btn').forEach(btn => {
-    btn.classList.toggle('hidden', !enabledCats.has(btn.dataset.cat));
+    setTabVisualState(btn, categoryStates[btn.dataset.cat] || 'unavailable');
   });
-  // Show/hide level-2 tabs
   document.querySelectorAll('.t2btn').forEach(btn => {
-    btn.classList.toggle('hidden', !enabledSubs.has(btn.dataset.sub));
+    setTabVisualState(btn, subStates[btn.dataset.sub] || 'unavailable');
   });
-  // Vision attach button
-  $('attach-btn').style.display = caps.includes('image_to_text') ? '' : 'none';
-
-  // Switch to first available cat
-  const firstCat = document.querySelector('.t1btn:not(.hidden)');
-  if (firstCat) selectCat(firstCat.dataset.cat);
+  $('attach-btn').style.display = caps.has('image_to_text') ? '' : 'none';
+  renderCapabilityCards();
+  renderDiagnostics();
+  const activeCatBtn = document.querySelector('.t1btn.active');
+  const nextCat = activeCatBtn?.dataset.cat || 'chat';
+  selectCat(nextCat);
 }
 
 function selectCat(cat) {
@@ -1317,18 +2094,25 @@ function selectCat(cat) {
     if (panel) panel.classList.add('active');
     return;
   }
-  // Show only sub-tabs belonging to this category; hide others
   document.querySelectorAll('.t2btn').forEach(btn => {
     const belongsHere = SUB_CAT[btn.dataset.sub] === cat;
-    // A sub-tab is visible if it belongs to this cat AND was enabled by updateTabs
-    btn.style.display = belongsHere && !btn.classList.contains('hidden') ? '' : 'none';
+    btn.dataset.catVisible = belongsHere ? cat : '';
+    btn.classList.toggle('state-hidden', !belongsHere);
   });
-  // Activate first visible sub-tab in this category
-  const firstSub = document.querySelector(`.t2btn:not([style*="display: none"]):not([style*="display:none"])`);
-  if (firstSub) selectSub(firstSub.dataset.sub);
+  const activeSub = document.querySelector('.t2btn.active');
+  const activeSubFits = activeSub && isSubVisibleForCategory(activeSub.dataset.sub, cat);
+  const nextSub = activeSubFits ? activeSub.dataset.sub : getFirstVisibleSub(cat)?.dataset.sub;
+  if (nextSub) selectSub(nextSub);
 }
 
 function selectSub(sub) {
+  if (SUB_CAT[sub] && currentTabState.subs[sub] === undefined) return;
+  if (SUB_CAT[sub]) {
+    const parentCat = SUB_CAT[sub];
+    const belongsToActiveCat = document.querySelector(`.t1btn.active`)?.dataset.cat === parentCat;
+    const btn = document.querySelector(`.t2btn[data-sub="${sub}"]`);
+    if (!belongsToActiveCat || !btn || btn.classList.contains('state-hidden')) return;
+  }
   document.querySelectorAll('.t2btn').forEach(b => b.classList.toggle('active', b.dataset.sub === sub));
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
   const panelId = SUB_PANEL_ALIAS[sub] || ('panel-' + sub);
@@ -1632,6 +2416,13 @@ async function genImage() {
     $('ig-out').innerHTML = `<div class="gen-out-inner">${
       imgs.map(s=>`<img class="out-img" src="${s}" onclick="window.open(this.src)">`).join('')
     }<a href="${imgs[0]}" download class="btn btn-ghost btn-sm dl">Download first</a></div>`;
+    pushArtifactHistory({
+      task:'Image generate',
+      family:'image generation',
+      model:activeModel.id,
+      summary:buildImageHistorySummary(imgs),
+      links:buildImageLinks(imgs),
+    });
     $('ig-prog').textContent='Done ✓';
   } catch(e) { $('ig-prog').textContent='Error: '+e.message; }
 }
@@ -1868,14 +2659,24 @@ async function genDub() {
   if (!activeModel) return;
   const vid = await b64OrNull('vd-src');
   if (!vid) { $('vd-prog').textContent='Select a video.'; return; }
+  const preview = buildDubPreferencePreview();
   $('vd-prog').textContent='Dubbing…';
   try {
     const d = await post('/v1/video/dub', {
       model:activeModel.id, video:vid,
-      source_lang:val('vd-slang')||undefined, target_lang:val('vd-tlang'),
-      burn_subtitles:chk('vd-burn'),
+      source_lang:preview.source_lang, target_lang:preview.target_lang,
+      burn_subtitles:preview.burn_subtitles,
     });
-    showVideo('vd-out', vidSrc(d.data[0]), 'vd-prog');
+    if (d && typeof d === 'object') d._studioPreview = preview;
+    const item = d.data[0];
+    showVideo('vd-out', vidSrc(item), 'vd-prog');
+    pushArtifactHistory({
+      task:'Video dub',
+      family:buildDubFamilyLabel(),
+      model:activeModel.id,
+      summary:buildDubHistorySummary(preview),
+      links:buildDubLinks(item),
+    });
   } catch(e) { $('vd-prog').textContent='Error: '+e.message; }
 }
 
@@ -2328,8 +3129,16 @@ async function genAudio() {
   };
   try {
     const d = await post('/v1/audio/generate', body);
-    const src = audSrc(d.data[0]);
+    const item = d.data[0];
+    const src = audSrc(item);
     showAudio('ag-out', src, 'ag-prog', 'wav');
+    pushArtifactHistory({
+      task:'Audio generate',
+      family:'audio generation',
+      model:activeModel.id,
+      summary:buildAudioHistorySummary(val('ag-prompt'), body.duration),
+      links:buildAudioLinks(item),
+    });
   } catch(e) { $('ag-prog').textContent='Error: '+e.message; }
 }
 
@@ -2349,6 +3158,13 @@ async function genTTS() {
     const blob = await r.blob();
     const src = URL.createObjectURL(blob);
     showAudio('at-out', src, 'at-prog', 'mp3');
+    pushArtifactHistory({
+      task:'Text to speech',
+      family:'tts',
+      model:activeModel.id,
+      summary:buildTTSHistorySummary(val('at-text'), val('at-voice')),
+      links: src ? [{ label:'Open', href:src }] : [],
+    });
   } catch(e) { $('at-prog').textContent='Error: '+e.message; }
 }
 
@@ -2370,6 +3186,13 @@ async function genSTT() {
       <pre style="white-space:pre-wrap;font-size:13px;line-height:1.6;background:var(--surface-2);padding:.75rem;border-radius:6px;width:100%;box-sizing:border-box">${d.text || JSON.stringify(d,null,2)}</pre>
       <button class="btn btn-ghost btn-sm" onclick="navigator.clipboard.writeText(${JSON.stringify(d.text||'')})">Copy</button>
     </div>`;
+    pushArtifactHistory({
+      task:'Transcription',
+      family:'speech to text',
+      model:activeModel.id,
+      summary:buildSTTHistorySummary(d.text || JSON.stringify(d), f.name),
+      links:[],
+    });
     $('as-prog').textContent='Done ✓';
   } catch(e) { $('as-prog').textContent='Error: '+e.message; }
 }
@@ -2485,6 +3308,7 @@ async function runPipeline3() {
 // fragment includes aren't available. Add them now:
 document.getElementById('panel-vid-t2v').innerHTML = `<div class="gen-wrap">
   <div class="gen-ctrl">
+    <div class="cap-card" id="cap-vid-t2v" style="display:none"></div>
     <div class="frow"><label class="fl">Prompt</label><textarea id="vt-prompt" class="fs" rows="4" placeholder="Describe the video…"></textarea></div>
     <div class="frow"><label class="fl">Negative prompt</label><textarea id="vt-neg" class="fs" rows="2" placeholder="Things to avoid…"></textarea></div>
     <div class="g2">
@@ -2518,6 +3342,7 @@ document.getElementById('panel-vid-t2v').innerHTML = `<div class="gen-wrap">
 
 loadModels();
 loadVoiceProfiles();
+initRequestPreviews();
 initPipelineBuilder();
 
 // ── Pipeline accordion: opening one card closes all others ────────
@@ -2563,10 +3388,15 @@ function renderCustomPipelineCards() {
   if (!container) return;
   container.innerHTML = _customPipelines.map(p => `
     <details class="pipe-card">
-      <summary>${p.name || p.id}
-        <span class="pipe-steps" style="margin:0;font-size:11px">
-          ${p.steps.map(s => `<span class="pipe-step">${s.label || s.type}</span>`).join('<span class="pipe-arrow">→</span>')}
-        </span>
+      <summary>
+        <div class="pipe-head">
+          <div class="pipe-title">${p.name || p.id}</div>
+          <div class="pipe-summary">${p.description || 'Custom multi-step pipeline for combining model and utility actions.'}</div>
+          <div class="pipe-steps">
+            ${p.steps.map(s => `<span class="pipe-step">${s.label || s.type}</span>`).join('<span class="pipe-arrow">→</span>')}
+          </div>
+          <div class="pipe-tags"><span class="pipe-tag">custom</span><span class="pipe-tag">pipeline</span><span class="pipe-tag">${p.steps.length} steps</span></div>
+        </div>
       </summary>
       <div class="pipe-card-body">
         ${p.description ? `<p style="font-size:12px;color:var(--text-2);margin:0 0 .4rem">${p.description}</p>` : ''}
