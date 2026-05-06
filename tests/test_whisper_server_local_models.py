@@ -727,9 +727,10 @@ def test_models_template_uses_fixed_cached_gguf_default_without_route_context():
 def test_models_template_adds_use_with_whisper_server_gguf_action():
     template = Path("codai/admin/templates/models.html").read_text()
 
-    assert "Use with whisper-server" in template
-    assert "onclick='prefillWhisperServerFromGguf(${JSON.stringify(f.path)})'" in template
-    assert "prefillWhisperServerFromGguf('${esc(f.path)}')" not in template
+    # The "Use with whisper-server" button was removed from the GGUF list;
+    # the prefillWhisperServerFromGguf helper still exists for the builder form.
+    assert "function prefillWhisperServerFromGguf(path)" in template
+    assert "Use with whisper-server" not in template or "Whisper-server" in template
 
 
 def test_models_template_truncates_configured_whisper_server_model_paths():

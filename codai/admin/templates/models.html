@@ -345,6 +345,10 @@
         <label class="form-label">Model ID / path</label>
         <div id="cfg-id-label" style="font-size:12px;font-family:monospace;color:var(--text-2);word-break:break-all;padding:.3rem 0"></div>
       </div>
+      <div class="form-row" id="cfg-quant-row" style="display:none">
+        <label class="form-label">Quantization</label>
+        <select id="cfg-quant-select" class="form-input" onchange="onCfgQuantChange()"></select>
+      </div>
       <div class="form-row">
         <label class="form-label" style="display:flex;align-items:center;gap:.5rem">Type
           <span id="cfg-type-autodet" style="font-size:11px;color:var(--text-3);font-weight:400"></span>
@@ -508,6 +512,41 @@ function fmtCapabilities(caps){
     lip_sync:'Lip-sync',subtitle_generation:'Subs',video_dubbing:'Dub'
   };
   return caps.slice(0,5).map(c=>`<span class="badge badge-user" style="font-size:10px;padding:.15rem .35rem">${esc(labels[c]||c)}</span>`).join(' ');
+}
+
+/* ── GGUF grouping helpers ───────────────────────────── */
+const _QUANT_RE = /[_\-\.](Q\d[_A-Z0-9]*|IQ\d[_A-Z0-9]*|F16|F32|BF16)(?=\.gguf$)/i;
+function _ggufQuant(filename){
+  const m = filename.match(_QUANT_RE);
+  return m ? m[1].toUpperCase() : null;
+}
+function _ggufBaseName(filename){
+  // Strip quant suffix and .gguf extension to get the model base name
+  return filename.replace(_QUANT_RE,'').replace(/\.gguf$/i,'');
+}
+function _switchGgufQuant(idx, newPath){
+  const m = _localModels[idx];
+  if(!m || !m.ggufGroup) return;
+  const f = m.ggufGroup.find(x=>x.path===newPath);
+  if(!f) return;
+  m.label = f.filename;
+  m.path = f.path;
+  m.size_gb = f.size_gb||0;
+  m.settings = f.settings||{};
+  m.in_config = f.in_config;
+  // Re-render quant badges in the row
+  const row = document.getElementById('gguf-row-'+idx);
+  if(!row) return;
+  const base = _ggufBaseName(f.filename);
+  const quantBadges = m.ggufGroup.length > 1
+    ? m.ggufGroup.map(gf=>{
+        const q = _ggufQuant(gf.filename);
+        const active = gf.path === newPath;
+        return `<span class="badge ${active?'badge-ok':'badge-user'}" style="font-size:10px;padding:.1rem .3rem;cursor:pointer" title="${esc(gf.filename)}" onclick="_switchGgufQuant(${idx},${JSON.stringify(gf.path)})">${esc(q||gf.filename)}</span>`;
+      }).join(' ')
+    : '';
+  const nameCell = row.querySelector('td:first-child');
+  if(nameCell) nameCell.innerHTML = `${esc(base)}<br>${quantBadges}`;
 }
 
 /* ── tab / modal ─────────────────────────────────────── */
@@ -1010,7 +1049,7 @@ function _renderWhisperServerRows(models){
       </td>
     </tr>`;
   });
-  return '<div class="card" style="margin-top:1rem">'+
+  return '<div class="card" style="margin-top:1rem" id="ws-rendered-card">'+
     '<div class="card-title">Configured whisper-server models</div>'+
     '<table style="width:100%;border-collapse:collapse;font-size:13px">'+
     '<thead><tr style="color:var(--text-2);font-size:10px;text-transform:uppercase;letter-spacing:.05em">'+
@@ -1130,38 +1169,61 @@ async function loadCachedModels(){
     if(!gguf.length){
       ggufEl.innerHTML = '<span class="muted small">No GGUF files cached.</span>';
     }else{
-      const rows = gguf.map(f=>{
+      // Group by base model name (strip quant suffix)
+      const groups = {};
+      gguf.forEach(f=>{
+        const base = _ggufBaseName(f.filename);
+        if(!groups[base]) groups[base] = [];
+        groups[base].push(f);
+      });
+      const rows = Object.entries(groups).map(([base, files])=>{
+        // Use the configured file if any, else first
+        const primary = files.find(f=>f.in_config) || files[0];
         const idx = _localModels.length;
-        _localModels.push({label:f.filename, path:f.path, cacheType:'gguf', size_gb:f.size_gb||0,
-          defaultType:f.model_type||'text_models', settings:f.settings||{}, in_config:f.in_config,
-          capabilities:f.capabilities||[]});
-        const loaded = _loadedKeys.has(f.path) || _loadedKeys.has(f.filename) || [..._loadedKeys].some(k=>k.endsWith(':'+f.path)||k.endsWith(':'+f.filename));
-        const capBadges = fmtCapabilities(f.capabilities||[]);
-        return `<tr style="border-top:1px solid var(--border)">
-          <td style="padding:.4rem .25rem;font-family:monospace;font-size:11px;max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(f.filename)}">${esc(f.filename)}</td>
-          <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${fmtGB(f.size_gb)}</td>
+        _localModels.push({label:primary.filename, path:primary.path, cacheType:'gguf',
+          size_gb:primary.size_gb||0, defaultType:primary.model_type||'text_models',
+          settings:primary.settings||{}, in_config:primary.in_config,
+          capabilities:primary.capabilities||[], ggufGroup:files});
+        const loaded = _loadedKeys.has(primary.path) || _loadedKeys.has(primary.filename) ||
+          [..._loadedKeys].some(k=>k.endsWith(':'+primary.path)||k.endsWith(':'+primary.filename));
+        const capBadges = fmtCapabilities(primary.capabilities||[]);
+        const in_config = files.some(f=>f.in_config);
+        // Quant badges
+        const quantBadges = files.length > 1
+          ? files.map(f=>{
+              const q = _ggufQuant(f.filename);
+              const active = f.path === primary.path;
+              return `<span class="badge ${active?'badge-ok':'badge-user'}" style="font-size:10px;padding:.1rem .3rem;cursor:pointer" title="${esc(f.filename)}" onclick="_switchGgufQuant(${idx},${JSON.stringify(f.path)})">${esc(q||f.filename)}</span>`;
+            }).join(' ')
+          : '';
+        return `<tr style="border-top:1px solid var(--border)" id="gguf-row-${idx}">
+          <td style="padding:.4rem .25rem;font-family:monospace;font-size:11px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(primary.filename)}">${esc(base)}<br>${quantBadges}</td>
+          <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${fmtGB(primary.size_gb)}</td>
           <td style="padding:.4rem .25rem;font-size:11px">${capBadges||'<span class="muted small">—</span>'}</td>
-          <td style="text-align:center;padding:.4rem .25rem">${f.in_config?'<span class="badge badge-ok">enabled</span>':'<span class="muted small">—</span>'}</td>
+          <td style="text-align:center;padding:.4rem .25rem">${in_config?'<span class="badge badge-ok">enabled</span>':'<span class="muted small">—</span>'}</td>
           <td style="padding:.4rem .25rem;text-align:right;white-space:nowrap">
-            ${f.in_config?(loaded
+            ${in_config?(loaded
               ?`<button class="btn btn-ghost btn-sm" onclick="unloadModel(${idx})">Unload</button>`
               :`<button class="btn btn-primary btn-sm" onclick="loadModel(${idx})">Load now</button>`):''}
-            <button class="btn btn-secondary btn-sm" onclick='prefillWhisperServerFromGguf(${JSON.stringify(f.path)})'>Use with whisper-server</button>
-            <button class="btn btn-secondary btn-sm" onclick="openCfgModal(${idx})">${f.in_config?'Configure':'Add to CoderAI'}</button>
-            ${f.in_config?`<button class="btn btn-ghost btn-sm" onclick="disableModel(${idx})">Remove</button>`:''}
+            <button class="btn btn-secondary btn-sm" onclick="openCfgModal(${idx})">${in_config?'Configure':'Add to CoderAI'}</button>
+            ${in_config?`<button class="btn btn-ghost btn-sm" onclick="disableModel(${idx})">Remove</button>`:''}
             <button class="btn btn-danger btn-sm" onclick="deleteModelConfirm(${idx})">Delete</button>
           </td>
         </tr>`;
       });
       ggufEl.innerHTML = '<table style="width:100%;border-collapse:collapse;font-size:13px">'+
         '<thead><tr style="color:var(--text-2);font-size:10px;text-transform:uppercase;letter-spacing:.05em">'+
-        '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">File</th>'+
+        '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Model</th>'+
         '<th style="text-align:right;padding:.3rem .25rem;font-weight:700">Size</th>'+
         '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Capabilities</th>'+
         '<th style="text-align:center;padding:.3rem .25rem;font-weight:700">Config</th>'+
         '<th></th></tr></thead><tbody>'+rows.join('')+'</tbody></table>';
     }
     ggufEl.insertAdjacentHTML('afterend', _renderWhisperServerRows(whisperModels));
+    // Remove any previously rendered whisper-server card before inserting the new one
+    document.querySelectorAll('#ws-rendered-card').forEach(el=>el.remove());
+    const wsHtml = _renderWhisperServerRows(whisperModels);
+    if(wsHtml) ggufEl.insertAdjacentHTML('afterend', wsHtml);
     resetWhisperServerBuilderDefaults();
   }catch(e){
     hfEl.innerHTML = ggufEl.innerHTML = `<span class="muted small">Error: ${esc(e.message)}</span>`;
@@ -1220,7 +1282,8 @@ async function clearCacheConfirm(type){
 async function deleteModelConfirm(idx){
   const m = _localModels[idx];
   if(!confirm(`Delete "${m.label}" from local cache? This cannot be undone.`)) return;
-  const idForUrl = m.cacheType === 'hf' ? m.path : m.label;
+  // Always send the full path so the backend can locate the file regardless of cache location
+  const idForUrl = m.path;
   try{
     const r = await fetch('/admin/api/cached-models/'+encodeURIComponent(idForUrl)+'?cache_type='+m.cacheType, {method:'DELETE'});
     const d = await r.json();
@@ -1274,6 +1337,17 @@ function _getCheckedTypes() {
   return {primaryType: categories[0] || 'text_models', model_types: categories, video_subtypes: subs};
 }
 
+function onCfgQuantChange(){
+  const quantSelect = document.getElementById('cfg-quant-select');
+  const idx = parseInt(quantSelect.dataset.idx);
+  const newPath = quantSelect.value;
+  _switchGgufQuant(idx, newPath);
+  // Update hidden path field and label
+  document.getElementById('cfg-path').value = newPath;
+  const m = _localModels[idx];
+  document.getElementById('cfg-id-label').textContent = m.label;
+}
+
 function openCfgModal(idx){
   const m = _localModels[idx];
   const s = m.settings || {};
@@ -1281,6 +1355,21 @@ function openCfgModal(idx){
   document.getElementById('cfg-id-label').textContent = m.label;
   document.getElementById('cfg-path').value = m.path;
   document.getElementById('cfg-orig-type').value = m.defaultType;
+
+  // Quantization selector for grouped GGUF models
+  const quantRow = document.getElementById('cfg-quant-row');
+  const quantSelect = document.getElementById('cfg-quant-select');
+  if(m.ggufGroup && m.ggufGroup.length > 1){
+    quantSelect.innerHTML = m.ggufGroup.map(f=>{
+      const q = _ggufQuant(f.filename) || f.filename;
+      return `<option value="${esc(f.path)}" ${f.path===m.path?'selected':''}>${esc(q)} — ${fmtGB(f.size_gb)}</option>`;
+    }).join('');
+    quantRow.style.display = '';
+    quantSelect.dataset.idx = idx;
+  } else {
+    quantRow.style.display = 'none';
+    quantSelect.innerHTML = '';
+  }
 
   // Determine type checkboxes: saved config > auto-detect from capabilities > defaultType
   const det = document.getElementById('cfg-type-autodet');

@@ -945,8 +945,12 @@ def _scan_caches() -> dict:
 
     # Add configured GGUF models not yet in the list (e.g., HF repo IDs or external paths)
     existing_paths = {m["path"] for m in result["gguf"]}
+    existing_fnames = {m["filename"] for m in result["gguf"]}
     for path, (settings, mtype) in configured_settings.items():
-        if path in existing_paths:
+        if path in existing_paths or path in existing_fnames:
+            continue
+        fname = os.path.basename(path) if '/' in path else path
+        if fname in existing_fnames:
             continue
         # Check if it's a GGUF model (ends with .gguf or is in a GGUF repo)
         is_gguf = path.endswith('.gguf') or 'gguf' in path.lower() or mtype == "gguf_models"
@@ -1115,7 +1119,11 @@ def _do_delete_model(model_id: str, cache_type: str) -> dict:
 
     if cache_type == "gguf":
         gguf_dir = get_model_cache_dir()
-        fp = os.path.join(gguf_dir, model_id)
+        # Support full absolute path (e.g. HF-cached GGUF) or bare filename
+        if os.path.isabs(model_id):
+            fp = model_id
+        else:
+            fp = os.path.join(gguf_dir, model_id)
         if os.path.isfile(fp):
             os.remove(fp)
             return {"success": True}
