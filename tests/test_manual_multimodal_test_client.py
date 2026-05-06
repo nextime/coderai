@@ -234,6 +234,52 @@ def test_build_request_spec_for_video_generation_uses_json_payload(tmp_path):
     }
 
 
+def test_build_request_spec_for_video_doubt_uses_text_endpoint_with_video_context(tmp_path):
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video-bytes")
+    config = {
+        "mode": "video-doubt",
+        "url": "http://127.0.0.1:6745",
+        "model": "vision:test",
+        "prompt": "What happens in this clip?",
+        "output_dir": tmp_path,
+        "token": None,
+        "audio_file": None,
+        "video_file": str(video_path),
+        "response_format": None,
+    }
+
+    spec = build_request_spec(config)
+
+    assert spec["url"].endswith("/v1/chat/completions")
+    assert spec["json"]["model"] == "vision:test"
+    assert str(video_path) in spec["json"]["messages"][0]["content"]
+    assert "What happens in this clip?" in spec["json"]["messages"][0]["content"]
+
+
+def test_build_request_spec_for_music_audio_doubt_uses_text_endpoint_with_audio_context(tmp_path):
+    audio_path = tmp_path / "clip.wav"
+    audio_path.write_bytes(b"audio-bytes")
+    config = {
+        "mode": "music-audio-doubt",
+        "url": "http://127.0.0.1:6745",
+        "model": "audio:test",
+        "prompt": "Describe the music.",
+        "output_dir": tmp_path,
+        "token": None,
+        "audio_file": str(audio_path),
+        "video_file": None,
+        "response_format": None,
+    }
+
+    spec = build_request_spec(config)
+
+    assert spec["url"].endswith("/v1/chat/completions")
+    assert spec["json"]["model"] == "audio:test"
+    assert str(audio_path) in spec["json"]["messages"][0]["content"]
+    assert "Describe the music." in spec["json"]["messages"][0]["content"]
+
+
 def test_build_request_spec_for_transcription_requires_audio_file_flag(tmp_path):
     config = {
         "mode": "transcription",
