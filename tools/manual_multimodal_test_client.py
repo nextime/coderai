@@ -250,4 +250,4 @@ def handle_response_payload(mode: str, response, output_dir: Path) -> dict:
 def execute_request(spec: dict):
     method = spec["method"]
     kwargs = {key: value for key, value in spec.items() if key not in {"method", "url"}}
-    return requests.request(method, spec["url"], timeout=300, **kwargs)
+    return requests.request(method=method, url=spec["url"], timeout=300, **kwargs)

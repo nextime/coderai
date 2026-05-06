@@ -3,6 +3,7 @@ from tools.manual_multimodal_test_client import (
     build_request_spec,
     build_parser,
     choose_mode_interactively,
+    execute_request,
     handle_response_payload,
     parse_args,
     resolve_mode_config,
@@ -370,7 +371,7 @@ class DummyResponse:
             raise RuntimeError(f"HTTP {self.status_code}")
 
 
-def test_handle_response_payload_returns_llm_text_without_artifact(tmp_path):
+def test_task5_handle_response_payload_returns_llm_text_without_artifact(tmp_path):
     response = DummyResponse({
         "choices": [{"message": {"content": "hello from model"}}]
     })
@@ -381,7 +382,7 @@ def test_handle_response_payload_returns_llm_text_without_artifact(tmp_path):
     assert result["artifact_path"] is None
 
 
-def test_handle_response_payload_downloads_url_artifact(monkeypatch, tmp_path):
+def test_task5_handle_response_payload_downloads_url_artifact(monkeypatch, tmp_path):
     response = DummyResponse({
         "data": [{"url": "http://example.invalid/audio.wav"}]
     })
@@ -396,7 +397,7 @@ def test_handle_response_payload_downloads_url_artifact(monkeypatch, tmp_path):
     assert result["artifact_path"].read_bytes() == b"wave-bytes"
 
 
-def test_handle_response_payload_decodes_base64_artifact(tmp_path):
+def test_task5_handle_response_payload_decodes_base64_artifact(tmp_path):
     response = DummyResponse({
         "data": [{"b64_json": "aGVsbG8="}]
     })
@@ -404,3 +405,34 @@ def test_handle_response_payload_decodes_base64_artifact(tmp_path):
     result = handle_response_payload("audio-generation", response, tmp_path)
 
     assert result["artifact_path"].read_bytes() == b"hello"
+
+
+def test_task5_execute_request_forwards_method_url_timeout_and_kwargs(monkeypatch):
+    captured = {}
+
+    def fake_request(*, method, url, timeout, **kwargs):
+        captured["method"] = method
+        captured["url"] = url
+        captured["timeout"] = timeout
+        captured["kwargs"] = kwargs
+        return "response-object"
+
+    monkeypatch.setattr("tools.manual_multimodal_test_client.requests.request", fake_request)
+
+    result = execute_request({
+        "method": "POST",
+        "url": "http://127.0.0.1:6745/v1/audio/generate",
+        "headers": {"Accept": "application/json"},
+        "json": {"prompt": "Ping"},
+    })
+
+    assert result == "response-object"
+    assert captured == {
+        "method": "POST",
+        "url": "http://127.0.0.1:6745/v1/audio/generate",
+        "timeout": 300,
+        "kwargs": {
+            "headers": {"Accept": "application/json"},
+            "json": {"prompt": "Ping"},
+        },
+    }
