@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 
 MODES = [
@@ -11,6 +12,39 @@ MODES = [
     "video-doubt",
     "music-audio-doubt",
 ]
+
+
+MODE_DEFAULTS = {
+    "llm": {
+        "model": "text",
+        "prompt": "Reply with a short test acknowledgement.",
+    },
+    "transcription": {
+        "model": "audio",
+        "prompt": None,
+        "audio_file": "samples/transcription.wav",
+    },
+    "audio-generation": {
+        "model": "audio_gen",
+        "prompt": "Generate a short calm ambient audio test clip.",
+        "response_format": "url",
+    },
+    "video-generation": {
+        "model": "video",
+        "prompt": "Generate a short test clip of a rotating cube.",
+        "response_format": "url",
+    },
+    "video-doubt": {
+        "model": "vision",
+        "prompt": "Describe the important events in this video.",
+        "video_file": "samples/question-video.mp4",
+    },
+    "music-audio-doubt": {
+        "model": "audio",
+        "prompt": "Describe the music and prominent sounds in this audio.",
+        "audio_file": "samples/question-audio.wav",
+    },
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,6 +63,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return build_parser().parse_args(argv)
+
+
+def resolve_mode_config(args: argparse.Namespace, selected_mode: str) -> dict:
+    defaults = MODE_DEFAULTS[selected_mode]
+    return {
+        "mode": selected_mode,
+        "url": args.url.rstrip("/"),
+        "token": args.token,
+        "model": args.model or defaults.get("model"),
+        "prompt": args.prompt if args.prompt is not None else defaults.get("prompt"),
+        "output_dir": Path(args.output_dir),
+        "file": args.file,
+        "audio_file": args.audio_file or defaults.get("audio_file"),
+        "video_file": args.video_file or defaults.get("video_file"),
+        "response_format": defaults.get("response_format"),
+    }
 
 
 def choose_mode_interactively() -> str:
