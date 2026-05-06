@@ -59,7 +59,7 @@ def set_config_manager(mgr):
 def _next_whisper_server_model_id(audio_models) -> str:
     used_suffixes = set()
     for model in audio_models or []:
-        if not isinstance(model, dict) or model.get("backend") != "whisper-server":
+        if not isinstance(model, dict):
             continue
         match = re.fullmatch(r"whisper(\d+)", str(model.get("id") or "").strip())
         if match:

@@ -189,6 +189,33 @@ def test_model_configure_defaults_missing_whisper_server_model_id_to_smallest_fr
     app.dependency_overrides.clear()
 
 
+def test_model_configure_defaults_missing_whisper_server_model_id_skips_non_whisper_server_collision(monkeypatch, tmp_path):
+    from codai.admin import routes
+
+    cfg = _build_config(tmp_path)
+    cfg.models_data["audio_models"] = [
+        {"id": "whisper0", "backend": "faster-whisper"},
+    ]
+    monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
+    app, client = _build_admin_test_client(routes)
+    response = client.post(
+        "/admin/api/model-configure",
+        json={
+            "backend": "whisper-server",
+            "server_path": "/usr/local/bin/whisper-server",
+            "model_path": "/models/ggml-base.bin",
+            "port": 8744,
+            "gpu_device": 0,
+            "load_mode": "on-request",
+        },
+    )
+
+    assert response.status_code == 200
+    assert cfg.models_data["audio_models"][-1]["id"] == "whisper1"
+
+    app.dependency_overrides.clear()
+
+
 def test_model_configure_defaults_missing_whisper_server_path_to_usr_local_bin(monkeypatch, tmp_path):
     from codai.admin import routes
 
@@ -212,6 +239,33 @@ def test_model_configure_defaults_missing_whisper_server_path_to_usr_local_bin(m
 
     assert response.status_code == 200
     assert cfg.models_data["audio_models"][0]["server_path"] == "/usr/local/bin/whisper-server"
+
+    app.dependency_overrides.clear()
+
+
+def test_model_configure_defaults_missing_whisper_server_path_uses_shutil_which_when_present(monkeypatch, tmp_path):
+    from codai.admin import routes
+
+    cfg = _build_config(tmp_path)
+    monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
+    monkeypatch.setattr(routes.shutil, "which", lambda _: "/opt/bin/whisper-server")
+    app, client = _build_admin_test_client(routes)
+    response = client.post(
+        "/admin/api/model-configure",
+        json={
+            "model_id": "whisper-vulkan-base",
+            "model_type": "audio_models",
+            "backend": "whisper-server",
+            "server_path": "",
+            "model_path": "/models/ggml-base.bin",
+            "port": 8744,
+            "gpu_device": 0,
+            "load_mode": "on-request",
+        },
+    )
+
+    assert response.status_code == 200
+    assert cfg.models_data["audio_models"][0]["server_path"] == "/opt/bin/whisper-server"
 
     app.dependency_overrides.clear()
 
