@@ -80,6 +80,74 @@ def resolve_mode_config(args: argparse.Namespace, selected_mode: str) -> dict:
     }
 
 
+def _require_file(path_value: str | None, flag_name: str) -> Path:
+    if not path_value:
+        raise FileNotFoundError(f"Missing required file. Supply {flag_name}.")
+    path = Path(path_value)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}. Supply {flag_name}.")
+    return path
+
+
+def build_request_spec(config: dict) -> dict:
+    mode = config["mode"]
+    headers = {"Accept": "application/json"}
+    if config.get("token"):
+        headers["Authorization"] = f"Bearer {config['token']}"
+
+    if mode == "llm":
+        return {
+            "method": "POST",
+            "url": f"{config['url']}/v1/chat/completions",
+            "headers": headers,
+            "json": {
+                "model": config["model"],
+                "messages": [{"role": "user", "content": config["prompt"]}],
+            },
+        }
+
+    if mode == "transcription":
+        audio_path = _require_file(config.get("audio_file"), "--audio-file")
+        return {
+            "method": "POST",
+            "url": f"{config['url']}/v1/audio/transcriptions",
+            "headers": headers,
+            "data": {
+                "model": config["model"],
+                "prompt": config["prompt"],
+            },
+            "files": {
+                "file": (audio_path.name, audio_path.read_bytes()),
+            },
+        }
+
+    if mode == "audio-generation":
+        return {
+            "method": "POST",
+            "url": f"{config['url']}/v1/audio/generate",
+            "headers": headers,
+            "json": {
+                "model": config["model"],
+                "prompt": config["prompt"],
+                "response_format": config["response_format"] or "url",
+            },
+        }
+
+    if mode == "video-generation":
+        return {
+            "method": "POST",
+            "url": f"{config['url']}/v1/video/generations",
+            "headers": headers,
+            "json": {
+                "model": config["model"],
+                "prompt": config["prompt"],
+                "response_format": config["response_format"] or "url",
+            },
+        }
+
+    raise ValueError(f"Unsupported mode for this task: {mode}")
+
+
 def choose_mode_interactively() -> str:
     for idx, mode in enumerate(MODES, start=1):
         print(f"{idx}. {mode}")

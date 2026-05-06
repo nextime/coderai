@@ -1,5 +1,6 @@
 from tools.manual_multimodal_test_client import (
     MODE_DEFAULTS,
+    build_request_spec,
     build_parser,
     choose_mode_interactively,
     parse_args,
@@ -118,3 +119,90 @@ def test_resolve_mode_config_keeps_explicit_empty_string_overrides(tmp_path):
     assert config["audio_file"] == ""
     assert config["video_file"] == ""
     assert config["response_format"] == ""
+
+
+def test_build_request_spec_for_llm_uses_chat_completions_payload(tmp_path):
+    config = {
+        "mode": "llm",
+        "url": "http://127.0.0.1:6745",
+        "model": "text:test",
+        "prompt": "Ping",
+        "output_dir": tmp_path,
+        "token": None,
+        "audio_file": None,
+        "video_file": None,
+        "response_format": None,
+    }
+
+    spec = build_request_spec(config)
+
+    assert spec["method"] == "POST"
+    assert spec["url"] == "http://127.0.0.1:6745/v1/chat/completions"
+    assert spec["json"]["model"] == "text:test"
+    assert spec["json"]["messages"][0]["content"] == "Ping"
+
+
+def test_build_request_spec_for_transcription_uses_multipart_file(tmp_path):
+    audio_path = tmp_path / "sample.wav"
+    audio_path.write_bytes(b"wav-bytes")
+    config = {
+        "mode": "transcription",
+        "url": "http://127.0.0.1:6745",
+        "model": "audio:test",
+        "prompt": "Transcribe carefully",
+        "output_dir": tmp_path,
+        "token": None,
+        "audio_file": str(audio_path),
+        "video_file": None,
+        "response_format": None,
+    }
+
+    spec = build_request_spec(config)
+
+    assert spec["url"].endswith("/v1/audio/transcriptions")
+    assert spec["data"]["model"] == "audio:test"
+    assert spec["data"]["prompt"] == "Transcribe carefully"
+    assert spec["files"]["file"][0] == "sample.wav"
+    assert spec["files"]["file"][1] == b"wav-bytes"
+
+
+def test_build_request_spec_for_audio_generation_uses_json_payload(tmp_path):
+    config = {
+        "mode": "audio-generation",
+        "url": "http://127.0.0.1:6745",
+        "model": "audio_gen:test",
+        "prompt": "Generate a bell sound",
+        "output_dir": tmp_path,
+        "token": None,
+        "audio_file": None,
+        "video_file": None,
+        "response_format": "url",
+    }
+
+    spec = build_request_spec(config)
+
+    assert spec["url"].endswith("/v1/audio/generate")
+    assert spec["json"]["model"] == "audio_gen:test"
+    assert spec["json"]["prompt"] == "Generate a bell sound"
+    assert spec["json"]["response_format"] == "url"
+
+
+def test_build_request_spec_for_video_generation_uses_json_payload(tmp_path):
+    config = {
+        "mode": "video-generation",
+        "url": "http://127.0.0.1:6745",
+        "model": "video:test",
+        "prompt": "Generate a short test clip",
+        "output_dir": tmp_path,
+        "token": None,
+        "audio_file": None,
+        "video_file": None,
+        "response_format": "url",
+    }
+
+    spec = build_request_spec(config)
+
+    assert spec["url"].endswith("/v1/video/generations")
+    assert spec["json"]["model"] == "video:test"
+    assert spec["json"]["prompt"] == "Generate a short test clip"
+    assert spec["json"]["response_format"] == "url"
