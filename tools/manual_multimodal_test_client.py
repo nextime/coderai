@@ -56,7 +56,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--response-format", default=None)
     parser.add_argument("--output-dir", default="tmp/manual-client-output")
-    parser.add_argument("--file", default=None)
     parser.add_argument("--audio-file", default=None)
     parser.add_argument("--video-file", default=None)
     return parser
@@ -72,12 +71,12 @@ def resolve_mode_config(args: argparse.Namespace, selected_mode: str) -> dict:
         "mode": selected_mode,
         "url": args.url.rstrip("/"),
         "token": args.token,
-        "model": args.model or defaults.get("model"),
+        "model": args.model if args.model is not None else defaults.get("model"),
         "prompt": args.prompt if args.prompt is not None else defaults.get("prompt"),
         "output_dir": Path(args.output_dir),
-        "audio_file": args.audio_file or defaults.get("audio_file"),
-        "video_file": args.video_file or defaults.get("video_file"),
-        "response_format": args.response_format or defaults.get("response_format"),
+        "audio_file": args.audio_file if args.audio_file is not None else defaults.get("audio_file"),
+        "video_file": args.video_file if args.video_file is not None else defaults.get("video_file"),
+        "response_format": args.response_format if args.response_format is not None else defaults.get("response_format"),
     }
 
 

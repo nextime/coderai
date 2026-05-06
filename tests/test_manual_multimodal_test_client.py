@@ -39,6 +39,15 @@ def test_parse_args_leaves_mode_empty_for_interactive_fallback():
     assert args.mode is None
 
 
+def test_parse_args_rejects_generic_file_argument():
+    try:
+        parse_args(["llm", "--file", "sample.dat"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("parse_args accepted deprecated --file argument")
+
+
 def test_resolve_mode_config_uses_mode_defaults_when_overrides_absent(tmp_path):
     args = parse_args(["audio-generation", "--output-dir", str(tmp_path)])
 
@@ -91,3 +100,21 @@ def test_resolve_mode_config_prefers_explicit_model_prompt_url_and_response_form
     assert config["prompt"] == "Custom prompt"
     assert config["response_format"] == "b64_json"
     assert config["output_dir"] == tmp_path
+
+
+def test_resolve_mode_config_keeps_explicit_empty_string_overrides(tmp_path):
+    args = parse_args([
+        "video-generation",
+        "--model", "",
+        "--audio-file", "",
+        "--video-file", "",
+        "--response-format", "",
+        "--output-dir", str(tmp_path),
+    ])
+
+    config = resolve_mode_config(args, selected_mode="video-generation")
+
+    assert config["model"] == ""
+    assert config["audio_file"] == ""
+    assert config["video_file"] == ""
+    assert config["response_format"] == ""
