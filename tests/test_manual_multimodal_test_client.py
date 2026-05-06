@@ -1,5 +1,6 @@
 from tools.manual_multimodal_test_client import (
     MODE_DEFAULTS,
+    _download_artifact,
     build_request_spec,
     build_parser,
     choose_mode_interactively,
@@ -371,6 +372,27 @@ class DummyResponse:
             raise RuntimeError(f"HTTP {self.status_code}")
 
 
+class DummyDownloadResponse:
+    def __init__(self, content, status_code=200):
+        self.content = content
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+def test_task5_download_artifact_returns_response_content(monkeypatch):
+    monkeypatch.setattr(
+        "tools.manual_multimodal_test_client.requests.get",
+        lambda url, timeout: DummyDownloadResponse(b"artifact-bytes"),
+    )
+
+    result = _download_artifact("http://example.invalid/artifact.bin")
+
+    assert result == b"artifact-bytes"
+
+
 def test_task5_handle_response_payload_returns_llm_text_without_artifact(tmp_path):
     payload = {
         "choices": [{"message": {"content": "hello from model"}}]
@@ -431,6 +453,23 @@ def test_task5_handle_response_payload_downloads_video_generation_artifact_as_mp
     assert result["artifact_path"].read_bytes() == b"video-bytes"
     assert result["text"] == "generated video summary"
     assert result["payload"] == payload
+
+
+def test_task5_handle_response_payload_propagates_http_errors(tmp_path):
+    response = DummyResponse({"error": "bad request"}, status_code=500)
+
+    with pytest.raises(RuntimeError, match=r"HTTP 500"):
+        handle_response_payload("llm", response, tmp_path)
+
+
+def test_task5_handle_response_payload_rejects_generation_without_artifact_fields(tmp_path):
+    payload = {
+        "data": [{"text": "generated audio summary"}]
+    }
+    response = DummyResponse(payload)
+
+    with pytest.raises(ValueError, match=r"No artifact found in generation response for mode: audio-generation"):
+        handle_response_payload("audio-generation", response, tmp_path)
 
 
 def test_task5_execute_request_forwards_method_url_timeout_and_kwargs(monkeypatch):
