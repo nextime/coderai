@@ -411,7 +411,21 @@ def test_models_template_preserves_whisper_server_manual_path_controls():
     template = Path("codai/admin/templates/models.html").read_text()
 
     assert "ws-model-path" in template
-    assert "Manual path" in template
+    assert 'placeholder="Manual path: /models/ggml-base.bin"' in template
+    assert "modelPath.style.display = useCached ? 'none' : '';" in template
+
+
+def test_models_template_defines_whisper_server_source_toggle_behavior():
+    template = Path("codai/admin/templates/models.html").read_text()
+
+    assert "function toggleWhisperModelSource()" in template
+    assert "const sourceSelect = document.getElementById('ws-model-source');" in template
+    assert "const source = sourceSelect ? sourceSelect.value : 'cached-gguf';" in template
+    assert "const ggufSelect = document.getElementById('ws-gguf-select');" in template
+    assert "const modelPath = document.getElementById('ws-model-path');" in template
+    assert "const useCached = source === 'cached-gguf';" in template
+    assert "ggufSelect.style.display = useCached ? '' : 'none';" in template
+    assert "modelPath.style.display = useCached ? 'none' : '';" in template
 
 
 def test_settings_template_no_longer_contains_whisper_server_section():

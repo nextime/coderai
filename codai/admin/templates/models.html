@@ -1121,7 +1121,8 @@ async function loadCachedModels(){
 }
 
 function toggleWhisperModelSource(){
-  const source = document.getElementById('ws-model-source')?.value || 'cached-gguf';
+  const sourceSelect = document.getElementById('ws-model-source');
+  const source = sourceSelect ? sourceSelect.value : 'cached-gguf';
   const ggufSelect = document.getElementById('ws-gguf-select');
   const modelPath = document.getElementById('ws-model-path');
   if(!ggufSelect || !modelPath) return;
