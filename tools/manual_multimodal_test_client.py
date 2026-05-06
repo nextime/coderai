@@ -139,7 +139,7 @@ def build_request_spec(config: dict) -> dict:
         }
 
     if mode == "transcription":
-        audio_path = _require_file(config.get("audio_file"), "--audio-file")
+        audio_path = ensure_sample_file(config.get("audio_file"), "--audio-file")
         file_stack = ExitStack()
         return {
             "method": "POST",
@@ -180,7 +180,7 @@ def build_request_spec(config: dict) -> dict:
         }
 
     if mode == "video-doubt":
-        video_path = _require_file(config.get("video_file"), "--video-file")
+        video_path = ensure_sample_file(config.get("video_file"), "--video-file")
         content = (
             f"Video file: {video_path}\n"
             f"Question: {config['prompt']}\n"
@@ -198,7 +198,7 @@ def build_request_spec(config: dict) -> dict:
         }
 
     if mode == "music-audio-doubt":
-        audio_path = _require_file(config.get("audio_file"), "--audio-file")
+        audio_path = ensure_sample_file(config.get("audio_file"), "--audio-file")
         content = (
             f"Audio file: {audio_path}\n"
             f"Question: {config['prompt']}\n"

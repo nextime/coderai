@@ -227,6 +227,45 @@ def test_build_request_spec_for_transcription_uses_multipart_file(tmp_path):
     uploaded_file.close()
 
 
+def test_build_request_spec_for_transcription_downloads_missing_managed_default(tmp_path, monkeypatch):
+    managed_path = tmp_path / "samples" / "transcription.wav"
+    downloaded = []
+    config = {
+        "mode": "transcription",
+        "url": "http://127.0.0.1:6745",
+        "model": "audio:test",
+        "prompt": "Transcribe carefully",
+        "output_dir": tmp_path,
+        "token": None,
+        "audio_file": str(managed_path),
+        "video_file": None,
+        "response_format": None,
+    }
+
+    def fake_download(path):
+        downloaded.append(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"downloaded-wav")
+        return path
+
+    monkeypatch.setattr(
+        "tools.manual_multimodal_test_client.SAMPLE_URLS",
+        {managed_path.as_posix(): "https://example.invalid/transcription.wav"},
+    )
+    monkeypatch.setattr(
+        "tools.manual_multimodal_test_client.download_default_sample",
+        fake_download,
+    )
+
+    spec = build_request_spec(config)
+
+    uploaded_name, uploaded_file = spec["files"]["file"]
+    assert uploaded_name == "transcription.wav"
+    assert uploaded_file.read() == b"downloaded-wav"
+    assert downloaded == [managed_path]
+    uploaded_file.close()
+
+
 def test_build_request_spec_for_audio_generation_uses_json_payload(tmp_path):
     config = {
         "mode": "audio-generation",
