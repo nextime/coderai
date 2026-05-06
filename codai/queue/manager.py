@@ -33,6 +33,12 @@ class QueueManager:
         self.model_loading: bool = False
         self.model_name: Optional[str] = None
         self.lock = asyncio.Lock()
+        self.max_size: int = 6
+
+    async def is_full(self) -> bool:
+        """Return True if the queue has reached max_size."""
+        async with self.lock:
+            return len(self.waiting_requests) >= self.max_size
     
     async def add_waiting(self, request_id: str) -> None:
         """Add a request to the waiting queue."""

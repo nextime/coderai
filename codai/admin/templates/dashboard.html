@@ -28,15 +28,17 @@
     <div class="stat-value" id="req-total">0</div>
     <div class="stat-sub"><span id="req-active">0</span> active</div>
   </div>
-  <div class="stat">
+  <div class="stat" id="vram-card" style="display:none">
     <div class="stat-label">VRAM</div>
-    <div class="stat-value" id="vram-pct">—</div>
+    <div class="stat-value" id="vram-pct" style="font-size:2rem">—</div>
     <div class="progress" style="margin-top:.625rem">
       <div class="progress-fill" id="vram-bar" style="width:0%"></div>
     </div>
-    <div class="progress-labels">
-      <span id="vram-used">—</span><span id="vram-total">—</span>
+    <div class="progress-labels" style="color:var(--text-1);font-size:12px;margin-top:.4rem">
+      <span id="vram-used">—</span><span id="vram-free">—</span>
     </div>
+    <div style="font-size:11.5px;color:var(--text-2);margin-top:.2rem;font-family:var(--mono)" id="vram-total-line"></div>
+    <div class="stat-sub" id="vram-gpu" style="margin-top:.25rem"></div>
   </div>
 </div>
 
@@ -85,13 +87,25 @@ async function poll() {
     document.getElementById('active-models').innerHTML = html || '<span class="muted small">No models loaded</span>';
 
     if (d.vram) {
-      const pct = Math.round(d.vram.used / d.vram.total * 100);
-      document.getElementById('vram-pct').textContent = pct + '%';
-      document.getElementById('vram-bar').style.width = pct + '%';
-      document.getElementById('vram-used').textContent = d.vram.used.toFixed(1) + ' GB';
-      document.getElementById('vram-total').textContent = d.vram.total.toFixed(1) + ' GB';
+      document.getElementById('vram-card').style.display = '';
+      if (d.vram.free != null && d.vram.total) {
+        const usedPct = Math.round(d.vram.used / d.vram.total * 100);
+        document.getElementById('vram-pct').textContent = usedPct + '%';
+        document.getElementById('vram-bar').style.width = usedPct + '%';
+        document.getElementById('vram-used').textContent = d.vram.used.toFixed(1) + ' GB used';
+        document.getElementById('vram-free').textContent = d.vram.free.toFixed(1) + ' GB free';
+        document.getElementById('vram-total-line').textContent = d.vram.total.toFixed(1) + ' GB total';
+      } else {
+        document.getElementById('vram-pct').textContent = d.vram.total ? d.vram.total.toFixed(1) + ' GB' : '—';
+        document.getElementById('vram-bar').style.width = '0%';
+        document.getElementById('vram-used').textContent = '';
+        document.getElementById('vram-free').textContent = '';
+        document.getElementById('vram-total-line').textContent = '';
+      }
+      const gpuName = d.vram.gpu || '';
+      document.getElementById('vram-gpu').textContent = gpuName.length > 32 ? gpuName.slice(0, 32) + '…' : gpuName;
     } else {
-      document.getElementById('vram-pct').textContent = 'N/A';
+      document.getElementById('vram-card').style.display = 'none';
     }
 
     if (d.requests) {

@@ -75,6 +75,16 @@ timm>=0.9.0                    # vision model backbones (depth/segment endpoints
 #   pip install audiocraft
 # AudioLDM2 is available via diffusers (already listed above)
 
+# Voice cloning (F5-TTS zero-shot voice cloning)
+f5-tts>=1.1.0
+
+# Voice conversion / singing voice conversion (Seed-VC — preserves pitch/melody)
+seed-vc>=0.4.0
+
+# Face swap (insightface INSwapper — downloads inswapper_128.onnx on first use)
+insightface>=0.7.3
+onnxruntime-gpu>=1.20.0        # GPU-accelerated ONNX runtime for insightface
+
 # Optional: for better performance
 # bitsandbytes>=0.41.0  # for 4-bit/8-bit quantization
 # sentencepiece>=0.1.99  # for some tokenizers

@@ -15,10 +15,13 @@
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 """Authentication and session management for admin dashboard."""
+import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -43,35 +46,62 @@ def get_or_create_secret(config_dir: Path) -> bytes:
 
 
 def hash_password(password: str) -> str:
-    """Hash a password using SHA-256 with salt.
-    
-    In production, use argon2 or bcrypt. This is a minimal implementation
-    for environments where those libraries aren't available.
+    """Hash a password using argon2 (preferred) or scrypt as fallback.
+
+    New hashes are always produced with a proper key-derivation function and
+    a per-password random salt.  The legacy SHA-256/static-salt format is
+    only retained for *verification* of pre-existing hashes.
     """
-    # Use SHA-256 with a pepper-like secret for basic hashing
-    # Real implementation should use argon2 from main.py
-    salt = b'static_salt_'  # In production, use per-user random salt
-    return hashlib.sha256(salt + password.encode()).hexdigest()
+    try:
+        from argon2 import PasswordHasher
+        ph = PasswordHasher()
+        return ph.hash(password)
+    except ImportError:
+        pass
+    # scrypt fallback: encode as "scrypt:<b64salt>:<b64key>"
+    salt = os.urandom(16)
+    key = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
+    return "scrypt:" + base64.b64encode(salt).decode() + ":" + base64.b64encode(key).decode()
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    """Verify a password against its hash."""
-    # Try argon2 first
+    """Verify a password against its hash.
+
+    Supports argon2, scrypt (new format), and the legacy SHA-256/static-salt
+    format so that old stored hashes continue to work.
+    """
+    # --- argon2 ---
     try:
         from argon2 import PasswordHasher
-        from argon2.exceptions import VerifyMismatchError
+        from argon2.exceptions import VerifyMismatchError, InvalidHashError
         ph = PasswordHasher()
         try:
             return ph.verify(password_hash, password)
         except VerifyMismatchError:
             return False
+        except InvalidHashError:
+            pass  # not an argon2 hash; fall through
         except Exception:
             pass
     except ImportError:
         pass
-    
-    # Fallback to simple hash
-    return hash_password(password) == password_hash
+
+    # --- scrypt ---
+    if password_hash.startswith("scrypt:"):
+        try:
+            parts = password_hash.split(":")
+            if len(parts) == 3:
+                salt = base64.b64decode(parts[1])
+                stored_key = base64.b64decode(parts[2])
+                new_key = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
+                return hmac.compare_digest(new_key, stored_key)
+        except Exception:
+            pass
+        return False
+
+    # --- legacy SHA-256 with static salt (read-only; never written for new passwords) ---
+    legacy = hashlib.sha256(b'static_salt_' + password.encode()).hexdigest()
+    return hmac.compare_digest(legacy, password_hash)
 
 
 class SessionManager:
@@ -81,7 +111,7 @@ class SessionManager:
         self.config_dir = config_dir
         self.secret = get_or_create_secret(config_dir)
         self.session_timeout = timedelta(minutes=session_timeout_minutes)
-        self._lock = __import__('threading').Lock()
+        self._lock = threading.Lock()
     
     def _load_auth_data(self) -> Dict[str, Any]:
         """Load auth.json data."""

@@ -389,6 +389,11 @@ class WhisperServerManager:
             "url": self.base_url
         }
 
+    def cleanup(self):
+        """Stop the subprocess — called by the VRAM eviction/unload machinery."""
+        print("whisper-server: evicted from VRAM, stopping subprocess")
+        self.stop()
+
 
 class MultiModelManager:
     """
@@ -412,9 +417,11 @@ class MultiModelManager:
         self.active_in_vram: Optional[str] = None  # most-recently-used model key
         self.models_in_vram: set = set()  # all models currently in VRAM
         self.model_aliases: Dict[str, str] = {}
-        self.whisper_server: Optional[WhisperServerManager] = None
+        self.whisper_server: Optional[WhisperServerManager] = None  # legacy single-instance compat
+        self.whisper_servers: Dict[str, WhisperServerManager] = {}  # id -> manager
         self.model_backend_types: Dict[str, str] = {}
         self.tool_breaker = FuzzyToolBreaker(threshold=3)  # Circuit breaker for repetitive tool calls
+        self._load_lock = threading.Lock()  # Prevents duplicate on-demand model loads
     
     @property
     def image_model(self) -> Optional[str]:
@@ -432,12 +439,17 @@ class MultiModelManager:
                 print(f"Warning: Error cleaning up model {key}: {e}")
         self.models.clear()
         
-        # Cleanup whisper server
-        if self.whisper_server:
+        # Cleanup whisper server(s)
+        for wsm in self.whisper_servers.values():
             try:
-                self.whisper_server.stop()
+                wsm.stop()
             except Exception as e:
                 print(f"Warning: Error cleaning up whisper server: {e}")
+        if self.whisper_server and self.whisper_server not in self.whisper_servers.values():
+            try:
+                self.whisper_server.stop()
+            except Exception:
+                pass
         
         # Clear all model lists
         self.default_model = None
@@ -520,125 +532,116 @@ class MultiModelManager:
             print(f"Model '{model_name}' cached as: {resolved_model}")
     
     def _load_default_model(self):
-        """Load the default model on demand."""
+        """Load the default model on demand (thread-safe)."""
         if not self.default_model:
             return None
-        
-        # Check if already loaded
+
+        # Fast path: already loaded (checked without lock for performance)
         if self.default_model in self.models:
             return self.models[self.default_model]
-        
-        # Get config and backend type
-        config = self.config.get(self.default_model, {})
-        backend_type = self.model_backend_types.get(self.default_model, "auto")
-        
-        # Get global args for additional parameters
-        try:
-            from codai.api.state import get_global_args
-            global_args = get_global_args()
-        except:
-            global_args = None
-        
-        # Create new model manager and load the model
-        model_manager = ModelManager()
-        
-        try:
-            # Build kwargs from config
-            kwargs = {}
-            if 'ctx' in config:
-                kwargs['ctx'] = config['ctx']
-            if global_args:
-                if hasattr(global_args, 'n_gpu_layers'):
-                    kwargs['n_gpu_layers'] = global_args.n_gpu_layers
-                if hasattr(global_args, 'offload_dir'):
-                    kwargs['offload_dir'] = global_args.offload_dir
-                if hasattr(global_args, 'ram'):
-                    kwargs['manual_ram_gb'] = global_args.ram
-                if hasattr(global_args, 'flash_attn'):
-                    kwargs['flash_attn'] = global_args.flash_attn
-                if hasattr(global_args, 'no_ram'):
-                    kwargs['no_ram'] = global_args.no_ram
-                if hasattr(global_args, 'offload_strategy'):
-                    kwargs['offload_strategy'] = global_args.offload_strategy
-                if hasattr(global_args, 'load_in_4bit'):
-                    kwargs['load_in_4bit'] = global_args.load_in_4bit
-                if hasattr(global_args, 'load_in_8bit'):
-                    kwargs['load_in_8bit'] = global_args.load_in_8bit
-                if hasattr(global_args, 'max_gpu_percent'):
-                    kwargs['max_gpu_percent'] = global_args.max_gpu_percent
-            
-            print(f"Loading default model on demand: {self.default_model}")
-            model_manager.load_model(self.default_model, backend_type=backend_type, **kwargs)
-            
-            # Add to models dict
-            self.models[self.default_model] = model_manager
-            self.current_model_key = self.default_model
-            
-            print(f"Model loaded successfully: {self.default_model}")
-            return model_manager
-            
-        except Exception as e:
-            print(f"Error loading model {self.default_model}: {e}")
-            return None
+
+        with self._load_lock:
+            # Re-check inside the lock to avoid duplicate loads from concurrent requests
+            if self.default_model in self.models:
+                return self.models[self.default_model]
+
+            config = self.config.get(self.default_model, {})
+            backend_type = self.model_backend_types.get(self.default_model, "auto")
+
+            try:
+                from codai.api.state import get_global_args
+                global_args = get_global_args()
+            except Exception:
+                global_args = None
+
+            model_manager = ModelManager()
+            try:
+                kwargs = {}
+                if 'ctx' in config:
+                    kwargs['ctx'] = config['ctx']
+                if global_args:
+                    if hasattr(global_args, 'n_gpu_layers'):
+                        kwargs['n_gpu_layers'] = global_args.n_gpu_layers
+                    if hasattr(global_args, 'offload_dir'):
+                        kwargs['offload_dir'] = global_args.offload_dir
+                    if hasattr(global_args, 'ram'):
+                        kwargs['manual_ram_gb'] = global_args.ram
+                    if hasattr(global_args, 'flash_attn'):
+                        kwargs['flash_attn'] = global_args.flash_attn
+                    if hasattr(global_args, 'no_ram'):
+                        kwargs['no_ram'] = global_args.no_ram
+                    if hasattr(global_args, 'offload_strategy'):
+                        kwargs['offload_strategy'] = global_args.offload_strategy
+                    if hasattr(global_args, 'load_in_4bit'):
+                        kwargs['load_in_4bit'] = global_args.load_in_4bit
+                    if hasattr(global_args, 'load_in_8bit'):
+                        kwargs['load_in_8bit'] = global_args.load_in_8bit
+                    if hasattr(global_args, 'max_gpu_percent'):
+                        kwargs['max_gpu_percent'] = global_args.max_gpu_percent
+
+                print(f"Loading default model on demand: {self.default_model}")
+                model_manager.load_model(self.default_model, backend_type=backend_type, **kwargs)
+                self.models[self.default_model] = model_manager
+                self.current_model_key = self.default_model
+                print(f"Model loaded successfully: {self.default_model}")
+                return model_manager
+            except Exception as e:
+                print(f"Error loading model {self.default_model}: {e}")
+                return None
     
     def _load_model_by_name(self, model_name: str):
-        """Load a model by name on demand."""
-        # Check if already loaded
+        """Load a model by name on demand (thread-safe)."""
         if model_name in self.models:
             return self.models[model_name]
-        
-        # Check if it's registered in config
-        config = self.config.get(model_name, {})
-        backend_type = self.model_backend_types.get(model_name, "auto")
-        
-        # Get global args for additional parameters
-        try:
-            from codai.api.state import get_global_args
-            global_args = get_global_args()
-        except:
-            global_args = None
-        
-        # Create new model manager and load the model
-        model_manager = ModelManager()
-        
-        try:
-            # Build kwargs from config
-            kwargs = {}
-            if 'ctx' in config:
-                kwargs['ctx'] = config['ctx']
-            if global_args:
-                if hasattr(global_args, 'n_gpu_layers'):
-                    kwargs['n_gpu_layers'] = global_args.n_gpu_layers
-                if hasattr(global_args, 'offload_dir'):
-                    kwargs['offload_dir'] = global_args.offload_dir
-                if hasattr(global_args, 'ram'):
-                    kwargs['manual_ram_gb'] = global_args.ram
-                if hasattr(global_args, 'flash_attn'):
-                    kwargs['flash_attn'] = global_args.flash_attn
-                if hasattr(global_args, 'no_ram'):
-                    kwargs['no_ram'] = global_args.no_ram
-                if hasattr(global_args, 'offload_strategy'):
-                    kwargs['offload_strategy'] = global_args.offload_strategy
-                if hasattr(global_args, 'load_in_4bit'):
-                    kwargs['load_in_4bit'] = global_args.load_in_4bit
-                if hasattr(global_args, 'load_in_8bit'):
-                    kwargs['load_in_8bit'] = global_args.load_in_8bit
-                if hasattr(global_args, 'max_gpu_percent'):
-                    kwargs['max_gpu_percent'] = global_args.max_gpu_percent
-            
-            print(f"Loading model on demand: {model_name}")
-            model_manager.load_model(model_name, backend_type=backend_type, **kwargs)
-            
-            # Add to models dict
-            self.models[model_name] = model_manager
-            self.current_model_key = model_name
-            
-            print(f"Model loaded successfully: {model_name}")
-            return model_manager
-            
-        except Exception as e:
-            print(f"Error loading model {model_name}: {e}")
-            return None
+
+        with self._load_lock:
+            # Re-check inside lock to prevent duplicate loads
+            if model_name in self.models:
+                return self.models[model_name]
+
+            config = self.config.get(model_name, {})
+            backend_type = self.model_backend_types.get(model_name, "auto")
+
+            try:
+                from codai.api.state import get_global_args
+                global_args = get_global_args()
+            except Exception:
+                global_args = None
+
+            model_manager = ModelManager()
+            try:
+                kwargs = {}
+                if 'ctx' in config:
+                    kwargs['ctx'] = config['ctx']
+                if global_args:
+                    if hasattr(global_args, 'n_gpu_layers'):
+                        kwargs['n_gpu_layers'] = global_args.n_gpu_layers
+                    if hasattr(global_args, 'offload_dir'):
+                        kwargs['offload_dir'] = global_args.offload_dir
+                    if hasattr(global_args, 'ram'):
+                        kwargs['manual_ram_gb'] = global_args.ram
+                    if hasattr(global_args, 'flash_attn'):
+                        kwargs['flash_attn'] = global_args.flash_attn
+                    if hasattr(global_args, 'no_ram'):
+                        kwargs['no_ram'] = global_args.no_ram
+                    if hasattr(global_args, 'offload_strategy'):
+                        kwargs['offload_strategy'] = global_args.offload_strategy
+                    if hasattr(global_args, 'load_in_4bit'):
+                        kwargs['load_in_4bit'] = global_args.load_in_4bit
+                    if hasattr(global_args, 'load_in_8bit'):
+                        kwargs['load_in_8bit'] = global_args.load_in_8bit
+                    if hasattr(global_args, 'max_gpu_percent'):
+                        kwargs['max_gpu_percent'] = global_args.max_gpu_percent
+
+                print(f"Loading model on demand: {model_name}")
+                model_manager.load_model(model_name, backend_type=backend_type, **kwargs)
+                self.models[model_name] = model_manager
+                self.current_model_key = model_name
+                print(f"Model loaded successfully: {model_name}")
+                return model_manager
+            except Exception as e:
+                print(f"Error loading model {model_name}: {e}")
+                return None
     
     def set_audio_model(self, model_name: str, config: Dict = None):
         """Add an audio transcription model and download/cache it if needed."""
@@ -654,6 +657,25 @@ class MultiModelManager:
             self.audio_models[idx] = resolved_model
             self.config[f"audio:{resolved_model}"] = self.config.pop(f"audio:{model_name}")
             print(f"Audio model '{model_name}' cached as: {resolved_model}")
+
+    def register_whisper_server(self, model_id: str, server_path: str, model_path: str = None,
+                                 port: int = 8744, gpu_device: int = 0, config: Dict = None):
+        """Register a whisper-server instance as an audio model."""
+        wsm = WhisperServerManager(server_path=server_path, port=port)
+        wsm._model_path = model_path
+        wsm._gpu_device = gpu_device
+        self.whisper_servers[model_id] = wsm
+        # Keep legacy single-instance reference pointing to the first one registered
+        if self.whisper_server is None:
+            self.whisper_server = wsm
+        # Register as allowed audio model with its config
+        cfg = config or {}
+        cfg.setdefault("load_mode", "on-request")
+        if model_id not in self.audio_models:
+            self.audio_models.append(model_id)
+        self.config[f"audio:{model_id}"] = cfg
+        print(f"Registered whisper-server audio model: {model_id} (server: {server_path})")
+        return wsm
     
     def set_tts_model(self, model_name: str, config: Dict = None):
         """Set the text-to-speech model and download/cache it if needed."""
@@ -805,6 +827,43 @@ class MultiModelManager:
 
         return allowed
 
+    def get_registered_model_type(self, name: str) -> Optional[str]:
+        """
+        Return the type a model is registered under ("text", "image", "audio",
+        "tts", "vision", "video", "audio_gen", "embedding"), or None if unknown.
+        Short-name (filename) matching is used so full paths resolve correctly.
+        """
+        def _matches(registered: str) -> bool:
+            if name == registered:
+                return True
+            n_short = name.split("/")[-1] if "/" in name else name
+            r_short = registered.split("/")[-1] if "/" in registered else registered
+            return n_short == r_short
+
+        if self.default_model and _matches(self.default_model):
+            return "text"
+        for m in self.image_models:
+            if _matches(m):
+                return "image"
+        for m in self.audio_models:
+            if _matches(m):
+                return "audio"
+        if self.tts_model and _matches(self.tts_model):
+            return "tts"
+        for m in self.vision_models:
+            if _matches(m):
+                return "vision"
+        for m in self.video_models:
+            if _matches(m):
+                return "video"
+        for m in self.audio_gen_models:
+            if _matches(m):
+                return "audio_gen"
+        for m in self.embedding_models:
+            if _matches(m):
+                return "embedding"
+        return None
+
     def is_allowed_model(self, requested_or_resolved: str, model_type: str = None) -> bool:
         """
         Check if a model name (raw request value *or* resolved name) is one of
@@ -822,6 +881,15 @@ class MultiModelManager:
         """
         if not requested_or_resolved:
             return False
+
+        # If a model_type is specified, reject models registered under a
+        # different type (e.g. an image GGUF requested via /v1/chat/completions).
+        if model_type:
+            registered_type = self.get_registered_model_type(requested_or_resolved)
+            if registered_type is not None and registered_type != model_type:
+                # "vision" models are acceptable for "text" endpoints (multimodal)
+                if not (model_type == "text" and registered_type == "vision"):
+                    return False
 
         # Quick check against the full set of allowed identifiers
         allowed = self.get_all_allowed_identifiers()
@@ -1365,9 +1433,26 @@ class MultiModelManager:
         # This prevents API callers from requesting arbitrary models that were not
         # specified on the command line (or registered as aliases).
         if not self.is_allowed_model(resolved_name, model_type):
-            # Also try the original requested_model value (before alias resolution)
-            # in case the caller used a valid alias that resolved to something we
-            # didn't recognise above (shouldn't happen, but be safe).
+            # Check if the model exists but is registered under a different type
+            registered_type = self.get_registered_model_type(resolved_name)
+            if registered_type is not None and registered_type != model_type:
+                endpoint_hint = {
+                    "image": "POST /v1/images/generations",
+                    "audio": "POST /v1/audio/transcriptions",
+                    "tts": "POST /v1/audio/speech",
+                    "video": "POST /v1/videos/generations",
+                }.get(registered_type, f"the {registered_type} endpoint")
+                print(f"Model type mismatch: '{resolved_name}' is a {registered_type} model, "
+                      f"requested via {model_type} endpoint")
+                return {
+                    'model_key': None,
+                    'model_name': None,
+                    'model_object': None,
+                    'config': {},
+                    'already_loaded': False,
+                    'error': (f"Model '{resolved_name}' is a {registered_type} model and cannot be used "
+                              f"for {model_type} generation. Use {endpoint_hint} instead."),
+                }
             allowed_ids = sorted(self.get_all_allowed_identifiers())
             print(f"Model validation failed: '{resolved_name}' is not an allowed model. "
                   f"Allowed models: {allowed_ids}")

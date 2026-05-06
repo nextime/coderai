@@ -19,11 +19,15 @@ FastAPI application module for codai API.
 Contains the FastAPI app initialization, lifespan, and core endpoints.
 """
 
+import logging
+import os
 from contextlib import asynccontextmanager
 from typing import List
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
+
+logger = logging.getLogger(__name__)
 
 # Import from codai modules
 from codai.pydantic.textrequest import ModelList
@@ -89,11 +93,19 @@ from codai.api.text import router as text_router
 from codai.api.video import router as video_router
 from codai.api.audio_gen import router as audio_gen_router
 from codai.api.embeddings import router as embeddings_router
+from codai.api.pipelines import router as pipelines_router
+from codai.api.custom_pipelines import router as custom_pipelines_router
+from codai.api.voice_clone import router as voice_clone_router
+from codai.api.voice_convert import router as voice_convert_router
+from codai.api.faceswap import router as faceswap_router
+from codai.api.characters import router as characters_router
 from codai.admin.routes import router as admin_router
 
 # Import and add middleware
 from codai.api.log import log_requests
+from codai.api.ratelimit import RateLimitMiddleware
 app.middleware("http")(log_requests)
+app.add_middleware(RateLimitMiddleware)
 
 # Mount static files for admin dashboard
 from fastapi.staticfiles import StaticFiles
@@ -110,6 +122,12 @@ app.include_router(text_router)
 app.include_router(video_router)
 app.include_router(audio_gen_router)
 app.include_router(embeddings_router)
+app.include_router(pipelines_router)
+app.include_router(custom_pipelines_router)
+app.include_router(voice_clone_router)
+app.include_router(voice_convert_router)
+app.include_router(faceswap_router)
+app.include_router(characters_router)
 app.include_router(admin_router)
 
 
@@ -133,11 +151,14 @@ async def list_models():
 @app.get("/v1/files/{filename}")
 async def get_file(filename: str):
     """Serve uploaded/generated files."""
-    print(f"DEBUG get_file: filename={filename}, global_file_path={global_file_path}")
-    if global_file_path:
-        import os
-        file_path = os.path.join(global_file_path, filename)
-        print(f"DEBUG get_file: full path={file_path}, exists={os.path.exists(file_path)}")
-        if os.path.exists(file_path):
-            return FileResponse(file_path)
-    raise HTTPException(status_code=404, detail="File not found")
+    if not global_file_path:
+        raise HTTPException(status_code=404, detail="File not found")
+    # Prevent path traversal: resolve to real paths and confirm the result
+    # stays inside the configured directory.
+    safe_base = os.path.realpath(global_file_path)
+    candidate = os.path.realpath(os.path.join(global_file_path, filename))
+    if not (candidate == safe_base or candidate.startswith(safe_base + os.sep)):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not os.path.isfile(candidate):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(candidate)

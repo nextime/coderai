@@ -21,14 +21,17 @@ Image generation endpoints for the codai API.
 import asyncio
 import base64
 import io
+import logging
 import os
 import time
 import uuid
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
+
+_log = logging.getLogger(__name__)
 from PIL import Image
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 # Import from codai modules
 from codai.models.manager import multi_model_manager
@@ -78,14 +81,12 @@ def get_cfg_scale():
                         for heap in mem:
                             if heap.get('flags', []).get('deviceLocal', False):
                                 vram_mb = heap.get('size', 0) / (1024 * 1024)
-                                print(f"DEBUG: Detected VRAM: {vram_mb:.0f} MB")
+                                _log.debug("Detected VRAM: %.0f MB", vram_mb)
                                 if vram_mb < 16000:  # Less than 16GB
-                                    print(f"DEBUG: VRAM < 16GB, using cfg_scale=1.0 for better performance")
                                     return 1.0
                                 break
             except Exception as e:
-                print(f"DEBUG: Could not detect VRAM: {e}")
-                # Default to 1.0 for Vulkan if detection fails
+                _log.debug("Could not detect VRAM: %s", e)
                 return 1.0
     
     return cfg_scale
@@ -117,7 +118,6 @@ def save_image_response(img, request_format="base64", http_request=None):
         # Add URL to response
         # Determine base URL based on --url argument
         url_setting = getattr(global_args, 'url', 'auto') if global_args else 'auto'
-        print(f"DEBUG: global_args={global_args}, url_setting={url_setting}")
         if url_setting == 'auto':
             # Use server host from request headers (what client used to connect)
             if http_request:
@@ -146,7 +146,6 @@ def save_image_response(img, request_format="base64", http_request=None):
                 protocol = "https" if use_https else "http"
                 port = getattr(global_args, 'port', 8000)
                 base_url = f"{protocol}://{client_host}:{port}"
-                print(f"DEBUG: client_host={client_host}, port={port}, base_url={base_url}")
             else:
                 base_url = "http://127.0.0.1:8000"
         else:
@@ -460,13 +459,9 @@ def _generate_with_diffusers(pipeline, request, global_args, http_request=None):
             raise Exception(f"Could not extract images from diffusers result: {img_err}")
     
     for img in result_images:
-        # Debug: print image type and value range
-        print(f"DEBUG: Image type: {type(img)}")
         if isinstance(img, np.ndarray):
-            print(f"DEBUG: Image shape: {img.shape}, dtype: {img.dtype}, min: {img.min()}, max: {img.max()}")
             img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
             img = np.clip(img, 0.0, 1.0)
-            print(f"DEBUG: After NaN handling - min: {img.min()}, max: {img.max()}")
         
         img_data = save_image_response(img, request.response_format, http_request)
         images.append(img_data)
@@ -532,16 +527,27 @@ def _load_sdcpp_model(model_path: str, global_args, model_config: dict = None):
     Returns the loaded StableDiffusion model or None.
     """
     from stable_diffusion_cpp import StableDiffusion
+    import stable_diffusion_cpp.stable_diffusion_cpp as sd_cpp
+    import ctypes
 
     # Check for --no-ram mode
     no_ram = getattr(global_args, 'no_ram', False) if global_args else False
 
     print(f"Loading sd.cpp model from: {model_path}")
 
+    # Intercept sd.cpp log to detect partial-init failures (e.g. unknown SD version)
+    log_lines = []
+    @sd_cpp.sd_log_callback
+    def _log_cb(level, text, data):
+        if text:
+            line = text.decode('utf-8', errors='replace').rstrip()
+            log_lines.append(line)
+    sd_cpp.sd_set_log_callback(_log_cb, None)
+
     # Build sd.cpp constructor args from config
     kwargs = {
         'model_path': model_path,
-        'offload_params_to_cpu': False,  # Use GPU by default
+        'offload_params_to_cpu': False,
         'keep_clip_on_cpu': False,
         'keep_control_net_on_cpu': False,
         'keep_vae_on_cpu': False,
@@ -575,6 +581,21 @@ def _load_sdcpp_model(model_path: str, global_args, model_config: dict = None):
             sd_model = StableDiffusion(**kwargs)
         else:
             raise
+    finally:
+        # Restore default log callback
+        sd_cpp.sd_set_log_callback(None, None)
+
+    # Check if sd.cpp failed to identify the model architecture.
+    # In this case new_sd_ctx returns a non-null but broken context that
+    # will segfault on generate_image — reject it early.
+    failed_version = any('get sd version from file failed' in l for l in log_lines)
+    if failed_version:
+        raise ValueError(
+            f"sd.cpp could not identify the model architecture in '{model_path}'. "
+            "This model may require a newer version of stable-diffusion-cpp-python, "
+            "or it may not be a supported Stable Diffusion GGUF format."
+        )
+
     return sd_model
 
 
@@ -1278,3 +1299,344 @@ async def create_image_segment(request: ImageSegmentRequest, http_request: Reque
         raise HTTPException(status_code=500, detail=f"Segmentation failed: {e}")
     result = save_image_response(seg_img, request.response_format, http_request)
     return {"created": int(time.time()), "data": [result]}
+
+
+# =============================================================================
+# Deblur Endpoint  (POST /v1/images/deblur)
+# =============================================================================
+
+class ImageDeblurRequest(BaseModel):
+    image: str                              # base64 input image
+    strength: Optional[float] = 0.5        # 0–1, deblur aggressiveness
+    response_format: Optional[str] = "url"
+    model_config = ConfigDict(extra="allow")
+
+
+def _run_deblur(image_bytes: bytes, strength: float) -> "PILImage.Image":
+    """Blind deblur using Wiener deconvolution + sharpening."""
+    import numpy as np
+    import cv2
+    from scipy.signal import wiener
+    from PIL import Image as PILImage
+
+    img = PILImage.open(io.BytesIO(image_bytes)).convert("RGB")
+    arr = np.array(img, dtype=np.float32) / 255.0
+
+    # Wiener filter per channel
+    noise_power = max(0.001, (1.0 - strength) * 0.05)
+    deblurred = np.stack([
+        wiener(arr[:, :, c], mysize=5, noise=noise_power)
+        for c in range(3)
+    ], axis=2)
+    deblurred = np.clip(deblurred, 0.0, 1.0)
+
+    # Unsharp mask pass for edge recovery
+    blur_sigma = max(0.5, (1.0 - strength) * 2.0)
+    blurred = cv2.GaussianBlur(deblurred, (0, 0), blur_sigma)
+    sharpened = cv2.addWeighted(deblurred, 1.0 + strength, blurred, -strength, 0)
+    sharpened = np.clip(sharpened, 0.0, 1.0)
+
+    return PILImage.fromarray((sharpened * 255).astype(np.uint8))
+
+
+@router.post("/v1/images/deblur")
+async def create_image_deblur(request: ImageDeblurRequest, http_request: Request = None):
+    """Remove blur from an image using Wiener deconvolution and unsharp masking."""
+    raw = base64.b64decode(request.image.split(',', 1)[-1] if ',' in request.image else request.image)
+    try:
+        result_img = await asyncio.get_event_loop().run_in_executor(
+            None, _run_deblur, raw, request.strength or 0.5)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Deblur failed: {e}")
+    result = save_image_response(result_img, request.response_format, http_request)
+    return {"created": int(time.time()), "data": [result]}
+
+
+# =============================================================================
+# Unpixelate Endpoint  (POST /v1/images/unpixelate)
+# Uses Real-ESRGAN super-resolution — designed exactly for this use case.
+# =============================================================================
+
+class ImageUnpixelateRequest(BaseModel):
+    image: str
+    scale: Optional[int] = 4               # 2, 4, or 8
+    model: Optional[str] = None            # optional custom Real-ESRGAN model path
+    response_format: Optional[str] = "url"
+    model_config = ConfigDict(extra="allow")
+
+
+def _run_unpixelate(image_bytes: bytes, scale: int, model_path: Optional[str]) -> "PILImage.Image":
+    import numpy as np
+    from basicsr.archs.rrdbnet_arch import RRDBNet
+    from realesrgan import RealESRGANer
+    import torch
+    from PIL import Image as PILImage
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    if model_path and os.path.exists(model_path):
+        mp = model_path
+    else:
+        # Download RealESRGAN_x4plus on demand
+        mp = os.path.expanduser('~/.cache/realesrgan/RealESRGAN_x4plus.pth')
+        if not os.path.exists(mp):
+            os.makedirs(os.path.dirname(mp), exist_ok=True)
+            import urllib.request
+            url = 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth'
+            print(f'Downloading RealESRGAN_x4plus.pth…')
+            urllib.request.urlretrieve(url, mp)
+
+    model_obj = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                        num_block=23, num_grow_ch=32, scale=4)
+    upsampler = RealESRGANer(scale=4, model_path=mp, model=model_obj,
+                              half=device.type == 'cuda', device=device)
+
+    img = PILImage.open(io.BytesIO(image_bytes)).convert("RGB")
+    out_arr, _ = upsampler.enhance(np.array(img), outscale=scale)
+    return PILImage.fromarray(out_arr)
+
+
+@router.post("/v1/images/unpixelate")
+async def create_image_unpixelate(request: ImageUnpixelateRequest, http_request: Request = None):
+    """Remove pixelation / upscale with detail recovery using Real-ESRGAN."""
+    raw = base64.b64decode(request.image.split(',', 1)[-1] if ',' in request.image else request.image)
+    try:
+        result_img = await asyncio.get_event_loop().run_in_executor(
+            None, _run_unpixelate, raw, request.scale or 4, request.model)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unpixelate failed: {e}")
+    result = save_image_response(result_img, request.response_format, http_request)
+    return {"created": int(time.time()), "data": [result]}
+
+
+# =============================================================================
+# Outfit Change Endpoint  (POST /v1/images/outfit)
+# Auto-generates a clothing mask via person segmentation, then inpaints.
+# =============================================================================
+
+class ImageOutfitRequest(BaseModel):
+    model: str                              # inpaint model id
+    image: Optional[str] = None            # base64 source image (image mode)
+    video: Optional[str] = None            # base64 source video (video mode)
+    prompt: str                             # description of the new outfit
+    negative_prompt: Optional[str] = None
+    mask: Optional[str] = None             # optional manual mask (base64); auto-generated if absent
+    steps: Optional[int] = 30
+    guidance_scale: Optional[float] = 7.5
+    strength: Optional[float] = 0.99
+    seed: Optional[int] = None
+    response_format: Optional[str] = "url"
+    model_config = ConfigDict(extra="allow")
+
+
+def _generate_clothing_mask(img_arr) -> "np.ndarray":
+    """
+    Generate a rough clothing mask using GrabCut person segmentation.
+    Returns a binary mask (255 = clothing area to replace).
+    """
+    import numpy as np
+    import cv2
+    h, w = img_arr.shape[:2]
+    bgr = cv2.cvtColor(img_arr, cv2.COLOR_RGB2BGR)
+
+    # GrabCut with a central rect (assumes person is roughly centered)
+    mask_gc = np.zeros((h, w), np.uint8)
+    bgd = np.zeros((1, 65), np.float64)
+    fgd = np.zeros((1, 65), np.float64)
+    margin_x, margin_y = w // 8, h // 8
+    rect = (margin_x, margin_y, w - 2 * margin_x, h - 2 * margin_y)
+    cv2.grabCut(bgr, mask_gc, rect, bgd, fgd, 5, cv2.GC_INIT_WITH_RECT)
+    fg_mask = np.where((mask_gc == cv2.GC_FGD) | (mask_gc == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+
+    # Exclude top 25% (head/hair) and bottom 10% (feet)
+    fg_mask[:h // 4, :] = 0
+    fg_mask[int(h * 0.9):, :] = 0
+
+    # Dilate slightly so inpaint covers clothing edges
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    fg_mask = cv2.dilate(fg_mask, kernel, iterations=2)
+    return fg_mask
+
+
+@router.post("/v1/images/outfit")
+async def create_image_outfit(request: ImageOutfitRequest, http_request: Request = None):
+    """Change the outfit/clothing in an image or video using inpainting."""
+    global global_args
+
+    if request.video:
+        return await _outfit_video(request, http_request)
+
+    raw = base64.b64decode(request.image.split(',', 1)[-1] if ',' in request.image else request.image)
+    from PIL import Image as PILImage
+    import numpy as np
+    img = PILImage.open(io.BytesIO(raw)).convert("RGB")
+    img_arr = np.array(img)
+
+    # Generate or decode mask
+    if request.mask:
+        mask_raw = base64.b64decode(request.mask.split(',', 1)[-1] if ',' in request.mask else request.mask)
+        mask_img = PILImage.open(io.BytesIO(mask_raw)).convert("L")
+    else:
+        try:
+            mask_arr = await asyncio.get_event_loop().run_in_executor(
+                None, _generate_clothing_mask, img_arr)
+            mask_img = PILImage.fromarray(mask_arr)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Mask generation failed: {e}")
+
+    # Load inpaint pipeline
+    model_key = f"inpaint:{request.model}"
+    pipeline = multi_model_manager.models.get(model_key)
+    if pipeline is None:
+        try:
+            pipeline = await asyncio.get_event_loop().run_in_executor(
+                None, _load_inpaint_pipeline, request.model, global_args)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to load inpaint model: {e}")
+        multi_model_manager.models[model_key] = pipeline
+
+    # Run inpaint
+    import torch
+    generator = torch.Generator().manual_seed(request.seed) if request.seed is not None else None
+
+    def _run():
+        kwargs = dict(
+            prompt=request.prompt,
+            image=img,
+            mask_image=mask_img,
+            num_inference_steps=request.steps or 30,
+            guidance_scale=request.guidance_scale or 7.5,
+            strength=request.strength or 0.99,
+        )
+        if request.negative_prompt:
+            kwargs['negative_prompt'] = request.negative_prompt
+        if generator:
+            kwargs['generator'] = generator
+        if hasattr(pipeline, 'safety_checker'):
+            pipeline.safety_checker = None
+        return pipeline(**kwargs).images[0]
+
+    try:
+        result_img = await asyncio.get_event_loop().run_in_executor(None, _run)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Outfit change failed: {e}")
+
+    result = save_image_response(result_img, request.response_format, http_request)
+    return {"created": int(time.time()), "data": [result]}
+
+
+async def _outfit_video(request: ImageOutfitRequest, http_request):
+    """Process outfit change frame-by-frame on a video."""
+    import subprocess
+    import tempfile
+    import shutil
+
+    raw = base64.b64decode(request.video.split(',', 1)[-1] if ',' in request.video else request.video)
+    temps = []
+    try:
+        in_path = tempfile.mktemp(suffix='.mp4')
+        temps.append(in_path)
+        with open(in_path, 'wb') as f:
+            f.write(raw)
+
+        frames_dir = tempfile.mkdtemp()
+        temps.append(frames_dir)
+        subprocess.run(['ffmpeg', '-y', '-i', in_path, f'{frames_dir}/%08d.png'],
+                       capture_output=True, check=True)
+
+        probe = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=r_frame_rate', '-of', 'default=nw=1:nk=1', in_path],
+            capture_output=True, text=True)
+        fps_str = probe.stdout.strip() or '25/1'
+        num, den = fps_str.split('/')
+        fps = float(num) / float(den)
+
+        # Load pipeline once
+        model_key = f"inpaint:{request.model}"
+        pipeline = multi_model_manager.models.get(model_key)
+        if pipeline is None:
+            pipeline = await asyncio.get_event_loop().run_in_executor(
+                None, _load_inpaint_pipeline, request.model, global_args)
+            multi_model_manager.models[model_key] = pipeline
+
+        import torch
+        from PIL import Image as PILImage
+        import numpy as np
+        import cv2
+
+        generator = torch.Generator().manual_seed(request.seed) if request.seed is not None else None
+
+        def _process_frames():
+            for fname in sorted(os.listdir(frames_dir)):
+                fpath = os.path.join(frames_dir, fname)
+                img = PILImage.open(fpath).convert("RGB")
+                img_arr = np.array(img)
+                if request.mask:
+                    mask_raw = base64.b64decode(request.mask.split(',', 1)[-1] if ',' in request.mask else request.mask)
+                    mask_img = PILImage.open(io.BytesIO(mask_raw)).convert("L")
+                else:
+                    mask_arr = _generate_clothing_mask(img_arr)
+                    mask_img = PILImage.fromarray(mask_arr)
+                kwargs = dict(
+                    prompt=request.prompt,
+                    image=img,
+                    mask_image=mask_img,
+                    num_inference_steps=request.steps or 30,
+                    guidance_scale=request.guidance_scale or 7.5,
+                    strength=request.strength or 0.99,
+                )
+                if request.negative_prompt:
+                    kwargs['negative_prompt'] = request.negative_prompt
+                if generator:
+                    kwargs['generator'] = generator
+                if hasattr(pipeline, 'safety_checker'):
+                    pipeline.safety_checker = None
+                result = pipeline(**kwargs).images[0]
+                result.save(fpath)
+
+        await asyncio.get_event_loop().run_in_executor(None, _process_frames)
+
+        out_path = tempfile.mktemp(suffix='_outfit.mp4')
+        temps.append(out_path)
+        subprocess.run(
+            ['ffmpeg', '-y', '-framerate', str(fps), '-i', f'{frames_dir}/%08d.png',
+             '-i', in_path, '-map', '0:v', '-map', '1:a?',
+             '-c:v', 'libx264', '-c:a', 'copy', '-shortest', out_path],
+            capture_output=True, check=True)
+
+        with open(out_path, 'rb') as f:
+            out_bytes = f.read()
+
+        if global_file_path:
+            fname = f'{uuid.uuid4().hex}_outfit.mp4'
+            fpath_out = os.path.join(global_file_path, fname)
+            os.makedirs(global_file_path, exist_ok=True)
+            with open(fpath_out, 'wb') as f:
+                f.write(out_bytes)
+            host = http_request.headers.get('host', '127.0.0.1') if http_request else '127.0.0.1'
+            if ':' in host:
+                parts = host.split(':')
+                if len(parts) == 2 and parts[1].isdigit():
+                    host = parts[0]
+            proto = 'https' if getattr(global_args, 'https', False) else 'http'
+            port = getattr(global_args, 'port', 8000) if global_args else 8000
+            data = [{'url': f'{proto}://{host}:{port}/v1/files/{fname}'}]
+        else:
+            data = [{'b64_mp4': base64.b64encode(out_bytes).decode()}]
+
+        return {'created': int(time.time()), 'data': data}
+
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f'ffmpeg error: {e.stderr.decode()[:200]}')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Video outfit change failed: {e}')
+    finally:
+        for t in temps:
+            try:
+                if os.path.isdir(t):
+                    shutil.rmtree(t)
+                else:
+                    os.unlink(t)
+            except Exception:
+                pass

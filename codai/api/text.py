@@ -20,11 +20,14 @@ Text generation endpoints for the codai API.
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from typing import AsyncGenerator, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
+
+logger = logging.getLogger(__name__)
 
 # Import from codai modules
 from codai.models.manager import ModelManager, WhisperServerManager, MultiModelManager, model_manager, multi_model_manager
@@ -119,68 +122,47 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             if auth_header.startswith('Bearer '):
                 api_key = auth_header[7:]  # Extract token after 'Bearer '
         
-        # If still no API key, use a fake key to allow litellm to proceed
-        # litellm will then fail with the actual provider error if needed
         if not api_key:
-            api_key = "fake-key-for-local-testing"
-            print("DEBUG: No API key provided, using fake key for litellm")
+            raise HTTPException(
+                status_code=401,
+                detail="An API key is required for the LiteLLM backend. "
+                       "Provide an 'Authorization: Bearer <key>' header.",
+            )
         
         # Determine the base URL for litellm to connect to
-        # Use the server's host and port for local connections
         api_base = None
-        
-        # Check if model starts with 'ollama:' - use local Ollama
+
         if request.model and request.model.startswith('ollama:'):
-            # Get the host from the request headers
             client_host = "127.0.0.1"
             if http_request:
                 host_header = http_request.headers.get('host', '')
                 if host_header:
-                    # Strip port if present
                     if ':' in host_header:
                         client_host = host_header.split(':')[0]
-                        if client_host.replace('.', '').isdigit():
-                            # It's an IP, keep it
-                            pass
-                        else:
-                            # It's a hostname, use localhost
-                            client_host = "127.0.0.1"
                     else:
                         client_host = host_header
-            
-            # Get port from global_args or use default
             port = getattr(global_args, 'port', 11434) if global_args else 11434
             api_base = f"http://{client_host}:{port}/v1"
-            print(f"DEBUG: Using api_base for Ollama: {api_base}")
         else:
-            # For non-Ollama models, use the server's own URL as base
-            # This allows LiteLLM to make requests to the local server
             if http_request:
-                # Get the host from the request headers
                 host_header = http_request.headers.get('host', '')
                 if host_header:
-                    # Strip port if present to reconstruct clean URL
                     if ':' in host_header:
-                        client_host = host_header.split(':')[0]
-                        # Keep the port from the request for consistency
-                        server_port = host_header.split(':')[1] if len(host_header.split(':')) > 1 else str(getattr(global_args, 'port', 6745))
+                        parts = host_header.split(':')
+                        client_host = parts[0]
+                        server_port = parts[1] if len(parts) > 1 else str(getattr(global_args, 'port', 6745))
                     else:
                         client_host = host_header
                         server_port = str(getattr(global_args, 'port', 6745))
                 else:
-                    # Fallback to client host if no Host header
                     client_host = http_request.client.host if http_request.client else "127.0.0.1"
                     server_port = str(getattr(global_args, 'port', 6745))
             else:
-                # Fallback if no http_request
                 client_host = "127.0.0.1"
                 server_port = str(getattr(global_args, 'port', 6745))
-            
-            # Determine protocol (http or https)
             use_https = getattr(global_args, 'https', False) or getattr(global_args, 'pubkey', None)
             protocol = "https" if use_https else "http"
             api_base = f"{protocol}://{client_host}:{server_port}/v1"
-            print(f"DEBUG: Using api_base for local server: {api_base}")
         
         # Get or create litellm backend
         litellm_backend = get_litellm_backend(
@@ -228,33 +210,21 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                             stream=True,
                             tool_parser=tool_parser,
                         ):
-                            # Add rate limit headers
-                            headers = {}
-                            if 'usage' in chunk:
-                                headers = litellm_backend.get_rate_limit_headers(
-                                    prompt_tokens=chunk.get('usage', {}).get('prompt_tokens', 0),
-                                    completion_tokens=chunk.get('usage', {}).get('completion_tokens', 0)
-                                )
-                            
-                            # Handle Qwen tool calls if model is Qwen family
                             if 'qwen' in request.model.lower():
                                 content = chunk.get('choices', [{}])[0].get('delta', {}).get('content', '')
                                 tool_calls = chunk.get('choices', [{}])[0].get('delta', {}).get('tool_calls', [])
-                                
                                 if not tool_calls and content:
-                                    # Try to parse tool calls from content
                                     tool_calls = litellm_backend.parse_qwen_tool_calls(content)
                                     if tool_calls:
-                                        # Strip tool tags from content
                                         content = litellm_backend.strip_tool_tags(content)
                                         chunk['choices'][0]['delta']['content'] = content
                                         chunk['choices'][0]['delta']['tool_calls'] = tool_calls
-                            
                             yield f"data: {json.dumps(chunk)}\n\n"
-                        
                         yield "data: [DONE]\n\n"
                     except Exception as e:
+                        # Send error chunk then [DONE] so clients don't hang waiting
                         yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'internal_error'}})}\n\n"
+                        yield "data: [DONE]\n\n"
                 
                 from fastapi.responses import StreamingResponse
                 return StreamingResponse(generate(), media_type="text/event-stream")
@@ -586,10 +556,6 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         elif not isinstance(m["content"], str):
             messages_dict[i]["content"] = str(m["content"])
     
-    # Debug: print first few messages to see their structure
-    print(f"DEBUG: messages_dict[0] keys: {list(messages_dict[0].keys()) if messages_dict else 'empty'}")
-    if len(messages_dict) > 1:
-        print(f"DEBUG: messages_dict[1] keys: {list(messages_dict[1].keys()) if len(messages_dict) > 1 else 'empty'}")
     
     # Convert tools to dict format if present
     tools_dict = None
@@ -650,10 +616,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             if get_global_debug():
                 print(f"RAW: template_manager.format_for_raw_completion not available")
     
-    # Get resolved model name for response (with coderai/ prefix and proper formatting)
-    # Use multi_model_manager to get the actual loaded models, not the individual model manager
     response_model_name = get_resolved_model_name(requested_model, multi_model_manager)
-    print(f"DEBUG: Requested model: {requested_model}, Resolved model for response: {response_model_name}")
     
     # Handle raw mode - two pass: first capture reasoning, then get final answer
     if use_raw_mode and raw_prompt_for_generation:
@@ -813,7 +776,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                                 )
                             tools_list.append(Tool(type=t.get("type", "function") if isinstance(t, dict) else t.type, function=tool_func))
                         except Exception as e:
-                            print(f"DEBUG: Error converting tool in raw stream: {e}")
+                            logger.debug("Error converting tool in raw stream: %s", e)
                             continue
                     
                     if tools_list:
@@ -1014,7 +977,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                         )
                     tools_list.append(Tool(type=t.get("type", "function") if isinstance(t, dict) else t.type, function=tool_func))
                 except Exception as e:
-                    print(f"DEBUG: Error converting tool in raw mode: {e}, tool type: {type(t)}")
+                    logger.debug("Error converting tool in raw mode: %s (type: %s)", e, type(t))
                     continue
         
         # Step 1: Use ModelParserAdapter to extract tool calls from final_text (NOT generated_text which includes reasoning)
@@ -1040,7 +1003,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                         validated_calls.append(tc)
                 
                 if len(validated_calls) != len(extracted_tool_calls):
-                    print(f"DEBUG: Filtered out {len(extracted_tool_calls) - len(validated_calls)} invalid tool calls in non-streaming")
+                    logger.debug("Filtered out %d invalid tool calls in non-streaming", len(extracted_tool_calls) - len(validated_calls))
                 extracted_tool_calls = validated_calls if validated_calls else None
             
             if extracted_tool_calls:
@@ -1213,7 +1176,6 @@ async def stream_chat_response(
     request_id = f"req-{uuid.uuid4().hex[:8]}"
     
     generated_text = ""
-    print(f"DEBUG: stream_chat_response started, stream=True, tools={tools is not None}")
     
     # Check if model is loaded - if not, notify waiting clients
     # The model manager exists but backend may not be loaded yet in on-demand mode
@@ -1365,9 +1327,6 @@ async def stream_chat_response(
             # Explicitly flush to ensure data is sent immediately
             await asyncio.sleep(0)
         
-        print(f"DEBUG: stream_chat_response completed, {chunk_count} chunks, generated_text length: {len(generated_text)}")
-        if not generated_text.strip():
-            print(f"DEBUG: Warning - no content generated!")
         
         # In debug mode, dump the full generated text
         if get_global_debug():
@@ -1407,7 +1366,7 @@ async def stream_chat_response(
                         )
                     tool_objects.append(Tool(type=t.get("type", "function") if isinstance(t, dict) else t.type, function=tool_func))
                 except Exception as e:
-                    print(f"DEBUG: Error converting tool: {e}, tool type: {type(t)}")
+                    logger.debug("Error converting tool: %s (type: %s)", e, type(t))
                     continue
             try:
                 tool_calls = tool_parser.extract_tool_calls(generated_text, tool_objects)
@@ -1423,10 +1382,10 @@ async def stream_chat_response(
                         elif isinstance(args, dict):
                             validated_calls.append(tc)
                     if len(validated_calls) != len(tool_calls):
-                        print(f"DEBUG: Filtered out {len(tool_calls) - len(validated_calls)} invalid tool calls in stream_chat_response")
+                        logger.debug("Filtered out %d invalid tool calls in stream_chat_response", len(tool_calls) - len(validated_calls))
                     tool_calls = validated_calls if validated_calls else None
             except Exception as e:
-                print(f"DEBUG: Error extracting tool calls: {e}")
+                logger.debug("Error extracting tool calls: %s", e)
                 tool_calls = None
             if tool_calls:
                 # In debug mode, dump tool calls
@@ -1628,7 +1587,7 @@ async def generate_chat_response(
                         )
                     tool_objects.append(Tool(type=t.get("type", "function") if isinstance(t, dict) else t.type, function=tool_func))
                 except Exception as e:
-                    print(f"DEBUG: Error converting tool: {e}, tool type: {type(t)}")
+                    logger.debug("Error converting tool: %s (type: %s)", e, type(t))
                     continue
             try:
                 tool_calls = tool_parser.extract_tool_calls(generated_text, tool_objects)
@@ -1644,10 +1603,10 @@ async def generate_chat_response(
                         elif isinstance(args, dict):
                             validated_calls.append(tc)
                     if len(validated_calls) != len(tool_calls):
-                        print(f"DEBUG: Filtered out {len(tool_calls) - len(validated_calls)} invalid tool calls in generate_chat_response")
+                        logger.debug("Filtered out %d invalid tool calls in generate_chat_response", len(tool_calls) - len(validated_calls))
                     tool_calls = validated_calls if validated_calls else None
             except Exception as e:
-                print(f"DEBUG: Error extracting tool calls: {e}")
+                logger.debug("Error extracting tool calls: %s", e)
                 tool_calls = None
             if tool_calls:
                 # Always strip tool call format from content

@@ -522,7 +522,14 @@ elif [ "$BACKEND" = "all" ]; then
         pip install setproctitle || echo -e "${YELLOW}Warning: setproctitle failed (optional)${NC}"
 
         # Try stable-diffusion-cpp-python (disable WebM to avoid missing libwebm cmake submodule)
-        CMAKE_ARGS="$SD_CMAKE_ARGS" pip install stable-diffusion-cpp-python || echo -e "${YELLOW}Warning: stable-diffusion-cpp-python failed (optional)${NC}"
+        # Use CUDA if available (detected later in this block, check nvcc now)
+        if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
+            CMAKE_ARGS="$SD_CMAKE_ARGS -DSD_CUDA=ON" pip install stable-diffusion-cpp-python --no-cache-dir || \
+            CMAKE_ARGS="$SD_CMAKE_ARGS" pip install stable-diffusion-cpp-python || \
+            echo -e "${YELLOW}Warning: stable-diffusion-cpp-python failed (optional)${NC}"
+        else
+            CMAKE_ARGS="$SD_CMAKE_ARGS" pip install stable-diffusion-cpp-python || echo -e "${YELLOW}Warning: stable-diffusion-cpp-python failed (optional)${NC}"
+        fi
     }
     
     # Install PyTorch with CUDA support (for nvidia backend)
@@ -622,14 +629,28 @@ elif [ "$BACKEND" = "all" ]; then
         echo -e "${YELLOW}Warning: Some Vulkan packages failed to install${NC}"
     }
     
-    # Try to install stable-diffusion-cpp-python with OpenCL
-    if [ "$OPENCL_AVAILABLE" = true ]; then
-        echo -e "${YELLOW}Installing stable-diffusion-cpp-python with OpenCL support...${NC}"
-        CMAKE_ARGS="$SD_CMAKE_ARGS" pip install stable-diffusion-cpp-python || {
-            echo -e "${YELLOW}Warning: stable-diffusion-cpp-python not available (requires CMake and build tools)${NC}"
+    # Try to install stable-diffusion-cpp-python with CUDA+Vulkan (preferred) or fallbacks
+    if [ "$CUDA_AVAILABLE" = true ] && [ "$VULKAN_AVAILABLE" = true ]; then
+        echo -e "${YELLOW}Installing stable-diffusion-cpp-python with CUDA+Vulkan support...${NC}"
+        CMAKE_ARGS="$SD_CMAKE_ARGS -DSD_CUDA=ON -DSD_VULKAN=ON" pip install stable-diffusion-cpp-python --no-cache-dir || {
+            echo -e "${YELLOW}CUDA+Vulkan build failed, trying CUDA only...${NC}"
+            CMAKE_ARGS="$SD_CMAKE_ARGS -DSD_CUDA=ON" pip install stable-diffusion-cpp-python --no-cache-dir || \
+                echo -e "${YELLOW}Warning: stable-diffusion-cpp-python not available${NC}"
         }
+    elif [ "$CUDA_AVAILABLE" = true ]; then
+        echo -e "${YELLOW}Installing stable-diffusion-cpp-python with CUDA support...${NC}"
+        CMAKE_ARGS="$SD_CMAKE_ARGS -DSD_CUDA=ON" pip install stable-diffusion-cpp-python --no-cache-dir || \
+            echo -e "${YELLOW}Warning: stable-diffusion-cpp-python not available${NC}"
+    elif [ "$VULKAN_AVAILABLE" = true ]; then
+        echo -e "${YELLOW}Installing stable-diffusion-cpp-python with Vulkan support...${NC}"
+        CMAKE_ARGS="$SD_CMAKE_ARGS -DSD_VULKAN=ON" pip install stable-diffusion-cpp-python --no-cache-dir || \
+            echo -e "${YELLOW}Warning: stable-diffusion-cpp-python not available${NC}"
+    elif [ "$OPENCL_AVAILABLE" = true ]; then
+        echo -e "${YELLOW}Installing stable-diffusion-cpp-python with OpenCL support...${NC}"
+        CMAKE_ARGS="$SD_CMAKE_ARGS -DSD_OPENCL=ON" pip install stable-diffusion-cpp-python --no-cache-dir || \
+            echo -e "${YELLOW}Warning: stable-diffusion-cpp-python not available${NC}"
     else
-        echo -e "${YELLOW}Skipping OpenCL (stable-diffusion-cpp-python) - OpenCL not available${NC}"
+        echo -e "${YELLOW}Skipping GPU-accelerated stable-diffusion-cpp-python - no GPU backend available${NC}"
     fi
 
     # Install additional requirements
@@ -667,8 +688,11 @@ elif [ "$BACKEND" = "all" ]; then
     echo "Available backends:"
     [ "$CUDA_AVAILABLE" = true ] && echo "  ✓ NVIDIA/CUDA (PyTorch)"
     [ "$CUDA_AVAILABLE" = true ] && echo "  ✓ CUDA (llama-cpp-python)"
+    [ "$CUDA_AVAILABLE" = true ] && [ "$VULKAN_AVAILABLE" = true ] && echo "  ✓ CUDA+Vulkan (stable-diffusion-cpp-python)"
+    [ "$CUDA_AVAILABLE" = true ] && [ "$VULKAN_AVAILABLE" != true ] && echo "  ✓ CUDA (stable-diffusion-cpp-python)"
+    [ "$CUDA_AVAILABLE" != true ] && [ "$VULKAN_AVAILABLE" = true ] && echo "  ✓ Vulkan (stable-diffusion-cpp-python)"
     [ "$VULKAN_AVAILABLE" = true ] && echo "  ✓ Vulkan (llama-cpp-python)"
-    [ "$OPENCL_AVAILABLE" = true ] && echo "  ✓ OpenCL (stable-diffusion-cpp-python)"
+    [ "$OPENCL_AVAILABLE" = true ] && [ "$CUDA_AVAILABLE" != true ] && [ "$VULKAN_AVAILABLE" != true ] && echo "  ✓ OpenCL (stable-diffusion-cpp-python)"
     echo "  ✓ CPU (fallback for all)"
     if [ "$FLASH" = true ] && [ "$CUDA_AVAILABLE" = true ]; then
         echo ""

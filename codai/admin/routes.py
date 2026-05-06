@@ -236,14 +236,50 @@ async def api_status(username: str = Depends(require_auth)):
 
     # VRAM info
     vram = None
+    is_cuda = False
     try:
         import torch
         if torch.cuda.is_available():
+            is_cuda = True
             free, total = torch.cuda.mem_get_info()
             used = total - free
-            vram = {"used": round(used / 1e9, 2), "total": round(total / 1e9, 2)}
+            vram = {"used": round(used / 1e9, 2), "free": round(free / 1e9, 2), "total": round(total / 1e9, 2),
+                    "gpu": torch.cuda.get_device_name(0)}
     except Exception:
         pass
+
+    # Non-CUDA: read from sysfs (AMD amdgpu / Intel i915 / Arc)
+    if not is_cuda:
+        import os, glob as _glob
+        for card in sorted(_glob.glob("/sys/class/drm/card[0-9]")):
+            dev = card + "/device"
+            vram_total_path = dev + "/mem_info_vram_total"
+            if not os.path.exists(vram_total_path):
+                continue
+            try:
+                total_b = int(open(vram_total_path).read())
+                used_b  = int(open(dev + "/mem_info_vram_used").read())
+                free_b  = total_b - used_b
+                # GPU name from lspci
+                gpu_name = ""
+                try:
+                    pci_addr = os.path.basename(os.path.realpath(dev))
+                    import subprocess
+                    r = subprocess.run(["lspci", "-s", pci_addr], capture_output=True, text=True, timeout=3)
+                    if r.returncode == 0 and r.stdout:
+                        # "05:00.0 VGA compatible controller: AMD Radeon RX 580"
+                        gpu_name = r.stdout.split(":", 2)[-1].strip().rstrip()
+                except Exception:
+                    pass
+                vram = {
+                    "gpu": gpu_name,
+                    "used": round(used_b / 1e9, 2),
+                    "free": round(free_b / 1e9, 2),
+                    "total": round(total_b / 1e9, 2),
+                }
+                break
+            except Exception:
+                continue
 
     # Request stats from queue manager
     req_total = 0
@@ -285,6 +321,17 @@ async def api_status(username: str = Depends(require_auth)):
     except Exception:
         pass
 
+    # Whisper-server status
+    whisper_status = None
+    try:
+        from codai.models.manager import multi_model_manager as _mmm
+        if _mmm.whisper_servers:
+            whisper_status = {mid: wsm.get_status() for mid, wsm in _mmm.whisper_servers.items()}
+        elif _mmm.whisper_server:
+            whisper_status = {"whisper-server": _mmm.whisper_server.get_status()}
+    except Exception:
+        pass
+
     return {
         "status": "ok",
         "backend": backend,
@@ -293,8 +340,10 @@ async def api_status(username: str = Depends(require_auth)):
         "loaded_models": loaded_keys,
         "enabled_models": enabled_models,
         "vram": vram,
+        "cuda": is_cuda,
         "requests": {"total": req_total, "active": req_active},
         "recent_activity": recent_activity,
+        "whisper_server": whisper_status,
     }
 
 
@@ -1195,16 +1244,23 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         raise HTTPException(status_code=503, detail="Config manager not initialized")
     data = await request.json()
     path = data.get("path") or data.get("model_id", "")
-    model_type = data.get("model_type", "text_models")
-    # Treat legacy gguf_models as text_models (GGUF is a format, not a type)
-    if model_type == "gguf_models":
-        model_type = "text_models"
     valid = {"text_models", "image_models", "audio_models", "tts_models", "vision_models", "video_models",
              "audio_gen_models", "embedding_models"}
     if not path:
         raise HTTPException(status_code=400, detail="path is required")
-    if model_type not in valid:
-        raise HTTPException(status_code=400, detail=f"model_type must be one of {valid}")
+
+    # Accept model_types (list) or fall back to single model_type
+    raw_types = data.get("model_types") or []
+    if not raw_types:
+        raw_types = [data.get("model_type", "text_models")]
+    # Normalize: gguf_models → text_models, deduplicate, filter valid
+    model_types = list(dict.fromkeys(
+        ("text_models" if t == "gguf_models" else t)
+        for t in raw_types if t
+    ))
+    model_types = [t for t in model_types if t in valid]
+    if not model_types:
+        model_types = ["text_models"]
 
     # Remove from all categories (handles type changes)
     for cat in valid | {"gguf_models"}:
@@ -1220,14 +1276,16 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         import os
         if os.path.isfile(path):
             size_bytes = os.path.getsize(path)
-            # GGUF: ~1.1x file size; HF safetensors: ~1.2x
             multiplier = 1.1 if path.endswith(".gguf") else 1.2
             used_vram_gb = round(size_bytes / 1e9 * multiplier, 2)
 
-    # Build settings entry (drop None-valued optional keys to keep JSON tidy)
-    entry: dict = {"path": path, "model_type": model_type}
+    # Build settings entry
+    entry: dict = {"path": path, "model_type": model_types[0], "model_types": model_types}
     if used_vram_gb is not None:
         entry["used_vram_gb"] = used_vram_gb
+    # Store video sub-types (t2v / i2v / v2v) when present
+    if data.get("video_subtypes"):
+        entry["video_subtypes"] = data["video_subtypes"]
     for key in ("alias", "backend", "load_mode", "n_gpu_layers", "n_ctx",
                 "max_gpu_percent", "manual_ram_gb", "load_in_4bit", "load_in_8bit",
                 "flash_attention", "no_ram", "offload_strategy", "offload_dir",
@@ -1235,7 +1293,9 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         if key in data:
             entry[key] = data[key]
 
-    config_manager.models_data.setdefault(model_type, []).append(entry)
+    # Add entry to each selected category
+    for mtype in model_types:
+        config_manager.models_data.setdefault(mtype, []).append(entry)
     config_manager.save_models()
     return {"success": True}
 
@@ -1286,6 +1346,7 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "https": c.server.https,
             "https_key_path": c.server.https_key_path,
             "https_cert_path": c.server.https_cert_path,
+            "queue_max_size": c.server.queue_max_size,
         },
         "backend": {
             "type": c.backend.type,
@@ -1341,6 +1402,10 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         c.server.https = bool(srv.get("https", c.server.https))
         c.server.https_key_path = srv.get("https_key_path") or None
         c.server.https_cert_path = srv.get("https_cert_path") or None
+        if "queue_max_size" in srv:
+            c.server.queue_max_size = max(1, int(srv["queue_max_size"]))
+            from codai.queue.manager import queue_manager
+            queue_manager.max_size = c.server.queue_max_size
 
     if "backend" in data:
         bk = data["backend"]
@@ -1393,6 +1458,81 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
 
     config_manager.save_config()
     return {"success": True}
+
+
+
+# --- Whisper-server management ---
+
+@router.get("/admin/api/whisper-server/status")
+async def api_whisper_server_status(username: str = Depends(require_admin)):
+    """Return status of all registered whisper-server instances."""
+    from codai.models.manager import multi_model_manager
+    if multi_model_manager.whisper_servers:
+        return {
+            mid: wsm.get_status()
+            for mid, wsm in multi_model_manager.whisper_servers.items()
+        }
+    # Legacy single-instance fallback
+    if multi_model_manager.whisper_server:
+        return {"whisper-server": multi_model_manager.whisper_server.get_status()}
+    return {}
+
+
+@router.post("/admin/api/whisper-server/start")
+async def api_whisper_server_start(request: Request, username: str = Depends(require_admin)):
+    """Start (or restart) a whisper-server instance by model_id."""
+    from codai.models.manager import multi_model_manager
+    data = await request.json()
+    model_id   = data.get("model_id", "whisper-server")
+    server_path = data.get("server_path", "")
+    model_path  = data.get("model_path") or None
+    port        = int(data.get("port", 8744))
+    gpu_device  = int(data.get("gpu_device", 0))
+
+    if not server_path:
+        raise HTTPException(status_code=400, detail="server_path required")
+
+    wsm = multi_model_manager.whisper_servers.get(model_id)
+    if wsm is None:
+        wsm = multi_model_manager.register_whisper_server(
+            model_id=model_id, server_path=server_path,
+            model_path=model_path, port=port, gpu_device=gpu_device,
+        )
+    else:
+        wsm.server_path = server_path
+        wsm.port = port
+        wsm.base_url = f"http://127.0.0.1:{port}"
+        wsm._model_path = model_path
+        wsm._gpu_device = gpu_device
+
+    result = wsm.start(model_path, gpu_device=gpu_device)
+    running = wsm.is_running()
+
+    if running:
+        ws_key = f"audio:{model_id}"
+        multi_model_manager.models[ws_key] = wsm
+        multi_model_manager.active_in_vram = ws_key
+        multi_model_manager.models_in_vram.add(ws_key)
+
+    return {"success": running, "running": running, "started_model": result}
+
+
+@router.post("/admin/api/whisper-server/stop")
+async def api_whisper_server_stop(request: Request, username: str = Depends(require_admin)):
+    """Stop a whisper-server instance by model_id."""
+    from codai.models.manager import multi_model_manager
+    data = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    model_id = data.get("model_id", "whisper-server")
+
+    wsm = multi_model_manager.whisper_servers.get(model_id) or multi_model_manager.whisper_server
+    if wsm:
+        wsm.stop()
+        ws_key = f"audio:{model_id}"
+        multi_model_manager.models.pop(ws_key, None)
+        multi_model_manager.models_in_vram.discard(ws_key)
+        if multi_model_manager.active_in_vram == ws_key:
+            multi_model_manager.active_in_vram = None
+    return {"success": True, "running": False}
 
 
 # --- HuggingFace model search proxy ---

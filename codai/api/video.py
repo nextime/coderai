@@ -263,7 +263,39 @@ def _apply_camera_motion(kw: dict, camera_motion: str):
         kw['camera_motion'] = camera_motion
 
 
-def _apply_character_refs(kw: dict, character_references: List[str], strength: float):
+def _resolve_character_inputs(request) -> tuple[List[str], List[str]]:
+    """Return (flat_image_list, name_list) from any combination of request fields."""
+    images: List[str] = []
+    names: List[str] = []
+
+    # 1. Expand named saved profiles
+    if request.character_profiles:
+        try:
+            from codai.api.characters import resolve_character_profiles
+            images += resolve_character_profiles(request.character_profiles)
+            names += list(request.character_profiles)
+        except Exception:
+            pass
+
+    # 2. Named character slots [{name, images:[...]}, ...]
+    if request.characters:
+        for slot in request.characters:
+            slot_imgs = slot.get('images') or []
+            images += slot_imgs
+            if slot.get('name'):
+                names.append(slot['name'])
+
+    # 3. Legacy flat list
+    if request.character_references:
+        images += list(request.character_references)
+        if request.character_names:
+            names += list(request.character_names)
+
+    return images, names
+
+
+def _apply_character_refs(kw: dict, character_references: List[str], strength: float,
+                           names: Optional[List[str]] = None):
     """Apply character reference images to pipeline kwargs."""
     if not character_references:
         return
@@ -291,8 +323,13 @@ def _generate_video(pipe, request: VideoGenerationRequest):
 
     _apply_camera_motion(kw, request.camera_motion)
 
-    if request.character_references:
-        _apply_character_refs(kw, request.character_references, request.character_strength or 0.8)
+    char_images, char_names = _resolve_character_inputs(request)
+    if char_images:
+        _apply_character_refs(kw, char_images, request.character_strength or 0.8, char_names)
+        # Prepend character names to prompt for better conditioning
+        if char_names and kw.get('prompt'):
+            names_hint = ', '.join(char_names)
+            kw['prompt'] = f"{names_hint}. {kw['prompt']}"
 
     init_src = request.init_image or request.image
 
@@ -359,35 +396,49 @@ def _ffmpeg_upscale(path: str, factor: int, temps: list) -> str:
     scale = f"scale=iw*{factor}:ih*{factor}:flags=lanczos"
     cmd = ['ffmpeg', '-y', '-i', path, '-vf', scale, '-c:a', 'copy', out]
     r = subprocess.run(cmd, capture_output=True)
-    if r.returncode == 0:
-        return out
-    return path  # fallback to original if ffmpeg fails
+    if r.returncode != 0:
+        import logging
+        logging.getLogger(__name__).warning(
+            "ffmpeg upscale failed (rc=%d): %s", r.returncode, r.stderr.decode(errors='replace')
+        )
+        return path  # fallback to original if ffmpeg fails
+    return out
 
 
 def _rife_interpolate(path: str, multiplier: int, temps: list) -> str:
     out = tempfile.mktemp(suffix='_rife.mp4')
     temps.append(out)
-    # Try rife-ncnn-vulkan binary if available
-    import shutil
+    import logging, shutil
+    _log = logging.getLogger(__name__)
     if shutil.which('rife-ncnn-vulkan'):
         frames_dir = tempfile.mkdtemp()
         out_dir = tempfile.mkdtemp()
         temps += [frames_dir, out_dir]
-        subprocess.run(['ffmpeg', '-y', '-i', path, f'{frames_dir}/%08d.png'],
-                       capture_output=True)
-        subprocess.run(['rife-ncnn-vulkan', '-i', frames_dir, '-o', out_dir,
-                        '-m', f'rife-v4'], capture_output=True)
-        subprocess.run(['ffmpeg', '-y', '-r', str(multiplier * 8), '-i',
-                        f'{out_dir}/%08d.png', '-c:v', 'libx264', out],
-                       capture_output=True)
-        if os.path.exists(out):
-            return out
+        r = subprocess.run(['ffmpeg', '-y', '-i', path, f'{frames_dir}/%08d.png'],
+                           capture_output=True)
+        if r.returncode != 0:
+            _log.warning("ffmpeg frame extraction failed: %s", r.stderr.decode(errors='replace'))
+        else:
+            r = subprocess.run(['rife-ncnn-vulkan', '-i', frames_dir, '-o', out_dir,
+                                '-m', 'rife-v4'], capture_output=True)
+            if r.returncode != 0:
+                _log.warning("rife-ncnn-vulkan failed: %s", r.stderr.decode(errors='replace'))
+            else:
+                r = subprocess.run(['ffmpeg', '-y', '-r', str(multiplier * 8), '-i',
+                                    f'{out_dir}/%08d.png', '-c:v', 'libx264', out],
+                                   capture_output=True)
+                if r.returncode != 0:
+                    _log.warning("ffmpeg reassembly failed: %s", r.stderr.decode(errors='replace'))
+                elif os.path.exists(out):
+                    return out
     # Simple ffmpeg minterpolate fallback
-    fps_expr = f"fps=fps={multiplier}*source_fps"
     cmd = ['ffmpeg', '-y', '-i', path, '-filter:v',
            f'minterpolate=fps={multiplier * 8}', '-c:a', 'copy', out]
     r = subprocess.run(cmd, capture_output=True)
-    return out if r.returncode == 0 else path
+    if r.returncode != 0:
+        _log.warning("ffmpeg minterpolate failed: %s", r.stderr.decode(errors='replace'))
+        return path
+    return out
 
 
 def _add_audio_to_video(path: str, request: VideoGenerationRequest,

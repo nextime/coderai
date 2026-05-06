@@ -18,3 +18,10 @@ huggingface-hub>=0.19.0
 # Optional: Audio transcription without PyTorch (whispercpp)
 # Note: faster-whisper requires PyTorch, but whispercpp works without it
 whispercpp>=0.0.17  # For GGUF-based Whisper transcription without PyTorch
+
+# Voice cloning (F5-TTS zero-shot voice cloning)
+f5-tts>=1.1.0
+
+# Face swap (insightface INSwapper — downloads inswapper_128.onnx on first use)
+insightface>=0.7.3
+onnxruntime>=1.20.0            # CPU ONNX runtime (use onnxruntime-gpu for GPU acceleration)

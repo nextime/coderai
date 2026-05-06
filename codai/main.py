@@ -368,7 +368,21 @@ def main():
     audio_models = models_config.get("audio_models", [])
     for m in audio_models:
         mid = _model_id(m)
-        if mid:
+        if not mid:
+            continue
+        backend = m.get("backend", "") if isinstance(m, dict) else ""
+        if backend == "whisper-server":
+            # Register as a whisper-server instance
+            cfg = _model_cfg(m, "audio")
+            multi_model_manager.register_whisper_server(
+                model_id=mid,
+                server_path=m.get("server_path", config.whisper.server_path or ""),
+                model_path=m.get("model_path") or None,
+                port=int(m.get("port", config.whisper.server_port)),
+                gpu_device=int(m.get("gpu_device", config.vulkan.device_id)),
+                config=cfg,
+            )
+        else:
             multi_model_manager.set_audio_model(mid, config=_model_cfg(m, "audio"))
 
     # Image models
@@ -446,7 +460,18 @@ def main():
                     print(f"  Loaded: {mid}")
                 else:
                     print(f"  Warning: {mid} failed to load")
-            # image/audio/vision/tts pre-loading is handled by their respective
+            elif mtype == "audio" and mid in multi_model_manager.whisper_servers:
+                wsm = multi_model_manager.whisper_servers[mid]
+                result = wsm.start(wsm._model_path, gpu_device=wsm._gpu_device)
+                if wsm.is_running():
+                    ws_key = f"audio:{mid}"
+                    multi_model_manager.models[ws_key] = wsm
+                    multi_model_manager.active_in_vram = ws_key
+                    multi_model_manager.models_in_vram.add(ws_key)
+                    print(f"  whisper-server started: {mid}")
+                else:
+                    print(f"  Warning: whisper-server '{mid}' failed to start")
+            # image/vision/tts pre-loading is handled by their respective
             # API modules on first request; we just log intent here.
             else:
                 print(f"  Note: pre-loading for {mtype} models happens on first request")
@@ -550,6 +575,27 @@ def main():
     if global_file_path:
         set_audiogen_file_path(global_file_path)
 
+    # Set voice clone module global args
+    from codai.api.voice_clone import set_global_args as set_vc_global_args, set_global_file_path as set_vc_file_path
+    set_vc_global_args(global_args)
+    if global_file_path:
+        set_vc_file_path(global_file_path)
+
+    from codai.api.voice_convert import set_global_args as set_vconv_global_args, set_global_file_path as set_vconv_file_path
+    set_vconv_global_args(global_args)
+    if global_file_path:
+        set_vconv_file_path(global_file_path)
+
+    # Set faceswap module global args
+    from codai.api.faceswap import set_global_args as set_fs_global_args, set_global_file_path as set_fs_file_path
+    set_fs_global_args(global_args)
+    if global_file_path:
+        set_fs_file_path(global_file_path)
+
+    # Set character profiles module global args
+    from codai.api.characters import set_global_args as set_chars_global_args
+    set_chars_global_args(global_args)
+
     # Set embeddings module global args
     from codai.api.embeddings import set_global_args as set_embed_global_args
     set_embed_global_args(global_args)
@@ -585,6 +631,10 @@ def main():
 
 
     
+    # Apply queue max size from config
+    from codai.queue.manager import queue_manager
+    queue_manager.max_size = config.server.queue_max_size
+
     # Start the server
     import uvicorn
     print(f"\nStarting server on http://{config.server.host}:{config.server.port}")

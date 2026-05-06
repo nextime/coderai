@@ -113,17 +113,39 @@
 .g3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:.5rem; }
 .frow { display:flex; flex-direction:column; gap:.15rem; }
 .char-refs { display:flex; flex-wrap:wrap; gap:.3rem; margin-top:.25rem; }
-.char-thumb { width:44px; height:44px; object-fit:cover; border-radius:4px; }
+.char-thumb { width:44px; height:44px; object-fit:cover; border-radius:4px; cursor:pointer; }
+.char-thumb:hover { opacity:.7; }
+.char-slot { border:1px solid var(--border); border-radius:6px; padding:.5rem .6rem; display:flex; flex-direction:column; gap:.35rem; background:var(--surface-1); }
+.char-slot-header { display:flex; gap:.4rem; align-items:center; }
+.char-slot-actions { display:flex; gap:.3rem; align-items:center; flex-wrap:wrap; }
+.media-input-group { display:flex; gap:.4rem; align-items:center; flex:1; }
+.media-preview img, .media-preview video, .media-preview audio { max-width:100%; max-height:120px; border-radius:6px; margin-top:.3rem; }
+.webcam-box { margin-top:.4rem; display:flex; flex-direction:column; gap:.4rem; }
+.webcam-box video { width:100%; max-height:200px; border-radius:6px; background:#000; }
+.webcam-box .webcam-controls { display:flex; gap:.4rem; flex-wrap:wrap; }
 /* download link styled as button */
 a.dl { display:inline-block; margin-top:.4rem; }
 
 /* ── Pipeline ─────────────────────────────────────────────────── */
-.pipe-panel { flex:1; overflow-y:auto; padding:1.2rem; display:flex; flex-direction:column; gap:1.2rem; }
-.pipe-card { background:var(--surface-1); border:1px solid var(--border); border-radius:8px; padding:1rem; }
-.pipe-title { font-weight:600; font-size:13px; margin-bottom:.75rem; }
-.pipe-steps { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; font-size:12px; color:var(--text-3); }
-.pipe-step { background:var(--surface-2); border-radius:5px; padding:.25rem .6rem; color:var(--text-2); }
+.pipe-panel { flex:1; overflow-y:auto; padding:1.2rem; display:flex; flex-direction:column; gap:.6rem; }
+.pipe-card { background:var(--surface-1); border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+.pipe-card summary { list-style:none; padding:.75rem 1rem; cursor:pointer; display:flex; align-items:center; justify-content:space-between; font-weight:600; font-size:13px; user-select:none; }
+.pipe-card summary::-webkit-details-marker { display:none; }
+.pipe-card summary::after { content:'›'; font-size:16px; color:var(--text-2); transition:transform .2s; }
+.pipe-card[open] summary::after { transform:rotate(90deg); }
+.pipe-card summary:hover { background:rgba(255,255,255,.03); }
+.pipe-card-body { padding:.75rem 1rem 1rem; border-top:1px solid var(--border); display:flex; flex-direction:column; gap:.5rem; }
+.pipe-title { font-weight:600; font-size:13px; }
+.pipe-steps { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; font-size:11px; color:var(--text-2); margin-bottom:.25rem; }
+.pipe-step { background:var(--surface-2); border-radius:5px; padding:.2rem .5rem; color:var(--text-2); }
 .pipe-arrow { color:var(--text-3); }
+.pb-step { background:var(--surface-2); border:1px solid var(--border); border-radius:6px; padding:.5rem .6rem; display:flex; flex-direction:column; gap:.3rem; }
+.pb-step-header { display:flex; align-items:center; gap:.4rem; font-size:12px; font-weight:600; }
+.pb-step-params { display:flex; flex-direction:column; gap:.25rem; padding-top:.25rem; }
+.pb-step-param { display:flex; align-items:center; gap:.4rem; font-size:12px; }
+.pb-step-param label { min-width:110px; color:var(--text-2); flex-shrink:0; }
+.pb-step-param input, .pb-step-param select, .pb-step-param textarea { flex:1; font-size:12px; }
+.pb-step-param textarea { rows:2; resize:vertical; min-height:40px; }
 </style>
 {% endblock %}
 
@@ -157,6 +179,10 @@ a.dl { display:inline-block; margin-top:.4rem; }
       <button class="t2btn hidden" data-sub="img-upscale" onclick="selectSub('img-upscale')">Upscale</button>
       <button class="t2btn hidden" data-sub="img-depth"  onclick="selectSub('img-depth')">Depth</button>
       <button class="t2btn hidden" data-sub="img-seg"    onclick="selectSub('img-seg')">Segment</button>
+      <button class="t2btn hidden" data-sub="img-faceswap" onclick="selectSub('img-faceswap')">Face Swap</button>
+      <button class="t2btn hidden" data-sub="img-deblur"  onclick="selectSub('img-deblur')">Deblur</button>
+      <button class="t2btn hidden" data-sub="img-unpix"   onclick="selectSub('img-unpix')">Unpixelate</button>
+      <button class="t2btn hidden" data-sub="img-outfit"  onclick="selectSub('img-outfit')">Outfit Change</button>
       <!-- Video sub-tabs -->
       <button class="t2btn hidden" data-sub="vid-t2v"   onclick="selectSub('vid-t2v')">Text→Video</button>
       <button class="t2btn hidden" data-sub="vid-i2v"   onclick="selectSub('vid-i2v')">Image→Video</button>
@@ -166,9 +192,13 @@ a.dl { display:inline-block; margin-top:.4rem; }
       <button class="t2btn hidden" data-sub="vid-sub"   onclick="selectSub('vid-sub')">Subtitles</button>
       <button class="t2btn hidden" data-sub="vid-dub"   onclick="selectSub('vid-dub')">Dub</button>
       <button class="t2btn hidden" data-sub="vid-up"    onclick="selectSub('vid-up')">Upscale</button>
+      <button class="t2btn hidden" data-sub="vid-faceswap" onclick="selectSub('vid-faceswap')">Face Swap</button>
+      <button class="t2btn hidden" data-sub="vid-outfit"   onclick="selectSub('vid-outfit')">Outfit Change</button>
       <!-- Audio sub-tabs -->
       <button class="t2btn hidden" data-sub="aud-gen"   onclick="selectSub('aud-gen')">Generate Music/SFX</button>
       <button class="t2btn hidden" data-sub="aud-tts"   onclick="selectSub('aud-tts')">TTS</button>
+      <button class="t2btn hidden" data-sub="aud-clone" onclick="selectSub('aud-clone')">Voice Clone</button>
+      <button class="t2btn hidden" data-sub="aud-convert" onclick="selectSub('aud-convert')">Voice Convert</button>
       <button class="t2btn hidden" data-sub="aud-stt"   onclick="selectSub('aud-stt')">Transcribe</button>
     </div>
 
@@ -308,6 +338,101 @@ a.dl { display:inline-block; margin-top:.4rem; }
       </div>
     </div>
 
+    <!-- Face Swap -->
+    <div class="panel" id="panel-img-faceswap">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="frow"><label class="fl">Source face</label>
+            <div class="media-input-group">
+              <input type="file" id="fs-src" accept="image/*" class="fi" onchange="previewMediaInput('fs-src','fs-src-preview')">
+              <button class="btn btn-ghost btn-sm" onclick="openWebcam('fs-src-cam','fs-src','fs-src-preview','photo')">📷 Webcam</button>
+            </div>
+          </div>
+          <div id="fs-src-preview" class="media-preview"></div>
+          <div id="fs-src-cam" class="webcam-box" style="display:none"></div>
+
+          <div class="frow"><label class="fl">Target type</label>
+            <select id="fs-type" class="fselect" onchange="fsFaceSwapTypeChange()">
+              <option value="image">Image</option>
+              <option value="video">Video</option>
+            </select>
+          </div>
+
+          <div class="frow" id="fs-tgt-wrap"><label class="fl">Target image</label>
+            <div class="media-input-group">
+              <input type="file" id="fs-tgt" accept="image/*,video/*" class="fi" onchange="previewMediaInput('fs-tgt','fs-tgt-preview')">
+              <button class="btn btn-ghost btn-sm" id="fs-tgt-cam-btn" onclick="openWebcam('fs-tgt-cam','fs-tgt','fs-tgt-preview','photo')">📷 Webcam</button>
+            </div>
+          </div>
+          <div id="fs-tgt-preview" class="media-preview"></div>
+          <div id="fs-tgt-cam" class="webcam-box" style="display:none"></div>
+
+          <button class="btn btn-primary" onclick="genFaceSwap()">Swap Face</button>
+          <div class="progress" id="fs-prog"></div>
+        </div>
+        <div class="gen-out" id="fs-out"><div class="gen-empty">Result will appear here</div></div>
+      </div>
+    </div>
+
+    <!-- Deblur -->
+    <div class="panel" id="panel-img-deblur">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="frow"><label class="fl">Source image</label><input type="file" id="db-src" accept="image/*" class="fi" onchange="previewMediaInput('db-src','db-src-preview')"></div>
+          <div id="db-src-preview" class="media-preview"></div>
+          <div class="frow"><label class="fl">Strength <span id="db-sv">0.5</span></label>
+            <input type="range" id="db-str" min="0.1" max="1" step="0.05" value="0.5" oninput="$('db-sv').textContent=(+this.value).toFixed(2)" style="width:100%"></div>
+          <button class="btn btn-primary" onclick="genDeblur()">Deblur</button>
+          <div class="progress" id="db-prog"></div>
+        </div>
+        <div class="gen-out" id="db-out"><div class="gen-empty">Deblurred image will appear here</div></div>
+      </div>
+    </div>
+
+    <!-- Unpixelate -->
+    <div class="panel" id="panel-img-unpix">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="frow"><label class="fl">Source image</label><input type="file" id="up-src" accept="image/*" class="fi" onchange="previewMediaInput('up-src','up-src-preview')"></div>
+          <div id="up-src-preview" class="media-preview"></div>
+          <div class="frow"><label class="fl">Scale</label>
+            <select id="up-scale" class="fselect"><option value="2">2×</option><option value="4" selected>4×</option><option value="8">8×</option></select>
+          </div>
+          <button class="btn btn-primary" onclick="genUnpixelate()">Unpixelate</button>
+          <div class="progress" id="up-prog"></div>
+        </div>
+        <div class="gen-out" id="up-out"><div class="gen-empty">Restored image will appear here</div></div>
+      </div>
+    </div>
+
+    <!-- Outfit Change -->
+    <div class="panel" id="panel-img-outfit">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="frow"><label class="fl">Target type</label>
+            <select id="ot-type" class="fselect" onchange="otOutfitTypeChange()">
+              <option value="image">Image</option>
+              <option value="video">Video</option>
+            </select>
+          </div>
+          <div class="frow" id="ot-img-wrap"><label class="fl">Source image</label><input type="file" id="ot-src" accept="image/*" class="fi" onchange="previewMediaInput('ot-src','ot-src-preview')"></div>
+          <div class="frow" id="ot-vid-wrap" style="display:none"><label class="fl">Source video</label><input type="file" id="ot-vid" accept="video/*" class="fi"></div>
+          <div id="ot-src-preview" class="media-preview"></div>
+          <div class="frow"><label class="fl">New outfit prompt</label><textarea id="ot-prompt" class="fs" rows="3" placeholder="e.g. red evening dress, formal suit, casual jeans and t-shirt…"></textarea></div>
+          <div class="frow"><label class="fl">Negative prompt</label><input id="ot-neg" class="fi" placeholder="ugly, deformed…"></div>
+          <div class="frow"><label class="fl">Mask (optional — auto-generated if blank)</label><input type="file" id="ot-mask" accept="image/*" class="fi"></div>
+          <div class="g2">
+            <div class="frow"><label class="fl">Steps</label><input type="number" id="ot-steps" class="fi" value="30"></div>
+            <div class="frow"><label class="fl">CFG</label><input type="number" id="ot-cfg" class="fi" value="7.5" step="0.5"></div>
+          </div>
+          <div class="frow"><label class="fl">Seed</label><input type="number" id="ot-seed" class="fi" placeholder="random"></div>
+          <button class="btn btn-primary" onclick="genOutfit()">Change Outfit</button>
+          <div class="progress" id="ot-prog"></div>
+        </div>
+        <div class="gen-out" id="ot-out"><div class="gen-empty">Result will appear here</div></div>
+      </div>
+    </div>
+
     <!-- ═══════════════ VIDEO ═══════════════ -->
 
     <!-- T2V -->
@@ -334,6 +459,25 @@ a.dl { display:inline-block; margin-top:.4rem; }
           <div class="frow"><label class="fl">Guidance</label><input type="number" id="vi-cfg" class="fi" value="7.5" step="0.5"></div>
         </div>
         <div class="frow"><label class="fl">Seed</label><input type="number" id="vi-seed" class="fi" placeholder="random"></div>
+        <div class="frow"><label class="fl">Camera motion</label>
+          <select id="vi-cam" class="fselect">
+            <option value="">None</option>
+            <option value="zoom-in">Zoom in</option><option value="zoom-out">Zoom out</option>
+            <option value="pan-left">Pan left</option><option value="pan-right">Pan right</option>
+            <option value="tilt-up">Tilt up</option><option value="tilt-down">Tilt down</option>
+            <option value="rotate">Rotate</option>
+          </select>
+        </div>
+        <!-- Character consistency -->
+        <details style="margin-top:.25rem">
+          <summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-2)">Character consistency</summary>
+          <div style="margin-top:.5rem;display:flex;flex-direction:column;gap:.6rem">
+            <div id="vi-char-slots"></div>
+            <button class="btn btn-ghost btn-sm" onclick="addCharSlot('vi')" style="align-self:flex-start;font-size:11px">+ Add character</button>
+            <div class="frow"><label class="fl">IP-Adapter strength <span id="vi-cs">0.80</span></label>
+              <input type="range" id="vi-cstr" min="0" max="1" step="0.05" value="0.8" oninput="$('vi-cs').textContent=(+this.value).toFixed(2)" style="width:100%"></div>
+          </div>
+        </details>
         <button class="btn btn-primary" onclick="genVideo('i2v')">Animate</button>
         <div class="progress" id="vi-prog"></div>
       </div>
@@ -352,6 +496,25 @@ a.dl { display:inline-block; margin-top:.4rem; }
           <div class="frow"><label class="fl">Guidance</label><input type="number" id="vv-cfg" class="fi" value="7.5" step="0.5"></div>
         </div>
         <div class="frow"><label class="fl">Seed</label><input type="number" id="vv-seed" class="fi" placeholder="random"></div>
+        <div class="frow"><label class="fl">Camera motion</label>
+          <select id="vv-cam" class="fselect">
+            <option value="">None</option>
+            <option value="zoom-in">Zoom in</option><option value="zoom-out">Zoom out</option>
+            <option value="pan-left">Pan left</option><option value="pan-right">Pan right</option>
+            <option value="tilt-up">Tilt up</option><option value="tilt-down">Tilt down</option>
+            <option value="rotate">Rotate</option>
+          </select>
+        </div>
+        <!-- Character consistency -->
+        <details style="margin-top:.25rem">
+          <summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-2)">Character consistency</summary>
+          <div style="margin-top:.5rem;display:flex;flex-direction:column;gap:.6rem">
+            <div id="vv-char-slots"></div>
+            <button class="btn btn-ghost btn-sm" onclick="addCharSlot('vv')" style="align-self:flex-start;font-size:11px">+ Add character</button>
+            <div class="frow"><label class="fl">IP-Adapter strength <span id="vv-cs">0.80</span></label>
+              <input type="range" id="vv-cstr" min="0" max="1" step="0.05" value="0.8" oninput="$('vv-cs').textContent=(+this.value).toFixed(2)" style="width:100%"></div>
+          </div>
+        </details>
         <button class="btn btn-primary" onclick="genVideo('v2v')">Transform</button>
         <div class="progress" id="vv-prog"></div>
       </div>
@@ -363,6 +526,9 @@ a.dl { display:inline-block; margin-top:.4rem; }
       <div class="gen-ctrl">
         <div class="frow"><label class="fl">Initial image</label><input type="file" id="ti-init" accept="image/*" class="fi"></div>
         <div class="frow"><label class="fl">End image (optional — for frame interpolation)</label><input type="file" id="ti-end" accept="image/*" class="fi"></div>
+        <div class="frow"><label class="fl">Source video (optional — enables V2V mode, overrides image)</label><input type="file" id="ti-vid" accept="video/*" class="fi"></div>
+        <div class="frow"><label class="fl">Strength (V2V denoising) <span id="ti-vs">0.70</span></label>
+          <input type="range" id="ti-vstr" min="0" max="1" step="0.05" value="0.70" oninput="$('ti-vs').textContent=(+this.value).toFixed(2)" style="width:100%"></div>
         <div class="frow"><label class="fl">Prompt</label><textarea id="ti-prompt" class="fs" rows="3" placeholder="Describe the video motion / story…"></textarea></div>
         <div class="frow"><label class="fl">Negative prompt</label><textarea id="ti-neg" class="fs" rows="2" placeholder="Things to avoid…"></textarea></div>
         <div class="g2">
@@ -391,13 +557,10 @@ a.dl { display:inline-block; margin-top:.4rem; }
         <!-- Character consistency -->
         <details style="margin-top:.25rem">
           <summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-2)">Character consistency</summary>
-          <div style="margin-top:.5rem;display:flex;flex-direction:column;gap:.4rem">
-            <div class="frow">
-              <label class="fl">Reference images</label>
-              <input type="file" id="ti-char" accept="image/*" multiple class="fi" onchange="addCharRefs('ti',this)">
-            </div>
-            <div class="char-refs" id="ti-char-thumbs"></div>
-            <div class="frow"><label class="fl">Strength <span id="ti-cs">0.80</span></label>
+          <div style="margin-top:.5rem;display:flex;flex-direction:column;gap:.6rem">
+            <div id="ti-char-slots"></div>
+            <button class="btn btn-ghost btn-sm" onclick="addCharSlot('ti')" style="align-self:flex-start;font-size:11px">+ Add character</button>
+            <div class="frow"><label class="fl">IP-Adapter strength <span id="ti-cs">0.80</span></label>
               <input type="range" id="ti-cstr" min="0" max="1" step="0.05" value="0.8" oninput="$('ti-cs').textContent=(+this.value).toFixed(2)" style="width:100%"></div>
           </div>
         </details>
@@ -523,6 +686,10 @@ a.dl { display:inline-block; margin-top:.4rem; }
             <div class="frow"><label class="fl">Duration (sec)</label><input type="number" id="ag-dur" class="fi" value="10" min="1" max="300"></div>
             <div class="frow"><label class="fl">Temperature</label><input type="number" id="ag-temp" class="fi" value="1.0" step="0.1" min="0.1"></div>
           </div>
+          <div class="g2">
+            <div class="frow"><label class="fl">Top-k</label><input type="number" id="ag-topk" class="fi" value="250" min="1"></div>
+            <div class="frow"><label class="fl">CFG coef</label><input type="number" id="ag-cfg" class="fi" value="3.0" step="0.5" min="0"></div>
+          </div>
           <div class="frow"><label class="fl">Melody reference (optional)</label><input type="file" id="ag-melody" accept="audio/*" class="fi"></div>
           <div class="frow"><label class="fl">Seed</label><input type="number" id="ag-seed" class="fi" placeholder="random"></div>
           <button class="btn btn-primary" onclick="genAudio()">Generate</button>
@@ -548,6 +715,95 @@ a.dl { display:inline-block; margin-top:.4rem; }
       </div>
     </div>
 
+    <!-- Voice Clone -->
+    <div class="panel" id="panel-aud-clone">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="frow"><label class="fl">Text to synthesize</label><textarea id="vc-text" class="fs" rows="4" placeholder="Enter text to speak in the cloned voice…"></textarea></div>
+          <div class="frow"><label class="fl">Voice profile (saved)</label>
+            <select id="vc-voice" class="fselect">
+              <option value="">— Or upload reference audio below —</option>
+            </select>
+          </div>
+          <div class="frow"><label class="fl">Reference audio (upload or record)</label>
+            <div class="media-input-group">
+              <input type="file" id="vc-ref" accept="audio/*" class="fi">
+              <button class="btn btn-ghost btn-sm" onclick="openWebcam('vc-ref-cam','vc-ref',null,'audio')">🎤 Record</button>
+            </div>
+          </div>
+          <div id="vc-ref-cam" class="webcam-box" style="display:none"></div>
+          <div class="frow"><label class="fl">Transcript of reference audio</label><input id="vc-reftxt" class="fi" placeholder="What the reference audio says…"></div>          <div class="g2">
+            <div class="frow"><label class="fl">Speed</label><input type="number" id="vc-speed" class="fi" value="1.0" step="0.1" min="0.5"></div>
+            <div class="frow"><label class="fl">Seed</label><input type="number" id="vc-seed" class="fi" placeholder="random"></div>
+          </div>
+          <button class="btn btn-primary" onclick="genVoiceClone()">Clone & Synthesize</button>
+          <div class="progress" id="vc-prog"></div>
+          <details style="margin-top:.75rem">
+            <summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-2)">Save voice profile</summary>
+            <div style="margin-top:.5rem;display:flex;flex-direction:column;gap:.4rem">
+              <div class="frow"><label class="fl">Profile name</label><input id="vc-savename" class="fi" placeholder="my-voice"></div>
+              <div class="frow"><label class="fl">Description</label><input id="vc-savedesc" class="fi" placeholder="Optional description"></div>
+              <div class="frow"><label class="fl">Reference audio (upload or record)</label>
+                <div class="media-input-group">
+                  <input type="file" id="vc-saveref" accept="audio/*" class="fi">
+                  <button class="btn btn-ghost btn-sm" onclick="openWebcam('vc-saveref-cam','vc-saveref',null,'audio')">🎤 Record</button>
+                </div>
+              </div>
+              <div id="vc-saveref-cam" class="webcam-box" style="display:none"></div>              <div class="frow"><label class="fl">Transcript</label><input id="vc-savetxt" class="fi" placeholder="What the audio says"></div>
+              <button class="btn btn-ghost btn-sm" onclick="saveVoiceProfile()">Save Profile</button>
+              <div class="progress" id="vc-saveprog"></div>
+            </div>
+          </details>
+        </div>
+        <div class="gen-out" id="vc-out"><div class="gen-empty">Cloned voice audio will appear here</div></div>
+      </div>
+    </div>
+
+    <!-- Voice Convert (SVC) -->
+    <div class="panel" id="panel-aud-convert">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <p style="font-size:12px;color:var(--text-3);margin:0 0 .5rem">
+            Converts only the <strong>timbre</strong> of the source audio to match the target voice,
+            preserving pitch, melody, rhythm and expression.
+            Use <strong>Singing mode</strong> for music and songs.
+          </p>
+          <div class="frow"><label class="fl">Source audio (to convert)</label>
+            <div class="media-input-group">
+              <input type="file" id="cv-src" accept="audio/*" class="fi">
+              <button class="btn btn-ghost btn-sm" onclick="openWebcam('cv-src-cam','cv-src',null,'audio')">🎤 Record</button>
+            </div>
+          </div>
+          <div id="cv-src-cam" class="webcam-box" style="display:none"></div>
+          <div class="frow"><label class="fl">Target voice profile</label>
+            <select id="cv-voice" class="fselect">
+              <option value="">— Or upload reference audio below —</option>
+            </select>
+          </div>
+          <div class="frow"><label class="fl">Target voice (upload)</label>
+            <div class="media-input-group">
+              <input type="file" id="cv-ref" accept="audio/*" class="fi">
+              <button class="btn btn-ghost btn-sm" onclick="openWebcam('cv-ref-cam','cv-ref',null,'audio')">🎤 Record</button>
+            </div>
+          </div>
+          <div id="cv-ref-cam" class="webcam-box" style="display:none"></div>
+          <div class="frow"><label class="fl">Mode</label>
+            <select id="cv-mode" class="fselect">
+              <option value="speech">Speech (fast)</option>
+              <option value="singing">Singing / Music (pitch-accurate)</option>
+            </select>
+          </div>
+          <div class="g2">
+            <div class="frow"><label class="fl">Pitch shift (semitones)</label><input type="number" id="cv-pitch" class="fi" value="0" min="-12" max="12"></div>
+            <div class="frow"><label class="fl">Diffusion steps</label><input type="number" id="cv-steps" class="fi" value="10" min="1" max="50"></div>
+          </div>
+          <button class="btn btn-primary" onclick="genVoiceConvert()">Convert Voice</button>
+          <div class="progress" id="cv-prog"></div>
+        </div>
+        <div class="gen-out" id="cv-out"><div class="gen-empty">Converted audio will appear here</div></div>
+      </div>
+    </div>
+
     <!-- STT -->
     <div class="panel" id="panel-aud-stt">
       <div class="gen-wrap">
@@ -570,77 +826,303 @@ a.dl { display:inline-block; margin-top:.4rem; }
     <div class="panel" id="panel-pipe">
       <div class="pipe-panel">
 
-        <div class="pipe-card">
-          <div class="pipe-title">Image → Video Pipeline</div>
-          <div class="pipe-steps">
-            <span class="pipe-step">1. Generate image</span><span class="pipe-arrow">→</span>
-            <span class="pipe-step">2. Animate to video</span><span class="pipe-arrow">→</span>
-            <span class="pipe-step">3. (Optional) Add audio</span>
-          </div>
-          <div style="margin-top:.75rem;display:flex;flex-direction:column;gap:.5rem">
+        <details class="pipe-card">
+          <summary>Image → Video Pipeline
+            <span class="pipe-steps" style="margin:0;font-size:11px">
+              <span class="pipe-step">Generate image</span><span class="pipe-arrow">→</span>
+              <span class="pipe-step">Animate</span><span class="pipe-arrow">→</span>
+              <span class="pipe-step">Audio (opt)</span>
+            </span>
+          </summary>
+          <div class="pipe-card-body">
             <div class="frow"><label class="fl">Text prompt</label><textarea id="pp1-prompt" class="fs" rows="3" placeholder="Describe the scene…"></textarea></div>
+            <div class="frow"><label class="fl">Negative prompt</label><textarea id="pp1-neg" class="fs" rows="2" placeholder="Things to avoid…"></textarea></div>
             <div class="g2">
               <div class="frow"><label class="fl">Image model</label><input id="pp1-imodel" class="fi" placeholder="model id"></div>
               <div class="frow"><label class="fl">Video model</label><input id="pp1-vmodel" class="fi" placeholder="model id"></div>
             </div>
             <div class="g2">
+              <div class="frow"><label class="fl">Image size</label><input id="pp1-isize" class="fi" value="1024x1024"></div>
+              <div class="frow"><label class="fl">Image steps</label><input type="number" id="pp1-isteps" class="fi" placeholder="default"></div>
+            </div>
+            <div class="g2">
+              <div class="frow"><label class="fl">Image CFG</label><input type="number" id="pp1-icfg" class="fi" placeholder="default" step="0.5"></div>
+              <div class="frow"><label class="fl">Image seed</label><input type="number" id="pp1-iseed" class="fi" placeholder="random"></div>
+            </div>
+            <div class="g2">
               <div class="frow"><label class="fl">Frames</label><input type="number" id="pp1-frames" class="fi" value="16"></div>
               <div class="frow"><label class="fl">FPS</label><input type="number" id="pp1-fps" class="fi" value="8"></div>
             </div>
+            <div class="g2">
+              <div class="frow"><label class="fl">Video steps</label><input type="number" id="pp1-vsteps" class="fi" value="25"></div>
+              <div class="frow"><label class="fl">Video CFG</label><input type="number" id="pp1-vcfg" class="fi" value="7.5" step="0.5"></div>
+            </div>
+            <div class="g2">
+              <div class="frow"><label class="fl">Camera motion</label>
+                <select id="pp1-cam" class="fselect">
+                  <option value="">None</option>
+                  <option value="zoom-in">Zoom in</option><option value="zoom-out">Zoom out</option>
+                  <option value="pan-left">Pan left</option><option value="pan-right">Pan right</option>
+                  <option value="tilt-up">Tilt up</option><option value="tilt-down">Tilt down</option>
+                  <option value="rotate">Rotate</option>
+                </select>
+              </div>
+              <div class="frow"><label class="fl">Video seed</label><input type="number" id="pp1-vseed" class="fi" placeholder="random"></div>
+            </div>
+            <details style="margin-top:.25rem">
+              <summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-2)">Add audio to video</summary>
+              <div style="margin-top:.5rem;display:flex;flex-direction:column;gap:.4rem">
+                <div class="frow"><label class="fl">Audio type</label>
+                  <select id="pp1-atype" class="fselect">
+                    <option value="">None</option>
+                    <option value="music">Music</option><option value="sfx">SFX</option>
+                    <option value="ambient">Ambient</option>
+                  </select>
+                </div>
+                <div class="frow"><label class="fl">Audio prompt</label><input id="pp1-aprompt" class="fi" placeholder="e.g. epic orchestral soundtrack"></div>
+              </div>
+            </details>
             <button class="btn btn-primary" onclick="runPipeline1()">Run Pipeline</button>
             <div class="progress" id="pp1-prog"></div>
             <div id="pp1-out"></div>
           </div>
-        </div>
+        </details>
 
-        <div class="pipe-card">
-          <div class="pipe-title">Video → Dub + Subtitle Pipeline</div>
-          <div class="pipe-steps">
-            <span class="pipe-step">1. Transcribe</span><span class="pipe-arrow">→</span>
-            <span class="pipe-step">2. Translate</span><span class="pipe-arrow">→</span>
-            <span class="pipe-step">3. TTS dub</span><span class="pipe-arrow">→</span>
-            <span class="pipe-step">4. Burn subtitles</span>
-          </div>
-          <div style="margin-top:.75rem;display:flex;flex-direction:column;gap:.5rem">
+        <details class="pipe-card">
+          <summary>Video → Dub + Subtitle
+            <span class="pipe-steps" style="margin:0;font-size:11px">
+              <span class="pipe-step">Transcribe</span><span class="pipe-arrow">→</span>
+              <span class="pipe-step">Translate</span><span class="pipe-arrow">→</span>
+              <span class="pipe-step">TTS dub</span><span class="pipe-arrow">→</span>
+              <span class="pipe-step">Burn subs</span>
+            </span>
+          </summary>
+          <div class="pipe-card-body">
             <div class="frow"><label class="fl">Source video</label><input type="file" id="pp2-src" accept="video/*" class="fi"></div>
             <div class="g2">
               <div class="frow"><label class="fl">Source language</label><input id="pp2-slang" class="fi" placeholder="en"></div>
               <div class="frow"><label class="fl">Target language</label><input id="pp2-tlang" class="fi" placeholder="es, fr, de…"></div>
             </div>
-            <div class="frow"><label class="fl">Transcription model</label><input id="pp2-model" class="fi" placeholder="whisper model id"></div>
+            <div class="frow"><label class="fl">Model (audio/video)</label><input id="pp2-model" class="fi" placeholder="model id"></div>
+            <label style="font-size:12px;display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="pp2-clone"> Clone original voice</label>
+            <label style="font-size:12px;display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="pp2-burn" checked> Burn subtitles into video</label>
             <button class="btn btn-primary" onclick="runPipeline2()">Run Pipeline</button>
             <div class="progress" id="pp2-prog"></div>
             <div id="pp2-out"></div>
           </div>
-        </div>
+        </details>
 
-        <div class="pipe-card">
-          <div class="pipe-title">Full Story Pipeline</div>
-          <div class="pipe-steps">
-            <span class="pipe-step">1. LLM generates script</span><span class="pipe-arrow">→</span>
-            <span class="pipe-step">2. Image gen per scene</span><span class="pipe-arrow">→</span>
-            <span class="pipe-step">3. Animate each scene</span><span class="pipe-arrow">→</span>
-            <span class="pipe-step">4. TTS narration</span><span class="pipe-arrow">→</span>
-            <span class="pipe-step">5. Merge</span>
-          </div>
-          <div style="margin-top:.75rem;display:flex;flex-direction:column;gap:.5rem">
+        <details class="pipe-card">
+          <summary>Full Story
+            <span class="pipe-steps" style="margin:0;font-size:11px">
+              <span class="pipe-step">LLM script</span><span class="pipe-arrow">→</span>
+              <span class="pipe-step">Images</span><span class="pipe-arrow">→</span>
+              <span class="pipe-step">Video</span><span class="pipe-arrow">→</span>
+              <span class="pipe-step">TTS</span>
+            </span>
+          </summary>
+          <div class="pipe-card-body">
             <div class="frow"><label class="fl">Story idea</label><textarea id="pp3-story" class="fs" rows="3" placeholder="A knight fights a dragon at sunset…"></textarea></div>
+            <div class="g2">
+              <div class="frow"><label class="fl">Scenes</label><input type="number" id="pp3-scenes" class="fi" value="3" min="1" max="6"></div>
+              <div class="frow"><label class="fl">Frames/scene</label><input type="number" id="pp3-frames" class="fi" value="16"></div>
+            </div>
             <div class="g3">
               <div class="frow"><label class="fl">Text model</label><input id="pp3-tmodel" class="fi" placeholder="llm id"></div>
               <div class="frow"><label class="fl">Image model</label><input id="pp3-imodel" class="fi" placeholder="sd id"></div>
               <div class="frow"><label class="fl">Video model</label><input id="pp3-vmodel" class="fi" placeholder="video id"></div>
             </div>
-            <div class="frow"><label class="fl">TTS model</label><input id="pp3-amodel" class="fi" placeholder="tts id"></div>
+            <div class="g2">
+              <div class="frow"><label class="fl">TTS model (optional)</label><input id="pp3-amodel" class="fi" placeholder="tts id"></div>
+              <div class="frow"><label class="fl">TTS voice</label><input id="pp3-voice" class="fi" placeholder="af_sarah"></div>
+            </div>
             <button class="btn btn-primary" onclick="runPipeline3()">Run Full Pipeline</button>
             <div class="progress" id="pp3-prog"></div>
             <div id="pp3-out"></div>
           </div>
+        </details>
+
+        <details class="pipe-card">
+          <summary>Audio/Video Dub with Voice Clone
+            <span class="pipe-steps" style="margin:0;font-size:11px">
+              <span class="pipe-step">Transcribe</span><span class="pipe-arrow">→</span>
+              <span class="pipe-step">Clone voice</span><span class="pipe-arrow">→</span>
+              <span class="pipe-step">Replace audio</span>
+            </span>
+          </summary>
+          <div class="pipe-card-body">
+            <div class="frow"><label class="fl">Source video or audio</label><input type="file" id="pp4-src" accept="audio/*,video/*" class="fi"></div>
+            <div class="frow"><label class="fl">Voice profile (saved)</label>
+              <select id="pp4-voice" class="fselect">
+                <option value="">— Or upload reference audio below —</option>
+              </select>
+            </div>
+            <div class="frow"><label class="fl">Reference audio (upload or record)</label>
+              <div class="media-input-group">
+                <input type="file" id="pp4-ref" accept="audio/*" class="fi">
+                <button class="btn btn-ghost btn-sm" onclick="openWebcam('pp4-ref-cam','pp4-ref',null,'audio')">🎤 Record</button>
+              </div>
+            </div>
+            <div id="pp4-ref-cam" class="webcam-box" style="display:none"></div>
+            <div class="frow"><label class="fl">Transcript of reference audio</label><input id="pp4-reftxt" class="fi" placeholder="What the reference audio says…"></div>
+            <div class="g2">
+              <div class="frow"><label class="fl">Source language</label><input id="pp4-slang" class="fi" placeholder="en (auto-detect)"></div>
+              <div class="frow"><label class="fl">Translate to</label><input id="pp4-tlang" class="fi" placeholder="es, fr… (optional)"></div>
+            </div>
+            <div class="g2">
+              <div class="frow"><label class="fl">Speed</label><input type="number" id="pp4-speed" class="fi" value="1.0" step="0.1"></div>
+              <div class="frow"><label class="fl">Whisper model</label><input id="pp4-whisper" class="fi" placeholder="base"></div>
+            </div>
+            <label style="font-size:12px;display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="pp4-burn"> Burn subtitles into video</label>
+            <button class="btn btn-primary" onclick="runPipeline4()">Run Pipeline</button>
+            <div class="progress" id="pp4-prog"></div>
+            <div id="pp4-out"></div>
+          </div>
+        </details>
+
+        <details class="pipe-card">
+          <summary>Face Swap
+            <span class="pipe-steps" style="margin:0;font-size:11px">
+              <span class="pipe-step">Source face</span><span class="pipe-arrow">→</span>
+              <span class="pipe-step">Target</span><span class="pipe-arrow">→</span>
+              <span class="pipe-step">Result</span>
+            </span>
+          </summary>
+          <div class="pipe-card-body">
+            <div class="frow"><label class="fl">Source face (upload or webcam)</label>
+              <div class="media-input-group">
+                <input type="file" id="pp5-src" accept="image/*" class="fi" onchange="previewMediaInput('pp5-src','pp5-src-preview')">
+                <button class="btn btn-ghost btn-sm" onclick="openWebcam('pp5-src-cam','pp5-src','pp5-src-preview','photo')">📷 Webcam</button>
+              </div>
+            </div>
+            <div id="pp5-src-preview" class="media-preview"></div>
+            <div id="pp5-src-cam" class="webcam-box" style="display:none"></div>
+            <div class="frow"><label class="fl">Target (upload or webcam)</label>
+              <div class="media-input-group">
+                <input type="file" id="pp5-tgt" accept="image/*,video/*" class="fi" onchange="previewMediaInput('pp5-tgt','pp5-tgt-preview')">
+                <button class="btn btn-ghost btn-sm" onclick="openWebcam('pp5-tgt-cam','pp5-tgt','pp5-tgt-preview','photo')">📷 Webcam</button>
+              </div>
+            </div>
+            <div id="pp5-tgt-preview" class="media-preview"></div>
+            <div id="pp5-tgt-cam" class="webcam-box" style="display:none"></div>
+            <div class="frow"><label class="fl">Target type</label>
+              <select id="pp5-type" class="fselect"><option value="image">Image</option><option value="video">Video</option></select>
+            </div>
+            <button class="btn btn-primary" onclick="runPipeline5()">Run Face Swap</button>
+            <div class="progress" id="pp5-prog"></div>
+            <div id="pp5-out"></div>
+          </div>
+        </details>
+
+        <details class="pipe-card">
+          <summary>Voice Clone (TTS)
+            <span class="pipe-steps" style="margin:0;font-size:11px">
+              <span class="pipe-step">Reference audio</span><span class="pipe-arrow">→</span>
+              <span class="pipe-step">Text</span><span class="pipe-arrow">→</span>
+              <span class="pipe-step">Cloned speech</span>
+            </span>
+          </summary>
+          <div class="pipe-card-body">
+            <p style="font-size:12px;color:var(--text-2);margin:0 0 .4rem">Synthesize new speech in a cloned voice. Good for dubbing scripts.</p>
+            <div class="frow"><label class="fl">Text to synthesize</label><textarea id="pvc-text" class="fs" rows="3" placeholder="Enter text…"></textarea></div>
+            <div class="frow"><label class="fl">Voice profile</label>
+              <select id="pvc-voice" class="fselect"><option value="">— Or upload reference below —</option></select>
+            </div>
+            <div class="frow"><label class="fl">Reference audio (upload or record)</label>
+              <div class="media-input-group">
+                <input type="file" id="pvc-ref" accept="audio/*" class="fi">
+                <button class="btn btn-ghost btn-sm" onclick="openWebcam('pvc-ref-cam','pvc-ref',null,'audio')">🎤 Record</button>
+              </div>
+            </div>
+            <div id="pvc-ref-cam" class="webcam-box" style="display:none"></div>
+            <div class="frow"><label class="fl">Transcript of reference</label><input id="pvc-reftxt" class="fi" placeholder="What the reference audio says…"></div>
+            <div class="g2">
+              <div class="frow"><label class="fl">Speed</label><input type="number" id="pvc-speed" class="fi" value="1.0" step="0.1"></div>
+              <div class="frow"><label class="fl">Seed</label><input type="number" id="pvc-seed" class="fi" placeholder="random"></div>
+            </div>
+            <button class="btn btn-primary" onclick="runPipelineVC()">Clone & Synthesize</button>
+            <div class="progress" id="pvc-prog"></div>
+            <div id="pvc-out"></div>
+          </div>
+        </details>
+
+        <details class="pipe-card">
+          <summary>Voice Convert (SVC)
+            <span class="pipe-steps" style="margin:0;font-size:11px">
+              <span class="pipe-step">Source audio</span><span class="pipe-arrow">→</span>
+              <span class="pipe-step">Target timbre</span><span class="pipe-arrow">→</span>
+              <span class="pipe-step">Converted audio</span>
+            </span>
+          </summary>
+          <div class="pipe-card-body">
+            <p style="font-size:12px;color:var(--text-2);margin:0 0 .4rem">Convert timbre while preserving pitch, melody and expression. Use <strong>Singing mode</strong> for music.</p>
+            <div class="frow"><label class="fl">Source audio (to convert)</label>
+              <div class="media-input-group">
+                <input type="file" id="psvc-src" accept="audio/*" class="fi">
+                <button class="btn btn-ghost btn-sm" onclick="openWebcam('psvc-src-cam','psvc-src',null,'audio')">🎤 Record</button>
+              </div>
+            </div>
+            <div id="psvc-src-cam" class="webcam-box" style="display:none"></div>
+            <div class="frow"><label class="fl">Target voice profile</label>
+              <select id="psvc-voice" class="fselect"><option value="">— Or upload reference below —</option></select>
+            </div>
+            <div class="frow"><label class="fl">Target voice (upload or record)</label>
+              <div class="media-input-group">
+                <input type="file" id="psvc-ref" accept="audio/*" class="fi">
+                <button class="btn btn-ghost btn-sm" onclick="openWebcam('psvc-ref-cam','psvc-ref',null,'audio')">🎤 Record</button>
+              </div>
+            </div>
+            <div id="psvc-ref-cam" class="webcam-box" style="display:none"></div>
+            <div class="frow"><label class="fl">Mode</label>
+              <select id="psvc-mode" class="fselect">
+                <option value="speech">Speech (fast)</option>
+                <option value="singing">Singing / Music (pitch-accurate)</option>
+              </select>
+            </div>
+            <div class="g2">
+              <div class="frow"><label class="fl">Pitch shift (semitones)</label><input type="number" id="psvc-pitch" class="fi" value="0" min="-12" max="12"></div>
+              <div class="frow"><label class="fl">Diffusion steps</label><input type="number" id="psvc-steps" class="fi" value="10" min="1" max="50"></div>
+            </div>
+            <button class="btn btn-primary" onclick="runPipelineSVC()">Convert Voice</button>
+            <div class="progress" id="psvc-prog"></div>
+            <div id="psvc-out"></div>
+          </div>
+        </details>
+
+    <!-- Custom pipeline builder + saved custom pipelines -->
+    <div id="custom-pipe-cards"></div>
+
+    <!-- Builder card (always open) -->
+    <details class="pipe-card" id="pipe-builder-card" open>
+      <summary>＋ Build New Pipeline
+        <span class="pipe-steps" style="margin:0;font-size:11px"><span class="pipe-step">Add steps</span><span class="pipe-arrow">→</span><span class="pipe-step">Configure</span><span class="pipe-arrow">→</span><span class="pipe-step">Save &amp; Run</span></span>
+      </summary>
+      <div class="pipe-card-body">
+        <div class="g2">
+          <div class="frow"><label class="fl">Pipeline name</label><input id="pb-name" class="fi" placeholder="My Pipeline"></div>
+          <div class="frow"><label class="fl">Description</label><input id="pb-desc" class="fi" placeholder="Optional"></div>
         </div>
-
+        <div id="pb-steps" style="display:flex;flex-direction:column;gap:.4rem;margin:.25rem 0"></div>
+        <div style="display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.25rem">
+          <select id="pb-add-type" class="fselect" style="flex:1"></select>
+          <button class="btn btn-ghost btn-sm" onclick="pbAddStep()">＋ Add Step</button>
+        </div>
+        <div style="display:flex;gap:.4rem;margin-top:.5rem;flex-wrap:wrap">
+          <div class="frow" style="flex:1"><label class="fl">Pipeline input</label><input id="pb-input" class="fi" placeholder="Initial text/prompt passed as {{ '{{' }}input{{ '}}' }}"></div>
+        </div>
+        <div style="display:flex;gap:.4rem;margin-top:.5rem">
+          <button class="btn btn-primary" onclick="pbSaveAndRun()">Save &amp; Run</button>
+          <button class="btn btn-ghost btn-sm" onclick="pbSave()">Save only</button>
+          <button class="btn btn-ghost btn-sm" onclick="pbRun()">Run without saving</button>
+        </div>
+        <div class="progress" id="pb-prog"></div>
+        <div id="pb-out"></div>
       </div>
-    </div>
+    </details>
 
-    <!-- ═══════════════ EMBEDDINGS ═══════════════ -->
+    </div><!-- pipe-panel -->
+    </div><!-- panel-pipe -->
+
     <div class="panel" id="panel-embed">
       <div class="gen-wrap">
         <div class="gen-ctrl">
@@ -666,7 +1148,8 @@ a.dl { display:inline-block; margin-top:.4rem; }
 //  State
 // ─────────────────────────────────────────────────────────────────
 let models = [], activeModel = null, chatHistory = [], chatBusy = false, attachedImage = null;
-let charRefs = {};   // prefix → list of base64 strings
+let charSlots = {};        // prefix → [{name:'', images:[b64...]}]
+let _charProfiles = [];    // cached list from /v1/characters
 
 const $ = id => document.getElementById(id);
 const val = id => ($(id) ? $(id).value : '');
@@ -697,13 +1180,18 @@ const CAP_SUB = {
 };
 // Sub-tab → parent category
 const SUB_CAT = {
-  'img-gen':'image','img-edit':'image','img-inpaint':'image','img-upscale':'image','img-depth':'image','img-seg':'image',
+  'img-gen':'image','img-edit':'image','img-inpaint':'image','img-upscale':'image','img-depth':'image','img-seg':'image','img-faceswap':'image','img-deblur':'image','img-unpix':'image','img-outfit':'image','img-outfit':'image',
   'vid-t2v':'video','vid-i2v':'video','vid-v2v':'video','vid-ti2v':'video','vid-interp':'video',
-  'vid-sub':'video','vid-dub':'video','vid-up':'video',
-  'aud-gen':'audio','aud-tts':'audio','aud-stt':'audio',
+  'vid-sub':'video','vid-dub':'video','vid-up':'video','vid-faceswap':'video','vid-outfit':'video',
+  'aud-gen':'audio','aud-tts':'audio','aud-stt':'audio','aud-clone':'audio','aud-convert':'audio',
 };
-// Video models also enable ti2v and dub
-const VIDEO_EXTRA_SUBS = ['vid-ti2v', 'vid-dub'];
+// Sub-tabs that share a panel with an image sub-tab (vid-X → panel-img-Y)
+const SUB_PANEL_ALIAS = {
+  'vid-faceswap': 'panel-img-faceswap',
+  'vid-outfit':   'panel-img-outfit',
+};
+// Video models also enable all video sub-tabs
+const VIDEO_EXTRA_SUBS = ['vid-ti2v', 'vid-dub', 'vid-v2v', 'vid-sub', 'vid-interp', 'vid-up', 'vid-faceswap', 'vid-outfit'];
 
 // ─────────────────────────────────────────────────────────────────
 //  Boot
@@ -756,6 +1244,16 @@ function selectModel(m) {
     el.classList.toggle('active', el.dataset.id === m.id));
   chatHistory = []; attachedImage = null; updateAttachBar();
   $('chat-msgs').innerHTML = `<div class="chat-empty"><h3>${m.id.split('/').pop()}</h3><p>Start below</p></div>`;
+  // Update chat input placeholder to hint at routing for non-text models
+  const PLACEHOLDER = {
+    image: 'Describe an image to generate…',
+    tts: 'Type text to speak…',
+    audio: 'Use Audio → Transcribe to upload audio',
+    video: 'Describe a video to generate…',
+    audio_gen: 'Describe music or audio to generate…',
+    embedding: 'Use the Embeddings tab',
+  };
+  $('chat-in').placeholder = PLACEHOLDER[m.type] || 'Send a message…';
   updateTabs(m);
 }
 
@@ -781,9 +1279,17 @@ function updateTabs(m) {
     enabledCats.add('video');
   }
 
-  // Pipelines available if at least 2 different types are loaded in the server
-  // (always show, user can fill in model IDs manually)
+  // Pipelines and voice clone always available
   enabledCats.add('pipe');
+  enabledCats.add('audio');
+  enabledSubs.add('aud-clone');
+  enabledSubs.add('aud-convert');
+  enabledCats.add('image');
+  enabledSubs.add('img-upscale');
+  enabledSubs.add('img-faceswap');
+  enabledSubs.add('img-deblur');
+  enabledSubs.add('img-unpix');
+  enabledSubs.add('img-outfit');
 
   // Show/hide level-1 tabs
   document.querySelectorAll('.t1btn').forEach(btn => {
@@ -803,7 +1309,6 @@ function updateTabs(m) {
 
 function selectCat(cat) {
   document.querySelectorAll('.t1btn').forEach(b => b.classList.toggle('active', b.dataset.cat === cat));
-  // Show tabbar2 only for image/video/audio
   const hasL2 = ['image','video','audio'].includes(cat);
   $('tabbar2').classList.toggle('visible', hasL2);
   if (!hasL2) {
@@ -812,16 +1317,26 @@ function selectCat(cat) {
     if (panel) panel.classList.add('active');
     return;
   }
+  // Show only sub-tabs belonging to this category; hide others
+  document.querySelectorAll('.t2btn').forEach(btn => {
+    const belongsHere = SUB_CAT[btn.dataset.sub] === cat;
+    // A sub-tab is visible if it belongs to this cat AND was enabled by updateTabs
+    btn.style.display = belongsHere && !btn.classList.contains('hidden') ? '' : 'none';
+  });
   // Activate first visible sub-tab in this category
-  const firstSub = document.querySelector(`.t2btn:not(.hidden)[data-sub^="${cat.substring(0,3)}"], .t2btn:not(.hidden)[data-sub^="${cat === 'audio' ? 'aud' : cat === 'video' ? 'vid' : 'img'}"]`);
+  const firstSub = document.querySelector(`.t2btn:not([style*="display: none"]):not([style*="display:none"])`);
   if (firstSub) selectSub(firstSub.dataset.sub);
 }
 
 function selectSub(sub) {
   document.querySelectorAll('.t2btn').forEach(b => b.classList.toggle('active', b.dataset.sub === sub));
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-  const panel = $('panel-' + sub);
+  const panelId = SUB_PANEL_ALIAS[sub] || ('panel-' + sub);
+  const panel = $(panelId);
   if (panel) panel.classList.add('active');
+  // When switching to vid-faceswap, pre-select video mode
+  if (sub === 'vid-faceswap') { const t = $('fs-type'); if (t) { t.value='video'; fsFaceSwapTypeChange(); } }
+  if (sub === 'vid-outfit')   { const t = $('ot-type'); if (t) { t.value='video'; otOutfitTypeChange(); } }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -862,6 +1377,51 @@ async function sendChat() {
   if (chatBusy || !activeModel) return;
   const input = $('chat-in');
   const text = input.value.trim(); if (!text) return;
+
+  // Route non-text models to the correct endpoint instead of /v1/chat/completions
+  const mtype = activeModel.type || 'text';
+  if (mtype === 'image') {
+    input.value = '';
+    // Switch to image-gen tab and pre-fill prompt
+    $('ig-prompt').value = text;
+    document.querySelector('.t1btn[data-cat="image"]')?.click();
+    document.querySelector('.t2btn[data-sub="img-gen"]')?.click();
+    await genImage();
+    return;
+  }
+  if (mtype === 'tts') {
+    input.value = '';
+    $('at-text').value = text;
+    document.querySelector('.t1btn[data-cat="audio"]')?.click();
+    document.querySelector('.t2btn[data-sub="aud-tts"]')?.click();
+    await genTTS();
+    return;
+  }
+  if (mtype === 'audio') {
+    addMsg('assistant', 'This is a speech-to-text model. Use the Audio → Transcribe tab to upload audio.');
+    return;
+  }
+  if (mtype === 'video') {
+    input.value = '';
+    $('vt-prompt').value = text;
+    document.querySelector('.t1btn[data-cat="video"]')?.click();
+    document.querySelector('.t2btn[data-sub="vid-t2v"]')?.click();
+    await genVideoT2V();
+    return;
+  }
+  if (mtype === 'audio_gen') {
+    input.value = '';
+    $('ag-prompt').value = text;
+    document.querySelector('.t1btn[data-cat="audio"]')?.click();
+    document.querySelector('.t2btn[data-sub="aud-gen"]')?.click();
+    await genAudio();
+    return;
+  }
+  if (mtype === 'embedding') {
+    addMsg('assistant', 'This is an embedding model. Use the Embeddings tab.');
+    return;
+  }
+
   addMsg('user', text, attachedImage);
   let content = text;
   if (attachedImage && (activeModel.capabilities||[]).includes('image_to_text')) {
@@ -944,19 +1504,111 @@ async function postForm(path, fd) {
 }
 
 // Character reference helpers
-function addCharRefs(prefix, input) {
-  if (!charRefs[prefix]) charRefs[prefix] = [];
-  const thumbs = $(prefix+'-char-thumbs');
+// ─────────────────────────────────────────────────────────────────
+//  Character consistency — named multi-slot system
+// ─────────────────────────────────────────────────────────────────
+async function loadCharProfileList() {
+  try {
+    const d = await fetch('/v1/characters').then(r => r.json());
+    _charProfiles = d.characters || [];
+  } catch(e) { _charProfiles = []; }
+}
+
+function _profileOptions(selectedName) {
+  const base = `<option value="">Load profile…</option>`;
+  return base + _charProfiles.map(p =>
+    `<option value="${p.name}" ${p.name===selectedName?'selected':''}>${p.name}</option>`
+  ).join('');
+}
+
+function renderCharSlots(prefix) {
+  const container = $(prefix+'-char-slots');
+  if (!container) return;
+  if (!charSlots[prefix]) charSlots[prefix] = [];
+  if (!charSlots[prefix].length) { container.innerHTML = ''; return; }
+  container.innerHTML = charSlots[prefix].map((slot, idx) => `
+    <div class="char-slot" id="${prefix}-slot-${idx}">
+      <div class="char-slot-header">
+        <input type="text" class="fi" style="flex:1;font-size:12px" placeholder="Character name (e.g. Alice)"
+          value="${slot.name||''}" onchange="charSlots['${prefix}'][${idx}].name=this.value">
+        <button class="btn btn-ghost btn-sm" style="color:var(--red);padding:.1rem .35rem" onclick="removeCharSlot('${prefix}',${idx})">✕</button>
+      </div>
+      <div class="char-slot-actions">
+        <input type="file" accept="image/*" multiple class="fi" style="flex:1;font-size:11px"
+          onchange="addCharSlotImages('${prefix}',${idx},this)">
+        <select class="fselect" style="font-size:11px;max-width:130px"
+          onchange="if(this.value)loadCharProfileIntoSlot('${prefix}',${idx},this.value);this.value=''">
+          ${_profileOptions('')}
+        </select>
+        <button class="btn btn-ghost btn-sm" style="font-size:11px" onclick="saveCharSlotAsProfile('${prefix}',${idx})">Save</button>
+      </div>
+      <div class="char-refs" id="${prefix}-slot-thumbs-${idx}">
+        ${slot.images.map((src,i)=>`<img class="char-thumb" src="${src}" title="Click to remove" onclick="removeCharSlotImage('${prefix}',${idx},${i})">`).join('')}
+      </div>
+    </div>`).join('');
+}
+
+function addCharSlot(prefix) {
+  if (!charSlots[prefix]) charSlots[prefix] = [];
+  charSlots[prefix].push({name:'', images:[]});
+  renderCharSlots(prefix);
+}
+
+function removeCharSlot(prefix, idx) {
+  charSlots[prefix].splice(idx, 1);
+  renderCharSlots(prefix);
+}
+
+function addCharSlotImages(prefix, idx, input) {
+  if (!charSlots[prefix]?.[idx]) return;
   Array.from(input.files).forEach(f => {
     const reader = new FileReader();
     reader.onload = e => {
-      charRefs[prefix].push(e.target.result);
-      const img = document.createElement('img');
-      img.src = e.target.result; img.className='char-thumb';
-      thumbs.appendChild(img);
+      charSlots[prefix][idx].images.push(e.target.result);
+      renderCharSlots(prefix);
     };
     reader.readAsDataURL(f);
   });
+}
+
+function removeCharSlotImage(prefix, idx, imgIdx) {
+  charSlots[prefix]?.[idx]?.images.splice(imgIdx, 1);
+  renderCharSlots(prefix);
+}
+
+async function loadCharProfileIntoSlot(prefix, idx, name) {
+  try {
+    const d = await fetch(`/v1/characters/${encodeURIComponent(name)}`).then(r => r.json());
+    if (!charSlots[prefix]?.[idx]) return;
+    charSlots[prefix][idx].name = charSlots[prefix][idx].name || d.name;
+    charSlots[prefix][idx].images = (d.images||[]).map(img => img.data);
+    renderCharSlots(prefix);
+  } catch(e) { alert('Failed to load profile: '+e.message); }
+}
+
+async function saveCharSlotAsProfile(prefix, idx) {
+  const slot = charSlots[prefix]?.[idx];
+  if (!slot || !slot.images.length) { alert('Add at least one image first.'); return; }
+  const name = slot.name || prompt('Profile name:');
+  if (!name) return;
+  try {
+    await post('/v1/characters', {
+      name,
+      description: '',
+      images: slot.images.map((data, i) => ({label:`ref${i}`, data})),
+    });
+    charSlots[prefix][idx].name = name;
+    await loadCharProfileList();
+    renderCharSlots(prefix);
+    alert(`Saved profile "${name}"`);
+  } catch(e) { alert('Save failed: '+e.message); }
+}
+
+function buildCharactersPayload(prefix) {
+  const slots = charSlots[prefix] || [];
+  const valid = slots.filter(s => s.images.length > 0);
+  if (!valid.length) return undefined;
+  return valid.map(s => ({name: s.name || undefined, images: s.images}));
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1080,6 +1732,7 @@ async function genVideo(mode) {
     body.num_frames=ival('vt-frames')||16; body.fps=ival('vt-fps')||8;
     body.num_inference_steps=ival('vt-steps')||25; body.guidance_scale=fval('vt-cfg')||7.5;
     if (val('vt-seed')) body.seed=ival('vt-seed');
+    if (val('vt-cam')) body.camera_motion=val('vt-cam');
     body.disable_safety_checker=chk('vt-nosafe');
   } else if (mode==='i2v') {
     const img = await b64OrNull('vi-src');
@@ -1088,14 +1741,20 @@ async function genVideo(mode) {
     body.num_frames=ival('vi-frames')||16; body.fps=ival('vi-fps')||8;
     body.num_inference_steps=ival('vi-steps')||25; body.guidance_scale=fval('vi-cfg')||7.5;
     if (val('vi-seed')) body.seed=ival('vi-seed');
+    if (val('vi-cam')) body.camera_motion=val('vi-cam');
     body.disable_safety_checker=chk('vt-nosafe');
+    const viChars = buildCharactersPayload('vi');
+    if (viChars) { body.characters=viChars; body.character_strength=fval('vi-cstr')||0.8; }
   } else {
     const vid = await b64OrNull('vv-src');
     if (!vid) { $(prog).textContent='Select a source video.'; return; }
     body.video=vid; body.prompt=val('vv-prompt'); body.strength=fval('vv-str');
     body.num_inference_steps=ival('vv-steps')||25; body.guidance_scale=fval('vv-cfg')||7.5;
     if (val('vv-seed')) body.seed=ival('vv-seed');
+    if (val('vv-cam')) body.camera_motion=val('vv-cam');
     body.disable_safety_checker=chk('vt-nosafe');
+    const vvChars = buildCharactersPayload('vv');
+    if (vvChars) { body.characters=vvChars; body.character_strength=fval('vv-cstr')||0.8; }
   }
   try {
     const d = await post('/v1/video/generations', body);
@@ -1109,21 +1768,23 @@ async function genVideo(mode) {
 async function genTi2V() {
   if (!activeModel) return;
   $('ti-prog').textContent='Generating… (may take several minutes)';
-  const [initImg, endImg] = await Promise.all([b64OrNull('ti-init'), b64OrNull('ti-end')]);
-  if (!initImg) { $('ti-prog').textContent='Select an initial image.'; return; }
+  const [initImg, endImg, srcVid] = await Promise.all([b64OrNull('ti-init'), b64OrNull('ti-end'), b64OrNull('ti-vid')]);
+  if (!srcVid && !initImg) { $('ti-prog').textContent='Select an initial image or source video.'; return; }
 
   const body = {
     model:activeModel.id,
-    mode: endImg ? 'interp' : (val('ti-prompt') ? 'ti2v' : 'i2v'),
+    mode: srcVid ? 'v2v' : endImg ? 'interp' : (val('ti-prompt') ? 'ti2v' : 'i2v'),
     prompt:val('ti-prompt'), negative_prompt:val('ti-neg'),
-    init_image:initImg, end_image:endImg||undefined,
+    init_image:initImg||undefined, end_image:endImg||undefined,
+    video:srcVid||undefined,
+    ...(srcVid ? {strength:fval('ti-vstr')||0.7} : {}),
     width:ival('ti-w')||512, height:ival('ti-h')||512,
     num_frames:ival('ti-frames')||16, fps:ival('ti-fps')||8,
     num_inference_steps:ival('ti-steps')||25, guidance_scale:fval('ti-cfg')||7.5,
     camera_motion:val('ti-cam')||undefined,
     ...(val('ti-seed') ? {seed:ival('ti-seed')} : {}),
     // Character
-    character_references:charRefs['ti']?.length ? charRefs['ti'] : undefined,
+    characters: buildCharactersPayload('ti'),
     character_strength:fval('ti-cstr')||0.8,
     // Audio
     add_audio:!!val('ti-atype'),
@@ -1236,8 +1897,419 @@ async function genVidUpscale() {
 //  T2V controls helper (shared form – inline because Jinja include
 //  isn't available here)
 // ─────────────────────────────────────────────────────────────────
-// The T2V panel controls are already inlined in the HTML above (vid-t2v).
-// For the 3 shared controls we use ids like vt-prompt, vt-neg, vt-w, etc.
+// ─────────────────────────────────────────────────────────────────
+//  Webcam / Microphone capture utility
+//  openWebcam(boxId, fileInputId, previewId, mode)
+//  mode: 'photo' | 'audio'
+// ─────────────────────────────────────────────────────────────────
+const _webcamState = {};  // boxId → { stream, recorder, chunks }
+
+async function openWebcam(boxId, fileInputId, previewId, mode) {
+  const box = $(boxId);
+  if (!box) return;
+  // Toggle off if already open
+  if (box.style.display !== 'none') {
+    _stopWebcam(boxId);
+    box.style.display = 'none';
+    return;
+  }
+  box.style.display = 'flex';
+  box.innerHTML = '<div style="color:var(--text-3);font-size:12px">Requesting permission…</div>';
+
+  try {
+    const constraints = mode === 'audio'
+      ? { audio: true }
+      : { video: { facingMode: 'user' }, audio: false };
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    _webcamState[boxId] = { stream, recorder: null, chunks: [] };
+
+    if (mode === 'photo') {
+      const video = document.createElement('video');
+      video.srcObject = stream; video.autoplay = true; video.muted = true;
+      video.style.cssText = 'width:100%;max-height:200px;border-radius:6px;background:#000';
+      const canvas = document.createElement('canvas');
+      canvas.style.display = 'none';
+      const snapBtn = document.createElement('button');
+      snapBtn.className = 'btn btn-primary btn-sm'; snapBtn.textContent = '📸 Capture';
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'btn btn-ghost btn-sm'; closeBtn.textContent = '✕ Close';
+      const ctrl = document.createElement('div');
+      ctrl.className = 'webcam-controls';
+      ctrl.append(snapBtn, closeBtn);
+      box.innerHTML = ''; box.append(video, canvas, ctrl);
+
+      snapBtn.onclick = () => {
+        canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+        canvas.getContext('2d').drawImage(video, 0, 0);
+        canvas.toBlob(blob => {
+          const file = new File([blob], 'webcam.png', { type: 'image/png' });
+          _setFileInput(fileInputId, file);
+          if (previewId) previewMediaInput(fileInputId, previewId);
+          _stopWebcam(boxId);
+          box.style.display = 'none';
+        }, 'image/png');
+      };
+      closeBtn.onclick = () => { _stopWebcam(boxId); box.style.display = 'none'; };
+
+    } else {
+      // Audio recording
+      const recorder = new MediaRecorder(stream);
+      _webcamState[boxId].recorder = recorder;
+      _webcamState[boxId].chunks = [];
+      recorder.ondataavailable = e => { if (e.data.size) _webcamState[boxId].chunks.push(e.data); };
+      recorder.onstop = () => {
+        const blob = new Blob(_webcamState[boxId].chunks, { type: 'audio/webm' });
+        const file = new File([blob], 'recording.webm', { type: 'audio/webm' });
+        _setFileInput(fileInputId, file);
+        _stopWebcam(boxId);
+        box.style.display = 'none';
+        // Show confirmation
+        const fi = $(fileInputId);
+        if (fi) fi.title = 'Recorded audio ready';
+      };
+
+      const recBtn = document.createElement('button');
+      recBtn.className = 'btn btn-primary btn-sm'; recBtn.textContent = '⏺ Start Recording';
+      const stopBtn = document.createElement('button');
+      stopBtn.className = 'btn btn-ghost btn-sm'; stopBtn.textContent = '⏹ Stop & Use';
+      stopBtn.disabled = true;
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'btn btn-ghost btn-sm'; closeBtn.textContent = '✕ Cancel';
+      const timer = document.createElement('span');
+      timer.style.cssText = 'font-size:12px;color:var(--text-3);min-width:3rem';
+      const ctrl = document.createElement('div');
+      ctrl.className = 'webcam-controls'; ctrl.append(recBtn, stopBtn, closeBtn, timer);
+      box.innerHTML = ''; box.append(ctrl);
+
+      let _timerInterval;
+      recBtn.onclick = () => {
+        recorder.start();
+        recBtn.disabled = true; stopBtn.disabled = false;
+        recBtn.textContent = '🔴 Recording…';
+        let secs = 0;
+        _timerInterval = setInterval(() => { secs++; timer.textContent = secs + 's'; }, 1000);
+      };
+      stopBtn.onclick = () => {
+        clearInterval(_timerInterval);
+        recorder.stop();
+      };
+      closeBtn.onclick = () => { clearInterval(_timerInterval); _stopWebcam(boxId); box.style.display = 'none'; };
+    }
+  } catch(e) {
+    box.innerHTML = `<div style="color:var(--error);font-size:12px">Permission denied: ${e.message}</div>`;
+  }
+}
+
+function _stopWebcam(boxId) {
+  const state = _webcamState[boxId];
+  if (!state) return;
+  if (state.stream) state.stream.getTracks().forEach(t => t.stop());
+  delete _webcamState[boxId];
+}
+
+function _setFileInput(fileInputId, file) {
+  const fi = $(fileInputId);
+  if (!fi) return;
+  const dt = new DataTransfer();
+  dt.items.add(file);
+  fi.files = dt.files;
+  fi.dispatchEvent(new Event('change'));
+}
+
+function previewMediaInput(fileInputId, previewId) {
+  const fi = $(fileInputId), prev = $(previewId);
+  if (!fi || !prev || !fi.files[0]) return;
+  const f = fi.files[0];
+  const url = URL.createObjectURL(f);
+  if (f.type.startsWith('image/'))
+    prev.innerHTML = `<img src="${url}" style="max-width:100%;max-height:120px;border-radius:6px">`;
+  else if (f.type.startsWith('video/'))
+    prev.innerHTML = `<video src="${url}" controls style="max-width:100%;max-height:120px;border-radius:6px"></video>`;
+  else if (f.type.startsWith('audio/'))
+    prev.innerHTML = `<audio src="${url}" controls style="width:100%"></audio>`;
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Deblur
+// ─────────────────────────────────────────────────────────────────
+async function genDeblur() {
+  const f = fileOrNull('db-src');
+  if (!f) { $('db-prog').textContent='Select an image.'; return; }
+  $('db-prog').textContent='Deblurring…';
+  try {
+    const d = await post('/v1/images/deblur', {image: await fileToB64(f), strength: fval('db-str')||0.5, response_format:'url'});
+    showImg('db-out', imgSrc(d.data[0]), 'db-prog');
+  } catch(e) { $('db-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Unpixelate
+// ─────────────────────────────────────────────────────────────────
+async function genUnpixelate() {
+  const f = fileOrNull('up-src');
+  if (!f) { $('up-prog').textContent='Select an image.'; return; }
+  $('up-prog').textContent='Restoring…';
+  try {
+    const d = await post('/v1/images/unpixelate', {image: await fileToB64(f), scale: ival('up-scale')||4, response_format:'url'});
+    showImg('up-out', imgSrc(d.data[0]), 'up-prog');
+  } catch(e) { $('up-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Outfit Change
+// ─────────────────────────────────────────────────────────────────
+function fsFaceSwapTypeChange() {
+  const isVideo = val('fs-type') === 'video';
+  const tgtInput = $('fs-tgt');
+  if (tgtInput) tgtInput.accept = isVideo ? 'video/*' : 'image/*,video/*';
+  const camBtn = $('fs-tgt-cam-btn');
+  if (camBtn) camBtn.style.display = isVideo ? 'none' : '';
+  const wrap = $('fs-tgt-wrap');
+  if (wrap) wrap.querySelector('.fl').textContent = isVideo ? 'Target video' : 'Target image';
+}
+
+function otOutfitTypeChange() {
+  const isVideo = val('ot-type') === 'video';
+  $('ot-img-wrap').style.display = isVideo ? 'none' : '';
+  $('ot-vid-wrap').style.display = isVideo ? '' : 'none';
+}
+
+async function genOutfit() {
+  if (!activeModel) return;
+  const isVideo = val('ot-type') === 'video';
+  if (!val('ot-prompt')) { $('ot-prog').textContent='Enter an outfit prompt.'; return; }
+  $('ot-prog').textContent = isVideo ? 'Changing outfit on video…' : 'Changing outfit…';
+  const body = {
+    model: activeModel.id,
+    prompt: val('ot-prompt'),
+    steps: ival('ot-steps')||30,
+    guidance_scale: fval('ot-cfg')||7.5,
+    response_format: 'url',
+  };
+  if (val('ot-neg')) body.negative_prompt = val('ot-neg');
+  if (val('ot-seed')) body.seed = ival('ot-seed');
+  const maskFile = fileOrNull('ot-mask');
+  if (maskFile) body.mask = await fileToB64(maskFile);
+  if (isVideo) {
+    const f = fileOrNull('ot-vid');
+    if (!f) { $('ot-prog').textContent='Select a source video.'; return; }
+    body.video = await fileToB64(f);
+  } else {
+    const f = fileOrNull('ot-src');
+    if (!f) { $('ot-prog').textContent='Select a source image.'; return; }
+    body.image = await fileToB64(f);
+  }
+  try {
+    const d = await post('/v1/images/outfit', body);
+    if (isVideo) showVideo('ot-out', vidSrc(d.data[0]), 'ot-prog');
+    else showImg('ot-out', imgSrc(d.data[0]), 'ot-prog');
+  } catch(e) { $('ot-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Face Swap
+// ─────────────────────────────────────────────────────────────────
+async function genFaceSwap() {
+  const srcFile = fileOrNull('fs-src'), tgtFile = fileOrNull('fs-tgt');
+  if (!srcFile || !tgtFile) { $('fs-prog').textContent='Select source face and target.'; return; }
+  $('fs-prog').textContent='Swapping face…';
+  const [src, tgt] = await Promise.all([fileToB64(srcFile), fileToB64(tgtFile)]);
+  const ttype = val('fs-type') || 'image';
+  try {
+    const d = await post('/v1/images/faceswap', { source_face:src, target:tgt, target_type:ttype, response_format:'url' });
+    const item = d.data[0];
+    if (ttype === 'video') showVideo('fs-out', vidSrc(item) || 'data:video/mp4;base64,'+item.b64_mp4, 'fs-prog');
+    else showImg('fs-out', imgSrc(item), 'fs-prog');
+  } catch(e) { $('fs-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Pipeline 5: Face Swap  (server-side)
+// ─────────────────────────────────────────────────────────────────
+async function runPipeline5() {
+  const srcFile = fileOrNull('pp5-src'), tgtFile = fileOrNull('pp5-tgt');
+  if (!srcFile || !tgtFile) { $('pp5-prog').textContent='Select source face and target.'; return; }
+  $('pp5-prog').textContent='Swapping face…';
+  const [src, tgt] = await Promise.all([fileToB64(srcFile), fileToB64(tgtFile)]);
+  const ttype = val('pp5-type') || 'image';
+  try {
+    const d = await post('/v1/images/faceswap', { source_face:src, target:tgt, target_type:ttype, response_format:'url' });
+    const item = d.data[0];
+    if (ttype === 'video') showVideo('pp5-out', vidSrc(item) || 'data:video/mp4;base64,'+item.b64_mp4, 'pp5-prog');
+    else showImg('pp5-out', imgSrc(item), 'pp5-prog');
+  } catch(e) { $('pp5-prog').textContent='Error: '+e.message; }
+}
+let _voiceProfiles = [];
+
+async function loadVoiceProfiles() {
+  try {
+    const d = await fetch('/v1/audio/voices').then(r => r.json());
+    _voiceProfiles = d.voices || [];
+    ['vc-voice', 'pp4-voice', 'cv-voice', 'pvc-voice', 'psvc-voice'].forEach(id => {
+      const sel = $(id); if (!sel) return;
+      const cur = sel.value;
+      sel.innerHTML = '<option value="">— Or upload reference audio below —</option>' +
+        _voiceProfiles.map(v => `<option value="${v.name}">${v.name}${v.description ? ' — '+v.description : ''}</option>`).join('');
+      if (cur) sel.value = cur;
+    });
+  } catch(e) {}
+}
+
+async function saveVoiceProfile() {
+  const name = val('vc-savename'), transcript = val('vc-savetxt');
+  const f = fileOrNull('vc-saveref');
+  if (!name || !transcript || !f) { $('vc-saveprog').textContent='Fill in name, transcript and audio file.'; return; }
+  $('vc-saveprog').textContent='Saving…';
+  const fd = new FormData();
+  fd.append('name', name); fd.append('transcript', transcript);
+  fd.append('description', val('vc-savedesc'));
+  fd.append('audio', f);
+  try {
+    const r = await fetch('/v1/audio/voices', {method:'POST', body:fd});
+    if (!r.ok) throw new Error(await r.text());
+    $('vc-saveprog').textContent='Saved ✓';
+    await loadVoiceProfiles();
+  } catch(e) { $('vc-saveprog').textContent='Error: '+e.message; }
+}
+
+async function genVoiceClone() {
+  const text = val('vc-text');
+  if (!text) { $('vc-prog').textContent='Enter text to synthesize.'; return; }
+  const voiceName = val('vc-voice');
+  const refFile = fileOrNull('vc-ref');
+  const refTxt = val('vc-reftxt');
+  if (!voiceName && (!refFile || !refTxt)) {
+    $('vc-prog').textContent='Select a voice profile or upload reference audio + transcript.'; return;
+  }
+  $('vc-prog').textContent='Cloning voice…';
+  const body = {
+    text,
+    speed: fval('vc-speed') || 1.0,
+    ...(val('vc-seed') ? {seed: ival('vc-seed')} : {}),
+    response_format: 'url',
+  };
+  if (voiceName) {
+    body.voice_name = voiceName;
+  } else {
+    body.ref_audio = await fileToB64(refFile);
+    body.ref_text = refTxt;
+  }
+  try {
+    const d = await post('/v1/audio/clone', body);
+    const src = audSrc(d.data[0]);
+    showAudio('vc-out', src, 'vc-prog', 'wav');
+  } catch(e) { $('vc-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Voice Convert (SVC — preserves pitch/melody)
+// ─────────────────────────────────────────────────────────────────
+async function genVoiceConvert() {
+  const srcFile = fileOrNull('cv-src');
+  if (!srcFile) { $('cv-prog').textContent='Select source audio.'; return; }
+  const voiceName = val('cv-voice');
+  const refFile = fileOrNull('cv-ref');
+  if (!voiceName && !refFile) { $('cv-prog').textContent='Select a voice profile or upload reference audio.'; return; }
+  const singing = val('cv-mode') === 'singing';
+  $('cv-prog').textContent = singing ? 'Converting (singing mode)…' : 'Converting…';
+  const src = await fileToB64(srcFile);
+  const body = {
+    source_audio: src,
+    f0_condition: singing,
+    pitch_shift: ival('cv-pitch') || 0,
+    diffusion_steps: ival('cv-steps') || 10,
+    response_format: 'url',
+  };
+  if (voiceName) body.voice_name = voiceName;
+  else body.target_voice = await fileToB64(refFile);
+  try {
+    const d = await post('/v1/audio/convert', body);
+    const src2 = audSrc(d.data[0]);
+    showAudio('cv-out', src2, 'cv-prog', 'wav');
+  } catch(e) { $('cv-prog').textContent='Error: '+e.message; }
+}
+
+// Also populate cv-voice dropdown when voice profiles load
+
+// ─────────────────────────────────────────────────────────────────
+//  Pipeline VC: Voice Clone
+// ─────────────────────────────────────────────────────────────────
+async function runPipelineVC() {
+  const text = val('pvc-text');
+  if (!text) { $('pvc-prog').textContent='Enter text to synthesize.'; return; }
+  const voiceName = val('pvc-voice'), refFile = fileOrNull('pvc-ref'), refTxt = val('pvc-reftxt');
+  if (!voiceName && (!refFile || !refTxt)) { $('pvc-prog').textContent='Select a voice profile or upload reference audio + transcript.'; return; }
+  $('pvc-prog').textContent='Cloning voice…';
+  const body = { text, speed: fval('pvc-speed')||1.0, response_format:'url' };
+  if (val('pvc-seed')) body.seed = ival('pvc-seed');
+  if (voiceName) body.voice_name = voiceName;
+  else { body.ref_audio = await fileToB64(refFile); body.ref_text = refTxt; }
+  try {
+    const d = await post('/v1/audio/clone', body);
+    showAudio('pvc-out', audSrc(d.data[0]), 'pvc-prog', 'wav');
+  } catch(e) { $('pvc-prog').textContent='Error: '+e.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Pipeline SVC: Voice Convert
+// ─────────────────────────────────────────────────────────────────
+async function runPipelineSVC() {
+  const srcFile = fileOrNull('psvc-src');
+  if (!srcFile) { $('psvc-prog').textContent='Select source audio.'; return; }
+  const voiceName = val('psvc-voice'), refFile = fileOrNull('psvc-ref');
+  if (!voiceName && !refFile) { $('psvc-prog').textContent='Select a voice profile or upload reference audio.'; return; }
+  const singing = val('psvc-mode') === 'singing';
+  $('psvc-prog').textContent = singing ? 'Converting (singing mode)…' : 'Converting…';
+  const body = {
+    source_audio: await fileToB64(srcFile),
+    f0_condition: singing,
+    pitch_shift: ival('psvc-pitch')||0,
+    diffusion_steps: ival('psvc-steps')||10,
+    response_format: 'url',
+  };
+  if (voiceName) body.voice_name = voiceName;
+  else body.target_voice = await fileToB64(refFile);
+  try {
+    const d = await post('/v1/audio/convert', body);
+    showAudio('psvc-out', audSrc(d.data[0]), 'psvc-prog', 'wav');
+  } catch(e) { $('psvc-prog').textContent='Error: '+e.message; }
+}
+
+async function runPipeline4() {
+  const f = fileOrNull('pp4-src');
+  if (!f) { $('pp4-prog').textContent='Select a source file.'; return; }
+  const voiceName = val('pp4-voice');
+  const refFile = fileOrNull('pp4-ref');
+  const refTxt = val('pp4-reftxt');
+  if (!voiceName && (!refFile || !refTxt)) {
+    $('pp4-prog').textContent='Select a voice profile or upload reference audio + transcript.'; return;
+  }
+  $('pp4-prog').textContent='Running audio dub pipeline…';
+  const isVideo = f.type.startsWith('video/');
+  const b64 = await fileToB64(f);
+  const body = {
+    speed: fval('pp4-speed') || 1.0,
+    source_lang: val('pp4-slang') || undefined,
+    target_lang: val('pp4-tlang') || undefined,
+    whisper_model: val('pp4-whisper') || undefined,
+    burn_subtitles: chk('pp4-burn'),
+    response_format: 'url',
+  };
+  if (isVideo) body.video = b64; else body.audio = b64;
+  if (voiceName) {
+    body.voice_name = voiceName;
+  } else {
+    body.ref_audio = await fileToB64(refFile);
+    body.ref_text = refTxt;
+  }
+  try {
+    const d = await post('/v1/pipelines/audio-dub', body);
+    const item = d.data[0];
+    if (item.b64_mp4 || item.url) showVideo('pp4-out', vidSrc(item) || 'data:video/mp4;base64,'+item.b64_mp4, 'pp4-prog');
+    else if (item.b64_wav) showAudio('pp4-out', 'data:audio/wav;base64,'+item.b64_wav, 'pp4-prog', 'wav');
+    else $('pp4-prog').textContent='Done ✓';
+  } catch(e) { $('pp4-prog').textContent='Error: '+e.message; }
+}
 
 // ─────────────────────────────────────────────────────────────────
 //  Audio Gen
@@ -1249,6 +2321,7 @@ async function genAudio() {
   const body = {
     model:activeModel.id, prompt:val('ag-prompt'),
     duration:fval('ag-dur')||10, temperature:fval('ag-temp')||1.0,
+    top_k:ival('ag-topk')||250, cfg_coef:fval('ag-cfg')||3.0,
     ...(val('ag-seed') ? {seed:ival('ag-seed')} : {}),
     ...(melody ? {melody} : {}),
     response_format:'url',
@@ -1328,82 +2401,83 @@ async function genEmbeddings() {
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  Pipeline 1: Image → Video
+//  Pipeline 1: Image → Video  (server-side)
 // ─────────────────────────────────────────────────────────────────
 async function runPipeline1() {
   const prompt=val('pp1-prompt'), imodel=val('pp1-imodel'), vmodel=val('pp1-vmodel');
   if (!prompt||!imodel||!vmodel) { $('pp1-prog').textContent='Fill in prompt + both model IDs.'; return; }
-  $('pp1-prog').textContent='Step 1/2: Generating image…';
+  $('pp1-prog').textContent='Running pipeline… (image → video)';
+  const body = {
+    prompt, image_model:imodel, video_model:vmodel,
+    image_size: val('pp1-isize')||'1024x1024',
+    num_frames:ival('pp1-frames')||16, fps:ival('pp1-fps')||8,
+    num_inference_steps:ival('pp1-vsteps')||25, guidance_scale:fval('pp1-vcfg')||7.5,
+    ...(val('pp1-neg')   ? {negative_prompt:val('pp1-neg')} : {}),
+    ...(val('pp1-isteps')? {image_steps:ival('pp1-isteps')} : {}),
+    ...(val('pp1-icfg')  ? {image_cfg:fval('pp1-icfg')} : {}),
+    ...(val('pp1-iseed') ? {image_seed:ival('pp1-iseed')} : {}),
+    ...(val('pp1-vseed') ? {video_seed:ival('pp1-vseed')} : {}),
+    ...(val('pp1-cam')   ? {camera_motion:val('pp1-cam')} : {}),
+    ...(val('pp1-atype') ? {add_audio:true, audio_type:val('pp1-atype'), audio_prompt:val('pp1-aprompt')} : {}),
+    response_format:'url',
+  };
   try {
-    const id = await post('/v1/images/generations', {model:imodel, prompt, response_format:'url'});
-    const imgSrcUrl = imgSrc(id.data[0]);
-    $('pp1-prog').textContent='Step 2/2: Animating image…';
-    const vd = await post('/v1/video/generations', {
-      model:vmodel, mode:'i2v', init_image:imgSrcUrl,
-      prompt, num_frames:ival('pp1-frames')||16, fps:ival('pp1-fps')||8,
-    });
-    $('pp1-out').innerHTML=`<img class="out-img" src="${imgSrcUrl}" style="max-width:200px;border-radius:6px">`;
-    showVideo('pp1-out', vidSrc(vd.data[0]), 'pp1-prog');
+    const d = await post('/v1/pipelines/image-to-video', body);
+    const item = d.data[0];
+    if (item.image_url) $('pp1-out').innerHTML=`<img class="out-img" src="${item.image_url}" style="max-width:200px;border-radius:6px">`;
+    if (item.url) showVideo('pp1-out', item.url, 'pp1-prog');
+    else $('pp1-prog').textContent='Done ✓';
   } catch(e) { $('pp1-prog').textContent='Error: '+e.message; }
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  Pipeline 2: Video → Dub + Subtitle
+//  Pipeline 2: Video → Dub + Subtitle  (server-side)
 // ─────────────────────────────────────────────────────────────────
 async function runPipeline2() {
   const f = fileOrNull('pp2-src');
   if (!f) { $('pp2-prog').textContent='Select a video.'; return; }
+  const tlang = val('pp2-tlang');
+  if (!tlang) { $('pp2-prog').textContent='Enter a target language.'; return; }
   const model = val('pp2-model') || (activeModel ? activeModel.id : '');
   $('pp2-prog').textContent='Dubbing + subtitling…';
   try {
     const vid = await fileToB64(f);
-    const d = await post('/v1/video/dub', {
+    const d = await post('/v1/pipelines/video-dub', {
       model, video:vid,
       source_lang:val('pp2-slang')||undefined,
-      target_lang:val('pp2-tlang'), burn_subtitles:true,
+      target_lang:tlang,
+      voice_clone:chk('pp2-clone'),
+      burn_subtitles:chk('pp2-burn'),
     });
     showVideo('pp2-out', vidSrc(d.data[0]), 'pp2-prog');
   } catch(e) { $('pp2-prog').textContent='Error: '+e.message; }
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  Pipeline 3: Full Story
+//  Pipeline 3: Full Story  (server-side)
 // ─────────────────────────────────────────────────────────────────
 async function runPipeline3() {
   const story=val('pp3-story'), tmodel=val('pp3-tmodel'), imodel=val('pp3-imodel'), vmodel=val('pp3-vmodel');
-  if (!story||!tmodel||!imodel||!vmodel) { $('pp3-prog').textContent='Fill in story and all model IDs.'; return; }
-  $('pp3-prog').textContent='Step 1: Generating script with LLM…';
+  if (!story||!tmodel||!imodel||!vmodel) { $('pp3-prog').textContent='Fill in story and text/image/video model IDs.'; return; }
+  $('pp3-prog').textContent='Running full story pipeline…';
   try {
-    // 1. LLM generates scene descriptions
-    const script = await post('/v1/chat/completions', {
-      model:tmodel,
-      messages:[{role:'user',content:`Write a 3-scene visual script for this story. For each scene write: SCENE X: [brief visual description]. Story: ${story}`}],
-      stream:false,
+    const d = await post('/v1/pipelines/story', {
+      story, text_model:tmodel, image_model:imodel, video_model:vmodel,
+      tts_model:val('pp3-amodel')||undefined,
+      tts_voice:val('pp3-voice')||'af_sarah',
+      num_scenes:ival('pp3-scenes')||3,
+      num_frames:ival('pp3-frames')||16,
+      response_format:'url',
     });
-    const scriptText = script.choices[0].message.content;
-    const scenes = scriptText.match(/SCENE \d+: [^\n]+/g) || [story];
-    $('pp3-prog').textContent=`Script: ${scenes.length} scenes. Generating images…`;
-
-    // 2. Generate image per scene
-    const imgUrls = [];
-    for (const scene of scenes.slice(0,3)) {
-      const desc = scene.replace(/SCENE \d+: /, '');
-      const id = await post('/v1/images/generations', {model:imodel, prompt:desc, response_format:'url'});
-      imgUrls.push(imgSrc(id.data[0]));
+    const item = d.data[0];
+    const imgs = (item.image_urls||[]).map(s=>`<img src="${s}" style="max-width:120px;border-radius:4px">`).join('');
+    if (imgs) $('pp3-out').innerHTML=`<div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.5rem">${imgs}</div>`;
+    if (item.video_url) showVideo('pp3-out', item.video_url, 'pp3-prog');
+    if (item.audio_url) {
+      const ext = item.audio_url.includes('mp3') ? 'mp3' : 'wav';
+      showAudio('pp3-out', item.audio_url, null, ext);
     }
-
-    // 3. Animate first scene image to video
-    $('pp3-prog').textContent='Animating first scene…';
-    const vd = await post('/v1/video/generations', {
-      model:vmodel, mode:'i2v', init_image:imgUrls[0],
-      prompt:scenes[0]?.replace(/SCENE \d+: /,''),
-      num_frames:16, fps:8,
-    });
-
-    const imgs = imgUrls.map(s=>`<img src="${s}" style="max-width:120px;border-radius:4px">`).join('');
-    $('pp3-out').innerHTML=`<div>${imgs}</div>`;
-    showVideo('pp3-out', vidSrc(vd.data[0]), 'pp3-prog');
-    $('pp3-prog').textContent='Done ✓ (tip: animate remaining scenes manually)';
+    if (!item.video_url) $('pp3-prog').textContent='Done ✓';
   } catch(e) { $('pp3-prog').textContent='Error: '+e.message; }
 }
 
@@ -1427,6 +2501,15 @@ document.getElementById('panel-vid-t2v').innerHTML = `<div class="gen-wrap">
     </div>
     <div class="frow"><label class="fl">Seed</label><input type="number" id="vt-seed" class="fi" placeholder="random"></div>
     <div class="frow"><label class="fl" title="Removes the model's built-in safety checker. Only use with uncensored/NSFW fine-tunes.">Disable safety filter</label><input type="checkbox" id="vt-nosafe"></div>
+    <div class="frow"><label class="fl">Camera motion</label>
+      <select id="vt-cam" class="fselect">
+        <option value="">None</option>
+        <option value="zoom-in">Zoom in</option><option value="zoom-out">Zoom out</option>
+        <option value="pan-left">Pan left</option><option value="pan-right">Pan right</option>
+        <option value="tilt-up">Tilt up</option><option value="tilt-down">Tilt down</option>
+        <option value="rotate">Rotate</option>
+      </select>
+    </div>
     <button class="btn btn-primary" onclick="genVideo('t2v')">Generate Video</button>
     <div class="progress" id="vt-prog"></div>
   </div>
@@ -1434,5 +2517,219 @@ document.getElementById('panel-vid-t2v').innerHTML = `<div class="gen-wrap">
 </div>`;
 
 loadModels();
+loadVoiceProfiles();
+initPipelineBuilder();
+
+// ── Pipeline accordion: opening one card closes all others ────────
+document.querySelector('.pipe-panel').addEventListener('click', e => {
+  const summary = e.target.closest('.pipe-card > summary');
+  if (!summary) return;
+  const card = summary.parentElement;
+  // If it's currently closed, it's about to open — close siblings
+  if (!card.open) {
+    card.closest('.pipe-panel').querySelectorAll('details.pipe-card[open]').forEach(d => {
+      if (d !== card) d.removeAttribute('open');
+    });
+  }
+});
+// ─────────────────────────────────────────────────────────────────
+//  Pipeline Builder
+// ─────────────────────────────────────────────────────────────────
+let _stepTypes = [];       // [{type, label, params:[...]}]
+let _pbSteps = [];         // current builder steps [{type, label, params:{}}]
+let _customPipelines = []; // saved custom pipelines
+let _editingPipelineId = null;
+
+async function initPipelineBuilder() {
+  try {
+    const [typesRes, pipesRes] = await Promise.all([
+      fetch('/v1/pipelines/step-types').then(r => r.json()),
+      fetch('/v1/pipelines/custom').then(r => r.json()),
+    ]);
+    _stepTypes = typesRes.step_types || [];
+    _customPipelines = pipesRes.pipelines || [];
+
+    // Populate step type selector
+    const sel = $('pb-add-type');
+    if (sel) sel.innerHTML = _stepTypes.map(t =>
+      `<option value="${t.type}">${t.label}</option>`).join('');
+
+    renderCustomPipelineCards();
+  } catch(e) { console.warn('Pipeline builder init failed:', e); }
+}
+
+function renderCustomPipelineCards() {
+  const container = $('custom-pipe-cards');
+  if (!container) return;
+  container.innerHTML = _customPipelines.map(p => `
+    <details class="pipe-card">
+      <summary>${p.name || p.id}
+        <span class="pipe-steps" style="margin:0;font-size:11px">
+          ${p.steps.map(s => `<span class="pipe-step">${s.label || s.type}</span>`).join('<span class="pipe-arrow">→</span>')}
+        </span>
+      </summary>
+      <div class="pipe-card-body">
+        ${p.description ? `<p style="font-size:12px;color:var(--text-2);margin:0 0 .4rem">${p.description}</p>` : ''}
+        <div class="frow"><label class="fl">Input</label><input id="cpr-input-${p.id}" class="fi" placeholder="{{ '{{' }}input{{ '}}' }} value"></div>
+        <div style="display:flex;gap:.4rem;margin-top:.4rem;flex-wrap:wrap">
+          <button class="btn btn-primary btn-sm" onclick="runCustomPipeline('${p.id}')">▶ Run</button>
+          <button class="btn btn-ghost btn-sm" onclick="editCustomPipeline('${p.id}')">✎ Edit</button>
+          <button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="deleteCustomPipeline('${p.id}')">✕ Delete</button>
+        </div>
+        <div class="progress" id="cpr-prog-${p.id}"></div>
+        <div id="cpr-out-${p.id}"></div>
+      </div>
+    </details>`).join('');
+}
+
+function pbAddStep() {
+  const sel = $('pb-add-type');
+  if (!sel) return;
+  const type = sel.value;
+  const typeDef = _stepTypes.find(t => t.type === type);
+  if (!typeDef) return;
+  const step = { type, label: typeDef.label, params: {} };
+  // Set defaults from param schema
+  (typeDef.params || []).forEach(([key, , , def]) => { if (def) step.params[key] = def; });
+  _pbSteps.push(step);
+  renderBuilderSteps();
+}
+
+function pbRemoveStep(idx) {
+  _pbSteps.splice(idx, 1);
+  renderBuilderSteps();
+}
+
+function pbMoveStep(idx, dir) {
+  const to = idx + dir;
+  if (to < 0 || to >= _pbSteps.length) return;
+  [_pbSteps[idx], _pbSteps[to]] = [_pbSteps[to], _pbSteps[idx]];
+  renderBuilderSteps();
+}
+
+function renderBuilderSteps() {
+  const container = $('pb-steps');
+  if (!container) return;
+  container.innerHTML = _pbSteps.map((step, i) => {
+    const typeDef = _stepTypes.find(t => t.type === step.type) || {params:[]};
+    const paramFields = (typeDef.params || []).map(([key, inputType, label, def]) => {
+      const v = step.params[key] ?? def ?? '';
+      const hint = 'step ' + i + ' → \x7B\x7Bstep' + i + '.output\x7D\x7D or \x7B\x7Bstep' + i + '.url\x7D\x7D';
+      if (inputType === 'textarea')
+        return `<div class="pb-step-param"><label title="${hint}">${label}</label><textarea class="fi" rows="2" onchange="_pbSteps[${i}].params['${key}']=this.value">${v}</textarea></div>`;
+      if (inputType === 'checkbox')
+        return `<div class="pb-step-param"><label>${label}</label><input type="checkbox" ${v?'checked':''} onchange="_pbSteps[${i}].params['${key}']=this.checked"></div>`;
+      if (inputType.startsWith('select:')) {
+        const opts = inputType.slice(7).split('|').map(o => `<option value="${o}" ${o===v?'selected':''}>${o}</option>`).join('');
+        return `<div class="pb-step-param"><label>${label}</label><select class="fselect" style="font-size:12px" onchange="_pbSteps[${i}].params['${key}']=this.value">${opts}</select></div>`;
+      }
+      if (inputType === 'ref')
+        return `<div class="pb-step-param"><label title="Use {{ '{{' }}stepN.url{{ '}}' }} to reference a previous step">${label}</label><input class="fi" value="${v}" placeholder="{{ '{{' }}step${i>0?i-1:0}.url{{ '}}' }} or base64" onchange="_pbSteps[${i}].params['${key}']=this.value"></div>`;
+      return `<div class="pb-step-param"><label>${label}</label><input type="${inputType==='number'?'number':'text'}" class="fi" value="${v}" onchange="_pbSteps[${i}].params['${key}']=this.value"></div>`;
+    }).join('');
+    return `<div class="pb-step">
+      <div class="pb-step-header">
+        <span style="background:var(--accent-s);color:var(--accent);border-radius:4px;padding:.1rem .4rem;font-size:11px">${i}</span>
+        <span style="flex:1">${step.label || step.type}</span>
+        <button class="btn btn-ghost btn-sm" style="padding:.1rem .3rem" onclick="pbMoveStep(${i},-1)" ${i===0?'disabled':''}>↑</button>
+        <button class="btn btn-ghost btn-sm" style="padding:.1rem .3rem" onclick="pbMoveStep(${i},1)" ${i===_pbSteps.length-1?'disabled':''}>↓</button>
+        <button class="btn btn-ghost btn-sm" style="padding:.1rem .3rem;color:var(--red)" onclick="pbRemoveStep(${i})">✕</button>
+      </div>
+      <div class="frow" style="margin-bottom:.1rem"><label class="fl" style="font-size:11px">Label</label><input class="fi" style="font-size:12px" value="${step.label||''}" placeholder="${step.type}" onchange="_pbSteps[${i}].label=this.value"></div>
+      <div class="pb-step-params">${paramFields}</div>
+    </div>`;
+  }).join('');
+}
+
+function _pbCollect() {
+  return {
+    id: _editingPipelineId || undefined,
+    name: val('pb-name') || 'Untitled Pipeline',
+    description: val('pb-desc') || '',
+    steps: _pbSteps.map(s => ({ type: s.type, label: s.label, params: {...s.params} })),
+  };
+}
+
+async function pbSave() {
+  const def = _pbCollect();
+  $('pb-prog').textContent = 'Saving…';
+  try {
+    let res;
+    if (_editingPipelineId) {
+      res = await fetch(`/v1/pipelines/custom/${_editingPipelineId}`, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(def)}).then(r => r.json());
+    } else {
+      res = await fetch('/v1/pipelines/custom', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(def)}).then(r => r.json());
+      _editingPipelineId = res.pipeline?.id;
+    }
+    _customPipelines = (await fetch('/v1/pipelines/custom').then(r => r.json())).pipelines || [];
+    renderCustomPipelineCards();
+    $('pb-prog').textContent = 'Saved ✓';
+  } catch(e) { $('pb-prog').textContent = 'Error: '+e.message; }
+}
+
+async function pbRun() {
+  const def = _pbCollect();
+  $('pb-prog').textContent = 'Running…';
+  $('pb-out').innerHTML = '';
+  try {
+    const d = await post('/v1/pipelines/run', {...def, input: val('pb-input')});
+    _renderPipelineResult('pb-out', 'pb-prog', d);
+  } catch(e) { $('pb-prog').textContent = 'Error: '+e.message; }
+}
+
+async function pbSaveAndRun() { await pbSave(); await pbRun(); }
+
+async function runCustomPipeline(id) {
+  const prog = $(`cpr-prog-${id}`), out = $(`cpr-out-${id}`);
+  if (prog) prog.textContent = 'Running…';
+  if (out) out.innerHTML = '';
+  try {
+    const input = val(`cpr-input-${id}`) || '';
+    const d = await post(`/v1/pipelines/custom/${id}/run`, {input});
+    _renderPipelineResult(`cpr-out-${id}`, `cpr-prog-${id}`, d);
+  } catch(e) { if (prog) prog.textContent = 'Error: '+e.message; }
+}
+
+function editCustomPipeline(id) {
+  const p = _customPipelines.find(x => x.id === id);
+  if (!p) return;
+  _editingPipelineId = id;
+  $('pb-name').value = p.name || '';
+  $('pb-desc').value = p.description || '';
+  _pbSteps = p.steps.map(s => ({...s, params:{...s.params}}));
+  renderBuilderSteps();
+  $('pipe-builder-card').open = true;
+  $('pipe-builder-card').scrollIntoView({behavior:'smooth'});
+  $('pb-prog').textContent = `Editing "${p.name}"`;
+}
+
+async function deleteCustomPipeline(id) {
+  if (!confirm('Delete this pipeline?')) return;
+  try {
+    await fetch(`/v1/pipelines/custom/${id}`, {method:'DELETE'});
+    _customPipelines = _customPipelines.filter(p => p.id !== id);
+    if (_editingPipelineId === id) { _editingPipelineId = null; _pbSteps = []; renderBuilderSteps(); }
+    renderCustomPipelineCards();
+  } catch(e) { alert('Delete failed: '+e.message); }
+}
+
+function _renderPipelineResult(outId, progId, d) {
+  const steps = d.steps || [];
+  const last = steps[steps.length - 1] || {};
+  // Show each step result
+  const html = steps.map(s => {
+    if (s.error) return `<div style="font-size:12px;color:var(--red);margin:.2rem 0">Step ${s.step} (${s.label}): ${s.error}</div>`;
+    let media = '';
+    if (s.url && s.url.match(/\.(mp4|webm)/i)) media = `<video controls src="${s.url}" style="max-width:100%;max-height:200px;border-radius:6px;margin-top:.3rem"></video>`;
+    else if (s.url) media = `<img src="${s.url}" style="max-width:100%;max-height:200px;border-radius:6px;margin-top:.3rem">`;
+    else if (s.b64_wav) media = `<audio controls src="data:audio/wav;base64,${s.b64_wav}" style="width:100%;margin-top:.3rem"></audio>`;
+    else if (s.output) media = `<pre style="font-size:11px;white-space:pre-wrap;background:var(--surface-2);padding:.4rem;border-radius:4px;margin-top:.2rem">${s.output.substring(0,400)}${s.output.length>400?'…':''}</pre>`;
+    return `<div style="font-size:12px;color:var(--text-2);margin:.2rem 0"><strong style="color:var(--text)">${s.label||s.type}</strong>${media}</div>`;
+  }).join('');
+  const out = $(outId);
+  if (out) out.innerHTML = `<div style="display:flex;flex-direction:column;gap:.2rem;margin-top:.4rem">${html}</div>`;
+  const prog = $(progId);
+  if (prog) prog.textContent = steps.some(s => s.error) ? 'Completed with errors' : 'Done ✓';
+}
 </script>
 {% endblock %}

@@ -94,6 +94,20 @@
     <div class="card-title">GGUF files <span id="gguf-file-badge" class="muted small"></span></div>
     <div id="gguf-models-list"><span class="muted small">Loading…</span></div>
   </div>
+
+  <!-- Whisper Server -->
+  <div class="card mb-0" style="margin-top:1rem" id="ws-card">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem">
+      <div>
+        <div class="card-title" style="margin:0">whisper-server <span class="muted" style="font-size:11px;font-weight:400">— native subprocess (AMD/Vulkan)</span></div>
+        <div id="ws-model-status" class="muted small" style="margin-top:.25rem">—</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:.5rem">
+        <span id="ws-running-badge" style="font-size:12px;font-weight:500">—</span>
+        <a href="/admin/settings" class="btn btn-sm btn-ghost">Configure</a>
+      </div>
+    </div>
+  </div>
 </div>
 
 <!-- SEARCH -->
@@ -315,24 +329,26 @@
         <label class="form-label">Model ID / path</label>
         <div id="cfg-id-label" style="font-size:12px;font-family:monospace;color:var(--text-2);word-break:break-all;padding:.3rem 0"></div>
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
-        <div class="form-row" style="margin:0">
-          <label class="form-label">Type</label>
-          <select id="cfg-type" class="form-input">
-            <option value="text_models">Text (LLM)</option>
-            <option value="image_models">Image generation</option>
-            <option value="video_models">Video generation</option>
-            <option value="audio_models">Audio transcription (STT)</option>
-            <option value="tts_models">Text-to-speech (TTS)</option>
-            <option value="vision_models">Vision / VLM</option>
-            <option value="audio_gen_models">Audio generation (Music/SFX)</option>
-            <option value="embedding_models">Embeddings</option>
-          </select>
+      <div class="form-row">
+        <label class="form-label" style="display:flex;align-items:center;gap:.5rem">Type
+          <span id="cfg-type-autodet" style="font-size:11px;color:var(--text-3);font-weight:400"></span>
+        </label>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.3rem .75rem;margin-top:.35rem">
+          <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:13px"><input type="checkbox" class="cfg-type-cb" value="text_models"> Text / LLM</label>
+          <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:13px"><input type="checkbox" class="cfg-type-cb" value="vision_models"> Vision / VLM</label>
+          <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:13px"><input type="checkbox" class="cfg-type-cb" value="image_models"> Image gen (T2I / I2I)</label>
+          <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:13px"><input type="checkbox" class="cfg-type-cb" data-sub="t2v" value="video_models"> Video gen (T2V)</label>
+          <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:13px"><input type="checkbox" class="cfg-type-cb" data-sub="i2v" value="video_models"> Image-to-Video (I2V)</label>
+          <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:13px"><input type="checkbox" class="cfg-type-cb" data-sub="v2v" value="video_models"> Video-to-Video (V2V)</label>
+          <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:13px"><input type="checkbox" class="cfg-type-cb" value="audio_models"> Audio transcription (STT)</label>
+          <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:13px"><input type="checkbox" class="cfg-type-cb" value="tts_models"> Text-to-Speech (TTS)</label>
+          <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:13px"><input type="checkbox" class="cfg-type-cb" value="audio_gen_models"> Audio generation</label>
+          <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:13px"><input type="checkbox" class="cfg-type-cb" value="embedding_models"> Embeddings</label>
         </div>
-        <div class="form-row" style="margin:0">
-          <label class="form-label">Alias <span class="muted">(optional)</span></label>
-          <input type="text" id="cfg-alias" class="form-input" placeholder="Friendly name">
-        </div>
+      </div>
+      <div class="form-row">
+        <label class="form-label">Alias <span class="muted">(optional)</span></label>
+        <input type="text" id="cfg-alias" class="form-input" placeholder="Friendly name">
       </div>
 
       <!-- backend -->
@@ -497,6 +513,33 @@ async function loadGlobalSettings(){
     if(r.ok){
       const d = await r.json();
       _defaultOffloadDir = d.offload?.directory || './offload';
+    }
+  }catch{}
+}
+
+async function loadWsStatus(){
+  try{
+    const s = await fetch('/admin/api/whisper-server/status').then(r=>r.json());
+    const card = document.getElementById('ws-card');
+    const badge = document.getElementById('ws-running-badge');
+    const modelEl = document.getElementById('ws-model-status');
+    const entries = Object.entries(s);
+    if(!entries.length){
+      card.style.display = 'none';
+      return;
+    }
+    card.style.display = '';
+    const running = entries.filter(([,v])=>v.running);
+    if(running.length){
+      badge.textContent = `● ${running.length}/${entries.length} running`;
+      badge.style.color = 'var(--green, #4ade80)';
+      card.style.borderColor = 'rgba(74,222,128,.3)';
+      modelEl.textContent = running.map(([id,v])=>`${id}: ${v.model||'?'} @ ${v.url}`).join(' | ');
+    } else {
+      badge.textContent = '○ stopped';
+      badge.style.color = 'var(--text-2)';
+      card.style.borderColor = '';
+      modelEl.textContent = entries.map(([id])=>id).join(', ') + ' — not started';
     }
   }catch{}
 }
@@ -958,7 +1001,8 @@ async function loadCachedModels(){
       const rows = hf.map(m=>{
         const idx = _localModels.length;
         _localModels.push({label:m.id, path:m.id, cacheType:'hf', size_gb:m.size_gb||0,
-          defaultType:m.model_type||'text_models', settings:m.settings||{}, in_config:m.in_config});
+          defaultType:m.model_type||'text_models', settings:m.settings||{}, in_config:m.in_config,
+          capabilities:m.capabilities||[]});
         const loaded = _loadedKeys.has(m.id) || [..._loadedKeys].some(k=>k.endsWith(':'+m.id)||k===m.id);
         const capBadges = fmtCapabilities(m.capabilities||[]);
         return `<tr style="border-top:1px solid var(--border)">
@@ -996,7 +1040,8 @@ async function loadCachedModels(){
       const rows = gguf.map(f=>{
         const idx = _localModels.length;
         _localModels.push({label:f.filename, path:f.path, cacheType:'gguf', size_gb:f.size_gb||0,
-          defaultType:f.model_type||'text_models', settings:f.settings||{}, in_config:f.in_config});
+          defaultType:f.model_type||'text_models', settings:f.settings||{}, in_config:f.in_config,
+          capabilities:f.capabilities||[]});
         const loaded = _loadedKeys.has(f.path) || _loadedKeys.has(f.filename) || [..._loadedKeys].some(k=>k.endsWith(':'+f.path)||k.endsWith(':'+f.filename));
         const capBadges = fmtCapabilities(f.capabilities||[]);
         return `<tr style="border-top:1px solid var(--border)">
@@ -1044,6 +1089,8 @@ async function refreshLocal(){
 
 loadGlobalSettings();
 refreshLocal();
+loadWsStatus();
+setInterval(loadWsStatus, 5000);
 
 async function clearCacheConfirm(type){
   const labels = {hf:'HuggingFace', gguf:'GGUF', all:'ALL'};
@@ -1070,6 +1117,51 @@ async function deleteModelConfirm(idx){
   }catch(e){alert('Error: '+e.message)}
 }
 
+/* ── type checkbox helpers ─────────────────────────────── */
+function _capabilitiesToTypes(caps) {
+  const categories = new Set(), subs = new Set();
+  if (!caps || !caps.length) return {categories, subs};
+  if (caps.includes('image_to_video'))  { categories.add('video_models'); subs.add('i2v'); }
+  if (caps.includes('video_generation')){ categories.add('video_models'); subs.add('t2v'); }
+  if (caps.includes('video_to_video'))  { categories.add('video_models'); subs.add('v2v'); }
+  if (caps.includes('image_generation') || caps.includes('image_to_image') ||
+      caps.includes('inpainting')       || caps.includes('controlnet')) categories.add('image_models');
+  if (caps.includes('image_to_text') && caps.includes('text_generation')) {
+    categories.add('vision_models');
+  } else if (caps.includes('text_generation') &&
+             !categories.has('video_models') && !categories.has('image_models')) {
+    categories.add('text_models');
+  }
+  if (caps.includes('speech_to_text')) categories.add('audio_models');
+  if (caps.includes('text_to_speech')) categories.add('tts_models');
+  if (caps.includes('audio_generation')) categories.add('audio_gen_models');
+  if (caps.includes('embeddings')) categories.add('embedding_models');
+  return {categories, subs};
+}
+
+function _setTypeCheckboxes(categories, subs) {
+  document.querySelectorAll('.cfg-type-cb').forEach(cb => {
+    const sub = cb.dataset.sub;
+    if (!categories.has(cb.value)) { cb.checked = false; return; }
+    if (sub) {
+      // Sub-typed checkbox (T2V / I2V / V2V): check only if this sub is in subs
+      cb.checked = subs.has(sub);
+    } else if (cb.value === 'video_models') {
+      // Non-sub video checkbox: only relevant when subs is empty (legacy/no-sub)
+      cb.checked = subs.size === 0;
+    } else {
+      cb.checked = true;
+    }
+  });
+}
+
+function _getCheckedTypes() {
+  const checked = [...document.querySelectorAll('.cfg-type-cb:checked')];
+  const categories = [...new Set(checked.map(cb => cb.value))];
+  const subs = checked.filter(cb => cb.dataset.sub).map(cb => cb.dataset.sub);
+  return {primaryType: categories[0] || 'text_models', model_types: categories, video_subtypes: subs};
+}
+
 function openCfgModal(idx){
   const m = _localModels[idx];
   const s = m.settings || {};
@@ -1077,9 +1169,46 @@ function openCfgModal(idx){
   document.getElementById('cfg-id-label').textContent = m.label;
   document.getElementById('cfg-path').value = m.path;
   document.getElementById('cfg-orig-type').value = m.defaultType;
-  // Map legacy gguf_models to text_models
-  const rawType = s.model_type || m.defaultType;
-  document.getElementById('cfg-type').value = rawType === 'gguf_models' ? 'text_models' : rawType;
+
+  // Determine type checkboxes: saved config > auto-detect from capabilities > defaultType
+  const det = document.getElementById('cfg-type-autodet');
+  if (s.model_types && s.model_types.length) {
+    // Previously saved multi-type config
+    const savedSubs = new Set(s.video_subtypes || []);
+    _setTypeCheckboxes(new Set(s.model_types), savedSubs);
+    det.textContent = '';
+  } else if (s.model_type) {
+    // Single saved type
+    const normType = s.model_type === 'gguf_models' ? 'text_models' : s.model_type;
+    let savedSubs = new Set(s.video_subtypes || []);
+    // Legacy video_models with no sub-types: infer from capabilities or default T2V
+    if (normType === 'video_models' && savedSubs.size === 0) {
+      const caps = m.capabilities || [];
+      if (caps.includes('image_to_video')) savedSubs.add('i2v');
+      if (caps.includes('video_to_video')) savedSubs.add('v2v');
+      if (caps.includes('video_generation') || savedSubs.size === 0) savedSubs.add('t2v');
+    }
+    _setTypeCheckboxes(new Set([normType]), savedSubs);
+    det.textContent = '';
+  } else {
+    // Auto-detect from capabilities
+    const caps = m.capabilities || [];
+    const {categories, subs} = _capabilitiesToTypes(caps);
+    if (categories.size > 0) {
+      _setTypeCheckboxes(categories, subs);
+      det.textContent = '(auto-detected)';
+    } else {
+      const rawType = m.defaultType === 'gguf_models' ? 'text_models' : (m.defaultType || 'text_models');
+      let fallbackSubs = new Set();
+      if (rawType === 'video_models') {
+        // No capabilities matched; default to T2V for unclassified video models
+        fallbackSubs.add('t2v');
+      }
+      _setTypeCheckboxes(new Set([rawType]), fallbackSubs);
+      det.textContent = m.cacheType === 'gguf' ? '(auto-detected: GGUF text model)' : '';
+    }
+  }
+
   document.getElementById('cfg-alias').value = s.alias || '';
   document.getElementById('cfg-backend').value = s.backend || 'auto';
   document.getElementById('cfg-load-mode').value = s.load_mode || 'on-request';
@@ -1117,9 +1246,12 @@ async function saveModelConfig(){
   const maxGpu = parseFloat(document.getElementById('cfg-max-gpu').value);
   const ramGb  = parseFloat(document.getElementById('cfg-ram-gb').value);
   const usedVram = parseFloat(document.getElementById('cfg-used-vram').value);
+  const {primaryType, model_types, video_subtypes} = _getCheckedTypes();
   const data = {
     path,
-    model_type:        document.getElementById('cfg-type').value,
+    model_type:        primaryType,
+    model_types:       model_types,
+    video_subtypes:    video_subtypes.length ? video_subtypes : undefined,
     alias:             document.getElementById('cfg-alias').value.trim() || null,
     backend:           document.getElementById('cfg-backend').value,
     load_mode:         document.getElementById('cfg-load-mode').value,

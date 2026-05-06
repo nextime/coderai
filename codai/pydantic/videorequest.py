@@ -57,9 +57,14 @@ class VideoGenerationRequest(BaseModel):
     camera_motion: Optional[str] = None     # zoom-in | zoom-out | pan-left | pan-right | tilt-up | tilt-down | rotate
 
     # ── Character consistency ─────────────────────────────────────────────
-    character_references: Optional[List[str]] = None  # list of base64/URL reference images
+    # Each entry: {"name": "Alice", "images": ["b64...", ...]}
+    characters: Optional[List[dict]] = None
+    # Legacy flat list of base64/URL reference images (still accepted)
+    character_references: Optional[List[str]] = None
     character_strength: Optional[float] = 0.8
     character_names: Optional[List[str]] = None       # optional names per reference
+    # Named saved profiles to load (resolved server-side)
+    character_profiles: Optional[List[str]] = None
 
     # ── Audio generation / manipulation ──────────────────────────────────
     add_audio: Optional[bool] = False

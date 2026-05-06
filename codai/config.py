@@ -30,6 +30,7 @@ class ServerConfig:
     https: bool = False
     https_key_path: Optional[str] = None
     https_cert_path: Optional[str] = None
+    queue_max_size: int = 6
 
 
 @dataclass
@@ -128,10 +129,12 @@ class ConfigManager:
         self.config_path = self.config_dir / "config.json"
         self.models_path = self.config_dir / "models.json"
         self.auth_path = self.config_dir / "auth.json"
+        self.pipelines_path = self.config_dir / "pipelines.json"
         
         self.config: Optional[Config] = None
         self.models_data: Dict[str, Any] = {}
         self.auth_data: Dict[str, Any] = {}
+        self.pipelines_data: list = []
     
     def ensure_config_dir(self):
         """Create configuration directory if it doesn't exist."""
@@ -196,19 +199,12 @@ class ConfigManager:
         
         # Create default auth.json
         if not self.auth_path.exists():
-            try:
-                from argon2 import PasswordHasher
-                ph = PasswordHasher()
-                default_admin_hash = ph.hash("admin")
-            except ImportError:
-                from codai.admin.auth import hash_password
-                default_admin_hash = hash_password("admin")
-            
+            from codai.admin.auth import hash_password
             default_auth = {
                 "users": [{
                     "id": 1,
                     "username": "admin",
-                    "password_hash": default_admin_hash,
+                    "password_hash": hash_password("admin"),
                     "role": "admin",
                     "created_at": "2026-05-03T00:00:00Z",
                     "must_change_password": True
@@ -219,8 +215,8 @@ class ConfigManager:
             with open(self.auth_path, 'w') as f:
                 json.dump(default_auth, f, indent=2)
             print(f"Created default auth config: {self.auth_path}")
-            print("\nDefault credentials: admin / admin")
-            print("You will be prompted to change the password on first login.\n")
+            print(f"\nDefault credentials: admin / admin")
+            print("IMPORTANT: Change this password immediately after first login.\n")
     
     def load(self) -> Config:
         """Load configuration from files.
@@ -229,8 +225,7 @@ class ConfigManager:
             Config object with loaded settings
         """
         # Create defaults if config directory is empty or doesn't exist
-        if not self.config_dir.exists() or not any(self.config_dir.iterdir()):
-            self.create_default_configs()
+        self.create_default_configs()
         
         # Load config.json
         if self.config_path.exists():
@@ -286,6 +281,13 @@ class ConfigManager:
                 "tokens": [],
                 "sessions": {}
             }
+
+        # Load pipelines.json
+        if self.pipelines_path.exists():
+            with open(self.pipelines_path, 'r') as f:
+                self.pipelines_data = json.load(f)
+        else:
+            self.pipelines_data = []
         
         return self.config
     
@@ -298,7 +300,8 @@ class ConfigManager:
                 "port": self.config.server.port,
                 "https": self.config.server.https,
                 "https_key_path": self.config.server.https_key_path,
-                "https_cert_path": self.config.server.https_cert_path
+                "https_cert_path": self.config.server.https_cert_path,
+                "queue_max_size": self.config.server.queue_max_size,
             },
             "backend": {
                 "type": self.config.backend.type,
@@ -366,6 +369,11 @@ class ConfigManager:
         """Save auth.json to disk."""
         with open(self.auth_path, 'w') as f:
             json.dump(self.auth_data, f, indent=2)
+
+    def save_pipelines(self):
+        """Save pipelines.json to disk."""
+        with open(self.pipelines_path, 'w') as f:
+            json.dump(self.pipelines_data, f, indent=2)
     
     def reload(self):
         """Reload all configuration files."""

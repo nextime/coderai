@@ -23,7 +23,14 @@ import os
 import tempfile
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi.responses import PlainTextResponse
 from typing import Optional
+
+# Maximum upload size: 100 MB
+_MAX_AUDIO_BYTES = 100 * 1024 * 1024
+
+# Safe audio extensions (user-supplied extension is NOT trusted for the suffix)
+_SAFE_EXTENSIONS = {'.wav', '.mp3', '.ogg', '.flac', '.m4a', '.webm', '.mp4'}
 
 # Import from codai modules
 from codai.models.manager import multi_model_manager
@@ -37,6 +44,71 @@ def set_global_args(args):
     """Set global args from coderai."""
     global global_args
     global_args = args
+
+
+# =============================================================================
+# Response formatting helpers
+# =============================================================================
+
+def _seconds_to_srt_time(s: float) -> str:
+    h = int(s // 3600)
+    m = int((s % 3600) // 60)
+    sec = s % 60
+    return f"{h:02d}:{m:02d}:{sec:06.3f}".replace('.', ',')
+
+
+def _seconds_to_vtt_time(s: float) -> str:
+    h = int(s // 3600)
+    m = int((s % 3600) // 60)
+    sec = s % 60
+    return f"{h:02d}:{m:02d}:{sec:06.3f}"
+
+
+def _format_response(fmt: str, text: str, segments: list):
+    """Format a transcription result according to the requested response_format."""
+    fmt = (fmt or "json").lower()
+
+    if fmt == "text":
+        return PlainTextResponse(text)
+
+    if fmt == "srt":
+        lines = []
+        for i, seg in enumerate(segments, 1):
+            start = _seconds_to_srt_time(seg.get("start", 0))
+            end = _seconds_to_srt_time(seg.get("end", 0))
+            lines.append(f"{i}\n{start} --> {end}\n{seg['text'].strip()}\n")
+        srt_body = "\n".join(lines) if lines else f"1\n00:00:00,000 --> 00:00:00,000\n{text}\n"
+        return PlainTextResponse(srt_body, media_type="text/plain")
+
+    if fmt == "vtt":
+        lines = ["WEBVTT\n"]
+        for seg in segments:
+            start = _seconds_to_vtt_time(seg.get("start", 0))
+            end = _seconds_to_vtt_time(seg.get("end", 0))
+            lines.append(f"{start} --> {end}\n{seg['text'].strip()}\n")
+        if not segments:
+            lines.append(f"00:00:00.000 --> 00:00:00.000\n{text}\n")
+        return PlainTextResponse("\n".join(lines), media_type="text/vtt")
+
+    if fmt == "verbose_json":
+        return {
+            "task": "transcribe",
+            "language": "unknown",
+            "duration": segments[-1].get("end", 0) if segments else 0,
+            "text": text,
+            "segments": [
+                {
+                    "id": i,
+                    "start": s.get("start", 0),
+                    "end": s.get("end", 0),
+                    "text": s.get("text", "").strip(),
+                }
+                for i, s in enumerate(segments)
+            ],
+        }
+
+    # Default: json
+    return {"text": text}
 
 
 # =============================================================================
@@ -58,43 +130,65 @@ async def create_transcription(
     """
     Audio transcription endpoint (OpenAI-compatible).
     """
-    # Check if whisper-server is available FIRST
-    if multi_model_manager.whisper_server and multi_model_manager.whisper_server.is_running():
-        file_content = await file.read()
-        result = multi_model_manager.whisper_server.transcribe(
-            file_content,
-            language=language,
-            prompt=prompt
-        )
-        if "error" in result:
-            raise HTTPException(status_code=500, detail=result["error"])
-        return {"text": result.get("text", "")}
-    
+    file_content = await file.read()
+    if len(file_content) > _MAX_AUDIO_BYTES:
+        raise HTTPException(status_code=413, detail="Audio file too large (max 100 MB)")
+
+    # Check if the requested model is a whisper-server instance
+    wsm = multi_model_manager.whisper_servers.get(model)
+    if wsm is None and multi_model_manager.whisper_server is not None:
+        # Legacy single-instance fallback: use it if no specific match
+        if not multi_model_manager.whisper_servers:
+            wsm = multi_model_manager.whisper_server
+
+    if wsm is not None:
+        ws_key = f"audio:{model}" if model in multi_model_manager.whisper_servers else "audio:whisper-server"
+
+        # Let the VRAM manager evict other models if needed
+        multi_model_manager.request_model(requested_model=model, model_type="audio")
+
+        # Start the subprocess if it isn't running (on-demand)
+        if not wsm.is_running():
+            wsm.start(getattr(wsm, '_model_path', None), gpu_device=getattr(wsm, '_gpu_device', 0))
+            if wsm.is_running():
+                multi_model_manager.models[ws_key] = wsm
+                multi_model_manager.active_in_vram = ws_key
+                multi_model_manager.models_in_vram.add(ws_key)
+
+        if wsm.is_running():
+            result = wsm.transcribe(file_content, language=language, prompt=prompt)
+            if "error" in result:
+                raise HTTPException(status_code=500, detail=result["error"])
+            return _format_response(response_format, result.get("text", ""), [])
+        # Fall through to Python backends if subprocess failed to start
+
     # Use the manager to resolve the model and manage VRAM
     model_info = multi_model_manager.request_model(
         requested_model=model,
         model_type="audio"
     )
-    
+
     # Check if the model was rejected as not allowed
     if model_info.get('error'):
         raise HTTPException(status_code=404, detail=model_info['error'])
-    
+
     model_name = model_info['model_name']
     model_key = model_info['model_key']
     whisper_model = model_info['model_object']
-    
+
     if not model_name:
         raise HTTPException(
             status_code=400,
             detail="Audio transcription not configured. Use --audio-model or --whisper-server."
         )
-    
-    # Read the uploaded file
-    file_content = await file.read()
-    
+
+    # Determine a safe file extension from the upload's content-type or filename,
+    # never trusting the raw user-supplied value for arbitrary suffixes.
+    raw_ext = os.path.splitext(file.filename or '')[1].lower()
+    safe_ext = raw_ext if raw_ext in _SAFE_EXTENSIONS else '.wav'
+
     # Save to temp file (needed for some backends)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=safe_ext) as tmp:
         tmp.write(file_content)
         tmp_path = tmp.name
     
@@ -102,88 +196,59 @@ async def create_transcription(
         # Try faster-whisper first
         try:
             from faster_whisper import WhisperModel
-            
+
             if whisper_model is None:
-                print(f"Loading faster-whisper model: {model_name}")
-                
-                # Determine compute type - always use int8 for CPU
-                compute_type = "int8"
-                
-                # Load the model
                 whisper_model = WhisperModel(
                     model_name,
-                    device="cpu",  # Always use CPU - faster-whisper CUDA doesn't work with AMD
-                    compute_type=compute_type,
+                    device="cpu",
+                    compute_type="int8",
                 )
-                
-                # Cache the model
                 multi_model_manager.add_model(model_key, whisper_model)
                 multi_model_manager.current_model_key = model_key
-                print(f"Loaded faster-whisper model: {model_name}")
-            
-            # Run transcription
-            segments, info = whisper_model.transcribe(
+
+            raw_segments, _ = whisper_model.transcribe(
                 tmp_path,
                 language=language,
                 initial_prompt=prompt,
                 temperature=temperature,
             )
-            
-            # Collect all segments
-            text_parts = []
-            for segment in segments:
-                text_parts.append(segment.text)
-            
-            full_text = "".join(text_parts)
-            
-            return {
-                "text": full_text.strip()
-            }
-            
+            # Materialise the generator so we have all segment data
+            segments = [
+                {"start": s.start, "end": s.end, "text": s.text}
+                for s in raw_segments
+            ]
+            full_text = "".join(s["text"] for s in segments)
+            return _format_response(response_format, full_text.strip(), segments)
+
         except ImportError:
             pass
-        
+
         # Try whispercpp as fallback
         try:
             import whispercpp
-            
+
             if whisper_model is None:
-                print(f"Loading whispercpp model: {model_name}")
-                
-                # Check if it's a built-in model name
-                if model_name in ['tiny.en', 'tiny', 'base.en', 'base', 'small.en', 'small', 'medium.en', 'medium', 'large-v1', 'large']:
-                    # It's a built-in model name
-                    whisper_model = whispercpp.Whisper.from_pretrained(model_name)
-                else:
-                    # It's a path to a GGUF file
-                    whisper_model = whispercpp.Whisper.from_pretrained(model_name)
-                
-                # Cache the model
+                whisper_model = whispercpp.Whisper.from_pretrained(model_name)
                 multi_model_manager.add_model(model_key, whisper_model)
                 multi_model_manager.current_model_key = model_key
-                print(f"Loaded whispercpp model: {model_name}")
-            
-            # Run transcription
+
             result = whisper_model.transcribe(tmp_path)
-            
-            # Extract text from result
+
             text = ""
             if hasattr(result, 'text'):
                 text = result.text
             elif isinstance(result, dict):
                 text = result.get('text', '')
             elif isinstance(result, list):
-                # Some versions return a list of segments
                 for segment in result:
                     if hasattr(segment, 'text'):
                         text += segment.text
                     elif isinstance(segment, dict):
                         text += segment.get('text', '')
-            
-            return {
-                "text": text.strip()
-            }
-            
+
+            # whispercpp does not expose per-segment timestamps easily
+            return _format_response(response_format, text.strip(), [])
+
         except ImportError as e:
             raise HTTPException(
                 status_code=501,
