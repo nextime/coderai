@@ -1,10 +1,14 @@
 from pathlib import Path
+import subprocess
+
+import tools.manual_multimodal_test_client as manual_multimodal_test_client
 
 from tools.manual_multimodal_test_client import (
     MODE_DEFAULTS,
     _download_artifact,
     build_request_spec,
     build_parser,
+    download_default_sample,
     choose_mode_interactively,
     ensure_sample_file,
     execute_request,
@@ -226,6 +230,58 @@ def test_ensure_sample_file_downloads_missing_managed_default_for_absolute_path(
     assert result == managed_path
     assert downloaded == [managed_path]
     assert managed_path.read_bytes() == b"wav"
+
+
+def test_ensure_sample_file_rejects_missing_explicit_override(tmp_path):
+    missing_path = tmp_path / "custom.wav"
+
+    with pytest.raises(FileNotFoundError, match=rf"File not found: {missing_path}\. Supply --audio-file\."):
+        ensure_sample_file(str(missing_path), "--audio-file")
+
+
+def test_download_default_sample_runs_wget_and_returns_path(tmp_path, monkeypatch):
+    sample_path = tmp_path / "samples" / "transcription.wav"
+    recorded = {}
+
+    def fake_run(command, check):
+        recorded["command"] = command
+        recorded["check"] = check
+        sample_path.parent.mkdir(parents=True, exist_ok=True)
+        sample_path.write_bytes(b"downloaded-wav")
+
+    monkeypatch.setattr(
+        "tools.manual_multimodal_test_client.SAMPLE_URLS",
+        {"samples/transcription.wav": "https://example.invalid/transcription.wav"},
+    )
+    monkeypatch.setattr(manual_multimodal_test_client.subprocess, "run", fake_run, raising=False)
+
+    result = download_default_sample(sample_path)
+
+    assert result == sample_path
+    assert recorded["command"] == [
+        "wget",
+        "-O",
+        str(sample_path),
+        "https://example.invalid/transcription.wav",
+    ]
+    assert recorded["check"] is True
+    assert sample_path.read_bytes() == b"downloaded-wav"
+
+
+def test_download_default_sample_wraps_wget_failure(tmp_path, monkeypatch):
+    sample_path = tmp_path / "samples" / "question-video.mp4"
+
+    def fake_run(command, check):
+        raise subprocess.CalledProcessError(returncode=1, cmd=command)
+
+    monkeypatch.setattr(
+        "tools.manual_multimodal_test_client.SAMPLE_URLS",
+        {"samples/question-video.mp4": "https://example.invalid/question-video.mp4"},
+    )
+    monkeypatch.setattr(manual_multimodal_test_client.subprocess, "run", fake_run, raising=False)
+
+    with pytest.raises(FileNotFoundError, match=r"Unable to download required default file"):
+        download_default_sample(sample_path)
 
 
 def test_build_request_spec_for_llm_uses_chat_completions_payload(tmp_path):

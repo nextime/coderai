@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import subprocess
 import time
 from contextlib import ExitStack
 from pathlib import Path
@@ -103,6 +104,17 @@ def _require_file(path_value: str | None, flag_name: str) -> Path:
 
 
 def download_default_sample(path: Path) -> Path:
+    key = _managed_sample_key(path)
+    url = SAMPLE_URLS.get(key)
+    if url is None:
+        raise FileNotFoundError(f"No managed sample source configured for {path}.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(["wget", "-O", str(path), url], check=True)
+    except subprocess.CalledProcessError as exc:
+        raise FileNotFoundError(f"Unable to download required default file: {path}") from exc
+    if not path.exists():
+        raise FileNotFoundError(f"Unable to download required default file: {path}")
     return path
 
 
