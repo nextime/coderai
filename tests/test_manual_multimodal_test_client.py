@@ -7,6 +7,8 @@ from tools.manual_multimodal_test_client import (
     resolve_mode_config,
 )
 
+import pytest
+
 
 def test_parse_args_accepts_direct_mode_and_global_overrides():
     args = parse_args([
@@ -136,10 +138,15 @@ def test_build_request_spec_for_llm_uses_chat_completions_payload(tmp_path):
 
     spec = build_request_spec(config)
 
-    assert spec["method"] == "POST"
-    assert spec["url"] == "http://127.0.0.1:6745/v1/chat/completions"
-    assert spec["json"]["model"] == "text:test"
-    assert spec["json"]["messages"][0]["content"] == "Ping"
+    assert spec == {
+        "method": "POST",
+        "url": "http://127.0.0.1:6745/v1/chat/completions",
+        "headers": {"Accept": "application/json"},
+        "json": {
+            "model": "text:test",
+            "messages": [{"role": "user", "content": "Ping"}],
+        },
+    }
 
 
 def test_build_request_spec_for_transcription_uses_multipart_file(tmp_path):
@@ -159,11 +166,18 @@ def test_build_request_spec_for_transcription_uses_multipart_file(tmp_path):
 
     spec = build_request_spec(config)
 
-    assert spec["url"].endswith("/v1/audio/transcriptions")
-    assert spec["data"]["model"] == "audio:test"
-    assert spec["data"]["prompt"] == "Transcribe carefully"
-    assert spec["files"]["file"][0] == "sample.wav"
-    assert spec["files"]["file"][1] == b"wav-bytes"
+    assert spec == {
+        "method": "POST",
+        "url": "http://127.0.0.1:6745/v1/audio/transcriptions",
+        "headers": {"Accept": "application/json"},
+        "data": {
+            "model": "audio:test",
+            "prompt": "Transcribe carefully",
+        },
+        "files": {
+            "file": ("sample.wav", b"wav-bytes"),
+        },
+    }
 
 
 def test_build_request_spec_for_audio_generation_uses_json_payload(tmp_path):
@@ -181,10 +195,16 @@ def test_build_request_spec_for_audio_generation_uses_json_payload(tmp_path):
 
     spec = build_request_spec(config)
 
-    assert spec["url"].endswith("/v1/audio/generate")
-    assert spec["json"]["model"] == "audio_gen:test"
-    assert spec["json"]["prompt"] == "Generate a bell sound"
-    assert spec["json"]["response_format"] == "url"
+    assert spec == {
+        "method": "POST",
+        "url": "http://127.0.0.1:6745/v1/audio/generate",
+        "headers": {"Accept": "application/json"},
+        "json": {
+            "model": "audio_gen:test",
+            "prompt": "Generate a bell sound",
+            "response_format": "url",
+        },
+    }
 
 
 def test_build_request_spec_for_video_generation_uses_json_payload(tmp_path):
@@ -202,7 +222,48 @@ def test_build_request_spec_for_video_generation_uses_json_payload(tmp_path):
 
     spec = build_request_spec(config)
 
-    assert spec["url"].endswith("/v1/video/generations")
-    assert spec["json"]["model"] == "video:test"
-    assert spec["json"]["prompt"] == "Generate a short test clip"
-    assert spec["json"]["response_format"] == "url"
+    assert spec == {
+        "method": "POST",
+        "url": "http://127.0.0.1:6745/v1/video/generations",
+        "headers": {"Accept": "application/json"},
+        "json": {
+            "model": "video:test",
+            "prompt": "Generate a short test clip",
+            "response_format": "url",
+        },
+    }
+
+
+def test_build_request_spec_for_transcription_requires_audio_file_flag(tmp_path):
+    config = {
+        "mode": "transcription",
+        "url": "http://127.0.0.1:6745",
+        "model": "audio:test",
+        "prompt": "Transcribe carefully",
+        "output_dir": tmp_path,
+        "token": None,
+        "audio_file": None,
+        "video_file": None,
+        "response_format": None,
+    }
+
+    with pytest.raises(FileNotFoundError, match=r"Missing required file\. Supply --audio-file\."):
+        build_request_spec(config)
+
+
+def test_build_request_spec_for_transcription_requires_existing_audio_file(tmp_path):
+    missing_path = tmp_path / "missing.wav"
+    config = {
+        "mode": "transcription",
+        "url": "http://127.0.0.1:6745",
+        "model": "audio:test",
+        "prompt": "Transcribe carefully",
+        "output_dir": tmp_path,
+        "token": None,
+        "audio_file": str(missing_path),
+        "video_file": None,
+        "response_format": None,
+    }
+
+    with pytest.raises(FileNotFoundError, match=rf"File not found: {missing_path}\. Supply --audio-file\."):
+        build_request_spec(config)
