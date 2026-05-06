@@ -16,6 +16,8 @@
 
 """Admin dashboard routes."""
 from pathlib import Path
+import re
+import shutil
 from typing import Optional
 
 from fastapi import APIRouter, Request, Response, Form, HTTPException, Depends
@@ -52,6 +54,25 @@ def set_config_manager(mgr):
     """Set the shared ConfigManager instance."""
     global config_manager
     config_manager = mgr
+
+
+def _next_whisper_server_model_id(audio_models) -> str:
+    used_suffixes = set()
+    for model in audio_models or []:
+        if not isinstance(model, dict) or model.get("backend") != "whisper-server":
+            continue
+        match = re.fullmatch(r"whisper(\d+)", str(model.get("id") or "").strip())
+        if match:
+            used_suffixes.add(int(match.group(1)))
+
+    suffix = 0
+    while suffix in used_suffixes:
+        suffix += 1
+    return f"whisper{suffix}"
+
+
+def _default_whisper_server_path() -> str:
+    return shutil.which("whisper-server") or "/usr/local/bin/whisper-server"
 
 
 def get_current_user(request: Request) -> Optional[str]:
@@ -1257,10 +1278,10 @@ async def api_model_configure(request: Request, username: str = Depends(require_
     if data.get("backend") == "whisper-server":
         model_id = (data.get("model_id") or "").strip()
         if not model_id:
-            raise HTTPException(status_code=400, detail="model_id is required")
+            model_id = _next_whisper_server_model_id(config_manager.models_data.get("audio_models", []))
         server_path = (data.get("server_path") or "").strip()
         if not server_path:
-            raise HTTPException(status_code=400, detail="server_path is required")
+            server_path = _default_whisper_server_path()
         model_source = (data.get("model_source") or "cached-gguf").strip() or "cached-gguf"
         if model_source not in {"cached-gguf", "manual-path"}:
             raise HTTPException(status_code=400, detail="model_source must be one of: cached-gguf, manual-path")

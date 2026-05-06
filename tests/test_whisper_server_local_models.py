@@ -2,7 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 
@@ -49,15 +49,19 @@ def _build_config(tmp_path):
     return cfg
 
 
+def _build_admin_test_client(routes):
+    app = FastAPI()
+    app.include_router(routes.router)
+    app.dependency_overrides[routes.require_admin] = lambda: "admin"
+    return app, TestClient(app)
+
+
 def test_model_configure_persists_whisper_server_audio_model(monkeypatch, tmp_path):
     from codai.admin import routes
-    from codai.api.app import app
 
     cfg = _build_config(tmp_path)
     monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
-    app.dependency_overrides[routes.require_admin] = lambda: "admin"
-
-    client = TestClient(app)
+    app, client = _build_admin_test_client(routes)
     response = client.post(
         "/admin/api/model-configure",
         json={
@@ -94,7 +98,6 @@ def test_model_configure_persists_whisper_server_audio_model(monkeypatch, tmp_pa
 
 def test_model_configure_rejects_duplicate_whisper_server_model_id(monkeypatch, tmp_path):
     from codai.admin import routes
-    from codai.api.app import app
 
     cfg = _build_config(tmp_path)
     cfg.models_data["audio_models"] = [
@@ -109,9 +112,7 @@ def test_model_configure_rejects_duplicate_whisper_server_model_id(monkeypatch, 
         }
     ]
     monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
-    app.dependency_overrides[routes.require_admin] = lambda: "admin"
-
-    client = TestClient(app)
+    app, client = _build_admin_test_client(routes)
     response = client.post(
         "/admin/api/model-configure",
         json={
@@ -132,15 +133,95 @@ def test_model_configure_rejects_duplicate_whisper_server_model_id(monkeypatch, 
     app.dependency_overrides.clear()
 
 
-def test_model_configure_accepts_cached_gguf_whisper_server_model(monkeypatch, tmp_path):
+def test_model_configure_defaults_missing_whisper_server_model_id_to_whisper0(monkeypatch, tmp_path):
     from codai.admin import routes
-    from codai.api.app import app
 
     cfg = _build_config(tmp_path)
     monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
-    app.dependency_overrides[routes.require_admin] = lambda: "admin"
+    app, client = _build_admin_test_client(routes)
+    response = client.post(
+        "/admin/api/model-configure",
+        json={
+            "model_id": "",
+            "model_type": "audio_models",
+            "backend": "whisper-server",
+            "server_path": "/usr/local/bin/whisper-server",
+            "model_path": "/models/ggml-base.bin",
+            "port": 8744,
+            "gpu_device": 0,
+            "load_mode": "on-request",
+        },
+    )
 
-    client = TestClient(app)
+    assert response.status_code == 200
+    assert cfg.models_data["audio_models"][0]["id"] == "whisper0"
+
+    app.dependency_overrides.clear()
+
+
+def test_model_configure_defaults_missing_whisper_server_model_id_to_smallest_free_suffix(monkeypatch, tmp_path):
+    from codai.admin import routes
+
+    cfg = _build_config(tmp_path)
+    cfg.models_data["audio_models"] = [
+        {"id": "whisper0", "backend": "whisper-server"},
+        {"id": "whisper1", "backend": "whisper-server"},
+        {"id": "whisper3", "backend": "whisper-server"},
+    ]
+    monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
+    app, client = _build_admin_test_client(routes)
+    response = client.post(
+        "/admin/api/model-configure",
+        json={
+            "model_type": "audio_models",
+            "backend": "whisper-server",
+            "server_path": "/usr/local/bin/whisper-server",
+            "model_path": "/models/ggml-small.bin",
+            "port": 8745,
+            "gpu_device": 1,
+            "load_mode": "load",
+        },
+    )
+
+    assert response.status_code == 200
+    assert cfg.models_data["audio_models"][-1]["id"] == "whisper2"
+
+    app.dependency_overrides.clear()
+
+
+def test_model_configure_defaults_missing_whisper_server_path_to_usr_local_bin(monkeypatch, tmp_path):
+    from codai.admin import routes
+
+    cfg = _build_config(tmp_path)
+    monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
+    monkeypatch.setattr(routes.shutil, "which", lambda _: None)
+    app, client = _build_admin_test_client(routes)
+    response = client.post(
+        "/admin/api/model-configure",
+        json={
+            "model_id": "whisper-vulkan-base",
+            "model_type": "audio_models",
+            "backend": "whisper-server",
+            "server_path": "",
+            "model_path": "/models/ggml-base.bin",
+            "port": 8744,
+            "gpu_device": 0,
+            "load_mode": "on-request",
+        },
+    )
+
+    assert response.status_code == 200
+    assert cfg.models_data["audio_models"][0]["server_path"] == "/usr/local/bin/whisper-server"
+
+    app.dependency_overrides.clear()
+
+
+def test_model_configure_accepts_cached_gguf_whisper_server_model(monkeypatch, tmp_path):
+    from codai.admin import routes
+
+    cfg = _build_config(tmp_path)
+    monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
+    app, client = _build_admin_test_client(routes)
     response = client.post(
         "/admin/api/model-configure",
         json={
@@ -176,13 +257,10 @@ def test_model_configure_accepts_cached_gguf_whisper_server_model(monkeypatch, t
 
 def test_model_configure_defaults_missing_whisper_server_model_source_to_cached_gguf(monkeypatch, tmp_path):
     from codai.admin import routes
-    from codai.api.app import app
 
     cfg = _build_config(tmp_path)
     monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
-    app.dependency_overrides[routes.require_admin] = lambda: "admin"
-
-    client = TestClient(app)
+    app, client = _build_admin_test_client(routes)
     response = client.post(
         "/admin/api/model-configure",
         json={
@@ -217,13 +295,10 @@ def test_model_configure_defaults_missing_whisper_server_model_source_to_cached_
 
 def test_model_configure_rejects_cached_gguf_whisper_server_without_model_path(monkeypatch, tmp_path):
     from codai.admin import routes
-    from codai.api.app import app
 
     cfg = _build_config(tmp_path)
     monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
-    app.dependency_overrides[routes.require_admin] = lambda: "admin"
-
-    client = TestClient(app)
+    app, client = _build_admin_test_client(routes)
     response = client.post(
         "/admin/api/model-configure",
         json={
@@ -247,13 +322,10 @@ def test_model_configure_rejects_cached_gguf_whisper_server_without_model_path(m
 
 def test_model_configure_rejects_manual_path_whisper_server_without_model_path(monkeypatch, tmp_path):
     from codai.admin import routes
-    from codai.api.app import app
 
     cfg = _build_config(tmp_path)
     monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
-    app.dependency_overrides[routes.require_admin] = lambda: "admin"
-
-    client = TestClient(app)
+    app, client = _build_admin_test_client(routes)
     response = client.post(
         "/admin/api/model-configure",
         json={
