@@ -286,10 +286,11 @@ def execute_mode(args: argparse.Namespace, selected_mode: str) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    selected_mode = args.mode or choose_mode_interactively()
     try:
+        selected_mode = args.mode or choose_mode_interactively()
         result = execute_mode(args, selected_mode)
     except Exception as exc:
+        selected_mode = args.mode or "interactive"
         print(f"ERROR [{selected_mode}]: {exc}")
         return 1
 

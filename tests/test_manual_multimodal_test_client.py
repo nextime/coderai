@@ -564,7 +564,7 @@ def test_main_runs_selected_mode_and_prints_text(monkeypatch, capsys, tmp_path):
     captured = capsys.readouterr()
 
     assert exit_code == 0
-    assert "done" in captured.out
+    assert captured.out == "done\n"
 
 
 def test_main_prints_artifact_path_when_present(monkeypatch, capsys, tmp_path):
@@ -581,5 +581,19 @@ def test_main_prints_artifact_path_when_present(monkeypatch, capsys, tmp_path):
     captured = capsys.readouterr()
 
     assert exit_code == 0
-    assert "summary" in captured.out
-    assert str(artifact) in captured.out
+    assert captured.out == f"summary\n{artifact}\n"
+
+
+def test_main_returns_error_when_interactive_mode_selection_fails(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(
+        "tools.manual_multimodal_test_client.choose_mode_interactively",
+        lambda: (_ for _ in ()).throw(ValueError("Invalid mode selection: 99")),
+    )
+
+    from tools.manual_multimodal_test_client import main
+
+    exit_code = main(["--output-dir", str(tmp_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.out == "ERROR [interactive]: Invalid mode selection: 99\n"
