@@ -1126,7 +1126,7 @@ async function loadCachedModels(){
             ${f.in_config?(loaded
               ?`<button class="btn btn-ghost btn-sm" onclick="unloadModel(${idx})">Unload</button>`
               :`<button class="btn btn-primary btn-sm" onclick="loadModel(${idx})">Load now</button>`):''}
-            <button class="btn btn-secondary btn-sm" onclick="prefillWhisperServerFromGguf('${esc(f.path)}')">Use with whisper-server</button>
+            <button class="btn btn-secondary btn-sm" onclick='prefillWhisperServerFromGguf(${JSON.stringify(f.path)})'>Use with whisper-server</button>
             <button class="btn btn-secondary btn-sm" onclick="openCfgModal(${idx})">${f.in_config?'Configure':'Add to CoderAI'}</button>
             ${f.in_config?`<button class="btn btn-ghost btn-sm" onclick="disableModel(${idx})">Remove</button>`:''}
             <button class="btn btn-danger btn-sm" onclick="deleteModelConfirm(${idx})">Delete</button>
