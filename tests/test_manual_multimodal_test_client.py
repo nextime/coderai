@@ -4,7 +4,6 @@ from tools.manual_multimodal_test_client import (
     build_request_spec,
     build_parser,
     choose_mode_interactively,
-    ensure_sample_file,
     execute_request,
     handle_response_payload,
     parse_args,
@@ -127,21 +126,24 @@ def test_resolve_mode_config_keeps_explicit_empty_string_overrides(tmp_path):
     assert config["response_format"] == ""
 
 
-def test_ensure_sample_file_returns_existing_path_without_download(tmp_path, monkeypatch):
+def test_require_file_returns_existing_path_for_task1_sample_resolution(tmp_path):
     sample_path = tmp_path / "samples" / "transcription.wav"
     sample_path.parent.mkdir(parents=True)
     sample_path.write_bytes(b"wav-bytes")
-    calls = []
 
-    monkeypatch.setattr(
-        "tools.manual_multimodal_test_client.download_default_sample",
-        lambda path: calls.append(path),
-    )
+    from tools.manual_multimodal_test_client import _require_file
 
-    result = ensure_sample_file(str(sample_path), "--audio-file")
+    result = _require_file(str(sample_path), "--audio-file")
 
     assert result == sample_path
-    assert calls == []
+
+
+def test_manual_multimodal_client_has_no_task1_sample_download_scaffolding():
+    import tools.manual_multimodal_test_client as client
+
+    assert not hasattr(client, "SAMPLE_URLS")
+    assert not hasattr(client, "download_default_sample")
+    assert not hasattr(client, "ensure_sample_file")
 
 
 def test_build_request_spec_for_llm_uses_chat_completions_payload(tmp_path):
