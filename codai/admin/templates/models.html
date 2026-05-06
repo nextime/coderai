@@ -1051,6 +1051,25 @@ function prefillWhisperServerFromGguf(path){
   }
 }
 
+function nextWhisperServerModelId(){
+  const whisperModels = _localModels.filter(m => m.cacheType === 'whisper-server');
+  const existingIds = new Set(whisperModels.map(m => m.id || ''));
+  let suffix = 0;
+  while(existingIds.has(`whisper${suffix}`)) suffix += 1;
+  return `whisper${suffix}`;
+}
+
+function defaultWhisperServerPath(){
+  return '/usr/local/bin/whisper-server';
+}
+
+function resetWhisperServerBuilderDefaults(){
+  const modelIdInput = document.getElementById('ws-model-id');
+  const serverPathInput = document.getElementById('ws-server-path');
+  if(modelIdInput && !modelIdInput.value.trim()) modelIdInput.value = nextWhisperServerModelId();
+  if(serverPathInput && !serverPathInput.value.trim()) serverPathInput.value = defaultWhisperServerPath();
+}
+
 async function loadCachedModels(){
   _localModels = [];
   const hfEl   = document.getElementById('hf-models-list');
@@ -1142,6 +1161,7 @@ async function loadCachedModels(){
         '<th></th></tr></thead><tbody>'+rows.join('')+'</tbody></table>';
     }
     ggufEl.insertAdjacentHTML('afterend', _renderWhisperServerRows(whisperModels));
+    resetWhisperServerBuilderDefaults();
   }catch(e){
     hfEl.innerHTML = ggufEl.innerHTML = `<span class="muted small">Error: ${esc(e.message)}</span>`;
   }
@@ -1399,6 +1419,8 @@ async function addWhisperServerModel(){
     });
     const d = await r.json();
     if(!r.ok) throw new Error(d.detail || 'Failed to add whisper-server model');
+    document.getElementById('ws-model-id').value = '';
+    document.getElementById('ws-server-path').value = '';
     refreshLocal();
   }catch(e){ alert('Error: '+e.message); }
 }

@@ -603,6 +603,38 @@ def test_models_template_defines_whisper_server_gguf_prefill_helpers():
     assert "prefillWhisperServerFromGguf(path)" in template
 
 
+def test_models_template_defines_next_whisper_server_model_id_helper():
+    template = Path("codai/admin/templates/models.html").read_text()
+
+    assert "function nextWhisperServerModelId()" in template
+    assert "whisperModels.map(m => m.id || '')" in template
+    assert "while(existingIds.has(`whisper${suffix}`)) suffix += 1;" in template
+    assert "return `whisper${suffix}`;" in template
+
+
+def test_models_template_defines_whisper_server_builder_default_helpers():
+    template = Path("codai/admin/templates/models.html").read_text()
+
+    assert "function defaultWhisperServerPath()" in template
+    assert "return '/usr/local/bin/whisper-server';" in template
+    assert "function resetWhisperServerBuilderDefaults()" in template
+    assert "const modelIdInput = document.getElementById('ws-model-id');" in template
+    assert "const serverPathInput = document.getElementById('ws-server-path');" in template
+    assert "if(modelIdInput && !modelIdInput.value.trim())" in template
+    assert "if(serverPathInput && !serverPathInput.value.trim())" in template
+    assert "modelIdInput.value = nextWhisperServerModelId();" in template
+    assert "serverPathInput.value = defaultWhisperServerPath();" in template
+
+
+def test_models_template_resets_whisper_server_builder_defaults_after_refresh_and_add():
+    template = Path("codai/admin/templates/models.html").read_text()
+
+    assert "resetWhisperServerBuilderDefaults();" in template
+    assert "document.getElementById('ws-model-id').value = '';" in template
+    assert "document.getElementById('ws-server-path').value = '';" in template
+    assert "refreshLocal();" in template
+
+
 def test_models_template_submits_whisper_server_source_and_resolved_gguf_path():
     template = Path("codai/admin/templates/models.html").read_text()
 
