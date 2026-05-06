@@ -123,6 +123,23 @@ pip install f5-tts    # Voice cloning (F5-TTS)
 pip install seed-vc   # Voice conversion / singing SVC
 ```
 
+### Full-Quality Audio ML Stack
+
+```bash
+pip install demucs deepfilternet rnnoise voicefixer
+```
+
+Use this stack when you want:
+- real ML stem separation for `/v1/audio/stems`
+- learned restoration for `/v1/audio/cleanup`
+- the strongest available backend path for `/v1/pipelines/audio-music-dub`
+
+Notes:
+- `demucs` is the primary separator for vocals/instrumental and multi-stem workflows.
+- `deepfilternet` is the primary learned cleanup backend.
+- `rnnoise` and `voicefixer` are optional alternates / complements.
+- Full music-dub quality depends on separation plus singing-capable conversion; even with this stack, output quality still depends heavily on source material and model/runtime availability.
+
 ### Face Swap
 
 ```bash

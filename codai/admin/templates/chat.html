@@ -331,6 +331,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
           <div class="frow"><label class="fl" title="Removes the model's built-in safety checker. Only use with uncensored/NSFW fine-tunes.">Disable safety filter</label><input type="checkbox" id="ig-nosafe"></div>
           <button class="btn btn-primary" onclick="genImage()">Generate</button>
           <div class="progress" id="ig-prog"></div>
+          <div class="req-preview" id="ig-preview"></div>
         </div>
         <div class="gen-out" id="ig-out"><div class="gen-empty">Image will appear here</div></div>
       </div>
@@ -812,6 +813,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
           </div>
           <button class="btn btn-primary" onclick="genTTS()">Synthesize</button>
           <div class="progress" id="at-prog"></div>
+          <div class="req-preview" id="at-preview"></div>
         </div>
         <div class="gen-out" id="at-out"><div class="gen-empty">Audio will appear here</div></div>
       </div>
@@ -917,6 +919,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
           </div>
           <button class="btn btn-primary" onclick="genSTT()">Transcribe</button>
           <div class="progress" id="as-prog"></div>
+          <div class="req-preview" id="as-preview"></div>
         </div>
         <div class="gen-out" id="as-out">
           <div class="gen-out-inner"><div class="gen-empty">Transcript will appear here</div></div>
@@ -936,13 +939,15 @@ a.dl { display:inline-block; margin-top:.4rem; }
           </div>
           <div class="frow"><label class="fl">Notes</label><textarea id="amd-notes" class="fs" rows="3" placeholder="Explain whether the priority is lyric translation, singability, or preserving the original arrangement."></textarea></div>
           <div class="cap-preserve-note">
-            <strong>Current studio behavior:</strong> there is no dedicated song-dubbing request path wired here. Use this panel to assess whether the selected model exposes enough speech, subtitle, or voice capabilities for a manual workflow.
+            <strong>Current studio behavior:</strong> this panel can now run transcript-first intake through existing speech-to-text primitives, then return a truthful partial workflow plan for lyric localization.
           </div>
-          <div class="cap-note"><strong>Fallback path:</strong> transcribe lyrics, translate them, then resynthesize guide vocals or use Voice Convert on isolated vocals before recombining outside this panel. Rhythm-safe lyric adaptation and automatic mix replacement are not exposed here.</div>
-          <div class="progress" id="amd-prog">No direct backend action from this panel.</div>
+          <div class="cap-note"><strong>Fallback path:</strong> transcribe lyrics, translate/adapt them, then resynthesize guide vocals or use Voice Convert on isolated vocals before recombining outside this panel. Rhythm-safe lyric adaptation and automatic mix replacement are still not exposed here.</div>
+          <button class="btn btn-primary" onclick="genMusicDubPlan()">Analyze Music Dub Path</button>
+          <div class="progress" id="amd-prog"></div>
+          <div class="req-preview" id="amd-preview"></div>
         </div>
         <div class="gen-out" id="amd-out">
-          <div class="gen-out-inner"><div class="gen-empty">Music dubbing is surfaced as planning guidance only until a dedicated backend route exists.</div></div>
+          <div class="gen-out-inner"><div class="gen-empty">Transcript, limitations, and next-step guidance will appear here.</div></div>
         </div>
       </div>
     </div>
@@ -955,13 +960,16 @@ a.dl { display:inline-block; margin-top:.4rem; }
           <div class="frow"><label class="fl">Source audio / video</label><input type="file" id="au-file" accept="audio/*,video/*" class="fi"></div>
           <div class="frow"><label class="fl">Analysis goal</label><textarea id="au-goal" class="fs" rows="4" placeholder="Examples: summarize the meeting, extract speakers and topics, describe the soundscape, identify notable events."></textarea></div>
           <div class="cap-preserve-note">
-            <strong>Current studio behavior:</strong> understanding depends on whether the active model can at least transcribe audio. Rich semantic answering over uploaded audio is not a separate API surface in this template.
+            <strong>Current studio behavior:</strong> understanding runs as a transcript-first composed request. If a text/chat model is also selected, Studio can ask it to summarize or reason over the transcript.
           </div>
-          <div class="cap-note"><strong>Fallback path:</strong> use Audio → Transcribe first, then send the transcript into Chat for summarization, extraction, or follow-up reasoning. If the model lacks speech-to-text, this remains unavailable here.</div>
-          <div class="progress" id="au-prog">Use Transcribe + Chat as the supported path.</div>
+          <div class="cap-note"><strong>Fallback path:</strong> if no text/chat model is selected, this panel still returns the transcript so you can continue reasoning manually in Chat.</div>
+          <div class="frow"><label class="fl">Reasoning / summary model <span style="font-weight:400">(optional)</span></label><input id="au-text-model" class="fi" placeholder="model id for chat summarization"></div>
+          <button class="btn btn-primary" onclick="genAudioUnderstand()">Analyze Audio</button>
+          <div class="progress" id="au-prog"></div>
+          <div class="req-preview" id="au-preview"></div>
         </div>
         <div class="gen-out" id="au-out">
-          <div class="gen-out-inner"><div class="gen-empty">No standalone audio-understanding request is sent from this panel.</div></div>
+          <div class="gen-out-inner"><div class="gen-empty">Transcript-backed understanding will appear here.</div></div>
         </div>
       </div>
     </div>
@@ -980,13 +988,15 @@ a.dl { display:inline-block; margin-top:.4rem; }
             </select>
           </div>
           <div class="cap-preserve-note">
-            <strong>Current studio behavior:</strong> no source-separation endpoint is wired into this page. This panel is an availability shell so users can see that stem workflows are recognized but not directly executable here.
+            <strong>Native backend:</strong> Studio now sends a real <code>/v1/audio/stems</code> request. The current backend uses ffmpeg-only heuristics, so outputs are best-effort estimates rather than production-grade ML demixing.
           </div>
-          <div class="cap-note"><strong>Relevant pipeline:</strong> if you need dubbed singing or cleanup, stem separation would normally happen before Voice Convert or remix assembly. That ordering is informational only in this UI.</div>
-          <div class="progress" id="ast-prog">Unavailable without a dedicated separation backend.</div>
+          <div class="cap-note"><strong>Quality note:</strong> vocals/instrumental works best when vocals are center-panned. The 4-stem and drums/bass/other modes are broad frequency-group splits, not clean source-isolated stems.</div>
+          <button class="btn btn-primary" onclick="genStems()">Split Stems</button>
+          <div class="progress" id="ast-prog"></div>
+          <div class="req-preview" id="ast-preview"></div>
         </div>
         <div class="gen-out" id="ast-out">
-          <div class="gen-out-inner"><div class="gen-empty">Stem files are not generated from this template today.</div></div>
+          <div class="gen-out-inner"><div class="gen-empty">Separated stem artifacts will appear here.</div></div>
         </div>
       </div>
     </div>
@@ -1006,13 +1016,15 @@ a.dl { display:inline-block; margin-top:.4rem; }
             <label class="cap-toggle"><input type="checkbox" id="ac-click"> Repair clicks</label>
           </div>
           <div class="cap-preserve-note">
-            <strong>Current studio behavior:</strong> cleanup and restoration are not exposed as native requests on this page. Some speech-to-text capable models can still help inspect a noisy recording by transcribing it first.
+            <strong>Native backend:</strong> Studio now sends a real <code>/v1/audio/cleanup</code> request. The current backend chains standard ffmpeg filters, so it can improve many recordings but is not a substitute for deep restoration models.
           </div>
-          <div class="cap-note"><strong>Fallback path:</strong> use Transcribe to judge intelligibility, then perform denoise/restoration outside Studio before returning for transcription, dubbing, or voice conversion.</div>
-          <div class="progress" id="ac-prog">No cleanup request is sent from this panel.</div>
+          <div class="cap-note"><strong>Fallback path:</strong> if the result is still not intelligible, use Transcribe to assess what survived and switch to dedicated external restoration before dubbing or conversion.</div>
+          <button class="btn btn-primary" onclick="genAudioCleanup()">Clean Audio</button>
+          <div class="progress" id="ac-prog"></div>
+          <div class="req-preview" id="ac-preview"></div>
         </div>
         <div class="gen-out" id="ac-out">
-          <div class="gen-out-inner"><div class="gen-empty">Audio cleanup is presented as an unsupported surface with guidance only.</div></div>
+          <div class="gen-out-inner"><div class="gen-empty">Cleaned audio and backend limitations will appear here.</div></div>
         </div>
       </div>
     </div>
@@ -1372,6 +1384,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
           <div class="frow"><label class="fl">Dimensions (truncate, optional)</label><input type="number" id="em-dims" class="fi" placeholder="all"></div>
           <button class="btn btn-primary" onclick="genEmbeddings()">Embed</button>
           <div class="progress" id="em-prog"></div>
+          <div class="req-preview" id="em-preview"></div>
         </div>
         <div class="gen-out" id="em-out"><div class="gen-empty">Embedding vectors will appear here</div></div>
       </div>
@@ -1495,28 +1508,28 @@ const STUDIO_CAPABILITIES = {
   'aud-stems': {
     category:'audio',
     label:'Stem separation',
-    summary:'Show source-separation readiness while clearly marking that this Studio page does not expose a stem-splitting route.',
-    requires:['audio_generation'],
-    optional:['speech_to_text'],
+    summary:'Run native ffmpeg-backed stem estimation while clearly signaling that the current backend is heuristic and quality-limited.',
+    requires:[],
+    optional:['audio_generation','speech_to_text'],
     notes:[
-      'Generation capability can support later recomposition, but it does not imply source separation support.',
-      'Use this as a planning surface for dubbing or remix workflows, not as a runnable endpoint.'
+      'This endpoint is runnable, but it performs best-effort estimation rather than ML source separation.',
+      'Center-panned vocals separate more cleanly than dense or heavily stereo-processed mixes.'
     ],
-    backendPath:'unsupported shell',
-    io:'Input: mixed audio. Output: no direct split stems from this UI.'
+    backendPath:'/v1/audio/stems',
+    io:'Input: mixed audio. Output: downloadable stem estimate artifacts.'
   },
   'aud-clean': {
     category:'audio',
     label:'Audio cleanup',
-    summary:'Expose denoise and restoration as recognized needs while keeping unsupported repair operations honest.',
-    requires:['speech_to_text'],
-    optional:['audio_generation'],
+    summary:'Run native ffmpeg filter-chain cleanup for denoise and basic restoration while keeping quality and backend limits explicit.',
+    requires:[],
+    optional:['speech_to_text'],
     notes:[
-      'Transcription can help judge intelligibility even when restoration is unavailable.',
-      'Noise removal, de-click, de-hum, and mastering remain external steps unless a dedicated cleanup backend is added.'
+      'This endpoint is runnable, but it uses standard filter processing rather than deep restoration models.',
+      'Transcription remains the fastest fallback for judging intelligibility when cleanup cannot fully recover the source.'
     ],
-    backendPath:'inspection only',
-    io:'Input: noisy audio. Output: guidance and fallback recommendations only.'
+    backendPath:'/v1/audio/cleanup',
+    io:'Input: noisy audio. Output: cleaned audio artifact plus applied-operation metadata.'
   }
 };
 const SUB_CAPABILITY_RULES = {
@@ -1557,6 +1570,30 @@ const CATEGORY_SUBS = {
   audio: Object.keys(SUB_CAPABILITY_RULES).filter(sub => SUB_CAT[sub] === 'audio'),
 };
 let currentTabState = { categories:{}, subs:{} };
+let audioBackendHealth = {
+  separation: { available:false, engine:null, model:null },
+  restoration: { available:false, engine:null, model:null },
+  musicDub: { available:false, stages:[] },
+};
+
+function refreshAudioBackendHealth() {
+  audioBackendHealth = {
+    separation: {
+      available: !!(activeModel?.capabilities || []).includes('audio_to_audio'),
+      engine: !!(activeModel?.capabilities || []).includes('audio_to_audio') ? 'ml-provider' : null,
+      model: activeModel?.id || null,
+    },
+    restoration: {
+      available: !!(activeModel?.capabilities || []).includes('audio_to_audio'),
+      engine: !!(activeModel?.capabilities || []).includes('audio_to_audio') ? 'ml-provider' : null,
+      model: activeModel?.id || null,
+    },
+    musicDub: {
+      available: !!(activeModel?.capabilities || []).includes('speech_to_text') && !!(activeModel?.capabilities || []).includes('audio_to_audio'),
+      stages: ['stems', 'stt', 'translate', 'voice_convert', 'remix'],
+    },
+  };
+}
 
 function capabilitySetForModel(m) {
   return new Set((m?.capabilities || []).filter(Boolean));
@@ -1675,6 +1712,7 @@ function renderCapabilityCard(sub) {
 
 function renderCapabilityCards() {
   Object.keys(STUDIO_CAPABILITIES).forEach(renderCapabilityCard);
+  renderAudioBackendHealth();
 }
 
 function summarizeDiagnostics() {
@@ -1692,6 +1730,23 @@ function summarizeDiagnostics() {
     unavailable: details.filter(item => item.state === 'unavailable'),
     fallbackOnly: details.filter(item => item.fallbackOnly),
   };
+}
+
+function renderAudioBackendHealth() {
+  const targets = {
+    'aud-music-dub': audioBackendHealth.musicDub,
+    'aud-stems': audioBackendHealth.separation,
+    'aud-clean': audioBackendHealth.restoration,
+  };
+  Object.entries(targets).forEach(([sub, info]) => {
+    const shell = $(`cap-${sub}`);
+    if (!shell) return;
+    const extra = [];
+    if (info?.engine) extra.push(`<div class="cap-note"><strong>Runtime engine:</strong> ${escapeHtml(info.engine)}</div>`);
+    if (info?.model) extra.push(`<div class="cap-note"><strong>Runtime model:</strong> ${escapeHtml(info.model)}</div>`);
+    if (Array.isArray(info?.stages) && info.stages.length) extra.push(`<div class="cap-note"><strong>Stages:</strong> ${info.stages.map(escapeHtml).join(' → ')}</div>`);
+    if (extra.length) shell.insertAdjacentHTML('beforeend', extra.join(''));
+  });
 }
 
 function renderDiagnostics() {
@@ -1786,6 +1841,24 @@ function buildSTTHistorySummary(text, fileName) {
   return `${fileName || 'uploaded file'} · ${compactSummary(text, 100)}`;
 }
 
+function buildStemHistorySummary(mode, count, backend) {
+  const engine = backend?.engine || 'unknown';
+  const model = backend?.model ? ` · ${backend.model}` : '';
+  return `${mode} · ${count} artifact${count === 1 ? '' : 's'} · ${engine}${model}`;
+}
+
+function buildCleanupHistorySummary(applied, fileName, backend) {
+  const engine = backend?.engine || 'unknown';
+  const model = backend?.model ? ` · ${backend.model}` : '';
+  return `${fileName || 'uploaded file'} · ${(applied || []).join(', ') || 'no ops'} · ${engine}${model}`;
+}
+
+function buildMusicDubHistorySummary(transcript, translatedLyrics, backend) {
+  const engine = backend?.engine || 'pipeline';
+  const model = backend?.model ? ` · ${backend.model}` : '';
+  return `${compactSummary(transcript, 50)} · ${compactSummary(translatedLyrics, 50)} · ${engine}${model}`;
+}
+
 function buildDubFamilyLabel() {
   return val('vd-track-mode') === 'localized-mix' ? 'video dub / localized mix' : 'video dub / speech-only';
 }
@@ -1857,6 +1930,91 @@ function buildAudioPreviewData() {
     cfg_coef: fval('ag-cfg') || 3.0,
     seed: val('ag-seed') ? ival('ag-seed') : undefined,
     melody: fileOrNull('ag-melody') ? '<audio file data>' : undefined,
+    response_format: 'url',
+  });
+}
+
+function buildTTSPreviewData() {
+  return previewExportBody('/v1/audio/speech', {
+    model: activeModel?.id || '',
+    input: val('at-text'),
+    voice: val('at-voice') || undefined,
+    speed: fval('at-speed') || 1.0,
+    response_format: 'mp3',
+  });
+}
+
+function buildSTTPreviewData() {
+  return previewExportBody('/v1/audio/transcriptions', {
+    model: activeModel?.id || '',
+    file: fileOrNull('as-file') ? '<multipart audio/video file>' : undefined,
+    language: val('as-lang') || undefined,
+    prompt: val('as-prompt') || undefined,
+    response_format: 'json',
+  });
+}
+
+function buildImageGenPreviewData() {
+  return previewExportBody('/v1/images/generations', {
+    model: activeModel?.id || '',
+    prompt: val('ig-prompt'),
+    negative_prompt: val('ig-neg') || undefined,
+    size: `${ival('ig-w') || 1024}x${ival('ig-h') || 1024}`,
+    steps: ival('ig-steps') || 30,
+    guidance_scale: fval('ig-cfg') || 7.5,
+    seed: val('ig-seed') ? ival('ig-seed') : undefined,
+    n: ival('ig-n') || 1,
+    response_format: 'url',
+    safety_checker: chk('ig-nosafe') ? false : undefined,
+  });
+}
+
+function buildEmbeddingsPreviewData() {
+  const lines = val('em-text').split('\n').filter(l => l.trim());
+  const input = lines.length <= 1 ? (lines[0] || '') : lines;
+  return previewExportBody('/v1/embeddings', {
+    model: activeModel?.id || '',
+    input,
+    encoding_format: val('em-enc') || 'float',
+    dimensions: val('em-dims') ? ival('em-dims') : undefined,
+  });
+}
+
+function buildAudioUnderstandPreviewData() {
+  return previewExportBody('/v1/pipelines/audio-understand', {
+    audio: fileOrNull('au-file') ? '<audio/video file data>' : undefined,
+    audio_model: activeModel?.id || '',
+    text_model: val('au-text-model') || undefined,
+    input: val('au-goal') || undefined,
+    language: val('as-lang') || undefined,
+  });
+}
+
+function buildMusicDubPreviewData() {
+  return previewExportBody('/v1/pipelines/audio-music-dub', {
+    audio: fileOrNull('amd-file') ? '<audio/video file data>' : undefined,
+    audio_model: activeModel?.id || '',
+    source_lang: val('amd-slang') || undefined,
+    target_lang: val('amd-tlang') || undefined,
+    notes: val('amd-notes') || undefined,
+  });
+}
+
+function buildStemPreviewData() {
+  return previewExportBody('/v1/audio/stems', {
+    audio: fileOrNull('ast-file') ? '<audio/video file data>' : undefined,
+    stem_mode: val('ast-mode') || 'vocals-instrumental',
+    response_format: 'url',
+  });
+}
+
+function buildCleanupPreviewData() {
+  return previewExportBody('/v1/audio/cleanup', {
+    audio: fileOrNull('ac-file') ? '<audio/video file data>' : undefined,
+    noise_reduction: chk('ac-noise'),
+    normalize: chk('ac-level'),
+    remove_hum: chk('ac-hum'),
+    repair_clicks: chk('ac-click'),
     response_format: 'url',
   });
 }
@@ -1947,6 +2105,74 @@ const REQUEST_PREVIEW_CONFIG = {
       { label:'Seed', value:preview => preview.body.seed ?? 'random' },
     ],
   },
+  'aud-tts': {
+    containerId:'at-preview',
+    snippet:'curl',
+    build:buildTTSPreviewData,
+    fields:[
+      { label:'Model', value:preview => preview.body.model || 'none selected' },
+      { label:'Voice', value:preview => preview.body.voice || 'default' },
+      { label:'Speed', value:preview => preview.body.speed },
+      { label:'Text', value:preview => preview.body.input || 'empty' },
+    ],
+  },
+  'aud-stt': {
+    containerId:'as-preview',
+    snippet:'curl',
+    build:buildSTTPreviewData,
+    fields:[
+      { label:'Model', value:preview => preview.body.model || 'none selected' },
+      { label:'File', value:() => previewFileName('as-file') },
+      { label:'Language', value:preview => preview.body.language || 'auto' },
+      { label:'Hint', value:preview => preview.body.prompt || 'none' },
+    ],
+  },
+  'img-gen': {
+    containerId:'ig-preview',
+    snippet:'curl',
+    build:buildImageGenPreviewData,
+    fields:[
+      { label:'Model', value:preview => preview.body.model || 'none selected' },
+      { label:'Prompt', value:preview => preview.body.prompt || 'empty' },
+      { label:'Size', value:preview => preview.body.size },
+      { label:'Steps', value:preview => preview.body.steps },
+      { label:'CFG', value:preview => preview.body.guidance_scale },
+      { label:'Count', value:preview => preview.body.n },
+    ],
+  },
+  'embed': {
+    containerId:'em-preview',
+    snippet:'curl',
+    build:buildEmbeddingsPreviewData,
+    fields:[
+      { label:'Model', value:preview => preview.body.model || 'none selected' },
+      { label:'Items', value:preview => Array.isArray(preview.body.input) ? preview.body.input.length : (preview.body.input ? 1 : 0) },
+      { label:'Encoding', value:preview => preview.body.encoding_format },
+      { label:'Dimensions', value:preview => preview.body.dimensions ?? 'full' },
+    ],
+  },
+  'aud-understand': {
+    containerId:'au-preview',
+    snippet:'curl',
+    build:buildAudioUnderstandPreviewData,
+    fields:[
+      { label:'Audio model', value:preview => preview.body.audio_model || 'none selected' },
+      { label:'Reasoning model', value:preview => preview.body.text_model || 'transcript only' },
+      { label:'File', value:() => previewFileName('au-file') },
+      { label:'Goal', value:preview => preview.body.input || 'general understanding' },
+    ],
+  },
+  'aud-music-dub': {
+    containerId:'amd-preview',
+    snippet:'curl',
+    build:buildMusicDubPreviewData,
+    fields:[
+      { label:'Audio model', value:preview => preview.body.audio_model || 'none selected' },
+      { label:'File', value:() => previewFileName('amd-file') },
+      { label:'Source lang', value:preview => preview.body.source_lang || 'auto' },
+      { label:'Target lang', value:preview => preview.body.target_lang || 'none' },
+    ],
+  },
   'vid-dub': {
     containerId:'vd-preview',
     snippet:'curl',
@@ -1969,20 +2195,44 @@ function updateRequestPreview(panel) {
 }
 
 function initRequestPreviews() {
-  ['ag-prompt','ag-dur','ag-temp','ag-topk','ag-cfg','ag-melody','ag-seed','vd-src','vd-slang','vd-tlang','vd-track-mode','vd-burn','vd-preserve-voice','vd-preserve-tone','vd-preserve-timing','vd-preserve-singing','vd-lyrics']
+  ['ag-prompt','ag-dur','ag-temp','ag-topk','ag-cfg','ag-melody','ag-seed','at-text','at-voice','at-speed','as-file','as-lang','as-prompt','ig-prompt','ig-neg','ig-w','ig-h','ig-steps','ig-cfg','ig-seed','ig-n','ig-nosafe','em-text','em-enc','em-dims','au-file','au-goal','au-text-model','amd-file','amd-slang','amd-tlang','amd-notes','vd-src','vd-slang','vd-tlang','vd-track-mode','vd-burn','vd-preserve-voice','vd-preserve-tone','vd-preserve-timing','vd-preserve-singing','vd-lyrics']
     .forEach(id => {
       const el = $(id);
       if (!el) return;
       el.addEventListener('input', () => {
         if (id.startsWith('ag-')) updateRequestPreview('aud-gen');
+        if (id.startsWith('at-')) updateRequestPreview('aud-tts');
+        if (id.startsWith('as-')) updateRequestPreview('aud-stt');
+        if (id.startsWith('ig-')) updateRequestPreview('img-gen');
+        if (id.startsWith('em-')) updateRequestPreview('embed');
+        if (id.startsWith('au-')) updateRequestPreview('aud-understand');
+        if (id.startsWith('amd-')) updateRequestPreview('aud-music-dub');
+        if (id.startsWith('ast-')) updateRequestPreview('aud-stems');
+        if (id.startsWith('ac-')) updateRequestPreview('aud-clean');
         if (id.startsWith('vd-')) updateRequestPreview('vid-dub');
       });
       el.addEventListener('change', () => {
         if (id.startsWith('ag-')) updateRequestPreview('aud-gen');
+        if (id.startsWith('at-')) updateRequestPreview('aud-tts');
+        if (id.startsWith('as-')) updateRequestPreview('aud-stt');
+        if (id.startsWith('ig-')) updateRequestPreview('img-gen');
+        if (id.startsWith('em-')) updateRequestPreview('embed');
+        if (id.startsWith('au-')) updateRequestPreview('aud-understand');
+        if (id.startsWith('amd-')) updateRequestPreview('aud-music-dub');
+        if (id.startsWith('ast-')) updateRequestPreview('aud-stems');
+        if (id.startsWith('ac-')) updateRequestPreview('aud-clean');
         if (id.startsWith('vd-')) updateRequestPreview('vid-dub');
       });
     });
   updateRequestPreview('aud-gen');
+  updateRequestPreview('aud-tts');
+  updateRequestPreview('aud-stt');
+  updateRequestPreview('img-gen');
+  updateRequestPreview('embed');
+  updateRequestPreview('aud-understand');
+  updateRequestPreview('aud-music-dub');
+  updateRequestPreview('aud-stems');
+  updateRequestPreview('aud-clean');
   updateRequestPreview('vid-dub');
   renderDiagnostics();
   renderArtifactHistory();
@@ -2040,6 +2290,14 @@ function selectModel(m) {
   chatHistory = []; attachedImage = null; updateAttachBar();
   $('chat-msgs').innerHTML = `<div class="chat-empty"><h3>${m.id.split('/').pop()}</h3><p>Start below</p></div>`;
   updateRequestPreview('aud-gen');
+  updateRequestPreview('aud-tts');
+  updateRequestPreview('aud-stt');
+  updateRequestPreview('img-gen');
+  updateRequestPreview('embed');
+  updateRequestPreview('aud-understand');
+  updateRequestPreview('aud-music-dub');
+  updateRequestPreview('aud-stems');
+  updateRequestPreview('aud-clean');
   updateRequestPreview('vid-dub');
   // Update chat input placeholder to hint at routing for non-text models
   const PLACEHOLDER = {
@@ -2057,6 +2315,7 @@ function selectModel(m) {
 function updateTabs(m) {
   const caps = capabilitySetForModel(m);
   const type = m.type || 'text';
+  refreshAudioBackendHealth();
   const subStates = {};
   Object.entries(SUB_CAPABILITY_RULES).forEach(([sub, rule]) => {
     if (VIDEO_EXTRA_SUBS.includes(sub) && type === 'video' && !rule.fallbackTypes) {
@@ -3197,6 +3456,74 @@ async function genSTT() {
   } catch(e) { $('as-prog').textContent='Error: '+e.message; }
 }
 
+async function genStems() {
+  const f = fileOrNull('ast-file');
+  if (!f) { $('ast-prog').textContent='Select a source mix.'; return; }
+  $('ast-prog').textContent='Separating stems…';
+  try {
+    const body = {
+      audio: await fileToB64(f),
+      stem_mode: val('ast-mode') || 'vocals-instrumental',
+      response_format: 'url',
+    };
+    const d = await post('/v1/audio/stems', body);
+    const items = d.data || [];
+    $('ast-out').innerHTML = `<div class="gen-out-inner" style="width:100%;text-align:left">${items.map(item => {
+      const src = audSrc(item);
+      return `<div style="width:100%;background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:.75rem;margin-bottom:.6rem;box-sizing:border-box">
+        <div style="font-size:12px;font-weight:600;margin-bottom:.35rem">${escapeHtml(item.name || 'stem')} · ${escapeHtml(item.role || 'artifact')}</div>
+        <audio class="out-audio" controls src="${src}"></audio>
+        <div style="font-size:11px;color:var(--text-3);margin-top:.35rem">${escapeHtml((d.limitations || []).join(' · '))}</div>
+        <a href="${src}" download="${escapeHtml(item.name || 'stem')}.wav" class="btn btn-ghost btn-sm dl">Download</a>
+      </div>`;
+    }).join('')}</div>`;
+    pushArtifactHistory({
+      task:'Stem separation',
+      family:'audio stems',
+      model:d.backend?.engine || 'ffmpeg',
+      summary:buildStemHistorySummary(d.stem_mode, items.length, d.backend),
+      links:buildMultiArtifactLinks(items),
+    });
+    $('ast-prog').textContent=`Done ✓ ${d.backend?.quality || 'best-effort'}`;
+  } catch(e) { $('ast-prog').textContent='Error: '+e.message; }
+}
+
+async function genAudioCleanup() {
+  const f = fileOrNull('ac-file');
+  if (!f) { $('ac-prog').textContent='Select a source recording.'; return; }
+  $('ac-prog').textContent='Cleaning audio…';
+  try {
+    const body = {
+      audio: await fileToB64(f),
+      noise_reduction: chk('ac-noise'),
+      normalize: chk('ac-level'),
+      remove_hum: chk('ac-hum'),
+      repair_clicks: chk('ac-click'),
+      response_format: 'url',
+    };
+    const d = await post('/v1/audio/cleanup', body);
+    const item = d.data?.[0];
+    const src = item ? audSrc(item) : null;
+    $('ac-out').innerHTML = `<div class="gen-out-inner" style="width:100%;text-align:left">
+      <audio class="out-audio" controls src="${src}"></audio>
+      <div style="font-size:12px;color:var(--text-2);width:100%;background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:.7rem;box-sizing:border-box">
+        <strong>Applied:</strong> ${escapeHtml((d.applied || []).join(', ') || 'none')}<br>
+        <strong>Backend:</strong> ${escapeHtml(d.backend?.engine || 'ffmpeg')} · ${escapeHtml(d.backend?.quality || 'best-effort')}<br>
+        <strong>Limitations:</strong> ${escapeHtml((d.limitations || []).join(' · '))}
+      </div>
+      <a href="${src}" download="cleaned.wav" class="btn btn-ghost btn-sm dl">Download</a>
+    </div>`;
+    pushArtifactHistory({
+      task:'Audio cleanup',
+      family:'audio cleanup',
+      model:d.backend?.engine || 'ffmpeg',
+      summary:buildCleanupHistorySummary(d.applied, f.name, d.backend),
+      links: src ? [{ label:'Open', href:src }] : [],
+    });
+    $('ac-prog').textContent=`Done ✓ ${d.backend?.quality || 'best-effort'}`;
+  } catch(e) { $('ac-prog').textContent='Error: '+e.message; }
+}
+
 // ─────────────────────────────────────────────────────────────────
 //  Embeddings
 // ─────────────────────────────────────────────────────────────────
@@ -3221,6 +3548,55 @@ async function genEmbeddings() {
     $('em-out').innerHTML = `<div class="gen-out-inner" style="width:100%;text-align:left">${preview}</div>`;
     $('em-prog').textContent='Done ✓';
   } catch(e) { $('em-prog').textContent='Error: '+e.message; }
+}
+
+async function genAudioUnderstand() {
+  if (!activeModel) return;
+  const f = fileOrNull('au-file');
+  if (!f) { $('au-prog').textContent='Select an audio or video file.'; return; }
+  $('au-prog').textContent='Analyzing audio…';
+  try {
+    const d = await post('/v1/pipelines/audio-understand', {
+      audio: await fileToB64(f),
+      audio_model: activeModel.id,
+      ...(val('au-text-model') ? {text_model: val('au-text-model')} : {}),
+      ...(val('au-goal') ? {input: val('au-goal')} : {}),
+    });
+    $('au-out').innerHTML = `<div class="gen-out-inner" style="width:100%;text-align:left;gap:.75rem">
+      <div style="width:100%"><strong>Transcript</strong><pre style="white-space:pre-wrap;font-size:13px;line-height:1.6;background:var(--surface-2);padding:.75rem;border-radius:6px;width:100%;box-sizing:border-box">${escapeHtml(d.transcript || 'No transcript returned.')}</pre></div>
+      ${d.summary ? `<div style="width:100%"><strong>Summary</strong><pre style="white-space:pre-wrap;font-size:13px;line-height:1.6;background:var(--surface-2);padding:.75rem;border-radius:6px;width:100%;box-sizing:border-box">${escapeHtml(d.summary)}</pre></div>` : ''}
+    </div>`;
+    $('au-prog').textContent = d.summary ? 'Done ✓ transcript + reasoning' : 'Done ✓ transcript only';
+  } catch(e) { $('au-prog').textContent='Error: '+e.message; }
+}
+
+async function genMusicDubPlan() {
+  if (!activeModel) return;
+  const f = fileOrNull('amd-file');
+  if (!f) { $('amd-prog').textContent='Select a source song or vocal mix.'; return; }
+  $('amd-prog').textContent='Inspecting music dub path…';
+  try {
+    const d = await post('/v1/pipelines/audio-music-dub', {
+      audio: await fileToB64(f),
+      audio_model: activeModel.id,
+      ...(val('amd-slang') ? {source_lang: val('amd-slang')} : {}),
+      ...(val('amd-tlang') ? {target_lang: val('amd-tlang')} : {}),
+      ...(val('amd-notes') ? {notes: val('amd-notes')} : {}),
+    });
+    $('amd-out').innerHTML = `<div class="gen-out-inner" style="width:100%;text-align:left;gap:.75rem">
+      <div style="width:100%"><strong>Transcript</strong><pre style="white-space:pre-wrap;font-size:13px;line-height:1.6;background:var(--surface-2);padding:.75rem;border-radius:6px;width:100%;box-sizing:border-box">${escapeHtml(d.transcript || 'No transcript returned.')}</pre></div>
+      <div style="width:100%"><strong>Translated lyrics</strong><pre style="white-space:pre-wrap;font-size:13px;line-height:1.6;background:var(--surface-2);padding:.75rem;border-radius:6px;width:100%;box-sizing:border-box">${escapeHtml(d.translated_lyrics || 'No translated lyrics returned.')}</pre></div>
+      <div style="width:100%"><strong>Final mix</strong><pre style="white-space:pre-wrap;font-size:13px;line-height:1.6;background:var(--surface-2);padding:.75rem;border-radius:6px;width:100%;box-sizing:border-box">${escapeHtml(d.final_mix?.path || 'No final mix path returned.')}</pre></div>
+    </div>`;
+    pushArtifactHistory({
+      task:'Music dub',
+      family:'audio music dub',
+      model:d.backend?.model || activeModel.id,
+      summary:buildMusicDubHistorySummary(d.transcript, d.translated_lyrics, d.backend),
+      links:d.final_mix?.path ? [{ label:'Final mix', href:d.final_mix.path }] : [],
+    });
+    $('amd-prog').textContent='Done ✓ full-stage pipeline';
+  } catch(e) { $('amd-prog').textContent='Error: '+e.message; }
 }
 
 // ─────────────────────────────────────────────────────────────────

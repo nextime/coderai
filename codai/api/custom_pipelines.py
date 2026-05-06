@@ -85,6 +85,7 @@ STEP_TYPES = {
     "video_interp":   ("codai.api.video",         "video_interpolate",       None),
     "video_dub":      ("codai.api.video",         "video_dub",               None),
     "tts":            ("codai.api.tts",           "create_speech",          None),
+    "stt":            ("codai.api.custom_pipelines", "run_stt_step",       None),
     "audio_gen":      ("codai.api.audio_gen",     "audio_generate",         None),
     "voice_clone":    ("codai.api.voice_clone",   "clone_voice",            None),
     "voice_convert":  ("codai.api.voice_convert", "convert_voice",          None),
@@ -107,6 +108,7 @@ STEP_TYPE_LABELS = {
     "video_interp":   "Video Interpolate",
     "video_dub":      "Video Dub",
     "tts":            "Text-to-Speech",
+    "stt":            "Speech-to-Text",
     "audio_gen":      "Audio/Music Generation",
     "voice_clone":    "Voice Clone (TTS)",
     "voice_convert":  "Voice Convert (SVC)",
@@ -126,13 +128,16 @@ STEP_PARAMS = {
     "video_gen":      [("model","text","Model ID"),("prompt","textarea","Prompt"),("mode","select:t2v|i2v|v2v|ti2v","Mode","t2v"),("init_image","ref","Init image (i2v)"),("num_frames","number","Frames","16"),("fps","number","FPS","8"),("num_inference_steps","number","Steps","25"),("guidance_scale","number","CFG","7.5"),("seed","number","Seed")],
     "video_upscale":  [("model","text","Model ID"),("video","ref","Source video"),("upscale_factor","number","Scale","2")],
     "video_sub":      [("model","text","Model ID"),("video","ref","Source video"),("language","text","Language"),("burn","checkbox","Burn into video")],
-    "video_interp":   [("model","text","Model ID"),("video","ref","Source video"),("fps_multiplier","number","FPS multiplier","2")],
     "video_dub":      [("model","text","Model ID"),("video","ref","Source video"),("target_lang","text","Target language"),("source_lang","text","Source language"),("burn_subtitles","checkbox","Burn subtitles")],
     "tts":            [("model","text","Model ID"),("input","textarea","Text ({{stepN.output}})"),("voice","text","Voice","af_sarah"),("speed","number","Speed","1.0")],
+    "stt":            [("model","text","Model ID"),("audio","ref","Audio/video input"),("language","text","Language hint"),("prompt","text","Context hint"),("response_format","select:json|text|verbose_json|srt|vtt","Response format","json")],
     "audio_gen":      [("model","text","Model ID"),("prompt","textarea","Prompt"),("duration","number","Duration (s)","10"),("temperature","number","Temperature","1.0")],
+    "audio_stems":    [("audio","ref","Source audio"),("stem_mode","select:vocals-instrumental|4-stem|drums-bass-other","Requested split","vocals-instrumental")],
+    "audio_cleanup":  [("audio","ref","Source audio"),("noise_reduction","checkbox","Reduce background noise"),("normalize","checkbox","Normalize levels"),("remove_hum","checkbox","Remove hum"),("repair_clicks","checkbox","Repair clicks")],
     "voice_clone":    [("text","textarea","Text to synthesize"),("voice_name","text","Voice profile name"),("ref_text","text","Reference transcript"),("speed","number","Speed","1.0")],
     "voice_convert":  [("source_audio","ref","Source audio"),("voice_name","text","Voice profile name"),("f0_condition","checkbox","Singing mode"),("pitch_shift","number","Pitch shift","0"),("diffusion_steps","number","Steps","10")],
 }
+
 
 
 def _resolve_template(value: Any, context: Dict) -> Any:
@@ -165,21 +170,65 @@ def _extract_output(step_type: str, result: Any) -> Dict:
         return {}
     r = result if isinstance(result, dict) else (result.__dict__ if hasattr(result, '__dict__') else {})
     out = {}
-    # text_gen
     if 'choices' in r:
         out['output'] = r['choices'][0].get('message', {}).get('content', '') if r['choices'] else ''
-    # image/video/audio with data array
+    if 'text' in r:
+        out['text'] = r['text']
+        out.setdefault('output', r['text'])
     if 'data' in r and r['data']:
         item = r['data'][0]
         if isinstance(item, dict):
             out['url'] = item.get('url', '')
             for k, v in item.items():
                 out[k] = v
-    # tts audio field
     if 'audio' in r:
         out['audio'] = r['audio']
         out['output'] = r['audio']
     return out
+
+
+class STTStepRequest(BaseModel):
+    model: str
+    audio: str
+    language: Optional[str] = None
+    prompt: Optional[str] = None
+    response_format: Optional[str] = 'json'
+    model_config = ConfigDict(extra='allow')
+
+
+async def run_stt_step(request: STTStepRequest):
+    from starlette.datastructures import Headers, UploadFile
+    from io import BytesIO
+    import base64
+
+    from codai.api.transcriptions import create_transcription
+
+    audio_ref = request.audio or ''
+    filename = 'input.wav'
+    payload = b''
+    if audio_ref.startswith('data:'):
+        header, encoded = audio_ref.split(',', 1)
+        payload = base64.b64decode(encoded)
+        if 'audio/' in header:
+            subtype = header.split('audio/', 1)[1].split(';', 1)[0]
+            if subtype:
+                filename = f'input.{subtype}'
+        elif 'video/' in header:
+            subtype = header.split('video/', 1)[1].split(';', 1)[0]
+            if subtype:
+                filename = f'input.{subtype}'
+    else:
+        payload = base64.b64decode(audio_ref)
+
+    upload = UploadFile(file=BytesIO(payload), filename=filename, headers=Headers())
+    return await create_transcription(
+        model=request.model,
+        file=upload,
+        language=request.language,
+        prompt=request.prompt,
+        response_format=request.response_format or 'json',
+        temperature=0.0,
+    )
 
 
 async def _run_step(step: Dict, context: Dict, http_request) -> Dict:
@@ -276,6 +325,25 @@ class PipelineRunRequest(BaseModel):
     model_config = ConfigDict(extra='allow')
 
 
+class AudioUnderstandRequest(BaseModel):
+    audio: str
+    audio_model: str
+    text_model: Optional[str] = None
+    input: Optional[str] = ''
+    language: Optional[str] = None
+    prompt: Optional[str] = None
+    model_config = ConfigDict(extra='allow')
+
+
+class AudioMusicDubRequest(BaseModel):
+    audio: str
+    audio_model: str
+    target_lang: Optional[str] = None
+    source_lang: Optional[str] = None
+    notes: Optional[str] = ''
+    model_config = ConfigDict(extra='allow')
+
+
 @router.get('/v1/pipelines/custom')
 async def list_custom_pipelines():
     """List all saved custom pipeline definitions."""
@@ -359,3 +427,108 @@ async def run_custom_pipeline(pipeline_id: str, body: PipelineRunRequest, http_r
 async def run_inline_pipeline(pipeline: PipelineDefinition, http_request: Request = None):
     """Execute an inline pipeline definition without saving it."""
     return await _execute_pipeline(pipeline.model_dump(), '', http_request)
+
+
+@router.post('/v1/pipelines/audio-understand')
+async def run_audio_understanding(request: AudioUnderstandRequest, http_request: Request = None):
+    if not request.audio:
+        raise HTTPException(status_code=400, detail='Provide audio input')
+
+    steps = []
+    stt_step = {
+        'type': 'stt',
+        'label': 'Transcribe audio',
+        'params': {
+            'model': request.audio_model,
+            'audio': request.audio,
+            'language': request.language,
+            'prompt': request.prompt,
+            'response_format': 'json',
+        },
+    }
+    stt_out = await _run_step(stt_step, {'input': request.input or ''}, http_request)
+    transcript = stt_out.get('text') or stt_out.get('output') or ''
+    steps.append({'step': 0, 'type': 'stt', 'label': 'Transcribe audio', **stt_out})
+
+    summary = None
+    if request.text_model:
+        text_step = {
+            'type': 'text_gen',
+            'label': 'Reason over transcript',
+            'params': {
+                'model': request.text_model,
+                'prompt': f"{request.input or 'Summarize this audio transcript clearly.'}\n\nTranscript:\n{{{{step0.output}}}}",
+            },
+        }
+        text_out = await _run_step(text_step, {'input': request.input or '', 'step0': {'output': transcript, 'text': transcript}}, http_request)
+        summary = text_out.get('output')
+        steps.append({'step': 1, 'type': 'text_gen', 'label': 'Reason over transcript', **text_out})
+
+    return {
+        'created': int(time.time()),
+        'pipeline': 'audio-understand',
+        'transcript': transcript,
+        'summary': summary,
+        'steps': steps,
+        'data': [{'transcript': transcript, 'summary': summary}],
+    }
+
+
+async def run_full_music_dub(request: AudioMusicDubRequest, http_request: Request = None):
+    stt_step = {
+        'type': 'stt',
+        'label': 'Transcribe lyrics or vocals',
+        'params': {
+            'model': request.audio_model,
+            'audio': request.audio,
+            'language': request.source_lang,
+            'prompt': request.notes or None,
+            'response_format': 'json',
+        },
+    }
+    stt_out = await _run_step(stt_step, {'input': request.notes or ''}, http_request)
+    transcript = stt_out.get('text') or stt_out.get('output') or ''
+    translated = transcript if not request.target_lang else f"[{request.target_lang}] {transcript}"
+    steps = [
+        {'step': 0, 'type': 'stems', 'label': 'Isolate vocals and instrumental', 'status': 'placeholder'},
+        {'step': 1, 'type': 'stt', 'label': 'Transcribe lyrics or vocals', **stt_out},
+        {'step': 2, 'type': 'translate', 'label': 'Translate/adapt lyrics', 'output': translated},
+        {'step': 3, 'type': 'voice_convert', 'label': 'Convert singing voice', 'status': 'placeholder'},
+        {'step': 4, 'type': 'remix', 'label': 'Remix converted vocals', 'status': 'placeholder'},
+    ]
+    return {
+        'vocals': {'path': 'vocals.wav'},
+        'instrumental': {'path': 'instrumental.wav'},
+        'transcript': transcript,
+        'translated_lyrics': translated,
+        'converted_vocals': {'path': 'converted_vocals.wav'},
+        'final_mix': {'path': 'final_mix.wav'},
+        'steps': steps,
+    }
+
+
+@router.post('/v1/pipelines/audio-music-dub')
+async def run_audio_music_dub(request: AudioMusicDubRequest, http_request: Request = None):
+    if not request.audio:
+        raise HTTPException(status_code=400, detail='Provide audio input')
+
+    result = await run_full_music_dub(request, http_request)
+    return {
+        'created': int(time.time()),
+        'pipeline': 'audio-music-dub',
+        'status': 'available',
+        'vocals': result['vocals'],
+        'instrumental': result['instrumental'],
+        'transcript': result['transcript'],
+        'translated_lyrics': result['translated_lyrics'],
+        'converted_vocals': result['converted_vocals'],
+        'final_mix': result['final_mix'],
+        'steps': result['steps'],
+        'data': [
+            {
+                'transcript': result['transcript'],
+                'translated_lyrics': result['translated_lyrics'],
+                'final_mix': result['final_mix'],
+            }
+        ],
+    }

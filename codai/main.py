@@ -580,6 +580,16 @@ def main():
     if global_file_path:
         set_audiogen_file_path(global_file_path)
 
+    from codai.api.audio_stems import set_global_args as set_astems_global_args, set_global_file_path as set_astems_file_path
+    set_astems_global_args(global_args)
+    if global_file_path:
+        set_astems_file_path(global_file_path)
+
+    from codai.api.audio_clean import set_global_args as set_aclean_global_args, set_global_file_path as set_aclean_file_path
+    set_aclean_global_args(global_args)
+    if global_file_path:
+        set_aclean_file_path(global_file_path)
+
     # Set voice clone module global args
     from codai.api.voice_clone import set_global_args as set_vc_global_args, set_global_file_path as set_vc_file_path
     set_vc_global_args(global_args)

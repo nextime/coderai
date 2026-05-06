@@ -15,6 +15,12 @@
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 # codai.api - FastAPI application module
-from .app import app
 
 __all__ = ['app']
+
+
+def __getattr__(name):
+    if name == 'app':
+        from .app import app
+        return app
+    raise AttributeError(name)
