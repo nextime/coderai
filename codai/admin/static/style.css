@@ -188,6 +188,22 @@ td code{font-family:var(--mono);font-size:11.5px;background:var(--raised);paddin
 .modal-close{background:none;border:none;color:var(--text-3);cursor:pointer;font-size:1.125rem;line-height:1;padding:.125rem;border-radius:3px;transition:color .1s}
 .modal-close:hover{color:var(--text)}
 .modal-body{padding:1.125rem}
+.donate-modal-box{max-width:520px}
+.nav-donate-btn{cursor:pointer;font-family:inherit;font-size:inherit;border:none}
+.donate-tagline{font-size:13px;color:var(--text-2);margin:0 0 1.25rem;line-height:1.55}
+.donate-coins{display:flex;gap:1rem}
+.donate-coin{flex:1;display:flex;flex-direction:column;align-items:center;gap:.625rem;padding:.875rem;background:var(--raised);border:1px solid var(--border);border-radius:8px}
+.donate-coin-header{display:flex;align-items:center;gap:.375rem}
+.donate-coin-icon{font-size:1rem;font-weight:700}
+.donate-coin-btc{color:#f7931a}
+.donate-coin-eth{color:#627eea}
+.donate-coin-name{font-size:13px;font-weight:600}
+.donate-qr{border-radius:6px;border:1px solid var(--border);background:#fff;padding:4px}
+.donate-addr-wrap{display:flex;align-items:center;gap:.375rem;width:100%}
+.donate-addr{flex:1;font-family:var(--mono);font-size:9.5px;color:var(--accent);word-break:break-all;line-height:1.4}
+.donate-copy{flex-shrink:0;background:none;border:1px solid var(--border);border-radius:4px;cursor:pointer;padding:.2rem .35rem;font-size:.8rem;color:var(--text-2);transition:color .1s,border-color .1s}
+.donate-copy:hover{color:var(--text);border-color:var(--border-2)}
+@media(max-width:480px){.donate-coins{flex-direction:column}}
 
 /* ── Tabs ────────────────────────────────────────────────────────── */
 .tabs{display:flex;gap:1px;border-bottom:1px solid var(--border);margin-bottom:1.25rem}

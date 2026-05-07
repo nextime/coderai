@@ -29,6 +29,7 @@
         <a href="/admin/users" class="nav-link {% if '/users' in request.url.path %}active{% endif %}">Users</a>
         <a href="/admin/settings" class="nav-link {% if '/settings' in request.url.path %}active{% endif %}">Settings</a>
         {% endif %}
+        <button class="nav-link nav-donate-btn" onclick="document.getElementById('donateModal').classList.add('show')">Donate</button>
       </div>
     </div>
     <div class="topnav-right">
@@ -38,6 +39,51 @@
     </div>
   </div>
 </nav>
+
+<div class="modal" id="donateModal" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="modal-box donate-modal-box">
+    <div class="modal-head">
+      <span class="modal-title">Support CoderAI</span>
+      <button class="modal-close" onclick="document.getElementById('donateModal').classList.remove('show')">&times;</button>
+    </div>
+    <div class="modal-body">
+      <p class="donate-tagline">CoderAI is free and open source. If you find it useful, consider supporting its development with a crypto donation — every bit helps!</p>
+      <div class="donate-coins">
+        <div class="donate-coin">
+          <div class="donate-coin-header">
+            <span class="donate-coin-icon donate-coin-btc">&#₿;</span>
+            <span class="donate-coin-name">Bitcoin (BTC)</span>
+          </div>
+          <img class="donate-qr" src="https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=bitcoin:bc1qcpt2uutqkz4456j5r78rjm3gwq03h5fpwmcc5u" alt="BTC QR code" width="160" height="160">
+          <div class="donate-addr-wrap">
+            <code class="donate-addr" id="btcAddr">bc1qcpt2uutqkz4456j5r78rjm3gwq03h5fpwmcc5u</code>
+            <button class="donate-copy" onclick="donateCopy('btcAddr',this)" title="Copy">&#128203;</button>
+          </div>
+        </div>
+        <div class="donate-coin">
+          <div class="donate-coin-header">
+            <span class="donate-coin-icon donate-coin-eth">&#9830;</span>
+            <span class="donate-coin-name">Ethereum (ETH)</span>
+          </div>
+          <img class="donate-qr" src="https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=ethereum:0xdA6dAb526515b5cb556d20269207D43fcc760E51" alt="ETH QR code" width="160" height="160">
+          <div class="donate-addr-wrap">
+            <code class="donate-addr" id="ethAddr">0xdA6dAb526515b5cb556d20269207D43fcc760E51</code>
+            <button class="donate-copy" onclick="donateCopy('ethAddr',this)" title="Copy">&#128203;</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+function donateCopy(id, btn) {
+  navigator.clipboard.writeText(document.getElementById(id).textContent).then(function() {
+    var orig = btn.innerHTML;
+    btn.innerHTML = '&#10003;';
+    setTimeout(function(){ btn.innerHTML = orig; }, 1500);
+  });
+}
+</script>
 <main class="main">
 {% endif %}
 
