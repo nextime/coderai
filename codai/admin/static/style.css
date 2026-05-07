@@ -175,6 +175,7 @@ td code{font-family:var(--mono);font-size:11.5px;background:var(--raised);paddin
 .badge-admin{background:var(--accent-s);color:#A5B4FC;border:1px solid rgba(99,102,241,.2)}
 .badge-user{background:var(--raised);color:var(--text-3);border:1px solid var(--border)}
 .badge-ok{background:rgba(52,211,153,.08);color:var(--green);border:1px solid rgba(52,211,153,.2)}
+.badge-warn{background:rgba(251,191,36,.08);color:#f59e0b;border:1px solid rgba(251,191,36,.2)}
 .badge-danger{background:rgba(248,113,113,.08);color:var(--red);border:1px solid rgba(248,113,113,.2)}
 
 /* ── Modals ──────────────────────────────────────────────────────── */

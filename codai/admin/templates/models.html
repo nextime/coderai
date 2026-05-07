@@ -468,6 +468,7 @@
           </label>
           <input type="number" id="cfg-max-instances" class="form-input" min="1" step="1" value="1" oninput="_updatePreloadAllVisibility()">
           <span style="font-size:11px;color:var(--text-3)">Parallel copies in VRAM</span>
+          <span id="cfg-instances-status" style="font-size:11px;color:var(--accent);display:none;margin-top:.2rem"></span>
         </div>
       </div>
       <div id="cfg-preload-all-row" style="display:none;margin-top:.5rem">
@@ -1213,12 +1214,13 @@ async function loadCachedModels(){
           capabilities:m.capabilities||[]});
         const loaded = _loadedKeys.has(m.id) || [..._loadedKeys].some(k=>k.endsWith(':'+m.id)||k===m.id);
         const capBadges = fmtCapabilities(m.capabilities||[]);
+        const instBadgeHf = m.in_config ? _instanceBadge([m.id], (m.settings||{}).max_instances||1) : '';
         return `<tr style="border-top:1px solid var(--border)">
           <td style="padding:.4rem .25rem;font-family:monospace;font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(m.id)}">${esc(m.id)}</td>
           <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${fmtGB(m.size_gb)}</td>
           <td style="text-align:right;padding:.4rem .25rem;color:var(--text-2)">${m.file_count}</td>
           <td style="padding:.4rem .25rem;font-size:11px">${capBadges||'<span class="muted small">—</span>'}</td>
-          <td style="text-align:center;padding:.4rem .25rem">${m.in_config?'<span class="badge badge-ok">enabled</span>':'<span class="muted small">—</span>'}</td>
+          <td style="text-align:center;padding:.4rem .25rem">${m.in_config?`<span class="badge badge-ok">enabled</span>${instBadgeHf?'<br>'+instBadgeHf:''}`:' <span class="muted small">—</span>'}</td>
           <td style="padding:.4rem .25rem;text-align:right;white-space:nowrap">
             ${m.in_config?(loaded
               ?`<button class="btn btn-ghost btn-sm" onclick="unloadModel(${idx})">Unload</button>`
@@ -1266,6 +1268,7 @@ async function loadCachedModels(){
           [..._loadedKeys].some(k=>k.endsWith(':'+primary.path)||k.endsWith(':'+primary.filename));
         const capBadges = fmtCapabilities(primary.capabilities||[]);
         const in_config = files.some(f=>f.in_config);
+        const instBadgeGguf = in_config ? _instanceBadge([primary.path, primary.filename], (primary.settings||{}).max_instances||1) : '';
         // Quant badges
         const quantBadges = files.length > 1
           ? files.map(f=>{
@@ -1278,7 +1281,7 @@ async function loadCachedModels(){
           <td style="padding:.4rem .25rem;font-family:monospace;font-size:11px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(primary.filename)}">${esc(base)}<br>${quantBadges}</td>
           <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${fmtGB(primary.size_gb)}</td>
           <td style="padding:.4rem .25rem;font-size:11px">${capBadges||'<span class="muted small">—</span>'}</td>
-          <td style="text-align:center;padding:.4rem .25rem">${in_config?'<span class="badge badge-ok">enabled</span>':'<span class="muted small">—</span>'}</td>
+          <td style="text-align:center;padding:.4rem .25rem">${in_config?`<span class="badge badge-ok">enabled</span>${instBadgeGguf?'<br>'+instBadgeGguf:''}`:' <span class="muted small">—</span>'}</td>
           <td style="padding:.4rem .25rem;text-align:right;white-space:nowrap">
             ${in_config?(loaded
               ?`<button class="btn btn-ghost btn-sm" onclick="unloadModel(${idx})">Unload</button>`
@@ -1326,12 +1329,40 @@ function getWhisperServerModelPath(){
 }
 
 let _loadedKeys = new Set();
+let _instanceInfo = {};   // loaded_key -> {loaded: N, max: N}
 
 async function refreshLoadedStatus(){
   try{
     const r = await fetch('/admin/api/model-loaded-status');
-    if(r.ok){ const d = await r.json(); _loadedKeys = new Set(d.loaded||[]); }
+    if(r.ok){
+      const d = await r.json();
+      _loadedKeys = new Set(d.loaded||[]);
+      _instanceInfo = d.instances || {};
+    }
   }catch{}
+}
+
+function _findLoadedKey(paths){
+  for(const p of paths){
+    if(_instanceInfo[p]) return p;
+    for(const k of Object.keys(_instanceInfo)){
+      if(k === p || k.endsWith(':'+p)) return k;
+    }
+  }
+  return null;
+}
+
+function _instanceBadge(lookupPaths, maxCfg){
+  if(!maxCfg || maxCfg <= 1) return '';
+  const instKey = _findLoadedKey(lookupPaths);
+  const info = instKey ? _instanceInfo[instKey] : null;
+  const loadedCount = info ? info.loaded : 0;
+  const maxCount = info ? info.max : maxCfg;
+  if(loadedCount === 0){
+    return `<span class="badge badge-user" style="font-size:10px" title="${maxCount} instances configured">×${maxCount} inst.</span>`;
+  }
+  const cls = loadedCount >= maxCount ? 'badge-ok' : 'badge-warn';
+  return `<span class="badge ${cls}" style="font-size:10px" title="${loadedCount} of ${maxCount} instances loaded">${loadedCount}/${maxCount} inst.</span>`;
 }
 
 async function refreshLocal(){
@@ -1576,6 +1607,18 @@ function openCfgModal(idx){
   document.getElementById('cfg-max-instances').value = s.max_instances != null ? s.max_instances : 1;
   document.getElementById('cfg-preload-all-instances').checked = !!s.preload_all_instances;
   _updatePreloadAllVisibility();
+  const instStatusEl = document.getElementById('cfg-instances-status');
+  if(instStatusEl){
+    const instKey = _findLoadedKey([m.path]);
+    const info = instKey ? _instanceInfo[instKey] : null;
+    if(info && info.max > 1){
+      instStatusEl.textContent = `Currently loaded: ${info.loaded}/${info.max} instances`;
+      instStatusEl.style.display = 'block';
+    } else {
+      instStatusEl.textContent = '';
+      instStatusEl.style.display = 'none';
+    }
+  }
   document.getElementById('cfg-max-gpu').value = s.max_gpu_percent != null ? s.max_gpu_percent : '';
   document.getElementById('cfg-ram-gb').value = s.manual_ram_gb != null ? s.manual_ram_gb : '';
   document.getElementById('cfg-4bit').checked = !!s.load_in_4bit;

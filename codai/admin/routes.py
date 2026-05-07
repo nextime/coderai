@@ -1225,9 +1225,26 @@ async def api_model_disable(request: Request, username: str = Depends(require_ad
 
 @router.get("/admin/api/model-loaded-status")
 async def api_model_loaded_status(username: str = Depends(require_admin)):
-    """Return the set of model keys currently loaded in VRAM."""
+    """Return loaded model keys with per-model instance pool info."""
     from codai.models.manager import multi_model_manager
-    return {"loaded": list(multi_model_manager.models.keys())}
+    loaded = list(multi_model_manager.models.keys())
+
+    instance_pools = {}
+    for key, pool in multi_model_manager.model_pools.items():
+        instance_pools[key] = {"loaded": pool.count, "max": pool.max_instances}
+
+    configured_max = {}
+    if config_manager:
+        for cat in ("text_models", "image_models", "audio_models", "vision_models",
+                    "tts_models", "gguf_models", "video_models", "audio_gen_models", "embedding_models"):
+            for m in config_manager.models_data.get(cat, []):
+                if isinstance(m, dict):
+                    path = m.get("path") or m.get("id") or ""
+                    max_inst = m.get("max_instances", 1)
+                    if path and max_inst and int(max_inst) > 1:
+                        configured_max[path] = int(max_inst)
+
+    return {"loaded": loaded, "instances": instance_pools, "configured_max": configured_max}
 
 
 @router.post("/admin/api/model-load")
