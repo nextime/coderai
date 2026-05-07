@@ -239,6 +239,8 @@ def choose_mode_interactively() -> str:
     for idx, mode in enumerate(MODES, start=1):
         print(f"{idx}. {mode}")
     raw = input("Choose mode: ").strip()
+    if raw in MODES:
+        return raw
     selected = int(raw)
     if selected < 1 or selected > len(MODES):
         raise ValueError(f"Invalid mode selection: {raw}")

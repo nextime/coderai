@@ -73,6 +73,7 @@
   font-size:9px; font-weight:700; letter-spacing:.04em; text-transform:uppercase;
   background:var(--surface-3,#333); color:var(--text-2);
 }
+.t1btn.state-ready .tab-status, .t2btn.state-ready .tab-status { background:#0d2e18; color:#4ade80; }
 .t1btn.state-partial .tab-status, .t2btn.state-partial .tab-status { background:#3a2510; color:#f0c060; }
 .t1btn.state-unavailable .tab-status, .t2btn.state-unavailable .tab-status { background:var(--surface-2); color:var(--text-3); }
 .t1btn.active .tab-status { background:rgba(255,255,255,.18); color:#fff; }
@@ -173,6 +174,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
   font-size:10px; border-radius:999px; padding:.16rem .45rem;
   background:var(--surface-2); color:var(--text-2); border:1px solid var(--border);
 }
+.cap-chip.ok { background:#0d2e18; color:#4ade80; border-color:transparent; }
 .cap-chip.warn { background:#3a2510; color:#f0c060; border-color:transparent; }
 .cap-chip.dim { opacity:.72; }
 .cap-missing, .cap-note { font-size:12px; color:var(--text-2); }
@@ -1494,7 +1496,7 @@ const SUB_PANEL_ALIAS = {
 // Video models also enable all video sub-tabs
 const VIDEO_EXTRA_SUBS = ['vid-ti2v', 'vid-dub', 'vid-v2v', 'vid-sub', 'vid-interp', 'vid-up', 'vid-faceswap', 'vid-outfit'];
 const TAB_STATE = {
-  available: { label:'', className:'' },
+  available: { label:'Ready', className:'state-ready' },
   partial: { label:'Partial', className:'state-partial' },
   unavailable: { label:'Unavailable', className:'state-unavailable' },
 };
@@ -1680,7 +1682,7 @@ function evaluateCategoryState(cat, subStates, caps, type) {
 
 function setTabVisualState(btn, state) {
   if (!btn) return;
-  btn.classList.remove('state-partial', 'state-unavailable');
+  btn.classList.remove('state-ready', 'state-partial', 'state-unavailable');
   const def = TAB_STATE[state] || TAB_STATE.unavailable;
   if (def.className) btn.classList.add(def.className);
   const badge = btn.querySelector('.tab-status');
@@ -1736,8 +1738,8 @@ function renderCapabilityCard(sub) {
   shell.classList.remove('state-partial', 'state-unavailable');
   if (details.availability === 'partial') shell.classList.add('state-partial');
   if (details.availability === 'unavailable') shell.classList.add('state-unavailable');
-  const availabilityLabel = details.availability === 'available' ? 'Available' : details.availability === 'partial' ? 'Partial' : 'Unavailable';
-  const availabilityClass = details.availability === 'available' ? '' : details.availability === 'partial' ? ' warn' : ' dim';
+  const availabilityLabel = details.availability === 'available' ? 'Ready' : details.availability === 'partial' ? 'Partial' : 'Unavailable';
+  const availabilityClass = details.availability === 'available' ? ' ok' : details.availability === 'partial' ? ' warn' : ' dim';
   const missingBits = [];
   if (details.missingRequired.length) missingBits.push(`<div class="cap-missing"><strong>Missing required:</strong> ${details.missingRequired.join(', ')}</div>`);
   if (details.missingOptional.length) missingBits.push(`<div class="cap-missing"><strong>Limited without:</strong> ${details.missingOptional.join(', ')}</div>`);
@@ -2138,15 +2140,18 @@ function buildDubPreviewData() {
 }
 
 function buildCodeSnippet(kind, preview) {
+  const origin = window.location.hostname === '0.0.0.0'
+    ? window.location.origin.replace('0.0.0.0', '127.0.0.1')
+    : window.location.origin;
   if (kind === 'curl') {
-    return `curl -X POST http://localhost:8000${preview.endpoint} \\
+    return `curl -X POST ${origin}${preview.endpoint} \\
   -H "Content-Type: application/json" \\
   -d '${preview.json.replace(/'/g, "'\\''")}'`;
   }
   if (kind === 'python') {
-    return `import requests\n\npayload = ${preview.json}\nresponse = requests.post(\n    "http://localhost:8000${preview.endpoint}",\n    json=payload,\n    timeout=300,\n)\nprint(response.json())`;
+    return `import requests\n\npayload = ${preview.json}\nresponse = requests.post(\n    "${origin}${preview.endpoint}",\n    json=payload,\n    timeout=300,\n)\nprint(response.json())`;
   }
-  return `const payload = ${preview.json};\nconst response = await fetch("${preview.endpoint}", {\n  method: "POST",\n  headers: { "Content-Type": "application/json" },\n  body: JSON.stringify(payload),\n});\nconst data = await response.json();\nconsole.log(data);`;
+  return `const payload = ${preview.json};\nconst response = await fetch("${origin}${preview.endpoint}", {\n  method: "POST",\n  headers: { "Content-Type": "application/json" },\n  body: JSON.stringify(payload),\n});\nconst data = await response.json();\nconsole.log(data);`;
 }
 
 function renderRequestPreview(panel, config) {

@@ -357,6 +357,17 @@ class SessionManager:
         self._save_auth_data(auth_data)
         return True
     
+    def verify_token(self, token: str) -> bool:
+        """Verify an API bearer token."""
+        if not token:
+            return False
+        auth_data = self._load_auth_data()
+        for t in auth_data.get("tokens", []):
+            stored = t.get("token", "")
+            if stored and hmac.compare_digest(stored, token):
+                return True
+        return False
+
     def delete_user(self, username: str) -> bool:
         """Delete a user.
         

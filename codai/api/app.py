@@ -105,9 +105,10 @@ from codai.admin.routes import router as admin_router
 
 # Import and add middleware
 from codai.api.log import log_requests
-from codai.api.ratelimit import RateLimitMiddleware
+from codai.api.ratelimit import RateLimitMiddleware, BearerAuthMiddleware
 app.middleware("http")(log_requests)
 app.add_middleware(RateLimitMiddleware)
+app.add_middleware(BearerAuthMiddleware)
 
 # Mount static files for admin dashboard
 from fastapi.staticfiles import StaticFiles

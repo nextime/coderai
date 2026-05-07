@@ -31,6 +31,45 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    """Reject /v1/ API requests that lack a valid Bearer token or active web session."""
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if not path.startswith("/v1/"):
+            return await call_next(request)
+
+        from codai.admin import routes as _admin_routes
+        sm = _admin_routes.session_manager
+        if sm is None:
+            return await call_next(request)
+
+        # Accept a valid Bearer token
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+            if sm.verify_token(token):
+                return await call_next(request)
+
+        # Accept a valid web session cookie (logged-in browser user)
+        cookie = request.cookies.get("session", "")
+        if cookie.endswith(".MUST_CHANGE"):
+            cookie = cookie[:-12]
+        if cookie and sm.validate_session(cookie):
+            return await call_next(request)
+
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": {
+                    "message": "Invalid API key. Provide a valid Bearer token.",
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key",
+                }
+            },
+        )
+
+
 # Per-route-prefix defaults: (max_requests, window_seconds)
 _DEFAULT_LIMITS: Dict[str, Tuple[int, int]] = {
     "/v1/chat/completions": (60, 60),
