@@ -51,6 +51,31 @@ router = APIRouter()
 global_args = None
 global_file_path = None
 
+# =============================================================================
+# Video generation progress tracking
+# =============================================================================
+_vid_progress: dict = {
+    "current": 0, "total": 0, "active": False,
+    "started_at": 0.0, "it_per_s": 0.0,
+}
+
+def _vid_progress_reset(total: int):
+    _vid_progress["current"] = 0
+    _vid_progress["total"] = total
+    _vid_progress["active"] = True
+    _vid_progress["started_at"] = time.monotonic()
+    _vid_progress["it_per_s"] = 0.0
+
+def _vid_progress_done():
+    _vid_progress["current"] = _vid_progress["total"]
+    _vid_progress["active"] = False
+
+def _vid_progress_step(step: int):
+    _vid_progress["current"] = step
+    elapsed = time.monotonic() - _vid_progress["started_at"]
+    if elapsed > 0 and step > 0:
+        _vid_progress["it_per_s"] = round(step / elapsed, 2)
+
 
 def set_global_args(args):
     global global_args
@@ -322,6 +347,17 @@ def _generate_video(pipe, request: VideoGenerationRequest):
     kw.setdefault('guidance_scale', 7.5)
     kw.setdefault('num_frames', 16)
 
+    _vid_progress_reset(kw['num_inference_steps'])
+
+    def _vid_step_cb(pipe, step_index, timestep, callback_kwargs):
+        _vid_progress_step(step_index + 1)
+        return callback_kwargs
+
+    try:
+        kw['callback_on_step_end'] = _vid_step_cb
+    except Exception:
+        pass
+
     _apply_camera_motion(kw, request.camera_motion)
 
     char_images, char_names = _resolve_character_inputs(request)
@@ -355,6 +391,7 @@ def _generate_video(pipe, request: VideoGenerationRequest):
             kw['strength'] = request.strength
 
     frames = _run_pipeline(pipe, kw)
+    _vid_progress_done()
     return frames, fps
 
 
@@ -782,6 +819,25 @@ def _translate_srt(srt_path: str, target_lang: str, temps: list) -> str:
 
 
 # =============================================================================
+# Progress endpoint
+# =============================================================================
+
+@router.get("/v1/video/progress")
+async def get_video_progress():
+    """Return current video generation step progress including speed."""
+    elapsed = time.monotonic() - _vid_progress["started_at"] if _vid_progress["active"] else 0.0
+    return {
+        "current":  _vid_progress["current"],
+        "total":    _vid_progress["total"],
+        "active":   _vid_progress["active"],
+        "pct":      int(_vid_progress["current"] / _vid_progress["total"] * 100)
+                    if _vid_progress["total"] > 0 else 0,
+        "it_per_s": _vid_progress["it_per_s"],
+        "elapsed":  round(elapsed, 1),
+    }
+
+
+# =============================================================================
 # Main generation endpoint
 # =============================================================================
 
@@ -836,6 +892,7 @@ async def video_generations(request: VideoGenerationRequest,
         frames, fps = await asyncio.get_event_loop().run_in_executor(
             None, _generate_video, pipe, request)
     except Exception as e:
+        _vid_progress_done()
         raise HTTPException(status_code=500, detail=f"Video generation failed: {e}")
 
     # Encode raw frames to MP4

@@ -37,6 +37,32 @@ router = APIRouter()
 global_args = None
 global_file_path = None
 
+# =============================================================================
+# Audio generation progress tracking
+# =============================================================================
+_aud_progress: dict = {
+    "current": 0, "total": 0, "active": False,
+    "started_at": 0.0, "it_per_s": 0.0, "unit": "it",
+}
+
+def _aud_progress_reset(total: int, unit: str = "it"):
+    _aud_progress["current"] = 0
+    _aud_progress["total"] = total
+    _aud_progress["active"] = True
+    _aud_progress["started_at"] = time.monotonic()
+    _aud_progress["it_per_s"] = 0.0
+    _aud_progress["unit"] = unit
+
+def _aud_progress_done():
+    _aud_progress["current"] = max(_aud_progress["current"], _aud_progress["total"])
+    _aud_progress["active"] = False
+
+def _aud_progress_step(step: int):
+    _aud_progress["current"] = step
+    elapsed = time.monotonic() - _aud_progress["started_at"]
+    if elapsed > 0 and step > 0:
+        _aud_progress["it_per_s"] = round(step / elapsed, 2)
+
 
 def set_global_args(args):
     global global_args
@@ -124,6 +150,8 @@ def _generate_audio(pipe, model_name: str, request: AudioGenerationRequest):
             temperature=request.temperature,
             cfg_coef=request.cfg_coef,
         )
+        # MusicGen/AudioGen generate in one shot — track elapsed only
+        _aud_progress_reset(0, unit="s")
         if request.melody and model_type == 'musicgen':
             import torchaudio, torch
             raw = _decode_b64_or_url(request.melody)
@@ -135,10 +163,18 @@ def _generate_audio(pipe, model_name: str, request: AudioGenerationRequest):
         sr = pipe.sample_rate
 
     elif model_type == 'audioldm':
+        num_steps = 50
+        _aud_progress_reset(num_steps, unit="it")
+
+        def _aud_step_cb(pipe, step_index, timestep, callback_kwargs):
+            _aud_progress_step(step_index + 1)
+            return callback_kwargs
+
         result = pipe(
             request.prompt,
-            num_inference_steps=50,
+            num_inference_steps=num_steps,
             audio_length_in_s=request.duration,
+            callback_on_step_end=_aud_step_cb,
         )
         audio_np = result.audios[0]
         sr = 16000
@@ -160,6 +196,23 @@ def _decode_b64_or_url(data: str) -> bytes:
         with urllib.request.urlopen(data, timeout=30) as r:
             return r.read()
     return base64.b64decode(data)
+
+
+@router.get("/v1/audio/progress")
+async def get_audio_progress():
+    """Return current audio generation progress including speed."""
+    elapsed = time.monotonic() - _aud_progress["started_at"] if _aud_progress["active"] else 0.0
+    total = _aud_progress["total"]
+    current = _aud_progress["current"]
+    return {
+        "current":  current,
+        "total":    total,
+        "active":   _aud_progress["active"],
+        "pct":      int(current / total * 100) if total > 0 else 0,
+        "it_per_s": _aud_progress["it_per_s"],
+        "elapsed":  round(elapsed, 1),
+        "unit":     _aud_progress["unit"],
+    }
 
 
 @router.post("/v1/audio/generate", response_model=AudioGenerationResponse)
@@ -196,7 +249,10 @@ async def audio_generate(request: AudioGenerationRequest, http_request: Request 
         audio_bytes, ext = await asyncio.get_event_loop().run_in_executor(
             None, _generate_audio, pipe, model_name, request)
     except Exception as e:
+        _aud_progress_done()
         raise HTTPException(status_code=500, detail=f"Audio generation failed: {e}")
+    finally:
+        _aud_progress_done()
 
     result = _save_audio_response(audio_bytes, ext, http_request)
 

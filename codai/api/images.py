@@ -118,12 +118,19 @@ queue_flags = {}
 # =============================================================================
 # Generation progress tracking
 # =============================================================================
-_gen_progress: dict = {"current": 0, "total": 0, "active": False}
+import time as _time
+
+_gen_progress: dict = {
+    "current": 0, "total": 0, "active": False,
+    "started_at": 0.0, "it_per_s": 0.0,
+}
 
 def _progress_reset(total: int):
     _gen_progress["current"] = 0
     _gen_progress["total"] = total
     _gen_progress["active"] = True
+    _gen_progress["started_at"] = _time.monotonic()
+    _gen_progress["it_per_s"] = 0.0
 
 def _progress_done():
     _gen_progress["current"] = _gen_progress["total"]
@@ -131,6 +138,9 @@ def _progress_done():
 
 def _progress_step(step: int):
     _gen_progress["current"] = step
+    elapsed = _time.monotonic() - _gen_progress["started_at"]
+    if elapsed > 0 and step > 0:
+        _gen_progress["it_per_s"] = round(step / elapsed, 2)
 
 
 # =============================================================================
@@ -884,13 +894,16 @@ router = APIRouter()
 
 @router.get("/v1/images/progress")
 async def get_image_progress():
-    """Return current image generation step progress."""
+    """Return current image generation step progress including speed."""
+    elapsed = _time.monotonic() - _gen_progress["started_at"] if _gen_progress["active"] else 0.0
     return {
-        "current": _gen_progress["current"],
-        "total":   _gen_progress["total"],
-        "active":  _gen_progress["active"],
-        "pct": int(_gen_progress["current"] / _gen_progress["total"] * 100)
-               if _gen_progress["total"] > 0 else 0,
+        "current":  _gen_progress["current"],
+        "total":    _gen_progress["total"],
+        "active":   _gen_progress["active"],
+        "pct":      int(_gen_progress["current"] / _gen_progress["total"] * 100)
+                    if _gen_progress["total"] > 0 else 0,
+        "it_per_s": _gen_progress["it_per_s"],
+        "elapsed":  round(elapsed, 1),
     }
 
 

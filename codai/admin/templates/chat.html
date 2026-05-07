@@ -797,6 +797,10 @@ a.dl { display:inline-block; margin-top:.4rem; }
         <div id="vi-dialog-section"></div>
         <button class="btn btn-primary" onclick="genVideo('i2v')">Animate</button>
         <div class="progress" id="vi-prog"></div>
+        <div class="gen-progress-wrap" id="vi-pbar-wrap">
+          <div class="gen-progress-bar-bg"><div class="gen-progress-bar-fill" id="vi-pbar-fill"></div></div>
+          <div class="gen-progress-label" id="vi-pbar-label"></div>
+        </div>
       </div>
       <div class="gen-out" id="vi-out"><div class="gen-empty">Animated video will appear here</div></div>
     </div></div>
@@ -842,6 +846,10 @@ a.dl { display:inline-block; margin-top:.4rem; }
         <div id="vv-dialog-section"></div>
         <button class="btn btn-primary" onclick="genVideo('v2v')">Transform</button>
         <div class="progress" id="vv-prog"></div>
+        <div class="gen-progress-wrap" id="vv-pbar-wrap">
+          <div class="gen-progress-bar-bg"><div class="gen-progress-bar-fill" id="vv-pbar-fill"></div></div>
+          <div class="gen-progress-label" id="vv-pbar-label"></div>
+        </div>
       </div>
       <div class="gen-out" id="vv-out"><div class="gen-empty">Transformed video will appear here</div></div>
     </div></div>
@@ -945,6 +953,10 @@ a.dl { display:inline-block; margin-top:.4rem; }
         </details>
         <button class="btn btn-primary" onclick="genTi2V()" style="margin-top:.25rem">Generate</button>
         <div class="progress" id="ti-prog"></div>
+        <div class="gen-progress-wrap" id="ti-pbar-wrap">
+          <div class="gen-progress-bar-bg"><div class="gen-progress-bar-fill" id="ti-pbar-fill"></div></div>
+          <div class="gen-progress-label" id="ti-pbar-label"></div>
+        </div>
       </div>
       <div class="gen-out" id="ti-out"><div class="gen-empty">Video will appear here</div></div>
     </div></div>
@@ -1100,6 +1112,10 @@ a.dl { display:inline-block; margin-top:.4rem; }
           <div class="req-preview" id="ag-preview"></div>
           <button class="btn btn-primary" onclick="genAudio()">Generate</button>
           <div class="progress" id="ag-prog"></div>
+          <div class="gen-progress-wrap" id="ag-pbar-wrap">
+            <div class="gen-progress-bar-bg"><div class="gen-progress-bar-fill" id="ag-pbar-fill"></div></div>
+            <div class="gen-progress-label" id="ag-pbar-label"></div>
+          </div>
         </div>
         <div class="gen-out" id="ag-out"><div class="gen-empty">Generated audio will appear here</div></div>
       </div>
@@ -2067,6 +2083,65 @@ a.dl { display:inline-block; margin-top:.4rem; }
 // ─────────────────────────────────────────────────────────────────
 let models = [], activeModel = null, chatHistory = [], chatBusy = false, attachedImage = null;
 let _imgPollTimer = null;
+let _vidPollTimer = null;
+let _audPollTimer = null;
+
+function _startVidPoll(prefix) {
+  if (_vidPollTimer) { clearInterval(_vidPollTimer); _vidPollTimer = null; }
+  const wrap = $(prefix+'-pbar-wrap'), fill = $(prefix+'-pbar-fill'), lbl = $(prefix+'-pbar-label');
+  if (!wrap) return;
+  wrap.classList.add('active'); fill.style.width='0%'; lbl.textContent='';
+  _vidPollTimer = setInterval(async () => {
+    try {
+      const p = await (await fetch('/v1/video/progress')).json();
+      if (p.total > 0) {
+        fill.style.width = p.pct + '%';
+        const spd = p.it_per_s > 0 ? ` · ${p.it_per_s} it/s` : (p.elapsed > 0 ? ` · ${p.elapsed}s` : '');
+        lbl.textContent = `${p.current} / ${p.total} steps${spd}`;
+      } else if (p.elapsed > 0) {
+        lbl.textContent = `${p.elapsed}s`;
+      }
+      if (!p.active) { clearInterval(_vidPollTimer); _vidPollTimer = null; }
+    } catch(_) {}
+  }, 500);
+}
+
+function _stopVidPoll(prefix, done) {
+  if (_vidPollTimer) { clearInterval(_vidPollTimer); _vidPollTimer = null; }
+  const wrap = $(prefix+'-pbar-wrap'), fill = $(prefix+'-pbar-fill'), lbl = $(prefix+'-pbar-label');
+  if (!wrap) return;
+  if (done) { fill.style.width='100%'; lbl.textContent='Done'; setTimeout(() => wrap.classList.remove('active'), 2000); }
+  else { wrap.classList.remove('active'); }
+}
+
+function _startAudPoll(prefix) {
+  if (_audPollTimer) { clearInterval(_audPollTimer); _audPollTimer = null; }
+  const wrap = $(prefix+'-pbar-wrap'), fill = $(prefix+'-pbar-fill'), lbl = $(prefix+'-pbar-label');
+  if (!wrap) return;
+  wrap.classList.add('active'); fill.style.width='0%'; lbl.textContent='';
+  _audPollTimer = setInterval(async () => {
+    try {
+      const p = await (await fetch('/v1/audio/progress')).json();
+      if (p.total > 0) {
+        fill.style.width = p.pct + '%';
+        const unit = p.unit || 'it';
+        const spd = p.it_per_s > 0 ? ` · ${p.it_per_s} ${unit}/s` : (p.elapsed > 0 ? ` · ${p.elapsed}s` : '');
+        lbl.textContent = `${p.current} / ${p.total} steps${spd}`;
+      } else if (p.elapsed > 0) {
+        lbl.textContent = `Elapsed: ${p.elapsed}s`;
+      }
+      if (!p.active) { clearInterval(_audPollTimer); _audPollTimer = null; }
+    } catch(_) {}
+  }, 500);
+}
+
+function _stopAudPoll(prefix, done) {
+  if (_audPollTimer) { clearInterval(_audPollTimer); _audPollTimer = null; }
+  const wrap = $(prefix+'-pbar-wrap'), fill = $(prefix+'-pbar-fill'), lbl = $(prefix+'-pbar-label');
+  if (!wrap) return;
+  if (done) { fill.style.width='100%'; lbl.textContent='Done'; setTimeout(() => wrap.classList.remove('active'), 2000); }
+  else { wrap.classList.remove('active'); }
+}
 let apiToken = null;
 let charSlots = {};        // prefix → [{name:'', images:[b64...]}]
 let _charProfiles = [];    // cached list from /v1/characters
@@ -3543,6 +3618,7 @@ async function sendChat() {
   attachedImage = null; updateAttachBar();
   chatBusy = true; $('send-btn').disabled = true;
   $('typing').textContent = 'Thinking…';
+  const _chatT0 = Date.now();
   try {
     const r = await fetch('/v1/chat/completions',{
       method:'POST',headers:{'Content-Type':'application/json'},
@@ -3551,10 +3627,15 @@ async function sendChat() {
     if (!r.ok) throw new Error('HTTP '+r.status+': '+await r.text());
     const d = await r.json();
     const reply = d.choices[0].message.content;
+    const elapsed = (Date.now() - _chatT0) / 1000;
+    const toks = d.usage?.completion_tokens;
+    if (toks && elapsed > 0) {
+      $('typing').textContent = `${toks} tok · ${(toks/elapsed).toFixed(1)} tok/s`;
+    }
     addMsg('assistant',reply);
     chatHistory.push({role:'assistant',content:reply});
   } catch(e) { addMsg('assistant','Error: '+e.message); }
-  finally { chatBusy=false; $('send-btn').disabled=false; $('typing').textContent=''; }
+  finally { chatBusy=false; $('send-btn').disabled=false; setTimeout(()=>{ $('typing').textContent=''; }, 3000); }
 }
 
 $('chat-in').addEventListener('keydown', e => { if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat();} });
@@ -3977,7 +4058,8 @@ async function genImage() {
       const p=await (await fetch('/v1/images/progress')).json();
       if(p.total>0){
         fill.style.width=p.pct+'%';
-        lbl.textContent=p.current+' / '+p.total+' steps';
+        const spd = p.it_per_s>0 ? ` · ${p.it_per_s} it/s` : (p.elapsed>0 ? ` · ${p.elapsed}s` : '');
+        lbl.textContent=`${p.current} / ${p.total} steps${spd}`;
       }
       if(!p.active){ clearInterval(_imgPollTimer); _imgPollTimer=null; }
     }catch(_){}
@@ -4104,10 +4186,12 @@ async function genSegment() {
 // ─────────────────────────────────────────────────────────────────
 async function genVideo(mode) {
   if (!activeModel) return;
-  const progMap = {t2v:'vt-prog', i2v:'vi-prog', v2v:'vv-prog'};
-  const outMap  = {t2v:'vt-out',  i2v:'vi-out',  v2v:'vv-out'};
-  const prog = progMap[mode], outId = outMap[mode];
+  const progMap   = {t2v:'vt-prog',  i2v:'vi-prog',  v2v:'vv-prog'};
+  const outMap    = {t2v:'vt-out',   i2v:'vi-out',   v2v:'vv-out'};
+  const prefixMap = {t2v:'vt',       i2v:'vi',        v2v:'vv'};
+  const prog = progMap[mode], outId = outMap[mode], prefix = prefixMap[mode];
   $(prog).textContent='Generating… (this may take several minutes)';
+  _startVidPoll(prefix);
   const subId = {t2v:'vid-t2v', i2v:'vid-i2v', v2v:'vid-v2v'}[mode];
   const body = {model:modelForSub(subId), mode};
   if (mode==='t2v') {
@@ -4160,8 +4244,9 @@ async function genVideo(mode) {
   }
   try {
     const d = await post('/v1/video/generations', body);
+    _stopVidPoll(prefix, true);
     showVideo(outId, vidSrc(d.data[0]), prog);
-  } catch(e) { $(prog).textContent='Error: '+e.message; }
+  } catch(e) { _stopVidPoll(prefix, false); $(prog).textContent='Error: '+e.message; }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -4172,6 +4257,7 @@ async function genTi2V() {
   $('ti-prog').textContent='Generating… (may take several minutes)';
   const [initImg, endImg, srcVid] = await Promise.all([b64OrNull('ti-init'), b64OrNull('ti-end'), b64OrNull('ti-vid')]);
   if (!srcVid && !initImg) { $('ti-prog').textContent='Select an initial image or source video.'; return; }
+  _startVidPoll('ti');
 
   const body = {
     model:modelForSub('vid-ti2v'),
@@ -4217,8 +4303,9 @@ async function genTi2V() {
 
   try {
     const d = await post('/v1/video/generations', body);
+    _stopVidPoll('ti', true);
     showVideo('ti-out', vidSrc(d.data[0]), 'ti-prog');
-  } catch(e) { $('ti-prog').textContent='Error: '+e.message; }
+  } catch(e) { _stopVidPoll('ti', false); $('ti-prog').textContent='Error: '+e.message; }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -4928,6 +5015,7 @@ async function runPipeline4() {
 async function genAudio() {
   if (!activeModel) return;
   $('ag-prog').textContent='Generating audio…';
+  _startAudPoll('ag');
   const melody = await b64OrNull('ag-melody');
   const body = {
     model:modelForSub('aud-gen'), prompt:val('ag-prompt'),
@@ -4939,6 +5027,7 @@ async function genAudio() {
   };
   try {
     const d = await post('/v1/audio/generate', body);
+    _stopAudPoll('ag', true);
     const item = d.data[0];
     const src = audSrc(item);
     showAudio('ag-out', src, 'ag-prog', 'wav');
@@ -4949,7 +5038,7 @@ async function genAudio() {
       summary:buildAudioHistorySummary(val('ag-prompt'), body.duration),
       links:buildAudioLinks(item),
     });
-  } catch(e) { $('ag-prog').textContent='Error: '+e.message; }
+  } catch(e) { _stopAudPoll('ag', false); $('ag-prog').textContent='Error: '+e.message; }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -5289,6 +5378,10 @@ document.getElementById('panel-vid-t2v').innerHTML = `<div class="gen-wrap">
     <div id="vt-dialog-section"></div>
     <button class="btn btn-primary" onclick="genVideo('t2v')">Generate Video</button>
     <div class="progress" id="vt-prog"></div>
+    <div class="gen-progress-wrap" id="vt-pbar-wrap">
+      <div class="gen-progress-bar-bg"><div class="gen-progress-bar-fill" id="vt-pbar-fill"></div></div>
+      <div class="gen-progress-label" id="vt-pbar-label"></div>
+    </div>
   </div>
   <div class="gen-out" id="vt-out"><div class="gen-empty">Video will appear here</div></div>
 </div>`;
