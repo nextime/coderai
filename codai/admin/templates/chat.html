@@ -245,6 +245,10 @@ a.dl { display:inline-block; margin-top:.4rem; }
 .pipe-summary { font-size:12px; color:var(--text-2); line-height:1.45; }
 .pipe-tags { display:flex; flex-wrap:wrap; gap:.35rem; }
 .pipe-tag { font-size:10px; padding:.16rem .45rem; border-radius:999px; background:var(--surface-2); color:var(--text-2); border:1px solid var(--border); }
+.pipe-badge { font-size:10px; padding:.15rem .45rem; border-radius:999px; font-weight:600; align-self:flex-start; }
+.pipe-badge.ready { background:#0f2a0f; color:#4caf50; border:1px solid #2a5a2a; }
+.pipe-badge.partial { background:#2a1f0a; color:#f0a020; border:1px solid #5a3a10; }
+.pipe-badge.unavailable { background:var(--surface-2); color:var(--text-3); border:1px solid var(--border); }
 .pipe-steps { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; font-size:11px; color:var(--text-2); margin-bottom:.1rem; }
 .pipe-step { background:var(--surface-2); border-radius:5px; padding:.2rem .5rem; color:var(--text-2); }
 .pipe-arrow { color:var(--text-3); }
@@ -1094,7 +1098,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
           <div class="hist-list" id="artifact-history-list"></div>
         </div>
 
-        <details class="pipe-card">
+        <details class="pipe-card" data-requires='["image_generation","image_to_video"]'>
           <summary>
             <div class="pipe-head">
               <div class="pipe-title">Image → Video Pipeline</div>
@@ -1161,7 +1165,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
           </div>
         </details>
 
-        <details class="pipe-card">
+        <details class="pipe-card" data-requires='["speech_to_text","text_to_speech"]'>
           <summary>
             <div class="pipe-head">
               <div class="pipe-title">Video → Dub + Subtitle</div>
@@ -1190,7 +1194,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
           </div>
         </details>
 
-        <details class="pipe-card">
+        <details class="pipe-card" data-requires='["text_generation","image_generation","video_generation"]' data-optional='["text_to_speech"]'>
           <summary>
             <div class="pipe-head">
               <div class="pipe-title">Full Story</div>
@@ -1225,7 +1229,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
           </div>
         </details>
 
-        <details class="pipe-card">
+        <details class="pipe-card" data-requires='["speech_to_text","text_to_speech"]'>
           <summary>
             <div class="pipe-head">
               <div class="pipe-title">Audio/Video Dub with Voice Clone</div>
@@ -1268,7 +1272,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
           </div>
         </details>
 
-        <details class="pipe-card">
+        <details class="pipe-card" data-requires='["image_to_image"]'>
           <summary>
             <div class="pipe-head">
               <div class="pipe-title">Face Swap</div>
@@ -1307,7 +1311,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
           </div>
         </details>
 
-        <details class="pipe-card">
+        <details class="pipe-card" data-requires='["text_to_speech"]'>
           <summary>
             <div class="pipe-head">
               <div class="pipe-title">Voice Clone (TTS)</div>
@@ -1344,7 +1348,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
           </div>
         </details>
 
-        <details class="pipe-card">
+        <details class="pipe-card" data-requires='["audio_to_audio"]' data-optional='["text_to_speech"]'>
           <summary>
             <div class="pipe-head">
               <div class="pipe-title">Voice Convert (SVC)</div>
@@ -1449,6 +1453,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
 //  State
 // ─────────────────────────────────────────────────────────────────
 let models = [], activeModel = null, chatHistory = [], chatBusy = false, attachedImage = null;
+let apiToken = null;
 let charSlots = {};        // prefix → [{name:'', images:[b64...]}]
 let _charProfiles = [];    // cached list from /v1/characters
 let artifactHistory = [];
@@ -1499,7 +1504,10 @@ const TAB_STATE = {
   available: { label:'Ready', className:'state-ready' },
   partial: { label:'Partial', className:'state-partial' },
   unavailable: { label:'Unavailable', className:'state-unavailable' },
+  none: {},
 };
+// Subs whose features are served by any available dedicated model, not only activeModel.
+const CROSS_MODEL_SUBS = new Set(['aud-stt', 'aud-tts', 'aud-gen', 'embed']);
 const STUDIO_CAPABILITIES = {
   'vid-dub': {
     category:'video',
@@ -1648,6 +1656,41 @@ function capabilitySetForModel(m) {
   return new Set((m?.capabilities || []).filter(Boolean));
 }
 
+function crossModelCaps() {
+  const s = new Set();
+  models.forEach(m => (m.capabilities || []).forEach(c => s.add(c)));
+  return s;
+}
+
+function bestModelForCap(cap) {
+  return models.find(m => (m.capabilities || []).includes(cap)) || null;
+}
+
+function updatePipelineBadges() {
+  const allCaps = crossModelCaps();
+  document.querySelectorAll('.pipe-card[data-requires]').forEach(card => {
+    let reqs, opts;
+    try { reqs = JSON.parse(card.dataset.requires || '[]'); } catch(e) { reqs = []; }
+    try { opts = JSON.parse(card.dataset.optional || '[]'); } catch(e) { opts = []; }
+    const hasAll = reqs.every(c => allCaps.has(c));
+    const hasSome = reqs.some(c => allCaps.has(c));
+    const state = hasAll ? 'ready' : (hasSome || (!reqs.length && opts.some(c => allCaps.has(c)))) ? 'partial' : 'unavailable';
+    const label = state === 'ready' ? 'Ready' : state === 'partial' ? 'Partial' : 'Unavailable';
+    const head = card.querySelector('.pipe-head');
+    if (!head) return;
+    let badge = head.querySelector('.pipe-badge');
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'pipe-badge';
+      const title = head.querySelector('.pipe-title');
+      if (title) title.insertAdjacentElement('afterend', badge);
+      else head.insertBefore(badge, head.firstChild);
+    }
+    badge.className = `pipe-badge ${state}`;
+    badge.textContent = label;
+  });
+}
+
 function hasTypeFallback(rule, type) {
   return Array.isArray(rule.fallbackTypes) && rule.fallbackTypes.includes(type);
 }
@@ -1672,7 +1715,7 @@ function evaluateCategoryState(cat, subStates, caps, type) {
       ? 'available'
       : 'partial';
   }
-  if (cat === 'pipe') return 'available';
+  if (cat === 'pipe') return 'none';
   if (cat === 'embed') return caps.has('embeddings') || type === 'embedding' ? 'available' : 'unavailable';
   const states = (CATEGORY_SUBS[cat] || []).map(sub => subStates[sub]).filter(Boolean);
   if (states.includes('available')) return 'available';
@@ -2054,8 +2097,9 @@ function buildTTSPreviewData() {
 }
 
 function buildSTTPreviewData() {
+  const sttModel = bestModelForCap('speech_to_text') || activeModel;
   return previewExportBody('/v1/audio/transcriptions', {
-    model: activeModel?.id || '',
+    model: sttModel?.id || '',
     file: fileOrNull('as-file') ? '<multipart audio/video file>' : undefined,
     language: val('as-lang') || undefined,
     prompt: val('as-prompt') || undefined,
@@ -2143,15 +2187,17 @@ function buildCodeSnippet(kind, preview) {
   const origin = window.location.hostname === '0.0.0.0'
     ? window.location.origin.replace('0.0.0.0', '127.0.0.1')
     : window.location.origin;
+  const token = apiToken || 'YOUR_API_KEY';
   if (kind === 'curl') {
     return `curl -X POST ${origin}${preview.endpoint} \\
   -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer ${token}" \\
   -d '${preview.json.replace(/'/g, "'\\''")}'`;
   }
   if (kind === 'python') {
-    return `import requests\n\npayload = ${preview.json}\nresponse = requests.post(\n    "${origin}${preview.endpoint}",\n    json=payload,\n    timeout=300,\n)\nprint(response.json())`;
+    return `import requests\n\npayload = ${preview.json}\nresponse = requests.post(\n    "${origin}${preview.endpoint}",\n    headers={"Authorization": "Bearer ${token}"},\n    json=payload,\n    timeout=300,\n)\nprint(response.json())`;
   }
-  return `const payload = ${preview.json};\nconst response = await fetch("${origin}${preview.endpoint}", {\n  method: "POST",\n  headers: { "Content-Type": "application/json" },\n  body: JSON.stringify(payload),\n});\nconst data = await response.json();\nconsole.log(data);`;
+  return `const payload = ${preview.json};\nconst response = await fetch("${origin}${preview.endpoint}", {\n  method: "POST",\n  headers: { "Content-Type": "application/json", "Authorization": "Bearer ${token}" },\n  body: JSON.stringify(payload),\n});\nconst data = await response.json();\nconsole.log(data);`;
 }
 
 function renderRequestPreview(panel, config) {
@@ -2426,6 +2472,7 @@ function selectModel(m) {
 
 function updateTabs(m) {
   const caps = capabilitySetForModel(m);
+  const allCaps = crossModelCaps();
   const type = m.type || 'text';
   refreshAudioBackendHealth();
   const subStates = {};
@@ -2433,8 +2480,10 @@ function updateTabs(m) {
     if (VIDEO_EXTRA_SUBS.includes(sub) && type === 'video' && !rule.fallbackTypes) {
       rule = Object.assign({}, rule, { fallbackTypes:['video'] });
     }
-    subStates[sub] = evaluateSubCapability(rule, caps, type);
+    const evalCaps = CROSS_MODEL_SUBS.has(sub) ? allCaps : caps;
+    subStates[sub] = evaluateSubCapability(rule, evalCaps, type);
   });
+  updatePipelineBadges();
   const categoryStates = {};
   CATEGORY_TABS.forEach(cat => {
     categoryStates[cat] = evaluateCategoryState(cat, subStates, caps, type);
@@ -3545,12 +3594,13 @@ async function genTTS() {
 //  STT
 // ─────────────────────────────────────────────────────────────────
 async function genSTT() {
-  if (!activeModel) return;
+  const sttModel = bestModelForCap('speech_to_text') || activeModel;
+  if (!sttModel) return;
   const f = fileOrNull('as-file');
   if (!f) { $('as-prog').textContent='Select an audio file.'; return; }
   $('as-prog').textContent='Transcribing…';
   const fd = new FormData();
-  fd.append('file', f); fd.append('model', activeModel.id);
+  fd.append('file', f); fd.append('model', sttModel.id);
   if (val('as-lang')) fd.append('language', val('as-lang'));
   if (val('as-prompt')) fd.append('prompt', val('as-prompt'));
   try {
@@ -3562,7 +3612,7 @@ async function genSTT() {
     pushArtifactHistory({
       task:'Transcription',
       family:'speech to text',
-      model:activeModel.id,
+      model:sttModel.id,
       summary:buildSTTHistorySummary(d.text || JSON.stringify(d), f.name),
       links:[],
     });
@@ -3834,6 +3884,9 @@ loadModels();
 loadVoiceProfiles();
 initRequestPreviews();
 initPipelineBuilder();
+fetch('/admin/api/tokens').then(r => r.json()).then(tokens => {
+  if (Array.isArray(tokens) && tokens.length) apiToken = tokens[0].token;
+}).catch(() => {});
 
 // ── Pipeline accordion: opening one card closes all others ────────
 document.querySelector('.pipe-panel').addEventListener('click', e => {
