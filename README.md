@@ -1,5 +1,7 @@
 # CoderAI
 
+**Repository:** [https://git.nexlab.net/nexlab/coderai](https://git.nexlab.net/nexlab/coderai)
+
 ![CoderAI](CoderAI.gif)
 
 An OpenAI-compatible API server to run models on your local GPU with web administration dashboard, supporting multiple GPU backends: NVIDIA (CUDA), AMD (Vulkan), and Intel (Vulkan). Configuration-driven architecture with per-model settings and full multi-modal support.
