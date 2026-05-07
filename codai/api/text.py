@@ -293,19 +293,28 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     if model_info.get('error'):
         raise HTTPException(status_code=404, detail=model_info['error'])
     
-    # Try to get the appropriate model (request_model handles VRAM cleanup)
-    mm = multi_model_manager.get_model_for_request(requested_model)
-    
+    # Acquire the least-busy instance (increments ref-count; released on response completion)
+    _model_key = model_info.get('model_key')
+    _instance_idx = None
+    _acq = multi_model_manager.acquire_model_instance(_model_key) if _model_key else None
+    if _acq:
+        _instance_idx, mm = _acq
+    else:
+        mm = multi_model_manager.get_model_for_request(requested_model)
+
+    def _release_instance():
+        if _instance_idx is not None and _model_key:
+            multi_model_manager.release_model_instance(_model_key, _instance_idx)
+
     if mm is None:
-        # Model not loaded - try to use default
+        _release_instance()
         if model_manager.backend is not None:
-            # Fallback to legacy model_manager
             current_manager = model_manager
         else:
             raise HTTPException(status_code=503, detail="Model not loaded")
     else:
         current_manager = mm
-    
+
     # Inject system prompt if --system-prompt flag was provided
     messages = request.messages
     global_system_prompt = get_global_system_prompt()
@@ -816,9 +825,16 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     # No tool calls, yield the content as usual
                     yield f"data: {json.dumps({'choices': [{'delta': {'content': second_pass_result}, 'finish_reason': 'stop'}]})}\n\n"
                 yield "data: [DONE]\n\n"
-            
+
+            async def _raw_stream_with_release():
+                try:
+                    async for chunk in raw_stream_generate():
+                        yield chunk
+                finally:
+                    _release_instance()
+
             from fastapi.responses import StreamingResponse
-            return StreamingResponse(raw_stream_generate(), media_type="text/event-stream")
+            return StreamingResponse(_raw_stream_with_release(), media_type="text/event-stream")
         
         # Non-streaming path (already implemented above)
         # First pass: generate until reasoning close tag
@@ -1127,9 +1143,29 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         return JSONResponse(content=formatted_response, headers=headers)
     
     if request.stream:
+        async def _managed_stream():
+            try:
+                async for chunk in stream_chat_response(
+                    messages_dict,
+                    response_model_name,
+                    request.max_tokens,
+                    request.temperature,
+                    request.top_p,
+                    stop_sequences,
+                    tools_dict,
+                    current_manager,
+                    tool_parser,
+                    request.response_format,
+                ):
+                    yield chunk
+            finally:
+                _release_instance()
+
         from fastapi.responses import StreamingResponse
-        return StreamingResponse(
-            stream_chat_response(
+        return StreamingResponse(_managed_stream(), media_type="text/event-stream")
+    else:
+        try:
+            return await generate_chat_response(
                 messages_dict,
                 response_model_name,
                 request.max_tokens,
@@ -1140,23 +1176,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 current_manager,
                 tool_parser,
                 request.response_format,
-            ),
-            media_type="text/event-stream",
-        )
-    else:
-        return await generate_chat_response(
-            messages_dict,
-            response_model_name,
-            request.max_tokens,
-            request.temperature,
-            request.top_p,
-            stop_sequences,
-            tools_dict,
-            current_manager,
-            tool_parser,
-            request.response_format,
-            force_reasoning_args,
-        )
+                force_reasoning_args,
+            )
+        finally:
+            _release_instance()
 
 async def stream_chat_response(
     messages: List[Dict],
@@ -1701,28 +1724,54 @@ async def completions(request: CompletionRequest):
     if model_info.get('error'):
         raise HTTPException(status_code=404, detail=model_info['error'])
     
-    # Try to get the appropriate model (request_model handles VRAM cleanup)
-    mm = multi_model_manager.get_model_for_request(requested_model)
-    
+    # Acquire the least-busy instance (increments ref-count; released on response completion)
+    _model_key = model_info.get('model_key')
+    _instance_idx = None
+    _acq = multi_model_manager.acquire_model_instance(_model_key) if _model_key else None
+    if _acq:
+        _instance_idx, mm = _acq
+    else:
+        mm = multi_model_manager.get_model_for_request(requested_model)
+
+    def _release_instance():
+        if _instance_idx is not None and _model_key:
+            multi_model_manager.release_model_instance(_model_key, _instance_idx)
+
     if mm is None:
-        # Model not loaded - try to use default
+        _release_instance()
         if model_manager.backend is not None:
-            # Fallback to legacy model_manager
             current_manager = model_manager
         else:
             raise HTTPException(status_code=503, detail="Model not loaded")
     else:
         current_manager = mm
-    
+
     prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
     stop_sequences = []
     if request.stop:
         stop_sequences = [request.stop] if isinstance(request.stop, str) else request.stop
-    
+
     if request.stream:
+        async def _managed_completion_stream():
+            try:
+                async for chunk in stream_completion_response(
+                    prompts[0],
+                    request.model,
+                    request.max_tokens,
+                    request.temperature,
+                    request.top_p,
+                    stop_sequences,
+                    current_manager,
+                ):
+                    yield chunk
+            finally:
+                _release_instance()
+
         from fastapi.responses import StreamingResponse
-        return StreamingResponse(
-            stream_completion_response(
+        return StreamingResponse(_managed_completion_stream(), media_type="text/event-stream")
+    else:
+        try:
+            return await generate_completion_response(
                 prompts[0],
                 request.model,
                 request.max_tokens,
@@ -1730,19 +1779,9 @@ async def completions(request: CompletionRequest):
                 request.top_p,
                 stop_sequences,
                 current_manager,
-            ),
-            media_type="text/event-stream",
-        )
-    else:
-        return await generate_completion_response(
-            prompts[0],
-            request.model,
-            request.max_tokens,
-            request.temperature,
-            request.top_p,
-            stop_sequences,
-            current_manager,
-        )
+            )
+        finally:
+            _release_instance()
 
 async def stream_completion_response(
     prompt: str,

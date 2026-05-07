@@ -25,8 +25,8 @@ from dataclasses import dataclass, field
 @dataclass
 class ServerConfig:
     """Server configuration."""
-    host: str = "0.0.0.0"
-    port: int = 8000
+    host: str = "127.0.0.1"
+    port: int = 8776
     https: bool = False
     https_key_path: Optional[str] = None
     https_cert_path: Optional[str] = None
@@ -49,6 +49,7 @@ class ModelsConfig:
     default_load_mode: str = "ondemand"
     hf_cache_dir: Optional[str] = None
     gguf_cache_dir: Optional[str] = None
+    max_model_instances: int = 1  # max concurrent instances per model (global default; overridable per-model via "max_instances")
 
 
 @dataclass
@@ -150,8 +151,8 @@ class ConfigManager:
             default_config = {
                 "version": "1.0",
                 "server": {
-                    "host": "0.0.0.0",
-                    "port": 8000,
+                    "host": "127.0.0.1",
+                    "port": 8776,
                     "https": False,
                     "https_key_path": None,
                     "https_cert_path": None

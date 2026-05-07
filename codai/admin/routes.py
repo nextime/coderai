@@ -1188,15 +1188,22 @@ async def api_model_disable(request: Request, username: str = Depends(require_ad
     """Remove a model from models.json (keeps it cached locally)."""
     if config_manager is None:
         raise HTTPException(status_code=503, detail="Config manager not initialized")
+    import os as _os
     data = await request.json()
     path = data.get("path") or data.get("model_id", "")
+    # Also match by bare filename so entries stored without full path are caught
+    fname = _os.path.basename(path) if (_os.sep in path or "/" in path) else ""
+
+    def _matches(m_entry) -> bool:
+        key = m_entry if isinstance(m_entry, str) else m_entry.get("path", m_entry.get("id", ""))
+        return key == path or (fname and _os.path.basename(key) == fname)
+
     changed = False
     for cat in ("text_models", "image_models", "audio_models",
                 "gguf_models", "tts_models", "vision_models", "video_models",
                 "audio_gen_models", "embedding_models"):
         lst = config_manager.models_data.get(cat, [])
-        new_lst = [m for m in lst
-                   if (m if isinstance(m, str) else m.get("path", m.get("id", ""))) != path]
+        new_lst = [m for m in lst if not _matches(m)]
         if len(new_lst) != len(lst):
             config_manager.models_data[cat] = new_lst
             changed = True
@@ -1391,13 +1398,23 @@ async def api_model_configure(request: Request, username: str = Depends(require_
     if not model_types:
         model_types = ["text_models"]
 
-    # Remove from all categories (handles type changes)
+    # Remove from all categories (handles type changes and quant switches)
+    # paths_to_remove: the new path + the original path before a quant change
+    import os as _os
+    paths_to_remove = {path}
+    orig_path = (data.get("orig_path") or "").strip()
+    if orig_path and orig_path != path:
+        paths_to_remove.add(orig_path)
+    # Also match by bare filename so entries stored without full path are caught
+    fnames_to_remove = {_os.path.basename(p) for p in paths_to_remove if _os.sep in p or "/" in p}
+
+    def _should_remove(m_entry) -> bool:
+        key = m_entry if isinstance(m_entry, str) else m_entry.get("path", m_entry.get("id", ""))
+        return key in paths_to_remove or (fnames_to_remove and _os.path.basename(key) in fnames_to_remove)
+
     for cat in valid | {"gguf_models"}:
         lst = config_manager.models_data.get(cat, [])
-        config_manager.models_data[cat] = [
-            m for m in lst
-            if (m if isinstance(m, str) else m.get("path", m.get("id", ""))) != path
-        ]
+        config_manager.models_data[cat] = [m for m in lst if not _should_remove(m)]
 
     # Auto-estimate used_vram_gb from file size if not provided
     used_vram_gb = data.get("used_vram_gb")
@@ -1418,7 +1435,8 @@ async def api_model_configure(request: Request, username: str = Depends(require_
     for key in ("alias", "backend", "load_mode", "n_gpu_layers", "n_ctx",
                 "max_gpu_percent", "manual_ram_gb", "load_in_4bit", "load_in_8bit",
                 "flash_attention", "no_ram", "offload_strategy", "offload_dir",
-                "system_prompt", "parser", "tools_closer_prompt", "grammar_guided"):
+                "system_prompt", "parser", "tools_closer_prompt", "grammar_guided",
+                "max_instances", "preload_all_instances"):
         if key in data:
             entry[key] = data[key]
 

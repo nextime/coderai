@@ -338,6 +338,7 @@
     </div>
     <div class="modal-body">
       <input type="hidden" id="cfg-path">
+      <input type="hidden" id="cfg-orig-path">
       <input type="hidden" id="cfg-orig-type">
 
       <!-- identity -->
@@ -386,7 +387,7 @@
         </div>
         <div class="form-row" style="margin:0">
           <label class="form-label">Load mode</label>
-          <select id="cfg-load-mode" class="form-input">
+          <select id="cfg-load-mode" class="form-input" onchange="_updatePreloadAllVisibility()">
             <option value="load">Load (pre-load in VRAM)</option>
             <option value="on-request">On-request (load when needed)</option>
           </select>
@@ -398,6 +399,20 @@
           <input type="number" id="cfg-used-vram" class="form-input" min="0" step="0.1" placeholder="auto-estimate">
           <span class="form-hint" id="cfg-used-vram-hint" style="font-size:11px;color:var(--text-3)"></span>
         </div>
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Max instances
+            <span class="muted" title="How many copies of this model can be loaded simultaneously in VRAM to serve parallel requests. Requires enough free VRAM for each additional copy."> (?)</span>
+          </label>
+          <input type="number" id="cfg-max-instances" class="form-input" min="1" step="1" value="1" oninput="_updatePreloadAllVisibility()">
+          <span style="font-size:11px;color:var(--text-3)">Parallel copies in VRAM</span>
+        </div>
+      </div>
+      <div id="cfg-preload-all-row" style="display:none;margin-top:.5rem">
+        <label style="display:flex;align-items:center;gap:.5rem;font-size:13px;cursor:pointer">
+          <input type="checkbox" id="cfg-preload-all-instances">
+          Load all instances at boot
+          <span class="muted" style="font-size:11px" title="Pre-load all N copies of this model into VRAM at server startup instead of loading each copy on demand.">(load all ${max_instances} copies on startup)</span>
+        </label>
       </div>
 
       <!-- inference -->
@@ -1354,6 +1369,7 @@ function openCfgModal(idx){
   document.getElementById('cfg-modal-title').textContent = m.in_config ? 'Configure model' : 'Add to CoderAI';
   document.getElementById('cfg-id-label').textContent = m.label;
   document.getElementById('cfg-path').value = m.path;
+  document.getElementById('cfg-orig-path').value = m.path;   // frozen at open time
   document.getElementById('cfg-orig-type').value = m.defaultType;
 
   // Quantization selector for grouped GGUF models
@@ -1416,11 +1432,15 @@ function openCfgModal(idx){
   // Used VRAM
   const usedVram = s.used_vram_gb != null ? s.used_vram_gb : null;
   document.getElementById('cfg-used-vram').value = usedVram != null ? usedVram : '';
-  // Show estimate hint from file size (GGUF: ~1.1x file size; HF: from size_gb)
-  const estVram = _estimateVram(m);
+  // Show estimate hint (weights × 1.15 + KV cache ~0.5 MB per 1 K ctx)
+  const nCtxForEst = s.n_ctx || 2048;
+  const estVram = _estimateVram(m, nCtxForEst);
   document.getElementById('cfg-used-vram-hint').textContent = estVram ? `Estimated: ~${estVram.toFixed(1)} GB` : '';
   document.getElementById('cfg-gpu-layers').value = s.n_gpu_layers !== undefined ? s.n_gpu_layers : -1;
-  document.getElementById('cfg-n-ctx').value = s.n_ctx || 2048;
+  document.getElementById('cfg-n-ctx').value = nCtxForEst;
+  document.getElementById('cfg-max-instances').value = s.max_instances != null ? s.max_instances : 1;
+  document.getElementById('cfg-preload-all-instances').checked = !!s.preload_all_instances;
+  _updatePreloadAllVisibility();
   document.getElementById('cfg-max-gpu').value = s.max_gpu_percent != null ? s.max_gpu_percent : '';
   document.getElementById('cfg-ram-gb').value = s.manual_ram_gb != null ? s.manual_ram_gb : '';
   document.getElementById('cfg-4bit').checked = !!s.load_in_4bit;
@@ -1439,10 +1459,19 @@ function openCfgModal(idx){
   openModal('cfg-modal');
 }
 
-function _estimateVram(m) {
-  // Estimate VRAM from file size: GGUF ~1.1x, HF safetensors ~1.2x
-  if (m.size_gb) return m.size_gb * (m.cacheType === 'gguf' ? 1.1 : 1.2);
-  return null;
+function _updatePreloadAllVisibility() {
+  const loadMode = document.getElementById('cfg-load-mode').value;
+  const maxInst = parseInt(document.getElementById('cfg-max-instances').value) || 1;
+  const row = document.getElementById('cfg-preload-all-row');
+  row.style.display = (loadMode === 'load' && maxInst > 1) ? '' : 'none';
+}
+
+function _estimateVram(m, nCtx) {
+  // Mirror the server-side formula: weights × 1.15 + KV cache (0.5 MB per 1 K ctx)
+  if (!m.size_gb) return null;
+  const weights = m.size_gb * (m.cacheType === 'gguf' ? 1.0 : 1.1);
+  const kvCacheGb = ((nCtx || 2048) / 1024) * 0.5 / 1024;
+  return weights * 1.15 + kvCacheGb;
 }
 
 async function saveModelConfig(){
@@ -1451,8 +1480,10 @@ async function saveModelConfig(){
   const ramGb  = parseFloat(document.getElementById('cfg-ram-gb').value);
   const usedVram = parseFloat(document.getElementById('cfg-used-vram').value);
   const {primaryType, model_types, video_subtypes} = _getCheckedTypes();
+  const origPath = document.getElementById('cfg-orig-path').value;
   const data = {
     path,
+    orig_path:         (origPath && origPath !== path) ? origPath : undefined,
     model_type:        primaryType,
     model_types:       model_types,
     video_subtypes:    video_subtypes.length ? video_subtypes : undefined,
@@ -1460,6 +1491,8 @@ async function saveModelConfig(){
     backend:           document.getElementById('cfg-backend').value,
     load_mode:         document.getElementById('cfg-load-mode').value,
     used_vram_gb:      isNaN(usedVram) ? null : usedVram,
+    max_instances:     parseInt(document.getElementById('cfg-max-instances').value) || 1,
+    preload_all_instances: document.getElementById('cfg-preload-all-instances').checked,
     n_gpu_layers:      parseInt(document.getElementById('cfg-gpu-layers').value) || -1,
     n_ctx:             parseInt(document.getElementById('cfg-n-ctx').value) || 2048,
     max_gpu_percent:   isNaN(maxGpu) ? null : maxGpu,
@@ -1557,14 +1590,20 @@ async function unloadModel(idx){
 async function disableModel(idx){
   const m = _localModels[idx];
   if(!confirm('Remove this model from CoderAI config? It will stay in the local cache.')) return;
+  // Collect all paths that are marked in_config for this model (covers quant groups)
+  const paths = m.ggufGroup
+    ? m.ggufGroup.filter(f=>f.in_config).map(f=>f.path)
+    : (m.in_config ? [m.path] : []);
+  if(!paths.length) paths.push(m.path);  // fallback
   try{
-    const r = await fetch('/admin/api/model-disable',{
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({path: m.path})
-    });
-    const d = await r.json();
-    if(d.success) loadCachedModels();
-    else alert('Error: '+(d.detail||'Unknown'));
+    // Disable each configured path in the group
+    for(const p of paths){
+      await fetch('/admin/api/model-disable',{
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({path: p})
+      });
+    }
+    loadCachedModels();
   }catch(e){ alert('Error: '+e.message); }
 }
 

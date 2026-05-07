@@ -234,6 +234,7 @@ def main():
     load_mode = config.models.default_load_mode or "ondemand"
     set_load_mode(load_mode)
     multi_model_manager.set_load_mode(load_mode)
+    multi_model_manager._global_max_instances = config.models.max_model_instances
     
     print(f"\nLoad mode: {load_mode}")
     if load_mode == "ondemand":
@@ -463,6 +464,18 @@ def main():
                 if mm is not None and mm.backend is not None:
                     multi_model_manager.active_in_vram = mid
                     print(f"  Loaded: {mid}")
+                    # Load additional instances if preload_all_instances is set
+                    if isinstance(m, dict) and m.get("preload_all_instances"):
+                        max_inst = m.get("max_instances", 1)
+                        if isinstance(max_inst, int) and max_inst > 1:
+                            for i in range(max_inst - 1):
+                                multi_model_manager._pending_new_instance.add(mid)
+                                mm2 = multi_model_manager._load_model_by_name(mid)
+                                if mm2 is not None and mm2.backend is not None:
+                                    print(f"  Loaded extra instance {i+2}/{max_inst}: {mid}")
+                                else:
+                                    print(f"  Warning: extra instance {i+2}/{max_inst} of '{mid}' failed to load")
+                                    break
                 else:
                     print(f"  Warning: {mid} failed to load")
             elif mtype == "audio" and mid in multi_model_manager.whisper_servers:

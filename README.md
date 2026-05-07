@@ -1,5 +1,7 @@
 # CoderAI
 
+![CoderAI](CoderAI.gif)
+
 An OpenAI-compatible API server with web administration dashboard, supporting multiple GPU backends: NVIDIA (CUDA), AMD (Vulkan), and Intel (Vulkan). Configuration-driven architecture with per-model settings and full multi-modal support.
 
 ## Features
@@ -72,6 +74,20 @@ Built-in multi-step pipelines callable from the API or web UI:
 
 ---
 
+## Quick Start
+
+```bash
+git clone git@git.nexlab.net:nexlab/coderai.git
+cd coderai
+./build.sh all          # build all backends (recommended)
+source venv_all/bin/activate
+python coderai          # starts on http://127.0.0.1:8776
+```
+
+That's it. Open `http://127.0.0.1:8776/admin` and log in with `admin` / `admin`.
+
+---
+
 ## Installation
 
 ### Prerequisites
@@ -81,7 +97,7 @@ Built-in multi-step pipelines callable from the API or web UI:
 - For AMD/Intel GPUs (Vulkan): Vulkan drivers and SDK
 - For CPU-only: No additional requirements
 
-### Quick Install with Build Script
+### Build Script
 
 ```bash
 git clone git@git.nexlab.net:nexlab/coderai.git
@@ -159,16 +175,16 @@ python coderai --config /path/to/cfg   # Custom config directory
 python coderai --debug                 # Debug mode
 ```
 
-Server starts on `http://0.0.0.0:8000`.
+Server starts on `http://127.0.0.1:8776` by default.
 
 ### Access Points
 
 | URL | Description |
 |---|---|
-| `http://localhost:8000/admin` | Admin dashboard |
-| `http://localhost:8000/chat` | Web Studio (generation UI) |
-| `http://localhost:8000/v1/*` | OpenAI-compatible API |
-| `http://localhost:8000/docs` | Interactive API docs |
+| `http://127.0.0.1:8776/admin` | Admin dashboard |
+| `http://127.0.0.1:8776/chat` | Web Studio (generation UI) |
+| `http://127.0.0.1:8776/v1/*` | OpenAI-compatible API |
+| `http://127.0.0.1:8776/docs` | Interactive API docs |
 
 Default credentials: `admin` / `admin` (prompted to change on first login).
 
@@ -191,7 +207,7 @@ Config files live in `~/.coderai/` (or `--config` path):
 
 ```json
 {
-  "server": { "host": "0.0.0.0", "port": 8000 },
+  "server": { "host": "127.0.0.1", "port": 8776 },
   "backend": { "type": "auto" },
   "models": { "default_load_mode": "ondemand" },
   "offload": { "load_in_4bit": false, "flash_attention": false },
@@ -399,9 +415,22 @@ MAX_JOBS=4 pip install flash-attn --no-build-isolation
 
 ---
 
+## Developer
+
+**Stefy Lanza** &lt;stefy@nexlab.net&gt;
+
 ## License
 
 GNU General Public License v3.0 — see [LICENSE.md](LICENSE.md).
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+## Donations
+
+If you find CoderAI useful, consider supporting development:
+
+- **Bitcoin (BTC):** `bc1qcpt2uutqkz4456j5r78rjm3gwq03h5fpwmcc5u`
+- **Ethereum (ETH):** `0xdA6dAb526515b5cb556d20269207D43fcc760E51`
 
 ## Contributing
 

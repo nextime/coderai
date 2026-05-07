@@ -395,11 +395,91 @@ class WhisperServerManager:
         self.stop()
 
 
+class ModelInstancePool:
+    """
+    Ref-counted pool of loaded instances for a single model key.
+
+    When max_instances > 1 and all existing instances are handling at least one
+    active request, the manager can load additional instances (up to the limit)
+    to serve concurrent requests in parallel.  Each caller must call release()
+    when it finishes using the instance so the ref-count stays accurate.
+    """
+
+    def __init__(self, max_instances: int = 1):
+        self.instances: list = []
+        self.ref_counts: list = []
+        self.max_instances: int = max_instances
+        self._lock = threading.Lock()
+
+    @property
+    def count(self) -> int:
+        return len(self.instances)
+
+    @property
+    def primary(self):
+        return self.instances[0] if self.instances else None
+
+    def add(self, model_obj) -> int:
+        """Register a new instance; return its index."""
+        with self._lock:
+            idx = len(self.instances)
+            self.instances.append(model_obj)
+            self.ref_counts.append(0)
+            return idx
+
+    def acquire(self):
+        """Return (idx, instance) of the least-busy instance, incrementing its ref-count."""
+        with self._lock:
+            if not self.instances:
+                return None
+            idx = min(range(len(self.instances)), key=lambda i: self.ref_counts[i])
+            self.ref_counts[idx] += 1
+            return idx, self.instances[idx]
+
+    def release(self, idx: int) -> None:
+        with self._lock:
+            if 0 <= idx < len(self.ref_counts):
+                self.ref_counts[idx] = max(0, self.ref_counts[idx] - 1)
+
+    def least_busy_instance(self):
+        """Return the instance with the lowest ref-count without incrementing."""
+        with self._lock:
+            if not self.instances:
+                return None
+            idx = min(range(len(self.instances)), key=lambda i: self.ref_counts[i])
+            return self.instances[idx]
+
+    def all_busy(self) -> bool:
+        """True if every instance is handling at least one request."""
+        with self._lock:
+            return bool(self.ref_counts) and all(r > 0 for r in self.ref_counts)
+
+    def can_add(self) -> bool:
+        return len(self.instances) < self.max_instances
+
+    def needs_new_instance(self) -> bool:
+        """True when all instances are busy and we are below max_instances."""
+        return self.all_busy() and self.can_add()
+
+    def cleanup_all(self) -> None:
+        with self._lock:
+            for obj in self.instances:
+                try:
+                    if hasattr(obj, 'cleanup'):
+                        obj.cleanup()
+                    elif hasattr(obj, 'to'):
+                        obj.to('cpu')
+                except Exception:
+                    pass
+            self.instances.clear()
+            self.ref_counts.clear()
+
+
 class MultiModelManager:
     """
     Manages multiple models: main text model, audio transcription, and image generation.
     """
-    
+
     def __init__(self):
         self.models: Dict[str, Any] = {}  # Can hold ModelManager, diffusers pipelines, sd.cpp models, etc.
         self.default_model: Optional[str] = None
@@ -422,6 +502,9 @@ class MultiModelManager:
         self.model_backend_types: Dict[str, str] = {}
         self.tool_breaker = FuzzyToolBreaker(threshold=3)  # Circuit breaker for repetitive tool calls
         self._load_lock = threading.Lock()  # Prevents duplicate on-demand model loads
+        self.model_pools: Dict[str, ModelInstancePool] = {}  # per-key instance pools
+        self._pending_new_instance: set = set()  # keys awaiting a second+ instance load
+        self._global_max_instances: int = 1  # set from config at startup
     
     @property
     def image_model(self) -> Optional[str]:
@@ -546,13 +629,14 @@ class MultiModelManager:
             return None
 
         # Fast path: already loaded (checked without lock for performance)
-        if self.default_model in self.models:
-            return self.models[self.default_model]
+        if self.default_model in self.models and self.default_model not in self._pending_new_instance:
+            return self._get_least_busy_instance(self.default_model)
 
         with self._load_lock:
             # Re-check inside the lock to avoid duplicate loads from concurrent requests
-            if self.default_model in self.models:
-                return self.models[self.default_model]
+            if self.default_model in self.models and self.default_model not in self._pending_new_instance:
+                return self._get_least_busy_instance(self.default_model)
+            self._pending_new_instance.discard(self.default_model)
 
             config = self.config.get(self.default_model, {})
             backend_type = self.model_backend_types.get(self.default_model, "auto")
@@ -590,7 +674,7 @@ class MultiModelManager:
 
                 print(f"Loading default model on demand: {self.default_model}")
                 model_manager.load_model(self.default_model, backend_type=backend_type, **kwargs)
-                self.models[self.default_model] = model_manager
+                self.add_model(self.default_model, model_manager)
                 self.current_model_key = self.default_model
                 print(f"Model loaded successfully: {self.default_model}")
                 return model_manager
@@ -600,13 +684,14 @@ class MultiModelManager:
     
     def _load_model_by_name(self, model_name: str):
         """Load a model by name on demand (thread-safe)."""
-        if model_name in self.models:
-            return self.models[model_name]
+        if model_name in self.models and model_name not in self._pending_new_instance:
+            return self._get_least_busy_instance(model_name)
 
         with self._load_lock:
-            # Re-check inside lock to prevent duplicate loads
-            if model_name in self.models:
-                return self.models[model_name]
+            # Re-check inside lock to prevent duplicate loads, but honour pending new instance.
+            if model_name in self.models and model_name not in self._pending_new_instance:
+                return self._get_least_busy_instance(model_name)
+            self._pending_new_instance.discard(model_name)
 
             config = self.config.get(model_name, {})
             backend_type = self.model_backend_types.get(model_name, "auto")
@@ -642,11 +727,15 @@ class MultiModelManager:
                     if hasattr(global_args, 'max_gpu_percent'):
                         kwargs['max_gpu_percent'] = global_args.max_gpu_percent
 
-                print(f"Loading model on demand: {model_name}")
+                pool = self.model_pools.get(model_name)
+                inst_num = pool.count + 1 if pool else 1
+                print(f"Loading model on demand: {model_name}"
+                      + (f" (instance {inst_num})" if inst_num > 1 else ""))
                 model_manager.load_model(model_name, backend_type=backend_type, **kwargs)
-                self.models[model_name] = model_manager
+                self.add_model(model_name, model_manager)
                 self.current_model_key = model_name
-                print(f"Model loaded successfully: {model_name}")
+                print(f"Model loaded successfully: {model_name}"
+                      + (f" (instance {inst_num})" if inst_num > 1 else ""))
                 return model_manager
             except Exception as e:
                 print(f"Error loading model {model_name}: {e}")
@@ -942,86 +1031,66 @@ class MultiModelManager:
         # Handle empty or "default" model names
         if not requested_model or requested_model == "default":
             if self.default_model:
-                # Check if already loaded
                 if self.default_model in self.models:
-                    self.current_model_key = self.default_model
-                    return self.models[self.default_model]
-                # Model not loaded yet - try to load it
+                    return self._get_least_busy_instance(self.default_model)
                 return self._load_default_model()
             return None
-        
+
         # Handle "audio" alias
         if requested_model == "audio":
             if self.audio_models:
-                first_audio = self.audio_models[0]
-                key = f"audio:{first_audio}"
+                key = f"audio:{self.audio_models[0]}"
                 if key in self.models:
-                    self.current_model_key = key
-                    return self.models[key]
+                    return self._get_least_busy_instance(key)
             return None
-        
+
         # Handle "image" alias
         if requested_model == "image":
             if self.image_models:
-                first_image = self.image_models[0]
-                key = f"image:{first_image}"
+                key = f"image:{self.image_models[0]}"
                 if key in self.models:
-                    self.current_model_key = key
-                    return self.models[key]
+                    return self._get_least_busy_instance(key)
             return None
-        
+
         # Handle "tts" alias
         if requested_model == "tts":
             if self.tts_model:
                 key = f"tts:{self.tts_model}"
                 if key in self.models:
-                    self.current_model_key = key
-                    return self.models[key]
+                    return self._get_least_busy_instance(key)
             return None
-        
+
         # Handle prefixed models
         if requested_model.startswith("audio:"):
-            audio_name = requested_model[6:]
-            key = f"audio:{audio_name}"
+            key = f"audio:{requested_model[6:]}"
             if key in self.models:
-                self.current_model_key = key
-                return self.models[key]
+                return self._get_least_busy_instance(key)
             return None
-        
+
         if requested_model.startswith("tts:"):
-            tts_name = requested_model[4:]
-            key = f"tts:{tts_name}"
+            key = f"tts:{requested_model[4:]}"
             if key in self.models:
-                self.current_model_key = key
-                return self.models[key]
+                return self._get_least_busy_instance(key)
             return None
-        
+
         if requested_model.startswith("vision:") or requested_model.startswith("image:"):
-            if requested_model.startswith("vision:"):
-                image_name = requested_model[7:]
-            else:
-                image_name = requested_model[6:]
+            image_name = requested_model[7:] if requested_model.startswith("vision:") else requested_model[6:]
             key = f"image:{image_name}"
             if key in self.models:
-                self.current_model_key = key
-                return self.models[key]
+                return self._get_least_busy_instance(key)
             return None
-        
+
         # Check if it's the default model
-        if self.default_model and (requested_model == self.default_model or 
+        if self.default_model and (requested_model == self.default_model or
                                     requested_model.endswith(self.default_model.split("/")[-1])):
-            # Check if already loaded
             if self.default_model in self.models:
-                self.current_model_key = self.default_model
-                return self.models[self.default_model]
-            # Try to load the default model
+                return self._get_least_busy_instance(self.default_model)
             return self._load_default_model()
-        
+
         # Check if any loaded model matches
-        for key, model in self.models.items():
+        for key in self.models:
             if requested_model in key or key.endswith(requested_model.split("/")[-1]):
-                self.current_model_key = key
-                return model
+                return self._get_least_busy_instance(key)
         
         # Validate the model is allowed before attempting to load it.
         # This prevents loading arbitrary models not registered via command line.
@@ -1292,12 +1361,71 @@ class MultiModelManager:
                 return free / 1e9
         except Exception:
             pass
+        # AMD GPU via sysfs (covers Vulkan/ROCm on Linux)
+        try:
+            import glob
+            for total_path in sorted(glob.glob('/sys/class/drm/card*/device/mem_info_vram_total')):
+                used_path = total_path.replace('vram_total', 'vram_used')
+                with open(total_path) as f:
+                    total = int(f.read().strip())
+                with open(used_path) as f:
+                    used = int(f.read().strip())
+                return (total - used) / 1e9
+        except Exception:
+            pass
         return 999.0  # Unknown — assume enough
 
-    def _get_model_used_vram_gb(self, model_key: str) -> float:
-        """Return the configured used_vram_gb for a model, or 0 if unknown."""
+    def _get_model_used_vram_gb(self, model_key: str, resolved_name: str = None) -> float:
+        """Return VRAM requirement in GB for a model.
+
+        Uses configured used_vram_gb when set; otherwise estimates from file size
+        for local model files (GGUF, GGML, whisper .bin, etc.) — weights + KV cache
+        + 15% buffer. Returns 0 when the requirement cannot be determined.
+        """
         cfg = self.config.get(model_key, {})
-        return float(cfg.get("used_vram_gb") or 0)
+        explicit = cfg.get("used_vram_gb")
+        if explicit:
+            return float(explicit)
+
+        # Build a list of candidate paths to check
+        candidates = []
+        if resolved_name:
+            candidates.append(resolved_name)
+        # model_key is often the path for text GGUF models
+        candidates.append(model_key)
+        # Strip type prefix (e.g. "audio:/path/to/model.bin")
+        if ":" in model_key:
+            candidates.append(model_key.split(":", 1)[1])
+        # Config may store the path explicitly
+        for field in ("path", "model_path", "model"):
+            v = cfg.get(field)
+            if v:
+                candidates.append(v)
+
+        import os
+        local_exts = {'.gguf', '.ggml', '.bin', '.pt', '.safetensors'}
+        for path in candidates:
+            if not path:
+                continue
+            _, ext = os.path.splitext(path)
+            if ext.lower() not in local_exts:
+                continue
+            try:
+                size_bytes = os.path.getsize(path)
+                weights_gb = size_bytes / 1e9
+
+                # KV cache: 2 bytes × 2 (K+V) × n_layers × n_ctx × head_dim
+                # We don't know the architecture, so estimate from n_ctx alone.
+                # Empirically ~0.5 MB per 1 K tokens covers most small models.
+                n_ctx = cfg.get("n_ctx") or 2048
+                kv_cache_gb = (n_ctx / 1024) * 0.5 / 1024  # 0.5 MB per 1 K ctx → GB
+
+                # 15% overhead for activations, graph buffers, scratch space
+                return weights_gb * 1.15 + kv_cache_gb
+            except OSError:
+                continue
+
+        return 0
 
     def _evict_models_for_vram(self, needed_gb: float):
         """Unload loaded models (LRU first) until we have at least needed_gb free VRAM."""
@@ -1509,7 +1637,7 @@ class MultiModelManager:
                     'already_loaded': True,
                 }
             # Not loaded — check VRAM and evict if needed
-            needed_gb = self._get_model_used_vram_gb(model_key)
+            needed_gb = self._get_model_used_vram_gb(model_key, resolved_name)
             if needed_gb > 0:
                 free_gb = self._get_free_vram_gb()
                 if free_gb < needed_gb:
@@ -1634,11 +1762,33 @@ class MultiModelManager:
                 }
         
         # =====================================================================
-        # ONDEMAND MODE (default): Only one model in memory at a time.
-        # Fully unload the current model before loading the new one.
+        # ONDEMAND MODE (default): One model in memory at a time — but if a model
+        # has max_instances > 1 and all instances are busy, load another copy.
         # =====================================================================
         if existing_model is not None:
-            # Already loaded and it's the only model - return it
+            pool = self.model_pools.get(model_key)
+            if pool is None:
+                # Pool wasn't created yet (model registered outside add_model); adopt it now.
+                pool = ModelInstancePool(max_instances=self._get_max_instances(model_key))
+                pool.add(existing_model)
+                self.model_pools[model_key] = pool
+
+            if pool.needs_new_instance():
+                needed_gb = self._get_model_used_vram_gb(model_key, resolved_name)
+                free_gb = self._get_free_vram_gb()
+                if needed_gb > 0 and free_gb >= needed_gb:
+                    print(f"Ondemand: all {pool.count} instance(s) of '{model_key}' busy — "
+                          f"loading instance {pool.count + 1}/{pool.max_instances} "
+                          f"(need {needed_gb:.1f} GB, have {free_gb:.1f} GB free)")
+                    self._pending_new_instance.add(model_key)
+                    return {
+                        'model_key': model_key,
+                        'model_name': resolved_name,
+                        'model_object': None,
+                        'config': self.config.get(model_key, {}),
+                        'already_loaded': False,
+                    }
+
             self.current_model_key = model_key
             self.active_in_vram = model_key
             return {
@@ -1663,19 +1813,26 @@ class MultiModelManager:
                 loaded_canonical = "legacy_model_manager"
             
             if loaded_canonical and loaded_canonical != model_key:
-                print(f"Ondemand mode - model switch detected:")
-                print(f"  Requested: '{model_key}' (resolved: '{resolved_name}')")
-                print(f"  Currently loaded: '{loaded_canonical}'")
-                print(f"  -> Unloading current model(s) before loading new model...")
-                self.unload_all_models()
-                
-                # Also cleanup the legacy singleton if it has a model
-                if has_legacy_model:
-                    try:
-                        print(f"  -> Cleaning up legacy model_manager...")
-                        _legacy_mm.cleanup()
-                    except Exception as e:
-                        print(f"  Warning: Error cleaning up legacy model_manager: {e}")
+                needed_gb = self._get_model_used_vram_gb(model_key, resolved_name)
+                free_gb = self._get_free_vram_gb()
+
+                if needed_gb > 0 and free_gb >= needed_gb:
+                    print(f"Ondemand mode - keeping '{loaded_canonical}' in VRAM alongside new model "
+                          f"(need {needed_gb:.1f} GB, have {free_gb:.1f} GB free)")
+                else:
+                    print(f"Ondemand mode - model switch detected:")
+                    print(f"  Requested: '{model_key}' (resolved: '{resolved_name}')")
+                    print(f"  Currently loaded: '{loaded_canonical}'")
+                    print(f"  -> Unloading current model(s) before loading new model...")
+                    self.unload_all_models()
+
+                    # Also cleanup the legacy singleton if it has a model
+                    if has_legacy_model:
+                        try:
+                            print(f"  -> Cleaning up legacy model_manager...")
+                            _legacy_mm.cleanup()
+                        except Exception as e:
+                            print(f"  Warning: Error cleaning up legacy model_manager: {e}")
         
         # Return info for the caller to load the model
         return {
@@ -1760,6 +1917,8 @@ class MultiModelManager:
         self.current_model_key = None
         self.active_in_vram = None
         self.models_in_vram = set()
+        self.model_pools.clear()
+        self._pending_new_instance.clear()
         
         # Force garbage collection
         for _ in range(3):
@@ -1779,11 +1938,56 @@ class MultiModelManager:
         time.sleep(1)
         print("=== FULL VRAM CLEANUP: Complete ===")
     
+    def _get_max_instances(self, model_key: str) -> int:
+        """Per-model max_instances, falling back to the global default."""
+        per_model = self.config.get(model_key, {}).get("max_instances")
+        if per_model is not None:
+            return int(per_model)
+        return self._global_max_instances
+
+    def _get_least_busy_instance(self, key: str):
+        """Return the least-busy instance for key without incrementing its ref-count."""
+        pool = self.model_pools.get(key)
+        if pool and pool.count > 0:
+            obj = pool.least_busy_instance()
+            if obj is not None:
+                self.current_model_key = key
+                return obj
+        obj = self.models.get(key)
+        if obj is not None:
+            self.current_model_key = key
+        return obj
+
     def add_model(self, key: str, manager):
         """Add a model (ModelManager, diffusers pipeline, sd.cpp model, etc.) for a specific key."""
-        self.models[key] = manager
+        pool = self.model_pools.get(key)
+        if pool is None:
+            pool = ModelInstancePool(max_instances=self._get_max_instances(key))
+            self.model_pools[key] = pool
+        pool.add(manager)
+        self.models[key] = pool.primary  # backward compat: always the first instance
         self.active_in_vram = key
         self.models_in_vram.add(key)
+
+    def acquire_model_instance(self, model_key: str):
+        """Acquire the least-busy instance, incrementing its ref-count.
+
+        Returns (instance_idx, model_obj) or None if no instance is loaded.
+        Callers MUST call release_model_instance() when done.
+        """
+        pool = self.model_pools.get(model_key)
+        if pool and pool.count > 0:
+            return pool.acquire()
+        obj = self.models.get(model_key)
+        if obj is not None:
+            return 0, obj
+        return None
+
+    def release_model_instance(self, model_key: str, instance_idx: int) -> None:
+        """Release a previously acquired instance, decrementing its ref-count."""
+        pool = self.model_pools.get(model_key)
+        if pool:
+            pool.release(instance_idx)
     
     def get_model(self, key: str) -> Optional[ModelManager]:
         """Get a model manager by key."""
