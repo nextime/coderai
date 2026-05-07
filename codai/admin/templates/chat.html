@@ -114,6 +114,8 @@
 .gen-wrap { flex:1; display:flex; overflow:hidden; }
 .gen-ctrl { width:min(380px,36vw); min-width:340px; max-width:420px; padding:.9rem 1rem; overflow-y:auto; border-right:1px solid var(--border);
   background:var(--surface-1); display:flex; flex-direction:column; gap:.65rem; flex-shrink:0; }
+/* spacer so Chrome doesn't clip the last child in overflow-y:auto */
+.gen-ctrl::after { content:''; display:block; min-height:.75rem; }
 .gen-out { flex:1; display:flex; align-items:center; justify-content:center;
   overflow:auto; padding:1.2rem; background:var(--surface-0); }
 .gen-out-inner { display:flex; flex-direction:column; align-items:center; gap:.6rem; width:100%; max-width:960px; }
@@ -122,7 +124,34 @@
 .out-video { max-width:100%; max-height:calc(100vh - 200px); border-radius:8px; }
 .out-audio { width:100%; }
 .fl { font-size:11px; font-weight:600; color:var(--text-2); margin-bottom:.15rem; display:block; }
-.progress { font-size:11px; color:var(--text-3); min-height:14px; }
+.progress { min-height:18px; }
+.progress:not(:empty) {
+  display:block; font-size:13px; font-weight:600; letter-spacing:.03em;
+  color:#c7caf5;
+  border-left:3px solid #6366f1;
+  padding:.3rem .55rem;
+  background:rgba(99,102,241,.1);
+  border-radius:0 5px 5px 0;
+  margin-top:.4rem;
+  overflow:visible;
+  animation:prog-pulse 1.6s ease-in-out infinite;
+}
+@keyframes prog-pulse { 0%,100%{opacity:1;border-color:#6366f1} 50%{opacity:.7;border-color:#a5b4fc} }
+.gen-progress-wrap { display:none; margin-top:.4rem; }
+.gen-progress-wrap.active { display:block; }
+.gen-progress-bar-bg {
+  height:6px; border-radius:3px; background:var(--surface-3);
+  overflow:hidden; margin-top:.3rem;
+}
+.gen-progress-bar-fill {
+  height:100%; border-radius:3px;
+  background:linear-gradient(90deg,#6366f1,#a5b4fc);
+  transition:width .4s ease;
+  width:0%;
+}
+.gen-progress-label {
+  font-size:11px; color:#a0a8cc; margin-top:.15rem; text-align:right;
+}
 .fi, .fs, .fselect { background:var(--surface-2); border:1px solid var(--border); border-radius:5px;
   color:var(--text-1); padding:.38rem .6rem; font-size:13px; font-family:inherit;
   outline:none; width:100%; box-sizing:border-box; color-scheme:dark; }
@@ -152,7 +181,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
 
 @media (max-width: 720px) {
   .gen-wrap { flex-direction:column; }
-  .gen-ctrl { width:100%; min-width:0; max-width:none; border-right:none; border-bottom:1px solid var(--border); }
+  .gen-ctrl { width:100%; min-width:0; max-width:none; border-right:none; border-bottom:1px solid var(--border); max-height:55vh; }
 }
 
 /* ── Capability cards ─────────────────────────────────────────── */
@@ -266,8 +295,14 @@ a.dl { display:inline-block; margin-top:.4rem; }
 .pipe-cap-chip.optional.ok { background:#1a1f0a; color:#c0d060; border-color:#3a4a10; }
 /* ── Sub-tab model picker ─────────────────────────────────────── */
 .cap-model-picker { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; padding-top:.4rem; border-top:1px solid var(--border); margin-top:.1rem; }
+.cap-model-picker.multi { flex-direction:column; align-items:flex-start; gap:.4rem; }
 .cap-model-picker-label { font-size:10px; color:var(--text-3); text-transform:uppercase; letter-spacing:.05em; white-space:nowrap; }
 .cap-model-chips { display:flex; flex-wrap:wrap; gap:.3rem; }
+.cap-assign-rows { display:flex; flex-direction:column; gap:.3rem; width:100%; }
+.cap-assign-row  { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; }
+.cap-assign-label { font-size:10px; color:var(--text-2); min-width:7rem; flex-shrink:0; text-align:right; }
+.cap-assign-row.opt .cap-assign-label { color:var(--text-3); }
+.cap-assign-sep  { font-size:10px; color:var(--text-3); text-transform:uppercase; letter-spacing:.05em; padding-top:.2rem; border-top:1px solid var(--border); width:100%; }
 .cap-model-chip { font-size:11px; padding:.18rem .55rem; border-radius:999px; border:1px solid; cursor:pointer; background:transparent; font-family:inherit; transition:background .15s; }
 .cap-model-chip.ok  { color:#4ade80; border-color:#2a5a2a; background:#0f2a0f; }
 .cap-model-chip.ok:hover  { background:#1a3f1a; }
@@ -275,11 +310,42 @@ a.dl { display:inline-block; margin-top:.4rem; }
 .cap-model-chip.warn:hover { background:#3a2f0a; }
 .cap-model-chip.active { font-weight:700; outline:1px solid currentColor; outline-offset:1px; }
 /* ── Sidebar capability highlights ───────────────────────────── */
-.model-item.cap-ok   { border-left:3px solid #4caf50; padding-left:calc(.6rem - 3px); }
-.model-item.cap-partial { border-left:3px solid #f0a020; padding-left:calc(.6rem - 3px); }
+.model-item.cap-ok      { border-left:3px solid #4caf50; padding-left:calc(.55rem - 3px); background:rgba(76,175,80,.13); }
+.model-item.cap-ok:hover { background:rgba(76,175,80,.22); }
+.model-item.cap-partial { border-left:3px solid #f0a020; padding-left:calc(.55rem - 3px); background:rgba(240,160,32,.11); }
+.model-item.cap-partial:hover { background:rgba(240,160,32,.2); }
 .pb-step-param label { min-width:110px; color:var(--text-2); flex-shrink:0; }
 .pb-step-param input, .pb-step-param select, .pb-step-param textarea { flex:1; font-size:12px; }
 .pb-step-param textarea { rows:2; resize:vertical; min-height:40px; }
+/* ── Archive panel ────────────────────────────────────────────── */
+.archive-panel { flex:1; overflow-y:auto; padding:1.2rem; display:flex; flex-direction:column; gap:.9rem; }
+.archive-toolbar { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:.5rem; }
+.archive-filters { display:flex; gap:.35rem; }
+.arch-filter { background:var(--surface-2); border:1px solid var(--border); border-radius:5px; color:var(--text-2); padding:.28rem .7rem; font-size:12px; cursor:pointer; font-family:inherit; transition:background .15s; }
+.arch-filter.active { background:var(--accent,#4e9cf5); color:#fff; border-color:var(--accent,#4e9cf5); }
+.archive-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:.7rem; }
+.arch-card { background:var(--surface-1); border:1px solid var(--border); border-radius:8px; overflow:hidden; display:flex; flex-direction:column; }
+.arch-thumb { width:100%; aspect-ratio:1; object-fit:cover; background:var(--surface-2); display:block; cursor:pointer; }
+.arch-thumb-ph { width:100%; aspect-ratio:1; background:var(--surface-2); display:flex; align-items:center; justify-content:center; font-size:2.2rem; color:var(--text-3); }
+.arch-info { padding:.35rem .5rem; display:flex; flex-direction:column; gap:.15rem; }
+.arch-name { font-size:11px; color:var(--text-2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.arch-meta { font-size:10px; color:var(--text-3); }
+.arch-actions { display:flex; gap:.25rem; padding:.3rem .4rem; border-top:1px solid var(--border); flex-wrap:wrap; }
+.arch-btn { flex:1; font-size:11px; padding:.22rem .35rem; border:1px solid var(--border); border-radius:4px; background:transparent; color:var(--text-2); cursor:pointer; font-family:inherit; text-decoration:none; text-align:center; white-space:nowrap; }
+.arch-btn:hover { background:var(--surface-2); color:var(--text-1); }
+.arch-btn.del:hover { background:#3a1010; color:#f07070; border-color:#5a2020; }
+.arch-empty { color:var(--text-3); text-align:center; padding:2rem 1rem; grid-column:1/-1; font-size:13px; }
+/* ── Role-picker popup ────────────────────────────────────────── */
+.role-picker-popup { position:fixed; z-index:9999; background:var(--surface-1); border:1px solid var(--border); border-radius:8px; padding:.7rem; box-shadow:0 8px 24px rgba(0,0,0,.5); min-width:200px; max-width:280px; }
+.role-picker-header { font-size:12px; color:var(--text-2); margin-bottom:.5rem; }
+.role-picker-caps { display:flex; flex-direction:column; gap:.3rem; }
+.role-pick-btn { background:var(--surface-2); border:1px solid var(--border); border-radius:5px; color:var(--text-1); padding:.35rem .6rem; font-size:12px; cursor:pointer; font-family:inherit; text-align:left; display:flex; align-items:center; justify-content:space-between; gap:.4rem; }
+.role-pick-btn:hover { background:var(--surface-3); }
+.role-pick-btn.active { border-color:#6366f1; background:rgba(99,102,241,.1); }
+.role-pick-cap { text-transform:capitalize; }
+.role-pick-badge { font-size:10px; color:#6366f1; }
+.role-picker-close { width:100%; margin-top:.45rem; background:transparent; border:1px solid var(--border); border-radius:5px; color:var(--text-3); padding:.28rem; font-size:11px; cursor:pointer; font-family:inherit; }
+.role-picker-close:hover { color:var(--text-1); background:var(--surface-2); }
 </style>
 {% endblock %}
 
@@ -302,6 +368,9 @@ a.dl { display:inline-block; margin-top:.4rem; }
       <button class="t1btn" data-cat="audio" onclick="selectCat('audio')">Audio <span class="tab-status" hidden></span></button>
       <button class="t1btn" data-cat="pipe" onclick="selectCat('pipe')">Pipelines <span class="tab-status" hidden></span></button>
       <button class="t1btn" data-cat="embed" onclick="selectCat('embed')">Embed <span class="tab-status" hidden></span></button>
+      <button class="t1btn" data-cat="archive" onclick="selectCat('archive')">Archive <span class="tab-status" hidden></span></button>
+      <button class="t1btn" data-cat="3d" onclick="selectCat('3d')">3D <span class="tab-status" hidden></span></button>
+      <button class="t1btn" data-cat="profiles" onclick="selectCat('profiles')">Profiles <span class="tab-status" hidden></span></button>
     </div>
 
     <!-- Level-2 tabs (sub-mode) -->
@@ -317,6 +386,8 @@ a.dl { display:inline-block; margin-top:.4rem; }
       <button class="t2btn" data-sub="img-deblur" onclick="selectSub('img-deblur')">Deblur <span class="tab-status" hidden></span></button>
       <button class="t2btn" data-sub="img-unpix" onclick="selectSub('img-unpix')">Unpixelate <span class="tab-status" hidden></span></button>
       <button class="t2btn" data-sub="img-outfit" onclick="selectSub('img-outfit')">Outfit Change <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="img-to3d" onclick="selectSub('img-to3d')">2D→3D <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="img-from3d" onclick="selectSub('img-from3d')">3D→2D <span class="tab-status" hidden></span></button>
       <!-- Video sub-tabs -->
       <button class="t2btn" data-sub="vid-t2v" onclick="selectSub('vid-t2v')">Text→Video <span class="tab-status" hidden></span></button>
       <button class="t2btn" data-sub="vid-i2v" onclick="selectSub('vid-i2v')">Image→Video <span class="tab-status" hidden></span></button>
@@ -328,6 +399,13 @@ a.dl { display:inline-block; margin-top:.4rem; }
       <button class="t2btn" data-sub="vid-up" onclick="selectSub('vid-up')">Upscale <span class="tab-status" hidden></span></button>
       <button class="t2btn" data-sub="vid-faceswap" onclick="selectSub('vid-faceswap')">Face Swap <span class="tab-status" hidden></span></button>
       <button class="t2btn" data-sub="vid-outfit" onclick="selectSub('vid-outfit')">Outfit Change <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="vid-to3d" onclick="selectSub('vid-to3d')">2D→3D <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="vid-from3d" onclick="selectSub('vid-from3d')">3D→Video <span class="tab-status" hidden></span></button>
+      <!-- 3D sub-tabs -->
+      <button class="t2btn" data-sub="3d-generate" onclick="selectSub('3d-generate')">Generate Model <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="3d-img-to3d" onclick="selectSub('3d-img-to3d')">Image→3D <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="3d-vid-to3d" onclick="selectSub('3d-vid-to3d')">Video→3D <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="3d-from3d" onclick="selectSub('3d-from3d')">3D→Render <span class="tab-status" hidden></span></button>
       <!-- Audio sub-tabs -->
       <button class="t2btn" data-sub="aud-gen" onclick="selectSub('aud-gen')">Generate Music/SFX <span class="tab-status" hidden></span></button>
       <button class="t2btn" data-sub="aud-music-dub" onclick="selectSub('aud-music-dub')">Music Dub <span class="tab-status" hidden></span></button>
@@ -338,6 +416,10 @@ a.dl { display:inline-block; margin-top:.4rem; }
       <button class="t2btn" data-sub="aud-understand" onclick="selectSub('aud-understand')">Understand <span class="tab-status" hidden></span></button>
       <button class="t2btn" data-sub="aud-stems" onclick="selectSub('aud-stems')">Stems <span class="tab-status" hidden></span></button>
       <button class="t2btn" data-sub="aud-clean" onclick="selectSub('aud-clean')">Clean <span class="tab-status" hidden></span></button>
+      <!-- Profiles sub-tabs -->
+      <button class="t2btn" data-sub="prof-char" onclick="selectSub('prof-char')">Characters <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="prof-env" onclick="selectSub('prof-env')">Environments <span class="tab-status" hidden></span></button>
+      <button class="t2btn" data-sub="prof-voice" onclick="selectSub('prof-voice')">Voices <span class="tab-status" hidden></span></button>
     </div>
 
     <!-- ═══════════════ CHAT ═══════════════ -->
@@ -351,7 +433,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
           <span style="font-size:11px;color:var(--text-3)" id="attach-name"></span>
           <button class="btn btn-ghost btn-sm" onclick="clearAttach()" style="margin-left:auto">✕</button>
         </div>
-        <div id="typing" style="font-size:11px;color:var(--text-3);height:14px;margin-bottom:.2rem;font-family:var(--mono)"></div>
+        <div id="typing" class="progress" style="margin-bottom:.2rem;font-family:var(--mono)"></div>
         <div class="chat-row">
           <label id="attach-btn" style="display:none;cursor:pointer;align-self:flex-end;padding:.35rem" title="Attach image">
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" style="width:15px;height:15px"><path d="M2 10l4-4 3 3 2-2 3 3"/><rect x="1" y="1" width="14" height="14" rx="2"/></svg>
@@ -386,9 +468,33 @@ a.dl { display:inline-block; margin-top:.4rem; }
           <div class="frow"><label class="fl">Seed</label><input type="number" id="ig-seed" class="fi" placeholder="random"></div>
           <div class="frow"><label class="fl">Count (n)</label><input type="number" id="ig-n" class="fi" value="1" min="1" max="8"></div>
           <div class="frow"><label class="fl" title="Removes the model's built-in safety checker. Only use with uncensored/NSFW fine-tunes.">Disable safety filter</label><input type="checkbox" id="ig-nosafe"></div>
+          <div class="frow" style="align-items:flex-start">
+            <label class="fl" style="padding-top:.3rem">Characters</label>
+            <div style="flex:1;display:flex;flex-direction:column;gap:.3rem">
+              <div id="ig-char-profile-slots"></div>
+              <button class="btn btn-ghost btn-sm" id="ig-add-char-btn" onclick="addCharProfileSlot('ig')" style="align-self:flex-start;font-size:11px">+ Add character</button>
+            </div>
+          </div>
+          <div class="frow"><label class="fl">Character strength <span id="ig-char-sv">0.6</span></label>
+            <input type="range" id="ig-char-str" min="0" max="1" step="0.05" value="0.6" oninput="$('ig-char-sv').textContent=this.value" style="width:100%">
+          </div>
+          <div class="frow" style="align-items:flex-start">
+            <label class="fl" style="padding-top:.3rem">Environments</label>
+            <div style="flex:1;display:flex;flex-direction:column;gap:.3rem">
+              <div id="ig-env-profile-slots"></div>
+              <button class="btn btn-ghost btn-sm" id="ig-add-env-btn" onclick="addEnvProfileSlot('ig')" style="align-self:flex-start;font-size:11px">+ Add environment</button>
+            </div>
+          </div>
+          <div class="frow"><label class="fl">Environment strength <span id="ig-env-sv">0.6</span></label>
+            <input type="range" id="ig-env-str" min="0" max="1" step="0.05" value="0.6" oninput="$('ig-env-sv').textContent=this.value" style="width:100%">
+          </div>
+          <div class="req-preview" id="ig-preview"></div>
           <button class="btn btn-primary" onclick="genImage()">Generate</button>
           <div class="progress" id="ig-prog"></div>
-          <div class="req-preview" id="ig-preview"></div>
+          <div class="gen-progress-wrap" id="ig-pbar-wrap">
+            <div class="gen-progress-bar-bg"><div class="gen-progress-bar-fill" id="ig-pbar-fill"></div></div>
+            <div class="gen-progress-label" id="ig-pbar-label"></div>
+          </div>
         </div>
         <div class="gen-out" id="ig-out"><div class="gen-empty">Image will appear here</div></div>
       </div>
@@ -582,6 +688,59 @@ a.dl { display:inline-block; margin-top:.4rem; }
       </div>
     </div>
 
+    <!-- Image 2D → 3D -->
+    <div class="panel" id="panel-img-to3d">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="cap-card" id="cap-img-to3d"></div>
+          <div class="frow"><label class="fl">Source image</label><input type="file" id="i3-src" accept="image/*" class="fi" onchange="previewMediaInput('i3-src','i3-src-preview')"></div>
+          <div id="i3-src-preview" class="media-preview"></div>
+          <div class="frow"><label class="fl">Output method</label>
+            <select id="i3-method" class="fselect">
+              <option value="stereo">Stereo (side-by-side)</option>
+              <option value="anaglyph">Anaglyph (red-cyan)</option>
+              <option value="depth">Depth map</option>
+              <option value="mesh">3D mesh (GLB)</option>
+            </select>
+          </div>
+          <div class="frow" id="i3-shift-row"><label class="fl">Parallax shift <span id="i3-sv">20</span>px</label>
+            <input type="range" id="i3-shift" min="5" max="50" step="1" value="20" oninput="$('i3-sv').textContent=this.value" style="width:100%">
+          </div>
+          <button class="btn btn-primary" onclick="genImageTo3D()">Convert to 3D</button>
+          <div class="progress" id="i3-prog"></div>
+        </div>
+        <div class="gen-out" id="i3-out"><div class="gen-empty">3D output will appear here</div></div>
+      </div>
+    </div>
+
+    <!-- Image 3D → 2D -->
+    <div class="panel" id="panel-img-from3d">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="cap-card" id="cap-img-from3d"></div>
+          <div class="frow"><label class="fl">3D model file (GLB/OBJ)</label><input type="file" id="f3-src" accept=".glb,.obj,.gltf" class="fi"></div>
+          <div class="frow"><label class="fl">Format</label>
+            <select id="f3-fmt" class="fselect">
+              <option value="glb">GLB</option>
+              <option value="obj">OBJ</option>
+            </select>
+          </div>
+          <div class="g3">
+            <div class="frow"><label class="fl">Distance</label><input type="number" id="f3-dist" class="fi" value="2.0" step="0.5"></div>
+            <div class="frow"><label class="fl">Elevation°</label><input type="number" id="f3-elev" class="fi" value="30" step="5"></div>
+            <div class="frow"><label class="fl">Azimuth°</label><input type="number" id="f3-azim" class="fi" value="45" step="5"></div>
+          </div>
+          <div class="g2">
+            <div class="frow"><label class="fl">Width</label><input type="number" id="f3-w" class="fi" value="512" step="64"></div>
+            <div class="frow"><label class="fl">Height</label><input type="number" id="f3-h" class="fi" value="512" step="64"></div>
+          </div>
+          <button class="btn btn-primary" onclick="genImageFrom3D()">Render to Image</button>
+          <div class="progress" id="f3-prog"></div>
+        </div>
+        <div class="gen-out" id="f3-out"><div class="gen-empty">Rendered image will appear here</div></div>
+      </div>
+    </div>
+
     <!-- ═══════════════ VIDEO ═══════════════ -->
 
     <!-- T2V -->
@@ -621,14 +780,21 @@ a.dl { display:inline-block; margin-top:.4rem; }
         </div>
         <!-- Character consistency -->
         <details style="margin-top:.25rem">
-          <summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-2)">Character consistency</summary>
+          <summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-2)">Characters &amp; Environment</summary>
           <div style="margin-top:.5rem;display:flex;flex-direction:column;gap:.6rem">
+            <div id="vi-char-profile-slots"></div>
+            <button class="btn btn-ghost btn-sm" id="vi-add-char-btn" onclick="addCharProfileSlot('vi')" style="align-self:flex-start;font-size:11px">+ Add saved character</button>
             <div id="vi-char-slots"></div>
-            <button class="btn btn-ghost btn-sm" onclick="addCharSlot('vi')" style="align-self:flex-start;font-size:11px">+ Add character</button>
-            <div class="frow"><label class="fl">IP-Adapter strength <span id="vi-cs">0.80</span></label>
+            <button class="btn btn-ghost btn-sm" onclick="addCharSlot('vi')" style="align-self:flex-start;font-size:11px">+ Add character images</button>
+            <div class="frow"><label class="fl">Character strength <span id="vi-cs">0.80</span></label>
               <input type="range" id="vi-cstr" min="0" max="1" step="0.05" value="0.8" oninput="$('vi-cs').textContent=(+this.value).toFixed(2)" style="width:100%"></div>
+            <div id="vi-env-profile-slots"></div>
+            <button class="btn btn-ghost btn-sm" id="vi-add-env-btn" onclick="addEnvProfileSlot('vi')" style="align-self:flex-start;font-size:11px">+ Add environment</button>
+            <div class="frow"><label class="fl">Environment strength <span id="vi-es">0.60</span></label>
+              <input type="range" id="vi-estr" min="0" max="1" step="0.05" value="0.6" oninput="$('vi-es').textContent=(+this.value).toFixed(2)" style="width:100%"></div>
           </div>
         </details>
+        <div id="vi-dialog-section"></div>
         <button class="btn btn-primary" onclick="genVideo('i2v')">Animate</button>
         <div class="progress" id="vi-prog"></div>
       </div>
@@ -657,16 +823,23 @@ a.dl { display:inline-block; margin-top:.4rem; }
             <option value="rotate">Rotate</option>
           </select>
         </div>
-        <!-- Character consistency -->
+        <!-- Characters & Environment -->
         <details style="margin-top:.25rem">
-          <summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-2)">Character consistency</summary>
+          <summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-2)">Characters &amp; Environment</summary>
           <div style="margin-top:.5rem;display:flex;flex-direction:column;gap:.6rem">
+            <div id="vv-char-profile-slots"></div>
+            <button class="btn btn-ghost btn-sm" id="vv-add-char-btn" onclick="addCharProfileSlot('vv')" style="align-self:flex-start;font-size:11px">+ Add saved character</button>
             <div id="vv-char-slots"></div>
-            <button class="btn btn-ghost btn-sm" onclick="addCharSlot('vv')" style="align-self:flex-start;font-size:11px">+ Add character</button>
-            <div class="frow"><label class="fl">IP-Adapter strength <span id="vv-cs">0.80</span></label>
+            <button class="btn btn-ghost btn-sm" onclick="addCharSlot('vv')" style="align-self:flex-start;font-size:11px">+ Add character images</button>
+            <div class="frow"><label class="fl">Character strength <span id="vv-cs">0.80</span></label>
               <input type="range" id="vv-cstr" min="0" max="1" step="0.05" value="0.8" oninput="$('vv-cs').textContent=(+this.value).toFixed(2)" style="width:100%"></div>
+            <div id="vv-env-profile-slots"></div>
+            <button class="btn btn-ghost btn-sm" id="vv-add-env-btn" onclick="addEnvProfileSlot('vv')" style="align-self:flex-start;font-size:11px">+ Add environment</button>
+            <div class="frow"><label class="fl">Environment strength <span id="vv-es">0.60</span></label>
+              <input type="range" id="vv-estr" min="0" max="1" step="0.05" value="0.6" oninput="$('vv-es').textContent=(+this.value).toFixed(2)" style="width:100%"></div>
           </div>
         </details>
+        <div id="vv-dialog-section"></div>
         <button class="btn btn-primary" onclick="genVideo('v2v')">Transform</button>
         <div class="progress" id="vv-prog"></div>
       </div>
@@ -707,16 +880,23 @@ a.dl { display:inline-block; margin-top:.4rem; }
         </div>
         <div class="frow"><label class="fl">Seed</label><input type="number" id="ti-seed" class="fi" placeholder="random"></div>
         <div class="frow"><label class="fl" title="Removes the model's built-in safety checker. Only use with uncensored/NSFW fine-tunes.">Disable safety filter</label><input type="checkbox" id="ti-nosafe"></div>
-        <!-- Character consistency -->
+        <!-- Characters & Environment -->
         <details style="margin-top:.25rem">
-          <summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-2)">Character consistency</summary>
+          <summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-2)">Characters &amp; Environment</summary>
           <div style="margin-top:.5rem;display:flex;flex-direction:column;gap:.6rem">
+            <div id="ti-char-profile-slots"></div>
+            <button class="btn btn-ghost btn-sm" id="ti-add-char-btn" onclick="addCharProfileSlot('ti')" style="align-self:flex-start;font-size:11px">+ Add saved character</button>
             <div id="ti-char-slots"></div>
-            <button class="btn btn-ghost btn-sm" onclick="addCharSlot('ti')" style="align-self:flex-start;font-size:11px">+ Add character</button>
-            <div class="frow"><label class="fl">IP-Adapter strength <span id="ti-cs">0.80</span></label>
+            <button class="btn btn-ghost btn-sm" onclick="addCharSlot('ti')" style="align-self:flex-start;font-size:11px">+ Add character images</button>
+            <div class="frow"><label class="fl">Character strength <span id="ti-cs">0.80</span></label>
               <input type="range" id="ti-cstr" min="0" max="1" step="0.05" value="0.8" oninput="$('ti-cs').textContent=(+this.value).toFixed(2)" style="width:100%"></div>
+            <div id="ti-env-profile-slots"></div>
+            <button class="btn btn-ghost btn-sm" id="ti-add-env-btn" onclick="addEnvProfileSlot('ti')" style="align-self:flex-start;font-size:11px">+ Add environment</button>
+            <div class="frow"><label class="fl">Environment strength <span id="ti-es">0.60</span></label>
+              <input type="range" id="ti-estr" min="0" max="1" step="0.05" value="0.6" oninput="$('ti-es').textContent=(+this.value).toFixed(2)" style="width:100%"></div>
           </div>
         </details>
+        <div id="ti-dialog-section"></div>
         <!-- Audio -->
         <details style="margin-top:.25rem">
           <summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-2)">Add audio</summary>
@@ -849,6 +1029,56 @@ a.dl { display:inline-block; margin-top:.4rem; }
       <div class="gen-out" id="vu-out"><div class="gen-empty">Upscaled video will appear here</div></div>
     </div></div>
 
+    <!-- Video 2D → 3D -->
+    <div class="panel" id="panel-vid-to3d"><div class="gen-wrap">
+      <div class="gen-ctrl">
+        <div class="cap-card" id="cap-vid-to3d"></div>
+        <div class="frow"><label class="fl">Source video</label><input type="file" id="v3-src" accept="video/*" class="fi"></div>
+        <div class="frow"><label class="fl">Output method</label>
+          <select id="v3-method" class="fselect">
+            <option value="anaglyph">Anaglyph (red-cyan)</option>
+            <option value="stereo">Stereo (side-by-side)</option>
+            <option value="depth">Depth video</option>
+          </select>
+        </div>
+        <div class="frow"><label class="fl">Parallax shift <span id="v3-sv">15</span>px</label>
+          <input type="range" id="v3-shift" min="5" max="40" step="1" value="15" oninput="$('v3-sv').textContent=this.value" style="width:100%">
+        </div>
+        <button class="btn btn-primary" onclick="genVideoTo3D()">Convert to 3D</button>
+        <div class="progress" id="v3-prog"></div>
+      </div>
+      <div class="gen-out" id="v3-out"><div class="gen-empty">3D video will appear here</div></div>
+    </div></div>
+
+    <!-- Video from 3D model (turntable) -->
+    <div class="panel" id="panel-vid-from3d"><div class="gen-wrap">
+      <div class="gen-ctrl">
+        <div class="cap-card" id="cap-vid-from3d"></div>
+        <div class="frow"><label class="fl">3D model file (GLB/OBJ)</label><input type="file" id="vf3-src" accept=".glb,.obj,.gltf" class="fi"></div>
+        <div class="frow"><label class="fl">Format</label>
+          <select id="vf3-fmt" class="fselect">
+            <option value="glb">GLB</option>
+            <option value="obj">OBJ</option>
+          </select>
+        </div>
+        <div class="g2">
+          <div class="frow"><label class="fl">Frames</label><input type="number" id="vf3-frames" class="fi" value="36"></div>
+          <div class="frow"><label class="fl">FPS</label><input type="number" id="vf3-fps" class="fi" value="12"></div>
+        </div>
+        <div class="g2">
+          <div class="frow"><label class="fl">Elevation°</label><input type="number" id="vf3-elev" class="fi" value="20" step="5"></div>
+          <div class="frow"><label class="fl">Distance</label><input type="number" id="vf3-dist" class="fi" value="2.5" step="0.5"></div>
+        </div>
+        <div class="g2">
+          <div class="frow"><label class="fl">Width</label><input type="number" id="vf3-w" class="fi" value="512" step="64"></div>
+          <div class="frow"><label class="fl">Height</label><input type="number" id="vf3-h" class="fi" value="512" step="64"></div>
+        </div>
+        <button class="btn btn-primary" onclick="genVideoFrom3D()">Render Turntable</button>
+        <div class="progress" id="vf3-prog"></div>
+      </div>
+      <div class="gen-out" id="vf3-out"><div class="gen-empty">Turntable video will appear here</div></div>
+    </div></div>
+
     <!-- ═══════════════ AUDIO ═══════════════ -->
 
     <!-- Music/SFX generation -->
@@ -882,8 +1112,13 @@ a.dl { display:inline-block; margin-top:.4rem; }
           <div class="cap-card" id="cap-aud-tts"></div>
           <div class="frow"><label class="fl">Text to speak</label><textarea id="at-text" class="fs" rows="6" placeholder="Enter text…"></textarea></div>
           <div class="g2">
-            <div class="frow"><label class="fl">Voice</label><input id="at-voice" class="fi" placeholder="af_sky, en-US-Jenny…"></div>
+            <div class="frow"><label class="fl">Voice ID</label><input id="at-voice" class="fi" placeholder="af_sky, en-US-Jenny…"></div>
             <div class="frow"><label class="fl">Speed</label><input type="number" id="at-speed" class="fi" value="1.0" step="0.1"></div>
+          </div>
+          <div class="frow"><label class="fl">Voice profile <span class="small muted">(overrides Voice ID, uses cloning)</span></label>
+            <select id="tts-voice-profile" class="fi" data-placeholder="— None (use Voice ID above) —">
+              <option value="">— None (use Voice ID above) —</option>
+            </select>
           </div>
           <button class="btn btn-primary" onclick="genTTS()">Synthesize</button>
           <div class="progress" id="at-prog"></div>
@@ -1464,6 +1699,363 @@ a.dl { display:inline-block; margin-top:.4rem; }
       </div>
     </div>
 
+    <div class="panel" id="panel-archive">
+      <div class="archive-panel">
+        <div class="archive-toolbar">
+          <div class="archive-filters">
+            <button class="arch-filter active" data-type="all" onclick="archiveSetFilter('all')">All</button>
+            <button class="arch-filter" data-type="image" onclick="archiveSetFilter('image')">Images</button>
+            <button class="arch-filter" data-type="video" onclick="archiveSetFilter('video')">Videos</button>
+            <button class="arch-filter" data-type="audio" onclick="archiveSetFilter('audio')">Audio</button>
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="loadArchive()">Refresh</button>
+        </div>
+        <div class="archive-grid" id="archive-grid">
+          <div class="arch-empty">Switch to this tab to load generated files.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════ PROFILES — CHARACTER ═══════════════ -->
+    <div class="panel" id="panel-prof-char">
+      <div class="gen-wrap" style="max-width:860px">
+        <div class="gen-hd">Character Profiles</div>
+
+        <!-- Toolbar -->
+        <div class="frow" style="gap:.5rem;margin-bottom:.6rem">
+          <button class="btn btn-primary btn-sm" onclick="profCharLoad()">Refresh</button>
+          <button class="btn btn-ghost btn-sm" onclick="profCharShowCreate()">+ New Profile</button>
+        </div>
+
+        <!-- Create / Edit form (hidden by default) -->
+        <div id="prof-char-form" style="display:none;background:var(--surface-2);border-radius:8px;padding:1rem;margin-bottom:1rem">
+          <div class="gen-hd" style="font-size:.85rem;margin-bottom:.5rem" id="prof-char-form-title">New Character Profile</div>
+          <input type="hidden" id="pc-edit-name">
+          <div class="frow"><label class="fl">Name*</label><input class="fi" id="pc-name" placeholder="alice"></div>
+          <div class="frow"><label class="fl">Description</label><input class="fi" id="pc-desc" placeholder="optional"></div>
+
+          <!-- Mode selector -->
+          <div class="frow" style="align-items:center;gap:1rem;margin-bottom:.2rem">
+            <label class="fl">Mode</label>
+            <label style="display:flex;align-items:center;gap:.3rem;cursor:pointer">
+              <input type="radio" name="pc-mode" value="extract" checked onchange="pcModeChange()"> Extract from media
+            </label>
+            <label style="display:flex;align-items:center;gap:.3rem;cursor:pointer">
+              <input type="radio" name="pc-mode" value="generate" onchange="pcModeChange()"> Generate from prompt
+            </label>
+          </div>
+
+          <!-- Extract-from-media fields -->
+          <div id="pc-extract-fields">
+            <div class="frow"><label class="fl">Source images</label>
+              <div style="flex:1">
+                <input type="file" id="pc-img-files" multiple accept="image/*" onchange="pcImgFilesChanged()" style="width:100%">
+                <div id="pc-img-previews" style="display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.4rem"></div>
+              </div>
+            </div>
+            <div class="frow"><label class="fl">Source videos</label>
+              <input type="file" id="pc-vid-files" multiple accept="video/*" style="flex:1">
+            </div>
+            <div class="frow"><label class="fl">Max ref images</label>
+              <input type="number" class="fi" id="pc-max" value="5" min="1" max="20" style="width:100px">
+            </div>
+          </div>
+
+          <!-- Generate-from-prompt fields -->
+          <div id="pc-generate-fields" style="display:none">
+            <div class="frow" style="align-items:flex-start"><label class="fl" style="padding-top:.3rem">Visual prompt*</label>
+              <textarea class="fi" id="pc-gen-prompt" rows="3" placeholder="e.g. a tall woman with red hair and blue eyes, realistic, studio lighting" style="flex:1;resize:vertical"></textarea>
+            </div>
+            <div class="frow"><label class="fl">Image model</label>
+              <select class="fi" id="pc-gen-model" style="flex:1">
+                <option value="">Default image model</option>
+              </select>
+            </div>
+            <div class="frow"><label class="fl">Ref images (n)</label>
+              <input type="number" class="fi" id="pc-gen-n" value="3" min="1" max="8" style="width:100px">
+            </div>
+            <details style="margin-top:.3rem">
+              <summary style="font-size:12px;cursor:pointer;color:var(--text-2)">Advanced</summary>
+              <div style="padding:.4rem 0">
+                <div class="frow"><label class="fl">Steps</label>
+                  <input type="number" class="fi" id="pc-gen-steps" placeholder="model default" min="1" max="150" style="width:120px">
+                </div>
+                <div class="frow"><label class="fl">Width</label>
+                  <input type="number" class="fi" id="pc-gen-w" value="512" min="64" max="2048" step="64" style="width:120px">
+                </div>
+                <div class="frow"><label class="fl">Height</label>
+                  <input type="number" class="fi" id="pc-gen-h" value="512" min="64" max="2048" step="64" style="width:120px">
+                </div>
+              </div>
+            </details>
+          </div>
+
+          <div style="display:flex;gap:.5rem;margin-top:.6rem">
+            <button class="btn btn-primary btn-sm" id="pc-submit-btn" onclick="profCharSubmit()">Extract &amp; Save</button>
+            <button class="btn btn-ghost btn-sm" onclick="profCharHideForm()">Cancel</button>
+          </div>
+          <div id="pc-form-status" class="small muted" style="margin-top:.4rem"></div>
+        </div>
+
+        <!-- Profile list -->
+        <div id="prof-char-list" class="archive-grid" style="margin-top:.6rem">
+          <div class="arch-empty">Loading…</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════ PROFILES — ENVIRONMENT ═══════════════ -->
+    <div class="panel" id="panel-prof-env">
+      <div class="gen-wrap" style="max-width:860px">
+        <div class="gen-hd">Environment Profiles</div>
+
+        <!-- Toolbar -->
+        <div class="frow" style="gap:.5rem;margin-bottom:.6rem">
+          <button class="btn btn-primary btn-sm" onclick="profEnvLoad()">Refresh</button>
+          <button class="btn btn-ghost btn-sm" onclick="profEnvShowCreate()">+ New Profile</button>
+        </div>
+
+        <!-- Create / Edit form (hidden by default) -->
+        <div id="prof-env-form" style="display:none;background:var(--surface-2);border-radius:8px;padding:1rem;margin-bottom:1rem">
+          <div class="gen-hd" style="font-size:.85rem;margin-bottom:.5rem">New Environment Profile</div>
+          <div class="frow"><label class="fl">Name*</label><input class="fi" id="pe-name" placeholder="living-room"></div>
+          <div class="frow"><label class="fl">Description</label><input class="fi" id="pe-desc" placeholder="optional"></div>
+
+          <!-- Mode selector -->
+          <div class="frow" style="align-items:center;gap:1rem;margin-bottom:.2rem">
+            <label class="fl">Mode</label>
+            <label style="display:flex;align-items:center;gap:.3rem;cursor:pointer">
+              <input type="radio" name="pe-mode" value="extract" checked onchange="peModeChange()"> Extract from media
+            </label>
+            <label style="display:flex;align-items:center;gap:.3rem;cursor:pointer">
+              <input type="radio" name="pe-mode" value="generate" onchange="peModeChange()"> Generate from prompt
+            </label>
+          </div>
+
+          <!-- Extract-from-media fields -->
+          <div id="pe-extract-fields">
+            <div class="frow"><label class="fl">Source images</label>
+              <div style="flex:1">
+                <input type="file" id="pe-img-files" multiple accept="image/*" onchange="peImgFilesChanged()" style="width:100%">
+                <div id="pe-img-previews" style="display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.4rem"></div>
+              </div>
+            </div>
+            <div class="frow"><label class="fl">Source videos</label>
+              <input type="file" id="pe-vid-files" multiple accept="video/*" style="flex:1">
+            </div>
+            <div class="frow"><label class="fl">Max ref images</label>
+              <input type="number" class="fi" id="pe-max" value="5" min="1" max="20" style="width:100px">
+            </div>
+          </div>
+
+          <!-- Generate-from-prompt fields -->
+          <div id="pe-generate-fields" style="display:none">
+            <div class="frow" style="align-items:flex-start"><label class="fl" style="padding-top:.3rem">Visual prompt*</label>
+              <textarea class="fi" id="pe-gen-prompt" rows="3" placeholder="e.g. a cozy living room with wooden floors, warm lighting, bookshelves" style="flex:1;resize:vertical"></textarea>
+            </div>
+            <div class="frow"><label class="fl">Image model</label>
+              <select class="fi" id="pe-gen-model" style="flex:1">
+                <option value="">Default image model</option>
+              </select>
+            </div>
+            <div class="frow"><label class="fl">Ref images (n)</label>
+              <input type="number" class="fi" id="pe-gen-n" value="3" min="1" max="8" style="width:100px">
+            </div>
+            <details style="margin-top:.3rem">
+              <summary style="font-size:12px;cursor:pointer;color:var(--text-2)">Advanced</summary>
+              <div style="padding:.4rem 0">
+                <div class="frow"><label class="fl">Steps</label>
+                  <input type="number" class="fi" id="pe-gen-steps" placeholder="model default" min="1" max="150" style="width:120px">
+                </div>
+                <div class="frow"><label class="fl">Width</label>
+                  <input type="number" class="fi" id="pe-gen-w" value="512" min="64" max="2048" step="64" style="width:120px">
+                </div>
+                <div class="frow"><label class="fl">Height</label>
+                  <input type="number" class="fi" id="pe-gen-h" value="512" min="64" max="2048" step="64" style="width:120px">
+                </div>
+              </div>
+            </details>
+          </div>
+
+          <div style="display:flex;gap:.5rem;margin-top:.6rem">
+            <button class="btn btn-primary btn-sm" id="pe-submit-btn" onclick="profEnvSubmit()">Extract &amp; Save</button>
+            <button class="btn btn-ghost btn-sm" onclick="profEnvHideForm()">Cancel</button>
+          </div>
+          <div id="pe-form-status" class="small muted" style="margin-top:.4rem"></div>
+        </div>
+
+        <!-- Profile list -->
+        <div id="prof-env-list" class="archive-grid" style="margin-top:.6rem">
+          <div class="arch-empty">Loading…</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════ PROFILES — VOICE ═══════════════ -->
+    <div class="panel" id="panel-prof-voice">
+      <div class="gen-wrap" style="max-width:860px">
+        <div class="gen-hd">Voice Profiles</div>
+
+        <!-- Toolbar -->
+        <div class="frow" style="gap:.5rem;margin-bottom:.6rem">
+          <button class="btn btn-primary btn-sm" onclick="profVoiceLoad()">Refresh</button>
+          <button class="btn btn-ghost btn-sm" onclick="profVoiceShowCreate()">+ New Profile</button>
+        </div>
+
+        <!-- Create / Edit form -->
+        <div id="prof-voice-form" style="display:none;background:var(--surface-2);border-radius:8px;padding:1rem;margin-bottom:1rem">
+          <div class="gen-hd" style="font-size:.85rem;margin-bottom:.5rem">Extract Voice Profile</div>
+          <div class="frow"><label class="fl">Name*</label><input class="fi" id="pv-name" placeholder="john-doe"></div>
+          <div class="frow"><label class="fl">Description</label><input class="fi" id="pv-desc" placeholder="optional"></div>
+          <div class="frow"><label class="fl">Audio or Video file*</label>
+            <input type="file" id="pv-file" accept="audio/*,video/*" style="flex:1">
+          </div>
+          <div class="frow"><label class="fl">Transcript (optional)</label>
+            <textarea class="fi fs" id="pv-transcript" rows="2" placeholder="Leave empty to auto-transcribe with Whisper"></textarea>
+          </div>
+          <div style="display:flex;gap:.5rem;margin-top:.6rem">
+            <button class="btn btn-primary btn-sm" onclick="profVoiceSave()">Extract &amp; Save</button>
+            <button class="btn btn-ghost btn-sm" onclick="profVoiceHideForm()">Cancel</button>
+          </div>
+          <div id="pv-form-status" class="small muted" style="margin-top:.4rem"></div>
+        </div>
+
+        <!-- Voice list -->
+        <div id="prof-voice-list" style="display:flex;flex-direction:column;gap:.6rem;margin-top:.6rem">
+          <div class="arch-empty">Loading…</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════ 3D ═══════════════ -->
+
+    <!-- 3D: Generate model from text / image -->
+    <div class="panel" id="panel-3d-generate">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="cap-card" id="cap-3d-generate"></div>
+          <div class="frow"><label class="fl">Prompt (text-to-3D)</label>
+            <textarea id="g3-prompt" class="fs" rows="3" placeholder="A wooden chair, a sci-fi helmet, a cute dog…"></textarea>
+          </div>
+          <div class="frow"><label class="fl">Reference image (image-to-3D, optional)</label>
+            <input type="file" id="g3-img" accept="image/*" class="fi" onchange="previewMediaInput('g3-img','g3-img-preview')">
+          </div>
+          <div id="g3-img-preview" class="media-preview"></div>
+          <div class="g2">
+            <div class="frow"><label class="fl">Steps</label><input type="number" id="g3-steps" class="fi" value="64" min="8"></div>
+            <div class="frow"><label class="fl">Seed</label><input type="number" id="g3-seed" class="fi" placeholder="random"></div>
+          </div>
+          <div style="font-size:11px;color:var(--text-3);margin-top:.2rem">
+            Requires <strong>TripoSR</strong> (image) or <strong>Shap-E</strong> (text/image). Falls back to a depth-based mesh when neither is installed.
+          </div>
+          <button class="btn btn-primary" onclick="gen3DModel()">Generate 3D Model</button>
+          <div class="progress" id="g3-prog"></div>
+          <div id="g3-dl" style="display:none;margin-top:.5rem"></div>
+        </div>
+        <div class="gen-out" id="g3-out"><div class="gen-empty">GLB model will be ready for download</div></div>
+      </div>
+    </div>
+
+    <!-- 3D: Image → 3D (alias panel, same as img-to3d but in 3D category) -->
+    <div class="panel" id="panel-3d-img-to3d">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="cap-card" id="cap-3d-img-to3d"></div>
+          <div class="frow"><label class="fl">Source image</label>
+            <input type="file" id="t3i-src" accept="image/*" class="fi" onchange="previewMediaInput('t3i-src','t3i-src-preview')">
+          </div>
+          <div id="t3i-src-preview" class="media-preview"></div>
+          <div class="frow"><label class="fl">Output method</label>
+            <select id="t3i-method" class="fselect">
+              <option value="stereo">Stereo (side-by-side)</option>
+              <option value="anaglyph">Anaglyph (red-cyan)</option>
+              <option value="depth">Depth map</option>
+              <option value="mesh">3D mesh (GLB)</option>
+            </select>
+          </div>
+          <div class="frow"><label class="fl">Parallax shift <span id="t3i-sv">20</span>px</label>
+            <input type="range" id="t3i-shift" min="5" max="50" step="1" value="20" oninput="$('t3i-sv').textContent=this.value" style="width:100%">
+          </div>
+          <button class="btn btn-primary" onclick="gen3DImgTo3D()">Convert to 3D</button>
+          <div class="progress" id="t3i-prog"></div>
+        </div>
+        <div class="gen-out" id="t3i-out"><div class="gen-empty">3D output will appear here</div></div>
+      </div>
+    </div>
+
+    <!-- 3D: Video → 3D (alias panel) -->
+    <div class="panel" id="panel-3d-vid-to3d">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="cap-card" id="cap-3d-vid-to3d"></div>
+          <div class="frow"><label class="fl">Source video</label>
+            <input type="file" id="t3v-src" accept="video/*" class="fi">
+          </div>
+          <div class="frow"><label class="fl">Output method</label>
+            <select id="t3v-method" class="fselect">
+              <option value="anaglyph">Anaglyph (red-cyan)</option>
+              <option value="stereo">Stereo (side-by-side)</option>
+              <option value="depth">Depth video</option>
+            </select>
+          </div>
+          <div class="frow"><label class="fl">Parallax shift <span id="t3v-sv">15</span>px</label>
+            <input type="range" id="t3v-shift" min="5" max="40" step="1" value="15" oninput="$('t3v-sv').textContent=this.value" style="width:100%">
+          </div>
+          <button class="btn btn-primary" onclick="gen3DVidTo3D()">Convert to 3D</button>
+          <div class="progress" id="t3v-prog"></div>
+        </div>
+        <div class="gen-out" id="t3v-out"><div class="gen-empty">3D video will appear here</div></div>
+      </div>
+    </div>
+
+    <!-- 3D: 3D model → rendered image/video -->
+    <div class="panel" id="panel-3d-from3d">
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="cap-card" id="cap-3d-from3d"></div>
+          <div class="frow"><label class="fl">3D model file (GLB/OBJ)</label>
+            <input type="file" id="r3-src" accept=".glb,.obj,.gltf" class="fi">
+          </div>
+          <div class="frow"><label class="fl">Format</label>
+            <select id="r3-fmt" class="fselect">
+              <option value="glb">GLB</option>
+              <option value="obj">OBJ</option>
+            </select>
+          </div>
+          <div class="frow"><label class="fl">Output type</label>
+            <select id="r3-type" class="fselect" onchange="r3TypeChange()">
+              <option value="image">Single image</option>
+              <option value="video">Turntable video</option>
+            </select>
+          </div>
+          <div id="r3-img-opts">
+            <div class="g3">
+              <div class="frow"><label class="fl">Distance</label><input type="number" id="r3-dist" class="fi" value="2.0" step="0.5"></div>
+              <div class="frow"><label class="fl">Elevation°</label><input type="number" id="r3-elev" class="fi" value="30" step="5"></div>
+              <div class="frow"><label class="fl">Azimuth°</label><input type="number" id="r3-azim" class="fi" value="45" step="5"></div>
+            </div>
+          </div>
+          <div id="r3-vid-opts" style="display:none">
+            <div class="g2">
+              <div class="frow"><label class="fl">Frames</label><input type="number" id="r3-frames" class="fi" value="36"></div>
+              <div class="frow"><label class="fl">FPS</label><input type="number" id="r3-fps" class="fi" value="12"></div>
+            </div>
+            <div class="g2">
+              <div class="frow"><label class="fl">Elevation°</label><input type="number" id="r3-velev" class="fi" value="20" step="5"></div>
+              <div class="frow"><label class="fl">Distance</label><input type="number" id="r3-vdist" class="fi" value="2.5" step="0.5"></div>
+            </div>
+          </div>
+          <div class="g2">
+            <div class="frow"><label class="fl">Width</label><input type="number" id="r3-w" class="fi" value="512" step="64"></div>
+            <div class="frow"><label class="fl">Height</label><input type="number" id="r3-h" class="fi" value="512" step="64"></div>
+          </div>
+          <button class="btn btn-primary" onclick="gen3DRender()">Render</button>
+          <div class="progress" id="r3-prog"></div>
+        </div>
+        <div class="gen-out" id="r3-out"><div class="gen-empty">Render will appear here</div></div>
+      </div>
+    </div>
+
   </div><!-- studio-main -->
 </div><!-- studio -->
 {% endblock %}
@@ -1474,6 +2066,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
 //  State
 // ─────────────────────────────────────────────────────────────────
 let models = [], activeModel = null, chatHistory = [], chatBusy = false, attachedImage = null;
+let _imgPollTimer = null;
 let apiToken = null;
 let charSlots = {};        // prefix → [{name:'', images:[b64...]}]
 let _charProfiles = [];    // cached list from /v1/characters
@@ -1506,13 +2099,19 @@ const CAP_SUB = {
   subtitle_generation:'vid-sub',
   text_to_speech:'aud-tts', speech_to_text:'aud-stt',
   audio_generation:'aud-gen',
+  model_3d_generation:'3d-generate', image_to_3d:'3d-img-to3d',
+  video_to_3d:'3d-vid-to3d', model_3d_to_image:'3d-from3d',
 };
 // Sub-tab → parent category
 const SUB_CAT = {
   'img-gen':'image','img-edit':'image','img-inpaint':'image','img-upscale':'image','img-depth':'image','img-seg':'image','img-faceswap':'image','img-deblur':'image','img-unpix':'image','img-outfit':'image','img-outfit':'image',
+  'img-to3d':'image','img-from3d':'image',
   'vid-t2v':'video','vid-i2v':'video','vid-v2v':'video','vid-ti2v':'video','vid-interp':'video',
   'vid-sub':'video','vid-dub':'video','vid-up':'video','vid-faceswap':'video','vid-outfit':'video',
+  'vid-to3d':'video','vid-from3d':'video',
   'aud-gen':'audio','aud-music-dub':'audio','aud-tts':'audio','aud-stt':'audio','aud-clone':'audio','aud-convert':'audio','aud-understand':'audio','aud-stems':'audio','aud-clean':'audio',
+  '3d-generate':'3d','3d-img-to3d':'3d','3d-vid-to3d':'3d','3d-from3d':'3d',
+  'prof-char':'profiles','prof-env':'profiles','prof-voice':'profiles',
 };
 // Sub-tabs that share a panel with an image sub-tab (vid-X → panel-img-Y)
 const SUB_PANEL_ALIAS = {
@@ -1631,6 +2230,14 @@ const SUB_CAPABILITY_RULES = {
   'vid-up': { category:'video', optional:['video_upscaling'], fallbackTypes:['video'] },
   'vid-faceswap': { category:'video', optional:['video_to_video'], fallbackTypes:['video'] },
   'vid-outfit': { category:'video', optional:['video_to_video'], fallbackTypes:['video'] },
+  'img-to3d': { category:'image', optional:['depth_estimation','image_to_3d'], fallbackTypes:['image'] },
+  'img-from3d': { category:'image', optional:['model_3d_to_image'], fallbackTypes:['image'] },
+  'vid-to3d': { category:'video', optional:['depth_estimation','video_to_3d'], fallbackTypes:['video'] },
+  'vid-from3d': { category:'video', optional:['model_3d_to_image'], fallbackTypes:['video'] },
+  '3d-generate': { category:'3d', optional:['model_3d_generation','image_to_3d'], fallbackTypes:['image'] },
+  '3d-img-to3d': { category:'3d', optional:['depth_estimation','image_to_3d'], fallbackTypes:['image'] },
+  '3d-vid-to3d': { category:'3d', optional:['depth_estimation','video_to_3d'], fallbackTypes:['video'] },
+  '3d-from3d': { category:'3d', optional:['model_3d_to_image'], fallbackTypes:['image'] },
   'aud-gen': { category:'audio', requiresAny:['audio_generation'] },
   'aud-music-dub': { category:'audio', optional:['speech_to_text','text_to_speech','audio_generation'] },
   'aud-tts': { category:'audio', requiresAny:['text_to_speech'] },
@@ -1641,11 +2248,12 @@ const SUB_CAPABILITY_RULES = {
   'aud-stems': { category:'audio', optional:['audio_generation'], fallbackTypes:['audio'] },
   'aud-clean': { category:'audio', optional:['speech_to_text'], fallbackTypes:['audio'] },
 };
-const CATEGORY_TABS = ['chat', 'image', 'video', 'audio', 'pipe', 'embed'];
+const CATEGORY_TABS = ['chat', 'image', 'video', 'audio', '3d', 'pipe', 'embed', 'archive'];
 const CATEGORY_SUBS = {
   image: Object.keys(SUB_CAPABILITY_RULES).filter(sub => SUB_CAT[sub] === 'image'),
   video: Object.keys(SUB_CAPABILITY_RULES).filter(sub => SUB_CAT[sub] === 'video'),
   audio: Object.keys(SUB_CAPABILITY_RULES).filter(sub => SUB_CAT[sub] === 'audio'),
+  '3d': Object.keys(SUB_CAPABILITY_RULES).filter(sub => SUB_CAT[sub] === '3d'),
 };
 let currentTabState = { categories:{}, subs:{} };
 let audioBackendHealth = {
@@ -1731,6 +2339,7 @@ function updatePipelineBadges() {
       capsDiv.innerHTML = parts.join('');
     }
   });
+  autoPopulatePipelineInputs();
 }
 
 function hasTypeFallback(rule, typeOrTypes) {
@@ -1760,7 +2369,9 @@ function evaluateCategoryState(cat, subStates, caps, type) {
       : 'partial';
   }
   if (cat === 'pipe') return 'none';
+  if (cat === 'archive') return 'none';
   if (cat === 'embed') return caps.has('embeddings') || type === 'embedding' ? 'available' : 'unavailable';
+  if (cat === '3d') return 'none';  // always show 3D tab (no required capability)
   const states = (CATEGORY_SUBS[cat] || []).map(sub => subStates[sub]).filter(Boolean);
   if (states.includes('available')) return 'available';
   if (states.includes('partial')) return 'partial';
@@ -2203,7 +2814,8 @@ function buildAudioUnderstandPreviewData() {
 function buildMusicDubPreviewData() {
   return previewExportBody('/v1/pipelines/audio-music-dub', {
     audio: fileOrNull('amd-file') ? '<audio/video file data>' : undefined,
-    audio_model: activeModel?.id || '',
+    stt_model: getAssignedModelId('aud-music-dub', 'speech_to_text'),
+    tts_model: getAssignedModelId('aud-music-dub', 'text_to_speech'),
     source_lang: val('amd-slang') || undefined,
     target_lang: val('amd-tlang') || undefined,
     notes: val('amd-notes') || undefined,
@@ -2232,7 +2844,8 @@ function buildCleanupPreviewData() {
 function buildDubPreviewData() {
   const preview = buildDubPreferencePreview();
   return previewExportBody('/v1/video/dub', {
-    model: activeModel?.id || '',
+    stt_model: getAssignedModelId('vid-dub', 'speech_to_text'),
+    tts_model: getAssignedModelId('vid-dub', 'text_to_speech'),
     video: fileOrNull('vd-src') ? '<video file data>' : undefined,
     source_lang: preview.source_lang,
     target_lang: preview.target_lang,
@@ -2382,7 +2995,8 @@ const REQUEST_PREVIEW_CONFIG = {
     snippet:'curl',
     build:buildMusicDubPreviewData,
     fields:[
-      { label:'Audio model', value:preview => preview.body.audio_model || 'none selected' },
+      { label:'STT model', value:preview => preview.body.stt_model || 'none selected' },
+      { label:'TTS model', value:preview => preview.body.tts_model || 'none selected' },
       { label:'File', value:() => previewFileName('amd-file') },
       { label:'Source lang', value:preview => preview.body.source_lang || 'auto' },
       { label:'Target lang', value:preview => preview.body.target_lang || 'none' },
@@ -2393,7 +3007,8 @@ const REQUEST_PREVIEW_CONFIG = {
     snippet:'curl',
     build:buildDubPreviewData,
     fields:[
-      { label:'Model', value:preview => preview.body.model || 'none selected' },
+      { label:'STT model', value:preview => preview.body.stt_model || 'none selected' },
+      { label:'TTS model', value:preview => preview.body.tts_model || 'none selected' },
       { label:'Video file', value:() => previewFileName('vd-src') },
       { label:'Source lang', value:preview => preview.body.source_lang || 'auto' },
       { label:'Target lang', value:preview => preview.body.target_lang || 'required at run time' },
@@ -2504,6 +3119,20 @@ function selectModel(m) {
     el.classList.toggle('active', el.dataset.id === m.id));
   chatHistory = []; attachedImage = null; updateAttachBar();
   $('chat-msgs').innerHTML = `<div class="chat-empty"><h3>${m.id.split('/').pop()}</h3><p>Start below</p></div>`;
+  // Sync to currently active sub-tab's cap assignment
+  const _activeSub = document.querySelector('.t2btn.active')?.dataset.sub;
+  if (_activeSub) {
+    if (subNeedsMultiModel(_activeSub)) {
+      // Multi-cap sub: let the user choose which role to assign this model to
+      showRolePicker(_activeSub, m);
+    } else {
+      const _cap = SUB_API_CAP[_activeSub];
+      if (_cap) {
+        if (!capModelAssignments[_activeSub]) capModelAssignments[_activeSub] = {};
+        capModelAssignments[_activeSub][_cap] = m.id;
+      }
+    }
+  }
   updateRequestPreview('aud-gen');
   updateRequestPreview('aud-tts');
   updateRequestPreview('aud-stt');
@@ -2539,6 +3168,8 @@ function updateTabs(m) {
     }
     subStates[sub] = evaluateSubCapability(rule, allCaps, allTypes);
   });
+  // Profile subs require no model capability — always available
+  ['prof-char', 'prof-env', 'prof-voice'].forEach(sub => { subStates[sub] = 'available'; });
   updatePipelineBadges();
   const categoryStates = {};
   CATEGORY_TABS.forEach(cat => {
@@ -2563,13 +3194,14 @@ function updateTabs(m) {
 
 function selectCat(cat) {
   document.querySelectorAll('.t1btn').forEach(b => b.classList.toggle('active', b.dataset.cat === cat));
-  const hasL2 = ['image','video','audio'].includes(cat);
+  const hasL2 = ['image','video','audio','3d','profiles'].includes(cat);
   $('tabbar2').classList.toggle('visible', hasL2);
   if (!hasL2) {
     clearSidebarHighlights();
     document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
     const panel = $('panel-' + cat);
     if (panel) panel.classList.add('active');
+    if (cat === 'archive') loadArchive();
     return;
   }
   document.querySelectorAll('.t2btn').forEach(btn => {
@@ -2577,35 +3209,214 @@ function selectCat(cat) {
     btn.dataset.catVisible = belongsHere ? cat : '';
     btn.classList.toggle('state-hidden', !belongsHere);
   });
+  if (cat === 'profiles') { profCharLoad(); profEnvLoad(); profVoiceLoad(); }
   const activeSub = document.querySelector('.t2btn.active');
   const activeSubFits = activeSub && isSubVisibleForCategory(activeSub.dataset.sub, cat);
   const nextSub = activeSubFits ? activeSub.dataset.sub : getFirstVisibleSub(cat)?.dataset.sub;
   if (nextSub) selectSub(nextSub);
 }
 
+// Stores per-capability model assignments for multi-model subs: {sub: {cap: modelId}}
+const capModelAssignments = {};
+
+function modelsForCap(cap) {
+  return models.filter(m => capabilitySetForModel(m).has(cap));
+}
+
 function modelsForSub(sub) {
   const rule = SUB_CAPABILITY_RULES[sub];
   if (!rule) return [];
   return models.map(m => {
-    const state = evaluateSubCapability(rule, capabilitySetForModel(m), m.type || 'text');
+    const caps = capabilitySetForModel(m);
+    let state = evaluateSubCapability(rule, caps, m.type || 'text');
+    if (state === 'unavailable' && rule.category === (m.type || 'text')) state = 'partial';
     return { model: m, state };
   }).filter(item => item.state !== 'unavailable');
 }
 
+function subNeedsMultiModel(sub) {
+  const studioRule = STUDIO_CAPABILITIES[sub];
+  if (!studioRule) return false;
+  return (studioRule.requires || []).length > 1;
+}
+
+function renderCapRow(sub, cap, isOptional) {
+  const capable = modelsForCap(cap);
+  if (!capable.length) {
+    if (isOptional) return '';
+    return `<div class="cap-assign-row">
+      <span class="cap-assign-label">${cap.replace(/_/g,' ')}</span>
+      <span class="cap-chip dim">No model available</span>
+    </div>`;
+  }
+  const assigned = capModelAssignments[sub]?.[cap];
+  const chips = capable.map(m => {
+    const isSelected = m.id === assigned;
+    const label = escapeHtml(m.id.split('/').pop());
+    const safe = JSON.stringify(m).replace(/"/g, '&quot;');
+    return `<button class="cap-model-chip ok${isSelected ? ' active' : ''}" onclick="assignModelToCap('${sub}','${cap}',${safe})" title="${m.id}">${label}</button>`;
+  }).join('');
+  return `<div class="cap-assign-row${isOptional ? ' opt' : ''}">
+    <span class="cap-assign-label">${cap.replace(/_/g,' ')}</span>
+    <div class="cap-model-chips">${chips}</div>
+  </div>`;
+}
+
+function renderMultiCapPicker(sub) {
+  const studioRule = STUDIO_CAPABILITIES[sub];
+  const required = studioRule?.requires || [];
+  const optional  = studioRule?.optional  || [];
+  const reqRows = required.map(c => renderCapRow(sub, c, false)).join('');
+  const optRows = optional.map(c => renderCapRow(sub, c, true)).join('');
+  const optSection = optRows
+    ? `<div class="cap-assign-sep">Optional</div>${optRows}`
+    : '';
+  return `<div class="cap-model-picker multi">
+    <span class="cap-model-picker-label">Models per role</span>
+    <div class="cap-assign-rows">${reqRows}${optSection}</div>
+  </div>`;
+}
+
 function renderSubModelPicker(sub) {
+  if (subNeedsMultiModel(sub)) return renderMultiCapPicker(sub);
   const compatible = modelsForSub(sub);
   if (!compatible.length) return '';
+  const cap = SUB_API_CAP[sub]
+    || (STUDIO_CAPABILITIES[sub]?.requires || SUB_CAPABILITY_RULES[sub]?.requiresAny || [])[0];
+  const selectedId = (cap ? capModelAssignments[sub]?.[cap] : null) || activeModel?.id;
   const chips = compatible.map(({ model, state }) => {
     const cls = state === 'available' ? 'ok' : 'warn';
-    const isActive = activeModel && model.id === activeModel.id;
+    const isActive = model.id === selectedId;
     const label = escapeHtml(model.id.split('/').pop());
     const safe = JSON.stringify(model).replace(/"/g, '&quot;');
-    return `<button class="cap-model-chip ${cls}${isActive ? ' active' : ''}" onclick="selectModel(${safe})" title="${model.id}">${label}</button>`;
+    return `<button class="cap-model-chip ${cls}${isActive ? ' active' : ''}" onclick="selectSubModel('${sub}',${safe})" title="${model.id}">${label}</button>`;
   }).join('');
   return `<div class="cap-model-picker"><span class="cap-model-picker-label">Models</span><div class="cap-model-chips">${chips}</div></div>`;
 }
 
+function assignModelToCap(sub, cap, model) {
+  if (!capModelAssignments[sub]) capModelAssignments[sub] = {};
+  capModelAssignments[sub][cap] = model.id;
+  // Sync left-panel selection only for single-cap subs; multi-cap subs have
+  // independent per-role assignments that shouldn't overwrite the global model.
+  if (!subNeedsMultiModel(sub)) {
+    activeModel = model;
+    document.querySelectorAll('.model-item').forEach(el =>
+      el.classList.toggle('active', el.dataset.id === model.id));
+  }
+  renderCapabilityCards();
+  if (SUB_CAT[sub]) highlightSidebarForSub(sub);
+}
+
+// Returns the user-assigned model ID for a capability, or falls back to activeModel.
+function getAssignedModelId(sub, cap) {
+  return capModelAssignments[sub]?.[cap] || activeModel?.id || '';
+}
+
+// Returns the ModelInfo object for the best model to use for a single capability.
+// Prefers models with load_mode:'load' (already resident), then smallest used_vram_gb.
+function bestModelForCap(cap) {
+  return modelsForCap(cap).slice().sort((a, b) => {
+    const al = a.load_mode === 'load' ? 0 : 1;
+    const bl = b.load_mode === 'load' ? 0 : 1;
+    if (al !== bl) return al - bl;
+    return (a.used_vram_gb || 99) - (b.used_vram_gb || 99);
+  })[0] || null;
+}
+
+// Primary capability per sub-tab — used for single-cap model assignment and API calls.
+const SUB_API_CAP = {
+  'img-gen':      'image_generation',
+  'img-edit':     'image_to_image',
+  'img-inpaint':  'inpainting',
+  'img-upscale':  'image_upscaling',
+  'img-depth':    'depth_estimation',
+  'img-seg':      'image_segmentation',
+  'img-faceswap': 'image_to_image',
+  'img-deblur':   'image_to_image',
+  'img-unpix':    'image_to_image',
+  'img-outfit':   'image_to_image',
+  'vid-t2v':      'video_generation',
+  'vid-i2v':      'image_to_video',
+  'vid-v2v':      'video_to_video',
+  'vid-ti2v':     'video_generation',
+  'vid-interp':   'video_interpolation',
+  'vid-sub':      'subtitle_generation',
+  'vid-up':       'video_upscaling',
+  'aud-gen':      'audio_generation',
+  'aud-tts':      'text_to_speech',
+  'aud-clone':    'text_to_speech',
+  'aud-convert':  'speech_to_text',
+  'aud-stt':      'speech_to_text',
+  'aud-understand':'speech_to_text',
+  'aud-music-dub':'speech_to_text',
+  'embed':        'embeddings',
+};
+
+// Returns the model ID to use for a sub-tab operation.
+// Prefers the user-assigned model, falls back to activeModel.
+function modelForSub(sub) {
+  const cap = SUB_API_CAP[sub];
+  if (cap && capModelAssignments[sub]?.[cap]) return capModelAssignments[sub][cap];
+  return activeModel?.id || '';
+}
+
+// Assigns a model to a single-cap sub without changing the global activeModel.
+function selectSubModel(sub, model) {
+  const cap = SUB_API_CAP[sub]
+    || (STUDIO_CAPABILITIES[sub]?.requires || SUB_CAPABILITY_RULES[sub]?.requiresAny || [])[0]
+    || '__default__';
+  assignModelToCap(sub, cap, model);
+}
+
+// Auto-assigns the best VRAM-fitting model to each capability for any sub.
+// Existing manual assignments are never overwritten.
+function autoAssignModels(sub) {
+  const studioRule = STUDIO_CAPABILITIES[sub];
+  if (subNeedsMultiModel(sub)) {
+    const caps = [...(studioRule?.requires || []), ...(studioRule?.optional || [])];
+    caps.forEach(cap => {
+      if (capModelAssignments[sub]?.[cap]) return;
+      const best = bestModelForCap(cap);
+      if (best) { if (!capModelAssignments[sub]) capModelAssignments[sub] = {}; capModelAssignments[sub][cap] = best.id; }
+    });
+  } else {
+    const cap = SUB_API_CAP[sub];
+    if (cap && !capModelAssignments[sub]?.[cap]) {
+      const best = bestModelForCap(cap);
+      if (best) { if (!capModelAssignments[sub]) capModelAssignments[sub] = {}; capModelAssignments[sub][cap] = best.id; }
+    }
+  }
+}
+
+// Auto-populates empty pipeline form inputs with the best available model for each role.
+const PIPELINE_INPUT_CAP = {
+  'pp1-imodel': 'image_generation',
+  'pp1-vmodel': 'image_to_video',
+  'pp2-model':  'speech_to_text',
+  'pp3-amodel': 'text_to_speech',
+};
+function autoPopulatePipelineInputs() {
+  Object.entries(PIPELINE_INPUT_CAP).forEach(([inputId, cap]) => {
+    const el = $(inputId);
+    if (!el || el.value) return; // don't overwrite user input
+    const best = bestModelForCap(cap);
+    if (best) el.value = best.id;
+  });
+}
+
 function highlightSidebarForSub(sub) {
+  if (subNeedsMultiModel(sub)) {
+    // Highlight every model that covers any required capability
+    const required = (STUDIO_CAPABILITIES[sub]?.requires || []);
+    const capable = new Set();
+    required.forEach(cap => modelsForCap(cap).forEach(m => capable.add(m.id)));
+    document.querySelectorAll('.model-item').forEach(el => {
+      el.classList.remove('cap-ok', 'cap-partial');
+      if (capable.has(el.dataset.id)) el.classList.add('cap-ok');
+    });
+    return;
+  }
   const compatible = new Map(modelsForSub(sub).map(({ model, state }) => [model.id, state]));
   document.querySelectorAll('.model-item').forEach(el => {
     el.classList.remove('cap-ok', 'cap-partial');
@@ -2636,7 +3447,7 @@ function selectSub(sub) {
   // When switching to vid-faceswap, pre-select video mode
   if (sub === 'vid-faceswap') { const t = $('fs-type'); if (t) { t.value='video'; fsFaceSwapTypeChange(); } }
   if (sub === 'vid-outfit')   { const t = $('ot-type'); if (t) { t.value='video'; otOutfitTypeChange(); } }
-  if (SUB_CAT[sub]) highlightSidebarForSub(sub);
+  if (SUB_CAT[sub]) { autoAssignModels(sub); highlightSidebarForSub(sub); }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -2904,6 +3715,127 @@ async function saveCharSlotAsProfile(prefix, idx) {
   } catch(e) { alert('Save failed: '+e.message); }
 }
 
+// ─────────────────────────────────────────────────────────────────
+//  Saved character profile multi-slot system (up to 6 per panel)
+// ─────────────────────────────────────────────────────────────────
+const MAX_CHAR_PROFILES = 6;
+
+function _charProfileOpts() {
+  return '<option value="">— select profile —</option>' +
+    _charProfiles.map(p =>
+      `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}${p.description ? ' — ' + escapeHtml(p.description) : ''}</option>`
+    ).join('');
+}
+
+function addCharProfileSlot(prefix) {
+  const container = $(`${prefix}-char-profile-slots`);
+  if (!container) return;
+  const rows = container.querySelectorAll('.char-prof-row');
+  if (rows.length >= MAX_CHAR_PROFILES) return;
+  const row = document.createElement('div');
+  row.className = 'frow char-prof-row';
+  row.style.cssText = 'gap:.3rem;margin:.1rem 0';
+  row.innerHTML =
+    `<select class="fi char-prof-sel" data-prefix="${prefix}" style="flex:1">${_charProfileOpts()}</select>` +
+    `<button class="btn btn-ghost btn-sm" onclick="removeCharProfileSlot('${prefix}',this)" ` +
+    `style="padding:.15rem .45rem;font-size:12px;flex-shrink:0">✕</button>`;
+  container.appendChild(row);
+  _updateAddCharBtn(prefix);
+}
+
+function removeCharProfileSlot(prefix, btn) {
+  btn.closest('.char-prof-row')?.remove();
+  _updateAddCharBtn(prefix);
+}
+
+function _updateAddCharBtn(prefix) {
+  const container = $(`${prefix}-char-profile-slots`);
+  const btn = $(`${prefix}-add-char-btn`);
+  if (!container || !btn) return;
+  btn.disabled = container.querySelectorAll('.char-prof-row').length >= MAX_CHAR_PROFILES;
+}
+
+function getCharProfilesList(prefix) {
+  const container = $(`${prefix}-char-profile-slots`);
+  if (!container) return [];
+  return Array.from(container.querySelectorAll('.char-prof-sel'))
+    .map(s => s.value).filter(Boolean);
+}
+
+function initCharProfileSlots() {
+  ['ig','vt','vi','vv','ti'].forEach(prefix => {
+    const container = $(`${prefix}-char-profile-slots`);
+    if (container && container.querySelectorAll('.char-prof-row').length === 0) {
+      addCharProfileSlot(prefix);
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Environment profile multi-slot system (up to 6 per panel)
+// ─────────────────────────────────────────────────────────────────
+let _envProfiles = [];   // cached list from /v1/environments
+
+function _envProfileOpts() {
+  return '<option value="">— select environment —</option>' +
+    _envProfiles.map(p =>
+      `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}${p.description ? ' — ' + escapeHtml(p.description) : ''}</option>`
+    ).join('');
+}
+
+function addEnvProfileSlot(prefix) {
+  const container = $(`${prefix}-env-profile-slots`);
+  if (!container) return;
+  const rows = container.querySelectorAll('.env-prof-row');
+  if (rows.length >= MAX_CHAR_PROFILES) return;
+  const row = document.createElement('div');
+  row.className = 'frow env-prof-row';
+  row.style.cssText = 'gap:.3rem;margin:.1rem 0';
+  row.innerHTML =
+    `<select class="fi env-prof-sel" data-prefix="${prefix}" style="flex:1">${_envProfileOpts()}</select>` +
+    `<button class="btn btn-ghost btn-sm" onclick="removeEnvProfileSlot('${prefix}',this)" ` +
+    `style="padding:.15rem .45rem;font-size:12px;flex-shrink:0">✕</button>`;
+  container.appendChild(row);
+  _updateAddEnvBtn(prefix);
+}
+
+function removeEnvProfileSlot(prefix, btn) {
+  btn.closest('.env-prof-row')?.remove();
+  _updateAddEnvBtn(prefix);
+}
+
+function _updateAddEnvBtn(prefix) {
+  const container = $(`${prefix}-env-profile-slots`);
+  const btn = $(`${prefix}-add-env-btn`);
+  if (!container || !btn) return;
+  btn.disabled = container.querySelectorAll('.env-prof-row').length >= MAX_CHAR_PROFILES;
+}
+
+function getEnvProfilesList(prefix) {
+  const container = $(`${prefix}-env-profile-slots`);
+  if (!container) return [];
+  return Array.from(container.querySelectorAll('.env-prof-sel'))
+    .map(s => s.value).filter(Boolean);
+}
+
+function refreshEnvSelectors() {
+  const opts = _envProfileOpts();
+  document.querySelectorAll('.env-prof-sel').forEach(sel => {
+    const cur = sel.value;
+    sel.innerHTML = opts;
+    if (cur) sel.value = cur;
+  });
+}
+
+function initEnvProfileSlots() {
+  ['ig','vt','vi','vv','ti'].forEach(prefix => {
+    const container = $(`${prefix}-env-profile-slots`);
+    if (container && container.querySelectorAll('.env-prof-row').length === 0) {
+      addEnvProfileSlot(prefix);
+    }
+  });
+}
+
 function buildCharactersPayload(prefix) {
   const slots = charSlots[prefix] || [];
   const valid = slots.filter(s => s.images.length > 0);
@@ -2912,14 +3844,149 @@ function buildCharactersPayload(prefix) {
 }
 
 // ─────────────────────────────────────────────────────────────────
+//  Character Dialog
+// ─────────────────────────────────────────────────────────────────
+const MAX_DIALOG_LINES = 6;
+
+function _dialogCharOpts() {
+  return '<option value="">— No character —</option>' +
+    (_charProfiles||[]).map(p=>`<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`).join('');
+}
+
+function _dialogVoiceOpts() {
+  return '<option value="">— TTS voice ID below —</option>' +
+    (_voiceProfiles||[]).map(v=>`<option value="${escapeHtml(v.name)}">${escapeHtml(v.name)}${v.description?' — '+escapeHtml(v.description):''}</option>`).join('');
+}
+
+function _dialogSectionHtml(prefix) {
+  return `<details style="margin-top:.25rem">
+  <summary style="font-size:12px;font-weight:600;cursor:pointer;color:var(--text-2)">Character Dialog</summary>
+  <div style="margin-top:.5rem;display:flex;flex-direction:column;gap:.5rem">
+    <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;font-size:12px">
+      <label style="display:flex;align-items:center;gap:.3rem">Timing:
+        <select id="${prefix}-dlg-timing" class="fselect" style="font-size:12px" onchange="refreshDialogTiming('${prefix}')">
+          <option value="sequential">Sequential</option>
+          <option value="manual">Manual</option>
+        </select>
+      </label>
+      <label style="display:flex;align-items:center;gap:.3rem">Lip sync:
+        <select id="${prefix}-dlg-method" class="fselect" style="font-size:12px">
+          <option value="wav2lip">Wav2Lip</option>
+          <option value="sadtalker">SadTalker</option>
+          <option value="">Disabled</option>
+        </select>
+      </label>
+    </div>
+    <div id="${prefix}-dialog-slots" style="display:flex;flex-direction:column;gap:.4rem"></div>
+    <button class="btn btn-ghost btn-sm" id="${prefix}-add-dlg-btn" onclick="addDialogLine('${prefix}')" style="align-self:flex-start;font-size:11px">+ Add line</button>
+  </div>
+</details>`;
+}
+
+function addDialogLine(prefix) {
+  const container = document.getElementById(`${prefix}-dialog-slots`);
+  if (!container) return;
+  if (container.querySelectorAll('.dlg-row').length >= MAX_DIALOG_LINES) return;
+  const row = document.createElement('div');
+  row.className = 'dlg-row';
+  row.style.cssText = 'background:var(--surface-2);border-radius:6px;padding:.5rem;display:flex;flex-direction:column;gap:.3rem';
+  const timing = (document.getElementById(`${prefix}-dlg-timing`)||{}).value||'sequential';
+  row.innerHTML = `
+    <div style="display:flex;gap:.3rem;align-items:center">
+      <select class="fi dlg-char" style="flex:1;font-size:12px" title="Character profile (for lip sync)">${_dialogCharOpts()}</select>
+      <select class="fi dlg-voice" style="flex:1;font-size:12px" title="Voice profile">${_dialogVoiceOpts()}</select>
+      <button class="btn btn-ghost btn-sm" onclick="removeDialogLine('${prefix}',this)" style="flex-shrink:0;padding:0 .4rem;font-size:13px" title="Remove line">✕</button>
+    </div>
+    <textarea class="fs dlg-text" rows="2" placeholder="Spoken text for this character…" style="font-size:12px;resize:vertical"></textarea>
+    <div style="display:flex;gap:.8rem;align-items:center;flex-wrap:wrap;font-size:12px">
+      <input class="fi dlg-voice-id" placeholder="TTS voice ID (if no profile)" style="flex:1;min-width:6rem;font-size:12px">
+      <label style="display:flex;align-items:center;gap:.3rem;white-space:nowrap"><input type="checkbox" class="dlg-lipsync" checked> Lip sync</label>
+      <label class="dlg-starttime-wrap" style="display:${timing==='manual'?'flex':'none'};align-items:center;gap:.3rem;white-space:nowrap">
+        Start (s): <input type="number" class="fi dlg-starttime" style="width:5rem;font-size:12px" min="0" step="0.1" placeholder="auto">
+      </label>
+    </div>`;
+  container.appendChild(row);
+  const addBtn = document.getElementById(`${prefix}-add-dlg-btn`);
+  if (addBtn) addBtn.disabled = container.querySelectorAll('.dlg-row').length >= MAX_DIALOG_LINES;
+}
+
+function removeDialogLine(prefix, btn) {
+  const row = btn.closest('.dlg-row');
+  if (row) row.remove();
+  const addBtn = document.getElementById(`${prefix}-add-dlg-btn`);
+  if (addBtn) addBtn.disabled = false;
+}
+
+function refreshDialogTiming(prefix) {
+  const timing = (document.getElementById(`${prefix}-dlg-timing`)||{}).value||'sequential';
+  const container = document.getElementById(`${prefix}-dialog-slots`);
+  if (!container) return;
+  container.querySelectorAll('.dlg-starttime-wrap').forEach(el => {
+    el.style.display = timing === 'manual' ? 'flex' : 'none';
+  });
+}
+
+function getDialogLines(prefix) {
+  const container = document.getElementById(`${prefix}-dialog-slots`);
+  if (!container) return [];
+  const lines = [];
+  container.querySelectorAll('.dlg-row').forEach(row => {
+    const text = (row.querySelector('.dlg-text')||{}).value||'';
+    if (!text.trim()) return;
+    const charSel = row.querySelector('.dlg-char');
+    const voiceSel = row.querySelector('.dlg-voice');
+    const voiceId = (row.querySelector('.dlg-voice-id')||{}).value||'';
+    const lipsync = (row.querySelector('.dlg-lipsync')||{}).checked !== false;
+    const startEl = row.querySelector('.dlg-starttime');
+    const startVal = startEl && startEl.value !== '' ? parseFloat(startEl.value) : null;
+    lines.push({
+      text,
+      character: (charSel && charSel.value) || undefined,
+      voice: (voiceSel && voiceSel.value) || voiceId || undefined,
+      lip_sync: lipsync,
+      start_time: startVal,
+    });
+  });
+  return lines;
+}
+
+function refreshDialogSelects() {
+  const charOpts = _dialogCharOpts();
+  const voiceOpts = _dialogVoiceOpts();
+  document.querySelectorAll('.dlg-char').forEach(sel => {
+    const cur = sel.value; sel.innerHTML = charOpts; if (cur) sel.value = cur;
+  });
+  document.querySelectorAll('.dlg-voice').forEach(sel => {
+    const cur = sel.value; sel.innerHTML = voiceOpts; if (cur) sel.value = cur;
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────
 //  Image Generation
 // ─────────────────────────────────────────────────────────────────
 async function genImage() {
   if (!activeModel) return;
+  // Cancel any previous orphaned poll timer
+  if (_imgPollTimer) { clearInterval(_imgPollTimer); _imgPollTimer = null; }
   $('ig-prog').textContent='Generating…';
+  const wrap=$('ig-pbar-wrap'), fill=$('ig-pbar-fill'), lbl=$('ig-pbar-label');
+  wrap.classList.add('active'); fill.style.width='0%'; lbl.textContent='';
+  $('ig-prog').scrollIntoView({behavior:'smooth', block:'nearest'});
+  _imgPollTimer = setInterval(async()=>{
+    try{
+      const p=await (await fetch('/v1/images/progress')).json();
+      if(p.total>0){
+        fill.style.width=p.pct+'%';
+        lbl.textContent=p.current+' / '+p.total+' steps';
+      }
+      if(!p.active){ clearInterval(_imgPollTimer); _imgPollTimer=null; }
+    }catch(_){}
+  },400);
   try {
+    const igCharProfiles = getCharProfilesList('ig');
+    const igEnvProfiles = getEnvProfilesList('ig');
     const d = await post('/v1/images/generations', {
-      model:activeModel.id, prompt:val('ig-prompt'),
+      model:modelForSub('img-gen'), prompt:val('ig-prompt'),
       size:val('ig-w')+'x'+val('ig-h'),
       steps:ival('ig-steps'), guidance_scale:fval('ig-cfg'),
       n:ival('ig-n')||1,
@@ -2927,7 +3994,11 @@ async function genImage() {
       ...(val('ig-neg') ? {negative_prompt:val('ig-neg')} : {}),
       disable_safety_checker: chk('ig-nosafe'),
       response_format:'url',
+      ...(igCharProfiles.length ? {character_profiles:igCharProfiles, character_strength:fval('ig-char-str')||0.6} : {}),
+      ...(igEnvProfiles.length ? {environment_profiles:igEnvProfiles, environment_strength:fval('ig-env-str')||0.6} : {}),
     });
+    clearInterval(_imgPollTimer); _imgPollTimer=null;
+    fill.style.width='100%'; lbl.textContent='Done';
     const imgs = d.data.map(imgSrc).filter(Boolean);
     $('ig-out').innerHTML = `<div class="gen-out-inner">${
       imgs.map(s=>`<img class="out-img" src="${s}" onclick="window.open(this.src)">`).join('')
@@ -2935,12 +4006,17 @@ async function genImage() {
     pushArtifactHistory({
       task:'Image generate',
       family:'image generation',
-      model:activeModel.id,
+      model:modelForSub('img-gen'),
       summary:buildImageHistorySummary(imgs),
       links:buildImageLinks(imgs),
     });
     $('ig-prog').textContent='Done ✓';
-  } catch(e) { $('ig-prog').textContent='Error: '+e.message; }
+    setTimeout(()=>{ wrap.classList.remove('active'); },2000);
+  } catch(e) {
+    clearInterval(_imgPollTimer); _imgPollTimer=null;
+    wrap.classList.remove('active');
+    $('ig-prog').textContent='Error: '+e.message;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -2953,7 +4029,7 @@ async function genEdit() {
   $('ie-prog').textContent='Editing…';
   try {
     const d = await post('/v1/images/edits', {
-      model:activeModel.id, prompt:val('ie-prompt'), image:img,
+      model:modelForSub('img-edit'), prompt:val('ie-prompt'), image:img,
       strength:fval('ie-str'), steps:ival('ie-steps'), guidance_scale:fval('ie-cfg'),
       ...(val('ie-seed') ? {seed:ival('ie-seed')} : {}), response_format:'url',
     });
@@ -2971,7 +4047,7 @@ async function genInpaint() {
   $('ip-prog').textContent='Inpainting…';
   try {
     const d = await post('/v1/images/inpaint', {
-      model:activeModel.id, prompt:val('ip-prompt'), image:img, mask,
+      model:modelForSub('img-inpaint'), prompt:val('ip-prompt'), image:img, mask,
       strength:fval('ip-str'), steps:ival('ip-steps'), guidance_scale:fval('ip-cfg'),
       ...(val('ip-seed') ? {seed:ival('ip-seed')} : {}), response_format:'url',
     });
@@ -2988,7 +4064,7 @@ async function genImgUpscale() {
   if (!img) { $('iu-prog').textContent='Select an image.'; return; }
   $('iu-prog').textContent='Upscaling…';
   try {
-    const d = await post('/v1/images/upscale', {model:activeModel.id, image:img, scale:ival('iu-scale'), response_format:'url'});
+    const d = await post('/v1/images/upscale', {model:modelForSub('img-upscale'), image:img, scale:ival('iu-scale'), response_format:'url'});
     showImg('iu-out', imgSrc(d.data[0]), 'iu-prog');
   } catch(e) { $('iu-prog').textContent='Error: '+e.message; }
 }
@@ -3002,7 +4078,7 @@ async function genDepth() {
   if (!img) { $('id-prog').textContent='Select an image.'; return; }
   $('id-prog').textContent='Estimating depth…';
   try {
-    const d = await post('/v1/images/depth', {model:activeModel.id, image:img, response_format:'url'});
+    const d = await post('/v1/images/depth', {model:modelForSub('img-depth'), image:img, response_format:'url'});
     showImg('id-out', imgSrc(d.data[0]), 'id-prog');
   } catch(e) { $('id-prog').textContent='Error: '+e.message; }
 }
@@ -3018,7 +4094,7 @@ async function genSegment() {
   const pts = val('is-pts') ? JSON.parse(val('is-pts')) : null;
   const boxes = val('is-boxes') ? JSON.parse(val('is-boxes')) : null;
   try {
-    const d = await post('/v1/images/segment', {model:activeModel.id, image:img, points:pts, boxes, response_format:'url'});
+    const d = await post('/v1/images/segment', {model:modelForSub('img-seg'), image:img, points:pts, boxes, response_format:'url'});
     showImg('is-out', imgSrc(d.data[0]), 'is-prog');
   } catch(e) { $('is-prog').textContent='Error: '+e.message; }
 }
@@ -3032,7 +4108,8 @@ async function genVideo(mode) {
   const outMap  = {t2v:'vt-out',  i2v:'vi-out',  v2v:'vv-out'};
   const prog = progMap[mode], outId = outMap[mode];
   $(prog).textContent='Generating… (this may take several minutes)';
-  const body = {model:activeModel.id, mode};
+  const subId = {t2v:'vid-t2v', i2v:'vid-i2v', v2v:'vid-v2v'}[mode];
+  const body = {model:modelForSub(subId), mode};
   if (mode==='t2v') {
     body.prompt=val('vt-prompt'); body.negative_prompt=val('vt-neg');
     body.width=ival('vt-w')||512; body.height=ival('vt-h')||512;
@@ -3041,6 +4118,12 @@ async function genVideo(mode) {
     if (val('vt-seed')) body.seed=ival('vt-seed');
     if (val('vt-cam')) body.camera_motion=val('vt-cam');
     body.disable_safety_checker=chk('vt-nosafe');
+    const vtProfiles = getCharProfilesList('vt');
+    if (vtProfiles.length) { body.character_profiles=vtProfiles; body.character_strength=fval('vt-char-str')||0.8; }
+    const vtEnvProfiles = getEnvProfilesList('vt');
+    if (vtEnvProfiles.length) { body.environment_profiles=vtEnvProfiles; body.environment_strength=fval('vt-env-str')||0.6; }
+    const vtDialogs = getDialogLines('vt');
+    if (vtDialogs.length) { body.dialogs=vtDialogs; body.lip_sync_method=val('vt-dlg-method')||'wav2lip'; }
   } else if (mode==='i2v') {
     const img = await b64OrNull('vi-src');
     if (!img) { $(prog).textContent='Select a source image.'; return; }
@@ -3050,8 +4133,14 @@ async function genVideo(mode) {
     if (val('vi-seed')) body.seed=ival('vi-seed');
     if (val('vi-cam')) body.camera_motion=val('vi-cam');
     body.disable_safety_checker=chk('vt-nosafe');
+    const viProfiles = getCharProfilesList('vi');
+    if (viProfiles.length) { body.character_profiles=viProfiles; body.character_strength=fval('vi-cstr')||0.8; }
     const viChars = buildCharactersPayload('vi');
     if (viChars) { body.characters=viChars; body.character_strength=fval('vi-cstr')||0.8; }
+    const viEnvProfiles = getEnvProfilesList('vi');
+    if (viEnvProfiles.length) { body.environment_profiles=viEnvProfiles; body.environment_strength=fval('vi-estr')||0.6; }
+    const viDialogs = getDialogLines('vi');
+    if (viDialogs.length) { body.dialogs=viDialogs; body.lip_sync_method=val('vi-dlg-method')||'wav2lip'; }
   } else {
     const vid = await b64OrNull('vv-src');
     if (!vid) { $(prog).textContent='Select a source video.'; return; }
@@ -3060,8 +4149,14 @@ async function genVideo(mode) {
     if (val('vv-seed')) body.seed=ival('vv-seed');
     if (val('vv-cam')) body.camera_motion=val('vv-cam');
     body.disable_safety_checker=chk('vt-nosafe');
+    const vvProfiles = getCharProfilesList('vv');
+    if (vvProfiles.length) { body.character_profiles=vvProfiles; body.character_strength=fval('vv-cstr')||0.8; }
     const vvChars = buildCharactersPayload('vv');
     if (vvChars) { body.characters=vvChars; body.character_strength=fval('vv-cstr')||0.8; }
+    const vvEnvProfiles = getEnvProfilesList('vv');
+    if (vvEnvProfiles.length) { body.environment_profiles=vvEnvProfiles; body.environment_strength=fval('vv-estr')||0.6; }
+    const vvDialogs = getDialogLines('vv');
+    if (vvDialogs.length) { body.dialogs=vvDialogs; body.lip_sync_method=val('vv-dlg-method')||'wav2lip'; }
   }
   try {
     const d = await post('/v1/video/generations', body);
@@ -3079,7 +4174,7 @@ async function genTi2V() {
   if (!srcVid && !initImg) { $('ti-prog').textContent='Select an initial image or source video.'; return; }
 
   const body = {
-    model:activeModel.id,
+    model:modelForSub('vid-ti2v'),
     mode: srcVid ? 'v2v' : endImg ? 'interp' : (val('ti-prompt') ? 'ti2v' : 'i2v'),
     prompt:val('ti-prompt'), negative_prompt:val('ti-neg'),
     init_image:initImg||undefined, end_image:endImg||undefined,
@@ -3091,8 +4186,11 @@ async function genTi2V() {
     camera_motion:val('ti-cam')||undefined,
     ...(val('ti-seed') ? {seed:ival('ti-seed')} : {}),
     // Character
+    ...(getCharProfilesList('ti').length ? {character_profiles:getCharProfilesList('ti')} : {}),
     characters: buildCharactersPayload('ti'),
     character_strength:fval('ti-cstr')||0.8,
+    // Environment
+    ...(getEnvProfilesList('ti').length ? {environment_profiles:getEnvProfilesList('ti'), environment_strength:fval('ti-estr')||0.6} : {}),
     // Audio
     add_audio:!!val('ti-atype'),
     audio_type:val('ti-atype')||undefined,
@@ -3101,6 +4199,8 @@ async function genTi2V() {
     tts_voice:val('ti-voice')||undefined,
     tts_speed:fval('ti-speed')||1.0,
     lip_sync:chk('ti-lipsync'),
+    // Character dialog
+    ...(getDialogLines('ti').length ? {dialogs:getDialogLines('ti'), lip_sync_method:val('ti-dlg-method')||'wav2lip'} : {}),
     // Subtitles
     generate_subtitles:chk('ti-gensub'),
     burn_subtitles:chk('ti-burnsub'),
@@ -3128,7 +4228,7 @@ async function genInterp() {
   if (!activeModel) return;
   $('vc-prog').textContent='Interpolating…';
   const [vid, init, end] = await Promise.all([b64OrNull('vc-src'), b64OrNull('vc-init'), b64OrNull('vc-end')]);
-  const body = {model:activeModel.id, fps_multiplier:ival('vc-mult')||2};
+  const body = {model:modelForSub('vid-interp'), fps_multiplier:ival('vc-mult')||2};
   if (vid) body.video=vid;
   else if (init && end) { body.init_image=init; body.end_image=end; }
   else { $('vc-prog').textContent='Provide a video or both frame images.'; return; }
@@ -3148,7 +4248,7 @@ async function genSubtitles() {
   $('vs-prog').textContent='Generating subtitles…';
   const burn = val('vs-fmt') === 'burned_video';
   const body = {
-    model:activeModel.id, video:vid,
+    model:modelForSub('vid-sub'), video:vid,
     language:val('vs-lang')||undefined,
     burn, format:val('vs-fmt'),
     translate:chk('vs-translate'),
@@ -3179,7 +4279,9 @@ async function genDub() {
   $('vd-prog').textContent='Dubbing…';
   try {
     const d = await post('/v1/video/dub', {
-      model:activeModel.id, video:vid,
+      stt_model: getAssignedModelId('vid-dub', 'speech_to_text'),
+      tts_model: getAssignedModelId('vid-dub', 'text_to_speech'),
+      video:vid,
       source_lang:preview.source_lang, target_lang:preview.target_lang,
       burn_subtitles:preview.burn_subtitles,
     });
@@ -3189,7 +4291,7 @@ async function genDub() {
     pushArtifactHistory({
       task:'Video dub',
       family:buildDubFamilyLabel(),
-      model:activeModel.id,
+      model:getAssignedModelId('vid-dub', 'speech_to_text') || activeModel?.id,
       summary:buildDubHistorySummary(preview),
       links:buildDubLinks(item),
     });
@@ -3205,15 +4307,206 @@ async function genVidUpscale() {
   if (!vid) { $('vu-prog').textContent='Select a video.'; return; }
   $('vu-prog').textContent='Upscaling…';
   try {
-    const d = await post('/v1/video/upscale', {model:activeModel.id, video:vid, upscale_factor:ival('vu-scale')||2});
+    const d = await post('/v1/video/upscale', {model:modelForSub('vid-up'), video:vid, upscale_factor:ival('vu-scale')||2});
     showVideo('vu-out', vidSrc(d.data[0]), 'vu-prog');
   } catch(e) { $('vu-prog').textContent='Error: '+e.message; }
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  T2V controls helper (shared form – inline because Jinja include
-//  isn't available here)
+//  2D ↔ 3D  &  3D model generation
 // ─────────────────────────────────────────────────────────────────
+
+async function _readFileB64(inputId) {
+  const el = $(inputId);
+  if (!el || !el.files || !el.files[0]) return null;
+  return new Promise(resolve => {
+    const fr = new FileReader();
+    fr.onload = e => resolve(e.target.result.split(',')[1]);
+    fr.readAsDataURL(el.files[0]);
+  });
+}
+
+async function genImageTo3D() {
+  const img = await b64OrNull('i3-src');
+  if (!img) { $('i3-prog').textContent='Select a source image.'; return; }
+  const method = val('i3-method') || 'stereo';
+  $('i3-prog').textContent='Converting…';
+  try {
+    const d = await post('/v1/images/to3d', {
+      image: img,
+      method,
+      max_shift: ival('i3-shift') || 20,
+      response_format: 'url',
+    });
+    const item = d.data[0];
+    if (method === 'mesh') {
+      const url = item.url || ('#data:model/gltf-binary;base64,' + item.b64_glb);
+      const link = `<a class="btn btn-ghost btn-sm dl" href="${item.url || ''}" download="model.glb">Download GLB</a>`;
+      $('i3-out').innerHTML = `<div class="gen-empty" style="padding:1rem">${link}<p style="font-size:12px;color:var(--text-3);margin-top:.5rem">GLB file ready</p></div>`;
+      $('i3-prog').textContent = 'Done ✓';
+    } else {
+      showImg('i3-out', imgSrc(item), 'i3-prog');
+    }
+  } catch(e) { $('i3-prog').textContent='Error: '+e.message; }
+}
+
+async function genImageFrom3D() {
+  const raw = await _readFileB64('f3-src');
+  if (!raw) { $('f3-prog').textContent='Select a 3D model file.'; return; }
+  $('f3-prog').textContent='Rendering…';
+  try {
+    const d = await post('/v1/images/from3d', {
+      model_data: raw,
+      format: val('f3-fmt') || 'glb',
+      camera_distance: fval('f3-dist') || 2.0,
+      camera_elevation: fval('f3-elev') || 30,
+      camera_azimuth: fval('f3-azim') || 45,
+      width: ival('f3-w') || 512,
+      height: ival('f3-h') || 512,
+      response_format: 'url',
+    });
+    showImg('f3-out', imgSrc(d.data[0]), 'f3-prog');
+  } catch(e) { $('f3-prog').textContent='Error: '+e.message; }
+}
+
+async function genVideoTo3D() {
+  const vid = await b64OrNull('v3-src');
+  if (!vid) { $('v3-prog').textContent='Select a source video.'; return; }
+  $('v3-prog').textContent='Converting frames… (may take a while)';
+  try {
+    const d = await post('/v1/video/to3d', {
+      video: vid,
+      method: val('v3-method') || 'anaglyph',
+      max_shift: ival('v3-shift') || 15,
+      response_format: 'url',
+    });
+    showVideo('v3-out', vidSrc(d.data[0]), 'v3-prog');
+  } catch(e) { $('v3-prog').textContent='Error: '+e.message; }
+}
+
+async function genVideoFrom3D() {
+  const raw = await _readFileB64('vf3-src');
+  if (!raw) { $('vf3-prog').textContent='Select a 3D model file.'; return; }
+  $('vf3-prog').textContent='Rendering turntable…';
+  try {
+    const d = await post('/v1/video/from3d', {
+      model_data: raw,
+      format: val('vf3-fmt') || 'glb',
+      frames: ival('vf3-frames') || 36,
+      fps: ival('vf3-fps') || 12,
+      camera_elevation: fval('vf3-elev') || 20,
+      camera_distance: fval('vf3-dist') || 2.5,
+      width: ival('vf3-w') || 512,
+      height: ival('vf3-h') || 512,
+      response_format: 'url',
+    });
+    showVideo('vf3-out', vidSrc(d.data[0]), 'vf3-prog');
+  } catch(e) { $('vf3-prog').textContent='Error: '+e.message; }
+}
+
+async function gen3DModel() {
+  const prompt = val('g3-prompt');
+  const img = await b64OrNull('g3-img');
+  if (!prompt && !img) { $('g3-prog').textContent='Enter a prompt or select an image.'; return; }
+  $('g3-prog').textContent='Generating 3D model… (may take several minutes)';
+  try {
+    const body = { response_format: 'url' };
+    if (prompt) body.prompt = prompt;
+    if (img) body.image = img;
+    if (ival('g3-steps')) body.steps = ival('g3-steps');
+    if (val('g3-seed')) body.seed = ival('g3-seed');
+    const d = await post('/v1/3d/generate', body);
+    const item = d.data[0];
+    const backend = d.backend || 'unknown';
+    const dlUrl = item.url;
+    const dlHref = dlUrl ? `<a class="btn btn-primary btn-sm dl" href="${dlUrl}" download="model.glb">Download GLB</a>` : '';
+    $('g3-out').innerHTML = `<div style="text-align:center;padding:1.5rem;display:flex;flex-direction:column;align-items:center;gap:.6rem">
+      <div style="font-size:13px;color:var(--text-2)">3D model generated (backend: <strong>${escapeHtml(backend)}</strong>)</div>
+      ${dlHref}
+      <div style="font-size:11px;color:var(--text-3)">Open the GLB in any 3D viewer (e.g. Blender, model-viewer, Windows 3D Viewer)</div>
+    </div>`;
+    $('g3-prog').textContent = 'Done ✓';
+  } catch(e) { $('g3-prog').textContent='Error: '+e.message; }
+}
+
+// 3D tab aliases (same logic, different input IDs)
+async function gen3DImgTo3D() {
+  const img = await b64OrNull('t3i-src');
+  if (!img) { $('t3i-prog').textContent='Select a source image.'; return; }
+  const method = val('t3i-method') || 'stereo';
+  $('t3i-prog').textContent='Converting…';
+  try {
+    const d = await post('/v1/images/to3d', {
+      image: img, method,
+      max_shift: ival('t3i-shift') || 20,
+      response_format: 'url',
+    });
+    const item = d.data[0];
+    if (method === 'mesh') {
+      $('t3i-out').innerHTML = `<div class="gen-empty" style="padding:1rem"><a class="btn btn-primary btn-sm dl" href="${item.url || ''}" download="model.glb">Download GLB</a></div>`;
+      $('t3i-prog').textContent = 'Done ✓';
+    } else {
+      showImg('t3i-out', imgSrc(item), 't3i-prog');
+    }
+  } catch(e) { $('t3i-prog').textContent='Error: '+e.message; }
+}
+
+async function gen3DVidTo3D() {
+  const vid = await b64OrNull('t3v-src');
+  if (!vid) { $('t3v-prog').textContent='Select a source video.'; return; }
+  $('t3v-prog').textContent='Converting frames… (may take a while)';
+  try {
+    const d = await post('/v1/video/to3d', {
+      video: vid,
+      method: val('t3v-method') || 'anaglyph',
+      max_shift: ival('t3v-shift') || 15,
+      response_format: 'url',
+    });
+    showVideo('t3v-out', vidSrc(d.data[0]), 't3v-prog');
+  } catch(e) { $('t3v-prog').textContent='Error: '+e.message; }
+}
+
+function r3TypeChange() {
+  const isVideo = val('r3-type') === 'video';
+  $('r3-img-opts').style.display = isVideo ? 'none' : '';
+  $('r3-vid-opts').style.display = isVideo ? '' : 'none';
+}
+
+async function gen3DRender() {
+  const raw = await _readFileB64('r3-src');
+  if (!raw) { $('r3-prog').textContent='Select a 3D model file.'; return; }
+  const isVideo = val('r3-type') === 'video';
+  $('r3-prog').textContent = isVideo ? 'Rendering turntable…' : 'Rendering…';
+  try {
+    if (isVideo) {
+      const d = await post('/v1/video/from3d', {
+        model_data: raw,
+        format: val('r3-fmt') || 'glb',
+        frames: ival('r3-frames') || 36,
+        fps: ival('r3-fps') || 12,
+        camera_elevation: fval('r3-velev') || 20,
+        camera_distance: fval('r3-vdist') || 2.5,
+        width: ival('r3-w') || 512,
+        height: ival('r3-h') || 512,
+        response_format: 'url',
+      });
+      showVideo('r3-out', vidSrc(d.data[0]), 'r3-prog');
+    } else {
+      const d = await post('/v1/images/from3d', {
+        model_data: raw,
+        format: val('r3-fmt') || 'glb',
+        camera_distance: fval('r3-dist') || 2.0,
+        camera_elevation: fval('r3-elev') || 30,
+        camera_azimuth: fval('r3-azim') || 45,
+        width: ival('r3-w') || 512,
+        height: ival('r3-h') || 512,
+        response_format: 'url',
+      });
+      showImg('r3-out', imgSrc(d.data[0]), 'r3-prog');
+    }
+  } catch(e) { $('r3-prog').textContent='Error: '+e.message; }
+}
+
 // ─────────────────────────────────────────────────────────────────
 //  Webcam / Microphone capture utility
 //  openWebcam(boxId, fileInputId, previewId, mode)
@@ -3397,7 +4690,7 @@ async function genOutfit() {
   if (!val('ot-prompt')) { $('ot-prog').textContent='Enter an outfit prompt.'; return; }
   $('ot-prog').textContent = isVideo ? 'Changing outfit on video…' : 'Changing outfit…';
   const body = {
-    model: activeModel.id,
+    model: modelForSub('img-outfit'),
     prompt: val('ot-prompt'),
     steps: ival('ot-steps')||30,
     guidance_scale: fval('ot-cfg')||7.5,
@@ -3469,6 +4762,7 @@ async function loadVoiceProfiles() {
         _voiceProfiles.map(v => `<option value="${v.name}">${v.name}${v.description ? ' — '+v.description : ''}</option>`).join('');
       if (cur) sel.value = cur;
     });
+    refreshDialogSelects();
   } catch(e) {}
 }
 
@@ -3636,7 +4930,7 @@ async function genAudio() {
   $('ag-prog').textContent='Generating audio…';
   const melody = await b64OrNull('ag-melody');
   const body = {
-    model:activeModel.id, prompt:val('ag-prompt'),
+    model:modelForSub('aud-gen'), prompt:val('ag-prompt'),
     duration:fval('ag-dur')||10, temperature:fval('ag-temp')||1.0,
     top_k:ival('ag-topk')||250, cfg_coef:fval('ag-cfg')||3.0,
     ...(val('ag-seed') ? {seed:ival('ag-seed')} : {}),
@@ -3651,7 +4945,7 @@ async function genAudio() {
     pushArtifactHistory({
       task:'Audio generate',
       family:'audio generation',
-      model:activeModel.id,
+      model:modelForSub('aud-gen'),
       summary:buildAudioHistorySummary(val('ag-prompt'), body.duration),
       links:buildAudioLinks(item),
     });
@@ -3665,10 +4959,13 @@ async function genTTS() {
   if (!activeModel) return;
   $('at-prog').textContent='Synthesizing…';
   try {
+    const ttsVoiceProfile = val('tts-voice-profile');
     const r = await fetch('/v1/audio/speech', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({model:activeModel.id, input:val('at-text'),
-        speed:fval('at-speed')||1.0, voice:val('at-voice')||undefined, response_format:'mp3'})
+      body:JSON.stringify({model:modelForSub('aud-tts'), input:val('at-text'),
+        speed:fval('at-speed')||1.0, voice:val('at-voice')||undefined, response_format:'mp3',
+        ...(ttsVoiceProfile ? {voice_profile:ttsVoiceProfile} : {}),
+      })
     });
     if (!r.ok) throw new Error(await r.text());
     const blob = await r.blob();
@@ -3677,7 +4974,7 @@ async function genTTS() {
     pushArtifactHistory({
       task:'Text to speech',
       family:'tts',
-      model:activeModel.id,
+      model:modelForSub('aud-tts'),
       summary:buildTTSHistorySummary(val('at-text'), val('at-voice')),
       links: src ? [{ label:'Open', href:src }] : [],
     });
@@ -3688,13 +4985,13 @@ async function genTTS() {
 //  STT
 // ─────────────────────────────────────────────────────────────────
 async function genSTT() {
-  const sttModel = bestModelForCap('speech_to_text') || activeModel;
-  if (!sttModel) return;
+  const sttModelId = modelForSub('aud-stt');
+  if (!sttModelId) return;
   const f = fileOrNull('as-file');
   if (!f) { $('as-prog').textContent='Select an audio file.'; return; }
   $('as-prog').textContent='Transcribing…';
   const fd = new FormData();
-  fd.append('file', f); fd.append('model', sttModel.id);
+  fd.append('file', f); fd.append('model', sttModelId);
   if (val('as-lang')) fd.append('language', val('as-lang'));
   if (val('as-prompt')) fd.append('prompt', val('as-prompt'));
   try {
@@ -3706,7 +5003,7 @@ async function genSTT() {
     pushArtifactHistory({
       task:'Transcription',
       family:'speech to text',
-      model:sttModel.id,
+      model:sttModelId,
       summary:buildSTTHistorySummary(d.text || JSON.stringify(d), f.name),
       links:[],
     });
@@ -3793,7 +5090,7 @@ async function genEmbeddings() {
   const input = lines.length === 1 ? lines[0] : lines;
   try {
     const d = await post('/v1/embeddings', {
-      model:activeModel.id, input,
+      model:modelForSub('embed'), input,
       encoding_format:val('em-enc'),
       ...(val('em-dims') ? {dimensions:ival('em-dims')} : {}),
     });
@@ -3816,7 +5113,7 @@ async function genAudioUnderstand() {
   try {
     const d = await post('/v1/pipelines/audio-understand', {
       audio: await fileToB64(f),
-      audio_model: activeModel.id,
+      audio_model: modelForSub('aud-understand'),
       ...(val('au-text-model') ? {text_model: val('au-text-model')} : {}),
       ...(val('au-goal') ? {input: val('au-goal')} : {}),
     });
@@ -3836,7 +5133,8 @@ async function genMusicDubPlan() {
   try {
     const d = await post('/v1/pipelines/audio-music-dub', {
       audio: await fileToB64(f),
-      audio_model: activeModel.id,
+      stt_model: getAssignedModelId('aud-music-dub', 'speech_to_text'),
+      tts_model: getAssignedModelId('aud-music-dub', 'text_to_speech'),
       ...(val('amd-slang') ? {source_lang: val('amd-slang')} : {}),
       ...(val('amd-tlang') ? {target_lang: val('amd-tlang')} : {}),
       ...(val('amd-notes') ? {notes: val('amd-notes')} : {}),
@@ -3968,14 +5266,444 @@ document.getElementById('panel-vid-t2v').innerHTML = `<div class="gen-wrap">
         <option value="rotate">Rotate</option>
       </select>
     </div>
+    <div class="frow" style="align-items:flex-start">
+      <label class="fl" style="padding-top:.3rem">Characters</label>
+      <div style="flex:1;display:flex;flex-direction:column;gap:.3rem">
+        <div id="vt-char-profile-slots"></div>
+        <button class="btn btn-ghost btn-sm" id="vt-add-char-btn" onclick="addCharProfileSlot('vt')" style="align-self:flex-start;font-size:11px">+ Add character</button>
+      </div>
+    </div>
+    <div class="frow"><label class="fl">Character strength <span id="vt-char-sv">0.80</span></label>
+      <input type="range" id="vt-char-str" min="0" max="1" step="0.05" value="0.8" oninput="document.getElementById('vt-char-sv').textContent=(+this.value).toFixed(2)" style="width:100%">
+    </div>
+    <div class="frow" style="align-items:flex-start">
+      <label class="fl" style="padding-top:.3rem">Environments</label>
+      <div style="flex:1;display:flex;flex-direction:column;gap:.3rem">
+        <div id="vt-env-profile-slots"></div>
+        <button class="btn btn-ghost btn-sm" id="vt-add-env-btn" onclick="addEnvProfileSlot('vt')" style="align-self:flex-start;font-size:11px">+ Add environment</button>
+      </div>
+    </div>
+    <div class="frow"><label class="fl">Environment strength <span id="vt-env-sv">0.60</span></label>
+      <input type="range" id="vt-env-str" min="0" max="1" step="0.05" value="0.6" oninput="document.getElementById('vt-env-sv').textContent=(+this.value).toFixed(2)" style="width:100%">
+    </div>
+    <div id="vt-dialog-section"></div>
     <button class="btn btn-primary" onclick="genVideo('t2v')">Generate Video</button>
     <div class="progress" id="vt-prog"></div>
   </div>
   <div class="gen-out" id="vt-out"><div class="gen-empty">Video will appear here</div></div>
 </div>`;
 
+// Inject dialog sections into all video panels
+['vt','vi','vv','ti'].forEach(p => {
+  const el = document.getElementById(p+'-dialog-section');
+  if (el) el.innerHTML = _dialogSectionHtml(p);
+});
+
+// ─────────────────────────────────────────────────────────────────
+//  Character Profile Manager
+// ─────────────────────────────────────────────────────────────────
+let _pcImagesB64 = [];   // images staged for create
+
+function profCharShowCreate() {
+  _pcImagesB64 = [];
+  $('pc-name').value = ''; $('pc-desc').value = ''; $('pc-max').value = '5';
+  $('pc-img-previews').innerHTML = '';
+  $('pc-form-status').textContent = '';
+  $('pc-gen-prompt').value = '';
+  $('pc-gen-n').value = '3';
+  $('pc-gen-steps').value = '';
+  $('pc-gen-w').value = '512'; $('pc-gen-h').value = '512';
+  // Reset to extract mode
+  document.querySelectorAll('input[name="pc-mode"]').forEach(r => r.checked = r.value === 'extract');
+  pcModeChange();
+  // Populate image model selector
+  pcPopulateModelSelect();
+  $('prof-char-form').style.display = 'block';
+}
+function profCharHideForm() { $('prof-char-form').style.display = 'none'; }
+
+function pcModeChange() {
+  const mode = (document.querySelector('input[name="pc-mode"]:checked') || {}).value || 'extract';
+  $('pc-extract-fields').style.display = mode === 'extract' ? '' : 'none';
+  $('pc-generate-fields').style.display = mode === 'generate' ? '' : 'none';
+  $('pc-submit-btn').innerHTML = mode === 'generate' ? 'Generate &amp; Save' : 'Extract &amp; Save';
+}
+
+function profCharSubmit() {
+  const mode = (document.querySelector('input[name="pc-mode"]:checked') || {}).value || 'extract';
+  if (mode === 'generate') profCharGenerate(); else profCharSave();
+}
+
+function pcPopulateModelSelect() {
+  const sel = $('pc-gen-model'); if (!sel) return;
+  const cur = sel.value;
+  // Collect image-capable models from the cached model list
+  const opts = ['<option value="">Default image model</option>'];
+  (models || []).forEach(m => {
+    const caps = m.capabilities || [];
+    if (caps.includes('image_generation') || caps.includes('image_to_image')) {
+      opts.push(`<option value="${escapeHtml(m.id)}">${escapeHtml(m.id)}</option>`);
+    }
+  });
+  sel.innerHTML = opts.join('');
+  if (cur) sel.value = cur;
+}
+
+function pcImgFilesChanged() {
+  _pcImagesB64 = [];
+  $('pc-img-previews').innerHTML = '';
+  const files = $('pc-img-files').files;
+  for (const f of files) {
+    const reader = new FileReader();
+    reader.onload = e => {
+      _pcImagesB64.push(e.target.result);
+      const img = document.createElement('img');
+      img.src = e.target.result;
+      img.style.cssText = 'height:64px;border-radius:4px;object-fit:cover';
+      $('pc-img-previews').appendChild(img);
+    };
+    reader.readAsDataURL(f);
+  }
+}
+
+async function profCharSave() {
+  const name = ($('pc-name').value||'').trim();
+  if (!name) { $('pc-form-status').textContent = 'Name is required.'; return; }
+  const hasImgs = _pcImagesB64.length > 0;
+  const hasVids = $('pc-vid-files').files.length > 0;
+  if (!hasImgs && !hasVids) { $('pc-form-status').textContent = 'Provide at least one image or video.'; return; }
+  $('pc-form-status').textContent = 'Extracting…';
+  try {
+    const body = { name, description: $('pc-desc').value||'', max_images: parseInt($('pc-max').value)||5 };
+    if (hasImgs) body.images = _pcImagesB64;
+    if (hasVids) {
+      body.videos = [];
+      for (const f of $('pc-vid-files').files) {
+        const b64 = await new Promise((res,rej)=>{const r=new FileReader();r.onload=e=>res(e.target.result);r.onerror=rej;r.readAsDataURL(f);});
+        body.videos.push(b64);
+      }
+    }
+    const r = await fetch('/v1/characters/extract', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    if (!r.ok) throw new Error((await r.json()).detail || await r.text());
+    const d = await r.json();
+    $('pc-form-status').textContent = `Saved "${d.name}" (${d.image_count} reference images) ✓`;
+    await profCharLoad();
+    setTimeout(profCharHideForm, 1200);
+  } catch(e) { $('pc-form-status').textContent = 'Error: ' + e.message; }
+}
+
+async function profCharGenerate() {
+  const name = ($('pc-name').value||'').trim();
+  if (!name) { $('pc-form-status').textContent = 'Name is required.'; return; }
+  const prompt = ($('pc-gen-prompt').value||'').trim();
+  if (!prompt) { $('pc-form-status').textContent = 'A visual prompt is required.'; return; }
+  $('pc-form-status').textContent = 'Generating reference images… (this may take a while)';
+  try {
+    const body = {
+      name,
+      description: $('pc-desc').value||'',
+      prompt,
+      n: parseInt($('pc-gen-n').value)||3,
+      width: parseInt($('pc-gen-w').value)||512,
+      height: parseInt($('pc-gen-h').value)||512,
+    };
+    const mdl = $('pc-gen-model').value;
+    if (mdl) body.model = mdl;
+    const steps = parseInt($('pc-gen-steps').value);
+    if (steps > 0) body.steps = steps;
+    const r = await fetch('/v1/characters/generate', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    if (!r.ok) throw new Error((await r.json()).detail || await r.text());
+    const d = await r.json();
+    $('pc-form-status').textContent = `Generated "${d.name}" (${d.image_count} reference images) ✓`;
+    await profCharLoad();
+    setTimeout(profCharHideForm, 1500);
+  } catch(e) { $('pc-form-status').textContent = 'Error: ' + e.message; }
+}
+
+async function profCharLoad() {
+  try {
+    const d = await fetch('/admin/api/characters').then(r=>r.json());
+    _charProfiles = d.characters || [];
+    renderCharList();
+    // Ensure every panel has at least one slot, then refresh options
+    initCharProfileSlots();
+    refreshCharSelectors();
+  } catch(e) { _charProfiles = []; }
+}
+
+function refreshCharSelectors() {
+  const opts = _charProfileOpts();
+  document.querySelectorAll('.char-prof-sel').forEach(sel => {
+    const cur = sel.value;
+    sel.innerHTML = opts;
+    if (cur) sel.value = cur;
+  });
+  refreshDialogSelects();
+}
+
+function renderCharList() {
+  const el = $('prof-char-list');
+  if (!el) return;
+  if (!_charProfiles.length) { el.innerHTML = '<div class="arch-empty">No character profiles yet.</div>'; return; }
+  el.innerHTML = _charProfiles.map(p => `
+    <div class="arch-card" style="position:relative;padding:1rem">
+      <div style="font-weight:600">${escapeHtml(p.name)}</div>
+      ${p.description ? `<div class="small muted">${escapeHtml(p.description)}</div>` : ''}
+      <div class="small muted">${p.image_count} reference image${p.image_count!==1?'s':''} · ${new Date(p.created_at*1000).toLocaleDateString()}</div>
+      <div style="display:flex;gap:.4rem;margin-top:.5rem">
+        <button class="btn btn-ghost btn-sm" onclick="profCharView('${escapeHtml(p.name)}')">View</button>
+        <button class="btn btn-danger btn-sm" onclick="profCharDelete('${escapeHtml(p.name)}')">Delete</button>
+      </div>
+    </div>`).join('');
+}
+
+async function profCharView(name) {
+  const d = await fetch('/admin/api/characters/'+encodeURIComponent(name)).then(r=>r.json());
+  const imgs = (d.images||[]).map(img=>`<img src="${img.data}" style="height:80px;border-radius:4px;object-fit:cover" title="${escapeHtml(img.label||'')}">`).join('');
+  alert(`Character: ${d.name}\nDescription: ${d.description||'—'}\nImages: ${d.image_count}\n\n(Images are shown in console; open DevTools to inspect)`);
+  console.log('[profCharView]', d.name, d);
+}
+
+async function profCharDelete(name) {
+  if (!confirm(`Delete character profile "${name}"?`)) return;
+  const r = await fetch('/admin/api/characters/'+encodeURIComponent(name), {method:'DELETE'});
+  if (r.ok) await profCharLoad();
+  else alert('Delete failed: ' + await r.text());
+}
+
+
+// ─────────────────────────────────────────────────────────────────
+//  Voice Profile Manager
+// ─────────────────────────────────────────────────────────────────
+
+function profVoiceShowCreate() {
+  $('pv-name').value=''; $('pv-desc').value=''; $('pv-transcript').value='';
+  $('pv-form-status').textContent='';
+  $('prof-voice-form').style.display='block';
+}
+function profVoiceHideForm() { $('prof-voice-form').style.display='none'; }
+
+async function profVoiceSave() {
+  const name = ($('pv-name').value||'').trim();
+  const f = $('pv-file').files[0];
+  if (!name) { $('pv-form-status').textContent='Name is required.'; return; }
+  if (!f) { $('pv-form-status').textContent='Select an audio or video file.'; return; }
+  $('pv-form-status').textContent='Extracting voice profile…';
+  try {
+    const b64 = await new Promise((res,rej)=>{const r=new FileReader();r.onload=e=>res(e.target.result);r.onerror=rej;r.readAsDataURL(f);});
+    const isVideo = f.type.startsWith('video/') || /\.(mp4|mov|mkv|avi|webm)$/i.test(f.name);
+    const body = { name, description: $('pv-desc').value||'', transcript: $('pv-transcript').value||'' };
+    if (isVideo) body.video = b64; else body.audio = b64;
+    const r = await fetch('/v1/audio/voices/extract', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    if (!r.ok) throw new Error((await r.json()).detail || await r.text());
+    const d = await r.json();
+    const transcript = d.voice?.transcript;
+    $('pv-form-status').textContent = `Saved "${d.voice?.name}" ✓` + (transcript ? ` — transcript: "${transcript.slice(0,60)}…"` : '');
+    await profVoiceLoad();
+    setTimeout(profVoiceHideForm, 1800);
+  } catch(e) { $('pv-form-status').textContent='Error: '+e.message; }
+}
+
+async function profVoiceLoad() {
+  try {
+    const d = await fetch('/admin/api/voices').then(r=>r.json());
+    const voices = d.voices || [];
+    renderVoiceList(voices);
+    // Refresh voice selectors (existing + new)
+    ['vc-voice','pp4-voice','cv-voice','pvc-voice','psvc-voice','tts-voice-profile'].forEach(id => {
+      const sel = $(id); if (!sel) return;
+      const cur = sel.value;
+      const placeholder = sel.dataset.placeholder || '— none —';
+      sel.innerHTML = `<option value="">${placeholder}</option>` +
+        voices.map(v=>`<option value="${escapeHtml(v.name)}">${escapeHtml(v.name)}${v.description?' — '+escapeHtml(v.description):''}</option>`).join('');
+      if (cur) sel.value = cur;
+    });
+    _voiceProfiles = voices;
+  } catch(e) {}
+}
+
+function renderVoiceList(voices) {
+  const el = $('prof-voice-list');
+  if (!el) return;
+  if (!voices.length) { el.innerHTML = '<div class="arch-empty">No voice profiles yet.</div>'; return; }
+  el.innerHTML = voices.map(v => `
+    <div style="background:var(--surface-2);border-radius:8px;padding:.8rem 1rem;display:flex;align-items:center;gap:.8rem">
+      <div style="flex:1">
+        <div style="font-weight:600">${escapeHtml(v.name)}</div>
+        ${v.description ? `<div class="small muted">${escapeHtml(v.description)}</div>` : ''}
+        ${v.transcript ? `<div class="small muted" style="font-style:italic">"${escapeHtml(v.transcript.slice(0,80))}${v.transcript.length>80?'…':''}"</div>` : ''}
+        <div class="small muted">${new Date(v.created_at*1000).toLocaleDateString()}</div>
+      </div>
+      <button class="btn btn-danger btn-sm" onclick="profVoiceDelete('${escapeHtml(v.name)}')">Delete</button>
+    </div>`).join('');
+}
+
+async function profVoiceDelete(name) {
+  if (!confirm(`Delete voice profile "${name}"?`)) return;
+  const r = await fetch('/admin/api/voices/'+encodeURIComponent(name), {method:'DELETE'});
+  if (r.ok) await profVoiceLoad();
+  else alert('Delete failed: ' + await r.text());
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Environment Profile Manager
+// ─────────────────────────────────────────────────────────────────
+let _peImagesB64 = [];
+
+function profEnvShowCreate() {
+  _peImagesB64 = [];
+  $('pe-name').value = ''; $('pe-desc').value = ''; $('pe-max').value = '5';
+  $('pe-img-previews').innerHTML = '';
+  $('pe-form-status').textContent = '';
+  $('pe-gen-prompt').value = '';
+  $('pe-gen-n').value = '3'; $('pe-gen-steps').value = '';
+  $('pe-gen-w').value = '512'; $('pe-gen-h').value = '512';
+  document.querySelectorAll('input[name="pe-mode"]').forEach(r => r.checked = r.value === 'extract');
+  peModeChange();
+  pePopulateModelSelect();
+  $('prof-env-form').style.display = 'block';
+}
+function profEnvHideForm() { $('prof-env-form').style.display = 'none'; }
+
+function peModeChange() {
+  const mode = (document.querySelector('input[name="pe-mode"]:checked') || {}).value || 'extract';
+  $('pe-extract-fields').style.display = mode === 'extract' ? '' : 'none';
+  $('pe-generate-fields').style.display = mode === 'generate' ? '' : 'none';
+  $('pe-submit-btn').innerHTML = mode === 'generate' ? 'Generate &amp; Save' : 'Extract &amp; Save';
+}
+
+function profEnvSubmit() {
+  const mode = (document.querySelector('input[name="pe-mode"]:checked') || {}).value || 'extract';
+  if (mode === 'generate') profEnvGenerate(); else profEnvSave();
+}
+
+function pePopulateModelSelect() {
+  const sel = $('pe-gen-model'); if (!sel) return;
+  const cur = sel.value;
+  const opts = ['<option value="">Default image model</option>'];
+  (models || []).forEach(m => {
+    const caps = m.capabilities || [];
+    if (caps.includes('image_generation') || caps.includes('image_to_image')) {
+      opts.push(`<option value="${escapeHtml(m.id)}">${escapeHtml(m.id)}</option>`);
+    }
+  });
+  sel.innerHTML = opts.join('');
+  if (cur) sel.value = cur;
+}
+
+function peImgFilesChanged() {
+  _peImagesB64 = [];
+  $('pe-img-previews').innerHTML = '';
+  for (const f of $('pe-img-files').files) {
+    const reader = new FileReader();
+    reader.onload = e => {
+      _peImagesB64.push(e.target.result);
+      const img = document.createElement('img');
+      img.src = e.target.result;
+      img.style.cssText = 'height:64px;border-radius:4px;object-fit:cover';
+      $('pe-img-previews').appendChild(img);
+    };
+    reader.readAsDataURL(f);
+  }
+}
+
+async function profEnvSave() {
+  const name = ($('pe-name').value||'').trim();
+  if (!name) { $('pe-form-status').textContent = 'Name is required.'; return; }
+  const hasImgs = _peImagesB64.length > 0;
+  const hasVids = $('pe-vid-files').files.length > 0;
+  if (!hasImgs && !hasVids) { $('pe-form-status').textContent = 'Provide at least one image or video.'; return; }
+  $('pe-form-status').textContent = 'Extracting…';
+  try {
+    const body = { name, description: $('pe-desc').value||'', max_images: parseInt($('pe-max').value)||5 };
+    if (hasImgs) body.images = _peImagesB64;
+    if (hasVids) {
+      body.videos = [];
+      for (const f of $('pe-vid-files').files) {
+        const b64 = await new Promise((res,rej)=>{const r=new FileReader();r.onload=e=>res(e.target.result);r.onerror=rej;r.readAsDataURL(f);});
+        body.videos.push(b64);
+      }
+    }
+    const r = await fetch('/v1/environments/extract', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    if (!r.ok) throw new Error((await r.json()).detail || await r.text());
+    const d = await r.json();
+    $('pe-form-status').textContent = `Saved "${d.name}" (${d.image_count} reference images) ✓`;
+    await profEnvLoad();
+    setTimeout(profEnvHideForm, 1200);
+  } catch(e) { $('pe-form-status').textContent = 'Error: ' + e.message; }
+}
+
+async function profEnvGenerate() {
+  const name = ($('pe-name').value||'').trim();
+  if (!name) { $('pe-form-status').textContent = 'Name is required.'; return; }
+  const prompt = ($('pe-gen-prompt').value||'').trim();
+  if (!prompt) { $('pe-form-status').textContent = 'A visual prompt is required.'; return; }
+  $('pe-form-status').textContent = 'Generating reference images… (this may take a while)';
+  try {
+    const body = {
+      name, description: $('pe-desc').value||'', prompt,
+      n: parseInt($('pe-gen-n').value)||3,
+      width: parseInt($('pe-gen-w').value)||512,
+      height: parseInt($('pe-gen-h').value)||512,
+    };
+    const mdl = $('pe-gen-model').value;
+    if (mdl) body.model = mdl;
+    const steps = parseInt($('pe-gen-steps').value);
+    if (steps > 0) body.steps = steps;
+    const r = await fetch('/v1/environments/generate', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    if (!r.ok) throw new Error((await r.json()).detail || await r.text());
+    const d = await r.json();
+    $('pe-form-status').textContent = `Generated "${d.name}" (${d.image_count} reference images) ✓`;
+    await profEnvLoad();
+    setTimeout(profEnvHideForm, 1500);
+  } catch(e) { $('pe-form-status').textContent = 'Error: ' + e.message; }
+}
+
+async function profEnvLoad() {
+  try {
+    const d = await fetch('/admin/api/environments').then(r=>r.json());
+    _envProfiles = d.environments || [];
+    renderEnvList();
+    initEnvProfileSlots();
+    refreshEnvSelectors();
+  } catch(e) { _envProfiles = []; }
+}
+
+function renderEnvList() {
+  const el = $('prof-env-list');
+  if (!el) return;
+  if (!_envProfiles.length) { el.innerHTML = '<div class="arch-empty">No environment profiles yet.</div>'; return; }
+  el.innerHTML = _envProfiles.map(p => `
+    <div class="arch-card" style="position:relative;padding:1rem">
+      <div style="font-weight:600">${escapeHtml(p.name)}</div>
+      ${p.description ? `<div class="small muted">${escapeHtml(p.description)}</div>` : ''}
+      <div class="small muted">${p.image_count} reference image${p.image_count!==1?'s':''} · ${new Date(p.created_at*1000).toLocaleDateString()}</div>
+      <div style="display:flex;gap:.4rem;margin-top:.5rem">
+        <button class="btn btn-ghost btn-sm" onclick="profEnvView('${escapeHtml(p.name)}')">View</button>
+        <button class="btn btn-danger btn-sm" onclick="profEnvDelete('${escapeHtml(p.name)}')">Delete</button>
+      </div>
+    </div>`).join('');
+}
+
+async function profEnvView(name) {
+  const d = await fetch('/admin/api/environments/'+encodeURIComponent(name)).then(r=>r.json());
+  alert(`Environment: ${d.name}\nDescription: ${d.description||'—'}\nImages: ${d.image_count}\n\n(Images are shown in console; open DevTools to inspect)`);
+  console.log('[profEnvView]', d.name, d);
+}
+
+async function profEnvDelete(name) {
+  if (!confirm(`Delete environment profile "${name}"?`)) return;
+  const r = await fetch('/admin/api/environments/'+encodeURIComponent(name), {method:'DELETE'});
+  if (r.ok) await profEnvLoad();
+  else alert('Delete failed: ' + await r.text());
+}
+
+// ─────────────────────────────────────────────────────────────────
 loadModels();
 loadVoiceProfiles();
+profCharLoad();
+profEnvLoad();
+profVoiceLoad();
 initRequestPreviews();
 initPipelineBuilder();
 fetch('/admin/api/tokens').then(r => r.json()).then(tokens => {
@@ -4211,6 +5939,152 @@ function _renderPipelineResult(outId, progId, d) {
   if (out) out.innerHTML = `<div style="display:flex;flex-direction:column;gap:.2rem;margin-top:.4rem">${html}</div>`;
   const prog = $(progId);
   if (prog) prog.textContent = steps.some(s => s.error) ? 'Completed with errors' : 'Done ✓';
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Role picker (multi-cap sidebar assignment)
+// ─────────────────────────────────────────────────────────────────
+function showRolePicker(sub, model) {
+  closeRolePicker();
+  const studioRule = STUDIO_CAPABILITIES[sub];
+  if (!studioRule) return;
+  const caps = [...(studioRule.requires || []), ...(studioRule.optional || [])];
+  if (!caps.length) return;
+
+  const popup = document.createElement('div');
+  popup.id = 'role-picker-popup';
+  popup.className = 'role-picker-popup';
+
+  const capBtns = caps.map(cap => {
+    const currentId = capModelAssignments[sub]?.[cap];
+    const isCurrent = currentId === model.id;
+    const safe = JSON.stringify(model).replace(/"/g, '&quot;');
+    return `<button class="role-pick-btn${isCurrent ? ' active' : ''}"
+      onclick="assignModelToCap('${sub}','${cap}',${safe});closeRolePicker()">
+      <span class="role-pick-cap">${cap.replace(/_/g,' ')}</span>
+      ${isCurrent ? '<span class="role-pick-badge">assigned</span>' : ''}
+    </button>`;
+  }).join('');
+
+  popup.innerHTML = `
+    <div class="role-picker-header">Assign <strong>${escapeHtml(model.id.split('/').pop())}</strong> as:</div>
+    <div class="role-picker-caps">${capBtns}</div>
+    <button class="role-picker-close" onclick="closeRolePicker()">Cancel</button>
+  `;
+  document.body.appendChild(popup);
+
+  // Position next to the active sidebar model item
+  const activeItem = document.querySelector('.model-item.active');
+  if (activeItem) {
+    const rect = activeItem.getBoundingClientRect();
+    const top = Math.min(rect.top, window.innerHeight - popup.offsetHeight - 16);
+    popup.style.top = Math.max(8, top) + 'px';
+    popup.style.left = (rect.right + 8) + 'px';
+  }
+
+  setTimeout(() => document.addEventListener('click', _rolePickerOutside, { once: true }), 0);
+}
+
+function _rolePickerOutside(e) {
+  const popup = $('role-picker-popup');
+  if (popup && !popup.contains(e.target)) closeRolePicker();
+  else if (popup) document.addEventListener('click', _rolePickerOutside, { once: true });
+}
+
+function closeRolePicker() {
+  const popup = $('role-picker-popup');
+  if (popup) popup.remove();
+  document.removeEventListener('click', _rolePickerOutside);
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Archive
+// ─────────────────────────────────────────────────────────────────
+let _archiveFilter = 'all';
+let _archiveFiles = [];
+
+async function loadArchive() {
+  const grid = $('archive-grid');
+  if (!grid) return;
+  grid.innerHTML = '<div class="arch-empty">Loading…</div>';
+  try {
+    const data = await (await fetch('/v1/archive')).json();
+    _archiveFiles = data.files || [];
+    renderArchive();
+  } catch(e) {
+    grid.innerHTML = `<div class="arch-empty">Error loading archive: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function archiveSetFilter(type) {
+  _archiveFilter = type;
+  document.querySelectorAll('.arch-filter').forEach(b =>
+    b.classList.toggle('active', b.dataset.type === type));
+  renderArchive();
+}
+
+function renderArchive() {
+  const grid = $('archive-grid');
+  if (!grid) return;
+  const files = _archiveFilter === 'all'
+    ? _archiveFiles
+    : _archiveFiles.filter(f => f.type === _archiveFilter);
+  if (!files.length) {
+    const msg = _archiveFiles.length
+      ? 'No files match the filter.'
+      : 'No generated files found. Set --file-path to save outputs to disk.';
+    grid.innerHTML = `<div class="arch-empty">${msg}</div>`;
+    return;
+  }
+  grid.innerHTML = files.map(f => {
+    const date = new Date(f.created * 1000).toLocaleString([], {
+      month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'
+    });
+    const size = f.size > 1048576
+      ? (f.size / 1048576).toFixed(1) + ' MB'
+      : Math.round(f.size / 1024) + ' KB';
+    const thumb = f.type === 'image'
+      ? `<img class="arch-thumb" src="${escapeHtml(f.url)}" onclick="window.open('${escapeHtml(f.url)}')" loading="lazy">`
+      : `<div class="arch-thumb-ph">${f.type === 'video' ? '[video]' : '[audio]'}</div>`;
+    const playBtn = f.type !== 'image'
+      ? `<button class="arch-btn" onclick="archivePlay(${JSON.stringify(f).replace(/"/g,'&quot;')})">Play</button>`
+      : '';
+    const safeUrl = escapeHtml(f.url);
+    const safeName = escapeHtml(f.filename);
+    return `<div class="arch-card">
+      ${thumb}
+      <div class="arch-info">
+        <div class="arch-name" title="${safeName}">${safeName}</div>
+        <div class="arch-meta">${date} &middot; ${size}</div>
+      </div>
+      <div class="arch-actions">
+        <a class="arch-btn" href="${safeUrl}" download="${safeName}">Download</a>
+        ${playBtn}
+        <button class="arch-btn del" onclick="archiveDelete('${safeName}')">Delete</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function archiveDelete(filename) {
+  if (!confirm(`Delete ${filename}?`)) return;
+  try {
+    const r = await fetch(`/v1/archive/${encodeURIComponent(filename)}`, { method: 'DELETE' });
+    if (!r.ok) throw new Error((await r.json()).detail || 'Delete failed');
+    _archiveFiles = _archiveFiles.filter(f => f.filename !== filename);
+    renderArchive();
+  } catch(e) {
+    alert('Delete failed: ' + e.message);
+  }
+}
+
+function archivePlay(file) {
+  const w = window.open('', '_blank', 'width=820,height=520');
+  if (!w) return;
+  const tag = file.type === 'video'
+    ? `<video src="${escapeHtml(file.url)}" controls autoplay style="max-width:100%;max-height:100vh"></video>`
+    : `<audio src="${escapeHtml(file.url)}" controls autoplay></audio>`;
+  w.document.write(`<!doctype html><html><body style="margin:0;background:#000;display:flex;align-items:center;justify-content:center;height:100vh">${tag}</body></html>`);
 }
 </script>
 {% endblock %}

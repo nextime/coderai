@@ -18,10 +18,12 @@
 Text-to-speech endpoints for the codai API.
 """
 
+import asyncio
 import base64
 import os
+from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 # Import from codai modules
@@ -51,7 +53,8 @@ class TTSRequest(BaseModel):
     voice: str = "af_sarah"
     response_format: str = "mp3"
     speed: float = 1.0
-    
+    voice_profile: Optional[str] = None   # saved voice profile name (uses F5-TTS cloning)
+
     model_config = ConfigDict(extra="allow")
 
 
@@ -62,13 +65,39 @@ class TTSResponse(BaseModel):
 
 
 @router.post("/v1/audio/speech")
-async def create_speech(request: TTSRequest):
+async def create_speech(request: TTSRequest, http_request: Request = None):
     """
     Text-to-speech endpoint (OpenAI-compatible).
     
     Supports:
     - Kokoro TTS models (when --tts-model is specified)
     """
+    # If a voice profile is requested, delegate to voice cloning (F5-TTS)
+    if request.voice_profile:
+        from codai.api.voice_clone import _load_voice, _f5tts_clone
+        meta = _load_voice(request.voice_profile)
+        if not meta:
+            raise HTTPException(status_code=404,
+                detail=f"Voice profile '{request.voice_profile}' not found")
+        ref_audio_path = meta['audio_file']
+        ref_text = meta.get('transcript', '')
+        if not ref_text:
+            raise HTTPException(status_code=400,
+                detail="Voice profile has no transcript; update it with PATCH /v1/audio/voices/{name}")
+        try:
+            audio_bytes = await asyncio.get_event_loop().run_in_executor(
+                None, _f5tts_clone,
+                ref_audio_path, ref_text, request.input,
+                request.speed or 1.0, None,
+            )
+        except ImportError:
+            raise HTTPException(status_code=501,
+                detail="f5-tts not installed. Run: pip install f5-tts")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Voice cloning failed: {e}")
+        audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
+        return {"audio": audio_base64}
+
     # Use the manager to resolve the model and manage VRAM
     model_info = multi_model_manager.request_model(
         requested_model=request.model,
@@ -119,10 +148,23 @@ async def create_speech(request: TTSRequest):
         speed = request.speed or 1.0
         
         audio_bytes = kokoro_model.generate(request.input, voice=voice, speed=speed)
-        
+
+        try:
+            from codai.api.archive import archive_manager
+            asyncio.get_event_loop().create_task(asyncio.to_thread(
+                archive_manager.save_generation,
+                "tts", "/v1/audio/speech",
+                model_name,
+                request.input,
+                {"voice": voice, "speed": speed, "response_format": request.response_format},
+                [(audio_bytes, request.response_format or "mp3")],
+            ))
+        except Exception:
+            pass
+
         # Convert to base64
         audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
-        
+
         return {
             "audio": audio_base64
         }

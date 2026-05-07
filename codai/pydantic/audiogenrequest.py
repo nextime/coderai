@@ -31,6 +31,8 @@ class AudioGenerationRequest(BaseModel):
     seed: Optional[int] = None
     # Reference audio for melody conditioning (MusicGen Melody)
     melody: Optional[str] = None           # base64/URL
+    # Voice profile for singing/speech conditioning
+    voice_profile: Optional[str] = None    # saved voice profile name
     # Output
     response_format: Optional[str] = "url"  # url | b64_wav | b64_mp3
     user: Optional[str] = None

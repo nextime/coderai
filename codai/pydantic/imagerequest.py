@@ -34,6 +34,12 @@ class ImageGenerationRequest(BaseModel):
     seed: Optional[int] = None
     user: Optional[str] = None
     disable_safety_checker: Optional[bool] = False
+    negative_prompt: Optional[str] = None
+
+    # Character consistency
+    character_profiles: Optional[List[str]] = None      # saved profile names
+    character_references: Optional[List[str]] = None    # inline base64 images
+    character_strength: Optional[float] = 0.6           # IP-Adapter scale
 
     model_config = ConfigDict(extra="allow")
 

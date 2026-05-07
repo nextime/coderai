@@ -20,6 +20,18 @@ from typing import Dict, List, Optional
 from pydantic import BaseModel, ConfigDict
 
 
+class CharacterDialogLine(BaseModel):
+    """One spoken line in a multi-character dialog sequence."""
+    character: Optional[str] = None    # character profile name (used for lip-sync face)
+    voice: Optional[str] = None        # voice profile name OR TTS voice id
+    text: str                          # dialog text to synthesise
+    start_time: Optional[float] = None # explicit offset in seconds (None = sequential)
+    lip_sync: Optional[bool] = True    # apply lip sync for this line
+    lang: Optional[str] = None         # language hint for TTS
+    speed: Optional[float] = 1.0
+    model_config = ConfigDict(extra="allow")
+
+
 class VideoGenerationRequest(BaseModel):
     model: str
     prompt: str = ""
@@ -77,6 +89,9 @@ class VideoGenerationRequest(BaseModel):
     sync_audio: Optional[bool] = False      # sync audio timing to video
     lip_sync: Optional[bool] = False        # warp mouth to match audio
     lip_sync_method: Optional[str] = "wav2lip"  # wav2lip | sadtalker
+
+    # ── Multi-character dialog ────────────────────────────────────────────
+    dialogs: Optional[List[CharacterDialogLine]] = None
 
     # ── Subtitles ────────────────────────────────────────────────────────
     generate_subtitles: Optional[bool] = False

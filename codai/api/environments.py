@@ -15,17 +15,19 @@
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 """
-Character profile endpoints.
+Environment profile endpoints.
 
-Saved character profiles are named collections of reference images used to
-maintain visual consistency of a character across image/video generations.
+Saved environment profiles are named collections of reference images that
+describe a setting, background, or location used to maintain visual
+consistency of an environment across image/video generations.
 
-POST   /v1/characters              – save / update a character profile
-POST   /v1/characters/extract      – extract character from images and/or videos
-GET    /v1/characters              – list all saved profiles (no images)
-GET    /v1/characters/{name}       – get a profile including base64 images
-PATCH  /v1/characters/{name}       – update description / add / remove images
-DELETE /v1/characters/{name}       – delete a profile
+POST   /v1/environments              – save / update an environment profile
+POST   /v1/environments/extract      – extract from images and/or videos
+POST   /v1/environments/generate     – generate from a text prompt
+GET    /v1/environments              – list all saved profiles (no images)
+GET    /v1/environments/{name}       – get a profile including base64 images
+PATCH  /v1/environments/{name}       – update description / add / remove images
+DELETE /v1/environments/{name}       – delete a profile
 """
 
 import base64
@@ -42,90 +44,81 @@ from pydantic import BaseModel, ConfigDict
 
 router = APIRouter()
 
-_CHARS_DIR: Optional[str] = None
+_ENVS_DIR: Optional[str] = None
 
 
 def set_global_args(args):
-    global _CHARS_DIR
+    global _ENVS_DIR
     base = getattr(args, 'file_path', None) or os.path.expanduser('~/.coderai')
     root = base if os.path.isdir(base) else (os.path.dirname(base) if base else os.path.expanduser('~/.coderai'))
-    _CHARS_DIR = os.path.join(root, 'characters')
-    os.makedirs(_CHARS_DIR, exist_ok=True)
+    _ENVS_DIR = os.path.join(root, 'environments')
+    os.makedirs(_ENVS_DIR, exist_ok=True)
 
 
 def set_global_file_path(path: str):
-    pass  # not needed for characters
+    pass  # not needed for environments
 
 
-def _chars_dir() -> str:
-    if _CHARS_DIR:
-        return _CHARS_DIR
-    d = os.path.expanduser('~/.coderai/characters')
+def _envs_dir() -> str:
+    if _ENVS_DIR:
+        return _ENVS_DIR
+    d = os.path.expanduser('~/.coderai/environments')
     os.makedirs(d, exist_ok=True)
     return d
 
 
-def _char_dir(name: str) -> str:
-    return os.path.join(_chars_dir(), name)
+def _env_dir(name: str) -> str:
+    return os.path.join(_envs_dir(), name)
 
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
 
-class CharacterImage(BaseModel):
-    label: Optional[str] = None      # e.g. "front", "side", "close-up"
+class EnvironmentImage(BaseModel):
+    label: Optional[str] = None
     data: str                         # base64 image (with or without data: prefix)
     model_config = ConfigDict(extra="allow")
 
 
-class CharacterSaveRequest(BaseModel):
+class EnvironmentSaveRequest(BaseModel):
     name: str
     description: Optional[str] = ""
-    images: List[CharacterImage]      # one or more reference images
+    images: List[EnvironmentImage]
     model_config = ConfigDict(extra="allow")
 
 
-class CharacterExtractRequest(BaseModel):
+class EnvironmentExtractRequest(BaseModel):
     name: str
     description: Optional[str] = ""
     images: Optional[List[str]] = None   # base64 source images
     videos: Optional[List[str]] = None   # base64/URL source videos
-    max_images: Optional[int] = 5        # max reference images to extract
+    max_images: Optional[int] = 5
     model_config = ConfigDict(extra="allow")
 
 
-class CharacterGenerateRequest(BaseModel):
+class EnvironmentGenerateRequest(BaseModel):
     name: str
     description: Optional[str] = ""
-    prompt: str                            # visual description prompt
-    model: Optional[str] = None           # image model to use
-    n: Optional[int] = 3                  # number of reference images to generate
-    steps: Optional[int] = None           # inference steps (None = model default)
+    prompt: str
+    model: Optional[str] = None
+    n: Optional[int] = 3
+    steps: Optional[int] = None
     width: Optional[int] = 512
     height: Optional[int] = 512
     model_config = ConfigDict(extra="allow")
 
 
-class CharacterPatchRequest(BaseModel):
+class EnvironmentPatchRequest(BaseModel):
     description: Optional[str] = None
-    add_images: Optional[List[CharacterImage]] = None
-    remove_indices: Optional[List[int]] = None   # 0-based indices to remove
-    model_config = ConfigDict(extra="allow")
-
-
-class CharacterProfile(BaseModel):
-    name: str
-    description: Optional[str] = ""
-    image_count: int
-    created_at: int
-    images: Optional[List[CharacterImage]] = None  # only populated on GET /{name}
+    add_images: Optional[List[EnvironmentImage]] = None
+    remove_indices: Optional[List[int]] = None
     model_config = ConfigDict(extra="allow")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _save_character(name: str, description: str, images: List[CharacterImage]) -> dict:
-    cdir = _char_dir(name)
-    os.makedirs(cdir, exist_ok=True)
+def _save_environment(name: str, description: str, images: List[EnvironmentImage]) -> dict:
+    edir = _env_dir(name)
+    os.makedirs(edir, exist_ok=True)
 
     img_files = []
     for i, img in enumerate(images):
@@ -135,10 +128,9 @@ def _save_character(name: str, description: str, images: List[CharacterImage]) -
         else:
             b64 = raw
         img_bytes = base64.b64decode(b64)
-        # Detect PNG vs JPEG from magic bytes
         ext = '.png' if img_bytes[:4] == b'\x89PNG' else '.jpg'
         fname = f"ref{i:02d}{ext}"
-        fpath = os.path.join(cdir, fname)
+        fpath = os.path.join(edir, fname)
         with open(fpath, 'wb') as f:
             f.write(img_bytes)
         img_files.append({'file': fname, 'label': img.label or f'ref{i}'})
@@ -150,27 +142,27 @@ def _save_character(name: str, description: str, images: List[CharacterImage]) -
         'image_count': len(img_files),
         'created_at': int(time.time()),
     }
-    with open(os.path.join(cdir, 'meta.json'), 'w') as f:
+    with open(os.path.join(edir, 'meta.json'), 'w') as f:
         json.dump(meta, f)
     return meta
 
 
-def _load_character_meta(name: str) -> Optional[dict]:
-    meta_path = os.path.join(_char_dir(name), 'meta.json')
+def _load_environment_meta(name: str) -> Optional[dict]:
+    meta_path = os.path.join(_env_dir(name), 'meta.json')
     if not os.path.exists(meta_path):
         return None
     with open(meta_path) as f:
         return json.load(f)
 
 
-def _load_character_images(name: str) -> List[CharacterImage]:
-    meta = _load_character_meta(name)
+def _load_environment_images(name: str) -> List[EnvironmentImage]:
+    meta = _load_environment_meta(name)
     if not meta:
         return []
-    cdir = _char_dir(name)
+    edir = _env_dir(name)
     result = []
     for img_info in meta.get('images', []):
-        fpath = os.path.join(cdir, img_info['file'])
+        fpath = os.path.join(edir, img_info['file'])
         if not os.path.exists(fpath):
             continue
         with open(fpath, 'rb') as f:
@@ -178,26 +170,25 @@ def _load_character_images(name: str) -> List[CharacterImage]:
         ext = img_info['file'].rsplit('.', 1)[-1]
         mime = 'image/png' if ext == 'png' else 'image/jpeg'
         b64 = base64.b64encode(raw).decode()
-        result.append(CharacterImage(
+        result.append(EnvironmentImage(
             label=img_info.get('label'),
             data=f"data:{mime};base64,{b64}",
         ))
     return result
 
 
-def _list_characters() -> list:
-    d = _chars_dir()
+def _list_environments() -> list:
+    d = _envs_dir()
     profiles = []
     for entry in os.scandir(d):
         if entry.is_dir():
-            meta = _load_character_meta(entry.name)
+            meta = _load_environment_meta(entry.name)
             if meta:
                 profiles.append({k: v for k, v in meta.items() if k != 'images'})
     return sorted(profiles, key=lambda p: p.get('created_at', 0))
 
 
 def _decode_source(data: str) -> bytes:
-    """Decode base64 or URL source into raw bytes."""
     if data.startswith('data:'):
         _, b64 = data.split(',', 1)
         return base64.b64decode(b64)
@@ -208,51 +199,7 @@ def _decode_source(data: str) -> bytes:
     return base64.b64decode(data)
 
 
-def _detect_faces_cv2(img_bytes: bytes):
-    """Return list of (x,y,w,h) face rects using Haar cascade, or [] if cv2 unavailable."""
-    try:
-        import cv2
-        import numpy as np
-        arr = np.frombuffer(img_bytes, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            return []
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        cascade = cv2.CascadeClassifier(cascade_path)
-        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
-        if len(faces) == 0:
-            return []
-        return [(int(x), int(y), int(w), int(h)) for x, y, w, h in faces]
-    except Exception:
-        return []
-
-
-def _crop_face(img_bytes: bytes, rect) -> Optional[bytes]:
-    """Crop a face rect (with padding) from an image, return PNG bytes."""
-    try:
-        import cv2
-        import numpy as np
-        x, y, w, h = rect
-        arr = np.frombuffer(img_bytes, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            return None
-        ih, iw = img.shape[:2]
-        pad = int(max(w, h) * 0.4)
-        x1 = max(0, x - pad)
-        y1 = max(0, y - pad)
-        x2 = min(iw, x + w + pad)
-        y2 = min(ih, y + h + pad)
-        crop = img[y1:y2, x1:x2]
-        ok, buf = cv2.imencode('.png', crop)
-        return bytes(buf) if ok else None
-    except Exception:
-        return None
-
-
 def _image_sharpness(img_bytes: bytes) -> float:
-    """Return a sharpness score (Laplacian variance) for frame selection."""
     try:
         import cv2
         import numpy as np
@@ -265,32 +212,25 @@ def _image_sharpness(img_bytes: bytes) -> float:
         return 0.0
 
 
-def _extract_from_image(img_bytes: bytes) -> List[bytes]:
-    """Return list of PNG crops from a single source image (one per detected face, or whole image)."""
-    faces = _detect_faces_cv2(img_bytes)
-    if faces:
-        crops = [c for f in faces for c in [_crop_face(img_bytes, f)] if c]
-        if crops:
-            return crops
-    # No face detected — use whole image as reference
+def _normalise_image(img_bytes: bytes) -> bytes:
+    """Convert any source image to a consistent PNG, resized to max 1024px on the long edge."""
     try:
         from PIL import Image as PILImage
         img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
+        img.thumbnail((1024, 1024), PILImage.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, 'PNG')
-        return [buf.getvalue()]
+        return buf.getvalue()
     except Exception:
-        return [img_bytes]
+        return img_bytes
 
 
 def _extract_frames_from_video(video_bytes: bytes, max_frames: int = 10) -> List[bytes]:
-    """Extract diverse frames from a video using ffmpeg, return PNG byte lists."""
     with tempfile.TemporaryDirectory() as tmpdir:
         in_path = os.path.join(tmpdir, 'input.mp4')
         with open(in_path, 'wb') as f:
             f.write(video_bytes)
 
-        # Get duration
         probe = subprocess.run(
             ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
              '-of', 'default=nw=1:nk=1', in_path],
@@ -301,7 +241,6 @@ def _extract_frames_from_video(video_bytes: bytes, max_frames: int = 10) -> List
         except (ValueError, AttributeError):
             duration = 10.0
 
-        # Extract evenly-spaced frames
         frames_dir = os.path.join(tmpdir, 'frames')
         os.makedirs(frames_dir, exist_ok=True)
         fps_target = max(1, max_frames) / max(1.0, duration)
@@ -321,51 +260,50 @@ def _extract_frames_from_video(video_bytes: bytes, max_frames: int = 10) -> List
 
 
 def _select_best_frames(frames: List[bytes], max_count: int) -> List[bytes]:
-    """Pick the sharpest frames, spaced across the video."""
     if not frames:
         return []
     scored = sorted(enumerate(frames), key=lambda t: _image_sharpness(t[1]), reverse=True)
     top = scored[:max(max_count * 2, 6)]
-    top.sort(key=lambda t: t[0])  # restore temporal order
+    top.sort(key=lambda t: t[0])
     step = max(1, len(top) // max_count)
     return [top[i][1] for i in range(0, len(top), step)][:max_count]
 
 
-def resolve_character_profiles(profile_names: List[str]) -> List[str]:
+def resolve_environment_profiles(profile_names: List[str]) -> List[str]:
     """Resolve saved profile names → flat list of base64 image strings."""
     out = []
     for name in profile_names:
-        for img in _load_character_images(name):
+        for img in _load_environment_images(name):
             out.append(img.data)
     return out
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@router.post("/v1/characters")
-async def save_character(req: CharacterSaveRequest):
-    """Save or update a named character profile."""
+@router.post("/v1/environments")
+async def save_environment(req: EnvironmentSaveRequest):
+    """Save or update a named environment profile."""
     if not req.name or '/' in req.name or '..' in req.name:
-        raise HTTPException(status_code=400, detail="Invalid character name")
+        raise HTTPException(status_code=400, detail="Invalid environment name")
     if not req.images:
         raise HTTPException(status_code=400, detail="At least one reference image required")
-    meta = _save_character(req.name, req.description or '', req.images)
+    meta = _save_environment(req.name, req.description or '', req.images)
     return {"ok": True, "name": meta['name'], "image_count": meta['image_count']}
 
 
-@router.get("/v1/characters")
-async def list_characters():
-    """List all saved character profiles (metadata only, no images)."""
-    return {"characters": _list_characters()}
+@router.get("/v1/environments")
+async def list_environments():
+    """List all saved environment profiles (metadata only)."""
+    return {"environments": _list_environments()}
 
 
-@router.get("/v1/characters/{name}")
-async def get_character(name: str):
-    """Get a character profile including its reference images as base64."""
-    meta = _load_character_meta(name)
+@router.get("/v1/environments/{name}")
+async def get_environment(name: str):
+    """Get an environment profile including its reference images as base64."""
+    meta = _load_environment_meta(name)
     if not meta:
-        raise HTTPException(status_code=404, detail=f"Character '{name}' not found")
-    images = _load_character_images(name)
+        raise HTTPException(status_code=404, detail=f"Environment '{name}' not found")
+    images = _load_environment_images(name)
     return {
         "name": meta['name'],
         "description": meta.get('description', ''),
@@ -375,38 +313,36 @@ async def get_character(name: str):
     }
 
 
-@router.delete("/v1/characters/{name}")
-async def delete_character(name: str):
-    """Delete a character profile."""
-    cdir = _char_dir(name)
-    if not os.path.isdir(cdir):
-        raise HTTPException(status_code=404, detail=f"Character '{name}' not found")
+@router.delete("/v1/environments/{name}")
+async def delete_environment(name: str):
+    """Delete an environment profile."""
+    edir = _env_dir(name)
+    if not os.path.isdir(edir):
+        raise HTTPException(status_code=404, detail=f"Environment '{name}' not found")
     import shutil
-    shutil.rmtree(cdir)
+    shutil.rmtree(edir)
     return {"ok": True, "name": name}
 
 
-@router.patch("/v1/characters/{name}")
-async def patch_character(name: str, req: CharacterPatchRequest):
-    """Update a character profile: description, add images, or remove images by index."""
-    meta = _load_character_meta(name)
+@router.patch("/v1/environments/{name}")
+async def patch_environment(name: str, req: EnvironmentPatchRequest):
+    """Update an environment profile: description, add images, or remove images by index."""
+    meta = _load_environment_meta(name)
     if not meta:
-        raise HTTPException(status_code=404, detail=f"Character '{name}' not found")
-    cdir = _char_dir(name)
+        raise HTTPException(status_code=404, detail=f"Environment '{name}' not found")
+    edir = _env_dir(name)
 
     img_files = list(meta.get('images', []))
 
-    # Remove by index (highest first so indices stay valid)
     if req.remove_indices:
         for idx in sorted(set(req.remove_indices), reverse=True):
             if 0 <= idx < len(img_files):
                 try:
-                    os.unlink(os.path.join(cdir, img_files[idx]['file']))
+                    os.unlink(os.path.join(edir, img_files[idx]['file']))
                 except Exception:
                     pass
                 img_files.pop(idx)
 
-    # Add new images
     if req.add_images:
         next_i = len(img_files)
         for img in req.add_images:
@@ -418,7 +354,7 @@ async def patch_character(name: str, req: CharacterPatchRequest):
             img_bytes = base64.b64decode(b64)
             ext = '.png' if img_bytes[:4] == b'\x89PNG' else '.jpg'
             fname = f"ref{next_i:02d}{ext}"
-            fpath = os.path.join(cdir, fname)
+            fpath = os.path.join(edir, fname)
             with open(fpath, 'wb') as f:
                 f.write(img_bytes)
             img_files.append({'file': fname, 'label': img.label or f'ref{next_i}'})
@@ -429,22 +365,22 @@ async def patch_character(name: str, req: CharacterPatchRequest):
 
     meta['images'] = img_files
     meta['image_count'] = len(img_files)
-    with open(os.path.join(cdir, 'meta.json'), 'w') as f:
+    with open(os.path.join(edir, 'meta.json'), 'w') as f:
         json.dump(meta, f)
 
     return {"ok": True, "name": name, "image_count": meta['image_count']}
 
 
-@router.post("/v1/characters/generate")
-async def generate_character(req: CharacterGenerateRequest, request: Request):
+@router.post("/v1/environments/generate")
+async def generate_environment(req: EnvironmentGenerateRequest, request: Request):
     """
-    Generate a character profile from a text prompt.
+    Generate an environment profile from a text prompt.
 
     Calls the local image generation pipeline to produce `n` reference images,
-    then saves them as a named character profile.
+    then saves them as a named environment profile.
     """
     if not req.name or '/' in req.name or '..' in req.name:
-        raise HTTPException(status_code=400, detail="Invalid character name")
+        raise HTTPException(status_code=400, detail="Invalid environment name")
     if not req.prompt or not req.prompt.strip():
         raise HTTPException(status_code=400, detail="A visual description prompt is required")
 
@@ -460,7 +396,6 @@ async def generate_character(req: CharacterGenerateRequest, request: Request):
     if req.steps:
         payload["steps"] = req.steps
 
-    # Forward the caller's auth token so rate-limit / auth middleware passes
     auth_header = request.headers.get("authorization", "")
     headers = {"Content-Type": "application/json"}
     if auth_header:
@@ -491,7 +426,7 @@ async def generate_character(req: CharacterGenerateRequest, request: Request):
     if not images_data:
         raise HTTPException(status_code=422, detail="No images were generated")
 
-    char_images: List[CharacterImage] = []
+    env_images: List[EnvironmentImage] = []
     for i, item in enumerate(images_data):
         b64 = item.get("b64_json") or item.get("data", "")
         if not b64:
@@ -501,49 +436,47 @@ async def generate_character(req: CharacterGenerateRequest, request: Request):
             mime = header.split(";")[0].split(":")[1] if ":" in header else "image/png"
         else:
             mime, b64_pure = "image/png", b64
-        char_images.append(CharacterImage(
+        env_images.append(EnvironmentImage(
             label=f"generated_{i:02d}",
             data=f"data:{mime};base64,{b64_pure}",
         ))
 
-    if not char_images:
+    if not env_images:
         raise HTTPException(status_code=422, detail="Generated images could not be decoded")
 
-    meta = _save_character(req.name, req.description or req.prompt, char_images)
+    meta = _save_environment(req.name, req.description or req.prompt, env_images)
     return {"ok": True, "name": meta["name"], "image_count": meta["image_count"]}
 
 
-@router.post("/v1/characters/extract")
-async def extract_character(req: CharacterExtractRequest):
+@router.post("/v1/environments/extract")
+async def extract_environment(req: EnvironmentExtractRequest):
     """
-    Extract a character profile from source images and/or videos.
+    Extract an environment profile from source images and/or videos.
 
-    Images and videos are analysed for faces; the best crops are saved as
-    reference images for the named character profile.
+    Whole frames are used as-is (no face cropping); the sharpest and most
+    diverse frames are selected as reference images for the profile.
     """
     import asyncio
 
     if not req.name or '/' in req.name or '..' in req.name:
-        raise HTTPException(status_code=400, detail="Invalid character name")
+        raise HTTPException(status_code=400, detail="Invalid environment name")
     if not req.images and not req.videos:
         raise HTTPException(status_code=400, detail="Provide at least one image or video")
 
-    max_per_source = max(1, (req.max_images or 5))
+    max_per_source = max(1, req.max_images or 5)
     collected: List[bytes] = []
 
-    # --- images ---
     if req.images:
         for src in req.images:
             try:
                 img_bytes = await asyncio.get_event_loop().run_in_executor(
                     None, _decode_source, src)
-                crops = await asyncio.get_event_loop().run_in_executor(
-                    None, _extract_from_image, img_bytes)
-                collected.extend(crops[:max_per_source])
+                norm = await asyncio.get_event_loop().run_in_executor(
+                    None, _normalise_image, img_bytes)
+                collected.append(norm)
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Failed to process image: {e}")
 
-    # --- videos ---
     if req.videos:
         for src in req.videos:
             try:
@@ -552,31 +485,29 @@ async def extract_character(req: CharacterExtractRequest):
                 frames = await asyncio.get_event_loop().run_in_executor(
                     None, _extract_frames_from_video, vid_bytes, max_per_source * 4)
                 best = await asyncio.get_event_loop().run_in_executor(
-                    None, _select_best_frames, frames, max_per_source * 2)
-                face_crops: List[bytes] = []
+                    None, _select_best_frames, frames, max_per_source)
+                normed = []
                 for frame in best:
-                    crops = await asyncio.get_event_loop().run_in_executor(
-                        None, _extract_from_image, frame)
-                    face_crops.extend(crops)
-                collected.extend(face_crops[:max_per_source])
+                    n = await asyncio.get_event_loop().run_in_executor(
+                        None, _normalise_image, frame)
+                    normed.append(n)
+                collected.extend(normed)
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Failed to process video: {e}")
 
     if not collected:
         raise HTTPException(status_code=422, detail="No usable frames could be extracted")
 
-    # Deduplicate and trim
     collected = collected[: req.max_images or 5]
 
-    # Build CharacterImage list from raw PNG bytes
-    char_images = []
+    env_images = []
     for i, img_bytes in enumerate(collected):
         b64 = base64.b64encode(img_bytes).decode()
         mime = 'image/png' if img_bytes[:4] == b'\x89PNG' else 'image/jpeg'
-        char_images.append(CharacterImage(
+        env_images.append(EnvironmentImage(
             label=f'extracted_{i:02d}',
             data=f'data:{mime};base64,{b64}',
         ))
 
-    meta = _save_character(req.name, req.description or '', char_images)
+    meta = _save_environment(req.name, req.description or '', env_images)
     return {"ok": True, "name": meta['name'], "image_count": meta['image_count']}

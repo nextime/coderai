@@ -34,9 +34,11 @@ from starlette.middleware.base import BaseHTTPMiddleware
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Reject /v1/ API requests that lack a valid Bearer token or active web session."""
 
+    _EXEMPT_PATHS = {"/v1/images/progress"}
+
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        if not path.startswith("/v1/"):
+        if not path.startswith("/v1/") or path in self._EXEMPT_PATHS:
             return await call_next(request)
 
         from codai.admin import routes as _admin_routes
@@ -112,14 +114,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 return prefix
         return ""
 
+    # Lightweight polling endpoints that must never be rate-limited
+    _EXEMPT_PATHS = {"/v1/images/progress"}
+
     async def dispatch(self, request: Request, call_next):
         if not RATE_LIMITING_ENABLED:
             return await call_next(request)
 
         path = request.url.path
 
-        # Queue-size enforcement for authenticated API requests
-        if any(path.startswith(p) for p in _QUEUED_PREFIXES):
+        if path in self._EXEMPT_PATHS:
+            return await call_next(request)
+
+        # Queue-size enforcement for authenticated API requests (not for status polls)
+        if path not in self._EXEMPT_PATHS and any(path.startswith(p) for p in _QUEUED_PREFIXES):
             from codai.queue.manager import queue_manager
             if await queue_manager.is_full():
                 return JSONResponse(

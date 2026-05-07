@@ -42,6 +42,9 @@ An OpenAI-compatible API server to run models on your local GPU with web adminis
 - **Face Swap**: InsightFace INSwapper — swap faces in images and videos
 - **Depth Estimation**: Monocular depth maps
 - **Segmentation**: SAM-based object segmentation
+- **Character Profiles**: Apply up to 6 named character profiles (IP-Adapter) to anchor appearance across generations
+- **Environment Profiles**: Apply up to 6 named environment profiles to condition scene/background style
+- **Generation Progress**: Real-time per-step progress tracking via `GET /v1/images/progress`
 
 ### Video Generation
 - **Text-to-Video**: Generate video from text prompts
@@ -52,6 +55,9 @@ An OpenAI-compatible API server to run models on your local GPU with web adminis
 - **Upscaling**: Real-ESRGAN video upscaling
 - **Subtitles**: Whisper transcription + optional translation + burn-in
 - **Dubbing**: Transcribe → translate → TTS → replace audio track
+- **Character Profiles**: Apply up to 6 saved character profiles for visual consistency
+- **Environment Profiles**: Apply up to 6 saved environment profiles to condition the scene
+- **Multi-Character Dialog**: Assign spoken lines to individual characters — each line picks a character profile, voice profile or TTS voice ID, and text; lines are TTS-synthesised, mixed with correct timing (sequential or manual), and lip-synced to the video via Wav2Lip or SadTalker
 
 ### Audio
 - **Text-to-Speech**: Kokoro TTS with voice selection and speed control
@@ -59,7 +65,35 @@ An OpenAI-compatible API server to run models on your local GPU with web adminis
 - **Music/SFX Generation**: MusicGen, AudioGen, AudioLDM2
 - **Voice Cloning**: F5-TTS zero-shot voice cloning from a reference audio clip
 - **Voice Conversion (SVC)**: Seed-VC — converts timbre while preserving pitch, melody and expression; **singing mode** for music
-- **Voice Profiles**: Save named voice profiles (reference audio + transcript) for reuse
+- **Voice Profiles**: Save named voice profiles (reference audio + transcript) for reuse; voice profiles can now be extracted directly from video files and updated via PATCH
+
+### Character Profiles
+Named collections of reference images used to condition character appearance via IP-Adapter across any image or video generation. Up to 6 profiles can be selected per generation.
+
+- **Extract from images/video**: Automatic face detection and cropping to build a reference set
+- **Generate from text prompt**: Create reference images from a visual description (no source images needed) using any registered image model
+- **Reuse across generations**: Select saved profiles by name in the API or web UI
+- **CRUD API**: Create, list, view, patch (add/remove images), and delete profiles
+
+### Environment Profiles
+Named collections of reference images that condition scene background and environment style via IP-Adapter. Same multi-slot selection (up to 6) as character profiles.
+
+- **Extract from images/video**: Selects the sharpest frames/images (no face crop — full image used)
+- **Generate from text prompt**: Create reference images from a scene description using any registered image model
+- **Reuse across generations**: Select saved profiles by name in image and video generation
+
+### 2D ↔ 3D Conversion
+- **Image → 3D**: Convert any image to stereo pair, anaglyph, depth map, or mesh (GLB/OBJ) via depth estimation + optional 3D reconstruction
+- **3D → Image**: Render a GLB/OBJ model to a 2D image from a specified viewpoint
+- **Video → 3D**: Apply frame-by-frame depth processing to produce a 3D video
+- **3D → Video**: Render a 3D model as a turntable rotation video
+- **Text/Image → 3D Model**: Generate a 3D GLB model from a text prompt or reference image (requires a compatible 3D generation model)
+
+### Generation Archive
+- **Auto-save**: Every generated file (image, video, audio) is optionally saved to a configurable local directory
+- **Configurable retention**: `1h`, `1d`, `2d`, `1w`, `1m`, `3m`, `6m`, `1y`, or `never` — automatic hourly cleanup
+- **Browse & delete**: View and delete archived files from the web UI Archive tab or via the API
+- **Settings page**: Archive directory and retention are configurable from the web UI Settings page without a restart
 
 ### Pipelines
 Built-in multi-step pipelines callable from the API or web UI:
@@ -221,9 +255,17 @@ Config files live in `~/.coderai/` (or `--config` path):
   "backend": { "type": "auto" },
   "models": { "default_load_mode": "ondemand" },
   "offload": { "load_in_4bit": false, "flash_attention": false },
-  "vulkan": { "n_gpu_layers": -1, "n_ctx": 2048, "device_id": 0 }
+  "vulkan": { "n_gpu_layers": -1, "n_ctx": 2048, "device_id": 0 },
+  "archive": {
+    "enabled": true,
+    "directory": "",
+    "retention": "1w"
+  }
 }
 ```
+
+`archive.directory` — absolute path, or empty to use `<config_dir>/archive`.
+`archive.retention` — one of: `1h`, `1d`, `2d`, `1w`, `1m`, `3m`, `6m`, `1y`, `never`.
 
 ### models.json
 
@@ -264,29 +306,74 @@ Config files live in `~/.coderai/` (or `--config` path):
 | `POST /v1/images/faceswap` | Face swap (image or video) |
 | `POST /v1/images/depth` | Depth estimation |
 | `POST /v1/images/segment` | Object segmentation |
+| `POST /v1/images/to3d` | Image → stereo / anaglyph / depth map / mesh |
+| `POST /v1/images/from3d` | 3D model → rendered 2D image |
+| `GET /v1/images/progress` | Current generation progress (step/total) |
 
 ### Video
 
 | Endpoint | Description |
 |---|---|
-| `POST /v1/video/generations` | Generate video (t2v/i2v/v2v/ti2v/interp) |
+| `POST /v1/video/generations` | Generate video (t2v/i2v/v2v/ti2v/interp) — supports `character_profiles`, `environment_profiles`, `dialogs` |
 | `POST /v1/video/upscale` | Upscale video |
 | `POST /v1/video/subtitle` | Generate/burn subtitles |
 | `POST /v1/video/interpolate` | Frame interpolation |
 | `POST /v1/video/dub` | Dub video to another language |
+| `POST /v1/video/to3d` | Video → 3D video (frame-by-frame depth) |
+| `POST /v1/video/from3d` | 3D model → turntable video |
 
 ### Audio
 
 | Endpoint | Description |
 |---|---|
-| `POST /v1/audio/speech` | Text-to-speech |
+| `POST /v1/audio/speech` | Text-to-speech (supports `voice_profile` for F5-TTS cloning) |
 | `POST /v1/audio/transcriptions` | Speech-to-text (Whisper) |
 | `POST /v1/audio/generate` | Music/SFX generation |
 | `POST /v1/audio/clone` | Voice cloning TTS (F5-TTS) |
 | `POST /v1/audio/convert` | Voice conversion / SVC (Seed-VC) |
 | `GET /v1/audio/voices` | List saved voice profiles |
 | `POST /v1/audio/voices` | Save a voice profile |
+| `GET /v1/audio/voices/{name}` | Get a specific voice profile |
+| `PATCH /v1/audio/voices/{name}` | Update a voice profile |
+| `POST /v1/audio/voices/extract` | Extract voice profile from audio/video |
 | `DELETE /v1/audio/voices/{name}` | Delete a voice profile |
+
+### Character Profiles
+
+| Endpoint | Description |
+|---|---|
+| `GET /v1/characters` | List all character profiles |
+| `POST /v1/characters` | Save a character profile from images/videos |
+| `POST /v1/characters/extract` | Extract a profile from source images/videos (face-crop + sharpness ranking) |
+| `POST /v1/characters/generate` | Generate reference images from a text prompt and save as profile |
+| `GET /v1/characters/{name}` | Get a character profile with images |
+| `PATCH /v1/characters/{name}` | Update description or add/remove reference images |
+| `DELETE /v1/characters/{name}` | Delete a character profile |
+
+### Environment Profiles
+
+| Endpoint | Description |
+|---|---|
+| `GET /v1/environments` | List all environment profiles |
+| `POST /v1/environments` | Save an environment profile from images/videos |
+| `POST /v1/environments/extract` | Extract a profile from source images/videos (sharpness ranking, full image) |
+| `POST /v1/environments/generate` | Generate reference images from a scene description and save as profile |
+| `GET /v1/environments/{name}` | Get an environment profile with images |
+| `PATCH /v1/environments/{name}` | Update description or add/remove reference images |
+| `DELETE /v1/environments/{name}` | Delete an environment profile |
+
+### 3D Generation
+
+| Endpoint | Description |
+|---|---|
+| `POST /v1/3d/generate` | Text or image → 3D model (GLB) |
+
+### Archive
+
+| Endpoint | Description |
+|---|---|
+| `GET /v1/archive` | List all archived generated files |
+| `DELETE /v1/archive/{filename}` | Delete an archived file |
 
 ### Pipelines
 
@@ -303,6 +390,51 @@ Config files live in `~/.coderai/` (or `--config` path):
 | `POST /v1/pipelines/custom/{id}/run` | Run a saved custom pipeline |
 | `POST /v1/pipelines/run` | Run an inline pipeline definition |
 | `GET /v1/pipelines/step-types` | List available step types |
+
+### Character & Environment Profile Usage
+
+Profiles are selected by name in any image or video generation request. Up to 6 of each type can be combined:
+
+```json
+{
+  "model": "wan-model",
+  "prompt": "Alice and Bob walking in a forest",
+  "character_profiles": ["Alice", "Bob"],
+  "character_strength": 0.8,
+  "environment_profiles": ["forest-summer"],
+  "environment_strength": 0.6
+}
+```
+
+### Multi-Character Dialog
+
+Add spoken dialog to a video generation. Each line specifies a character, a voice, and text. Lines are TTS-synthesised, timed, mixed, and lip-synced:
+
+```json
+{
+  "model": "wan-model",
+  "prompt": "Two characters having a conversation",
+  "character_profiles": ["Alice", "Bob"],
+  "lip_sync_method": "wav2lip",
+  "dialogs": [
+    {
+      "character": "Alice",
+      "voice": "alice-voice-profile",
+      "text": "Hello, how are you today?",
+      "lip_sync": true
+    },
+    {
+      "character": "Bob",
+      "voice": "en-US-GuyNeural",
+      "text": "I'm doing great, thanks for asking!",
+      "lip_sync": true,
+      "start_time": 3.5
+    }
+  ]
+}
+```
+
+Fields per dialog line: `character` (profile name for lip-sync face selection), `voice` (saved voice profile name or TTS voice ID), `text`, `start_time` (seconds; omit for sequential auto-timing), `lip_sync` (bool), `lang`, `speed`.
 
 ### Custom Pipeline Definition
 
@@ -339,7 +471,7 @@ Config files live in `~/.coderai/` (or `--config` path):
 
 Template variables: `{{input}}`, `{{stepN.output}}`, `{{stepN.url}}`.
 
-Available step types: `text_gen`, `image_gen`, `image_edit`, `image_inpaint`, `image_upscale`, `image_deblur`, `image_unpix`, `image_outfit`, `image_faceswap`, `video_gen`, `video_upscale`, `video_sub`, `video_interp`, `video_dub`, `tts`, `audio_gen`, `voice_clone`, `voice_convert`.
+Available step types: `text_gen`, `image_gen`, `image_edit`, `image_inpaint`, `image_upscale`, `image_deblur`, `image_unpix`, `image_outfit`, `image_faceswap`, `image_to3d`, `video_gen`, `video_upscale`, `video_sub`, `video_interp`, `video_dub`, `video_to3d`, `tts`, `audio_gen`, `voice_clone`, `voice_convert`.
 
 ---
 
@@ -456,3 +588,5 @@ Merge requests welcome.
 - [F5-TTS](https://github.com/SWivid/F5-TTS) — voice cloning
 - [Seed-VC](https://github.com/Plachta/Seed-VC) — singing voice conversion
 - [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) — image/video upscaling
+- [Wav2Lip](https://github.com/Rudrabha/Wav2Lip) — audio-driven lip sync
+- [SadTalker](https://github.com/OpenTalker/SadTalker) — talking head / lip sync generation

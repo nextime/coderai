@@ -1,0 +1,380 @@
+{% extends "base.html" %}
+{% block title %}Archive — CoderAI{% endblock %}
+
+{% block head %}
+<style>
+.archive-toolbar{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;margin-bottom:1.25rem}
+.archive-filters{display:flex;align-items:center;gap:.5rem;flex:1;flex-wrap:wrap}
+.filter-chip{padding:.25rem .75rem;border-radius:999px;border:1.5px solid var(--border);background:transparent;color:var(--text-muted);font-size:12px;font-weight:500;cursor:pointer;transition:.15s}
+.filter-chip.active,.filter-chip:hover{border-color:var(--accent);color:var(--accent);background:rgba(99,102,241,.08)}
+.archive-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:1rem}
+.archive-card{border-radius:10px;border:1.5px solid var(--border);background:var(--surface);overflow:hidden;cursor:pointer;transition:.15s;position:relative}
+.archive-card:hover{border-color:var(--accent);transform:translateY(-2px);box-shadow:0 6px 24px rgba(0,0,0,.18)}
+.archive-card:hover .card-overlay{opacity:1}
+.card-thumb{width:100%;aspect-ratio:1/1;object-fit:cover;background:var(--surface-2);display:block}
+.card-thumb-audio{width:100%;aspect-ratio:1/1;display:flex;align-items:center;justify-content:center;background:var(--surface-2);font-size:2.5rem}
+.card-overlay{position:absolute;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;gap:.5rem;opacity:0;transition:.15s}
+.card-meta{padding:.6rem .75rem}
+.card-type{font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--text-muted);margin-bottom:.2rem}
+.card-prompt{font-size:12px;color:var(--text);line-height:1.4;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;word-break:break-word}
+.card-date{font-size:11px;color:var(--text-muted);margin-top:.3rem}
+.archive-empty{text-align:center;padding:4rem 1rem;color:var(--text-muted)}
+.archive-empty-icon{font-size:3rem;opacity:.3;margin-bottom:.75rem}
+/* Detail modal */
+.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;align-items:start}
+@media(max-width:640px){.detail-grid{grid-template-columns:1fr}}
+.detail-preview{border-radius:8px;overflow:hidden;background:var(--surface-2);display:flex;align-items:center;justify-content:center;min-height:220px}
+.detail-preview img,.detail-preview video{max-width:100%;max-height:400px;object-fit:contain;display:block}
+.detail-info .kv{display:flex;gap:.5rem;margin-bottom:.5rem;font-size:13px;flex-wrap:wrap}
+.detail-info .kv .k{font-weight:600;color:var(--text-muted);min-width:90px}
+.detail-info .kv .v{color:var(--text);word-break:break-all}
+.detail-info .prompt-box{background:var(--surface-2);border-radius:6px;padding:.75rem;font-size:13px;line-height:1.55;word-break:break-word;margin-bottom:.75rem}
+.param-list{display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.5rem}
+.param-chip{font-size:11px;padding:.18rem .55rem;border-radius:4px;background:var(--surface-2);color:var(--text-muted);border:1px solid var(--border)}
+.pagination{display:flex;align-items:center;gap:.4rem;justify-content:center;margin-top:1.5rem}
+.page-btn{padding:.3rem .75rem;border-radius:6px;border:1.5px solid var(--border);background:transparent;color:var(--text-muted);font-size:13px;cursor:pointer;transition:.15s}
+.page-btn:hover:not([disabled]){border-color:var(--accent);color:var(--accent)}
+.page-btn[disabled]{opacity:.35;cursor:default}
+.page-btn.active{background:var(--accent);border-color:var(--accent);color:#fff}
+/* Settings panel */
+.archive-settings-panel{background:var(--surface);border:1.5px solid var(--border);border-radius:10px;padding:1.25rem;margin-bottom:1.25rem}
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Archive</h1>
+    <p>All generated images, videos, and audio</p>
+  </div>
+  <div class="header-actions">
+    <button class="btn" onclick="toggleSettings()" id="settings-btn">Settings</button>
+  </div>
+</div>
+
+<div id="settings-panel" class="archive-settings-panel" style="display:none">
+  <div class="card-title" style="margin-bottom:1rem">Archive Settings</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1rem;align-items:end">
+    <div class="form-row" style="margin:0">
+      <label class="form-label">Archive directory <span class="muted">(leave blank for default)</span></label>
+      <input type="text" id="arc-dir" class="form-input" placeholder="Loading…">
+      <span class="form-hint" id="arc-dir-hint"></span>
+    </div>
+    <div class="form-row" style="margin:0">
+      <label class="form-label">Auto-delete after</label>
+      <select id="arc-retention" class="form-input">
+        <option value="never">Never (keep forever)</option>
+        <option value="1h">1 hour</option>
+        <option value="1d">1 day</option>
+        <option value="2d">2 days</option>
+        <option value="1w">1 week</option>
+        <option value="1m">1 month</option>
+        <option value="3m">3 months</option>
+        <option value="6m">6 months</option>
+        <option value="1y">1 year</option>
+      </select>
+    </div>
+    <div class="form-row" style="margin:0">
+      <label class="form-label">Enabled</label>
+      <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;padding:.5rem 0">
+        <input type="checkbox" id="arc-enabled">
+        <span style="font-size:13px">Save generations to archive</span>
+      </label>
+    </div>
+  </div>
+  <div style="display:flex;gap:.75rem;margin-top:1rem;align-items:center">
+    <button class="btn btn-primary" onclick="saveArchiveSettings()">Save settings</button>
+    <span id="arc-save-status" class="muted small"></span>
+  </div>
+</div>
+
+<div class="archive-toolbar">
+  <div class="archive-filters" id="type-filters">
+    <button class="filter-chip active" onclick="setFilter('all',this)">All</button>
+    <button class="filter-chip" onclick="setFilter('image',this)">Images</button>
+    <button class="filter-chip" onclick="setFilter('video',this)">Video</button>
+    <button class="filter-chip" onclick="setFilter('audio',this)">Audio</button>
+    <button class="filter-chip" onclick="setFilter('tts',this)">TTS</button>
+  </div>
+  <span id="arc-count" class="muted small"></span>
+</div>
+
+<div id="archive-grid" class="archive-grid"></div>
+<div id="archive-empty" class="archive-empty" style="display:none">
+  <div class="archive-empty-icon">&#128190;</div>
+  <p>No generations archived yet.</p>
+  <p class="small">Images, videos, and audio will appear here after generation.</p>
+</div>
+<div id="pagination" class="pagination" style="display:none"></div>
+
+<!-- Detail modal -->
+<div class="modal" id="detailModal" onclick="if(event.target===this)closeDetail()">
+  <div class="modal-box" style="max-width:780px;width:95%">
+    <div class="modal-head">
+      <span class="modal-title" id="detail-title">Generation Detail</span>
+      <button class="modal-close" onclick="closeDetail()">&times;</button>
+    </div>
+    <div class="modal-body" id="detail-body" style="padding:1.25rem"></div>
+    <div style="display:flex;gap:.75rem;padding:.75rem 1.25rem 1.25rem;border-top:1px solid var(--border)">
+      <a id="detail-download-btn" class="btn btn-primary" download>Download</a>
+      <button class="btn btn-danger" onclick="deleteEntry()">Delete</button>
+      <button class="btn" onclick="closeDetail()">Close</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const PAGE_SIZE = 48;
+let currentPage = 0;
+let currentFilter = 'all';
+let currentEntry = null;
+let totalEntries = 0;
+
+const TYPE_ICONS = {image:'🖼️', video:'🎬', audio:'🎵', tts:'🗣️'};
+const TYPE_LABELS = {image:'Image', video:'Video', audio:'Audio', tts:'TTS'};
+
+function setFilter(type, btn) {
+  currentFilter = type;
+  currentPage = 0;
+  document.querySelectorAll('.filter-chip').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  loadArchive();
+}
+
+function toggleSettings() {
+  const p = document.getElementById('settings-panel');
+  p.style.display = p.style.display === 'none' ? '' : 'none';
+}
+
+function formatDate(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  return d.toLocaleString();
+}
+
+function shortPrompt(p, len=60) {
+  if (!p) return '(no prompt)';
+  return p.length > len ? p.slice(0, len) + '…' : p;
+}
+
+function previewUrl(entry) {
+  if (!entry.preview) return null;
+  return `/admin/api/archive/${entry.id}/files/${entry.preview}`;
+}
+
+function buildCard(entry) {
+  const div = document.createElement('div');
+  div.className = 'archive-card';
+  div.onclick = () => openDetail(entry);
+
+  const purl = previewUrl(entry);
+  let thumbHtml;
+  if (purl && (entry.type === 'image' || entry.type === 'video')) {
+    thumbHtml = `<img class="card-thumb" src="${purl}" loading="lazy" alt="">`;
+  } else if (purl && entry.type === 'video' && entry.preview?.endsWith('.webp')) {
+    thumbHtml = `<img class="card-thumb" src="${purl}" loading="lazy" alt="">`;
+  } else {
+    const icon = TYPE_ICONS[entry.type] || '📄';
+    thumbHtml = `<div class="card-thumb-audio">${icon}</div>`;
+  }
+
+  div.innerHTML = `
+    ${thumbHtml}
+    <div class="card-overlay">
+      <span style="color:#fff;font-size:1.5rem">&#128269;</span>
+    </div>
+    <div class="card-meta">
+      <div class="card-type">${TYPE_LABELS[entry.type] || entry.type}</div>
+      <div class="card-prompt">${shortPrompt(entry.prompt)}</div>
+      <div class="card-date">${formatDate(entry.created_at)}</div>
+    </div>`;
+  return div;
+}
+
+async function loadArchive() {
+  const grid = document.getElementById('archive-grid');
+  const empty = document.getElementById('archive-empty');
+  const countEl = document.getElementById('arc-count');
+  grid.innerHTML = '<span class="muted small">Loading…</span>';
+
+  try {
+    const resp = await fetch(`/admin/api/archive?limit=${PAGE_SIZE}&offset=${currentPage * PAGE_SIZE}`);
+    const data = await resp.json();
+    totalEntries = data.total || 0;
+
+    let entries = data.entries || [];
+    if (currentFilter !== 'all') {
+      entries = entries.filter(e => e.type === currentFilter);
+    }
+
+    grid.innerHTML = '';
+    if (entries.length === 0) {
+      empty.style.display = '';
+      countEl.textContent = '';
+    } else {
+      empty.style.display = 'none';
+      countEl.textContent = `${totalEntries} total`;
+      entries.forEach(e => grid.appendChild(buildCard(e)));
+    }
+
+    renderPagination(totalEntries);
+  } catch(err) {
+    grid.innerHTML = `<span class="muted small">Failed to load: ${err.message}</span>`;
+  }
+}
+
+function renderPagination(total) {
+  const pages = Math.ceil(total / PAGE_SIZE);
+  const el = document.getElementById('pagination');
+  if (pages <= 1) { el.style.display = 'none'; return; }
+  el.style.display = 'flex';
+  el.innerHTML = '';
+
+  const prev = document.createElement('button');
+  prev.className = 'page-btn';
+  prev.textContent = '←';
+  prev.disabled = currentPage === 0;
+  prev.onclick = () => { currentPage--; loadArchive(); };
+  el.appendChild(prev);
+
+  for (let i = 0; i < pages; i++) {
+    const btn = document.createElement('button');
+    btn.className = 'page-btn' + (i === currentPage ? ' active' : '');
+    btn.textContent = i + 1;
+    btn.onclick = () => { currentPage = i; loadArchive(); };
+    el.appendChild(btn);
+  }
+
+  const next = document.createElement('button');
+  next.className = 'page-btn';
+  next.textContent = '→';
+  next.disabled = currentPage >= pages - 1;
+  next.onclick = () => { currentPage++; loadArchive(); };
+  el.appendChild(next);
+}
+
+function openDetail(entry) {
+  currentEntry = entry;
+  document.getElementById('detail-title').textContent =
+    `${TYPE_LABELS[entry.type] || entry.type} — ${formatDate(entry.created_at)}`;
+
+  const purl = previewUrl(entry);
+  let previewHtml = '';
+  if (purl) {
+    if (entry.type === 'video') {
+      const firstMp4 = (entry.files || []).find(f => f.endsWith('.mp4'));
+      const src = firstMp4 ? `/admin/api/archive/${entry.id}/files/${firstMp4}` : purl;
+      previewHtml = `<video controls style="max-width:100%;max-height:360px"><source src="${src}"></video>`;
+    } else if (entry.type === 'audio' || entry.type === 'tts') {
+      const firstAudio = (entry.files || []).find(f => /\.(wav|mp3|ogg|flac)$/.test(f));
+      if (firstAudio) {
+        previewHtml = `<audio controls style="width:100%"><source src="/admin/api/archive/${entry.id}/files/${firstAudio}"></audio>`;
+      } else {
+        previewHtml = `<div style="font-size:3rem;padding:2rem;text-align:center">${TYPE_ICONS[entry.type]}</div>`;
+      }
+    } else {
+      previewHtml = `<img src="${purl}" style="max-width:100%;max-height:360px;object-fit:contain" alt="">`;
+    }
+  } else {
+    previewHtml = `<div style="font-size:3rem;padding:2rem;text-align:center">${TYPE_ICONS[entry.type] || '📄'}</div>`;
+  }
+
+  // Build params
+  const params = entry.parameters || {};
+  const paramChips = Object.entries(params)
+    .filter(([k,v]) => v !== null && v !== undefined && v !== '')
+    .map(([k,v]) => `<span class="param-chip">${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}</span>`)
+    .join('');
+
+  document.getElementById('detail-body').innerHTML = `
+    <div class="detail-grid">
+      <div class="detail-preview">${previewHtml}</div>
+      <div class="detail-info">
+        <div class="kv"><span class="k">Type</span><span class="v">${TYPE_LABELS[entry.type] || entry.type}</span></div>
+        <div class="kv"><span class="k">Model</span><span class="v">${entry.model || '—'}</span></div>
+        <div class="kv"><span class="k">Created</span><span class="v">${formatDate(entry.created_at)}</span></div>
+        <div class="kv"><span class="k">ID</span><span class="v" style="font-family:monospace;font-size:11px">${entry.id}</span></div>
+        ${entry.prompt ? `<div style="margin:.75rem 0 .25rem;font-size:12px;font-weight:600;color:var(--text-muted)">Prompt</div>
+        <div class="prompt-box">${entry.prompt}</div>` : ''}
+        ${paramChips ? `<div style="margin:.5rem 0 .25rem;font-size:12px;font-weight:600;color:var(--text-muted)">Parameters</div>
+        <div class="param-list">${paramChips}</div>` : ''}
+        ${entry.files?.length > 1 ? `<div style="margin:.75rem 0 .25rem;font-size:12px;font-weight:600;color:var(--text-muted)">Files</div>
+        <div style="display:flex;flex-direction:column;gap:.3rem">${entry.files.map(f =>
+          `<a href="/admin/api/archive/${entry.id}/files/${f}" target="_blank" style="font-size:12px;color:var(--accent)">${f}</a>`
+        ).join('')}</div>` : ''}
+      </div>
+    </div>`;
+
+  // Set download button
+  const dlBtn = document.getElementById('detail-download-btn');
+  const dlFile = entry.files?.[0];
+  if (dlFile) {
+    dlBtn.href = `/admin/api/archive/${entry.id}/files/${dlFile}`;
+    dlBtn.download = dlFile;
+    dlBtn.style.display = '';
+  } else {
+    dlBtn.style.display = 'none';
+  }
+
+  document.getElementById('detailModal').classList.add('show');
+}
+
+function closeDetail() {
+  document.getElementById('detailModal').classList.remove('show');
+  currentEntry = null;
+}
+
+async function deleteEntry() {
+  if (!currentEntry) return;
+  if (!confirm('Delete this generation from archive?')) return;
+  try {
+    const r = await fetch(`/admin/api/archive/${currentEntry.id}`, {method:'DELETE'});
+    if (!r.ok) throw new Error(await r.text());
+    closeDetail();
+    loadArchive();
+  } catch(e) {
+    alert('Delete failed: ' + e.message);
+  }
+}
+
+// Settings
+async function loadArchiveSettings() {
+  try {
+    const d = await fetch('/admin/api/archive-settings').then(r=>r.json());
+    document.getElementById('arc-dir').value = d.directory || '';
+    document.getElementById('arc-dir').placeholder = d.default_directory || '<config_dir>/archive';
+    document.getElementById('arc-dir-hint').textContent = `Default: ${d.default_directory || '<config_dir>/archive'}`;
+    document.getElementById('arc-retention').value = d.retention || 'never';
+    document.getElementById('arc-enabled').checked = !!d.enabled;
+  } catch(e) {}
+}
+
+async function saveArchiveSettings() {
+  const status = document.getElementById('arc-save-status');
+  try {
+    const payload = {
+      archive: {
+        enabled: document.getElementById('arc-enabled').checked,
+        directory: document.getElementById('arc-dir').value.trim(),
+        retention: document.getElementById('arc-retention').value,
+      }
+    };
+    const r = await fetch('/admin/api/settings', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    status.textContent = 'Saved.';
+    setTimeout(() => status.textContent = '', 3000);
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+  }
+}
+
+loadArchive();
+loadArchiveSettings();
+</script>
+{% endblock %}

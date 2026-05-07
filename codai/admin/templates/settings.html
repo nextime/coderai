@@ -69,6 +69,38 @@
     <span class="form-hint">Models will inherit this as default when configured</span>
   </div>
 </div>
+
+<!-- Archive -->
+<div class="card mb-0" style="margin-top:1rem">
+  <div class="card-title">Generation Archive</div>
+  <div class="form-row">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-arc-enabled">
+      <span style="font-size:13px;font-weight:500">Enable generation archive</span>
+    </label>
+    <span class="form-hint">When enabled, every generation (image, video, audio, text) is logged with its prompt, model, and output files.</span>
+  </div>
+  <div class="form-row">
+    <label class="form-label">Archive directory <span class="muted" id="s-arc-dir-hint"></span></label>
+    <input type="text" id="s-arc-dir" class="form-input" placeholder="(default)">
+    <span class="form-hint">Absolute path or relative to the config directory. Leave blank to use the default.</span>
+  </div>
+  <div class="form-row" style="margin:0">
+    <label class="form-label">Retention period</label>
+    <select id="s-arc-retention" class="form-input" style="max-width:200px">
+      <option value="1h">1 hour</option>
+      <option value="1d">1 day</option>
+      <option value="2d">2 days</option>
+      <option value="1w">1 week</option>
+      <option value="1m">1 month</option>
+      <option value="3m">3 months</option>
+      <option value="6m">6 months</option>
+      <option value="1y">1 year</option>
+      <option value="never">Never (keep forever)</option>
+    </select>
+    <span class="form-hint">Archived entries older than this are automatically deleted. Takes effect immediately on save.</span>
+  </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -99,6 +131,18 @@ async function loadSettings(){
     document.getElementById('s-gguf-cache').value = d.models?.gguf_cache_dir ?? '';
     document.getElementById('s-offload-dir').value = d.offload?.directory ?? './offload';
     toggleHttps();
+    // Archive
+    const arc = d.archive || {};
+    document.getElementById('s-arc-enabled').checked = !!arc.enabled;
+    document.getElementById('s-arc-dir').value = arc.directory ?? '';
+    document.getElementById('s-arc-retention').value = arc.retention ?? 'never';
+    // Show effective default dir as placeholder hint
+    try {
+      const as = await fetch('/admin/api/archive-settings').then(r=>r.json());
+      const hint = document.getElementById('s-arc-dir-hint');
+      if (hint && as.default_directory) hint.textContent = `(default: ${as.default_directory})`;
+      document.getElementById('s-arc-dir').placeholder = as.default_directory || '(default)';
+    } catch(_){}
   }catch(e){ showAlert('error','Failed to load settings: '+e.message); }
 }
 
@@ -119,14 +163,19 @@ async function saveSettings(){
     },
     offload:{
       directory: document.getElementById('s-offload-dir').value.trim() || './offload',
-    }
+    },
+    archive:{
+      enabled: document.getElementById('s-arc-enabled').checked,
+      directory: document.getElementById('s-arc-dir').value.trim(),
+      retention: document.getElementById('s-arc-retention').value,
+    },
   };
   try{
     const r = await fetch('/admin/api/settings',{
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(data)
     });
-    if(r.ok) showAlert('info','Settings saved. Restart CoderAI to apply.');
+    if(r.ok) showAlert('info','Settings saved. Archive changes take effect immediately; restart CoderAI for other changes.');
     else{ const e=await r.json(); showAlert('error', e.detail||'Save failed'); }
   }catch(e){ showAlert('error','Error: '+e.message); }
 }

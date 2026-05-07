@@ -42,6 +42,7 @@ from codai.pydantic.videorequest import (
     VideoGenerationRequest, VideoGenerationResponse,
     VideoUpscaleRequest, VideoSubtitleRequest,
     VideoInterpolateRequest, VideoDubRequest,
+    CharacterDialogLine,
 )
 from codai.api.images import _disable_safety_checker
 
@@ -363,7 +364,7 @@ def _generate_video(pipe, request: VideoGenerationRequest):
 
 def _postprocess_video(mp4_bytes: bytes, request: VideoGenerationRequest,
                        http_request, temp_paths: list) -> bytes:
-    """Apply upscale / interpolation / audio steps to a raw mp4 blob."""
+    """Apply upscale / interpolation / audio / dialog steps to a raw mp4 blob."""
     path = _tmp_write(mp4_bytes, '.mp4')
     temp_paths.append(path)
 
@@ -375,6 +376,10 @@ def _postprocess_video(mp4_bytes: bytes, request: VideoGenerationRequest,
 
     if request.add_audio:
         path = _add_audio_to_video(path, request, temp_paths)
+
+    if request.dialogs:
+        path = _process_dialogs(path, request.dialogs,
+                                request.lip_sync_method or 'wav2lip', temp_paths)
 
     if request.generate_subtitles or request.burn_subtitles:
         path = _add_subtitles(path, request, temp_paths)
@@ -489,6 +494,220 @@ def _generate_tts(text: str, voice: Optional[str], speed: float,
     except ImportError:
         pass
     return None
+
+
+def _get_audio_duration(path: str) -> float:
+    """Return audio/video duration in seconds via ffprobe."""
+    try:
+        r = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', path],
+            capture_output=True, text=True)
+        return float(r.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def _generate_tts_for_line(line: CharacterDialogLine, temps: list) -> Optional[str]:
+    """Generate TTS for a single dialog line, using the voice profile's reference audio if available."""
+    voice = line.voice
+    text = line.text
+    speed = line.speed or 1.0
+    lang = line.lang
+
+    # Try to load voice profile reference audio first (for kokoro/RVC cloning)
+    ref_audio = None
+    if voice:
+        try:
+            from codai.api.voice_clone import _load_voice, _voice_path
+            meta = _load_voice(voice)
+            audio_file = meta.get('audio_file') or meta.get('audio_path')
+            if audio_file and os.path.isfile(audio_file):
+                ref_audio = audio_file
+        except Exception:
+            pass
+
+    # edge_tts with voice id
+    try:
+        import edge_tts, asyncio as _aio
+        voice_id = voice if (voice and not ref_audio) else (
+            f"{lang.split('-')[0]}-" if lang else 'en-'
+        ) + 'US-JennyNeural'
+        if not voice or ref_audio:
+            voice_id = 'en-US-JennyNeural'
+        out = tempfile.mktemp(suffix='.mp3')
+        temps.append(out)
+        tts = edge_tts.Communicate(text, voice_id, rate=f"+{int((speed - 1) * 100)}%")
+        _aio.get_event_loop().run_until_complete(tts.save(out))
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            return out
+    except Exception:
+        pass
+
+    # kokoro with optional reference voice
+    try:
+        from kokoro import KPipeline
+        import soundfile as sf, numpy as np
+        lang_code = 'a'
+        if lang:
+            lang_code = lang.split('-')[0][:1].lower()
+        pipe = KPipeline(lang_code=lang_code)
+        kokoro_voice = voice if (voice and not ref_audio) else 'af_sky'
+        audio, sr = pipe(text, voice=kokoro_voice, speed=speed)
+        out = tempfile.mktemp(suffix='.wav')
+        temps.append(out)
+        sf.write(out, np.concatenate(audio), sr)
+        return out
+    except Exception:
+        pass
+
+    return None
+
+
+def _mix_dialog_audio(clips: list, temps: list) -> Optional[str]:
+    """
+    Mix a list of (start_time_sec, audio_path) clips into one audio file.
+    Uses ffmpeg adelay + amix. Returns path to mixed audio or None.
+    """
+    if not clips:
+        return None
+    if len(clips) == 1:
+        return clips[0][1]
+
+    # Build complex filter: delay each stream, then amix
+    filter_parts = []
+    inputs = []
+    for i, (start_sec, apath) in enumerate(clips):
+        inputs += ['-i', apath]
+        delay_ms = int(start_sec * 1000)
+        filter_parts.append(f'[{i}]adelay={delay_ms}|{delay_ms}[a{i}]')
+
+    mix_inputs = ''.join(f'[a{i}]' for i in range(len(clips)))
+    filter_parts.append(f'{mix_inputs}amix=inputs={len(clips)}:duration=longest:dropout_transition=0[out]')
+    filter_str = ';'.join(filter_parts)
+
+    out = tempfile.mktemp(suffix='_mixed.wav')
+    temps.append(out)
+    cmd = ['ffmpeg', '-y'] + inputs + ['-filter_complex', filter_str, '-map', '[out]', out]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode == 0 and os.path.exists(out):
+        return out
+
+    # Fallback: simple concatenation (ignore timing)
+    import logging
+    logging.getLogger(__name__).warning(
+        "ffmpeg amix failed (rc=%d), falling back to concat: %s",
+        r.returncode, r.stderr.decode(errors='replace'))
+    list_path = tempfile.mktemp(suffix='.txt')
+    temps.append(list_path)
+    with open(list_path, 'w') as f:
+        for _, apath in clips:
+            f.write(f"file '{apath}'\n")
+    out2 = tempfile.mktemp(suffix='_cat.wav')
+    temps.append(out2)
+    r2 = subprocess.run(['ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+                         '-i', list_path, out2], capture_output=True)
+    return out2 if r2.returncode == 0 else None
+
+
+def _apply_lipsync(video_path: str, audio_path: str, method: str, temps: list) -> str:
+    """Apply lip sync to video using wav2lip or sadtalker. Returns new video path."""
+    import logging, shutil
+    _log = logging.getLogger(__name__)
+    out = tempfile.mktemp(suffix='_lipsync.mp4')
+    temps.append(out)
+
+    if method == 'wav2lip':
+        wav2lip_bin = shutil.which('wav2lip') or shutil.which('Wav2Lip')
+        if wav2lip_bin:
+            cmd = [wav2lip_bin, '--face', video_path, '--audio', audio_path, '--outfile', out]
+            r = subprocess.run(cmd, capture_output=True)
+            if r.returncode == 0 and os.path.exists(out):
+                return out
+            _log.warning("wav2lip failed (rc=%d): %s", r.returncode, r.stderr.decode(errors='replace'))
+        else:
+            # Try wav2lip Python API
+            try:
+                import inference as wav2lip_inference  # noqa
+                wav2lip_inference.main(face=video_path, audio=audio_path, outfile=out)
+                if os.path.exists(out):
+                    return out
+            except Exception as e:
+                _log.warning("wav2lip Python API failed: %s", e)
+
+    elif method == 'sadtalker':
+        sadtalker_bin = shutil.which('sadtalker')
+        if sadtalker_bin:
+            cmd = [sadtalker_bin, '--driven_audio', audio_path, '--source_video', video_path,
+                   '--result_dir', os.path.dirname(out)]
+            r = subprocess.run(cmd, capture_output=True)
+            if r.returncode == 0:
+                # Find output file
+                out_dir = os.path.dirname(out)
+                for f in sorted(os.listdir(out_dir)):
+                    if f.endswith('.mp4'):
+                        return os.path.join(out_dir, f)
+            _log.warning("sadtalker failed (rc=%d): %s", r.returncode, r.stderr.decode(errors='replace'))
+
+    # Fallback: just mux audio onto video without lip sync
+    _log.warning("Lip sync unavailable (%s not found/working), merging audio only", method)
+    out_fallback = tempfile.mktemp(suffix='_nosync.mp4')
+    temps.append(out_fallback)
+    cmd = ['ffmpeg', '-y', '-i', video_path, '-i', audio_path,
+           '-c:v', 'copy', '-c:a', 'aac', '-shortest', out_fallback]
+    r = subprocess.run(cmd, capture_output=True)
+    return out_fallback if r.returncode == 0 else video_path
+
+
+def _process_dialogs(path: str, dialogs: list, lip_sync_method: str, temps: list) -> str:
+    """
+    Generate TTS for each dialog line, mix with correct timing, apply lip sync to full video.
+    Returns new video path.
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+
+    # First pass: generate TTS audio for each line and calculate timing
+    clips = []  # (start_sec, audio_path)
+    cursor = 0.0
+    for line in dialogs:
+        if not line.text.strip():
+            continue
+        audio_path = _generate_tts_for_line(line, temps)
+        if not audio_path or not os.path.exists(audio_path):
+            _log.warning("TTS generation failed for dialog line: %r", line.text[:40])
+            continue
+
+        if line.start_time is not None:
+            start = float(line.start_time)
+        else:
+            start = cursor
+
+        duration = _get_audio_duration(audio_path)
+        clips.append((start, audio_path))
+        cursor = start + duration + 0.1  # small gap between sequential lines
+
+    if not clips:
+        return path
+
+    # Mix all clips into one audio track
+    mixed_audio = _mix_dialog_audio(clips, temps)
+    if not mixed_audio or not os.path.exists(mixed_audio):
+        return path
+
+    # Determine if any line wants lip sync
+    wants_lip_sync = any(getattr(line, 'lip_sync', True) for line in dialogs if line.text.strip())
+
+    if wants_lip_sync and lip_sync_method:
+        return _apply_lipsync(path, mixed_audio, lip_sync_method, temps)
+
+    # No lip sync — just mux audio
+    out = tempfile.mktemp(suffix='_dialog.mp4')
+    temps.append(out)
+    cmd = ['ffmpeg', '-y', '-i', path, '-i', mixed_audio,
+           '-c:v', 'copy', '-c:a', 'aac', '-shortest', out]
+    r = subprocess.run(cmd, capture_output=True)
+    return out if r.returncode == 0 else path
 
 
 def _add_subtitles(path: str, request: VideoGenerationRequest, temps: list) -> str:
@@ -635,6 +854,7 @@ async def video_generations(request: VideoGenerationRequest,
             request.upscale_output,
             request.interpolate_output,
             request.add_audio,
+            bool(request.dialogs),
             request.generate_subtitles,
             request.burn_subtitles,
         ])
@@ -653,6 +873,29 @@ async def video_generations(request: VideoGenerationRequest,
                 pass
 
     result = _save_file(mp4_bytes, 'mp4', http_request)
+
+    try:
+        from codai.api.archive import archive_manager
+        asyncio.get_event_loop().create_task(asyncio.to_thread(
+            archive_manager.save_generation,
+            "video", "/v1/video/generations",
+            request.model,
+            request.prompt or "",
+            {
+                "mode": request.mode,
+                "num_frames": request.num_frames,
+                "fps": request.fps,
+                "width": request.width,
+                "height": request.height,
+                "num_inference_steps": request.num_inference_steps,
+                "guidance_scale": request.guidance_scale,
+                "seed": request.seed,
+            },
+            [(mp4_bytes, "mp4")],
+        ))
+    except Exception:
+        pass
+
     return VideoGenerationResponse(created=int(time.time()), data=[result])
 
 

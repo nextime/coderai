@@ -1,10 +1,12 @@
 """
 Voice cloning endpoints.
 
-POST /v1/audio/clone          — synthesize speech in a cloned voice
-GET  /v1/audio/voices         — list saved voice profiles
-POST /v1/audio/voices         — save a named voice profile (ref audio + transcript)
-DELETE /v1/audio/voices/{name} — delete a voice profile
+POST   /v1/audio/clone              — synthesize speech in a cloned voice
+GET    /v1/audio/voices             — list saved voice profiles
+POST   /v1/audio/voices             — save a named voice profile (ref audio + transcript)
+POST   /v1/audio/voices/extract     — extract voice profile from audio or video file
+PATCH  /v1/audio/voices/{name}      — update description / replace reference audio
+DELETE /v1/audio/voices/{name}      — delete a voice profile
 """
 
 import asyncio
@@ -12,6 +14,7 @@ import base64
 import io
 import json
 import os
+import subprocess
 import tempfile
 import time
 from typing import Optional
@@ -103,6 +106,17 @@ def _decode_audio(data: str) -> tuple[bytes, str]:
     return base64.b64decode(data), '.wav'
 
 
+def _decode_b64_or_url(data: str) -> bytes:
+    if data.startswith('data:'):
+        _, b64 = data.split(',', 1)
+        return base64.b64decode(b64)
+    if data.startswith('http://') or data.startswith('https://'):
+        import urllib.request
+        with urllib.request.urlopen(data, timeout=60) as r:
+            return r.read()
+    return base64.b64decode(data)
+
+
 def _f5tts_clone(ref_audio_path: str, ref_text: str, gen_text: str,
                   speed: float = 1.0, seed: Optional[int] = None) -> bytes:
     """Run F5-TTS voice cloning, return WAV bytes."""
@@ -153,6 +167,26 @@ def _save_audio_response(audio_bytes: bytes, http_request: Request) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+
+class VoiceExtractRequest(BaseModel):
+    name: str
+    description: str = ''
+    audio: Optional[str] = None      # base64/URL audio file
+    video: Optional[str] = None      # base64/URL video (audio track extracted)
+    transcript: Optional[str] = ''   # optional; auto-transcribed if omitted
+    model_config = ConfigDict(extra="allow")
+
+
+class VoicePatchRequest(BaseModel):
+    description: Optional[str] = None
+    transcript: Optional[str] = None
+    audio: Optional[str] = None      # replace reference audio (base64)
+    model_config = ConfigDict(extra="allow")
+
+
+# ---------------------------------------------------------------------------
 # Voice profile management
 # ---------------------------------------------------------------------------
 
@@ -196,6 +230,122 @@ async def delete_voice(name: str):
         raise HTTPException(status_code=404, detail=f"Voice '{name}' not found")
     shutil.rmtree(vdir)
     return {"deleted": True, "name": name}
+
+
+@router.patch("/v1/audio/voices/{name}")
+async def patch_voice(name: str, req: VoicePatchRequest):
+    """Update description, transcript, or reference audio of a saved voice profile."""
+    meta = _load_voice(name)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Voice '{name}' not found")
+    vdir = _voice_path(name)
+
+    if req.description is not None:
+        meta['description'] = req.description
+    if req.transcript is not None:
+        meta['transcript'] = req.transcript
+    if req.audio:
+        audio_bytes, ext = _decode_audio(req.audio)
+        audio_file = os.path.join(vdir, f'ref{ext}')
+        # Remove old audio file(s)
+        for f in os.listdir(vdir):
+            if f.startswith('ref.') or f.startswith('ref'):
+                try:
+                    os.unlink(os.path.join(vdir, f))
+                except Exception:
+                    pass
+        with open(audio_file, 'wb') as f:
+            f.write(audio_bytes)
+        meta['audio_file'] = audio_file
+        meta['audio_ext'] = ext
+
+    with open(os.path.join(vdir, 'meta.json'), 'w') as f:
+        json.dump(meta, f)
+    return {"updated": True, "voice": meta}
+
+
+@router.get("/v1/audio/voices/{name}")
+async def get_voice(name: str):
+    """Get a single voice profile metadata."""
+    meta = _load_voice(name)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Voice '{name}' not found")
+    return {"voice": meta}
+
+
+@router.post("/v1/audio/voices/extract")
+async def extract_voice(req: VoiceExtractRequest):
+    """
+    Extract a voice profile from a source audio or video file.
+
+    - audio: base64/URL audio file (wav, mp3, flac, …)
+    - video: base64/URL video file — audio track is extracted automatically
+    - transcript: optional; auto-transcribed with Whisper when omitted
+    """
+    if not req.name.replace('-', '').replace('_', '').isalnum():
+        raise HTTPException(status_code=400, detail="Voice name must be alphanumeric (hyphens/underscores allowed)")
+    if not req.audio and not req.video:
+        raise HTTPException(status_code=400, detail="Provide audio or video")
+
+    temps = []
+    try:
+        audio_bytes: Optional[bytes] = None
+        audio_ext = '.wav'
+
+        if req.video:
+            # Extract audio track from video with ffmpeg
+            raw = _decode_b64_or_url(req.video)
+            in_tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+            in_tmp.write(raw)
+            in_tmp.close()
+            temps.append(in_tmp.name)
+            out_tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            out_tmp.close()
+            temps.append(out_tmp.name)
+            r = subprocess.run(
+                ['ffmpeg', '-y', '-i', in_tmp.name, '-vn', '-acodec', 'pcm_s16le',
+                 '-ar', '22050', '-ac', '1', out_tmp.name],
+                capture_output=True, timeout=120,
+            )
+            if r.returncode != 0:
+                raise HTTPException(status_code=422,
+                    detail=f"Audio extraction from video failed: {r.stderr.decode(errors='replace')[:200]}")
+            with open(out_tmp.name, 'rb') as f:
+                audio_bytes = f.read()
+        else:
+            audio_bytes, audio_ext = _decode_audio(req.audio)
+
+        # Auto-transcribe if transcript not provided
+        transcript = req.transcript or ''
+        if not transcript:
+            try:
+                import whisper
+                in_tmp2 = tempfile.NamedTemporaryFile(suffix=audio_ext, delete=False)
+                in_tmp2.write(audio_bytes)
+                in_tmp2.close()
+                temps.append(in_tmp2.name)
+                model = whisper.load_model('base')
+                result = model.transcribe(in_tmp2.name)
+                transcript = result.get('text', '').strip()
+            except Exception:
+                pass
+
+        # Validate audio
+        try:
+            import soundfile as sf
+            sf.info(io.BytesIO(audio_bytes))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid audio: {e}")
+
+        meta = _save_voice(req.name, audio_bytes, audio_ext, transcript, req.description)
+        return {"created": True, "voice": meta}
+
+    finally:
+        for t in temps:
+            try:
+                os.unlink(t)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------

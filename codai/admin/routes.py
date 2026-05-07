@@ -1556,6 +1556,11 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "device_id": c.vulkan.device_id,
             "single_gpu": c.vulkan.single_gpu,
         },
+        "archive": {
+            "enabled": c.archive.enabled,
+            "directory": c.archive.directory,
+            "retention": c.archive.retention,
+        },
         "system_prompt": c.system_prompt,
         "tools_closer_prompt": c.tools_closer_prompt,
         "grammar_guided": c.grammar_guided,
@@ -1632,8 +1637,95 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
     if "parser" in data:
         c.parser = data["parser"]
 
+    if "archive" in data:
+        import os as _os
+        from codai.api.archive import archive_manager, RETENTION_OPTIONS
+        arc = data["archive"]
+        c.archive.enabled = bool(arc.get("enabled", c.archive.enabled))
+        raw_dir = (arc.get("directory") or "").strip()
+        c.archive.directory = raw_dir  # store as-is (empty = default)
+        ret = arc.get("retention", c.archive.retention)
+        c.archive.retention = ret if ret in RETENTION_OPTIONS else "never"
+        # Resolve for live reconfiguration
+        cfg_dir = str(config_manager.config_dir)
+        resolved = raw_dir if raw_dir and _os.path.isabs(raw_dir) else _os.path.join(cfg_dir, raw_dir or "archive")
+        archive_manager.configure(c.archive.enabled, resolved, c.archive.retention)
+
     config_manager.save_config()
     return {"success": True}
+
+
+# =============================================================================
+# Archive management
+# =============================================================================
+
+@router.get("/admin/archive", response_class=HTMLResponse)
+async def archive_page(request: Request, username: str = Depends(require_admin)):
+    return templates.TemplateResponse(request, "archive.html", {"username": username, "is_admin": True})
+
+
+@router.get("/admin/api/archive")
+async def api_archive_list(
+    limit: int = 50,
+    offset: int = 0,
+    username: str = Depends(require_admin),
+):
+    from codai.api.archive import archive_manager
+    entries = archive_manager.list_entries(limit=limit, offset=offset)
+    total = archive_manager.count_entries()
+    return {"entries": entries, "total": total}
+
+
+@router.get("/admin/api/archive/{gen_id}")
+async def api_archive_get(gen_id: str, username: str = Depends(require_admin)):
+    from codai.api.archive import archive_manager
+    entry = archive_manager.get_entry(gen_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Entry not found")
+    return entry
+
+
+@router.delete("/admin/api/archive/{gen_id}")
+async def api_archive_delete(gen_id: str, username: str = Depends(require_admin)):
+    from codai.api.archive import archive_manager
+    if not archive_manager.delete_entry(gen_id):
+        raise HTTPException(status_code=404, detail="Entry not found")
+    return {"success": True}
+
+
+@router.get("/admin/api/archive/{gen_id}/files/{filename}")
+async def api_archive_file(
+    gen_id: str,
+    filename: str,
+    username: str = Depends(require_auth),
+):
+    from fastapi.responses import FileResponse
+    from codai.api.archive import archive_manager
+    path = archive_manager.get_file_path(gen_id, filename)
+    if path is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    import mimetypes
+    media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return FileResponse(path, media_type=media_type)
+
+
+@router.get("/admin/api/archive-settings")
+async def api_archive_settings_get(username: str = Depends(require_admin)):
+    if config_manager is None or config_manager.config is None:
+        raise HTTPException(status_code=503, detail="Config not ready")
+    import os as _os
+    c = config_manager.config.archive
+    from codai.api.archive import RETENTION_OPTIONS
+    default_dir = _os.path.join(str(config_manager.config_dir), "archive")
+    return {
+        "enabled": c.enabled,
+        "directory": c.directory,
+        "default_directory": default_dir,
+        "retention": c.retention,
+        "retention_options": RETENTION_OPTIONS,
+    }
+
+
 # --- HuggingFace model search proxy ---
 
 import re as _re
@@ -1792,6 +1884,110 @@ async def api_hf_model_files(model_id: str, username: str = Depends(require_admi
 
     files.sort(key=lambda f: f.get("size_gb") or 0)
     return files
+
+
+# =============================================================================
+# Character profile management proxy (admin UI)
+# =============================================================================
+
+@router.get("/admin/api/characters")
+async def api_list_characters(username: str = Depends(require_auth)):
+    from codai.api.characters import _list_characters
+    return {"characters": _list_characters()}
+
+
+@router.get("/admin/api/characters/{name}")
+async def api_get_character(name: str, username: str = Depends(require_auth)):
+    from codai.api.characters import _load_character_meta, _load_character_images
+    meta = _load_character_meta(name)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Character '{name}' not found")
+    images = _load_character_images(name)
+    return {
+        "name": meta['name'],
+        "description": meta.get('description', ''),
+        "image_count": meta['image_count'],
+        "created_at": meta['created_at'],
+        "images": [img.model_dump() for img in images],
+    }
+
+
+@router.delete("/admin/api/characters/{name}")
+async def api_delete_character(name: str, username: str = Depends(require_auth)):
+    import os as _os, shutil
+    from codai.api.characters import _char_dir
+    cdir = _char_dir(name)
+    if not _os.path.isdir(cdir):
+        raise HTTPException(status_code=404, detail=f"Character '{name}' not found")
+    shutil.rmtree(cdir)
+    return {"ok": True, "name": name}
+
+
+# =============================================================================
+# Environment profile management proxy (admin UI)
+# =============================================================================
+
+@router.get("/admin/api/environments")
+async def api_list_environments(username: str = Depends(require_auth)):
+    from codai.api.environments import _list_environments
+    return {"environments": _list_environments()}
+
+
+@router.get("/admin/api/environments/{name}")
+async def api_get_environment(name: str, username: str = Depends(require_auth)):
+    from codai.api.environments import _load_environment_meta, _load_environment_images
+    meta = _load_environment_meta(name)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Environment '{name}' not found")
+    images = _load_environment_images(name)
+    return {
+        "name": meta['name'],
+        "description": meta.get('description', ''),
+        "image_count": meta['image_count'],
+        "created_at": meta['created_at'],
+        "images": [img.model_dump() for img in images],
+    }
+
+
+@router.delete("/admin/api/environments/{name}")
+async def api_delete_environment(name: str, username: str = Depends(require_auth)):
+    import os as _os, shutil
+    from codai.api.environments import _env_dir
+    edir = _env_dir(name)
+    if not _os.path.isdir(edir):
+        raise HTTPException(status_code=404, detail=f"Environment '{name}' not found")
+    shutil.rmtree(edir)
+    return {"ok": True, "name": name}
+
+
+# =============================================================================
+# Voice profile management proxy (admin UI)
+# =============================================================================
+
+@router.get("/admin/api/voices")
+async def api_list_voices(username: str = Depends(require_auth)):
+    from codai.api.voice_clone import _list_voices
+    return {"voices": _list_voices()}
+
+
+@router.get("/admin/api/voices/{name}")
+async def api_get_voice(name: str, username: str = Depends(require_auth)):
+    from codai.api.voice_clone import _load_voice
+    meta = _load_voice(name)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Voice '{name}' not found")
+    return {"voice": meta}
+
+
+@router.delete("/admin/api/voices/{name}")
+async def api_delete_voice(name: str, username: str = Depends(require_auth)):
+    import os as _os, shutil
+    from codai.api.voice_clone import _voice_path
+    vdir = _voice_path(name)
+    if not _os.path.exists(vdir):
+        raise HTTPException(status_code=404, detail=f"Voice '{name}' not found")
+    shutil.rmtree(vdir)
+    return {"deleted": True, "name": name}
 
 
 @router.get("/admin/api/hf-model-info")

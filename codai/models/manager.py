@@ -1632,6 +1632,23 @@ class MultiModelManager:
                 'error': f"Model '{resolved_name}' is not available. Use one of: {', '.join(allowed_ids)}",
             }
         
+        # Step 1c: Resolve short-name to canonical registered name (e.g. "Foo" → "org/Foo")
+        _type_registry = {
+            "image": self.image_models,
+            "audio": self.audio_models,
+            "tts": [self.tts_model] if self.tts_model else [],
+            "vision": self.vision_models,
+            "video": self.video_models,
+            "audio_gen": self.audio_gen_models,
+            "embedding": self.embedding_models,
+        }
+        _candidates = _type_registry.get(model_type, []) if model_type else []
+        if resolved_name not in _candidates:
+            for _m in _candidates:
+                if "/" in _m and _m.split("/")[-1] == resolved_name:
+                    resolved_name = _m
+                    break
+
         # Step 2: Build the model key (prefixed with type)
         if model_type and model_type != "text":
             model_key = f"{model_type}:{resolved_name}"
@@ -1640,6 +1657,19 @@ class MultiModelManager:
         
         # Step 3: Check if already loaded in self.models
         existing_model = self.models.get(model_key)
+
+        # Fuzzy fallback: if not found by exact key, check for org-prefix
+        # variations (e.g. "image:Model" vs "image:org/Model").
+        if existing_model is None:
+            type_prefix = f"{model_type}:" if model_type and model_type != "text" else ""
+            short = resolved_name.split("/")[-1]
+            for k, v in self.models.items():
+                k_name = k[len(type_prefix):] if type_prefix and k.startswith(type_prefix) else k
+                if k_name == resolved_name or k_name.split("/")[-1] == short:
+                    model_key = k
+                    resolved_name = k_name
+                    existing_model = v
+                    break
 
         # =====================================================================
         # PER-MODEL LOAD MODE: Check per-model config first.

@@ -115,6 +115,23 @@ global_file_path = None
 model_semaphores = {}
 queue_flags = {}
 
+# =============================================================================
+# Generation progress tracking
+# =============================================================================
+_gen_progress: dict = {"current": 0, "total": 0, "active": False}
+
+def _progress_reset(total: int):
+    _gen_progress["current"] = 0
+    _gen_progress["total"] = total
+    _gen_progress["active"] = True
+
+def _progress_done():
+    _gen_progress["current"] = _gen_progress["total"]
+    _gen_progress["active"] = False
+
+def _progress_step(step: int):
+    _gen_progress["current"] = step
+
 
 # =============================================================================
 # Helper Functions
@@ -451,7 +468,7 @@ def _load_diffusers_pipeline(model_name: str, global_args):
     return pipeline
 
 
-def _generate_with_diffusers(pipeline, request, global_args, http_request=None):
+async def _generate_with_diffusers(pipeline, request, global_args, http_request=None):
     """Generate images using a diffusers pipeline (with prompt-embedding cache)."""
     import torch
     import numpy as np
@@ -497,6 +514,8 @@ def _generate_with_diffusers(pipeline, request, global_args, http_request=None):
     cfg_scale = request.guidance_scale if request.guidance_scale else (
         getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0
     )
+
+    _progress_reset(num_steps)
 
     # ------------------------------------------------------------------
     # Prompt embedding cache
@@ -549,6 +568,22 @@ def _generate_with_diffusers(pipeline, request, global_args, http_request=None):
             print(f"Warning: prompt encode/cache failed ({e}), using plain text prompt")
             embed_kwargs = {}
 
+    def _step_cb(pipe, step_index, timestep, callback_kwargs):
+        _progress_step(step_index + 1)
+        return callback_kwargs
+
+    # Resolve character references (saved profiles + inline images)
+    char_images = []
+    try:
+        profiles = getattr(request, 'character_profiles', None) or []
+        if profiles:
+            from codai.api.characters import resolve_character_profiles
+            char_images += resolve_character_profiles(profiles)
+        inline = getattr(request, 'character_references', None) or []
+        char_images += list(inline)
+    except Exception:
+        pass
+
     # Build call kwargs
     if embed_kwargs:
         call_kwargs = dict(
@@ -558,6 +593,7 @@ def _generate_with_diffusers(pipeline, request, global_args, http_request=None):
             generator=generator,
             guidance_scale=cfg_scale,
             num_inference_steps=num_steps,
+            callback_on_step_end=_step_cb,
             **embed_kwargs,
         )
     else:
@@ -570,9 +606,35 @@ def _generate_with_diffusers(pipeline, request, global_args, http_request=None):
             generator=generator,
             guidance_scale=cfg_scale,
             num_inference_steps=num_steps,
+            callback_on_step_end=_step_cb,
         )
 
-    result = pipeline(**call_kwargs)
+    # Inject IP-Adapter images if character references provided
+    if char_images and hasattr(pipeline, 'set_ip_adapter_scale'):
+        try:
+            strength = getattr(request, 'character_strength', 0.6) or 0.6
+            ref_imgs = []
+            for ref in char_images:
+                from PIL import Image as PILImage
+                if ref.startswith('data:'):
+                    _, b64 = ref.split(',', 1)
+                    raw = base64.b64decode(b64)
+                else:
+                    raw = base64.b64decode(ref)
+                ref_imgs.append(PILImage.open(io.BytesIO(raw)).convert('RGB'))
+            pipeline.set_ip_adapter_scale(strength)
+            call_kwargs['ip_adapter_image'] = ref_imgs[0] if len(ref_imgs) == 1 else ref_imgs
+        except Exception as _ip_err:
+            print(f"Warning: IP-Adapter injection failed ({_ip_err}), continuing without character refs")
+
+    try:
+        result = await asyncio.to_thread(pipeline, **call_kwargs)
+    except TypeError:
+        # Older pipeline that doesn't support callback_on_step_end
+        call_kwargs.pop('callback_on_step_end', None)
+        result = await asyncio.to_thread(pipeline, **call_kwargs)
+    finally:
+        _progress_done()
 
     # Extract images
     images = []
@@ -583,12 +645,44 @@ def _generate_with_diffusers(pipeline, request, global_args, http_request=None):
         if result_images is None:
             raise Exception(f"Could not extract images from diffusers result: {img_err}")
 
+    _archive_artifacts = []
     for img in result_images:
         if isinstance(img, np.ndarray):
             img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
             img = np.clip(img, 0.0, 1.0)
         img_data = save_image_response(img, request.response_format, http_request)
         images.append(img_data)
+        try:
+            _buf = io.BytesIO()
+            if isinstance(img, Image.Image):
+                img.convert("RGB").save(_buf, "PNG")
+            else:
+                Image.fromarray(img).convert("RGB").save(_buf, "PNG")
+            _archive_artifacts.append((_buf.getvalue(), "png"))
+        except Exception:
+            pass
+
+    if _archive_artifacts:
+        try:
+            from codai.api.archive import archive_manager
+            asyncio.create_task(asyncio.to_thread(
+                archive_manager.save_generation,
+                "image", "/v1/images/generations",
+                getattr(request, 'model', None) or model_id,
+                request.prompt,
+                {
+                    "size": request.size,
+                    "n": request.n,
+                    "steps": num_steps,
+                    "guidance_scale": cfg_scale,
+                    "seed": seed,
+                    "quality": quality,
+                    "negative_prompt": neg_prompt or None,
+                },
+                _archive_artifacts,
+            ))
+        except Exception:
+            pass
 
     return {
         "created": timestamp,
@@ -613,32 +707,83 @@ async def _generate_with_sdcpp(sd_model, request, global_args, http_request=None
                 pass
     
     # Use default steps for fast generation
-    steps = 4
-    
+    steps = request.steps if request.steps else 4
+
+    _progress_reset(steps)
+
+    def _sdcpp_progress(step: int, total: int, elapsed: float):
+        _progress_step(step)
+
     # Use request seed if provided, otherwise use CLI default seed
     seed = request.seed if request.seed is not None else getattr(global_args, 'image_seed', None)
-    
-    result = await asyncio.to_thread(
-        sd_model.generate_image,
-        prompt=request.prompt,
-        negative_prompt='',
-        width=width,
-        height=height,
-        cfg_scale=get_cfg_scale(),
-        sample_steps=steps,
-        seed=seed if seed is not None else 42,
-        batch_count=request.n if request.n else 1,
-    )
+
+    try:
+        result = await asyncio.to_thread(
+            sd_model.generate_image,
+            prompt=request.prompt,
+            negative_prompt='',
+            width=width,
+            height=height,
+            cfg_scale=get_cfg_scale(),
+            sample_steps=steps,
+            seed=seed if seed is not None else 42,
+            batch_count=request.n if request.n else 1,
+            progress_callback=_sdcpp_progress,
+        )
+    except TypeError:
+        result = await asyncio.to_thread(
+            sd_model.generate_image,
+            prompt=request.prompt,
+            negative_prompt='',
+            width=width,
+            height=height,
+            cfg_scale=get_cfg_scale(),
+            sample_steps=steps,
+            seed=seed if seed is not None else 42,
+            batch_count=request.n if request.n else 1,
+        )
+    finally:
+        _progress_done()
     
     # Small delay to let Vulkan driver settle after generation
     time.sleep(0.1)
     
     # Convert results to response format
     images = []
+    _archive_artifacts = []
     for img in result:
         img_data = save_image_response(img, http_request=http_request)
         images.append(img_data)
-    
+        try:
+            _buf = io.BytesIO()
+            if isinstance(img, Image.Image):
+                img.convert("RGB").save(_buf, "PNG")
+            else:
+                Image.fromarray(img).convert("RGB").save(_buf, "PNG")
+            _archive_artifacts.append((_buf.getvalue(), "png"))
+        except Exception:
+            pass
+
+    if _archive_artifacts:
+        try:
+            import asyncio as _asyncio
+            from codai.api.archive import archive_manager
+            _asyncio.create_task(_asyncio.to_thread(
+                archive_manager.save_generation,
+                "image", "/v1/images/generations",
+                getattr(request, 'model', None),
+                request.prompt,
+                {
+                    "size": request.size,
+                    "n": request.n,
+                    "steps": steps,
+                    "seed": seed,
+                },
+                _archive_artifacts,
+            ))
+        except Exception:
+            pass
+
     return {
         "created": int(time.time()),
         "data": images
@@ -712,9 +857,15 @@ def _load_sdcpp_model(model_path: str, global_args, model_config: dict = None):
 
     # Check if sd.cpp failed to identify the model architecture.
     # In this case new_sd_ctx returns a non-null but broken context that
-    # will segfault on generate_image — reject it early.
+    # will segfault on free_sd_ctx — null out the pointer before raising so
+    # the destructor skips the free call and doesn't kill the server process.
     failed_version = any('get sd version from file failed' in l for l in log_lines)
     if failed_version:
+        try:
+            if hasattr(sd_model, '_model') and hasattr(sd_model._model, 'model'):
+                sd_model._model.model = None
+        except Exception:
+            pass
         raise ValueError(
             f"sd.cpp could not identify the model architecture in '{model_path}'. "
             "This model may require a newer version of stable-diffusion-cpp-python, "
@@ -729,6 +880,18 @@ def _load_sdcpp_model(model_path: str, global_args, model_config: dict = None):
 # =============================================================================
 
 router = APIRouter()
+
+
+@router.get("/v1/images/progress")
+async def get_image_progress():
+    """Return current image generation step progress."""
+    return {
+        "current": _gen_progress["current"],
+        "total":   _gen_progress["total"],
+        "active":  _gen_progress["active"],
+        "pct": int(_gen_progress["current"] / _gen_progress["total"] * 100)
+               if _gen_progress["total"] > 0 else 0,
+    }
 
 
 @router.post("/v1/images/generations")
@@ -832,7 +995,7 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
             else:
                 # Assume it's a diffusers pipeline
                 print(f"Using cached diffusers pipeline for generation")
-                return _generate_with_diffusers(pipeline, request, global_args, http_request)
+                return await _generate_with_diffusers(pipeline, request, global_args, http_request)
         
         # =====================================================================
         # Step 4: Model not loaded - try to load it
@@ -853,7 +1016,7 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                     multi_model_manager.current_model_key = model_key
                     print(f"Loaded diffusers model: {model_name}")
                     
-                    return _generate_with_diffusers(pipeline, request, global_args, http_request)
+                    return await _generate_with_diffusers(pipeline, request, global_args, http_request)
                     
             except ImportError as e:
                 diffusers_error = str(e)

@@ -62,6 +62,12 @@ class ModelCapabilities:
     lip_sync: bool = False              # Wav2Lip, SadTalker
     video_dubbing: bool = False         # Translation + TTS + lip sync
 
+    # 3D generation and conversion
+    image_to_3d: bool = False           # 2D image → stereo / anaglyph / depth / mesh
+    video_to_3d: bool = False           # 2D video → stereo / anaglyph / depth video
+    model_3d_generation: bool = False   # text / image → 3D model (GLB)
+    model_3d_to_image: bool = False     # 3D model → rendered 2D image / video
+
     def to_list(self) -> List[str]:
         out = []
         for name, val in self.__dataclass_fields__.items():
@@ -84,6 +90,15 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
         return caps
 
     n = model_name.lower()
+
+    # ── 3D generation ────────────────────────────────────────────────────────
+    if any(x in n for x in ['triposr', 'tsr', 'shap-e', 'shape-e', 'point-e', 'pointe',
+                              'zero123', 'wonder3d', 'instant3d', 'one-2-3-45',
+                              'mvdiffusion', 'syncdreamer', 'dreamgaussian']):
+        caps.model_3d_generation = True
+        caps.image_to_3d = True
+        caps.model_3d_to_image = True
+        return caps
 
     # ── Video generation ─────────────────────────────────────────────────────
     if any(x in n for x in ['cogvideox', 'cogvideo', 'ltx-video', 'ltxvideo',

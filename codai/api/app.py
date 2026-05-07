@@ -66,8 +66,33 @@ def set_global_file_path_wrapper(path: str):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown."""
-    # Startup
+    import asyncio as _asyncio
+
+    async def _archive_cleanup_loop():
+        from codai.api.archive import archive_manager
+        while True:
+            await _asyncio.sleep(3600)
+            try:
+                archive_manager.run_cleanup()
+            except Exception:
+                pass
+
+    cleanup_task = _asyncio.create_task(_archive_cleanup_loop())
+    # Run initial cleanup on startup
+    try:
+        from codai.api.archive import archive_manager
+        archive_manager.run_cleanup()
+    except Exception:
+        pass
+
     yield
+
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except _asyncio.CancelledError:
+        pass
+
     # Shutdown
     multi_model_manager.cleanup()
     model_manager.cleanup()
@@ -101,6 +126,8 @@ from codai.api.voice_clone import router as voice_clone_router
 from codai.api.voice_convert import router as voice_convert_router
 from codai.api.faceswap import router as faceswap_router
 from codai.api.characters import router as characters_router
+from codai.api.spatial import router as spatial_router
+from codai.api.environments import router as environments_router
 from codai.admin.routes import router as admin_router
 
 # Import and add middleware
@@ -133,6 +160,8 @@ app.include_router(voice_clone_router)
 app.include_router(voice_convert_router)
 app.include_router(faceswap_router)
 app.include_router(characters_router)
+app.include_router(environments_router)
+app.include_router(spatial_router)
 app.include_router(admin_router)
 
 
@@ -167,3 +196,58 @@ async def get_file(filename: str):
     if not os.path.isfile(candidate):
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(candidate)
+
+
+_IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.gif'}
+_VIDEO_EXTS = {'.mp4', '.webm', '.avi', '.mov'}
+_AUDIO_EXTS = {'.wav', '.mp3', '.ogg', '.flac', '.aac', '.m4a'}
+
+
+@app.get("/v1/archive")
+async def list_archive():
+    """List all generated files in the output directory."""
+    if not global_file_path or not os.path.isdir(global_file_path):
+        return {"files": []}
+    files = []
+    try:
+        names = os.listdir(global_file_path)
+    except OSError:
+        return {"files": []}
+    for fname in names:
+        fpath = os.path.join(global_file_path, fname)
+        if not os.path.isfile(fpath):
+            continue
+        ext = os.path.splitext(fname)[1].lower()
+        if ext in _IMAGE_EXTS:
+            ftype = 'image'
+        elif ext in _VIDEO_EXTS:
+            ftype = 'video'
+        elif ext in _AUDIO_EXTS:
+            ftype = 'audio'
+        else:
+            continue
+        stat = os.stat(fpath)
+        files.append({
+            'filename': fname,
+            'type': ftype,
+            'size': stat.st_size,
+            'created': stat.st_mtime,
+            'url': f'/v1/files/{fname}',
+        })
+    files.sort(key=lambda f: f['created'], reverse=True)
+    return {"files": files}
+
+
+@app.delete("/v1/archive/{filename}")
+async def delete_archive_file(filename: str):
+    """Delete a generated file from the output directory."""
+    if not global_file_path:
+        raise HTTPException(status_code=404, detail="File not found")
+    safe_base = os.path.realpath(global_file_path)
+    candidate = os.path.realpath(os.path.join(global_file_path, filename))
+    if not (candidate == safe_base or candidate.startswith(safe_base + os.sep)):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not os.path.isfile(candidate):
+        raise HTTPException(status_code=404, detail="File not found")
+    os.remove(candidate)
+    return {"deleted": filename}

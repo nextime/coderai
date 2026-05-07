@@ -199,4 +199,24 @@ async def audio_generate(request: AudioGenerationRequest, http_request: Request 
         raise HTTPException(status_code=500, detail=f"Audio generation failed: {e}")
 
     result = _save_audio_response(audio_bytes, ext, http_request)
+
+    try:
+        from codai.api.archive import archive_manager
+        asyncio.get_event_loop().create_task(asyncio.to_thread(
+            archive_manager.save_generation,
+            "audio", "/v1/audio/generate",
+            model_name,
+            request.prompt,
+            {
+                "duration": request.duration,
+                "top_k": request.top_k,
+                "top_p": request.top_p,
+                "temperature": request.temperature,
+                "cfg_coef": request.cfg_coef,
+            },
+            [(audio_bytes, ext)],
+        ))
+    except Exception:
+        pass
+
     return AudioGenerationResponse(created=int(time.time()), data=[result])

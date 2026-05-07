@@ -99,6 +99,14 @@ class WhisperConfig:
 
 
 @dataclass
+class ArchiveConfig:
+    """Generation archive configuration."""
+    enabled: bool = True
+    directory: str = ""        # empty = <config_dir>/archive; relative paths resolve from config_dir
+    retention: str = "never"   # one of: 1h 1d 2d 1w 1m 3m 6m 1y never
+
+
+@dataclass
 class Config:
     """Main configuration class."""
     version: str = "1.0"
@@ -109,6 +117,7 @@ class Config:
     vulkan: VulkanConfig = field(default_factory=VulkanConfig)
     image: ImageConfig = field(default_factory=ImageConfig)
     whisper: WhisperConfig = field(default_factory=WhisperConfig)
+    archive: ArchiveConfig = field(default_factory=ArchiveConfig)
     system_prompt: Optional[str] = None
     tools_closer_prompt: bool = False
     grammar_guided: bool = False
@@ -244,6 +253,7 @@ class ConfigManager:
                 vulkan=VulkanConfig(**config_data.get("vulkan", {})),
                 image=ImageConfig(**config_data.get("image", {})),
                 whisper=WhisperConfig(**config_data.get("whisper", {})),
+                archive=ArchiveConfig(**config_data.get("archive", {})),
                 system_prompt=config_data.get("system_prompt"),
                 tools_closer_prompt=config_data.get("tools_closer_prompt", False),
                 grammar_guided=config_data.get("grammar_guided", False),
@@ -346,6 +356,11 @@ class ConfigManager:
                 "seed": self.config.image.seed,
                 "vae_tiling": self.config.image.vae_tiling,
                 "clip_on_cpu": self.config.image.clip_on_cpu
+            },
+            "archive": {
+                "enabled": self.config.archive.enabled,
+                "directory": self.config.archive.directory,
+                "retention": self.config.archive.retention,
             },
             "system_prompt": self.config.system_prompt,
             "tools_closer_prompt": self.config.tools_closer_prompt,

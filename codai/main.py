@@ -22,6 +22,7 @@ import os
 from codai.cli import parse_args
 from codai.config import ConfigManager
 from codai.admin.routes import init_session_manager, set_config_manager
+from codai.api.archive import archive_manager
 
 
 def main():
@@ -55,6 +56,18 @@ def main():
     if config.models.gguf_cache_dir:
         os.environ['CODERAI_CACHE_DIR'] = config.models.gguf_cache_dir
     
+    # Configure generation archive
+    _arc_dir = config.archive.directory
+    if not _arc_dir:
+        _arc_dir = os.path.join(config_dir, "archive")
+    elif not os.path.isabs(_arc_dir):
+        _arc_dir = os.path.join(config_dir, _arc_dir)
+    archive_manager.configure(
+        enabled=config.archive.enabled,
+        directory=_arc_dir,
+        retention=config.archive.retention,
+    )
+
     # Initialize admin session manager and expose config to admin routes
     from pathlib import Path
     init_session_manager(Path(config_dir))
@@ -364,6 +377,8 @@ def main():
                 multi_model_manager.model_backend_types[mid] = (
                     m.get("backend", "auto") if isinstance(m, dict) else "auto"
                 )
+            if isinstance(m, dict) and m.get("alias"):
+                multi_model_manager.set_model_alias(m["alias"], mid)
 
     # Audio models
     audio_models = models_config.get("audio_models", [])
@@ -400,6 +415,8 @@ def main():
         mid = _model_id(m)
         if mid:
             multi_model_manager.set_image_model(mid, config=_model_cfg(m, "image"))
+            if isinstance(m, dict) and m.get("alias"):
+                multi_model_manager.set_model_alias(m["alias"], mid)
 
     # Vision models
     vision_models = models_config.get("vision_models", [])
@@ -407,6 +424,8 @@ def main():
         mid = _model_id(m)
         if mid:
             multi_model_manager.set_vision_model(mid, config=_model_cfg(m, "vision"))
+            if isinstance(m, dict) and m.get("alias"):
+                multi_model_manager.set_model_alias(m["alias"], mid)
 
     # TTS models
     tts_models = models_config.get("tts_models", [])
@@ -414,6 +433,8 @@ def main():
         mid = _model_id(m)
         if mid:
             multi_model_manager.set_tts_model(mid, config=_model_cfg(m, "tts") if isinstance(m, dict) else {})
+            if isinstance(m, dict) and m.get("alias"):
+                multi_model_manager.set_model_alias(m["alias"], mid)
 
     # Video generation models
     video_models = models_config.get("video_models", [])
@@ -421,6 +442,8 @@ def main():
         mid = _model_id(m)
         if mid:
             multi_model_manager.set_video_model(mid, config=_model_cfg(m, "video") if isinstance(m, dict) else {})
+            if isinstance(m, dict) and m.get("alias"):
+                multi_model_manager.set_model_alias(m["alias"], mid)
 
     # Audio generation models (MusicGen, AudioLDM2, …)
     audio_gen_models = models_config.get("audio_gen_models", [])
@@ -428,6 +451,8 @@ def main():
         mid = _model_id(m)
         if mid:
             multi_model_manager.set_audio_gen_model(mid, config=_model_cfg(m, "audio_gen") if isinstance(m, dict) else {})
+            if isinstance(m, dict) and m.get("alias"):
+                multi_model_manager.set_model_alias(m["alias"], mid)
 
     # Embedding models
     embedding_models = models_config.get("embedding_models", [])
@@ -435,6 +460,8 @@ def main():
         mid = _model_id(m)
         if mid:
             multi_model_manager.set_embedding_model(mid, config=_model_cfg(m, "embedding") if isinstance(m, dict) else {})
+            if isinstance(m, dict) and m.get("alias"):
+                multi_model_manager.set_model_alias(m["alias"], mid)
 
     # Register aliases
     aliases = models_config.get("aliases", {})
@@ -623,9 +650,19 @@ def main():
     if global_file_path:
         set_fs_file_path(global_file_path)
 
+    # Set spatial (3D) module global args
+    from codai.api.spatial import set_global_args as set_spatial_global_args, set_global_file_path as set_spatial_file_path
+    set_spatial_global_args(global_args)
+    if global_file_path:
+        set_spatial_file_path(global_file_path)
+
     # Set character profiles module global args
     from codai.api.characters import set_global_args as set_chars_global_args
     set_chars_global_args(global_args)
+
+    # Set environment profiles module global args
+    from codai.api.environments import set_global_args as set_envs_global_args
+    set_envs_global_args(global_args)
 
     # Set embeddings module global args
     from codai.api.embeddings import set_global_args as set_embed_global_args
