@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 # Import from codai modules
 from codai.models.manager import ModelManager, WhisperServerManager, MultiModelManager, model_manager, multi_model_manager
 from codai.queue.manager import QueueManager, queue_manager
+from codai.api.prompt_cache import prompt_cache_manager
 from codai.pydantic.textrequest import ChatCompletionRequest, ToolFunction, Tool
 from codai.models.parser import filter_malformed_content, filter_repetition, format_tools_for_prompt, cleanup_control_tokens, OpenAIFormatter, ModelParserAdapter, ToolCallParser
 
@@ -1142,6 +1143,9 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         from fastapi.responses import JSONResponse
         return JSONResponse(content=formatted_response, headers=headers)
     
+    # Compute prefix key for prompt-aggregation scheduling
+    _prefix_key = prompt_cache_manager.get_prefix_key(messages_dict)
+
     if request.stream:
         async def _managed_stream():
             try:
@@ -1156,6 +1160,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     current_manager,
                     tool_parser,
                     request.response_format,
+                    _prefix_key,
                 ):
                     yield chunk
             finally:
@@ -1192,6 +1197,7 @@ async def stream_chat_response(
     current_manager: ModelManager,
     tool_parser: ToolCallParser,
     response_format: Optional[Dict] = None,
+    prefix_key: str = "",
 ) -> AsyncGenerator[str, None]:
     """Stream chat completion response with queue notifications."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -1214,7 +1220,7 @@ async def stream_chat_response(
     
     # If model not loaded, add to queue and send waiting notifications
     if not model_loaded:
-        await queue_manager.add_waiting(request_id)
+        await queue_manager.add_waiting(request_id, prefix_key=prefix_key)
         wait_interval = 2.0  # Send waiting update every 2 seconds
         last_wait_update = time.time()
         
@@ -1457,10 +1463,24 @@ async def stream_chat_response(
             prompt_text = "\n".join([m.get("content", "") for m in messages])
             prompt_tokens = len(prompt_text.split())
             completion_tokens = len(generated_text.split()) if generated_text else 0
-            
+
+            # Read accurate usage (including cached_tokens) from the backend
+            _model_key_for_cache = getattr(current_manager, 'model_name', None) or model_name
+            last_usage = (current_manager.get_last_usage()
+                          if hasattr(current_manager, 'get_last_usage') else {})
+            if last_usage.get('prompt_tokens'):
+                prompt_tokens = last_usage['prompt_tokens']
+            if last_usage.get('completion_tokens'):
+                completion_tokens = last_usage['completion_tokens']
+            cached_tokens = last_usage.get('cached_tokens', 0)
+
+            # Store in prompt cache manager for future prefix matching
+            prompt_cache_manager.store(messages, _model_key_for_cache,
+                                       prompt_tokens, cached_tokens)
+
             # Get context size
             context_size = current_manager.get_context_size()
-            
+
             # Build complete final chunk with all OpenAI fields
             final_chunk = {
                 "id": completion_id,
@@ -1479,7 +1499,7 @@ async def stream_chat_response(
                     "total_tokens": prompt_tokens + completion_tokens,
                     "context_size": context_size,
                     "prompt_tokens_details": {
-                        "cached_tokens": 0,
+                        "cached_tokens": cached_tokens,
                         "audio_tokens": 0,
                     },
                     "completion_tokens_details": {
@@ -1494,7 +1514,7 @@ async def stream_chat_response(
                 "system_fingerprint": None,
             }
             yield f"data: {json.dumps(final_chunk)}\n\n"
-        
+
         yield "data: [DONE]\n\n"
     except Exception as e:
         print(f"Error during streaming generation: {e}")
@@ -1638,11 +1658,20 @@ async def generate_chat_response(
                 response_message["tool_calls"] = tool_calls
                 finish_reason = "tool_calls"
         
-        # Calculate token counts - rough estimate since we don't have direct access to tokenizer
+        # Read accurate usage (including cached_tokens) from the backend
+        _model_key_for_cache = getattr(current_manager, 'model_name', None) or model_name
+        last_usage = (current_manager.get_last_usage()
+                      if hasattr(current_manager, 'get_last_usage') else {})
         prompt_text = "\n".join([m.get("content", "") for m in messages])
-        prompt_tokens = len(prompt_text.split())
-        completion_tokens = len(generated_text.split()) if generated_text else 0
-        
+        prompt_tokens = last_usage.get('prompt_tokens') or len(prompt_text.split())
+        completion_tokens = last_usage.get('completion_tokens') or (
+            len(generated_text.split()) if generated_text else 0)
+        cached_tokens = last_usage.get('cached_tokens', 0)
+
+        # Store in prompt cache manager for future prefix matching
+        prompt_cache_manager.store(messages, _model_key_for_cache,
+                                   prompt_tokens, cached_tokens)
+
         # Get context size
         context_size = current_manager.get_context_size()
         
@@ -1655,6 +1684,10 @@ async def generate_chat_response(
             tool_calls=response_message.get("tool_calls"),
             context_size=context_size
         )
+        # Patch in the real cached_tokens value
+        if formatted_response and 'usage' in formatted_response:
+            details = formatted_response['usage'].setdefault('prompt_tokens_details', {})
+            details['cached_tokens'] = cached_tokens
         
         # Add mock reasoning stats if 'mock' is in force_reasoning_args
         # But only if we don't already have real reasoning in the response

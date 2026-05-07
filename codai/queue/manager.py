@@ -40,6 +40,7 @@ class WaitingRequest:
     sequence: int
     event: asyncio.Event = field(default_factory=asyncio.Event)
     bypassed_by: int = 0
+    prefix_key: str = ""  # stable hash of the cacheable prompt prefix
 
 
 class QueueManager:
@@ -61,6 +62,7 @@ class QueueManager:
         self.model_name: Optional[str] = None
         self._processing: bool = False
         self._ready_request_ids: Set[str] = set()
+        self._last_prefix_key: str = ""  # prefix key of the last completed request
 
     def set_loaded_models(self, model_keys: Set[str]) -> None:
         self.loaded_models = set(model_keys)
@@ -83,17 +85,19 @@ class QueueManager:
         self.model_name = None
         self._processing = False
         self._ready_request_ids.clear()
+        self._last_prefix_key = ""
 
     async def is_full(self) -> bool:
         async with self.lock:
             return len(self.waiting) >= self.max_size
 
-    async def acquire(self, request_id: str, model_key: str) -> SchedulerLease:
+    async def acquire(self, request_id: str, model_key: str,
+                      prefix_key: str = "") -> SchedulerLease:
         waiter = None
         async with self.lock:
             if self._can_start_now(model_key):
                 return self._grant_lease(request_id, model_key)
-            waiter = self._enqueue_waiter(request_id, model_key)
+            waiter = self._enqueue_waiter(request_id, model_key, prefix_key)
 
         await waiter.event.wait()
         async with self.lock:
@@ -103,7 +107,8 @@ class QueueManager:
             lease.wait_time_seconds = max(0.0, time.time() - waiter.enqueued_at)
             return lease
 
-    async def release(self, lease: SchedulerLease) -> None:
+    async def release(self, lease: SchedulerLease,
+                      prefix_key: str = "") -> None:
         async with self.lock:
             self.active_leases.pop(lease.request_id, None)
             current = self.active_by_model.get(lease.model_key, 0)
@@ -113,14 +118,17 @@ class QueueManager:
                 self.active_by_model[lease.model_key] = current - 1
             if self.current_request_id == lease.request_id:
                 self.current_request_id = None
+            if prefix_key:
+                self._last_prefix_key = prefix_key
             self._processing = bool(self.active_leases)
             self._wake_waiters_locked()
 
-    async def add_waiting(self, request_id: str, model_key: str = "") -> None:
+    async def add_waiting(self, request_id: str, model_key: str = "",
+                          prefix_key: str = "") -> None:
         async with self.lock:
             if request_id in self.waiting_by_id:
                 return
-            self._enqueue_waiter(request_id, model_key or request_id)
+            self._enqueue_waiter(request_id, model_key or request_id, prefix_key)
 
     async def remove_waiting(self, request_id: str) -> None:
         async with self.lock:
@@ -172,13 +180,15 @@ class QueueManager:
             "loaded_models": sorted(self.loaded_models),
         }
 
-    def _enqueue_waiter(self, request_id: str, model_key: str) -> WaitingRequest:
+    def _enqueue_waiter(self, request_id: str, model_key: str,
+                        prefix_key: str = "") -> WaitingRequest:
         self.sequence += 1
         waiter = WaitingRequest(
             request_id=request_id,
             model_key=model_key,
             enqueued_at=time.time(),
             sequence=self.sequence,
+            prefix_key=prefix_key,
         )
         self.waiting.append(waiter)
         self.waiting_by_id[request_id] = waiter
@@ -233,17 +243,39 @@ class QueueManager:
                 return
 
     def _pick_next_waiter_locked(self) -> Optional[WaitingRequest]:
-        for waiter in self.waiting:
-            if self._waiter_can_start_locked(waiter):
-                older_blocked = [
-                    other for other in self.waiting
-                    if other.sequence < waiter.sequence and not self._waiter_can_start_locked(other)
-                ]
-                if any(other.bypassed_by >= self.fairness_bypass_limit for other in older_blocked):
-                    continue
-                for other in older_blocked:
-                    other.bypassed_by += 1
+        # Collect all candidates that can start now.
+        candidates = [w for w in self.waiting if self._waiter_can_start_locked(w)]
+        if not candidates:
+            return None
+
+        # Fairness: don't bypass an older waiter more than the limit.
+        def _is_fair(waiter: WaitingRequest) -> bool:
+            older_blocked = [
+                other for other in self.waiting
+                if other.sequence < waiter.sequence and not self._waiter_can_start_locked(other)
+            ]
+            if any(other.bypassed_by >= self.fairness_bypass_limit for other in older_blocked):
+                return False
+            for other in older_blocked:
+                other.bypassed_by += 1
+            return True
+
+        # Prompt aggregation: prefer candidates whose prefix key matches the
+        # last completed request — they will hit a warm KV cache.
+        if self._last_prefix_key:
+            warm_candidates = [
+                w for w in candidates
+                if w.prefix_key and w.prefix_key == self._last_prefix_key
+            ]
+            for waiter in warm_candidates:
+                if _is_fair(waiter):
+                    return waiter
+
+        # Fall back to FIFO order.
+        for waiter in candidates:
+            if _is_fair(waiter):
                 return waiter
+
         return None
 
     def _waiting_counts_locked(self) -> Dict[str, int]:

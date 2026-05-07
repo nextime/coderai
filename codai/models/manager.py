@@ -233,6 +233,12 @@ class ModelManager:
         if self.backend is not None:
             return self.backend.get_context_size()
         return 2048  # Default fallback
+
+    def get_last_usage(self) -> dict:
+        """Return usage info (including cached_tokens) from the most recent call."""
+        if self.backend is not None and hasattr(self.backend, 'get_last_usage'):
+            return self.backend.get_last_usage()
+        return {}
     
     def cleanup(self):
         if self.backend is not None:
@@ -2040,11 +2046,29 @@ class MultiModelManager:
             "embedding_models": "embedding",
         }
 
+        # Minimum capability guaranteed by a model's config category.
+        # Applied when heuristic name detection doesn't recognise the model ID.
+        TYPE_MIN_CAP = {
+            "image":     "image_generation",
+            "video":     "video_generation",
+            "audio":     "speech_to_text",
+            "tts":       "text_to_speech",
+            "audio_gen": "audio_generation",
+            "embedding": "embeddings",
+        }
+
         def _add(model_id: str, model_type: str = None, meta: Dict[str, Any] = None):
             if model_id in seen_ids:
                 return
             seen_ids.add(model_id)
             caps = detect_model_capabilities(model_id)
+            # If heuristic detection missed the type (e.g. custom/vendor model IDs
+            # that don't match any keyword), ensure the minimum capability for the
+            # config-declared type is set so badges display correctly.
+            if model_type and model_type in TYPE_MIN_CAP:
+                min_cap = TYPE_MIN_CAP[model_type]
+                if not getattr(caps, min_cap, False):
+                    setattr(caps, min_cap, True)
             resolved_type = model_type or (caps.to_list()[0].split("_")[0] if caps.to_list() else "text")
             meta = meta or {}
             models.append(ModelInfo(
@@ -2075,6 +2099,11 @@ class MultiModelManager:
                         else:
                             raw = m.get("path") or m.get("id") or ""
                             alias = m.get("alias") or ""
+                            # Auto-derive a clean alias for GGUF files that have no
+                            # explicit alias so the full filesystem path isn't exposed.
+                            if not alias and raw.lower().endswith(".gguf"):
+                                stem = raw.split("/")[-1][:-5]  # filename without .gguf
+                                alias = stem
                             # whisper-server aliases are round-robin group keys shared across
                             # multiple instances — don't expose the alias as a separate model
                             if m.get("backend") == "whisper-server":

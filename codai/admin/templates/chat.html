@@ -256,6 +256,27 @@ a.dl { display:inline-block; margin-top:.4rem; }
 .pb-step-header { display:flex; align-items:center; gap:.4rem; font-size:12px; font-weight:600; }
 .pb-step-params { display:flex; flex-direction:column; gap:.25rem; padding-top:.25rem; }
 .pb-step-param { display:flex; align-items:center; gap:.4rem; font-size:12px; }
+/* ── Pipeline capability chips ────────────────────────────────── */
+.pipe-caps { display:flex; flex-wrap:wrap; align-items:center; gap:.3rem; padding-bottom:.6rem; margin-bottom:.25rem; border-bottom:1px solid var(--border); }
+.pipe-caps-label { font-size:10px; color:var(--text-3); text-transform:uppercase; letter-spacing:.05em; margin-right:.1rem; }
+.pipe-cap-chip { font-size:10px; padding:.1rem .4rem; border-radius:4px; border:1px solid transparent; }
+.pipe-cap-chip.ok { background:#0d2e18; color:#4ade80; border-color:#1a4a1a; }
+.pipe-cap-chip.missing { background:#2e0d0d; color:#f07070; border-color:#5a1a1a; }
+.pipe-cap-chip.optional { background:var(--surface-2); color:var(--text-3); }
+.pipe-cap-chip.optional.ok { background:#1a1f0a; color:#c0d060; border-color:#3a4a10; }
+/* ── Sub-tab model picker ─────────────────────────────────────── */
+.cap-model-picker { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; padding-top:.4rem; border-top:1px solid var(--border); margin-top:.1rem; }
+.cap-model-picker-label { font-size:10px; color:var(--text-3); text-transform:uppercase; letter-spacing:.05em; white-space:nowrap; }
+.cap-model-chips { display:flex; flex-wrap:wrap; gap:.3rem; }
+.cap-model-chip { font-size:11px; padding:.18rem .55rem; border-radius:999px; border:1px solid; cursor:pointer; background:transparent; font-family:inherit; transition:background .15s; }
+.cap-model-chip.ok  { color:#4ade80; border-color:#2a5a2a; background:#0f2a0f; }
+.cap-model-chip.ok:hover  { background:#1a3f1a; }
+.cap-model-chip.warn { color:#f0c060; border-color:#5a3a10; background:#2a1f0a; }
+.cap-model-chip.warn:hover { background:#3a2f0a; }
+.cap-model-chip.active { font-weight:700; outline:1px solid currentColor; outline-offset:1px; }
+/* ── Sidebar capability highlights ───────────────────────────── */
+.model-item.cap-ok   { border-left:3px solid #4caf50; padding-left:calc(.6rem - 3px); }
+.model-item.cap-partial { border-left:3px solid #f0a020; padding-left:calc(.6rem - 3px); }
 .pb-step-param label { min-width:110px; color:var(--text-2); flex-shrink:0; }
 .pb-step-param input, .pb-step-param select, .pb-step-param textarea { flex:1; font-size:12px; }
 .pb-step-param textarea { rows:2; resize:vertical; min-height:40px; }
@@ -1688,19 +1709,42 @@ function updatePipelineBadges() {
     }
     badge.className = `pipe-badge ${state}`;
     badge.textContent = label;
+    // Capability chips in the card body
+    const body = card.querySelector('.pipe-card-body');
+    if (body) {
+      let capsDiv = body.querySelector('.pipe-caps');
+      if (!capsDiv) {
+        capsDiv = document.createElement('div');
+        capsDiv.className = 'pipe-caps';
+        body.insertBefore(capsDiv, body.firstChild);
+      }
+      const fmt = c => c.replace(/_/g, ' ');
+      const reqChips = reqs.map(c =>
+        `<span class="pipe-cap-chip${allCaps.has(c) ? ' ok' : ' missing'}" title="${c}">${fmt(c)}</span>`
+      ).join('');
+      const optChips = opts.map(c =>
+        `<span class="pipe-cap-chip optional${allCaps.has(c) ? ' ok' : ''}" title="${c}">${fmt(c)}</span>`
+      ).join('');
+      const parts = [];
+      if (reqChips) parts.push(`<span class="pipe-caps-label">Requires</span>${reqChips}`);
+      if (optChips) parts.push(`<span class="pipe-caps-label">Optional</span>${optChips}`);
+      capsDiv.innerHTML = parts.join('');
+    }
   });
 }
 
-function hasTypeFallback(rule, type) {
-  return Array.isArray(rule.fallbackTypes) && rule.fallbackTypes.includes(type);
+function hasTypeFallback(rule, typeOrTypes) {
+  if (!Array.isArray(rule.fallbackTypes)) return false;
+  if (typeOrTypes instanceof Set) return rule.fallbackTypes.some(t => typeOrTypes.has(t));
+  return rule.fallbackTypes.includes(typeOrTypes);
 }
 
-function evaluateSubCapability(rule, caps, type) {
+function evaluateSubCapability(rule, caps, typeOrTypes) {
   const required = rule.requiresAny || [];
   const optional = rule.optional || [];
   const hasRequired = required.some(cap => caps.has(cap));
   const hasOptional = optional.some(cap => caps.has(cap));
-  const fallback = hasTypeFallback(rule, type);
+  const fallback = hasTypeFallback(rule, typeOrTypes);
 
   if (hasRequired) return 'available';
   if (!required.length && (hasOptional || fallback)) return 'partial';
@@ -1754,7 +1798,7 @@ function getSubtabState(sub) {
 function getCapabilityDetails(sub) {
   const def = STUDIO_CAPABILITIES[sub];
   if (!def) return null;
-  const caps = capabilitySetForModel(activeModel);
+  const caps = crossModelCaps();
   const required = def.requires || [];
   const optional = def.optional || [];
   const missingRequired = required.filter(cap => !caps.has(cap));
@@ -1802,6 +1846,7 @@ function renderCapabilityCard(sub) {
     </div>
     ${missingBits.join('')}
     ${notes}
+    ${renderSubModelPicker(sub)}
   `;
 }
 
@@ -1813,14 +1858,25 @@ function renderCapabilityCards() {
     const shell = $(`cap-${sub}`);
     if (!shell) return;
     const state = currentTabState.subs[sub] || 'unavailable';
-    if (state === 'available') { shell.style.display = 'none'; shell.innerHTML = ''; return; }
+    const picker = renderSubModelPicker(sub);
+    if (state === 'available') {
+      if (picker) {
+        shell.style.display = '';
+        shell.classList.remove('state-partial', 'state-unavailable');
+        shell.innerHTML = picker;
+      } else {
+        shell.style.display = 'none';
+        shell.innerHTML = '';
+      }
+      return;
+    }
     shell.style.display = '';
     shell.classList.remove('state-partial', 'state-unavailable');
     shell.classList.add(state === 'partial' ? 'state-partial' : 'state-unavailable');
     const rule = SUB_CAPABILITY_RULES[sub];
-    const caps = capabilitySetForModel(activeModel);
-    const missingRequired = (rule.requiresAny || []).filter(c => !caps.has(c));
-    const missingOptional = (rule.optional || []).filter(c => !caps.has(c));
+    const allCaps = crossModelCaps();
+    const missingRequired = (rule.requiresAny || []).filter(c => !allCaps.has(c));
+    const missingOptional = (rule.optional || []).filter(c => !allCaps.has(c));
     const label = document.querySelector(`.t2btn[data-sub="${sub}"]`)?.childNodes[0]?.textContent?.trim() || sub;
     const missingBits = [];
     if (missingRequired.length) missingBits.push(`<div class="cap-missing"><strong>Missing required:</strong> ${missingRequired.join(', ')}</div>`);
@@ -1833,6 +1889,7 @@ function renderCapabilityCards() {
         <span class="cap-chip${availabilityClass}">${availabilityLabel}</span>
       </div>
       ${missingBits.join('')}
+      ${picker}
     `;
   });
   renderAudioBackendHealth();
@@ -2471,22 +2528,21 @@ function selectModel(m) {
 }
 
 function updateTabs(m) {
-  const caps = capabilitySetForModel(m);
   const allCaps = crossModelCaps();
+  const allTypes = new Set(models.map(mdl => mdl.type || 'text'));
   const type = m.type || 'text';
   refreshAudioBackendHealth();
   const subStates = {};
   Object.entries(SUB_CAPABILITY_RULES).forEach(([sub, rule]) => {
-    if (VIDEO_EXTRA_SUBS.includes(sub) && type === 'video' && !rule.fallbackTypes) {
+    if (VIDEO_EXTRA_SUBS.includes(sub) && allTypes.has('video') && !rule.fallbackTypes) {
       rule = Object.assign({}, rule, { fallbackTypes:['video'] });
     }
-    const evalCaps = CROSS_MODEL_SUBS.has(sub) ? allCaps : caps;
-    subStates[sub] = evaluateSubCapability(rule, evalCaps, type);
+    subStates[sub] = evaluateSubCapability(rule, allCaps, allTypes);
   });
   updatePipelineBadges();
   const categoryStates = {};
   CATEGORY_TABS.forEach(cat => {
-    categoryStates[cat] = evaluateCategoryState(cat, subStates, caps, type);
+    categoryStates[cat] = evaluateCategoryState(cat, subStates, allCaps, type);
   });
   currentTabState = { categories:categoryStates, subs:subStates };
 
@@ -2496,7 +2552,7 @@ function updateTabs(m) {
   document.querySelectorAll('.t2btn').forEach(btn => {
     setTabVisualState(btn, subStates[btn.dataset.sub] || 'unavailable');
   });
-  $('attach-btn').style.display = caps.has('image_to_text') ? '' : 'none';
+  $('attach-btn').style.display = capabilitySetForModel(m).has('image_to_text') ? '' : 'none';
   renderCapabilityCards();
   renderDiagnostics();
   renderOutputCapabilityNotes();
@@ -2510,6 +2566,7 @@ function selectCat(cat) {
   const hasL2 = ['image','video','audio'].includes(cat);
   $('tabbar2').classList.toggle('visible', hasL2);
   if (!hasL2) {
+    clearSidebarHighlights();
     document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
     const panel = $('panel-' + cat);
     if (panel) panel.classList.add('active');
@@ -2524,6 +2581,42 @@ function selectCat(cat) {
   const activeSubFits = activeSub && isSubVisibleForCategory(activeSub.dataset.sub, cat);
   const nextSub = activeSubFits ? activeSub.dataset.sub : getFirstVisibleSub(cat)?.dataset.sub;
   if (nextSub) selectSub(nextSub);
+}
+
+function modelsForSub(sub) {
+  const rule = SUB_CAPABILITY_RULES[sub];
+  if (!rule) return [];
+  return models.map(m => {
+    const state = evaluateSubCapability(rule, capabilitySetForModel(m), m.type || 'text');
+    return { model: m, state };
+  }).filter(item => item.state !== 'unavailable');
+}
+
+function renderSubModelPicker(sub) {
+  const compatible = modelsForSub(sub);
+  if (!compatible.length) return '';
+  const chips = compatible.map(({ model, state }) => {
+    const cls = state === 'available' ? 'ok' : 'warn';
+    const isActive = activeModel && model.id === activeModel.id;
+    const label = escapeHtml(model.id.split('/').pop());
+    const safe = JSON.stringify(model).replace(/"/g, '&quot;');
+    return `<button class="cap-model-chip ${cls}${isActive ? ' active' : ''}" onclick="selectModel(${safe})" title="${model.id}">${label}</button>`;
+  }).join('');
+  return `<div class="cap-model-picker"><span class="cap-model-picker-label">Models</span><div class="cap-model-chips">${chips}</div></div>`;
+}
+
+function highlightSidebarForSub(sub) {
+  const compatible = new Map(modelsForSub(sub).map(({ model, state }) => [model.id, state]));
+  document.querySelectorAll('.model-item').forEach(el => {
+    el.classList.remove('cap-ok', 'cap-partial');
+    const state = compatible.get(el.dataset.id);
+    if (state === 'available') el.classList.add('cap-ok');
+    else if (state === 'partial') el.classList.add('cap-partial');
+  });
+}
+
+function clearSidebarHighlights() {
+  document.querySelectorAll('.model-item').forEach(el => el.classList.remove('cap-ok', 'cap-partial'));
 }
 
 function selectSub(sub) {
@@ -2543,6 +2636,7 @@ function selectSub(sub) {
   // When switching to vid-faceswap, pre-select video mode
   if (sub === 'vid-faceswap') { const t = $('fs-type'); if (t) { t.value='video'; fsFaceSwapTypeChange(); } }
   if (sub === 'vid-outfit')   { const t = $('ot-type'); if (t) { t.value='video'; otOutfitTypeChange(); } }
+  if (SUB_CAT[sub]) highlightSidebarForSub(sub);
 }
 
 // ─────────────────────────────────────────────────────────────────

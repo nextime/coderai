@@ -63,6 +63,7 @@ class VulkanBackend(ModelBackend):
         self.force_cuda = original_backend in ("nvidia", "cuda")  # Force CUDA if original was nvidia
         if self.force_cuda:
             print("DEBUG: GGUF model will use CUDA backend (forced by --backend nvidia)")
+        self._last_usage: dict = {}  # usage from the most recent completion call
         self._detect_chat_template()
     
     def _detect_chat_template(self):
@@ -649,6 +650,8 @@ class VulkanBackend(ModelBackend):
                 stop=stop,
                 grammar=use_grammar,
             )
+            usage = result.get('usage', {})
+            self._store_usage(usage.get('prompt_tokens', 0), usage.get('completion_tokens', 0))
             return result['choices'][0]['text']
         except Exception as e:
             # If grammar generation fails, fall back to normal generation
@@ -664,6 +667,8 @@ class VulkanBackend(ModelBackend):
                         repeat_penalty=repeat_penalty,
                         stop=stop,
                     )
+                    usage = result.get('usage', {})
+                    self._store_usage(usage.get('prompt_tokens', 0), usage.get('completion_tokens', 0))
                     return result['choices'][0]['text']
                 except Exception as e2:
                     print(f"Error during fallback generation: {e2}")
@@ -934,6 +939,112 @@ class VulkanBackend(ModelBackend):
             "n_ctx": self.n_ctx,
             "n_gpu_layers": self.n_gpu_layers,
         }
+
+    # ------------------------------------------------------------------
+    # Usage / cache helpers
+    # ------------------------------------------------------------------
+
+    def _read_cached_tokens(self, prompt_tokens: int) -> int:
+        """Extract cached token count from llama.cpp timings after a completion."""
+        try:
+            timings = getattr(self.model, 'timings', None)
+            if timings is None:
+                # Try the internal context if timings property not exposed
+                ctx = getattr(self.model, '_ctx', None)
+                if ctx and hasattr(ctx, 'timings'):
+                    timings = ctx.timings()
+            if timings is not None:
+                n_p_eval = getattr(timings, 'n_p_eval', None)
+                if n_p_eval is not None:
+                    return max(0, prompt_tokens - int(n_p_eval))
+        except Exception:
+            pass
+        return 0
+
+    def _store_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
+        cached = self._read_cached_tokens(prompt_tokens)
+        self._last_usage = {
+            'prompt_tokens': prompt_tokens,
+            'completion_tokens': completion_tokens,
+            'total_tokens': prompt_tokens + completion_tokens,
+            'cached_tokens': cached,
+        }
+
+    def get_last_usage(self) -> dict:
+        """Return usage dict from the most recent completion (includes cached_tokens)."""
+        return dict(self._last_usage)
+
+    # ------------------------------------------------------------------
+    # Chat-level generation (uses llama.cpp native chat template)
+    # ------------------------------------------------------------------
+
+    def generate_chat(self, messages, max_tokens=None, temperature=0.7, top_p=1.0,
+                      stop=None, tools=None, response_format=None):
+        """Non-streaming chat completion using llama.cpp's native chat handler."""
+        if self.model is None:
+            raise RuntimeError("Model not loaded")
+
+        kwargs = dict(
+            messages=messages,
+            max_tokens=max_tokens or 512,
+            temperature=temperature,
+            top_p=top_p,
+        )
+        if stop:
+            kwargs['stop'] = stop
+        if response_format and response_format.get('type') == 'json_object':
+            kwargs['response_format'] = {'type': 'json_object'}
+
+        result = self.model.create_chat_completion(**kwargs)
+        usage = result.get('usage', {})
+        self._store_usage(
+            prompt_tokens=usage.get('prompt_tokens', 0),
+            completion_tokens=usage.get('completion_tokens', 0),
+        )
+        content = result['choices'][0]['message'].get('content') or ''
+        return content
+
+    async def generate_chat_stream(self, messages, max_tokens=None, temperature=0.7,
+                                   top_p=1.0, stop=None, tools=None, response_format=None):
+        """Streaming chat completion using llama.cpp's native chat handler."""
+        if self.model is None:
+            raise RuntimeError("Model not loaded")
+
+        kwargs = dict(
+            messages=messages,
+            max_tokens=max_tokens or 512,
+            temperature=temperature,
+            top_p=top_p,
+            stream=True,
+        )
+        if stop:
+            kwargs['stop'] = stop
+
+        prompt_tokens = 0
+        completion_tokens = 0
+        try:
+            for chunk in self.model.create_chat_completion(**kwargs):
+                delta = chunk['choices'][0].get('delta', {})
+                text = delta.get('content') or ''
+                if text:
+                    completion_tokens += 1
+                    yield text
+                # Capture usage if present in final streaming chunk
+                if chunk.get('usage'):
+                    u = chunk['usage']
+                    prompt_tokens = u.get('prompt_tokens', 0)
+                    completion_tokens = u.get('completion_tokens', completion_tokens)
+                if chunk['choices'][0].get('finish_reason'):
+                    break
+        finally:
+            # Timings are available after the stream is exhausted
+            if prompt_tokens == 0:
+                # Estimate from word split if llama.cpp didn't report
+                prompt_tokens = sum(
+                    len(str(m.get('content', '')).split())
+                    for m in messages
+                )
+            self._store_usage(prompt_tokens, completion_tokens)
 
     def get_model_name(self) -> str:
         """Return the loaded model name."""

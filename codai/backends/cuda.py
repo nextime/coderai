@@ -17,6 +17,7 @@
 """CUDA backend using HuggingFace Transformers."""
 
 import os
+import time as _time
 from typing import Optional, List, Dict
 from threading import Thread
 from abc import ABC
@@ -53,6 +54,13 @@ class NvidiaBackend(ModelBackend):
         self.device = None
         self.use_flash_attn = False
         self.flash_attn_available = False
+        # KV prefix cache (single-entry, keyed by formatted prefix text)
+        self._kv_prefix_text: Optional[str] = None
+        self._kv_past_key_values = None   # past_key_values tensor tuple
+        self._kv_prefix_len: int = 0      # token count of the cached prefix
+        self._kv_timestamp: float = 0.0
+        self._kv_ttl: float = 300.0       # 5 min TTL
+        self._last_usage: Dict = {}
         
     def check_flash_attn_support(self) -> None:
         """Check and print Flash Attention availability status."""
@@ -872,11 +880,288 @@ class NvidiaBackend(ModelBackend):
         elif generation_error:
             yield f"\n[Error during generation: {generation_error}]"
     
+    # ------------------------------------------------------------------
+    # KV prefix cache helpers
+    # ------------------------------------------------------------------
+
+    def _kv_cache_valid(self) -> bool:
+        return (
+            self._kv_past_key_values is not None and
+            _time.time() - self._kv_timestamp < self._kv_ttl
+        )
+
+    def _build_kv_prefix(self, prefix_text: str):
+        """Forward-pass on prefix_text to populate the KV state."""
+        import torch
+        inputs = self.tokenizer(
+            prefix_text, return_tensors="pt", add_special_tokens=False
+        )
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            out = self.model(**inputs, use_cache=True, return_dict=True)
+        return out.past_key_values, int(inputs['input_ids'].shape[1])
+
+    def _store_kv(self, prefix_text: str, past_kv, prefix_len: int) -> None:
+        self._kv_prefix_text = prefix_text
+        self._kv_past_key_values = past_kv
+        self._kv_prefix_len = prefix_len
+        self._kv_timestamp = _time.time()
+
+    def invalidate_kv_cache(self) -> None:
+        """Discard the cached KV state (call on model unload/swap)."""
+        self._kv_prefix_text = None
+        self._kv_past_key_values = None
+        self._kv_prefix_len = 0
+        self._kv_timestamp = 0.0
+
+    # ------------------------------------------------------------------
+    # Usage tracking
+    # ------------------------------------------------------------------
+
+    def get_last_usage(self) -> dict:
+        return dict(self._last_usage)
+
+    # ------------------------------------------------------------------
+    # Chat-level generation (with KV prefix caching)
+    # ------------------------------------------------------------------
+
+    def _format_messages_to_str(self, messages) -> str:
+        """Convert a list of message dicts to a formatted prompt string."""
+        from codai.pydantic.textrequest import ChatMessage
+        chat_msgs = [
+            ChatMessage(**m) if isinstance(m, dict) else m
+            for m in messages
+        ]
+        return self.format_messages(chat_msgs)
+
+    def generate_chat(self, messages, max_tokens=None, temperature=0.7,
+                      top_p=1.0, stop=None, tools=None, response_format=None) -> str:
+        """
+        Non-streaming chat generation with KV prefix caching.
+
+        Detects when the current request shares a system-prompt / history
+        prefix with the previous request and reuses the cached KV state,
+        only encoding the new suffix tokens.
+        """
+        import torch
+        if max_tokens is None:
+            max_tokens = 512
+
+        full_prompt = self._format_messages_to_str(messages)
+        total_input_ids = self.tokenizer(full_prompt, return_tensors="pt")['input_ids']
+        total_prompt_len = int(total_input_ids.shape[1])
+
+        # Build prefix text (all turns except the final user turn)
+        prefix_msgs = (
+            messages[:-1]
+            if messages and messages[-1].get('role') == 'user'
+            else []
+        )
+
+        past_kv = None
+        cached_len = 0
+
+        if prefix_msgs:
+            prefix_text = self._format_messages_to_str(prefix_msgs)
+            if self._kv_cache_valid() and self._kv_prefix_text == prefix_text:
+                past_kv = self._kv_past_key_values
+                cached_len = self._kv_prefix_len
+            else:
+                try:
+                    past_kv, cached_len = self._build_kv_prefix(prefix_text)
+                    self._store_kv(prefix_text, past_kv, cached_len)
+                except Exception as e:
+                    print(f"Warning: KV prefix cache build failed: {e}")
+                    past_kv, cached_len = None, 0
+
+        temperature, top_p, do_sample = self._validate_params(temperature, top_p)
+        gen_kwargs = dict(
+            max_new_tokens=max_tokens,
+            temperature=temperature if do_sample else None,
+            top_p=top_p if do_sample else None,
+            do_sample=do_sample,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+            use_cache=True,
+        )
+
+        generated_text = ""
+        try:
+            total_input_ids = total_input_ids.to(self.model.device)
+            if past_kv is not None and 0 < cached_len < total_prompt_len:
+                suffix_ids = total_input_ids[:, cached_len:]
+                full_attn = torch.ones(
+                    1, total_prompt_len, dtype=torch.long, device=self.model.device
+                )
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        input_ids=suffix_ids,
+                        past_key_values=past_kv,
+                        attention_mask=full_attn,
+                        **gen_kwargs,
+                    )
+                new_tokens = outputs[0][suffix_ids.shape[1]:]
+            else:
+                cached_len = 0
+                attn_mask = torch.ones_like(total_input_ids)
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        input_ids=total_input_ids,
+                        attention_mask=attn_mask,
+                        **gen_kwargs,
+                    )
+                new_tokens = outputs[0][total_prompt_len:]
+            generated_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        except Exception as e:
+            print(f"Warning: KV-cached generate_chat failed ({e}), retrying without cache")
+            cached_len = 0
+            try:
+                total_input_ids = self.tokenizer(
+                    full_prompt, return_tensors="pt"
+                )['input_ids'].to(self.model.device)
+                attn_mask = torch.ones_like(total_input_ids)
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        input_ids=total_input_ids,
+                        attention_mask=attn_mask,
+                        **gen_kwargs,
+                    )
+                new_tokens = outputs[0][total_prompt_len:]
+                generated_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+            except Exception as e2:
+                print(f"Error: generate_chat fallback failed: {e2}")
+                generated_text = ""
+
+        try:
+            comp_len = len(self.tokenizer.encode(generated_text)) if generated_text else 0
+        except Exception:
+            comp_len = len(generated_text.split())
+
+        self._last_usage = {
+            'prompt_tokens': total_prompt_len,
+            'completion_tokens': comp_len,
+            'cached_tokens': cached_len,
+        }
+        return generated_text
+
+    async def generate_chat_stream(self, messages, max_tokens=None,
+                                   temperature=0.7, top_p=1.0, stop=None,
+                                   tools=None, response_format=None):
+        """
+        Streaming chat generation with KV prefix caching.
+        Uses the same prefix-cache strategy as generate_chat.
+        """
+        import torch
+        from transformers import TextIteratorStreamer, StoppingCriteria, StoppingCriteriaList
+        from threading import Thread
+
+        if max_tokens is None:
+            max_tokens = 512
+
+        full_prompt = self._format_messages_to_str(messages)
+        total_input_ids = self.tokenizer(full_prompt, return_tensors="pt")['input_ids']
+        total_prompt_len = int(total_input_ids.shape[1])
+
+        prefix_msgs = (
+            messages[:-1]
+            if messages and messages[-1].get('role') == 'user'
+            else []
+        )
+        past_kv = None
+        cached_len = 0
+
+        if prefix_msgs:
+            prefix_text = self._format_messages_to_str(prefix_msgs)
+            if self._kv_cache_valid() and self._kv_prefix_text == prefix_text:
+                past_kv = self._kv_past_key_values
+                cached_len = self._kv_prefix_len
+            else:
+                try:
+                    past_kv, cached_len = self._build_kv_prefix(prefix_text)
+                    self._store_kv(prefix_text, past_kv, cached_len)
+                except Exception as e:
+                    print(f"Warning: KV prefix cache build failed (stream): {e}")
+                    past_kv, cached_len = None, 0
+
+        temperature, top_p, do_sample = self._validate_params(temperature, top_p)
+
+        total_input_ids = total_input_ids.to(self.model.device)
+        if past_kv is not None and 0 < cached_len < total_prompt_len:
+            gen_input_ids = total_input_ids[:, cached_len:]
+            full_attn = torch.ones(
+                1, total_prompt_len, dtype=torch.long, device=self.model.device
+            )
+            extra_gen = {'past_key_values': past_kv, 'attention_mask': full_attn}
+        else:
+            cached_len = 0
+            gen_input_ids = total_input_ids
+            extra_gen = {'attention_mask': torch.ones_like(total_input_ids)}
+
+        streamer = TextIteratorStreamer(
+            self.tokenizer, skip_prompt=True, skip_special_tokens=True
+        )
+
+        gen_kwargs = dict(
+            input_ids=gen_input_ids,
+            max_new_tokens=max_tokens,
+            temperature=temperature if do_sample else None,
+            top_p=top_p if do_sample else None,
+            do_sample=do_sample,
+            streamer=streamer,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+            use_cache=True,
+            **extra_gen,
+        )
+
+        if stop:
+            class _StopOnSeq(StoppingCriteria):
+                def __init__(self, seqs, tok):
+                    self.seqs = seqs
+                    self.tok = tok
+                def __call__(self, input_ids, scores, **kw):
+                    decoded = self.tok.decode(input_ids[0][-20:], skip_special_tokens=True)
+                    return any(s in decoded for s in self.seqs)
+            gen_kwargs['stopping_criteria'] = StoppingCriteriaList(
+                [_StopOnSeq(stop, self.tokenizer)]
+            )
+
+        gen_error = [None]
+        comp_tokens = [0]
+
+        def _run():
+            try:
+                with torch.no_grad():
+                    self.model.generate(**gen_kwargs)
+            except Exception as e:
+                gen_error[0] = str(e)
+
+        thread = Thread(target=_run)
+        thread.start()
+
+        try:
+            for text in streamer:
+                comp_tokens[0] += 1
+                yield text
+        except Exception as e:
+            print(f"Error during KV-cached stream iteration: {e}")
+        finally:
+            thread.join()
+            self._last_usage = {
+                'prompt_tokens': total_prompt_len,
+                'completion_tokens': comp_tokens[0],
+                'cached_tokens': cached_len,
+            }
+
+        if gen_error[0]:
+            print(f"Warning: KV-cached stream generation error: {gen_error[0]}")
+
     def get_model_name(self) -> str:
         return self.model_name or "unknown"
     
     def cleanup(self) -> None:
         import torch
+        self.invalidate_kv_cache()
         if self.model is not None:
             del self.model
             del self.tokenizer

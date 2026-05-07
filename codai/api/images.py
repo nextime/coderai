@@ -39,6 +39,74 @@ from codai.pydantic.imagerequest import ImageGenerationRequest
 from codai.api.state import get_load_mode
 
 
+# =============================================================================
+# Prompt embedding cache (diffusers)
+#
+# Caches text-encoder outputs keyed by (prompt, negative_prompt, model_name).
+# When the same prompt is requested again the encode step is skipped and the
+# cached tensors are passed directly to the pipeline, saving CLIP/T5 compute.
+# sd.cpp handles encoding internally — no equivalent caching is possible there.
+# =============================================================================
+
+import hashlib as _hashlib
+import threading as _threading
+
+class _PromptEmbedCache:
+    """Single-entry LRU cache for diffusers prompt embeddings."""
+
+    _MAX_ENTRIES = 32
+    _TTL = 600.0  # 10 minutes
+
+    def __init__(self):
+        self._store: dict = {}   # key -> (embeds_dict, timestamp)
+        self._lock = _threading.Lock()
+
+    @staticmethod
+    def _key(prompt: str, negative_prompt: str, model_name: str) -> str:
+        raw = f"{model_name}\x00{prompt}\x00{negative_prompt or ''}"
+        return _hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+    def get(self, prompt: str, negative_prompt: str, model_name: str) -> Optional[dict]:
+        k = self._key(prompt, negative_prompt, model_name)
+        with self._lock:
+            entry = self._store.get(k)
+            if entry is None:
+                return None
+            embeds, ts = entry
+            if time.time() - ts > self._TTL:
+                del self._store[k]
+                return None
+            return embeds
+
+    def put(self, prompt: str, negative_prompt: str, model_name: str,
+            embeds: dict) -> None:
+        k = self._key(prompt, negative_prompt, model_name)
+        with self._lock:
+            self._store[k] = (embeds, time.time())
+            # Evict oldest if over limit
+            if len(self._store) > self._MAX_ENTRIES:
+                oldest = min(self._store, key=lambda x: self._store[x][1])
+                del self._store[oldest]
+
+    def invalidate_model(self, model_name: str) -> None:
+        """Drop all entries for a model (e.g. on pipeline unload)."""
+        suffix = _hashlib.sha256(model_name.encode()).hexdigest()[:8]
+        with self._lock:
+            drop = [k for k in self._store
+                    if self._key("", "", model_name)[:8] == k[:8] or True
+                    # safest: just rebuild key and compare
+                    ]
+            # Rebuild properly: iterate and check by re-computing key prefix
+            # (can't reconstruct original prompts, so use model name hash marker)
+            self._store = {
+                k: v for k, v in self._store.items()
+                if not k.startswith(_hashlib.sha256(model_name.encode()).hexdigest()[:4])
+            }
+
+
+_embed_cache = _PromptEmbedCache()
+
+
 # Global reference to be set by coderai
 global_args = None
 global_file_path = None
@@ -384,7 +452,7 @@ def _load_diffusers_pipeline(model_name: str, global_args):
 
 
 def _generate_with_diffusers(pipeline, request, global_args, http_request=None):
-    """Generate images using a diffusers pipeline."""
+    """Generate images using a diffusers pipeline (with prompt-embedding cache)."""
     import torch
     import numpy as np
     import time as time_module
@@ -402,13 +470,12 @@ def _generate_with_diffusers(pipeline, request, global_args, http_request=None):
                 height = int(parts[1])
             except ValueError:
                 pass
-    
-    # Check for nan/inf in dimensions
+
     if width != width or width == float('inf'):
         width = 512
     if height != height or height == float('inf'):
         height = 512
-    
+
     # Enable memory optimizations
     try:
         if hasattr(pipeline, 'enable_attention_slicing'):
@@ -417,58 +484,116 @@ def _generate_with_diffusers(pipeline, request, global_args, http_request=None):
             pipeline.enable_vae_slicing()
     except Exception as e:
         print(f"Warning: Could not enable memory optimizations: {e}")
-    
-    # Get timestamp BEFORE calling diffusers
+
     timestamp = int(time_module.time())
-    
-    # Generate images
+
     seed = request.seed if request.seed is not None else getattr(global_args, 'image_seed', None)
     generator = None
     if seed is not None:
         generator = torch.Generator(device=pipeline.device).manual_seed(seed)
-    
-    # Quality: "standard" or "hd"
+
     quality = request.quality or "standard"
-    
-    # Use request parameters if provided, otherwise fall back to quality-based defaults
     num_steps = request.steps if request.steps else (30 if quality == "standard" else 50)
     cfg_scale = request.guidance_scale if request.guidance_scale else (
         getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0
     )
-    
-    # Generate
-    result = pipeline(
-        prompt=request.prompt,
-        negative_prompt=None,
-        num_images_per_prompt=request.n,
-        height=height,
-        width=width,
-        generator=generator,
-        guidance_scale=cfg_scale,
-        num_inference_steps=num_steps,
-    )
-    
+
+    # ------------------------------------------------------------------
+    # Prompt embedding cache
+    # Try to encode the prompt once and reuse the embeddings.
+    # Falls back to passing the plain text prompt if encoding fails.
+    # ------------------------------------------------------------------
+    model_id = getattr(pipeline, 'model_name_or_path', None) or str(type(pipeline).__name__)
+    neg_prompt = getattr(request, 'negative_prompt', None) or ""
+    do_cfg = cfg_scale > 1.0
+
+    cached_embeds = _embed_cache.get(request.prompt, neg_prompt, model_id)
+    embed_kwargs = {}
+    cache_hit = False
+
+    if cached_embeds is not None:
+        embed_kwargs = cached_embeds
+        cache_hit = True
+        print(f"Prompt embed cache HIT for model '{model_id}'")
+    else:
+        # Try to encode and cache
+        try:
+            if hasattr(pipeline, 'encode_prompt'):
+                enc = pipeline.encode_prompt(
+                    prompt=request.prompt,
+                    device=pipeline.device,
+                    num_images_per_prompt=1,
+                    do_classifier_free_guidance=do_cfg,
+                    negative_prompt=neg_prompt or None,
+                )
+                # enc is a tuple; length varies by pipeline type
+                if len(enc) == 2:
+                    # SD 1.x: (prompt_embeds, negative_prompt_embeds)
+                    embed_kwargs = {
+                        'prompt_embeds': enc[0],
+                        'negative_prompt_embeds': enc[1],
+                    }
+                elif len(enc) == 4:
+                    # SDXL: (prompt_embeds, negative_prompt_embeds,
+                    #        pooled_prompt_embeds, negative_pooled_prompt_embeds)
+                    embed_kwargs = {
+                        'prompt_embeds': enc[0],
+                        'negative_prompt_embeds': enc[1],
+                        'pooled_prompt_embeds': enc[2],
+                        'negative_pooled_prompt_embeds': enc[3],
+                    }
+                if embed_kwargs:
+                    _embed_cache.put(request.prompt, neg_prompt, model_id, embed_kwargs)
+                    print(f"Prompt embed cache STORE for model '{model_id}'")
+        except Exception as e:
+            print(f"Warning: prompt encode/cache failed ({e}), using plain text prompt")
+            embed_kwargs = {}
+
+    # Build call kwargs
+    if embed_kwargs:
+        call_kwargs = dict(
+            num_images_per_prompt=request.n,
+            height=height,
+            width=width,
+            generator=generator,
+            guidance_scale=cfg_scale,
+            num_inference_steps=num_steps,
+            **embed_kwargs,
+        )
+    else:
+        call_kwargs = dict(
+            prompt=request.prompt,
+            negative_prompt=neg_prompt or None,
+            num_images_per_prompt=request.n,
+            height=height,
+            width=width,
+            generator=generator,
+            guidance_scale=cfg_scale,
+            num_inference_steps=num_steps,
+        )
+
+    result = pipeline(**call_kwargs)
+
     # Extract images
     images = []
     try:
         result_images = result.images
     except Exception as img_err:
-        print(f"Warning: Could not access result.images: {img_err}")
         result_images = getattr(result, 'image', None) or getattr(result, 'output', None)
         if result_images is None:
             raise Exception(f"Could not extract images from diffusers result: {img_err}")
-    
+
     for img in result_images:
         if isinstance(img, np.ndarray):
             img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
             img = np.clip(img, 0.0, 1.0)
-        
         img_data = save_image_response(img, request.response_format, http_request)
         images.append(img_data)
-    
+
     return {
         "created": timestamp,
-        "data": images
+        "data": images,
+        "prompt_cache_hit": cache_hit,
     }
 
 

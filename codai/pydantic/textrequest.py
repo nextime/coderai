@@ -39,6 +39,7 @@ class ChatMessage(BaseModel):
     name: Optional[str] = None
     tool_calls: Optional[List[Dict]] = None
     tool_call_id: Optional[str] = None
+    cache_control: Optional[Dict] = None  # OpenAI-style: {"type": "ephemeral"}
     
     @field_validator('content', mode='before')
     @classmethod

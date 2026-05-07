@@ -13,6 +13,14 @@ An OpenAI-compatible API server to run models on your local GPU with web adminis
 - **Multi-Modal**: Text, image, video, audio, TTS, STT, embeddings
 - **Per-Model Configuration**: Individual settings for each model (GPU layers, quantization, context size)
 - **On-Demand Loading**: Models load automatically when requested, unload when idle
+- **Memory Management**: Smart VRAM → RAM → Disk offloading for efficient resource usage
+- **Parallel Execution**: Run multiple models simultaneously (VRAM permitting)
+- **Auto-Swap**: Automatic model switching on request — load what's needed, unload what's idle
+- **Request Queue**: Concurrent requests are queued and processed in order per model
+- **Prompt Caching**: Reuse KV cache across requests to reduce latency and computation
+- **Prompt Aggregation**: Batch concurrent requests into a single inference pass for higher throughput
+- **Custom Pipelines**: Create and save multi-step workflows combining any generation tasks
+- **Pre-Built Pipelines**: Ready-to-use pipelines for common workflows (image-to-video, dubbing, story generation)
 
 ### GPU Backend Support
 - **NVIDIA (CUDA)**: PyTorch + Transformers for HuggingFace models
