@@ -499,6 +499,8 @@ class MultiModelManager:
         self.model_aliases: Dict[str, str] = {}
         self.whisper_server: Optional[WhisperServerManager] = None  # legacy single-instance compat
         self.whisper_servers: Dict[str, WhisperServerManager] = {}  # id -> manager
+        self.whisper_aliases: Dict[str, List[str]] = {}  # alias -> [model_id, ...]
+        self._whisper_alias_counters: Dict[str, int] = {}  # alias -> next round-robin index
         self.model_backend_types: Dict[str, str] = {}
         self.tool_breaker = FuzzyToolBreaker(threshold=3)  # Circuit breaker for repetitive tool calls
         self._load_lock = threading.Lock()  # Prevents duplicate on-demand model loads
@@ -761,7 +763,8 @@ class MultiModelManager:
             print(f"Audio model '{model_name}' cached as: {resolved_model}")
 
     def register_whisper_server(self, model_id: str, server_path: str, model_path: str = None,
-                                 port: int = 8744, gpu_device: int = 0, config: Dict = None):
+                                 port: int = 8744, gpu_device: int = 0, config: Dict = None,
+                                 alias: str = None):
         """Register a whisper-server instance as an audio model."""
         wsm = WhisperServerManager(server_path=server_path, port=port)
         wsm._model_path = model_path
@@ -776,8 +779,25 @@ class MultiModelManager:
         if model_id not in self.audio_models:
             self.audio_models.append(model_id)
         self.config[f"audio:{model_id}"] = cfg
-        print(f"Registered whisper-server audio model: {model_id} (server: {server_path})")
+        # Register alias for round-robin routing
+        if alias:
+            wsm._alias = alias
+            ids = self.whisper_aliases.setdefault(alias, [])
+            if model_id not in ids:
+                ids.append(model_id)
+            self._whisper_alias_counters.setdefault(alias, 0)
+        print(f"Registered whisper-server audio model: {model_id} (server: {server_path})"
+              + (f" alias={alias}" if alias else ""))
         return wsm
+
+    def resolve_whisper_alias(self, name: str) -> Optional[WhisperServerManager]:
+        """Return the next round-robin WhisperServerManager for an alias, or None."""
+        ids = self.whisper_aliases.get(name)
+        if not ids:
+            return None
+        idx = self._whisper_alias_counters.get(name, 0) % len(ids)
+        self._whisper_alias_counters[name] = idx + 1
+        return self.whisper_servers.get(ids[idx])
     
     def set_tts_model(self, model_name: str, config: Dict = None):
         """Set the text-to-speech model and download/cache it if needed."""
@@ -2033,6 +2053,8 @@ class MultiModelManager:
                 capabilities=caps.to_list(),
                 backend=meta.get("backend"),
                 model_path=meta.get("model_path"),
+                server_path=meta.get("server_path"),
+                alias=meta.get("alias"),
                 port=meta.get("port"),
                 gpu_device=meta.get("gpu_device"),
                 load_mode=meta.get("load_mode"),
@@ -2051,13 +2073,19 @@ class MultiModelManager:
                         if isinstance(m, str):
                             mid = m
                         else:
-                            mid = m.get("alias") or m.get("path") or m.get("id") or ""
                             raw = m.get("path") or m.get("id") or ""
-                            if raw and raw != mid:
-                                _add(raw, mtype, m)
-                                short = raw.split("/")[-1] if "/" in raw else raw
-                                if short != raw:
-                                    _add(short, mtype, m)
+                            alias = m.get("alias") or ""
+                            # whisper-server aliases are round-robin group keys shared across
+                            # multiple instances — don't expose the alias as a separate model
+                            if m.get("backend") == "whisper-server":
+                                mid = raw
+                            else:
+                                mid = alias or raw
+                                if raw and raw != mid:
+                                    _add(raw, mtype, m)
+                                    short = raw.split("/")[-1] if "/" in raw else raw
+                                    if short != raw:
+                                        _add(short, mtype, m)
                         if mid:
                             _add(mid, mtype, m if isinstance(m, dict) else None)
                             short = mid.split("/")[-1] if "/" in mid else mid

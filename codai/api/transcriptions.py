@@ -134,8 +134,12 @@ async def create_transcription(
     if len(file_content) > _MAX_AUDIO_BYTES:
         raise HTTPException(status_code=413, detail="Audio file too large (max 100 MB)")
 
-    # Check if the requested model maps to a configured whisper-server instance first
-    whisper_server = multi_model_manager.whisper_servers.get(model)
+    # Check if the requested model maps to a configured whisper-server instance first.
+    # Try alias round-robin resolution before direct ID lookup.
+    whisper_server = (
+        multi_model_manager.resolve_whisper_alias(model)
+        or multi_model_manager.whisper_servers.get(model)
+    )
     if whisper_server is not None:
         multi_model_manager.request_model(requested_model=model, model_type="audio")
         if not whisper_server.is_running():

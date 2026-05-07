@@ -79,11 +79,19 @@ async function poll() {
 
     const loaded = d.loaded_models || [];
     const enabled = d.enabled_models || [];
+    const aliases = d.enabled_aliases || {};
     const loadedSet = new Set(loaded);
     const notLoaded = enabled.filter(m => !loadedSet.has(m));
     let html = '';
     if(loaded.length) html += loaded.map(m => `<span class="badge badge-admin" style="margin:.125rem" title="Loaded">● ${m}</span>`).join('');
     if(notLoaded.length) html += notLoaded.map(m => `<span class="badge" style="margin:.125rem;opacity:.55" title="Enabled, not loaded">○ ${m}</span>`).join('');
+    const aliasEntries = Object.entries(aliases);
+    if(aliasEntries.length) {
+      html += aliasEntries.map(([alias, ids]) => {
+        const tip = ids.length > 1 ? `Round-robin alias → ${ids.join(', ')}` : `Alias → ${ids[0] || ''}`;
+        return `<span class="badge" style="margin:.125rem;background:var(--bg);border:1px solid var(--border);color:var(--text-2)" title="${tip}">⇄ ${alias}</span>`;
+      }).join('');
+    }
     document.getElementById('active-models').innerHTML = html || '<span class="muted small">No models loaded</span>';
 
     if (d.vram) {

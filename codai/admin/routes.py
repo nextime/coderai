@@ -338,17 +338,27 @@ async def api_status(username: str = Depends(require_auth)):
     except Exception:
         pass
 
-    # Enabled (configured) models
+    # Enabled (configured) models + aliases
     enabled_models = []
+    enabled_aliases: dict = {}  # alias -> [model_id, ...]
     try:
         if config_manager:
             md = config_manager.models_data
             for cat in ("text_models", "image_models", "audio_models", "vision_models", "tts_models",
                         "video_models", "audio_gen_models", "embedding_models"):
                 for m in md.get(cat, []):
-                    mid = (m.get("path") or m.get("id") or m) if isinstance(m, dict) else m
+                    if isinstance(m, dict):
+                        mid = m.get("path") or m.get("id") or ""
+                        alias = (m.get("alias") or "").strip()
+                    else:
+                        mid = m
+                        alias = ""
                     if mid and mid not in enabled_models:
                         enabled_models.append(mid)
+                    if alias:
+                        enabled_aliases.setdefault(alias, [])
+                        if mid and mid not in enabled_aliases[alias]:
+                            enabled_aliases[alias].append(mid)
     except Exception:
         pass
 
@@ -399,6 +409,7 @@ async def api_status(username: str = Depends(require_auth)):
         "models_loaded": len(loaded_keys),
         "loaded_models": loaded_keys,
         "enabled_models": enabled_models,
+        "enabled_aliases": enabled_aliases,
         "vram": vram,
         "cuda": is_cuda,
         "requests": {
@@ -1356,13 +1367,13 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         gpu_device = int(data.get("gpu_device", 0))
         if gpu_device < 0:
             raise HTTPException(status_code=400, detail="gpu_device must be >= 0")
-        for existing in config_manager.models_data.get("audio_models", []):
-            if (
-                isinstance(existing, dict)
-                and existing.get("backend") == "whisper-server"
-                and existing.get("id") == model_id
-            ):
-                raise HTTPException(status_code=409, detail=f"whisper-server model '{model_id}' already exists")
+        # Remove existing entry with same id (update semantics)
+        audio_list = config_manager.models_data.get("audio_models", [])
+        config_manager.models_data["audio_models"] = [
+            m for m in audio_list
+            if not (isinstance(m, dict) and m.get("id") == model_id)
+        ]
+        alias = (data.get("alias") or "").strip() or None
         entry = {
             "id": model_id,
             "backend": "whisper-server",
@@ -1374,11 +1385,16 @@ async def api_model_configure(request: Request, username: str = Depends(require_
             "model_type": "audio_models",
             "model_types": ["audio_models"],
         }
+        if alias:
+            entry["alias"] = alias
         if data.get("used_vram_gb") is not None:
             entry["used_vram_gb"] = data["used_vram_gb"]
         config_manager.models_data.setdefault("audio_models", []).append(entry)
         config_manager.save_models()
-        return {"success": True, "model_id": model_id, "model_path": model_path, "server_path": server_path}
+        result = {"success": True, "model_id": model_id, "model_path": model_path, "server_path": server_path}
+        if alias:
+            result["alias"] = alias
+        return result
     path = data.get("path") or data.get("model_id", "")
     valid = {"text_models", "image_models", "audio_models", "tts_models", "vision_models", "video_models",
              "audio_gen_models", "embedding_models"}

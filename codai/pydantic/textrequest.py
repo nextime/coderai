@@ -123,6 +123,8 @@ class ModelInfo(BaseModel):
     capabilities: Optional[List[str]] = None  # list of capability strings
     backend: Optional[str] = None
     model_path: Optional[str] = None
+    server_path: Optional[str] = None
+    alias: Optional[str] = None
     port: Optional[int] = None
     gpu_device: Optional[int] = None
     load_mode: Optional[str] = None

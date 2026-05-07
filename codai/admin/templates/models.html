@@ -118,10 +118,10 @@
     </div>
     <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.75rem;margin-top:.75rem">
       <input id="ws-used-vram" class="form-input" type="number" min="0" step="0.1" placeholder="Used VRAM (optional)">
-      <div></div>
+      <input id="ws-alias" class="form-input" placeholder="Alias (optional, e.g. whisper)">
     </div>
     <div class="form-actions" style="margin-top:.75rem">
-      <button class="btn btn-primary" onclick="addWhisperServerModel()">Add model</button>
+      <button class="btn btn-primary" id="ws-submit-btn" onclick="addWhisperServerModel()">Add model</button>
     </div>
   </div>
 </div>
@@ -324,6 +324,69 @@
           <span id="upload-pct">0%</span>
           <span id="upload-status">—</span>
         </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Whisper-server edit modal -->
+<div id="ws-edit-modal" class="modal">
+  <div class="modal-box" style="max-width:520px">
+    <div class="modal-head">
+      <span class="modal-title">Edit whisper-server model</span>
+      <button class="modal-close" onclick="closeModal('ws-edit-modal')">×</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="wse-model-id">
+      <div class="form-row">
+        <label class="form-label">Model ID</label>
+        <div id="wse-id-label" style="font-size:12px;font-family:monospace;color:var(--text-2);padding:.3rem 0"></div>
+      </div>
+      <div class="form-row">
+        <label class="form-label">Alias <span class="muted small">(optional — shared by multiple instances for round-robin)</span></label>
+        <input id="wse-alias" class="form-input" placeholder="e.g. whisper">
+      </div>
+      <div class="form-row">
+        <label class="form-label">Server path</label>
+        <input id="wse-server-path" class="form-input" placeholder="/usr/local/bin/whisper-server">
+      </div>
+      <div class="form-row">
+        <label class="form-label">Model source</label>
+        <select id="wse-model-source" class="form-input" onchange="toggleWseModelSource()">
+          <option value="cached-gguf">Downloaded GGUF</option>
+          <option value="manual-path">Manual path</option>
+        </select>
+      </div>
+      <div class="form-row" id="wse-gguf-row">
+        <label class="form-label">Downloaded GGUF</label>
+        <select id="wse-gguf-select" class="form-input">
+          <option value="">Select downloaded GGUF</option>
+        </select>
+      </div>
+      <div class="form-row" id="wse-path-row" style="display:none">
+        <label class="form-label">Model path</label>
+        <input id="wse-model-path" class="form-input" placeholder="/path/to/ggml-model.bin">
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.75rem">
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Port</label>
+          <input id="wse-port" class="form-input" type="number" min="1" max="65535">
+        </div>
+        <div class="form-row" style="margin:0">
+          <label class="form-label">GPU device</label>
+          <input id="wse-gpu-device" class="form-input" type="number" min="0">
+        </div>
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Load mode</label>
+          <select id="wse-load-mode" class="form-input">
+            <option value="on-request">On request</option>
+            <option value="load">Load</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-actions" style="margin-top:1rem">
+        <button class="btn btn-primary" onclick="saveWhisperServerEdit()">Save</button>
+        <button class="btn btn-ghost" onclick="closeModal('ws-edit-modal')">Cancel</button>
       </div>
     </div>
   </div>
@@ -1037,20 +1100,21 @@ function _renderWhisperServerRows(models){
       size_gb:0,
       defaultType:'audio_models',
       settings:{
-        backend:m.backend || 'whisper-server',
-        load_mode:m.load_mode || 'on-request',
-        model_type:'audio_models',
-        model_path:m.model_path || '',
-        port:m.port,
-        gpu_device:m.gpu_device,
+        backend: m.backend || 'whisper-server',
+        load_mode: m.load_mode || 'on-request',
+        model_type: 'audio_models',
+        model_path: m.model_path || '',
+        server_path: m.server_path || '',
+        alias: m.alias || '',
+        port: m.port ?? 8744,
+        gpu_device: m.gpu_device ?? 0,
       },
       in_config:true,
       capabilities:m.capabilities || ['speech_to_text']
     });
     const loaded = _loadedKeys.has(`audio:${m.id}`) || _loadedKeys.has(m.id);
     return `<tr style="border-top:1px solid var(--border)">
-      <td style="padding:.4rem .25rem;font-family:monospace;font-size:12px">${esc(m.id)}</td>
-      <td style="padding:.4rem .25rem"><span class="badge badge-ok">${esc(m.backend || 'whisper-server')}</span></td>
+      <td style="padding:.4rem .25rem;font-family:monospace;font-size:12px">${esc(m.id)}${m.alias?`<br><span style="color:var(--text-2);font-size:10px">alias: ${esc(m.alias)}</span>`:''}</td>
       <td style="padding:.4rem .25rem;font-size:11px;color:var(--text-2);max-width:160px;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;line-height:1.25;max-height:2.5em" title="${esc(m.model_path || "—")}">${esc(m.model_path || "—")}</td>
       <td style="padding:.4rem .25rem;font-size:11px;color:var(--text-2)">${m.port ?? '—'} / GPU ${m.gpu_device ?? 0}</td>
       <td style="padding:.4rem .25rem;font-size:11px;color:var(--text-2)">${esc(m.load_mode || 'on-request')}</td>
@@ -1059,7 +1123,7 @@ function _renderWhisperServerRows(models){
         ${loaded
           ?`<button class="btn btn-ghost btn-sm" onclick="unloadModel(${idx})">Unload</button>`
           :`<button class="btn btn-primary btn-sm" onclick="loadModel(${idx})">Load now</button>`}
-        <button class="btn btn-secondary btn-sm" onclick="openCfgModal(${idx})">Configure</button>
+        <button class="btn btn-secondary btn-sm" onclick="openCfgModal(${idx})">Edit</button>
         <button class="btn btn-ghost btn-sm" onclick="disableModel(${idx})">Remove</button>
       </td>
     </tr>`;
@@ -1068,8 +1132,7 @@ function _renderWhisperServerRows(models){
     '<div class="card-title">Configured whisper-server models</div>'+
     '<table style="width:100%;border-collapse:collapse;font-size:13px">'+
     '<thead><tr style="color:var(--text-2);font-size:10px;text-transform:uppercase;letter-spacing:.05em">'+
-    '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Model</th>'+
-    '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Backend</th>'+
+    '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Model / Alias</th>'+
     '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Model path</th>'+
     '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Port / GPU</th>'+
     '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Load mode</th>'+
@@ -1234,7 +1297,6 @@ async function loadCachedModels(){
         '<th style="text-align:center;padding:.3rem .25rem;font-weight:700">Config</th>'+
         '<th></th></tr></thead><tbody>'+rows.join('')+'</tbody></table>';
     }
-    ggufEl.insertAdjacentHTML('afterend', _renderWhisperServerRows(whisperModels));
     // Remove any previously rendered whisper-server card before inserting the new one
     document.querySelectorAll('#ws-rendered-card').forEach(el=>el.remove());
     const wsHtml = _renderWhisperServerRows(whisperModels);
@@ -1363,8 +1425,81 @@ function onCfgQuantChange(){
   document.getElementById('cfg-id-label').textContent = m.label;
 }
 
+function toggleWseModelSource() {
+  const source = document.getElementById('wse-model-source').value;
+  document.getElementById('wse-gguf-row').style.display = source === 'cached-gguf' ? '' : 'none';
+  document.getElementById('wse-path-row').style.display = source === 'manual-path' ? '' : 'none';
+}
+
+function _getWseModelPath() {
+  const source = document.getElementById('wse-model-source').value;
+  return source === 'cached-gguf'
+    ? document.getElementById('wse-gguf-select').value
+    : document.getElementById('wse-model-path').value.trim();
+}
+
+function _openWhisperServerEdit(m) {
+  const s = m.settings || {};
+  document.getElementById('wse-model-id').value = m.path;
+  document.getElementById('wse-id-label').textContent = m.path;
+  document.getElementById('wse-alias').value = s.alias || '';
+  document.getElementById('wse-server-path').value = s.server_path || defaultWhisperServerPath();
+  document.getElementById('wse-port').value = s.port ?? 8744;
+  document.getElementById('wse-gpu-device').value = s.gpu_device ?? 0;
+  document.getElementById('wse-load-mode').value = s.load_mode || 'on-request';
+
+  // Populate the GGUF select with current options from the add-form's list
+  const srcSelect = document.getElementById('ws-gguf-select');
+  const dstSelect = document.getElementById('wse-gguf-select');
+  dstSelect.innerHTML = srcSelect ? srcSelect.innerHTML : '<option value="">Select downloaded GGUF</option>';
+
+  const modelPath = s.model_path || '';
+  const inGguf = modelPath && _ggufFiles.some(f => f.path === modelPath);
+  if (inGguf) {
+    document.getElementById('wse-model-source').value = 'cached-gguf';
+    dstSelect.value = modelPath;
+  } else {
+    document.getElementById('wse-model-source').value = 'manual-path';
+    document.getElementById('wse-model-path').value = modelPath;
+  }
+  toggleWseModelSource();
+  openModal('ws-edit-modal');
+}
+
+async function saveWhisperServerEdit() {
+  const model_id = document.getElementById('wse-model-id').value;
+  const model_source = document.getElementById('wse-model-source').value;
+  const model_path = _getWseModelPath();
+  if (!model_path) { alert('Model path is required'); return; }
+  const payload = {
+    model_id,
+    backend: 'whisper-server',
+    model_source,
+    server_path: document.getElementById('wse-server-path').value.trim(),
+    model_path,
+    port: parseInt(document.getElementById('wse-port').value, 10) || 8744,
+    gpu_device: parseInt(document.getElementById('wse-gpu-device').value, 10) || 0,
+    load_mode: document.getElementById('wse-load-mode').value,
+    alias: document.getElementById('wse-alias').value.trim() || null,
+  };
+  try {
+    const r = await fetch('/admin/api/model-configure', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'Failed to save');
+    closeModal('ws-edit-modal');
+    refreshLocal();
+  } catch(e) { alert('Error: ' + e.message); }
+}
+
 function openCfgModal(idx){
   const m = _localModels[idx];
+  if (m.cacheType === 'whisper-server') {
+    _openWhisperServerEdit(m);
+    return;
+  }
   const s = m.settings || {};
   document.getElementById('cfg-modal-title').textContent = m.in_config ? 'Configure model' : 'Add to CoderAI';
   document.getElementById('cfg-id-label').textContent = m.label;
@@ -1453,9 +1588,6 @@ function openCfgModal(idx){
   document.getElementById('cfg-parser').value = s.parser || 'auto';
   document.getElementById('cfg-tools').checked = !!s.tools_closer_prompt;
   document.getElementById('cfg-grammar').checked = !!s.grammar_guided;
-  if (m.cacheType === 'whisper-server') {
-    document.getElementById('cfg-backend').value = 'cpu';
-  }
   openModal('cfg-modal');
 }
 
@@ -1533,6 +1665,7 @@ async function addWhisperServerModel(){
     gpu_device: parseInt(document.getElementById('ws-gpu-device').value, 10) || 0,
     load_mode: document.getElementById('ws-load-mode').value,
     used_vram_gb: Number.isNaN(usedVram) ? null : usedVram,
+    alias: document.getElementById('ws-alias').value.trim() || null,
   };
   try{
     const r = await fetch('/admin/api/model-configure', {
@@ -1551,6 +1684,8 @@ async function addWhisperServerModel(){
     document.getElementById('ws-gpu-device').value = '0';
     document.getElementById('ws-load-mode').value = 'on-request';
     document.getElementById('ws-used-vram').value = '';
+    document.getElementById('ws-alias').value = '';
+    document.getElementById('ws-submit-btn').textContent = 'Add model';
     toggleWhisperModelSource();
     refreshLocal();
   }catch(e){ alert('Error: '+e.message); }

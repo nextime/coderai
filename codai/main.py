@@ -373,12 +373,14 @@ def main():
             continue
         if isinstance(m, dict) and m.get("backend") == "whisper-server":
             cfg = _model_cfg(m, "audio")
+            alias = (m.get("alias") or "").strip() or None
             cfg.update({
                 "backend": "whisper-server",
                 "server_path": m.get("server_path", ""),
                 "model_path": m.get("model_path") or None,
                 "port": int(m.get("port", 8744)),
                 "gpu_device": int(m.get("gpu_device", 0)),
+                "alias": alias,
             })
             multi_model_manager.register_whisper_server(
                 model_id=mid,
@@ -387,6 +389,7 @@ def main():
                 port=int(m.get("port", 8744)),
                 gpu_device=int(m.get("gpu_device", 0)),
                 config=cfg,
+                alias=alias,
             )
         else:
             multi_model_manager.set_audio_model(mid, config=_model_cfg(m, "audio"))
