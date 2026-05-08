@@ -1823,7 +1823,7 @@ async def api_hf_search(
         if effective_q:
             pairs.append(("search", effective_q))
         pairs.extend(filter_pairs)
-        pairs += [("sort", sort), ("direction", "-1"), ("limit", limit), ("full", "false")]
+        pairs += [("sort", sort), ("direction", "-1"), ("limit", limit), ("full", "true")]
         url = "https://huggingface.co/api/models?" + urllib.parse.urlencode(pairs)
         rq = urllib.request.Request(url, headers={"User-Agent": "coderai-admin/1.0"})
         def _fetch():
@@ -1857,12 +1857,14 @@ async def api_hf_search(
             merged = [m for m in merged if "gguf" not in (m.get("modelId") or m.get("id", "")).lower()]
 
         # Get VRAM info
-        vram_gb = None
+        vram_total_gb = None
+        vram_free_gb = None
         try:
             import torch
             if torch.cuda.is_available():
                 free, total = torch.cuda.mem_get_info()
-                vram_gb = round(free / 1e9, 2)
+                vram_total_gb = round(total / 1e9, 2)
+                vram_free_gb = round(free / 1e9, 2)
         except Exception:
             pass
 
@@ -1876,12 +1878,24 @@ async def api_hf_search(
             # Only cache when pipeline_tag gave us authoritative information
             if m.get("pipeline_tag"):
                 update_capability_cache(mid, caps)
+            # Estimate size from safetensors metadata when available
+            safetensors_size_gb = None
+            sf = m.get("safetensors") or {}
+            total_params = sf.get("total", 0)
+            if total_params:
+                params_by_dtype = sf.get("parameters") or {}
+                dominant = max(params_by_dtype, key=params_by_dtype.get) if params_by_dtype else "BF16"
+                bpp = {"F32": 4, "F16": 2, "BF16": 2, "F8_E4M3": 1, "F8_E5M2": 1, "I8": 1, "I4": 0.5, "U8": 1}.get(dominant, 2)
+                safetensors_size_gb = round(total_params * bpp / 1e9, 2)
+
             results.append({
                 "id": mid,
                 "downloads": m.get("downloads", 0),
                 "likes": m.get("likes", 0),
                 "pipeline_tag": m.get("pipeline_tag", ""),
-                "vram_available": vram_gb,
+                "vram_total": vram_total_gb,
+                "vram_free": vram_free_gb,
+                "safetensors_size_gb": safetensors_size_gb,
                 "capabilities": caps.to_list(),
             })
         return results

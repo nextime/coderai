@@ -674,16 +674,33 @@ let _filesCache = {};
 let _activeQuants = new Set();
 let _cachedSearchIds = new Set();  // HF repo IDs (and GGUF source_repos) cached locally
 
-function estimateModelSize(modelId){
+function estimateModelSize(modelId, safetensorsSizeGb){
+  // 1. Safetensors metadata from HF API (most accurate)
+  if(safetensorsSizeGb != null) return safetensorsSizeGb;
+
   const id = modelId.toLowerCase();
-  // Extract parameter count (e.g., 7b, 13b, 70b)
+
+  // 2. Xb parameter count in model name
   const match = id.match(/(\d+\.?\d*)b/);
-  if(!match) return 8; // default guess
-  const params = parseFloat(match[1]);
-  // Rough estimate: Q4 ≈ 0.5GB per B params, Q8 ≈ 1GB per B, FP16 ≈ 2GB per B
-  if(id.includes('q4') || id.includes('4bit')) return params * 0.5;
-  if(id.includes('q8') || id.includes('8bit')) return params * 1.0;
-  return params * 2; // assume FP16
+  if(match){
+    const params = parseFloat(match[1]);
+    if(id.includes('q4') || id.includes('4bit')) return params * 0.5;
+    if(id.includes('q8') || id.includes('8bit')) return params * 1.0;
+    return params * 2; // assume FP16
+  }
+
+  // 3. Keyword heuristics for models without a param count in their name
+  if(/\b(tiny|nano|micro)\b/.test(id)) return 0.1;
+  if(/\bsmall\b/.test(id))             return 0.3;
+  if(/\bbase\b/.test(id))              return 0.5;
+  if(/\bmedium\b/.test(id))            return 1.0;
+  if(/\blarge[-_v]/.test(id) && /v[23]/.test(id)) return 3.0; // large-v2/v3
+  if(/\blarge\b/.test(id))             return 2.0;
+  if(/\bxxl\b/.test(id))               return 10.0;
+  if(/\bxl\b/.test(id))                return 5.0;
+  if(/\bhuge\b/.test(id))              return 7.0;
+
+  return null;
 }
 
 document.getElementById('search-q').addEventListener('keydown',e=>{if(e.key==='Enter')doSearch()});
@@ -727,14 +744,18 @@ async function doSearch(){
     
     if(!_results.length){out.innerHTML='<span class="muted small">No results. Try different keywords or fewer filters.</span>';return}
     
-    const vramAvail = _results[0]?.vram_available;
-    
+    const vramTotal = _results[0]?.vram_total;
+    const vramFree  = _results[0]?.vram_free;
+
     out.innerHTML = _results.map((m,i)=>{
       let vramDot = '';
-      if(vramAvail){
-        const estSize = estimateModelSize(m.id);
-        const color = estSize <= vramAvail*0.8 ? '#10b981' : estSize <= vramAvail*0.95 ? '#f59e0b' : '#ef4444';
-        vramDot = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${color};margin-right:.35rem" title="Est. ${estSize}GB / ${vramAvail}GB available"></span>`;
+      if(vramTotal){
+        const estSize = estimateModelSize(m.id, m.safetensors_size_gb ?? null);
+        if(estSize !== null){
+          const color = estSize <= vramTotal*0.8 ? '#10b981' : estSize <= vramTotal*0.95 ? '#f59e0b' : '#ef4444';
+          const freeHint = vramFree != null ? ` — ${vramFree}GB free now` : '';
+          vramDot = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${color};margin-right:.35rem" title="Est. ~${estSize}GB / ${vramTotal}GB total${freeHint}"></span>`;
+        }
       }
       const capBadges = fmtCapabilities(m.capabilities||[]);
       const isDownloaded = _cachedSearchIds.has(m.id);
