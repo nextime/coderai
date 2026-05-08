@@ -31,7 +31,7 @@
         <a href="/admin/archive" class="nav-link {% if '/archive' in request.url.path %}active{% endif %}">Archive</a>
         <a href="/admin/settings" class="nav-link {% if '/settings' in request.url.path %}active{% endif %}">Settings</a>
         {% endif %}
-        <button class="nav-link nav-donate-btn" onclick="document.getElementById('donateModal').classList.add('show')">Donate &#9829;</button>
+        <button class="nav-link nav-donate-btn" onclick="document.getElementById('donateModal').classList.add('show')">&#9829; Donate</button>
       </div>
     </div>
     <div class="topnav-right">
@@ -67,13 +67,23 @@
             <button class="donate-copy" onclick="donateCopy('ethAddr',this)">Copy</button>
           </div>
         </div>
+        <div class="donate-coin">
+          <span class="donate-coin-label">PayPal</span>
+          <img class="donate-qr" src="https://api.qrserver.com/v1/create-qr-code/?size=160x160&color=DDE1F0&bgcolor=161820&qzone=2&data=https://paypal.me/nexlab" alt="PayPal QR code" width="160" height="160">
+          <div class="donate-addr-row">
+            <a class="donate-addr donate-paypal-link" id="ppAddr" href="https://paypal.me/nexlab" target="_blank" rel="noopener">paypal.me/nexlab</a>
+            <a class="donate-copy" href="https://paypal.me/nexlab" target="_blank" rel="noopener">Open</a>
+          </div>
+        </div>
       </div>
     </div>
   </div>
 </div>
 <script>
 function donateCopy(id, btn) {
-  navigator.clipboard.writeText(document.getElementById(id).textContent).then(function() {
+  var el = document.getElementById(id);
+  var text = el.href || el.textContent;
+  navigator.clipboard.writeText(text.trim()).then(function() {
     var orig = btn.innerHTML;
     btn.innerHTML = '&#10003;';
     setTimeout(function(){ btn.innerHTML = orig; }, 1500);

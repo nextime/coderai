@@ -17,7 +17,11 @@
 """Model capabilities module."""
 
 from dataclasses import dataclass
-from typing import List
+from threading import Lock
+from typing import List, Optional
+import json
+import os
+import time
 
 
 @dataclass
@@ -180,12 +184,22 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
         caps.video_generation = True
         return caps
 
+    # ── Image: upscaling (checked before general SD rule to catch SD-family upscalers) ──
+    if any(x in n for x in ['real-esrgan', 'esrgan', 'swinir', 'edsr',
+                              'bsrgan', 'hat-', 'dat-',
+                              'x2-upscaler', 'x4-upscaler', 'x2_upscaler', 'x4_upscaler',
+                              'latent-upscaler', 'latent_upscaler',
+                              'ldm-super-resolution', 'rcan-', 'sr3-']):
+        caps.image_upscaling = True
+        caps.image_to_image = True
+        return caps
+
     # ── Image: generation ────────────────────────────────────────────────────
     if any(x in n for x in ['inpaint', 'instruct-pix2pix', 'paint-by-example']):
         caps.inpainting = True
         caps.image_generation = True
         caps.image_to_image = True
-        caps.text_generation = True  # T2I models process text
+        caps.text_generation = True
         return caps
 
     if 'controlnet' in n:
@@ -194,14 +208,34 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
         caps.text_generation = True
         return caps
 
-    if any(x in n for x in ['stable-diffusion', 'sd15', 'sdxl', 'sd-xl',
-                              'playground', 'flux', 'kandinsky', 'deepfloyd',
-                              'pixart', 'dalle', 'waifu', 'pony',
-                              'realistic-vision', 'realistic_vision']):
+    if any(x in n for x in [
+        # Stable Diffusion family
+        'stable-diffusion', 'sd15', 'sdxl', 'sd-xl', 'sd-turbo', 'sdxl-turbo',
+        'sd3', 'stable-cascade', 'stable-zero123',
+        # Other major T2I families
+        'flux', 'flux-dev', 'flux-schnell',
+        'kandinsky', 'deepfloyd', 'pixart', 'hunyuan-dit',
+        'dalle', 'dall-e',
+        'playground', 'playgroundai',
+        'imagen', 'parti-',
+        # Community / fine-tuned SD models (common naming conventions)
+        'dreamshaper', 'dreamlike', 'juggernaut', 'revanimated',
+        'epicrealism', 'absolutereality', 'counterfeit', 'deliberate',
+        'anything-v', 'openjourney', 'realvis', 'photon-',
+        'waifu', 'pony', 'realistic-vision', 'realistic_vision',
+        'aingdiffusion', 'majicmix', 'chillout', 'ghostmix',
+        # Speed / distilled variants (turbo, lightning, hyper)
+        'image-turbo', 'image-lightning', 'image-hyper', 'image-flash',
+        'diffusion-turbo', 'diffusion-lightning',
+        # Explicit T2I naming
+        'text-to-image', 'txt2img', 'text2img', 't2i-adapter',
+        # Generic diffusion bases
+        'latent-diffusion', 'ldm-',
+    ]):
         caps.image_generation = True
         caps.image_to_image = True
-        caps.inpainting = True    # most SD/SDXL/Flux support inpainting variant
-        caps.text_generation = True  # T2I models process text
+        caps.inpainting = True    # most SD/SDXL/Flux checkpoints support inpainting via mask
+        caps.text_generation = True
         return caps
 
     # ── Image: analysis / processing ─────────────────────────────────────────
@@ -217,12 +251,6 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
         caps.image_to_text = True
         return caps
 
-    if any(x in n for x in ['real-esrgan', 'esrgan', 'swinir', 'edsr',
-                              'bsrgan', 'hat-', 'dat-']):
-        caps.image_upscaling = True
-        caps.image_to_image = True
-        return caps
-
     if any(x in n for x in ['codeformer', 'gfpgan', 'restoreformer']):
         caps.face_restoration = True
         caps.image_upscaling = True
@@ -235,20 +263,39 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
         return caps
 
     # ── Vision / multimodal LLMs ─────────────────────────────────────────────
-    if any(x in n for x in ['vision', 'vl-', '-vl', 'llava', 'qwen2-vl',
-                              'qwen-vl', 'phi-4-mini', 'pixtral', 'clip',
-                              'blip', 'internvl', 'moondream', 'idefics',
-                              'cogvlm', 'minigpt', 'flamingo']):
+    if any(x in n for x in [
+        'vision', 'vl-', '-vl', 'llava', 'llava-next', 'llavanext',
+        'qwen2-vl', 'qwen-vl', 'qwen2.5-vl',
+        'phi-4-mini', 'phi-3-vision', 'phi3-vision',
+        'pixtral', 'mistral-pixtral',
+        'clip', 'clip-vit',
+        'blip', 'blip-2', 'blip2',
+        'internvl', 'internlm-xcomposer',
+        'moondream', 'idefics', 'idefics2', 'idefics3',
+        'cogvlm', 'cogvlm2',
+        'minigpt', 'minigpt4',
+        'flamingo', 'openflamingo',
+        'paligemma', 'gemma-2-vl',
+        'deepseek-vl', 'deepseek-vl2',
+        'minicpm-v', 'minicpmv',
+        'mllm', 'multimodal',
+    ]):
         caps.image_to_text = True
         caps.text_generation = True
         return caps
 
     # ── Embeddings ───────────────────────────────────────────────────────────
-    if any(x in n for x in ['embed', 'bge-', 'e5-', 'minilm',
-                              'sentence-transformer', 'nomic-embed',
-                              'instructor-', 'gte-', 'jina-embed']):
+    if any(x in n for x in [
+        'embed', 'bge-', 'e5-', 'minilm',
+        'sentence-transformer', 'sentence-bert',
+        'nomic-embed', 'nomic-text',
+        'instructor-', 'gte-', 'jina-embed', 'jina-clip',
+        'all-mpnet', 'all-minilm', 'paraphrase-',
+        'multilingual-e5', 'multilingual-mpnet',
+        'text-embedding', 'voyage-',
+    ]):
         caps.embeddings = True
-        caps.text_generation = True  # Embedding models process text
+        caps.text_generation = True
         return caps
 
     # ── GGUF quantised text models ───────────────────────────────────────────
@@ -258,4 +305,130 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
 
     # Default: text generation
     caps.text_generation = True
+    return caps
+
+
+# ── HuggingFace pipeline_tag → capability fields ─────────────────────────────
+_PIPELINE_TAG_CAPS: dict = {
+    'text-generation':                ['text_generation'],
+    'text2text-generation':           ['text_generation'],
+    'image-to-text':                  ['image_to_text', 'text_generation'],
+    'visual-question-answering':      ['image_to_text', 'text_generation'],
+    'image-text-to-text':             ['image_to_text', 'text_generation'],
+    'text-to-image':                  ['image_generation', 'image_to_image', 'text_generation'],
+    'unconditional-image-generation': ['image_generation'],
+    'image-to-image':                 ['image_to_image'],   # sub-typed below
+    'automatic-speech-recognition':   ['speech_to_text'],
+    'audio-to-audio':                 ['audio_to_audio'],
+    'text-to-speech':                 ['text_to_speech'],
+    'text-to-audio':                  ['audio_generation'],
+    'text-to-video':                  ['video_generation', 'text_generation'],
+    'image-to-video':                 ['image_to_video'],
+    'feature-extraction':             ['embeddings', 'text_generation'],
+    'sentence-similarity':            ['embeddings', 'text_generation'],
+    'depth-estimation':               ['depth_estimation', 'image_to_text'],
+    'image-segmentation':             ['image_segmentation', 'image_to_text'],
+    'object-detection':               ['object_detection', 'image_to_text'],
+    'image-classification':           ['image_to_text'],
+    'video-classification':           ['image_to_text'],
+    'zero-shot-image-classification': ['image_to_text'],
+    'mask-generation':                ['image_segmentation', 'image_to_text'],
+}
+
+
+def detect_capabilities_from_pipeline_tag(
+    pipeline_tag: str, model_name: str = ""
+) -> ModelCapabilities:
+    """
+    Detect capabilities using the HuggingFace pipeline_tag as the primary signal,
+    supplemented by name heuristics for sub-types (e.g. upscaling vs I2I).
+    Falls back to detect_model_capabilities when tag is absent or unrecognised.
+    """
+    tag = (pipeline_tag or "").lower().strip()
+    fields = _PIPELINE_TAG_CAPS.get(tag)
+
+    if not fields:
+        return detect_model_capabilities(model_name)
+
+    caps = ModelCapabilities()
+    for f in fields:
+        if hasattr(caps, f):
+            setattr(caps, f, True)
+
+    # For generic image-to-image, use name heuristics to identify sub-type
+    if tag == 'image-to-image' and model_name:
+        name_caps = detect_model_capabilities(model_name)
+        if name_caps.image_upscaling:
+            caps.image_upscaling = True
+        if name_caps.inpainting:
+            caps.inpainting = True
+            caps.image_generation = True
+        if name_caps.face_restoration:
+            caps.face_restoration = True
+            caps.image_upscaling = True
+        if name_caps.style_transfer:
+            caps.style_transfer = True
+
+    return caps
+
+
+# ── Persistent capability cache ───────────────────────────────────────────────
+# Populated from HF search results (pipeline_tag-based, authoritative).
+# Used as first-pass during local model scans so pipeline_tag info survives offline.
+
+_CAP_CACHE_TTL = 90 * 86400  # 90 days
+_cap_cache: dict = {}
+_cap_cache_path: Optional[str] = None
+_cap_cache_lock = Lock()
+
+
+def init_capability_cache(config_dir: str) -> None:
+    """Load the on-disk capability cache. Call once at server startup."""
+    global _cap_cache, _cap_cache_path
+    _cap_cache_path = os.path.join(config_dir, "capability_cache.json")
+    try:
+        with open(_cap_cache_path) as f:
+            loaded = json.load(f)
+        now = time.time()
+        # Prune stale entries on load
+        _cap_cache = {k: v for k, v in loaded.items()
+                      if now - v.get("ts", 0) < _CAP_CACHE_TTL}
+    except Exception:
+        _cap_cache = {}
+
+
+def _flush_capability_cache() -> None:
+    if _cap_cache_path is None:
+        return
+    try:
+        with open(_cap_cache_path, "w") as f:
+            json.dump(_cap_cache, f, indent=2)
+    except Exception:
+        pass
+
+
+def update_capability_cache(model_id: str, caps: ModelCapabilities) -> None:
+    """Store authoritative (pipeline_tag-derived) capabilities and persist to disk."""
+    if not model_id:
+        return
+    with _cap_cache_lock:
+        _cap_cache[model_id] = {"caps": caps.to_list(), "ts": int(time.time())}
+        _flush_capability_cache()
+
+
+def lookup_capability_cache(model_id: str) -> Optional[ModelCapabilities]:
+    """Return cached ModelCapabilities, or None if absent or expired."""
+    if not model_id:
+        return None
+    entry = _cap_cache.get(model_id)
+    if not entry:
+        return None
+    if time.time() - entry.get("ts", 0) > _CAP_CACHE_TTL:
+        with _cap_cache_lock:
+            _cap_cache.pop(model_id, None)
+        return None
+    caps = ModelCapabilities()
+    for field in entry.get("caps", []):
+        if hasattr(caps, field):
+            setattr(caps, field, True)
     return caps

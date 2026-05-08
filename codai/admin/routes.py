@@ -54,6 +54,8 @@ def set_config_manager(mgr):
     """Set the shared ConfigManager instance."""
     global config_manager
     config_manager = mgr
+    from codai.models.capabilities import init_capability_cache
+    init_capability_cache(str(mgr.config_dir))
 
 
 def _next_whisper_server_model_id(audio_models) -> str:
@@ -859,7 +861,9 @@ def _scan_caches() -> dict:
     result: dict = {"hf": [], "gguf": []}
 
     from codai.models.cache import get_all_cache_dirs, get_model_cache_dir
-    from codai.models.capabilities import detect_model_capabilities
+    from codai.models.capabilities import (
+        detect_model_capabilities, lookup_capability_cache,
+    )
     caches = get_all_cache_dirs()
 
     # Collect configured models: key (path/id) → (settings_dict, model_type)
@@ -917,7 +921,8 @@ def _scan_caches() -> dict:
                     continue  # skip adding to hf list
 
                 cfg = configured_settings.get(repo.repo_id, ({}, None))
-                caps = detect_model_capabilities(repo.repo_id)
+                caps = (lookup_capability_cache(repo.repo_id)
+                        or detect_model_capabilities(repo.repo_id))
                 result["hf"].append({
                     "id": repo.repo_id,
                     "size_gb": round(size_bytes / 1e9, 2),
@@ -1784,7 +1789,7 @@ async def api_hf_search(
     import urllib.request
     import urllib.parse
     import json as _json
-    from codai.models.capabilities import detect_model_capabilities
+    from codai.models.capabilities import detect_capabilities_from_pipeline_tag
 
     if sort not in ("downloads", "likes", "lastModified", "createdAt"):
         sort = "downloads"
@@ -1861,17 +1866,25 @@ async def api_hf_search(
         except Exception:
             pass
 
-        return [
-            {
-                "id": m.get("modelId") or m.get("id", ""),
+        from codai.models.capabilities import update_capability_cache
+        results = []
+        for m in merged[:20]:
+            mid = m.get("modelId") or m.get("id", "")
+            caps = detect_capabilities_from_pipeline_tag(
+                m.get("pipeline_tag", ""), mid,
+            )
+            # Only cache when pipeline_tag gave us authoritative information
+            if m.get("pipeline_tag"):
+                update_capability_cache(mid, caps)
+            results.append({
+                "id": mid,
                 "downloads": m.get("downloads", 0),
                 "likes": m.get("likes", 0),
                 "pipeline_tag": m.get("pipeline_tag", ""),
                 "vram_available": vram_gb,
-                "capabilities": detect_model_capabilities(m.get("modelId") or m.get("id", "")).to_list(),
-            }
-            for m in merged[:20]
-        ]
+                "capabilities": caps.to_list(),
+            })
+        return results
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"HuggingFace API error: {e}")
 

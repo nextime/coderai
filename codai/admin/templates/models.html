@@ -640,6 +640,7 @@ function closeModal(id){document.getElementById(id).classList.remove('show')}
 
 /* ── Global settings ─────────────────────────────────── */
 let _defaultOffloadDir = './offload';
+let _highlightCap = null;  // capability to highlight in local models list (from ?local_cap= param)
 
 async function loadGlobalSettings(){
   try{
@@ -1218,7 +1219,8 @@ async function loadCachedModels(){
         const loaded = _loadedKeys.has(m.id) || [..._loadedKeys].some(k=>k.endsWith(':'+m.id)||k===m.id);
         const capBadges = fmtCapabilities(m.capabilities||[]);
         const instBadgeHf = m.in_config ? _instanceBadge([m.id], (m.settings||{}).max_instances||1) : '';
-        return `<tr style="border-top:1px solid var(--border)">
+        const hlHf = _highlightCap && (m.capabilities||[]).includes(_highlightCap);
+        return `<tr${hlHf?' class="local-cap-highlight"':''} style="border-top:1px solid var(--border)${hlHf?';background:rgba(110,207,126,.07);outline:2px solid rgba(110,207,126,.25);outline-offset:-1px':''}">
           <td style="padding:.4rem .25rem;font-family:monospace;font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(m.id)}">${esc(m.id)}</td>
           <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${fmtGB(m.size_gb)}</td>
           <td style="text-align:right;padding:.4rem .25rem;color:var(--text-2)">${m.file_count}</td>
@@ -1280,7 +1282,8 @@ async function loadCachedModels(){
               return `<span class="badge ${active?'badge-ok':'badge-user'}" style="font-size:10px;padding:.1rem .3rem;cursor:pointer" title="${esc(f.filename)}" onclick="_switchGgufQuant(${idx},${JSON.stringify(f.path)})">${esc(q||f.filename)}</span>`;
             }).join(' ')
           : '';
-        return `<tr style="border-top:1px solid var(--border)" id="gguf-row-${idx}">
+        const hlGguf = _highlightCap && files.some(f=>(f.capabilities||[]).includes(_highlightCap));
+        return `<tr${hlGguf?' class="local-cap-highlight"':''} id="gguf-row-${idx}" style="border-top:1px solid var(--border)${hlGguf?';background:rgba(110,207,126,.07);outline:2px solid rgba(110,207,126,.25);outline-offset:-1px':''}">
           <td style="padding:.4rem .25rem;font-family:monospace;font-size:11px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(primary.filename)}">${esc(base)}<br>${quantBadges}</td>
           <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${fmtGB(primary.size_gb)}</td>
           <td style="padding:.4rem .25rem;font-size:11px">${capBadges||'<span class="muted small">—</span>'}</td>
@@ -1303,6 +1306,12 @@ async function loadCachedModels(){
         '<th style="text-align:center;padding:.3rem .25rem;font-weight:700">Config</th>'+
         '<th></th></tr></thead><tbody>'+rows.join('')+'</tbody></table>';
     }
+    // Scroll to first highlighted model if a local_cap deep-link is active
+    if (_highlightCap) {
+      const first = document.querySelector('.local-cap-highlight');
+      if (first) first.scrollIntoView({behavior:'smooth', block:'center'});
+    }
+
     // Rebuild set of locally cached model IDs for search results indicator
     _cachedSearchIds.clear();
     (d.hf||[]).forEach(m => _cachedSearchIds.add(m.id));
@@ -1383,8 +1392,27 @@ loadGlobalSettings();
 refreshLocal();
 
 // ── Deep-link from Studio: /admin/models?tab=search&q=...&pipeline=...&gguf=...
+// ── or: /admin/models?local_cap=CAPABILITY — highlight local models with that capability
 (function applyDeepLink(){
   const p = new URLSearchParams(location.search);
+
+  // Local capability highlight mode
+  const localCap = p.get('local_cap');
+  if (localCap) {
+    _highlightCap = localCap;
+    const banner = document.createElement('div');
+    banner.id = 'local-cap-banner';
+    banner.style.cssText = 'background:var(--accent-s);border:1px solid rgba(99,102,241,.35);border-radius:8px;padding:.5rem .875rem;margin-bottom:.75rem;font-size:13px;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap';
+    banner.innerHTML = `<span style="color:#A5B4FC;font-weight:600">Looking for capability:</span>`
+      + `<span class="badge badge-user" style="font-size:12px">${localCap.replace(/_/g,' ')}</span>`
+      + `<span style="color:var(--text-2)">— models highlighted below can be configured to enable it</span>`
+      + `<button onclick="document.getElementById('local-cap-banner').remove();_highlightCap=null" style="margin-left:auto;background:none;border:none;color:var(--text-2);cursor:pointer;font-size:16px;line-height:1">×</button>`;
+    const tabLocal = document.getElementById('tab-local');
+    tabLocal.insertBefore(banner, tabLocal.firstChild);
+    // local tab is already active by default — no tab switch needed
+    return;
+  }
+
   if (p.get('tab') !== 'search') return;
   // Switch to the HF search tab
   const tabBtn = document.querySelector('.tab[onclick*="search"]');
@@ -1398,7 +1426,7 @@ refreshLocal();
   const pipelineEl = document.getElementById('filter-pipeline');
   if (pipelineEl && pipeline) pipelineEl.value = pipeline;
   // Set gguf mode toggle
-  const gguf = p.get('gguf') || 'gguf';
+  const gguf = p.get('gguf') || 'all';
   document.querySelectorAll('.tog-btn').forEach(btn => {
     btn.classList.toggle('on', btn.dataset.val === gguf);
     if (btn.dataset.val === gguf) btn.click();  // fires the existing toggle handler

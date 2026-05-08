@@ -2087,6 +2087,7 @@ a.dl { display:inline-block; margin-top:.4rem; }
 //  State
 // ─────────────────────────────────────────────────────────────────
 let models = [], activeModel = null, chatHistory = [], chatBusy = false, attachedImage = null;
+let _localCapSet = new Set();  // capabilities available from locally downloaded (not necessarily configured) models
 let _imgPollTimer = null;
 let _vidPollTimer = null;
 let _audPollTimer = null;
@@ -2290,28 +2291,42 @@ const STUDIO_CAPABILITIES = {
   }
 };
 // Maps a capability token to the best HuggingFace search parameters
+// NOTE: HF API `search=` is AND — keep q to one or two co-occurring terms.
+// The pipeline filter already narrows by category; q just refines within it.
 const CAP_TO_HF_SEARCH = {
-  'image_generation':    { pipeline:'text-to-image',              q:'',                   gguf:'no-gguf' },
-  'image_to_image':      { pipeline:'image-to-image',             q:'',                   gguf:'no-gguf' },
-  'inpainting':          { pipeline:'image-to-image',             q:'inpainting',         gguf:'no-gguf' },
-  'image_upscaling':     { pipeline:'image-to-image',             q:'upscale',            gguf:'no-gguf' },
-  'depth_estimation':    { pipeline:'depth-estimation',           q:'',                   gguf:'no-gguf' },
-  'image_segmentation':  { pipeline:'image-segmentation',         q:'',                   gguf:'no-gguf' },
-  'video_generation':    { pipeline:'text-to-video',              q:'',                   gguf:'no-gguf' },
-  'image_to_video':      { pipeline:'image-to-video',             q:'',                   gguf:'no-gguf' },
-  'video_to_video':      { pipeline:'',                           q:'video to video',     gguf:'no-gguf' },
-  'video_interpolation': { pipeline:'',                           q:'frame interpolation',gguf:'no-gguf' },
-  'video_upscaling':     { pipeline:'',                           q:'video upscaling',    gguf:'no-gguf' },
-  'speech_to_text':      { pipeline:'automatic-speech-recognition',q:'',                  gguf:'gguf'    },
-  'text_to_speech':      { pipeline:'text-to-speech',             q:'',                   gguf:'no-gguf' },
-  'audio_generation':    { pipeline:'text-to-audio',              q:'',                   gguf:'no-gguf' },
-  'text_generation':     { pipeline:'text-generation',            q:'',                   gguf:'gguf'    },
-  'audio_to_audio':      { pipeline:'audio-to-audio',             q:'voice conversion',   gguf:'no-gguf' },
-  'subtitle_generation': { pipeline:'automatic-speech-recognition',q:'',                  gguf:'gguf'    },
-  'image_to_3d':         { pipeline:'',                           q:'image to 3d',        gguf:'no-gguf' },
-  'video_to_3d':         { pipeline:'',                           q:'video depth 3d',     gguf:'no-gguf' },
-  'model_3d_generation': { pipeline:'',                           q:'3d generation',      gguf:'no-gguf' },
-  'model_3d_to_image':   { pipeline:'',                           q:'3d rendering',       gguf:'no-gguf' },
+  // Text / LLM
+  'text_generation':     { pipeline:'text-generation',             q:'instruct',                gguf:'gguf'    },
+  'embeddings':          { pipeline:'feature-extraction',          q:'embedding',               gguf:'all'     },
+  'image_to_text':       { pipeline:'image-to-text',               q:'vision',                  gguf:'gguf'    },
+  // Image generation & editing
+  'image_generation':    { pipeline:'text-to-image',               q:'diffusion',               gguf:'no-gguf' },
+  'image_to_image':      { pipeline:'image-to-image',              q:'diffusion',               gguf:'no-gguf' },
+  'inpainting':          { pipeline:'image-to-image',              q:'inpainting',              gguf:'no-gguf' },
+  'image_upscaling':     { pipeline:'image-to-image',              q:'upscaler',                gguf:'no-gguf' },
+  'face_restoration':    { pipeline:'image-to-image',              q:'face restoration',        gguf:'no-gguf' },
+  'style_transfer':      { pipeline:'image-to-image',              q:'style transfer',          gguf:'no-gguf' },
+  'controlnet':          { pipeline:'',                            q:'controlnet',              gguf:'no-gguf' },
+  // Image analysis
+  'depth_estimation':    { pipeline:'depth-estimation',            q:'depth',                   gguf:'no-gguf' },
+  'image_segmentation':  { pipeline:'image-segmentation',          q:'segmentation',            gguf:'no-gguf' },
+  'object_detection':    { pipeline:'object-detection',            q:'detection',               gguf:'no-gguf' },
+  // Image 3D
+  'image_to_3d':         { pipeline:'',                            q:'image-to-3d',             gguf:'no-gguf' },
+  'model_3d_generation': { pipeline:'',                            q:'3d generation',           gguf:'no-gguf' },
+  'model_3d_to_image':   { pipeline:'',                            q:'3d rendering',            gguf:'no-gguf' },
+  // Video
+  'video_generation':    { pipeline:'text-to-video',               q:'video',                   gguf:'no-gguf' },
+  'image_to_video':      { pipeline:'image-to-video',              q:'image-to-video',          gguf:'no-gguf' },
+  'video_to_video':      { pipeline:'',                            q:'video diffusion',         gguf:'no-gguf' },
+  'video_interpolation': { pipeline:'',                            q:'frame interpolation',     gguf:'no-gguf' },
+  'video_upscaling':     { pipeline:'',                            q:'video upscaling',         gguf:'no-gguf' },
+  'video_to_3d':         { pipeline:'',                            q:'video depth',             gguf:'no-gguf' },
+  // Audio
+  'speech_to_text':      { pipeline:'automatic-speech-recognition',q:'whisper',                gguf:'gguf'    },
+  'subtitle_generation': { pipeline:'automatic-speech-recognition',q:'whisper',                gguf:'gguf'    },
+  'text_to_speech':      { pipeline:'text-to-speech',              q:'tts',                     gguf:'no-gguf' },
+  'audio_generation':    { pipeline:'text-to-audio',               q:'music',                   gguf:'no-gguf' },
+  'audio_to_audio':      { pipeline:'audio-to-audio',              q:'voice conversion',        gguf:'no-gguf' },
 };
 function capSearchUrl(cap) {
   const s = CAP_TO_HF_SEARCH[cap];
@@ -2322,10 +2337,14 @@ function capSearchUrl(cap) {
 function capMissingHtml(caps, label) {
   if (!caps.length) return '';
   const links = caps.map(cap => {
-    const url = capSearchUrl(cap);
     const chip = `<span class="cap-chip dim">${cap.replace(/_/g,' ')}</span>`;
+    if (_localCapSet.has(cap)) {
+      const url = `/admin/models?local_cap=${encodeURIComponent(cap)}`;
+      return `<a href="${url}" class="cap-find-link" title="You have a local model with ${cap.replace(/_/g,' ')} — click to configure it">${chip}<span class="cap-find-icon" style="color:#6ecf7e">↑ configure</span></a>`;
+    }
+    const url = capSearchUrl(cap);
     return url
-      ? `<a href="${url}" target="_blank" class="cap-find-link" title="Find ${cap.replace(/_/g,' ')} model on HuggingFace">${chip}<span class="cap-find-icon">↗</span></a>`
+      ? `<a href="${url}" target="_blank" class="cap-find-link" title="Find ${cap.replace(/_/g,' ')} model on HuggingFace">${chip}<span class="cap-find-icon">↗ HuggingFace</span></a>`
       : chip;
   }).join(' ');
   return `<div class="cap-missing"><strong>${label}:</strong> ${links}</div>`;
@@ -2335,7 +2354,7 @@ const SUB_CAPABILITY_RULES = {
   'img-gen': { category:'image', requiresAny:['image_generation'] },
   'img-edit': { category:'image', requiresAny:['image_to_image'] },
   'img-inpaint': { category:'image', requiresAny:['inpainting'] },
-  'img-upscale': { category:'image', optional:['image_upscaling'] },
+  'img-upscale': { category:'image', requiresAny:['image_upscaling'] },
   'img-depth': { category:'image', requiresAny:['depth_estimation'] },
   'img-seg': { category:'image', requiresAny:['image_segmentation'] },
   'img-faceswap': { category:'image', optional:['image_to_image'] },
@@ -2349,7 +2368,7 @@ const SUB_CAPABILITY_RULES = {
   'vid-interp': { category:'video', optional:['video_interpolation'], fallbackTypes:['video'] },
   'vid-sub': { category:'video', optional:['subtitle_generation'], fallbackTypes:['video'] },
   'vid-dub': { category:'video', optional:['subtitle_generation','speech_to_text','text_to_speech'], fallbackTypes:['video'] },
-  'vid-up': { category:'video', optional:['video_upscaling'], fallbackTypes:['video'] },
+  'vid-up': { category:'video', requiresAny:['video_upscaling'], fallbackTypes:['video'] },
   'vid-faceswap': { category:'video', optional:['video_to_video'], fallbackTypes:['video'] },
   'vid-outfit': { category:'video', optional:['video_to_video'], fallbackTypes:['video'] },
   'img-to3d': { category:'image', optional:['depth_estimation','image_to_3d'], fallbackTypes:['image'] },
@@ -3247,6 +3266,20 @@ async function loadModels() {
   } catch(e) {
     $('model-list').innerHTML = '<div class="muted small" style="padding:.5rem .6rem">Failed to load models</div>';
   }
+}
+
+async function loadLocalCapabilities() {
+  try {
+    const r = await fetch('/admin/api/cached-models');
+    if (!r.ok) return;
+    const d = await r.json();
+    _localCapSet.clear();
+    [...(d.hf||[]), ...(d.gguf||[])].forEach(m => {
+      (m.capabilities||[]).forEach(cap => _localCapSet.add(cap));
+    });
+    // Re-render capability cards now that local data is available
+    renderCapabilityCards();
+  } catch(e) {}
 }
 
 const BADGE = {text:'mb-text',vision:'mb-vision',image:'mb-image',video:'mb-video',
@@ -5908,6 +5941,7 @@ async function profEnvDelete(name) {
 
 // ─────────────────────────────────────────────────────────────────
 loadModels();
+loadLocalCapabilities();
 loadVoiceProfiles();
 profCharLoad();
 profEnvLoad();
