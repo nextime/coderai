@@ -912,6 +912,7 @@ def _scan_caches() -> dict:
                                 "model_type": cfg[1] if cfg[1] and cfg[1] != "gguf_models" else "text_models",
                                 "settings": cfg[0] if isinstance(cfg[0], dict) else {},
                                 "capabilities": caps.to_list(),
+                                "source_repo": repo.repo_id,
                             })
                     continue  # skip adding to hf list
 
@@ -1275,9 +1276,24 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
     if result.get("already_loaded"):
         return {"success": True, "already_loaded": True}
 
+    # Proactive VRAM check: evict loaded models if free VRAM is insufficient.
+    # request_model handles this for "on-request" load mode; cover remaining modes here.
+    # HuggingFace repo IDs return needed_gb==0 (size unknown); handle that case too.
+    model_key = result.get("model_key") or path
+    needed_gb = multi_model_manager._get_model_used_vram_gb(model_key, path)
+    free_gb = multi_model_manager._get_free_vram_gb()
+    if needed_gb > 0 and free_gb < needed_gb:
+        print(f"Admin model-load: need {needed_gb:.1f} GB VRAM, have {free_gb:.1f} GB free — evicting models")
+        multi_model_manager._evict_models_for_vram(needed_gb)
+    elif needed_gb == 0 and multi_model_manager.models and free_gb < 4.0:
+        # Unknown model size but VRAM nearly full — evict everything to avoid OOM on first attempt
+        print(f"Admin model-load: unknown model size, only {free_gb:.1f} GB free — evicting models proactively")
+        multi_model_manager.unload_all_models()
+
     # Not loaded yet — trigger actual load
     try:
         if model_type == "text":
+            # _load_model_by_name already records the VRAM delta internally
             mm = multi_model_manager._load_model_by_name(result["model_name"] or path)
             if mm is None:
                 raise RuntimeError("Model failed to load")
@@ -1286,6 +1302,7 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
         elif model_type == "audio":
             wsm = multi_model_manager.whisper_servers.get(path)
             if wsm is not None:
+                _snap = multi_model_manager.vram_before_load()
                 started = wsm.start(getattr(wsm, "_model_path", None), gpu_device=getattr(wsm, "_gpu_device", 0))
                 if not wsm.is_running():
                     raise RuntimeError("whisper-server failed to start")
@@ -1293,12 +1310,14 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
                 multi_model_manager.models[model_key] = wsm
                 multi_model_manager.active_in_vram = model_key
                 multi_model_manager.models_in_vram.add(model_key)
+                multi_model_manager.record_vram_delta(model_key, _snap)
                 return {"success": True, "already_loaded": False, "started_model": started}
         elif model_type == "image":
             from codai.api.images import _load_diffusers_pipeline, _is_gguf_model, _load_sdcpp_model
             from codai.api.state import get_global_args
             global_args = get_global_args()
             model_key = f"image:{path}"
+            _snap = multi_model_manager.vram_before_load()
             if _is_gguf_model(path):
                 resolved = multi_model_manager.load_model(path)
                 import os as _os
@@ -1306,10 +1325,12 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
                     sd_model = _load_sdcpp_model(resolved, global_args)
                     if sd_model:
                         multi_model_manager.add_model(model_key, sd_model)
+                        multi_model_manager.record_vram_delta(model_key, _snap)
             else:
                 pipeline = _load_diffusers_pipeline(path, global_args)
                 if pipeline:
                     multi_model_manager.add_model(model_key, pipeline)
+                    multi_model_manager.record_vram_delta(model_key, _snap)
         return {"success": True, "already_loaded": False}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1453,10 +1474,16 @@ async def api_model_configure(request: Request, username: str = Depends(require_
     used_vram_gb = data.get("used_vram_gb")
     if used_vram_gb is None:
         import os
+        from codai.models.cache import is_huggingface_model_id
         if os.path.isfile(path):
             size_bytes = os.path.getsize(path)
             multiplier = 1.1 if path.endswith(".gguf") else 1.2
             used_vram_gb = round(size_bytes / 1e9 * multiplier, 2)
+        elif is_huggingface_model_id(path):
+            from codai.models.manager import MultiModelManager
+            size_bytes = MultiModelManager._hf_cached_model_size_bytes(path)
+            if size_bytes > 0:
+                used_vram_gb = round(size_bytes / 1e9 * 1.2, 2)
 
     # Build settings entry
     entry: dict = {"path": path, "model_type": model_types[0], "model_types": model_types}
@@ -1912,6 +1939,24 @@ async def api_get_character(name: str, username: str = Depends(require_auth)):
     }
 
 
+@router.get("/admin/api/characters/{name}/thumbnail")
+async def api_character_thumbnail(name: str, username: str = Depends(require_auth)):
+    import os as _os
+    from codai.api.characters import _char_dir, _load_character_meta
+    from fastapi.responses import FileResponse
+    meta = _load_character_meta(name)
+    if not meta:
+        raise HTTPException(status_code=404)
+    cdir = _char_dir(name)
+    for img_info in meta.get('images', []):
+        fpath = _os.path.join(cdir, img_info['file'])
+        if _os.path.exists(fpath):
+            ext = img_info['file'].rsplit('.', 1)[-1].lower()
+            media_type = 'image/png' if ext == 'png' else 'image/jpeg'
+            return FileResponse(fpath, media_type=media_type)
+    raise HTTPException(status_code=404)
+
+
 @router.delete("/admin/api/characters/{name}")
 async def api_delete_character(name: str, username: str = Depends(require_auth)):
     import os as _os, shutil
@@ -1947,6 +1992,24 @@ async def api_get_environment(name: str, username: str = Depends(require_auth)):
         "created_at": meta['created_at'],
         "images": [img.model_dump() for img in images],
     }
+
+
+@router.get("/admin/api/environments/{name}/thumbnail")
+async def api_environment_thumbnail(name: str, username: str = Depends(require_auth)):
+    import os as _os
+    from codai.api.environments import _env_dir, _load_environment_meta
+    from fastapi.responses import FileResponse
+    meta = _load_environment_meta(name)
+    if not meta:
+        raise HTTPException(status_code=404)
+    edir = _env_dir(name)
+    for img_info in meta.get('images', []):
+        fpath = _os.path.join(edir, img_info['file'])
+        if _os.path.exists(fpath):
+            ext = img_info['file'].rsplit('.', 1)[-1].lower()
+            media_type = 'image/png' if ext == 'png' else 'image/jpeg'
+            return FileResponse(fpath, media_type=media_type)
+    raise HTTPException(status_code=404)
 
 
 @router.delete("/admin/api/environments/{name}")

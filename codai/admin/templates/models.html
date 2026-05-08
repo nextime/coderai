@@ -142,8 +142,8 @@
       <div style="display:flex;align-items:center;gap:.35rem">
         <span class="fl">Format</span>
         <div class="tog-grp">
-          <button class="tog-btn on" data-val="gguf">GGUF</button>
-          <button class="tog-btn" data-val="all">All</button>
+          <button class="tog-btn" data-val="gguf">GGUF</button>
+          <button class="tog-btn on" data-val="all">All</button>
           <button class="tog-btn" data-val="no-gguf">No GGUF</button>
         </div>
       </div>
@@ -652,7 +652,7 @@ async function loadGlobalSettings(){
 }
 
 /* ── GGUF format toggle ──────────────────────────────── */
-let _ggufMode = 'gguf';
+let _ggufMode = 'all';
 document.querySelectorAll('.tog-btn').forEach(btn=>{
   btn.addEventListener('click',()=>{
     document.querySelectorAll('.tog-btn').forEach(b=>b.classList.remove('on'));
@@ -671,6 +671,7 @@ function getChips(id){return[...document.querySelectorAll('#'+id+' .chip.on')].m
 let _results   = [];
 let _filesCache = {};
 let _activeQuants = new Set();
+let _cachedSearchIds = new Set();  // HF repo IDs (and GGUF source_repos) cached locally
 
 function estimateModelSize(modelId){
   const id = modelId.toLowerCase();
@@ -735,12 +736,14 @@ async function doSearch(){
         vramDot = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${color};margin-right:.35rem" title="Est. ${estSize}GB / ${vramAvail}GB available"></span>`;
       }
       const capBadges = fmtCapabilities(m.capabilities||[]);
+      const isDownloaded = _cachedSearchIds.has(m.id);
+      const downloadedBadge = isDownloaded ? `<span class="badge badge-ok" style="font-size:10px;padding:.1rem .35rem;margin-left:.4rem;vertical-align:middle">✓ local</span>` : '';
       return `
       <div style="padding:.75rem 0;border-bottom:1px solid var(--border)">
         <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:.5rem">
           <div style="min-width:0;flex:1">
             <div style="font-weight:500;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center"
-                 title="${esc(m.id)}">${vramDot}${esc(m.id)}</div>
+                 title="${esc(m.id)}">${vramDot}${esc(m.id)}${downloadedBadge}</div>
             <div style="font-size:11px;color:var(--text-3);margin-top:.25rem;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
               ${m.pipeline_tag?`<span class="badge badge-user">${esc(m.pipeline_tag)}</span>`:''}
               ${capBadges}
@@ -1300,6 +1303,11 @@ async function loadCachedModels(){
         '<th style="text-align:center;padding:.3rem .25rem;font-weight:700">Config</th>'+
         '<th></th></tr></thead><tbody>'+rows.join('')+'</tbody></table>';
     }
+    // Rebuild set of locally cached model IDs for search results indicator
+    _cachedSearchIds.clear();
+    (d.hf||[]).forEach(m => _cachedSearchIds.add(m.id));
+    (d.gguf||[]).forEach(f => { if (f.source_repo) _cachedSearchIds.add(f.source_repo); });
+
     // Remove any previously rendered whisper-server card before inserting the new one
     document.querySelectorAll('#ws-rendered-card').forEach(el=>el.remove());
     const wsHtml = _renderWhisperServerRows(whisperModels);
@@ -1374,6 +1382,31 @@ async function refreshLocal(){
 loadGlobalSettings();
 refreshLocal();
 
+// ── Deep-link from Studio: /admin/models?tab=search&q=...&pipeline=...&gguf=...
+(function applyDeepLink(){
+  const p = new URLSearchParams(location.search);
+  if (p.get('tab') !== 'search') return;
+  // Switch to the HF search tab
+  const tabBtn = document.querySelector('.tab[onclick*="search"]');
+  if (tabBtn) switchTab('search', tabBtn);
+  // Fill query
+  const q = p.get('q') || '';
+  const searchQ = document.getElementById('search-q');
+  if (searchQ) searchQ.value = q;
+  // Set pipeline filter
+  const pipeline = p.get('pipeline') || '';
+  const pipelineEl = document.getElementById('filter-pipeline');
+  if (pipelineEl && pipeline) pipelineEl.value = pipeline;
+  // Set gguf mode toggle
+  const gguf = p.get('gguf') || 'gguf';
+  document.querySelectorAll('.tog-btn').forEach(btn => {
+    btn.classList.toggle('on', btn.dataset.val === gguf);
+    if (btn.dataset.val === gguf) btn.click();  // fires the existing toggle handler
+  });
+  // Trigger search automatically
+  doSearch();
+})();
+
 async function clearCacheConfirm(type){
   const labels = {hf:'HuggingFace', gguf:'GGUF', all:'ALL'};
   if(!confirm(`Delete ${labels[type]} model cache? This cannot be undone.`)) return;
@@ -1401,6 +1434,16 @@ async function deleteModelConfirm(idx){
 }
 
 /* ── type checkbox helpers ─────────────────────────────── */
+function _autoDetectParser(path) {
+  const n = (path || '').toLowerCase();
+  if (n.includes('llama') || n.includes('codellama')) return 'llama';
+  if (n.includes('mistral') || n.includes('mixtral')) return 'mistral';
+  if (/phi[-_.]?\d|phi.*instruct/i.test(n)) return 'phi';
+  if (n.includes('gemma')) return 'gemma';
+  if (n.includes('qwen')) return 'qwen';
+  return 'auto';
+}
+
 function _capabilitiesToTypes(caps) {
   const categories = new Set(), subs = new Set();
   if (!caps || !caps.length) return {categories, subs};
@@ -1628,7 +1671,7 @@ function openCfgModal(idx){
   document.getElementById('cfg-offload-strategy').value = s.offload_strategy || 'auto';
   document.getElementById('cfg-offload-dir').value = s.offload_dir || _defaultOffloadDir;
   document.getElementById('cfg-sysprompt').value = s.system_prompt || '';
-  document.getElementById('cfg-parser').value = s.parser || 'auto';
+  document.getElementById('cfg-parser').value = s.parser || (!m.in_config ? _autoDetectParser(m.path) : 'auto');
   document.getElementById('cfg-tools').checked = !!s.tools_closer_prompt;
   document.getElementById('cfg-grammar').checked = !!s.grammar_guided;
   openModal('cfg-modal');

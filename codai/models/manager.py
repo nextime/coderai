@@ -513,6 +513,7 @@ class MultiModelManager:
         self.model_pools: Dict[str, ModelInstancePool] = {}  # per-key instance pools
         self._pending_new_instance: set = set()  # keys awaiting a second+ instance load
         self._global_max_instances: int = 1  # set from config at startup
+        self._measured_vram_gb: Dict[str, float] = {}  # actual measured VRAM delta per model key
     
     @property
     def image_model(self) -> Optional[str]:
@@ -681,8 +682,10 @@ class MultiModelManager:
                         kwargs['max_gpu_percent'] = global_args.max_gpu_percent
 
                 print(f"Loading default model on demand: {self.default_model}")
+                _snap = self.vram_before_load()
                 model_manager.load_model(self.default_model, backend_type=backend_type, **kwargs)
                 self.add_model(self.default_model, model_manager)
+                self.record_vram_delta(self.default_model, _snap)
                 self.current_model_key = self.default_model
                 print(f"Model loaded successfully: {self.default_model}")
                 return model_manager
@@ -739,8 +742,10 @@ class MultiModelManager:
                 inst_num = pool.count + 1 if pool else 1
                 print(f"Loading model on demand: {model_name}"
                       + (f" (instance {inst_num})" if inst_num > 1 else ""))
+                _snap = self.vram_before_load()
                 model_manager.load_model(model_name, backend_type=backend_type, **kwargs)
                 self.add_model(model_name, model_manager)
+                self.record_vram_delta(model_name, _snap)
                 self.current_model_key = model_name
                 print(f"Model loaded successfully: {model_name}"
                       + (f" (instance {inst_num})" if inst_num > 1 else ""))
@@ -748,7 +753,7 @@ class MultiModelManager:
             except Exception as e:
                 print(f"Error loading model {model_name}: {e}")
                 return None
-    
+
     def set_audio_model(self, model_name: str, config: Dict = None):
         """Add an audio transcription model and download/cache it if needed."""
         if model_name not in self.audio_models:
@@ -1401,28 +1406,169 @@ class MultiModelManager:
             pass
         return 999.0  # Unknown — assume enough
 
+    @staticmethod
+    def _free_vram_snapshot() -> float:
+        """Return current free VRAM in bytes (CUDA) or -1 if unavailable."""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free, _ = torch.cuda.mem_get_info()
+                return float(free)
+        except Exception:
+            pass
+        return -1.0
+
+    def vram_before_load(self) -> float:
+        """Call immediately before loading a model; returns a snapshot for delta measurement."""
+        return self._free_vram_snapshot()
+
+    def record_vram_delta(self, model_key: str, free_before: float) -> None:
+        """Call immediately after a model finishes loading to record actual VRAM consumed.
+
+        If the measured value exceeds the stored estimate by more than 10%, the real
+        value is written back into the model config and persisted to models.json so
+        future eviction decisions use the accurate figure.
+        """
+        if free_before < 0:
+            return
+        free_after = self._free_vram_snapshot()
+        if free_after < 0:
+            return
+        delta_gb = (free_before - free_after) / 1e9
+        if delta_gb <= 0:
+            return
+
+        measured = round(delta_gb, 3)
+        # Read the pre-existing estimate BEFORE storing the measurement so that
+        # _get_model_used_vram_gb doesn't return the measured value as the baseline.
+        estimated = self._get_model_used_vram_gb(model_key)
+        self._measured_vram_gb[model_key] = measured
+        print(f"Measured VRAM for '{model_key}': {measured:.2f} GB")
+
+        # Persist the real value when it's meaningfully larger than the current estimate
+        try:
+            if estimated <= 0 or measured > estimated * 1.10:
+                label = f"{estimated:.2f} GB estimated" if estimated > 0 else "no estimate"
+                print(f"  Updating used_vram_gb for '{model_key}': {label} → {measured:.2f} GB (real)")
+                # Update in-memory config
+                cfg = self.config.get(model_key, {})
+                cfg["used_vram_gb"] = measured
+                self.config[model_key] = cfg
+                # Persist to models.json via config_manager
+                try:
+                    from codai.admin.routes import config_manager
+                    if config_manager is not None:
+                        # Strip type prefix to get the bare path/id used in models_data
+                        bare = model_key.split(":", 1)[1] if ":" in model_key else model_key
+                        for cat in ("text_models", "image_models", "audio_models", "tts_models",
+                                    "vision_models", "video_models", "audio_gen_models",
+                                    "embedding_models"):
+                            for entry in config_manager.models_data.get(cat, []):
+                                if not isinstance(entry, dict):
+                                    continue
+                                epath = entry.get("path") or entry.get("id") or ""
+                                if epath == bare or epath.split("/")[-1] == bare.split("/")[-1]:
+                                    entry["used_vram_gb"] = measured
+                        config_manager.save_models()
+                except Exception as e:
+                    print(f"  Warning: could not persist used_vram_gb: {e}")
+        except Exception as e:
+            print(f"  Warning: VRAM update check failed: {e}")
+
+    # In-process cache: model_id -> size_bytes (never stale within a run)
+    _hf_size_cache: Dict[str, int] = {}
+
+    @staticmethod
+    def _hf_cached_model_size_bytes(model_id: str) -> int:
+        """Return total weight-file bytes for a HuggingFace model.
+
+        Tries in order:
+        1. In-process memory cache (no I/O).
+        2. Local HuggingFace hub cache scan.
+        3. HuggingFace API (network, one call per model per process lifetime).
+
+        Returns 0 on any failure.
+        """
+        if model_id in MultiModelManager._hf_size_cache:
+            return MultiModelManager._hf_size_cache[model_id]
+
+        weight_exts = {'.safetensors', '.bin', '.gguf', '.ggml', '.pt'}
+
+        # --- Try local HF hub cache first (no network) ---
+        try:
+            from huggingface_hub import scan_cache_dir
+            from codai.models.cache import get_all_cache_dirs
+            hf_dir = get_all_cache_dirs().get("huggingface")
+            if hf_dir:
+                info = scan_cache_dir(hf_dir)
+                for repo in info.repos:
+                    if repo.repo_id != model_id:
+                        continue
+                    revs = sorted(repo.revisions, key=lambda r: r.last_modified, reverse=True)
+                    if revs:
+                        total = sum(
+                            f.size_on_disk
+                            for f in revs[0].files
+                            if os.path.splitext(f.file_name)[1].lower() in weight_exts
+                        )
+                        if total > 0:
+                            MultiModelManager._hf_size_cache[model_id] = total
+                            return total
+        except Exception:
+            pass
+
+        # --- Fallback: HuggingFace API (one network call, result cached) ---
+        try:
+            import urllib.request, urllib.parse, json as _json
+            safe_id = urllib.parse.quote(model_id, safe="/")
+            url = f"https://huggingface.co/api/models/{safe_id}"
+            req = urllib.request.Request(url, headers={"User-Agent": "coderai/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = _json.loads(resp.read())
+            total = 0
+            for sib in data.get("siblings", []):
+                name = sib.get("rfilename", "")
+                if os.path.splitext(name)[1].lower() not in weight_exts:
+                    continue
+                lfs = sib.get("lfs") or {}
+                size = lfs.get("size") or sib.get("size") or 0
+                total += size
+            if total > 0:
+                MultiModelManager._hf_size_cache[model_id] = total
+                return total
+        except Exception:
+            pass
+
+        # Cache the miss too so we don't hammer the API on every call
+        MultiModelManager._hf_size_cache[model_id] = 0
+        return 0
+
     def _get_model_used_vram_gb(self, model_key: str, resolved_name: str = None) -> float:
         """Return VRAM requirement in GB for a model.
 
-        Uses configured used_vram_gb when set; otherwise estimates from file size
-        for local model files (GGUF, GGML, whisper .bin, etc.) — weights + KV cache
-        + 15% buffer. Returns 0 when the requirement cannot be determined.
+        Priority:
+        1. Explicit ``used_vram_gb`` in the model's config entry.
+        2. File size of a local weight file (GGUF/GGML/bin/safetensors).
+        3. File size of matching weight files in the HuggingFace hub cache.
+        Returns 0 when the requirement cannot be determined.
         """
         cfg = self.config.get(model_key, {})
         explicit = cfg.get("used_vram_gb")
         if explicit:
             return float(explicit)
 
-        # Build a list of candidate paths to check
+        # Measured actual VRAM delta from when this model was loaded
+        measured = self._measured_vram_gb.get(model_key)
+        if measured:
+            return measured
+
+        # Build a list of candidate paths/IDs to check
         candidates = []
         if resolved_name:
             candidates.append(resolved_name)
-        # model_key is often the path for text GGUF models
         candidates.append(model_key)
-        # Strip type prefix (e.g. "audio:/path/to/model.bin")
         if ":" in model_key:
             candidates.append(model_key.split(":", 1)[1])
-        # Config may store the path explicitly
         for field in ("path", "model_path", "model"):
             v = cfg.get(field)
             if v:
@@ -1430,6 +1576,8 @@ class MultiModelManager:
 
         import os
         local_exts = {'.gguf', '.ggml', '.bin', '.pt', '.safetensors'}
+
+        # --- Pass 1: local file with a known extension ---
         for path in candidates:
             if not path:
                 continue
@@ -1439,17 +1587,27 @@ class MultiModelManager:
             try:
                 size_bytes = os.path.getsize(path)
                 weights_gb = size_bytes / 1e9
-
-                # KV cache: 2 bytes × 2 (K+V) × n_layers × n_ctx × head_dim
-                # We don't know the architecture, so estimate from n_ctx alone.
-                # Empirically ~0.5 MB per 1 K tokens covers most small models.
                 n_ctx = cfg.get("n_ctx") or 2048
                 kv_cache_gb = (n_ctx / 1024) * 0.5 / 1024  # 0.5 MB per 1 K ctx → GB
-
-                # 15% overhead for activations, graph buffers, scratch space
                 return weights_gb * 1.15 + kv_cache_gb
             except OSError:
                 continue
+
+        # --- Pass 2: HuggingFace repo ID → scan local HF hub cache ---
+        from codai.models.cache import is_huggingface_model_id
+        for candidate in candidates:
+            if not candidate or not is_huggingface_model_id(candidate):
+                continue
+            # Strip any type prefix that survived (e.g. "image:org/repo")
+            repo_id = candidate.split(":", 1)[1] if ":" in candidate else candidate
+            if not is_huggingface_model_id(repo_id):
+                continue
+            size_bytes = self._hf_cached_model_size_bytes(repo_id)
+            if size_bytes > 0:
+                weights_gb = size_bytes / 1e9
+                # Diffusers / transformers models don't have a KV-cache term;
+                # use 20% overhead for activations, optimizer states, scratch buffers.
+                return weights_gb * 1.2
 
         return 0
 
@@ -1477,18 +1635,28 @@ class MultiModelManager:
             except Exception:
                 pass
 
+        def _size_label(key: str) -> str:
+            m = self._measured_vram_gb.get(key)
+            e = self._get_model_used_vram_gb(key)
+            if m:
+                return f"measured {m:.2f} GB"
+            if e:
+                return f"estimated {e:.2f} GB"
+            return "size unknown"
+
         # First pass: evict non-active models in LRU order
         for key in list(self.models.keys()):
             if key == self.active_in_vram:
                 continue
             if self._get_free_vram_gb() >= needed_gb:
                 break
-            print(f"On-request VRAM eviction: unloading '{key}' to free VRAM")
+            print(f"On-request VRAM eviction: unloading '{key}' ({_size_label(key)}) to free VRAM")
             _evict_key(key)
 
         # Second pass: evict active model if still not enough
         if self._get_free_vram_gb() < needed_gb and self.active_in_vram and self.active_in_vram in self.models:
-            print(f"On-request VRAM eviction: unloading active model '{self.active_in_vram}' to free VRAM")
+            print(f"On-request VRAM eviction: unloading active model '{self.active_in_vram}' "
+                  f"({_size_label(self.active_in_vram)}) to free VRAM")
             _evict_key(self.active_in_vram)
             self.active_in_vram = None
 

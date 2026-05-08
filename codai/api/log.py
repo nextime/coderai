@@ -80,21 +80,22 @@ async def log_requests(request: Request, call_next):
         body = b""
         body_str = ""
         model = "—"
-        try:
-            body = await request.body()
-            body_str = body.decode('utf-8')
-            parsed = json.loads(body_str)
-            model = parsed.get("model", "—")
+        if request.method in ("POST", "PUT", "PATCH"):
+            try:
+                body = await request.body()
+                body_str = body.decode('utf-8')
+                parsed = json.loads(body_str)
+                model = parsed.get("model", "—")
 
-            if global_debug:
-                print(f"\n{'='*80}")
-                print(f"=== FULL REQUEST DEBUG ===")
-                print(f"Method: {request.method}  URL: {request.url}")
-                print(json.dumps(parsed, indent=2))
-                print(f"{'='*80}\n")
-        except Exception as e:
-            if global_debug:
-                print(f"Error reading request body: {e}")
+                if global_debug:
+                    print(f"\n{'='*80}")
+                    print(f"=== FULL REQUEST DEBUG ===")
+                    print(f"Method: {request.method}  URL: {request.url}")
+                    print(json.dumps(parsed, indent=2))
+                    print(f"{'='*80}\n")
+            except Exception as e:
+                if global_debug:
+                    print(f"Error reading request body: {e}")
 
         t0 = time.time()
         response = await call_next(request)

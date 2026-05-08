@@ -208,6 +208,9 @@ a.dl { display:inline-block; margin-top:.4rem; }
 .cap-chip.dim { opacity:.72; }
 .cap-missing, .cap-note { font-size:12px; color:var(--text-2); }
 .cap-note strong, .cap-missing strong { color:var(--text-1); }
+.cap-find-link { display:inline-flex; align-items:center; gap:2px; text-decoration:none; border-radius:4px; transition:opacity .15s; }
+.cap-find-link:hover { opacity:.75; }
+.cap-find-icon { font-size:10px; color:var(--text-3); }
 .cap-output-note {
   width:100%; max-width:960px; border:1px solid rgba(245,158,11,.35); background:rgba(58,37,16,.85);
   color:#f6d08a; border-radius:8px; padding:.85rem 1rem; display:flex; flex-direction:column; gap:.4rem;
@@ -335,6 +338,24 @@ a.dl { display:inline-block; margin-top:.4rem; }
 .arch-btn:hover { background:var(--surface-2); color:var(--text-1); }
 .arch-btn.del:hover { background:#3a1010; color:#f07070; border-color:#5a2020; }
 .arch-empty { color:var(--text-3); text-align:center; padding:2rem 1rem; grid-column:1/-1; font-size:13px; }
+/* ── Profile panels ───────────────────────────────────────────── */
+.prof-gen-out { align-items:flex-start; justify-content:flex-start; flex-direction:column; padding:0; }
+.prof-out-hd { display:flex; align-items:center; justify-content:space-between; padding:.6rem 1rem .55rem; flex-shrink:0; border-bottom:1px solid var(--border); width:100%; box-sizing:border-box; }
+.prof-out-hd-title { font-size:13px; font-weight:600; color:var(--text-1); }
+.prof-out-body { flex:1; overflow-y:auto; padding:.8rem; width:100%; box-sizing:border-box; }
+.prof-card-info { padding:.6rem .75rem .75rem; display:flex; flex-direction:column; gap:.15rem; flex:1; }
+.prof-card-name { font-weight:600; font-size:13px; color:var(--text-1); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.prof-card-desc { font-size:11.5px; color:var(--text-2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.prof-card-meta { font-size:11px; color:var(--text-3); }
+.prof-card-actions { display:flex; gap:.4rem; margin-top:.45rem; }
+.prof-voice-list { display:flex; flex-direction:column; gap:.55rem; }
+.prof-voice-card { display:flex; align-items:flex-start; gap:.85rem; background:var(--surface-1); border:1px solid var(--border); border-radius:8px; padding:.75rem .9rem; }
+.prof-voice-icon { width:40px; height:40px; border-radius:8px; background:var(--surface-3); display:flex; align-items:center; justify-content:center; font-size:1.3rem; flex-shrink:0; }
+.prof-voice-info { flex:1; min-width:0; }
+.prof-voice-name { font-weight:600; font-size:13px; color:var(--text-1); }
+.prof-voice-meta { font-size:11px; color:var(--text-3); margin-top:.15rem; }
+.prof-voice-quote { font-style:italic; color:var(--text-3); font-size:11.5px; margin-top:.15rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.prof-voice-actions { display:flex; gap:.4rem; margin-top:.5rem; }
 /* ── Role-picker popup ────────────────────────────────────────── */
 .role-picker-popup { position:fixed; z-index:9999; background:var(--surface-1); border:1px solid var(--border); border-radius:8px; padding:.7rem; box-shadow:0 8px 24px rgba(0,0,0,.5); min-width:200px; max-width:280px; }
 .role-picker-header { font-size:12px; color:var(--text-2); margin-bottom:.5rem; }
@@ -1734,34 +1755,23 @@ a.dl { display:inline-block; margin-top:.4rem; }
 
     <!-- ═══════════════ PROFILES — CHARACTER ═══════════════ -->
     <div class="panel" id="panel-prof-char">
-      <div class="gen-wrap" style="max-width:860px">
-        <div class="gen-hd">Character Profiles</div>
-
-        <!-- Toolbar -->
-        <div class="frow" style="gap:.5rem;margin-bottom:.6rem">
-          <button class="btn btn-primary btn-sm" onclick="profCharLoad()">Refresh</button>
-          <button class="btn btn-ghost btn-sm" onclick="profCharShowCreate()">+ New Profile</button>
-        </div>
-
-        <!-- Create / Edit form (hidden by default) -->
-        <div id="prof-char-form" style="display:none;background:var(--surface-2);border-radius:8px;padding:1rem;margin-bottom:1rem">
-          <div class="gen-hd" style="font-size:.85rem;margin-bottom:.5rem" id="prof-char-form-title">New Character Profile</div>
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="gen-hd">New Character</div>
           <input type="hidden" id="pc-edit-name">
           <div class="frow"><label class="fl">Name*</label><input class="fi" id="pc-name" placeholder="alice"></div>
           <div class="frow"><label class="fl">Description</label><input class="fi" id="pc-desc" placeholder="optional"></div>
 
-          <!-- Mode selector -->
           <div class="frow" style="align-items:center;gap:1rem;margin-bottom:.2rem">
             <label class="fl">Mode</label>
-            <label style="display:flex;align-items:center;gap:.3rem;cursor:pointer">
-              <input type="radio" name="pc-mode" value="extract" checked onchange="pcModeChange()"> Extract from media
+            <label style="display:flex;align-items:center;gap:.3rem;cursor:pointer;font-size:12px">
+              <input type="radio" name="pc-mode" value="extract" checked onchange="pcModeChange()"> Extract
             </label>
-            <label style="display:flex;align-items:center;gap:.3rem;cursor:pointer">
-              <input type="radio" name="pc-mode" value="generate" onchange="pcModeChange()"> Generate from prompt
+            <label style="display:flex;align-items:center;gap:.3rem;cursor:pointer;font-size:12px">
+              <input type="radio" name="pc-mode" value="generate" onchange="pcModeChange()"> Generate
             </label>
           </div>
 
-          <!-- Extract-from-media fields -->
           <div id="pc-extract-fields">
             <div class="frow"><label class="fl">Source images</label>
               <div style="flex:1">
@@ -1777,15 +1787,12 @@ a.dl { display:inline-block; margin-top:.4rem; }
             </div>
           </div>
 
-          <!-- Generate-from-prompt fields -->
           <div id="pc-generate-fields" style="display:none">
-            <div class="frow" style="align-items:flex-start"><label class="fl" style="padding-top:.3rem">Visual prompt*</label>
+            <div class="frow" style="align-items:flex-start"><label class="fl" style="padding-top:.3rem">Prompt*</label>
               <textarea class="fi" id="pc-gen-prompt" rows="3" placeholder="e.g. a tall woman with red hair and blue eyes, realistic, studio lighting" style="flex:1;resize:vertical"></textarea>
             </div>
             <div class="frow"><label class="fl">Image model</label>
-              <select class="fi" id="pc-gen-model" style="flex:1">
-                <option value="">Default image model</option>
-              </select>
+              <select class="fi" id="pc-gen-model" style="flex:1"><option value="">Default image model</option></select>
             </div>
             <div class="frow"><label class="fl">Ref images (n)</label>
               <input type="number" class="fi" id="pc-gen-n" value="3" min="1" max="8" style="width:100px">
@@ -1806,49 +1813,45 @@ a.dl { display:inline-block; margin-top:.4rem; }
             </details>
           </div>
 
-          <div style="display:flex;gap:.5rem;margin-top:.6rem">
+          <div style="display:flex;gap:.5rem;margin-top:.7rem">
             <button class="btn btn-primary btn-sm" id="pc-submit-btn" onclick="profCharSubmit()">Extract &amp; Save</button>
-            <button class="btn btn-ghost btn-sm" onclick="profCharHideForm()">Cancel</button>
+            <button class="btn btn-ghost btn-sm" onclick="profCharShowCreate()">Reset</button>
           </div>
           <div id="pc-form-status" class="small muted" style="margin-top:.4rem"></div>
         </div>
 
-        <!-- Profile list -->
-        <div id="prof-char-list" class="archive-grid" style="margin-top:.6rem">
-          <div class="arch-empty">Loading…</div>
+        <div class="gen-out prof-gen-out">
+          <div class="prof-out-hd">
+            <span class="prof-out-hd-title">Character Profiles</span>
+            <button class="btn btn-ghost btn-sm" onclick="profCharLoad()">Refresh</button>
+          </div>
+          <div class="prof-out-body">
+            <div id="prof-char-list" class="archive-grid">
+              <div class="arch-empty">Loading…</div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
 
     <!-- ═══════════════ PROFILES — ENVIRONMENT ═══════════════ -->
     <div class="panel" id="panel-prof-env">
-      <div class="gen-wrap" style="max-width:860px">
-        <div class="gen-hd">Environment Profiles</div>
-
-        <!-- Toolbar -->
-        <div class="frow" style="gap:.5rem;margin-bottom:.6rem">
-          <button class="btn btn-primary btn-sm" onclick="profEnvLoad()">Refresh</button>
-          <button class="btn btn-ghost btn-sm" onclick="profEnvShowCreate()">+ New Profile</button>
-        </div>
-
-        <!-- Create / Edit form (hidden by default) -->
-        <div id="prof-env-form" style="display:none;background:var(--surface-2);border-radius:8px;padding:1rem;margin-bottom:1rem">
-          <div class="gen-hd" style="font-size:.85rem;margin-bottom:.5rem">New Environment Profile</div>
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="gen-hd">New Environment</div>
           <div class="frow"><label class="fl">Name*</label><input class="fi" id="pe-name" placeholder="living-room"></div>
           <div class="frow"><label class="fl">Description</label><input class="fi" id="pe-desc" placeholder="optional"></div>
 
-          <!-- Mode selector -->
           <div class="frow" style="align-items:center;gap:1rem;margin-bottom:.2rem">
             <label class="fl">Mode</label>
-            <label style="display:flex;align-items:center;gap:.3rem;cursor:pointer">
-              <input type="radio" name="pe-mode" value="extract" checked onchange="peModeChange()"> Extract from media
+            <label style="display:flex;align-items:center;gap:.3rem;cursor:pointer;font-size:12px">
+              <input type="radio" name="pe-mode" value="extract" checked onchange="peModeChange()"> Extract
             </label>
-            <label style="display:flex;align-items:center;gap:.3rem;cursor:pointer">
-              <input type="radio" name="pe-mode" value="generate" onchange="peModeChange()"> Generate from prompt
+            <label style="display:flex;align-items:center;gap:.3rem;cursor:pointer;font-size:12px">
+              <input type="radio" name="pe-mode" value="generate" onchange="peModeChange()"> Generate
             </label>
           </div>
 
-          <!-- Extract-from-media fields -->
           <div id="pe-extract-fields">
             <div class="frow"><label class="fl">Source images</label>
               <div style="flex:1">
@@ -1864,15 +1867,12 @@ a.dl { display:inline-block; margin-top:.4rem; }
             </div>
           </div>
 
-          <!-- Generate-from-prompt fields -->
           <div id="pe-generate-fields" style="display:none">
-            <div class="frow" style="align-items:flex-start"><label class="fl" style="padding-top:.3rem">Visual prompt*</label>
+            <div class="frow" style="align-items:flex-start"><label class="fl" style="padding-top:.3rem">Prompt*</label>
               <textarea class="fi" id="pe-gen-prompt" rows="3" placeholder="e.g. a cozy living room with wooden floors, warm lighting, bookshelves" style="flex:1;resize:vertical"></textarea>
             </div>
             <div class="frow"><label class="fl">Image model</label>
-              <select class="fi" id="pe-gen-model" style="flex:1">
-                <option value="">Default image model</option>
-              </select>
+              <select class="fi" id="pe-gen-model" style="flex:1"><option value="">Default image model</option></select>
             </div>
             <div class="frow"><label class="fl">Ref images (n)</label>
               <input type="number" class="fi" id="pe-gen-n" value="3" min="1" max="8" style="width:100px">
@@ -1893,52 +1893,57 @@ a.dl { display:inline-block; margin-top:.4rem; }
             </details>
           </div>
 
-          <div style="display:flex;gap:.5rem;margin-top:.6rem">
+          <div style="display:flex;gap:.5rem;margin-top:.7rem">
             <button class="btn btn-primary btn-sm" id="pe-submit-btn" onclick="profEnvSubmit()">Extract &amp; Save</button>
-            <button class="btn btn-ghost btn-sm" onclick="profEnvHideForm()">Cancel</button>
+            <button class="btn btn-ghost btn-sm" onclick="profEnvShowCreate()">Reset</button>
           </div>
           <div id="pe-form-status" class="small muted" style="margin-top:.4rem"></div>
         </div>
 
-        <!-- Profile list -->
-        <div id="prof-env-list" class="archive-grid" style="margin-top:.6rem">
-          <div class="arch-empty">Loading…</div>
+        <div class="gen-out prof-gen-out">
+          <div class="prof-out-hd">
+            <span class="prof-out-hd-title">Environment Profiles</span>
+            <button class="btn btn-ghost btn-sm" onclick="profEnvLoad()">Refresh</button>
+          </div>
+          <div class="prof-out-body">
+            <div id="prof-env-list" class="archive-grid">
+              <div class="arch-empty">Loading…</div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
 
     <!-- ═══════════════ PROFILES — VOICE ═══════════════ -->
     <div class="panel" id="panel-prof-voice">
-      <div class="gen-wrap" style="max-width:860px">
-        <div class="gen-hd">Voice Profiles</div>
-
-        <!-- Toolbar -->
-        <div class="frow" style="gap:.5rem;margin-bottom:.6rem">
-          <button class="btn btn-primary btn-sm" onclick="profVoiceLoad()">Refresh</button>
-          <button class="btn btn-ghost btn-sm" onclick="profVoiceShowCreate()">+ New Profile</button>
-        </div>
-
-        <!-- Create / Edit form -->
-        <div id="prof-voice-form" style="display:none;background:var(--surface-2);border-radius:8px;padding:1rem;margin-bottom:1rem">
-          <div class="gen-hd" style="font-size:.85rem;margin-bottom:.5rem">Extract Voice Profile</div>
+      <div class="gen-wrap">
+        <div class="gen-ctrl">
+          <div class="gen-hd">Extract Voice</div>
           <div class="frow"><label class="fl">Name*</label><input class="fi" id="pv-name" placeholder="john-doe"></div>
           <div class="frow"><label class="fl">Description</label><input class="fi" id="pv-desc" placeholder="optional"></div>
-          <div class="frow"><label class="fl">Audio or Video file*</label>
+          <div class="frow"><label class="fl">Audio or Video*</label>
             <input type="file" id="pv-file" accept="audio/*,video/*" style="flex:1">
           </div>
-          <div class="frow"><label class="fl">Transcript (optional)</label>
-            <textarea class="fi fs" id="pv-transcript" rows="2" placeholder="Leave empty to auto-transcribe with Whisper"></textarea>
+          <div class="frow" style="align-items:flex-start"><label class="fl" style="padding-top:.3rem">Transcript</label>
+            <textarea class="fi fs" id="pv-transcript" rows="3" placeholder="Leave empty to auto-transcribe with Whisper" style="resize:vertical"></textarea>
           </div>
-          <div style="display:flex;gap:.5rem;margin-top:.6rem">
+          <div style="display:flex;gap:.5rem;margin-top:.7rem">
             <button class="btn btn-primary btn-sm" onclick="profVoiceSave()">Extract &amp; Save</button>
-            <button class="btn btn-ghost btn-sm" onclick="profVoiceHideForm()">Cancel</button>
+            <button class="btn btn-ghost btn-sm" onclick="profVoiceShowCreate()">Reset</button>
           </div>
           <div id="pv-form-status" class="small muted" style="margin-top:.4rem"></div>
         </div>
 
-        <!-- Voice list -->
-        <div id="prof-voice-list" style="display:flex;flex-direction:column;gap:.6rem;margin-top:.6rem">
-          <div class="arch-empty">Loading…</div>
+        <div class="gen-out prof-gen-out">
+          <div class="prof-out-hd">
+            <span class="prof-out-hd-title">Voice Profiles</span>
+            <button class="btn btn-ghost btn-sm" onclick="profVoiceLoad()">Refresh</button>
+          </div>
+          <div class="prof-out-body">
+            <div id="prof-voice-list" class="prof-voice-list">
+              <div class="arch-empty">Loading…</div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -2284,6 +2289,48 @@ const STUDIO_CAPABILITIES = {
     io:'Input: noisy audio. Output: cleaned audio artifact plus applied-operation metadata.'
   }
 };
+// Maps a capability token to the best HuggingFace search parameters
+const CAP_TO_HF_SEARCH = {
+  'image_generation':    { pipeline:'text-to-image',              q:'',                   gguf:'no-gguf' },
+  'image_to_image':      { pipeline:'image-to-image',             q:'',                   gguf:'no-gguf' },
+  'inpainting':          { pipeline:'image-to-image',             q:'inpainting',         gguf:'no-gguf' },
+  'image_upscaling':     { pipeline:'image-to-image',             q:'upscale',            gguf:'no-gguf' },
+  'depth_estimation':    { pipeline:'depth-estimation',           q:'',                   gguf:'no-gguf' },
+  'image_segmentation':  { pipeline:'image-segmentation',         q:'',                   gguf:'no-gguf' },
+  'video_generation':    { pipeline:'text-to-video',              q:'',                   gguf:'no-gguf' },
+  'image_to_video':      { pipeline:'image-to-video',             q:'',                   gguf:'no-gguf' },
+  'video_to_video':      { pipeline:'',                           q:'video to video',     gguf:'no-gguf' },
+  'video_interpolation': { pipeline:'',                           q:'frame interpolation',gguf:'no-gguf' },
+  'video_upscaling':     { pipeline:'',                           q:'video upscaling',    gguf:'no-gguf' },
+  'speech_to_text':      { pipeline:'automatic-speech-recognition',q:'',                  gguf:'gguf'    },
+  'text_to_speech':      { pipeline:'text-to-speech',             q:'',                   gguf:'no-gguf' },
+  'audio_generation':    { pipeline:'text-to-audio',              q:'',                   gguf:'no-gguf' },
+  'text_generation':     { pipeline:'text-generation',            q:'',                   gguf:'gguf'    },
+  'audio_to_audio':      { pipeline:'audio-to-audio',             q:'voice conversion',   gguf:'no-gguf' },
+  'subtitle_generation': { pipeline:'automatic-speech-recognition',q:'',                  gguf:'gguf'    },
+  'image_to_3d':         { pipeline:'',                           q:'image to 3d',        gguf:'no-gguf' },
+  'video_to_3d':         { pipeline:'',                           q:'video depth 3d',     gguf:'no-gguf' },
+  'model_3d_generation': { pipeline:'',                           q:'3d generation',      gguf:'no-gguf' },
+  'model_3d_to_image':   { pipeline:'',                           q:'3d rendering',       gguf:'no-gguf' },
+};
+function capSearchUrl(cap) {
+  const s = CAP_TO_HF_SEARCH[cap];
+  if (!s) return null;
+  const p = new URLSearchParams({ tab:'search', q: s.q, pipeline: s.pipeline, gguf: s.gguf });
+  return '/admin/models?' + p.toString();
+}
+function capMissingHtml(caps, label) {
+  if (!caps.length) return '';
+  const links = caps.map(cap => {
+    const url = capSearchUrl(cap);
+    const chip = `<span class="cap-chip dim">${cap.replace(/_/g,' ')}</span>`;
+    return url
+      ? `<a href="${url}" target="_blank" class="cap-find-link" title="Find ${cap.replace(/_/g,' ')} model on HuggingFace">${chip}<span class="cap-find-icon">↗</span></a>`
+      : chip;
+  }).join(' ');
+  return `<div class="cap-missing"><strong>${label}:</strong> ${links}</div>`;
+}
+
 const SUB_CAPABILITY_RULES = {
   'img-gen': { category:'image', requiresAny:['image_generation'] },
   'img-edit': { category:'image', requiresAny:['image_to_image'] },
@@ -2323,7 +2370,7 @@ const SUB_CAPABILITY_RULES = {
   'aud-stems': { category:'audio', optional:['audio_generation'], fallbackTypes:['audio'] },
   'aud-clean': { category:'audio', optional:['speech_to_text'], fallbackTypes:['audio'] },
 };
-const CATEGORY_TABS = ['chat', 'image', 'video', 'audio', '3d', 'pipe', 'embed', 'archive'];
+const CATEGORY_TABS = ['chat', 'image', 'video', 'audio', '3d', 'profiles', 'pipe', 'embed', 'archive'];
 const CATEGORY_SUBS = {
   image: Object.keys(SUB_CAPABILITY_RULES).filter(sub => SUB_CAT[sub] === 'image'),
   video: Object.keys(SUB_CAPABILITY_RULES).filter(sub => SUB_CAT[sub] === 'video'),
@@ -2445,6 +2492,7 @@ function evaluateCategoryState(cat, subStates, caps, type) {
   }
   if (cat === 'pipe') return 'none';
   if (cat === 'archive') return 'none';
+  if (cat === 'profiles') return 'none';
   if (cat === 'embed') return caps.has('embeddings') || type === 'embedding' ? 'available' : 'unavailable';
   if (cat === '3d') return 'none';  // always show 3D tab (no required capability)
   const states = (CATEGORY_SUBS[cat] || []).map(sub => subStates[sub]).filter(Boolean);
@@ -2514,8 +2562,8 @@ function renderCapabilityCard(sub) {
   const availabilityLabel = details.availability === 'available' ? 'Ready' : details.availability === 'partial' ? 'Partial' : 'Unavailable';
   const availabilityClass = details.availability === 'available' ? ' ok' : details.availability === 'partial' ? ' warn' : ' dim';
   const missingBits = [];
-  if (details.missingRequired.length) missingBits.push(`<div class="cap-missing"><strong>Missing required:</strong> ${details.missingRequired.join(', ')}</div>`);
-  if (details.missingOptional.length) missingBits.push(`<div class="cap-missing"><strong>Limited without:</strong> ${details.missingOptional.join(', ')}</div>`);
+  if (details.missingRequired.length) missingBits.push(capMissingHtml(details.missingRequired, 'Missing required'));
+  if (details.missingOptional.length) missingBits.push(capMissingHtml(details.missingOptional, 'Limited without'));
   const notes = (details.notes || []).map(note => `<div class="cap-note">${note}</div>`).join('');
   shell.innerHTML = `
     <div class="cap-card-top">
@@ -2565,8 +2613,8 @@ function renderCapabilityCards() {
     const missingOptional = (rule.optional || []).filter(c => !allCaps.has(c));
     const label = document.querySelector(`.t2btn[data-sub="${sub}"]`)?.childNodes[0]?.textContent?.trim() || sub;
     const missingBits = [];
-    if (missingRequired.length) missingBits.push(`<div class="cap-missing"><strong>Missing required:</strong> ${missingRequired.join(', ')}</div>`);
-    if (missingOptional.length) missingBits.push(`<div class="cap-missing"><strong>Limited without:</strong> ${missingOptional.join(', ')}</div>`);
+    if (missingRequired.length) missingBits.push(capMissingHtml(missingRequired, 'Missing required'));
+    if (missingOptional.length) missingBits.push(capMissingHtml(missingOptional, 'Limited without'));
     const availabilityLabel = state === 'partial' ? 'Partial' : 'Unavailable';
     const availabilityClass = state === 'partial' ? ' warn' : ' dim';
     shell.innerHTML = `
@@ -2589,13 +2637,25 @@ function renderCapabilityOutputNote(sub) {
   if (!panel) return;
   panel.querySelector(`#${noteId}`)?.remove();
   if (!details || details.availability === 'available') return;
-  const missing = [];
-  if (details.missingRequired.length) missing.push(...details.missingRequired.map(item => `<strong>Required:</strong> ${item}`));
-  if (details.missingOptional.length) missing.push(...details.missingOptional.map(item => `<strong>Optional:</strong> ${item}`));
-  if (!missing.length && Array.isArray(details.notes)) missing.push(...details.notes);
+  const missingItems = [];
+  details.missingRequired.forEach(cap => {
+    const url = capSearchUrl(cap);
+    const label = cap.replace(/_/g,' ');
+    missingItems.push(url
+      ? `<strong>Required:</strong> <a href="${url}" target="_blank" class="cap-find-link">${label}<span class="cap-find-icon">↗</span></a>`
+      : `<strong>Required:</strong> ${label}`);
+  });
+  details.missingOptional.forEach(cap => {
+    const url = capSearchUrl(cap);
+    const label = cap.replace(/_/g,' ');
+    missingItems.push(url
+      ? `<strong>Optional:</strong> <a href="${url}" target="_blank" class="cap-find-link">${label}<span class="cap-find-icon">↗</span></a>`
+      : `<strong>Optional:</strong> ${label}`);
+  });
+  if (!missingItems.length && Array.isArray(details.notes)) missingItems.push(...details.notes);
   const title = details.availability === 'unavailable' ? '⚠ Feature unavailable' : '⚠ Feature partially available';
-  const detailHtml = missing.length
-    ? `<ul>${missing.map(item => `<li>${item}</li>`).join('')}</ul>`
+  const detailHtml = missingItems.length
+    ? `<ul>${missingItems.map(item => `<li>${item}</li>`).join('')}</ul>`
     : '<div>Some required pieces are missing for this surface.</div>';
   const target = panel.querySelector('.gen-out') || panel.querySelector('.gen-wrap') || panel;
   target.insertAdjacentHTML('afterbegin', `
@@ -3146,10 +3206,42 @@ function initRequestPreviews() {
 // ─────────────────────────────────────────────────────────────────
 //  Boot
 // ─────────────────────────────────────────────────────────────────
+function deduplicateModels(raw) {
+  const TYPE_PREFIXES = /^(audio|tts|image|vision|video|audio_gen|embedding):/;
+
+  // Group entries sharing the same alias → keep only the entry whose id === alias
+  const aliasGroups = {};
+  const noAlias = [];
+  for (const m of raw) {
+    if (m.alias) (aliasGroups[m.alias] = aliasGroups[m.alias] || []).push(m);
+    else noAlias.push(m);
+  }
+  const result = [];
+  for (const alias in aliasGroups) {
+    const g = aliasGroups[alias];
+    result.push(g.find(m => m.id === alias) || g[0]);
+  }
+  // For alias-less entries, skip bare basenames that are short forms of a full path
+  const fullIds = new Set(noAlias.map(m => m.id));
+  for (const m of noAlias) {
+    if (m.id.includes('/')) {
+      result.push(m);
+    } else if (![...fullIds].some(id => id.endsWith('/' + m.id))) {
+      result.push(m);
+    }
+  }
+  // Drop "type:modelname" entries when "modelname" already appears in the result
+  const resultIds = new Set(result.map(m => m.id));
+  return result.filter(m => {
+    const match = m.id.match(TYPE_PREFIXES);
+    return !match || !resultIds.has(m.id.slice(match[0].length));
+  });
+}
+
 async function loadModels() {
   try {
     const d = await fetch('/v1/models').then(r => r.json());
-    models = d.data || [];
+    models = deduplicateModels(d.data || []);
     renderSidebar();
     if (models.length) selectModel(models[0]);
   } catch(e) {
@@ -5406,14 +5498,11 @@ function profCharShowCreate() {
   $('pc-gen-n').value = '3';
   $('pc-gen-steps').value = '';
   $('pc-gen-w').value = '512'; $('pc-gen-h').value = '512';
-  // Reset to extract mode
   document.querySelectorAll('input[name="pc-mode"]').forEach(r => r.checked = r.value === 'extract');
   pcModeChange();
-  // Populate image model selector
   pcPopulateModelSelect();
-  $('prof-char-form').style.display = 'block';
 }
-function profCharHideForm() { $('prof-char-form').style.display = 'none'; }
+function profCharHideForm() { profCharShowCreate(); }
 
 function pcModeChange() {
   const mode = (document.querySelector('input[name="pc-mode"]:checked') || {}).value || 'extract';
@@ -5538,16 +5627,26 @@ function renderCharList() {
   const el = $('prof-char-list');
   if (!el) return;
   if (!_charProfiles.length) { el.innerHTML = '<div class="arch-empty">No character profiles yet.</div>'; return; }
-  el.innerHTML = _charProfiles.map(p => `
-    <div class="arch-card" style="position:relative;padding:1rem">
-      <div style="font-weight:600">${escapeHtml(p.name)}</div>
-      ${p.description ? `<div class="small muted">${escapeHtml(p.description)}</div>` : ''}
-      <div class="small muted">${p.image_count} reference image${p.image_count!==1?'s':''} · ${new Date(p.created_at*1000).toLocaleDateString()}</div>
-      <div style="display:flex;gap:.4rem;margin-top:.5rem">
-        <button class="btn btn-ghost btn-sm" onclick="profCharView('${escapeHtml(p.name)}')">View</button>
-        <button class="btn btn-danger btn-sm" onclick="profCharDelete('${escapeHtml(p.name)}')">Delete</button>
+  el.innerHTML = _charProfiles.map(p => {
+    const n = escapeHtml(p.name);
+    const thumb = p.image_count > 0
+      ? `<img class="arch-thumb" src="/admin/api/characters/${encodeURIComponent(p.name)}/thumbnail" loading="lazy" onerror="this.outerHTML='<div class=arch-thumb-ph>\u{1F464}</div>'" onclick="profCharView('${n}')">`
+      : `<div class="arch-thumb-ph" onclick="profCharView('${n}')">\u{1F464}</div>`;
+    const date = new Date(p.created_at * 1000).toLocaleDateString();
+    return `
+    <div class="arch-card">
+      ${thumb}
+      <div class="prof-card-info">
+        <div class="prof-card-name">${n}</div>
+        ${p.description ? `<div class="prof-card-desc">${escapeHtml(p.description)}</div>` : ''}
+        <div class="prof-card-meta">${p.image_count} ref image${p.image_count!==1?'s':''} · ${date}</div>
+        <div class="prof-card-actions">
+          <button class="btn btn-ghost btn-sm" onclick="profCharView('${n}')">View</button>
+          <button class="btn btn-danger btn-sm" onclick="profCharDelete('${n}')">Delete</button>
+        </div>
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 
 async function profCharView(name) {
@@ -5572,9 +5671,8 @@ async function profCharDelete(name) {
 function profVoiceShowCreate() {
   $('pv-name').value=''; $('pv-desc').value=''; $('pv-transcript').value='';
   $('pv-form-status').textContent='';
-  $('prof-voice-form').style.display='block';
 }
-function profVoiceHideForm() { $('prof-voice-form').style.display='none'; }
+function profVoiceHideForm() { profVoiceShowCreate(); }
 
 async function profVoiceSave() {
   const name = ($('pv-name').value||'').trim();
@@ -5619,16 +5717,24 @@ function renderVoiceList(voices) {
   const el = $('prof-voice-list');
   if (!el) return;
   if (!voices.length) { el.innerHTML = '<div class="arch-empty">No voice profiles yet.</div>'; return; }
-  el.innerHTML = voices.map(v => `
-    <div style="background:var(--surface-2);border-radius:8px;padding:.8rem 1rem;display:flex;align-items:center;gap:.8rem">
-      <div style="flex:1">
-        <div style="font-weight:600">${escapeHtml(v.name)}</div>
-        ${v.description ? `<div class="small muted">${escapeHtml(v.description)}</div>` : ''}
-        ${v.transcript ? `<div class="small muted" style="font-style:italic">"${escapeHtml(v.transcript.slice(0,80))}${v.transcript.length>80?'…':''}"</div>` : ''}
-        <div class="small muted">${new Date(v.created_at*1000).toLocaleDateString()}</div>
+  el.innerHTML = voices.map(v => {
+    const n = escapeHtml(v.name);
+    const date = new Date(v.created_at * 1000).toLocaleDateString();
+    const quote = v.transcript ? `<div class="prof-voice-quote">&ldquo;${escapeHtml(v.transcript.slice(0,90))}${v.transcript.length>90?'&hellip;':''}&rdquo;</div>` : '';
+    return `
+    <div class="prof-voice-card">
+      <div class="prof-voice-icon">&#127908;</div>
+      <div class="prof-voice-info">
+        <div class="prof-voice-name">${n}</div>
+        ${v.description ? `<div class="prof-voice-meta">${escapeHtml(v.description)}</div>` : ''}
+        ${quote}
+        <div class="prof-voice-meta">${date}</div>
+        <div class="prof-voice-actions">
+          <button class="btn btn-danger btn-sm" onclick="profVoiceDelete('${n}')">Delete</button>
+        </div>
       </div>
-      <button class="btn btn-danger btn-sm" onclick="profVoiceDelete('${escapeHtml(v.name)}')">Delete</button>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 
 async function profVoiceDelete(name) {
@@ -5654,9 +5760,8 @@ function profEnvShowCreate() {
   document.querySelectorAll('input[name="pe-mode"]').forEach(r => r.checked = r.value === 'extract');
   peModeChange();
   pePopulateModelSelect();
-  $('prof-env-form').style.display = 'block';
 }
-function profEnvHideForm() { $('prof-env-form').style.display = 'none'; }
+function profEnvHideForm() { profEnvShowCreate(); }
 
 function peModeChange() {
   const mode = (document.querySelector('input[name="pe-mode"]:checked') || {}).value || 'extract';
@@ -5766,16 +5871,26 @@ function renderEnvList() {
   const el = $('prof-env-list');
   if (!el) return;
   if (!_envProfiles.length) { el.innerHTML = '<div class="arch-empty">No environment profiles yet.</div>'; return; }
-  el.innerHTML = _envProfiles.map(p => `
-    <div class="arch-card" style="position:relative;padding:1rem">
-      <div style="font-weight:600">${escapeHtml(p.name)}</div>
-      ${p.description ? `<div class="small muted">${escapeHtml(p.description)}</div>` : ''}
-      <div class="small muted">${p.image_count} reference image${p.image_count!==1?'s':''} · ${new Date(p.created_at*1000).toLocaleDateString()}</div>
-      <div style="display:flex;gap:.4rem;margin-top:.5rem">
-        <button class="btn btn-ghost btn-sm" onclick="profEnvView('${escapeHtml(p.name)}')">View</button>
-        <button class="btn btn-danger btn-sm" onclick="profEnvDelete('${escapeHtml(p.name)}')">Delete</button>
+  el.innerHTML = _envProfiles.map(p => {
+    const n = escapeHtml(p.name);
+    const thumb = p.image_count > 0
+      ? `<img class="arch-thumb" src="/admin/api/environments/${encodeURIComponent(p.name)}/thumbnail" loading="lazy" onerror="this.outerHTML='<div class=arch-thumb-ph>\u{1F304}</div>'" onclick="profEnvView('${n}')">`
+      : `<div class="arch-thumb-ph" onclick="profEnvView('${n}')">\u{1F304}</div>`;
+    const date = new Date(p.created_at * 1000).toLocaleDateString();
+    return `
+    <div class="arch-card">
+      ${thumb}
+      <div class="prof-card-info">
+        <div class="prof-card-name">${n}</div>
+        ${p.description ? `<div class="prof-card-desc">${escapeHtml(p.description)}</div>` : ''}
+        <div class="prof-card-meta">${p.image_count} ref image${p.image_count!==1?'s':''} · ${date}</div>
+        <div class="prof-card-actions">
+          <button class="btn btn-ghost btn-sm" onclick="profEnvView('${n}')">View</button>
+          <button class="btn btn-danger btn-sm" onclick="profEnvDelete('${n}')">Delete</button>
+        </div>
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 
 async function profEnvView(name) {

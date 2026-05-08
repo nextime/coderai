@@ -23,6 +23,7 @@
       <div class="nav-links">
         <a href="/admin" class="nav-link {% if request.url.path == '/admin' %}active{% endif %}">Overview</a>
         <a href="/chat" class="nav-link {% if request.url.path == '/chat' %}active{% endif %}">Studio</a>
+        <a href="/docs" class="nav-link" target="_blank">API Docs</a>
         {% if is_admin|default(false) %}
         <a href="/admin/models" class="nav-link {% if '/models' in request.url.path %}active{% endif %}">Models</a>
         <a href="/admin/tokens" class="nav-link {% if '/tokens' in request.url.path %}active{% endif %}">Tokens</a>

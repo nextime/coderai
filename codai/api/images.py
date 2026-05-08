@@ -415,6 +415,24 @@ def _load_diffusers_pipeline(model_name: str, global_args):
             )
     
     # =====================================================================
+    # Proactive VRAM eviction before first load attempt
+    # =====================================================================
+    # HF repo IDs have no local file, so their size is unknown; we can't
+    # pre-compute needed_gb. Instead, evict if other models are loaded and
+    # free VRAM is below 15% of total (almost certainly an OOM on attempt 1).
+    if torch.cuda.is_available():
+        try:
+            from codai.models.manager import multi_model_manager as _mmm
+            if _mmm.models:
+                _free, _total = torch.cuda.mem_get_info()
+                if _total > 0 and (_free / _total) < 0.15:
+                    print(f"Low VRAM ({_free/1e9:.1f} GB free of {_total/1e9:.1f} GB) with "
+                          f"{len(_mmm.models)} model(s) loaded — evicting before load attempt")
+                    _mmm.unload_all_models()
+        except Exception:
+            pass
+
+    # =====================================================================
     # Standard loading path (with OOM fallback)
     # =====================================================================
     # Track loading attempts for OOM handling
@@ -467,6 +485,16 @@ def _load_diffusers_pipeline(model_name: str, global_args):
             
             if is_oom and load_attempt < max_attempts:
                 print(f"OOM during model loading: {load_error}")
+                # Evict other loaded models from VRAM before retrying
+                from codai.models.manager import multi_model_manager as _mmm
+                if _mmm.models:
+                    print(f"Evicting {len(_mmm.models)} loaded model(s) to free VRAM for retry...")
+                    _mmm.unload_all_models()
+                else:
+                    import gc as _gc
+                    _gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 print(f"Retrying with more aggressive memory optimization...")
                 pipeline = None  # Reset for retry
             else:
@@ -1156,9 +1184,14 @@ def _load_img2img_pipeline(model_name: str, global_args):
         except RuntimeError as e:
             if 'out of memory' in str(e).lower() and attempt < 2:
                 import gc, torch
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                from codai.models.manager import multi_model_manager as _mmm
+                if _mmm.models:
+                    print(f"OOM loading img2img — evicting {len(_mmm.models)} model(s) to free VRAM...")
+                    _mmm.unload_all_models()
+                else:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 continue
             raise
 
@@ -1289,9 +1322,14 @@ def _load_inpaint_pipeline(model_name: str, global_args):
         except RuntimeError as e:
             if 'out of memory' in str(e).lower() and attempt < 2:
                 import gc, torch
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                from codai.models.manager import multi_model_manager as _mmm
+                if _mmm.models:
+                    print(f"OOM loading inpaint — evicting {len(_mmm.models)} model(s) to free VRAM...")
+                    _mmm.unload_all_models()
+                else:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 continue
             raise
 
