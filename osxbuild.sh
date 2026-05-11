@@ -1,6 +1,6 @@
 #!/bin/bash
 # CoderAI macOS build script
-# Usage: ./osxbuild.sh [metal|cpu|all] [--venv <venv>]
+# Usage: ./osxbuild.sh [metal|cpu|all] [--venv <venv>] [--package]
 
 set -e
 
@@ -12,6 +12,7 @@ NC='\033[0m'
 
 BACKEND="${1:-all}"
 CUSTOM_VENV=""
+PACKAGE=false
 
 i=1
 for arg in "$@"; do
@@ -19,6 +20,9 @@ for arg in "$@"; do
         --venv)
             i=$((i + 1))
             eval "CUSTOM_VENV=\${$i}"
+            ;;
+        --package)
+            PACKAGE=true
             ;;
     esac
     i=$((i + 1))
@@ -107,6 +111,46 @@ install_cpu_stack() {
     python -m pip install stable-diffusion-cpp-python || true
 }
 
+package_app() {
+    echo -e "${YELLOW}Packaging CoderAI with PyInstaller...${NC}"
+    python -m pip install pyinstaller
+    mkdir -p dist-package
+    pyinstaller --clean --noconfirm --onefile --name coderai \
+        --collect-all codai \
+        --collect-all fastapi \
+        --collect-all uvicorn \
+        --collect-all pydantic \
+        --collect-all transformers \
+        --collect-all diffusers \
+        --collect-all sentence_transformers \
+        --collect-all whispercpp \
+        --collect-all insightface \
+        --collect-all onnxruntime \
+        --collect-all PIL \
+        coderai
+    pyinstaller --clean --noconfirm --windowed --name CoderAI \
+        --collect-all codai \
+        --collect-all fastapi \
+        --collect-all uvicorn \
+        --collect-all pydantic \
+        --collect-all transformers \
+        --collect-all diffusers \
+        --collect-all sentence_transformers \
+        --collect-all whispercpp \
+        --collect-all insightface \
+        --collect-all onnxruntime \
+        --collect-all PIL \
+        coderai
+    cp dist/coderai dist-package/coderai
+    if [ -d "dist/CoderAI.app" ]; then
+        rm -rf dist-package/CoderAI.app
+        cp -R dist/CoderAI.app dist-package/CoderAI.app
+    fi
+    echo -e "${GREEN}✓ Packaged CLI binary: dist-package/coderai${NC}"
+    echo -e "${GREEN}✓ Packaged macOS app bundle: dist-package/CoderAI.app${NC}"
+    echo -e "${YELLOW}Note: macOS equivalent packaging is a single CLI binary plus a .app bundle; target machines still need compatible GPU/runtime libraries.${NC}"
+}
+
 if [ "$BACKEND" = "metal" ]; then
     install_metal_stack
     install_common_ml_stack
@@ -119,6 +163,9 @@ else
 fi
 
 echo "$BACKEND" > .backend
+if [ "$PACKAGE" = true ]; then
+    package_app
+fi
 echo -e "${GREEN}Build completed successfully!${NC}"
 echo ""
 echo "To activate the environment in the future, run:"

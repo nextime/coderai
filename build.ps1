@@ -1,6 +1,7 @@
 param(
     [string]$Backend = "all",
-    [string]$Venv = ""
+    [string]$Venv = "",
+    [switch]$Package
 )
 
 $ErrorActionPreference = "Stop"
@@ -76,6 +77,28 @@ function Install-CpuStack {
     try { & $venvPython -m pip install onnxruntime } catch { Write-Warn "onnxruntime CPU install failed; continuing" }
 }
 
+function Invoke-PackageBuild {
+    Write-Info "Packaging CoderAI with PyInstaller..."
+    & $venvPython -m pip install pyinstaller
+    New-Item -ItemType Directory -Force -Path "dist-package" | Out-Null
+    & $venvPython -m PyInstaller --clean --noconfirm --onefile --name coderai `
+        --collect-all codai `
+        --collect-all fastapi `
+        --collect-all uvicorn `
+        --collect-all pydantic `
+        --collect-all transformers `
+        --collect-all diffusers `
+        --collect-all sentence_transformers `
+        --collect-all whispercpp `
+        --collect-all insightface `
+        --collect-all onnxruntime `
+        --collect-all PIL `
+        coderai
+    Copy-Item "dist\coderai.exe" "dist-package\coderai.exe" -Force
+    Write-Ok "Packaged executable: dist-package\coderai.exe"
+    Write-Warn "Target systems still need compatible GPU/runtime drivers such as CUDA when GPU backends are used."
+}
+
 switch ($Backend) {
     "cuda" {
         Install-CudaStack
@@ -92,6 +115,9 @@ switch ($Backend) {
 }
 
 Set-Content -Path ".backend" -Value $Backend
+if ($Package) {
+    Invoke-PackageBuild
+}
 Write-Ok "Build completed successfully!"
 Write-Host ""
 Write-Host "To activate the environment in the future, run:"

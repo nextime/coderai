@@ -178,6 +178,30 @@ Platform-specific alternatives:
 .\build.ps1 -Backend all   # Windows, prefers CUDA-backed builds when available
 ```
 
+Packaging options:
+
+```bash
+./build.sh all --package
+./osxbuild.sh all --package
+```
+
+```powershell
+.\build.ps1 -Backend all -Package
+```
+
+`--package` installs PyInstaller into the build virtual environment and produces a self-contained distributable from the venv that was just created or updated.
+
+Packaging outputs:
+- Linux: `dist-package/coderai`
+- macOS: `dist-package/coderai` and `dist-package/CoderAI.app`
+- Windows: `dist-package/coderai.exe`
+
+Packaging notes:
+- macOS does have an equivalent to a standalone packaged app: a `.app` bundle. `osxbuild.sh --package` now builds both a single CLI binary and a macOS app bundle.
+- These packages bundle the Python interpreter and Python modules from the venv, but they do not eliminate the need for compatible external GPU/runtime drivers on the target machine.
+- CUDA builds on Linux and Windows still require matching NVIDIA driver/runtime support on the destination system.
+- Metal builds on macOS still require a compatible macOS system with Metal support.
+
 The build script creates a virtual environment, installs dependencies, and builds GPU-accelerated backends including `stable-diffusion-cpp-python` with CUDA+Vulkan support.
 
 Platform backend notes:
