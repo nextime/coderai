@@ -16,7 +16,7 @@
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 # Build script for CoderAI - Supports NVIDIA (CUDA), Vulkan, OpenCL, and CPU backends
-# Usage: ./build.sh [nvidia|vulkan|vulkan-nvidia|cuda|opencl|all] [--flash] [--venv <venv>]
+# Usage: ./build.sh [nvidia|vulkan|vulkan-nvidia|cuda|opencl|all] [--flash] [--venv <venv>] [--package]
 # Default: all (installs all backends)
 # --flash: Enable and install Flash Attention 2 (for NVIDIA GPUs)
 # --venv <venv>: Specify custom virtual environment name
@@ -34,6 +34,7 @@ NC='\033[0m' # No Color
 BACKEND="${1:-all}"
 FLASH=false
 CUSTOM_VENV=""
+PACKAGE=false
 
 # Parse arguments
 i=1
@@ -45,6 +46,9 @@ for arg in "$@"; do
         --venv)
             i=$((i + 1))
             eval "CUSTOM_VENV=\${$i}"
+            ;;
+        --package)
+            PACKAGE=true
             ;;
     esac
     i=$((i + 1))
@@ -719,8 +723,34 @@ elif [ "$BACKEND" = "all" ]; then
     echo ""
 fi
 
+package_app() {
+    echo -e "${YELLOW}Packaging CoderAI with PyInstaller...${NC}"
+    pip install pyinstaller
+    mkdir -p dist-package
+    pyinstaller --clean --noconfirm --onefile --name coderai \
+        --collect-all codai \
+        --collect-all fastapi \
+        --collect-all uvicorn \
+        --collect-all pydantic \
+        --collect-all transformers \
+        --collect-all diffusers \
+        --collect-all sentence_transformers \
+        --collect-all whispercpp \
+        --collect-all insightface \
+        --collect-all onnxruntime \
+        --collect-all PIL \
+        coderai
+    cp dist/coderai dist-package/coderai
+    echo -e "${GREEN}✓ Packaged executable: dist-package/coderai${NC}"
+    echo -e "${YELLOW}Note: The target machine must still provide compatible system GPU/runtime libraries.${NC}"
+}
+
 # Create .backend file to track which backend was used
 echo "$BACKEND" > .backend
+
+if [ "$PACKAGE" = true ]; then
+    package_app
+fi
 
 echo -e "${GREEN}Build completed successfully!${NC}"
 echo ""

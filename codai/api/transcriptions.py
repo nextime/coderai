@@ -136,9 +136,11 @@ async def create_transcription(
 
     # Check if the requested model maps to a configured whisper-server instance first.
     # Try alias round-robin resolution before direct ID lookup.
+    whisper_model_id = multi_model_manager.resolve_whisper_alias_model_id(model)
     whisper_server = (
-        multi_model_manager.resolve_whisper_alias(model)
-        or multi_model_manager.whisper_servers.get(model)
+        multi_model_manager.whisper_servers.get(whisper_model_id)
+        if whisper_model_id is not None
+        else multi_model_manager.whisper_servers.get(model)
     )
     if whisper_server is not None:
         multi_model_manager.request_model(requested_model=model, model_type="audio")
@@ -148,7 +150,7 @@ async def create_transcription(
                 gpu_device=getattr(whisper_server, "_gpu_device", 0),
             )
             if whisper_server.is_running():
-                ws_key = f"audio:{model}"
+                ws_key = f"audio:{whisper_model_id or model}"
                 multi_model_manager.models[ws_key] = whisper_server
                 multi_model_manager.active_in_vram = ws_key
                 multi_model_manager.models_in_vram.add(ws_key)

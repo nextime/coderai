@@ -25,6 +25,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Stre
 from fastapi.templating import Jinja2Templates
 
 from codai.admin.auth import SessionManager
+from codai.platform_paths import default_whisper_server_path
 import queue as _q
 import threading as _t
 import uuid as _uuid
@@ -90,7 +91,7 @@ def _next_whisper_server_model_id(audio_models) -> str:
 
 
 def _default_whisper_server_path() -> str:
-    return shutil.which("whisper-server") or "/usr/local/bin/whisper-server"
+    return shutil.which("whisper-server") or default_whisper_server_path()
 
 
 def get_current_user(request: Request) -> Optional[str]:
@@ -239,7 +240,11 @@ async def admin_dashboard(request: Request, username: str = Depends(require_auth
 
 @router.get("/admin/models", response_class=HTMLResponse)
 async def models_page(request: Request, username: str = Depends(require_admin)):
-    return _tmpl(request, "models.html", {"username": username, "is_admin": True})
+    return _tmpl(request, "models.html", {
+        "username": username,
+        "is_admin": True,
+        "default_whisper_server_path": _default_whisper_server_path(),
+    })
 
 
 @router.get("/admin/tokens", response_class=HTMLResponse)
@@ -1434,12 +1439,14 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         gpu_device = int(data.get("gpu_device", 0))
         if gpu_device < 0:
             raise HTTPException(status_code=400, detail="gpu_device must be >= 0")
-        # Remove existing entry with same id (update semantics)
         audio_list = config_manager.models_data.get("audio_models", [])
-        config_manager.models_data["audio_models"] = [
-            m for m in audio_list
-            if not (isinstance(m, dict) and m.get("id") == model_id)
-        ]
+        if any(
+            isinstance(m, dict)
+            and m.get("backend") == "whisper-server"
+            and m.get("id") == model_id
+            for m in audio_list
+        ):
+            raise HTTPException(status_code=409, detail=f"whisper-server model '{model_id}' already exists")
         alias = (data.get("alias") or "").strip() or None
         entry = {
             "id": model_id,
@@ -1617,6 +1624,22 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "directory": c.archive.directory,
             "retention": c.archive.retention,
         },
+        "broker": {
+            "enabled": c.broker.enabled,
+            "base_url": c.broker.base_url,
+            "scope": c.broker.scope,
+            "username": c.broker.username,
+            "provider_id": c.broker.provider_id,
+            "client_id": c.broker.client_id,
+            "registration_token": c.broker.registration_token,
+            "advertised_endpoint": c.broker.advertised_endpoint,
+            "transport": c.broker.transport,
+            "heartbeat_interval_seconds": c.broker.heartbeat_interval_seconds,
+            "connect_timeout_seconds": c.broker.connect_timeout_seconds,
+            "request_timeout_seconds": c.broker.request_timeout_seconds,
+            "reconnect_initial_delay_seconds": c.broker.reconnect_initial_delay_seconds,
+            "reconnect_max_delay_seconds": c.broker.reconnect_max_delay_seconds,
+        },
         "system_prompt": c.system_prompt,
         "tools_closer_prompt": c.tools_closer_prompt,
         "grammar_guided": c.grammar_guided,
@@ -1706,6 +1729,28 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         cfg_dir = str(config_manager.config_dir)
         resolved = raw_dir if raw_dir and _os.path.isabs(raw_dir) else _os.path.join(cfg_dir, raw_dir or "archive")
         archive_manager.configure(c.archive.enabled, resolved, c.archive.retention)
+
+    if "broker" in data:
+        bro = data["broker"]
+        c.broker.enabled = bool(bro.get("enabled", c.broker.enabled))
+        c.broker.base_url = (bro.get("base_url") or "").strip()
+        c.broker.scope = (bro.get("scope") or c.broker.scope or "user").strip()
+        c.broker.username = (bro.get("username") or "").strip()
+        c.broker.provider_id = (bro.get("provider_id") or "").strip()
+        c.broker.client_id = (bro.get("client_id") or "").strip()
+        c.broker.registration_token = (bro.get("registration_token") or "").strip()
+        c.broker.advertised_endpoint = (bro.get("advertised_endpoint") or "").strip()
+        c.broker.transport = (bro.get("transport") or c.broker.transport or "websocket").strip()
+        c.broker.heartbeat_interval_seconds = max(1, int(bro.get("heartbeat_interval_seconds", c.broker.heartbeat_interval_seconds)))
+        c.broker.connect_timeout_seconds = max(1, int(bro.get("connect_timeout_seconds", c.broker.connect_timeout_seconds)))
+        c.broker.request_timeout_seconds = max(1, int(bro.get("request_timeout_seconds", c.broker.request_timeout_seconds)))
+        c.broker.reconnect_initial_delay_seconds = max(1, int(bro.get("reconnect_initial_delay_seconds", c.broker.reconnect_initial_delay_seconds)))
+        c.broker.reconnect_max_delay_seconds = max(
+            c.broker.reconnect_initial_delay_seconds,
+            int(bro.get("reconnect_max_delay_seconds", c.broker.reconnect_max_delay_seconds)),
+        )
+        from codai.broker.config import build_broker_runtime_config
+        request.app.state.broker_runtime = build_broker_runtime_config(c.broker)
 
     config_manager.save_config()
     return {"success": True}

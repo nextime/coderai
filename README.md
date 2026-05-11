@@ -128,6 +128,22 @@ source venv_all/bin/activate
 python coderai          # starts on http://127.0.0.1:8776
 ```
 
+macOS:
+
+```bash
+./osxbuild.sh all
+source venv_osx_all/bin/activate
+python coderai
+```
+
+Windows PowerShell:
+
+```powershell
+.\build.ps1 -Backend all
+.\venv_win_all\Scripts\Activate.ps1
+python coderai
+```
+
 That's it. Open `http://127.0.0.1:8776/admin` and log in with `admin` / `admin`.
 
 ---
@@ -152,7 +168,66 @@ cd coderai
 ./build.sh vulkan   # AMD/Intel only
 ```
 
+Platform-specific alternatives:
+
+```bash
+./osxbuild.sh all   # macOS, prefers Metal-backed builds when available
+```
+
+```powershell
+.\build.ps1 -Backend all   # Windows, prefers CUDA-backed builds when available
+```
+
+Packaging options:
+
+```bash
+./build.sh all --package
+./osxbuild.sh all --package
+```
+
+```powershell
+.\build.ps1 -Backend all -Package
+```
+
+`--package` installs PyInstaller into the build virtual environment and produces a self-contained distributable from the venv that was just created or updated.
+
+Packaging outputs:
+- Linux: `dist-package/coderai`
+- macOS: `dist-package/coderai` and `dist-package/CoderAI.app`
+- Windows: `dist-package/coderai.exe`
+
+Packaging notes:
+- macOS does have an equivalent to a standalone packaged app: a `.app` bundle. `osxbuild.sh --package` now builds both a single CLI binary and a macOS app bundle.
+- These packages bundle the Python interpreter and Python modules from the venv, but they do not eliminate the need for compatible external GPU/runtime drivers on the target machine.
+- CUDA builds on Linux and Windows still require matching NVIDIA driver/runtime support on the destination system.
+- Metal builds on macOS still require a compatible macOS system with Metal support.
+
 The build script creates a virtual environment, installs dependencies, and builds GPU-accelerated backends including `stable-diffusion-cpp-python` with CUDA+Vulkan support.
+
+Platform backend notes:
+- Linux: CUDA for NVIDIA, Vulkan for AMD/Intel/NVIDIA, OpenCL fallback where supported.
+- macOS: Metal is the correct GPU acceleration path instead of CUDA. `osxbuild.sh` uses PyTorch MPS plus `GGML_METAL` / `SD_METAL` builds where available.
+- Windows: CUDA remains the primary NVIDIA acceleration path. `build.ps1` focuses on CUDA or CPU installs.
+- There is no general-purpose CUDA workflow for current macOS systems; Apple GPU acceleration uses Metal.
+
+### Platform Support Matrix
+
+| Capability | Linux | macOS | Windows |
+|---|---|---|---|
+| Core server / admin UI | Yes | Yes | Yes |
+| Default path handling | Yes | Yes | Yes |
+| PyTorch GPU acceleration | CUDA | Metal (MPS) | CUDA |
+| `llama-cpp-python` GPU path | CUDA / Vulkan | Metal | CUDA |
+| `stable-diffusion-cpp-python` GPU path | CUDA / Vulkan / OpenCL | Metal | CUDA |
+| `whisper.cpp` accelerated path | Vulkan / CPU fallback | Metal / CPU fallback | CPU fallback |
+| InsightFace / ONNX runtime | `onnxruntime-gpu` | `onnxruntime-silicon` or CPU | `onnxruntime-gpu` |
+| Build script included in repo | `build.sh` | `osxbuild.sh` | `build.ps1` |
+
+Notes:
+- "Yes" means CoderAI has an intended path for that platform, not that every optional dependency is guaranteed to install on every machine.
+- macOS GPU acceleration is Metal-based; there is no standard modern CUDA path for macOS.
+- Windows currently uses CUDA as the main NVIDIA acceleration path; Vulkan/OpenCL build flows are not the primary Windows setup in this repository.
+- Some optional audio and media packages may still vary by Python version, hardware, and upstream wheel availability.
 
 ### Manual Installation
 
@@ -246,6 +321,45 @@ Config files live in `~/.coderai/` (or `--config` path):
 ├── pipelines.json   # Custom pipeline definitions
 └── secret_key       # Session signing key (auto-generated)
 ```
+
+### AISBF Broker Client
+
+CoderAI includes an AISBF broker websocket client that can register this instance
+with a broker and receive brokered requests.
+
+You can configure it either by editing `config.json` directly or from the admin
+Settings page under `AISBF Broker`.
+
+Example broker configuration:
+
+```json
+{
+  "broker": {
+    "enabled": true,
+    "base_url": "https://broker.example.com",
+    "scope": "user",
+    "username": "alice",
+    "provider_id": "coderai-local",
+    "client_id": "workstation-01",
+    "registration_token": "your-registration-token",
+    "advertised_endpoint": "http://127.0.0.1:8776",
+    "transport": "websocket",
+    "heartbeat_interval_seconds": 30,
+    "connect_timeout_seconds": 10,
+    "request_timeout_seconds": 30,
+    "reconnect_initial_delay_seconds": 1,
+    "reconnect_max_delay_seconds": 60
+  }
+}
+```
+
+Broker notes:
+- `base_url` accepts `http`, `https`, `ws`, or `wss`; the websocket route is derived automatically.
+- `scope: "user"` requires a non-global `username`.
+- `scope: "global"` requires `username: "global"`.
+- When `enabled` is `true`, `provider_id`, `client_id`, and `registration_token` are required.
+- `advertised_endpoint` is optional and is sent to the broker as the externally reachable endpoint for this instance.
+- Restart CoderAI after changing broker settings so the background broker service reconnects with the new configuration.
 
 ### config.json
 

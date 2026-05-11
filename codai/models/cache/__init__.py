@@ -40,6 +40,8 @@ import hashlib
 import pathlib
 from typing import Optional, Dict, List, Tuple
 
+from codai.platform_paths import default_model_cache_dir, legacy_style_cache_root
+
 # For type hints
 import time
 
@@ -49,8 +51,7 @@ def get_model_cache_dir() -> str:
     if os.environ.get('CODERAI_CACHE_DIR'):
         cache_dir = os.environ['CODERAI_CACHE_DIR']
     else:
-        cache_home = os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache'))
-        cache_dir = os.path.join(cache_home, 'coderai', 'models')
+        cache_dir = str(default_model_cache_dir())
     pathlib.Path(cache_dir).mkdir(parents=True, exist_ok=True)
     return cache_dir
 
@@ -58,7 +59,7 @@ def get_model_cache_dir() -> str:
 def get_all_cache_dirs() -> dict:
     """Get all model cache directories."""
     caches = {}
-    cache_home = os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache'))
+    cache_home = str(legacy_style_cache_root())
 
     # Coderai GGUF cache
     coderai_cache = get_model_cache_dir()
@@ -79,7 +80,7 @@ def get_all_cache_dirs() -> dict:
             caches['huggingface'] = hf_cache
 
     # Local diffusers cache
-    local_diffusers = os.path.expanduser('~/.cache/diffusers')
+    local_diffusers = os.path.join(cache_home, 'diffusers')
     if os.path.exists(local_diffusers):
         caches['diffusers'] = local_diffusers
 

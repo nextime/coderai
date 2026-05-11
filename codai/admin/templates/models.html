@@ -26,6 +26,9 @@
 {% endblock %}
 
 {% block content %}
+<script>
+window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }};
+</script>
 <div class="page-header">
   <div>
     <h1>Models</h1>
@@ -1253,7 +1256,7 @@ function nextWhisperServerModelId(){
 }
 
 function defaultWhisperServerPath(){
-  return '/usr/local/bin/whisper-server';
+  return window.__DEFAULT_WHISPER_SERVER_PATH__ || '';
 }
 
 function resetWhisperServerBuilderDefaults(){

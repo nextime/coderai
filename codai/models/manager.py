@@ -18,6 +18,7 @@
 
 from typing import Optional, Dict, Any, List
 import os
+import random
 import subprocess
 import signal
 import requests
@@ -256,6 +257,7 @@ class WhisperServerManager:
         self.current_model = None
         self.base_url = f"http://127.0.0.1:{port}"
         self.lock = threading.Lock()
+        self._active_requests = 0
         
         # Check if port is available
         if not self._is_port_available(port):
@@ -351,7 +353,8 @@ class WhisperServerManager:
         """Send transcription request to whisper-server."""
         if not self.is_running():
             return {"error": "whisper-server not running"}
-        
+        with self.lock:
+            self._active_requests += 1
         try:
             files = {"file": ("audio.wav", audio_data, "audio/wav")}
             data = {}
@@ -373,6 +376,16 @@ class WhisperServerManager:
                 return {"error": f"Server error: {response.status_code}", "detail": response.text}
         except Exception as e:
             return {"error": str(e)}
+        finally:
+            with self.lock:
+                self._active_requests = max(0, self._active_requests - 1)
+
+    def active_requests(self) -> int:
+        with self.lock:
+            return self._active_requests
+
+    def is_idle(self) -> bool:
+        return self.active_requests() == 0
     
     def _wait_for_server(self, timeout: int = 30) -> bool:
         """Wait for whisper-server to be ready."""
@@ -810,6 +823,17 @@ class MultiModelManager:
         idx = self._whisper_alias_counters.get(name, 0) % len(ids)
         self._whisper_alias_counters[name] = idx + 1
         return self.whisper_servers.get(ids[idx])
+
+    def resolve_whisper_alias_model_id(self, name: str) -> Optional[str]:
+        """Return an idle whisper-server model id for an alias, else a random one."""
+        ids = self.whisper_aliases.get(name)
+        if not ids:
+            return None
+        idle_ids = [mid for mid in ids if (self.whisper_servers.get(mid) and self.whisper_servers[mid].is_idle())]
+        choices = idle_ids or list(ids)
+        if len(choices) == 1:
+            return choices[0]
+        return random.choice(choices)
     
     def set_tts_model(self, model_name: str, config: Dict = None):
         """Set the text-to-speech model and download/cache it if needed."""
@@ -900,6 +924,9 @@ class MultiModelManager:
             for m in self.audio_models:
                 allowed.add(m)
                 allowed.add(f"audio:{m}")
+        for alias in self.whisper_aliases:
+            allowed.add(alias)
+            allowed.add(f"audio:{alias}")
 
         # TTS model
         if self.tts_model:
@@ -963,10 +990,18 @@ class MultiModelManager:
                             "video_models", "audio_gen_models", "embedding_models",
                             "spatial_models"):
                     for m in md.get(cat, []):
-                        mid = (m if isinstance(m, str) else
-                               m.get("alias") or m.get("path") or m.get("id") or "")
+                        if isinstance(m, str):
+                            mid = m
+                        elif m.get("backend") == "whisper-server":
+                            mid = m.get("id") or ""
+                        else:
+                            mid = m.get("alias") or m.get("path") or m.get("id") or ""
                         raw = (m if isinstance(m, str) else m.get("path") or m.get("id") or "")
-                        for val in (mid, raw):
+                        alias = "" if isinstance(m, str) else (m.get("alias") or "")
+                        vals = [mid, raw]
+                        if alias:
+                            vals.append(alias)
+                        for val in vals:
                             if val:
                                 allowed.add(val)
                                 short = val.split("/")[-1] if "/" in val else val

@@ -42,6 +42,8 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
+from codai.platform_paths import default_environments_dir, legacy_style_config_dir
+
 router = APIRouter()
 
 _ENVS_DIR: Optional[str] = None
@@ -49,8 +51,8 @@ _ENVS_DIR: Optional[str] = None
 
 def set_global_args(args):
     global _ENVS_DIR
-    base = getattr(args, 'file_path', None) or os.path.expanduser('~/.coderai')
-    root = base if os.path.isdir(base) else (os.path.dirname(base) if base else os.path.expanduser('~/.coderai'))
+    base = getattr(args, 'file_path', None) or str(legacy_style_config_dir())
+    root = base if os.path.isdir(base) else (os.path.dirname(base) if base else str(legacy_style_config_dir()))
     _ENVS_DIR = os.path.join(root, 'environments')
     os.makedirs(_ENVS_DIR, exist_ok=True)
 
@@ -62,7 +64,7 @@ def set_global_file_path(path: str):
 def _envs_dir() -> str:
     if _ENVS_DIR:
         return _ENVS_DIR
-    d = os.path.expanduser('~/.coderai/environments')
+    d = str(default_environments_dir())
     os.makedirs(d, exist_ok=True)
     return d
 

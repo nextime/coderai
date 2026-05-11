@@ -20,6 +20,8 @@ import json
 import os
 from pathlib import Path
 
+from codai.platform_paths import legacy_style_config_dir
+
 
 def load_config_file(config_dir: Path) -> dict:
     """Load the main config.json file."""
@@ -166,11 +168,12 @@ def setup_default_config(config_dir: Path):
 
 def parse_args():
     """Parse command line arguments."""
+    default_config = str(legacy_style_config_dir())
     parser = argparse.ArgumentParser(
         description="OpenAI-compatible API server supporting NVIDIA (CUDA) and Vulkan backends",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Configuration: All settings are loaded from JSON config files in the
-configuration directory (--config DIR, default: ~/.coderai/). Key files:
+configuration directory (--config DIR, default: OS-specific CoderAI directory). Key files:
   config.json  - Server and backend settings
   models.json  - Model registry and configurations
   auth.json    - Users, tokens, and sessions"""
@@ -178,8 +181,8 @@ configuration directory (--config DIR, default: ~/.coderai/). Key files:
     parser.add_argument(
         "--config",
         type=str,
-        default=os.path.expanduser("~/.coderai/"),
-        help="Configuration directory (default: ~/.coderai/)",
+        default=default_config,
+        help=f"Configuration directory (default: {default_config})",
     )
     parser.add_argument(
         "--debug",

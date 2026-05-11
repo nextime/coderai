@@ -22,6 +22,8 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Form
 from pydantic import BaseModel, ConfigDict
 
+from codai.platform_paths import default_voices_dir
+
 router = APIRouter()
 
 global_args = None
@@ -35,8 +37,8 @@ def set_global_args(args):
     global global_args, _VOICES_DIR
     global_args = args
     # Store voice profiles alongside output files, or in a default location
-    base = getattr(args, 'file_path', None) or os.path.expanduser('~/.coderai/voices')
-    _VOICES_DIR = os.path.join(base if os.path.isdir(base) else os.path.dirname(base) if base else os.path.expanduser('~/.coderai'), 'voices')
+    base = getattr(args, 'file_path', None) or str(default_voices_dir())
+    _VOICES_DIR = os.path.join(base if os.path.isdir(base) else os.path.dirname(base) if base else str(default_voices_dir().parent), 'voices')
     os.makedirs(_VOICES_DIR, exist_ok=True)
 
 
@@ -48,7 +50,7 @@ def set_global_file_path(path):
 def _voices_dir() -> str:
     if _VOICES_DIR:
         return _VOICES_DIR
-    d = os.path.expanduser('~/.coderai/voices')
+    d = str(default_voices_dir())
     os.makedirs(d, exist_ok=True)
     return d
 
