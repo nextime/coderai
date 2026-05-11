@@ -1624,6 +1624,22 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "directory": c.archive.directory,
             "retention": c.archive.retention,
         },
+        "broker": {
+            "enabled": c.broker.enabled,
+            "base_url": c.broker.base_url,
+            "scope": c.broker.scope,
+            "username": c.broker.username,
+            "provider_id": c.broker.provider_id,
+            "client_id": c.broker.client_id,
+            "registration_token": c.broker.registration_token,
+            "advertised_endpoint": c.broker.advertised_endpoint,
+            "transport": c.broker.transport,
+            "heartbeat_interval_seconds": c.broker.heartbeat_interval_seconds,
+            "connect_timeout_seconds": c.broker.connect_timeout_seconds,
+            "request_timeout_seconds": c.broker.request_timeout_seconds,
+            "reconnect_initial_delay_seconds": c.broker.reconnect_initial_delay_seconds,
+            "reconnect_max_delay_seconds": c.broker.reconnect_max_delay_seconds,
+        },
         "system_prompt": c.system_prompt,
         "tools_closer_prompt": c.tools_closer_prompt,
         "grammar_guided": c.grammar_guided,
@@ -1713,6 +1729,28 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         cfg_dir = str(config_manager.config_dir)
         resolved = raw_dir if raw_dir and _os.path.isabs(raw_dir) else _os.path.join(cfg_dir, raw_dir or "archive")
         archive_manager.configure(c.archive.enabled, resolved, c.archive.retention)
+
+    if "broker" in data:
+        bro = data["broker"]
+        c.broker.enabled = bool(bro.get("enabled", c.broker.enabled))
+        c.broker.base_url = (bro.get("base_url") or "").strip()
+        c.broker.scope = (bro.get("scope") or c.broker.scope or "user").strip()
+        c.broker.username = (bro.get("username") or "").strip()
+        c.broker.provider_id = (bro.get("provider_id") or "").strip()
+        c.broker.client_id = (bro.get("client_id") or "").strip()
+        c.broker.registration_token = (bro.get("registration_token") or "").strip()
+        c.broker.advertised_endpoint = (bro.get("advertised_endpoint") or "").strip()
+        c.broker.transport = (bro.get("transport") or c.broker.transport or "websocket").strip()
+        c.broker.heartbeat_interval_seconds = max(1, int(bro.get("heartbeat_interval_seconds", c.broker.heartbeat_interval_seconds)))
+        c.broker.connect_timeout_seconds = max(1, int(bro.get("connect_timeout_seconds", c.broker.connect_timeout_seconds)))
+        c.broker.request_timeout_seconds = max(1, int(bro.get("request_timeout_seconds", c.broker.request_timeout_seconds)))
+        c.broker.reconnect_initial_delay_seconds = max(1, int(bro.get("reconnect_initial_delay_seconds", c.broker.reconnect_initial_delay_seconds)))
+        c.broker.reconnect_max_delay_seconds = max(
+            c.broker.reconnect_initial_delay_seconds,
+            int(bro.get("reconnect_max_delay_seconds", c.broker.reconnect_max_delay_seconds)),
+        )
+        from codai.broker.config import build_broker_runtime_config
+        request.app.state.broker_runtime = build_broker_runtime_config(c.broker)
 
     config_manager.save_config()
     return {"success": True}

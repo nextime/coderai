@@ -101,6 +101,81 @@
     <span class="form-hint">Archived entries older than this are automatically deleted. Takes effect immediately on save.</span>
   </div>
 </div>
+
+<div class="card mb-0" style="margin-top:1rem">
+  <div class="card-title">AISBF Broker</div>
+  <div class="form-row">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-broker-enabled" onchange="toggleBrokerFields()">
+      <span style="font-size:13px;font-weight:500">Enable broker client</span>
+    </label>
+    <span class="form-hint">Registers this CoderAI instance with an AISBF broker so it can receive brokered requests.</span>
+  </div>
+  <div id="broker-fields" style="display:none">
+    <div class="form-row">
+      <label class="form-label">Broker base URL</label>
+      <input type="text" id="s-broker-base-url" class="form-input" placeholder="https://broker.example.com">
+      <span class="form-hint">Supports `http`, `https`, `ws`, or `wss`. The websocket endpoint is derived automatically.</span>
+    </div>
+    <div style="display:grid;grid-template-columns:180px 1fr;gap:1rem;align-items:start">
+      <div class="form-row" style="margin:0">
+        <label class="form-label">Scope</label>
+        <select id="s-broker-scope" class="form-input">
+          <option value="user">user</option>
+          <option value="global">global</option>
+        </select>
+      </div>
+      <div class="form-row" style="margin:0">
+        <label class="form-label">Username</label>
+        <input type="text" id="s-broker-username" class="form-input" placeholder="alice or global">
+        <span class="form-hint">Use `global` when scope is `global`; otherwise provide the AISBF username.</span>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;align-items:start">
+      <div class="form-row" style="margin:0">
+        <label class="form-label">Provider ID</label>
+        <input type="text" id="s-broker-provider-id" class="form-input" placeholder="coderai-local">
+      </div>
+      <div class="form-row" style="margin:0">
+        <label class="form-label">Client ID</label>
+        <input type="text" id="s-broker-client-id" class="form-input" placeholder="workstation-01">
+      </div>
+    </div>
+    <div class="form-row">
+      <label class="form-label">Registration token</label>
+      <input type="password" id="s-broker-registration-token" class="form-input" placeholder="Broker registration token">
+    </div>
+    <div class="form-row">
+      <label class="form-label">Advertised endpoint</label>
+      <input type="text" id="s-broker-advertised-endpoint" class="form-input" placeholder="http://127.0.0.1:8776">
+      <span class="form-hint">Optional external URL advertised to the broker for this instance.</span>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(3, minmax(0, 1fr));gap:1rem;align-items:start">
+      <div class="form-row" style="margin:0">
+        <label class="form-label">Heartbeat seconds</label>
+        <input type="number" id="s-broker-heartbeat" class="form-input" min="1" placeholder="30">
+      </div>
+      <div class="form-row" style="margin:0">
+        <label class="form-label">Connect timeout</label>
+        <input type="number" id="s-broker-connect-timeout" class="form-input" min="1" placeholder="10">
+      </div>
+      <div class="form-row" style="margin:0">
+        <label class="form-label">Request timeout</label>
+        <input type="number" id="s-broker-request-timeout" class="form-input" min="1" placeholder="30">
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:1rem;align-items:start">
+      <div class="form-row" style="margin:0">
+        <label class="form-label">Reconnect initial delay</label>
+        <input type="number" id="s-broker-reconnect-initial" class="form-input" min="1" placeholder="1">
+      </div>
+      <div class="form-row" style="margin:0">
+        <label class="form-label">Reconnect max delay</label>
+        <input type="number" id="s-broker-reconnect-max" class="form-input" min="1" placeholder="60">
+      </div>
+    </div>
+  </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -108,6 +183,11 @@
 function toggleHttps(){
   document.getElementById('https-fields').style.display =
     document.getElementById('s-https').checked ? 'block' : 'none';
+}
+
+function toggleBrokerFields(){
+  document.getElementById('broker-fields').style.display =
+    document.getElementById('s-broker-enabled').checked ? 'block' : 'none';
 }
 
 function showAlert(type, msg){
@@ -143,6 +223,21 @@ async function loadSettings(){
       if (hint && as.default_directory) hint.textContent = `(default: ${as.default_directory})`;
       document.getElementById('s-arc-dir').placeholder = as.default_directory || '(default)';
     } catch(_){}
+    const broker = d.broker || {};
+    document.getElementById('s-broker-enabled').checked = !!broker.enabled;
+    document.getElementById('s-broker-base-url').value = broker.base_url ?? '';
+    document.getElementById('s-broker-scope').value = broker.scope ?? 'user';
+    document.getElementById('s-broker-username').value = broker.username ?? '';
+    document.getElementById('s-broker-provider-id').value = broker.provider_id ?? '';
+    document.getElementById('s-broker-client-id').value = broker.client_id ?? '';
+    document.getElementById('s-broker-registration-token').value = broker.registration_token ?? '';
+    document.getElementById('s-broker-advertised-endpoint').value = broker.advertised_endpoint ?? '';
+    document.getElementById('s-broker-heartbeat').value = broker.heartbeat_interval_seconds ?? 30;
+    document.getElementById('s-broker-connect-timeout').value = broker.connect_timeout_seconds ?? 10;
+    document.getElementById('s-broker-request-timeout').value = broker.request_timeout_seconds ?? 30;
+    document.getElementById('s-broker-reconnect-initial').value = broker.reconnect_initial_delay_seconds ?? 1;
+    document.getElementById('s-broker-reconnect-max').value = broker.reconnect_max_delay_seconds ?? 60;
+    toggleBrokerFields();
   }catch(e){ showAlert('error','Failed to load settings: '+e.message); }
 }
 
@@ -168,6 +263,22 @@ async function saveSettings(){
       enabled: document.getElementById('s-arc-enabled').checked,
       directory: document.getElementById('s-arc-dir').value.trim(),
       retention: document.getElementById('s-arc-retention').value,
+    },
+    broker:{
+      enabled: document.getElementById('s-broker-enabled').checked,
+      base_url: document.getElementById('s-broker-base-url').value.trim(),
+      scope: document.getElementById('s-broker-scope').value,
+      username: document.getElementById('s-broker-username').value.trim(),
+      provider_id: document.getElementById('s-broker-provider-id').value.trim(),
+      client_id: document.getElementById('s-broker-client-id').value.trim(),
+      registration_token: document.getElementById('s-broker-registration-token').value.trim(),
+      advertised_endpoint: document.getElementById('s-broker-advertised-endpoint').value.trim(),
+      heartbeat_interval_seconds: parseInt(document.getElementById('s-broker-heartbeat').value) || 30,
+      connect_timeout_seconds: parseInt(document.getElementById('s-broker-connect-timeout').value) || 10,
+      request_timeout_seconds: parseInt(document.getElementById('s-broker-request-timeout').value) || 30,
+      reconnect_initial_delay_seconds: parseInt(document.getElementById('s-broker-reconnect-initial').value) || 1,
+      reconnect_max_delay_seconds: parseInt(document.getElementById('s-broker-reconnect-max').value) || 60,
+      transport: 'websocket',
     },
   };
   try{

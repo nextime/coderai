@@ -247,6 +247,45 @@ Config files live in `~/.coderai/` (or `--config` path):
 └── secret_key       # Session signing key (auto-generated)
 ```
 
+### AISBF Broker Client
+
+CoderAI includes an AISBF broker websocket client that can register this instance
+with a broker and receive brokered requests.
+
+You can configure it either by editing `config.json` directly or from the admin
+Settings page under `AISBF Broker`.
+
+Example broker configuration:
+
+```json
+{
+  "broker": {
+    "enabled": true,
+    "base_url": "https://broker.example.com",
+    "scope": "user",
+    "username": "alice",
+    "provider_id": "coderai-local",
+    "client_id": "workstation-01",
+    "registration_token": "your-registration-token",
+    "advertised_endpoint": "http://127.0.0.1:8776",
+    "transport": "websocket",
+    "heartbeat_interval_seconds": 30,
+    "connect_timeout_seconds": 10,
+    "request_timeout_seconds": 30,
+    "reconnect_initial_delay_seconds": 1,
+    "reconnect_max_delay_seconds": 60
+  }
+}
+```
+
+Broker notes:
+- `base_url` accepts `http`, `https`, `ws`, or `wss`; the websocket route is derived automatically.
+- `scope: "user"` requires a non-global `username`.
+- `scope: "global"` requires `username: "global"`.
+- When `enabled` is `true`, `provider_id`, `client_id`, and `registration_token` are required.
+- `advertised_endpoint` is optional and is sent to the broker as the externally reachable endpoint for this instance.
+- Restart CoderAI after changing broker settings so the background broker service reconnects with the new configuration.
+
 ### config.json
 
 ```json

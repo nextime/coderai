@@ -841,3 +841,15 @@ def test_settings_template_keeps_queue_size_control():
 
     assert "Request queue max size" in template
     assert "s-queue-max" in template
+
+
+def test_settings_template_includes_broker_controls():
+    template = Path("codai/admin/templates/settings.html").read_text()
+
+    assert "AISBF Broker" in template
+    assert "s-broker-enabled" in template
+    assert "s-broker-base-url" in template
+    assert "s-broker-provider-id" in template
+    assert "s-broker-client-id" in template
+    assert "s-broker-registration-token" in template
+    assert "toggleBrokerFields()" in template
