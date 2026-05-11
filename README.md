@@ -128,6 +128,22 @@ source venv_all/bin/activate
 python coderai          # starts on http://127.0.0.1:8776
 ```
 
+macOS:
+
+```bash
+./osxbuild.sh all
+source venv_osx_all/bin/activate
+python coderai
+```
+
+Windows PowerShell:
+
+```powershell
+.\build.ps1 -Backend all
+.\venv_win_all\Scripts\Activate.ps1
+python coderai
+```
+
 That's it. Open `http://127.0.0.1:8776/admin` and log in with `admin` / `admin`.
 
 ---
@@ -152,7 +168,42 @@ cd coderai
 ./build.sh vulkan   # AMD/Intel only
 ```
 
+Platform-specific alternatives:
+
+```bash
+./osxbuild.sh all   # macOS, prefers Metal-backed builds when available
+```
+
+```powershell
+.\build.ps1 -Backend all   # Windows, prefers CUDA-backed builds when available
+```
+
 The build script creates a virtual environment, installs dependencies, and builds GPU-accelerated backends including `stable-diffusion-cpp-python` with CUDA+Vulkan support.
+
+Platform backend notes:
+- Linux: CUDA for NVIDIA, Vulkan for AMD/Intel/NVIDIA, OpenCL fallback where supported.
+- macOS: Metal is the correct GPU acceleration path instead of CUDA. `osxbuild.sh` uses PyTorch MPS plus `GGML_METAL` / `SD_METAL` builds where available.
+- Windows: CUDA remains the primary NVIDIA acceleration path. `build.ps1` focuses on CUDA or CPU installs.
+- There is no general-purpose CUDA workflow for current macOS systems; Apple GPU acceleration uses Metal.
+
+### Platform Support Matrix
+
+| Capability | Linux | macOS | Windows |
+|---|---|---|---|
+| Core server / admin UI | Yes | Yes | Yes |
+| Default path handling | Yes | Yes | Yes |
+| PyTorch GPU acceleration | CUDA | Metal (MPS) | CUDA |
+| `llama-cpp-python` GPU path | CUDA / Vulkan | Metal | CUDA |
+| `stable-diffusion-cpp-python` GPU path | CUDA / Vulkan / OpenCL | Metal | CUDA |
+| `whisper.cpp` accelerated path | Vulkan / CPU fallback | Metal / CPU fallback | CPU fallback |
+| InsightFace / ONNX runtime | `onnxruntime-gpu` | `onnxruntime-silicon` or CPU | `onnxruntime-gpu` |
+| Build script included in repo | `build.sh` | `osxbuild.sh` | `build.ps1` |
+
+Notes:
+- "Yes" means CoderAI has an intended path for that platform, not that every optional dependency is guaranteed to install on every machine.
+- macOS GPU acceleration is Metal-based; there is no standard modern CUDA path for macOS.
+- Windows currently uses CUDA as the main NVIDIA acceleration path; Vulkan/OpenCL build flows are not the primary Windows setup in this repository.
+- Some optional audio and media packages may still vary by Python version, hardware, and upstream wheel availability.
 
 ### Manual Installation
 
