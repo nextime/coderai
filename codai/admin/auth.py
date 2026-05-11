@@ -54,7 +54,10 @@ def get_or_create_secret(config_dir: Path) -> bytes:
         secret = secrets.token_bytes(32)
         with open(secret_path, 'wb') as f:
             f.write(secret)
-        secret_path.chmod(0o600)
+        try:
+            secret_path.chmod(0o600)
+        except OSError:
+            pass
         return secret
 
 

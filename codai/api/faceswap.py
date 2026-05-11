@@ -20,13 +20,14 @@ from PIL import Image
 from pydantic import BaseModel, ConfigDict
 
 from codai.api.images import save_image_response
+from codai.platform_paths import default_insightface_model_path
 
 router = APIRouter()
 
 global_args = None
 global_file_path = None
 
-_INSWAPPER_MODEL_PATH = os.path.expanduser('~/.insightface/models/inswapper_128.onnx')
+_INSWAPPER_MODEL_PATH = str(default_insightface_model_path())
 _INSWAPPER_HF_REPO = 'deepinsight/inswapper'
 _INSWAPPER_HF_FILE = 'inswapper_128.onnx'
 

@@ -1713,7 +1713,8 @@ def _run_unpixelate(image_bytes: bytes, scale: int, model_path: Optional[str]) -
         mp = model_path
     else:
         # Download RealESRGAN_x4plus on demand
-        mp = os.path.expanduser('~/.cache/realesrgan/RealESRGAN_x4plus.pth')
+        from codai.platform_paths import default_realesrgan_model_path
+        mp = str(default_realesrgan_model_path())
         if not os.path.exists(mp):
             os.makedirs(os.path.dirname(mp), exist_ok=True)
             import urllib.request

@@ -25,6 +25,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Stre
 from fastapi.templating import Jinja2Templates
 
 from codai.admin.auth import SessionManager
+from codai.platform_paths import default_whisper_server_path
 import queue as _q
 import threading as _t
 import uuid as _uuid
@@ -90,7 +91,7 @@ def _next_whisper_server_model_id(audio_models) -> str:
 
 
 def _default_whisper_server_path() -> str:
-    return shutil.which("whisper-server") or "/usr/local/bin/whisper-server"
+    return shutil.which("whisper-server") or default_whisper_server_path()
 
 
 def get_current_user(request: Request) -> Optional[str]:
@@ -239,7 +240,11 @@ async def admin_dashboard(request: Request, username: str = Depends(require_auth
 
 @router.get("/admin/models", response_class=HTMLResponse)
 async def models_page(request: Request, username: str = Depends(require_admin)):
-    return _tmpl(request, "models.html", {"username": username, "is_admin": True})
+    return _tmpl(request, "models.html", {
+        "username": username,
+        "is_admin": True,
+        "default_whisper_server_path": _default_whisper_server_path(),
+    })
 
 
 @router.get("/admin/tokens", response_class=HTMLResponse)
@@ -1434,12 +1439,14 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         gpu_device = int(data.get("gpu_device", 0))
         if gpu_device < 0:
             raise HTTPException(status_code=400, detail="gpu_device must be >= 0")
-        # Remove existing entry with same id (update semantics)
         audio_list = config_manager.models_data.get("audio_models", [])
-        config_manager.models_data["audio_models"] = [
-            m for m in audio_list
-            if not (isinstance(m, dict) and m.get("id") == model_id)
-        ]
+        if any(
+            isinstance(m, dict)
+            and m.get("backend") == "whisper-server"
+            and m.get("id") == model_id
+            for m in audio_list
+        ):
+            raise HTTPException(status_code=409, detail=f"whisper-server model '{model_id}' already exists")
         alias = (data.get("alias") or "").strip() or None
         entry = {
             "id": model_id,

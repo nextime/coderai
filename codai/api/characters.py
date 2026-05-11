@@ -40,6 +40,8 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
+from codai.platform_paths import default_characters_dir, legacy_style_config_dir
+
 router = APIRouter()
 
 _CHARS_DIR: Optional[str] = None
@@ -47,8 +49,8 @@ _CHARS_DIR: Optional[str] = None
 
 def set_global_args(args):
     global _CHARS_DIR
-    base = getattr(args, 'file_path', None) or os.path.expanduser('~/.coderai')
-    root = base if os.path.isdir(base) else (os.path.dirname(base) if base else os.path.expanduser('~/.coderai'))
+    base = getattr(args, 'file_path', None) or str(legacy_style_config_dir())
+    root = base if os.path.isdir(base) else (os.path.dirname(base) if base else str(legacy_style_config_dir()))
     _CHARS_DIR = os.path.join(root, 'characters')
     os.makedirs(_CHARS_DIR, exist_ok=True)
 
@@ -60,7 +62,7 @@ def set_global_file_path(path: str):
 def _chars_dir() -> str:
     if _CHARS_DIR:
         return _CHARS_DIR
-    d = os.path.expanduser('~/.coderai/characters')
+    d = str(default_characters_dir())
     os.makedirs(d, exist_ok=True)
     return d
 

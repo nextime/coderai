@@ -247,6 +247,7 @@ def test_model_configure_allows_whisper_server_id_coexistence_with_other_audio_b
 
 def test_model_configure_defaults_missing_whisper_server_path_to_usr_local_bin(monkeypatch, tmp_path):
     from codai.admin import routes
+    from codai.platform_paths import default_whisper_server_path
 
     cfg = _build_config(tmp_path)
     monkeypatch.setattr(routes, "config_manager", cfg, raising=False)
@@ -267,7 +268,7 @@ def test_model_configure_defaults_missing_whisper_server_path_to_usr_local_bin(m
     )
 
     assert response.status_code == 200
-    assert cfg.models_data["audio_models"][0]["server_path"] == "/usr/local/bin/whisper-server"
+    assert cfg.models_data["audio_models"][0]["server_path"] == default_whisper_server_path()
 
     app.dependency_overrides.clear()
 
@@ -546,6 +547,67 @@ def test_transcription_requires_configured_whisper_server_model_id():
     assert "not configured" in str(exc.value.detail).lower() or "not available" in str(exc.value.detail).lower()
 
 
+def test_whisper_alias_prefers_idle_instance(monkeypatch):
+    from codai.models.manager import MultiModelManager
+
+    manager = MultiModelManager()
+    busy = SimpleNamespace(is_idle=lambda: False)
+    idle = SimpleNamespace(is_idle=lambda: True)
+    manager.whisper_servers = {"whisper0": busy, "whisper1": idle}
+    manager.whisper_aliases = {"shared-whisper": ["whisper0", "whisper1"]}
+
+    assert manager.resolve_whisper_alias_model_id("shared-whisper") == "whisper1"
+
+
+def test_whisper_alias_uses_random_choice_when_multiple_idle(monkeypatch):
+    from codai.models.manager import MultiModelManager
+
+    manager = MultiModelManager()
+    idle0 = SimpleNamespace(is_idle=lambda: True)
+    idle1 = SimpleNamespace(is_idle=lambda: True)
+    manager.whisper_servers = {"whisper0": idle0, "whisper1": idle1}
+    manager.whisper_aliases = {"shared-whisper": ["whisper0", "whisper1"]}
+    monkeypatch.setattr("codai.models.manager.random.choice", lambda items: items[-1])
+
+    assert manager.resolve_whisper_alias_model_id("shared-whisper") == "whisper1"
+
+
+def test_get_all_allowed_identifiers_includes_whisper_alias(monkeypatch):
+    from codai.admin import routes
+    from codai.models.manager import MultiModelManager
+
+    manager = MultiModelManager()
+    manager.audio_models[:] = ["whisper0", "whisper1"]
+    manager.whisper_aliases = {"shared-whisper": ["whisper0", "whisper1"]}
+    monkeypatch.setattr(
+        routes,
+        "config_manager",
+        SimpleNamespace(
+            models_data={
+                "text_models": [],
+                "image_models": [],
+                "audio_models": [
+                    {"id": "whisper0", "backend": "whisper-server", "alias": "shared-whisper"},
+                    {"id": "whisper1", "backend": "whisper-server", "alias": "shared-whisper"},
+                ],
+                "vision_models": [],
+                "tts_models": [],
+                "gguf_models": [],
+                "video_models": [],
+                "audio_gen_models": [],
+                "embedding_models": [],
+                "aliases": {},
+            }
+        ),
+        raising=False,
+    )
+
+    allowed = manager.get_all_allowed_identifiers()
+
+    assert "shared-whisper" in allowed
+    assert "audio:shared-whisper" in allowed
+
+
 def test_get_all_allowed_identifiers_includes_configured_whisper_server_id_without_legacy_alias(monkeypatch):
     from codai.admin import routes
     from codai.models.manager import MultiModelManager
@@ -673,7 +735,7 @@ def test_models_template_defines_whisper_server_builder_default_helpers():
     template = Path("codai/admin/templates/models.html").read_text()
 
     assert "function defaultWhisperServerPath()" in template
-    assert "return '/usr/local/bin/whisper-server';" in template
+    assert "return window.__DEFAULT_WHISPER_SERVER_PATH__ || '';" in template
     assert "function resetWhisperServerBuilderDefaults()" in template
     assert "const modelIdInput = document.getElementById('ws-model-id');" in template
     assert "const serverPathInput = document.getElementById('ws-server-path');" in template
