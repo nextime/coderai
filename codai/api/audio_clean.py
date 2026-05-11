@@ -43,21 +43,8 @@ def _ffmpeg_binary() -> str:
     return ffmpeg
 
 
-def _base_url(http_request: Request) -> str:
-    url_setting = getattr(global_args, "url", "auto") if global_args else "auto"
-    if url_setting != "auto":
-        return url_setting.rstrip("/")
-    host = http_request.headers.get("host", "127.0.0.1") if http_request else "127.0.0.1"
-    if ":" in host:
-        parts = host.split(":")
-        if len(parts) == 2 and parts[1].isdigit():
-            host = parts[0]
-    proto = "https" if getattr(global_args, "https", False) else "http"
-    port = getattr(global_args, "port", 8000) if global_args else 8000
-    return f"{proto}://{host}:{port}"
-
-
 def _persist_file(path: str, suffix: str, http_request: Request) -> dict:
+    from codai.api.urlutils import build_file_url
     data = Path(path).read_bytes()
     if global_file_path:
         os.makedirs(global_file_path, exist_ok=True)
@@ -65,7 +52,7 @@ def _persist_file(path: str, suffix: str, http_request: Request) -> dict:
         out_path = os.path.join(global_file_path, filename)
         with open(out_path, "wb") as handle:
             handle.write(data)
-        return {"url": f"{_base_url(http_request)}/v1/files/{filename}"}
+        return {"url": build_file_url(filename, http_request)}
     return {f"b64_{suffix.lstrip('.')}": base64.b64encode(data).decode("ascii")}
 
 

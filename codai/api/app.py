@@ -137,6 +137,36 @@ app.middleware("http")(log_requests)
 app.add_middleware(RateLimitMiddleware)
 app.add_middleware(BearerAuthMiddleware)
 
+# Reverse-proxy support: update ASGI scope with forwarded headers so that
+# request.url, redirects, and url_for() reflect the public-facing URL.
+try:
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+    app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+except ImportError:
+    pass
+
+
+class _ForwardedPrefixMiddleware:
+    """Populate ASGI root_path from X-Forwarded-Prefix / X-Script-Name headers."""
+
+    def __init__(self, app):
+        self._app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            headers = dict(scope.get("headers", []))
+            prefix = (
+                headers.get(b"x-forwarded-prefix", b"")
+                or headers.get(b"x-script-name", b"")
+            )
+            if prefix:
+                scope = dict(scope)
+                scope["root_path"] = prefix.decode().rstrip("/")
+        await self._app(scope, receive, send)
+
+
+app.add_middleware(_ForwardedPrefixMiddleware)
+
 # Mount static files for admin dashboard
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
@@ -171,7 +201,9 @@ async def unauthorized_redirect(request: Request, exc: HTTPException):
     accept = request.headers.get("accept", "")
     if "text/html" in accept:
         from fastapi.responses import RedirectResponse
-        return RedirectResponse(url="/login", status_code=302)
+        from codai.api.urlutils import get_public_prefix
+        prefix = get_public_prefix(request)
+        return RedirectResponse(url=f"{prefix}/login", status_code=302)
     return JSONResponse(status_code=401, content={"detail": exc.detail})
 
 
@@ -204,10 +236,11 @@ _AUDIO_EXTS = {'.wav', '.mp3', '.ogg', '.flac', '.aac', '.m4a'}
 
 
 @app.get("/v1/archive")
-async def list_archive():
+async def list_archive(request: Request):
     """List all generated files in the output directory."""
     if not global_file_path or not os.path.isdir(global_file_path):
         return {"files": []}
+    from codai.api.urlutils import build_file_url
     files = []
     try:
         names = os.listdir(global_file_path)
@@ -232,7 +265,7 @@ async def list_archive():
             'type': ftype,
             'size': stat.st_size,
             'created': stat.st_mtime,
-            'url': f'/v1/files/{fname}',
+            'url': build_file_url(fname, request),
         })
     files.sort(key=lambda f: f['created'], reverse=True)
     return {"files": files}

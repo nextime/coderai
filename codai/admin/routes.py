@@ -44,6 +44,20 @@ _download_sessions: dict = {}
 _download_status: dict = {}   # session_id → latest progress state (survives SSE disconnect)
 
 
+def _url(request: Request, path: str) -> str:
+    """Return a proxy-aware absolute path (root_path prefix + path)."""
+    from codai.api.urlutils import get_public_prefix
+    return get_public_prefix(request) + path
+
+
+def _tmpl(request: Request, name: str, ctx: dict = None):
+    """Render a template with root_path injected into the context."""
+    from codai.api.urlutils import get_public_prefix
+    c = ctx or {}
+    c.setdefault("root_path", get_public_prefix(request))
+    return templates.TemplateResponse(request, name, c)
+
+
 def init_session_manager(config_dir: Path):
     """Initialize the session manager."""
     global session_manager
@@ -117,9 +131,9 @@ async def login_page(request: Request):
     # If already logged in, redirect to dashboard
     username = get_current_user(request)
     if username:
-        return RedirectResponse(url="/admin", status_code=302)
-    
-    return templates.TemplateResponse(request, "login.html", {"error": None})
+        return RedirectResponse(url=_url(request, "/admin"), status_code=302)
+
+    return _tmpl(request, "login.html", {"error": None})
 
 
 @router.post("/login")
@@ -135,17 +149,15 @@ async def login(
     session_cookie = session_manager.authenticate(username, password)
 
     if not session_cookie:
-        return templates.TemplateResponse(request, "login.html", {"error": "Invalid username or password"})
-    
+        return _tmpl(request, "login.html", {"error": "Invalid username or password"})
+
     # Check if must change password
     must_change = session_cookie.endswith(".MUST_CHANGE")
     if must_change:
         session_cookie = session_cookie[:-12]
-    
-    response = RedirectResponse(
-        url="/admin/change-password" if must_change else "/admin",
-        status_code=302
-    )
+
+    redirect_path = "/admin/change-password" if must_change else "/admin"
+    response = RedirectResponse(url=_url(request, redirect_path), status_code=302)
     response.set_cookie(
         key="session",
         value=session_cookie,
@@ -163,8 +175,8 @@ async def logout(request: Request):
     if session_manager:
         cookie = request.cookies.get("session")
         session_manager.destroy_session(cookie)
-    
-    response = RedirectResponse(url="/login", status_code=302)
+
+    response = RedirectResponse(url=_url(request, "/login"), status_code=302)
     response.delete_cookie("session")
     return response
 
@@ -173,7 +185,7 @@ async def logout(request: Request):
 async def change_password_page(request: Request, username: str = Depends(require_auth)):
     user = session_manager.get_user(username)
     must_change = user.get("must_change_password", False) if user else False
-    return templates.TemplateResponse(request, "change_password.html", {
+    return _tmpl(request, "change_password.html", {
         "username": username,
         "must_change": must_change,
         "is_admin": session_manager.is_admin(username),
@@ -194,7 +206,7 @@ async def change_password(
     must_change = user.get("must_change_password", False) if user else False
 
     def render_error(msg: str):
-        return templates.TemplateResponse(request, "change_password.html", {
+        return _tmpl(request, "change_password.html", {
             "username": username, "must_change": must_change,
             "is_admin": is_admin, "error": msg,
         })
@@ -214,38 +226,38 @@ async def change_password(
     if not success:
         return render_error("Current password is incorrect")
 
-    return RedirectResponse(url="/admin", status_code=302)
+    return RedirectResponse(url=_url(request, "/admin"), status_code=302)
 
 
 @router.get("/admin", response_class=HTMLResponse)
 async def admin_dashboard(request: Request, username: str = Depends(require_auth)):
     is_admin = session_manager.is_admin(username)
-    return templates.TemplateResponse(request, "dashboard.html", {
+    return _tmpl(request, "dashboard.html", {
         "username": username, "is_admin": is_admin,
     })
 
 
 @router.get("/admin/models", response_class=HTMLResponse)
 async def models_page(request: Request, username: str = Depends(require_admin)):
-    return templates.TemplateResponse(request, "models.html", {"username": username, "is_admin": True})
+    return _tmpl(request, "models.html", {"username": username, "is_admin": True})
 
 
 @router.get("/admin/tokens", response_class=HTMLResponse)
 async def tokens_page(request: Request, username: str = Depends(require_admin)):
-    return templates.TemplateResponse(request, "tokens.html", {"username": username, "is_admin": True})
+    return _tmpl(request, "tokens.html", {"username": username, "is_admin": True})
 
 
 @router.get("/admin/users", response_class=HTMLResponse)
 async def users_page(request: Request, username: str = Depends(require_admin)):
     users = session_manager.list_users()
-    return templates.TemplateResponse(request, "users.html", {
+    return _tmpl(request, "users.html", {
         "username": username, "is_admin": True, "users": users,
     })
 
 
 @router.get("/chat", response_class=HTMLResponse)
 async def chat_page(request: Request, username: str = Depends(require_auth)):
-    return templates.TemplateResponse(request, "chat.html", {
+    return _tmpl(request, "chat.html", {
         "username": username, "is_admin": session_manager.is_admin(username),
     })
 
@@ -347,7 +359,7 @@ async def api_status(username: str = Depends(require_auth)):
         if config_manager:
             md = config_manager.models_data
             for cat in ("text_models", "image_models", "audio_models", "vision_models", "tts_models",
-                        "video_models", "audio_gen_models", "embedding_models"):
+                        "video_models", "audio_gen_models", "embedding_models", "spatial_models"):
                 for m in md.get(cat, []):
                     if isinstance(m, dict):
                         mid = m.get("path") or m.get("id") or ""
@@ -872,7 +884,7 @@ def _scan_caches() -> dict:
         md = config_manager.models_data
         for cat in ("text_models", "image_models", "audio_models",
                     "gguf_models", "tts_models", "vision_models", "video_models",
-                    "audio_gen_models", "embedding_models"):
+                    "audio_gen_models", "embedding_models", "spatial_models"):
             for m in md.get(cat, []):
                 if isinstance(m, str):
                     p = m
@@ -906,7 +918,9 @@ def _scan_caches() -> dict:
                             cfg = (configured_settings.get(fpath)
                                    or configured_settings.get(fname)
                                    or ({}, None))
-                            caps = detect_model_capabilities(fname)
+                            cfg_s = cfg[0] if isinstance(cfg[0], dict) else {}
+                            saved_caps = cfg_s.get("capabilities") or []
+                            caps_list = saved_caps if saved_caps else detect_model_capabilities(fname).to_list()
                             result["gguf"].append({
                                 "filename": fname,
                                 "path": fpath,
@@ -914,15 +928,21 @@ def _scan_caches() -> dict:
                                 "size_bytes": fsize,
                                 "in_config": fpath in configured_settings or fname in configured_settings,
                                 "model_type": cfg[1] if cfg[1] and cfg[1] != "gguf_models" else "text_models",
-                                "settings": cfg[0] if isinstance(cfg[0], dict) else {},
-                                "capabilities": caps.to_list(),
+                                "settings": cfg_s,
+                                "capabilities": caps_list,
                                 "source_repo": repo.repo_id,
                             })
                     continue  # skip adding to hf list
 
                 cfg = configured_settings.get(repo.repo_id, ({}, None))
-                caps = (lookup_capability_cache(repo.repo_id)
-                        or detect_model_capabilities(repo.repo_id))
+                cfg_settings = cfg[0] if isinstance(cfg[0], dict) else {}
+                saved_caps = cfg_settings.get("capabilities") or []
+                if saved_caps:
+                    caps_list = saved_caps
+                else:
+                    caps = (lookup_capability_cache(repo.repo_id)
+                            or detect_model_capabilities(repo.repo_id))
+                    caps_list = caps.to_list()
                 result["hf"].append({
                     "id": repo.repo_id,
                     "size_gb": round(size_bytes / 1e9, 2),
@@ -932,8 +952,8 @@ def _scan_caches() -> dict:
                     "file_count": len(files),
                     "in_config": repo.repo_id in configured_settings,
                     "model_type": cfg[1] if cfg[1] and cfg[1] != "gguf_models" else "text_models",
-                    "settings": cfg[0] if isinstance(cfg[0], dict) else {},
-                    "capabilities": caps.to_list(),
+                    "settings": cfg_settings,
+                    "capabilities": caps_list,
                 })
         except Exception as e:
             result["hf_error"] = str(e)
@@ -948,7 +968,9 @@ def _scan_caches() -> dict:
                 cfg = (configured_settings.get(fpath)
                        or configured_settings.get(fname)
                        or ({}, None))
-                caps = detect_model_capabilities(fname)
+                cfg_s = cfg[0] if isinstance(cfg[0], dict) else {}
+                saved_caps = cfg_s.get("capabilities") or []
+                caps_list = saved_caps if saved_caps else detect_model_capabilities(fname).to_list()
                 result["gguf"].append({
                     "filename": fname,
                     "path": fpath,
@@ -956,8 +978,8 @@ def _scan_caches() -> dict:
                     "size_bytes": size,
                     "in_config": fpath in configured_settings or fname in configured_settings,
                     "model_type": cfg[1] if cfg[1] and cfg[1] != "gguf_models" else "text_models",
-                    "settings": cfg[0] if isinstance(cfg[0], dict) else {},
-                    "capabilities": caps.to_list(),
+                    "settings": cfg_s,
+                    "capabilities": caps_list,
                 })
 
     # Add configured GGUF models not yet in the list (e.g., HF repo IDs or external paths)
@@ -1190,7 +1212,7 @@ async def api_model_enable(request: Request, username: str = Depends(require_adm
     path = data.get("path") or data.get("model_id", "")
     model_type = data.get("model_type", "text_models")
     valid = {"text_models", "image_models", "audio_models", "gguf_models", "tts_models", "vision_models",
-             "video_models", "audio_gen_models", "embedding_models"}
+             "video_models", "audio_gen_models", "embedding_models", "spatial_models"}
     if model_type not in valid:
         raise HTTPException(status_code=400, detail=f"model_type must be one of {valid}")
     lst = config_manager.models_data.setdefault(model_type, [])
@@ -1218,7 +1240,7 @@ async def api_model_disable(request: Request, username: str = Depends(require_ad
     changed = False
     for cat in ("text_models", "image_models", "audio_models",
                 "gguf_models", "tts_models", "vision_models", "video_models",
-                "audio_gen_models", "embedding_models"):
+                "audio_gen_models", "embedding_models", "spatial_models"):
         lst = config_manager.models_data.get(cat, [])
         new_lst = [m for m in lst if not _matches(m)]
         if len(new_lst) != len(lst):
@@ -1242,7 +1264,8 @@ async def api_model_loaded_status(username: str = Depends(require_admin)):
     configured_max = {}
     if config_manager:
         for cat in ("text_models", "image_models", "audio_models", "vision_models",
-                    "tts_models", "gguf_models", "video_models", "audio_gen_models", "embedding_models"):
+                    "tts_models", "gguf_models", "video_models", "audio_gen_models",
+                    "embedding_models", "spatial_models"):
             for m in config_manager.models_data.get(cat, []):
                 if isinstance(m, dict):
                     path = m.get("path") or m.get("id") or ""
@@ -1270,7 +1293,8 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
                            ("vision_models", "vision"), ("tts_models", "tts"),
                            ("video_models", "video"),
                            ("audio_gen_models", "audio_gen"),
-                           ("embedding_models", "embedding")):
+                           ("embedding_models", "embedding"),
+                           ("spatial_models", "spatial")):
             for m in md.get(cat, []):
                 mid = m if isinstance(m, str) else m.get("path") or m.get("id") or ""
                 if mid == path:
@@ -1440,7 +1464,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         return result
     path = data.get("path") or data.get("model_id", "")
     valid = {"text_models", "image_models", "audio_models", "tts_models", "vision_models", "video_models",
-             "audio_gen_models", "embedding_models"}
+             "audio_gen_models", "embedding_models", "spatial_models"}
     if not path:
         raise HTTPException(status_code=400, detail="path is required")
 
@@ -1501,7 +1525,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "max_gpu_percent", "manual_ram_gb", "load_in_4bit", "load_in_8bit",
                 "flash_attention", "no_ram", "offload_strategy", "offload_dir",
                 "system_prompt", "parser", "tools_closer_prompt", "grammar_guided",
-                "max_instances", "preload_all_instances"):
+                "max_instances", "preload_all_instances", "capabilities"):
         if key in data:
             entry[key] = data[key]
 
@@ -1542,7 +1566,7 @@ from datetime import datetime
 
 @router.get("/admin/settings", response_class=HTMLResponse)
 async def settings_page(request: Request, username: str = Depends(require_admin)):
-    return templates.TemplateResponse(request, "settings.html", {"username": username, "is_admin": True})
+    return _tmpl(request, "settings.html", {"username": username, "is_admin": True})
 
 
 @router.get("/admin/api/settings")
@@ -1693,7 +1717,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
 
 @router.get("/admin/archive", response_class=HTMLResponse)
 async def archive_page(request: Request, username: str = Depends(require_admin)):
-    return templates.TemplateResponse(request, "archive.html", {"username": username, "is_admin": True})
+    return _tmpl(request, "archive.html", {"username": username, "is_admin": True})
 
 
 @router.get("/admin/api/archive")

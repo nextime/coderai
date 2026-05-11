@@ -119,21 +119,8 @@ def _pil_from_b64(data: str):
 
 
 def _build_url(filename: str, http_request) -> str:
-    url_setting = getattr(global_args, 'url', 'auto') if global_args else 'auto'
-    if url_setting == 'auto':
-        host = (http_request.headers.get('host', '127.0.0.1')
-                if http_request else '127.0.0.1')
-        if ':' in host:
-            parts = host.split(':')
-            if len(parts) == 2 and parts[1].isdigit():
-                host = parts[0]
-        use_https = getattr(global_args, 'https', False) or getattr(global_args, 'pubkey', None)
-        proto = 'https' if use_https else 'http'
-        port = getattr(global_args, 'port', 8000) if global_args else 8000
-        base_url = f"{proto}://{host}:{port}"
-    else:
-        base_url = url_setting.rstrip('/')
-    return f"{base_url}/v1/files/{filename}"
+    from codai.api.urlutils import build_file_url
+    return build_file_url(filename, http_request)
 
 
 def _save_file(data: bytes, ext: str, http_request) -> dict:

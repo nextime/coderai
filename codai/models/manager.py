@@ -496,6 +496,7 @@ class MultiModelManager:
         self.video_models: List[str] = []       # video generation models (t2v / i2v / v2v)
         self.audio_gen_models: List[str] = []   # music / sfx generation (MusicGen, AudioLDM2…)
         self.embedding_models: List[str] = []   # text / multimodal embeddings
+        self.spatial_models: List[str] = []     # depth estimation, segmentation, object detection
         self.config: Dict[str, Dict] = {}  # Store model configurations
         self.tool_parser = ModelParserAdapter()
         self.current_model_key: Optional[str] = None
@@ -868,6 +869,13 @@ class MultiModelManager:
         self.config[f"embedding:{model_name}"] = config or {}
         print(f"Registered embedding model: {model_name}")
 
+    def set_spatial_model(self, model_name: str, config: Dict = None):
+        """Add a depth estimation / segmentation / object detection model."""
+        if model_name not in self.spatial_models:
+            self.spatial_models.append(model_name)
+        self.config[f"spatial:{model_name}"] = config or {}
+        print(f"Registered spatial model: {model_name}")
+
     def set_model_alias(self, alias: str, model_name: str):
         """Register an alias for a model."""
         self.model_aliases[alias] = model_name
@@ -934,6 +942,13 @@ class MultiModelManager:
                 allowed.add(m)
                 allowed.add(f"embedding:{m}")
 
+        # Spatial models (depth estimation, segmentation, detection)
+        if self.spatial_models:
+            allowed.add("spatial")
+            for m in self.spatial_models:
+                allowed.add(m)
+                allowed.add(f"spatial:{m}")
+
         # Custom aliases
         for alias in self.model_aliases:
             allowed.add(alias)
@@ -945,7 +960,8 @@ class MultiModelManager:
                 md = config_manager.models_data
                 for cat in ("text_models", "image_models", "audio_models",
                             "gguf_models", "tts_models", "vision_models",
-                            "video_models", "audio_gen_models", "embedding_models"):
+                            "video_models", "audio_gen_models", "embedding_models",
+                            "spatial_models"):
                     for m in md.get(cat, []):
                         mid = (m if isinstance(m, str) else
                                m.get("alias") or m.get("path") or m.get("id") or "")
@@ -995,6 +1011,9 @@ class MultiModelManager:
         for m in self.embedding_models:
             if _matches(m):
                 return "embedding"
+        for m in self.spatial_models:
+            if _matches(m):
+                return "spatial"
         return None
 
     def is_allowed_model(self, requested_or_resolved: str, model_type: str = None) -> bool:
@@ -1462,7 +1481,7 @@ class MultiModelManager:
                         bare = model_key.split(":", 1)[1] if ":" in model_key else model_key
                         for cat in ("text_models", "image_models", "audio_models", "tts_models",
                                     "vision_models", "video_models", "audio_gen_models",
-                                    "embedding_models"):
+                                    "embedding_models", "spatial_models"):
                             for entry in config_manager.models_data.get(cat, []):
                                 if not isinstance(entry, dict):
                                     continue
@@ -1712,6 +1731,8 @@ class MultiModelManager:
                 resolved_name = self.audio_gen_models[0] if self.audio_gen_models else None
             elif model_type == "embedding":
                 resolved_name = self.embedding_models[0] if self.embedding_models else None
+            elif model_type == "spatial":
+                resolved_name = self.spatial_models[0] if self.spatial_models else None
             else:
                 resolved_name = self.default_model
         else:
@@ -1737,6 +1758,8 @@ class MultiModelManager:
                 resolved_name = self.audio_gen_models[0] if self.audio_gen_models else None
             elif requested_model == "embedding":
                 resolved_name = self.embedding_models[0] if self.embedding_models else None
+            elif requested_model == "spatial":
+                resolved_name = self.spatial_models[0] if self.spatial_models else None
             # Handle prefixed models (e.g., "image:model_name")
             elif requested_model.startswith("image:"):
                 resolved_name = requested_model[6:]
@@ -1752,6 +1775,8 @@ class MultiModelManager:
                 resolved_name = requested_model[10:]
             elif requested_model.startswith("embedding:"):
                 resolved_name = requested_model[10:]
+            elif requested_model.startswith("spatial:"):
+                resolved_name = requested_model[8:]
             else:
                 resolved_name = requested_model
         
@@ -1809,6 +1834,7 @@ class MultiModelManager:
             "video": self.video_models,
             "audio_gen": self.audio_gen_models,
             "embedding": self.embedding_models,
+            "spatial": self.spatial_models,
         }
         _candidates = _type_registry.get(model_type, []) if model_type else []
         if resolved_name not in _candidates:
@@ -2227,7 +2253,7 @@ class MultiModelManager:
     
     def list_models(self) -> List[ModelInfo]:
         """List all available models (configured + runtime aliases) with type/capability metadata."""
-        from codai.models.capabilities import detect_model_capabilities
+        from codai.models.capabilities import detect_model_capabilities, ModelCapabilities
 
         models = []
         seen_ids: set = set()
@@ -2242,6 +2268,7 @@ class MultiModelManager:
             "video_models": "video",
             "audio_gen_models": "audio_gen",
             "embedding_models": "embedding",
+            "spatial_models": "spatial",
         }
 
         # Minimum capability guaranteed by a model's config category.
@@ -2253,22 +2280,31 @@ class MultiModelManager:
             "tts":       "text_to_speech",
             "audio_gen": "audio_generation",
             "embedding": "embeddings",
+            "spatial":   "depth_estimation",
         }
 
         def _add(model_id: str, model_type: str = None, meta: Dict[str, Any] = None):
             if model_id in seen_ids:
                 return
             seen_ids.add(model_id)
-            caps = detect_model_capabilities(model_id)
-            # If heuristic detection missed the type (e.g. custom/vendor model IDs
-            # that don't match any keyword), ensure the minimum capability for the
-            # config-declared type is set so badges display correctly.
-            if model_type and model_type in TYPE_MIN_CAP:
-                min_cap = TYPE_MIN_CAP[model_type]
-                if not getattr(caps, min_cap, False):
-                    setattr(caps, min_cap, True)
-            resolved_type = model_type or (caps.to_list()[0].split("_")[0] if caps.to_list() else "text")
             meta = meta or {}
+            # Use saved capabilities from config when available; fall back to heuristic.
+            saved_caps = meta.get("capabilities") or []
+            if saved_caps:
+                caps = ModelCapabilities()
+                for f in saved_caps:
+                    if hasattr(caps, f):
+                        setattr(caps, f, True)
+            else:
+                caps = detect_model_capabilities(model_id)
+                # If heuristic detection missed the type (e.g. custom/vendor model IDs
+                # that don't match any keyword), ensure the minimum capability for the
+                # config-declared type is set so badges display correctly.
+                if model_type and model_type in TYPE_MIN_CAP:
+                    min_cap = TYPE_MIN_CAP[model_type]
+                    if not getattr(caps, min_cap, False):
+                        setattr(caps, min_cap, True)
+            resolved_type = model_type or (caps.to_list()[0].split("_")[0] if caps.to_list() else "text")
             models.append(ModelInfo(
                 id=model_id,
                 type=resolved_type,
@@ -2289,7 +2325,8 @@ class MultiModelManager:
                 md = config_manager.models_data
                 for cat in ("text_models", "vision_models", "image_models",
                             "audio_models", "tts_models", "gguf_models",
-                            "video_models", "audio_gen_models", "embedding_models"):
+                            "video_models", "audio_gen_models", "embedding_models",
+                            "spatial_models"):
                     mtype = CAT_TYPE.get(cat, "text")
                     for m in md.get(cat, []):
                         if isinstance(m, str):
@@ -2365,6 +2402,11 @@ class MultiModelManager:
             _add("embedding", "embedding")
             for m in self.embedding_models:
                 _add(f"embedding:{m}", "embedding")
+
+        if self.spatial_models:
+            _add("spatial", "spatial")
+            for m in self.spatial_models:
+                _add(f"spatial:{m}", "spatial")
 
         # --- Custom aliases ---
         for alias in self.model_aliases:

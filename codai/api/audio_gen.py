@@ -89,20 +89,8 @@ def _save_audio_response(audio_data: bytes, ext: str, http_request: Request) -> 
         fpath = os.path.join(global_file_path, filename)
         with open(fpath, 'wb') as f:
             f.write(audio_data)
-        url_setting = getattr(global_args, 'url', 'auto') if global_args else 'auto'
-        if url_setting == 'auto':
-            host = http_request.headers.get('host', '127.0.0.1') if http_request else '127.0.0.1'
-            if ':' in host:
-                parts = host.split(':')
-                if len(parts) == 2 and parts[1].isdigit():
-                    host = parts[0]
-            use_https = getattr(global_args, 'https', False) if global_args else False
-            proto = 'https' if use_https else 'http'
-            port = getattr(global_args, 'port', 8000) if global_args else 8000
-            base_url = f"{proto}://{host}:{port}"
-        else:
-            base_url = url_setting.rstrip('/')
-        return {"url": f"{base_url}/v1/files/{filename}"}
+        from codai.api.urlutils import build_file_url
+        return {"url": build_file_url(filename, http_request)}
     else:
         b64 = base64.b64encode(audio_data).decode()
         return {f"b64_{ext}": b64}

@@ -463,6 +463,15 @@ def main():
             if isinstance(m, dict) and m.get("alias"):
                 multi_model_manager.set_model_alias(m["alias"], mid)
 
+    # Spatial models (depth estimation, segmentation, object detection)
+    spatial_models = models_config.get("spatial_models", [])
+    for m in spatial_models:
+        mid = _model_id(m)
+        if mid:
+            multi_model_manager.set_spatial_model(mid, config=_model_cfg(m, "spatial") if isinstance(m, dict) else {})
+            if isinstance(m, dict) and m.get("alias"):
+                multi_model_manager.set_model_alias(m["alias"], mid)
+
     # Register aliases
     aliases = models_config.get("aliases", {})
     for alias, model in aliases.items():
@@ -477,7 +486,8 @@ def main():
         [("tts", m) for m in tts_models] +
         [("video", m) for m in video_models] +
         [("audio_gen", m) for m in audio_gen_models] +
-        [("embedding", m) for m in embedding_models]
+        [("embedding", m) for m in embedding_models] +
+        [("spatial", m) for m in spatial_models]
     )
     for mtype, m in all_model_entries:
         mid = _model_id(m)

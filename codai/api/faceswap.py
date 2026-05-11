@@ -251,14 +251,8 @@ async def _faceswap_video(src_img, request, http_request):
             os.makedirs(global_file_path, exist_ok=True)
             with open(fpath, 'wb') as f:
                 f.write(out_bytes)
-            host = http_request.headers.get('host', '127.0.0.1') if http_request else '127.0.0.1'
-            if ':' in host:
-                parts = host.split(':')
-                if len(parts) == 2 and parts[1].isdigit():
-                    host = parts[0]
-            proto = 'https' if getattr(global_args, 'https', False) else 'http'
-            port = getattr(global_args, 'port', 8000) if global_args else 8000
-            data = [{'url': f'{proto}://{host}:{port}/v1/files/{fname}'}]
+            from codai.api.urlutils import build_file_url
+            data = [{'url': build_file_url(fname, http_request)}]
         else:
             data = [{'b64_mp4': base64.b64encode(out_bytes).decode()}]
 

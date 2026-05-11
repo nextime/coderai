@@ -47,7 +47,7 @@
   <div id="active-models"><span class="muted small">No models loaded</span></div>
   {% if is_admin %}
   <div style="margin-top:.875rem">
-    <a href="/admin/models" class="btn btn-ghost btn-sm">Manage models</a>
+    <a href="{{ root_path }}/admin/models" class="btn btn-ghost btn-sm">Manage models</a>
   </div>
   {% endif %}
 </div>
@@ -69,7 +69,7 @@
 <script>
 async function poll() {
   try {
-    const d = await fetch('/admin/api/status').then(r => r.json());
+    const d = await fetch(ROOT_PATH + '/admin/api/status').then(r => r.json());
     const ok = d.status === 'ok';
     document.getElementById('sys-status').textContent = ok ? 'Online' : 'Error';
     document.getElementById('sys-status').className = 'stat-value small ' + (ok ? 'text-green' : 'text-red');

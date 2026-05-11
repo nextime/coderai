@@ -120,7 +120,7 @@ function showAlert(type, msg){
 
 async function loadSettings(){
   try{
-    const d = await fetch('/admin/api/settings').then(r=>r.json());
+    const d = await fetch(ROOT_PATH + '/admin/api/settings').then(r=>r.json());
     document.getElementById('s-host').value  = d.server?.host ?? '0.0.0.0';
     document.getElementById('s-port').value  = d.server?.port ?? 8000;
     document.getElementById('s-https').checked = !!d.server?.https;
@@ -138,7 +138,7 @@ async function loadSettings(){
     document.getElementById('s-arc-retention').value = arc.retention ?? 'never';
     // Show effective default dir as placeholder hint
     try {
-      const as = await fetch('/admin/api/archive-settings').then(r=>r.json());
+      const as = await fetch(ROOT_PATH + '/admin/api/archive-settings').then(r=>r.json());
       const hint = document.getElementById('s-arc-dir-hint');
       if (hint && as.default_directory) hint.textContent = `(default: ${as.default_directory})`;
       document.getElementById('s-arc-dir').placeholder = as.default_directory || '(default)';
@@ -171,7 +171,7 @@ async function saveSettings(){
     },
   };
   try{
-    const r = await fetch('/admin/api/settings',{
+    const r = await fetch(ROOT_PATH + '/admin/api/settings',{
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(data)
     });

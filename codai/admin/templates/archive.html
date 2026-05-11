@@ -270,7 +270,7 @@ function openDetail(entry) {
     } else if (entry.type === 'audio' || entry.type === 'tts') {
       const firstAudio = (entry.files || []).find(f => /\.(wav|mp3|ogg|flac)$/.test(f));
       if (firstAudio) {
-        previewHtml = `<audio controls style="width:100%"><source src="/admin/api/archive/${entry.id}/files/${firstAudio}"></audio>`;
+        previewHtml = `<audio controls style="width:100%"><source src="${ROOT_PATH}/admin/api/archive/${entry.id}/files/${firstAudio}"></audio>`;
       } else {
         previewHtml = `<div style="font-size:3rem;padding:2rem;text-align:center">${TYPE_ICONS[entry.type]}</div>`;
       }
@@ -302,7 +302,7 @@ function openDetail(entry) {
         <div class="param-list">${paramChips}</div>` : ''}
         ${entry.files?.length > 1 ? `<div style="margin:.75rem 0 .25rem;font-size:12px;font-weight:600;color:var(--text-muted)">Files</div>
         <div style="display:flex;flex-direction:column;gap:.3rem">${entry.files.map(f =>
-          `<a href="/admin/api/archive/${entry.id}/files/${f}" target="_blank" style="font-size:12px;color:var(--accent)">${f}</a>`
+          `<a href="${ROOT_PATH}/admin/api/archive/${entry.id}/files/${f}" target="_blank" style="font-size:12px;color:var(--accent)">${f}</a>`
         ).join('')}</div>` : ''}
       </div>
     </div>`;
@@ -342,7 +342,7 @@ async function deleteEntry() {
 // Settings
 async function loadArchiveSettings() {
   try {
-    const d = await fetch('/admin/api/archive-settings').then(r=>r.json());
+    const d = await fetch(ROOT_PATH + '/admin/api/archive-settings').then(r=>r.json());
     document.getElementById('arc-dir').value = d.directory || '';
     document.getElementById('arc-dir').placeholder = d.default_directory || '<config_dir>/archive';
     document.getElementById('arc-dir-hint').textContent = `Default: ${d.default_directory || '<config_dir>/archive'}`;
@@ -361,7 +361,7 @@ async function saveArchiveSettings() {
         retention: document.getElementById('arc-retention').value,
       }
     };
-    const r = await fetch('/admin/api/settings', {
+    const r = await fetch(ROOT_PATH + '/admin/api/settings', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify(payload),

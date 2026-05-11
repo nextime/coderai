@@ -222,6 +222,9 @@
         <span class="chip" data-val="speech_to_text">STT</span>
         <span class="chip" data-val="text_to_speech">TTS</span>
         <span class="chip" data-val="embeddings">Embed</span>
+        <span class="chip" data-val="depth_estimation">Depth</span>
+        <span class="chip" data-val="image_segmentation">Segment</span>
+        <span class="chip" data-val="object_detection">Detect</span>
         <span class="chip" data-val="function-calling">Tool calling</span>
         <span class="chip" data-val="vision">Vision</span>
         <span class="chip" data-val="reasoning">Reasoning</span>
@@ -428,7 +431,51 @@
           <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:13px"><input type="checkbox" class="cfg-type-cb" value="tts_models"> Text-to-Speech (TTS)</label>
           <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:13px"><input type="checkbox" class="cfg-type-cb" value="audio_gen_models"> Audio generation</label>
           <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:13px"><input type="checkbox" class="cfg-type-cb" value="embedding_models"> Embeddings</label>
+          <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:13px"><input type="checkbox" class="cfg-type-cb" value="spatial_models"> Depth / Segmentation / Detection</label>
         </div>
+      </div>
+
+      <!-- Capabilities -->
+      <div class="card-title" style="margin-top:1.25rem;display:flex;align-items:center;gap:.5rem">
+        Capabilities
+        <span id="cfg-caps-autodet" style="font-size:11px;color:var(--text-3);font-weight:400"></span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.25rem .75rem">
+        <div style="grid-column:1/-1;font-size:11px;color:var(--text-3);margin-bottom:.15rem">Text / Language</div>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="text_generation"> Text generation</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="embeddings"> Embeddings</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="image_to_text"> Image-to-text (vision input)</label>
+        <div style="grid-column:1/-1;font-size:11px;color:var(--text-3);margin-top:.5rem;margin-bottom:.15rem">Image generation &amp; editing</div>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="image_generation"> Image generation (T2I)</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="image_to_image"> Image-to-image (I2I)</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="inpainting"> Inpainting</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="controlnet"> ControlNet</label>
+        <div style="grid-column:1/-1;font-size:11px;color:var(--text-3);margin-top:.5rem;margin-bottom:.15rem">Image analysis &amp; processing</div>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="depth_estimation"> Depth estimation</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="image_segmentation"> Image segmentation</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="object_detection"> Object detection</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="image_upscaling"> Image upscaling</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="face_restoration"> Face restoration</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="style_transfer"> Style transfer</label>
+        <div style="grid-column:1/-1;font-size:11px;color:var(--text-3);margin-top:.5rem;margin-bottom:.15rem">Video</div>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="video_generation"> Video generation (T2V)</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="image_to_video"> Image-to-video (I2V)</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="video_to_video"> Video-to-video (V2V)</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="video_interpolation"> Frame interpolation</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="video_upscaling"> Video upscaling</label>
+        <div style="grid-column:1/-1;font-size:11px;color:var(--text-3);margin-top:.5rem;margin-bottom:.15rem">Audio</div>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="speech_to_text"> Speech-to-text (STT)</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="text_to_speech"> Text-to-speech (TTS)</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="subtitle_generation"> Subtitle generation</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="audio_generation"> Audio generation</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="audio_to_audio"> Audio-to-audio</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="lip_sync"> Lip sync</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="video_dubbing"> Video dubbing</label>
+        <div style="grid-column:1/-1;font-size:11px;color:var(--text-3);margin-top:.5rem;margin-bottom:.15rem">3D</div>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="image_to_3d"> Image-to-3D</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="video_to_3d"> Video-to-3D</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="model_3d_generation"> 3D model generation</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:12px"><input type="checkbox" class="cfg-cap-cb" value="model_3d_to_image"> 3D model to image</label>
       </div>
       <div class="form-row">
         <label class="form-label">Alias <span class="muted">(optional)</span></label>
@@ -588,7 +635,9 @@ function fmtCapabilities(caps){
     inpainting:'Inpaint',controlnet:'ControlNet',depth_estimation:'Depth',
     image_segmentation:'Segment',image_upscaling:'Upscale',face_restoration:'Face',
     object_detection:'Detect',video_interpolation:'Interp',video_upscaling:'V-Upscale',
-    lip_sync:'Lip-sync',subtitle_generation:'Subs',video_dubbing:'Dub'
+    lip_sync:'Lip-sync',subtitle_generation:'Subs',video_dubbing:'Dub',
+    style_transfer:'Style',image_to_3d:'I→3D',video_to_3d:'V→3D',
+    model_3d_generation:'3D-Gen',model_3d_to_image:'3D→Img'
   };
   return caps.slice(0,5).map(c=>`<span class="badge badge-user" style="font-size:10px;padding:.15rem .35rem">${esc(labels[c]||c)}</span>`).join(' ');
 }
@@ -644,7 +693,7 @@ let _highlightCap = null;  // capability to highlight in local models list (from
 
 async function loadGlobalSettings(){
   try{
-    const r = await fetch('/admin/api/settings');
+    const r = await fetch(ROOT_PATH + '/admin/api/settings');
     if(r.ok){
       const d = await r.json();
       _defaultOffloadDir = d.offload?.directory || './offload';
@@ -730,7 +779,7 @@ async function doSearch(){
   if(caps.length) params.append('capabilities', caps.join(','));
 
   try{
-    const r = await fetch('/admin/api/hf-search?'+params);
+    const r = await fetch(ROOT_PATH + '/admin/api/hf-search?'+params);
     if(!r.ok){const e=await r.json();throw new Error(e.detail||r.statusText)}
     _results = await r.json();
     
@@ -809,7 +858,7 @@ async function toggleFiles(i){
   if(_filesCache[modelId]){renderFiles(panel,modelId,_filesCache[modelId]);return}
   panel.innerHTML='<span class="muted small">Fetching file list…</span>';
   try{
-    const r = await fetch('/admin/api/hf-model-files?model_id='+encodeURIComponent(modelId));
+    const r = await fetch(ROOT_PATH + '/admin/api/hf-model-files?model_id='+encodeURIComponent(modelId));
     if(!r.ok)throw new Error((await r.json()).detail||r.statusText);
     const files = await r.json();
     _filesCache[modelId]=files;
@@ -866,7 +915,7 @@ function closeInfo(){
 
 async function loadInfo(modelId){
   try{
-    const r = await fetch('/admin/api/hf-model-info?model_id='+encodeURIComponent(modelId));
+    const r = await fetch(ROOT_PATH + '/admin/api/hf-model-info?model_id='+encodeURIComponent(modelId));
     if(!r.ok)throw new Error((await r.json()).detail||r.statusText);
     renderInfo(await r.json());
   }catch(e){
@@ -1036,13 +1085,13 @@ async function startDownload(){
   document.getElementById('dl-form').style.display='none';
   document.getElementById('dl-progress').style.display='block';
   try{
-    const r=await fetch('/admin/api/model-download',{
+    const r=await fetch(ROOT_PATH + '/admin/api/model-download',{
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({model_id:id,file_pattern:document.getElementById('dl-pattern').value||null})
     });
     if(!r.ok){const e=await r.json();showDownloadError(e.detail||'Request failed');return}
     const {session_id}=await r.json();
-    _dlEs=new EventSource('/admin/api/download-stream/'+session_id);
+    _dlEs=new EventSource(ROOT_PATH + '/admin/api/download-stream/'+session_id);
     _dlEs.onmessage=function(e){
       try{handleProgressEvent(JSON.parse(e.data))}catch{}
     };
@@ -1059,7 +1108,7 @@ let _pollTimer = null;
 
 async function pollDownloads(){
   try{
-    const r = await fetch('/admin/api/downloads');
+    const r = await fetch(ROOT_PATH + '/admin/api/downloads');
     if(!r.ok) return;
     const all = await r.json();
     const active = all.filter(d=>d.status!=='done'&&d.status!=='error');
@@ -1099,7 +1148,7 @@ startPolling();
 /* ── cache stats & local models ──────────────────────── */
 async function loadCacheStats(){
   try{
-    const r = await fetch('/admin/api/cache-stats');
+    const r = await fetch(ROOT_PATH + '/admin/api/cache-stats');
     if(!r.ok) return;
     const s = await r.json();
     document.getElementById('stat-hf-size').textContent  = fmtBytes(s.hf_bytes);
@@ -1220,10 +1269,10 @@ async function loadCachedModels(){
   const ggufEl = document.getElementById('gguf-models-list');
   hfEl.innerHTML = ggufEl.innerHTML = '<span class="muted small">Loading…</span>';
   try{
-    const r = await fetch('/admin/api/cached-models');
+    const r = await fetch(ROOT_PATH + '/admin/api/cached-models');
     if(!r.ok) throw new Error((await r.json()).detail||r.statusText);
     const d = await r.json();
-    const whisperModels = (await fetch('/admin/api/models').then(r=>r.ok?r.json():[]))
+    const whisperModels = (await fetch(ROOT_PATH + '/admin/api/models').then(r=>r.ok?r.json():[]))
       .filter(m => m.backend === 'whisper-server');
 
     // HF models
@@ -1371,7 +1420,7 @@ let _instanceInfo = {};   // loaded_key -> {loaded: N, max: N}
 
 async function refreshLoadedStatus(){
   try{
-    const r = await fetch('/admin/api/model-loaded-status');
+    const r = await fetch(ROOT_PATH + '/admin/api/model-loaded-status');
     if(r.ok){
       const d = await r.json();
       _loadedKeys = new Set(d.loaded||[]);
@@ -1460,7 +1509,7 @@ async function clearCacheConfirm(type){
   const labels = {hf:'HuggingFace', gguf:'GGUF', all:'ALL'};
   if(!confirm(`Delete ${labels[type]} model cache? This cannot be undone.`)) return;
   try{
-    const r = await fetch('/admin/api/cache?cache_type='+type, {method:'DELETE'});
+    const r = await fetch(ROOT_PATH + '/admin/api/cache?cache_type='+type, {method:'DELETE'});
     const d = await r.json();
     if(d.success){
       refreshLocal();
@@ -1475,7 +1524,7 @@ async function deleteModelConfirm(idx){
   // Always send the full path so the backend can locate the file regardless of cache location
   const idForUrl = m.path;
   try{
-    const r = await fetch('/admin/api/cached-models/'+encodeURIComponent(idForUrl)+'?cache_type='+m.cacheType, {method:'DELETE'});
+    const r = await fetch(ROOT_PATH + '/admin/api/cached-models/'+encodeURIComponent(idForUrl)+'?cache_type='+m.cacheType, {method:'DELETE'});
     const d = await r.json();
     if(d.success) refreshLocal();
     else alert('Error: '+(d.detail||'Unknown'));
@@ -1500,11 +1549,16 @@ function _capabilitiesToTypes(caps) {
   if (caps.includes('video_generation')){ categories.add('video_models'); subs.add('t2v'); }
   if (caps.includes('video_to_video'))  { categories.add('video_models'); subs.add('v2v'); }
   if (caps.includes('image_generation') || caps.includes('image_to_image') ||
-      caps.includes('inpainting')       || caps.includes('controlnet')) categories.add('image_models');
+      caps.includes('inpainting')       || caps.includes('controlnet') ||
+      caps.includes('image_upscaling')  || caps.includes('face_restoration') ||
+      caps.includes('style_transfer')) categories.add('image_models');
+  if (caps.includes('depth_estimation') || caps.includes('image_segmentation') ||
+      caps.includes('object_detection')) categories.add('spatial_models');
   if (caps.includes('image_to_text') && caps.includes('text_generation')) {
     categories.add('vision_models');
   } else if (caps.includes('text_generation') &&
-             !categories.has('video_models') && !categories.has('image_models')) {
+             !categories.has('video_models') && !categories.has('image_models') &&
+             !categories.has('spatial_models')) {
     categories.add('text_models');
   }
   if (caps.includes('speech_to_text')) categories.add('audio_models');
@@ -1606,7 +1660,7 @@ async function saveWhisperServerEdit() {
     alias: document.getElementById('wse-alias').value.trim() || null,
   };
   try {
-    const r = await fetch('/admin/api/model-configure', {
+    const r = await fetch(ROOT_PATH + '/admin/api/model-configure', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(payload)
     });
@@ -1683,6 +1737,13 @@ function openCfgModal(idx){
       det.textContent = m.cacheType === 'gguf' ? '(auto-detected: GGUF text model)' : '';
     }
   }
+
+  // Capabilities checkboxes: saved config > auto-detected from model
+  const capsdet = document.getElementById('cfg-caps-autodet');
+  const savedCaps = new Set(s.capabilities && s.capabilities.length ? s.capabilities : (m.capabilities || []));
+  const capsFromConfig = !!(s.capabilities && s.capabilities.length);
+  document.querySelectorAll('.cfg-cap-cb').forEach(cb => { cb.checked = savedCaps.has(cb.value); });
+  capsdet.textContent = capsFromConfig ? '' : '(auto-detected)';
 
   document.getElementById('cfg-alias').value = s.alias || '';
   document.getElementById('cfg-backend').value = s.backend || 'auto';
@@ -1774,9 +1835,10 @@ async function saveModelConfig(){
     parser:            document.getElementById('cfg-parser').value,
     tools_closer_prompt: document.getElementById('cfg-tools').checked,
     grammar_guided:    document.getElementById('cfg-grammar').checked,
+    capabilities:      [...document.querySelectorAll('.cfg-cap-cb:checked')].map(cb => cb.value),
   };
   try{
-    const r = await fetch('/admin/api/model-configure',{
+    const r = await fetch(ROOT_PATH + '/admin/api/model-configure',{
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(data)
     });
@@ -1803,7 +1865,7 @@ async function addWhisperServerModel(){
     alias: document.getElementById('ws-alias').value.trim() || null,
   };
   try{
-    const r = await fetch('/admin/api/model-configure', {
+    const r = await fetch(ROOT_PATH + '/admin/api/model-configure', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify(payload)
@@ -1834,7 +1896,7 @@ async function loadModel(idx){
   const btn = document.querySelector(`button[onclick="loadModel(${idx})"]`);
   if(btn){ btn.disabled = true; btn.textContent = 'Loading…'; }
   try{
-    const r = await fetch('/admin/api/model-load',{
+    const r = await fetch(ROOT_PATH + '/admin/api/model-load',{
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({path: m.path})
     });
@@ -1847,7 +1909,7 @@ async function loadModel(idx){
 async function unloadModel(idx){
   const m = _localModels[idx];
   try{
-    const r = await fetch('/admin/api/model-unload',{
+    const r = await fetch(ROOT_PATH + '/admin/api/model-unload',{
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({path: m.path})
     });
@@ -1868,7 +1930,7 @@ async function disableModel(idx){
   try{
     // Disable each configured path in the group
     for(const p of paths){
-      await fetch('/admin/api/model-disable',{
+      await fetch(ROOT_PATH + '/admin/api/model-disable',{
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({path: p})
       });
@@ -1904,7 +1966,7 @@ async function startUpload(){
     formData.append('upload_id', uploadId);
 
     try{
-      const r = await fetch('/admin/api/model-upload',{method:'POST', body:formData});
+      const r = await fetch(ROOT_PATH + '/admin/api/model-upload',{method:'POST', body:formData});
       const d = await r.json();
       if(!d.success){ alert('Upload failed: '+(d.detail||'Unknown')); return; }
 

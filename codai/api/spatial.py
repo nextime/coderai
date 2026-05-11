@@ -67,18 +67,8 @@ def _decode_b64(data: str) -> bytes:
 
 
 def _build_url(filename: str, http_request) -> str:
-    url_setting = getattr(global_args, 'url', 'auto') if global_args else 'auto'
-    if url_setting == 'auto':
-        host = (http_request.headers.get('host', '127.0.0.1') if http_request else '127.0.0.1')
-        if ':' in host:
-            parts = host.split(':')
-            if len(parts) == 2 and parts[1].isdigit():
-                host = parts[0]
-        use_https = getattr(global_args, 'https', False) or getattr(global_args, 'pubkey', None)
-        proto = 'https' if use_https else 'http'
-        port = getattr(global_args, 'port', 8000) if global_args else 8000
-        return f"{proto}://{host}:{port}/v1/files/{filename}"
-    return f"{url_setting.rstrip('/')}/v1/files/{filename}"
+    from codai.api.urlutils import build_file_url
+    return build_file_url(filename, http_request)
 
 
 def _save_output(data: bytes, ext: str, http_request) -> dict:
@@ -111,14 +101,26 @@ def _img_to_bytes(img_pil, fmt: str = "PNG") -> bytes:
 # Depth estimation
 # =============================================================================
 
+def _configured_depth_model_id() -> str:
+    """Return the configured spatial/depth model ID, or empty string if none."""
+    try:
+        from codai.models.manager import multi_model_manager
+        if multi_model_manager.spatial_models:
+            return multi_model_manager.spatial_models[0]
+    except Exception:
+        pass
+    return ""
+
+
 def _estimate_depth(img_pil) -> np.ndarray:
     """Return depth array normalised to 0–1 (float32). Higher = closer."""
     device = _derive_device()
 
-    # Prefer transformers depth-estimation pipeline
+    # Prefer transformers depth-estimation pipeline (use configured model if available)
     try:
         from transformers import pipeline as hf_pipeline
-        pipe = hf_pipeline("depth-estimation", device=device)
+        model_id = _configured_depth_model_id() or None
+        pipe = hf_pipeline("depth-estimation", model=model_id, device=device)
         result = pipe(img_pil)
         depth = np.array(result['depth'], dtype=np.float32)
         d_min, d_max = depth.min(), depth.max()

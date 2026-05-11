@@ -67,14 +67,8 @@ def _save_response(audio_np: np.ndarray, sr: int, http_request) -> dict:
         fpath = os.path.join(global_file_path, filename)
         with open(fpath, 'wb') as f:
             f.write(wav_bytes)
-        host = http_request.headers.get('host', '127.0.0.1') if http_request else '127.0.0.1'
-        if ':' in host:
-            parts = host.split(':')
-            if len(parts) == 2 and parts[1].isdigit():
-                host = parts[0]
-        proto = 'https' if getattr(global_args, 'https', False) else 'http'
-        port = getattr(global_args, 'port', 8000) if global_args else 8000
-        return {'url': f'{proto}://{host}:{port}/v1/files/{filename}'}
+        from codai.api.urlutils import build_file_url
+        return {'url': build_file_url(filename, http_request)}
     return {'b64_wav': base64.b64encode(wav_bytes).decode()}
 
 

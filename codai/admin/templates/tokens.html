@@ -93,7 +93,7 @@ function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').re
 
 async function loadTokens() {
   try {
-    const tokens = await fetch('/admin/api/tokens').then(r => r.json());
+    const tokens = await fetch(ROOT_PATH + '/admin/api/tokens').then(r => r.json());
     const tbody = document.getElementById('tokens-body');
     if (!tokens.length) {
       tbody.innerHTML = '<tr class="empty-row"><td colspan="6">No tokens — create one to get started</td></tr>';
@@ -115,7 +115,7 @@ async function createToken() {
   const name = document.getElementById('t-name').value.trim();
   if (!name) { document.getElementById('t-name').focus(); return; }
   try {
-    const r = await fetch('/admin/api/tokens', {
+    const r = await fetch(ROOT_PATH + '/admin/api/tokens', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({name, provider: document.getElementById('t-provider').value})
     });
@@ -133,7 +133,7 @@ async function createToken() {
 
 async function delToken(id) {
   if (!confirm('Delete this token? Clients using it will lose access immediately.')) return;
-  const r = await fetch('/admin/api/tokens/'+id, {method:'DELETE'});
+  const r = await fetch(ROOT_PATH + '/admin/api/tokens/'+id, {method:'DELETE'});
   if (r.ok) loadTokens(); else alert('Failed to delete');
 }
 

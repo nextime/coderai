@@ -28,7 +28,7 @@
         <td class="mono small dim">{{ user.created_at[:10] }}</td>
         <td style="text-align:right">
           {% if user.username == username %}
-          <a href="/admin/change-password" class="btn btn-ghost btn-sm">Change password</a>
+          <a href="{{ root_path }}/admin/change-password" class="btn btn-ghost btn-sm">Change password</a>
           {% else %}
           <button class="btn btn-danger btn-sm" onclick="delUser({{ user.id }}, '{{ user.username }}')">Delete</button>
           {% endif %}
@@ -92,7 +92,7 @@ async function addUser() {
   if (!uname) { errEl.textContent = 'Username required'; errEl.style.display = 'flex'; return; }
   if (pwd.length < 8) { errEl.textContent = 'Password must be at least 8 characters'; errEl.style.display = 'flex'; return; }
   try {
-    const r = await fetch('/admin/api/users', {
+    const r = await fetch(ROOT_PATH + '/admin/api/users', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({username: uname, password: pwd, role: document.getElementById('new-role').value})
     });
@@ -103,7 +103,7 @@ async function addUser() {
 
 async function delUser(id, name) {
   if (!confirm('Delete user "' + name + '"?')) return;
-  const r = await fetch('/admin/api/users/'+id, {method:'DELETE'});
+  const r = await fetch(ROOT_PATH + '/admin/api/users/'+id, {method:'DELETE'});
   if (r.ok) location.reload();
   else { const e = await r.json(); alert(e.detail || 'Failed'); }
 }

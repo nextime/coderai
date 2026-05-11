@@ -211,42 +211,8 @@ def save_image_response(img, request_format="base64", http_request=None):
         file_path = os.path.join(global_file_path, filename)
         img.save(file_path, format="PNG")
         # Add URL to response
-        # Determine base URL based on --url argument
-        url_setting = getattr(global_args, 'url', 'auto') if global_args else 'auto'
-        if url_setting == 'auto':
-            # Use server host from request headers (what client used to connect)
-            if http_request:
-                # Get the Host header - this is what the client used to reach the server
-                # The Host header typically includes the port, e.g., "192.168.1.1:6745"
-                client_host = http_request.headers.get('host', '')
-                if not client_host:
-                    # Fallback to client IP if no Host header
-                    client_host = http_request.client.host if http_request.client else '127.0.0.1'
-                
-                # Strip port from host if present (Host header includes port like "192.168.1.1:6745")
-                if ':' in client_host:
-                    # Check if the part after : is a port number
-                    parts = client_host.split(':')
-                    if len(parts) == 2 and parts[1].isdigit():
-                        # It's a port number, strip it
-                        client_host = parts[0]
-                    elif len(parts) > 2:
-                        # IPv6 or other format, take last part as port check
-                        last_part = parts[-1]
-                        if last_part.isdigit():
-                            client_host = ':'.join(parts[:-1])
-                
-                # Check if HTTPS is enabled
-                use_https = getattr(global_args, 'https', False) or getattr(global_args, 'pubkey', None)
-                protocol = "https" if use_https else "http"
-                port = getattr(global_args, 'port', 8000)
-                base_url = f"{protocol}://{client_host}:{port}"
-            else:
-                base_url = "http://127.0.0.1:8000"
-        else:
-            # Use explicitly provided URL (strip trailing slash if present)
-            base_url = url_setting.rstrip('/')
-        result["url"] = f"{base_url}/v1/files/{filename}"
+        from codai.api.urlutils import build_file_url
+        result["url"] = build_file_url(filename, http_request)
         
         # If client explicitly requested base64, include it
         # Otherwise, only return URL when file-path is set
@@ -1474,7 +1440,7 @@ async def create_image_upscale(request: ImageUpscaleRequest, http_request: Reque
 # =============================================================================
 
 class ImageDepthRequest(BaseModel):
-    model: str
+    model: Optional[str] = None
     image: str
     response_format: Optional[str] = "url"
     class Config:
@@ -1522,11 +1488,39 @@ def _run_depth(depth_model, image_bytes: bytes):
     return PILImage.fromarray(depth_arr)
 
 
+def _resolve_spatial_model(requested: Optional[str], capability: str) -> Optional[str]:
+    """Return a configured spatial model for the given capability, or the requested ID."""
+    if requested:
+        return requested
+    try:
+        from codai.admin.routes import config_manager
+        if config_manager is not None:
+            for entry in config_manager.models_data.get("spatial_models", []):
+                if isinstance(entry, dict):
+                    saved_caps = entry.get("capabilities") or []
+                    mid = entry.get("path") or entry.get("id") or ""
+                    if capability in saved_caps and mid:
+                        return mid
+        # Fall back to runtime list using name heuristic
+        from codai.models.capabilities import detect_model_capabilities
+        for m in multi_model_manager.spatial_models:
+            caps = detect_model_capabilities(m)
+            if getattr(caps, capability, False):
+                return m
+        if multi_model_manager.spatial_models:
+            return multi_model_manager.spatial_models[0]
+    except Exception:
+        pass
+    return None
+
+
 @router.post("/v1/images/depth")
 async def create_image_depth(request: ImageDepthRequest, http_request: Request = None):
     """Estimate depth map from an image."""
     global global_args
-    model_name = request.model
+    model_name = _resolve_spatial_model(request.model, "depth_estimation")
+    if not model_name:
+        raise HTTPException(status_code=400, detail="No depth estimation model configured. Add one via Admin > Models.")
     model_key = f"depth:{model_name}"
     depth_model = multi_model_manager.models.get(model_key)
     if depth_model is None:
@@ -1551,7 +1545,7 @@ async def create_image_depth(request: ImageDepthRequest, http_request: Request =
 # =============================================================================
 
 class ImageSegmentRequest(BaseModel):
-    model: str
+    model: Optional[str] = None
     image: str
     points: Optional[list] = None   # [[x,y], ...] positive prompt points for SAM
     boxes: Optional[list] = None    # [[x1,y1,x2,y2], ...] box prompts
@@ -1619,7 +1613,9 @@ def _run_segmentation(seg_model, image_bytes: bytes, points, boxes):
 async def create_image_segment(request: ImageSegmentRequest, http_request: Request = None):
     """Segment objects in an image using SAM or similar models."""
     global global_args
-    model_name = request.model
+    model_name = _resolve_spatial_model(request.model, "image_segmentation")
+    if not model_name:
+        raise HTTPException(status_code=400, detail="No segmentation model configured. Add one via Admin > Models.")
     model_key = f"segment:{model_name}"
     seg_model = multi_model_manager.models.get(model_key)
     if seg_model is None:
@@ -1953,14 +1949,8 @@ async def _outfit_video(request: ImageOutfitRequest, http_request):
             os.makedirs(global_file_path, exist_ok=True)
             with open(fpath_out, 'wb') as f:
                 f.write(out_bytes)
-            host = http_request.headers.get('host', '127.0.0.1') if http_request else '127.0.0.1'
-            if ':' in host:
-                parts = host.split(':')
-                if len(parts) == 2 and parts[1].isdigit():
-                    host = parts[0]
-            proto = 'https' if getattr(global_args, 'https', False) else 'http'
-            port = getattr(global_args, 'port', 8000) if global_args else 8000
-            data = [{'url': f'{proto}://{host}:{port}/v1/files/{fname}'}]
+            from codai.api.urlutils import build_file_url
+            data = [{'url': build_file_url(fname, http_request)}]
         else:
             data = [{'b64_mp4': base64.b64encode(out_bytes).decode()}]
 
