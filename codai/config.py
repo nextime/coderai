@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from dataclasses import dataclass, field
 
+from codai.broker.config import BrokerConfig
+
 
 @dataclass
 class ServerConfig:
@@ -118,6 +120,7 @@ class Config:
     image: ImageConfig = field(default_factory=ImageConfig)
     whisper: WhisperConfig = field(default_factory=WhisperConfig)
     archive: ArchiveConfig = field(default_factory=ArchiveConfig)
+    broker: BrokerConfig = field(default_factory=BrokerConfig)
     system_prompt: Optional[str] = None
     tools_closer_prompt: bool = False
     grammar_guided: bool = False
@@ -177,6 +180,22 @@ class ConfigManager:
                 },
                 "offload": {
                     "directory": "./offload"
+                },
+                "broker": {
+                    "enabled": False,
+                    "base_url": "",
+                    "scope": "user",
+                    "username": "",
+                    "provider_id": "",
+                    "client_id": "",
+                    "registration_token": "",
+                    "advertised_endpoint": "",
+                    "transport": "websocket",
+                    "heartbeat_interval_seconds": 30,
+                    "connect_timeout_seconds": 10,
+                    "request_timeout_seconds": 30,
+                    "reconnect_initial_delay_seconds": 1,
+                    "reconnect_max_delay_seconds": 60
                 },
                 "system_prompt": None,
                 "tools_closer_prompt": False,
@@ -254,6 +273,7 @@ class ConfigManager:
                 image=ImageConfig(**config_data.get("image", {})),
                 whisper=WhisperConfig(**config_data.get("whisper", {})),
                 archive=ArchiveConfig(**config_data.get("archive", {})),
+                broker=BrokerConfig(**config_data.get("broker", {})),
                 system_prompt=config_data.get("system_prompt"),
                 tools_closer_prompt=config_data.get("tools_closer_prompt", False),
                 grammar_guided=config_data.get("grammar_guided", False),
@@ -361,6 +381,22 @@ class ConfigManager:
                 "enabled": self.config.archive.enabled,
                 "directory": self.config.archive.directory,
                 "retention": self.config.archive.retention,
+            },
+            "broker": {
+                "enabled": self.config.broker.enabled,
+                "base_url": self.config.broker.base_url,
+                "scope": self.config.broker.scope,
+                "username": self.config.broker.username,
+                "provider_id": self.config.broker.provider_id,
+                "client_id": self.config.broker.client_id,
+                "registration_token": self.config.broker.registration_token,
+                "advertised_endpoint": self.config.broker.advertised_endpoint,
+                "transport": self.config.broker.transport,
+                "heartbeat_interval_seconds": self.config.broker.heartbeat_interval_seconds,
+                "connect_timeout_seconds": self.config.broker.connect_timeout_seconds,
+                "request_timeout_seconds": self.config.broker.request_timeout_seconds,
+                "reconnect_initial_delay_seconds": self.config.broker.reconnect_initial_delay_seconds,
+                "reconnect_max_delay_seconds": self.config.broker.reconnect_max_delay_seconds,
             },
             "system_prompt": self.config.system_prompt,
             "tools_closer_prompt": self.config.tools_closer_prompt,

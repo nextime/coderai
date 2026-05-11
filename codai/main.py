@@ -17,12 +17,17 @@
 """Main entry point for codai server."""
 import sys
 import os
+import logging
 
 # Import configuration from codai modules
 from codai.cli import parse_args
 from codai.config import ConfigManager
 from codai.admin.routes import init_session_manager, set_config_manager
 from codai.api.archive import archive_manager
+from codai.broker import BrokerConfigError, build_broker_runtime_config
+
+
+logger = logging.getLogger(__name__)
 
 
 def main():
@@ -194,6 +199,11 @@ def main():
     fastapi_app = app.app
     fastapi_app.state.config_mgr = config_mgr
     fastapi_app.state.config = config
+    try:
+        fastapi_app.state.broker_runtime = build_broker_runtime_config(config.broker)
+    except BrokerConfigError as error:
+        logger.warning("Broker disabled due to invalid configuration: %s", error)
+        fastapi_app.state.broker_runtime = build_broker_runtime_config(config.broker.__class__())
     
     # Set global variables from config and args (args override config for now)
     global global_system_prompt, global_tools_closer_prompt, global_debug, global_dump, global_file_path, grammar_guided_gen

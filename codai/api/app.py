@@ -27,11 +27,15 @@ from typing import List
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
+from codai.broker.client import BrokerClient
+from codai.broker.service import BrokerService
+
 logger = logging.getLogger(__name__)
 
 # Import from codai modules
 from codai.pydantic.textrequest import ModelList
 from codai.models.manager import model_manager, multi_model_manager
+from codai.broker import build_capabilities_document, build_hardware_summary
 
 # Import global state functions - re-export for backward compatibility
 from codai.api.state import (
@@ -78,6 +82,12 @@ async def lifespan(app: FastAPI):
                 pass
 
     cleanup_task = _asyncio.create_task(_archive_cleanup_loop())
+    broker_service = None
+    broker_runtime = getattr(app.state, "broker_runtime", None)
+    if broker_runtime is not None:
+        broker_service = BrokerService(BrokerClient(broker_runtime), app)
+        app.state.broker_service = broker_service
+        broker_service.start()
     # Run initial cleanup on startup
     try:
         from codai.api.archive import archive_manager
@@ -86,6 +96,9 @@ async def lifespan(app: FastAPI):
         pass
 
     yield
+
+    if broker_service is not None:
+        await broker_service.stop()
 
     cleanup_task.cancel()
     try:
@@ -212,6 +225,12 @@ async def list_models():
     """List available models."""
     models = multi_model_manager.list_models()
     return ModelList(data=models)
+
+
+@app.get("/coderai/capabilities")
+async def get_broker_capabilities():
+    """Return broker capability metadata."""
+    return build_capabilities_document(hardware=build_hardware_summary())
 
 
 @app.get("/v1/files/{filename}")
