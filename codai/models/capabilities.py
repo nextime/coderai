@@ -110,12 +110,10 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
                               'animatediff', 'text2video', 'modelscope-t2v',
                               'zeroscope', 'lavie']):
         caps.video_generation = True
-        caps.text_generation = True  # T2V models also do text
         return caps
 
     if any(x in n for x in ['wan2.1-t2v', 'wan-t2v']):
         caps.video_generation = True
-        caps.text_generation = True
         return caps
 
     # Image-to-video
@@ -124,17 +122,14 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
                               'wan2.1-i2v', 'wan-i2v', 'img2vid',
                               'image2video', 'motionctrl']):
         caps.image_to_video = True
-        caps.image_to_text = True  # I2V models process images
         return caps
 
     # Wan generic (detect sub-variant)
     if 'wan' in n and ('video' in n or 'diffuser' in n):
         if 'i2v' in n:
             caps.image_to_video = True
-            caps.image_to_text = True
         else:
             caps.video_generation = True
-            caps.text_generation = True
         return caps
 
     # Video interpolation
@@ -158,7 +153,6 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
     if any(x in n for x in ['musicgen', 'audiogen', 'audioldm', 'stable-audio',
                               'mustango', 'noise2music', 'jukebox', 'audiocraft']):
         caps.audio_generation = True
-        caps.text_generation = True  # T2A models process text
         return caps
 
     if any(x in n for x in ['demucs', 'spleeter', 'asteroid', 'open-unmix']):
@@ -174,7 +168,6 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
     if any(x in n for x in ['kokoro', 'xtts', 'bark', 'tortoise',
                               'speecht5', 'matcha-tts', 'voicebox']):
         caps.text_to_speech = True
-        caps.text_generation = True  # TTS models process text
         return caps
 
     # Lip sync / dubbing
@@ -199,13 +192,11 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
         caps.inpainting = True
         caps.image_generation = True
         caps.image_to_image = True
-        caps.text_generation = True
         return caps
 
     if 'controlnet' in n:
         caps.controlnet = True
         caps.image_generation = True
-        caps.text_generation = True
         return caps
 
     if any(x in n for x in [
@@ -235,7 +226,6 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
         caps.image_generation = True
         caps.image_to_image = True
         caps.inpainting = True    # most SD/SDXL/Flux checkpoints support inpainting via mask
-        caps.text_generation = True
         return caps
 
     # ── Image: analysis / processing ─────────────────────────────────────────
@@ -295,12 +285,6 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
         'text-embedding', 'voyage-',
     ]):
         caps.embeddings = True
-        caps.text_generation = True
-        return caps
-
-    # ── GGUF quantised text models ───────────────────────────────────────────
-    if '.gguf' in n or 'gguf' in n:
-        caps.text_generation = True
         return caps
 
     # Default: text generation
@@ -315,17 +299,17 @@ _PIPELINE_TAG_CAPS: dict = {
     'image-to-text':                  ['image_to_text', 'text_generation'],
     'visual-question-answering':      ['image_to_text', 'text_generation'],
     'image-text-to-text':             ['image_to_text', 'text_generation'],
-    'text-to-image':                  ['image_generation', 'image_to_image', 'text_generation'],
+    'text-to-image':                  ['image_generation', 'image_to_image'],
     'unconditional-image-generation': ['image_generation'],
     'image-to-image':                 ['image_to_image'],   # sub-typed below
     'automatic-speech-recognition':   ['speech_to_text'],
     'audio-to-audio':                 ['audio_to_audio'],
     'text-to-speech':                 ['text_to_speech'],
     'text-to-audio':                  ['audio_generation'],
-    'text-to-video':                  ['video_generation', 'text_generation'],
+    'text-to-video':                  ['video_generation'],
     'image-to-video':                 ['image_to_video'],
-    'feature-extraction':             ['embeddings', 'text_generation'],
-    'sentence-similarity':            ['embeddings', 'text_generation'],
+    'feature-extraction':             ['embeddings'],
+    'sentence-similarity':            ['embeddings'],
     'depth-estimation':               ['depth_estimation', 'image_to_text'],
     'image-segmentation':             ['image_segmentation', 'image_to_text'],
     'object-detection':               ['object_detection', 'image_to_text'],

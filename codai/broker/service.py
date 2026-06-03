@@ -18,14 +18,17 @@ class BrokerService:
 
             self.client.dispatcher = dispatch
         self.task: asyncio.Task | None = None
+        self._started = False
 
     def start(self):
-        if not self.client.runtime.enabled or self.task is not None:
+        if not self.client.runtime.enabled or self.task is not None or self._started:
             return
+        self._started = True
         self.task = asyncio.create_task(self.client.run_forever())
 
     async def stop(self):
         if self.task is None:
+            self._started = False
             return
         task = self.task
         self.task = None
@@ -34,3 +37,5 @@ class BrokerService:
             await task
         except asyncio.CancelledError:
             pass
+        finally:
+            self._started = False

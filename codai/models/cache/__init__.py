@@ -56,6 +56,26 @@ def get_model_cache_dir() -> str:
     return cache_dir
 
 
+def get_hf_hub_cache_dir() -> str:
+    """Return the HuggingFace Hub cache directory CoderAI is configured to use.
+
+    Mirrors huggingface_hub's own env-var priority so that passing this value
+    as ``cache_dir`` to snapshot_download / hf_hub_download always targets the
+    same location the library would choose on its own — even if the directory
+    does not yet exist (first download).
+    """
+    # Priority mirrors huggingface_hub.constants:
+    #   HUGGINGFACE_HUB_CACHE  (explicit cache path)
+    #   HF_HOME/hub            (parent-home style)
+    #   ~/.cache/huggingface/hub  (built-in default)
+    hf_hub_cache = (
+        os.environ.get('HUGGINGFACE_HUB_CACHE')
+        or (os.path.join(os.environ['HF_HOME'], 'hub') if 'HF_HOME' in os.environ else None)
+        or os.path.join(os.path.expanduser('~'), '.cache', 'huggingface', 'hub')
+    )
+    return hf_hub_cache
+
+
 def get_all_cache_dirs() -> dict:
     """Get all model cache directories."""
     caches = {}
@@ -540,6 +560,7 @@ def remove_all_cached_models() -> int:
 # Export all public functions
 __all__ = [
     'get_model_cache_dir',
+    'get_hf_hub_cache_dir',
     'get_all_cache_dirs',
     'get_cached_model_path',
     'is_huggingface_model_id',

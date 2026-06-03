@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% block wrapper_class %}container container--full{% endblock %}
 {% block title %}Models — CoderAI{% endblock %}
 
 {% block head %}
@@ -22,6 +23,7 @@
 #info-drawer.open{transform:translateX(0)}
 #info-sticky{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--border);z-index:1;padding:1rem 1.25rem;display:flex;align-items:center;gap:.75rem}
 #info-title{font-weight:600;font-size:14px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+._dl-quant-row:hover{background:var(--raised)}
 </style>
 {% endblock %}
 
@@ -36,7 +38,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
   </div>
   <div class="header-actions">
     <button class="btn btn-secondary" onclick="openModal('upload-modal')">Upload GGUF</button>
-    <button class="btn btn-primary" onclick="openModal('dl-modal')">Download model</button>
+    <button class="btn btn-primary" onclick="openDownloadFor('')">Download model</button>
   </div>
 </div>
 
@@ -96,6 +98,16 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
   <div class="card mb-0">
     <div class="card-title">GGUF files <span id="gguf-file-badge" class="muted small"></span></div>
     <div id="gguf-models-list"><span class="muted small">Loading…</span></div>
+  </div>
+
+  <!-- Component files -->
+  <div class="card" style="margin-top:1rem">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem;margin-bottom:.5rem">
+      <div class="card-title" style="margin:0">Component files <span id="comp-badge" class="muted small"></span></div>
+      <button class="btn btn-secondary btn-sm" onclick="openDownloadFor('')">Download</button>
+    </div>
+    <p class="muted small" style="margin-top:0;margin-bottom:.75rem">VAEs, text encoders (T5-XXL, CLIP), and other standalone files used alongside main models.</p>
+    <div id="comp-list"><span class="muted small">Loading…</span></div>
   </div>
 
   <div class="card mb-0" style="margin-top:1rem" id="ws-model-builder">
@@ -238,7 +250,23 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       </div>
     </div>
 
-    <!-- filter row 4: quant chips (file-level filter) -->
+    <!-- filter row 4: component type chips (single-select) -->
+    <div style="display:flex;align-items:flex-start;gap:.5rem;margin-bottom:.5rem">
+      <span class="fl" style="padding-top:.25rem;min-width:32px">Comp.</span>
+      <div class="chip-row" id="comp-type-chips">
+        <span class="chip" data-val="vae">VAE</span>
+        <span class="chip" data-val="t5xxl">T5-XXL</span>
+        <span class="chip" data-val="clip_l">CLIP-L</span>
+        <span class="chip" data-val="clip_g">CLIP-G</span>
+        <span class="chip" data-val="clip_vision">CLIP Vision</span>
+        <span class="chip" data-val="lora">LoRA</span>
+        <span class="chip" data-val="encoder">Encoder</span>
+        <span class="chip" data-val="controlnet">ControlNet</span>
+        <span class="chip" data-val="unet">UNet</span>
+      </div>
+    </div>
+
+    <!-- filter row 5: quant chips (file-level filter) -->
     <div style="display:flex;align-items:flex-start;gap:.5rem;margin-bottom:1rem">
       <span class="fl" style="padding-top:.25rem;min-width:32px">Quant</span>
       <div class="chip-row" id="quant-chips">
@@ -262,6 +290,23 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
 </div>
 
 
+<!-- Generic confirm modal -->
+<div id="confirm-modal" class="modal" onclick="if(event.target===this)document.getElementById('confirm-modal-cancel').click()">
+  <div class="modal-box" style="max-width:420px">
+    <div class="modal-head">
+      <span class="modal-title" id="confirm-modal-title">Confirm</span>
+      <button class="modal-close" id="confirm-modal-x">&times;</button>
+    </div>
+    <div class="modal-body">
+      <p id="confirm-modal-msg" style="margin:0 0 1.25rem"></p>
+      <div style="display:flex;gap:.5rem;justify-content:flex-end">
+        <button class="btn btn-ghost" id="confirm-modal-cancel">Cancel</button>
+        <button class="btn btn-danger" id="confirm-modal-ok">Confirm</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Download modal -->
 <div id="dl-modal" class="modal">
   <div class="modal-box">
@@ -273,20 +318,35 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       <div id="dl-form">
         <div class="form-row">
           <label class="form-label">HuggingFace repo ID or URL</label>
-          <input type="text" id="dl-id" class="form-input" placeholder="e.g. bartowski/Llama-3.1-8B-Instruct-GGUF">
+          <div style="display:flex;gap:.5rem">
+            <input type="text" id="dl-id" class="form-input" style="flex:1" placeholder="e.g. bartowski/Llama-3.1-8B-Instruct-GGUF" onkeydown="if(event.key==='Enter'){event.preventDefault();browseHfFiles()}">
+            <button class="btn btn-ghost btn-sm" id="dl-browse-btn" onclick="browseHfFiles()" style="white-space:nowrap" title="Fetch available files from HuggingFace">Browse</button>
+          </div>
         </div>
-        <!-- GGUF mode: specific file or pattern -->
+        <!-- Quant picker: shown when GGUF files are found via Browse -->
+        <div id="dl-quant-row" style="display:none;margin-top:.5rem">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.35rem">
+            <label class="form-label" style="margin:0">Select quantizations to download</label>
+            <span style="font-size:11px;display:flex;gap:.25rem">
+              <button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.1rem .4rem" onclick="_dlSelectAll(true)">All</button>
+              <button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.1rem .4rem" onclick="_dlSelectAll(false)">None</button>
+            </span>
+          </div>
+          <div id="dl-quant-list" style="max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:.25rem .5rem;display:flex;flex-direction:column;gap:.1rem"></div>
+          <div id="dl-quant-note" style="font-size:11px;color:var(--text-2);margin-top:.4rem"></div>
+        </div>
+        <!-- GGUF mode: manual file / pattern (fallback when Browse not used) -->
         <div id="dl-pattern-row" class="form-row">
-          <label class="form-label">File / pattern</label>
+          <label class="form-label">File / pattern <span class="muted">(or use Browse above)</span></label>
           <input type="text" id="dl-pattern" class="form-input" placeholder=".gguf">
-          <span class="form-hint" id="dl-hint">Exact filename (e.g. <code>model-Q4_K_M.gguf</code>) or pattern (<code>.gguf</code>). Leave blank to download the first .gguf found.</span>
+          <span class="form-hint">Exact filename or suffix pattern. Leave blank to download all .gguf files.</span>
         </div>
-        <!-- Snapshot mode: full repo via HF API -->
+        <!-- Snapshot mode: full repo -->
         <div id="dl-snapshot-note" class="alert alert-info" style="display:none">
           Will download the full repository using the HuggingFace snapshot API. This is the correct method for safetensors / non-GGUF models. Large repos may take a while.
         </div>
         <div class="form-actions">
-          <button class="btn btn-primary" onclick="startDownload()">Download</button>
+          <button class="btn btn-primary" id="dl-start-btn" onclick="startDownloadFromForm()">Download</button>
           <button class="btn btn-ghost" onclick="closeModal('dl-modal')">Close</button>
         </div>
       </div>
@@ -300,6 +360,9 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           <span id="dl-pct">0%</span>
         </div>
         <div id="dl-log" style="display:none;background:var(--raised);border-radius:6px;padding:.4rem .6rem;font-size:11px;font-family:monospace;color:var(--text-2);max-height:72px;overflow-y:auto"></div>
+        <div style="display:flex;justify-content:flex-end;margin-top:.75rem">
+          <button class="btn btn-ghost btn-sm" onclick="minimizeDownload()" title="Close this window — the download continues in the background">Minimize ↓</button>
+        </div>
       </div>
     </div>
   </div>
@@ -409,11 +472,13 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       <input type="hidden" id="cfg-path">
       <input type="hidden" id="cfg-orig-path">
       <input type="hidden" id="cfg-orig-type">
+      <input type="hidden" id="cfg-config-id">
 
       <!-- identity -->
       <div class="form-row">
         <label class="form-label">Model ID / path</label>
         <div id="cfg-id-label" style="font-size:12px;font-family:monospace;color:var(--text-2);word-break:break-all;padding:.3rem 0"></div>
+        <div id="cfg-path-moved-notice" style="display:none;font-size:11px;color:#f59e0b;margin-top:.2rem;padding:.25rem .5rem;background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.25);border-radius:4px"></div>
       </div>
       <div class="form-row" id="cfg-quant-row" style="display:none">
         <label class="form-label">Quantization</label>
@@ -483,6 +548,11 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       <div class="form-row">
         <label class="form-label">Alias <span class="muted">(optional)</span></label>
         <input type="text" id="cfg-alias" class="form-input" placeholder="Friendly name">
+      </div>
+      <div class="form-row" id="cfg-config-name-row">
+        <label class="form-label">Configuration name <span class="muted">(optional)</span></label>
+        <input type="text" id="cfg-config-name" class="form-input" placeholder="Label for this config in the model list">
+        <div style="font-size:11px;color:var(--text-2);margin-top:.25rem">Shown on the config pill. Falls back to alias, then "Config N".</div>
       </div>
 
       <!-- backend -->
@@ -563,15 +633,97 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           <label class="form-label">Strategy</label>
           <select id="cfg-offload-strategy" class="form-input">
             <option value="auto">Auto</option>
-            <option value="cpu">CPU RAM</option>
+            <option value="model">CPU offload (model)</option>
+            <option value="sequential">CPU offload (sequential)</option>
+            <option value="cpu">CPU RAM (legacy)</option>
             <option value="disk">Disk</option>
-            <option value="none">None</option>
+            <option value="none">None (GPU only)</option>
           </select>
         </div>
         <div class="form-row" style="margin:0">
           <label class="form-label">Offload directory</label>
           <input type="text" id="cfg-offload-dir" class="form-input" placeholder="./offload">
         </div>
+      </div>
+
+      <!-- sd.cpp video options -->
+      <div class="card-title" style="margin-top:1.25rem">sd.cpp Video Options</div>
+      <div class="form-row" style="margin-bottom:.5rem">
+        <label class="form-label">Max VRAM budget (MB) <span class="muted">graph-cut execution limit, 0 = disabled</span></label>
+        <input type="number" id="cfg-max-vram" class="form-input" min="0" step="512" placeholder="0">
+      </div>
+      <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-top:.5rem">
+        <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-sdcpp-flash"> Flash Attention</label>
+        <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-sdcpp-diff-flash"> Diffusion Flash Attention</label>
+        <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-vae-tiling"> VAE Tiling <span class="muted">(reduces VRAM at decode)</span></label>
+      </div>
+
+      <!-- components -->
+      <div class="card-title" style="margin-top:1.25rem">Components</div>
+      <div class="form-row">
+        <label class="form-label">Model template <span class="muted">(architecture hint for sd.cpp)</span></label>
+        <select id="cfg-template" class="form-input">
+          <option value="">Auto-detect</option>
+          <optgroup label="WAN">
+            <option value="wan_t2v_1.3b">WAN 1.3B T2V</option>
+            <option value="wan_t2v_14b">WAN 14B T2V</option>
+            <option value="wan_i2v_480p">WAN 1.3B I2V 480p</option>
+            <option value="wan_i2v_720p">WAN 14B I2V 720p</option>
+            <option value="wan_vace">WAN VACE</option>
+          </optgroup>
+          <optgroup label="FLUX">
+            <option value="flux_dev">FLUX.1-dev</option>
+            <option value="flux_schnell">FLUX.1-schnell</option>
+          </optgroup>
+          <optgroup label="Stable Diffusion">
+            <option value="sd15">Stable Diffusion 1.5</option>
+            <option value="sdxl">Stable Diffusion XL</option>
+            <option value="sd3">Stable Diffusion 3</option>
+          </optgroup>
+          <optgroup label="Other">
+            <option value="auraflow">AuraFlow</option>
+            <option value="chroma">Chroma</option>
+            <option value="hunyuan_video">HunyuanVideo</option>
+            <option value="mochi">Mochi</option>
+            <option value="ltxv">LTX-Video</option>
+            <option value="cogvideox">CogVideoX</option>
+          </optgroup>
+        </select>
+      </div>
+      <div class="form-row" style="margin-top:.5rem">
+        <label class="form-label">VAE <span class="muted">(optional)</span></label>
+        <select id="cfg-vae-sel" class="form-input" onchange="_onCompPick('vae')"></select>
+        <input type="text" id="cfg-vae-path" class="form-input" style="display:none;margin-top:.3rem" placeholder="Custom VAE path…">
+      </div>
+      <div class="form-row">
+        <label class="form-label">T5-XXL <span class="muted">(optional)</span></label>
+        <select id="cfg-t5xxl-sel" class="form-input" onchange="_onCompPick('t5xxl')"></select>
+        <input type="text" id="cfg-t5xxl-path" class="form-input" style="display:none;margin-top:.3rem" placeholder="Custom T5-XXL path…">
+      </div>
+      <div class="form-row">
+        <label class="form-label">CLIP-L <span class="muted">(optional)</span></label>
+        <select id="cfg-clip-l-sel" class="form-input" onchange="_onCompPick('clip-l')"></select>
+        <input type="text" id="cfg-clip-l-path" class="form-input" style="display:none;margin-top:.3rem" placeholder="Custom CLIP-L path…">
+      </div>
+      <div class="form-row">
+        <label class="form-label">CLIP-G <span class="muted">(optional)</span></label>
+        <select id="cfg-clip-g-sel" class="form-input" onchange="_onCompPick('clip-g')"></select>
+        <input type="text" id="cfg-clip-g-path" class="form-input" style="display:none;margin-top:.3rem" placeholder="Custom CLIP-G path…">
+      </div>
+      <div class="form-row">
+        <label class="form-label">CLIP Vision <span class="muted">(optional)</span></label>
+        <select id="cfg-clip-vision-sel" class="form-input" onchange="_onCompPick('clip-vision')"></select>
+        <input type="text" id="cfg-clip-vision-path" class="form-input" style="display:none;margin-top:.3rem" placeholder="Custom CLIP Vision path…">
+      </div>
+      <div class="form-row">
+        <label class="form-label">LoRA file <span class="muted">(optional — applied at load)</span></label>
+        <select id="cfg-lora-sel" class="form-input" onchange="_onCompPick('lora')"></select>
+        <input type="text" id="cfg-lora-path" class="form-input" style="display:none;margin-top:.3rem" placeholder="Custom LoRA path…">
+        <span class="form-hint" style="font-size:11px;color:var(--text-3)">Tip: use &lt;lora:name:strength&gt; in prompts to apply at inference time</span>
+      </div>
+      <div class="form-row">
+        <label class="form-label">LoRA directory <span class="muted">(optional — for prompt-based loras)</span></label>
+        <input type="text" id="cfg-lora-dir" class="form-input" placeholder="e.g. /models/loras">
       </div>
 
       <!-- generation -->
@@ -601,9 +753,11 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-grammar"> Grammar-guided generation</label>
       </div>
 
-      <div class="form-actions" style="margin-top:1.5rem">
+      <div class="form-actions" style="margin-top:1.5rem;display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
         <button class="btn btn-primary" onclick="saveModelConfig()">Save</button>
+        <button class="btn btn-secondary" id="cfg-save-new-btn" onclick="saveNewModelConfig()" style="display:none" title="Save as a separate configuration for the same model file">Save as new config</button>
         <button class="btn btn-ghost" onclick="closeModal('cfg-modal')">Cancel</button>
+        <button class="btn btn-danger btn-sm" id="cfg-remove-config-btn" onclick="removeThisConfig()" style="display:none;margin-left:auto" title="Remove only this configuration (keeps other configs and the model file)">Remove this config</button>
       </div>
     </div>
   </div>
@@ -624,6 +778,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
 <script>
 /* ── helpers ─────────────────────────────────────────── */
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function jq(v){return JSON.stringify(v).replace(/"/g,'&quot;')}
 function fmtNum(n){if(!n)return'0';return n>=1e6?(n/1e6).toFixed(1)+'M':n>=1000?(n/1000).toFixed(1)+'k':String(n)}
 function fmtGB(gb){if(!gb)return'—';return gb>=1?gb.toFixed(1)+' GB':(gb*1024).toFixed(0)+' MB'}
 function fmtDate(s){try{return new Date(s).toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'})}catch{return s}}
@@ -655,30 +810,6 @@ function _ggufBaseName(filename){
   // Strip quant suffix and .gguf extension to get the model base name
   return filename.replace(_QUANT_RE,'').replace(/\.gguf$/i,'');
 }
-function _switchGgufQuant(idx, newPath){
-  const m = _localModels[idx];
-  if(!m || !m.ggufGroup) return;
-  const f = m.ggufGroup.find(x=>x.path===newPath);
-  if(!f) return;
-  m.label = f.filename;
-  m.path = f.path;
-  m.size_gb = f.size_gb||0;
-  m.settings = f.settings||{};
-  m.in_config = f.in_config;
-  // Re-render quant badges in the row
-  const row = document.getElementById('gguf-row-'+idx);
-  if(!row) return;
-  const base = _ggufBaseName(f.filename);
-  const quantBadges = m.ggufGroup.length > 1
-    ? m.ggufGroup.map(gf=>{
-        const q = _ggufQuant(gf.filename);
-        const active = gf.path === newPath;
-        return `<span class="badge ${active?'badge-ok':'badge-user'}" style="font-size:10px;padding:.1rem .3rem;cursor:pointer" title="${esc(gf.filename)}" onclick="_switchGgufQuant(${idx},${JSON.stringify(gf.path)})">${esc(q||gf.filename)}</span>`;
-      }).join(' ')
-    : '';
-  const nameCell = row.querySelector('td:first-child');
-  if(nameCell) nameCell.innerHTML = `${esc(base)}<br>${quantBadges}`;
-}
 
 /* ── tab / modal ─────────────────────────────────────── */
 function switchTab(name,btn){
@@ -689,6 +820,31 @@ function switchTab(name,btn){
 }
 function openModal(id){document.getElementById(id).classList.add('show')}
 function closeModal(id){document.getElementById(id).classList.remove('show')}
+
+// Custom confirm to avoid browser native-dialog blocking
+function showConfirm(title, msg, okLabel){
+  return new Promise(resolve => {
+    document.getElementById('confirm-modal-title').textContent = title;
+    document.getElementById('confirm-modal-msg').textContent = msg;
+    const okBtn    = document.getElementById('confirm-modal-ok');
+    const cancelBtn= document.getElementById('confirm-modal-cancel');
+    const xBtn     = document.getElementById('confirm-modal-x');
+    okBtn.textContent = okLabel || 'Confirm';
+    openModal('confirm-modal');
+    function cleanup(result){
+      closeModal('confirm-modal');
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      xBtn.removeEventListener('click', onCancel);
+      resolve(result);
+    }
+    function onOk(){ cleanup(true); }
+    function onCancel(){ cleanup(false); }
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+    xBtn.addEventListener('click', onCancel);
+  });
+}
 
 /* ── Global settings ─────────────────────────────────── */
 let _defaultOffloadDir = './offload';
@@ -717,6 +873,24 @@ document.querySelectorAll('.tog-btn').forEach(btn=>{
 /* ── chip toggles ────────────────────────────────────── */
 document.querySelectorAll('.chip').forEach(c=>{
   c.addEventListener('click',()=>c.classList.toggle('on'));
+});
+// Component type chips are single-select: clicking one deselects the rest.
+// Also switch the format toggle to "All" when a component is selected,
+// since most components are safetensors and not GGUF.
+document.querySelectorAll('#comp-type-chips .chip').forEach(c=>{
+  c.addEventListener('click',()=>{
+    const wasOn = c.classList.contains('on');
+    document.querySelectorAll('#comp-type-chips .chip').forEach(x=>x.classList.remove('on'));
+    if(!wasOn){
+      c.classList.add('on');
+      if(_ggufMode === 'gguf'){
+        document.querySelectorAll('.tog-btn').forEach(b=>{
+          b.classList.toggle('on', b.dataset.val === 'all');
+        });
+        _ggufMode = 'all';
+      }
+    }
+  });
 });
 function getChips(id){return[...document.querySelectorAll('#'+id+' .chip.on')].map(c=>c.dataset.val)}
 
@@ -760,10 +934,11 @@ document.getElementById('search-q').addEventListener('keydown',e=>{if(e.key==='E
 async function doSearch(){
   const q   = document.getElementById('search-q').value.trim();
   const out = document.getElementById('search-results');
-  const pipeline = document.getElementById('filter-pipeline').value;
-  const arch     = document.getElementById('filter-arch').value;
-  const sort     = document.getElementById('filter-sort').value;
-  const sizes    = getChips('size-chips').join(',');
+  const pipeline    = document.getElementById('filter-pipeline').value;
+  const arch        = document.getElementById('filter-arch').value;
+  const sort        = document.getElementById('filter-sort').value;
+  const sizes       = getChips('size-chips').join(',');
+  const compType    = getChips('comp-type-chips')[0] || '';
   _activeQuants  = new Set(getChips('quant-chips').map(v=>v.toUpperCase().split(' ')[0])); // strip ★
 
   // Get selected capability filters (from our custom chips)
@@ -775,9 +950,10 @@ async function doSearch(){
   out.innerHTML = '<span class="muted small">Searching HuggingFace…</span>';
 
   const params = new URLSearchParams({q:q||' ', gguf_mode:_ggufMode, sort});
-  if(pipeline) params.append('pipeline_tag', pipeline);
-  if(sizes)    params.append('sizes', sizes);
-  if(arch)     params.append('arch', arch);
+  if(pipeline)  params.append('pipeline_tag', pipeline);
+  if(sizes)     params.append('sizes', sizes);
+  if(arch)      params.append('arch', arch);
+  if(compType)  params.append('component_type', compType);
   const caps = getChips('cap-chips');
   if(caps.length) params.append('capabilities', caps.join(','));
 
@@ -812,12 +988,14 @@ async function doSearch(){
       const capBadges = fmtCapabilities(m.capabilities||[]);
       const isDownloaded = _cachedSearchIds.has(m.id);
       const downloadedBadge = isDownloaded ? `<span class="badge badge-ok" style="font-size:10px;padding:.1rem .35rem;margin-left:.4rem;vertical-align:middle">✓ local</span>` : '';
+      const detectedRole = _detectCompRole(m.id.split('/').pop() || m.id);
+      const compBadge = detectedRole ? `<span class="badge badge-user" style="font-size:10px;padding:.1rem .35rem;margin-left:.4rem;vertical-align:middle">${esc(detectedRole.label)}</span>` : '';
       return `
       <div style="padding:.75rem 0;border-bottom:1px solid var(--border)">
         <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:.5rem">
           <div style="min-width:0;flex:1">
             <div style="font-weight:500;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center"
-                 title="${esc(m.id)}">${vramDot}${esc(m.id)}${downloadedBadge}</div>
+                 title="${esc(m.id)}">${vramDot}${esc(m.id)}${downloadedBadge}${compBadge}</div>
             <div style="font-size:11px;color:var(--text-3);margin-top:.25rem;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
               ${m.pipeline_tag?`<span class="badge badge-user">${esc(m.pipeline_tag)}</span>`:''}
               ${capBadges}
@@ -993,18 +1171,38 @@ function looksLikeGguf(modelId, filePattern){
 }
 
 function openDownloadFor(modelId, filePattern){
-  document.getElementById('dl-id').value = modelId;
+  // Always reset to form view so the user can start a new download even while
+  // one is already running. The existing download continues on the server; the
+  // strip tracks it via polling independently of the EventSource.
+  if(_dlEs){ _dlEs.close(); _dlEs=null; }
+  _dlSessionId=null;
+  _dlQuantFiles=[];
+  document.getElementById('dl-form').style.display='block';
+  document.getElementById('dl-progress').style.display='none';
+  document.getElementById('dl-quant-row').style.display='none';
+  document.getElementById('dl-start-btn').textContent='Download';
+
+  document.getElementById('dl-id').value = modelId || '';
+  document.getElementById('dl-pattern').value = filePattern || '';
+
   const isGguf = looksLikeGguf(modelId, filePattern);
-  if(isGguf){
+  if(!modelId){
+    // Blank form — show pattern row as default
     document.getElementById('dl-pattern-row').style.display = 'block';
     document.getElementById('dl-snapshot-note').style.display = 'none';
-    document.getElementById('dl-pattern').value = filePattern || '.gguf';
-  } else {
+  } else if(!isGguf && modelId.includes('/')){
+    // Looks like a full HF non-GGUF repo
     document.getElementById('dl-pattern-row').style.display = 'none';
     document.getElementById('dl-snapshot-note').style.display = 'flex';
-    document.getElementById('dl-pattern').value = '';
+  } else {
+    document.getElementById('dl-pattern-row').style.display = 'block';
+    document.getElementById('dl-snapshot-note').style.display = 'none';
   }
   openModal('dl-modal');
+  // Auto-browse if we have a specific HF repo ID so the quant picker appears immediately
+  if(modelId && modelId.includes('/')){
+    browseHfFiles();
+  }
 }
 
 /* progress helpers */
@@ -1014,6 +1212,8 @@ function fmtEta(s){if(s===null||s===undefined)return'';s=Math.round(s);if(s<60)r
 
 let _dlEs = null;
 let _dlDone = false;
+let _dlSessionId = null;
+let _dlQuantFiles = [];
 
 function _dlReset(){
   const bar = document.getElementById('dl-bar');
@@ -1071,38 +1271,277 @@ function handleProgressEvent(evt){
       closeModal('dl-modal');
       document.getElementById('dl-form').style.display='block';
       document.getElementById('dl-progress').style.display='none';
+      document.getElementById('dl-quant-row').style.display='none';
+      document.getElementById('dl-pattern-row').style.display='block';
+      document.getElementById('dl-start-btn').textContent='Download';
+      _dlQuantFiles=[];
       _dlReset();
     },1800);
   }else if(evt.type==='error'){
     _dlDone=true;
     showDownloadError(evt.message);
+  }else if(evt.type==='cancelled'){
+    _dlDone=true;
+    if(_dlEs){_dlEs.close();_dlEs=null;}
+    showDownloadError('Download cancelled');
   }
   // keepalive: ignore
+}
+
+function minimizeDownload(){
+  closeModal('dl-modal');
+}
+
+async function reopenDownload(session_id){
+  openModal('dl-modal');
+  document.getElementById('dl-form').style.display='none';
+  document.getElementById('dl-progress').style.display='block';
+
+  // Already tracking this session with a live EventSource — just show the modal.
+  if(_dlSessionId===session_id && _dlEs) return;
+
+  // Different session or page reload: seed state from status API, then reconnect.
+  if(_dlEs){_dlEs.close();_dlEs=null;}
+  _dlSessionId=session_id;
+  _dlDone=false;
+  _dlReset();
+
+  try{
+    const r=await fetch(ROOT_PATH + '/admin/api/downloads');
+    if(r.ok){
+      const all=await r.json();
+      const s=all.find(d=>d.session_id===session_id);
+      if(s){
+        document.getElementById('dl-filename').textContent=s.filename||s.model_id||'Downloading…';
+        const pct=s.percent||0;
+        const bar=document.getElementById('dl-bar');
+        bar.style.transition='none';
+        bar.style.width=pct+'%';
+        requestAnimationFrame(()=>{bar.style.transition='';});
+        document.getElementById('dl-pct').textContent=pct.toFixed(1)+'%';
+        if(s.downloaded!=null&&s.total!=null)
+          document.getElementById('dl-bytes').textContent=fmtBytes(s.downloaded)+' / '+fmtBytes(s.total);
+        if(s.rate) document.getElementById('dl-speed').textContent=fmtRate(s.rate);
+        if(s.eta!=null) document.getElementById('dl-eta').textContent=fmtEta(s.eta);
+        if(s.status==='done'){handleProgressEvent({type:'done'});return;}
+        if(s.status==='cancelled'){showDownloadError('Download cancelled');return;}
+        if(s.status==='error'){showDownloadError(s.error||'Download failed');return;}
+      }
+    }
+  }catch{}
+
+  // Connect a fresh EventSource to stream remaining progress events.
+  _dlEs=new EventSource(ROOT_PATH + '/admin/api/download-stream/'+session_id);
+  _dlEs.onmessage=function(e){
+    try{handleProgressEvent(JSON.parse(e.data))}catch{}
+  };
+  _dlEs.onerror=function(){
+    if(_dlDone) return;
+    if(_dlEs&&_dlEs.readyState===EventSource.CLOSED) return;
+    showDownloadError('Connection to download stream lost');
+  };
+}
+
+async function stopDownload(session_id){
+  if(!confirm('Cancel this download?')) return;
+  try{
+    await fetch(ROOT_PATH + '/admin/api/download-cancel/'+session_id, {method:'POST'});
+    if(_dlSessionId===session_id){
+      if(_dlEs){_dlEs.close();_dlEs=null;}
+      _dlDone=true;
+      showDownloadError('Download cancelled');
+    }
+  }catch(e){
+    alert('Could not cancel download: '+e.message);
+  }
+}
+
+/* ── quant picker ──────────────────────────────────────── */
+
+function _quantLabel(fname){
+  // Reuse the quant extractor; fall back to the bare filename
+  const q = _ggufQuant(fname);
+  return q || fname.replace(/\.gguf$/i,'');
+}
+
+const _RECOMMENDED_QUANTS = new Set(['Q4_K_M','Q5_K_M','Q6_K','Q4_K_S','Q5_K_S','IQ4_NL','IQ4_XS']);
+
+function _dlSelectAll(val){
+  document.querySelectorAll('#dl-quant-list input[type=checkbox]').forEach(cb=>cb.checked=val);
+}
+
+function renderQuantPicker(ggufFiles, initialPattern){
+  _dlQuantFiles = ggufFiles;
+  // Sort: recommended first, then by size descending
+  const sorted = [...ggufFiles].sort((a,b)=>{
+    const ar = _RECOMMENDED_QUANTS.has(_quantLabel(a.name).toUpperCase());
+    const br = _RECOMMENDED_QUANTS.has(_quantLabel(b.name).toUpperCase());
+    if(ar!==br) return br-ar;
+    return (b.size||0)-(a.size||0);
+  });
+  const pat = (initialPattern||'').toLowerCase();
+  const list = document.getElementById('dl-quant-list');
+  list.innerHTML = sorted.map((f,i)=>{
+    const label = _quantLabel(f.name);
+    const upper = label.toUpperCase();
+    const isRec = _RECOMMENDED_QUANTS.has(upper);
+    const sz = f.size ? fmtBytes(f.size) : '?';
+    // Pre-check: recommended ones by default, or whatever matches the initial pattern
+    const checked = pat ? f.name.toLowerCase().includes(pat.replace('*','')) : isRec;
+    return `<label style="display:flex;align-items:center;gap:.6rem;padding:.3rem .25rem;border-radius:4px;cursor:pointer;font-size:13px" class="_dl-quant-row">
+      <input type="checkbox" data-fname="${esc(f.name)}" ${checked?'checked':''}>
+      <span style="flex:1;font-family:monospace;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(f.name)}">${esc(label)}</span>
+      ${isRec?'<span class="badge badge-user" style="font-size:9px;padding:.1rem .3rem">rec</span>':''}
+      <span style="color:var(--text-2);font-size:11px;white-space:nowrap;flex-shrink:0">${esc(sz)}</span>
+    </label>`;
+  }).join('');
+  // Show picker, hide manual pattern row
+  document.getElementById('dl-quant-row').style.display = 'block';
+  document.getElementById('dl-pattern-row').style.display = 'none';
+  document.getElementById('dl-snapshot-note').style.display = 'none';
+  const note = document.getElementById('dl-quant-note');
+  const rec = sorted.filter(f=>_RECOMMENDED_QUANTS.has(_quantLabel(f.name).toUpperCase())).length;
+  note.textContent = rec
+    ? `${rec} recommended quantization${rec>1?'s':''} pre-selected (marked "rec"). Larger Q = better quality, more VRAM.`
+    : `${ggufFiles.length} quantization${ggufFiles.length!==1?'s':''} available. Select which to download.`;
+  document.getElementById('dl-start-btn').textContent = 'Download selected';
+}
+
+async function browseHfFiles(){
+  const id = document.getElementById('dl-id').value.trim();
+  if(!id){ document.getElementById('dl-id').focus(); return; }
+  if(!id.includes('/')){
+    // Local path or bare name — can't browse, use pattern fallback
+    document.getElementById('dl-quant-row').style.display='none';
+    const isGguf = looksLikeGguf(id,'');
+    document.getElementById('dl-pattern-row').style.display = isGguf?'block':'none';
+    document.getElementById('dl-snapshot-note').style.display = isGguf?'none':'flex';
+    return;
+  }
+  const btn = document.getElementById('dl-browse-btn');
+  btn.textContent='…'; btn.disabled=true;
+  try{
+    const r = await fetch(ROOT_PATH+'/admin/api/hf-files?repo_id='+encodeURIComponent(id));
+    if(!r.ok){ throw new Error((await r.json()).detail||'Request failed'); }
+    const {files, error} = await r.json();
+    if(error){ throw new Error(error); }
+    const gguf = (files||[]).filter(f=>f.name.toLowerCase().endsWith('.gguf'));
+    if(gguf.length){
+      renderQuantPicker(gguf, document.getElementById('dl-pattern').value);
+    } else {
+      // Non-GGUF repo — hide picker, show snapshot note
+      _dlQuantFiles=[];
+      document.getElementById('dl-quant-row').style.display='none';
+      document.getElementById('dl-pattern-row').style.display='none';
+      document.getElementById('dl-snapshot-note').style.display='flex';
+      document.getElementById('dl-start-btn').textContent='Download';
+      const note = document.getElementById('dl-quant-note');
+      note.textContent='';
+    }
+  }catch(e){
+    // Fall back to manual pattern input
+    _dlQuantFiles=[];
+    document.getElementById('dl-quant-row').style.display='none';
+    document.getElementById('dl-pattern-row').style.display='block';
+    document.getElementById('dl-snapshot-note').style.display='none';
+    document.getElementById('dl-start-btn').textContent='Download';
+    alert('Could not browse repo: '+e.message);
+  }finally{
+    btn.textContent='Browse'; btn.disabled=false;
+  }
+}
+
+async function _startSingleDownload(modelId, filePattern){
+  /* Starts one download session, returns the session_id or null on error. */
+  const r = await fetch(ROOT_PATH+'/admin/api/model-download',{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({model_id:modelId, file_pattern:filePattern||null})
+  });
+  if(!r.ok){ const e=await r.json(); throw new Error(e.detail||'Request failed'); }
+  return (await r.json()).session_id;
+}
+
+function _attachEventSource(session_id){
+  if(_dlEs){_dlEs.close();_dlEs=null;}
+  _dlSessionId=session_id;
+  _dlEs=new EventSource(ROOT_PATH+'/admin/api/download-stream/'+session_id);
+  _dlEs.onmessage=function(e){ try{handleProgressEvent(JSON.parse(e.data))}catch{} };
+  _dlEs.onerror=function(){
+    if(_dlDone) return;
+    if(_dlEs&&_dlEs.readyState===EventSource.CLOSED) return;
+    showDownloadError('Connection to download stream lost');
+  };
+}
+
+async function startDownloadFromForm(){
+  const id = document.getElementById('dl-id').value.trim();
+  if(!id){ document.getElementById('dl-id').focus(); return; }
+
+  // For HF repo IDs: always browse first so the user can pick specific files.
+  // Skip if the quant picker is already visible (Browse was already done).
+  const quantRowVisible = document.getElementById('dl-quant-row').style.display!=='none';
+  const looksLikeHfRepo = id.includes('/') && !id.startsWith('http');
+  if(!quantRowVisible && looksLikeHfRepo){
+    await browseHfFiles();
+    // If Browse produced a quant picker, stop here — let the user select files.
+    if(document.getElementById('dl-quant-row').style.display!=='none'){
+      return;
+    }
+    // No GGUF files found (non-GGUF repo or browse error) — fall through to snapshot download.
+  }
+
+  const pickerVisible = document.getElementById('dl-quant-row').style.display!=='none';
+  if(pickerVisible){
+    // Multi-file download from quant picker
+    const checked = [...document.querySelectorAll('#dl-quant-list input[type=checkbox]:checked')];
+    if(!checked.length){ alert('Select at least one quantization to download.'); return; }
+    _dlDone=false; _dlSessionId=null; _dlReset();
+
+    if(checked.length===1){
+      // Single selection → show progress in modal
+      document.getElementById('dl-form').style.display='none';
+      document.getElementById('dl-progress').style.display='block';
+      try{
+        const sid = await _startSingleDownload(id, checked[0].dataset.fname);
+        startPolling();
+        _attachEventSource(sid);
+      }catch(e){ showDownloadError(e.message); }
+    } else {
+      // Multiple selections → start all, show in strip
+      document.getElementById('dl-form').style.display='none';
+      document.getElementById('dl-progress').style.display='block';
+      document.getElementById('dl-filename').textContent=`Starting ${checked.length} downloads…`;
+      try{
+        const sids = [];
+        for(const cb of checked){
+          const sid = await _startSingleDownload(id, cb.dataset.fname);
+          sids.push(sid);
+        }
+        startPolling();
+        // Attach EventSource to the first one, rest tracked in strip
+        _attachEventSource(sids[0]);
+        document.getElementById('dl-filename').textContent=`Downloading ${checked.length} files — see strip below`;
+      }catch(e){ showDownloadError(e.message); }
+    }
+  } else {
+    // Manual / snapshot mode
+    await startDownload();
+  }
 }
 
 async function startDownload(){
   const id=document.getElementById('dl-id').value.trim();
   if(!id){document.getElementById('dl-id').focus();return}
   _dlDone=false;
+  _dlSessionId=null;
   _dlReset();
   document.getElementById('dl-form').style.display='none';
   document.getElementById('dl-progress').style.display='block';
   try{
-    const r=await fetch(ROOT_PATH + '/admin/api/model-download',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({model_id:id,file_pattern:document.getElementById('dl-pattern').value||null})
-    });
-    if(!r.ok){const e=await r.json();showDownloadError(e.detail||'Request failed');return}
-    const {session_id}=await r.json();
-    _dlEs=new EventSource(ROOT_PATH + '/admin/api/download-stream/'+session_id);
-    _dlEs.onmessage=function(e){
-      try{handleProgressEvent(JSON.parse(e.data))}catch{}
-    };
-    _dlEs.onerror=function(){
-      if(_dlDone) return;
-      if(_dlEs&&_dlEs.readyState===EventSource.CLOSED) return;
-      showDownloadError('Connection to download stream lost');
-    };
+    const sid = await _startSingleDownload(id, document.getElementById('dl-pattern').value||null);
+    _dlSessionId=sid;
+    startPolling();
+    _attachEventSource(sid);
   }catch(e){showDownloadError(e.message)}
 }
 
@@ -1114,16 +1553,22 @@ async function pollDownloads(){
     const r = await fetch(ROOT_PATH + '/admin/api/downloads');
     if(!r.ok) return;
     const all = await r.json();
-    const active = all.filter(d=>d.status!=='done'&&d.status!=='error');
+    const active = all.filter(d=>d.status!=='done'&&d.status!=='error'&&d.status!=='cancelled');
     const strip = document.getElementById('dl-strip');
     const list  = document.getElementById('dl-strip-list');
-    if(!active.length){ strip.style.display='none'; return; }
+    if(!active.length){
+      strip.style.display='none';
+      stopPolling();
+      return;
+    }
+    startPolling(); // keep the timer alive (handles page-load case where timer was never set)
     strip.style.display='block';
     list.innerHTML = active.map(d=>{
       const pct = d.percent||0;
       const name = d.filename||d.model_id||'';
       const spd  = d.rate?fmtRate(d.rate):'';
       const eta  = d.eta!=null?fmtEta(d.eta):'';
+      const sid  = d.session_id||'';
       return `<div style="display:flex;align-items:center;gap:.75rem;padding:.2rem 0">
         <div style="flex:1;min-width:0">
           <div style="font-size:12px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(d.model_id)}</div>
@@ -1134,6 +1579,10 @@ async function pollDownloads(){
           <div>${pct.toFixed(1)}%</div>
           ${spd?`<div>${esc(spd)}</div>`:''}
           ${eta?`<div class="muted">${esc(eta)}</div>`:''}
+          ${sid?`<div style="margin-top:.25rem;display:flex;gap:.3rem">
+            <button class="btn btn-ghost" style="font-size:10px;padding:.1rem .35rem;line-height:1.4" onclick="reopenDownload('${sid}')" title="Open download progress">↗ View</button>
+            <button class="btn btn-ghost" style="font-size:10px;padding:.1rem .35rem;line-height:1.4;color:var(--error,#e55)" onclick="stopDownload('${sid}')" title="Cancel this download">✕ Stop</button>
+          </div>`:''}
         </div>
       </div>`;
     }).join('<div style="border-top:1px solid var(--border);margin:.3rem 0"></div>');
@@ -1146,7 +1595,12 @@ function startPolling(){
   pollDownloads();
 }
 
-startPolling();
+function stopPolling(){
+  if(_pollTimer){ clearInterval(_pollTimer); _pollTimer=null; }
+}
+
+// Single one-shot check on page load; polling only runs while downloads are active.
+pollDownloads();
 
 /* ── cache stats & local models ──────────────────────── */
 async function loadCacheStats(){
@@ -1166,6 +1620,183 @@ async function loadCacheStats(){
 
 let _localModels = [];
 let _ggufFiles = [];
+let _hfModels = [];
+
+function _renderConfigPills(idx, m) {
+  const configs = m.configs || [];
+  if (!configs.length) return '';
+  const pills = configs.map((c, cfgIdx) => {
+    const label = (c.settings && (c.settings.config_name || c.settings.alias)) || `Config ${cfgIdx + 1}`;
+    return `<span class="badge badge-user" style="font-size:10px;cursor:pointer;vertical-align:middle;margin:.1rem .1rem 0 0" onclick="openCfgModal(${idx},${cfgIdx})" title="Edit this configuration">${esc(label)}</span>`;
+  }).join('');
+  const addPill = `<span class="badge" style="font-size:10px;cursor:pointer;vertical-align:middle;margin:.1rem 0 0 0;background:var(--raised);border:1px dashed var(--border);color:var(--text-2)" onclick="openCfgModalNew(${idx})" title="Add another configuration for this model">+ Config</span>`;
+  return `<br style="line-height:.5rem">${pills}${addPill}`;
+}
+
+// ── Component file helpers ────────────────────────────────────────────────────
+const _COMP_ROLES = [
+  {key:'vae',         label:'VAE',         pat:/vae|(^|[^a-z])ae\.(gguf|safetensors)/i},
+  {key:'t5xxl',       label:'T5-XXL',      pat:/t5.?xxl|t5.?v1_1/i},
+  {key:'clip_l',      label:'CLIP-L',      pat:/clip[_\-]l(?![_\-g])/i},
+  {key:'clip_g',      label:'CLIP-G',      pat:/clip[_\-]g(?![_\-]v)/i},
+  {key:'clip_vision', label:'CLIP Vision', pat:/clip[_\-]vi(?:s|t)/i},
+  {key:'lora',        label:'LoRA',        pat:/\blora\b/i},
+  {key:'encoder',     label:'Encoder',     pat:/encoder|text.?enc/i},
+];
+
+function _detectCompRole(filename) {
+  for(const r of _COMP_ROLES) if(r.pat.test(filename)) return r;
+  return null;
+}
+
+function _isCompFile(filename) {
+  return _COMP_ROLES.some(r => r.pat.test(filename));
+}
+
+function renderComponentsList(ggufFiles) {
+  // Files from the local cache (GGUF cache dir — any extension: .gguf, .safetensors, etc.)
+  const fileComps = ggufFiles.filter(f => _isCompFile(f.filename));
+  // HF repos whose repo-name looks like a component
+  const hfComps = _hfModels.filter(m => _isCompFile(m.id.split('/').pop() || m.id));
+  const total = fileComps.length + hfComps.length;
+  const badge = document.getElementById('comp-badge');
+  if(badge) badge.textContent = total ? `(${total})` : '';
+  const el = document.getElementById('comp-list');
+  if(!el) return;
+  if(!total){
+    el.innerHTML = '<span class="muted small">No component files detected. Use Download to fetch VAEs, text encoders, CLIP models or LoRAs.</span>';
+    return;
+  }
+  const fileRows = fileComps.map(f => {
+    const role = _detectCompRole(f.filename);
+    const ext = f.filename.includes('.') ? f.filename.split('.').pop().toUpperCase() : '';
+    return `<tr style="border-top:1px solid var(--border)">
+      <td style="padding:.4rem .25rem;font-family:monospace;font-size:11px;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(f.filename)}">${esc(f.filename)}</td>
+      <td style="padding:.4rem .25rem;white-space:nowrap">
+        <span class="badge badge-user" style="font-size:10px">${role?esc(role.label):'component'}</span>
+        ${ext && ext !== 'GGUF' ? `<span class="badge" style="font-size:10px;background:var(--raised)">${esc(ext)}</span>` : ''}
+      </td>
+      <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${fmtGB(f.size_gb)}</td>
+      <td style="padding:.4rem .25rem;font-family:monospace;font-size:10px;color:var(--text-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px" title="${esc(f.path)}">${esc(f.path)}</td>
+      <td style="padding:.4rem .25rem;text-align:right;white-space:nowrap">
+        <button class="btn btn-danger btn-sm" onclick="_deleteCompFile(${jq(f.path)},'gguf')">Delete</button>
+      </td>
+    </tr>`;
+  });
+  const hfRows = hfComps.map(m => {
+    const role = _detectCompRole(m.id.split('/').pop() || m.id);
+    return `<tr style="border-top:1px solid var(--border)">
+      <td style="padding:.4rem .25rem;font-family:monospace;font-size:11px;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(m.id)}">${esc(m.id)}</td>
+      <td style="padding:.4rem .25rem;white-space:nowrap">
+        <span class="badge badge-user" style="font-size:10px">${role?esc(role.label):'component'}</span>
+        <span class="badge" style="font-size:10px;background:var(--raised)">HF</span>
+      </td>
+      <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${fmtGB(m.size_gb)}</td>
+      <td style="padding:.4rem .25rem;font-size:10px;color:var(--text-3)">${m.file_count} file${m.file_count!==1?'s':''}</td>
+      <td style="padding:.4rem .25rem;text-align:right;white-space:nowrap">
+        <button class="btn btn-danger btn-sm" onclick="_deleteCompFile(${jq(m.id)},'hf')">Delete</button>
+      </td>
+    </tr>`;
+  });
+  el.innerHTML = '<table style="width:100%;border-collapse:collapse;font-size:13px">'+
+    '<thead><tr style="color:var(--text-2);font-size:10px;text-transform:uppercase;letter-spacing:.05em">'+
+    '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">File / Repo</th>'+
+    '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Type</th>'+
+    '<th style="text-align:right;padding:.3rem .25rem;font-weight:700">Size</th>'+
+    '<th style="text-align:left;padding:.3rem .25rem;font-weight:700">Path / Info</th>'+
+    '<th></th></tr></thead><tbody>'+fileRows.join('')+hfRows.join('')+'</tbody></table>';
+}
+
+async function _deleteCompFile(id, cacheType) {
+  if(!await showConfirm('Delete component file', `Delete "${id}" from local cache? This cannot be undone.`, 'Delete')) return;
+  try{
+    const r = await fetch(ROOT_PATH + '/admin/api/cached-models/' + encodeURIComponent(id) + '?cache_type=' + (cacheType||'gguf'), {method:'DELETE'});
+    const d = await r.json();
+    if(d.success) refreshLocal();
+    else await showConfirm('Delete failed', d.detail || 'Unknown error', 'OK');
+  }catch(e){ await showConfirm('Error', e.message, 'OK'); }
+}
+
+// ── Component select combos ───────────────────────────────────────────────────
+// role slug → input IDs: sel = 'cfg-{role}-sel', text = 'cfg-{role}-path'
+// role slugs used: vae  t5xxl  clip-l  clip-g  clip-vision
+const _COMP_FIELDS = [
+  {slug:'vae',        pathId:'cfg-vae-path'},
+  {slug:'t5xxl',      pathId:'cfg-t5xxl-path'},
+  {slug:'clip-l',     pathId:'cfg-clip-l-path'},
+  {slug:'clip-g',     pathId:'cfg-clip-g-path'},
+  {slug:'clip-vision',pathId:'cfg-clip-vision-path'},
+  {slug:'lora',       pathId:'cfg-lora-path'},
+];
+
+function _populateCompSelects(){
+  const loraRol = _COMP_ROLES.find(r=>r.key==='lora');
+  const loras   = _ggufFiles.filter(f=>loraRol?.pat.test(f.filename));
+  const other   = _ggufFiles.filter(f=>_isCompFile(f.filename) && !loraRol?.pat.test(f.filename));
+  const rest    = _ggufFiles.filter(f=>!_isCompFile(f.filename));
+  const hfComps = _hfModels.filter(m=>_isCompFile(m.id.split('/').pop()||m.id));
+  const hfRest  = _hfModels.filter(m=>!_isCompFile(m.id.split('/').pop()||m.id));
+  const mkOpt = (val, text) => `<option value="${esc(val)}">${esc(text)}</option>`;
+  const otherOpts = other.length
+    ? `<optgroup label="Component files">${other.map(f=>mkOpt(f.path, f.filename+' ('+fmtGB(f.size_gb)+')')).join('')}</optgroup>`
+    : '';
+  const loraOpts  = loras.length
+    ? `<optgroup label="LoRA files">${loras.map(f=>mkOpt(f.path, f.filename+' ('+fmtGB(f.size_gb)+')')).join('')}</optgroup>`
+    : '';
+  const restOpts  = rest.length
+    ? `<optgroup label="Local files">${rest.map(f=>mkOpt(f.path, f.filename+' ('+fmtGB(f.size_gb)+')')).join('')}</optgroup>`
+    : '';
+  const hfCompOpts = hfComps.length
+    ? `<optgroup label="HuggingFace component repos">${hfComps.map(m=>mkOpt(m.id, m.id+' ('+fmtGB(m.size_gb)+')')).join('')}</optgroup>`
+    : '';
+  const hfRestOpts = hfRest.length
+    ? `<optgroup label="HuggingFace repos">${hfRest.map(m=>mkOpt(m.id, m.id+' ('+fmtGB(m.size_gb)+')')).join('')}</optgroup>`
+    : '';
+  _COMP_FIELDS.forEach(({slug}) => {
+    const sel = document.getElementById('cfg-'+slug+'-sel');
+    if(!sel) return;
+    const html = slug === 'lora'
+      ? `<option value="">None</option>${loraOpts}${otherOpts}${hfCompOpts}${restOpts}${hfRestOpts}<option value="__custom__">Custom path…</option>`
+      : `<option value="">None</option>${otherOpts}${hfCompOpts}${loraOpts}${restOpts}${hfRestOpts}<option value="__custom__">Custom path…</option>`;
+    sel.innerHTML = html;
+  });
+}
+
+function _setCompField(slug, savedPath){
+  const sel  = document.getElementById('cfg-'+slug+'-sel');
+  const inp  = document.getElementById('cfg-'+slug+'-path');
+  if(!sel) return;
+  if(!savedPath){
+    sel.value = '';
+    if(inp){ inp.value=''; inp.style.display='none'; }
+    return;
+  }
+  const match = Array.from(sel.options).find(o=>o.value===savedPath);
+  if(match){
+    sel.value = savedPath;
+    if(inp){ inp.value=''; inp.style.display='none'; }
+  } else {
+    sel.value = '__custom__';
+    if(inp){ inp.value=savedPath; inp.style.display=''; }
+  }
+}
+
+function _onCompPick(slug){
+  const sel   = document.getElementById('cfg-'+slug+'-sel');
+  const pathId= 'cfg-'+slug+'-path';
+  const inp   = document.getElementById(pathId);
+  if(!sel || !inp) return;
+  inp.style.display = sel.value === '__custom__' ? '' : 'none';
+  if(sel.value !== '__custom__') inp.value = '';
+}
+
+function _readCompField(slug){
+  const sel = document.getElementById('cfg-'+slug+'-sel');
+  const inp = document.getElementById('cfg-'+slug+'-path');
+  if(!sel) return '';
+  if(sel.value === '__custom__') return inp ? inp.value.trim() : '';
+  return sel.value || '';
+}
 
 function _renderWhisperServerRows(models){
   if(!models.length) return '';
@@ -1280,32 +1911,41 @@ async function loadCachedModels(){
 
     // HF models
     const hf = d.hf||[];
-    document.getElementById('hf-model-badge').textContent = hf.length ? `(${hf.length})` : '';
-    if(!hf.length){
+    _hfModels = hf;
+    const hfModelList = hf.filter(m => !_isCompFile(m.id.split('/').pop() || m.id));
+    document.getElementById('hf-model-badge').textContent = hfModelList.length ? `(${hfModelList.length})` : '';
+    if(!hfModelList.length){
       hfEl.innerHTML = '<span class="muted small">No HuggingFace models cached.</span>';
     }else{
-      const rows = hf.map(m=>{
+      const rows = hfModelList.map(m=>{
         const idx = _localModels.length;
         _localModels.push({label:m.id, path:m.id, cacheType:'hf', size_gb:m.size_gb||0,
           defaultType:m.model_type||'text_models', settings:m.settings||{}, in_config:m.in_config,
-          capabilities:m.capabilities||[]});
+          capabilities:m.capabilities||[], incomplete:!!m.incomplete, configs:m.configs||[]});
         const loaded = _loadedKeys.has(m.id) || [..._loadedKeys].some(k=>k.endsWith(':'+m.id)||k===m.id);
         const capBadges = fmtCapabilities(m.capabilities||[]);
-        const instBadgeHf = m.in_config ? _instanceBadge([m.id], (m.settings||{}).max_instances||1) : '';
+        const _hfLm = _localModels[idx];
+        const _hfConfigPills = _renderConfigPills(idx, _hfLm);
+        const _hfConfigs = _hfLm.configs || [];
+        const _hfCfgMax = _hfConfigs.length === 1 ? ((_hfConfigs[0].settings||{}).max_instances||1) : 1;
+        const instBadgeHf = m.in_config ? _instanceBadge([m.id], _hfCfgMax) : '';
         const hlHf = _highlightCap && (m.capabilities||[]).includes(_highlightCap);
-        return `<tr${hlHf?' class="local-cap-highlight"':''} style="border-top:1px solid var(--border)${hlHf?';background:rgba(110,207,126,.07);outline:2px solid rgba(110,207,126,.25);outline-offset:-1px':''}">
-          <td style="padding:.4rem .25rem;font-family:monospace;font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(m.id)}">${esc(m.id)}</td>
+        const incompleteBadgeHf = m.incomplete ? '<span class="badge" style="background:rgba(255,160,0,.18);color:#b87200;font-size:10px;margin-left:.3rem" title="Download may be incomplete — some files are missing or truncated">⚠ incomplete</span>' : '';
+        const _hfConfigCount = _hfConfigs.length;
+        return `<tr${hlHf?' class="local-cap-highlight"':''} style="border-top:1px solid var(--border)${hlHf?';background:rgba(110,207,126,.07);outline:2px solid rgba(110,207,126,.25);outline-offset:-1px':''}${m.incomplete?';background:rgba(255,160,0,.04)':''}">
+          <td style="padding:.4rem .25rem;font-family:monospace;font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis" title="${esc(m.id)}">${esc(m.id)}${incompleteBadgeHf}${_hfConfigPills}</td>
           <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${fmtGB(m.size_gb)}</td>
           <td style="text-align:right;padding:.4rem .25rem;color:var(--text-2)">${m.file_count}</td>
           <td style="padding:.4rem .25rem;font-size:11px">${capBadges||'<span class="muted small">—</span>'}</td>
-          <td style="text-align:center;padding:.4rem .25rem">${m.in_config?`<span class="badge badge-ok">enabled</span>${instBadgeHf?'<br>'+instBadgeHf:''}`:' <span class="muted small">—</span>'}</td>
+          <td style="text-align:center;padding:.4rem .25rem">${m.in_config?`<span class="badge badge-ok">enabled${_hfConfigCount>1?` ×${_hfConfigCount}`:''}</span>${instBadgeHf?'<br>'+instBadgeHf:''}`:' <span class="muted small">—</span>'}</td>
           <td style="padding:.4rem .25rem;text-align:right;white-space:nowrap">
             ${m.in_config?(loaded
-              ?`<button class="btn btn-ghost btn-sm" onclick="unloadModel(${idx})">Unload</button>`
-              :`<button class="btn btn-primary btn-sm" onclick="loadModel(${idx})">Load now</button>`):''}
-            <button class="btn btn-secondary btn-sm" onclick="openCfgModal(${idx})">${m.in_config?'Configure':'Add to CoderAI'}</button>
-            ${m.in_config?`<button class="btn btn-ghost btn-sm" onclick="disableModel(${idx})">Remove</button>`:''}
-            <button class="btn btn-danger btn-sm" onclick="deleteModelConfirm(${idx})">Delete</button>
+              ?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="unloadModel(${idx})">Unload</button>`
+              :`<button class="btn btn-primary btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="loadModel(${idx})">Load now</button>`):''}
+            <button class="btn btn-secondary btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openCfgModal(${idx},0)">${m.in_config?'Configure':'Add'}</button>
+            ${m.in_config?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="disableModel(${idx})">Remove</button>`:''}
+            <button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openDownloadFor('${esc(m.id)}')" title="Re-download from HuggingFace">⬇ Re-download</button>
+            <button class="btn btn-danger btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="deleteModelConfirm(${idx})">Delete</button>
           </td>
         </tr>`;
       });
@@ -1323,51 +1963,58 @@ async function loadCachedModels(){
     const gguf = d.gguf||[];
     _ggufFiles = gguf;
     refreshWhisperGgufOptions();
-    document.getElementById('gguf-file-badge').textContent = gguf.length ? `(${gguf.length})` : '';
-    if(!gguf.length){
+    renderComponentsList(gguf);
+    const ggufModelFiles = gguf.filter(f => !_isCompFile(f.filename));
+    document.getElementById('gguf-file-badge').textContent = ggufModelFiles.length ? `(${ggufModelFiles.length})` : '';
+    if(!ggufModelFiles.length){
       ggufEl.innerHTML = '<span class="muted small">No GGUF files cached.</span>';
     }else{
-      // Group by base model name (strip quant suffix)
-      const groups = {};
-      gguf.forEach(f=>{
-        const base = _ggufBaseName(f.filename);
-        if(!groups[base]) groups[base] = [];
-        groups[base].push(f);
-      });
-      const rows = Object.entries(groups).map(([base, files])=>{
-        // Use the configured file if any, else first
-        const primary = files.find(f=>f.in_config) || files[0];
-        const idx = _localModels.length;
-        _localModels.push({label:primary.filename, path:primary.path, cacheType:'gguf',
-          size_gb:primary.size_gb||0, defaultType:primary.model_type||'text_models',
-          settings:primary.settings||{}, in_config:primary.in_config,
-          capabilities:primary.capabilities||[], ggufGroup:files});
-        const loaded = _loadedKeys.has(primary.path) || _loadedKeys.has(primary.filename) ||
-          [..._loadedKeys].some(k=>k.endsWith(':'+primary.path)||k.endsWith(':'+primary.filename));
-        const capBadges = fmtCapabilities(primary.capabilities||[]);
-        const in_config = files.some(f=>f.in_config);
-        const instBadgeGguf = in_config ? _instanceBadge([primary.path, primary.filename], (primary.settings||{}).max_instances||1) : '';
-        // Quant badges
-        const quantBadges = files.length > 1
-          ? files.map(f=>{
-              const q = _ggufQuant(f.filename);
-              const active = f.path === primary.path;
-              return `<span class="badge ${active?'badge-ok':'badge-user'}" style="font-size:10px;padding:.1rem .3rem;cursor:pointer" title="${esc(f.filename)}" onclick="_switchGgufQuant(${idx},${JSON.stringify(f.path)})">${esc(q||f.filename)}</span>`;
-            }).join(' ')
-          : '';
-        const hlGguf = _highlightCap && files.some(f=>(f.capabilities||[]).includes(_highlightCap));
-        return `<tr${hlGguf?' class="local-cap-highlight"':''} id="gguf-row-${idx}" style="border-top:1px solid var(--border)${hlGguf?';background:rgba(110,207,126,.07);outline:2px solid rgba(110,207,126,.25);outline-offset:-1px':''}">
-          <td style="padding:.4rem .25rem;font-family:monospace;font-size:11px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(primary.filename)}">${esc(base)}<br>${quantBadges}</td>
-          <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${fmtGB(primary.size_gb)}</td>
+      // One row per file — no grouping. Each quantization is independently
+      // visible and can be individually configured, removed, and deleted.
+      const rows = ggufModelFiles.map(f=>{
+        const base  = _ggufBaseName(f.filename);
+        const quant = _ggufQuant(f.filename);
+        const idx   = _localModels.length;
+        _localModels.push({label:f.filename, path:f.path, cacheType:'gguf',
+          size_gb:f.size_gb||0, defaultType:f.model_type||'text_models',
+          settings:f.settings||{}, in_config:f.in_config,
+          capabilities:f.capabilities||[], ggufGroup:[f],
+          source_repo:f.source_repo||'',
+          incomplete:!!f.incomplete,
+          missing:!!f.missing,
+          configured_path:f.configured_path||'',
+          configs:f.configs||[]});
+        const loaded = _loadedKeys.has(f.path) || _loadedKeys.has(f.filename) ||
+          [..._loadedKeys].some(k=>k.endsWith(':'+f.path)||k.endsWith(':'+f.filename));
+        const capBadges   = fmtCapabilities(f.capabilities||[]);
+        const lm          = _localModels[idx];
+        const _cfgMax     = lm.configs && lm.configs.length === 1 ? ((lm.configs[0].settings||{}).max_instances||1) : 1;
+        const instBadge   = f.in_config ? _instanceBadge([f.path, f.filename], _cfgMax) : '';
+        const quantBadge  = quant ? `<span class="badge badge-user" style="font-size:10px;padding:.1rem .3rem;margin-left:.3rem">${esc(quant)}</span>` : '';
+        const hl          = _highlightCap && (f.capabilities||[]).includes(_highlightCap);
+        const missingBadge = f.missing ? ' <span class="badge" style="background:rgba(220,50,50,.18);color:#e05555;font-size:10px" title="File not found at configured path — re-download or remove this configuration">✕ file missing</span>' : '';
+        const incompleteBadge = f.incomplete ? ' <span class="badge" style="background:rgba(255,160,0,.18);color:#b87200;font-size:10px" title="Download may be incomplete">⚠ incomplete</span>' : '';
+        const redownloadTarget  = f.source_repo || '';
+        const redownloadPattern = f.source_repo ? f.filename : '';
+        const configPills = _renderConfigPills(idx, lm);
+        const configCount = (lm.configs||[]).length;
+        const rowBg = f.missing ? ';background:rgba(220,50,50,.04);outline:1px solid rgba(220,50,50,.2);outline-offset:-1px'
+                    : f.incomplete ? ';background:rgba(255,160,0,.04)' : '';
+        return `<tr${hl?' class="local-cap-highlight"':''} id="gguf-row-${idx}" style="border-top:1px solid var(--border)${hl?';background:rgba(110,207,126,.07);outline:2px solid rgba(110,207,126,.25);outline-offset:-1px':''}${rowBg}">
+          <td style="padding:.4rem .25rem;font-family:monospace;font-size:11px;max-width:280px;overflow:hidden;text-overflow:ellipsis" title="${esc(f.path)}">${esc(base)}${quantBadge}${missingBadge}${incompleteBadge}${configPills}</td>
+          <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${f.missing?'<span class="muted small">—</span>':fmtGB(f.size_gb)}</td>
           <td style="padding:.4rem .25rem;font-size:11px">${capBadges||'<span class="muted small">—</span>'}</td>
-          <td style="text-align:center;padding:.4rem .25rem">${in_config?`<span class="badge badge-ok">enabled</span>${instBadgeGguf?'<br>'+instBadgeGguf:''}`:' <span class="muted small">—</span>'}</td>
+          <td style="text-align:center;padding:.4rem .25rem">${f.in_config?`<span class="badge ${f.missing?'badge-err':'badge-ok'}">enabled${configCount>1?` ×${configCount}`:''}</span>${instBadge?'<br>'+instBadge:''}`:' <span class="muted small">—</span>'}</td>
           <td style="padding:.4rem .25rem;text-align:right;white-space:nowrap">
-            ${in_config?(loaded
-              ?`<button class="btn btn-ghost btn-sm" onclick="unloadModel(${idx})">Unload</button>`
-              :`<button class="btn btn-primary btn-sm" onclick="loadModel(${idx})">Load now</button>`):''}
-            <button class="btn btn-secondary btn-sm" onclick="openCfgModal(${idx})">${in_config?'Configure':'Add to CoderAI'}</button>
-            ${in_config?`<button class="btn btn-ghost btn-sm" onclick="disableModel(${idx})">Remove</button>`:''}
-            <button class="btn btn-danger btn-sm" onclick="deleteModelConfirm(${idx})">Delete</button>
+            ${f.in_config&&!f.missing?(loaded
+              ?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="unloadModel(${idx})">Unload</button>`
+              :`<button class="btn btn-primary btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="loadModel(${idx})">Load now</button>`):''}
+            ${f.missing
+              ?`<button class="btn btn-warn btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openDownloadFor('${esc(redownloadTarget)}','${esc(redownloadPattern)}')" title="Re-download to restore this model">⬇ Re-download</button>`
+              :`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openDownloadFor('${esc(redownloadTarget)}','${esc(redownloadPattern)}')" title="${redownloadTarget?'Re-download from HuggingFace':'Download a replacement'}">⬇ Re-download</button>`}
+            <button class="btn btn-secondary btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openCfgModal(${idx},0)">${f.in_config?'Configure':'Add'}</button>
+            ${f.in_config?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="disableModel(${idx})">Remove</button>`:''}
+            ${!f.missing?`<button class="btn btn-danger btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="deleteModelConfirm(${idx})">Delete</button>`:''}
           </td>
         </tr>`;
       });
@@ -1442,17 +2089,19 @@ function _findLoadedKey(paths){
   return null;
 }
 
-function _instanceBadge(lookupPaths, maxCfg){
-  if(!maxCfg || maxCfg <= 1) return '';
+function _instanceBadge(lookupPaths, cfgMax){
   const instKey = _findLoadedKey(lookupPaths);
   const info = instKey ? _instanceInfo[instKey] : null;
-  const loadedCount = info ? info.loaded : 0;
-  const maxCount = info ? info.max : maxCfg;
-  if(loadedCount === 0){
-    return `<span class="badge badge-user" style="font-size:10px" title="${maxCount} instances configured">×${maxCount} inst.</span>`;
+  if(info && info.max > 1){
+    // Live data: show actual loaded/max counts
+    const cls = info.loaded >= info.max ? 'badge-ok' : 'badge-warn';
+    return `<span class="badge ${cls}" style="font-size:10px" title="${info.loaded} of ${info.max} instances loaded">${info.loaded}/${info.max} inst.</span>`;
   }
-  const cls = loadedCount >= maxCount ? 'badge-ok' : 'badge-warn';
-  return `<span class="badge ${cls}" style="font-size:10px" title="${loadedCount} of ${maxCount} instances loaded">${loadedCount}/${maxCount} inst.</span>`;
+  if(cfgMax && cfgMax > 1){
+    // Configured but not yet loaded — show the configured count
+    return `<span class="badge badge-user" style="font-size:10px" title="${cfgMax} instances configured">×${cfgMax} inst.</span>`;
+  }
+  return '';
 }
 
 async function refreshLocal(){
@@ -1510,27 +2159,39 @@ refreshLocal();
 
 async function clearCacheConfirm(type){
   const labels = {hf:'HuggingFace', gguf:'GGUF', all:'ALL'};
-  if(!confirm(`Delete ${labels[type]} model cache? This cannot be undone.`)) return;
+  if(!await showConfirm('Clear cache', `Delete ${labels[type]} model cache? This cannot be undone.`, 'Delete')) return;
   try{
     const r = await fetch(ROOT_PATH + '/admin/api/cache?cache_type='+type, {method:'DELETE'});
     const d = await r.json();
-    if(d.success){
-      refreshLocal();
-      alert(`Cache cleared. Freed ${fmtBytes(d.freed_bytes||0)}.`);
-    }else alert('Error clearing cache');
-  }catch(e){alert('Error: '+e.message)}
+    if(d.success) refreshLocal();
+    else await showConfirm('Error', 'Error clearing cache', 'OK');
+  }catch(e){ await showConfirm('Error', e.message, 'OK'); }
 }
 
 async function deleteModelConfirm(idx){
   const m = _localModels[idx];
-  if(!confirm(`Delete "${m.label}" from local cache? This cannot be undone.`)) return;
-  // Always send the full path so the backend can locate the file regardless of cache location
-  const idForUrl = m.path;
+  if(!m){ alert('Error: model not found — please refresh the page.'); return; }
+  const extra = m.in_config ? ' It will also be removed from your configuration.' : '';
+  if(!await showConfirm('Delete model', `Delete "${m.label}" from local cache? This cannot be undone.${extra}`, 'Delete')) return;
   try{
+    // De-configure first if the model is currently enabled, to avoid dangling config entries
+    if(m.in_config){
+      const paths = m.ggufGroup
+        ? m.ggufGroup.filter(f=>f.in_config).map(f=>f.path)
+        : [m.path];
+      for(const p of paths.length ? paths : [m.path]){
+        await fetch(ROOT_PATH + '/admin/api/model-disable', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({path: p})
+        });
+      }
+    }
+    // Remove from cache
+    const idForUrl = m.path;
     const r = await fetch(ROOT_PATH + '/admin/api/cached-models/'+encodeURIComponent(idForUrl)+'?cache_type='+m.cacheType, {method:'DELETE'});
     const d = await r.json();
     if(d.success) refreshLocal();
-    else alert('Error: '+(d.detail||'Unknown'));
+    else alert('Error: '+(d.detail||d.error||'Unknown'));
   }catch(e){alert('Error: '+e.message)}
 }
 
@@ -1674,18 +2335,66 @@ async function saveWhisperServerEdit() {
   } catch(e) { alert('Error: ' + e.message); }
 }
 
-function openCfgModal(idx){
+function openCfgModalNew(idx) {
+  // Open modal for a brand-new config (no config_id) on an existing model
+  openCfgModal(idx, -1);
+}
+
+function openCfgModal(idx, cfgIdx){
   const m = _localModels[idx];
   if (m.cacheType === 'whisper-server') {
     _openWhisperServerEdit(m);
     return;
   }
-  const s = m.settings || {};
-  document.getElementById('cfg-modal-title').textContent = m.in_config ? 'Configure model' : 'Add to CoderAI';
+  // Determine which config's settings to load
+  const configs = m.configs || [];
+  // Normalize cfgIdx: undefined/null → 0, -1 → "new"
+  const _cfgIdx = (cfgIdx == null) ? 0 : cfgIdx;
+  let s, configId, isNewConfig;
+  if (_cfgIdx === -1 || (configs.length === 0 && !m.in_config)) {
+    // New config: explicitly requested (-1) or truly unconfigured model
+    s = {};
+    configId = '';
+    isNewConfig = true;
+  } else if (_cfgIdx >= 0 && configs[_cfgIdx]) {
+    s = configs[_cfgIdx].settings || {};
+    configId = s.config_id || '';
+    isNewConfig = false;
+  } else {
+    // Fallback to legacy m.settings
+    s = m.settings || {};
+    configId = s.config_id || '';
+    isNewConfig = !configId;
+  }
+  document.getElementById('cfg-config-id').value = configId;
+
+  // Show/hide "Save as new config" and "Remove this config" buttons
+  const saveNewBtn = document.getElementById('cfg-save-new-btn');
+  saveNewBtn.style.display = (!isNewConfig && m.in_config) ? '' : 'none';
+  const removeConfigBtn = document.getElementById('cfg-remove-config-btn');
+  // Only show remove-this-config when the model has multiple configs — removing the last one is handled by the row-level Remove button
+  removeConfigBtn.style.display = (!isNewConfig && configId && configs.length > 1) ? '' : 'none';
+
+  const cfgLabel = isNewConfig
+    ? (m.in_config ? 'Add configuration' : 'Add')
+    : (configs.length > 1 ? `Configure: ${s.alias || ('Config ' + (_cfgIdx + 1))}` : 'Configure model');
+  document.getElementById('cfg-modal-title').textContent = cfgLabel;
   document.getElementById('cfg-id-label').textContent = m.label;
   document.getElementById('cfg-path').value = m.path;
-  document.getElementById('cfg-orig-path').value = m.path;   // frozen at open time
+  // If the file was re-downloaded to a new path, use the old configured path as orig_path
+  // so saveModelConfig removes the stale entry and writes one at the new location.
+  document.getElementById('cfg-orig-path').value = m.configured_path || m.path;
   document.getElementById('cfg-orig-type').value = m.defaultType;
+  // Show a notice when the file moved (re-downloaded to a different location)
+  const pathMovedEl = document.getElementById('cfg-path-moved-notice');
+  if(pathMovedEl){
+    if(m.configured_path && m.configured_path !== m.path){
+      pathMovedEl.textContent = `File re-downloaded to new path. Saving will update the configuration.`;
+      pathMovedEl.style.display = '';
+    } else {
+      pathMovedEl.style.display = 'none';
+    }
+  }
 
   // Quantization selector for grouped GGUF models
   const quantRow = document.getElementById('cfg-quant-row');
@@ -1749,6 +2458,10 @@ function openCfgModal(idx){
   capsdet.textContent = capsFromConfig ? '' : '(auto-detected)';
 
   document.getElementById('cfg-alias').value = s.alias || '';
+  document.getElementById('cfg-config-name').value = s.config_name || '';
+  // Show config-name field only when multiple configs exist or a new one is being added to an existing model
+  document.getElementById('cfg-config-name-row').style.display =
+    (configs.length > 1 || (isNewConfig && m.in_config)) ? '' : 'none';
   document.getElementById('cfg-backend').value = s.backend || 'auto';
   document.getElementById('cfg-load-mode').value = s.load_mode || 'on-request';
   // Used VRAM
@@ -1787,6 +2500,19 @@ function openCfgModal(idx){
   document.getElementById('cfg-parser').value = s.parser || (!m.in_config ? _autoDetectParser(m.path) : 'auto');
   document.getElementById('cfg-tools').checked = !!s.tools_closer_prompt;
   document.getElementById('cfg-grammar').checked = !!s.grammar_guided;
+  document.getElementById('cfg-template').value = s.model_template || '';
+  document.getElementById('cfg-max-vram').value = s.max_vram != null ? s.max_vram : '';
+  document.getElementById('cfg-sdcpp-flash').checked = !!s.sdcpp_flash_attn;
+  document.getElementById('cfg-sdcpp-diff-flash').checked = !!s.sdcpp_diffusion_flash_attn;
+  document.getElementById('cfg-vae-tiling').checked = !!s.vae_tiling;
+  _populateCompSelects();
+  _setCompField('vae',        s.vae_path        || '');
+  _setCompField('t5xxl',      s.t5xxl_path      || '');
+  _setCompField('clip-l',     s.clip_l_path     || '');
+  _setCompField('clip-g',     s.clip_g_path     || '');
+  _setCompField('clip-vision',s.clip_vision_path|| '');
+  _setCompField('lora',       s.lora_path       || '');
+  document.getElementById('cfg-lora-dir').value = s.lora_model_dir || '';
   openModal('cfg-modal');
 }
 
@@ -1805,6 +2531,32 @@ function _estimateVram(m, nCtx) {
   return weights * 1.15 + kvCacheGb;
 }
 
+function saveNewModelConfig(){
+  // Clear config_id so saveModelConfig creates a new entry instead of updating
+  document.getElementById('cfg-config-id').value = '';
+  saveModelConfig();
+}
+
+async function removeThisConfig(){
+  const path = document.getElementById('cfg-path').value;
+  const configId = document.getElementById('cfg-config-id').value.trim();
+  if (!configId) return;
+  if (!await showConfirm('Remove configuration', 'Remove this configuration? The model file and other configurations will be kept.', 'Remove')) return;
+  try {
+    const r = await fetch(ROOT_PATH + '/admin/api/model-disable', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path, config_id: configId})
+    });
+    if (!r.ok) {
+      let msg = `HTTP ${r.status}`;
+      try { const d = await r.json(); msg = d.detail || d.error || msg; } catch(_){}
+      throw new Error(msg);
+    }
+    closeModal('cfg-modal');
+    loadCachedModels();
+  } catch(e) { alert('Error: ' + e.message); }
+}
+
 async function saveModelConfig(){
   const path = document.getElementById('cfg-path').value;
   const maxGpu = parseFloat(document.getElementById('cfg-max-gpu').value);
@@ -1812,13 +2564,16 @@ async function saveModelConfig(){
   const usedVram = parseFloat(document.getElementById('cfg-used-vram').value);
   const {primaryType, model_types, video_subtypes} = _getCheckedTypes();
   const origPath = document.getElementById('cfg-orig-path').value;
+  const configId = document.getElementById('cfg-config-id').value.trim();
   const data = {
     path,
+    config_id:         configId || undefined,
     orig_path:         (origPath && origPath !== path) ? origPath : undefined,
     model_type:        primaryType,
     model_types:       model_types,
     video_subtypes:    video_subtypes.length ? video_subtypes : undefined,
     alias:             document.getElementById('cfg-alias').value.trim() || null,
+    config_name:       document.getElementById('cfg-config-name').value.trim() || null,
     backend:           document.getElementById('cfg-backend').value,
     load_mode:         document.getElementById('cfg-load-mode').value,
     used_vram_gb:      isNaN(usedVram) ? null : usedVram,
@@ -1839,6 +2594,18 @@ async function saveModelConfig(){
     tools_closer_prompt: document.getElementById('cfg-tools').checked,
     grammar_guided:    document.getElementById('cfg-grammar').checked,
     capabilities:      [...document.querySelectorAll('.cfg-cap-cb:checked')].map(cb => cb.value),
+    model_template:    document.getElementById('cfg-template').value || null,
+    vae_path:          _readCompField('vae')         || null,
+    t5xxl_path:        _readCompField('t5xxl')       || null,
+    clip_l_path:       _readCompField('clip-l')      || null,
+    clip_g_path:       _readCompField('clip-g')      || null,
+    clip_vision_path:  _readCompField('clip-vision') || null,
+    lora_path:         _readCompField('lora')        || null,
+    lora_model_dir:    document.getElementById('cfg-lora-dir').value.trim() || null,
+    max_vram:          parseFloat(document.getElementById('cfg-max-vram').value) || 0,
+    sdcpp_flash_attn:  document.getElementById('cfg-sdcpp-flash').checked,
+    sdcpp_diffusion_flash_attn: document.getElementById('cfg-sdcpp-diff-flash').checked,
+    vae_tiling:        document.getElementById('cfg-vae-tiling').checked,
   };
   try{
     const r = await fetch(ROOT_PATH + '/admin/api/model-configure',{
@@ -1924,19 +2691,25 @@ async function unloadModel(idx){
 
 async function disableModel(idx){
   const m = _localModels[idx];
-  if(!confirm('Remove this model from CoderAI config? It will stay in the local cache.')) return;
-  // Collect all paths that are marked in_config for this model (covers quant groups)
-  const paths = m.ggufGroup
-    ? m.ggufGroup.filter(f=>f.in_config).map(f=>f.path)
-    : (m.in_config ? [m.path] : []);
-  if(!paths.length) paths.push(m.path);  // fallback
+  if(!m){ alert('Error: model not found — please refresh the page.'); return; }
+  if(!await showConfirm('Remove model', 'Remove this model from CoderAI config? It will stay in the local cache.', 'Remove')) return;
   try{
+    // Collect all paths that are marked in_config for this model (covers quant groups)
+    const paths = m.ggufGroup
+      ? m.ggufGroup.filter(f=>f.in_config).map(f=>f.path)
+      : (m.in_config ? [m.path] : []);
+    if(!paths.length) paths.push(m.path);  // fallback
     // Disable each configured path in the group
     for(const p of paths){
-      await fetch(ROOT_PATH + '/admin/api/model-disable',{
+      const r = await fetch(ROOT_PATH + '/admin/api/model-disable',{
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({path: p})
       });
+      if(!r.ok){
+        let msg = `HTTP ${r.status}`;
+        try{ const d = await r.json(); msg = d.detail || d.error || msg; }catch(_){}
+        throw new Error(msg);
+      }
     }
     loadCachedModels();
   }catch(e){ alert('Error: '+e.message); }

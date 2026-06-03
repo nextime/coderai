@@ -57,18 +57,30 @@ global_file_path = None
 _vid_progress: dict = {
     "current": 0, "total": 0, "active": False,
     "started_at": 0.0, "it_per_s": 0.0,
+    "phase": "idle", "model": "",
 }
+
+def _vid_progress_loading(model_name: str = ""):
+    _vid_progress["phase"] = "loading"
+    _vid_progress["active"] = True
+    _vid_progress["current"] = 0
+    _vid_progress["total"] = 0
+    _vid_progress["it_per_s"] = 0.0
+    _vid_progress["started_at"] = time.monotonic()
+    _vid_progress["model"] = model_name or ""
 
 def _vid_progress_reset(total: int):
     _vid_progress["current"] = 0
     _vid_progress["total"] = total
     _vid_progress["active"] = True
+    _vid_progress["phase"] = "generating"
     _vid_progress["started_at"] = time.monotonic()
     _vid_progress["it_per_s"] = 0.0
 
 def _vid_progress_done():
     _vid_progress["current"] = _vid_progress["total"]
     _vid_progress["active"] = False
+    _vid_progress["phase"] = "idle"
 
 def _vid_progress_step(step: int):
     _vid_progress["current"] = step
@@ -190,37 +202,328 @@ def _detect_pipeline_class(model_name: str, mode: str):
         return None
 
 
-def _load_video_pipeline(model_name: str, device: str, mode: str):
-    import torch, gc
+def _gguf_needs_wan_prefix(path: str) -> bool:
+    """Return True if this GGUF has bare WAN tensor names (no model.diffusion_model. prefix)."""
+    import struct
+    try:
+        with open(path, 'rb') as f:
+            magic = f.read(4)
+            if magic != b'GGUF':
+                return False
+            f.read(4)  # version
+            f.read(8)  # tensor_count
+            kv_count = struct.unpack('<Q', f.read(8))[0]
+
+            def _read_str(fh):
+                n = struct.unpack('<Q', fh.read(8))[0]
+                return fh.read(n)
+
+            arch = b''
+            for _ in range(kv_count):
+                key = _read_str(f)
+                vtype = struct.unpack('<I', f.read(4))[0]
+                if vtype == 8:   # string
+                    val = _read_str(f)
+                    if key == b'general.architecture':
+                        arch = val
+                elif vtype in (0, 1, 7):  # u8/i8/bool
+                    f.read(1)
+                elif vtype in (2, 3):    # u16/i16
+                    f.read(2)
+                elif vtype in (4, 5, 6): # u32/i32/f32
+                    f.read(4)
+                elif vtype in (10, 11, 12): # u64/i64/f64
+                    f.read(8)
+                elif vtype == 9:         # array — skip
+                    atype = struct.unpack('<I', f.read(4))[0]
+                    alen  = struct.unpack('<Q', f.read(8))[0]
+                    # skip array payload: only handle simple element types
+                    sizes = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8}
+                    if atype in sizes:
+                        f.read(alen * sizes[atype])
+                    else:
+                        return False  # complex array — bail out safely
+                else:
+                    return False  # unknown type — bail out
+
+            if arch.lower() != b'wan':
+                return False
+
+            # Read first tensor name; if it lacks the expected prefix, rewrite is needed
+            name = _read_str(f)
+            return not name.startswith(b'model.diffusion_model.')
+    except Exception:
+        return False
+
+
+def _ensure_wan_prefixed_gguf(src_path: str) -> str:
+    """Return a path to a GGUF with model.diffusion_model. prefixed tensor names.
+
+    If src_path already has the prefix, returns it unchanged.
+    Otherwise creates a sibling file <name>.sdcpp.gguf by rewriting the header
+    and streaming the original data section — no full file load into memory.
+    """
+    import os as _os, struct, shutil
+
+    dst_path = src_path + '.sdcpp.gguf'
+    if _os.path.exists(dst_path) and _os.path.getmtime(dst_path) >= _os.path.getmtime(src_path):
+        print(f"  [gguf] using cached prefixed GGUF: {dst_path}")
+        return dst_path
+
+    prefix = b'model.diffusion_model.'
+    print(f"  [gguf] rewriting tensor names with '{prefix.decode()}' prefix …")
+
+    with open(src_path, 'rb') as src:
+        magic   = src.read(4)
+        version = src.read(4)
+        tensor_count_bytes = src.read(8)
+        kv_count_bytes     = src.read(8)
+        tensor_count = struct.unpack('<Q', tensor_count_bytes)[0]
+        kv_count     = struct.unpack('<Q', kv_count_bytes)[0]
+
+        # ── collect raw KV bytes (pass through unchanged) ──────────────────
+        kv_bytes = bytearray()
+
+        def _read_str_raw(fh):
+            n_bytes = fh.read(8)
+            n = struct.unpack('<Q', n_bytes)[0]
+            data = fh.read(n)
+            return n_bytes + data, data
+
+        for _ in range(kv_count):
+            raw_key, _ = _read_str_raw(src)
+            kv_bytes += raw_key
+            vtype_bytes = src.read(4)
+            vtype = struct.unpack('<I', vtype_bytes)[0]
+            kv_bytes += vtype_bytes
+            if vtype == 8:
+                raw_val, _ = _read_str_raw(src)
+                kv_bytes += raw_val
+            elif vtype in (0, 1, 7):
+                kv_bytes += src.read(1)
+            elif vtype in (2, 3):
+                kv_bytes += src.read(2)
+            elif vtype in (4, 5, 6):
+                kv_bytes += src.read(4)
+            elif vtype in (10, 11, 12):
+                kv_bytes += src.read(8)
+            elif vtype == 9:
+                atype_bytes = src.read(4)
+                alen_bytes  = src.read(8)
+                atype = struct.unpack('<I', atype_bytes)[0]
+                alen  = struct.unpack('<Q', alen_bytes)[0]
+                sizes = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8}
+                elem_size = sizes.get(atype, 0)
+                arr_data = src.read(alen * elem_size) if elem_size else b''
+                kv_bytes += atype_bytes + alen_bytes + arr_data
+
+        # ── collect tensor info, prefixing each name ────────────────────────
+        ti_bytes = bytearray()
+        for _ in range(tensor_count):
+            raw_nlen, name = _read_str_raw(src)
+            new_name = prefix + name
+            ti_bytes += struct.pack('<Q', len(new_name)) + new_name
+            n_dims_bytes = src.read(4)
+            n_dims = struct.unpack('<I', n_dims_bytes)[0]
+            ti_bytes += n_dims_bytes
+            ti_bytes += src.read(n_dims * 8)  # shape (u64 each)
+            ti_bytes += src.read(4)            # dtype
+            ti_bytes += src.read(8)            # offset within data section
+
+        # Alignment: GGUF data section starts at next 32-byte boundary
+        ALIGN = 32
+        header_size = 4 + 4 + 8 + 8 + len(kv_bytes) + len(ti_bytes)
+        pad = (ALIGN - header_size % ALIGN) % ALIGN
+        data_offset = src.tell() + ((ALIGN - src.tell() % ALIGN) % ALIGN)
+        src.seek(data_offset)
+
+        with open(dst_path, 'wb') as dst:
+            dst.write(magic + version + tensor_count_bytes + kv_count_bytes)
+            dst.write(kv_bytes)
+            dst.write(ti_bytes)
+            dst.write(b'\x00' * pad)
+            shutil.copyfileobj(src, dst, length=8 * 1024 * 1024)
+
+    print(f"  [gguf] prefixed GGUF written: {dst_path}")
+    return dst_path
+
+
+def _load_sdcpp_video_model(model_path: str, offload: str = None, model_cfg: dict = None):
+    """Load a GGUF video model via stable-diffusion.cpp."""
+    try:
+        from stable_diffusion_cpp import StableDiffusion
+        import stable_diffusion_cpp.stable_diffusion_cpp as _sd_cpp
+    except ImportError:
+        raise RuntimeError("stable-diffusion-cpp-python required: pip install stable-diffusion-cpp-python")
+
+    import os as _os
+    model_cfg = model_cfg or {}
+
+    # Resolve bare filename to absolute path from the GGUF cache
+    if not _os.path.isabs(model_path) and not _os.path.exists(model_path):
+        try:
+            from codai.models.cache import get_model_cache_dir
+            candidate = _os.path.join(get_model_cache_dir(), model_path)
+            if _os.path.exists(candidate):
+                model_path = candidate
+        except Exception:
+            pass
+    if not _os.path.exists(model_path):
+        raise FileNotFoundError(f"GGUF video model not found: {model_path}")
+
+    # WAN DiT-only GGUFs (e.g. QuantStack) contain only the denoiser — no VAE or
+    # text encoders.  They must be loaded via diffusion_model_path, not model_path.
+    # sd.cpp internally prepends "model.diffusion_model." when reading tensors from
+    # diffusion_model_path, so the original bare-named file is passed directly.
+    # VAE / text encoders must be supplied separately via model_cfg component paths.
+    _is_wan_dit = _gguf_needs_wan_prefix(model_path)
+    if _is_wan_dit:
+        print(f"Loading sd.cpp video model (WAN DiT, diffusion_model_path): {model_path}")
+        kwargs = {'diffusion_model_path': model_path, 'verbose': True}
+    else:
+        print(f"Loading sd.cpp video model: {model_path}")
+        kwargs = {'model_path': model_path, 'verbose': True}
+    if offload in ('model', 'cpu', 'sequential'):
+        kwargs['offload_params_to_cpu'] = True
+        kwargs['keep_clip_on_cpu'] = True
+        kwargs['keep_vae_on_cpu'] = True
+
+    # sd.cpp VRAM budget for graph-cut layer execution (0 = disabled)
+    max_vram = float(model_cfg.get('max_vram') or 0)
+    if max_vram > 0:
+        kwargs['max_vram'] = max_vram
+
+    # Flash attention variants (sdcpp_flash_attn = full, sdcpp_diffusion_flash_attn = DiT only)
+    if model_cfg.get('sdcpp_flash_attn'):
+        kwargs['flash_attn'] = True
+    if model_cfg.get('sdcpp_diffusion_flash_attn'):
+        kwargs['diffusion_flash_attn'] = True
+
+    # Inject component paths from per-model configuration
+    for key in ('vae_path', 't5xxl_path', 'clip_l_path', 'clip_g_path',
+                'clip_vision_path', 'lora_model_dir'):
+        val = (model_cfg.get(key) or '').strip()
+        if val:
+            kwargs[key] = val
+            print(f"  [sd.cpp] {key}: {val}")
+
+    # A single LoRA file associated with this model: derive lora_model_dir from its parent
+    # and append <lora:basename:1.0> to the default prompt via lora_model_dir.
+    # sd.cpp needs a directory, so point it at the file's parent directory.
+    lora_path = (model_cfg.get('lora_path') or '').strip()
+    if lora_path and 'lora_model_dir' not in kwargs:
+        import os as _os2
+        kwargs['lora_model_dir'] = _os2.path.dirname(lora_path) or '.'
+        print(f"  [sd.cpp] lora_path: {lora_path} → lora_model_dir: {kwargs['lora_model_dir']}")
+
+    @_sd_cpp.sd_log_callback
+    def _log_cb(level, text, data):
+        if text:
+            line = text.decode('utf-8', errors='replace').rstrip()
+            if line:
+                print(f"  [sd.cpp] {line}", flush=True)
+
+    _sd_cpp.sd_set_log_callback(_log_cb, None)
+    try:
+        model = StableDiffusion(**kwargs)
+    finally:
+        _sd_cpp.sd_set_log_callback(None, None)
+    return model
+
+
+def _generate_sdcpp_video(sd_model, request, model_cfg=None):
+    """Generate frames via stable-diffusion.cpp and return (frames, fps)."""
+    mode = request.mode or 't2v'
+    fps = request.fps or 8
+    num_frames = request.num_frames or 25
+    steps = request.num_inference_steps or 20
+
+    _vid_progress_reset(steps)
+
+    def _progress_cb(step: int, total: int, elapsed: float):
+        _vid_progress_step(step)
+
+    kw = {
+        'prompt':          request.prompt or '',
+        'negative_prompt': request.negative_prompt or '',
+        'width':           request.width or 512,
+        'height':          request.height or 512,
+        'video_frames':    num_frames,
+        'sample_steps':    steps,
+        'cfg_scale':       request.guidance_scale or 7.0,
+        'seed':            request.seed if request.seed is not None else -1,
+        'progress_callback': _progress_cb,
+    }
+
+    if (model_cfg or {}).get('vae_tiling'):
+        kw['vae_tiling'] = True
+
+    init_src = request.init_image or request.image
+    if mode in ('i2v', 'ti2v') and init_src:
+        kw['init_image'] = _pil_from_b64(init_src)
+    elif mode == 'interp':
+        if not init_src or not request.end_image:
+            raise ValueError("interp mode requires both init_image and end_image")
+        kw['init_image'] = _pil_from_b64(init_src)
+        kw['end_image']  = _pil_from_b64(request.end_image)
+
+    frames = sd_model.generate_video(**kw)
+    _vid_progress_done()
+    return list(frames), fps
+
+
+def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str = None, model_cfg: dict = None):
+    # GGUF models go through stable-diffusion.cpp, not diffusers
+    from codai.api.images import _is_gguf_model
+    if _is_gguf_model(model_name):
+        return _load_sdcpp_video_model(model_name, offload, model_cfg)
+
+    import sys, time, torch, gc
     PClass = _detect_pipeline_class(model_name, mode)
     if PClass is None:
         raise RuntimeError("diffusers not installed: pip install diffusers")
     precision = getattr(global_args, 'image_precision', 'bf16') if global_args else 'bf16'
     dtype_map = {'bf16': torch.bfloat16, 'f16': torch.float16, 'f32': torch.float32}
     torch_dtype = dtype_map.get(precision, torch.bfloat16)
-    offload = getattr(global_args, 'offload_strategy', None) if global_args else None
+    # Explicit parameter wins; fall back to global CLI arg
+    if offload is None:
+        offload = getattr(global_args, 'offload_strategy', None) if global_args else None
+    # Normalise UI values to diffusers vocabulary
+    if offload == 'cpu':
+        offload = 'model'
 
-    for attempt in range(3):
-        try:
-            pipe = PClass.from_pretrained(model_name, torch_dtype=torch_dtype)
-            if offload == 'sequential' or attempt >= 2:
-                pipe.enable_sequential_cpu_offload()
-            elif offload == 'model' or attempt >= 1:
-                pipe.enable_model_cpu_offload()
-            else:
-                pipe = pipe.to(device)
-            return pipe
-        except RuntimeError as e:
-            if 'out of memory' in str(e).lower() and attempt < 2:
-                gc.collect()
-                try:
-                    import torch as _torch
-                    if _torch.cuda.is_available():
-                        _torch.cuda.empty_cache()
-                except Exception:
-                    pass
-                continue
-            raise
+    # Lower the GIL switch interval so the asyncio event loop thread wins the GIL
+    # more often during Python-heavy component loading (diffusers from_pretrained
+    # holds the GIL for extended stretches while instantiating pipeline components).
+    _old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(0.001)
+    try:
+        for attempt in range(3):
+            try:
+                time.sleep(0)  # yield GIL before heavy loading begins
+                pipe = PClass.from_pretrained(model_name, torch_dtype=torch_dtype)
+                time.sleep(0)  # yield GIL before GPU transfer
+                if offload == 'sequential' or attempt >= 2:
+                    pipe.enable_sequential_cpu_offload()
+                elif offload == 'model' or attempt >= 1:
+                    pipe.enable_model_cpu_offload()
+                else:
+                    pipe = pipe.to(device)
+                return pipe
+            except RuntimeError as e:
+                if 'out of memory' in str(e).lower() and attempt < 2:
+                    gc.collect()
+                    try:
+                        import torch as _torch
+                        if _torch.cuda.is_available():
+                            _torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    time.sleep(0)
+                    continue
+                raise
+    finally:
+        sys.setswitchinterval(_old_interval)
 
 
 # =============================================================================
@@ -817,6 +1120,8 @@ async def get_video_progress():
         "current":  _vid_progress["current"],
         "total":    _vid_progress["total"],
         "active":   _vid_progress["active"],
+        "phase":    _vid_progress.get("phase", "idle"),
+        "model":    _vid_progress.get("model", ""),
         "pct":      int(_vid_progress["current"] / _vid_progress["total"] * 100)
                     if _vid_progress["total"] > 0 else 0,
         "it_per_s": _vid_progress["it_per_s"],
@@ -843,6 +1148,7 @@ async def video_generations(request: VideoGenerationRequest,
     """
     if not request.model:
         raise HTTPException(status_code=400, detail="model is required")
+    _vid_progress_loading(request.model)
 
     # Infer mode from inputs if not set
     if not request.mode or request.mode == 't2v':
@@ -864,9 +1170,11 @@ async def video_generations(request: VideoGenerationRequest,
 
     if pipe is None:
         device = _derive_device()
+        _model_cfg = model_info.get('config') or {}
+        _offload = _model_cfg.get('offload_strategy') or None
         try:
             pipe = await asyncio.get_event_loop().run_in_executor(
-                None, _load_video_pipeline, model_name, device, request.mode)
+                None, _load_video_pipeline, model_name, device, request.mode, _offload, _model_cfg)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load video model: {e}")
         multi_model_manager.models[model_key] = pipe
@@ -875,9 +1183,20 @@ async def video_generations(request: VideoGenerationRequest,
     if getattr(request, 'disable_safety_checker', False):
         _disable_safety_checker(pipe)
 
+    _is_sdcpp_video = False
     try:
-        frames, fps = await asyncio.get_event_loop().run_in_executor(
-            None, _generate_video, pipe, request)
+        from stable_diffusion_cpp import StableDiffusion as _SD
+        _is_sdcpp_video = isinstance(pipe, _SD)
+    except ImportError:
+        pass
+
+    try:
+        if _is_sdcpp_video:
+            frames, fps = await asyncio.get_event_loop().run_in_executor(
+                None, _generate_sdcpp_video, pipe, request, _model_cfg)
+        else:
+            frames, fps = await asyncio.get_event_loop().run_in_executor(
+                None, _generate_video, pipe, request)
     except Exception as e:
         _vid_progress_done()
         raise HTTPException(status_code=500, detail=f"Video generation failed: {e}")

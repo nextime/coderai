@@ -40,9 +40,11 @@ templates = Jinja2Templates(directory=str(templates_dir))
 
 # Session manager (will be initialized in main.py)
 session_manager: Optional[SessionManager] = None
+SESSION_COOKIE_NAME: str = "session"   # overridden at startup to be port-specific
 config_manager = None  # set via set_config_manager()
 _download_sessions: dict = {}
 _download_status: dict = {}   # session_id → latest progress state (survives SSE disconnect)
+_download_cancelled: set = set()  # session_ids the user has requested to cancel
 
 
 def _url(request: Request, path: str) -> str:
@@ -59,10 +61,17 @@ def _tmpl(request: Request, name: str, ctx: dict = None):
     return templates.TemplateResponse(request, name, c)
 
 
-def init_session_manager(config_dir: Path):
-    """Initialize the session manager."""
-    global session_manager
+def init_session_manager(config_dir: Path, port: int = 0):
+    """Initialize the session manager.
+
+    port is used to derive a port-specific cookie name so that two instances
+    running on different ports on the same host don't share (and overwrite)
+    each other's browser cookie.
+    """
+    global session_manager, SESSION_COOKIE_NAME
     session_manager = SessionManager(config_dir)
+    if port:
+        SESSION_COOKIE_NAME = f"session_{port}"
 
 
 def set_config_manager(mgr):
@@ -71,6 +80,21 @@ def set_config_manager(mgr):
     config_manager = mgr
     from codai.models.capabilities import init_capability_cache
     init_capability_cache(str(mgr.config_dir))
+
+
+def _broker_notify_models_updated(request: Request) -> None:
+    """Fire-and-forget: tell AISBF broker to refresh its model cache if connected."""
+    try:
+        broker_service = getattr(request.app.state, "broker_service", None)
+        if broker_service is None:
+            return
+        client = getattr(broker_service, "client", None)
+        if client is None:
+            return
+        import asyncio
+        asyncio.create_task(client.notify_models_updated())
+    except Exception:
+        pass
 
 
 def _next_whisper_server_model_id(audio_models) -> str:
@@ -99,7 +123,7 @@ def get_current_user(request: Request) -> Optional[str]:
     if session_manager is None:
         return None
     
-    cookie = request.cookies.get("session")
+    cookie = request.cookies.get(SESSION_COOKIE_NAME)
     if not cookie:
         return None
     
@@ -160,7 +184,7 @@ async def login(
     redirect_path = "/admin/change-password" if must_change else "/admin"
     response = RedirectResponse(url=_url(request, redirect_path), status_code=302)
     response.set_cookie(
-        key="session",
+        key=SESSION_COOKIE_NAME,
         value=session_cookie,
         httponly=True,
         secure=False,  # Set to True if using HTTPS
@@ -174,11 +198,11 @@ async def login(
 async def logout(request: Request):
     """Handle logout."""
     if session_manager:
-        cookie = request.cookies.get("session")
+        cookie = request.cookies.get(SESSION_COOKIE_NAME)
         session_manager.destroy_session(cookie)
 
     response = RedirectResponse(url=_url(request, "/login"), status_code=302)
-    response.delete_cookie("session")
+    response.delete_cookie(SESSION_COOKIE_NAME)
     return response
 
 
@@ -568,7 +592,56 @@ async def api_list_models(username: str = Depends(require_admin)):
         return []
 
 
-def _make_tqdm_class(pq, status=None):
+_DISK_MIN_FREE_BYTES = 256 * 1024 * 1024  # 256 MB safety margin
+
+
+def _check_disk_space(path: str, needed_bytes: int = 0) -> None:
+    """Raise RuntimeError if `path`'s filesystem lacks enough free space."""
+    import os as _os, shutil
+    # Walk up to an existing ancestor — the target dir may not exist yet on first download
+    check_path = path
+    while check_path and not _os.path.exists(check_path):
+        parent = _os.path.dirname(check_path)
+        if parent == check_path:
+            break
+        check_path = parent
+    try:
+        free = shutil.disk_usage(check_path).free
+    except OSError:
+        return  # can't stat — proceed anyway
+    required = needed_bytes + _DISK_MIN_FREE_BYTES
+    if free < required:
+        free_gb = free / 1e9
+        needed_gb = needed_bytes / 1e9
+        msg = (
+            f"Not enough disk space: {free_gb:.1f} GB free"
+            + (f", ~{needed_gb:.1f} GB needed" if needed_bytes else "")
+            + ". Free up space and try again."
+        )
+        raise RuntimeError(msg)
+
+
+def _get_hf_expected_size(model_id: str, file_pattern: str) -> int:
+    """Return expected download size in bytes for a HF model (best-effort, 0 on failure)."""
+    try:
+        import fnmatch
+        from huggingface_hub import model_info as _hf_model_info
+        info = _hf_model_info(model_id, files_metadata=True)
+        siblings = info.siblings or []
+        if file_pattern:
+            if file_pattern.startswith('.'):
+                pats = [f"*{file_pattern}"]
+            elif '/' in file_pattern:
+                pats = [file_pattern]
+            else:
+                pats = [f"*{file_pattern}"]
+            siblings = [s for s in siblings if any(fnmatch.fnmatch(s.rfilename, p) for p in pats)]
+        return sum(getattr(s, 'size', 0) or 0 for s in siblings)
+    except Exception:
+        return 0
+
+
+def _make_tqdm_class(pq, status=None, session_id=None, cache_dir=None):
     """Return a tqdm-compatible class that forwards progress events to pq and optionally updates a status dict."""
     import time as _time
 
@@ -579,6 +652,7 @@ def _make_tqdm_class(pq, status=None):
             self.total = int(total) if total else 0
             self.n = int(initial) if initial else 0
             self._start = _time.time()
+            self._update_count = 0
             if self.total:
                 pq.put({"type": "start", "filename": self.desc, "total": self.total})
                 if status is not None:
@@ -586,7 +660,13 @@ def _make_tqdm_class(pq, status=None):
                                    "total": self.total, "downloaded": self.n, "percent": 0})
 
         def update(self, n=1):
+            if session_id and session_id in _download_cancelled:
+                raise RuntimeError("Download cancelled by user")
             self.n += n
+            self._update_count += 1
+            # Check disk space every 64 progress ticks
+            if cache_dir and self._update_count % 64 == 0:
+                _check_disk_space(cache_dir)
             elapsed = (_time.time() - self._start) or 0.001
             rate = self.n / elapsed
             eta = (self.total - self.n) / rate if rate and self.total else None
@@ -675,37 +755,97 @@ def _run_download_thread(session_id: str, model_id: str, file_pattern: str, pq):
             status["last_info"] = evt.get("message", "")
 
     try:
-        from codai.models.cache import is_huggingface_model_id
+        from codai.models.cache import is_huggingface_model_id, get_model_cache_dir, get_hf_hub_cache_dir
         from huggingface_hub import snapshot_download
 
-        tqdm_cls = _make_tqdm_class(pq, status=status)
-
         if is_huggingface_model_id(model_id):
-            if file_pattern:
-                # Convert suffix/quant pattern to fnmatch glob for allow_patterns
-                if file_pattern.startswith('.'):
-                    allow = [f"*{file_pattern}"]          # ".gguf" → "*.gguf"
-                elif '/' in file_pattern:
-                    allow = [file_pattern]                  # exact subpath
+            # GGUF files always land in the GGUF cache (flat); everything else
+            # (full repos, transformers checkpoints, diffusers, …) goes in the HF cache.
+            is_gguf_download = file_pattern and '.gguf' in file_pattern.lower()
+
+            if is_gguf_download:
+                gguf_cache = get_model_cache_dir()
+                dl_cache_dir = gguf_cache
+            else:
+                dl_cache_dir = get_hf_hub_cache_dir()
+
+            # Pre-check disk space using HF file-size metadata
+            expected_bytes = _get_hf_expected_size(model_id, file_pattern)
+            _check_disk_space(dl_cache_dir, expected_bytes)
+
+            tqdm_cls = _make_tqdm_class(pq, status=status, session_id=session_id, cache_dir=dl_cache_dir)
+
+            if is_gguf_download:
+                import fnmatch as _fnmatch
+                import shutil as _shutil
+                from huggingface_hub import list_repo_files, hf_hub_download
+
+                # If pattern has no wildcards and looks like an exact filename, skip listing.
+                _is_exact = ('*' not in file_pattern and '?' not in file_pattern
+                             and file_pattern.lower().endswith('.gguf'))
+                if _is_exact:
+                    matching = [file_pattern]
                 else:
-                    allow = [f"*{file_pattern}"]          # "Q4_K_M.gguf" → "*Q4_K_M.gguf"
+                    # Resolve the pattern to actual filenames in the repo
+                    if file_pattern.startswith('.'):
+                        pat = f"*{file_pattern}"
+                    elif '/' in file_pattern:
+                        pat = file_pattern
+                    else:
+                        pat = f"*{file_pattern}"
+
+                    all_repo_files = list(list_repo_files(model_id))
+                    matching = [
+                        f for f in all_repo_files
+                        if _fnmatch.fnmatch(f, pat) or _fnmatch.fnmatch(os.path.basename(f), pat)
+                    ]
+                    if not matching:
+                        push({"type": "error", "message": f"No files matching {file_pattern!r} found in {model_id}"})
+                        return
+
+                last_dest = gguf_cache
+                for hf_filename in matching:
+                    basename = os.path.basename(hf_filename)
+                    push({"type": "info", "message": f"Downloading {basename} from {model_id}…"})
+                    dl_path = hf_hub_download(
+                        repo_id=model_id,
+                        filename=hf_filename,
+                        local_dir=gguf_cache,
+                        tqdm_class=tqdm_cls,
+                    )
+                    # hf_hub_download preserves subfolder structure; flatten to cache root
+                    flat_dest = os.path.join(gguf_cache, basename)
+                    if os.path.abspath(dl_path) != os.path.abspath(flat_dest) and os.path.isfile(dl_path):
+                        _shutil.move(dl_path, flat_dest)
+                    last_dest = flat_dest
+                path = last_dest
+
+            elif file_pattern:
+                # Non-GGUF pattern — use snapshot into HF cache
+                if file_pattern.startswith('.'):
+                    allow = [f"*{file_pattern}"]
+                elif '/' in file_pattern:
+                    allow = [file_pattern]
+                else:
+                    allow = [f"*{file_pattern}"]
                 push({"type": "info", "message": f"Downloading {allow[0]} from {model_id}…"})
-                path = snapshot_download(model_id, allow_patterns=allow, tqdm_class=tqdm_cls)
+                path = snapshot_download(model_id, cache_dir=dl_cache_dir, allow_patterns=allow, tqdm_class=tqdm_cls)
             else:
                 push({"type": "info", "message": f"Downloading full repository {model_id}…"})
-                path = snapshot_download(model_id, tqdm_class=tqdm_cls)
+                path = snapshot_download(model_id, cache_dir=dl_cache_dir, tqdm_class=tqdm_cls)
 
         else:
             # Direct URL download (non-HF source)
             import requests as _req
             import hashlib
-            from codai.models.cache import get_model_cache_dir
 
-            cache_dir = get_model_cache_dir()
+            dl_cache_dir = get_model_cache_dir()
+            _check_disk_space(dl_cache_dir)  # basic free-space sanity check before connecting
+
             url_path = model_id.split('?')[0]
             filename = os.path.basename(url_path) or "model.bin"
             url_hash = hashlib.sha256(model_id.encode()).hexdigest()
-            dest = os.path.join(cache_dir, f"{url_hash}_{filename}")
+            dest = os.path.join(dl_cache_dir, f"{url_hash}_{filename}")
 
             if os.path.exists(dest):
                 push({"type": "done", "path": dest})
@@ -714,14 +854,22 @@ def _run_download_thread(session_id: str, model_id: str, file_pattern: str, pq):
             resp = _req.get(model_id, stream=True, timeout=60, allow_redirects=True)
             resp.raise_for_status()
             total = int(resp.headers.get('content-length', 0))
+            if total:
+                _check_disk_space(dl_cache_dir, total)
             push({"type": "start", "filename": filename, "total": total})
 
+            tqdm_cls = _make_tqdm_class(pq, status=status, session_id=session_id, cache_dir=dl_cache_dir)
             downloaded = 0
             start_t = time.time()
             last_evt = 0.0
             with open(dest, 'wb') as f:
                 for chunk in resp.iter_content(chunk_size=524288):
                     if chunk:
+                        if session_id in _download_cancelled:
+                            raise RuntimeError("Download cancelled by user")
+                        # Check disk space roughly every 64 MB
+                        if downloaded % (64 * 1024 * 1024) < len(chunk):
+                            _check_disk_space(dl_cache_dir)
                         f.write(chunk)
                         downloaded += len(chunk)
                         now = time.time()
@@ -742,8 +890,13 @@ def _run_download_thread(session_id: str, model_id: str, file_pattern: str, pq):
         push({"type": "done", "path": str(path)})
 
     except Exception as exc:
-        push({"type": "error", "message": str(exc)})
+        if session_id in _download_cancelled:
+            pq.put({"type": "cancelled", "message": "Download cancelled by user"})
+            _download_status.get(session_id, {}).update({"status": "cancelled"})
+        else:
+            push({"type": "error", "message": str(exc)})
     finally:
+        _download_cancelled.discard(session_id)
         def _gc():
             time.sleep(300)
             _download_sessions.pop(session_id, None)
@@ -831,10 +984,41 @@ async def api_delete_model(
 
 # --- Download status / cache management ---
 
+@router.get("/admin/api/hf-files")
+async def api_hf_repo_files(repo_id: str, username: str = Depends(require_admin)):
+    """Return the file list for a HuggingFace repo with name and size metadata."""
+    import asyncio
+
+    def _fetch():
+        try:
+            from huggingface_hub import model_info as _hf_model_info
+            info = _hf_model_info(repo_id, files_metadata=True)
+            return {
+                "repo_id": repo_id,
+                "files": [
+                    {"name": f.rfilename, "size": getattr(f, "size", None)}
+                    for f in (info.siblings or [])
+                ],
+            }
+        except Exception as exc:
+            return {"repo_id": repo_id, "files": [], "error": str(exc)}
+
+    return await asyncio.to_thread(_fetch)
+
+
 @router.get("/admin/api/downloads")
 async def api_list_downloads(username: str = Depends(require_admin)):
     """Return status of all active and recently completed download sessions."""
     return list(_download_status.values())
+
+
+@router.post("/admin/api/download-cancel/{session_id}")
+async def api_cancel_download(session_id: str, username: str = Depends(require_admin)):
+    """Request cancellation of an active download session."""
+    if session_id not in _download_sessions and session_id not in _download_status:
+        raise HTTPException(status_code=404, detail="Download session not found")
+    _download_cancelled.add(session_id)
+    return {"success": True}
 
 
 @router.post("/admin/api/model-upload")
@@ -873,6 +1057,22 @@ async def api_model_upload(request: Request, username: str = Depends(require_adm
 
 # ── cache scan helpers (run in thread pool) ──────────────────────────────────
 
+def _hf_repo_id_from_path(path: str) -> str:
+    """Extract a HuggingFace repo ID from an HF hub cache path.
+
+    HF hub cache paths look like:
+      .../hub/models--OWNER--REPO-NAME/snapshots/HASH/filename.gguf
+    The first '--' inside the 'models--...' component separates owner from repo.
+    """
+    for part in path.replace('\\', '/').split('/'):
+        if part.startswith('models--'):
+            repo_part = part[len('models--'):]
+            sep = repo_part.find('--')
+            if sep != -1:
+                return repo_part[:sep] + '/' + repo_part[sep + 2:]
+    return ''
+
+
 def _scan_caches() -> dict:
     import os
     result: dict = {"hf": [], "gguf": []}
@@ -883,8 +1083,11 @@ def _scan_caches() -> dict:
     )
     caches = get_all_cache_dirs()
 
-    # Collect configured models: key (path/id) → (settings_dict, model_type)
+    # Collect configured models.
+    # configured_settings: path → primary (first) config entry  (backward compat)
+    # all_configs:         path → list of all config entries     (for multi-config support)
     configured_settings: dict = {}
+    all_configs: dict = {}
     if config_manager:
         md = config_manager.models_data
         for cat in ("text_models", "image_models", "audio_models",
@@ -892,12 +1095,31 @@ def _scan_caches() -> dict:
                     "audio_gen_models", "embedding_models", "spatial_models"):
             for m in md.get(cat, []):
                 if isinstance(m, str):
-                    p = m
-                    configured_settings[p] = ({}, cat)
+                    p, s = m, {}
                 else:
-                    p = m.get("path") or m.get("id") or ""
-                    if p:
-                        configured_settings[p] = (m, cat)
+                    # Whisper-server entries have no "path"; their file is at "model_path"
+                    if m.get("backend") == "whisper-server" and m.get("model_path"):
+                        p = m["model_path"]
+                    else:
+                        p = m.get("path") or m.get("id") or ""
+                    s = m if isinstance(m, dict) else {}
+                if not p:
+                    continue
+                if p not in configured_settings:
+                    configured_settings[p] = (s, cat)
+                all_configs.setdefault(p, []).append({"settings": s, "cat": cat})
+
+    # Secondary index: basename → (settings_tuple, original_path)
+    # Used to reconnect a config to a re-downloaded file that landed at a different path.
+    # Only populated for .gguf entries whose basename is unique (avoids ambiguous matches).
+    _cfg_by_fname: dict = {}
+    for _p, _val in configured_settings.items():
+        _bn = os.path.basename(_p) if ('/' in _p or os.sep in _p) else _p
+        if _bn and _bn.endswith('.gguf'):
+            if _bn in _cfg_by_fname:
+                _cfg_by_fname[_bn] = None   # mark as ambiguous — don't use
+            else:
+                _cfg_by_fname[_bn] = (_val, _p)
 
     # HuggingFace cache
     hf_dir = caches.get("huggingface")
@@ -905,6 +1127,30 @@ def _scan_caches() -> dict:
         try:
             from huggingface_hub import scan_cache_dir
             info = scan_cache_dir(hf_dir)
+
+            # Build set of repo IDs that have incomplete/corrupted cache entries.
+            # huggingface_hub reports these via info.warnings (CorruptedCacheException).
+            incomplete_repos: set = set()
+            for w in getattr(info, 'warnings', []):
+                rid = getattr(w, 'repo_id', None)
+                if rid:
+                    incomplete_repos.add(str(rid))
+            # Also scan each repo's blobs directory for .incomplete marker files
+            # (used by some huggingface_hub versions for in-progress downloads).
+            try:
+                for _repo_entry in os.scandir(hf_dir):
+                    if not _repo_entry.is_dir() or not _repo_entry.name.startswith('models--'):
+                        continue
+                    _blobs = os.path.join(_repo_entry.path, 'blobs')
+                    if os.path.isdir(_blobs) and any(
+                        n.endswith('.incomplete') or n.endswith('.lock')
+                        for n in os.listdir(_blobs)
+                    ):
+                        _rid = _repo_entry.name[len('models--'):].replace('--', '/', 1)
+                        incomplete_repos.add(_rid)
+            except Exception:
+                pass
+
             for repo in sorted(info.repos, key=lambda r: r.repo_id):
                 revs = sorted(repo.revisions, key=lambda r: r.commit_hash)
                 size_bytes = sum(r.size_on_disk for r in repo.revisions)
@@ -921,22 +1167,31 @@ def _scan_caches() -> dict:
                             fname = hf_file.file_name
                             fsize = hf_file.size_on_disk
                             cfg = (configured_settings.get(fpath)
-                                   or configured_settings.get(fname)
-                                   or ({}, None))
+                                   or configured_settings.get(fname))
+                            _fname_match = None if cfg else _cfg_by_fname.get(fname)
+                            cfg = cfg or (_fname_match[0] if _fname_match else None) or ({}, None)
+                            _configured_path = _fname_match[1] if _fname_match else None
                             cfg_s = cfg[0] if isinstance(cfg[0], dict) else {}
                             saved_caps = cfg_s.get("capabilities") or []
                             caps_list = saved_caps if saved_caps else detect_model_capabilities(fname).to_list()
-                            result["gguf"].append({
+                            _direct_match = fpath in configured_settings or fname in configured_settings
+                            _gguf_key = fpath if fpath in all_configs else (fname if fname in all_configs else (_configured_path or fpath))
+                            _entry = {
                                 "filename": fname,
                                 "path": fpath,
                                 "size_gb": round(fsize / 1e9, 2),
                                 "size_bytes": fsize,
-                                "in_config": fpath in configured_settings or fname in configured_settings,
+                                "in_config": _direct_match or bool(_fname_match),
                                 "model_type": cfg[1] if cfg[1] and cfg[1] != "gguf_models" else "text_models",
                                 "settings": cfg_s,
                                 "capabilities": caps_list,
                                 "source_repo": repo.repo_id,
-                            })
+                                "incomplete": repo.repo_id in incomplete_repos,
+                                "configs": all_configs.get(_gguf_key, []),
+                            }
+                            if _configured_path:
+                                _entry["configured_path"] = _configured_path
+                            result["gguf"].append(_entry)
                     continue  # skip adding to hf list
 
                 cfg = configured_settings.get(repo.repo_id, ({}, None))
@@ -959,6 +1214,8 @@ def _scan_caches() -> dict:
                     "model_type": cfg[1] if cfg[1] and cfg[1] != "gguf_models" else "text_models",
                     "settings": cfg_settings,
                     "capabilities": caps_list,
+                    "incomplete": repo.repo_id in incomplete_repos,
+                    "configs": all_configs.get(repo.repo_id, []),
                 })
         except Exception as e:
             result["hf_error"] = str(e)
@@ -966,26 +1223,52 @@ def _scan_caches() -> dict:
     # GGUF cache (coderai-specific)
     gguf_dir = caches.get("coderai") or get_model_cache_dir()
     if gguf_dir and os.path.exists(gguf_dir):
+        # Files with these suffixes are known-incomplete downloads
+        _incomplete_gguf_stems = {
+            os.path.splitext(n)[0]
+            for n in os.listdir(gguf_dir)
+            if n.endswith(('.part', '.tmp', '.download', '.incomplete'))
+        }
         for fname in sorted(os.listdir(gguf_dir)):
             fpath = os.path.join(gguf_dir, fname)
-            if os.path.isfile(fpath):
-                size = os.path.getsize(fpath)
-                cfg = (configured_settings.get(fpath)
-                       or configured_settings.get(fname)
-                       or ({}, None))
-                cfg_s = cfg[0] if isinstance(cfg[0], dict) else {}
-                saved_caps = cfg_s.get("capabilities") or []
-                caps_list = saved_caps if saved_caps else detect_model_capabilities(fname).to_list()
-                result["gguf"].append({
-                    "filename": fname,
-                    "path": fpath,
-                    "size_gb": round(size / 1e9, 2),
-                    "size_bytes": size,
-                    "in_config": fpath in configured_settings or fname in configured_settings,
-                    "model_type": cfg[1] if cfg[1] and cfg[1] != "gguf_models" else "text_models",
-                    "settings": cfg_s,
-                    "capabilities": caps_list,
-                })
+            if not os.path.isfile(fpath):
+                continue
+            # Skip the partial-download sentinel files themselves
+            if any(fname.endswith(s) for s in ('.part', '.tmp', '.download', '.incomplete')):
+                continue
+            size = os.path.getsize(fpath)
+            cfg = (configured_settings.get(fpath)
+                   or configured_settings.get(fname))
+            _fname_match = None if cfg else _cfg_by_fname.get(fname)
+            cfg = cfg or (_fname_match[0] if _fname_match else None) or ({}, None)
+            _configured_path = _fname_match[1] if _fname_match else None
+            cfg_s = cfg[0] if isinstance(cfg[0], dict) else {}
+            saved_caps = cfg_s.get("capabilities") or []
+            caps_list = saved_caps if saved_caps else detect_model_capabilities(fname).to_list()
+            # A file is incomplete if there is a same-stem partial file alongside it,
+            # or if an active download session targets this exact path/filename.
+            _stem = os.path.splitext(fname)[0]
+            _dl_active = any(
+                s.get("model_id") in (fname, fpath) and s.get("status") not in ("done", "error", "cancelled")
+                for s in _download_status.values()
+            )
+            _direct_match = fpath in configured_settings or fname in configured_settings
+            _key = fpath if fpath in all_configs else (fname if fname in all_configs else (_configured_path or fpath))
+            _entry = {
+                "filename": fname,
+                "path": fpath,
+                "size_gb": round(size / 1e9, 2),
+                "size_bytes": size,
+                "in_config": _direct_match or bool(_fname_match),
+                "model_type": cfg[1] if cfg[1] and cfg[1] != "gguf_models" else "text_models",
+                "settings": cfg_s,
+                "capabilities": caps_list,
+                "incomplete": _stem in _incomplete_gguf_stems or _dl_active,
+                "configs": all_configs.get(_key, []),
+            }
+            if _configured_path:
+                _entry["configured_path"] = _configured_path
+            result["gguf"].append(_entry)
 
     # Add configured GGUF models not yet in the list (e.g., HF repo IDs or external paths)
     existing_paths = {m["path"] for m in result["gguf"]}
@@ -999,20 +1282,24 @@ def _scan_caches() -> dict:
         # Check if it's a GGUF model (ends with .gguf or is in a GGUF repo)
         is_gguf = path.endswith('.gguf') or 'gguf' in path.lower() or mtype == "gguf_models"
         if is_gguf:
-            # Try to get size if it's a local file
-            size_bytes = 0
-            if os.path.isfile(path):
-                size_bytes = os.path.getsize(path)
+            file_exists = os.path.isfile(path)
+            size_bytes = os.path.getsize(path) if file_exists else 0
             caps = detect_model_capabilities(path)
+            s = settings if isinstance(settings, dict) else {}
+            # Derive HF repo ID from path when not explicitly stored in settings
+            source_repo = s.get("source_repo") or _hf_repo_id_from_path(path)
             result["gguf"].append({
                 "filename": os.path.basename(path) if '/' in path else path,
                 "path": path,
                 "size_gb": round(size_bytes / 1e9, 2) if size_bytes else 0,
                 "size_bytes": size_bytes,
                 "in_config": True,
+                "missing": not file_exists,
+                "source_repo": source_repo,
                 "model_type": mtype if mtype and mtype != "gguf_models" else "text_models",
-                "settings": settings if isinstance(settings, dict) else {},
+                "settings": s,
                 "capabilities": caps.to_list(),
+                "configs": all_configs.get(path, []),
             })
 
     return result
@@ -1224,6 +1511,7 @@ async def api_model_enable(request: Request, username: str = Depends(require_adm
     if path not in lst:
         lst.append(path)
         config_manager.save_models()
+    _broker_notify_models_updated(request)
     return {"success": True}
 
 
@@ -1235,11 +1523,17 @@ async def api_model_disable(request: Request, username: str = Depends(require_ad
     import os as _os
     data = await request.json()
     path = data.get("path") or data.get("model_id", "")
+    config_id = (data.get("config_id") or "").strip()
     # Also match by bare filename so entries stored without full path are caught
     fname = _os.path.basename(path) if (_os.sep in path or "/" in path) else ""
 
     def _matches(m_entry) -> bool:
-        key = m_entry if isinstance(m_entry, str) else m_entry.get("path", m_entry.get("id", ""))
+        if isinstance(m_entry, str):
+            return m_entry == path or (fname and _os.path.basename(m_entry) == fname)
+        if config_id:
+            # Targeted removal: only remove the entry with this config_id
+            return m_entry.get("config_id", "") == config_id
+        key = m_entry.get("path", m_entry.get("id", ""))
         return key == path or (fname and _os.path.basename(key) == fname)
 
     changed = False
@@ -1253,6 +1547,7 @@ async def api_model_disable(request: Request, username: str = Depends(require_ad
             changed = True
     if changed:
         config_manager.save_models()
+    _broker_notify_models_updated(request)
     return {"success": True}
 
 
@@ -1292,6 +1587,7 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
 
     # Find the model config entry to determine its type
     model_type = "text"
+    model_cfg: dict = {}
     if config_manager:
         md = config_manager.models_data
         for cat, mtype in (("image_models", "image"), ("audio_models", "audio"),
@@ -1304,6 +1600,7 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
                 mid = m if isinstance(m, str) else m.get("path") or m.get("id") or ""
                 if mid == path:
                     model_type = mtype
+                    model_cfg = m if isinstance(m, dict) else {}
                     break
 
     result = multi_model_manager.request_model(path, model_type if model_type != "text" else None)
@@ -1365,6 +1662,77 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
                 if pipeline:
                     multi_model_manager.add_model(model_key, pipeline)
                     multi_model_manager.record_vram_delta(model_key, _snap)
+        elif model_type == "video":
+            import asyncio
+            from codai.api.video import _load_video_pipeline, _derive_device
+            model_key = f"video:{path}"
+            device = _derive_device()
+            _snap = multi_model_manager.vram_before_load()
+            _offload = model_cfg.get("offload_strategy") or None
+            pipe = await asyncio.to_thread(_load_video_pipeline, path, device, "t2v", _offload, model_cfg)
+            if pipe is None:
+                raise RuntimeError("Video model failed to load")
+            multi_model_manager.models[model_key] = pipe
+            multi_model_manager.current_model_key = model_key
+            multi_model_manager.active_in_vram = model_key
+            multi_model_manager.models_in_vram.add(model_key)
+            multi_model_manager.record_vram_delta(model_key, _snap)
+        elif model_type == "audio_gen":
+            import asyncio
+            from codai.api.audio_gen import _load_musicgen, _load_audioldm, _detect_audio_gen_type, _derive_device
+            model_key = f"audio_gen:{path}"
+            device = _derive_device()
+            _snap = multi_model_manager.vram_before_load()
+            gen_type = _detect_audio_gen_type(path)
+            if gen_type in ("musicgen", "audiogen"):
+                pipe = await asyncio.to_thread(_load_musicgen, path, device)
+            else:
+                pipe = await asyncio.to_thread(_load_audioldm, path, device)
+            if pipe is None:
+                raise RuntimeError("Audio gen model failed to load")
+            multi_model_manager.models[model_key] = pipe
+            multi_model_manager.current_model_key = model_key
+            multi_model_manager.active_in_vram = model_key
+            multi_model_manager.models_in_vram.add(model_key)
+            multi_model_manager.record_vram_delta(model_key, _snap)
+        elif model_type == "tts":
+            import asyncio
+            model_key = f"tts:{path}"
+            _snap = multi_model_manager.vram_before_load()
+            def _load_tts():
+                try:
+                    from kokoro import Kokoro
+                    return Kokoro(path)
+                except ImportError:
+                    pass
+                try:
+                    from bark import preload_models
+                    preload_models()
+                    return {"bark": True}
+                except ImportError:
+                    pass
+                return None
+            tts_obj = await asyncio.to_thread(_load_tts)
+            if tts_obj is None:
+                raise RuntimeError("No supported TTS backend found (kokoro / bark)")
+            multi_model_manager.models[model_key] = tts_obj
+            multi_model_manager.current_model_key = model_key
+            multi_model_manager.active_in_vram = model_key
+            multi_model_manager.models_in_vram.add(model_key)
+            multi_model_manager.record_vram_delta(model_key, _snap)
+        elif model_type in ("embedding", "spatial", "vision"):
+            import asyncio
+            from codai.api.images import _load_diffusers_pipeline
+            from codai.api.state import get_global_args
+            model_key = f"{model_type}:{path}"
+            _snap = multi_model_manager.vram_before_load()
+            pipeline = await asyncio.to_thread(_load_diffusers_pipeline, path, get_global_args())
+            if pipeline is None:
+                raise RuntimeError(f"{model_type} model failed to load")
+            multi_model_manager.add_model(model_key, pipeline)
+            multi_model_manager.active_in_vram = model_key
+            multi_model_manager.models_in_vram.add(model_key)
+            multi_model_manager.record_vram_delta(model_key, _snap)
         return {"success": True, "already_loaded": False}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1488,18 +1856,34 @@ async def api_model_configure(request: Request, username: str = Depends(require_
     if not model_types:
         model_types = ["text_models"]
 
-    # Remove from all categories (handles type changes and quant switches)
-    # paths_to_remove: the new path + the original path before a quant change
+    # config_id: when provided, identifies a specific config entry to update.
+    # A new UUID is assigned if none is given (new entry).
+    config_id = (data.get("config_id") or "").strip()
+    is_new_config = not config_id
+    if is_new_config:
+        config_id = str(_uuid.uuid4())
+
+    # Remove from all categories.
+    # When config_id matches an existing entry, remove only that entry so that
+    # sibling configs (same path, different config_id) are preserved.
+    # Fall back to path-based removal for entries that predate config_id support.
     import os as _os
     paths_to_remove = {path}
     orig_path = (data.get("orig_path") or "").strip()
     if orig_path and orig_path != path:
         paths_to_remove.add(orig_path)
-    # Also match by bare filename so entries stored without full path are caught
     fnames_to_remove = {_os.path.basename(p) for p in paths_to_remove if _os.sep in p or "/" in p}
 
     def _should_remove(m_entry) -> bool:
-        key = m_entry if isinstance(m_entry, str) else m_entry.get("path", m_entry.get("id", ""))
+        if not isinstance(m_entry, dict):
+            # Legacy string entry — fall back to path matching
+            return m_entry in paths_to_remove
+        existing_cid = m_entry.get("config_id", "")
+        if existing_cid and not is_new_config:
+            # Targeted removal: only the entry that shares this config_id
+            return existing_cid == config_id
+        # Path-based removal (no config_id on either side, or new entry replacing old)
+        key = m_entry.get("path", m_entry.get("id", ""))
         return key in paths_to_remove or (fnames_to_remove and _os.path.basename(key) in fnames_to_remove)
 
     for cat in valid | {"gguf_models"}:
@@ -1522,17 +1906,20 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 used_vram_gb = round(size_bytes / 1e9 * 1.2, 2)
 
     # Build settings entry
-    entry: dict = {"path": path, "model_type": model_types[0], "model_types": model_types}
+    entry: dict = {"path": path, "model_type": model_types[0], "model_types": model_types, "config_id": config_id}
     if used_vram_gb is not None:
         entry["used_vram_gb"] = used_vram_gb
     # Store video sub-types (t2v / i2v / v2v) when present
     if data.get("video_subtypes"):
         entry["video_subtypes"] = data["video_subtypes"]
-    for key in ("alias", "backend", "load_mode", "n_gpu_layers", "n_ctx",
+    for key in ("alias", "config_name", "backend", "load_mode", "n_gpu_layers", "n_ctx",
                 "max_gpu_percent", "manual_ram_gb", "load_in_4bit", "load_in_8bit",
                 "flash_attention", "no_ram", "offload_strategy", "offload_dir",
                 "system_prompt", "parser", "tools_closer_prompt", "grammar_guided",
-                "max_instances", "preload_all_instances", "capabilities"):
+                "max_instances", "preload_all_instances", "capabilities",
+                "model_template", "vae_path", "t5xxl_path", "clip_l_path",
+                "clip_g_path", "clip_vision_path", "lora_path", "lora_model_dir",
+                "max_vram", "sdcpp_flash_attn", "sdcpp_diffusion_flash_attn", "vae_tiling"):
         if key in data:
             entry[key] = data[key]
 
@@ -1633,12 +2020,14 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "client_id": c.broker.client_id,
             "registration_token": c.broker.registration_token,
             "advertised_endpoint": c.broker.advertised_endpoint,
+            "websocket_path": c.broker.websocket_path,
             "transport": c.broker.transport,
             "heartbeat_interval_seconds": c.broker.heartbeat_interval_seconds,
             "connect_timeout_seconds": c.broker.connect_timeout_seconds,
             "request_timeout_seconds": c.broker.request_timeout_seconds,
             "reconnect_initial_delay_seconds": c.broker.reconnect_initial_delay_seconds,
             "reconnect_max_delay_seconds": c.broker.reconnect_max_delay_seconds,
+            "websocket_ping_interval": c.broker.websocket_ping_interval,
         },
         "system_prompt": c.system_prompt,
         "tools_closer_prompt": c.tools_closer_prompt,
@@ -1735,11 +2124,16 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         c.broker.enabled = bool(bro.get("enabled", c.broker.enabled))
         c.broker.base_url = (bro.get("base_url") or "").strip()
         c.broker.scope = (bro.get("scope") or c.broker.scope or "user").strip()
-        c.broker.username = (bro.get("username") or "").strip()
+        broker_username = (bro.get("username") or "").strip()
+        if c.broker.scope == "global":
+            c.broker.username = "global"
+        else:
+            c.broker.username = broker_username
         c.broker.provider_id = (bro.get("provider_id") or "").strip()
         c.broker.client_id = (bro.get("client_id") or "").strip()
         c.broker.registration_token = (bro.get("registration_token") or "").strip()
         c.broker.advertised_endpoint = (bro.get("advertised_endpoint") or "").strip()
+        c.broker.websocket_path = (bro.get("websocket_path") or "").strip()
         c.broker.transport = (bro.get("transport") or c.broker.transport or "websocket").strip()
         c.broker.heartbeat_interval_seconds = max(1, int(bro.get("heartbeat_interval_seconds", c.broker.heartbeat_interval_seconds)))
         c.broker.connect_timeout_seconds = max(1, int(bro.get("connect_timeout_seconds", c.broker.connect_timeout_seconds)))
@@ -1749,8 +2143,12 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             c.broker.reconnect_initial_delay_seconds,
             int(bro.get("reconnect_max_delay_seconds", c.broker.reconnect_max_delay_seconds)),
         )
-        from codai.broker.config import build_broker_runtime_config
-        request.app.state.broker_runtime = build_broker_runtime_config(c.broker)
+        c.broker.websocket_ping_interval = max(5, int(bro.get("websocket_ping_interval", c.broker.websocket_ping_interval)))
+        from codai.broker.config import BrokerConfigError, build_broker_runtime_config
+        try:
+            request.app.state.broker_runtime = build_broker_runtime_config(c.broker)
+        except BrokerConfigError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     config_manager.save_config()
     return {"success": True}
@@ -1851,6 +2249,7 @@ async def api_hf_search(
     sizes: str = "",            # comma-separated e.g. "7b,70b"
     arch: str = "",
     capabilities: str = "",     # comma-separated e.g. "function-calling,vision"
+    component_type: str = "",   # "vae" | "t5xxl" | "clip_l" | "clip_g" | "clip_vision" | "lora" | "encoder" | "controlnet" | "unet"
     username: str = Depends(require_admin),
 ):
     """Proxy HuggingFace model search; supports multiple sizes via parallel requests."""
@@ -1863,6 +2262,28 @@ async def api_hf_search(
     if sort not in ("downloads", "likes", "lastModified", "createdAt"):
         sort = "downloads"
 
+    # Component type → search keywords + HF tags
+    # Most components are safetensors, so override gguf_mode → "all" unless caller forced it
+    _COMP_SEARCH: dict = {
+        "vae":          {"kw": "vae",              "tags": ["vae"]},
+        "t5xxl":        {"kw": "t5xxl OR t5-xxl",  "tags": []},
+        "clip_l":       {"kw": "clip-l encoder",   "tags": []},
+        "clip_g":       {"kw": "clip-g encoder",   "tags": []},
+        "clip_vision":  {"kw": "clip vision encoder","tags": []},
+        "lora":         {"kw": "lora",             "tags": ["lora"]},
+        "encoder":      {"kw": "text encoder",     "tags": []},
+        "controlnet":   {"kw": "controlnet",       "tags": ["controlnet"]},
+        "unet":         {"kw": "unet",             "tags": []},
+    }
+    comp_kw: str = ""
+    comp_tags: list = []
+    if component_type and component_type in _COMP_SEARCH:
+        spec = _COMP_SEARCH[component_type]
+        comp_kw = spec["kw"]
+        comp_tags = spec["tags"]
+        if gguf_mode == "gguf":
+            gguf_mode = "all"  # components are usually safetensors; respect explicit "no-gguf" only
+
     # Filter tags shared across all requests
     filter_pairs: list = []
     if gguf_mode == "gguf":
@@ -1871,7 +2292,9 @@ async def api_hf_search(
         filter_pairs.append(("filter", pipeline_tag))
     if arch == "lora":
         filter_pairs.append(("filter", "lora"))
-    
+    for tag in comp_tags:
+        filter_pairs.append(("filter", tag))
+
     # Capability filters
     cap_list = [c.strip() for c in capabilities.split(",") if c.strip()]
     for cap in cap_list:
@@ -1879,6 +2302,8 @@ async def api_hf_search(
 
     # Base search keywords
     base_parts = [q.strip()] if q.strip() else []
+    if comp_kw:
+        base_parts.append(comp_kw)
     if arch == "moe":
         base_parts.append("moe")
 

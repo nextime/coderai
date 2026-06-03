@@ -84,14 +84,51 @@ def test_build_broker_runtime_config_global_scope_builds_url_and_headers():
         "x-coderai-provider-id": "provider-1",
         "x-coderai-client-id": "client-1",
         "x-coderai-username": "global",
+        "x-coderai-registration-token": "token-123",
         "x-coderai-advertised-endpoint": "https://server.example.com",
     }
+    assert runtime.provider_id == "provider-1"
+    assert runtime.client_id == "client-1"
+    assert runtime.username == "global"
+    assert runtime.registration_token == "token-123"
     assert runtime.transport == "websocket"
     assert runtime.heartbeat_interval_seconds == 30
     assert runtime.connect_timeout_seconds == 10
     assert runtime.request_timeout_seconds == 20
     assert runtime.reconnect_initial_delay_seconds == 1
     assert runtime.reconnect_max_delay_seconds == 60
+
+
+def test_build_broker_runtime_config_global_scope_uses_global_service_paths():
+    runtime = build_broker_runtime_config(
+        BrokerConfig(
+            enabled=True,
+            base_url="https://broker.example.com/base",
+            scope="global",
+            username="global",
+            provider_id="provider-1",
+            client_id="client-1",
+            registration_token="token-123",
+        )
+    )
+
+    assert runtime.websocket_url.startswith("wss://broker.example.com/base/api/coderai/wss")
+
+
+def test_build_broker_runtime_config_user_scope_uses_user_service_paths():
+    runtime = build_broker_runtime_config(
+        BrokerConfig(
+            enabled=True,
+            base_url="https://broker.example.com/base",
+            scope="user",
+            username="alice",
+            provider_id="provider-1",
+            client_id="client-1",
+            registration_token="token-123",
+        )
+    )
+
+    assert runtime.websocket_url.startswith("wss://broker.example.com/base/api/u/alice/coderai/wss")
 
 
 def test_build_broker_runtime_config_rejects_invalid_global_username():
@@ -139,6 +176,7 @@ def test_build_broker_runtime_config_user_scope_uses_user_path():
         "x-coderai-provider-id": "provider-1",
         "x-coderai-client-id": "client-1",
         "x-coderai-username": "alice",
+        "x-coderai-registration-token": "token-123",
         "x-coderai-advertised-endpoint": "https://server.example.com/alice",
     }
 
@@ -158,6 +196,28 @@ def test_build_broker_runtime_config_preserves_base_url_prefix_in_websocket_url(
 
     assert runtime.websocket_url == (
         "wss://broker.example.com/prefix/api/coderai/wss"
+        "?provider_id=provider-1"
+        "&client_id=client-1"
+        "&username=global"
+        "&registration_token=token-123"
+    )
+
+
+def test_build_broker_runtime_config_does_not_duplicate_api_prefix_when_base_url_already_ends_with_api():
+    runtime = build_broker_runtime_config(
+        BrokerConfig(
+            enabled=True,
+            base_url="https://aisbf.cloud/api",
+            scope="global",
+            username="global",
+            provider_id="provider-1",
+            client_id="client-1",
+            registration_token="token-123",
+        )
+    )
+
+    assert runtime.websocket_url == (
+        "wss://aisbf.cloud/api/coderai/wss"
         "?provider_id=provider-1"
         "&client_id=client-1"
         "&username=global"
@@ -185,6 +245,48 @@ def test_build_broker_runtime_config_encodes_reserved_username_path_characters()
         "&username=alice%2Fbob+smith%3Fteam%3Dml"
         "&registration_token=token-123"
     )
+
+
+def test_build_broker_runtime_config_uses_manual_websocket_path_override():
+    runtime = build_broker_runtime_config(
+        BrokerConfig(
+            enabled=True,
+            base_url="https://broker.example.com/prefix",
+            scope="global",
+            username="global",
+            provider_id="provider-1",
+            client_id="client-1",
+            registration_token="token-123",
+            websocket_path="/custom/broker/socket",
+        )
+    )
+
+    assert runtime.websocket_path == "/custom/broker/socket"
+    assert runtime.websocket_url == (
+        "wss://broker.example.com/prefix/custom/broker/socket"
+        "?provider_id=provider-1"
+        "&client_id=client-1"
+        "&username=global"
+        "&registration_token=token-123"
+    )
+
+
+def test_build_broker_runtime_config_normalizes_manual_websocket_path_override_without_leading_slash():
+    runtime = build_broker_runtime_config(
+        BrokerConfig(
+            enabled=True,
+            base_url="https://broker.example.com",
+            scope="user",
+            username="alice",
+            provider_id="provider-1",
+            client_id="client-1",
+            registration_token="token-123",
+            websocket_path="broker/ws",
+        )
+    )
+
+    assert runtime.websocket_path == "broker/ws"
+    assert runtime.websocket_url.startswith("wss://broker.example.com/broker/ws")
 
 
 def test_build_broker_runtime_config_rejects_invalid_user_scope_username():
@@ -294,11 +396,17 @@ def test_build_register_message_includes_capabilities_and_hardware():
         "v": 1,
         "op": "register",
         "request_id": "req-1",
+        "registration_token": "token-123",
+        "capabilities": capabilities,
         "payload": {
             "endpoint": "https://server.example.com/alice",
             "transport": "websocket",
             "registration_token": "token-123",
             "hardware": {"gpu": True, "memory_gb": 24},
+            "gpus": [],
+            "gpu_count": 0,
+            "total_vram_mb": 0,
+            "available_vram_mb": 0,
             "studio_endpoints": EXPECTED_STUDIO_ENDPOINTS,
             "capabilities": capabilities,
         },
@@ -318,15 +426,63 @@ def test_build_register_message_defaults_token_and_studio_endpoints_for_empty_ru
         "v": 1,
         "op": "register",
         "request_id": "req-1",
+        "registration_token": "",
+        "capabilities": {"server": "codai"},
         "payload": {
             "endpoint": "",
             "transport": "websocket",
             "registration_token": "",
             "hardware": None,
+            "gpus": [],
+            "gpu_count": 0,
+            "total_vram_mb": 0,
+            "available_vram_mb": 0,
             "studio_endpoints": DEFAULT_STUDIO_ENDPOINTS,
             "capabilities": {"server": "codai"},
         },
     }
+
+
+def test_build_hardware_summary_reports_torch_cuda_vram(monkeypatch):
+    class FakeProps:
+        total_memory = 24 * 1024 * 1024 * 1024
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def device_count():
+            return 1
+
+        @staticmethod
+        def current_device():
+            return 0
+
+        @staticmethod
+        def get_device_properties(index):
+            return FakeProps()
+
+        @staticmethod
+        def get_device_name(index):
+            return "RTX Test"
+
+        @staticmethod
+        def mem_get_info():
+            return (10 * 1024 * 1024 * 1024, 24 * 1024 * 1024 * 1024)
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+
+    hardware = build_hardware_summary()
+
+    assert hardware["gpu_count"] == 1
+    assert hardware["total_vram_mb"] == 24576
+    assert hardware["available_vram_mb"] == 10240
+    assert hardware["gpus"] == [{"index": 0, "name": "RTX Test", "total_vram_mb": 24576}]
 
 
 def test_build_capabilities_document_lists_openai_and_studio_support():

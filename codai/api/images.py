@@ -123,18 +123,30 @@ import time as _time
 _gen_progress: dict = {
     "current": 0, "total": 0, "active": False,
     "started_at": 0.0, "it_per_s": 0.0,
+    "phase": "idle", "model": "",
 }
+
+def _progress_loading(model_name: str = ""):
+    _gen_progress["phase"] = "loading"
+    _gen_progress["active"] = True
+    _gen_progress["current"] = 0
+    _gen_progress["total"] = 0
+    _gen_progress["it_per_s"] = 0.0
+    _gen_progress["started_at"] = _time.monotonic()
+    _gen_progress["model"] = model_name or ""
 
 def _progress_reset(total: int):
     _gen_progress["current"] = 0
     _gen_progress["total"] = total
     _gen_progress["active"] = True
+    _gen_progress["phase"] = "generating"
     _gen_progress["started_at"] = _time.monotonic()
     _gen_progress["it_per_s"] = 0.0
 
 def _progress_done():
     _gen_progress["current"] = _gen_progress["total"]
     _gen_progress["active"] = False
+    _gen_progress["phase"] = "idle"
 
 def _progress_step(step: int):
     _gen_progress["current"] = step
@@ -894,6 +906,8 @@ async def get_image_progress():
         "current":  _gen_progress["current"],
         "total":    _gen_progress["total"],
         "active":   _gen_progress["active"],
+        "phase":    _gen_progress.get("phase", "idle"),
+        "model":    _gen_progress.get("model", ""),
         "pct":      int(_gen_progress["current"] / _gen_progress["total"] * 100)
                     if _gen_progress["total"] > 0 else 0,
         "it_per_s": _gen_progress["it_per_s"],
@@ -944,6 +958,7 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
         # =====================================================================
         # Step 1: Ask the manager to resolve the model and manage VRAM
         # =====================================================================
+        _progress_loading(request.model or "image")
         model_info = multi_model_manager.request_model(
             requested_model=request.model,
             model_type="image"
@@ -1173,6 +1188,7 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
     if not request.image:
         raise HTTPException(status_code=400, detail="image is required")
 
+    _progress_loading(request.model or "image")
     model_info = multi_model_manager.request_model(request.model, model_type="image")
     model_name = model_info.get('model_name')
     if not model_name:
@@ -1306,6 +1322,7 @@ async def create_image_inpaint(request: ImageInpaintRequest, http_request: Reque
     global global_args
     if not request.image or not request.mask:
         raise HTTPException(status_code=400, detail="image and mask are required")
+    _progress_loading(request.model or "image")
     model_info = multi_model_manager.request_model(request.model, model_type="image")
     model_name = model_info.get('model_name')
     if not model_name:
@@ -1414,6 +1431,7 @@ def _run_upscale(upscaler, image_bytes: bytes, scale: int):
 async def create_image_upscale(request: ImageUpscaleRequest, http_request: Request = None):
     """Upscale an image using Real-ESRGAN or PIL LANCZOS fallback."""
     global global_args
+    _progress_loading(request.model or "image")
     model_info = multi_model_manager.request_model(request.model, model_type="image")
     model_name = model_info.get('model_name') or request.model
     model_key = f"upscale:{model_name}"

@@ -41,6 +41,11 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if not path.startswith("/v1/") or path in self._EXEMPT_PATHS:
             return await call_next(request)
 
+        # Requests from the ASGI broker bridge are in-process and have no real
+        # Bearer token. Identify them by the sentinel server tuple set in asgi_bridge.py.
+        if request.scope.get("server") == ("internal", 80):
+            return await call_next(request)
+
         from codai.admin import routes as _admin_routes
         sm = _admin_routes.session_manager
         if sm is None:
@@ -96,6 +101,7 @@ class _Bucket:
     def __init__(self, now: float):
         self.count = 0
         self.window_start = now
+
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):

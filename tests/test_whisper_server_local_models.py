@@ -849,7 +849,10 @@ def test_settings_template_includes_broker_controls():
     assert "AISBF Broker" in template
     assert "s-broker-enabled" in template
     assert "s-broker-base-url" in template
+    assert 'id="s-broker-scope" class="form-input" onchange="toggleBrokerFields()"' in template
     assert "s-broker-provider-id" in template
     assert "s-broker-client-id" in template
     assert "s-broker-registration-token" in template
+    assert "s-broker-websocket-path" in template
     assert "toggleBrokerFields()" in template
+    assert "forced to `global` for global scope" in template

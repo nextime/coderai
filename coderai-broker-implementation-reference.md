@@ -89,6 +89,22 @@ The outbound WebSocket connection must include:
 - `username`: either `global` or the AISBF username for user-owned providers
 - `registration_token`: provider-scoped secret from AISBF provider configuration
 
+### Current server-side resolution order
+
+AISBF resolves broker identity in this exact order when the WebSocket handshake arrives:
+
+- `provider_id`: query param `provider_id`, then header `x-coderai-provider-id`, then default `coderai`
+- `client_id`: query param `client_id`, then header `x-coderai-client-id`, then generated fallback `anon-<unix_timestamp>`
+- `username`: query param `username`, then header `x-coderai-username`, then the path scope name (`global` or the `/api/u/{username}` path segment)
+- `registration_token`: query param `registration_token`, then header `x-coderai-registration-token`
+
+Important constraints:
+
+- the `registration_token` is required for admission
+- `Authorization: Bearer ...` is currently not used by the broker WebSocket admission check
+- if you omit `client_id`, AISBF generates an `anon-*` client id and future broker routing will only work if AISBF also targets that exact generated value
+- the `client_id` used by the CoderAI client must match the `coderai_config.client_id` used by the AISBF provider, or the broker can show the session as connected while requests still fail to route
+
 ## Optional Headers
 
 AISBF also accepts or may expect these headers:
@@ -108,6 +124,35 @@ Recommended behavior:
 ### 1. Connect
 
 Open the outbound WebSocket to the correct scoped AISBF endpoint.
+
+The handshake is a normal WebSocket upgrade request, which starts as an HTTP `GET` carrying query parameters. This is expected.
+
+Recommended connect template:
+
+```text
+wss://<aisbf-host>/<optional-prefix>/api/coderai/wss?provider_id=<provider_id>&client_id=<stable_client_id>&username=global&registration_token=<provider_registration_token>
+```
+
+User-scoped template:
+
+```text
+wss://<aisbf-host>/<optional-prefix>/api/u/<username>/coderai/wss?provider_id=<provider_id>&client_id=<stable_client_id>&username=<username>&registration_token=<provider_registration_token>
+```
+
+Recommended handshake headers:
+
+```text
+x-coderai-provider-id: <provider_id>
+x-coderai-client-id: <stable_client_id>
+x-coderai-username: <username>
+x-coderai-registration-token: <provider_registration_token>
+```
+
+Best practice:
+
+- send the same identity in both query parameters and headers
+- keep `client_id` stable across reconnects
+- always reconnect with the same provider scope and owner scope
 
 ### 2. Wait for `registered` event
 
@@ -135,10 +180,20 @@ Store:
 - `client_id`
 - `username`
 - `scope_name`
+- `owner_user_id`
+- `expires_at`
+
+Notes:
+
+- this event means the socket is admitted and the session row exists
+- it does not yet mean hardware/capabilities metadata has been uploaded
+- the client should send the explicit `register` operation immediately after this event
 
 ### 3. Send explicit `register` operation
 
 After the `registered` event, CoderAI must send a `register` message describing its capabilities, hardware inventory, and advertised endpoints.
+
+AISBF currently processes `register` as a normal inbound WebSocket message and responds with `status=ok` using the same `request_id`.
 
 ### 4. Enter long-lived receive loop
 
@@ -233,6 +288,60 @@ CoderAI should send this after receiving the initial AISBF `registered` event.
 
 AISBF replies with a success envelope.
 
+### Fields AISBF currently reads from the `register` message
+
+Top-level:
+
+- `v`
+- `op` with value `register`
+- `request_id`
+- optional top-level `registration_token`
+- optional top-level `capabilities`
+
+From `payload`:
+
+- `endpoint`
+- `transport`
+- `registration_token`
+- `studio_endpoints`
+- `hardware`
+- `gpus`
+- `gpu_count`
+- `total_vram_mb`
+- `available_vram_mb`
+- `capabilities`
+
+AISBF behavior:
+
+- if `payload.registration_token` or top-level `registration_token` is present and does not match the handshake token, AISBF replies with an error envelope
+- if token matches, AISBF persists the metadata onto the broker session
+- `payload.capabilities` takes precedence over missing top-level capability data
+- if `gpus`, `gpu_count`, `total_vram_mb`, or `available_vram_mb` are omitted at the top level, AISBF falls back to the values inside `payload.hardware`
+
+Minimal acceptable `register` message:
+
+```json
+{
+  "v": 1,
+  "op": "register",
+  "request_id": "reg-1",
+  "payload": {
+    "transport": "websocket",
+    "registration_token": "<same_registration_token>",
+    "capabilities": {}
+  }
+}
+```
+
+Recommended full `register` message:
+
+- include `endpoint`
+- include `transport`
+- include `registration_token`
+- include `hardware.gpus`, `hardware.gpu_count`, `hardware.total_vram_mb`, `hardware.available_vram_mb`
+- include `studio_endpoints`
+- include `capabilities`
+
 ### Hardware Reporting Requirements
 
 The `register` payload should include the best hardware view available to the running CoderAI process.
@@ -325,6 +434,37 @@ Heartbeat payloads may also refresh dynamic hardware state such as changing free
   }
 }
 ```
+
+Current AISBF note:
+
+- AISBF acknowledges heartbeat messages and merges the heartbeat `payload` into session metadata
+- keep heartbeat payloads small and non-blocking
+- use heartbeats for lightweight dynamic updates only; do not block the main receive loop on expensive hardware rescans
+
+## Async Client Requirements
+
+The broker WebSocket integration must be fully asynchronous.
+
+CoderAI client requirements:
+
+- the main receive loop must never block on model loading, inference, GPU inspection, or disk/network I/O
+- expensive work should run in background tasks or worker executors while the socket remains responsive to incoming frames and ping/pong traffic
+- the client should be able to receive broker requests while also sending progress or result frames for earlier requests
+- the client must not serialize all work behind registration or heartbeat handling
+
+AISBF broker behavior:
+
+- AISBF now drains queued outbound broker requests in a background async task while independently reading inbound websocket messages
+- this means the CoderAI client should expect inbound requests to arrive even while it is still sending heartbeat or response messages for unrelated work
+- operations are correlated strictly by `request_id`; client implementations must not rely on message ordering alone
+
+Recommended client architecture:
+
+1. one async reader task for inbound WebSocket frames
+2. one async writer path or send queue for outbound replies/events
+3. per-request async tasks for local execution
+4. a lightweight periodic heartbeat task
+5. explicit request correlation by `request_id`
 
 AISBF merges those updates into the broker session metadata.
 

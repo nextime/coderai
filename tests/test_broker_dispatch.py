@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
 from fastapi import FastAPI
+from fastapi import File, Form, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from starlette.responses import Response
@@ -87,6 +88,7 @@ async def test_execute_broker_request_returns_success_envelope_for_json_route():
 
     envelope = BrokerRequestEnvelope(
         request_id="req-123",
+        op="chat.completions",
         method="POST",
         path="/v1/chat/completions",
         headers={"accept": "application/json"},
@@ -96,7 +98,7 @@ async def test_execute_broker_request_returns_success_envelope_for_json_route():
     response = await execute_broker_request(app, envelope)
 
     assert response["request_id"] == "req-123"
-    assert response["ok"] is True
+    assert response["status"] == "ok"
     assert response["payload"] == {
         "status_code": 201,
         "headers": {
@@ -125,6 +127,7 @@ async def test_execute_broker_request_preserves_binary_payload_metadata():
 
     envelope = BrokerRequestEnvelope(
         request_id="req-binary",
+        op="proxy",
         method="GET",
         path="/v1/images/render",
     )
@@ -132,7 +135,7 @@ async def test_execute_broker_request_preserves_binary_payload_metadata():
     response = await execute_broker_request(app, envelope)
 
     assert response["request_id"] == "req-binary"
-    assert response["ok"] is True
+    assert response["status"] == "ok"
     assert response["payload"] == {
         "status_code": 200,
         "headers": {
@@ -149,11 +152,74 @@ async def test_execute_broker_request_preserves_binary_payload_metadata():
 
 
 @pytest.mark.anyio("asyncio")
+async def test_execute_broker_request_maps_proxy_operation_to_internal_route():
+    app = FastAPI()
+
+    @app.post("/v1/video/dub")
+    async def dub_route(payload: dict):
+        return {"received": payload, "route": "dub"}
+
+    envelope = BrokerRequestEnvelope(
+        request_id="req-proxy-op",
+        op="proxy",
+        payload={
+            "endpoint_path": "v1/video/dub",
+            "method": "POST",
+            "headers": {"content-type": "application/json"},
+            "body": {"prompt": "hello"},
+        },
+    )
+
+    response = await execute_broker_request(app, envelope)
+
+    assert response["status"] == "ok"
+    assert response["payload"]["status_code"] == 200
+    assert response["payload"]["body"] == '{"received":{"prompt":"hello"},"route":"dub"}'
+
+
+@pytest.mark.anyio("asyncio")
+async def test_execute_broker_request_supports_proxy_multipart_payloads():
+    app = FastAPI()
+
+    @app.post("/v1/audio/transcriptions")
+    async def transcription_route(model: str = Form(...), file: UploadFile = File(...)):
+        data = await file.read()
+        return {"model": model, "filename": file.filename, "size": len(data)}
+
+    envelope = BrokerRequestEnvelope(
+        request_id="req-multipart",
+        op="proxy",
+        payload={
+            "endpoint_path": "v1/audio/transcriptions",
+            "method": "POST",
+            "multipart": {
+                "fields": [{"name": "model", "value": "whisper-large"}],
+                "files": [
+                    {
+                        "name": "file",
+                        "filename": "sample.wav",
+                        "content_type": "audio/wav",
+                        "data_base64": "aGVsbG8=",
+                    }
+                ],
+            },
+        },
+    )
+
+    response = await execute_broker_request(app, envelope)
+
+    assert response["status"] == "ok"
+    assert response["payload"]["status_code"] == 200
+    assert response["payload"]["body"] == '{"model":"whisper-large","filename":"sample.wav","size":5}'
+
+
+@pytest.mark.anyio("asyncio")
 async def test_brokered_models_match_direct_http_response_shape():
     direct_response = TestClient(real_app).get("/v1/models")
 
     envelope = BrokerRequestEnvelope(
         request_id="req-models-shape",
+        op="models.list",
         method="GET",
         path="/v1/models",
         headers={"accept": "application/json"},
@@ -163,7 +229,7 @@ async def test_brokered_models_match_direct_http_response_shape():
     brokered_body = json.loads(brokered_response["payload"]["body"])
     direct_body = direct_response.json()
 
-    assert brokered_response["ok"] is True
+    assert brokered_response["status"] == "ok"
     assert brokered_response["payload"]["status_code"] == direct_response.status_code
     assert brokered_response["payload"]["content_type"] == direct_response.headers["content-type"]
     assert brokered_response["payload"]["headers"]["content-type"] == direct_response.headers["content-type"]
@@ -192,6 +258,7 @@ async def test_execute_broker_request_rejects_unsupported_endpoint():
     app = FastAPI()
     envelope = BrokerRequestEnvelope(
         request_id="req-unsupported",
+        op="proxy",
         method="GET",
         path="/internal",
     )
@@ -199,8 +266,9 @@ async def test_execute_broker_request_rejects_unsupported_endpoint():
     response = await execute_broker_request(app, envelope)
 
     assert response == {
+        "v": 1,
         "request_id": "req-unsupported",
-        "ok": False,
+        "status": "error",
         "error": {
             "code": "unsupported_endpoint",
             "message": "Unsupported endpoint: /internal",

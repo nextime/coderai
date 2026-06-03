@@ -18,6 +18,7 @@
 import sys
 import os
 import logging
+import threading as _t
 
 # Import configuration from codai modules
 from codai.cli import parse_args
@@ -28,6 +29,83 @@ from codai.broker import BrokerConfigError, build_broker_runtime_config
 
 
 logger = logging.getLogger(__name__)
+
+
+def _migrate_hf_gguf_to_gguf_cache() -> None:
+    """Move GGUF files stored in the HF cache into the flat GGUF cache directory.
+
+    Runs once at startup in a background thread.  For repos whose only
+    non-trivial content is GGUF files, the HF cache entry is removed after
+    the files are safely copied across.
+    """
+    import shutil
+    from codai.models.cache import get_hf_hub_cache_dir, get_model_cache_dir
+
+    hf_dir = get_hf_hub_cache_dir()
+    if not os.path.exists(hf_dir):
+        return
+
+    gguf_cache = get_model_cache_dir()
+
+    try:
+        from huggingface_hub import scan_cache_dir
+        info = scan_cache_dir(hf_dir)
+    except Exception:
+        return
+
+    _TRIVIAL_EXTS = {'.json', '.txt', '.md', '.py', '.gitattributes', '.model', '.tiktoken', '.vocab'}
+
+    migrated_count = 0
+    repos_to_purge = []   # HF cache repo dirs safe to delete after migration
+
+    for repo in info.repos:
+        if not repo.revisions:
+            continue
+        latest_rev = sorted(repo.revisions, key=lambda r: r.commit_hash)[-1]
+
+        gguf_files = [f for f in latest_rev.files if f.file_name.endswith('.gguf')]
+        if not gguf_files:
+            continue
+
+        # Determine whether this repo contains ONLY gguf + trivial metadata
+        non_trivial = [
+            f for f in latest_rev.files
+            if os.path.splitext(f.file_name)[1].lower() not in _TRIVIAL_EXTS
+        ]
+        gguf_only_repo = non_trivial and all(f.file_name.endswith('.gguf') for f in non_trivial)
+
+        all_migrated = True
+        for f in gguf_files:
+            dest = os.path.join(gguf_cache, os.path.basename(f.file_name))
+            if os.path.exists(dest):
+                continue  # already present in GGUF cache
+            try:
+                src = os.path.realpath(str(f.file_path))  # resolve symlink → blob
+                shutil.copy2(src, dest)
+                migrated_count += 1
+                logger.info("Migrated GGUF: %s → %s", f.file_name, dest)
+            except Exception as exc:
+                logger.warning("Could not migrate %s: %s", f.file_name, exc)
+                all_migrated = False
+
+        if gguf_only_repo and all_migrated:
+            repo_dir = os.path.join(hf_dir, f"models--{repo.repo_id.replace('/', '--')}")
+            if os.path.isdir(repo_dir):
+                repos_to_purge.append((repo.repo_id, repo_dir))
+
+    for repo_id, repo_dir in repos_to_purge:
+        try:
+            shutil.rmtree(repo_dir)
+            logger.info("Removed migrated HF cache entry: %s", repo_id)
+        except Exception as exc:
+            logger.warning("Could not remove HF cache entry %s: %s", repo_id, exc)
+
+    if migrated_count or repos_to_purge:
+        logger.info(
+            "GGUF cache migration: %d file(s) moved to %s, %d HF cache entr%s cleaned up.",
+            migrated_count, gguf_cache,
+            len(repos_to_purge), "ies" if len(repos_to_purge) != 1 else "y",
+        )
 
 
 def main():
@@ -54,10 +132,22 @@ def main():
     config_mgr = ConfigManager(config_dir)
     config = config_mgr.load()
 
-    # Apply cache directory overrides from config before any cache module is used
+    # Apply cache directory overrides from config before any cache module is used.
+    # We set env vars AND patch huggingface_hub.constants in case the library was
+    # already imported (constants are computed once at import time from env vars).
     if config.models.hf_cache_dir:
+        hf_hub_cache = os.path.join(config.models.hf_cache_dir, 'hub')
         os.environ['HF_HOME'] = config.models.hf_cache_dir
-        os.environ['HUGGINGFACE_HUB_CACHE'] = config.models.hf_cache_dir
+        os.environ['HUGGINGFACE_HUB_CACHE'] = hf_hub_cache
+        try:
+            import sys as _sys
+            if 'huggingface_hub.constants' in _sys.modules:
+                import huggingface_hub.constants as _hfc
+                _hfc.HF_HUB_CACHE = hf_hub_cache
+                if hasattr(_hfc, 'HF_HOME'):
+                    _hfc.HF_HOME = config.models.hf_cache_dir
+        except Exception:
+            pass
     if config.models.gguf_cache_dir:
         os.environ['CODERAI_CACHE_DIR'] = config.models.gguf_cache_dir
     
@@ -75,7 +165,7 @@ def main():
 
     # Initialize admin session manager and expose config to admin routes
     from pathlib import Path
-    init_session_manager(Path(config_dir))
+    init_session_manager(Path(config_dir), port=config.server.port)
     set_config_manager(config_mgr)
     
     # Handle early exit options (before heavy imports)
@@ -145,7 +235,8 @@ def main():
                         print("No GGUF files found, downloading full HuggingFace repo...")
                         try:
                             from huggingface_hub import snapshot_download
-                            cached_path = snapshot_download(model_id)
+                            from codai.models.cache import get_hf_hub_cache_dir
+                            cached_path = snapshot_download(model_id, cache_dir=get_hf_hub_cache_dir())
                         except Exception as e:
                             print(f"Error downloading full repo: {e}")
                             cached_path = None
@@ -175,6 +266,9 @@ def main():
             print(f"Error listing devices: {e}")
         sys.exit(0)
     
+    # Migrate any GGUF files that ended up in the HF cache to the GGUF cache
+    _t.Thread(target=_migrate_hf_gguf_to_gguf_cache, daemon=True).start()
+
     # Import core modules (only after early exits)
     from codai.api import app
     from codai.api.state import (
@@ -724,18 +818,36 @@ def main():
     queue_manager.max_size = config.server.queue_max_size
     queue_manager.max_parallel_requests = config.server.max_parallel_requests
 
+    # Configure Python logging so broker/API log calls reach the terminal.
+    # uvicorn is started with log_config=None to keep our config in place.
+    _log_level = logging.DEBUG if global_debug else logging.INFO
+    logging.basicConfig(
+        level=_log_level,
+        format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
+        stream=sys.stdout,
+        force=True,
+    )
+    # Suppress noisy third-party libraries at WARNING unless in debug mode.
+    for _noisy in ("httpx", "httpcore", "urllib3", "multipart", "PIL"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+    if not global_debug:
+        logging.getLogger("websockets").setLevel(logging.WARNING)
+        logging.getLogger("asyncio").setLevel(logging.WARNING)
+
     # Start the server
     import uvicorn
     print(f"\nStarting server on http://{config.server.host}:{config.server.port}")
     print(f"API docs: http://{config.server.host}:{config.server.port}/docs")
     print(f"Admin UI: http://{config.server.host}:{config.server.port}/admin")
-    
+
     if model_manager.backend is not None:
         actual_backend = model_manager.backend_type
         if hasattr(model_manager.backend, 'force_cuda') and model_manager.backend.force_cuda:
             actual_backend = "cuda (via llama-cpp-python)"
         print(f"Using backend: {actual_backend}")
-    
+
+    _uvi_log_level = "debug" if global_debug else "info"
+
     if config.server.https:
         import ssl
         ssl_keyfile = config.server.https_key_path
@@ -758,14 +870,17 @@ def main():
             except Exception as e:
                 print(f"Warning: Could not generate certificate: {e}")
                 print("Falling back to HTTP...")
-                uvicorn.run(fastapi_app, host=config.server.host, port=config.server.port)
+                uvicorn.run(fastapi_app, host=config.server.host, port=config.server.port,
+                            log_level=_uvi_log_level, log_config=None)
                 return
-        
+
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_context.load_cert_chain(ssl_certfile, ssl_keyfile)
-        uvicorn.run(fastapi_app, host=config.server.host, port=config.server.port, ssl_context=ssl_context)
+        uvicorn.run(fastapi_app, host=config.server.host, port=config.server.port,
+                    ssl_context=ssl_context, log_level=_uvi_log_level, log_config=None)
     else:
-        uvicorn.run(fastapi_app, host=config.server.host, port=config.server.port)
+        uvicorn.run(fastapi_app, host=config.server.host, port=config.server.port,
+                    log_level=_uvi_log_level, log_config=None)
 
 
 if __name__ == "__main__":

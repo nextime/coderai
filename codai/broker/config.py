@@ -21,12 +21,14 @@ class BrokerConfig:
     client_id: str = ""
     registration_token: str = ""
     advertised_endpoint: str = ""
+    websocket_path: str = ""
     transport: str = "websocket"
     heartbeat_interval_seconds: int = 30
     connect_timeout_seconds: int = 10
     request_timeout_seconds: int = 30
     reconnect_initial_delay_seconds: int = 1
     reconnect_max_delay_seconds: int = 60
+    websocket_ping_interval: int = 20
 
 
 @dataclass
@@ -36,13 +38,28 @@ class BrokerRuntimeConfig:
     enabled: bool
     websocket_url: str = ""
     headers: Dict[str, str] = field(default_factory=dict)
+    provider_id: str = ""
+    client_id: str = ""
+    username: str = ""
+    registration_token: str = ""
     advertised_endpoint: str = ""
+    websocket_path: str = ""
     transport: str = "websocket"
     heartbeat_interval_seconds: int = 30
     connect_timeout_seconds: int = 10
     request_timeout_seconds: int = 30
     reconnect_initial_delay_seconds: int = 1
     reconnect_max_delay_seconds: int = 60
+    websocket_ping_interval: int = 20
+
+
+def _join_broker_path(base_path: str, suffix: str) -> str:
+    normalized_base = (base_path or "").rstrip("/")
+    normalized_suffix = suffix if suffix.startswith("/") else f"/{suffix}"
+
+    if normalized_base.endswith("/api") and normalized_suffix.startswith("/api/"):
+        return f"{normalized_base}{normalized_suffix[4:]}"
+    return f"{normalized_base}{normalized_suffix}" if normalized_base else normalized_suffix
 
 
 def build_broker_runtime_config(config: BrokerConfig) -> BrokerRuntimeConfig:
@@ -50,18 +67,29 @@ def build_broker_runtime_config(config: BrokerConfig) -> BrokerRuntimeConfig:
 
     runtime = BrokerRuntimeConfig(
         enabled=config.enabled,
+        provider_id=config.provider_id,
+        client_id=config.client_id,
+        username=config.username,
+        registration_token=config.registration_token,
         advertised_endpoint=config.advertised_endpoint,
+        websocket_path=config.websocket_path,
         transport=config.transport,
         heartbeat_interval_seconds=config.heartbeat_interval_seconds,
         connect_timeout_seconds=config.connect_timeout_seconds,
         request_timeout_seconds=config.request_timeout_seconds,
         reconnect_initial_delay_seconds=config.reconnect_initial_delay_seconds,
         reconnect_max_delay_seconds=config.reconnect_max_delay_seconds,
+        websocket_ping_interval=config.websocket_ping_interval,
     )
     if not config.enabled:
         return runtime
 
-    if config.scope == "global":
+    custom_websocket_path = (config.websocket_path or "").strip()
+    if custom_websocket_path:
+        suffix = custom_websocket_path
+        if not suffix.startswith("/"):
+            suffix = f"/{suffix}"
+    elif config.scope == "global":
         if config.username != "global":
             raise BrokerConfigError("global broker scope requires username 'global'")
         suffix = "/api/coderai/wss"
@@ -88,7 +116,7 @@ def build_broker_runtime_config(config: BrokerConfig) -> BrokerRuntimeConfig:
 
     scheme = {"http": "ws", "https": "wss"}.get(split_url.scheme, split_url.scheme)
     base_path = split_url.path.rstrip("/")
-    path = f"{base_path}{suffix}" if base_path else suffix
+    path = _join_broker_path(base_path, suffix)
     query = urlencode(
         {
             "provider_id": config.provider_id,
@@ -103,6 +131,7 @@ def build_broker_runtime_config(config: BrokerConfig) -> BrokerRuntimeConfig:
         "x-coderai-provider-id": config.provider_id,
         "x-coderai-client-id": config.client_id,
         "x-coderai-username": config.username,
+        "x-coderai-registration-token": config.registration_token,
         "x-coderai-advertised-endpoint": config.advertised_endpoint,
     }
     return runtime

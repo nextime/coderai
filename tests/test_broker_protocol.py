@@ -28,12 +28,17 @@ class FakeWebSocket:
     def __init__(self, messages):
         self._messages = list(messages)
         self.sent_messages = []
+        self.closed = False
 
     async def recv(self):
         return self._messages.pop(0)
 
     async def send(self, message):
         self.sent_messages.append(message)
+
+    async def close(self):
+        self.closed = True
+        return None
 
 
 @pytest.mark.anyio("asyncio")
@@ -46,19 +51,32 @@ async def test_broker_client_waits_for_registered_before_register():
                     "accepted": True,
                     "session_id": "session-123",
                 }
-            )
+            ),
+            json.dumps({"request_id": "session-123", "status": "ok"}),
         ]
     )
     runtime = BrokerRuntimeConfig(
         enabled=True,
         websocket_url="wss://broker.example/ws",
         headers={"Authorization": "Bearer token"},
+        registration_token="token",
         advertised_endpoint="http://localhost:8000",
     )
 
     with patch("codai.broker.client.websockets.connect", new=AsyncMock(return_value=websocket)) as connect_mock:
         client = BrokerClient(runtime)
-        await client.connect_and_register()
+        with patch(
+            "codai.broker.client.build_hardware_summary",
+            return_value={
+                "hostname": "test-host",
+                "platform": "linux",
+                "gpus": [],
+                "gpu_count": 0,
+                "total_vram_mb": 0,
+                "available_vram_mb": 0,
+            },
+        ):
+            await client.connect_and_register()
 
     connect_mock.assert_awaited_once_with(
         runtime.websocket_url,
@@ -71,7 +89,11 @@ async def test_broker_client_waits_for_registered_before_register():
 
     register_message = json.loads(websocket.sent_messages[0])
     assert register_message["op"] == "register"
+    assert register_message["request_id"] == "session-123"
+    assert register_message["capabilities"] == register_message["payload"]["capabilities"]
+    assert register_message["payload"]["registration_token"] == "token"
     assert register_message["payload"]["hardware"]["gpu_count"] == 0
+    assert register_message["payload"]["gpus"] == []
     assert register_message["payload"]["capabilities"]["transports"] == ["websocket"]
     assert register_message["payload"]["studio_endpoints"] == DEFAULT_STUDIO_ENDPOINTS
 
@@ -98,7 +120,10 @@ async def test_broker_client_rejects_registered_ack_without_session_id():
 @pytest.mark.anyio("asyncio")
 async def test_broker_client_passes_connect_timeout_to_websocket_connection():
     websocket = FakeWebSocket(
-        [json.dumps({"event": "registered", "accepted": True, "session_id": "session-123"})]
+        [
+            json.dumps({"event": "registered", "accepted": True, "session_id": "session-123"}),
+            json.dumps({"request_id": "session-123", "status": "ok"}),
+        ]
     )
     runtime = BrokerRuntimeConfig(
         enabled=True,
@@ -121,7 +146,10 @@ async def test_broker_client_passes_connect_timeout_to_websocket_connection():
 @pytest.mark.anyio("asyncio")
 async def test_broker_client_applies_request_timeout_to_socket_reads():
     websocket = FakeWebSocket(
-        [json.dumps({"event": "registered", "accepted": True, "session_id": "session-123"})]
+        [
+            json.dumps({"event": "registered", "accepted": True, "session_id": "session-123"}),
+            json.dumps({"request_id": "session-123", "status": "ok"}),
+        ]
     )
     runtime = BrokerRuntimeConfig(enabled=True, request_timeout_seconds=23)
     timeout_calls = []
@@ -136,7 +164,107 @@ async def test_broker_client_applies_request_timeout_to_socket_reads():
         client = BrokerClient(runtime)
         await client.connect_and_register()
 
-    assert timeout_calls == [runtime.request_timeout_seconds]
+    assert timeout_calls == [runtime.request_timeout_seconds, runtime.request_timeout_seconds]
+
+
+@pytest.mark.anyio("asyncio")
+async def test_broker_client_rejects_failed_register_ack():
+    websocket = FakeWebSocket(
+        [
+            json.dumps({"event": "registered", "accepted": True, "session_id": "session-123"}),
+            json.dumps({"request_id": "session-123", "status": "error"}),
+        ]
+    )
+    runtime = BrokerRuntimeConfig(enabled=True, headers={"Authorization": "Bearer token"})
+
+    with patch("codai.broker.client.websockets.connect", new=AsyncMock(return_value=websocket)):
+        client = BrokerClient(runtime)
+        with pytest.raises(ValueError, match="broker did not acknowledge register message"):
+            await client.connect_and_register()
+
+
+@pytest.mark.anyio("asyncio")
+async def test_broker_client_stores_registered_session_metadata():
+    websocket = FakeWebSocket(
+        [
+            json.dumps(
+                {
+                    "event": "registered",
+                    "accepted": True,
+                    "session_id": "session-123",
+                    "provider_id": "provider-1",
+                    "client_id": "client-1",
+                    "username": "alice",
+                    "scope_name": "alice",
+                    "owner_user_id": 42,
+                    "expires_at": "2026-05-13T00:00:00Z",
+                }
+            ),
+            json.dumps({"request_id": "session-123", "status": "ok"}),
+        ]
+    )
+    runtime = BrokerRuntimeConfig(enabled=True, headers={"Authorization": "Bearer token"})
+
+    with patch("codai.broker.client.websockets.connect", new=AsyncMock(return_value=websocket)):
+        client = BrokerClient(runtime)
+        await client.connect_and_register()
+
+    assert client.session_metadata == {
+        "session_id": "session-123",
+        "provider_id": "provider-1",
+        "client_id": "client-1",
+        "username": "alice",
+        "scope_name": "alice",
+        "owner_user_id": 42,
+        "expires_at": "2026-05-13T00:00:00Z",
+    }
+
+
+@pytest.mark.anyio("asyncio")
+async def test_broker_client_run_forever_closes_registered_socket_before_reconnect():
+    runtime = BrokerRuntimeConfig(
+        enabled=True,
+        reconnect_initial_delay_seconds=1,
+        reconnect_max_delay_seconds=4,
+    )
+    client = BrokerClient(runtime)
+
+    attempts = []
+    sockets = []
+    reconnected = asyncio.Event()
+
+    class DisconnectingWebSocket(FakeWebSocket):
+        def __init__(self):
+            super().__init__([])
+
+        async def recv(self):
+            raise RuntimeError("disconnect")
+
+    async def fake_connect_and_register():
+        attempts.append("connect")
+        websocket = DisconnectingWebSocket()
+        sockets.append(websocket)
+        client.websocket = websocket
+        if len(attempts) >= 2:
+            reconnected.set()
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay):
+        await real_sleep(0)
+
+    client.connect_and_register = AsyncMock(side_effect=fake_connect_and_register)
+
+    with patch("codai.broker.client.asyncio.sleep", new=AsyncMock(side_effect=fake_sleep)):
+        task = asyncio.create_task(client.run_forever())
+        await asyncio.wait_for(reconnected.wait(), timeout=0.2)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert attempts[:2] == ["connect", "connect"]
+    assert sockets[0].closed is True
 
 
 @pytest.mark.anyio("asyncio")
@@ -158,8 +286,9 @@ async def test_broker_client_replies_to_heartbeat():
         )
 
     assert response == {
+        "v": 1,
         "request_id": "req-heartbeat",
-        "ok": True,
+        "status": "ok",
         "event": "heartbeat",
         "payload": {"ts": 1715443200},
     }
@@ -174,7 +303,7 @@ async def test_broker_client_dispatches_non_heartbeat_messages():
     dispatcher = AsyncMock(
         return_value={
             "request_id": "req-dispatch",
-            "ok": True,
+            "status": "ok",
             "payload": {"status": "handled"},
         }
     )
@@ -193,7 +322,7 @@ async def test_broker_client_dispatches_non_heartbeat_messages():
     dispatcher.assert_awaited_once_with(json.loads(raw_message))
     assert response == {
         "request_id": "req-dispatch",
-        "ok": True,
+        "status": "ok",
         "payload": {"status": "handled"},
     }
     assert websocket.sent_messages == [json.dumps(response)]
@@ -214,11 +343,8 @@ async def test_broker_client_dispatches_request_messages_through_fastapi_app():
     service = BrokerService(client, app)
     client.websocket = FakeWebSocket([])
     message = {
-        "op": "request",
+        "op": "chat.completions",
         "request_id": "req-app",
-        "method": "POST",
-        "path": "/v1/chat/completions",
-        "headers": {"accept": "application/json"},
         "payload": {"message": "hello"},
     }
 
@@ -227,9 +353,10 @@ async def test_broker_client_dispatches_request_messages_through_fastapi_app():
 
     assert envelope == BrokerRequestEnvelope(
         request_id="req-app",
+        op="chat.completions",
         method="POST",
         path="/v1/chat/completions",
-        headers={"accept": "application/json"},
+        headers={},
         query={},
         payload={"message": "hello"},
         stream=False,
@@ -237,12 +364,68 @@ async def test_broker_client_dispatches_request_messages_through_fastapi_app():
     )
     expected_response = await execute_broker_request(app, envelope)
     assert response["request_id"] == "req-app"
-    assert response["ok"] is True
+    assert response["status"] == "ok"
     assert response["payload"] == expected_response["payload"]
     assert response["payload"]["status_code"] == 200
     assert response["payload"]["content_type"] == "application/json"
     assert response["payload"]["body"] == '{"received":{"message":"hello"},"route":"chat"}'
     assert client.websocket.sent_messages == [json.dumps(response)]
+
+
+@pytest.mark.anyio("asyncio")
+async def test_broker_client_maps_proxy_op_to_endpoint_envelope():
+    client = BrokerClient(BrokerRuntimeConfig(enabled=True))
+    message = {
+        "op": "proxy",
+        "request_id": "req-proxy",
+        "payload": {
+            "endpoint_path": "v1/video/dub",
+            "method": "POST",
+            "headers": {"accept": "application/json"},
+            "query_params": {"job_id": "123"},
+            "body": {"prompt": "hello"},
+            "stream": True,
+        },
+    }
+
+    envelope = client.message_to_envelope(message)
+
+    assert envelope == BrokerRequestEnvelope(
+        request_id="req-proxy",
+        op="proxy",
+        method="POST",
+        path="v1/video/dub",
+        headers={"accept": "application/json"},
+        query={"job_id": "123"},
+        payload=message["payload"],
+        stream=True,
+        content_type="application/json",
+    )
+
+
+@pytest.mark.anyio("asyncio")
+async def test_broker_client_maps_models_list_operation_to_internal_route():
+    client = BrokerClient(BrokerRuntimeConfig(enabled=True))
+
+    envelope = client.message_to_envelope(
+        {
+            "op": "models.list",
+            "request_id": "req-models",
+            "payload": {},
+        }
+    )
+
+    assert envelope == BrokerRequestEnvelope(
+        request_id="req-models",
+        op="models.list",
+        method="GET",
+        path="/v1/models",
+        headers={},
+        query={},
+        payload={},
+        stream=False,
+        content_type="application/json",
+    )
 
 
 @pytest.mark.anyio("asyncio")
@@ -336,6 +519,65 @@ async def test_broker_client_run_forever_reconnects_after_disconnect():
 
 
 @pytest.mark.anyio("asyncio")
+async def test_broker_client_run_forever_processes_requests_concurrently():
+    runtime = BrokerRuntimeConfig(enabled=True, request_timeout_seconds=1)
+    client = BrokerClient(runtime)
+
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_finished = asyncio.Event()
+
+    class MessageWebSocket:
+        def __init__(self):
+            self.sent_messages = []
+            self._messages = [
+                json.dumps({"op": "chat.completions", "request_id": "req-1", "payload": {"message": "one"}}),
+                json.dumps({"op": "capabilities", "request_id": "req-2", "payload": {}}),
+            ]
+
+        async def recv(self):
+            if self._messages:
+                return self._messages.pop(0)
+            await asyncio.sleep(0)
+            raise RuntimeError("disconnect")
+
+        async def send(self, message):
+            self.sent_messages.append(json.loads(message))
+
+        async def close(self):
+            return None
+
+    websocket = MessageWebSocket()
+
+    async def fake_connect_and_register():
+        client.websocket = websocket
+
+    async def dispatcher(message):
+        if message["request_id"] == "req-1":
+            first_started.set()
+            await release_first.wait()
+            return {"v": 1, "request_id": "req-1", "status": "ok", "payload": {"done": 1}}
+        second_finished.set()
+        return {"v": 1, "request_id": "req-2", "status": "ok", "payload": {"done": 2}}
+
+    client.connect_and_register = AsyncMock(side_effect=fake_connect_and_register)
+    client.dispatcher = dispatcher
+
+    task = asyncio.create_task(client.run_forever())
+    await asyncio.wait_for(first_started.wait(), timeout=0.2)
+    await asyncio.wait_for(second_finished.wait(), timeout=0.2)
+    release_first.set()
+    await asyncio.sleep(0.05)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    sent_ids = [message["request_id"] for message in websocket.sent_messages]
+    assert "req-2" in sent_ids
+
+
+@pytest.mark.anyio("asyncio")
 async def test_broker_client_run_forever_handles_heartbeat_before_reconnect():
     runtime = BrokerRuntimeConfig(
         enabled=True,
@@ -394,8 +636,9 @@ async def test_broker_client_run_forever_handles_heartbeat_before_reconnect():
     assert attempts[:2] == ["connect", "connect"]
     assert sleep_calls[0] == 1
     assert json.loads(sockets[0].sent_messages[0]) == {
+        "v": 1,
         "request_id": "req-heartbeat",
-        "ok": True,
+        "status": "ok",
         "event": "heartbeat",
         "payload": {"ts": 1715443200},
     }
@@ -427,6 +670,32 @@ async def test_broker_service_start_and_stop_manage_background_task():
     client.run_forever.assert_awaited_once_with()
     assert task.cancelled()
     assert service.task is None
+
+
+@pytest.mark.anyio("asyncio")
+async def test_broker_service_start_is_idempotent_while_running():
+    runtime = BrokerRuntimeConfig(enabled=True)
+    client = BrokerClient(runtime)
+
+    started = asyncio.Event()
+
+    async def fake_run_forever():
+        started.set()
+        await asyncio.Future()
+
+    client.run_forever = AsyncMock(side_effect=fake_run_forever)
+    service = BrokerService(client)
+
+    service.start()
+    service.start()
+    await started.wait()
+
+    task = service.task
+    assert task is not None
+
+    await service.stop()
+
+    client.run_forever.assert_awaited_once_with()
 
 
 @pytest.mark.anyio("asyncio")

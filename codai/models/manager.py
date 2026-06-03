@@ -1541,6 +1541,10 @@ class MultiModelManager:
         2. Local HuggingFace hub cache scan.
         3. HuggingFace API (network, one call per model per process lifetime).
 
+        For LoRA adapters (repos containing adapter_config.json) the size of
+        the base model is added so that VRAM requirements are not
+        underestimated.
+
         Returns 0 on any failure.
         """
         if model_id in MultiModelManager._hf_size_cache:
@@ -1548,10 +1552,19 @@ class MultiModelManager:
 
         weight_exts = {'.safetensors', '.bin', '.gguf', '.ggml', '.pt'}
 
+        def _resolve_base_model(base_model_id: str) -> int:
+            from codai.models.cache import is_huggingface_model_id
+            if not base_model_id or base_model_id == model_id:
+                return 0
+            if not is_huggingface_model_id(base_model_id):
+                return 0
+            return MultiModelManager._hf_cached_model_size_bytes(base_model_id)
+
         # --- Try local HF hub cache first (no network) ---
         try:
             from huggingface_hub import scan_cache_dir
             from codai.models.cache import get_all_cache_dirs
+            import json as _json
             hf_dir = get_all_cache_dirs().get("huggingface")
             if hf_dir:
                 info = scan_cache_dir(hf_dir)
@@ -1560,11 +1573,26 @@ class MultiModelManager:
                         continue
                     revs = sorted(repo.revisions, key=lambda r: r.last_modified, reverse=True)
                     if revs:
+                        rev = revs[0]
                         total = sum(
                             f.size_on_disk
-                            for f in revs[0].files
+                            for f in rev.files
                             if os.path.splitext(f.file_name)[1].lower() in weight_exts
                         )
+                        # LoRA adapter: add base model size
+                        for f in rev.files:
+                            if f.file_name == "adapter_config.json":
+                                try:
+                                    with open(f.file_path) as fp:
+                                        adapter_cfg = _json.load(fp)
+                                    base_id = (
+                                        adapter_cfg.get("base_model_name_or_path")
+                                        or adapter_cfg.get("base_model")
+                                    )
+                                    total += _resolve_base_model(base_id)
+                                except Exception:
+                                    pass
+                                break
                         if total > 0:
                             MultiModelManager._hf_size_cache[model_id] = total
                             return total
@@ -1580,13 +1608,31 @@ class MultiModelManager:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = _json.loads(resp.read())
             total = 0
+            has_adapter_config = False
             for sib in data.get("siblings", []):
                 name = sib.get("rfilename", "")
+                if name == "adapter_config.json":
+                    has_adapter_config = True
+                    continue
                 if os.path.splitext(name)[1].lower() not in weight_exts:
                     continue
                 lfs = sib.get("lfs") or {}
                 size = lfs.get("size") or sib.get("size") or 0
                 total += size
+            # LoRA adapter: fetch adapter_config.json to get the base model
+            if has_adapter_config:
+                try:
+                    cfg_url = f"https://huggingface.co/{model_id}/resolve/main/adapter_config.json"
+                    cfg_req = urllib.request.Request(cfg_url, headers={"User-Agent": "coderai/1.0"})
+                    with urllib.request.urlopen(cfg_req, timeout=10) as resp:
+                        adapter_cfg = _json.loads(resp.read())
+                    base_id = (
+                        adapter_cfg.get("base_model_name_or_path")
+                        or adapter_cfg.get("base_model")
+                    )
+                    total += _resolve_base_model(base_id)
+                except Exception:
+                    pass
             if total > 0:
                 MultiModelManager._hf_size_cache[model_id] = total
                 return total
@@ -2101,9 +2147,12 @@ class MultiModelManager:
                 needed_gb = self._get_model_used_vram_gb(model_key, resolved_name)
                 free_gb = self._get_free_vram_gb()
 
-                if needed_gb > 0 and free_gb >= needed_gb:
+                # Require headroom beyond raw weight size for activation buffers
+                # and generation scratch (30% of model size + 1 GB base).
+                headroom_gb = max(1.0, needed_gb * 0.30)
+                if needed_gb > 0 and free_gb >= needed_gb + headroom_gb:
                     print(f"Ondemand mode - keeping '{loaded_canonical}' in VRAM alongside new model "
-                          f"(need {needed_gb:.1f} GB, have {free_gb:.1f} GB free)")
+                          f"(need {needed_gb:.1f} GB + {headroom_gb:.1f} GB headroom, have {free_gb:.1f} GB free)")
                 else:
                     print(f"Ondemand mode - model switch detected:")
                     print(f"  Requested: '{model_key}' (resolved: '{resolved_name}')")

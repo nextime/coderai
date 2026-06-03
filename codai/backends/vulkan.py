@@ -41,11 +41,44 @@ except (ImportError, AttributeError):
 try:
     from llama_cpp import Llama
     from llama_cpp.llama_chat_format import ChatFormatterResponse
+    import llama_cpp as _llama_cpp
     LLAMA_CPP_AVAILABLE = True
 except ImportError:
     LLAMA_CPP_AVAILABLE = False
     Llama = None
     ChatFormatterResponse = None
+    _llama_cpp = None
+
+
+def _install_layer_log_callback():
+    """Replace llama.cpp's log callback with one that prints load-time layer/buffer
+    messages directly to stdout.  Returns the callback object — keep a reference
+    alive for the duration of the load so ctypes doesn't garbage-collect it."""
+    if _llama_cpp is None:
+        return None
+
+    # Keywords that identify interesting load-phase messages
+    _KEEP = (
+        'llm_load_tensors', 'llm_load_print_meta',
+        'offload', 'layer', 'buffer size', 'buffer type',
+        'GPU', 'CUDA', 'Vulkan', 'Metal', 'ROCm', 'SYCL',
+        'CPU', 'VRAM', 'n_layer', 'n_gpu_layers',
+    )
+
+    @_llama_cpp.llama_log_callback
+    def _cb(level, text, user_data):
+        try:
+            msg = (text.decode('utf-8', errors='replace') if isinstance(text, bytes) else str(text)).rstrip()
+            if msg and any(k in msg for k in _KEEP):
+                print(f"  [llama.cpp] {msg}", flush=True)
+        except Exception:
+            pass
+
+    try:
+        _llama_cpp.llama_log_set(_cb, None)
+    except Exception:
+        return None
+    return _cb  # caller must hold this reference
 
 
 class VulkanBackend(ModelBackend):
@@ -450,17 +483,18 @@ class VulkanBackend(ModelBackend):
             # Try to find GGUF files in the repository
             try:
                 from huggingface_hub import list_repo_files, hf_hub_download
+                from codai.models.cache import get_hf_hub_cache_dir
                 print(f"DEBUG: Searching for GGUF files in {model_path}...")
                 files = list(list_repo_files(model_path, repo_type="model"))
                 gguf_files = [f for f in files if f.lower().endswith('.gguf')]
-                
+
                 if gguf_files:
                     # Prefer Q4_K_M or Q4_K quantizations, otherwise use first available
                     preferred = [f for f in gguf_files if 'q4_k_m' in f.lower() or 'q4_k' in f.lower()]
                     selected = preferred[0] if preferred else gguf_files[0]
                     print(f"DEBUG: Found GGUF files: {gguf_files}")
                     print(f"DEBUG: Selected: {selected}")
-                    model_path = hf_hub_download(repo_id=model_path, filename=selected, cache_dir=kwargs.get('cache_dir'))
+                    model_path = hf_hub_download(repo_id=model_path, filename=selected, cache_dir=kwargs.get('cache_dir') or get_hf_hub_cache_dir())
                     print(f"DEBUG: Downloaded: {model_path}")
                 else:
                     print(f"Warning: No GGUF files found in {model_path}, trying direct download...")
@@ -471,8 +505,9 @@ class VulkanBackend(ModelBackend):
             # Try to get from HuggingFace
             try:
                 from huggingface_hub import hf_hub_download
+                from codai.models.cache import get_hf_hub_cache_dir
                 # Download the GGUF file
-                model_path = hf_hub_download(repo_id=model_path, filename="*.gguf", cache_dir=kwargs.get('cache_dir'))
+                model_path = hf_hub_download(repo_id=model_path, filename="*.gguf", cache_dir=kwargs.get('cache_dir') or get_hf_hub_cache_dir())
             except Exception as e:
                 print(f"Warning: Could not download from HuggingFace: {e}")
                 # Try as-is
@@ -557,18 +592,41 @@ class VulkanBackend(ModelBackend):
             os.environ['CUDA_VISIBLE_DEVICES'] = '0'
             # llama-cpp-python will use CUDA when available
         
+        # Pre-load summary
+        gpu_label = "all" if self.n_gpu_layers == -1 else str(self.n_gpu_layers)
+        print(f"  n_gpu_layers : {gpu_label}  |  n_ctx : {self.n_ctx}  |  main_gpu : {self.main_gpu}")
+        if _llama_cpp:
+            gpu_supported = _llama_cpp.llama_supports_gpu_offload()
+            print(f"  GPU offload  : {'supported' if gpu_supported else 'NOT supported by this build'}")
+
+        _log_cb = _install_layer_log_callback()
         try:
             self.model = Llama(**llama_kwargs)
-            
-            # Try to detect and set up chat template
-            self._finalize_chat_template_detection()
-            
-            print(f"DEBUG: VulkanBackend loaded model: {model_path}")
-            print(f"DEBUG: n_gpu_layers={self.n_gpu_layers}, n_ctx={self.n_ctx}, no_ram={no_ram}")
-            print(f"DEBUG: chat_template={self.chat_template}")
         except Exception as e:
             print(f"Error loading GGUF model: {e}")
             raise
+        finally:
+            # Restore llama.cpp's default (quiet) logging after load
+            if _llama_cpp:
+                try:
+                    _llama_cpp.llama_log_set(None, None)
+                except Exception:
+                    pass
+            _log_cb = None  # release callback
+
+        # Post-load layer/buffer summary
+        try:
+            n_total = _llama_cpp.llama_model_n_layer(self.model.model)
+            n_gpu_actual = n_total if self.n_gpu_layers == -1 else min(self.n_gpu_layers, n_total)
+            n_cpu = n_total - n_gpu_actual
+            print(f"  Layers total : {n_total}")
+            print(f"  Layers → GPU : {n_gpu_actual}  |  Layers → CPU : {n_cpu}")
+        except Exception:
+            pass
+
+        # Try to detect and set up chat template
+        self._finalize_chat_template_detection()
+        print(f"  chat_template: {self.chat_template}")
     
     def generate(
         self,

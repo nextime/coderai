@@ -9,8 +9,9 @@ class BrokerRequestEnvelope:
     """Normalized broker request payload."""
 
     request_id: str
-    method: str
-    path: str
+    op: str
+    method: str = "GET"
+    path: str = ""
     headers: Dict[str, str] = field(default_factory=dict)
     query: Dict[str, Any] = field(default_factory=dict)
     payload: Any = None
@@ -22,9 +23,13 @@ class BrokerRequestEnvelope:
 
         if not self.request_id or not isinstance(self.request_id, str):
             raise ValueError("request_id is required")
+        if not self.op or not isinstance(self.op, str):
+            raise ValueError("op is required")
+        if self.op != "proxy" and not self.path:
+            raise ValueError("path is required")
         if not self.method or not isinstance(self.method, str):
             raise ValueError("method is required")
-        if not self.path or not isinstance(self.path, str):
+        if self.path and not isinstance(self.path, str):
             raise ValueError("path is required")
 
 
@@ -32,8 +37,9 @@ def success_envelope(request_id: str, payload: Any, event: str | None = None, me
     """Build a success response envelope."""
 
     envelope = {
+        "v": 1,
         "request_id": request_id,
-        "ok": True,
+        "status": "ok",
         "payload": payload,
     }
     if event is not None:
@@ -53,7 +59,8 @@ def error_envelope(request_id: str, code: str, message: str, details: Dict[str, 
     if details is not None:
         error["details"] = details
     return {
+        "v": 1,
         "request_id": request_id,
-        "ok": False,
+        "status": "error",
         "error": error,
     }

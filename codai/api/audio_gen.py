@@ -43,12 +43,23 @@ global_file_path = None
 _aud_progress: dict = {
     "current": 0, "total": 0, "active": False,
     "started_at": 0.0, "it_per_s": 0.0, "unit": "it",
+    "phase": "idle", "model": "",
 }
+
+def _aud_progress_loading(model_name: str = ""):
+    _aud_progress["phase"] = "loading"
+    _aud_progress["active"] = True
+    _aud_progress["current"] = 0
+    _aud_progress["total"] = 0
+    _aud_progress["it_per_s"] = 0.0
+    _aud_progress["started_at"] = time.monotonic()
+    _aud_progress["model"] = model_name or ""
 
 def _aud_progress_reset(total: int, unit: str = "it"):
     _aud_progress["current"] = 0
     _aud_progress["total"] = total
     _aud_progress["active"] = True
+    _aud_progress["phase"] = "generating"
     _aud_progress["started_at"] = time.monotonic()
     _aud_progress["it_per_s"] = 0.0
     _aud_progress["unit"] = unit
@@ -56,6 +67,7 @@ def _aud_progress_reset(total: int, unit: str = "it"):
 def _aud_progress_done():
     _aud_progress["current"] = max(_aud_progress["current"], _aud_progress["total"])
     _aud_progress["active"] = False
+    _aud_progress["phase"] = "idle"
 
 def _aud_progress_step(step: int):
     _aud_progress["current"] = step
@@ -196,6 +208,8 @@ async def get_audio_progress():
         "current":  current,
         "total":    total,
         "active":   _aud_progress["active"],
+        "phase":    _aud_progress.get("phase", "idle"),
+        "model":    _aud_progress.get("model", ""),
         "pct":      int(current / total * 100) if total > 0 else 0,
         "it_per_s": _aud_progress["it_per_s"],
         "elapsed":  round(elapsed, 1),
@@ -209,6 +223,7 @@ async def audio_generate(request: AudioGenerationRequest, http_request: Request 
     Generate music, sound effects, or ambient audio.
     Compatible models: MusicGen, AudioGen, AudioLDM2, StableAudio.
     """
+    _aud_progress_loading(request.model or "audio")
     model_info = multi_model_manager.request_model(request.model, model_type="audio_gen")
     model_name = model_info.get('model_name')
     if not model_name:

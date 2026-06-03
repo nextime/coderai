@@ -28,8 +28,9 @@ async def test_stream_chunk_envelope_preserves_request_id_and_order():
     )
 
     assert chunk_one == {
+        "v": 1,
         "request_id": "req-stream",
-        "ok": True,
+        "status": "ok",
         "event": "stream",
         "payload": {
             "sequence": 0,
@@ -37,8 +38,9 @@ async def test_stream_chunk_envelope_preserves_request_id_and_order():
         },
     }
     assert chunk_two == {
+        "v": 1,
         "request_id": "req-stream",
-        "ok": True,
+        "status": "ok",
         "event": "stream",
         "payload": {
             "sequence": 1,
@@ -56,8 +58,9 @@ async def test_finalize_stream_attaches_metrics():
     )
 
     assert response == {
+        "v": 1,
         "request_id": "req-stream",
-        "ok": True,
+        "status": "ok",
         "event": "stream_end",
         "payload": {
             "total_chunks": 2,
@@ -82,6 +85,7 @@ async def test_execute_broker_request_wraps_streaming_response_metadata():
 
     envelope = BrokerRequestEnvelope(
         request_id="req-stream-route",
+        op="proxy",
         method="GET",
         path="/v1/chat/completions",
         stream=True,
@@ -89,9 +93,9 @@ async def test_execute_broker_request_wraps_streaming_response_metadata():
 
     response = await execute_broker_request(app, envelope)
 
-    assert set(response) == {"request_id", "ok", "payload", "metrics"}
+    assert set(response) == {"v", "request_id", "status", "payload", "metrics"}
     assert response["request_id"] == "req-stream-route"
-    assert response["ok"] is True
+    assert response["status"] == "ok"
     assert response["payload"] == {
         "status_code": 200,
         "headers": {
@@ -127,6 +131,7 @@ async def test_brokered_streaming_route_preserves_event_stream_body():
 
     envelope = BrokerRequestEnvelope(
         request_id="req-stream-equivalence",
+        op="proxy",
         method="GET",
         path="/v1/chat/completions",
         headers={"accept": "text/event-stream"},
@@ -135,7 +140,7 @@ async def test_brokered_streaming_route_preserves_event_stream_body():
 
     brokered_response = await execute_broker_request(app, envelope)
 
-    assert brokered_response["ok"] is True
+    assert brokered_response["status"] == "ok"
     assert brokered_response["payload"]["status_code"] == direct_status_code
     assert brokered_response["payload"]["content_type"] == direct_content_type
     assert brokered_response["payload"]["headers"]["content-type"] == direct_content_type
