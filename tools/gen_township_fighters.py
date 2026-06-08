@@ -503,6 +503,40 @@ class CoderAIClient:
         r.raise_for_status()
         return r.json()
 
+    def _delete(self, path: str) -> dict:
+        r = self.session.delete(f"{self.base}{path}", timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    def _patch(self, path: str, body: dict) -> dict:
+        r = self.session.patch(f"{self.base}{path}", json=body, timeout=60)
+        if not r.ok:
+            raise RuntimeError(f"PATCH {path} → {r.status_code}: {r.text[:400]}")
+        return r.json()
+
+    def delete_profile(self, kind: str, name: str) -> dict:
+        plural = "characters" if kind == "character" else "environments"
+        return self._delete(f"/v1/{plural}/{name}")
+
+    def patch_profile(self, kind: str, name: str, description: str = None,
+                      remove_indices: list = None, add_images: list = None) -> dict:
+        plural = "characters" if kind == "character" else "environments"
+        body = {}
+        if description is not None:
+            body["description"] = description
+        if remove_indices:
+            body["remove_indices"] = remove_indices
+        if add_images:
+            # Each entry may be a data-uri/base64 str or a {data,label} dict.
+            imgs = []
+            for j, im in enumerate(add_images):
+                if isinstance(im, dict):
+                    imgs.append(im)
+                else:
+                    imgs.append({"data": im, "label": f"regen_{j:02d}"})
+            body["add_images"] = imgs
+        return self._patch(f"/v1/{plural}/{name}", body)
+
     def list_models(self) -> list:
         return self._get("/v1/models").get("data", [])
 
@@ -561,7 +595,7 @@ class CoderAIClient:
                        character_profiles: list = None,
                        loras: list = None, character_strength: float = 0.7,
                        size: str = "512x512", steps: int = 28,
-                       seed: int = None) -> bytes:
+                       seed: int = None, environment_profiles: list = None) -> bytes:
         """Generate a single still image (used for keyframes). Returns PNG bytes."""
         w, h = size.split("x")
         body = {
@@ -571,6 +605,9 @@ class CoderAIClient:
         }
         if character_profiles:
             body["character_profiles"] = list(character_profiles)
+            body["character_strength"] = character_strength
+        if environment_profiles:
+            body["environment_profiles"] = list(environment_profiles)
             body["character_strength"] = character_strength
         if loras:
             body["loras"] = loras
@@ -588,13 +625,17 @@ class CoderAIClient:
         return base64.b64decode(raw)
 
     def train_lora(self, name: str, base_model: str, character: str = None,
-                   images: list = None, steps: int = 800, rank: int = 16,
+                   environment: str = None, images: list = None,
+                   steps: int = 800, rank: int = 16,
                    resolution: int = 512) -> dict:
-        """Train a per-character LoRA on the server. Blocks until complete."""
+        """Train a per-character or per-environment LoRA on the server.
+        Blocks until complete."""
         body = {"name": name, "base_model": base_model,
                 "steps": int(steps), "rank": int(rank), "resolution": int(resolution)}
         if character:
             body["character"] = character
+        if environment:
+            body["environment"] = environment
         if images:
             body["images"] = images
         return self._post("/v1/loras/train", body)
@@ -1108,6 +1149,7 @@ CONFIG_FIELDS = [
     "only_prompts", "only_videos",
     "consistency", "keyframe_steps", "keyframe_size",
     "character_strength", "lora_steps", "lora_rank", "lora_weight",
+    "no_env_loras", "env_lora_steps", "env_lora_rank", "env_lora_weight",
     "web_port",
 ]
 
@@ -1190,18 +1232,38 @@ def _lora_specs_for(fighters: list, lora_map: dict, weight: float) -> list:
     return specs
 
 
-def stage_loras(client: CoderAIClient, image_model: str, out_dir: Path,
-                char_names: list, lora_steps: int = 800, lora_rank: int = 16) -> dict:
-    """Train one identity LoRA per fighter (server-side). Returns {fighter: lora_path}.
+def _env_lora_specs_for(env: str, env_lora_map: dict, weight: float) -> list:
+    """Build the `loras` request entry for the environment used in a clip."""
+    if not env:
+        return []
+    path = (env_lora_map or {}).get(env)
+    if path:
+        return [{"model": path, "weight": float(weight), "name": f"env_{env}"}]
+    return []
 
-    Resumable: skips fighters whose LoRA already exists locally (loras.json) or on
-    the server. All training is grouped here so the image base model is touched
-    once for the whole batch.
+
+# Per-kind LoRA training parameters: server name prefix, local cache file,
+# the train_lora keyword used to pull reference images, and a friendly label.
+_LORA_KINDS = {
+    "character":   {"prefix": "fighter_", "file": "loras.json",     "label": "Character"},
+    "environment": {"prefix": "env_",     "file": "env_loras.json", "label": "Environment"},
+}
+
+
+def _train_profile_loras(client: CoderAIClient, image_model: str, out_dir: Path,
+                         names: list, kind: str,
+                         lora_steps: int = 800, lora_rank: int = 16) -> dict:
+    """Train one identity LoRA per profile of `kind` (server-side).
+
+    Returns {name: lora_path}. Resumable: skips profiles whose LoRA already
+    exists locally (<kind>_loras.json) or on the server. All training is grouped
+    here so the image base model is touched once for the whole batch.
     """
+    spec = _LORA_KINDS[kind]
     _log("\n" + "═" * 60)
-    _log("  STAGE — Character LoRA training")
+    _log(f"  STAGE — {spec['label']} LoRA training")
     _log("═" * 60)
-    lora_file = out_dir / "loras.json"
+    lora_file = out_dir / spec["file"]
     lora_map = {}
     if lora_file.exists():
         try:
@@ -1218,28 +1280,29 @@ def stage_loras(client: CoderAIClient, image_model: str, out_dir: Path,
         try:
             lora_file.write_text(json.dumps(lora_map, indent=2))
         except Exception as e:
-            _log(f"    ⚠ could not save loras.json: {e}")
+            _log(f"    ⚠ could not save {spec['file']}: {e}")
 
-    for i, name in enumerate(char_names, 1):
-        lora_name = f"fighter_{name}"
+    for i, name in enumerate(names, 1):
+        lora_name = f"{spec['prefix']}{name}"
         # Already trained and recorded?
         cur = lora_map.get(name)
         if cur and Path(cur).exists():
-            _log(f"  [{i}/{len(char_names)}] {name}: reusing trained LoRA")
+            _log(f"  [{i}/{len(names)}] {name}: reusing trained LoRA")
             continue
         if lora_name in existing and existing[lora_name]:
             lora_map[name] = existing[lora_name]
             _save()
-            _log(f"  [{i}/{len(char_names)}] {name}: found existing LoRA on server")
+            _log(f"  [{i}/{len(names)}] {name}: found existing LoRA on server")
             continue
-        _log(f"  [{i}/{len(char_names)}] {name}: training LoRA "
+        _log(f"  [{i}/{len(names)}] {name}: training LoRA "
              f"({lora_steps} steps, rank {lora_rank}) — this can take a while…")
+        train_kwargs = dict(name=lora_name, base_model=image_model,
+                            steps=lora_steps, rank=lora_rank)
+        train_kwargs[kind] = name  # character=name OR environment=name
         try:
             res = _run_with_spinner(
-                f"training LoRA '{name}'",
-                client.train_lora,
-                name=lora_name, base_model=image_model, character=name,
-                steps=lora_steps, rank=lora_rank,
+                f"training {kind} LoRA '{name}'",
+                client.train_lora, **train_kwargs,
             )
             path = res.get("path")
             if path:
@@ -1251,14 +1314,29 @@ def stage_loras(client: CoderAIClient, image_model: str, out_dir: Path,
         except Exception as e:
             _log(f"    ✗ LoRA training failed for {name}: {e}")
 
-    _log(f"\n  LoRAs ready: {len(lora_map)}/{len(char_names)}")
+    _log(f"\n  {spec['label']} LoRAs ready: {len(lora_map)}/{len(names)}")
     return lora_map
+
+
+def stage_loras(client: CoderAIClient, image_model: str, out_dir: Path,
+                char_names: list, lora_steps: int = 800, lora_rank: int = 16) -> dict:
+    """Train one identity LoRA per fighter. Returns {fighter: lora_path}."""
+    return _train_profile_loras(client, image_model, out_dir, char_names,
+                                "character", lora_steps, lora_rank)
+
+
+def stage_env_loras(client: CoderAIClient, image_model: str, out_dir: Path,
+                    env_names: list, lora_steps: int = 800, lora_rank: int = 16) -> dict:
+    """Train one identity LoRA per environment. Returns {environment: lora_path}."""
+    return _train_profile_loras(client, image_model, out_dir, env_names,
+                                "environment", lora_steps, lora_rank)
 
 
 def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: Path,
                         fight_plan: list, outcome_plan: list, consistency: set,
                         lora_map: dict, char_strength: float, keyframe_steps: int,
-                        keyframe_size: str, lora_weight: float):
+                        keyframe_size: str, lora_weight: float,
+                        env_lora_map: dict = None, env_lora_weight: float = 0.8):
     """Generate one keyframe still per clip (image model). Saved as PNG keyed by
     the clip's output stem so the render phase can pick them up as init images.
     Resumable: existing PNGs are kept."""
@@ -1284,7 +1362,10 @@ def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: P
             skipped += 1
             continue
         profiles = list(fighters) if use_ip else None
-        loras = _lora_specs_for(fighters, lora_map, lora_weight) if use_lora else None
+        loras = None
+        if use_lora:
+            loras = (_lora_specs_for(fighters, lora_map, lora_weight)
+                     + _env_lora_specs_for(env, env_lora_map, env_lora_weight)) or None
         kf_prompt = prompt
         if env:
             kf_prompt = f"[{env} location] " + kf_prompt
@@ -1315,7 +1396,8 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
                  consistency: set = None, image_model: str = None,
                  lora_map: dict = None, char_strength: float = 0.7,
                  keyframe_steps: int = 28, keyframe_size: str = "512x512",
-                 lora_weight: float = 0.85, keyframes_only: bool = False):
+                 lora_weight: float = 0.85, keyframes_only: bool = False,
+                 env_lora_map: dict = None, env_lora_weight: float = 0.8):
     _log("\n" + "═" * 60)
     _log("  STAGE 3 — Videos")
     _log("═" * 60)
@@ -1338,7 +1420,8 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
         _generate_keyframes(client, image_model, keyframe_dir,
                             saved.get("fight_plan", []), saved.get("outcome_plan", []),
                             consistency or {"prompt", "keyframe"}, lora_map or {},
-                            char_strength, keyframe_steps, keyframe_size, lora_weight)
+                            char_strength, keyframe_steps, keyframe_size, lora_weight,
+                            env_lora_map=env_lora_map or {}, env_lora_weight=env_lora_weight)
         return
 
     consistency = consistency or {"prompt"}
@@ -1377,14 +1460,16 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
         if use_keyframe and image_model:
             _generate_keyframes(client, image_model, keyframe_dir,
                                 fight_plan, outcome_plan, consistency, lora_map,
-                                char_strength, keyframe_steps, keyframe_size, lora_weight)
+                                char_strength, keyframe_steps, keyframe_size, lora_weight,
+                                env_lora_map=env_lora_map or {}, env_lora_weight=env_lora_weight)
         # Jump straight to Phase 3 (rendering) below.
         return _stage_videos_render(
             client, video_model, video_dir, fight_plan, outcome_plan,
             total_matches, total_outcomes, fps, clip_delay,
             consistency=consistency, lora_map=lora_map,
             keyframe_dir=keyframe_dir if use_keyframe else None,
-            lora_weight=lora_weight)
+            lora_weight=lora_weight,
+            env_lora_map=env_lora_map or {}, env_lora_weight=env_lora_weight)
 
     # =========================================================================
     # PHASE 1 — PLAN every clip up front (no API calls).
@@ -1520,25 +1605,28 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
     if use_keyframe and image_model:
         _generate_keyframes(client, image_model, keyframe_dir,
                             fight_plan, outcome_plan, consistency, lora_map,
-                            char_strength, keyframe_steps, keyframe_size, lora_weight)
+                            char_strength, keyframe_steps, keyframe_size, lora_weight,
+                            env_lora_map=env_lora_map or {}, env_lora_weight=env_lora_weight)
 
     return _stage_videos_render(
         client, video_model, video_dir, fight_plan, outcome_plan,
         total_matches, total_outcomes, fps, clip_delay,
         consistency=consistency, lora_map=lora_map,
         keyframe_dir=keyframe_dir if use_keyframe else None,
-        lora_weight=lora_weight)
+        lora_weight=lora_weight,
+        env_lora_map=env_lora_map or {}, env_lora_weight=env_lora_weight)
 
 
 def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_plan,
                          total_matches, total_outcomes, fps, clip_delay,
                          consistency=None, lora_map=None, keyframe_dir=None,
-                         lora_weight=0.85):
+                         lora_weight=0.85, env_lora_map=None, env_lora_weight=0.8):
     """PHASE 3 — render ALL videos from pre-written prompts (video model stays loaded)."""
     _log("\n  ── Phase B — rendering all videos (video model) ──")
     render_start = time.monotonic()
     consistency = consistency or {"prompt"}
     lora_map = lora_map or {}
+    env_lora_map = env_lora_map or {}
     use_lora = "lora" in consistency
 
     def _keyframe_bytes(stem: str):
@@ -1555,7 +1643,10 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
     def _render(label, prompt, profiles, env, nf, out_path, stem=None, fighters=None):
         """Render one clip; returns (ok, duration_or_None, fatal)."""
         init_image = _keyframe_bytes(stem) if stem else None
-        loras = _lora_specs_for(fighters or profiles or [], lora_map, lora_weight) if use_lora else None
+        loras = None
+        if use_lora:
+            loras = (_lora_specs_for(fighters or profiles or [], lora_map, lora_weight)
+                     + _env_lora_specs_for(env, env_lora_map, env_lora_weight)) or None
         try:
             mp4 = _run_with_spinner(
                 label, client.generate_video_clip,
@@ -1710,6 +1801,7 @@ def launch_web_ui(default_args):
     _state = {
         "running": False,
         "done": False,
+        "current": "",            # label of the run currently/last executing
         "log_lines": [],          # all lines so far (for late-joining SSE clients)
         "abort": threading.Event(),
         "jobs": {},               # job_id -> {status, progress, output, error}
@@ -1832,6 +1924,108 @@ def launch_web_ui(default_args):
         except Exception as exc:
             _fail(str(exc))
 
+    def _next_ref_path(base: Path, ext: str = ".png") -> Path:
+        """Return the next free ref_NN path in a profile folder. The index is
+        unique across extensions so ref_00.png and ref_00.jpg can't coexist."""
+        i = 0
+        while True:
+            if not any((base / f"ref_{i:02d}{e}").exists()
+                       for e in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
+                return base / f"ref_{i:02d}{ext}"
+            i += 1
+
+    def _run_regen_job(job_id: str, kind: str, name: str, count: int, guide: bool):
+        """Generate `count` NEW reference images for a profile and APPEND them,
+        preserving every existing (non-deleted) image. Runs server-side image
+        generation; updates job progress for the profile page to poll."""
+        with _jobs_lock:
+            _state["jobs"][job_id] = {"status": "running", "progress": 3,
+                                      "output": None, "error": None,
+                                      "_msg": "starting…", "added": 0}
+
+        def _prog(pct, msg=""):
+            with _jobs_lock:
+                _state["jobs"][job_id]["progress"] = pct
+                if msg:
+                    _state["jobs"][job_id]["_msg"] = msg
+
+        def _fail(msg):
+            with _jobs_lock:
+                _state["jobs"][job_id].update({"status": "error", "error": msg})
+
+        try:
+            base = out_dir / (kind + "s") / name
+            meta = {}
+            try:
+                meta = json.loads((base / "meta.json").read_text())
+            except Exception:
+                pass
+            # Build a generation prompt from the saved profile.
+            prompt = (meta.get("prompt") or meta.get("description") or name).strip()
+            if kind == "environment":
+                size = "768x512"
+            else:
+                size = "512x512"
+
+            client = CoderAIClient(default_args.base_url,
+                                   getattr(default_args, "api_key", None))
+            _prog(8, "selecting image model…")
+            model = getattr(default_args, "image_model", None)
+            if not model:
+                try:
+                    model = pick_model(client, "image", None)
+                except Exception as e:
+                    _fail(f"no image model available: {e}")
+                    return
+
+            # Guide new images with the surviving references via IP-Adapter so
+            # regenerated refs match the ones the user kept. Characters use
+            # character_profiles; environments use environment_profiles.
+            char_p = [name] if (guide and kind == "character") else None
+            env_p = [name] if (guide and kind == "environment") else None
+
+            base.mkdir(parents=True, exist_ok=True)
+            added_uris = []
+            for k in range(count):
+                _prog(int(10 + 80 * k / max(1, count)),
+                      f"generating image {k+1}/{count}…")
+                try:
+                    img = client.generate_image(
+                        prompt=prompt, model=model,
+                        character_profiles=char_p, environment_profiles=env_p,
+                        character_strength=0.7,
+                        size=size, steps=28, seed=random.randint(0, 2**31),
+                    )
+                except Exception as e:
+                    _web_log(f"  ✗ regen image {k+1}/{count} for {name} failed: {e}")
+                    continue
+                out_png = _next_ref_path(base)
+                out_png.write_bytes(img)
+                added_uris.append("data:image/png;base64," +
+                                  base64.b64encode(img).decode())
+
+            if not added_uris:
+                _fail("no images were generated")
+                return
+
+            # Append to the CoderAI server profile too (best-effort), so video
+            # and keyframe generation that resolves this profile sees them.
+            _prog(94, "syncing new images to CoderAI…")
+            synced = True
+            try:
+                client.patch_profile(kind, name, add_images=added_uris)
+            except Exception:
+                synced = False
+
+            with _jobs_lock:
+                _state["jobs"][job_id].update({
+                    "status": "done", "progress": 100,
+                    "added": len(added_uris), "synced": synced,
+                    "_msg": f"added {len(added_uris)} image(s)",
+                })
+        except Exception as exc:
+            _fail(str(exc))
+
     def _web_log(msg: str):
         """Override _log so output goes to both stdout and the web log queue."""
         print(msg, flush=True)
@@ -1886,6 +2080,7 @@ input[type=checkbox]{width:auto;accent-color:#f5a623;margin-right:.3rem}
          height:340px;overflow-y:auto;font-family:monospace;font-size:.78rem;
          line-height:1.55;white-space:pre-wrap;word-break:break-all}
 #log-box .info{color:#9ad89a}#log-box .warn{color:#f5c842}#log-box .err{color:#e07070}
+#log-box .head{color:#f5a623;font-weight:700}
 .status-pill{display:inline-block;padding:.2rem .55rem;border-radius:10px;
              font-size:.72rem;font-weight:700}
 .status-idle{background:#333;color:#888}
@@ -1920,11 +2115,28 @@ input[type=checkbox]{width:auto;accent-color:#f5a623;margin-right:.3rem}
 .progress-fill{height:100%;background:#f5a623;border-radius:4px;transition:width .4s}
 .job-status{font-size:.78rem;margin-top:.4rem;min-height:1.2rem}
 .job-status.done{color:#7ed87e}.job-status.error{color:#e07070}
+/* profile editor */
+textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5rem;
+         border-radius:4px;width:100%;font-size:.85rem;font-family:inherit;
+         resize:vertical;min-height:3rem}
+.pf-head{display:flex;justify-content:space-between;align-items:center;gap:.6rem}
+.pf-name{font-weight:700;color:#f5a623;font-size:1.05rem}
+.pf-thumbs{display:flex;gap:.4rem;flex-wrap:wrap;margin:.5rem 0}
+.pf-thumb{position:relative;width:92px;height:92px}
+.pf-thumb img{width:92px;height:92px;object-fit:cover;border-radius:4px;background:#111}
+.pf-thumb-del{position:absolute;top:2px;right:2px;background:rgba(192,57,43,.92);color:#fff;
+              border:none;border-radius:3px;cursor:pointer;font-size:.7rem;
+              width:18px;height:18px;line-height:1;padding:0}
+.pf-thumb-del:hover{background:#c0392b}
+.pf-status{font-size:.76rem;color:#7ed87e;min-height:1.1rem;margin-left:.5rem}
+.pf-actions{display:flex;gap:.5rem;align-items:center;margin-top:.7rem}
 """
 
     def _page(title, body, active="run"):
         nav_items = [
             ("run", "/", "▶ Run"),
+            ("characters", "/characters", "👤 Characters"),
+            ("environments", "/environments", "🏞 Environments"),
             ("gallery", "/gallery", "🎬 Gallery"),
         ]
         nav = "".join(
@@ -1940,8 +2152,15 @@ input[type=checkbox]{width:auto;accent-color:#f5a623;margin-right:.3rem}
 </body></html>"""
 
     def _run_page_html(args_ns):
+        import json as _json
         def _v(attr, default=""): return getattr(args_ns, attr, default)
         def _c(attr): return " checked" if getattr(args_ns, attr, False) else ""
+
+        # If the script was launched with -c/--config, the Save button defaults
+        # to that same path so saving overwrites the loaded config file.
+        _cfg_arg = getattr(args_ns, "config", None)
+        _save_default = os.path.abspath(_cfg_arg) if _cfg_arg else "township_config.json"
+        _save_default_js = _json.dumps(_save_default)
 
         char_mode = ("reuse" if _v("reuse_fighters") else
                      "fighters" if _v("fighters") else
@@ -2076,13 +2295,25 @@ input[type=checkbox]{width:auto;accent-color:#f5a623;margin-right:.3rem}
     </div>
   </div>
   <div id=lora_fields style="margin-top:.6rem">
-    <div class=row>
+    <label style="margin-top:0">Character LoRAs <span class=hint>(per-fighter identity)</span></label>
+    <div class=row3>
       <div><label>LoRA train steps</label>
            <input name=lora_steps type=number min=100 max=3000 step=50 value="{_v('lora_steps', 800)}"></div>
       <div><label>LoRA rank</label>
            <input name=lora_rank type=number min=2 max=128 value="{_v('lora_rank', 16)}"></div>
       <div><label>LoRA weight <span class=hint>(at generation)</span></label>
            <input name=lora_weight type=number min=0 max=2 step=0.05 value="{_v('lora_weight', 0.85)}"></div>
+    </div>
+    <div style="margin-top:.6rem">
+      <label><input type=checkbox name=env_loras{"" if _v('no_env_loras') else " checked"}> Also train per-environment LoRAs <span class=hint>(lock each location’s look)</span></label>
+    </div>
+    <div class=row3 style="margin-top:.4rem">
+      <div><label>Env LoRA train steps</label>
+           <input name=env_lora_steps type=number min=100 max=3000 step=50 value="{_v('env_lora_steps', 800)}"></div>
+      <div><label>Env LoRA rank</label>
+           <input name=env_lora_rank type=number min=2 max=128 value="{_v('env_lora_rank', 16)}"></div>
+      <div><label>Env LoRA weight <span class=hint>(at generation)</span></label>
+           <input name=env_lora_weight type=number min=0 max=2 step=0.05 value="{_v('env_lora_weight', 0.8)}"></div>
     </div>
   </div>
 </div>
@@ -2139,11 +2370,13 @@ async function runStep(step){{
   if(j.error){{ appendLog('✗ '+j.error); return; }}
   setStatus(true,false);
   startSSE();
+  setTimeout(refreshStatus, 500);
 }}
 async function saveConfig(){{
   // Save the current options to a file ON THE SERVER (where the script runs).
-  // Relative paths are written inside the output directory.
-  const def = 'township_config.json';
+  // Relative paths are written inside the output directory. When launched with
+  // -c/--config, the default below is that same config path (overwrite-in-place).
+  const def = {_save_default_js};
   const path = prompt('Save configuration to file (relative paths go inside the output dir):', def);
   if(path === null) return;  // cancelled
   const fd = new FormData(document.getElementById('run-form'));
@@ -2162,6 +2395,8 @@ function clearLog(){{ document.getElementById('log-box').innerHTML=''; }}
 let _es = null;
 function colorLine(t){{
   const low = t.toLowerCase();
+  if(t.indexOf('▶')!==-1 || t.trim().startsWith('━'))
+    return '<span class=head>'+escHtml(t)+'</span>';
   if(low.includes('✗')||low.includes('error')||low.includes('oom')||low.includes('fatal'))
     return '<span class=err>'+escHtml(t)+'</span>';
   if(low.includes('✓')||low.includes('loaded')||low.includes('saved')||low.includes('done'))
@@ -2178,28 +2413,32 @@ function appendLog(t){{
   box.innerHTML += colorLine(t)+'\\n';
   box.scrollTop=box.scrollHeight;
 }}
-function setStatus(running, done){{
+function setStatus(running, done, label){{
   const pill=document.getElementById('status-pill');
   const startBtn=document.getElementById('start-btn');
   const stopBtn=document.getElementById('stop-btn');
-  if(done){{ pill.className='status-pill status-done'; pill.textContent='Done'; }}
-  else if(running){{ pill.className='status-pill status-run'; pill.textContent='Running…'; }}
+  const lbl = label ? (' — '+label) : '';
+  if(running){{ pill.className='status-pill status-run'; pill.textContent='Running…'+lbl; }}
+  else if(done){{ pill.className='status-pill status-done'; pill.textContent='Done'+lbl; }}
   else{{ pill.className='status-pill status-idle'; pill.textContent='Idle'; }}
   startBtn.style.display = running ? 'none' : '';
   stopBtn.style.display  = running ? '' : 'none';
   if(!running && _es){{ _es.close(); _es=null; }}
+}}
+function refreshStatus(){{
+  fetch('/status').then(r=>r.json()).then(d=>setStatus(d.running,d.done,d.label)).catch(()=>{{}});
 }}
 function startSSE(){{
   if(_es){{ _es.close(); }}
   _es = new EventSource('/stream');
   _es.onmessage = e => appendLog(e.data);
   _es.onerror = () => {{
-    setTimeout(()=>fetch('/status').then(r=>r.json()).then(d=>setStatus(d.running,d.done)),1000);
+    setTimeout(()=>fetch('/status').then(r=>r.json()).then(d=>setStatus(d.running,d.done,d.label)),1000);
   }};
 }}
 function pollStatus(){{
   fetch('/status').then(r=>r.json()).then(d=>{{
-    setStatus(d.running,d.done);
+    setStatus(d.running,d.done,d.label);
     if(d.running) setTimeout(pollStatus,3000);
   }}).catch(()=>setTimeout(pollStatus,5000));
 }}
@@ -2211,6 +2450,7 @@ document.getElementById('run-form').onsubmit = async function(e){{
   if(j.error){{ appendLog('✗ '+j.error); return; }}
   setStatus(true,false);
   startSSE();
+  setTimeout(refreshStatus, 500);
 }};
 async function stopRun(){{
   await fetch('/stop',{{method:'POST'}});
@@ -2218,11 +2458,230 @@ async function stopRun(){{
 // Restore state on page load
 toggleConsFields();
 fetch('/status').then(r=>r.json()).then(d=>{{
-  setStatus(d.running,d.done);
+  setStatus(d.running,d.done,d.label);
   if(d.running) startSSE();
   d.log.forEach(l=>appendLog(l));
 }});
 </script>"""
+
+    def _list_profiles(kind: str) -> list:
+        """Return locally-saved profiles of a kind with their meta + image files."""
+        base = out_dir / (kind + "s")
+        out = []
+        if not base.exists():
+            return out
+        for d in sorted(base.iterdir()):
+            if not d.is_dir():
+                continue
+            mp = d / "meta.json"
+            if not mp.exists():
+                continue
+            try:
+                meta = json.loads(mp.read_text())
+            except Exception:
+                meta = {}
+            imgs = sorted(
+                p.name for p in d.iterdir()
+                if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+            )
+            out.append({"name": d.name, "meta": meta, "images": imgs})
+        return out
+
+    def _profiles_html(kind: str):
+        import html as _html
+        label = "Characters" if kind == "character" else "Environments"
+        profiles = _list_profiles(kind)
+
+        def esc(v):
+            return _html.escape(str(v if v is not None else ""), quote=True)
+
+        cards = []
+        for p in profiles:
+            name = p["name"]
+            meta = p["meta"]
+            thumbs = "".join(
+                f'<div class=pf-thumb>'
+                f'<img src="/media/{kind}s/{esc(name)}/{esc(img)}" loading=lazy alt="{esc(img)}">'
+                f'<button class=pf-thumb-del title="Delete this image" '
+                f'onclick="delImg(\'{kind}\',\'{esc(name)}\',\'{esc(img)}\')">✕</button>'
+                f'</div>'
+                for img in p["images"]
+            ) or '<span class=hint>No reference images.</span>'
+
+            gender_html = ""
+            if kind == "character":
+                gender_html = (
+                    f'<div><label>Gender</label>'
+                    f'<input type=text data-field=gender value="{esc(meta.get("gender",""))}"></div>'
+                )
+            # Both kinds can guide regeneration with their kept references via
+            # IP-Adapter (characters → character_profiles, envs → environment_profiles).
+            guide_html = (
+                '<label style="margin:0;font-size:.78rem;display:inline-flex;align-items:center;gap:.25rem">'
+                '<input type=checkbox data-regen=guide checked style="width:auto"> match kept refs</label>'
+            )
+
+            # Any OTHER scalar fields present in meta.json become editable inputs
+            # too, so every field of a profile can be edited (not just the fixed
+            # set). Bookkeeping / already-rendered keys are excluded.
+            _shown = {"name", "region", "gender", "description", "prompt",
+                      "images", "image_count", "created_at", "created"}
+            extra_rows = []
+            for fk, fval in meta.items():
+                if fk in _shown or isinstance(fval, (dict, list)):
+                    continue
+                extra_rows.append(
+                    f'<div><label>{esc(fk)}</label>'
+                    f'<input type=text data-field="{esc(fk)}" value="{esc(fval)}"></div>'
+                )
+            extra_html = (f'<div class=row3 style="margin-top:.4rem">{"".join(extra_rows)}</div>'
+                          if extra_rows else "")
+
+            cards.append(
+                f'<div class=card id="pf-{kind}-{esc(name)}">'
+                f'  <div class=pf-head>'
+                f'    <span class=pf-name>{esc(name)}</span>'
+                f'    <span class=hint>{len(p["images"])} image(s)</span>'
+                f'  </div>'
+                f'  <div class=pf-thumbs>{thumbs}</div>'
+                f'  <div class=row>'
+                f'    <div><label>Region</label>'
+                f'<input type=text data-field=region value="{esc(meta.get("region",""))}"></div>'
+                f'    {gender_html}'
+                f'  </div>'
+                f'  <label>Description <span class=hint>(synced to CoderAI)</span></label>'
+                f'  <textarea data-field=description rows=2>{esc(meta.get("description",""))}</textarea>'
+                f'  <label>Prompt</label>'
+                f'  <textarea data-field=prompt rows=3>{esc(meta.get("prompt",""))}</textarea>'
+                f'  {extra_html}'
+                f'  <div class=pf-actions>'
+                f'    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
+                f'onclick="saveProfile(\'{kind}\',\'{esc(name)}\')">💾 Save</button>'
+                f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
+                f'onclick="delProfile(\'{kind}\',\'{esc(name)}\')">🗑 Remove</button>'
+                f'    <span class=pf-status></span>'
+                f'  </div>'
+                f'  <div class=pf-actions style="border-top:1px solid #222;padding-top:.6rem;margin-top:.6rem">'
+                f'    <label style="margin:0;font-size:.78rem">Add <input type=number data-regen=count '
+                f'value=4 min=1 max=8 style="width:54px;display:inline-block"> new ref(s)</label>'
+                f'    {guide_html}'
+                f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+                f'onclick="regenProfile(\'{kind}\',\'{esc(name)}\')">♻ Regenerate references</button>'
+                f'    <span class=pf-regen-status style="font-size:.76rem;color:#7ea8f7"></span>'
+                f'  </div>'
+                f'  <div class=pf-actions style="padding-top:.5rem">'
+                f'    <label style="margin:0;font-size:.78rem">Or upload your own:</label>'
+                f'    <input type=file data-upload=files accept="image/*" multiple '
+                f'style="font-size:.76rem;width:auto;flex:1;min-width:160px">'
+                f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+                f'onclick="uploadRefs(\'{kind}\',\'{esc(name)}\')">⬆ Upload references</button>'
+                f'    <span class=pf-upload-status style="font-size:.76rem;color:#7ea8f7"></span>'
+                f'  </div>'
+                f'</div>'
+            )
+
+        if cards:
+            inner = "".join(cards)
+        else:
+            inner = (f'<div class=card style="color:#666">No {label.lower()} found in '
+                     f'<code>{esc(str(out_dir))}</code> yet. Generate some from the Run page first.</div>')
+
+        script = """
+<script>
+async function saveProfile(kind,name){
+  const root=document.getElementById('pf-'+kind+'-'+name);
+  const st=root.querySelector('.pf-status');
+  st.style.color='#aaa'; st.textContent='Saving…';
+  const fd=new FormData();
+  fd.append('kind',kind); fd.append('name',name);
+  root.querySelectorAll('[data-field]').forEach(el=>fd.append(el.getAttribute('data-field'),el.value));
+  try{
+    const r=await fetch('/profile/save',{method:'POST',body:fd});
+    const j=await r.json();
+    if(j.error){st.style.color='#e07070'; st.textContent='✗ '+j.error; return;}
+    st.style.color='#7ed87e'; st.textContent='✓ Saved'+(j.synced?' (synced to CoderAI)':'');
+  }catch(e){st.style.color='#e07070'; st.textContent='✗ '+e;}
+}
+async function delProfile(kind,name){
+  if(!confirm('Remove "'+name+'" and all its images? This deletes the local profile'
+    +' and removes it from CoderAI. This cannot be undone.'))return;
+  const fd=new FormData(); fd.append('kind',kind); fd.append('name',name);
+  const r=await fetch('/profile/delete',{method:'POST',body:fd});
+  const j=await r.json();
+  if(j.error){alert('Delete failed: '+j.error); return;}
+  const el=document.getElementById('pf-'+kind+'-'+name);
+  if(el) el.remove();
+}
+async function delImg(kind,name,file){
+  if(!confirm('Delete image "'+file+'"?'))return;
+  const fd=new FormData(); fd.append('kind',kind); fd.append('name',name); fd.append('file',file);
+  const r=await fetch('/profile/delete-image',{method:'POST',body:fd});
+  const j=await r.json();
+  if(j.error){alert('Delete failed: '+j.error); return;}
+  location.reload();
+}
+async function regenProfile(kind,name){
+  const root=document.getElementById('pf-'+kind+'-'+name);
+  const st=root.querySelector('.pf-regen-status');
+  const cnt=root.querySelector('[data-regen=count]');
+  const guideEl=root.querySelector('[data-regen=guide]');
+  const count=Math.max(1,Math.min(8,parseInt(cnt&&cnt.value||'4',10)||4));
+  const fd=new FormData();
+  fd.append('kind',kind); fd.append('name',name); fd.append('count',count);
+  fd.append('guide', (guideEl && guideEl.checked) ? '1' : '0');
+  st.style.color='#aaa'; st.textContent='Starting…';
+  let j;
+  try{
+    const r=await fetch('/profile/regenerate',{method:'POST',body:fd});
+    j=await r.json();
+  }catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; return; }
+  if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
+  const jobId=j.job_id;
+  st.style.color='#7ea8f7';
+  const poll=async()=>{
+    let d;
+    try{ d=await (await fetch('/job/'+jobId)).json(); }
+    catch(e){ setTimeout(poll,1500); return; }
+    const pct=d.progress||0;
+    if(d.status==='running'){ st.textContent='⏳ '+(d._msg||('working… '+pct+'%')); setTimeout(poll,1200); }
+    else if(d.status==='done'){
+      st.style.color='#7ed87e';
+      st.textContent='✓ added '+(d.added||0)+' image(s)'+(d.synced===false?' (local only)':'')+' — reloading…';
+      setTimeout(()=>location.reload(),900);
+    } else {
+      st.style.color='#e07070'; st.textContent='✗ '+(d.error||'failed');
+    }
+  };
+  setTimeout(poll,800);
+}
+async function uploadRefs(kind,name){
+  const root=document.getElementById('pf-'+kind+'-'+name);
+  const inp=root.querySelector('[data-upload=files]');
+  const st=root.querySelector('.pf-upload-status');
+  if(!inp||!inp.files||!inp.files.length){
+    st.style.color='#e07070'; st.textContent='Choose image file(s) first'; return;
+  }
+  const fd=new FormData();
+  fd.append('kind',kind); fd.append('name',name);
+  for(const f of inp.files) fd.append('files',f);
+  st.style.color='#aaa'; st.textContent='Uploading '+inp.files.length+' file(s)…';
+  try{
+    const r=await fetch('/profile/upload-image',{method:'POST',body:fd});
+    const j=await r.json();
+    if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
+    st.style.color='#7ed87e';
+    st.textContent='✓ added '+j.added+(j.rejected?(' ('+j.rejected+' skipped)'):'')
+      +(j.synced===false?' (local only)':'')+' — reloading…';
+    setTimeout(()=>location.reload(),800);
+  }catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; }
+}
+</script>"""
+        return (f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                f'<h1>{label}</h1>'
+                f'<a href="/{kind}s" class="btn btn-secondary" style="font-size:.8rem">↻ Refresh</a></div>'
+                f'<p class=hint style="margin-bottom:.8rem">Edit a profile’s fields and Save, or '
+                f'Remove it entirely. Changes apply to the local output folder and are synced to CoderAI.</p>'
+                f'{inner}{script}')
 
     def _gallery_html(out_path: Path):
         sections = []
@@ -2426,6 +2885,14 @@ async function pollJob(){
                 html = _page("Run", _run_page_html(default_args), "run")
                 self._send(200, "text/html; charset=utf-8", html)
 
+            elif path == "/characters":
+                html = _page("Characters", _profiles_html("character"), "characters")
+                self._send(200, "text/html; charset=utf-8", html)
+
+            elif path == "/environments":
+                html = _page("Environments", _profiles_html("environment"), "environments")
+                self._send(200, "text/html; charset=utf-8", html)
+
             elif path == "/gallery":
                 html = _page("Gallery", _gallery_html(out_dir), "gallery")
                 self._send(200, "text/html; charset=utf-8", html)
@@ -2435,6 +2902,7 @@ async function pollJob(){
                 payload = _j.dumps({
                     "running": _state["running"],
                     "done": _state["done"],
+                    "label": _state.get("current", ""),
                     "log": _state["log_lines"][-200:],
                 })
                 self._send(200, "application/json", payload)
@@ -2541,6 +3009,208 @@ async function pollJob(){
                 self._send(200, "application/json", _j.dumps({"ok": True}))
                 return
 
+            if path == "/profile/regenerate":
+                import json as _j, uuid as _u
+                clen = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(clen)
+                ctype = self.headers.get("Content-Type", "")
+                if "multipart/form-data" in ctype:
+                    boundary = ctype.split("boundary=")[-1].strip().encode()
+                    form = _parse_multipart(raw, boundary)
+                else:
+                    form = dict(urllib.parse.parse_qsl(raw.decode(errors="replace")))
+
+                def _fv(k, default=""):
+                    v = form.get(k)
+                    if v is None: return default
+                    return v if isinstance(v, str) else v.decode(errors="replace")
+
+                kind = _fv("kind"); name = _fv("name")
+                if (kind not in ("character", "environment") or not name
+                        or "/" in name or "\\" in name or ".." in name):
+                    self._send(400, "application/json",
+                               _j.dumps({"error": "invalid kind/name"}))
+                    return
+                try:
+                    count = max(1, min(8, int(_fv("count", "4") or 4)))
+                except ValueError:
+                    count = 4
+                guide = _fv("guide", "1") not in ("0", "false", "no", "")
+                job_id = _u.uuid4().hex[:12]
+                threading.Thread(target=_run_regen_job,
+                                 args=(job_id, kind, name, count, guide),
+                                 daemon=True).start()
+                self._send(200, "application/json", _j.dumps({"job_id": job_id}))
+                return
+
+            if path == "/profile/upload-image":
+                # Append user-uploaded image files as new references, preserving
+                # all existing ones.
+                import json as _j
+                clen = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(clen)
+                ctype = self.headers.get("Content-Type", "")
+                if "multipart/form-data" not in ctype:
+                    self._send(400, "application/json",
+                               _j.dumps({"error": "expected multipart/form-data"}))
+                    return
+                boundary = ctype.split("boundary=")[-1].strip().encode()
+                fields, files = _parse_multipart_full(raw, boundary)
+                kind = fields.get("kind", "")
+                name = fields.get("name", "")
+                if (kind not in ("character", "environment") or not name
+                        or "/" in name or "\\" in name or ".." in name):
+                    self._send(400, "application/json",
+                               _j.dumps({"error": "invalid kind/name"}))
+                    return
+
+                def _img_ext(data: bytes):
+                    if data[:4] == b"\x89PNG": return ".png", "image/png"
+                    if data[:2] == b"\xff\xd8": return ".jpg", "image/jpeg"
+                    if data[:4] == b"RIFF" and data[8:12] == b"WEBP": return ".webp", "image/webp"
+                    if data[:6] in (b"GIF87a", b"GIF89a"): return ".gif", "image/gif"
+                    return None, None
+
+                base = out_dir / (kind + "s") / name
+                base.mkdir(parents=True, exist_ok=True)
+                added_uris, rejected = [], 0
+                for f in files:
+                    data = f.get("data") or b""
+                    ext, mime = _img_ext(data)
+                    if not ext:
+                        rejected += 1
+                        continue
+                    out_p = _next_ref_path(base, ext)
+                    try:
+                        out_p.write_bytes(data)
+                    except Exception:
+                        rejected += 1
+                        continue
+                    added_uris.append("data:%s;base64,%s" % (
+                        mime, __import__("base64").b64encode(data).decode()))
+                if not added_uris:
+                    self._send(400, "application/json",
+                               _j.dumps({"error": "no valid image files uploaded"}))
+                    return
+                synced = True
+                try:
+                    client = CoderAIClient(default_args.base_url,
+                                           getattr(default_args, "api_key", None))
+                    client.patch_profile(kind, name, add_images=added_uris)
+                except Exception:
+                    synced = False
+                self._send(200, "application/json",
+                           _j.dumps({"ok": True, "added": len(added_uris),
+                                     "rejected": rejected, "synced": synced}))
+                return
+
+            if path in ("/profile/save", "/profile/delete", "/profile/delete-image"):
+                import json as _j
+                import shutil as _shutil
+                clen = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(clen)
+                ctype = self.headers.get("Content-Type", "")
+                if "multipart/form-data" in ctype:
+                    boundary = ctype.split("boundary=")[-1].strip().encode()
+                    form = _parse_multipart(raw, boundary)
+                else:
+                    form = dict(urllib.parse.parse_qsl(raw.decode(errors="replace")))
+
+                def _fv(k, default=""):
+                    v = form.get(k)
+                    if v is None: return default
+                    return v if isinstance(v, str) else v.decode(errors="replace")
+
+                kind = _fv("kind")
+                name = _fv("name")
+                # Reject anything that could escape the profile directory.
+                if (kind not in ("character", "environment") or not name
+                        or "/" in name or "\\" in name or ".." in name):
+                    self._send(400, "application/json",
+                               _j.dumps({"error": "invalid kind/name"}))
+                    return
+
+                base = out_dir / (kind + "s") / name
+                client = CoderAIClient(default_args.base_url,
+                                       getattr(default_args, "api_key", None))
+
+                if path == "/profile/delete":
+                    try:
+                        if base.exists():
+                            _shutil.rmtree(base)
+                    except Exception as e:
+                        self._send(500, "application/json",
+                                   _j.dumps({"error": f"cannot delete local: {e}"}))
+                        return
+                    synced = True
+                    try:
+                        client.delete_profile(kind, name)
+                    except Exception:
+                        synced = False
+                    self._send(200, "application/json",
+                               _j.dumps({"ok": True, "synced": synced}))
+                    return
+
+                if path == "/profile/delete-image":
+                    file = _fv("file")
+                    if not file or "/" in file or "\\" in file or ".." in file:
+                        self._send(400, "application/json",
+                                   _j.dumps({"error": "invalid file"}))
+                        return
+                    imgs = sorted(
+                        p.name for p in base.iterdir()
+                        if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+                    ) if base.exists() else []
+                    idx = imgs.index(file) if file in imgs else None
+                    fp = base / file
+                    try:
+                        if fp.exists():
+                            fp.unlink()
+                    except Exception as e:
+                        self._send(500, "application/json",
+                                   _j.dumps({"error": f"cannot delete image: {e}"}))
+                        return
+                    if idx is not None:
+                        try:
+                            client.patch_profile(kind, name, remove_indices=[idx])
+                        except Exception:
+                            pass
+                    self._send(200, "application/json", _j.dumps({"ok": True}))
+                    return
+
+                # /profile/save — update local meta.json (+ sync description to server)
+                meta_path = base / "meta.json"
+                meta = {}
+                try:
+                    meta = json.loads(meta_path.read_text())
+                except Exception:
+                    pass
+                # Write back every submitted field (the editor exposes all of
+                # them), skipping control + bookkeeping keys.
+                _reserved = {"kind", "name", "images", "image_count",
+                             "created_at", "created"}
+                for fk in form.keys():
+                    if fk in _reserved:
+                        continue
+                    meta[fk] = _fv(fk)
+                meta["name"] = name
+                try:
+                    base.mkdir(parents=True, exist_ok=True)
+                    meta_path.write_text(json.dumps(meta, indent=2))
+                except Exception as e:
+                    self._send(500, "application/json",
+                               _j.dumps({"error": f"cannot save: {e}"}))
+                    return
+                synced = False
+                try:
+                    client.patch_profile(kind, name, description=meta.get("description", ""))
+                    synced = True
+                except Exception:
+                    pass
+                self._send(200, "application/json",
+                           _j.dumps({"ok": True, "synced": synced}))
+                return
+
             if path == "/save-config":
                 # Write the submitted options to a config file ON THE SERVER
                 # (the machine running this script), reusable later via --config.
@@ -2589,6 +3259,10 @@ async function pollJob(){
                     "lora_steps": int(_fv("lora_steps", "800") or 800),
                     "lora_rank": int(_fv("lora_rank", "16") or 16),
                     "lora_weight": float(_fv("lora_weight", "0.85") or 0.85),
+                    "no_env_loras": "env_loras" not in form,
+                    "env_lora_steps": int(_fv("env_lora_steps", "800") or 800),
+                    "env_lora_rank": int(_fv("env_lora_rank", "16") or 16),
+                    "env_lora_weight": float(_fv("env_lora_weight", "0.8") or 0.8),
                     "skip_characters": cm == "skip",
                     "reuse_fighters": cm == "reuse",
                     "fighters": _s(_fv("fighters")) if cm == "fighters" else None,
@@ -2706,6 +3380,11 @@ async function pollJob(){
             ns.lora_steps        = int(_fv("lora_steps", "800"))
             ns.lora_rank         = int(_fv("lora_rank", "16"))
             ns.lora_weight       = float(_fv("lora_weight", "0.85"))
+            # Environment LoRAs: checkbox "env_loras" present ⇒ train them.
+            ns.no_env_loras      = ("env_loras" not in form)
+            ns.env_lora_steps    = int(_fv("env_lora_steps", "800"))
+            ns.env_lora_rank     = int(_fv("env_lora_rank", "16"))
+            ns.env_lora_weight   = float(_fv("env_lora_weight", "0.8"))
             # char mode
             cm = _fv("char_mode", "generate")
             ns.skip_characters  = (cm == "skip")
@@ -2763,10 +3442,43 @@ async function pollJob(){
                 elif step == "videos":
                     ns.skip_characters = True; ns.skip_environments = True; ns.only_videos = True
 
+            # Human-readable label for what's being executed, shown as a banner
+            # at the top of the (freshly cleared) log so it's always obvious
+            # which run/step is currently in progress.
+            _STEP_LABELS = {
+                "characters":   "Step 1 · Generate Characters",
+                "environments": "Step 2 · Generate Environments",
+                "prompts":      "Step 3 · Write Video Prompts",
+                "loras":        "Step 4 · Train Character LoRAs",
+                "keyframes":    "Step 5 · Generate Keyframes",
+                "videos":       "Step 6 · Render Videos",
+            }
+            if step:
+                run_label = _STEP_LABELS.get(step, f"Step · {step}")
+            elif ns.only_characters:
+                run_label = "Full Run · Characters only"
+            elif ns.only_environments:
+                run_label = "Full Run · Environments only"
+            elif ns.only_assets:
+                run_label = "Full Run · Assets only (characters + environments)"
+            elif ns.only_prompts:
+                run_label = "Full Run · Prompts only"
+            elif ns.only_videos:
+                run_label = "Full Run · Videos only (render from saved prompts)"
+            else:
+                run_label = "Full Run · All stages"
+
             _state["abort"].clear()
             _state["log_lines"].clear()
             _state["done"] = False
             _state["running"] = True
+            _state["current"] = run_label
+
+            _bar = "━" * 58
+            _web_log(_bar)
+            _web_log(f"▶ {run_label}    [{time.strftime('%H:%M:%S')}]")
+            _web_log(f"   consistency: {ns.consistency}    output: {ns.out_dir}")
+            _web_log(_bar)
 
             def _run_thread():
                 import sys as _sys
@@ -2779,7 +3491,7 @@ async function pollJob(){
                 finally:
                     _state["running"] = False
                     _state["done"] = True
-                    _web_log("✓ Run complete.")
+                    _web_log(f"✓ {run_label} — complete.")
                     with _sse_lock:
                         for q in list(_sse_clients):
                             try: q.put(None)
@@ -2808,6 +3520,40 @@ async function pollJob(){
             if name:
                 result[name] = value.decode(errors="replace")
         return result
+
+    def _parse_multipart_full(body: bytes, boundary: bytes):
+        """Parse multipart/form-data preserving raw bytes for file parts.
+
+        Returns (fields, files) where fields maps name→str and files is a list
+        of {'name', 'filename', 'data': bytes} for parts with a filename.
+        """
+        fields, files = {}, []
+        delimiter = b"--" + boundary
+        for part in body.split(delimiter)[1:]:
+            if part[:2] == b"\r\n":
+                part = part[2:]
+            if part.strip() in (b"", b"--"):
+                continue
+            if b"\r\n\r\n" not in part:
+                continue
+            header_raw, _, value = part.partition(b"\r\n\r\n")
+            if value.endswith(b"\r\n"):
+                value = value[:-2]
+            headers_text = header_raw.decode(errors="replace")
+            name = filename = None
+            for hdr_line in headers_text.splitlines():
+                if "Content-Disposition" in hdr_line:
+                    if 'name="' in hdr_line:
+                        name = hdr_line.split('name="')[1].split('"')[0]
+                    if 'filename="' in hdr_line:
+                        filename = hdr_line.split('filename="')[1].split('"')[0]
+            if name is None:
+                continue
+            if filename is not None:
+                files.append({"name": name, "filename": filename, "data": value})
+            else:
+                fields[name] = value.decode(errors="replace")
+        return fields, files
 
     def _run_main_with_args(args):
         """Run the full generation pipeline with a pre-built args Namespace."""
@@ -2897,21 +3643,31 @@ async function pollJob(){
         only_loras = getattr(args, "only_loras", False)
         only_keyframes = getattr(args, "only_keyframes", False)
 
-        # Load any previously-trained LoRA map from disk so keyframe/video steps
-        # can reuse it without retraining.
-        lora_map = {}
-        lora_file = out_dir_r / "loras.json"
-        if lora_file.exists():
-            try:
-                lora_map = json.loads(lora_file.read_text()) or {}
-            except Exception:
-                lora_map = {}
+        # Load any previously-trained LoRA maps from disk so keyframe/video steps
+        # can reuse them without retraining (characters + environments).
+        def _load_map(fname):
+            fp = out_dir_r / fname
+            if fp.exists():
+                try:
+                    return json.loads(fp.read_text()) or {}
+                except Exception:
+                    return {}
+            return {}
+        lora_map = _load_map("loras.json")
+        env_lora_map = _load_map("env_loras.json")
+        _no_env_loras = getattr(args, "no_env_loras", False)
+        _env_lora_weight = getattr(args, "env_lora_weight", 0.8)
 
         # Train LoRAs when requested (full run with lora strategy, or the LoRA step).
         if "lora" in consistency and (char_names or []) and (only_loras or not args.skip_videos):
             lora_map = stage_loras(client, image_model, out_dir_r, char_names or [],
                                    lora_steps=getattr(args, "lora_steps", 800),
                                    lora_rank=getattr(args, "lora_rank", 16))
+        if ("lora" in consistency and not _no_env_loras and (env_names or [])
+                and (only_loras or not args.skip_videos)):
+            env_lora_map = stage_env_loras(client, image_model, out_dir_r, env_names or [],
+                                           lora_steps=getattr(args, "env_lora_steps", 800),
+                                           lora_rank=getattr(args, "env_lora_rank", 16))
 
         if only_loras:
             _web_log("\n✓ LoRA step complete.")
@@ -2927,6 +3683,7 @@ async function pollJob(){
                 keyframe_steps=getattr(args, "keyframe_steps", 28),
                 keyframe_size=getattr(args, "keyframe_size", "512x512"),
                 lora_weight=getattr(args, "lora_weight", 0.85),
+                env_lora_map=env_lora_map, env_lora_weight=_env_lora_weight,
                 keyframes_only=True,
             )
             _web_log("\n✓ Keyframe step complete.")
@@ -2949,6 +3706,7 @@ async function pollJob(){
                 keyframe_steps=getattr(args, "keyframe_steps", 28),
                 keyframe_size=getattr(args, "keyframe_size", "512x512"),
                 lora_weight=getattr(args, "lora_weight", 0.85),
+                env_lora_map=env_lora_map, env_lora_weight=_env_lora_weight,
             )
 
         _web_log("\n✓ Done.")
@@ -3212,6 +3970,15 @@ OUTPUT LAYOUT
                           help="LoRA rank (default: 16).")
     cons_grp.add_argument("--lora-weight", type=float, default=0.85, metavar="F",
                           help="Weight applied to each character LoRA at generation (default: 0.85).")
+    cons_grp.add_argument("--no-env-loras", action="store_true",
+                          help="Do not train/apply per-environment identity LoRAs when the "
+                               "'lora' strategy is active (by default environments get LoRAs too).")
+    cons_grp.add_argument("--env-lora-steps", type=int, default=800, metavar="N",
+                          help="Training steps per environment LoRA (default: 800).")
+    cons_grp.add_argument("--env-lora-rank", type=int, default=16, metavar="N",
+                          help="Environment LoRA rank (default: 16).")
+    cons_grp.add_argument("--env-lora-weight", type=float, default=0.8, metavar="F",
+                          help="Weight applied to each environment LoRA at generation (default: 0.8).")
 
     parser.add_argument("--cli-mode", action="store_true",
                         help="Run in CLI mode (default when --cli-mode is present). "
@@ -3344,12 +4111,18 @@ OUTPUT LAYOUT
     else:
         env_names = stage_environments(client, image_model, out_dir, region_filter=args.region)
 
-    # ── Stage 2.5: Character LoRA training (image base model) ───────────────────
+    # ── Stage 2.5: LoRA training (image base model) — characters + environments ─
     lora_map = {}
+    env_lora_map = {}
     if "lora" in consistency and not args.skip_videos and (char_names or []):
         lora_map = stage_loras(client, image_model, out_dir, char_names or [],
                                lora_steps=getattr(args, "lora_steps", 800),
                                lora_rank=getattr(args, "lora_rank", 16))
+    if ("lora" in consistency and not args.skip_videos
+            and not getattr(args, "no_env_loras", False) and (env_names or [])):
+        env_lora_map = stage_env_loras(client, image_model, out_dir, env_names or [],
+                                       lora_steps=getattr(args, "env_lora_steps", 800),
+                                       lora_rank=getattr(args, "env_lora_rank", 16))
 
     # ── Stage 3: Videos ────────────────────────────────────────────────────────
     if not args.skip_videos:
@@ -3371,6 +4144,8 @@ OUTPUT LAYOUT
             keyframe_steps=getattr(args, "keyframe_steps", 28),
             keyframe_size=getattr(args, "keyframe_size", "512x512"),
             lora_weight=getattr(args, "lora_weight", 0.85),
+            env_lora_map=env_lora_map,
+            env_lora_weight=getattr(args, "env_lora_weight", 0.8),
         )
 
     _log("\n✓ Done.")

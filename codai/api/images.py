@@ -51,6 +51,14 @@ from codai.api.state import get_load_mode
 import hashlib as _hashlib
 import threading as _threading
 
+# Serializes all diffusers from_pretrained() calls.
+# huggingface_hub acquires per-repo .lock files during from_pretrained; running
+# two from_pretrained calls concurrently (or one alongside snapshot_download on
+# the same repo) causes a filelock deadlock that hangs the process indefinitely.
+# A single threading.Lock here ensures only one pipeline loads at a time.
+_DIFFUSERS_LOAD_LOCK = _threading.Lock()
+
+
 class _PromptEmbedCache:
     """Single-entry LRU cache for diffusers prompt embeddings."""
 
@@ -323,21 +331,29 @@ def _disable_safety_checker(pipe):
     return pipe
 
 
-def _load_diffusers_pipeline(model_name: str, global_args):
+def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = None):
     """
     Try to load a model using the diffusers library.
-    
+
     Returns the loaded pipeline or None if diffusers can't handle this model.
     Raises Exception if loading fails for other reasons.
+
+    Per-model configuration (model_config) is the source of truth and takes
+    precedence over CLI/global args for precision, offload, quantization, etc.
     """
     from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline, DiffusionPipeline
     import torch
-    
-    # Check for --no-ram mode
-    no_ram = getattr(global_args, 'no_ram', False) if global_args else False
-    
-    # Determine precision from CLI argument (--image-precision)
-    precision = getattr(global_args, 'image_precision', 'f32') or 'f32'
+
+    _mc = model_config or {}
+
+    def _cfg(key, default=None):
+        """Read a value from the per-model configuration only (source of truth)."""
+        v = _mc.get(key)
+        return v if v is not None else default
+
+    # All loading parameters come from the per-model configuration.
+    no_ram = bool(_cfg('no_ram', False))
+    precision = _cfg('precision', 'f32') or 'f32'
     precision_map = {
         'bf16': torch.bfloat16,
         'f32': torch.float32,
@@ -354,14 +370,45 @@ def _load_diffusers_pipeline(model_name: str, global_args):
     else:
         print(f"Using precision: {precision} ({dtype})")
     
-    # Check if CPU offload is requested via CLI
-    use_sequential_offload = getattr(global_args, 'image_cpu_offload', False)
+    # CPU offload comes from the per-model configuration: an explicit
+    # cpu_offload flag, or an offload_strategy that implies CPU offloading.
+    _offload_strategy = _mc.get('offload_strategy')
+    use_sequential_offload = bool(
+        _mc.get('cpu_offload')
+        or (_offload_strategy in ('cpu', 'sequential', 'model', 'disk'))
+    )
+
+    # Quantization (per-model config).  Builds a diffusers quantization config
+    # applied per-component so 4-bit/8-bit image models use less VRAM.  Per-model
+    # 'component_quantization' overrides win; otherwise the global flag applies
+    # to all heavy components (backbone + text encoders).
+    from codai.models.hf_loading import (
+        build_pipeline_quant_config, build_gguf_pipeline_components)
+    _img_quant_config, _img_quant_desc = build_pipeline_quant_config(model_name, _mc, dtype)
+    if _img_quant_config is not None:
+        print(f"Image quantization: {_img_quant_desc}")
+    _img_gguf_components, _img_gguf_desc = build_gguf_pipeline_components(model_name, _mc, dtype)
+    if _img_gguf_components:
+        print(f"Image GGUF components: {_img_gguf_desc}")
     
     # --no-ram mode: never use CPU offload
     if no_ram and use_sequential_offload:
         print("--no-ram mode: ignoring --image-cpu-offload, forcing full GPU loading")
         use_sequential_offload = False
     
+    # Refuse to load a model that is currently being downloaded — the HF hub
+    # file lock on the same repo would deadlock the process.
+    try:
+        from codai.admin.routes import get_active_download_model_ids
+        active_downloads = get_active_download_model_ids()
+        if model_name in active_downloads:
+            raise RuntimeError(
+                f"Model '{model_name}' is currently being downloaded. "
+                "Wait for the download to finish before loading it."
+            )
+    except ImportError:
+        pass
+
     # =====================================================================
     # --no-ram mode: load directly on GPU, no CPU RAM fallback
     # =====================================================================
@@ -370,20 +417,31 @@ def _load_diffusers_pipeline(model_name: str, global_args):
         print(f"--no-ram mode: loading diffusers model directly on {cuda_device}")
         
         try:
+            _xtra = {}
+            if _img_quant_config is not None:
+                _xtra['quantization_config'] = _img_quant_config
+            if _img_gguf_components:
+                _xtra.update(_img_gguf_components)
+            with _DIFFUSERS_LOAD_LOCK:
+                try:
+                    pipeline = StableDiffusionXLPipeline.from_pretrained(
+                        model_name,
+                        torch_dtype=dtype,
+                        use_safetensors=True,
+                        **_xtra,
+                    )
+                except Exception:
+                    pipeline = DiffusionPipeline.from_pretrained(
+                        model_name,
+                        torch_dtype=dtype,
+                        use_safetensors=True,
+                        **_xtra,
+                    )
             try:
-                pipeline = StableDiffusionXLPipeline.from_pretrained(
-                    model_name,
-                    torch_dtype=dtype,
-                    use_safetensors=True,
-                )
+                pipeline = pipeline.to(cuda_device)
             except Exception:
-                pipeline = DiffusionPipeline.from_pretrained(
-                    model_name,
-                    torch_dtype=dtype,
-                    use_safetensors=True,
-                )
-            
-            pipeline = pipeline.to(cuda_device)
+                if _img_quant_config is None:
+                    raise  # only quantized pipelines may reject .to()
             print(f"--no-ram: Diffusers model loaded on {cuda_device}")
             return pipeline
         except Exception as e:
@@ -395,20 +453,39 @@ def _load_diffusers_pipeline(model_name: str, global_args):
     # =====================================================================
     # Proactive VRAM eviction before first load attempt
     # =====================================================================
-    # HF repo IDs have no local file, so their size is unknown; we can't
-    # pre-compute needed_gb. Instead, evict if other models are loaded and
-    # free VRAM is below 15% of total (almost certainly an OOM on attempt 1).
+    # Evict only the minimum needed so models that fit together can coexist.
+    # Prefer the model's configured/estimated VRAM need; only fall back to the
+    # blunt "free < 15%" heuristic when the size is genuinely unknown.
     if torch.cuda.is_available():
         try:
             from codai.models.manager import multi_model_manager as _mmm
             if _mmm.models:
                 _free, _total = torch.cuda.mem_get_info()
-                if _total > 0 and (_free / _total) < 0.15:
-                    print(f"Low VRAM ({_free/1e9:.1f} GB free of {_total/1e9:.1f} GB) with "
-                          f"{len(_mmm.models)} model(s) loaded — evicting before load attempt")
-                    _mmm.unload_all_models()
-        except Exception:
-            pass
+                _free_gb = _free / 1e9
+                # Needed VRAM for this model (config used_vram_gb, with quant/offload
+                # factors applied) — 0 when it can't be determined.
+                _key = None
+                for _k in (model_key, model_name, f"image:{model_name}"):
+                    if _k in _mmm.config:
+                        _key = _k
+                        break
+                _need_gb = _mmm._get_model_used_vram_gb(_key or model_name, model_name)
+                if _need_gb > 0:
+                    if _free_gb < _need_gb:
+                        print(f"Image model needs {_need_gb:.1f} GB, {_free_gb:.1f} GB free "
+                              f"— evicting the minimum to fit (others may coexist)")
+                        _mmm._evict_models_for_vram(_need_gb)
+                    else:
+                        print(f"Image model needs {_need_gb:.1f} GB, {_free_gb:.1f} GB free "
+                              f"— no eviction needed (coexisting with loaded models)")
+                elif _total > 0 and (_free / _total) < 0.15:
+                    # Size unknown and VRAM nearly full — evict LRU one at a time
+                    # until we clear ~25% headroom, instead of nuking everything.
+                    print(f"Low VRAM ({_free_gb:.1f} GB free of {_total/1e9:.1f} GB), "
+                          f"unknown model size — evicting LRU to free headroom")
+                    _mmm._evict_models_for_vram(_total * 0.25 / 1e9)
+        except Exception as _ee:
+            print(f"  Proactive eviction skipped: {_ee}")
 
     # =====================================================================
     # Standard loading path (with OOM fallback)
@@ -422,22 +499,46 @@ def _load_diffusers_pipeline(model_name: str, global_args):
         try:
             load_attempt += 1
             print(f"Loading attempt {load_attempt}/{max_attempts}...")
-            
-            # Try to load as Stable Diffusion XL first, then generic DiffusionPipeline
-            try:
-                pipeline = StableDiffusionXLPipeline.from_pretrained(
-                    model_name,
-                    torch_dtype=dtype,
-                    use_safetensors=True,
-                )
-            except Exception:
-                # Try generic diffusion pipeline (supports custom pipelines like ZImagePipeline)
-                pipeline = DiffusionPipeline.from_pretrained(
-                    model_name,
-                    torch_dtype=dtype,
-                    use_safetensors=True,
-                )
-            
+
+            # Acquire the global load lock before any from_pretrained call.
+            # This prevents concurrent HF hub file-lock conflicts (e.g. when
+            # another pipeline or snapshot_download holds the same .lock file).
+            with _DIFFUSERS_LOAD_LOCK:
+                # Re-check download conflict inside the lock — a download may
+                # have started between our first check and acquiring the lock.
+                try:
+                    from codai.admin.routes import get_active_download_model_ids
+                    if model_name in get_active_download_model_ids():
+                        raise RuntimeError(
+                            f"Model '{model_name}' started downloading while waiting "
+                            "for the load lock. Wait for the download to finish."
+                        )
+                except ImportError:
+                    pass
+
+                # Inject per-model quantization config when configured.
+                _xtra = {}
+                if _img_quant_config is not None:
+                    _xtra['quantization_config'] = _img_quant_config
+                if _img_gguf_components:
+                    _xtra.update(_img_gguf_components)
+                # Try to load as Stable Diffusion XL first, then generic DiffusionPipeline
+                try:
+                    pipeline = StableDiffusionXLPipeline.from_pretrained(
+                        model_name,
+                        torch_dtype=dtype,
+                        use_safetensors=True,
+                        **_xtra,
+                    )
+                except Exception:
+                    # Try generic diffusion pipeline (supports custom pipelines like ZImagePipeline)
+                    pipeline = DiffusionPipeline.from_pretrained(
+                        model_name,
+                        torch_dtype=dtype,
+                        use_safetensors=True,
+                        **_xtra,
+                    )
+
             # Apply memory optimizations based on attempt
             if torch.cuda.is_available():
                 if load_attempt >= 2:
@@ -445,8 +546,17 @@ def _load_diffusers_pipeline(model_name: str, global_args):
                     print("Enabling attention slicing for lower VRAM usage...")
                     if hasattr(pipeline, 'enable_attention_slicing'):
                         pipeline.enable_attention_slicing()
-                
-                if load_attempt >= 3 or use_sequential_offload:
+
+                if _img_quant_config is not None:
+                    # Quantized (bitsandbytes) pipelines are already placed on GPU
+                    # by from_pretrained and cannot be moved with .to(); only the
+                    # non-quantized components need an explicit device move.
+                    print("Quantized pipeline — placing non-quantized components on GPU")
+                    try:
+                        pipeline = pipeline.to("cuda")
+                    except Exception:
+                        pass  # bitsandbytes components stay where loaded
+                elif load_attempt >= 3 or use_sequential_offload:
                     # Third attempt or offload requested: enable sequential CPU offload
                     print("Enabling sequential CPU offload for lower VRAM usage...")
                     if hasattr(pipeline, 'enable_sequential_cpu_offload'):
@@ -484,6 +594,85 @@ def _load_diffusers_pipeline(model_name: str, global_args):
     return pipeline
 
 
+async def _apply_vae_override(pipeline, vae_model_id: str):
+    """Swap the pipeline's VAE with an alternate model (diffusers only)."""
+    try:
+        import torch
+        from diffusers import AutoencoderKL
+        dtype = next(pipeline.parameters()).dtype if hasattr(pipeline, 'parameters') else torch.float16
+        vae = AutoencoderKL.from_pretrained(vae_model_id, torch_dtype=dtype)
+        vae = vae.to(pipeline.device)
+        pipeline.vae = vae
+        _log.info("VAE override applied: %s", vae_model_id)
+    except Exception as e:
+        _log.warning("Could not load VAE override %s: %s", vae_model_id, e)
+
+
+def _ensure_ip_adapter_loaded(pipeline) -> bool:
+    """Lazily load IP-Adapter weights matching the pipeline architecture.
+
+    Returns True if IP-Adapter is loaded and ready (so the caller can pass
+    ip_adapter_image), False if this pipeline type isn't supported.  The result
+    is cached on the pipeline so repeated requests don't reload.
+    """
+    # Already loaded (or already known-unsupported) for this pipeline instance.
+    flag = getattr(pipeline, '_coderai_ip_state', None)
+    if flag == 'loaded':
+        return True
+    if flag == 'unsupported':
+        return False
+    if not hasattr(pipeline, 'load_ip_adapter'):
+        try:
+            pipeline._coderai_ip_state = 'unsupported'
+        except Exception:
+            pass
+        return False
+
+    # Detect SDXL vs SD1.5 by the presence of a second text encoder.
+    is_sdxl = hasattr(pipeline, 'text_encoder_2') and getattr(pipeline, 'text_encoder_2', None) is not None
+    cls_name = type(pipeline).__name__.lower()
+    if 'xl' in cls_name:
+        is_sdxl = True
+
+    attempts = []
+    if is_sdxl:
+        attempts.append(("h94/IP-Adapter", "sdxl_models", "ip-adapter_sdxl.bin"))
+    else:
+        attempts.append(("h94/IP-Adapter", "models", "ip-adapter_sd15.bin"))
+
+    for repo, subfolder, weight_name in attempts:
+        try:
+            pipeline.load_ip_adapter(repo, subfolder=subfolder, weight_name=weight_name)
+            pipeline._coderai_ip_state = 'loaded'
+            _log.info("IP-Adapter loaded: %s/%s/%s", repo, subfolder, weight_name)
+            return True
+        except Exception as e:
+            _log.warning("IP-Adapter load failed (%s/%s): %s", repo, weight_name, e)
+
+    try:
+        pipeline._coderai_ip_state = 'unsupported'
+    except Exception:
+        pass
+    return False
+
+
+def _apply_loras(pipeline, loras):
+    """Load and activate LoRA weights on a diffusers pipeline."""
+    try:
+        names = []
+        weights = []
+        for i, lora in enumerate(loras):
+            name = lora.name or f"lora_{i}"
+            pipeline.load_lora_weights(lora.model, adapter_name=name)
+            names.append(name)
+            weights.append(float(lora.weight if lora.weight is not None else 1.0))
+        if names:
+            pipeline.set_adapters(names, weights)
+            _log.info("LoRA weights applied: %s", names)
+    except Exception as e:
+        _log.warning("Could not apply LoRA weights: %s", e)
+
+
 async def _generate_with_diffusers(pipeline, request, global_args, http_request=None):
     """Generate images using a diffusers pipeline (with prompt-embedding cache)."""
     import torch
@@ -492,6 +681,14 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
 
     if getattr(request, 'disable_safety_checker', False):
         _disable_safety_checker(pipeline)
+
+    # Apply optional per-request VAE override
+    if getattr(request, 'vae_model', None):
+        await _apply_vae_override(pipeline, request.vae_model)
+
+    # Apply optional per-request LoRA weights
+    if getattr(request, 'loras', None):
+        _apply_loras(pipeline, request.loras)
 
     # Determine size
     width, height = 1024, 1024
@@ -513,7 +710,9 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
     try:
         if hasattr(pipeline, 'enable_attention_slicing'):
             pipeline.enable_attention_slicing(slice_size="auto")
-        if hasattr(pipeline, 'enable_vae_slicing'):
+        if hasattr(pipeline, 'vae') and hasattr(pipeline.vae, 'enable_slicing'):
+            pipeline.vae.enable_slicing()
+        elif hasattr(pipeline, 'enable_vae_slicing'):
             pipeline.enable_vae_slicing()
     except Exception as e:
         print(f"Warning: Could not enable memory optimizations: {e}")
@@ -554,13 +753,18 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
         # Try to encode and cache
         try:
             if hasattr(pipeline, 'encode_prompt'):
-                enc = pipeline.encode_prompt(
-                    prompt=request.prompt,
-                    device=pipeline.device,
-                    num_images_per_prompt=1,
-                    do_classifier_free_guidance=do_cfg,
-                    negative_prompt=neg_prompt or None,
-                )
+                import inspect as _inspect
+                _ep_params = set(_inspect.signature(pipeline.encode_prompt).parameters)
+                _ep_kwargs = {"prompt": request.prompt}
+                if "device" in _ep_params:
+                    _ep_kwargs["device"] = pipeline.device
+                if "num_images_per_prompt" in _ep_params:
+                    _ep_kwargs["num_images_per_prompt"] = 1
+                if "do_classifier_free_guidance" in _ep_params:
+                    _ep_kwargs["do_classifier_free_guidance"] = do_cfg
+                if "negative_prompt" in _ep_params:
+                    _ep_kwargs["negative_prompt"] = neg_prompt or None
+                enc = pipeline.encode_prompt(**_ep_kwargs)
                 # enc is a tuple; length varies by pipeline type
                 if len(enc) == 2:
                     # SD 1.x: (prompt_embeds, negative_prompt_embeds)
@@ -586,6 +790,12 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
 
     def _step_cb(pipe, step_index, timestep, callback_kwargs):
         _progress_step(step_index + 1)
+        # Mid-generation thermal checkpoint: pause between denoise steps if too hot.
+        try:
+            from codai.models.thermal import checkpoint as _thermal_checkpoint
+            _thermal_checkpoint(context="image-gen")
+        except Exception:
+            pass
         return callback_kwargs
 
     # Resolve character references (saved profiles + inline images)
@@ -597,6 +807,16 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
             char_images += resolve_character_profiles(profiles)
         inline = getattr(request, 'character_references', None) or []
         char_images += list(inline)
+    except Exception:
+        pass
+
+    # Environment profiles feed the SAME IP-Adapter reference set, so a
+    # regenerated location keyframe can match the references kept on disk.
+    try:
+        env_profiles = getattr(request, 'environment_profiles', None) or []
+        if env_profiles:
+            from codai.api.environments import resolve_environment_profiles
+            char_images += resolve_environment_profiles(env_profiles)
     except Exception:
         pass
 
@@ -625,21 +845,27 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
             callback_on_step_end=_step_cb,
         )
 
-    # Inject IP-Adapter images if character references provided
+    # Inject IP-Adapter images if character references provided.  The pipeline
+    # must have IP-Adapter *weights* loaded first — _ensure_ip_adapter_loaded
+    # lazily downloads + loads the right checkpoint for the architecture.
     if char_images and hasattr(pipeline, 'set_ip_adapter_scale'):
         try:
-            strength = getattr(request, 'character_strength', 0.6) or 0.6
-            ref_imgs = []
-            for ref in char_images:
-                from PIL import Image as PILImage
-                if ref.startswith('data:'):
-                    _, b64 = ref.split(',', 1)
-                    raw = base64.b64decode(b64)
-                else:
-                    raw = base64.b64decode(ref)
-                ref_imgs.append(PILImage.open(io.BytesIO(raw)).convert('RGB'))
-            pipeline.set_ip_adapter_scale(strength)
-            call_kwargs['ip_adapter_image'] = ref_imgs[0] if len(ref_imgs) == 1 else ref_imgs
+            if _ensure_ip_adapter_loaded(pipeline):
+                strength = getattr(request, 'character_strength', 0.6) or 0.6
+                ref_imgs = []
+                for ref in char_images:
+                    from PIL import Image as PILImage
+                    if ref.startswith('data:'):
+                        _, b64 = ref.split(',', 1)
+                        raw = base64.b64decode(b64)
+                    else:
+                        raw = base64.b64decode(ref)
+                    ref_imgs.append(PILImage.open(io.BytesIO(raw)).convert('RGB'))
+                pipeline.set_ip_adapter_scale(strength)
+                call_kwargs['ip_adapter_image'] = ref_imgs[0] if len(ref_imgs) == 1 else ref_imgs
+            else:
+                print("Note: IP-Adapter weights unavailable for this pipeline — "
+                      "relying on prompt/LoRA for character consistency")
         except Exception as _ip_err:
             print(f"Warning: IP-Adapter injection failed ({_ip_err}), continuing without character refs")
 
@@ -959,9 +1185,19 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
         # Step 1: Ask the manager to resolve the model and manage VRAM
         # =====================================================================
         _progress_loading(request.model or "image")
-        model_info = multi_model_manager.request_model(
+        # Reserve VRAM for any per-request LoRA adapters so eviction frees enough
+        # headroom for base weights + adapters before the pipeline loads.
+        _lora_extra_gb = 0.0
+        if getattr(request, 'loras', None):
+            try:
+                _lora_extra_gb = multi_model_manager._lora_vram_gb(request.loras)
+            except Exception:
+                _lora_extra_gb = 0.0
+        model_info = await asyncio.to_thread(
+            multi_model_manager.request_model,
             requested_model=request.model,
-            model_type="image"
+            model_type="image",
+            extra_vram_gb=_lora_extra_gb,
         )
         
         # Check if the model was rejected as not allowed
@@ -1030,14 +1266,22 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
         if not is_gguf:
             try:
                 print(f"Loading diffusers model: {model_name}")
-                pipeline = _load_diffusers_pipeline(model_name, global_args)
-                
+                _diff_cfg = (multi_model_manager.config.get(model_key)
+                             or multi_model_manager.config.get(model_name) or {})
+                _vram_before = multi_model_manager.vram_before_load()
+                pipeline = await asyncio.to_thread(
+                    _load_diffusers_pipeline, model_name, global_args, _diff_cfg)
+
                 if pipeline is not None:
                     # Cache the loaded pipeline in the manager
                     multi_model_manager.add_model(model_key, pipeline)
                     multi_model_manager.current_model_key = model_key
+                    try:
+                        multi_model_manager.record_vram_delta(model_key, _vram_before)
+                    except Exception:
+                        pass
                     print(f"Loaded diffusers model: {model_name}")
-                    
+
                     return await _generate_with_diffusers(pipeline, request, global_args, http_request)
                     
             except ImportError as e:
@@ -1054,19 +1298,24 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
             # For GGUF models or URLs, resolve the model path through the cache
             resolved_path = model_name
             if is_gguf or model_name.startswith('http://') or model_name.startswith('https://'):
-                resolved_path = multi_model_manager.load_model(model_name)
+                resolved_path = await asyncio.to_thread(multi_model_manager.load_model, model_name)
                 if not resolved_path:
                     raise Exception(f"Failed to resolve model path: {model_name}")
-            
+
             # Only use sd.cpp if we have a local file path
             if resolved_path and os.path.isfile(resolved_path):
                 cfg = multi_model_manager.config.get(model_key) or multi_model_manager.config.get(model_name) or {}
-                sd_model = _load_sdcpp_model(resolved_path, global_args, model_config=cfg)
-                
+                _vram_before = multi_model_manager.vram_before_load()
+                sd_model = await asyncio.to_thread(_load_sdcpp_model, resolved_path, global_args, model_config=cfg)
+
                 if sd_model is not None:
                     # Cache the loaded model in the manager
                     multi_model_manager.add_model(model_key, sd_model)
                     multi_model_manager.current_model_key = model_key
+                    try:
+                        multi_model_manager.record_vram_delta(model_key, _vram_before)
+                    except Exception:
+                        pass
                     print(f"Loaded sd.cpp model: {model_name}")
                     
                     return await _generate_with_sdcpp(sd_model, request, global_args, http_request)
@@ -1155,7 +1404,8 @@ def _load_img2img_pipeline(model_name: str, global_args):
 
     for attempt in range(3):
         try:
-            pipe = PipeClass.from_pretrained(model_name, torch_dtype=torch_dtype)
+            with _DIFFUSERS_LOAD_LOCK:
+                pipe = PipeClass.from_pretrained(model_name, torch_dtype=torch_dtype)
             pipe = pipe.to(device)
             if attempt >= 1:
                 pipe.enable_attention_slicing()
@@ -1189,7 +1439,8 @@ async def create_image_edit(request: ImageEditRequest, http_request: Request = N
         raise HTTPException(status_code=400, detail="image is required")
 
     _progress_loading(request.model or "image")
-    model_info = multi_model_manager.request_model(request.model, model_type="image")
+    model_info = await asyncio.to_thread(
+        multi_model_manager.request_model, request.model, model_type="image")
     model_name = model_info.get('model_name')
     if not model_name:
         err = model_info.get('error', f"Model '{request.model}' not found or not registered")
@@ -1294,7 +1545,8 @@ def _load_inpaint_pipeline(model_name: str, global_args):
         PClass = DiffusionPipeline
     for attempt in range(3):
         try:
-            pipe = PClass.from_pretrained(model_name, torch_dtype=torch_dtype)
+            with _DIFFUSERS_LOAD_LOCK:
+                pipe = PClass.from_pretrained(model_name, torch_dtype=torch_dtype)
             pipe = pipe.to(device)
             if attempt >= 1:
                 pipe.enable_attention_slicing()
@@ -1323,7 +1575,8 @@ async def create_image_inpaint(request: ImageInpaintRequest, http_request: Reque
     if not request.image or not request.mask:
         raise HTTPException(status_code=400, detail="image and mask are required")
     _progress_loading(request.model or "image")
-    model_info = multi_model_manager.request_model(request.model, model_type="image")
+    model_info = await asyncio.to_thread(
+        multi_model_manager.request_model, request.model, model_type="image")
     model_name = model_info.get('model_name')
     if not model_name:
         raise HTTPException(status_code=404, detail=model_info.get('error', 'Model not found'))
@@ -1432,7 +1685,8 @@ async def create_image_upscale(request: ImageUpscaleRequest, http_request: Reque
     """Upscale an image using Real-ESRGAN or PIL LANCZOS fallback."""
     global global_args
     _progress_loading(request.model or "image")
-    model_info = multi_model_manager.request_model(request.model, model_type="image")
+    model_info = await asyncio.to_thread(
+        multi_model_manager.request_model, request.model, model_type="image")
     model_name = model_info.get('model_name') or request.model
     model_key = f"upscale:{model_name}"
     upscaler = multi_model_manager.models.get(model_key)
@@ -1465,11 +1719,17 @@ class ImageDepthRequest(BaseModel):
         extra = "allow"
 
 
-def _load_depth_model(model_name: str, global_args):
+def _load_depth_model(model_name: str, global_args, model_config: dict = None):
     device = _derive_diffusers_device(global_args)
     try:
         from transformers import pipeline as hf_pipeline
-        pipe = hf_pipeline("depth-estimation", model=model_name, device=device)
+        from codai.models.hf_loading import pipeline_device_kwargs
+        pk = pipeline_device_kwargs(model_config)
+        # device and device_map are mutually exclusive in HF pipeline.
+        if 'device_map' in pk:
+            pipe = hf_pipeline("depth-estimation", model=model_name, **pk)
+        else:
+            pipe = hf_pipeline("depth-estimation", model=model_name, device=device, **pk)
         return ('transformers', pipe)
     except Exception:
         pass
@@ -1542,9 +1802,11 @@ async def create_image_depth(request: ImageDepthRequest, http_request: Request =
     model_key = f"depth:{model_name}"
     depth_model = multi_model_manager.models.get(model_key)
     if depth_model is None:
+        _sp_cfg = (multi_model_manager.config.get(f"spatial:{model_name}")
+                   or multi_model_manager.config.get(model_name) or {})
         try:
             depth_model = await asyncio.get_event_loop().run_in_executor(
-                None, _load_depth_model, model_name, global_args)
+                None, _load_depth_model, model_name, global_args, _sp_cfg)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load depth model: {e}")
         multi_model_manager.models[model_key] = depth_model
@@ -1572,19 +1834,28 @@ class ImageSegmentRequest(BaseModel):
         extra = "allow"
 
 
-def _load_segmentation_model(model_name: str, global_args):
+def _load_segmentation_model(model_name: str, global_args, model_config: dict = None):
     device = _derive_diffusers_device(global_args)
+    from codai.models.hf_loading import build_from_pretrained_kwargs, pipeline_device_kwargs
     try:
         from transformers import SamModel, SamProcessor
         import torch
-        model = SamModel.from_pretrained(model_name).to(device)
+        fp = build_from_pretrained_kwargs(model_config)
+        model = SamModel.from_pretrained(model_name, **fp)
+        # Quantized/offloaded models are already placed; only plain models move.
+        if 'quantization_config' not in fp and 'device_map' not in fp:
+            model = model.to(device)
         processor = SamProcessor.from_pretrained(model_name)
         return ('sam', (model, processor, device))
     except Exception:
         pass
     try:
         from transformers import pipeline as hf_pipeline
-        pipe = hf_pipeline("image-segmentation", model=model_name, device=device)
+        pk = pipeline_device_kwargs(model_config)
+        if 'device_map' in pk:
+            pipe = hf_pipeline("image-segmentation", model=model_name, **pk)
+        else:
+            pipe = hf_pipeline("image-segmentation", model=model_name, device=device, **pk)
         return ('transformers', pipe)
     except Exception as e:
         raise RuntimeError(f"Cannot load segmentation model: {e}")
@@ -1637,9 +1908,11 @@ async def create_image_segment(request: ImageSegmentRequest, http_request: Reque
     model_key = f"segment:{model_name}"
     seg_model = multi_model_manager.models.get(model_key)
     if seg_model is None:
+        _sp_cfg = (multi_model_manager.config.get(f"spatial:{model_name}")
+                   or multi_model_manager.config.get(model_name) or {})
         try:
             seg_model = await asyncio.get_event_loop().run_in_executor(
-                None, _load_segmentation_model, model_name, global_args)
+                None, _load_segmentation_model, model_name, global_args, _sp_cfg)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load segmentation model: {e}")
         multi_model_manager.models[model_key] = seg_model

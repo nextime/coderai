@@ -21,6 +21,13 @@ from typing import Dict, List, Optional
 from pydantic import BaseModel, ConfigDict
 
 
+class LoraConfig(BaseModel):
+    model: str
+    weight: float = 1.0
+    name: Optional[str] = None
+    model_config = ConfigDict(extra="allow")
+
+
 class ImageGenerationRequest(BaseModel):
     model: str
     prompt: str
@@ -36,10 +43,15 @@ class ImageGenerationRequest(BaseModel):
     disable_safety_checker: Optional[bool] = False
     negative_prompt: Optional[str] = None
 
+    # Per-request component overrides
+    vae_model: Optional[str] = None                 # Override the VAE for this request
+    loras: Optional[List[LoraConfig]] = None        # Additional LoRA weights for this request
+
     # Character consistency
     character_profiles: Optional[List[str]] = None      # saved profile names
     character_references: Optional[List[str]] = None    # inline base64 images
     character_strength: Optional[float] = 0.6           # IP-Adapter scale
+    environment_profiles: Optional[List[str]] = None    # saved environment profile names (IP-Adapter)
 
     model_config = ConfigDict(extra="allow")
 
