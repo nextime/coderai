@@ -381,6 +381,74 @@ WIN_SHOT_TEMPLATES = {
     ],
 }
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Global prompt configuration (editable from the web "Prompts" page).
+# Overrides are persisted to <out-dir>/prompts_config.json and re-applied to the
+# module-level templates so both the LLM prompts and the static fallbacks change.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PROMPT_OUTCOMES = ("win", "ko_win", "retire", "draw")
+
+
+def prompts_config_snapshot() -> dict:
+    """Return the current global prompt templates as a plain dict."""
+    import sys as _sys
+    m = _sys.modules[__name__]
+    return {
+        "llm_system": m._LLM_SYSTEM,
+        "llm_outcome_system": m._LLM_OUTCOME_SYSTEM,
+        "fight_shot_templates": list(m.FIGHT_SHOT_TEMPLATES),
+        "win_shot_templates": {k: list(m.WIN_SHOT_TEMPLATES.get(k, []))
+                               for k in _PROMPT_OUTCOMES},
+    }
+
+
+def apply_prompts_config(cfg: dict) -> None:
+    """Apply a (partial) prompt-config dict to the live module globals."""
+    if not cfg:
+        return
+    import sys as _sys
+    m = _sys.modules[__name__]
+    if cfg.get("llm_system"):
+        m._LLM_SYSTEM = str(cfg["llm_system"])
+    if cfg.get("llm_outcome_system"):
+        m._LLM_OUTCOME_SYSTEM = str(cfg["llm_outcome_system"])
+    fst = cfg.get("fight_shot_templates")
+    if isinstance(fst, list):
+        cleaned = [str(s).strip() for s in fst if str(s).strip()]
+        if cleaned:
+            m.FIGHT_SHOT_TEMPLATES = cleaned
+    wst = cfg.get("win_shot_templates")
+    if isinstance(wst, dict):
+        merged = {k: list(v) for k, v in m.WIN_SHOT_TEMPLATES.items()}
+        for k in _PROMPT_OUTCOMES:
+            if isinstance(wst.get(k), list):
+                cleaned = [str(s).strip() for s in wst[k] if str(s).strip()]
+                if cleaned:
+                    merged[k] = cleaned
+        m.WIN_SHOT_TEMPLATES = merged
+
+
+def _prompts_config_path(out_dir) -> Path:
+    return Path(out_dir) / "prompts_config.json"
+
+
+def load_prompts_config(out_dir) -> dict:
+    p = _prompts_config_path(out_dir)
+    if p.exists():
+        try:
+            return json.loads(p.read_text()) or {}
+        except Exception:
+            return {}
+    return {}
+
+
+def save_prompts_config(out_dir, cfg: dict) -> None:
+    p = _prompts_config_path(out_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(cfg, indent=2))
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Local output structure helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -779,6 +847,11 @@ _LLM_OUTCOME_SYSTEM = """\
 You are a creative director writing vivid 15-25 word video-generation prompts for fight outcome moments.
 Be specific about body language, expression, lighting, and atmosphere.
 Return ONLY the prompt, no quotes or explanation."""
+
+# Snapshot the built-in defaults now that every template/system prompt is
+# defined (before any saved override is applied), so the web "Prompts" page can
+# offer a reset-to-defaults.
+_PROMPT_DEFAULTS = prompts_config_snapshot()
 
 
 class PromptGenerator:
@@ -1820,6 +1893,8 @@ def launch_web_ui(default_args):
 
     port = getattr(default_args, 'web_port', 7788)
     out_dir = Path(default_args.out_dir)
+    # Apply any saved global-prompt overrides so the UI + runs use them.
+    apply_prompts_config(load_prompts_config(out_dir))
 
     # Shared state
     _state = {
@@ -2444,6 +2519,7 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
             ("characters", "/characters", "👤 Characters"),
             ("environments", "/environments", "🏞 Environments"),
             ("matches", "/matches", "🥊 Matches"),
+            ("prompts", "/prompts", "✍ Prompts"),
             ("gallery", "/gallery", "🎬 Gallery"),
         ]
         nav = "".join(
@@ -3042,14 +3118,9 @@ async function uploadRefs(kind,name){
                 f'Remove it entirely. Changes apply to the local output folder and are synced to CoderAI.</p>'
                 f'{inner}{script}')
 
-    def _matches_html():
-        import html as _html
+    def _scan_matches():
+        """Return (vdir, plan, fight_by_name, matches, outcomes) from disk."""
         vdir = out_dir / "videos"
-
-        def esc(v):
-            return _html.escape(str(v if v is not None else ""), quote=True)
-
-        # Load the saved plan (for fighters/env + which clips belong to a match).
         plan = {}
         pf = vdir / "prompts.json"
         if pf.exists():
@@ -3058,10 +3129,7 @@ async function uploadRefs(kind,name){
             except Exception:
                 plan = {}
         fight_by_name = {m.get("match_name"): m for m in plan.get("fight_plan", [])}
-
-        # Group the rendered files on disk.
-        matches = {}     # match_name -> {"short":p,"long":p,"clips":[p,...]}
-        outcomes = []    # outcome .mp4 files
+        matches, outcomes = {}, []
         if vdir.exists():
             for v in sorted(vdir.glob("*.mp4")):
                 stem = v.stem
@@ -3073,126 +3141,32 @@ async function uploadRefs(kind,name){
                     matches.setdefault(mn, {}).setdefault("clips", []).append(v)
                 else:
                     outcomes.append(v)
-        # Matches referenced in the plan but not yet rendered also show up.
         for mn in fight_by_name:
             matches.setdefault(mn, {})
+        return vdir, plan, fight_by_name, matches, outcomes
 
-        def _vid(relpath, height=150):
-            url = "/media/" + str(relpath).replace("\\", "/")
-            return (f'<video src="{esc(url)}" controls preload=metadata '
-                    f'style="width:100%;height:{height}px;object-fit:cover;'
-                    f'border-radius:6px;background:#111"></video>')
+    def _dur_str(p: Path) -> str:
+        d = get_video_duration(str(p)) or 0
+        return f"{d:.0f}s" if d else "?"
 
-        cards = []
-        for mn in sorted(matches):
-            info = matches[mn]
-            meta = fight_by_name.get(mn, {})
-            finals = info.get("finals", {})
-            clips = sorted(info.get("clips", []), key=lambda p: p.name)
-            f1, f2 = meta.get("f1", ""), meta.get("f2", "")
-            env = meta.get("env", "")
-            title = f"{f1} vs {f2}" if f1 else mn.replace("match_", "").replace("_", " ")
+    def _esc(v):
+        import html as _html
+        return _html.escape(str(v if v is not None else ""), quote=True)
 
-            finals_html = ""
-            for k in ("short", "long"):
-                if k in finals:
-                    rel = finals[k].relative_to(out_dir)
-                    finals_html += (f'<div style="flex:1;min-width:200px">'
-                                    f'<div class=hint style="margin-bottom:.2rem">{k} ({_dur_str(finals[k])})</div>'
-                                    f'{_vid(rel)}</div>')
-            if not finals_html:
-                finals_html = '<span class=hint>No assembled videos yet.</span>'
+    def _vid_tag(p: Path, h=180):
+        url = "/media/" + str(p.relative_to(out_dir)).replace("\\", "/")
+        return (f'<video src="{_esc(url)}" controls preload=none '
+                f'style="width:100%;height:{h}px;object-fit:cover;'
+                f'border-radius:6px;background:#111"></video>')
 
-            clips_html = "".join(
-                f'<div style="width:150px">'
-                f'{_vid(c.relative_to(out_dir), height=96)}'
-                f'<div class=hint style="text-align:center">clip {esc(c.stem.split("_clip")[-1])}'
-                f' · <a href="#" onclick="reMatch(event,\'clip\',{{match:\'{esc(mn)}\',idx:\'{esc(c.stem.split("_clip")[-1])}\'}})" '
-                f'style="color:#7eb8f7">re-render</a></div>'
-                f'</div>'
-                for c in clips
-            ) or '<span class=hint>No clips rendered.</span>'
-
-            cards.append(
-                f'<div class=card id="match-{esc(mn)}">'
-                f'  <div class=pf-head><span class=pf-name>🥊 {esc(title)}</span>'
-                f'  <span class=hint>{esc(env)} · {len(clips)} clip(s)</span></div>'
-                f'  <div class=section-title style="margin:.5rem 0 .3rem">Final videos</div>'
-                f'  <div style="display:flex;gap:.6rem;flex-wrap:wrap">{finals_html}</div>'
-                f'  <div class=section-title style="margin:.7rem 0 .3rem">Single clips</div>'
-                f'  <div style="display:flex;gap:.5rem;flex-wrap:wrap">{clips_html}</div>'
-                f'  <div class=pf-actions style="border-top:1px solid #222;padding-top:.6rem;margin-top:.7rem">'
-                f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
-                f'onclick="reMatch(event,\'match-clips\',{{match:\'{esc(mn)}\'}})">♻ Re-render all clips</button>'
-                f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
-                f'onclick="reMatch(event,\'reassemble\',{{match:\'{esc(mn)}\'}})">🎞 Reassemble finals</button>'
-                f'    <span class=match-status style="font-size:.76rem;color:#7ea8f7"></span>'
-                f'  </div>'
-                f'</div>'
-            )
-
-        # Outcome clips ("outputs"), grouped by fighter.
-        out_by_fighter = {}
-        for v in outcomes:
-            fighter = v.stem.rsplit("_", 1)[0] if "_" in v.stem else v.stem
-            out_by_fighter.setdefault(fighter, []).append(v)
-        out_cards = []
-        for fighter in sorted(out_by_fighter):
-            vids = sorted(out_by_fighter[fighter], key=lambda p: p.name)
-            grid = "".join(
-                f'<div style="width:150px">{_vid(v.relative_to(out_dir), height=96)}'
-                f'<div class=hint style="text-align:center">{esc(v.stem.split("_",1)[-1])}'
-                f' · <a href="#" onclick="reMatch(event,\'outcome\',{{fighter:\'{esc(fighter)}\',outcome:\'{esc(v.stem.split("_",1)[-1])}\'}})" '
-                f'style="color:#7eb8f7">re-render</a></div></div>'
-                for v in vids
-            )
-            out_cards.append(
-                f'<div class=card id="out-{esc(fighter)}">'
-                f'  <div class=pf-head><span class=pf-name>🎬 {esc(fighter)} — outputs</span>'
-                f'  <span class=hint>{len(vids)} clip(s)</span></div>'
-                f'  <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.4rem">{grid}</div>'
-                f'  <div class=pf-actions style="border-top:1px solid #222;padding-top:.6rem;margin-top:.7rem">'
-                f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
-                f'onclick="reMatch(event,\'outcomes\',{{fighter:\'{esc(fighter)}\'}})">♻ Re-render {esc(fighter)} outputs</button>'
-                f'    <span class=match-status style="font-size:.76rem;color:#7ea8f7"></span>'
-                f'  </div>'
-                f'</div>'
-            )
-
-        body = ""
-        if cards:
-            body += "".join(cards)
-        if out_cards:
-            body += ('<div class=section-title style="margin:1.2rem 0 .4rem;font-size:1rem">'
-                     'Outcome clips (outputs)</div>' + "".join(out_cards))
-        if not body:
-            body = ('<div class=card style="color:#666">No matches found yet. Render '
-                    'videos from the Run page first (or run the Videos step).</div>')
-
-        script = """
+    # Shared JS for the Matches list + detail pages (regenerate / save / remove).
+    _match_js = """
 <script>
-async function reMatch(ev, scope, params){
-  if(ev) ev.preventDefault();
-  const labels={'match-clips':'Re-render ALL clips of this match (uses the video model, can take a while)?',
-                'clip':'Re-render this single clip?',
-                'reassemble':'Reassemble the final short/long videos from the existing clips? (fast, no model)',
-                'outcomes':'Re-render all output clips for this fighter (uses the video model)?',
-                'outcome':'Re-render this output clip?'};
-  if(!(await uiConfirm(labels[scope]||'Proceed?',
-       {title:'Regenerate', okText:(scope==='reassemble'?'Reassemble':'Re-render'),
-        danger:(scope!=='reassemble')})))return;
-  // Locate the status span of the card that triggered this.
+function _findStatus(ev){
   const card = ev && ev.target ? ev.target.closest('.card') : null;
-  const st = card ? card.querySelector('.match-status') : null;
-  const setSt=(c,t)=>{ if(st){ st.style.color=c; st.textContent=t; } };
-  const fd=new FormData(); fd.append('scope',scope);
-  for(const k in params) fd.append(k, params[k]);
-  setSt('#aaa','Starting…');
-  let j;
-  try{ j=await (await fetch('/matches/render',{method:'POST',body:fd})).json(); }
-  catch(e){ setSt('#e07070','✗ '+e); return; }
-  if(j.error){ setSt('#e07070','✗ '+j.error); return; }
-  const jobId=j.job_id;
+  return card ? card.querySelector('.match-status') : document.getElementById('detail-status');
+}
+function _pollJob(jobId, setSt){
   const poll=async()=>{
     let d;
     try{ d=await (await fetch('/job/'+jobId)).json(); }
@@ -3204,19 +3178,384 @@ async function reMatch(ev, scope, params){
   };
   setTimeout(poll,900);
 }
+async function reMatch(ev, scope, params){
+  if(ev) ev.preventDefault();
+  const labels={'match-clips':'Re-render ALL clips of this match (uses the video model, can take a while)?',
+                'clip':'Re-render this single clip?',
+                'reassemble':'Reassemble the final short/long videos from the existing clips? (fast, no model)',
+                'outcomes':'Re-render all output clips for this fighter (uses the video model)?',
+                'outcome':'Re-render this output clip?'};
+  if(!(await uiConfirm(labels[scope]||'Proceed?',
+       {title:'Regenerate', okText:(scope==='reassemble'?'Reassemble':'Re-render'),
+        danger:(scope!=='reassemble')})))return;
+  const stEl=_findStatus(ev);
+  const setSt=(c,t)=>{ if(stEl){ stEl.style.color=c; stEl.textContent=t; } };
+  const fd=new FormData(); fd.append('scope',scope);
+  for(const k in params) fd.append(k, params[k]);
+  setSt('#aaa','Starting…');
+  let j;
+  try{ j=await (await fetch('/matches/render',{method:'POST',body:fd})).json(); }
+  catch(e){ setSt('#e07070','✗ '+e); return; }
+  if(j.error){ setSt('#e07070','✗ '+j.error); return; }
+  _pollJob(j.job_id, setSt);
+}
+async function delVid(ev, scope, params){
+  if(ev) ev.preventDefault();
+  const labels={'clip':'Delete this clip video file?',
+                'final':'Delete this assembled video file?',
+                'match':'Delete ALL video files for this match (clips + finals)? The plan/prompts are kept so you can re-render.',
+                'output':'Delete this output video file?',
+                'outputs':'Delete ALL output video files for this fighter?'};
+  if(!(await uiConfirm(labels[scope]||'Delete?',{title:'Remove videos', okText:'Delete', danger:true})))return;
+  const stEl=_findStatus(ev);
+  const setSt=(c,t)=>{ if(stEl){ stEl.style.color=c; stEl.textContent=t; } };
+  const fd=new FormData(); fd.append('scope',scope);
+  for(const k in params) fd.append(k, params[k]);
+  let j;
+  try{ j=await (await fetch('/matches/delete',{method:'POST',body:fd})).json(); }
+  catch(e){ setSt('#e07070','✗ '+e); return; }
+  if(j.error){ setSt('#e07070','✗ '+j.error); return; }
+  setSt('#7ed87e','✓ removed '+(j.removed||0)+' file(s) — reloading…');
+  setTimeout(()=>location.reload(),700);
+}
+async function saveMatch(ev, name){
+  const root=document.getElementById('detail');
+  const st=document.getElementById('detail-status');
+  const setSt=(c,t)=>{ st.style.color=c; st.textContent=t; };
+  const fd=new FormData(); fd.append('mode','match'); fd.append('name',name);
+  ['f1','f2','env','short_target','long_target'].forEach(k=>{
+    const el=root.querySelector('[data-field="'+k+'"]'); if(el) fd.append(k, el.value);
+  });
+  root.querySelectorAll('[data-clip]').forEach(el=>fd.append('clip_'+el.getAttribute('data-clip'), el.value));
+  setSt('#aaa','Saving…');
+  try{
+    const j=await (await fetch('/matches/save',{method:'POST',body:fd})).json();
+    if(j.error){ setSt('#e07070','✗ '+j.error); return; }
+    setSt('#7ed87e','✓ Saved');
+  }catch(e){ setSt('#e07070','✗ '+e); }
+}
+async function saveOutputs(ev, fighter){
+  const root=document.getElementById('detail');
+  const st=document.getElementById('detail-status');
+  const setSt=(c,t)=>{ st.style.color=c; st.textContent=t; };
+  const fd=new FormData(); fd.append('mode','outputs'); fd.append('fighter',fighter);
+  root.querySelectorAll('[data-out]').forEach(el=>fd.append('out_'+el.getAttribute('data-out'), el.value));
+  setSt('#aaa','Saving…');
+  try{
+    const j=await (await fetch('/matches/save',{method:'POST',body:fd})).json();
+    if(j.error){ setSt('#e07070','✗ '+j.error); return; }
+    setSt('#7ed87e','✓ Saved');
+  }catch(e){ setSt('#e07070','✗ '+e); }
+}
 </script>"""
+
+    def _matches_html():
+        """Lightweight LIST of matches + outputs — no embedded video players."""
+        vdir, plan, fight_by_name, matches, outcomes = _scan_matches()
+
+        def _row(mn):
+            info = matches[mn]
+            meta = fight_by_name.get(mn, {})
+            clips = info.get("clips", [])
+            finals = info.get("finals", {})
+            f1, f2 = meta.get("f1", ""), meta.get("f2", "")
+            env = meta.get("env", "")
+            title = f"{f1} vs {f2}" if f1 else mn.replace("match_", "").replace("_", " ")
+            fin = ", ".join(k for k in ("short", "long") if k in finals) or "none"
+            return (
+                f'<div class=card id="row-{_esc(mn)}" '
+                f'style="display:flex;align-items:center;gap:.8rem;padding:.7rem 1rem">'
+                f'  <div style="flex:1">'
+                f'    <div class=pf-name style="font-size:.98rem">🥊 {_esc(title)}</div>'
+                f'    <div class=hint>{_esc(env) or "no env"} · {len(clips)} clip(s) · finals: {_esc(fin)}</div>'
+                f'  </div>'
+                f'  <span class=match-status style="font-size:.74rem;color:#7ea8f7"></span>'
+                f'  <a class="btn btn-primary" style="font-size:.8rem;padding:.35rem .9rem" '
+                f'href="/match?name={_esc(mn)}">Open ▸</a>'
+                f'  <button class="btn btn-danger" style="font-size:.8rem;padding:.35rem .8rem" '
+                f'onclick="delVid(event,\'match\',{{match:\'{_esc(mn)}\'}})">🗑 Remove videos</button>'
+                f'</div>'
+            )
+
+        match_rows = "".join(_row(mn) for mn in sorted(matches))
+
+        # Outputs: one lightweight row per fighter linking to its detail.
+        out_by_fighter = {}
+        for v in outcomes:
+            fighter = v.stem.rsplit("_", 1)[0] if "_" in v.stem else v.stem
+            out_by_fighter.setdefault(fighter, []).append(v)
+        out_rows = "".join(
+            f'<div class=card id="orow-{_esc(fr)}" '
+            f'style="display:flex;align-items:center;gap:.8rem;padding:.7rem 1rem">'
+            f'  <div style="flex:1"><div class=pf-name style="font-size:.95rem">🎬 {_esc(fr)} — outputs</div>'
+            f'  <div class=hint>{len(vs)} clip(s)</div></div>'
+            f'  <span class=match-status style="font-size:.74rem;color:#7ea8f7"></span>'
+            f'  <a class="btn btn-primary" style="font-size:.8rem;padding:.35rem .9rem" '
+            f'href="/match?fighter={_esc(fr)}">Open ▸</a>'
+            f'  <button class="btn btn-danger" style="font-size:.8rem;padding:.35rem .8rem" '
+            f'onclick="delVid(event,\'outputs\',{{fighter:\'{_esc(fr)}\'}})">🗑 Remove videos</button>'
+            f'</div>'
+            for fr, vs in sorted(out_by_fighter.items())
+        )
+
+        body = ""
+        if match_rows:
+            body += '<div class=section-title style="margin:.3rem 0 .4rem">Matches</div>' + match_rows
+        if out_rows:
+            body += ('<div class=section-title style="margin:1.1rem 0 .4rem">Outcome clips (outputs)</div>'
+                     + out_rows)
+        if not body:
+            body = ('<div class=card style="color:#666">No matches found yet. Render '
+                    'videos from the Run page first (or run the Videos step).</div>')
 
         return (f'<div style="display:flex;justify-content:space-between;align-items:center">'
                 f'<h1>Matches</h1>'
                 f'<a href="/matches" class="btn btn-secondary" style="font-size:.8rem">↻ Refresh</a></div>'
-                f'<p class=hint style="margin-bottom:.8rem">Final videos, single clips and outcome '
-                f'outputs per match. Re-render clips/outputs with the video model, or reassemble the '
-                f'final short/long videos from existing clips (no model).</p>'
-                f'{body}{script}')
+                f'<p class=hint style="margin-bottom:.8rem">Select a match to view, edit and '
+                f'regenerate its videos. Videos are only loaded on the detail page.</p>'
+                f'{body}{_match_js}')
 
-    def _dur_str(p: Path) -> str:
-        d = get_video_duration(str(p)) or 0
-        return f"{d:.0f}s" if d else "?"
+    def _match_detail_html(name=None, fighter=None):
+        """Detail view for a single match (or a fighter's outputs): embeds that
+        item's videos only, with edit + regenerate + remove controls."""
+        vdir, plan, fight_by_name, matches, outcomes = _scan_matches()
+        back = ('<a href="/matches" style="font-size:.85rem">‹ Back to matches</a>')
+
+        # ── Fighter outputs detail ─────────────────────────────────────────────
+        if fighter:
+            vids = sorted((v for v in outcomes if v.stem.rsplit("_", 1)[0] == fighter),
+                          key=lambda p: p.name)
+            o_by_outcome = {o["outcome"]: o for o in plan.get("outcome_plan", [])
+                            if o.get("fighter") == fighter}
+            tiles = []
+            seen = set()
+            for v in vids:
+                outcome = v.stem.split("_", 1)[-1]
+                seen.add(outcome)
+                o = o_by_outcome.get(outcome, {})
+                tiles.append(
+                    f'<div class=card style="width:280px">'
+                    f'  <div class=pf-name style="font-size:.9rem">{_esc(outcome)}</div>'
+                    f'  {_vid_tag(v, 150)}'
+                    f'  <label>Prompt</label>'
+                    f'  <textarea data-out="{_esc(outcome)}" rows=2>{_esc(o.get("prompt",""))}</textarea>'
+                    f'  <div class=pf-actions style="margin-top:.4rem">'
+                    f'    <button class="btn btn-secondary" style="font-size:.78rem;padding:.3rem .7rem" '
+                    f'onclick="reMatch(event,\'outcome\',{{fighter:\'{_esc(fighter)}\',outcome:\'{_esc(outcome)}\'}})">♻ Re-render</button>'
+                    f'    <button class="btn btn-danger" style="font-size:.78rem;padding:.3rem .7rem" '
+                    f'onclick="delVid(event,\'output\',{{fighter:\'{_esc(fighter)}\',outcome:\'{_esc(outcome)}\'}})">🗑 Remove</button>'
+                    f'  </div>'
+                    f'</div>'
+                )
+            # Planned outcomes without a rendered file yet (edit prompt + render).
+            for outcome, o in o_by_outcome.items():
+                if outcome in seen:
+                    continue
+                tiles.append(
+                    f'<div class=card style="width:280px">'
+                    f'  <div class=pf-name style="font-size:.9rem">{_esc(outcome)} '
+                    f'<span class=hint>(not rendered)</span></div>'
+                    f'  <label>Prompt</label>'
+                    f'  <textarea data-out="{_esc(outcome)}" rows=2>{_esc(o.get("prompt",""))}</textarea>'
+                    f'  <div class=pf-actions style="margin-top:.4rem">'
+                    f'    <button class="btn btn-secondary" style="font-size:.78rem;padding:.3rem .7rem" '
+                    f'onclick="reMatch(event,\'outcome\',{{fighter:\'{_esc(fighter)}\',outcome:\'{_esc(outcome)}\'}})">▶ Render</button>'
+                    f'  </div>'
+                    f'</div>'
+                )
+            tiles_html = "".join(tiles) or '<span class=hint>No outputs for this fighter.</span>'
+            return (
+                f'<div id=detail>{back}'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;margin:.4rem 0">'
+                f'<h1>🎬 {_esc(fighter)} — outputs</h1>'
+                f'<span id=detail-status style="font-size:.8rem;color:#7ea8f7"></span></div>'
+                f'<div class=pf-actions style="margin-bottom:.8rem">'
+                f'  <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
+                f'onclick="saveOutputs(event,\'{_esc(fighter)}\')">💾 Save prompts</button>'
+                f'  <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+                f'onclick="reMatch(event,\'outcomes\',{{fighter:\'{_esc(fighter)}\'}})">♻ Re-render all outputs</button>'
+                f'  <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
+                f'onclick="delVid(event,\'outputs\',{{fighter:\'{_esc(fighter)}\'}})">🗑 Remove all outputs</button>'
+                f'</div>'
+                f'<div style="display:flex;gap:.7rem;flex-wrap:wrap">{tiles_html}</div>'
+                f'</div>{_match_js}'
+            )
+
+        # ── Match detail ───────────────────────────────────────────────────────
+        if not name or name not in matches:
+            return f'<div class=card style="color:#666">Match not found. {back}</div>'
+        meta = fight_by_name.get(name, {})
+        info = matches[name]
+        finals = info.get("finals", {})
+        clip_files = {}
+        for p in info.get("clips", []):
+            suf = p.stem.split("_clip")[-1]
+            if suf.isdigit():
+                clip_files[int(suf)] = p
+        plan_clips = meta.get("clips", [])
+        f1, f2 = meta.get("f1", ""), meta.get("f2", "")
+        env = meta.get("env", "")
+        title = f"{f1} vs {f2}" if f1 else name.replace("match_", "").replace("_", " ")
+
+        finals_html = ""
+        for k in ("short", "long"):
+            if k in finals:
+                finals_html += (
+                    f'<div style="flex:1;min-width:220px">'
+                    f'<div class=hint style="margin-bottom:.2rem">{k} ({_dur_str(finals[k])})</div>'
+                    f'{_vid_tag(finals[k])}'
+                    f'<div style="margin-top:.3rem"><button class="btn btn-danger" '
+                    f'style="font-size:.76rem;padding:.25rem .7rem" '
+                    f'onclick="delVid(event,\'final\',{{match:\'{_esc(name)}\',which:\'{k}\'}})">🗑 Remove {k}</button></div>'
+                    f'</div>')
+        if not finals_html:
+            finals_html = '<span class=hint>No assembled videos yet.</span>'
+
+        # Clip tiles: prefer the saved plan order; show video + editable prompt.
+        clip_tiles = []
+        idxs = [c["idx"] for c in plan_clips] if plan_clips else sorted(clip_files)
+        for c in (plan_clips or [{"idx": i, "prompt": ""} for i in idxs]):
+            idx = c["idx"]
+            vp = clip_files.get(idx)
+            vid_html = _vid_tag(vp, 120) if vp else '<div class=hint>not rendered</div>'
+            rm_html = (f'<button class="btn btn-danger" style="font-size:.72rem;padding:.2rem .55rem" '
+                       f'onclick="delVid(event,\'clip\',{{match:\'{_esc(name)}\',idx:\'{idx}\'}})">🗑</button>'
+                       if vp else '')
+            clip_tiles.append(
+                f'<div class=card style="width:230px">'
+                f'  <div class=hint style="display:flex;justify-content:space-between;align-items:center">'
+                f'<span>clip {idx:02d}</span>'
+                f'<span><a href="#" style="color:#7eb8f7" '
+                f'onclick="reMatch(event,\'clip\',{{match:\'{_esc(name)}\',idx:\'{idx}\'}})">re-render</a> {rm_html}</span></div>'
+                f'  {vid_html}'
+                f'  <textarea data-clip="{idx}" rows=2 style="margin-top:.3rem">{_esc(c.get("prompt",""))}</textarea>'
+                f'</div>'
+            )
+        clip_tiles_html = "".join(clip_tiles) or '<span class=hint>No clips planned.</span>'
+
+        return (
+            f'<div id=detail>{back}'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;margin:.4rem 0">'
+            f'<h1>🥊 {_esc(title)}</h1>'
+            f'<span id=detail-status style="font-size:.8rem;color:#7ea8f7"></span></div>'
+            # edit meta
+            f'<div class=card>'
+            f'  <div class=row3>'
+            f'    <div><label>Fighter 1</label><input type=text data-field=f1 value="{_esc(f1)}"></div>'
+            f'    <div><label>Fighter 2</label><input type=text data-field=f2 value="{_esc(f2)}"></div>'
+            f'    <div><label>Environment</label><input type=text data-field=env value="{_esc(env)}"></div>'
+            f'  </div>'
+            f'  <div class=row style="margin-top:.4rem">'
+            f'    <div><label>Short target (s)</label><input type=number data-field=short_target '
+            f'value="{_esc(meta.get("short_target",45))}"></div>'
+            f'    <div><label>Long target (s)</label><input type=number data-field=long_target '
+            f'value="{_esc(meta.get("long_target",70))}"></div>'
+            f'  </div>'
+            f'  <div class=pf-actions style="margin-top:.6rem">'
+            f'    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="saveMatch(event,\'{_esc(name)}\')">💾 Save match</button>'
+            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="reMatch(event,\'match-clips\',{{match:\'{_esc(name)}\'}})">♻ Re-render all clips</button>'
+            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="reMatch(event,\'reassemble\',{{match:\'{_esc(name)}\'}})">🎞 Reassemble finals</button>'
+            f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="delVid(event,\'match\',{{match:\'{_esc(name)}\'}})">🗑 Remove all videos</button>'
+            f'  </div>'
+            f'</div>'
+            f'<div class=section-title style="margin:.7rem 0 .3rem">Final videos</div>'
+            f'<div style="display:flex;gap:.6rem;flex-wrap:wrap">{finals_html}</div>'
+            f'<div class=section-title style="margin:.9rem 0 .3rem">Single clips '
+            f'<span class=hint>(edit prompt, then Save match + Re-render)</span></div>'
+            f'<div style="display:flex;gap:.6rem;flex-wrap:wrap">{clip_tiles_html}</div>'
+            f'</div>{_match_js}'
+        )
+
+    def _prompts_html():
+        """Edit the global prompt templates used by the script (LLM system
+        prompts + static fallback shot/outcome templates)."""
+        cfg = prompts_config_snapshot()  # live values (defaults + any overrides)
+
+        def ta(field, value, rows=3):
+            return (f'<textarea data-pf="{_esc(field)}" rows={rows}>'
+                    f'{_esc(value)}</textarea>')
+
+        wst = cfg["win_shot_templates"]
+        outcome_blocks = "".join(
+            f'<label>{_esc(k)} outcome templates <span class=hint>(one per line)</span></label>'
+            f'{ta("win::"+k, chr(10).join(wst.get(k, [])), 4)}'
+            for k in _PROMPT_OUTCOMES
+        )
+
+        body = (
+            f'<div id=pf-root>'
+            f'<div class=card>'
+            f'  <h2>LLM system prompts</h2>'
+            f'  <p class=hint style="margin-bottom:.4rem">Used to instruct the text model when '
+            f'writing clip / outcome prompts (when a text model is enabled).</p>'
+            f'  <label>Fight-shot system prompt</label>{ta("llm_system", cfg["llm_system"], 5)}'
+            f'  <label>Outcome system prompt</label>{ta("llm_outcome_system", cfg["llm_outcome_system"], 4)}'
+            f'</div>'
+            f'<div class=card>'
+            f'  <h2>Static fallback templates</h2>'
+            f'  <p class=hint style="margin-bottom:.4rem">Used when no text model is available '
+            f'(one template per line).</p>'
+            f'  <label>Fight-shot templates <span class=hint>(one per line)</span></label>'
+            f'  {ta("fight_shot_templates", chr(10).join(cfg["fight_shot_templates"]), 8)}'
+            f'  {outcome_blocks}'
+            f'</div>'
+            f'<div class=pf-actions>'
+            f'  <button class="btn btn-primary" style="font-size:.85rem;padding:.4rem 1rem" '
+            f'onclick="savePrompts(event)">💾 Save prompts</button>'
+            f'  <button class="btn btn-secondary" style="font-size:.85rem;padding:.4rem 1rem" '
+            f'onclick="resetPrompts(event)">↺ Reset to defaults</button>'
+            f'  <span id=pf-status style="font-size:.8rem;color:#7ea8f7"></span>'
+            f'</div>'
+            f'</div>'
+        )
+
+        script = """
+<script>
+function _gatherPrompts(){
+  const root=document.getElementById('pf-root');
+  const cfg={llm_system:'',llm_outcome_system:'',fight_shot_templates:[],win_shot_templates:{}};
+  root.querySelectorAll('[data-pf]').forEach(el=>{
+    const f=el.getAttribute('data-pf'); const v=el.value;
+    if(f==='llm_system'||f==='llm_outcome_system'){ cfg[f]=v; }
+    else if(f==='fight_shot_templates'){ cfg.fight_shot_templates=v.split('\\n').map(s=>s.trim()).filter(Boolean); }
+    else if(f.startsWith('win::')){ cfg.win_shot_templates[f.slice(5)]=v.split('\\n').map(s=>s.trim()).filter(Boolean); }
+  });
+  return cfg;
+}
+async function savePrompts(ev){
+  const st=document.getElementById('pf-status');
+  const set=(c,t)=>{st.style.color=c;st.textContent=t;};
+  set('#aaa','Saving…');
+  const fd=new FormData(); fd.append('config', JSON.stringify(_gatherPrompts()));
+  try{
+    const j=await (await fetch('/prompts/save',{method:'POST',body:fd})).json();
+    if(j.error){ set('#e07070','✗ '+j.error); return; }
+    set('#7ed87e','✓ Saved — applied to future runs');
+  }catch(e){ set('#e07070','✗ '+e); }
+}
+async function resetPrompts(ev){
+  if(!(await uiConfirm('Reset all global prompts to the built-in defaults?',
+      {title:'Reset prompts', okText:'Reset', danger:true})))return;
+  const st=document.getElementById('pf-status');
+  const fd=new FormData(); fd.append('reset','1');
+  try{
+    const j=await (await fetch('/prompts/save',{method:'POST',body:fd})).json();
+    if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
+    location.reload();
+  }catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; }
+}
+</script>"""
+
+        return (f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                f'<h1>Global prompts</h1></div>'
+                f'<p class=hint style="margin-bottom:.8rem">These templates drive how clip and '
+                f'outcome prompts are written for every match. Per-match prompts are edited on the '
+                f'Matches page. Changes apply to future runs/regenerations.</p>'
+                f'{body}{script}')
 
     def _gallery_html(out_path: Path):
         sections = []
@@ -3430,6 +3769,17 @@ async function pollJob(){
 
             elif path == "/matches":
                 html = _page("Matches", _matches_html(), "matches")
+                self._send(200, "text/html; charset=utf-8", html)
+
+            elif path == "/match":
+                qs = urllib.parse.parse_qs(parsed.query)
+                nm = qs.get("name", [None])[0]
+                fr = qs.get("fighter", [None])[0]
+                html = _page("Match", _match_detail_html(nm, fr), "matches")
+                self._send(200, "text/html; charset=utf-8", html)
+
+            elif path == "/prompts":
+                html = _page("Prompts", _prompts_html(), "prompts")
                 self._send(200, "text/html; charset=utf-8", html)
 
             elif path == "/gallery":
@@ -3655,6 +4005,162 @@ async function pollJob(){
                                  args=(job_id, scope, params),
                                  daemon=True).start()
                 self._send(200, "application/json", _j.dumps({"job_id": job_id}))
+                return
+
+            if path == "/prompts/save":
+                import json as _j
+                clen = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(clen)
+                ctype = self.headers.get("Content-Type", "")
+                if "multipart/form-data" in ctype:
+                    boundary = ctype.split("boundary=")[-1].strip().encode()
+                    form = _parse_multipart(raw, boundary)
+                else:
+                    form = dict(urllib.parse.parse_qsl(raw.decode(errors="replace")))
+
+                def _fv(k, default=""):
+                    v = form.get(k)
+                    if v is None: return default
+                    return v if isinstance(v, str) else v.decode(errors="replace")
+
+                if _fv("reset"):
+                    apply_prompts_config(_PROMPT_DEFAULTS)
+                    try:
+                        p = _prompts_config_path(out_dir)
+                        if p.exists():
+                            p.unlink()
+                    except Exception:
+                        pass
+                    self._send(200, "application/json", _j.dumps({"ok": True, "reset": True}))
+                    return
+                try:
+                    cfg = _j.loads(_fv("config", "{}"))
+                except Exception as e:
+                    self._send(400, "application/json", _j.dumps({"error": f"bad config: {e}"}))
+                    return
+                if not isinstance(cfg, dict):
+                    self._send(400, "application/json", _j.dumps({"error": "config must be an object"}))
+                    return
+                apply_prompts_config(cfg)
+                try:
+                    save_prompts_config(out_dir, cfg)
+                except Exception as e:
+                    self._send(500, "application/json", _j.dumps({"error": f"cannot save: {e}"}))
+                    return
+                self._send(200, "application/json", _j.dumps({"ok": True}))
+                return
+
+            if path in ("/matches/save", "/matches/delete"):
+                import json as _j
+                clen = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(clen)
+                ctype = self.headers.get("Content-Type", "")
+                if "multipart/form-data" in ctype:
+                    boundary = ctype.split("boundary=")[-1].strip().encode()
+                    form = _parse_multipart(raw, boundary)
+                else:
+                    form = dict(urllib.parse.parse_qsl(raw.decode(errors="replace")))
+
+                def _fv(k, default=""):
+                    v = form.get(k)
+                    if v is None: return default
+                    return v if isinstance(v, str) else v.decode(errors="replace")
+
+                def _safe(s):
+                    return s and "/" not in s and "\\" not in s and ".." not in s
+
+                vdir = out_dir / "videos"
+                prompts_file = vdir / "prompts.json"
+
+                if path == "/matches/save":
+                    try:
+                        data = json.loads(prompts_file.read_text()) if prompts_file.exists() else {}
+                    except Exception:
+                        data = {}
+                    mode = _fv("mode")
+                    if mode == "match":
+                        nm = _fv("name")
+                        if not _safe(nm):
+                            self._send(400, "application/json", _j.dumps({"error": "invalid name"})); return
+                        m = next((x for x in data.get("fight_plan", []) if x.get("match_name") == nm), None)
+                        if not m:
+                            self._send(404, "application/json", _j.dumps({"error": "match not in prompts.json"})); return
+                        if "f1" in form: m["f1"] = _fv("f1") or m.get("f1")
+                        if "f2" in form: m["f2"] = _fv("f2") or m.get("f2")
+                        if "env" in form: m["env"] = _fv("env") or None
+                        for _tk in ("short_target", "long_target"):
+                            if _tk in form:
+                                try: m[_tk] = float(_fv(_tk))
+                                except ValueError: pass
+                        for c in m.get("clips", []):
+                            key = f"clip_{c['idx']}"
+                            if key in form:
+                                c["prompt"] = _fv(key)
+                    elif mode == "outputs":
+                        fr = _fv("fighter")
+                        if not _safe(fr):
+                            self._send(400, "application/json", _j.dumps({"error": "invalid fighter"})); return
+                        for o in data.get("outcome_plan", []):
+                            if o.get("fighter") == fr:
+                                key = f"out_{o['outcome']}"
+                                if key in form:
+                                    o["prompt"] = _fv(key)
+                    else:
+                        self._send(400, "application/json", _j.dumps({"error": "invalid mode"})); return
+                    try:
+                        vdir.mkdir(parents=True, exist_ok=True)
+                        prompts_file.write_text(json.dumps(data, indent=2))
+                    except Exception as e:
+                        self._send(500, "application/json", _j.dumps({"error": f"cannot save: {e}"})); return
+                    self._send(200, "application/json", _j.dumps({"ok": True}))
+                    return
+
+                # /matches/delete — remove rendered video files (keep plan/keyframes)
+                scope = _fv("scope")
+                removed = 0
+
+                def _rm(p: Path):
+                    nonlocal removed
+                    try:
+                        if p.exists() and p.is_file():
+                            p.unlink(); removed += 1
+                    except Exception:
+                        pass
+
+                if scope == "clip":
+                    mn, idx = _fv("match"), _fv("idx")
+                    if not _safe(mn):
+                        self._send(400, "application/json", _j.dumps({"error": "invalid match"})); return
+                    try:
+                        _rm(vdir / f"{mn}_clip{int(idx):02d}.mp4")
+                    except ValueError:
+                        pass
+                elif scope == "final":
+                    mn, which = _fv("match"), _fv("which")
+                    if not _safe(mn) or which not in ("short", "long"):
+                        self._send(400, "application/json", _j.dumps({"error": "invalid args"})); return
+                    _rm(vdir / f"{mn}_{which}.mp4")
+                elif scope == "match":
+                    mn = _fv("match")
+                    if not _safe(mn):
+                        self._send(400, "application/json", _j.dumps({"error": "invalid match"})); return
+                    for p in vdir.glob(f"{mn}_*.mp4"):
+                        _rm(p)
+                elif scope == "output":
+                    fr, oc = _fv("fighter"), _fv("outcome")
+                    if not _safe(fr) or not _safe(oc):
+                        self._send(400, "application/json", _j.dumps({"error": "invalid args"})); return
+                    _rm(vdir / f"{fr}_{oc}.mp4")
+                elif scope == "outputs":
+                    fr = _fv("fighter")
+                    if not _safe(fr):
+                        self._send(400, "application/json", _j.dumps({"error": "invalid fighter"})); return
+                    for p in vdir.glob(f"{fr}_*.mp4"):
+                        if "_clip" not in p.stem and not p.stem.startswith("match_"):
+                            _rm(p)
+                else:
+                    self._send(400, "application/json", _j.dumps({"error": "invalid scope"})); return
+                self._send(200, "application/json", _j.dumps({"ok": True, "removed": removed}))
                 return
 
             if path == "/profile/upload-image":
@@ -4188,6 +4694,7 @@ async function pollJob(){
         # Identical logic to main() after parse_args(), driven by args.
         out_dir_r = Path(args.out_dir)
         out_dir_r.mkdir(parents=True, exist_ok=True)
+        apply_prompts_config(load_prompts_config(out_dir_r))
 
         _web_log("╔══════════════════════════════════════════════════════════╗")
         _web_log("║       Township Fighters — Content Generator              ║")
@@ -4363,11 +4870,14 @@ async function pollJob(){
     print(f"\n⚔  Township Fighters — Web UI")
     print(f"   Open: {url}")
     print(f"   Press Ctrl+C to stop\n", flush=True)
-    try:
-        import webbrowser
-        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
-    except Exception:
-        pass
+    # Only auto-open a browser when explicitly asked (--browser); on a headless
+    # server webbrowser.open can otherwise spawn a terminal text browser.
+    if getattr(default_args, "browser", False):
+        try:
+            import webbrowser
+            threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+        except Exception:
+            pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -4627,6 +5137,9 @@ OUTPUT LAYOUT
                              "Without this flag the script launches a web UI instead of processing.")
     parser.add_argument("--web-port", type=int, default=7788, metavar="PORT",
                         help="Port for the web UI (default: 7788, only used without --cli-mode).")
+    parser.add_argument("--browser", action="store_true",
+                        help="Auto-open a web browser at the UI URL on startup. Off by default "
+                             "(avoids spawning a terminal text browser on headless servers).")
 
     # Two-phase parse: pre-scan for -c/--config so the saved values become
     # parser defaults that explicit command-line arguments can still override.
@@ -4671,6 +5184,7 @@ OUTPUT LAYOUT
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    apply_prompts_config(load_prompts_config(out_dir))
 
     _log("╔══════════════════════════════════════════════════════════╗")
     _log("║       Township Fighters — Content Generator              ║")
