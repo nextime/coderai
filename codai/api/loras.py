@@ -136,6 +136,14 @@ class LoraTrainRequest(BaseModel):
     # when `base_model` (the generation model) is a transformer/DiT (Z-Image,
     # Flux, SD3) this trainer can't target.  Falls back to base_model if unset.
     train_base_model: Optional[str] = None
+    # Target pipeline for the LoRA: "image" (default, SD1.x/SDXL UNet) or "video"
+    # (Wan video DiT). For "video", `base_model` is the VIDEO model id/path and the
+    # LoRA is trained against that exact model so it loads on the video pipeline.
+    target: Optional[str] = "image"
+    # Quantize the (large) video transformer to 4-bit for training (QLoRA). Lets a
+    # 14B video model's LoRA fit on a consumer GPU. Ignored for image targets.
+    quantize_4bit: Optional[bool] = True
+    num_frames: Optional[int] = 1          # training video length (1 = stills-only)
     character: Optional[str] = None        # saved character profile to pull images from
     environment: Optional[str] = None      # OR saved environment profile to pull images from
     images: Optional[List[str]] = None     # OR explicit base64/data-uri images
@@ -170,11 +178,20 @@ def _configured_train_base(base_model: str) -> Optional[str]:
     return None
 
 
-def _resolve_base_model_path(base_model: str) -> str:
-    """Resolve an image model key (or path/HF id) to a diffusers model directory."""
+def _resolve_base_model_path(base_model: str, category: str = "image") -> str:
+    """Resolve a model key (or path/HF id) to a diffusers model directory.
+
+    `category` selects the models.json key prefix to try first ("image" or
+    "video"), so a video LoRA resolves against the video model entry."""
     try:
         from codai.models.manager import multi_model_manager
-        for key in (f"image:{base_model}", base_model):
+        keys = ([f"{category}:{base_model}", f"image:{base_model}",
+                 f"video:{base_model}", base_model])
+        seen = set()
+        for key in keys:
+            if key in seen:
+                continue
+            seen.add(key)
             cfg = multi_model_manager.config.get(key)
             if cfg:
                 for k in ('path', 'model_path', 'model', 'diffusers_path'):
@@ -389,6 +406,39 @@ def _train_lora_sync(req: LoraTrainRequest) -> dict:
     from transformers import CLIPTextModel, CLIPTokenizer
 
     name = req.name
+
+    # ── Video (Wan DiT) LoRA target ───────────────────────────────────────────
+    # Train directly against the configured VIDEO model so the resulting LoRA
+    # loads on the video pipeline. No SD UNet fallback here — the base IS the DiT.
+    if (req.target or "image").lower() == "video":
+        video_path = _resolve_base_model_path(req.base_model, category="video")
+        steps = max(50, min(5000, int(req.steps or 800)))
+        rank = max(2, min(128, int(req.rank or 16)))
+        resolution = int(req.resolution or 512)
+        lr = float(req.learning_rate or 1e-4)
+        seed = int(req.seed if req.seed is not None else 42)
+        _set_progress(active=True, name=name, step=0, total=steps,
+                      status="preparing", message="loading reference images",
+                      started_at=time.time(), path=None)
+        images = _gather_images(req)
+        if not images:
+            raise HTTPException(status_code=400,
+                                detail="No training images (provide `character` or `images`)")
+        if req.instance_prompt:
+            instance_prompt = req.instance_prompt
+        elif req.environment and not req.character:
+            instance_prompt = f"a video of {name} place"
+        else:
+            instance_prompt = f"a video of {name} person"
+        try:
+            from codai.models.manager import multi_model_manager
+            multi_model_manager.unload_all_models()
+        except Exception as e:
+            print(f"  [lora] could not unload models before training: {e}")
+        device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+        return _train_wan(req, video_path, images, instance_prompt,
+                          steps, rank, resolution, lr, seed, device)
+
     # Resolve the model to TRAIN against (the generation model may be a DiT this
     # trainer can't target). Precedence: explicit request override > per-model
     # `lora_train_base_model` from models.json config > the base_model itself.
@@ -743,6 +793,225 @@ def _train_sdxl(req, base_path, images, instance_prompt,
     try:
         del optimizer, latents_list, lora_params
         del prompt_embeds, pooled, add_time_ids
+    except Exception:
+        pass
+    _free_train_vram()
+
+    path = _lora_weight_file(name) or save_dir
+    _set_progress(active=False, status="done", message="done", path=path)
+    return {"name": name, "path": path}
+
+
+def _train_wan(req, base_path, images, instance_prompt,
+               steps, rank, resolution, lr, seed, device):
+    """Train a LoRA for a Wan video DiT directly, so it loads on the video
+    pipeline. Stills are treated as 1-frame videos: VAE-encoded to latents, then a
+    rectified-flow (flow-matching) loss trains PEFT LoRA adapters on the
+    transformer attention layers. Wan2.2 A14B has two experts (transformer +
+    transformer_2 routed by a noise boundary); both get adapters and are trained
+    on the timestep range they own. The base is quantized to 4-bit (QLoRA) when
+    requested so a 14B model's LoRA fits on a consumer GPU.
+    """
+    import os as _os
+    import torch
+    import torch.nn.functional as F
+    from peft import LoraConfig as PeftLoraConfig
+    from peft.utils import get_peft_model_state_dict
+    from torchvision import transforms
+    try:
+        from diffusers import (AutoencoderKLWan, WanTransformer3DModel,
+                               FlowMatchEulerDiscreteScheduler, WanPipeline)
+        from diffusers.utils import convert_state_dict_to_diffusers
+        from transformers import UMT5EncoderModel, AutoTokenizer
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=("Wan video LoRA training needs a diffusers build with Wan "
+                    f"support (AutoencoderKLWan/WanTransformer3DModel): {e}"))
+
+    name = req.name
+    torch.manual_seed(seed)
+    compute_dtype = torch.bfloat16
+    quantize = bool(getattr(req, "quantize_4bit", True))
+    num_frames = max(1, int(getattr(req, "num_frames", 1) or 1))
+
+    # ── 1. VAE (3D): encode each still as a 1-frame video latent, then offload ──
+    _set_progress(status="preparing", message=f"loading Wan VAE: {base_path}")
+    vae = AutoencoderKLWan.from_pretrained(base_path, subfolder="vae",
+                                           torch_dtype=torch.float32).to(device)
+    vae.requires_grad_(False)
+    vae.eval()
+    z_dim = int(vae.config.z_dim)
+    lat_mean = torch.tensor(vae.config.latents_mean).view(1, z_dim, 1, 1, 1).to(device)
+    lat_std = torch.tensor(vae.config.latents_std).view(1, z_dim, 1, 1, 1).to(device)
+    spatial = (resolution // 16) * 16  # Wan VAE prefers multiples of 16
+    tfm = transforms.Compose([
+        transforms.Resize(spatial, interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.CenterCrop(spatial),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
+    latents_list = []
+    with torch.no_grad():
+        for img in images:
+            px = tfm(img)                              # [3,H,W] in [-1,1]
+            vid = px.unsqueeze(0).unsqueeze(2)         # [1,3,1,H,W]
+            if num_frames > 1:
+                vid = vid.repeat(1, 1, num_frames, 1, 1)
+            vid = vid.to(device, dtype=torch.float32)
+            lat = vae.encode(vid).latent_dist.sample()  # [1,z,t,h,w]
+            lat = (lat - lat_mean) / lat_std
+            latents_list.append(lat.to(compute_dtype).cpu())
+    vae.to("cpu")
+    del vae
+    _free_train_vram()
+
+    # ── 2. Text encoder (UMT5): encode the instance prompt once, then offload ──
+    _set_progress(status="preparing", message="encoding prompt (UMT5)")
+    tokenizer = AutoTokenizer.from_pretrained(base_path, subfolder="tokenizer")
+    text_encoder = UMT5EncoderModel.from_pretrained(
+        base_path, subfolder="text_encoder", torch_dtype=compute_dtype).to(device)
+    text_encoder.requires_grad_(False)
+    text_encoder.eval()
+    with torch.no_grad():
+        tok = tokenizer(instance_prompt, padding="max_length", max_length=512,
+                        truncation=True, return_tensors="pt")
+        ids = tok.input_ids.to(device)
+        mask = tok.attention_mask.to(device)
+        enc = text_encoder(ids, attention_mask=mask).last_hidden_state
+        encoder_hidden_states = (enc * mask.unsqueeze(-1)).to(compute_dtype).cpu()
+    text_encoder.to("cpu")
+    del text_encoder
+    _free_train_vram()
+
+    # ── 3. Transformer expert(s) + LoRA ───────────────────────────────────────
+    _set_progress(status="preparing",
+                  message=f"loading Wan transformer{' (4-bit)' if quantize else ''}")
+    q_cfg = None
+    if quantize:
+        try:
+            from diffusers import BitsAndBytesConfig as _DiffBnb
+            q_cfg = _DiffBnb(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                             bnb_4bit_compute_dtype=compute_dtype)
+        except Exception as e:
+            print(f"  [lora][wan] 4-bit unavailable ({e}); loading in bf16")
+            q_cfg = None
+
+    def _load_transformer(subfolder):
+        kw = dict(subfolder=subfolder, torch_dtype=compute_dtype)
+        if q_cfg is not None:
+            kw["quantization_config"] = q_cfg
+        tr = WanTransformer3DModel.from_pretrained(base_path, **kw)
+        if q_cfg is None:
+            tr = tr.to(device)
+        return tr
+
+    experts = [("transformer", _load_transformer("transformer"))]
+    if _os.path.isdir(_os.path.join(base_path, "transformer_2")):
+        experts.append(("transformer_2", _load_transformer("transformer_2")))
+
+    boundary = getattr(experts[0][1].config, "boundary_ratio", None)
+    lora_cfg = PeftLoraConfig(
+        r=rank, lora_alpha=rank, init_lora_weights="gaussian",
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+    )
+    lora_params = []
+    for _, tr in experts:
+        tr.requires_grad_(False)
+        tr.add_adapter(lora_cfg, adapter_name="default")
+        try:
+            tr.enable_gradient_checkpointing()
+            # Make checkpointing track grads through a frozen/quantized base.
+            tr.patch_embedding.register_forward_hook(
+                lambda m, i, o: o.requires_grad_(True))
+        except Exception:
+            pass
+        tr.train()
+        lora_params += [p for p in tr.parameters() if p.requires_grad]
+    if not lora_params:
+        raise HTTPException(status_code=500,
+                            detail="Wan LoRA: no trainable adapter params were created")
+    optimizer = torch.optim.AdamW(lora_params, lr=lr)
+
+    try:
+        sched = FlowMatchEulerDiscreteScheduler.from_pretrained(base_path, subfolder="scheduler")
+        shift = float(getattr(sched.config, "shift", 3.0) or 3.0)
+        num_train_t = float(getattr(sched.config, "num_train_timesteps", 1000) or 1000)
+    except Exception:
+        shift, num_train_t = 3.0, 1000.0
+
+    def _pick_expert(t_val):
+        if len(experts) > 1 and boundary is not None:
+            # High-noise expert (index 0) owns t >= boundary; low-noise is index 1.
+            return experts[0][1] if t_val >= float(boundary) else experts[1][1]
+        return experts[0][1]
+
+    _set_progress(status="training", message="training (Wan video LoRA)")
+    n = len(latents_list)
+    for step in range(steps):
+        x0 = latents_list[step % n].to(device, dtype=compute_dtype)
+        noise = torch.randn_like(x0)
+        # Rectified-flow timestep with Wan resolution shift applied to sigma.
+        u = torch.rand(1, device=device)
+        sigma = (shift * u) / (1.0 + (shift - 1.0) * u)
+        s = sigma.view(-1, 1, 1, 1, 1)
+        x_t = (1.0 - s) * x0 + s * noise
+        target = noise - x0                              # flow-matching velocity
+        timestep = (sigma * num_train_t).to(compute_dtype)
+        tr = _pick_expert(float(sigma.item()))
+        pred = tr(hidden_states=x_t, timestep=timestep,
+                  encoder_hidden_states=encoder_hidden_states.to(device),
+                  return_dict=False)[0]
+        loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
+        optimizer.step()
+        optimizer.zero_grad()
+
+        if step % 10 == 0 or step == steps - 1:
+            _set_progress(step=step + 1,
+                          message=f"step {step+1}/{steps} loss={loss.item():.4f}")
+            _dbg_lora(f"Wan step {step+1}/{steps} loss={loss.item():.4f}")
+        try:
+            from codai.models.thermal import checkpoint as _thermal_checkpoint
+            _thermal_checkpoint(context="lora-train", throttle_seconds=2.0)
+        except Exception:
+            pass
+
+    # ── 4. Save (transformer + optional transformer_2 LoRA layers) ─────────────
+    _set_progress(status="saving", message="saving Wan LoRA weights")
+    save_dir = _lora_dir(name)
+    os.makedirs(save_dir, exist_ok=True)
+    save_kwargs = {"transformer_lora_layers":
+                   convert_state_dict_to_diffusers(get_peft_model_state_dict(experts[0][1]))}
+    if len(experts) > 1:
+        t2 = convert_state_dict_to_diffusers(get_peft_model_state_dict(experts[1][1]))
+        try:
+            WanPipeline.save_lora_weights(save_directory=save_dir,
+                                          transformer_2_lora_layers=t2,
+                                          safe_serialization=True, **save_kwargs)
+        except TypeError:
+            print("  [lora][wan] this diffusers WanPipeline.save_lora_weights has no "
+                  "transformer_2 arg — saving high-noise expert LoRA only")
+            WanPipeline.save_lora_weights(save_directory=save_dir,
+                                          safe_serialization=True, **save_kwargs)
+    else:
+        WanPipeline.save_lora_weights(save_directory=save_dir,
+                                      safe_serialization=True, **save_kwargs)
+    _write_meta(name, req, base_path, len(images), "wan", instance_prompt)
+
+    # ── 5. Tear down: drop adapters + free VRAM for the next request ───────────
+    for _, tr in experts:
+        try:
+            tr.delete_adapters("default")
+        except Exception:
+            pass
+        try:
+            tr.to("cpu")
+        except Exception:
+            pass  # 4-bit modules can't move; just drop the refs below
+    try:
+        del optimizer, lora_params, latents_list, encoder_hidden_states, experts
     except Exception:
         pass
     _free_train_vram()
