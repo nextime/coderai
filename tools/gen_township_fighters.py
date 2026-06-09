@@ -1756,14 +1756,42 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
 def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_plan,
                          total_matches, total_outcomes, fps, clip_delay,
                          consistency=None, lora_map=None, keyframe_dir=None,
-                         lora_weight=0.85, env_lora_map=None, env_lora_weight=0.8):
-    """PHASE 3 — render ALL videos from pre-written prompts (video model stays loaded)."""
+                         lora_weight=0.85, env_lora_map=None, env_lora_weight=0.8,
+                         progress_cb=None, clip_cb=None):
+    """PHASE 3 — render ALL videos from pre-written prompts (video model stays loaded).
+
+    progress_cb(done, total, label) — optional; called after each clip finishes so
+    callers (e.g. the web match-render job) can surface per-clip advancement.
+    clip_cb(gidx, phase, ok) — optional; phase is "start" (clip gidx begins) or
+    "end" (finished, ok=True/False). gidx is a 0-based index over the combined
+    sequence of fight clips (in plan order) followed by outcome clips.
+    """
     _log("\n  ── Phase B — rendering all videos (video model) ──")
     render_start = time.monotonic()
     consistency = consistency or {"prompt"}
     lora_map = lora_map or {}
     env_lora_map = env_lora_map or {}
     use_lora = "lora" in consistency
+
+    _total_clips = sum(len(m.get("clips", [])) for m in fight_plan) + len(outcome_plan)
+    _done_clips = 0
+    _gidx = 0  # running index over the combined clip sequence
+
+    def _tick(label=""):
+        nonlocal _done_clips
+        _done_clips += 1
+        if progress_cb:
+            try:
+                progress_cb(_done_clips, _total_clips, label)
+            except Exception:
+                pass
+
+    def _clip(phase, ok=None):
+        if clip_cb:
+            try:
+                clip_cb(_gidx, phase, ok)
+            except Exception:
+                pass
 
     def _keyframe_bytes(stem: str):
         if not keyframe_dir:
@@ -1824,23 +1852,31 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
             clip_stem = _clip_stem_fight(m['match_name'], c['idx'])
             clip_path = video_dir / f"{clip_stem}.mp4"
             _log(f"  │  clip {c['idx']:02d}  {c['clip_seconds']:.1f}s / {c['nf']}f")
+            _clip("start")
             ok, dur, is_fatal = _render(
                 f"clip {c['idx']:02d} — {m['f1']} vs {m['f2']}",
                 c["prompt"], [m["f1"], m["f2"]], m["env"], c["nf"], str(clip_path),
                 stem=clip_stem, fighters=[m["f1"], m["f2"]])
             if is_fatal:
                 fatal = True
+                _clip("end", False)
                 break
             if ok:
                 clips.append((str(clip_path), dur or c["clip_seconds"]))
                 rendered_clips += 1
                 consecutive_failures = 0
                 _log(f"  │    ✓ {clip_path.name}  ({dur or c['clip_seconds']:.1f}s)")
+                _clip("end", True)
+                _tick(f"clip {c['idx']:02d} of {m['match_name']}")
             else:
                 consecutive_failures += 1
+                _clip("end", False)
+                _tick(f"clip {c['idx']:02d} failed")
                 if consecutive_failures >= 3:
                     _log("  │    ✗ 3 consecutive failures — skipping rest of match")
+                    _gidx += 1
                     break
+            _gidx += 1
 
         if not clips:
             _log("  └─ ✗ No clips generated for this match")
@@ -1870,16 +1906,22 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         clip_name = _clip_stem_outcome(o['fighter'], o['outcome'], o.get('match_name'))
         out_path = str(video_dir / f"{clip_name}.mp4")
         _log(f"\n  [{oi+1}/{total_outcomes}] {clip_name}  ({o['target_s']:.0f}s, env={o['env']})")
+        _clip("start")
         ok, dur, is_fatal = _render(
             f"{clip_name} outcome clip",
             o["prompt"], [o["fighter"]], o["env"], o["nf"], out_path,
             stem=clip_name, fighters=[o["fighter"]])
         if is_fatal:
             fatal = True
+            _clip("end", False)
+            _gidx += 1
             continue
         if ok:
             rendered_clips += 1
             _log(f"    ✓ {dur or o['target_s']:.1f}s → {clip_name}.mp4")
+        _clip("end", bool(ok))
+        _tick(f"output {oi+1}/{total_outcomes}")
+        _gidx += 1
 
     _log(f"\n  Videos saved to: {video_dir}")
 
@@ -2282,7 +2324,8 @@ def launch_web_ui(default_args):
         with _jobs_lock:
             _state["jobs"][job_id] = {"status": "running", "progress": 3,
                                       "output": None, "error": None,
-                                      "_msg": "starting…"}
+                                      "_msg": "starting…", "jtype": "match",
+                                      "scope": scope, "match": params.get("match")}
 
         def _prog(pct, msg=""):
             with _jobs_lock:
@@ -2298,8 +2341,24 @@ def launch_web_ui(default_args):
 
         def _done(msg):
             with _jobs_lock:
-                _state["jobs"][job_id].update({"status": "done", "progress": 100,
-                                               "_msg": msg})
+                j = _state["jobs"][job_id]
+                # Any item still left pending/rendering is now finished.
+                for it in j.get("items", []):
+                    if it.get("status") in ("pending", "rendering"):
+                        it["status"] = "done"
+                j.update({"status": "done", "progress": 100, "_msg": msg})
+
+        def _set_items(labels):
+            with _jobs_lock:
+                _state["jobs"][job_id]["items"] = [
+                    {"label": lbl, "status": "pending"} for lbl in labels]
+
+        def _item(gidx, phase, ok=None):
+            st = "rendering" if phase == "start" else ("done" if ok else "failed")
+            with _jobs_lock:
+                items = _state["jobs"][job_id].get("items") or []
+                if 0 <= gidx < len(items):
+                    items[gidx]["status"] = st
 
         def _load_map(fname):
             fp = out_dir / fname
@@ -2369,12 +2428,20 @@ def launch_web_ui(default_args):
                     if not mm["clips"]:
                         _fail("clip not found in prompts.json")
                         return
-                _prog(8, f"rendering {len(mm['clips'])} clip(s) — see Run log for detail…")
+                _set_items([f"clip {int(c['idx']):02d}" for c in mm["clips"]])
+                _prog(8, f"rendering {len(mm['clips'])} clip(s)…")
+
+                def _cb(done, total, label):
+                    pct = 8 + int(88 * done / max(1, total))
+                    _prog(pct, f"clip {done}/{total} done"
+                               + (f" — {label}" if label else ""))
+
                 _stage_videos_render(
                     client, video_model, vdir, [mm], [], 1, 0, fps, clip_delay,
                     consistency=consistency, lora_map=lora_map,
                     keyframe_dir=keyframe_dir, lora_weight=lw,
-                    env_lora_map=env_lora_map, env_lora_weight=elw)
+                    env_lora_map=env_lora_map, env_lora_weight=elw,
+                    progress_cb=_cb, clip_cb=_item)
                 _done(f"re-rendered {len(mm['clips'])} clip(s)")
                 return
 
@@ -2395,12 +2462,21 @@ def launch_web_ui(default_args):
                 if not sel:
                     _fail("no matching outputs in prompts.json")
                     return
-                _prog(8, f"rendering {len(sel)} output clip(s) — see Run log for detail…")
+                _set_items([_clip_stem_outcome(o['fighter'], o['outcome'],
+                                                o.get('match_name')) for o in sel])
+                _prog(8, f"rendering {len(sel)} output clip(s)…")
+
+                def _cb(done, total, label):
+                    pct = 8 + int(88 * done / max(1, total))
+                    _prog(pct, f"output {done}/{total} done"
+                               + (f" — {label}" if label else ""))
+
                 _stage_videos_render(
                     client, video_model, vdir, [], sel, 0, len(sel), fps, clip_delay,
                     consistency=consistency, lora_map=lora_map,
                     keyframe_dir=keyframe_dir, lora_weight=lw,
-                    env_lora_map=env_lora_map, env_lora_weight=elw)
+                    env_lora_map=env_lora_map, env_lora_weight=elw,
+                    progress_cb=_cb, clip_cb=_item)
                 _done(f"re-rendered {len(sel)} output(s)")
                 return
 
@@ -2495,6 +2571,16 @@ input[type=checkbox]{width:auto;accent-color:#f5a623;margin-right:.3rem}
                             padding:.3rem .45rem;border-radius:4px;width:100%;font-size:.82rem}
 .progress-bar{background:#222;border-radius:4px;height:8px;margin:.6rem 0;overflow:hidden}
 .progress-fill{height:100%;background:#f5a623;border-radius:4px;transition:width .4s}
+.progress-fill.ok{background:#3a9d3a}
+.progress-fill.fail{background:#c0392b}
+.progress-fill.striped{background:repeating-linear-gradient(45deg,#f5a623,#f5a623 8px,#d98e0f 8px,#d98e0f 16px);animation:prgmove 1s linear infinite}
+@keyframes prgmove{from{background-position:0 0}to{background-position:32px 0}}
+#match-progress{margin:.6rem 0}
+#match-progress.hidden{display:none}
+.prg-global .prg-label{font-size:.78rem;color:#bbb;margin-bottom:.1rem;font-weight:600}
+.prg-items{display:flex;flex-direction:column;gap:.15rem;margin-top:.5rem}
+.prg-item .prg-ilabel{font-size:.72rem;color:#999}
+.prg-item .progress-bar{height:6px;margin:.12rem 0}
 .job-status{font-size:.78rem;margin-top:.4rem;min-height:1.2rem}
 .job-status.done{color:#7ed87e}.job-status.error{color:#e07070}
 /* profile editor */
@@ -3313,6 +3399,44 @@ function _pollJob(jobId, setSt){
   };
   setTimeout(poll,900);
 }
+function _esch(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function _renderMatchBars(wrap, d){
+  if(!wrap) return;
+  const pct=d.progress||0;
+  let h='<div class=prg-global><div class=prg-label>Overall — '+pct+'%</div>'
+       +'<div class=progress-bar><div class=progress-fill style="width:'+pct+'%"></div></div></div>';
+  const items=d.items||[];
+  if(items.length){
+    h+='<div class=prg-items>';
+    for(const it of items){
+      const s=it.status||'pending';
+      let w='0%', cls='';
+      if(s==='rendering'){ w='100%'; cls=' striped'; }
+      else if(s==='done'){ w='100%'; cls=' ok'; }
+      else if(s==='failed'){ w='100%'; cls=' fail'; }
+      const icon=s==='done'?'✓':(s==='failed'?'✗':(s==='rendering'?'⏳':'·'));
+      h+='<div class=prg-item><div class=prg-ilabel>'+icon+' '+_esch(it.label)+' — '+s+'</div>'
+        +'<div class=progress-bar><div class="progress-fill'+cls+'" style="width:'+w+'"></div></div></div>';
+    }
+    h+='</div>';
+  }
+  wrap.innerHTML=h;
+  wrap.classList.remove('hidden');
+}
+// Detail-page poller: drives the text status AND the visual progress bars.
+function _pollMatchBars(jobId, setSt, wrap){
+  const poll=async()=>{
+    let d;
+    try{ d=await (await fetch('/job/'+jobId)).json(); }
+    catch(e){ setTimeout(poll,2000); return; }
+    _renderMatchBars(wrap, d);
+    const pct=d.progress||0;
+    if(d.status==='running'){ setSt('#7ea8f7','⏳ '+(d._msg||'working…')+' ('+pct+'%)'); setTimeout(poll,1200); }
+    else if(d.status==='done'){ setSt('#7ed87e','✓ '+(d._msg||'done')+' — reloading…'); setTimeout(()=>location.reload(),1600); }
+    else { setSt('#e07070','✗ '+(d.error||'failed')); }
+  };
+  setTimeout(poll,500);
+}
 async function reMatch(ev, scope, params){
   if(ev) ev.preventDefault();
   const labels={'match-clips':'Re-render ALL clips of this match (uses the video model, can take a while)?',
@@ -3332,7 +3456,9 @@ async function reMatch(ev, scope, params){
   try{ j=await (await fetch('/matches/render',{method:'POST',body:fd})).json(); }
   catch(e){ setSt('#e07070','✗ '+e); return; }
   if(j.error){ setSt('#e07070','✗ '+j.error); return; }
-  _pollJob(j.job_id, setSt);
+  const wrap=document.getElementById('match-progress');
+  if(wrap && scope!=='reassemble'){ wrap.innerHTML=''; wrap.classList.remove('hidden'); _pollMatchBars(j.job_id, setSt, wrap); }
+  else { _pollJob(j.job_id, setSt); }
 }
 async function delVid(ev, scope, params){
   if(ev) ev.preventDefault();
@@ -3383,6 +3509,35 @@ async function saveOutputs(ev, fighter){
     setSt('#7ed87e','✓ Saved');
   }catch(e){ setSt('#e07070','✗ '+e); }
 }
+// After a page reload, re-attach the progress display to an in-flight render
+// for the match being viewed (detail page) or a visible match card.
+async function resumeMatchJobs(){
+  let data;
+  try{ data=await (await fetch('/active-jobs')).json(); }
+  catch(e){ return; }
+  for(const j of (data.jobs||[])){
+    if(j.jtype!=='match') continue;
+    const det=document.getElementById('detail');
+    if(det && det.getAttribute('data-match')===j.match){
+      const stEl=document.getElementById('detail-status');
+      if(!stEl) continue;
+      const setSt=(c,t)=>{ stEl.style.color=c; stEl.textContent=t; };
+      setSt('#7ea8f7','⏳ '+(j._msg||'rendering…')+' ('+(j.progress||0)+'%)');
+      const wrap=document.getElementById('match-progress');
+      if(wrap && j.scope!=='reassemble'){ _pollMatchBars(j.job_id, setSt, wrap); }
+      else { _pollJob(j.job_id, setSt); }
+    } else {
+      const card=document.querySelector('.match-card[data-match="'+(j.match||'')+'"]');
+      if(!card) continue;
+      const stEl=card.querySelector('.match-status');
+      if(!stEl) continue;
+      const setSt=(c,t)=>{ stEl.style.color=c; stEl.textContent=t; };
+      setSt('#7ea8f7','⏳ '+(j._msg||'rendering…')+' ('+(j.progress||0)+'%)');
+      _pollJob(j.job_id, setSt);
+    }
+  }
+}
+document.addEventListener('DOMContentLoaded', resumeMatchJobs);
 </script>"""
 
     def _match_preview(mn, info):
@@ -3417,7 +3572,7 @@ async function saveOutputs(ev, fighter){
             title = f"{f1} vs {f2}" if f1 else mn.replace("match_", "").replace("_", " ")
             fin = ", ".join(k for k in ("short", "long") if k in finals) or "none"
             return (
-                f'<div class=card id="row-{_esc(mn)}" '
+                f'<div class="card match-card" id="row-{_esc(mn)}" data-match="{_esc(mn)}" '
                 f'style="display:flex;align-items:center;gap:.8rem;padding:.7rem 1rem">'
                 f'  {_match_preview(mn, info)}'
                 f'  <div style="flex:1;min-width:0">'
@@ -3564,7 +3719,7 @@ async function saveOutputs(ev, fighter){
         outcomes_html = "".join(outcome_groups) or '<span class=hint>No outcomes planned for this match.</span>'
 
         return (
-            f'<div id=detail>{back}'
+            f'<div id=detail data-match="{_esc(name or "")}">{back}'
             f'<div style="display:flex;justify-content:space-between;align-items:center;margin:.4rem 0">'
             f'<h1>🥊 {_esc(title)}</h1>'
             f'<span id=detail-status style="font-size:.8rem;color:#7ea8f7"></span></div>'
@@ -3594,6 +3749,7 @@ async function saveOutputs(ev, fighter){
             f'onclick="delVid(event,\'match\',{{match:\'{_esc(name)}\'}})">🗑 Remove all videos</button>'
             f'  </div>'
             f'</div>'
+            f'<div id=match-progress class=hidden></div>'
             f'<div class=section-title style="margin:.7rem 0 .3rem">Final videos</div>'
             f'<div style="display:flex;gap:.6rem;flex-wrap:wrap">{finals_html}</div>'
             f'<div class=section-title style="margin:.9rem 0 .3rem">Single clips '
@@ -4000,12 +4156,14 @@ async function pollJob(){
                 active = []
                 with _jobs_lock:
                     for jid, j in _state["jobs"].items():
-                        if j.get("status") == "running" and j.get("jtype") in ("regen", "train"):
+                        if j.get("status") == "running" and j.get("jtype") in ("regen", "train", "match"):
                             active.append({
                                 "job_id": jid,
                                 "kind": j.get("kind"),
                                 "name": j.get("name"),
                                 "jtype": j.get("jtype"),
+                                "scope": j.get("scope"),
+                                "match": j.get("match"),
                                 "progress": j.get("progress", 0),
                                 "_msg": j.get("_msg", ""),
                             })
