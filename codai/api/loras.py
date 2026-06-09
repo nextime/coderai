@@ -44,6 +44,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 from codai.platform_paths import default_loras_dir
+from codai.queue.manager import queue_manager
 
 router = APIRouter()
 
@@ -776,31 +777,61 @@ def _write_meta(name, req, base_path, n_images, arch, instance_prompt):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+# Scheduler model key for training. A constant key makes the central queue
+# serialize trainings (one at a time, protecting the shared base cache) while
+# still admitting them through the same scheduler as every other request.
+_TRAIN_MODEL_KEY = "lora-train"
+
+
+def _train_lora_blocking(req: LoraTrainRequest) -> dict:
+    """Run one training job to completion (called inside a worker thread).
+
+    Holds _train_lock for the job's duration so a second training never overlaps
+    (also the signal _release_base_cache uses to know a job is in flight). The
+    central queue already serializes us, so this acquire returns immediately.
+    """
+    _train_lock.acquire()
+    try:
+        return _train_lora_sync(req)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        # On error the base may be in a half-moved / inconsistent state — drop the
+        # cache entirely (and reclaim its VRAM) rather than reuse it.
+        try:
+            _set_progress(active=False, status="error", message="training failed")
+        except Exception:
+            pass
+        _drop_base_cache()
+        raise
+    finally:
+        _train_lock.release()
+
+
 @router.post("/v1/loras/train")
 async def train_lora(req: LoraTrainRequest, _auth=Depends(_require_api_auth)):
-    """Train a LoRA from a saved character profile or supplied images (blocking)."""
+    """Train a LoRA (blocking). Admitted through the central request scheduler,
+    so concurrent training requests queue and run one after another (instead of
+    being rejected) alongside all other model requests."""
     import asyncio
+    import uuid
     if not req.name or '/' in req.name or '..' in req.name:
         raise HTTPException(status_code=400, detail="Invalid LoRA name")
     if not req.base_model:
         raise HTTPException(status_code=400, detail="base_model is required")
-    if not _train_lock.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail="A LoRA training job is already running")
+
+    request_id = f"lora-train-{uuid.uuid4().hex[:8]}"
+    # Wait for a scheduler slot (queues behind other in-flight work; the constant
+    # model key keeps trainings strictly one-at-a-time).
+    lease = await queue_manager.acquire(request_id, _TRAIN_MODEL_KEY)
     try:
-        try:
-            result = await asyncio.to_thread(_train_lora_sync, req)
-        except HTTPException:
-            raise
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            _set_progress(active=False, status="error", message=str(e))
-            # On error the base may be in a half-moved / inconsistent state — drop
-            # the cache entirely (and reclaim its VRAM) rather than reuse it.
-            _drop_base_cache()
-            raise HTTPException(status_code=500, detail=f"LoRA training failed: {e}")
+        result = await asyncio.to_thread(_train_lora_blocking, req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LoRA training failed: {e}")
     finally:
-        _train_lock.release()
+        await queue_manager.release(lease)
     return {"ok": True, **result}
 
 
