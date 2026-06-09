@@ -695,11 +695,19 @@ class CoderAIClient:
     def train_lora(self, name: str, base_model: str, character: str = None,
                    environment: str = None, images: list = None,
                    steps: int = 800, rank: int = 16,
-                   resolution: int = 512, train_base_model: str = None) -> dict:
+                   resolution: int = 512, train_base_model: str = None,
+                   target: str = "image", quantize_4bit: bool = True) -> dict:
         """Train a per-character or per-environment LoRA on the server.
-        Blocks until complete."""
+        Blocks until complete.
+
+        target="image" trains an SD1.x/SDXL UNet LoRA (for keyframes); target=
+        "video" trains a Wan video-DiT LoRA against `base_model` (the video model),
+        so it loads directly on the video pipeline."""
         body = {"name": name, "base_model": base_model,
-                "steps": int(steps), "rank": int(rank), "resolution": int(resolution)}
+                "steps": int(steps), "rank": int(rank), "resolution": int(resolution),
+                "target": target}
+        if target == "video":
+            body["quantize_4bit"] = bool(quantize_4bit)
         if train_base_model:
             body["train_base_model"] = train_base_model
         if character:
@@ -765,15 +773,7 @@ class CoderAIClient:
         }
         if model:
             body["model"] = model
-        d = self._post("/v1/video/upscale", body)
-        raw = d["data"][0].get("b64_mp4") or d["data"][0].get("url", "")
-        if raw.startswith("data:"):
-            raw = raw.split(",", 1)[1]
-        if raw.startswith("http"):
-            import urllib.request
-            with urllib.request.urlopen(raw, timeout=600) as resp:
-                return resp.read()
-        return base64.b64decode(raw)
+        return self._video_bytes(self._post("/v1/video/upscale", body))
 
     def interpolate_video(self, video_bytes: bytes, fps_multiplier: int = 2,
                           model: str = None) -> bytes:
@@ -785,15 +785,7 @@ class CoderAIClient:
         }
         if model:
             body["model"] = model
-        d = self._post("/v1/video/interpolate", body)
-        raw = d["data"][0].get("b64_mp4") or d["data"][0].get("url", "")
-        if raw.startswith("data:"):
-            raw = raw.split(",", 1)[1]
-        if raw.startswith("http"):
-            import urllib.request
-            with urllib.request.urlopen(raw, timeout=600) as resp:
-                return resp.read()
-        return base64.b64decode(raw)
+        return self._video_bytes(self._post("/v1/video/interpolate", body))
 
     def generate_video_clip(self, prompt: str, model: str,
                             character_profiles: list = None,
@@ -824,12 +816,17 @@ class CoderAIClient:
             body["loras"] = loras
 
         d = self._post("/v1/video/generations", body)
-        raw = d["data"][0].get("b64_mp4") or d["data"][0].get("url", "")
+        return self._video_bytes(d)
+
+    def _video_bytes(self, d: dict) -> bytes:
+        """Extract mp4 bytes from a /v1/video/* response (b64 or URL form)."""
+        item = (d.get("data") or [{}])[0]
+        raw = item.get("b64_mp4") or item.get("url", "")
         if raw.startswith("data:"):
             raw = raw.split(",", 1)[1]
         if raw.startswith("http"):
             import urllib.request
-            with urllib.request.urlopen(raw, timeout=120) as resp:
+            with urllib.request.urlopen(raw, timeout=600) as resp:
                 return resp.read()
         return base64.b64decode(raw)
 
@@ -1226,6 +1223,8 @@ CONFIG_FIELDS = [
     "character_strength", "lora_steps", "lora_rank", "lora_weight",
     "lora_train_base_model",
     "no_env_loras", "env_lora_steps", "env_lora_rank", "env_lora_weight",
+    "video_loras",
+    "upscale_factor", "fps_multiplier",
     "web_port",
 ]
 
@@ -1314,6 +1313,40 @@ def _reassemble_finals(video_dir: Path, match_name: str,
     return len(clips)
 
 
+def _enhance_suffix(upscale: int, fps_mult: int) -> str:
+    """Filename suffix describing the enhancement, e.g. '_2x', '_3xfps', '_2x_2xfps'."""
+    parts = []
+    if upscale in (2, 4):
+        parts.append(f"{upscale}x")
+    if fps_mult and fps_mult > 1:
+        parts.append(f"{fps_mult}xfps")
+    return ("_" + "_".join(parts)) if parts else ""
+
+
+def _enhance_video_file(client, model: str, src: Path,
+                        upscale: int = 0, fps_mult: int = 0) -> Optional[Path]:
+    """Upscale (2x/4x) and/or raise FPS of one video, writing a NEW file alongside
+    the original (e.g. match_short_2x_2xfps.mp4). Returns the new path, or None if
+    nothing to do. Skips re-doing an already-enhanced output that is newer."""
+    suffix = _enhance_suffix(upscale, fps_mult)
+    if not suffix:
+        return None
+    out = src.with_name(src.stem + suffix + src.suffix)
+    if out.exists() and out.stat().st_mtime >= src.stat().st_mtime:
+        _log(f"    ↻ already enhanced: {out.name}")
+        return out
+    data = src.read_bytes()
+    if upscale in (2, 4):
+        _log(f"    ⬆ upscaling {src.name} ×{upscale}…")
+        data = client.upscale_video(data, upscale, model)
+    if fps_mult and fps_mult > 1:
+        _log(f"    ⏩ raising FPS of {src.name} ×{fps_mult}…")
+        data = client.interpolate_video(data, fps_mult, model)
+    out.write_bytes(data)
+    _log(f"    ✓ enhanced → {out.name}  ({get_video_duration(str(out)):.1f}s)")
+    return out
+
+
 def _clip_stem_fight(match_name: str, idx: int) -> str:
     return f"{match_name}_clip{idx:02d}"
 
@@ -1325,6 +1358,27 @@ def _clip_stem_outcome(fighter: str, outcome: str, match_name: str = None) -> st
     if match_name:
         return f"{match_name}_{fighter}_{outcome}"
     return f"{fighter}_{outcome}"
+
+
+def _model_slug(model_id: str) -> str:
+    """Short filesystem-safe slug for a model id, used to tag video LoRAs with the
+    exact model they were trained for (e.g. Wan-AI/Wan2.2-T2V-A14B-Diffusers →
+    'wan-ai_wan2.2-t2v-a14b-diffusers')."""
+    import re as _re
+    s = (model_id or "").strip().lower()
+    s = s.replace("/", "_").replace("\\", "_").replace(" ", "-")
+    s = _re.sub(r"[^a-z0-9._-]+", "-", s).strip("-_.")
+    return s or "model"
+
+
+def _load_json_map(path: Path) -> dict:
+    """Load a JSON dict map from disk, or {} if missing/unreadable."""
+    try:
+        if Path(path).exists():
+            return json.loads(Path(path).read_text()) or {}
+    except Exception:
+        pass
+    return {}
 
 
 def _lora_specs_for(fighters: list, lora_map: dict, weight: float) -> list:
@@ -1347,11 +1401,49 @@ def _env_lora_specs_for(env: str, env_lora_map: dict, weight: float) -> list:
     return []
 
 
+def _video_lora_path(entry, slug: str):
+    """Resolve a video-LoRA map entry to the path for the current model slug.
+
+    Video maps are nested: name -> {slug: path} (a fighter can have a LoRA per
+    video model). Tolerates a legacy flat string entry."""
+    if isinstance(entry, dict):
+        return entry.get(slug)
+    if isinstance(entry, str):
+        return entry
+    return None
+
+
+def _video_lora_specs_for(fighters: list, vmap: dict, slug: str, weight: float) -> list:
+    """`loras` specs from the per-model video-LoRA map for the current video model."""
+    specs = []
+    for f in fighters:
+        path = _video_lora_path((vmap or {}).get(f), slug)
+        if path:
+            specs.append({"model": path, "weight": float(weight), "name": f})
+    return specs
+
+
+def _env_video_lora_specs_for(env: str, env_vmap: dict, slug: str, weight: float) -> list:
+    if not env:
+        return []
+    path = _video_lora_path((env_vmap or {}).get(env), slug)
+    if path:
+        return [{"model": path, "weight": float(weight), "name": f"env_{env}"}]
+    return []
+
+
 # Per-kind LoRA training parameters: server name prefix, local cache file,
 # the train_lora keyword used to pull reference images, and a friendly label.
 _LORA_KINDS = {
     "character":   {"prefix": "fighter_", "file": "loras.json",     "label": "Character"},
     "environment": {"prefix": "env_",     "file": "env_loras.json", "label": "Environment"},
+}
+
+# Video (Wan DiT) LoRAs are kept ALONGSIDE the image LoRAs above — separate maps,
+# separate on-disk names tagged with the video model they were trained for.
+_VIDEO_LORA_KINDS = {
+    "character":   {"prefix": "vfighter_", "file": "video_loras.json",     "label": "Character video"},
+    "environment": {"prefix": "venv_",     "file": "env_video_loras.json", "label": "Environment video"},
 }
 
 
@@ -1445,6 +1537,82 @@ def stage_env_loras(client: CoderAIClient, image_model: str, out_dir: Path,
                                 "environment", lora_steps, lora_rank, train_base_model)
 
 
+def _train_profile_video_loras(client: CoderAIClient, video_model: str, out_dir: Path,
+                               names: list, kind: str,
+                               lora_steps: int = 800, lora_rank: int = 16,
+                               quantize_4bit: bool = True) -> dict:
+    """Train one Wan video-DiT LoRA per profile of `kind`, against `video_model`.
+
+    Returns the full nested map {name: {slug: path}}. Resumable: skips a profile
+    that already has a LoRA for THIS video model's slug. The image LoRAs are left
+    untouched — these are stored separately and tagged with the model slug."""
+    spec = _VIDEO_LORA_KINDS[kind]
+    slug = _model_slug(video_model)
+    _log("\n" + "═" * 60)
+    _log(f"  STAGE — {spec['label']} LoRA training  (model: {video_model})")
+    _log("═" * 60)
+    lora_file = out_dir / spec["file"]
+    vmap = {}
+    if lora_file.exists():
+        try:
+            vmap = json.loads(lora_file.read_text()) or {}
+        except Exception:
+            vmap = {}
+
+    def _save():
+        try:
+            lora_file.write_text(json.dumps(vmap, indent=2))
+        except Exception as e:
+            _log(f"    ⚠ could not save {spec['file']}: {e}")
+
+    for i, name in enumerate(names, 1):
+        entry = vmap.get(name)
+        cur = _video_lora_path(entry, slug)
+        if cur and Path(cur).exists():
+            _log(f"  [{i}/{len(names)}] {name}: reusing video LoRA for this model")
+            continue
+        lora_name = f"{spec['prefix']}{name}__{slug}"
+        _log(f"  [{i}/{len(names)}] {name}: training video LoRA "
+             f"({lora_steps} steps, rank {lora_rank}) — slow on large models…")
+        try:
+            res = _run_with_spinner(
+                f"training {kind} video LoRA '{name}'",
+                client.train_lora, name=lora_name, base_model=video_model,
+                target="video", quantize_4bit=quantize_4bit,
+                steps=lora_steps, rank=lora_rank, **{kind: name},
+            )
+            path = res.get("path")
+            if path:
+                if not isinstance(vmap.get(name), dict):
+                    vmap[name] = {}
+                vmap[name][slug] = path
+                _save()
+                _log(f"    ✓ video LoRA saved → {path}")
+            else:
+                _log(f"    ✗ training returned no path: {res}")
+        except Exception as e:
+            _log(f"    ✗ video LoRA training failed for {name}: {e}")
+
+    _log(f"\n  {spec['label']} LoRAs ready for {slug}")
+    return vmap
+
+
+def stage_video_loras(client: CoderAIClient, video_model: str, out_dir: Path,
+                      char_names: list, lora_steps: int = 800, lora_rank: int = 16,
+                      quantize_4bit: bool = True) -> dict:
+    """Train one Wan video LoRA per fighter against the video model."""
+    return _train_profile_video_loras(client, video_model, out_dir, char_names,
+                                      "character", lora_steps, lora_rank, quantize_4bit)
+
+
+def stage_env_video_loras(client: CoderAIClient, video_model: str, out_dir: Path,
+                          env_names: list, lora_steps: int = 800, lora_rank: int = 16,
+                          quantize_4bit: bool = True) -> dict:
+    """Train one Wan video LoRA per environment against the video model."""
+    return _train_profile_video_loras(client, video_model, out_dir, env_names,
+                                      "environment", lora_steps, lora_rank, quantize_4bit)
+
+
 def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: Path,
                         fight_plan: list, outcome_plan: list, consistency: set,
                         lora_map: dict, char_strength: float, keyframe_steps: int,
@@ -1510,7 +1678,8 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
                  lora_map: dict = None, char_strength: float = 0.7,
                  keyframe_steps: int = 28, keyframe_size: str = "512x512",
                  lora_weight: float = 0.85, keyframes_only: bool = False,
-                 env_lora_map: dict = None, env_lora_weight: float = 0.8):
+                 env_lora_map: dict = None, env_lora_weight: float = 0.8,
+                 upscale_factor: int = 0, fps_multiplier: int = 0):
     _log("\n" + "═" * 60)
     _log("  STAGE 3 — Videos")
     _log("═" * 60)
@@ -1518,6 +1687,10 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
     video_dir.mkdir(parents=True, exist_ok=True)
     prompts_file = video_dir / "prompts.json"
     keyframe_dir = video_dir / "keyframes"
+
+    # Per-model video LoRA maps (attached to the VIDEO request when present).
+    video_lora_map = _load_json_map(out_dir / "video_loras.json")
+    env_video_lora_map = _load_json_map(out_dir / "env_video_loras.json")
 
     # Keyframes-only step: load saved prompts, generate keyframes, stop.
     if keyframes_only:
@@ -1576,13 +1749,17 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
                                 char_strength, keyframe_steps, keyframe_size, lora_weight,
                                 env_lora_map=env_lora_map or {}, env_lora_weight=env_lora_weight)
         # Jump straight to Phase 3 (rendering) below.
-        return _stage_videos_render(
+        _stage_videos_render(
             client, video_model, video_dir, fight_plan, outcome_plan,
             total_matches, total_outcomes, fps, clip_delay,
             consistency=consistency, lora_map=lora_map,
             keyframe_dir=keyframe_dir if use_keyframe else None,
             lora_weight=lora_weight,
-            env_lora_map=env_lora_map or {}, env_lora_weight=env_lora_weight)
+            env_lora_map=env_lora_map or {}, env_lora_weight=env_lora_weight,
+            video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map)
+        _stage_enhance_videos(client, video_model, video_dir, fight_plan,
+                              outcome_plan, upscale_factor, fps_multiplier)
+        return
 
     # =========================================================================
     # PHASE 1 — PLAN every clip up front (no API calls).
@@ -1744,20 +1921,24 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
                             char_strength, keyframe_steps, keyframe_size, lora_weight,
                             env_lora_map=env_lora_map or {}, env_lora_weight=env_lora_weight)
 
-    return _stage_videos_render(
+    _stage_videos_render(
         client, video_model, video_dir, fight_plan, outcome_plan,
         total_matches, total_outcomes, fps, clip_delay,
         consistency=consistency, lora_map=lora_map,
         keyframe_dir=keyframe_dir if use_keyframe else None,
         lora_weight=lora_weight,
-        env_lora_map=env_lora_map or {}, env_lora_weight=env_lora_weight)
+        env_lora_map=env_lora_map or {}, env_lora_weight=env_lora_weight,
+        video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map)
+    _stage_enhance_videos(client, video_model, video_dir, fight_plan,
+                          outcome_plan, upscale_factor, fps_multiplier)
 
 
 def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_plan,
                          total_matches, total_outcomes, fps, clip_delay,
                          consistency=None, lora_map=None, keyframe_dir=None,
                          lora_weight=0.85, env_lora_map=None, env_lora_weight=0.8,
-                         progress_cb=None, clip_cb=None):
+                         progress_cb=None, clip_cb=None,
+                         video_lora_map=None, env_video_lora_map=None):
     """PHASE 3 — render ALL videos from pre-written prompts (video model stays loaded).
 
     progress_cb(done, total, label) — optional; called after each clip finishes so
@@ -1765,12 +1946,19 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
     clip_cb(gidx, phase, ok) — optional; phase is "start" (clip gidx begins) or
     "end" (finished, ok=True/False). gidx is a 0-based index over the combined
     sequence of fight clips (in plan order) followed by outcome clips.
+
+    LoRAs on the VIDEO request come from the per-model video LoRA maps (matched to
+    this video model's slug) — image LoRAs don't apply to a Wan video DiT, so they
+    are used only for keyframes, not here.
     """
     _log("\n  ── Phase B — rendering all videos (video model) ──")
     render_start = time.monotonic()
     consistency = consistency or {"prompt"}
     lora_map = lora_map or {}
     env_lora_map = env_lora_map or {}
+    video_lora_map = video_lora_map or {}
+    env_video_lora_map = env_video_lora_map or {}
+    video_slug = _model_slug(video_model)
     use_lora = "lora" in consistency
 
     _total_clips = sum(len(m.get("clips", [])) for m in fight_plan) + len(outcome_plan)
@@ -1809,8 +1997,12 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         init_image = _keyframe_bytes(stem) if stem else None
         loras = None
         if use_lora:
-            loras = (_lora_specs_for(fighters or profiles or [], lora_map, lora_weight)
-                     + _env_lora_specs_for(env, env_lora_map, env_lora_weight)) or None
+            # Video-DiT LoRAs trained for THIS video model (image LoRAs can't apply
+            # to a Wan video transformer — they live on the keyframe path instead).
+            loras = (_video_lora_specs_for(fighters or profiles or [],
+                                           video_lora_map, video_slug, lora_weight)
+                     + _env_video_lora_specs_for(env, env_video_lora_map,
+                                                 video_slug, env_lora_weight)) or None
         try:
             mp4 = _run_with_spinner(
                 label, client.generate_video_clip,
@@ -1924,6 +2116,62 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         _gidx += 1
 
     _log(f"\n  Videos saved to: {video_dir}")
+
+
+def _enhance_targets(video_dir: Path, fight_plan: list, outcome_plan: list) -> list:
+    """Existing final (short/long) + outcome video files to post-process."""
+    targets = []
+    for m in fight_plan:
+        mn = m.get("match_name")
+        for kind in ("short", "long"):
+            p = video_dir / f"{mn}_{kind}.mp4"
+            if p.exists():
+                targets.append(p)
+    for o in outcome_plan:
+        p = video_dir / (_clip_stem_outcome(o["fighter"], o["outcome"],
+                                             o.get("match_name")) + ".mp4")
+        if p.exists() and p not in targets:
+            targets.append(p)
+    return targets
+
+
+def _stage_enhance_videos(client, video_model, video_dir, fight_plan, outcome_plan,
+                          upscale: int = 0, fps_mult: int = 0,
+                          progress_cb=None, clip_cb=None) -> int:
+    """PHASE C — upscale / raise-FPS the final + outcome videos (new files alongside).
+    Returns the number of videos enhanced. Callbacks mirror _stage_videos_render."""
+    if upscale not in (2, 4) and (not fps_mult or fps_mult <= 1):
+        return 0
+    targets = _enhance_targets(Path(video_dir), fight_plan, outcome_plan)
+    if not targets:
+        _log("  (no final/outcome videos found to enhance)")
+        return 0
+    label = []
+    if upscale in (2, 4):
+        label.append(f"upscale ×{upscale}")
+    if fps_mult and fps_mult > 1:
+        label.append(f"FPS ×{fps_mult}")
+    _log(f"\n  ── Phase C — enhancing {len(targets)} video(s): {', '.join(label)} ──")
+    done = 0
+    for i, src in enumerate(targets):
+        if clip_cb:
+            try: clip_cb(i, "start")
+            except Exception: pass
+        ok = False
+        try:
+            _enhance_video_file(client, video_model, src, upscale, fps_mult)
+            ok = True
+            done += 1
+        except Exception as e:
+            _log(f"    ✗ enhance failed for {src.name}: {e}")
+        if clip_cb:
+            try: clip_cb(i, "end", ok)
+            except Exception: pass
+        if progress_cb:
+            try: progress_cb(i + 1, len(targets), src.name)
+            except Exception: pass
+    _log(f"  └─ enhanced {done}/{len(targets)} video(s)")
+    return done
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2209,15 +2457,20 @@ def launch_web_ui(default_args):
         except Exception as exc:
             _fail(str(exc))
 
-    def _run_train_lora_job(job_id: str, kind: str, name: str, steps: int, rank: int):
+    def _run_train_lora_job(job_id: str, kind: str, name: str, steps: int, rank: int,
+                            target: str = "image"):
         """Train one profile's identity LoRA (server-side, blocking) while
         polling the server's progress so the profile page shows live step
-        counts. On success records the path in loras.json / env_loras.json."""
+        counts. target="image" records in loras.json/env_loras.json; target=
+        "video" trains a Wan LoRA against the video model and records it (tagged
+        with the model slug) in video_loras.json/env_video_loras.json."""
+        is_video = (target == "video")
         with _jobs_lock:
             _state["jobs"][job_id] = {"status": "running", "progress": 2,
                                       "output": None, "error": None,
                                       "_msg": "starting…",
-                                      "kind": kind, "name": name, "jtype": "train"}
+                                      "kind": kind, "name": name, "jtype": "train",
+                                      "target": target}
 
         def _prog(pct, msg=""):
             with _jobs_lock:
@@ -2234,14 +2487,23 @@ def launch_web_ui(default_args):
         try:
             client = CoderAIClient(default_args.base_url,
                                    getattr(default_args, "api_key", None))
-            _prog(4, "selecting image model…")
-            model = getattr(default_args, "image_model", None)
-            if not model:
-                try:
-                    model = pick_model(client, "image", None)
-                except Exception as e:
-                    _fail(f"no image model available: {e}")
-                    return
+            _prog(4, f"selecting {'video' if is_video else 'image'} model…")
+            if is_video:
+                model = getattr(default_args, "video_model", None)
+                if not model:
+                    try:
+                        model = pick_model(client, "video", None)
+                    except Exception as e:
+                        _fail(f"no video model available: {e}")
+                        return
+            else:
+                model = getattr(default_args, "image_model", None)
+                if not model:
+                    try:
+                        model = pick_model(client, "image", None)
+                    except Exception as e:
+                        _fail(f"no image model available: {e}")
+                        return
 
             # Server-side training pulls reference images from the CoderAI copy
             # of the profile — make sure the local profile is uploaded first, or
@@ -2252,10 +2514,16 @@ def launch_web_ui(default_args):
             except Exception:
                 pass
 
-            prefix = "fighter_" if kind == "character" else "env_"
-            lora_name = f"{prefix}{name}"
-            _web_log(f"  🧠 Training {kind} LoRA '{lora_name}' "
-                     f"({steps} steps, rank {rank})…")
+            slug = _model_slug(model)
+            if is_video:
+                vprefix = "vfighter_" if kind == "character" else "venv_"
+                lora_name = f"{vprefix}{name}__{slug}"
+            else:
+                prefix = "fighter_" if kind == "character" else "env_"
+                lora_name = f"{prefix}{name}"
+            _web_log(f"  🧠 Training {kind} {'VIDEO ' if is_video else ''}LoRA "
+                     f"'{lora_name}' ({steps} steps, rank {rank})"
+                     + (f" against {model}" if is_video else "") + "…")
 
             # Run the blocking train call in an inner thread; poll progress here.
             result, err = {}, {}
@@ -2263,9 +2531,12 @@ def launch_web_ui(default_args):
                 try:
                     kwargs = dict(name=lora_name, base_model=model,
                                   steps=int(steps), rank=int(rank))
-                    _tbm = getattr(default_args, "lora_train_base_model", None) or None
-                    if _tbm:
-                        kwargs["train_base_model"] = _tbm
+                    if is_video:
+                        kwargs["target"] = "video"
+                    else:
+                        _tbm = getattr(default_args, "lora_train_base_model", None) or None
+                        if _tbm:
+                            kwargs["train_base_model"] = _tbm
                     kwargs[kind] = name
                     result["res"] = client.train_lora(**kwargs)
                 except Exception as e:
@@ -2297,13 +2568,26 @@ def launch_web_ui(default_args):
                 _fail(f"training returned no path: {res}")
                 return
 
-            # Record the trained LoRA in the on-disk map so video/keyframe runs reuse it.
-            map_file = out_dir / ("loras.json" if kind == "character" else "env_loras.json")
+            # Record the trained LoRA in the on-disk map so video/keyframe runs
+            # reuse it. Image LoRAs → loras.json/env_loras.json (flat name→path).
+            # Video LoRAs → video_loras.json/env_video_loras.json (nested
+            # name→{model_slug: path}), keeping the image maps untouched.
+            if is_video:
+                map_file = out_dir / ("video_loras.json" if kind == "character"
+                                      else "env_video_loras.json")
+            else:
+                map_file = out_dir / ("loras.json" if kind == "character"
+                                      else "env_loras.json")
             try:
                 lmap = json.loads(map_file.read_text()) if map_file.exists() else {}
             except Exception:
                 lmap = {}
-            lmap[name] = path
+            if is_video:
+                if not isinstance(lmap.get(name), dict):
+                    lmap[name] = {}
+                lmap[name][slug] = path
+            else:
+                lmap[name] = path
             try:
                 map_file.write_text(json.dumps(lmap, indent=2))
             except Exception:
@@ -2411,10 +2695,70 @@ def launch_web_ui(default_args):
             consistency = parse_consistency(getattr(default_args, "consistency", "keyframe"))
             lora_map = _load_map("loras.json")
             env_lora_map = _load_map("env_loras.json")
+            video_lora_map = _load_map("video_loras.json")
+            env_video_lora_map = _load_map("env_video_loras.json")
             keyframe_dir = vdir / "keyframes" if "keyframe" in consistency else None
             clip_delay = float(getattr(default_args, "clip_delay", 5.0))
             lw = float(getattr(default_args, "lora_weight", 0.85))
             elw = float(getattr(default_args, "env_lora_weight", 0.8))
+
+            # ── Enhance: upscale / raise-FPS existing finals + outcome videos ──
+            if scope == "enhance":
+                try:
+                    upscale = int(params.get("upscale") or 0)
+                except Exception:
+                    upscale = 0
+                try:
+                    fps_mult = int(params.get("fps") or 0)
+                except Exception:
+                    fps_mult = 0
+                if upscale not in (2, 4) and (not fps_mult or fps_mult <= 1):
+                    _fail("nothing selected — choose Upscale 2x/4x and/or a FPS multiplier")
+                    return
+                target = params.get("target") or "all"
+                m = next((x for x in fight_plan if x.get("match_name") == match_name), {})
+                mf = {m.get("f1"), m.get("f2")} - {None}
+                srcs = []
+                if target in ("finals", "all"):
+                    for kind in ("short", "long"):
+                        p = vdir / f"{match_name}_{kind}.mp4"
+                        if p.exists():
+                            srcs.append(p)
+                if target in ("outcomes", "all"):
+                    for o in outcome_plan:
+                        if o.get("match_name"):
+                            if o.get("match_name") != match_name:
+                                continue
+                        elif o.get("fighter") not in mf:
+                            continue
+                        p = vdir / (_clip_stem_outcome(o["fighter"], o["outcome"],
+                                                       o.get("match_name")) + ".mp4")
+                        if p.exists() and p not in srcs:
+                            srcs.append(p)
+                if not srcs:
+                    _fail("no matching videos found to enhance")
+                    return
+                _set_items([s.name for s in srcs])
+                lbl = []
+                if upscale in (2, 4):
+                    lbl.append(f"×{upscale}")
+                if fps_mult and fps_mult > 1:
+                    lbl.append(f"{fps_mult}×fps")
+                _prog(8, f"enhancing {len(srcs)} video(s) ({', '.join(lbl)})…")
+                for i, src in enumerate(srcs):
+                    _item(i, "start")
+                    ok = False
+                    try:
+                        _enhance_video_file(client, video_model, src, upscale, fps_mult)
+                        ok = True
+                    except Exception as e:
+                        _dbg = str(e)
+                        print(f"  [enhance] failed {src.name}: {_dbg}", flush=True)
+                    _item(i, "end", ok)
+                    _prog(8 + int(88 * (i + 1) / len(srcs)),
+                          f"{i+1}/{len(srcs)} — {src.name}")
+                _done(f"enhanced {len(srcs)} video(s)")
+                return
 
             if scope in ("match-clips", "clip"):
                 m = next((x for x in fight_plan if x.get("match_name") == match_name), None)
@@ -2441,20 +2785,34 @@ def launch_web_ui(default_args):
                     consistency=consistency, lora_map=lora_map,
                     keyframe_dir=keyframe_dir, lora_weight=lw,
                     env_lora_map=env_lora_map, env_lora_weight=elw,
-                    progress_cb=_cb, clip_cb=_item)
+                    progress_cb=_cb, clip_cb=_item,
+                    video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map)
                 _done(f"re-rendered {len(mm['clips'])} clip(s)")
                 return
 
             if scope in ("outcomes", "outcome"):
                 fighter = params.get("fighter")
                 outcome = params.get("outcome")
+                # Fighters of this match (to resolve LEGACY per-fighter outcomes,
+                # which have no match_name — they belong to any match the fighter
+                # appears in).
+                _m = next((x for x in fight_plan
+                           if x.get("match_name") == match_name), {}) if match_name else {}
+                _match_fighters = {_m.get("f1"), _m.get("f2")} - {None}
+
+                def _belongs(o):
+                    if o.get("match_name"):
+                        return (not match_name) or o.get("match_name") == match_name
+                    # Legacy entry (no match_name): tie it to the match by fighter.
+                    return (not match_name) or o.get("fighter") in _match_fighters
+
                 if scope == "outcome":
                     sel = [o for o in outcome_plan
                            if o.get("fighter") == fighter and o.get("outcome") == outcome
-                           and (not match_name or o.get("match_name") == match_name)]
+                           and _belongs(o)]
                 elif match_name:
-                    # All outcomes of this match.
-                    sel = [o for o in outcome_plan if o.get("match_name") == match_name]
+                    # All outcomes of this match (per-match + legacy per-fighter).
+                    sel = [o for o in outcome_plan if _belongs(o)]
                 elif fighter:
                     sel = [o for o in outcome_plan if o.get("fighter") == fighter]
                 else:
@@ -2462,6 +2820,14 @@ def launch_web_ui(default_args):
                 if not sel:
                     _fail("no matching outputs in prompts.json")
                     return
+                # Keep a match's outcomes in the SAME environment as the match.
+                # Legacy per-fighter outcomes carry their own (often different) env,
+                # so override env/env_desc with the match's when rendering in a
+                # match context.
+                if match_name and _m.get("env"):
+                    sel = [{**o, "env": _m.get("env"),
+                            "env_desc": _m.get("env_desc", o.get("env_desc"))}
+                           for o in sel]
                 _set_items([_clip_stem_outcome(o['fighter'], o['outcome'],
                                                 o.get('match_name')) for o in sel])
                 _prog(8, f"rendering {len(sel)} output clip(s)…")
@@ -2476,7 +2842,8 @@ def launch_web_ui(default_args):
                     consistency=consistency, lora_map=lora_map,
                     keyframe_dir=keyframe_dir, lora_weight=lw,
                     env_lora_map=env_lora_map, env_lora_weight=elw,
-                    progress_cb=_cb, clip_cb=_item)
+                    progress_cb=_cb, clip_cb=_item,
+                    video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map)
                 _done(f"re-rendered {len(sel)} output(s)")
                 return
 
@@ -2598,6 +2965,15 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
 .lightbox-bg.open{display:flex}
 .lightbox-bg img{max-width:95vw;max-height:95vh;object-fit:contain;border-radius:8px;
                  box-shadow:0 0 40px rgba(0,0,0,.8)}
+/* video lightbox (a preview enlarges + centers when you press play) */
+.vlightbox-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:210;
+              align-items:flex-start;justify-content:center;padding:3vh 1.5rem}
+.vlightbox-bg.open{display:flex}
+.vlightbox-bg video{max-width:92vw;max-height:90vh;width:auto;border-radius:10px;background:#000;
+                    box-shadow:0 12px 48px rgba(0,0,0,.7)}
+.vlightbox-close{position:fixed;top:.7rem;right:1.3rem;color:#fff;font-size:1.7rem;line-height:1;
+                 cursor:pointer;z-index:211;font-weight:700}
+.vlightbox-close:hover{color:#f5a623}
 .pf-thumb-del{position:absolute;top:2px;right:2px;background:rgba(192,57,43,.92);color:#fff;
               border:none;border-radius:3px;cursor:pointer;font-size:.7rem;
               width:18px;height:18px;line-height:1;padding:0}
@@ -2665,6 +3041,10 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
 <div class=lightbox-bg id=img-lightbox onclick="this.classList.remove('open')">
   <img id=img-lightbox-img src="" alt="">
 </div>
+<div class=vlightbox-bg id=vid-lightbox onclick="if(event.target===this)window.closeVid&&closeVid()">
+  <span class=vlightbox-close onclick="window.closeVid&&closeVid()">✕</span>
+  <video id=vid-lightbox-vid controls playsinline></video>
+</div>
 <script>
 (function(){
   window.showImg=function(src,alt){
@@ -2674,8 +3054,32 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
     im.src=src; im.alt=alt||'';
     bg.classList.add('open');
   };
+  // Enlarge + center a video when it starts playing; pause the small inline one
+  // and continue playback from the same spot in the big centered player.
+  window.showVid=function(el){
+    var bg=document.getElementById('vid-lightbox');
+    var v=document.getElementById('vid-lightbox-vid');
+    if(!bg||!v||!el) return;
+    var t=0; try{ t=el.currentTime||0; }catch(e){}
+    try{ el.pause(); }catch(e){}
+    v.src=el.currentSrc||el.getAttribute('src')||el.src;
+    bg.classList.add('open');
+    v.onloadedmetadata=function(){ if(t>0){ try{ v.currentTime=t; }catch(e){} } };
+    var p=v.play(); if(p&&p.catch) p.catch(function(){});
+  };
+  window.closeVid=function(){
+    var bg=document.getElementById('vid-lightbox');
+    var v=document.getElementById('vid-lightbox-vid');
+    if(!bg||!v) return;
+    try{ v.pause(); }catch(e){}
+    bg.classList.remove('open');
+    v.removeAttribute('src'); try{ v.load(); }catch(e){}
+  };
   document.addEventListener('keydown',function(e){
-    if(e.key==='Escape'){var bg=document.getElementById('img-lightbox'); if(bg) bg.classList.remove('open');}
+    if(e.key==='Escape'){
+      var bg=document.getElementById('img-lightbox'); if(bg) bg.classList.remove('open');
+      if(window.closeVid) closeVid();
+    }
   });
 })();
 </script>"""
@@ -2707,6 +3111,11 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
         import json as _json
         def _v(attr, default=""): return getattr(args_ns, attr, default)
         def _c(attr): return " checked" if getattr(args_ns, attr, False) else ""
+        def _sel(attr, val):
+            try:
+                return " selected" if int(getattr(args_ns, attr, 0) or 0) == int(val) else ""
+            except Exception:
+                return ""
 
         # If the script was launched with -c/--config, the Save button defaults
         # to that same path so saving overwrites the loaded config file.
@@ -2806,6 +3215,23 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
     <div><label>Clip delay between requests (seconds)</label>
          <input name=clip_delay type=number min=0 step=0.5 value="{_v('clip_delay', 5.0)}"></div>
   </div>
+  <div class=row style="margin-top:.4rem">
+    <div><label>Post-process upscale (finals + outcomes)</label>
+         <select name=upscale_factor>
+           <option value=0{_sel('upscale_factor', 0)}>none</option>
+           <option value=2{_sel('upscale_factor', 2)}>2× (super-res)</option>
+           <option value=4{_sel('upscale_factor', 4)}>4× (super-res)</option>
+         </select></div>
+    <div><label>Post-process raise FPS (finals + outcomes)</label>
+         <select name=fps_multiplier>
+           <option value=0{_sel('fps_multiplier', 0)}>none</option>
+           <option value=2{_sel('fps_multiplier', 2)}>2×</option>
+           <option value=3{_sel('fps_multiplier', 3)}>3×</option>
+           <option value=4{_sel('fps_multiplier', 4)}>4×</option>
+         </select></div>
+  </div>
+  <p class=hint style="margin-top:.15rem">Enhancement runs after rendering and writes new
+     <code>*_2x</code>/<code>*_NxfpS</code> files alongside the originals.</p>
   <div style="margin-top:.6rem">
     <label><input type=checkbox name=skip_videos{_c('skip_videos')}> Skip Stage 3 entirely</label><br>
     <label><input type=checkbox name=only_outcomes{_c('only_outcomes')}> Outcomes only (skip fight matches)</label>
@@ -2863,6 +3289,7 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
     </div>
     <div style="margin-top:.6rem">
       <label><input type=checkbox name=env_loras{"" if _v('no_env_loras') else " checked"}> Also train per-environment LoRAs <span class=hint>(lock each location’s look)</span></label>
+      <label><input type=checkbox name=video_loras{" checked" if _v('video_loras') else ""}> Also train Wan VIDEO LoRAs <span class=hint>(per fighter/env, trained against the video model — heavy)</span></label>
     </div>
     <div class=row3 style="margin-top:.4rem">
       <div><label>Env LoRA train steps</label>
@@ -2889,6 +3316,7 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
     <button class="btn btn-secondary" type=button onclick="runStep('environments')">2 · Environments</button>
     <button class="btn btn-secondary" type=button onclick="runStep('prompts')">3 · Prompts</button>
     <button class="btn btn-secondary" type=button onclick="runStep('loras')">4 · Train LoRAs</button>
+    <button class="btn btn-secondary" type=button onclick="runStep('video-loras')">4b · Train Video LoRAs</button>
     <button class="btn btn-secondary" type=button onclick="runStep('keyframes')">5 · Keyframes</button>
     <button class="btn btn-secondary" type=button onclick="runStep('videos')">6 · Render videos</button>
   </div>
@@ -3055,6 +3483,12 @@ fetch('/status').then(r=>r.json()).then(d=>{{
             _lora_map = json.loads(_lora_file.read_text()) if _lora_file.exists() else {}
         except Exception:
             _lora_map = {}
+        # Per-model video LoRA map + the current video model's slug, to show which
+        # fighters already have a Wan video LoRA for the configured video model.
+        _vlora_file = out_dir / ("video_loras.json" if kind == "character"
+                                 else "env_video_loras.json")
+        _vlora_map = _load_json_map(_vlora_file)
+        _vslug = _model_slug(getattr(default_args, "video_model", None) or "")
 
         def esc(v):
             return _html.escape(str(v if v is not None else ""), quote=True)
@@ -3150,8 +3584,22 @@ fetch('/status').then(r=>r.json()).then(d=>{{
                 f'    <label style="margin:0;font-size:.78rem">rank <input type=number data-lora=rank '
                 f'value=16 min=2 max=128 style="width:54px;display:inline-block"></label>'
                 f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
-                f'onclick="trainLora(\'{kind}\',\'{esc(name)}\')">🧠 {"Retrain" if (_lora_map.get(name)) else "Train"} LoRA</button>'
+                f'onclick="trainLora(\'{kind}\',\'{esc(name)}\')">🧠 {"Retrain" if (_lora_map.get(name)) else "Train"} image LoRA</button>'
                 f'    <span class=pf-lora-status style="font-size:.76rem;color:#7ea8f7"></span>'
+                f'  </div>'
+                # Video (Wan) LoRA — separate, tagged with the current video model.
+                f'  <div class=pf-actions style="border-top:1px solid #222;padding-top:.6rem;margin-top:.6rem">'
+                f'    <span style="font-size:.78rem;color:{"#7ed87e" if _video_lora_path(_vlora_map.get(name), _vslug) else "#888"}">'
+                f'Video LoRA ({esc(_vslug or "no video model")}): '
+                f'{"trained ✓" if _video_lora_path(_vlora_map.get(name), _vslug) else "not trained"}</span>'
+                f'    <label style="margin:0;font-size:.78rem">steps <input type=number data-vlora=steps '
+                f'value=800 min=50 max=5000 step=50 style="width:66px;display:inline-block"></label>'
+                f'    <label style="margin:0;font-size:.78rem">rank <input type=number data-vlora=rank '
+                f'value=16 min=2 max=128 style="width:54px;display:inline-block"></label>'
+                f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+                f'onclick="trainLora(\'{kind}\',\'{esc(name)}\',\'video\')">🎬 '
+                f'{"Retrain" if _video_lora_path(_vlora_map.get(name), _vslug) else "Train"} video LoRA</button>'
+                f'    <span class=pf-vlora-status style="font-size:.76rem;color:#7ea8f7"></span>'
                 f'  </div>'
                 f'</div>'
             )
@@ -3234,17 +3682,25 @@ function pollRegen(jobId, st){
   };
   setTimeout(poll,800);
 }
-async function trainLora(kind,name){
+async function trainLora(kind,name,target){
+  target = target||'image';
+  const isV = target==='video';
   const root=document.getElementById('pf-'+kind+'-'+name);
-  const st=root.querySelector('.pf-lora-status');
-  const steps=parseInt(root.querySelector('[data-lora=steps]').value||'800',10);
-  const rank=parseInt(root.querySelector('[data-lora=rank]').value||'16',10);
-  if(!(await uiConfirm('Train identity LoRA for "'+name+'" ('+steps+' steps)? '
-    +'This evicts loaded models and can take several minutes.',
-    {title:'Train LoRA', okText:'Train'})))return;
+  const st=root.querySelector(isV?'.pf-vlora-status':'.pf-lora-status');
+  const sel=isV?'[data-vlora=steps]':'[data-lora=steps]';
+  const rsel=isV?'[data-vlora=rank]':'[data-lora=rank]';
+  const steps=parseInt((root.querySelector(sel)||{}).value||'800',10);
+  const rank=parseInt((root.querySelector(rsel)||{}).value||'16',10);
+  const msg = isV
+    ? 'Train a VIDEO (Wan) LoRA for "'+name+'" ('+steps+' steps) against the configured video model? '
+      +'This is heavy — it evicts loaded models and can take a long time (large video models may need 4-bit).'
+    : 'Train image identity LoRA for "'+name+'" ('+steps+' steps)? '
+      +'This evicts loaded models and can take several minutes.';
+  if(!(await uiConfirm(msg,{title:(isV?'Train video LoRA':'Train LoRA'), okText:'Train'})))return;
   const fd=new FormData();
   fd.append('kind',kind); fd.append('name',name);
   fd.append('steps',steps); fd.append('rank',rank);
+  fd.append('target',target);
   st.style.color='#aaa'; st.textContent='Starting…';
   let j;
   try{ j=await (await fetch('/profile/train-lora',{method:'POST',body:fd})).json(); }
@@ -3280,7 +3736,7 @@ async function resumeActiveJobs(){
       const st=root.querySelector('.pf-regen-status');
       if(st){ st.textContent='⏳ '+(j._msg||'working…'); pollRegen(j.job_id, st); }
     } else if(j.jtype==='train'){
-      const st=root.querySelector('.pf-lora-status');
+      const st=root.querySelector(j.target==='video'?'.pf-vlora-status':'.pf-lora-status');
       if(st){ st.textContent='⏳ '+(j._msg||'training…'); pollTrain(j.job_id, st); }
     }
   });
@@ -3377,7 +3833,9 @@ async function uploadRefs(kind,name){
     def _vid_tag(p: Path, h=180):
         url = "/media/" + str(p.relative_to(out_dir)).replace("\\", "/")
         return (f'<video src="{_esc(url)}" controls preload=none '
-                f'style="width:100%;height:{h}px;object-fit:cover;'
+                f'onplay="window.showVid&&showVid(this)" '
+                f'title="Press play to enlarge" '
+                f'style="width:100%;height:{h}px;object-fit:cover;cursor:zoom-in;'
                 f'border-radius:6px;background:#111"></video>')
 
     # Shared JS for the Matches list + detail pages (regenerate / save / remove).
@@ -3458,6 +3916,28 @@ async function reMatch(ev, scope, params){
   if(j.error){ setSt('#e07070','✗ '+j.error); return; }
   const wrap=document.getElementById('match-progress');
   if(wrap && scope!=='reassemble'){ wrap.innerHTML=''; wrap.classList.remove('hidden'); _pollMatchBars(j.job_id, setSt, wrap); }
+  else { _pollJob(j.job_id, setSt); }
+}
+async function enhanceMatch(ev, target, match){
+  if(ev) ev.preventDefault();
+  const up=(document.getElementById('enh-upscale')||{}).value||'0';
+  const fps=(document.getElementById('enh-fps')||{}).value||'0';
+  if(up==='0' && (fps==='0'||fps==='1')){ alert('Pick an Upscale factor and/or a FPS multiplier first.'); return; }
+  const tlabel={finals:'final videos',outcomes:'outcome videos',all:'finals + outcomes'}[target]||target;
+  const bits=[]; if(up!=='0') bits.push('upscale '+up+'×'); if(fps!=='0'&&fps!=='1') bits.push('FPS '+fps+'×');
+  if(!(await uiConfirm('Enhance '+tlabel+' ('+bits.join(', ')+')? New files are written alongside the originals.',
+       {title:'Enhance videos', okText:'Enhance'})))return;
+  const stEl=document.getElementById('detail-status');
+  const setSt=(c,t)=>{ if(stEl){ stEl.style.color=c; stEl.textContent=t; } };
+  const fd=new FormData(); fd.append('scope','enhance'); fd.append('match',match);
+  fd.append('target',target); fd.append('upscale',up); fd.append('fps',fps);
+  setSt('#aaa','Starting…');
+  let j;
+  try{ j=await (await fetch('/matches/render',{method:'POST',body:fd})).json(); }
+  catch(e){ setSt('#e07070','✗ '+e); return; }
+  if(j.error){ setSt('#e07070','✗ '+j.error); return; }
+  const wrap=document.getElementById('match-progress');
+  if(wrap){ wrap.innerHTML=''; wrap.classList.remove('hidden'); _pollMatchBars(j.job_id, setSt, wrap); }
   else { _pollJob(j.job_id, setSt); }
 }
 async function delVid(ev, scope, params){
@@ -3683,8 +4163,10 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
 
         # ── Outcomes for this match (per participating fighter) ────────────────
         rendered_out = {(fr, oc): p for (fr, oc, p) in info.get("outcomes", [])}
+        _mfighters = {f1, f2} - {""}
         plan_out = {(o["fighter"], o["outcome"]): o for o in plan.get("outcome_plan", [])
-                    if o.get("match_name") == name}
+                    if (o.get("match_name") == name
+                        or (not o.get("match_name") and o.get("fighter") in _mfighters))}
         out_fighters = [x for x in (f1, f2) if x]
         # Include any fighters that appear in rendered/planned outcomes but not in meta.
         for (fr, _oc) in list(rendered_out) + list(plan_out):
@@ -3748,6 +4230,23 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="delVid(event,\'match\',{{match:\'{_esc(name)}\'}})">🗑 Remove all videos</button>'
             f'  </div>'
+            f'</div>'
+            # ── Enhance (upscale / raise FPS) ──
+            f'<div class=card style="display:flex;align-items:flex-end;gap:.6rem;flex-wrap:wrap">'
+            f'  <div style="min-width:130px"><label>Upscale</label>'
+            f'    <select id=enh-upscale><option value=0>none</option>'
+            f'      <option value=2>2× (super-res)</option><option value=4>4× (super-res)</option></select></div>'
+            f'  <div style="min-width:130px"><label>Raise FPS</label>'
+            f'    <select id=enh-fps><option value=0>none</option>'
+            f'      <option value=2>2×</option><option value=3>3×</option><option value=4>4×</option></select></div>'
+            f'  <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="enhanceMatch(event,\'finals\',\'{_esc(name)}\')">✨ Enhance finals</button>'
+            f'  <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="enhanceMatch(event,\'outcomes\',\'{_esc(name)}\')">✨ Enhance outcomes</button>'
+            f'  <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="enhanceMatch(event,\'all\',\'{_esc(name)}\')">✨ Enhance all</button>'
+            f'  <span class=hint style="flex-basis:100%;margin-top:.1rem">Writes new '
+            f'<code>*_2x</code>/<code>*_NxfpS</code> files alongside the originals (non-destructive).</span>'
             f'</div>'
             f'<div id=match-progress class=hidden></div>'
             f'<div class=section-title style="margin:.7rem 0 .3rem">Final videos</div>'
@@ -4162,6 +4661,7 @@ async function pollJob(){
                                 "kind": j.get("kind"),
                                 "name": j.get("name"),
                                 "jtype": j.get("jtype"),
+                                "target": j.get("target"),
                                 "scope": j.get("scope"),
                                 "match": j.get("match"),
                                 "progress": j.get("progress", 0),
@@ -4290,9 +4790,10 @@ async function pollJob(){
                     rank = max(2, min(128, int(_fv("rank", "16") or 16)))
                 except ValueError:
                     rank = 16
+                target = "video" if _fv("target") == "video" else "image"
                 job_id = _u.uuid4().hex[:12]
                 threading.Thread(target=_run_train_lora_job,
-                                 args=(job_id, kind, name, steps, rank),
+                                 args=(job_id, kind, name, steps, rank, target),
                                  daemon=True).start()
                 self._send(200, "application/json", _j.dumps({"job_id": job_id}))
                 return
@@ -4314,12 +4815,13 @@ async function pollJob(){
                     return v if isinstance(v, str) else v.decode(errors="replace")
 
                 scope = _fv("scope")
-                if scope not in ("match-clips", "clip", "reassemble", "outcomes", "outcome"):
+                if scope not in ("match-clips", "clip", "reassemble", "outcomes",
+                                 "outcome", "enhance"):
                     self._send(400, "application/json",
                                _j.dumps({"error": "invalid scope"}))
                     return
                 params = {}
-                for k in ("match", "idx", "fighter", "outcome"):
+                for k in ("match", "idx", "fighter", "outcome", "target", "upscale", "fps"):
                     val = _fv(k)
                     if val:
                         # Guard path-like fields against traversal.
@@ -4738,6 +5240,8 @@ async function pollJob(){
                     "include_female": "include_female" in form,
                     "fps": int(_fv("fps", "8") or 8),
                     "clip_delay": float(_fv("clip_delay", "5") or 5),
+                    "upscale_factor": int(_fv("upscale_factor", "0") or 0),
+                    "fps_multiplier": int(_fv("fps_multiplier", "0") or 0),
                     "matches": int(_fv("matches", "6") or 6),
                     "skip_videos": "skip_videos" in form,
                     "only_outcomes": "only_outcomes" in form,
@@ -4867,6 +5371,8 @@ async function pollJob(){
             ns.include_female = "include_female" in form
             ns.fps          = int(_fv("fps", "8"))
             ns.clip_delay   = float(_fv("clip_delay", "5.0"))
+            ns.upscale_factor = int(_fv("upscale_factor", "0") or 0)
+            ns.fps_multiplier = int(_fv("fps_multiplier", "0") or 0)
             ns.matches      = int(_fv("matches", "6"))
             ns.skip_videos  = "skip_videos" in form
             ns.only_outcomes = "only_outcomes" in form
@@ -4927,6 +5433,9 @@ async function pollJob(){
             # (stages are resumable / pick up saved state on disk).
             ns.only_loras = False
             ns.only_keyframes = False
+            # Full-run checkbox: also train Wan video LoRAs after image LoRAs.
+            ns.video_loras = ("video_loras" in form)
+            ns.only_video_loras = False
             step = _fv("step", "").strip()
             if step:
                 ns.only_characters = ns.only_environments = ns.only_assets = False
@@ -4941,6 +5450,9 @@ async function pollJob(){
                 elif step == "loras":
                     ns.skip_characters = True; ns.skip_environments = True
                     ns.skip_videos = True; ns.only_loras = True
+                elif step == "video-loras":
+                    ns.skip_characters = True; ns.skip_environments = True
+                    ns.skip_videos = True; ns.only_video_loras = True; ns.video_loras = True
                 elif step == "keyframes":
                     ns.skip_characters = True; ns.skip_environments = True
                     ns.only_keyframes = True
@@ -4955,6 +5467,7 @@ async function pollJob(){
                 "environments": "Step 2 · Generate Environments",
                 "prompts":      "Step 3 · Write Video Prompts",
                 "loras":        "Step 4 · Train Character LoRAs",
+                "video-loras":  "Step · Train Video (Wan) LoRAs",
                 "keyframes":    "Step 5 · Generate Keyframes",
                 "videos":       "Step 6 · Render Videos",
             }
@@ -5190,7 +5703,31 @@ async function pollJob(){
                 else:
                     _web_log("  ⚠ No environments found to train LoRAs for.")
 
-        if only_loras:
+        # Video (Wan) LoRAs — trained against the configured video model and stored
+        # separately (tagged with the model slug); image LoRAs above stay intact.
+        _want_video_lora = (getattr(args, "video_loras", False)
+                            or getattr(args, "only_video_loras", False))
+        if _want_video_lora:
+            _vm = video_model or pick_model(client, "video", args.video_model)
+            if not _vm:
+                _web_log("  ⚠ Video LoRA training needs a video model.")
+            else:
+                if char_names:
+                    _web_log(f"  Training character VIDEO LoRAs ({_model_slug(_vm)}) "
+                             f"for {len(char_names)} fighter(s)…")
+                    stage_video_loras(client, _vm, out_dir_r, char_names or [],
+                                      lora_steps=getattr(args, "lora_steps", 800),
+                                      lora_rank=getattr(args, "lora_rank", 16))
+                if not _no_env_loras and env_names:
+                    _web_log(f"  Training environment VIDEO LoRAs ({_model_slug(_vm)}) "
+                             f"for {len(env_names)} location(s)…")
+                    stage_env_video_loras(client, _vm, out_dir_r, env_names or [],
+                                          lora_steps=getattr(args, "env_lora_steps", 800),
+                                          lora_rank=getattr(args, "env_lora_rank", 16))
+
+        if getattr(args, "only_video_loras", False):
+            _web_log("\n✓ Video LoRA step complete.")
+        elif only_loras:
             _web_log(f"\n✓ LoRA step complete. "
                      f"Characters: {len(lora_map)} | Environments: {len(env_lora_map)}")
         elif only_keyframes:
@@ -5229,6 +5766,8 @@ async function pollJob(){
                 keyframe_size=getattr(args, "keyframe_size", "512x512"),
                 lora_weight=getattr(args, "lora_weight", 0.85),
                 env_lora_map=env_lora_map, env_lora_weight=_env_lora_weight,
+                upscale_factor=getattr(args, "upscale_factor", 0),
+                fps_multiplier=getattr(args, "fps_multiplier", 0),
             )
 
         _web_log("\n✓ Done.")
@@ -5420,6 +5959,12 @@ OUTPUT LAYOUT
                         help="Video FPS (default: 8). Higher = smoother, much slower.")
     parser.add_argument("--clip-delay", type=float, default=5.0, metavar="SECONDS",
                         help="Seconds between video clip requests (default: 5). Raise if rate-limited.")
+    parser.add_argument("--upscale-factor", type=int, default=0, choices=[0, 2, 4], metavar="N",
+                        help="Post-process the final + outcome videos with NxN super-resolution "
+                             "(2 or 4; 0=off, default). Writes new *_2x/_4x files alongside.")
+    parser.add_argument("--fps-multiplier", type=int, default=0, metavar="N",
+                        help="Post-process the final + outcome videos by raising FPS Nx via frame "
+                             "interpolation (e.g. 2; 0/1=off, default). Writes new *_NxfpS files.")
     parser.add_argument("--region",    default=None, metavar="REGION",
                         help="Filter characters/environments by region keyword, e.g. kampala, soweto, jinja.")
 
@@ -5509,6 +6054,13 @@ OUTPUT LAYOUT
                           help="Environment LoRA rank (default: 16).")
     cons_grp.add_argument("--env-lora-weight", type=float, default=0.8, metavar="F",
                           help="Weight applied to each environment LoRA at generation (default: 0.8).")
+    cons_grp.add_argument("--video-loras", action="store_true",
+                          help="Also train Wan VIDEO LoRAs (per fighter + environment) against the "
+                               "configured --video-model. Stored separately (tagged with the model) "
+                               "and applied to the video request. Heavy on large video models.")
+    cons_grp.add_argument("--only-video-loras", action="store_true",
+                          help="Train ONLY the Wan video LoRAs (skip everything else), against "
+                               "--video-model. Implies --video-loras.")
 
     parser.add_argument("--cli-mode", action="store_true",
                         help="Run in CLI mode (default when --cli-mode is present). "
@@ -5660,6 +6212,21 @@ OUTPUT LAYOUT
                                        lora_rank=getattr(args, "env_lora_rank", 16),
                                        train_base_model=getattr(args, "lora_train_base_model", None) or None)
 
+    # ── Stage 2.6: Video (Wan) LoRA training — against the video model ─────────
+    if getattr(args, "video_loras", False) or getattr(args, "only_video_loras", False):
+        _vm = video_model or pick_model(client, "video", args.video_model)
+        if _vm and (char_names or []):
+            stage_video_loras(client, _vm, out_dir, char_names or [],
+                              lora_steps=getattr(args, "lora_steps", 800),
+                              lora_rank=getattr(args, "lora_rank", 16))
+        if (_vm and not getattr(args, "no_env_loras", False) and (env_names or [])):
+            stage_env_video_loras(client, _vm, out_dir, env_names or [],
+                                  lora_steps=getattr(args, "env_lora_steps", 800),
+                                  lora_rank=getattr(args, "env_lora_rank", 16))
+        if getattr(args, "only_video_loras", False):
+            _log("\n✓ Video LoRA training complete.")
+            return
+
     # ── Stage 3: Videos ────────────────────────────────────────────────────────
     if not args.skip_videos:
         stage_videos(
@@ -5682,6 +6249,8 @@ OUTPUT LAYOUT
             lora_weight=getattr(args, "lora_weight", 0.85),
             env_lora_map=env_lora_map,
             env_lora_weight=getattr(args, "env_lora_weight", 0.8),
+            upscale_factor=getattr(args, "upscale_factor", 0),
+            fps_multiplier=getattr(args, "fps_multiplier", 0),
         )
 
     _log("\n✓ Done.")
