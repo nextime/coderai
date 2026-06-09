@@ -108,6 +108,116 @@ def _migrate_hf_gguf_to_gguf_cache() -> None:
         )
 
 
+# Category → (type string used by build_runtime_kwargs, manager config-key prefix)
+_CATEGORY_TYPE_PREFIX = {
+    "text_models":      ("text", ""),
+    "gguf_models":      ("text", ""),
+    "image_models":     ("image", "image:"),
+    "audio_models":     ("audio", "audio:"),
+    "tts_models":       ("tts", "tts:"),
+    "vision_models":    ("vision", "vision:"),
+    "video_models":     ("video", "video:"),
+    "audio_gen_models": ("audio_gen", "audio_gen:"),
+    "embedding_models": ("embedding", "embedding:"),
+    "spatial_models":   ("spatial", "spatial:"),
+}
+
+
+def build_runtime_kwargs(model_cfg, model_type):
+    """Translate a models.json entry into the runtime kwargs stored in
+    ``multi_model_manager.config``. Pure function (no external state) so it can
+    be reused both at startup and when applying an admin config change live."""
+    _flash = bool(
+        model_cfg.get('flash_attention', model_cfg.get('flash_attn', False))
+        or model_cfg.get('sdcpp_flash_attn', False)
+        or model_cfg.get('sdcpp_diffusion_flash_attn', False)
+    )
+    kwargs = {
+        'load_in_4bit':    model_cfg.get('load_in_4bit', False),
+        'load_in_8bit':    model_cfg.get('load_in_8bit', False),
+        'flash_attn':      _flash,
+        'offload_strategy': model_cfg.get('offload_strategy', 'auto'),
+        'offload_dir':     model_cfg.get('offload_dir'),
+        'max_gpu_percent': model_cfg.get('max_gpu_percent'),
+        'manual_ram_gb':   model_cfg.get('manual_ram_gb'),
+        'no_ram':          model_cfg.get('no_ram', False),
+        'n_gpu_layers':    model_cfg.get('n_gpu_layers', -1),
+        'force_vram_update': model_cfg.get('force_vram_update', False),
+        '_raw_cfg':        dict(model_cfg) if isinstance(model_cfg, dict) else {},
+    }
+    if model_type == "text":
+        kwargs['ctx'] = model_cfg.get('n_ctx', model_cfg.get('context_size'))
+    elif model_type == "image":
+        kwargs['llm_path'] = model_cfg.get('llm_path')
+        kwargs['vae_path'] = model_cfg.get('vae_path')
+        kwargs['sample_method'] = model_cfg.get('sample_method', 'res_multistep')
+        kwargs['steps'] = model_cfg.get('steps', 4)
+        kwargs['width'] = model_cfg.get('width', 512)
+        kwargs['height'] = model_cfg.get('height', 512)
+        kwargs['cfg_scale'] = model_cfg.get('cfg_scale', 1.0)
+        kwargs['precision'] = model_cfg.get('precision', 'f32')
+        kwargs['cpu_offload'] = model_cfg.get('cpu_offload', False)
+        kwargs['seed'] = model_cfg.get('seed')
+        kwargs['vae_tiling'] = model_cfg.get('vae_tiling', False)
+        kwargs['clip_on_cpu'] = model_cfg.get('clip_on_cpu', False)
+    elif model_type == "audio":
+        kwargs['ctx'] = model_cfg.get('context_ms')
+        kwargs['offload'] = model_cfg.get('offload') or model_cfg.get('offload_strategy')
+        kwargs['vulkan_device'] = model_cfg.get('vulkan_device', 0)
+    elif model_type == "vision":
+        kwargs['ctx'] = model_cfg.get('n_ctx', model_cfg.get('context_size'))
+        kwargs['offload'] = model_cfg.get('offload') or model_cfg.get('offload_strategy')
+    elif model_type == "video":
+        kwargs['precision'] = model_cfg.get('precision', 'bf16')
+        kwargs['vae_tiling'] = model_cfg.get('vae_tiling', True)
+        kwargs['balanced_gpu_percent'] = model_cfg.get('balanced_gpu_percent', 80)
+        kwargs['output_crf'] = model_cfg.get('output_crf')
+    return kwargs
+
+
+def build_runtime_model_cfg(entry, model_type):
+    """build_runtime_kwargs + the extra passthrough keys main() applies."""
+    cfg = build_runtime_kwargs(entry, model_type) if isinstance(entry, dict) else {}
+    if isinstance(entry, dict):
+        for k in ("load_mode", "used_vram_gb", "alias", "max_instances"):
+            if k in entry:
+                cfg[k] = entry[k]
+    return cfg
+
+
+def apply_model_entry_live(entry, model_types) -> int:
+    """Update the running ``multi_model_manager.config`` for one models.json
+    entry so config changes (e.g. lora_train_base_model, vae_path, quant flags)
+    take effect immediately without a restart. Only the config dict is touched —
+    already-loaded weights and VRAM bookkeeping are left alone, and no downloads
+    are triggered. Returns the number of live config keys updated."""
+    try:
+        from codai.models.manager import multi_model_manager
+    except Exception:
+        return 0
+    if not isinstance(entry, dict):
+        return 0
+    mid = entry.get("path") or entry.get("id") or ""
+    if not mid:
+        return 0
+    updated = 0
+    for cat in (model_types or []):
+        tp = _CATEGORY_TYPE_PREFIX.get(cat)
+        if not tp:
+            continue
+        type_str, prefix = tp
+        cfg = build_runtime_model_cfg(entry, type_str)
+        multi_model_manager.config[f"{prefix}{mid}"] = cfg
+        updated += 1
+        alias = entry.get("alias")
+        if alias:
+            try:
+                multi_model_manager.set_model_alias(alias, mid)
+            except Exception:
+                pass
+    return updated
+
+
 def main():
     """Main entry point for the codai server."""
     # Suppress unraisable exceptions from LlamaModel.__del__
@@ -400,42 +510,10 @@ def main():
                 return m
         return {}
     
-    # Helper to build kwargs from model config
-    def build_kwargs_from_config(model_cfg, model_type):
-        kwargs = {}
-        if model_type == "text":
-            kwargs['ctx'] = model_cfg.get('context_size')
-            kwargs['n_gpu_layers'] = model_cfg.get('n_gpu_layers', -1)
-            kwargs['load_in_4bit'] = model_cfg.get('load_in_4bit', False)
-            kwargs['load_in_8bit'] = model_cfg.get('load_in_8bit', False)
-            kwargs['flash_attn'] = model_cfg.get('flash_attn', False)
-            kwargs['offload_strategy'] = model_cfg.get('offload_strategy', 'auto')
-            kwargs['manual_ram_gb'] = model_cfg.get('manual_ram_gb')
-            kwargs['max_gpu_percent'] = model_cfg.get('max_gpu_percent')
-            kwargs['no_ram'] = model_cfg.get('no_ram', False)
-        elif model_type == "image":
-            kwargs['llm_path'] = model_cfg.get('llm_path')
-            kwargs['vae_path'] = model_cfg.get('vae_path')
-            kwargs['sample_method'] = model_cfg.get('sample_method', 'res_multistep')
-            kwargs['steps'] = model_cfg.get('steps', 4)
-            kwargs['width'] = model_cfg.get('width', 512)
-            kwargs['height'] = model_cfg.get('height', 512)
-            kwargs['cfg_scale'] = model_cfg.get('cfg_scale', 1.0)
-            kwargs['precision'] = model_cfg.get('precision', 'f32')
-            kwargs['cpu_offload'] = model_cfg.get('cpu_offload', False)
-            kwargs['seed'] = model_cfg.get('seed')
-            kwargs['vae_tiling'] = model_cfg.get('vae_tiling', False)
-            kwargs['clip_on_cpu'] = model_cfg.get('clip_on_cpu', False)
-        elif model_type == "audio":
-            kwargs['ctx'] = model_cfg.get('context_ms')
-            kwargs['offload'] = model_cfg.get('offload')
-            kwargs['vulkan_device'] = model_cfg.get('vulkan_device', 0)
-        elif model_type == "vision":
-            kwargs['ctx'] = model_cfg.get('context_size')
-            kwargs['offload'] = model_cfg.get('offload')
-            kwargs['n_gpu_layers'] = model_cfg.get('n_gpu_layers', -1)
-        return kwargs
-    
+    # Helper to build kwargs from model config (module-level build_runtime_kwargs
+    # is the single source of truth; admin live-apply reuses the same function).
+    build_kwargs_from_config = build_runtime_kwargs
+
     # =========================================================================
     # Register and optionally pre-load all configured models
     # Models with load_mode == "load" are pre-loaded at startup.
@@ -670,6 +748,14 @@ def main():
     global_args.load_in_8bit = config.offload.load_in_8bit
     global_args.flash_attn = config.offload.flash_attention
     global_args.max_gpu_percent = config.offload.max_gpu_percent
+    # Thermal protection settings (read live by codai.models.thermal).
+    global_args.thermal_cpu_enabled = config.thermal.cpu_enabled
+    global_args.thermal_gpu_enabled = config.thermal.gpu_enabled
+    global_args.thermal_cpu_high = config.thermal.cpu_high
+    global_args.thermal_cpu_resume = config.thermal.cpu_resume
+    global_args.thermal_gpu_high = config.thermal.gpu_high
+    global_args.thermal_gpu_resume = config.thermal.gpu_resume
+    global_args.thermal_poll_seconds = config.thermal.poll_seconds
     global_args.n_gpu_layers = config.vulkan.n_gpu_layers
     global_args.n_ctx = [config.vulkan.n_ctx]
     global_args.vulkan_device = config.vulkan.device_id
@@ -688,6 +774,9 @@ def main():
     global_args.tools_closer_prompt = config.tools_closer_prompt
     global_args.grammar_guided_gen = config.grammar_guided
     global_args.debug = global_debug
+    global_args.debug_web = getattr(args, 'debug_web', False)
+    global_args.debug_thermal = getattr(args, 'debug_thermal', False)
+    global_args.debug_lora = getattr(args, 'debug_lora', False)
     global_args.dump = global_dump
     global_args.file_path = config.file_path
     global_args.parser = config.parser
@@ -774,6 +863,10 @@ def main():
     from codai.api.characters import set_global_args as set_chars_global_args
     set_chars_global_args(global_args)
 
+    # Set LoRA training module global args
+    from codai.api.loras import set_global_args as set_loras_global_args
+    set_loras_global_args(global_args)
+
     # Set environment profiles module global args
     from codai.api.environments import set_global_args as set_envs_global_args
     set_envs_global_args(global_args)
@@ -821,18 +914,41 @@ def main():
     # Configure Python logging so broker/API log calls reach the terminal.
     # uvicorn is started with log_config=None to keep our config in place.
     _log_level = logging.DEBUG if global_debug else logging.INFO
+
+    class _RenameUvicornError(logging.Filter):
+        """uvicorn names its general-purpose lifecycle logger 'uvicorn.error' even
+        for non-error messages (startup, listening address, shutdown).  Rename it
+        to 'uvicorn' in the output so INFO lines don't look like errors."""
+        def filter(self, record):
+            if record.name == "uvicorn.error":
+                record.name = "uvicorn"
+            return True
+
     logging.basicConfig(
         level=_log_level,
         format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
         stream=sys.stdout,
         force=True,
     )
+    logging.getLogger("uvicorn.error").addFilter(_RenameUvicornError())
     # Suppress noisy third-party libraries at WARNING unless in debug mode.
     for _noisy in ("httpx", "httpcore", "urllib3", "multipart", "PIL"):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
     if not global_debug:
-        logging.getLogger("websockets").setLevel(logging.WARNING)
         logging.getLogger("asyncio").setLevel(logging.WARNING)
+    # WebSocket + broker-client debug logs are suppressed unless --debug-ws is given.
+    # --debug alone does NOT enable them; they are too noisy for general debugging.
+    _debug_ws = getattr(args, 'debug_ws', False)
+    if not _debug_ws:
+        logging.getLogger("websockets").setLevel(logging.WARNING)
+        logging.getLogger("websockets.client").setLevel(logging.WARNING)
+        logging.getLogger("websockets.server").setLevel(logging.WARNING)
+        logging.getLogger("codai.broker.client").setLevel(logging.INFO)
+    # Per-request HTTP access lines (uvicorn.access) are noisy — e.g. the web UI
+    # polls /v1/loras/progress every ~1.5s. Suppress them unless --debug-web.
+    _debug_web = getattr(args, 'debug_web', False)
+    if not _debug_web:
+        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
     # Start the server
     import uvicorn

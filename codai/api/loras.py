@@ -149,6 +149,26 @@ class LoraTrainRequest(BaseModel):
 
 # ── Base-model resolution ─────────────────────────────────────────────────────
 
+def _configured_train_base(base_model: str) -> Optional[str]:
+    """Read a per-model `lora_train_base_model` override from the image model's
+    config (models.json entry), if any.  Lets a deployment declare once that e.g.
+    a Z-Image generation model should train LoRAs against an SDXL model, so no
+    client has to know.  Returns the configured model key/path or None."""
+    try:
+        from codai.models.manager import multi_model_manager
+        for key in (f"image:{base_model}", base_model):
+            cfg = multi_model_manager.config.get(key)
+            if not cfg:
+                continue
+            for src in (cfg, cfg.get('_raw_cfg') or {}):
+                v = src.get('lora_train_base_model') if isinstance(src, dict) else None
+                if v and isinstance(v, str) and v.strip():
+                    return v.strip()
+    except Exception:
+        pass
+    return None
+
+
 def _resolve_base_model_path(base_model: str) -> str:
     """Resolve an image model key (or path/HF id) to a diffusers model directory."""
     try:
@@ -210,6 +230,148 @@ def _set_progress(**kw):
         _progress.update(kw)
 
 
+def _lora_debug_enabled() -> bool:
+    """LoRA training step logging to the terminal is gated on --debug-lora."""
+    try:
+        from codai.api.state import get_global_args
+        return bool(getattr(get_global_args(), "debug_lora", False))
+    except Exception:
+        return False
+
+
+def _dbg_lora(msg: str) -> None:
+    if _lora_debug_enabled():
+        print(f"  [lora][debug] {msg}", flush=True)
+
+
+def _free_vram_gb() -> float:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return torch.cuda.mem_get_info()[0] / (1024 ** 3)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _free_train_vram() -> None:
+    """Fully release training-base-model VRAM after a job.
+
+    The trainer loads the SD1.x/SDXL base directly (not via the model manager),
+    so eviction can't see it. peft adapter hooks create reference cycles that
+    keep the modules alive until a gc pass runs, so empty_cache() alone leaves
+    the memory pinned. Collect twice, then drop the allocator cache.
+    """
+    import gc
+    try:
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        _dbg_lora(f"freed training VRAM — {_free_vram_gb():.1f} GB now free")
+    except Exception:
+        pass
+
+
+# ── Training base-model cache ────────────────────────────────────────────────
+# The SD1.x/SDXL base used for LoRA training is expensive to load from disk.
+# We keep its components cached *on CPU* between consecutive training jobs so a
+# back-to-back job against the same base skips the reload. Holding it on CPU
+# (not GPU) means it consumes no VRAM between jobs, so image/video generation
+# can use the GPU freely — components are moved to the GPU only while a job is
+# actually running, then moved back to CPU when it finishes.
+_base_lock = threading.RLock()
+_base_cache = {"path": None, "arch": None, "components": None}
+
+
+def _load_base_components(base_path, arch, dtype):
+    """Load all base components on CPU at the given dtype (no GPU placement)."""
+    from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
+    if arch == "sdxl":
+        from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
+        return {
+            "tokenizer_1": CLIPTokenizer.from_pretrained(base_path, subfolder="tokenizer"),
+            "tokenizer_2": CLIPTokenizer.from_pretrained(base_path, subfolder="tokenizer_2"),
+            "text_encoder_1": CLIPTextModel.from_pretrained(base_path, subfolder="text_encoder").to(dtype=dtype),
+            "text_encoder_2": CLIPTextModelWithProjection.from_pretrained(base_path, subfolder="text_encoder_2").to(dtype=dtype),
+            "vae": AutoencoderKL.from_pretrained(base_path, subfolder="vae").to(dtype=dtype),
+            "unet": UNet2DConditionModel.from_pretrained(base_path, subfolder="unet").to(dtype=dtype),
+            "noise_scheduler": DDPMScheduler.from_pretrained(base_path, subfolder="scheduler"),
+        }
+    from transformers import CLIPTextModel, CLIPTokenizer
+    return {
+        "tokenizer": CLIPTokenizer.from_pretrained(base_path, subfolder="tokenizer"),
+        "text_encoder": CLIPTextModel.from_pretrained(base_path, subfolder="text_encoder").to(dtype=dtype),
+        "vae": AutoencoderKL.from_pretrained(base_path, subfolder="vae").to(dtype=dtype),
+        "unet": UNet2DConditionModel.from_pretrained(base_path, subfolder="unet").to(dtype=dtype),
+        "noise_scheduler": DDPMScheduler.from_pretrained(base_path, subfolder="scheduler"),
+    }
+
+
+def _acquire_base(base_path, arch, dtype):
+    """Return cached CPU-resident base components, loading from disk if needed.
+
+    A change of base_path/arch drops the previous cache first. Must be called
+    inside a training job (holds the train lock for the job's duration)."""
+    with _base_lock:
+        c = _base_cache
+        if c["components"] is not None and c["path"] == base_path and c["arch"] == arch:
+            _dbg_lora(f"reusing cached base model (CPU): {base_path}")
+            return c["components"]
+        if c["components"] is not None:
+            _dbg_lora(f"base model changed ({c['path']} → {base_path}); dropping cache")
+            _drop_base_cache_locked()
+        _dbg_lora(f"loading base model from disk: {base_path} ({arch})")
+        comps = _load_base_components(base_path, arch, dtype)
+        c.update(path=base_path, arch=arch, components=comps)
+        return comps
+
+
+def _drop_base_cache_locked() -> None:
+    _base_cache["components"] = None
+    _base_cache["path"] = None
+    _base_cache["arch"] = None
+
+
+def _drop_base_cache() -> None:
+    with _base_lock:
+        had = _base_cache["components"] is not None
+        _drop_base_cache_locked()
+    if had:
+        _free_train_vram()
+
+
+def _release_base_cache(needed_gb: float = 0.0) -> float:
+    """External VRAM releaser (registered with the model manager).
+
+    Drops the cached training base on demand. Skips while a training job is
+    running (the base is in use). Between jobs the base lives on CPU, so this
+    mainly reclaims host RAM; it returns the VRAM delta it observed."""
+    if not _train_lock.acquire(blocking=False):
+        return 0.0
+    try:
+        with _base_lock:
+            if _base_cache["components"] is None:
+                return 0.0
+        before = _free_vram_gb()
+        _drop_base_cache()
+        return max(0.0, _free_vram_gb() - before)
+    finally:
+        _train_lock.release()
+
+
+# Let the model manager reclaim this cache when a generation needs VRAM.
+try:
+    from codai.models.manager import multi_model_manager as _mmm
+    _mmm.register_external_vram_releaser(_release_base_cache)
+except Exception:
+    pass
+
+
 # ── Training core ─────────────────────────────────────────────────────────────
 
 def _train_lora_sync(req: LoraTrainRequest) -> dict:
@@ -226,9 +388,16 @@ def _train_lora_sync(req: LoraTrainRequest) -> dict:
     from transformers import CLIPTextModel, CLIPTokenizer
 
     name = req.name
-    # Train against a dedicated UNet model when provided (the generation model
-    # may be a DiT this trainer can't target); otherwise use base_model.
-    base_path = _resolve_base_model_path(req.train_base_model or req.base_model)
+    # Resolve the model to TRAIN against (the generation model may be a DiT this
+    # trainer can't target). Precedence: explicit request override > per-model
+    # `lora_train_base_model` from models.json config > the base_model itself.
+    train_base = (req.train_base_model
+                  or _configured_train_base(req.base_model)
+                  or req.base_model)
+    if train_base != req.base_model:
+        print(f"  [lora] training '{name}' against base '{train_base}' "
+              f"(generation model: '{req.base_model}')")
+    base_path = _resolve_base_model_path(train_base)
     steps = max(50, min(5000, int(req.steps or 800)))
     rank = max(2, min(128, int(req.rank or 16)))
     resolution = int(req.resolution or 512)
@@ -335,11 +504,13 @@ def _train_sd15(req, base_path, images, instance_prompt,
 
     # Consistent fp32 precision (see _train_sdxl) to avoid mixed-dtype crashes.
     weight_dtype = torch.float32
-    tokenizer = CLIPTokenizer.from_pretrained(base_path, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(base_path, subfolder="text_encoder").to(device, dtype=weight_dtype)
-    vae = AutoencoderKL.from_pretrained(base_path, subfolder="vae").to(device, dtype=weight_dtype)
-    unet = UNet2DConditionModel.from_pretrained(base_path, subfolder="unet").to(device, dtype=weight_dtype)
-    noise_scheduler = DDPMScheduler.from_pretrained(base_path, subfolder="scheduler")
+    # Components come from the cross-job CPU cache; move to GPU for this job.
+    comps = _acquire_base(base_path, "sd15", weight_dtype)
+    tokenizer = comps["tokenizer"]
+    text_encoder = comps["text_encoder"].to(device, dtype=weight_dtype)
+    vae = comps["vae"].to(device, dtype=weight_dtype)
+    unet = comps["unet"].to(device, dtype=weight_dtype)
+    noise_scheduler = comps["noise_scheduler"]
 
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
@@ -349,7 +520,7 @@ def _train_sd15(req, base_path, images, instance_prompt,
         r=rank, lora_alpha=rank, init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
-    unet.add_adapter(lora_cfg)
+    unet.add_adapter(lora_cfg, adapter_name="default")
     lora_params = [p for p in unet.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(lora_params, lr=lr)
 
@@ -362,8 +533,10 @@ def _train_sd15(req, base_path, images, instance_prompt,
                         return_tensors="pt").input_ids.to(device)
         encoder_hidden_states = text_encoder(tok)[0]
 
-    # VAE + text encoder are done; free them so only the UNet trains resident.
-    del vae, text_encoder
+    # VAE + text encoder are done; move them back to CPU (keeps them cached for
+    # the next job) so only the UNet stays resident during training.
+    vae.to("cpu")
+    text_encoder.to("cpu")
     try:
         torch.cuda.empty_cache()
     except Exception:
@@ -393,6 +566,7 @@ def _train_sd15(req, base_path, images, instance_prompt,
 
         if step % 10 == 0 or step == steps - 1:
             _set_progress(step=step + 1, message=f"step {step+1}/{steps} loss={loss.item():.4f}")
+            _dbg_lora(f"SD1.5 step {step+1}/{steps} loss={loss.item():.4f}")
         # Mid-training thermal checkpoint (pauses if CPU/GPU too hot).
         try:
             from codai.models.thermal import checkpoint as _thermal_checkpoint
@@ -409,12 +583,19 @@ def _train_sd15(req, base_path, images, instance_prompt,
                                               safe_serialization=True)
     _write_meta(name, req, base_path, len(images), "sd15", instance_prompt)
 
-    # Release training tensors.
-    del unet, optimizer, latents_list
+    # Job done: drop this job's adapter + transients and move the UNet back to
+    # CPU. The base stays cached on CPU (reused by the next job); no VRAM is held
+    # afterwards, so the next image/video request gets the full GPU.
     try:
-        torch.cuda.empty_cache()
+        unet.delete_adapters("default")
     except Exception:
         pass
+    unet.to("cpu")
+    try:
+        del optimizer, latents_list, lora_params, encoder_hidden_states
+    except Exception:
+        pass
+    _free_train_vram()
 
     path = _lora_weight_file(name) or save_dir
     _set_progress(active=False, status="done", message="done", path=path)
@@ -443,13 +624,15 @@ def _train_sdxl(req, base_path, images, instance_prompt,
     # LoRA fine-tuning.
     weight_dtype = torch.float32
 
-    tokenizer_1 = CLIPTokenizer.from_pretrained(base_path, subfolder="tokenizer")
-    tokenizer_2 = CLIPTokenizer.from_pretrained(base_path, subfolder="tokenizer_2")
-    text_encoder_1 = CLIPTextModel.from_pretrained(base_path, subfolder="text_encoder").to(device, dtype=weight_dtype)
-    text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(base_path, subfolder="text_encoder_2").to(device, dtype=weight_dtype)
-    vae = AutoencoderKL.from_pretrained(base_path, subfolder="vae").to(device, dtype=weight_dtype)
-    unet = UNet2DConditionModel.from_pretrained(base_path, subfolder="unet").to(device, dtype=weight_dtype)
-    noise_scheduler = DDPMScheduler.from_pretrained(base_path, subfolder="scheduler")
+    # Components come from the cross-job CPU cache; move to GPU for this job.
+    comps = _acquire_base(base_path, "sdxl", weight_dtype)
+    tokenizer_1 = comps["tokenizer_1"]
+    tokenizer_2 = comps["tokenizer_2"]
+    text_encoder_1 = comps["text_encoder_1"].to(device, dtype=weight_dtype)
+    text_encoder_2 = comps["text_encoder_2"].to(device, dtype=weight_dtype)
+    vae = comps["vae"].to(device, dtype=weight_dtype)
+    unet = comps["unet"].to(device, dtype=weight_dtype)
+    noise_scheduler = comps["noise_scheduler"]
 
     for m in (vae, text_encoder_1, text_encoder_2, unet):
         m.requires_grad_(False)
@@ -458,7 +641,7 @@ def _train_sdxl(req, base_path, images, instance_prompt,
         r=rank, lora_alpha=rank, init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
-    unet.add_adapter(lora_cfg)
+    unet.add_adapter(lora_cfg, adapter_name="default")
     lora_params = [p for p in unet.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(lora_params, lr=lr)
 
@@ -496,9 +679,12 @@ def _train_sdxl(req, base_path, images, instance_prompt,
         device=device, dtype=prompt_embeds.dtype,
     )
 
-    # VAE + text encoders are no longer needed during the training loop; free
-    # them so only the UNet stays resident (keeps SDXL fp32 training in budget).
-    del vae, text_encoder_1, text_encoder_2
+    # VAE + text encoders are no longer needed during the training loop; move
+    # them back to CPU (keeps them cached for the next job) so only the UNet
+    # stays resident — keeps SDXL fp32 training in VRAM budget.
+    vae.to("cpu")
+    text_encoder_1.to("cpu")
+    text_encoder_2.to("cpu")
     try:
         torch.cuda.empty_cache()
     except Exception:
@@ -529,6 +715,7 @@ def _train_sdxl(req, base_path, images, instance_prompt,
 
         if step % 10 == 0 or step == steps - 1:
             _set_progress(step=step + 1, message=f"step {step+1}/{steps} loss={loss.item():.4f}")
+            _dbg_lora(f"SDXL step {step+1}/{steps} loss={loss.item():.4f}")
         try:
             from codai.models.thermal import checkpoint as _thermal_checkpoint
             _thermal_checkpoint(context="lora-train", throttle_seconds=2.0)
@@ -544,11 +731,20 @@ def _train_sdxl(req, base_path, images, instance_prompt,
                                                 safe_serialization=True)
     _write_meta(name, req, base_path, len(images), "sdxl", instance_prompt)
 
-    del unet, optimizer, latents_list
+    # Job done: drop this job's adapter + transients and move the UNet back to
+    # CPU. The base stays cached on CPU for the next job; no VRAM held afterwards
+    # so the next image/video request gets the full GPU (see _train_sd15 note).
     try:
-        torch.cuda.empty_cache()
+        unet.delete_adapters("default")
     except Exception:
         pass
+    unet.to("cpu")
+    try:
+        del optimizer, latents_list, lora_params
+        del prompt_embeds, pooled, add_time_ids
+    except Exception:
+        pass
+    _free_train_vram()
 
     path = _lora_weight_file(name) or save_dir
     _set_progress(active=False, status="done", message="done", path=path)
@@ -559,7 +755,9 @@ def _write_meta(name, req, base_path, n_images, arch, instance_prompt):
     meta = {
         "name": name,
         "base_model": req.base_model,
-        "train_base_model": req.train_base_model or req.base_model,
+        "train_base_model": (req.train_base_model
+                             or _configured_train_base(req.base_model)
+                             or req.base_model),
         "base_path": base_path,
         "arch": arch,
         "instance_prompt": instance_prompt,
@@ -597,6 +795,9 @@ async def train_lora(req: LoraTrainRequest, _auth=Depends(_require_api_auth)):
             import traceback
             traceback.print_exc()
             _set_progress(active=False, status="error", message=str(e))
+            # On error the base may be in a half-moved / inconsistent state — drop
+            # the cache entirely (and reclaim its VRAM) rather than reuse it.
+            _drop_base_cache()
             raise HTTPException(status_code=500, detail=f"LoRA training failed: {e}")
     finally:
         _train_lock.release()

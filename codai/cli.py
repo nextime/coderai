@@ -190,6 +190,26 @@ configuration directory (--config DIR, default: OS-specific CoderAI directory). 
         help="Enable debug mode - dumps full request/response to stdout for troubleshooting",
     )
     parser.add_argument(
+        "--debug-ws",
+        action="store_true",
+        help="Enable WebSocket debug logging (websockets library). Requires --debug or standalone.",
+    )
+    parser.add_argument(
+        "--debug-web",
+        action="store_true",
+        help="Enable web/HTTP access logging (uvicorn per-request lines, e.g. /v1/loras/progress polling). Off by default.",
+    )
+    parser.add_argument(
+        "--debug-thermal",
+        action="store_true",
+        help="Enable thermal-protection debug logging ([thermal][debug] temperature checks). Off by default.",
+    )
+    parser.add_argument(
+        "--debug-lora",
+        action="store_true",
+        help="Enable LoRA training step logging to the terminal (per-step loss/progress). Off by default.",
+    )
+    parser.add_argument(
         "--dump",
         action="store_true",
         help="Dump model output: raw output, parsed output, and litellm debug info",

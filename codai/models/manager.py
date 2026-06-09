@@ -36,6 +36,24 @@ from codai.models.utils import FuzzyToolBreaker
 from codai.pydantic.textrequest import ModelInfo
 
 
+def _trim_cpu_ram() -> None:
+    """Return freed CPU heap memory to the OS (and let the kernel reclaim swap).
+
+    Python frees evicted-model tensors, but glibc's allocator keeps the pages in
+    the process arena (RSS stays high; swap is not returned).  malloc_trim(0)
+    releases the top of the heap back to the OS.  No-op on non-glibc platforms.
+    """
+    try:
+        gc.collect()
+        import ctypes, ctypes.util
+        _libc_name = ctypes.util.find_library('c') or 'libc.so.6'
+        _libc = ctypes.CDLL(_libc_name)
+        if hasattr(_libc, 'malloc_trim'):
+            _libc.malloc_trim(0)
+    except Exception:
+        pass
+
+
 class ModelManager:
     """Manages the loaded model and tokenizer."""
     
@@ -170,13 +188,20 @@ class ModelManager:
     def generate_chat(self, messages: List[Dict], max_tokens: Optional[int] = None,
                       temperature: float = 0.7, top_p: float = 1.0,
                       stop: Optional[List[str]] = None, tools: Optional[List] = None,
-                      response_format: Optional[Dict] = None):
+                      response_format: Optional[Dict] = None, enable_thinking: bool = False):
         """Generate chat completion non-streaming."""
         if self.backend is None:
             raise RuntimeError("No model loaded")
         # Use generate_chat if available (Vulkan backend), otherwise format and use generate
         if hasattr(self.backend, 'generate_chat'):
-            return self.backend.generate_chat(messages, max_tokens, temperature, top_p, stop, tools, response_format)
+            try:
+                return self.backend.generate_chat(messages, max_tokens, temperature, top_p,
+                                                  stop, tools, response_format,
+                                                  enable_thinking=enable_thinking)
+            except TypeError:
+                # Backend doesn't accept enable_thinking (e.g. Vulkan) — call plainly.
+                return self.backend.generate_chat(messages, max_tokens, temperature, top_p,
+                                                  stop, tools, response_format)
         else:
             # Fallback for NVIDIA backend
             from codai.pydantic.textrequest import ChatMessage
@@ -195,13 +220,20 @@ class ModelManager:
     async def generate_chat_stream(self, messages: List[Dict], max_tokens: Optional[int] = None,
                                     temperature: float = 0.7, top_p: float = 1.0,
                                     stop: Optional[List[str]] = None, tools: Optional[List] = None,
-                                    response_format: Optional[Dict] = None):
+                                    response_format: Optional[Dict] = None, enable_thinking: bool = False):
         """Generate chat completion streaming."""
         if self.backend is None:
             raise RuntimeError("No model loaded")
         # Use generate_chat_stream if available (Vulkan backend), otherwise format and use generate_stream
         if hasattr(self.backend, 'generate_chat_stream'):
-            async for chunk in self.backend.generate_chat_stream(messages, max_tokens, temperature, top_p, stop, tools, response_format):
+            try:
+                _gen = self.backend.generate_chat_stream(
+                    messages, max_tokens, temperature, top_p, stop, tools,
+                    response_format, enable_thinking=enable_thinking)
+            except TypeError:
+                _gen = self.backend.generate_chat_stream(
+                    messages, max_tokens, temperature, top_p, stop, tools, response_format)
+            async for chunk in _gen:
                 yield chunk
         else:
             # Fallback for NVIDIA backend
@@ -524,11 +556,63 @@ class MultiModelManager:
         self.model_backend_types: Dict[str, str] = {}
         self.tool_breaker = FuzzyToolBreaker(threshold=3)  # Circuit breaker for repetitive tool calls
         self._load_lock = threading.Lock()  # Prevents duplicate on-demand model loads
+        # Set when NO model switch/load is in progress; cleared during load.
+        # Callers that need to wait for a load to complete can poll this event.
+        self._model_ready_event = threading.Event()
+        self._model_ready_event.set()   # initially ready (nothing loading)
         self.model_pools: Dict[str, ModelInstancePool] = {}  # per-key instance pools
+        # Set once a CUDA device-side assert / unrecoverable CUDA error is seen.
+        # The CUDA context is corrupted process-wide after such an error, so all
+        # further GPU work is futile until the server is restarted.  We surface
+        # this immediately instead of retrying loads dozens of times.
+        self.cuda_context_poisoned: bool = False
+        self.cuda_poison_reason: Optional[str] = None
         self._pending_new_instance: set = set()  # keys awaiting a second+ instance load
         self._global_max_instances: int = 1  # set from config at startup
         self._measured_vram_gb: Dict[str, float] = {}  # actual measured VRAM delta per model key
-    
+        # Callbacks that free VRAM held *outside* the model manager (e.g. the
+        # LoRA trainer caches its SD/SDXL base model between jobs). Each returns
+        # the GB it freed (or None). Invoked as a last resort during eviction.
+        self._external_vram_releasers: List[Any] = []
+
+    def register_external_vram_releaser(self, fn) -> None:
+        """Register a callback that frees VRAM held outside the manager.
+
+        Called during on-request eviction when freeing tracked models isn't
+        enough. The callback must be safe to call when there's nothing to free
+        (return 0.0 / None) and must not block on in-flight work it owns.
+        """
+        if callable(fn) and fn not in self._external_vram_releasers:
+            self._external_vram_releasers.append(fn)
+
+    @staticmethod
+    def _is_cuda_context_fatal(err: Exception) -> bool:
+        """True for CUDA errors that corrupt the whole process context."""
+        s = str(err).lower()
+        return (
+            'device-side assert' in s
+            or 'cuda error' in s
+            or 'cublas' in s and 'not initialized' in s
+            or 'an illegal memory access' in s
+            or 'misaligned address' in s
+        )
+
+    def _mark_cuda_poisoned_if_fatal(self, err: Exception) -> bool:
+        """Record process-wide CUDA corruption. Returns True if poisoned."""
+        if self.cuda_context_poisoned:
+            return True
+        if self._is_cuda_context_fatal(err):
+            self.cuda_context_poisoned = True
+            self.cuda_poison_reason = str(err).split('\n', 1)[0][:200]
+            print("\n" + "=" * 72)
+            print("FATAL: CUDA context corrupted (device-side assert / CUDA error).")
+            print(f"  Reason: {self.cuda_poison_reason}")
+            print("  All GPU operations will fail until coderai is RESTARTED.")
+            print("  Failing fast instead of retrying. Restart the server.")
+            print("=" * 72 + "\n")
+            return True
+        return False
+
     @property
     def image_model(self) -> Optional[str]:
         """Return the first image model or None."""
@@ -655,9 +739,11 @@ class MultiModelManager:
         if self.default_model in self.models and self.default_model not in self._pending_new_instance:
             return self._get_least_busy_instance(self.default_model)
 
+        self._model_ready_event.clear()   # signal: load in progress
         with self._load_lock:
             # Re-check inside the lock to avoid duplicate loads from concurrent requests
             if self.default_model in self.models and self.default_model not in self._pending_new_instance:
+                self._model_ready_event.set()
                 return self._get_least_busy_instance(self.default_model)
             self._pending_new_instance.discard(self.default_model)
 
@@ -672,46 +758,73 @@ class MultiModelManager:
 
             model_manager = ModelManager()
             try:
+                # Build kwargs: per-model config takes precedence over global_args.
+                # This ensures settings configured per-model in coderai (4-bit quant,
+                # flash attention, offload strategy, …) are honoured on every load,
+                # including on-demand reloads after VRAM eviction.
                 kwargs = {}
-                if 'ctx' in config:
-                    kwargs['ctx'] = config['ctx']
-                if global_args:
-                    if hasattr(global_args, 'n_gpu_layers'):
-                        kwargs['n_gpu_layers'] = global_args.n_gpu_layers
-                    if hasattr(global_args, 'offload_dir'):
-                        kwargs['offload_dir'] = global_args.offload_dir
-                    if hasattr(global_args, 'ram'):
-                        kwargs['manual_ram_gb'] = global_args.ram
-                    if hasattr(global_args, 'flash_attn'):
-                        kwargs['flash_attn'] = global_args.flash_attn
-                    if hasattr(global_args, 'no_ram'):
-                        kwargs['no_ram'] = global_args.no_ram
-                    if hasattr(global_args, 'offload_strategy'):
-                        kwargs['offload_strategy'] = global_args.offload_strategy
-                    if hasattr(global_args, 'load_in_4bit'):
-                        kwargs['load_in_4bit'] = global_args.load_in_4bit
-                    if hasattr(global_args, 'load_in_8bit'):
-                        kwargs['load_in_8bit'] = global_args.load_in_8bit
-                    if hasattr(global_args, 'max_gpu_percent'):
-                        kwargs['max_gpu_percent'] = global_args.max_gpu_percent
+                _ga = global_args  # shorthand
+
+                def _cfg_or_global(cfg_key, ga_attr, default=None):
+                    if cfg_key in config and config[cfg_key] is not None:
+                        return config[cfg_key]
+                    if _ga and hasattr(_ga, ga_attr):
+                        v = getattr(_ga, ga_attr)
+                        if v is not None:
+                            return v
+                    return default
+
+                ctx = _cfg_or_global('ctx', 'n_ctx')
+                if ctx:
+                    kwargs['ctx'] = ctx
+                n_gpu_layers = _cfg_or_global('n_gpu_layers', 'n_gpu_layers')
+                if n_gpu_layers is not None:
+                    kwargs['n_gpu_layers'] = n_gpu_layers
+                offload_dir = _cfg_or_global('offload_dir', 'offload_dir')
+                if offload_dir:
+                    kwargs['offload_dir'] = offload_dir
+                manual_ram = _cfg_or_global('manual_ram_gb', 'ram')
+                if manual_ram is not None:
+                    kwargs['manual_ram_gb'] = manual_ram
+                # flash_attn comes from the per-model config (source of truth).
+                # build_kwargs_from_config populates it from the model's
+                # 'flash_attention' setting; CLI/global is NOT consulted here.
+                kwargs['flash_attn'] = bool(config.get('flash_attn', False))
+                no_ram = _cfg_or_global('no_ram', 'no_ram', False)
+                kwargs['no_ram'] = bool(no_ram)
+                offload_strategy = _cfg_or_global('offload_strategy', 'offload_strategy', 'auto')
+                if offload_strategy:
+                    kwargs['offload_strategy'] = offload_strategy
+                load_in_4bit = _cfg_or_global('load_in_4bit', 'load_in_4bit', False)
+                kwargs['load_in_4bit'] = bool(load_in_4bit)
+                load_in_8bit = _cfg_or_global('load_in_8bit', 'load_in_8bit', False)
+                kwargs['load_in_8bit'] = bool(load_in_8bit)
+                max_gpu_pct = _cfg_or_global('max_gpu_percent', 'max_gpu_percent')
+                if max_gpu_pct is not None:
+                    kwargs['max_gpu_percent'] = max_gpu_pct
 
                 print(f"Loading default model on demand: {self.default_model}")
                 _snap = self.vram_before_load()
+                kwargs['expected_vram_gb'] = self._get_model_used_vram_gb(self.default_model)
                 model_manager.load_model(self.default_model, backend_type=backend_type, **kwargs)
                 self.add_model(self.default_model, model_manager)
                 self.record_vram_delta(self.default_model, _snap)
                 self.current_model_key = self.default_model
                 print(f"Model loaded successfully: {self.default_model}")
+                self._model_ready_event.set()
                 return model_manager
             except Exception as e:
                 print(f"Error loading model {self.default_model}: {e}")
+                self._mark_cuda_poisoned_if_fatal(e)
+                self._model_ready_event.set()
                 return None
-    
+
     def _load_model_by_name(self, model_name: str):
         """Load a model by name on demand (thread-safe)."""
         if model_name in self.models and model_name not in self._pending_new_instance:
             return self._get_least_busy_instance(model_name)
 
+        self._model_ready_event.clear()   # signal: load in progress
         with self._load_lock:
             # Re-check inside lock to prevent duplicate loads, but honour pending new instance.
             if model_name in self.models and model_name not in self._pending_new_instance:
@@ -729,43 +842,70 @@ class MultiModelManager:
 
             model_manager = ModelManager()
             try:
+                # Per-model config takes precedence over global_args (same logic as
+                # _load_default_model so on-demand reloads respect per-model settings).
                 kwargs = {}
-                if 'ctx' in config:
-                    kwargs['ctx'] = config['ctx']
-                if global_args:
-                    if hasattr(global_args, 'n_gpu_layers'):
-                        kwargs['n_gpu_layers'] = global_args.n_gpu_layers
-                    if hasattr(global_args, 'offload_dir'):
-                        kwargs['offload_dir'] = global_args.offload_dir
-                    if hasattr(global_args, 'ram'):
-                        kwargs['manual_ram_gb'] = global_args.ram
-                    if hasattr(global_args, 'flash_attn'):
-                        kwargs['flash_attn'] = global_args.flash_attn
-                    if hasattr(global_args, 'no_ram'):
-                        kwargs['no_ram'] = global_args.no_ram
-                    if hasattr(global_args, 'offload_strategy'):
-                        kwargs['offload_strategy'] = global_args.offload_strategy
-                    if hasattr(global_args, 'load_in_4bit'):
-                        kwargs['load_in_4bit'] = global_args.load_in_4bit
-                    if hasattr(global_args, 'load_in_8bit'):
-                        kwargs['load_in_8bit'] = global_args.load_in_8bit
-                    if hasattr(global_args, 'max_gpu_percent'):
-                        kwargs['max_gpu_percent'] = global_args.max_gpu_percent
+                _ga = global_args
+
+                def _cfg_or_global(cfg_key, ga_attr, default=None):
+                    if cfg_key in config and config[cfg_key] is not None:
+                        return config[cfg_key]
+                    if _ga and hasattr(_ga, ga_attr):
+                        v = getattr(_ga, ga_attr)
+                        if v is not None:
+                            return v
+                    return default
+
+                ctx = _cfg_or_global('ctx', 'n_ctx')
+                if ctx:
+                    kwargs['ctx'] = ctx
+                n_gpu_layers = _cfg_or_global('n_gpu_layers', 'n_gpu_layers')
+                if n_gpu_layers is not None:
+                    kwargs['n_gpu_layers'] = n_gpu_layers
+                offload_dir = _cfg_or_global('offload_dir', 'offload_dir')
+                if offload_dir:
+                    kwargs['offload_dir'] = offload_dir
+                manual_ram = _cfg_or_global('manual_ram_gb', 'ram')
+                if manual_ram is not None:
+                    kwargs['manual_ram_gb'] = manual_ram
+                # flash_attn comes from the per-model config (source of truth).
+                # build_kwargs_from_config populates it from the model's
+                # 'flash_attention' setting; CLI/global is NOT consulted here.
+                kwargs['flash_attn'] = bool(config.get('flash_attn', False))
+                no_ram = _cfg_or_global('no_ram', 'no_ram', False)
+                kwargs['no_ram'] = bool(no_ram)
+                offload_strategy = _cfg_or_global('offload_strategy', 'offload_strategy', 'auto')
+                if offload_strategy:
+                    kwargs['offload_strategy'] = offload_strategy
+                load_in_4bit = _cfg_or_global('load_in_4bit', 'load_in_4bit', False)
+                kwargs['load_in_4bit'] = bool(load_in_4bit)
+                load_in_8bit = _cfg_or_global('load_in_8bit', 'load_in_8bit', False)
+                kwargs['load_in_8bit'] = bool(load_in_8bit)
+                max_gpu_pct = _cfg_or_global('max_gpu_percent', 'max_gpu_percent')
+                if max_gpu_pct is not None:
+                    kwargs['max_gpu_percent'] = max_gpu_pct
 
                 pool = self.model_pools.get(model_name)
                 inst_num = pool.count + 1 if pool else 1
                 print(f"Loading model on demand: {model_name}"
                       + (f" (instance {inst_num})" if inst_num > 1 else ""))
                 _snap = self.vram_before_load()
+                # Tell the backend how much VRAM this model is expected to need so
+                # it can decide whether Flash-Attention-2 is safe (FA2 requires the
+                # whole model on GPU; it device-side-asserts when layers offload).
+                kwargs['expected_vram_gb'] = self._get_model_used_vram_gb(model_name)
                 model_manager.load_model(model_name, backend_type=backend_type, **kwargs)
                 self.add_model(model_name, model_manager)
                 self.record_vram_delta(model_name, _snap)
                 self.current_model_key = model_name
                 print(f"Model loaded successfully: {model_name}"
                       + (f" (instance {inst_num})" if inst_num > 1 else ""))
+                self._model_ready_event.set()   # signal: ready
                 return model_manager
             except Exception as e:
                 print(f"Error loading model {model_name}: {e}")
+                self._mark_cuda_poisoned_if_fatal(e)
+                self._model_ready_event.set()   # signal: ready (even on failure)
                 return None
 
     def set_audio_model(self, model_name: str, config: Dict = None):
@@ -1492,42 +1632,60 @@ class MultiModelManager:
         if delta_gb <= 0:
             return
 
-        measured = round(delta_gb, 3)
-        # Read the pre-existing estimate BEFORE storing the measurement so that
-        # _get_model_used_vram_gb doesn't return the measured value as the baseline.
-        estimated = self._get_model_used_vram_gb(model_key)
+        # The delta is the resident WEIGHT footprint measured at load time. Add
+        # the runtime reserve (KV cache / activations / VAE-decode spike) so the
+        # value we cache and persist reflects the model's PEAK runtime need — not
+        # just its loaded weights — and future eviction frees enough headroom.
+        cfg = self.config.get(model_key, {})
+        reserve_gb = self._runtime_reserve_gb(
+            cfg if isinstance(cfg, dict) else {}, model_key, delta_gb)
+        measured = round(delta_gb + reserve_gb, 3)
+        # In-memory truth for the rest of this run (used by eviction estimates).
         self._measured_vram_gb[model_key] = measured
-        print(f"Measured VRAM for '{model_key}': {measured:.2f} GB")
+        print(f"Measured VRAM for '{model_key}': {delta_gb:.2f} GB weights "
+              f"+ {reserve_gb:.2f} GB runtime reserve = {measured:.2f} GB")
 
-        # Persist the real value when it's meaningfully larger than the current estimate
+        # Persist the real value into the SEPARATE, system-owned
+        # `measured_vram_gb` field (never the user's `used_vram_gb`). Rules:
+        #   * force_vram_update set → refresh it EVERY run, even when
+        #     used_vram_gb is configured.
+        #   * otherwise → only when used_vram_gb is NOT configured (a configured
+        #     value is authoritative and must remain unchanged).
+        force_update = bool(cfg.get("force_vram_update")) if isinstance(cfg, dict) else False
+        if not force_update:
+            if isinstance(cfg, dict) and cfg.get("used_vram_gb") is not None:
+                return  # configured & not forced → leave it exactly as-is
+            # Avoid churning models.json when the measurement hasn't meaningfully
+            # changed from what's already persisted.
+            prev = cfg.get("measured_vram_gb") if isinstance(cfg, dict) else None
+            try:
+                if prev is not None and abs(measured - float(prev)) <= max(0.5, float(prev) * 0.10):
+                    return
+            except (TypeError, ValueError):
+                pass
         try:
-            if estimated <= 0 or measured > estimated * 1.10:
-                label = f"{estimated:.2f} GB estimated" if estimated > 0 else "no estimate"
-                print(f"  Updating used_vram_gb for '{model_key}': {label} → {measured:.2f} GB (real)")
-                # Update in-memory config
-                cfg = self.config.get(model_key, {})
-                cfg["used_vram_gb"] = measured
-                self.config[model_key] = cfg
-                # Persist to models.json via config_manager
-                try:
-                    from codai.admin.routes import config_manager
-                    if config_manager is not None:
-                        # Strip type prefix to get the bare path/id used in models_data
-                        bare = model_key.split(":", 1)[1] if ":" in model_key else model_key
-                        for cat in ("text_models", "image_models", "audio_models", "tts_models",
-                                    "vision_models", "video_models", "audio_gen_models",
-                                    "embedding_models", "spatial_models"):
-                            for entry in config_manager.models_data.get(cat, []):
-                                if not isinstance(entry, dict):
-                                    continue
-                                epath = entry.get("path") or entry.get("id") or ""
-                                if epath == bare or epath.split("/")[-1] == bare.split("/")[-1]:
-                                    entry["used_vram_gb"] = measured
-                        config_manager.save_models()
-                except Exception as e:
-                    print(f"  Warning: could not persist used_vram_gb: {e}")
+            _why = "force_vram_update" if force_update else "no used_vram_gb configured"
+            print(f"  Saving measured_vram_gb for '{model_key}': {measured:.2f} GB ({_why})")
+            cfg = dict(cfg) if isinstance(cfg, dict) else {}
+            cfg["measured_vram_gb"] = measured
+            self.config[model_key] = cfg
+            # Persist to models.json via config_manager (separate field; the
+            # user's own keys are never touched).
+            from codai.admin.routes import config_manager
+            if config_manager is not None:
+                bare = model_key.split(":", 1)[1] if ":" in model_key else model_key
+                for cat in ("text_models", "image_models", "audio_models", "tts_models",
+                            "vision_models", "video_models", "audio_gen_models",
+                            "embedding_models", "spatial_models"):
+                    for entry in config_manager.models_data.get(cat, []):
+                        if not isinstance(entry, dict):
+                            continue
+                        epath = entry.get("path") or entry.get("id") or ""
+                        if epath == bare or epath.split("/")[-1] == bare.split("/")[-1]:
+                            entry["measured_vram_gb"] = measured
+                config_manager.save_models()
         except Exception as e:
-            print(f"  Warning: VRAM update check failed: {e}")
+            print(f"  Warning: could not persist measured_vram_gb: {e}")
 
     # In-process cache: model_id -> size_bytes (never stale within a run)
     _hf_size_cache: Dict[str, int] = {}
@@ -1574,11 +1732,27 @@ class MultiModelManager:
                     revs = sorted(repo.revisions, key=lambda r: r.last_modified, reverse=True)
                     if revs:
                         rev = revs[0]
-                        total = sum(
-                            f.size_on_disk
-                            for f in rev.files
-                            if os.path.splitext(f.file_name)[1].lower() in weight_exts
+                        # Separate GGUF files (alternative quantizations of the same model)
+                        # from dense weight files (safetensors/bin shards that collectively
+                        # represent one model variant).  Summing all GGUFs produces wildly
+                        # inflated estimates; instead take the largest single GGUF as the
+                        # worst-case for that format, and sum the dense shards separately.
+                        gguf_exts = {'.gguf', '.ggml'}
+                        dense_exts = {'.safetensors', '.bin', '.pt'}
+                        gguf_sizes = [
+                            f.size_on_disk for f in rev.files
+                            if os.path.splitext(f.file_name)[1].lower() in gguf_exts
+                        ]
+                        dense_total = sum(
+                            f.size_on_disk for f in rev.files
+                            if os.path.splitext(f.file_name)[1].lower() in dense_exts
                         )
+                        # Use whichever single-load format is smaller (prefer the real
+                        # on-disk format that will actually be used).
+                        largest_gguf = max(gguf_sizes) if gguf_sizes else 0
+                        total = dense_total if dense_total > 0 else largest_gguf
+                        if total == 0:
+                            total = largest_gguf  # fallback
                         # LoRA adapter: add base model size
                         for f in rev.files:
                             if f.file_name == "adapter_config.json":
@@ -1607,18 +1781,25 @@ class MultiModelManager:
             req = urllib.request.Request(url, headers={"User-Agent": "coderai/1.0"})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = _json.loads(resp.read())
-            total = 0
+            gguf_sizes_api = []
+            dense_total_api = 0
             has_adapter_config = False
             for sib in data.get("siblings", []):
                 name = sib.get("rfilename", "")
                 if name == "adapter_config.json":
                     has_adapter_config = True
                     continue
-                if os.path.splitext(name)[1].lower() not in weight_exts:
+                ext = os.path.splitext(name)[1].lower()
+                if ext not in weight_exts:
                     continue
                 lfs = sib.get("lfs") or {}
                 size = lfs.get("size") or sib.get("size") or 0
-                total += size
+                if ext in {'.gguf', '.ggml'}:
+                    gguf_sizes_api.append(size)
+                else:
+                    dense_total_api += size
+            largest_gguf_api = max(gguf_sizes_api) if gguf_sizes_api else 0
+            total = dense_total_api if dense_total_api > 0 else largest_gguf_api
             # LoRA adapter: fetch adapter_config.json to get the base model
             if has_adapter_config:
                 try:
@@ -1643,24 +1824,429 @@ class MultiModelManager:
         MultiModelManager._hf_size_cache[model_id] = 0
         return 0
 
+    @staticmethod
+    def _quant_divisor(mode) -> float:
+        """Approx. VRAM reduction factor (vs fp16) for a quantization mode.
+
+        Accepts the strings used in coderai configs / component_quantization,
+        including GGUF file paths (the Qn level is sniffed from the name).
+        Returns 1.0 for full precision / unknown.
+        """
+        s = str(mode or "").strip().lower()
+        if not s or s in ("none", "full", "fp16", "bf16", "f16", "f32", "fp32", "default"):
+            return 1.0
+        # GGUF file or label → infer from the Qn tag (Q2..Q8).
+        if "gguf" in s or s.endswith(".gguf") or s.startswith("q"):
+            if "q2" in s or "2bit" in s:
+                return 6.0
+            if "q3" in s or "3bit" in s:
+                return 5.0
+            if "q4" in s or "4bit" in s:
+                return 4.0
+            if "q5" in s or "5bit" in s:
+                return 3.2
+            if "q6" in s or "6bit" in s:
+                return 2.67
+            if "q8" in s or "8bit" in s:
+                return 2.0
+            return 3.0  # unknown GGUF level — moderate default
+        norm = s.replace("_", "").replace("-", "")
+        if norm in ("4bit", "int4", "nf4", "fp4"):
+            return 4.0
+        if norm in ("8bit", "int8", "fp8"):
+            return 2.0
+        if norm in ("2bit", "int2"):
+            return 6.0
+        if norm in ("3bit", "int3"):
+            return 5.0
+        if norm in ("5bit",):
+            return 3.2
+        if norm in ("6bit",):
+            return 2.67
+        return 1.0
+
+    def _effective_quant_multiplier(self, cfg: dict,
+                                    load_in_4bit: bool, load_in_8bit: bool) -> float:
+        """Fraction of full-precision weight size that stays resident.
+
+        Per-component quantization wins when present: the big weight-bearing
+        components (transformer(s), unet, text encoders) dominate, so we assume
+        the quantized components carry ~80 % of the weight and the rest (VAE,
+        etc.) stays dense. Falls back to the global 4/8-bit flags.
+        """
+        comp_q = cfg.get("component_quantization") or {}
+        divisors = [self._quant_divisor(v) for v in comp_q.values()]
+        divisors = [d for d in divisors if d > 1.0]
+        if divisors:
+            avg_div = sum(divisors) / len(divisors)
+            # Lean slightly HIGH: assume ~70 % of the footprint is shrunk by
+            # quantization and ~30 % (VAE, embeddings, fp16 compute buffers,
+            # bitsandbytes scale/absmax tensors) stays dense. Better to slightly
+            # over-estimate and evict enough than to under-estimate and OOM —
+            # but not so high it exceeds the card and forces needless offload.
+            # (e.g. all-4bit → ~0.475× raw, ×1.15 overhead ≈ 0.55× → ~+10% over
+            # the measured resident size.)
+            quantized_share = 0.7
+            return quantized_share / avg_div + (1.0 - quantized_share)
+        if load_in_4bit:
+            # 4-bit nf4 keeps scale/absmax + fp16 buffers → effective ~0.3, not 0.25.
+            return 0.3
+        if load_in_8bit:
+            return 0.55
+        return 1.0
+
+    @staticmethod
+    def _model_type_of(model_key: str) -> str:
+        """Extract the model type from a 'type:name' key (default 'text')."""
+        return model_key.split(":", 1)[0] if ":" in model_key else "text"
+
+    # bytes-per-element for safetensors dtype strings
+    _DTYPE_BYTES = {
+        'F64': 8, 'F32': 4, 'F16': 2, 'BF16': 2,
+        'F8_E4M3': 1, 'F8_E5M2': 1, 'I64': 8, 'I32': 4,
+        'I16': 2, 'I8': 1, 'U8': 1, 'BOOL': 1,
+    }
+    _storage_dtype_cache: Dict[str, float] = {}
+
+    @classmethod
+    def _safetensors_numel_bytes(cls, path: str):
+        """Return (total_numel, total_weight_bytes) for a .safetensors file.
+
+        Only the header (8-byte length + JSON) is read, never the weights. Used
+        to compute a parameter-weighted average bytes/elem across a model so a
+        MIXED-precision model (e.g. fp32 transformer + bf16 text encoder) isn't
+        misjudged from a single file.
+        """
+        try:
+            import json as _json
+            with open(path, 'rb') as f:
+                n = int.from_bytes(f.read(8), 'little')
+                if n <= 0 or n > 100_000_000:
+                    return 0, 0
+                header = _json.loads(f.read(n))
+        except Exception:
+            return 0, 0
+        total_numel = 0
+        total_bytes = 0
+        for name, meta in header.items():
+            if name == '__metadata__' or not isinstance(meta, dict):
+                continue
+            dt = meta.get('dtype')
+            b = cls._DTYPE_BYTES.get(dt)
+            if not b:
+                continue
+            numel = 1
+            for d in (meta.get('shape') or []):
+                numel *= max(1, int(d))
+            total_numel += numel
+            total_bytes += numel * b
+        return total_numel, total_bytes
+
+    def _storage_bytes_per_elem(self, model_key: str, resolved_name: str, cfg: dict) -> float:
+        """Detect the on-disk weight precision (bytes/elem) for a model.
+
+        Computes the PARAMETER-WEIGHTED average bytes/elem across all of the
+        model's safetensors files (total weight bytes / total params), so a
+        mixed-precision model is handled correctly. Defaults to 2.0 (fp16) when
+        it can't be determined, so the normalization is a no-op rather than a
+        wrong guess. Cached per model.
+        """
+        ck = resolved_name or model_key
+        cached = self._storage_dtype_cache.get(ck)
+        if cached is not None:
+            return cached
+
+        import os
+        result = 2.0  # safe default: treat unknown as fp16 (normalization no-op)
+        candidates = []
+        for v in (resolved_name, cfg.get('path'), cfg.get('model_path'), cfg.get('model')):
+            if v and isinstance(v, str):
+                candidates.append(v)
+
+        st_files = []  # (size, path)
+        try:
+            # Local file or directory.
+            for c in candidates:
+                if os.path.isfile(c) and c.endswith('.safetensors'):
+                    st_files.append((os.path.getsize(c), c))
+                elif os.path.isdir(c):
+                    for root, _, files in os.walk(c):
+                        for fn in files:
+                            if fn.endswith('.safetensors'):
+                                p = os.path.join(root, fn)
+                                try:
+                                    st_files.append((os.path.getsize(p), p))
+                                except OSError:
+                                    pass
+            # HuggingFace hub cache.
+            if not st_files:
+                from huggingface_hub import scan_cache_dir
+                from codai.models.cache import get_all_cache_dirs, is_huggingface_model_id
+                hf_dir = get_all_cache_dirs().get("huggingface")
+                for c in candidates:
+                    repo_id = c.split(":", 1)[1] if ":" in c else c
+                    if not (hf_dir and is_huggingface_model_id(repo_id)):
+                        continue
+                    info = scan_cache_dir(hf_dir)
+                    for repo in info.repos:
+                        if repo.repo_id != repo_id:
+                            continue
+                        revs = sorted(repo.revisions, key=lambda r: r.last_modified, reverse=True)
+                        if revs:
+                            for fobj in revs[0].files:
+                                if str(fobj.file_name).endswith('.safetensors'):
+                                    st_files.append((fobj.size_on_disk, str(fobj.file_path)))
+                    if st_files:
+                        break
+        except Exception:
+            pass
+
+        if st_files:
+            # Parameter-weighted average across ALL files (mixed-precision aware).
+            st_files.sort(reverse=True)  # largest first (cap the count we read)
+            agg_numel = 0
+            agg_bytes = 0
+            for _, p in st_files[:64]:
+                numel, wbytes = self._safetensors_numel_bytes(p)
+                agg_numel += numel
+                agg_bytes += wbytes
+            if agg_numel > 0:
+                result = agg_bytes / agg_numel
+
+        self._storage_dtype_cache[ck] = result
+        return result
+
+    @staticmethod
+    def _load_bytes_per_elem(cfg: dict) -> float:
+        """Bytes/elem for the configured LOAD precision (default fp16 = 2)."""
+        prec = str((cfg or {}).get('precision') or '').lower()
+        if prec in ('f32', 'fp32', 'float32'):
+            return 4.0
+        if prec in ('f16', 'fp16', 'bf16', 'float16', 'bfloat16', 'half'):
+            return 2.0
+        return 2.0  # default load precision for HF/diffusers is half
+
+    # LoRA adapters load into VRAM alongside the base weights; applying/fusing
+    # them also briefly holds extra copies. Scale the raw adapter size to cover
+    # that transient spike.
+    _LORA_SPIKE_FACTOR = 1.3
+
+    @classmethod
+    def _path_or_hf_size_bytes(cls, spec: str) -> int:
+        """Best-effort on-disk size for a LoRA/adapter spec (file, dir, or HF id)."""
+        import os
+        if not spec or not isinstance(spec, str):
+            return 0
+        try:
+            if os.path.isfile(spec):
+                return os.path.getsize(spec)
+            if os.path.isdir(spec):
+                total = 0
+                for root, _, files in os.walk(spec):
+                    for f in files:
+                        if f.endswith((".safetensors", ".bin", ".pt", ".ckpt")):
+                            try:
+                                total += os.path.getsize(os.path.join(root, f))
+                            except OSError:
+                                pass
+                return total
+        except OSError:
+            pass
+        # HuggingFace repo id → scan local hub cache.
+        try:
+            from codai.models.cache import is_huggingface_model_id
+            if is_huggingface_model_id(spec):
+                return cls._hf_cached_model_size_bytes(spec)
+        except Exception:
+            pass
+        return 0
+
+    def _lora_vram_gb(self, specs) -> float:
+        """Approx. extra VRAM (GB) for one or more LoRA adapters (× spike factor).
+
+        `specs` may be a path/id string, a list of those, or a list of objects
+        exposing a `.model` attribute (LoraConfig) / dicts with a 'model' key.
+        """
+        if not specs:
+            return 0.0
+        if isinstance(specs, (str, bytes)):
+            specs = [specs]
+        total_bytes = 0
+        for s in specs:
+            path = None
+            if isinstance(s, str):
+                path = s
+            elif isinstance(s, dict):
+                path = s.get("model") or s.get("path") or s.get("lora") or s.get("name")
+            else:
+                path = getattr(s, "model", None) or getattr(s, "path", None)
+            if path:
+                total_bytes += self._path_or_hf_size_bytes(path)
+        if total_bytes <= 0:
+            return 0.0
+        return (total_bytes / 1e9) * self._LORA_SPIKE_FACTOR
+
+    def _config_lora_vram_gb(self, cfg: dict) -> float:
+        """Extra VRAM for LoRA(s) declared in the model config (lora_path/dir)."""
+        if not isinstance(cfg, dict):
+            return 0.0
+        specs = []
+        for key in ("lora_path", "lora_model_dir"):
+            v = cfg.get(key)
+            if v:
+                specs.append(v)
+        return self._lora_vram_gb(specs)
+
+    def _runtime_reserve_gb(self, cfg: dict, model_key: str, base_gb: float) -> float:
+        """Extra VRAM the model needs at RUNTIME beyond its resident weights.
+
+        A model occupies its weights at load time, but inference allocates more:
+        the KV cache (autoregressive text/vision, grows with context length),
+        attention/temporal activations and the VAE-decode spike (diffusion
+        image/video). The eviction estimate and the persisted measurement must
+        account for this so we reserve enough headroom and don't OOM mid-run.
+        Returned as GB to add on top of `base_gb` (the weight footprint).
+        """
+        if base_gb <= 0:
+            return 0.0
+        mtype = self._model_type_of(model_key)
+        if mtype in ("text", "vision"):
+            # KV cache + activations scale with context length.
+            try:
+                n_ctx = int(cfg.get("n_ctx") or cfg.get("context_size") or 2048)
+            except (TypeError, ValueError):
+                n_ctx = 2048
+            ctx_factor = min(3.0, max(1.0, n_ctx / 4096.0))
+            return base_gb * (0.10 + 0.08 * ctx_factor)   # ~0.18–0.34×
+        if mtype == "video":
+            return base_gb * 0.08   # temporal activations + VAE decode (tiling-capped)
+        if mtype == "image":
+            return base_gb * 0.08
+        return base_gb * 0.08
+
     def _get_model_used_vram_gb(self, model_key: str, resolved_name: str = None) -> float:
         """Return VRAM requirement in GB for a model.
 
         Priority:
         1. Explicit ``used_vram_gb`` in the model's config entry.
-        2. File size of a local weight file (GGUF/GGML/bin/safetensors).
-        3. File size of matching weight files in the HuggingFace hub cache.
+        2. Measured actual VRAM delta from a previous load of this model.
+        3. File size of a local weight file, adjusted for quantization/offload.
+        4. HuggingFace hub cache size (dense shards or largest GGUF), adjusted.
         Returns 0 when the requirement cannot be determined.
         """
         cfg = self.config.get(model_key, {})
-        explicit = cfg.get("used_vram_gb")
-        if explicit:
-            return float(explicit)
+        # Unwrap a forwarded `_raw_cfg` so we see the ORIGINAL model entry the
+        # same way the loaders do (build_kwargs_from_config only copies a few
+        # keys to the top level — component_quantization lives ONLY in _raw_cfg).
+        # Without this the per-component quant map is invisible here and the
+        # estimate stays at full precision (e.g. 54 GB instead of ~25 GB).
+        if isinstance(cfg, dict) and isinstance(cfg.get('_raw_cfg'), dict):
+            _merged = dict(cfg)
+            for _k, _v in cfg['_raw_cfg'].items():
+                _merged.setdefault(_k, _v)
+            cfg = _merged
 
-        # Measured actual VRAM delta from when this model was loaded
+        # --- Read quantization / offload settings from model config ---
+        # These come from the coderai model configuration and dramatically
+        # change how much VRAM the model actually occupies.  Read them FIRST so
+        # they apply to every estimate path, including the explicit value below.
+        load_in_4bit = cfg.get("load_in_4bit", False)
+        load_in_8bit = cfg.get("load_in_8bit", False)
+        offload_strategy = cfg.get("offload_strategy") or "auto"
+        max_gpu_percent = cfg.get("max_gpu_percent")  # explicit cap, 0-100
+
+        explicit = cfg.get("used_vram_gb")
+
+        # Effective quantization multiplier (fraction of full-precision weight
+        # size that remains in memory). Honours BOTH the global load_in_4/8bit
+        # flags AND per-component quantization (component_quantization map), so a
+        # diffusion pipeline whose transformer/text_encoder are 4-bit isn't
+        # wildly over-estimated at full precision.
+        quant_mult = self._effective_quant_multiplier(
+            cfg, load_in_4bit, load_in_8bit)
+
+        # Precision normalization: used_vram_gb / disk-scan baselines are STORAGE
+        # sizes at the on-disk dtype (e.g. Wan2.2 ships fp32 → 4 bytes/elem), but
+        # the quant divisors are fp16-relative and the model loads at `precision`
+        # (bf16/fp16 → 2 bytes). Without this a 4-bit fp32 model is ~2× over-
+        # estimated (151 GB → 49 instead of ~24). factor = load_bytes/storage_bytes.
+        _storage_bpe = self._storage_bytes_per_elem(model_key, resolved_name, cfg)
+        _load_bpe = self._load_bytes_per_elem(cfg)
+        prec_factor = (_load_bpe / _storage_bpe) if _storage_bpe > 0 else 1.0
+
+        def _dbg_est(source: str, value: float) -> float:
+            try:
+                from codai.api.state import get_global_debug
+                if get_global_debug():
+                    print(f"  [vram-est][debug] key='{model_key}' source={source} "
+                          f"-> {value:.2f} GB | used_vram_gb={explicit} "
+                          f"measured_cfg={cfg.get('measured_vram_gb')} "
+                          f"component_quantization={cfg.get('component_quantization')} "
+                          f"load_in_4bit={load_in_4bit} load_in_8bit={load_in_8bit} "
+                          f"quant_mult={quant_mult:.3f} "
+                          f"prec(load{_load_bpe:.0f}/disk{_storage_bpe:.0f})={prec_factor:.2f}")
+            except Exception:
+                pass
+            return value
+
+        def _apply_factors(raw_weights_gb: float) -> float:
+            """Adjust raw weight size for quantization and GPU-offload settings."""
+            # Normalize storage precision → load precision, then apply the
+            # (fp16-relative) quantization multiplier.
+            gpu_gb = raw_weights_gb * prec_factor * quant_mult
+
+            # When offload is active the model is split across GPU + CPU RAM.
+            # Only the GPU portion counts toward free-VRAM requirements.
+            if offload_strategy and offload_strategy != "none":
+                if max_gpu_percent is not None:
+                    # User has set an explicit GPU cap — honour it.
+                    gpu_gb = gpu_gb * max(0.0, min(1.0, float(max_gpu_percent) / 100.0))
+                else:
+                    # Conservative default: assume the model will use at most
+                    # 93 % of whatever GPU headroom exists.  Since we don't know
+                    # the exact GPU size here, cap the estimate at gpu_gb itself
+                    # (no reduction) so eviction is still triggered when needed.
+                    # The actual split is decided by transformers/accelerate at
+                    # load time.
+                    pass  # no reduction — be conservative
+
+            # Add the runtime reserve (KV cache / activations / VAE-decode spike)
+            # so the estimate reflects the model's PEAK footprint, not just its
+            # resident weights — otherwise eviction frees too little and the run
+            # OOMs mid-generation. Type-aware (ctx-scaled for text).
+            return gpu_gb + self._runtime_reserve_gb(cfg, model_key, gpu_gb)
+
+        # Resolve a real measurement (this run via `_measured_vram_gb`, or the
+        # persisted, system-owned `measured_vram_gb` field from a prior load). It
+        # already reflects quant/precision/offload, so it's used WITHOUT factors.
         measured = self._measured_vram_gb.get(model_key)
+        if not measured:
+            _cm = cfg.get("measured_vram_gb")
+            if _cm:
+                try:
+                    measured = float(_cm)
+                except (TypeError, ValueError):
+                    measured = None
+
+        # force_vram_update: the real measurement ALWAYS wins — even over a
+        # configured used_vram_gb — and is refreshed from reality every run.
+        if bool(cfg.get("force_vram_update")) and measured:
+            return _dbg_est("measured(force)", float(measured))
+
+        # used_vram_gb set in config is AUTHORITATIVE — use it as-is (with the
+        # usual quant/offload factors) and never override it with a measurement.
+        # Per user intent: a configured value must remain unchanged even if the
+        # resulting estimate is imperfect (unless force_vram_update is set).
+        # Config-declared LoRA(s) are added on top — they load into VRAM beyond
+        # the base weights. (Not added to forced/measured: forced is the user's
+        # final number; a measurement already reflects any load-time adapters.)
+        if explicit is not None:
+            return _dbg_est("used_vram_gb",
+                            _apply_factors(float(explicit)) + self._config_lora_vram_gb(cfg))
+
+        # No configured used_vram_gb → the real measurement is GROUND TRUTH.
         if measured:
-            return measured
+            return _dbg_est("measured", float(measured))
 
         # Build a list of candidate paths/IDs to check
         candidates = []
@@ -1687,9 +2273,8 @@ class MultiModelManager:
             try:
                 size_bytes = os.path.getsize(path)
                 weights_gb = size_bytes / 1e9
-                n_ctx = cfg.get("n_ctx") or 2048
-                kv_cache_gb = (n_ctx / 1024) * 0.5 / 1024  # 0.5 MB per 1 K ctx → GB
-                return weights_gb * 1.15 + kv_cache_gb
+                # _apply_factors already adds the runtime reserve (incl. KV cache).
+                return _apply_factors(weights_gb) + self._config_lora_vram_gb(cfg)
             except OSError:
                 continue
 
@@ -1705,35 +2290,99 @@ class MultiModelManager:
             size_bytes = self._hf_cached_model_size_bytes(repo_id)
             if size_bytes > 0:
                 weights_gb = size_bytes / 1e9
-                # Diffusers / transformers models don't have a KV-cache term;
-                # use 20% overhead for activations, optimizer states, scratch buffers.
-                return weights_gb * 1.2
+                return _apply_factors(weights_gb) + self._config_lora_vram_gb(cfg)
 
         return 0
 
+    def _is_key_busy(self, key: str) -> bool:
+        """True if any instance for this key is currently serving a request.
+
+        Evicting a busy model would move its tensors to CPU mid-forward-pass,
+        which triggers a CUDA device-side assert in the in-flight request and
+        corrupts the whole context.  Such models must NOT be evicted until idle.
+        """
+        pool = self.model_pools.get(key)
+        if pool is not None:
+            with pool._lock:
+                return any(r > 0 for r in pool.ref_counts)
+        return False
+
+    def _wait_until_idle(self, key: str, timeout: float = 120.0) -> bool:
+        """Block until no instance of `key` is busy, or until timeout. Returns idle?"""
+        import time as _time
+        deadline = _time.time() + timeout
+        while self._is_key_busy(key):
+            if _time.time() >= deadline:
+                return False
+            _time.sleep(0.25)
+        return True
+
     def _evict_models_for_vram(self, needed_gb: float):
-        """Unload loaded models (LRU first) until we have at least needed_gb free VRAM."""
+        """Unload loaded models (LRU first) until we have at least needed_gb free VRAM.
+
+        Never evicts a model that is actively serving a request — doing so would
+        move its weights off the GPU mid-generation and crash the CUDA context.
+        Busy models are waited on (briefly) before eviction.
+        """
         if needed_gb <= 0:
             return
 
         def _evict_key(key):
+            # Make absolutely sure nothing is mid-request on this model before we
+            # pull its tensors off the GPU.
+            if self._is_key_busy(key):
+                if not self._wait_until_idle(key):
+                    print(f"  Skipping eviction of '{key}' — still busy after wait")
+                    return
             model_obj = self.models.pop(key, None)
             self.models_in_vram.discard(key)
+            # Debug-only: ground-truth the object state before cleanup so an
+            # orphaned/detached backend (VRAM that won't free) is visible.
+            try:
+                from codai.api.state import get_global_debug
+                if get_global_debug():
+                    _be = getattr(model_obj, 'backend', '∅')
+                    _has_model = (getattr(_be, 'model', None) is not None) if _be not in ('∅', None) else False
+                    _pool = self.model_pools.get(key)
+                    print(f"  evict-debug '{key}': obj_id={id(model_obj)} "
+                          f"backend={'None' if _be is None else ('missing' if _be=='∅' else 'set')} "
+                          f"backend.model={'set' if _has_model else 'None'} "
+                          f"pool_instances={_pool.count if _pool else 0}")
+            except Exception:
+                pass
+            # Clean every instance in the pool (not just the primary) so extra
+            # instances don't leak VRAM, then drop the pool.
+            pool = self.model_pools.pop(key, None)
+            if pool is not None:
+                try:
+                    pool.cleanup_all()
+                except Exception as e:
+                    print(f"  Warning cleaning pool for '{key}': {e}")
             if model_obj is not None:
                 try:
                     if hasattr(model_obj, 'cleanup'):
                         model_obj.cleanup()
                     elif hasattr(model_obj, 'to'):
+                        # Diffusers pipeline: move all components to CPU explicitly
+                        # before dropping the reference so VRAM is freed promptly.
                         model_obj.to('cpu')
                 except Exception as e:
                     print(f"  Warning during eviction of '{key}': {e}")
-            gc.collect()
+            del model_obj
+            for _ in range(3):
+                gc.collect()
             try:
                 import torch
                 if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                     torch.cuda.empty_cache()
             except Exception:
                 pass
+            # Return freed CPU heap (the evicted model's host-side copy / offloaded
+            # weights) to the OS, and let the kernel reclaim any swap backing it —
+            # otherwise RSS stays high across evict/load cycles and the machine
+            # slowly fills RAM + swap.
+            _trim_cpu_ram()
 
         def _size_label(key: str) -> str:
             m = self._measured_vram_gb.get(key)
@@ -1744,23 +2393,86 @@ class MultiModelManager:
                 return f"estimated {e:.2f} GB"
             return "size unknown"
 
-        # First pass: evict non-active models in LRU order
+        _free_before = self._get_free_vram_gb()
+
+        # First pass: evict idle non-active models in LRU order.
         for key in list(self.models.keys()):
             if key == self.active_in_vram:
                 continue
             if self._get_free_vram_gb() >= needed_gb:
                 break
+            if self._is_key_busy(key):
+                print(f"  '{key}' is busy serving a request — not evicting it")
+                continue
             print(f"On-request VRAM eviction: unloading '{key}' ({_size_label(key)}) to free VRAM")
             _evict_key(key)
 
-        # Second pass: evict active model if still not enough
-        if self._get_free_vram_gb() < needed_gb and self.active_in_vram and self.active_in_vram in self.models:
-            print(f"On-request VRAM eviction: unloading active model '{self.active_in_vram}' "
-                  f"({_size_label(self.active_in_vram)}) to free VRAM")
-            _evict_key(self.active_in_vram)
-            self.active_in_vram = None
+        # Second pass: evict the active model if still not enough AND it is idle.
+        if (self._get_free_vram_gb() < needed_gb and self.active_in_vram
+                and self.active_in_vram in self.models):
+            _active = self.active_in_vram
+            if self._is_key_busy(_active):
+                print(f"  Active model '{_active}' is busy — waiting for it to go idle "
+                      f"before eviction…")
+            if self._wait_until_idle(_active):
+                print(f"On-request VRAM eviction: unloading active model '{_active}' "
+                      f"({_size_label(_active)}) to free VRAM")
+                _evict_key(_active)
+                self.active_in_vram = None
+            else:
+                print(f"  Active model '{_active}' still busy after wait — leaving it loaded")
 
-    def request_model(self, requested_model: str, model_type: str = None) -> Dict[str, Any]:
+        # Last resort: ask external holders (e.g. the LoRA trainer's cached base
+        # model) to release their VRAM. These aren't tracked models, so eviction
+        # above can't see them — this is what stops a cached training base from
+        # forcing the next image request into CPU/disk offload.
+        if self._get_free_vram_gb() < needed_gb and self._external_vram_releasers:
+            for _rel in list(self._external_vram_releasers):
+                try:
+                    freed = _rel(needed_gb)
+                    if freed:
+                        print(f"On-request VRAM eviction: external releaser freed {freed:.1f} GB")
+                except Exception as e:
+                    print(f"  Warning in external VRAM releaser: {e}")
+                if self._get_free_vram_gb() >= needed_gb:
+                    break
+
+        # Report what we actually freed so a failure to free is visible.
+        _free_after = self._get_free_vram_gb()
+        if _free_after < needed_gb:
+            print(f"  ⚠ Eviction freed {_free_after - _free_before:.1f} GB "
+                  f"(now {_free_after:.1f} GB free, needed {needed_gb:.1f} GB). "
+                  f"Remaining models are busy or VRAM is held elsewhere — the new "
+                  f"model will load with CPU/disk offload.")
+
+    def ensure_vram_for(self, model_key: str, resolved_name: str = None,
+                        extra_vram_gb: float = 0.0) -> None:
+        """Make room in VRAM for a model about to load — ANY type, ANY load mode.
+
+        Universal guarantee: before loading a model that is not already resident,
+        if its estimated VRAM need exceeds the free VRAM, evict other loaded
+        models (LRU first, then the active one) until there is enough room.
+        `_evict_models_for_vram` already frees one-or-more models as needed and
+        never touches a model that is busy serving a request.
+
+        `extra_vram_gb` is added to the model's own estimate — used to reserve
+        room for per-request additions the base estimate can't know about (e.g.
+        dynamically-applied LoRA adapters).
+        """
+        needed_gb = self._get_model_used_vram_gb(model_key, resolved_name)
+        if extra_vram_gb and extra_vram_gb > 0:
+            needed_gb += extra_vram_gb
+        if needed_gb <= 0:
+            return
+        free_gb = self._get_free_vram_gb()
+        if free_gb < needed_gb:
+            _extra = f" (+{extra_vram_gb:.1f} GB LoRA/extra)" if extra_vram_gb else ""
+            print(f"Loading '{model_key}': need {needed_gb:.1f} GB VRAM{_extra}, "
+                  f"have {free_gb:.1f} GB free — evicting models to make room")
+            self._evict_models_for_vram(needed_gb)
+
+    def request_model(self, requested_model: str, model_type: str = None,
+                      extra_vram_gb: float = 0.0) -> Dict[str, Any]:
         """
         Central method for API modules to request a model.
         
@@ -1789,9 +2501,32 @@ class MultiModelManager:
                 - 'config': The stored configuration for this model
                 - 'already_loaded': True if the model is already loaded and ready in VRAM
         """
+        # Fail fast if the CUDA context is already corrupted — loading anything
+        # onto a poisoned context just re-triggers the same async assert.
+        if self.cuda_context_poisoned:
+            return {
+                'model_key': None,
+                'model_name': requested_model,
+                'model_object': None,
+                'config': {},
+                'already_loaded': False,
+                'error': ("CUDA context corrupted by an earlier device-side assert "
+                          f"({self.cuda_poison_reason}). Restart coderai to recover."),
+            }
+
+        # Thermal protection: before serving a request, wait if the CPU/GPU are
+        # too hot so a long sequence of heavy generations can't overheat the
+        # machine and trip its power-off protection. No-op when disabled or cool.
+        try:
+            from codai.models.thermal import wait_until_safe
+            wait_until_safe(context=f"{model_type or 'model'}:{requested_model}")
+        except Exception as _therr:
+            # Never let thermal monitoring failures block serving.
+            print(f"[thermal] monitor unavailable ({_therr}) — serving without wait")
+
         from codai.api.state import get_load_mode
         mode = get_load_mode()
-        
+
         # Step 1: Resolve the model name from aliases
         resolved_name = None
         model_key = None
@@ -1967,13 +2702,8 @@ class MultiModelManager:
                     'config': per_model_cfg,
                     'already_loaded': True,
                 }
-            # Not loaded — check VRAM and evict if needed
-            needed_gb = self._get_model_used_vram_gb(model_key, resolved_name)
-            if needed_gb > 0:
-                free_gb = self._get_free_vram_gb()
-                if free_gb < needed_gb:
-                    print(f"On-request: need {needed_gb:.1f} GB VRAM, have {free_gb:.1f} GB free — evicting models")
-                    self._evict_models_for_vram(needed_gb)
+            # Not loaded — make room in VRAM (evict other models as needed).
+            self.ensure_vram_for(model_key, resolved_name, extra_vram_gb)
             return {
                 'model_key': model_key,
                 'model_name': resolved_name,
@@ -1994,6 +2724,10 @@ class MultiModelManager:
                     'config': per_model_cfg,
                     'already_loaded': True,
                 }
+            # A "load" model that is NOT currently resident was evicted to make
+            # room for an on-request model (e.g. the text model bumped for a video
+            # model).  Make room again so it returns to VRAM instead of CPU.
+            self.ensure_vram_for(model_key, resolved_name, extra_vram_gb)
             return {
                 'model_key': model_key,
                 'model_name': resolved_name,
@@ -2019,6 +2753,7 @@ class MultiModelManager:
             # Model not loaded yet in loadall mode - caller needs to load it
             # (this happens for models not pre-loaded at startup, e.g., image models)
             print(f"Loadall mode: Model '{model_key}' not pre-loaded, will load now")
+            self.ensure_vram_for(model_key, resolved_name, extra_vram_gb)
             return {
                 'model_key': model_key,
                 'model_name': resolved_name,
@@ -2154,16 +2889,16 @@ class MultiModelManager:
                     print(f"Ondemand mode - keeping '{loaded_canonical}' in VRAM alongside new model "
                           f"(need {needed_gb:.1f} GB + {headroom_gb:.1f} GB headroom, have {free_gb:.1f} GB free)")
                 else:
-                    print(f"Ondemand mode - model switch detected:")
-                    print(f"  Requested: '{model_key}' (resolved: '{resolved_name}')")
-                    print(f"  Currently loaded: '{loaded_canonical}'")
-                    print(f"  -> Unloading current model(s) before loading new model...")
-                    self.unload_all_models()
-
-                    # Also cleanup the legacy singleton if it has a model
-                    if has_legacy_model:
+                    print(f"Ondemand mode - model switch detected (requested '{model_key}', "
+                          f"loaded '{loaded_canonical}'):")
+                    # Evict one-or-more models (LRU first) until there is enough
+                    # room — preserves coexistence of models that still fit rather
+                    # than nuking everything.
+                    self._evict_models_for_vram(needed_gb + headroom_gb)
+                    # If still short, fall back to cleaning the legacy singleton.
+                    if has_legacy_model and self._get_free_vram_gb() < needed_gb:
                         try:
-                            print(f"  -> Cleaning up legacy model_manager...")
+                            print(f"  -> Cleaning up legacy model_manager…")
                             _legacy_mm.cleanup()
                         except Exception as e:
                             print(f"  Warning: Error cleaning up legacy model_manager: {e}")
@@ -2381,13 +3116,12 @@ class MultiModelManager:
                         setattr(caps, f, True)
             else:
                 caps = detect_model_capabilities(model_id)
-                # If heuristic detection missed the type (e.g. custom/vendor model IDs
-                # that don't match any keyword), ensure the minimum capability for the
-                # config-declared type is set so badges display correctly.
-                if model_type and model_type in TYPE_MIN_CAP:
-                    min_cap = TYPE_MIN_CAP[model_type]
-                    if not getattr(caps, min_cap, False):
-                        setattr(caps, min_cap, True)
+            # Apply minimum capability for the config-declared category only when
+            # detection found nothing at all (unrecognized model name). If any caps
+            # were detected (e.g. image_upscaling for latent-upscaler models), trust
+            # the detection result — TYPE_MIN_CAP must not override it.
+            if model_type and model_type in TYPE_MIN_CAP and not caps.to_list():
+                setattr(caps, TYPE_MIN_CAP[model_type], True)
             resolved_type = model_type or (caps.to_list()[0].split("_")[0] if caps.to_list() else "text")
             models.append(ModelInfo(
                 id=model_id,

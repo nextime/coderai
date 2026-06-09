@@ -320,8 +320,9 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           <label class="form-label">HuggingFace repo ID or URL</label>
           <div style="display:flex;gap:.5rem">
             <input type="text" id="dl-id" class="form-input" style="flex:1" placeholder="e.g. bartowski/Llama-3.1-8B-Instruct-GGUF" onkeydown="if(event.key==='Enter'){event.preventDefault();browseHfFiles()}">
-            <button class="btn btn-ghost btn-sm" id="dl-browse-btn" onclick="browseHfFiles()" style="white-space:nowrap" title="Fetch available files from HuggingFace">Browse</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="dl-browse-btn" onclick="browseHfFiles()" style="white-space:nowrap" title="Fetch available files from HuggingFace">Browse</button>
           </div>
+          <div id="dl-browse-status" style="font-size:11px;margin-top:.3rem;min-height:1em"></div>
         </div>
         <!-- Quant picker: shown when GGUF files are found via Browse -->
         <div id="dl-quant-row" style="display:none;margin-top:.5rem">
@@ -581,6 +582,11 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           <label class="form-label">Used VRAM <span class="muted">(GB)</span></label>
           <input type="number" id="cfg-used-vram" class="form-input" min="0" step="0.1" placeholder="auto-estimate">
           <span class="form-hint" id="cfg-used-vram-hint" style="font-size:11px;color:var(--text-3)"></span>
+          <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;margin-top:.4rem">
+            <input type="checkbox" id="cfg-force-vram-update">
+            <span style="font-size:12px">Force VRAM update</span>
+          </label>
+          <span class="form-hint" style="font-size:11px;color:var(--text-3)">When on, the real measured VRAM is re-recorded every run and used for eviction even if "Used VRAM" is set above.</span>
         </div>
         <div class="form-row" style="margin:0">
           <label class="form-label">Max instances
@@ -626,6 +632,17 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-noram"> No RAM fallback</label>
       </div>
 
+      <!-- Per-component quantization (diffusers image/video pipelines) -->
+      <div id="cfg-compquant-wrap">
+        <div class="card-title" style="margin-top:1.25rem">Component Quantization <span class="muted" style="font-weight:normal">(image / video pipelines)</span></div>
+        <div style="font-size:12px;color:var(--text-muted,#888);margin:.25rem 0 .5rem">
+          Quantize individual pipeline components. <b>Default</b> uses the global 4-bit/8-bit checkboxes above.
+          <b>2-bit</b> needs optimum-quanto; <b>GGUF file</b> (Q5_K/Q6_K…) needs a pre-quantized .gguf path/URL.
+          Tip: backbone <code>4-bit</code> + text encoder <code>8-bit</code> + VAE <code>None</code> = best quality-per-GB.
+        </div>
+        <div id="cfg-compquant-rows" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:.5rem"></div>
+      </div>
+
       <!-- offload -->
       <div class="card-title" style="margin-top:1.25rem">Offload</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
@@ -656,6 +673,20 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-sdcpp-flash"> Flash Attention</label>
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-sdcpp-diff-flash"> Diffusion Flash Attention</label>
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-vae-tiling"> VAE Tiling <span class="muted">(reduces VRAM at decode)</span></label>
+      </div>
+
+      <!-- video output quality (CRF) — only relevant for video models -->
+      <div class="form-row" style="margin-top:.75rem;max-width:340px">
+        <label class="form-label">Video output quality — CRF
+          <span class="muted">(video models; blank = default)</span></label>
+        <input type="number" id="cfg-output-crf" class="form-input" min="0" max="51" step="1"
+               placeholder="e.g. 20 (lower = better quality, bigger file)">
+      </div>
+      <div class="form-row" style="margin-top:.75rem;max-width:340px">
+        <label class="form-label">Balanced GPU % <span class="muted">(video models; default 80)</span></label>
+        <input type="number" id="cfg-balanced-gpu-pct" class="form-input" min="10" max="99" step="1"
+               placeholder="80">
+        <span class="form-hint">When the model won't fit entirely in VRAM, fill this % of free VRAM then spill the rest to CPU RAM. Also the cap used by auto-balanced fallback.</span>
       </div>
 
       <!-- components -->
@@ -724,6 +755,16 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       <div class="form-row">
         <label class="form-label">LoRA directory <span class="muted">(optional — for prompt-based loras)</span></label>
         <input type="text" id="cfg-lora-dir" class="form-input" placeholder="e.g. /models/loras">
+      </div>
+      <div class="form-row">
+        <label class="form-label">LoRA training base model <span class="muted">(optional — SD1.x/SDXL to train LoRAs against)</span></label>
+        <input type="text" id="cfg-lora-train-base" class="form-input"
+          placeholder="e.g. stabilityai/stable-diffusion-xl-base-1.0">
+        <div class="muted small" style="margin-top:.25rem">
+          When this image model is a transformer/DiT (Z-Image, Flux, SD3) the in-process LoRA
+          trainer can't target it. Set a UNet-based SD1.x/SDXL model here to train identity LoRAs
+          against, while generation still uses this model. Leave empty to train on this model.
+        </div>
       </div>
 
       <!-- generation -->
@@ -1181,6 +1222,9 @@ function openDownloadFor(modelId, filePattern){
   document.getElementById('dl-progress').style.display='none';
   document.getElementById('dl-quant-row').style.display='none';
   document.getElementById('dl-start-btn').textContent='Download';
+  const _browseBtn = document.getElementById('dl-browse-btn');
+  if(_browseBtn){ _browseBtn.textContent='Browse'; _browseBtn.disabled=false; }
+  _dlStatus('');
 
   document.getElementById('dl-id').value = modelId || '';
   document.getElementById('dl-pattern').value = filePattern || '';
@@ -1407,11 +1451,22 @@ function renderQuantPicker(ggufFiles, initialPattern){
   document.getElementById('dl-start-btn').textContent = 'Download selected';
 }
 
+function _dlStatus(msg, color){
+  const el = document.getElementById('dl-browse-status');
+  if(!el) return;
+  el.textContent = msg;
+  el.style.color = color || 'var(--text-2)';
+}
+
 async function browseHfFiles(){
   const id = document.getElementById('dl-id').value.trim();
-  if(!id){ document.getElementById('dl-id').focus(); return; }
+  if(!id){
+    _dlStatus('Enter a HuggingFace repo ID first, e.g. bartowski/Llama-3.1-8B-Instruct-GGUF', 'var(--red,#f87171)');
+    document.getElementById('dl-id').focus();
+    return;
+  }
   if(!id.includes('/')){
-    // Local path or bare name — can't browse, use pattern fallback
+    _dlStatus('Use the format owner/model-name (e.g. bartowski/Llama-3.1-8B-Instruct-GGUF)', 'var(--red,#f87171)');
     document.getElementById('dl-quant-row').style.display='none';
     const isGguf = looksLikeGguf(id,'');
     document.getElementById('dl-pattern-row').style.display = isGguf?'block':'none';
@@ -1419,34 +1474,40 @@ async function browseHfFiles(){
     return;
   }
   const btn = document.getElementById('dl-browse-btn');
-  btn.textContent='…'; btn.disabled=true;
+  btn.textContent='Fetching…'; btn.disabled=true;
+  _dlStatus('Fetching file list from HuggingFace…');
+  const controller = new AbortController();
+  const _browseTimeout = setTimeout(()=>controller.abort(), 20000);
   try{
-    const r = await fetch(ROOT_PATH+'/admin/api/hf-files?repo_id='+encodeURIComponent(id));
-    if(!r.ok){ throw new Error((await r.json()).detail||'Request failed'); }
+    const r = await fetch(ROOT_PATH+'/admin/api/hf-files?repo_id='+encodeURIComponent(id), {signal:controller.signal});
+    if(!r.ok){
+      let detail='Request failed (HTTP '+r.status+')';
+      try{ detail=(await r.json()).detail||detail; }catch(_){}
+      throw new Error(detail);
+    }
     const {files, error} = await r.json();
     if(error){ throw new Error(error); }
     const gguf = (files||[]).filter(f=>f.name.toLowerCase().endsWith('.gguf'));
     if(gguf.length){
+      _dlStatus(gguf.length+' GGUF file'+(gguf.length!==1?'s':'')+' found — select quantizations below');
       renderQuantPicker(gguf, document.getElementById('dl-pattern').value);
     } else {
-      // Non-GGUF repo — hide picker, show snapshot note
+      _dlStatus('No GGUF files — will download as full repository snapshot');
       _dlQuantFiles=[];
       document.getElementById('dl-quant-row').style.display='none';
       document.getElementById('dl-pattern-row').style.display='none';
       document.getElementById('dl-snapshot-note').style.display='flex';
       document.getElementById('dl-start-btn').textContent='Download';
-      const note = document.getElementById('dl-quant-note');
-      note.textContent='';
     }
   }catch(e){
-    // Fall back to manual pattern input
+    const errMsg = e.name==='AbortError' ? 'Timed out — HuggingFace did not respond in 20s' : e.message;
+    _dlStatus('Error: '+errMsg, 'var(--red,#f87171)');
     _dlQuantFiles=[];
     document.getElementById('dl-quant-row').style.display='none';
     document.getElementById('dl-pattern-row').style.display='block';
     document.getElementById('dl-snapshot-note').style.display='none';
-    document.getElementById('dl-start-btn').textContent='Download';
-    alert('Could not browse repo: '+e.message);
   }finally{
+    clearTimeout(_browseTimeout);
     btn.textContent='Browse'; btn.disabled=false;
   }
 }
@@ -1796,6 +1857,57 @@ function _readCompField(slug){
   if(!sel) return '';
   if(sel.value === '__custom__') return inp ? inp.value.trim() : '';
   return sel.value || '';
+}
+
+// Per-component quantization (diffusers image/video pipelines).
+// Common component names across SD/SDXL/Flux/Wan; 'default' = use global flag.
+const COMPONENT_QUANT_NAMES = [
+  'transformer', 'transformer_2', 'unet',
+  'text_encoder', 'text_encoder_2', 'text_encoder_3', 'vae'
+];
+function _isGgufVal(v){ return typeof v==='string' && v.trim().toLowerCase().endsWith('.gguf'); }
+function _renderComponentQuant(current){
+  current = current || {};
+  const host = document.getElementById('cfg-compquant-rows');
+  if(!host) return;
+  host.innerHTML = COMPONENT_QUANT_NAMES.map(name=>{
+    const raw = (current[name] || 'default').toString();
+    const isGguf = _isGgufVal(raw);
+    const mode = isGguf ? 'gguf'
+      : (['2bit','4bit','8bit','none'].includes(raw.toLowerCase()) ? raw.toLowerCase() : 'default');
+    const opt = (val,lbl)=>`<option value="${val}"${mode===val?' selected':''}>${lbl}</option>`;
+    const ggufPath = isGguf ? raw : '';
+    return `<div style="display:flex;flex-direction:column;gap:2px;font-size:12px">
+      <label style="display:flex;align-items:center;justify-content:space-between;gap:.5rem">
+        <span style="font-family:monospace">${name}</span>
+        <select class="form-input cfg-compquant" data-comp="${name}" style="width:120px;padding:2px 6px"
+          onchange="_toggleGgufInput(this)">
+          ${opt('default','Default')}${opt('2bit','2-bit (quanto)')}${opt('4bit','4-bit')}${opt('8bit','8-bit')}${opt('gguf','GGUF file…')}${opt('none','None')}
+        </select>
+      </label>
+      <input type="text" class="form-input cfg-compquant-gguf" data-comp="${name}"
+        placeholder="path or URL to .gguf (Q5_K, Q6_K…)" value="${ggufPath}"
+        style="padding:2px 6px;${mode==='gguf'?'':'display:none'}">
+    </div>`;
+  }).join('');
+}
+function _toggleGgufInput(sel){
+  const inp = sel.closest('div').querySelector('.cfg-compquant-gguf');
+  if(inp) inp.style.display = (sel.value==='gguf') ? '' : 'none';
+}
+function _collectComponentQuant(){
+  const out = {};
+  document.querySelectorAll('.cfg-compquant').forEach(sel=>{
+    const comp = sel.dataset.comp;
+    if(sel.value === 'gguf'){
+      const inp = document.querySelector('.cfg-compquant-gguf[data-comp="'+comp+'"]');
+      const path = inp ? inp.value.trim() : '';
+      if(path) out[comp] = path;            // store the .gguf path/URL
+    } else if(sel.value && sel.value !== 'default'){
+      out[comp] = sel.value;                // '2bit' | '4bit' | '8bit' | 'none'
+    }
+  });
+  return Object.keys(out).length ? out : null;
 }
 
 function _renderWhisperServerRows(models){
@@ -2471,6 +2583,7 @@ function openCfgModal(idx, cfgIdx){
   const nCtxForEst = s.n_ctx || 2048;
   const estVram = _estimateVram(m, nCtxForEst);
   document.getElementById('cfg-used-vram-hint').textContent = estVram ? `Estimated: ~${estVram.toFixed(1)} GB` : '';
+  document.getElementById('cfg-force-vram-update').checked = !!s.force_vram_update;
   document.getElementById('cfg-gpu-layers').value = s.n_gpu_layers !== undefined ? s.n_gpu_layers : -1;
   document.getElementById('cfg-n-ctx').value = nCtxForEst;
   document.getElementById('cfg-max-instances').value = s.max_instances != null ? s.max_instances : 1;
@@ -2492,6 +2605,7 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-ram-gb').value = s.manual_ram_gb != null ? s.manual_ram_gb : '';
   document.getElementById('cfg-4bit').checked = !!s.load_in_4bit;
   document.getElementById('cfg-8bit').checked = !!s.load_in_8bit;
+  _renderComponentQuant(s.component_quantization || {});
   document.getElementById('cfg-flash').checked = !!s.flash_attention;
   document.getElementById('cfg-noram').checked = !!s.no_ram;
   document.getElementById('cfg-offload-strategy').value = s.offload_strategy || 'auto';
@@ -2505,6 +2619,8 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-sdcpp-flash').checked = !!s.sdcpp_flash_attn;
   document.getElementById('cfg-sdcpp-diff-flash').checked = !!s.sdcpp_diffusion_flash_attn;
   document.getElementById('cfg-vae-tiling').checked = !!s.vae_tiling;
+  document.getElementById('cfg-output-crf').value = (s.output_crf != null ? s.output_crf : '');
+  document.getElementById('cfg-balanced-gpu-pct').value = (s.balanced_gpu_percent != null ? s.balanced_gpu_percent : '');
   _populateCompSelects();
   _setCompField('vae',        s.vae_path        || '');
   _setCompField('t5xxl',      s.t5xxl_path      || '');
@@ -2513,6 +2629,7 @@ function openCfgModal(idx, cfgIdx){
   _setCompField('clip-vision',s.clip_vision_path|| '');
   _setCompField('lora',       s.lora_path       || '');
   document.getElementById('cfg-lora-dir').value = s.lora_model_dir || '';
+  document.getElementById('cfg-lora-train-base').value = s.lora_train_base_model || '';
   openModal('cfg-modal');
 }
 
@@ -2577,6 +2694,7 @@ async function saveModelConfig(){
     backend:           document.getElementById('cfg-backend').value,
     load_mode:         document.getElementById('cfg-load-mode').value,
     used_vram_gb:      isNaN(usedVram) ? null : usedVram,
+    force_vram_update: document.getElementById('cfg-force-vram-update').checked,
     max_instances:     parseInt(document.getElementById('cfg-max-instances').value) || 1,
     preload_all_instances: document.getElementById('cfg-preload-all-instances').checked,
     n_gpu_layers:      parseInt(document.getElementById('cfg-gpu-layers').value) || -1,
@@ -2585,6 +2703,7 @@ async function saveModelConfig(){
     manual_ram_gb:     isNaN(ramGb) ? null : ramGb,
     load_in_4bit:      document.getElementById('cfg-4bit').checked,
     load_in_8bit:      document.getElementById('cfg-8bit').checked,
+    component_quantization: _collectComponentQuant(),
     flash_attention:   document.getElementById('cfg-flash').checked,
     no_ram:            document.getElementById('cfg-noram').checked,
     offload_strategy:  document.getElementById('cfg-offload-strategy').value,
@@ -2602,10 +2721,15 @@ async function saveModelConfig(){
     clip_vision_path:  _readCompField('clip-vision') || null,
     lora_path:         _readCompField('lora')        || null,
     lora_model_dir:    document.getElementById('cfg-lora-dir').value.trim() || null,
+    lora_train_base_model: document.getElementById('cfg-lora-train-base').value.trim() || null,
     max_vram:          parseFloat(document.getElementById('cfg-max-vram').value) || 0,
     sdcpp_flash_attn:  document.getElementById('cfg-sdcpp-flash').checked,
     sdcpp_diffusion_flash_attn: document.getElementById('cfg-sdcpp-diff-flash').checked,
     vae_tiling:        document.getElementById('cfg-vae-tiling').checked,
+    output_crf:        (document.getElementById('cfg-output-crf').value.trim() === ''
+                          ? null : parseInt(document.getElementById('cfg-output-crf').value)),
+    balanced_gpu_percent: (document.getElementById('cfg-balanced-gpu-pct').value.trim() === ''
+                          ? null : parseFloat(document.getElementById('cfg-balanced-gpu-pct').value)),
   };
   try{
     const r = await fetch(ROOT_PATH + '/admin/api/model-configure',{

@@ -47,6 +47,15 @@ _download_status: dict = {}   # session_id → latest progress state (survives S
 _download_cancelled: set = set()  # session_ids the user has requested to cancel
 
 
+def get_active_download_model_ids() -> set:
+    """Return the set of model IDs whose download is currently in progress."""
+    return {
+        s["model_id"]
+        for s in _download_status.values()
+        if s.get("status") == "downloading"
+    }
+
+
 def _url(request: Request, path: str) -> str:
     """Return a proxy-aware absolute path (root_path prefix + path)."""
     from codai.api.urlutils import get_public_prefix
@@ -54,11 +63,19 @@ def _url(request: Request, path: str) -> str:
 
 
 def _tmpl(request: Request, name: str, ctx: dict = None):
-    """Render a template with root_path injected into the context."""
+    """Render a template with root_path injected into the context.
+
+    Admin pages are served with no-cache headers so template/UI changes are
+    picked up on a normal reload instead of being masked by the browser cache.
+    """
     from codai.api.urlutils import get_public_prefix
     c = ctx or {}
     c.setdefault("root_path", get_public_prefix(request))
-    return templates.TemplateResponse(request, name, c)
+    resp = templates.TemplateResponse(request, name, c)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 def init_session_manager(config_dir: Path, port: int = 0):
@@ -1919,7 +1936,10 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "max_instances", "preload_all_instances", "capabilities",
                 "model_template", "vae_path", "t5xxl_path", "clip_l_path",
                 "clip_g_path", "clip_vision_path", "lora_path", "lora_model_dir",
-                "max_vram", "sdcpp_flash_attn", "sdcpp_diffusion_flash_attn", "vae_tiling"):
+                "lora_train_base_model",
+                "max_vram", "sdcpp_flash_attn", "sdcpp_diffusion_flash_attn", "vae_tiling",
+                "component_quantization", "output_crf", "force_vram_update",
+                "balanced_gpu_percent"):
         if key in data:
             entry[key] = data[key]
 
@@ -1927,7 +1947,27 @@ async def api_model_configure(request: Request, username: str = Depends(require_
     for mtype in model_types:
         config_manager.models_data.setdefault(mtype, []).append(entry)
     config_manager.save_models()
-    return {"success": True}
+
+    # Apply to the running server immediately so config changes (e.g.
+    # lora_train_base_model, vae_path, quant flags) take effect without a
+    # restart. Only the live config dict is updated — loaded weights are left
+    # alone; weight-level changes (quantization) still apply on next (re)load.
+    applied = 0
+    try:
+        from codai.main import apply_model_entry_live, _CATEGORY_TYPE_PREFIX
+        # Drop stale live-config keys for any path we removed (e.g. a rename),
+        # so the running server doesn't keep serving the old entry's config.
+        from codai.models.manager import multi_model_manager as _mmm
+        stale = {p for p in paths_to_remove if p and p != path}
+        if stale:
+            prefixes = {pref for (_t, pref) in _CATEGORY_TYPE_PREFIX.values()}
+            for sp in stale:
+                for pref in prefixes:
+                    _mmm.config.pop(f"{pref}{sp}", None)
+        applied = apply_model_entry_live(entry, model_types)
+    except Exception as e:
+        print(f"  [admin] live config apply failed (restart to apply): {e}")
+    return {"success": True, "applied_live": applied}
 
 
 # --- System endpoints ---
@@ -2010,6 +2050,15 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "enabled": c.archive.enabled,
             "directory": c.archive.directory,
             "retention": c.archive.retention,
+        },
+        "thermal": {
+            "cpu_enabled": c.thermal.cpu_enabled,
+            "gpu_enabled": c.thermal.gpu_enabled,
+            "cpu_high": c.thermal.cpu_high,
+            "cpu_resume": c.thermal.cpu_resume,
+            "gpu_high": c.thermal.gpu_high,
+            "gpu_resume": c.thermal.gpu_resume,
+            "poll_seconds": c.thermal.poll_seconds,
         },
         "broker": {
             "enabled": c.broker.enabled,
@@ -2118,6 +2167,30 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         cfg_dir = str(config_manager.config_dir)
         resolved = raw_dir if raw_dir and _os.path.isabs(raw_dir) else _os.path.join(cfg_dir, raw_dir or "archive")
         archive_manager.configure(c.archive.enabled, resolved, c.archive.retention)
+
+    if "thermal" in data:
+        th = data["thermal"]
+        c.thermal.cpu_enabled = bool(th.get("cpu_enabled", c.thermal.cpu_enabled))
+        c.thermal.gpu_enabled = bool(th.get("gpu_enabled", c.thermal.gpu_enabled))
+        c.thermal.cpu_high = float(th.get("cpu_high", c.thermal.cpu_high))
+        c.thermal.cpu_resume = float(th.get("cpu_resume", c.thermal.cpu_resume))
+        c.thermal.gpu_high = float(th.get("gpu_high", c.thermal.gpu_high))
+        c.thermal.gpu_resume = float(th.get("gpu_resume", c.thermal.gpu_resume))
+        c.thermal.poll_seconds = max(1.0, float(th.get("poll_seconds", c.thermal.poll_seconds)))
+        # Push to the live global_args so changes apply without a restart.
+        try:
+            from codai.api.state import get_global_args
+            ga = get_global_args()
+            if ga is not None:
+                ga.thermal_cpu_enabled = c.thermal.cpu_enabled
+                ga.thermal_gpu_enabled = c.thermal.gpu_enabled
+                ga.thermal_cpu_high = c.thermal.cpu_high
+                ga.thermal_cpu_resume = c.thermal.cpu_resume
+                ga.thermal_gpu_high = c.thermal.gpu_high
+                ga.thermal_gpu_resume = c.thermal.gpu_resume
+                ga.thermal_poll_seconds = c.thermal.poll_seconds
+        except Exception:
+            pass
 
     if "broker" in data:
         bro = data["broker"]
