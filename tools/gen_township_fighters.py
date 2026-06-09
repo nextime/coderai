@@ -1315,7 +1315,12 @@ def _clip_stem_fight(match_name: str, idx: int) -> str:
     return f"{match_name}_clip{idx:02d}"
 
 
-def _clip_stem_outcome(fighter: str, outcome: str) -> str:
+def _clip_stem_outcome(fighter: str, outcome: str, match_name: str = None) -> str:
+    # Per-match outcomes are named "<match>_<fighter>_<outcome>" so each match
+    # has its own (different) outcome scenes. Legacy per-fighter outcomes (no
+    # match_name) keep the old "<fighter>_<outcome>" name.
+    if match_name:
+        return f"{match_name}_{fighter}_{outcome}"
     return f"{fighter}_{outcome}"
 
 
@@ -1448,7 +1453,7 @@ def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: P
             jobs.append((_clip_stem_fight(m["match_name"], c["idx"]),
                          c["prompt"], [m["f1"], m["f2"]], m.get("env")))
     for o in outcome_plan:
-        jobs.append((_clip_stem_outcome(o["fighter"], o["outcome"]),
+        jobs.append((_clip_stem_outcome(o["fighter"], o["outcome"], o.get("match_name")),
                      o["prompt"], [o["fighter"]], o.get("env")))
 
     _log(f"\n  ── Keyframe phase — {len(jobs)} keyframe image(s) (image model) ──")
@@ -1593,6 +1598,27 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
         else:
             break
 
+    # Existing match names on disk so re-runs don't collide with saved matches.
+    _used_names = set()
+    if prompts_file.exists():
+        try:
+            for _m in json.loads(prompts_file.read_text()).get("fight_plan", []):
+                if _m.get("match_name"):
+                    _used_names.add(_m["match_name"])
+        except Exception:
+            pass
+
+    def _unique_match_name(f1, f2):
+        # The same pair (+ environment) can have multiple matches, so names get a
+        # numeric suffix when the base name is already taken.
+        base = f"match_{f1}_vs_{f2}"
+        name, n = base, 2
+        while name in _used_names:
+            name = f"{base}_{n}"
+            n += 1
+        _used_names.add(name)
+        return name
+
     # Fight-match plan: each match holds a list of clip specs.
     fight_plan = []
     for f1, f2 in pairs:
@@ -1616,24 +1642,26 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
             ci += 1
         fight_plan.append({
             "f1": f1, "f2": f2, "env": env, "env_desc": env_desc,
-            "match_name": f"match_{f1}_vs_{f2}",
+            "match_name": _unique_match_name(f1, f2),
             "short_target": short_target, "long_target": long_target,
             "clips": clips_spec,
         })
 
-    # Outcome-clip plan: one clip per fighter per outcome.
+    # Outcome-clip plan: per MATCH, one clip per participating fighter per
+    # outcome — so each match has its own (different) outcome scenes.
     outcomes = ["win", "ko_win", "retire", "draw"]
     outcome_plan = []
-    for fighter in char_names:
-        for outcome in outcomes:
-            env = random.choice(env_names) if env_names else None
-            target_s = random.uniform(10, 15)
-            outcome_plan.append({
-                "fighter": fighter, "outcome": outcome,
-                "env": env, "env_desc": _env_description(env) if env else "African township",
-                "target_s": target_s, "nf": frames_for_seconds(target_s, fps),
-                "shot": None, "prompt": None,
-            })
+    for m in fight_plan:
+        for fighter in (m["f1"], m["f2"]):
+            for outcome in outcomes:
+                target_s = random.uniform(10, 15)
+                outcome_plan.append({
+                    "match_name": m["match_name"],
+                    "fighter": fighter, "outcome": outcome,
+                    "env": m["env"], "env_desc": m["env_desc"],
+                    "target_s": target_s, "nf": frames_for_seconds(target_s, fps),
+                    "shot": None, "prompt": None,
+                })
 
     total_matches = len(fight_plan)
     total_fight_clips = sum(len(m["clips"]) for m in fight_plan)
@@ -1828,7 +1856,7 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
             break
         if rendered_clips > 0:
             time.sleep(clip_delay)
-        clip_name = _clip_stem_outcome(o['fighter'], o['outcome'])
+        clip_name = _clip_stem_outcome(o['fighter'], o['outcome'], o.get('match_name'))
         out_path = str(video_dir / f"{clip_name}.mp4")
         _log(f"\n  [{oi+1}/{total_outcomes}] {clip_name}  ({o['target_s']:.0f}s, env={o['env']})")
         ok, dur, is_fatal = _render(
@@ -2047,6 +2075,8 @@ def launch_web_ui(default_args):
                 _state["jobs"][job_id]["progress"] = pct
                 if msg:
                     _state["jobs"][job_id]["_msg"] = msg
+            if msg:
+                print(f"  [regen {name}] {msg}", flush=True)
 
         def _fail(msg):
             with _jobs_lock:
@@ -2139,6 +2169,8 @@ def launch_web_ui(default_args):
                 _state["jobs"][job_id]["progress"] = max(2, min(99, int(pct)))
                 if msg:
                     _state["jobs"][job_id]["_msg"] = msg
+            if msg:
+                print(f"  [train {name}] {msg}", flush=True)
 
         def _fail(msg):
             with _jobs_lock:
@@ -2241,6 +2273,8 @@ def launch_web_ui(default_args):
                 _state["jobs"][job_id]["progress"] = max(2, min(99, int(pct)))
                 if msg:
                     _state["jobs"][job_id]["_msg"] = msg
+            if msg:
+                print(f"  [match] {msg}", flush=True)
 
         def _fail(msg):
             with _jobs_lock:
@@ -2330,12 +2364,16 @@ def launch_web_ui(default_args):
 
             if scope in ("outcomes", "outcome"):
                 fighter = params.get("fighter")
+                outcome = params.get("outcome")
                 if scope == "outcome":
-                    target = f"{fighter}_{params.get('outcome')}"
                     sel = [o for o in outcome_plan
-                           if _clip_stem_outcome(o["fighter"], o["outcome"]) == target]
+                           if o.get("fighter") == fighter and o.get("outcome") == outcome
+                           and (not match_name or o.get("match_name") == match_name)]
+                elif match_name:
+                    # All outcomes of this match.
+                    sel = [o for o in outcome_plan if o.get("match_name") == match_name]
                 elif fighter:
-                    sel = [o for o in outcome_plan if o["fighter"] == fighter]
+                    sel = [o for o in outcome_plan if o.get("fighter") == fighter]
                 else:
                     sel = list(outcome_plan)
                 if not sel:
@@ -3119,7 +3157,14 @@ async function uploadRefs(kind,name){
                 f'{inner}{script}')
 
     def _scan_matches():
-        """Return (vdir, plan, fight_by_name, matches, outcomes) from disk."""
+        """Return (vdir, plan, fight_by_name, matches, legacy_outcomes).
+
+        Each matches[mn] may hold: finals{short,long}, clips[], outcomes[(fighter,
+        outcome, path)]. Per-match outcomes are files '<match>_<fighter>_<outcome>';
+        legacy per-fighter outcomes ('<fighter>_<outcome>') go to legacy_outcomes.
+        """
+        # Longest outcome first so 'ko_win' isn't matched as 'win'.
+        _oc = sorted(_PROMPT_OUTCOMES, key=len, reverse=True)
         vdir = out_dir / "videos"
         plan = {}
         pf = vdir / "prompts.json"
@@ -3129,7 +3174,7 @@ async function uploadRefs(kind,name){
             except Exception:
                 plan = {}
         fight_by_name = {m.get("match_name"): m for m in plan.get("fight_plan", [])}
-        matches, outcomes = {}, []
+        matches, leftovers = {}, []
         if vdir.exists():
             for v in sorted(vdir.glob("*.mp4")):
                 stem = v.stem
@@ -3140,10 +3185,27 @@ async function uploadRefs(kind,name){
                     mn = stem.split("_clip")[0]
                     matches.setdefault(mn, {}).setdefault("clips", []).append(v)
                 else:
-                    outcomes.append(v)
+                    leftovers.append(v)
         for mn in fight_by_name:
             matches.setdefault(mn, {})
-        return vdir, plan, fight_by_name, matches, outcomes
+
+        # Resolve leftovers into per-match outcomes (longest matching match name
+        # prefix) or legacy per-fighter outcomes.
+        known = sorted(matches.keys(), key=len, reverse=True)
+        legacy_outcomes = []
+        for v in leftovers:
+            stem = v.stem
+            outcome = next((o for o in _oc if stem.endswith("_" + o)), None)
+            if not outcome:
+                continue
+            core = stem[: -(len(outcome) + 1)]   # "<match>_<fighter>" or "<fighter>"
+            mn = next((k for k in known if k and core.startswith(k + "_")), None)
+            if mn:
+                fighter = core[len(mn) + 1:]
+                matches[mn].setdefault("outcomes", []).append((fighter, outcome, v))
+            else:
+                legacy_outcomes.append((core, outcome, v))
+        return vdir, plan, fight_by_name, matches, legacy_outcomes
 
     def _dur_str(p: Path) -> str:
         d = get_video_duration(str(p)) or 0
@@ -3227,6 +3289,7 @@ async function saveMatch(ev, name){
     const el=root.querySelector('[data-field="'+k+'"]'); if(el) fd.append(k, el.value);
   });
   root.querySelectorAll('[data-clip]').forEach(el=>fd.append('clip_'+el.getAttribute('data-clip'), el.value));
+  root.querySelectorAll('[data-outc]').forEach(el=>fd.append('outc_'+el.getAttribute('data-outc'), el.value));
   setSt('#aaa','Saving…');
   try{
     const j=await (await fetch('/matches/save',{method:'POST',body:fd})).json();
@@ -3249,15 +3312,33 @@ async function saveOutputs(ev, fighter){
 }
 </script>"""
 
+    def _match_preview(mn, info):
+        """Lightweight preview thumbnail: clip00 keyframe image if present, else
+        a metadata-only poster of the short/first video. No full video load."""
+        kf = out_dir / "videos" / "keyframes" / f"{mn}_clip00.png"
+        box = "width:128px;height:72px;object-fit:cover;border-radius:5px;background:#111;flex:none"
+        if kf.exists():
+            url = "/media/" + str(kf.relative_to(out_dir)).replace("\\", "/")
+            return f'<img src="{_esc(url)}" loading=lazy style="{box}">'
+        finals = info.get("finals", {})
+        clips = info.get("clips", [])
+        vp = finals.get("short") or finals.get("long") or (sorted(clips, key=lambda p: p.name)[0] if clips else None)
+        if vp:
+            url = "/media/" + str(vp.relative_to(out_dir)).replace("\\", "/")
+            return f'<video src="{_esc(url)}" preload=metadata muted style="{box}"></video>'
+        return (f'<div style="{box};display:flex;align-items:center;justify-content:center;'
+                f'color:#555;font-size:.7rem">no preview</div>')
+
     def _matches_html():
-        """Lightweight LIST of matches + outputs — no embedded video players."""
-        vdir, plan, fight_by_name, matches, outcomes = _scan_matches()
+        """Lightweight LIST of matches (with preview) — videos load on detail."""
+        vdir, plan, fight_by_name, matches, legacy_outcomes = _scan_matches()
 
         def _row(mn):
             info = matches[mn]
             meta = fight_by_name.get(mn, {})
             clips = info.get("clips", [])
             finals = info.get("finals", {})
+            n_out = len(info.get("outcomes", []))
             f1, f2 = meta.get("f1", ""), meta.get("f2", "")
             env = meta.get("env", "")
             title = f"{f1} vs {f2}" if f1 else mn.replace("match_", "").replace("_", " ")
@@ -3265,9 +3346,12 @@ async function saveOutputs(ev, fighter){
             return (
                 f'<div class=card id="row-{_esc(mn)}" '
                 f'style="display:flex;align-items:center;gap:.8rem;padding:.7rem 1rem">'
-                f'  <div style="flex:1">'
+                f'  {_match_preview(mn, info)}'
+                f'  <div style="flex:1;min-width:0">'
                 f'    <div class=pf-name style="font-size:.98rem">🥊 {_esc(title)}</div>'
-                f'    <div class=hint>{_esc(env) or "no env"} · {len(clips)} clip(s) · finals: {_esc(fin)}</div>'
+                f'    <div class=hint>{_esc(env) or "no env"} · {len(clips)} clip(s) · '
+                f'{n_out} outcome(s) · finals: {_esc(fin)}</div>'
+                f'    <div class=hint style="opacity:.6">{_esc(mn)}</div>'
                 f'  </div>'
                 f'  <span class=match-status style="font-size:.74rem;color:#7ea8f7"></span>'
                 f'  <a class="btn btn-primary" style="font-size:.8rem;padding:.35rem .9rem" '
@@ -3279,31 +3363,27 @@ async function saveOutputs(ev, fighter){
 
         match_rows = "".join(_row(mn) for mn in sorted(matches))
 
-        # Outputs: one lightweight row per fighter linking to its detail.
-        out_by_fighter = {}
-        for v in outcomes:
-            fighter = v.stem.rsplit("_", 1)[0] if "_" in v.stem else v.stem
-            out_by_fighter.setdefault(fighter, []).append(v)
-        out_rows = "".join(
-            f'<div class=card id="orow-{_esc(fr)}" '
-            f'style="display:flex;align-items:center;gap:.8rem;padding:.7rem 1rem">'
-            f'  <div style="flex:1"><div class=pf-name style="font-size:.95rem">🎬 {_esc(fr)} — outputs</div>'
-            f'  <div class=hint>{len(vs)} clip(s)</div></div>'
-            f'  <span class=match-status style="font-size:.74rem;color:#7ea8f7"></span>'
-            f'  <a class="btn btn-primary" style="font-size:.8rem;padding:.35rem .9rem" '
-            f'href="/match?fighter={_esc(fr)}">Open ▸</a>'
-            f'  <button class="btn btn-danger" style="font-size:.8rem;padding:.35rem .8rem" '
-            f'onclick="delVid(event,\'outputs\',{{fighter:\'{_esc(fr)}\'}})">🗑 Remove videos</button>'
-            f'</div>'
-            for fr, vs in sorted(out_by_fighter.items())
-        )
+        # Legacy per-fighter outcome files (from older runs) — simple list.
+        leg_rows = ""
+        if legacy_outcomes:
+            cells = "".join(
+                f'<div class=card style="display:flex;align-items:center;gap:.6rem;padding:.5rem .8rem">'
+                f'  <div style="flex:1"><span class=pf-name style="font-size:.9rem">{_esc(core)}</span>'
+                f'  <span class=hint> · {_esc(outcome)}</span></div>'
+                f'  <a class="btn btn-secondary" style="font-size:.78rem;padding:.25rem .7rem" '
+                f'href="/media/videos/{_esc(p.name)}" target=_blank>▶ View</a>'
+                f'  <button class="btn btn-danger" style="font-size:.78rem;padding:.25rem .7rem" '
+                f'onclick="delVid(event,\'file\',{{file:\'{_esc(p.name)}\'}})">🗑</button>'
+                f'</div>'
+                for core, outcome, p in sorted(legacy_outcomes, key=lambda t: t[2].name)
+            )
+            leg_rows = ('<div class=section-title style="margin:1.1rem 0 .4rem">'
+                        'Legacy per-fighter outputs</div>' + cells)
 
         body = ""
         if match_rows:
             body += '<div class=section-title style="margin:.3rem 0 .4rem">Matches</div>' + match_rows
-        if out_rows:
-            body += ('<div class=section-title style="margin:1.1rem 0 .4rem">Outcome clips (outputs)</div>'
-                     + out_rows)
+        body += leg_rows
         if not body:
             body = ('<div class=card style="color:#666">No matches found yet. Render '
                     'videos from the Run page first (or run the Videos step).</div>')
@@ -3312,74 +3392,14 @@ async function saveOutputs(ev, fighter){
                 f'<h1>Matches</h1>'
                 f'<a href="/matches" class="btn btn-secondary" style="font-size:.8rem">↻ Refresh</a></div>'
                 f'<p class=hint style="margin-bottom:.8rem">Select a match to view, edit and '
-                f'regenerate its videos. Videos are only loaded on the detail page.</p>'
+                f'regenerate its clips, finals and outcomes. Videos load on the detail page.</p>'
                 f'{body}{_match_js}')
 
     def _match_detail_html(name=None, fighter=None):
-        """Detail view for a single match (or a fighter's outputs): embeds that
-        item's videos only, with edit + regenerate + remove controls."""
-        vdir, plan, fight_by_name, matches, outcomes = _scan_matches()
+        """Detail view for a single match: embeds that match's videos only, with
+        edit + regenerate + remove for its clips, finals and outcomes."""
+        vdir, plan, fight_by_name, matches, legacy_outcomes = _scan_matches()
         back = ('<a href="/matches" style="font-size:.85rem">‹ Back to matches</a>')
-
-        # ── Fighter outputs detail ─────────────────────────────────────────────
-        if fighter:
-            vids = sorted((v for v in outcomes if v.stem.rsplit("_", 1)[0] == fighter),
-                          key=lambda p: p.name)
-            o_by_outcome = {o["outcome"]: o for o in plan.get("outcome_plan", [])
-                            if o.get("fighter") == fighter}
-            tiles = []
-            seen = set()
-            for v in vids:
-                outcome = v.stem.split("_", 1)[-1]
-                seen.add(outcome)
-                o = o_by_outcome.get(outcome, {})
-                tiles.append(
-                    f'<div class=card style="width:280px">'
-                    f'  <div class=pf-name style="font-size:.9rem">{_esc(outcome)}</div>'
-                    f'  {_vid_tag(v, 150)}'
-                    f'  <label>Prompt</label>'
-                    f'  <textarea data-out="{_esc(outcome)}" rows=2>{_esc(o.get("prompt",""))}</textarea>'
-                    f'  <div class=pf-actions style="margin-top:.4rem">'
-                    f'    <button class="btn btn-secondary" style="font-size:.78rem;padding:.3rem .7rem" '
-                    f'onclick="reMatch(event,\'outcome\',{{fighter:\'{_esc(fighter)}\',outcome:\'{_esc(outcome)}\'}})">♻ Re-render</button>'
-                    f'    <button class="btn btn-danger" style="font-size:.78rem;padding:.3rem .7rem" '
-                    f'onclick="delVid(event,\'output\',{{fighter:\'{_esc(fighter)}\',outcome:\'{_esc(outcome)}\'}})">🗑 Remove</button>'
-                    f'  </div>'
-                    f'</div>'
-                )
-            # Planned outcomes without a rendered file yet (edit prompt + render).
-            for outcome, o in o_by_outcome.items():
-                if outcome in seen:
-                    continue
-                tiles.append(
-                    f'<div class=card style="width:280px">'
-                    f'  <div class=pf-name style="font-size:.9rem">{_esc(outcome)} '
-                    f'<span class=hint>(not rendered)</span></div>'
-                    f'  <label>Prompt</label>'
-                    f'  <textarea data-out="{_esc(outcome)}" rows=2>{_esc(o.get("prompt",""))}</textarea>'
-                    f'  <div class=pf-actions style="margin-top:.4rem">'
-                    f'    <button class="btn btn-secondary" style="font-size:.78rem;padding:.3rem .7rem" '
-                    f'onclick="reMatch(event,\'outcome\',{{fighter:\'{_esc(fighter)}\',outcome:\'{_esc(outcome)}\'}})">▶ Render</button>'
-                    f'  </div>'
-                    f'</div>'
-                )
-            tiles_html = "".join(tiles) or '<span class=hint>No outputs for this fighter.</span>'
-            return (
-                f'<div id=detail>{back}'
-                f'<div style="display:flex;justify-content:space-between;align-items:center;margin:.4rem 0">'
-                f'<h1>🎬 {_esc(fighter)} — outputs</h1>'
-                f'<span id=detail-status style="font-size:.8rem;color:#7ea8f7"></span></div>'
-                f'<div class=pf-actions style="margin-bottom:.8rem">'
-                f'  <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
-                f'onclick="saveOutputs(event,\'{_esc(fighter)}\')">💾 Save prompts</button>'
-                f'  <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
-                f'onclick="reMatch(event,\'outcomes\',{{fighter:\'{_esc(fighter)}\'}})">♻ Re-render all outputs</button>'
-                f'  <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
-                f'onclick="delVid(event,\'outputs\',{{fighter:\'{_esc(fighter)}\'}})">🗑 Remove all outputs</button>'
-                f'</div>'
-                f'<div style="display:flex;gap:.7rem;flex-wrap:wrap">{tiles_html}</div>'
-                f'</div>{_match_js}'
-            )
 
         # ── Match detail ───────────────────────────────────────────────────────
         if not name or name not in matches:
@@ -3433,6 +3453,43 @@ async function saveOutputs(ev, fighter){
             )
         clip_tiles_html = "".join(clip_tiles) or '<span class=hint>No clips planned.</span>'
 
+        # ── Outcomes for this match (per participating fighter) ────────────────
+        rendered_out = {(fr, oc): p for (fr, oc, p) in info.get("outcomes", [])}
+        plan_out = {(o["fighter"], o["outcome"]): o for o in plan.get("outcome_plan", [])
+                    if o.get("match_name") == name}
+        out_fighters = [x for x in (f1, f2) if x]
+        # Include any fighters that appear in rendered/planned outcomes but not in meta.
+        for (fr, _oc) in list(rendered_out) + list(plan_out):
+            if fr not in out_fighters:
+                out_fighters.append(fr)
+        outcome_groups = []
+        for fr in out_fighters:
+            tiles = []
+            for oc in _PROMPT_OUTCOMES:
+                p = rendered_out.get((fr, oc))
+                o = plan_out.get((fr, oc), {})
+                vid = _vid_tag(p, 110) if p else '<div class=hint>not rendered</div>'
+                rm = (f'<button class="btn btn-danger" style="font-size:.72rem;padding:.2rem .55rem" '
+                      f'onclick="delVid(event,\'output\',{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\',outcome:\'{_esc(oc)}\'}})">🗑</button>'
+                      if p else '')
+                act = "re-render" if p else "render"
+                tiles.append(
+                    f'<div class=card style="width:215px">'
+                    f'  <div class=hint style="display:flex;justify-content:space-between;align-items:center">'
+                    f'<span>{_esc(oc)}</span>'
+                    f'<span><a href="#" style="color:#7eb8f7" '
+                    f'onclick="reMatch(event,\'outcome\',{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\',outcome:\'{_esc(oc)}\'}})">{act}</a> {rm}</span></div>'
+                    f'  {vid}'
+                    f'  <textarea data-outc="{_esc(fr)}|{_esc(oc)}" rows=2 style="margin-top:.3rem">{_esc(o.get("prompt",""))}</textarea>'
+                    f'</div>'
+                )
+            outcome_groups.append(
+                f'<div style="margin-top:.5rem"><div class=hint style="font-weight:700;color:#bbb">'
+                f'{_esc(fr)}</div>'
+                f'<div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.25rem">{"".join(tiles)}</div></div>'
+            )
+        outcomes_html = "".join(outcome_groups) or '<span class=hint>No outcomes planned for this match.</span>'
+
         return (
             f'<div id=detail>{back}'
             f'<div style="display:flex;justify-content:space-between;align-items:center;margin:.4rem 0">'
@@ -3458,6 +3515,8 @@ async function saveOutputs(ev, fighter){
             f'onclick="reMatch(event,\'match-clips\',{{match:\'{_esc(name)}\'}})">♻ Re-render all clips</button>'
             f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="reMatch(event,\'reassemble\',{{match:\'{_esc(name)}\'}})">🎞 Reassemble finals</button>'
+            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="reMatch(event,\'outcomes\',{{match:\'{_esc(name)}\'}})">♻ Re-render all outcomes</button>'
             f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="delVid(event,\'match\',{{match:\'{_esc(name)}\'}})">🗑 Remove all videos</button>'
             f'  </div>'
@@ -3467,6 +3526,9 @@ async function saveOutputs(ev, fighter){
             f'<div class=section-title style="margin:.9rem 0 .3rem">Single clips '
             f'<span class=hint>(edit prompt, then Save match + Re-render)</span></div>'
             f'<div style="display:flex;gap:.6rem;flex-wrap:wrap">{clip_tiles_html}</div>'
+            f'<div class=section-title style="margin:.9rem 0 .3rem">Outcomes '
+            f'<span class=hint>(per fighter — edit prompt, Save match, then Re-render)</span></div>'
+            f'{outcomes_html}'
             f'</div>{_match_js}'
         )
 
@@ -3489,16 +3551,18 @@ async function saveOutputs(ev, fighter){
         body = (
             f'<div id=pf-root>'
             f'<div class=card>'
-            f'  <h2>LLM system prompts</h2>'
-            f'  <p class=hint style="margin-bottom:.4rem">Used to instruct the text model when '
-            f'writing clip / outcome prompts (when a text model is enabled).</p>'
-            f'  <label>Fight-shot system prompt</label>{ta("llm_system", cfg["llm_system"], 5)}'
-            f'  <label>Outcome system prompt</label>{ta("llm_outcome_system", cfg["llm_outcome_system"], 4)}'
+            f'  <h2>Master prompts (LLM)</h2>'
+            f'  <p class=hint style="margin-bottom:.4rem">These are the <b>master prompts</b> the text '
+            f'model follows to write a <b>unique</b> prompt for every clip and every outcome of every '
+            f'match (so no two matches/outcomes are identical). A text model must be enabled.</p>'
+            f'  <label>Fight-shot master prompt</label>{ta("llm_system", cfg["llm_system"], 5)}'
+            f'  <label>Outcome master prompt</label>{ta("llm_outcome_system", cfg["llm_outcome_system"], 4)}'
             f'</div>'
             f'<div class=card>'
             f'  <h2>Static fallback templates</h2>'
-            f'  <p class=hint style="margin-bottom:.4rem">Used when no text model is available '
-            f'(one template per line).</p>'
+            f'  <p class=hint style="margin-bottom:.4rem">Only used when <b>no text model</b> is '
+            f'available — these are identical across matches, so enable a text model for per-match '
+            f'variety. One template per line.</p>'
             f'  <label>Fight-shot templates <span class=hint>(one per line)</span></label>'
             f'  {ta("fight_shot_templates", chr(10).join(cfg["fight_shot_templates"]), 8)}'
             f'  {outcome_blocks}'
@@ -4096,6 +4160,26 @@ async function pollJob(){
                             key = f"clip_{c['idx']}"
                             if key in form:
                                 c["prompt"] = _fv(key)
+                        # Outcome prompts for this match: keys "outc_<fighter>|<outcome>".
+                        for fk in list(form.keys()):
+                            if not fk.startswith("outc_"):
+                                continue
+                            spec = fk[5:]
+                            fr_o, _, oc_o = spec.rpartition("|")
+                            if not fr_o or not oc_o:
+                                continue
+                            o = next((x for x in data.get("outcome_plan", [])
+                                      if x.get("match_name") == nm
+                                      and x.get("fighter") == fr_o
+                                      and x.get("outcome") == oc_o), None)
+                            if o is None:
+                                # Create the entry so the prompt is kept even if the
+                                # plan didn't have it yet.
+                                o = {"match_name": nm, "fighter": fr_o, "outcome": oc_o,
+                                     "env": m.get("env"), "env_desc": _env_description(m.get("env"))
+                                     if m.get("env") else "African township"}
+                                data.setdefault("outcome_plan", []).append(o)
+                            o["prompt"] = _fv(fk)
                     elif mode == "outputs":
                         fr = _fv("fighter")
                         if not _safe(fr):
@@ -4144,20 +4228,41 @@ async function pollJob(){
                     mn = _fv("match")
                     if not _safe(mn):
                         self._send(400, "application/json", _j.dumps({"error": "invalid match"})); return
-                    for p in vdir.glob(f"{mn}_*.mp4"):
-                        _rm(p)
+                    # Use the scanner so a sibling match (e.g. "<mn>_2") is not
+                    # caught by a naive "<mn>_*" glob.
+                    _, _, _, _matches_map, _ = _scan_matches()
+                    _info = _matches_map.get(mn, {})
+                    for _p in list(_info.get("finals", {}).values()):
+                        _rm(_p)
+                    for _p in _info.get("clips", []):
+                        _rm(_p)
+                    for (_f, _o, _p) in _info.get("outcomes", []):
+                        _rm(_p)
                 elif scope == "output":
-                    fr, oc = _fv("fighter"), _fv("outcome")
+                    mn, fr, oc = _fv("match"), _fv("fighter"), _fv("outcome")
                     if not _safe(fr) or not _safe(oc):
                         self._send(400, "application/json", _j.dumps({"error": "invalid args"})); return
-                    _rm(vdir / f"{fr}_{oc}.mp4")
+                    if mn and _safe(mn):
+                        _rm(vdir / f"{mn}_{fr}_{oc}.mp4")        # per-match outcome
+                    else:
+                        _rm(vdir / f"{fr}_{oc}.mp4")             # legacy per-fighter
                 elif scope == "outputs":
-                    fr = _fv("fighter")
-                    if not _safe(fr):
-                        self._send(400, "application/json", _j.dumps({"error": "invalid fighter"})); return
-                    for p in vdir.glob(f"{fr}_*.mp4"):
-                        if "_clip" not in p.stem and not p.stem.startswith("match_"):
-                            _rm(p)
+                    mn, fr = _fv("match"), _fv("fighter")
+                    if mn and _safe(mn):
+                        _, _, _, _matches_map, _ = _scan_matches()
+                        for (_f, _o, _p) in _matches_map.get(mn, {}).get("outcomes", []):
+                            _rm(_p)
+                    elif fr and _safe(fr):
+                        for p in vdir.glob(f"{fr}_*.mp4"):
+                            if "_clip" not in p.stem and not p.stem.startswith("match_"):
+                                _rm(p)
+                    else:
+                        self._send(400, "application/json", _j.dumps({"error": "invalid args"})); return
+                elif scope == "file":
+                    fn = _fv("file")
+                    if not _safe(fn) or not fn.endswith(".mp4"):
+                        self._send(400, "application/json", _j.dumps({"error": "invalid file"})); return
+                    _rm(vdir / fn)
                 else:
                     self._send(400, "application/json", _j.dumps({"error": "invalid scope"})); return
                 self._send(200, "application/json", _j.dumps({"ok": True, "removed": removed}))
