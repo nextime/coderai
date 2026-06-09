@@ -944,11 +944,27 @@ def main():
         logging.getLogger("websockets.client").setLevel(logging.WARNING)
         logging.getLogger("websockets.server").setLevel(logging.WARNING)
         logging.getLogger("codai.broker.client").setLevel(logging.INFO)
-    # Per-request HTTP access lines (uvicorn.access) are noisy — e.g. the web UI
-    # polls /v1/loras/progress every ~1.5s. Suppress them unless --debug-web.
+    # Some endpoints are polled constantly (e.g. the web UI hits
+    # /v1/loras/progress every ~1.5s), flooding the access log. Drop ONLY those
+    # noisy polling paths from uvicorn.access unless --debug-web is set; all other
+    # API request lines keep showing. A logger filter survives uvicorn's own
+    # configure_logging (which resets the access logger LEVEL at startup).
     _debug_web = getattr(args, 'debug_web', False)
     if not _debug_web:
-        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+        class _AccessNoiseFilter(logging.Filter):
+            # uvicorn.access record args: (client_addr, method, full_path, http_ver, status)
+            _NOISY = ("/v1/loras/progress",)
+            def filter(self, record):
+                try:
+                    args = record.args
+                    if isinstance(args, (tuple, list)) and len(args) >= 3:
+                        path = str(args[2]).split("?", 1)[0]
+                        if any(path == p or path.startswith(p) for p in self._NOISY):
+                            return False
+                except Exception:
+                    pass
+                return True
+        logging.getLogger("uvicorn.access").addFilter(_AccessNoiseFilter())
 
     # Start the server
     import uvicorn
