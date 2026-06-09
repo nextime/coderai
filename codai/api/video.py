@@ -1218,6 +1218,26 @@ def _unload_video_loras(pipe):
         pass
 
 
+def _present_adapters(pipe) -> set:
+    """Adapter names actually registered on the pipe's PEFT-capable components.
+
+    After load_lora_weights, an adapter only appears here if the LoRA state dict
+    had keys matching that component. An SD/SDXL UNet LoRA loaded onto a video DiT
+    (e.g. WanTransformer3DModel) matches nothing, so its name never shows up.
+    """
+    present = set()
+    for attr in ('transformer', 'transformer_2', 'unet', 'prior',
+                 'text_encoder', 'text_encoder_2'):
+        comp = getattr(pipe, attr, None)
+        pc = getattr(comp, 'peft_config', None)
+        if pc:
+            try:
+                present |= set(pc.keys())
+            except Exception:
+                pass
+    return present
+
+
 def _lora_signature(loras) -> tuple:
     """Normalized identity of a requested LoRA set: ((model, name, weight), ...).
 
@@ -1261,20 +1281,41 @@ def _sync_video_loras(pipe, loras) -> None:
     if not hasattr(pipe, 'load_lora_weights'):
         print("  [video][lora] pipeline does not support LoRA — skipping")
         return
-    names, weights = [], []
-    try:
-        for model, name, w in desired:
+    # Remember this request as the active set even if some adapters turn out
+    # incompatible, so identical follow-up clips don't re-attempt the same load.
+    pipe._coderai_active_loras = desired
+    model_cls = type(getattr(pipe, 'transformer', None)
+                      or getattr(pipe, 'unet', None) or pipe).__name__
+    loaded = []  # (name, weight) that actually registered on the model
+    before = _present_adapters(pipe)
+    for model, name, w in desired:
+        try:
             pipe.load_lora_weights(model, adapter_name=name)
-            names.append(name)
-            weights.append(w)
-        if names:
-            pipe.set_adapters(names, weights)
-            pipe._coderai_active_loras = desired
-            print(f"  [video][lora] applied: {names} weights={weights}")
-    except Exception as e:
-        print(f"  [video][lora] could not apply LoRA weights: {e}")
-        # Partial load — clear so the next request starts clean.
+        except Exception as e:
+            print(f"  [video][lora] failed to load '{name}': {e}")
+            continue
+        now = _present_adapters(pipe)
+        if name in now and name not in before:
+            loaded.append((name, w))
+            before = now
+        else:
+            # Keys matched nothing on this architecture (e.g. an SD/SDXL image
+            # LoRA on a Wan video transformer). Skip it; it would not affect output.
+            print(f"  [video][lora] '{name}' has no weights matching {model_cls} "
+                  f"— skipping (incompatible LoRA for this video model)")
+    if not loaded:
+        print("  [video][lora] no compatible adapters — generating without LoRA")
         _unload_video_loras(pipe)
+        pipe._coderai_active_loras = desired  # _unload reset it; restore for dedup
+        return
+    try:
+        pipe.set_adapters([n for n, _ in loaded], [w for _, w in loaded])
+        print(f"  [video][lora] applied: {[n for n, _ in loaded]} "
+              f"weights={[w for _, w in loaded]}")
+    except Exception as e:
+        print(f"  [video][lora] could not activate LoRA weights: {e}")
+        _unload_video_loras(pipe)
+        pipe._coderai_active_loras = desired
 
 
 def _run_pipeline(pipe, kw: dict):
