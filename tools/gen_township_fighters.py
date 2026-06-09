@@ -2079,7 +2079,8 @@ def launch_web_ui(default_args):
         with _jobs_lock:
             _state["jobs"][job_id] = {"status": "running", "progress": 3,
                                       "output": None, "error": None,
-                                      "_msg": "starting…", "added": 0}
+                                      "_msg": "starting…", "added": 0,
+                                      "kind": kind, "name": name, "jtype": "regen"}
 
         def _prog(pct, msg=""):
             with _jobs_lock:
@@ -2173,7 +2174,8 @@ def launch_web_ui(default_args):
         with _jobs_lock:
             _state["jobs"][job_id] = {"status": "running", "progress": 2,
                                       "output": None, "error": None,
-                                      "_msg": "starting…"}
+                                      "_msg": "starting…",
+                                      "kind": kind, "name": name, "jtype": "train"}
 
         def _prog(pct, msg=""):
             with _jobs_lock:
@@ -3126,7 +3128,9 @@ async function regenProfile(kind,name){
     j=await r.json();
   }catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; return; }
   if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
-  const jobId=j.job_id;
+  pollRegen(j.job_id, st);
+}
+function pollRegen(jobId, st){
   st.style.color='#7ea8f7';
   const poll=async()=>{
     let d;
@@ -3160,7 +3164,9 @@ async function trainLora(kind,name){
   try{ j=await (await fetch('/profile/train-lora',{method:'POST',body:fd})).json(); }
   catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; return; }
   if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
-  const jobId=j.job_id;
+  pollTrain(j.job_id, st);
+}
+function pollTrain(jobId, st){
   st.style.color='#7ea8f7';
   const poll=async()=>{
     let d;
@@ -3175,6 +3181,25 @@ async function trainLora(kind,name){
   };
   setTimeout(poll,900);
 }
+// On page load, re-attach progress to any regen/train job still running so a
+// reload doesn't lose the live progress display.
+async function resumeActiveJobs(){
+  let data;
+  try{ data=await (await fetch('/active-jobs')).json(); }
+  catch(e){ return; }
+  (data.jobs||[]).forEach(j=>{
+    const root=document.getElementById('pf-'+j.kind+'-'+j.name);
+    if(!root) return;
+    if(j.jtype==='regen'){
+      const st=root.querySelector('.pf-regen-status');
+      if(st){ st.textContent='⏳ '+(j._msg||'working…'); pollRegen(j.job_id, st); }
+    } else if(j.jtype==='train'){
+      const st=root.querySelector('.pf-lora-status');
+      if(st){ st.textContent='⏳ '+(j._msg||'training…'); pollTrain(j.job_id, st); }
+    }
+  });
+}
+document.addEventListener('DOMContentLoaded', resumeActiveJobs);
 async function uploadRefs(kind,name){
   const root=document.getElementById('pf-'+kind+'-'+name);
   const inp=root.querySelector('[data-upload=files]');
@@ -3967,6 +3992,24 @@ async function pollJob(){
                 with _jobs_lock:
                     job = dict(_state["jobs"].get(job_id, {"status": "not_found"}))
                 self._send(200, "application/json", _j.dumps(job))
+
+            elif path == "/active-jobs":
+                # Running regen/train jobs, so a reloaded Characters/Environments
+                # page can re-attach its progress display to in-flight work.
+                import json as _j
+                active = []
+                with _jobs_lock:
+                    for jid, j in _state["jobs"].items():
+                        if j.get("status") == "running" and j.get("jtype") in ("regen", "train"):
+                            active.append({
+                                "job_id": jid,
+                                "kind": j.get("kind"),
+                                "name": j.get("name"),
+                                "jtype": j.get("jtype"),
+                                "progress": j.get("progress", 0),
+                                "_msg": j.get("_msg", ""),
+                            })
+                self._send(200, "application/json", _j.dumps({"jobs": active}))
 
             elif path.startswith("/media/"):
                 rel = path[len("/media/"):]
