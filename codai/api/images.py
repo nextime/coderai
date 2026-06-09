@@ -737,11 +737,23 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
     # Try to encode the prompt once and reuse the embeddings.
     # Falls back to passing the plain text prompt if encoding fails.
     # ------------------------------------------------------------------
-    model_id = getattr(pipeline, 'model_name_or_path', None) or str(type(pipeline).__name__)
+    # Bind the cache entry to this specific *loaded* pipeline instance, so a
+    # reload (the model-swapping workflow does this constantly) is a guaranteed
+    # cache miss instead of feeding stale GPU tensors into a fresh pipeline.
+    _pipe_cls = str(type(pipeline).__name__)
+    _model_name = getattr(pipeline, 'model_name_or_path', None) or _pipe_cls
+    model_id = f"{_model_name}#{id(pipeline)}"
     neg_prompt = getattr(request, 'negative_prompt', None) or ""
     do_cfg = cfg_scale > 1.0
 
-    cached_embeds = _embed_cache.get(request.prompt, neg_prompt, model_id)
+    # Some pipelines (Z-Image) return prompt embeddings as *per-sample lists*
+    # rather than stacked tensors, and the pipeline consumes/extends those
+    # lists during a run.  Reusing them on a later request corrupts the batch
+    # dimension (`assert len(size) == bsz` in the Z-Image transformer's
+    # unpatchify).  These are not safe to cache, so encode fresh every time.
+    _embed_cacheable = "ZImage" not in _pipe_cls
+
+    cached_embeds = _embed_cache.get(request.prompt, neg_prompt, model_id) if _embed_cacheable else None
     embed_kwargs = {}
     cache_hit = False
 
@@ -749,6 +761,11 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
         embed_kwargs = cached_embeds
         cache_hit = True
         print(f"Prompt embed cache HIT for model '{model_id}'")
+    elif not _embed_cacheable:
+        # Z-Image et al.: don't pre-encode at all.  Leaving embed_kwargs empty
+        # makes the call below pass the raw prompt, so the pipeline runs its own
+        # native encode + batching (the only path that survives reuse here).
+        pass
     else:
         # Try to encode and cache
         try:
@@ -781,7 +798,7 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
                         'pooled_prompt_embeds': enc[2],
                         'negative_pooled_prompt_embeds': enc[3],
                     }
-                if embed_kwargs:
+                if embed_kwargs and _embed_cacheable:
                     _embed_cache.put(request.prompt, neg_prompt, model_id, embed_kwargs)
                     print(f"Prompt embed cache STORE for model '{model_id}'")
         except Exception as e:

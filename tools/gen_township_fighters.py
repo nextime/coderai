@@ -695,11 +695,13 @@ class CoderAIClient:
     def train_lora(self, name: str, base_model: str, character: str = None,
                    environment: str = None, images: list = None,
                    steps: int = 800, rank: int = 16,
-                   resolution: int = 512) -> dict:
+                   resolution: int = 512, train_base_model: str = None) -> dict:
         """Train a per-character or per-environment LoRA on the server.
         Blocks until complete."""
         body = {"name": name, "base_model": base_model,
                 "steps": int(steps), "rank": int(rank), "resolution": int(resolution)}
+        if train_base_model:
+            body["train_base_model"] = train_base_model
         if character:
             body["character"] = character
         if environment:
@@ -1222,6 +1224,7 @@ CONFIG_FIELDS = [
     "only_prompts", "only_videos",
     "consistency", "keyframe_steps", "keyframe_size",
     "character_strength", "lora_steps", "lora_rank", "lora_weight",
+    "lora_train_base_model",
     "no_env_loras", "env_lora_steps", "env_lora_rank", "env_lora_weight",
     "web_port",
 ]
@@ -1354,12 +1357,16 @@ _LORA_KINDS = {
 
 def _train_profile_loras(client: CoderAIClient, image_model: str, out_dir: Path,
                          names: list, kind: str,
-                         lora_steps: int = 800, lora_rank: int = 16) -> dict:
+                         lora_steps: int = 800, lora_rank: int = 16,
+                         train_base_model: str = None) -> dict:
     """Train one identity LoRA per profile of `kind` (server-side).
 
     Returns {name: lora_path}. Resumable: skips profiles whose LoRA already
     exists locally (<kind>_loras.json) or on the server. All training is grouped
     here so the image base model is touched once for the whole batch.
+
+    `train_base_model` overrides the model the LoRA is *trained* against (must be
+    a UNet-based SD1.x/SDXL model); `image_model` stays the generation model.
     """
     spec = _LORA_KINDS[kind]
     _log("\n" + "═" * 60)
@@ -1400,6 +1407,8 @@ def _train_profile_loras(client: CoderAIClient, image_model: str, out_dir: Path,
              f"({lora_steps} steps, rank {lora_rank}) — this can take a while…")
         train_kwargs = dict(name=lora_name, base_model=image_model,
                             steps=lora_steps, rank=lora_rank)
+        if train_base_model:
+            train_kwargs["train_base_model"] = train_base_model
         train_kwargs[kind] = name  # character=name OR environment=name
         try:
             res = _run_with_spinner(
@@ -1421,17 +1430,19 @@ def _train_profile_loras(client: CoderAIClient, image_model: str, out_dir: Path,
 
 
 def stage_loras(client: CoderAIClient, image_model: str, out_dir: Path,
-                char_names: list, lora_steps: int = 800, lora_rank: int = 16) -> dict:
+                char_names: list, lora_steps: int = 800, lora_rank: int = 16,
+                train_base_model: str = None) -> dict:
     """Train one identity LoRA per fighter. Returns {fighter: lora_path}."""
     return _train_profile_loras(client, image_model, out_dir, char_names,
-                                "character", lora_steps, lora_rank)
+                                "character", lora_steps, lora_rank, train_base_model)
 
 
 def stage_env_loras(client: CoderAIClient, image_model: str, out_dir: Path,
-                    env_names: list, lora_steps: int = 800, lora_rank: int = 16) -> dict:
+                    env_names: list, lora_steps: int = 800, lora_rank: int = 16,
+                    train_base_model: str = None) -> dict:
     """Train one identity LoRA per environment. Returns {environment: lora_path}."""
     return _train_profile_loras(client, image_model, out_dir, env_names,
-                                "environment", lora_steps, lora_rank)
+                                "environment", lora_steps, lora_rank, train_base_model)
 
 
 def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: Path,
@@ -2208,6 +2219,9 @@ def launch_web_ui(default_args):
                 try:
                     kwargs = dict(name=lora_name, base_model=model,
                                   steps=int(steps), rank=int(rank))
+                    _tbm = getattr(default_args, "lora_train_base_model", None) or None
+                    if _tbm:
+                        kwargs["train_base_model"] = _tbm
                     kwargs[kind] = name
                     result["res"] = client.train_lora(**kwargs)
                 except Exception as e:
@@ -2717,6 +2731,11 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
     </div>
   </div>
   <div id=lora_fields style="margin-top:.6rem">
+    <div><label>LoRA training base model <span class=hint>(SD1.x/SDXL — leave empty to train on the image model)</span></label>
+         <input name=lora_train_base_model type=text style="width:100%"
+                placeholder="e.g. stabilityai/stable-diffusion-xl-base-1.0"
+                value="{_v('lora_train_base_model','')}"></div>
+    <p class=hint style="margin:.2rem 0 .6rem">Z-Image / Flux / SD3 image models can't be LoRA-trained directly. Set a UNet-based SD1.x or SDXL model here to train identity LoRAs while still generating with the image model above.</p>
     <label style="margin-top:0">Character LoRAs <span class=hint>(per-fighter identity)</span></label>
     <div class=row3>
       <div><label>LoRA train steps</label>
@@ -4499,6 +4518,7 @@ async function pollJob(){
                     "lora_steps": int(_fv("lora_steps", "800") or 800),
                     "lora_rank": int(_fv("lora_rank", "16") or 16),
                     "lora_weight": float(_fv("lora_weight", "0.85") or 0.85),
+                    "lora_train_base_model": _s(_fv("lora_train_base_model")) or "",
                     "no_env_loras": "env_loras" not in form,
                     "env_lora_steps": int(_fv("env_lora_steps", "800") or 800),
                     "env_lora_rank": int(_fv("env_lora_rank", "16") or 16),
@@ -4520,7 +4540,7 @@ async function pollJob(){
                 # immediately, so subsequent per-profile jobs (regenerate, train
                 # LoRA) and runs use them — not the values from script launch.
                 for _k in ("base_url", "api_key", "image_model",
-                           "video_model", "text_model"):
+                           "video_model", "text_model", "lora_train_base_model"):
                     setattr(default_args, _k, cfg.get(_k))
                 _web_log(f"  ⚙ Settings applied (image model: "
                          f"{cfg.get('image_model') or 'auto'})")
@@ -4628,6 +4648,7 @@ async function pollJob(){
             ns.lora_steps        = int(_fv("lora_steps", "800"))
             ns.lora_rank         = int(_fv("lora_rank", "16"))
             ns.lora_weight       = float(_fv("lora_weight", "0.85"))
+            ns.lora_train_base_model = (_fv("lora_train_base_model", "") or "").strip()
             # Environment LoRAs: checkbox "env_loras" present ⇒ train them.
             ns.no_env_loras      = ("env_loras" not in form)
             ns.env_lora_steps    = int(_fv("env_lora_steps", "800"))
@@ -4658,7 +4679,7 @@ async function pollJob(){
             # Apply the submitted connection/model settings to the live session
             # so later per-profile jobs (regenerate, train LoRA) use them too.
             for _k in ("base_url", "api_key", "image_model",
-                       "video_model", "text_model"):
+                       "video_model", "text_model", "lora_train_base_model"):
                 setattr(default_args, _k, getattr(ns, _k, None))
 
             # Apply the same shortcut logic as CLI
@@ -4923,7 +4944,8 @@ async function pollJob(){
                          f"{', '.join(char_names)}")
                 lora_map = stage_loras(client, image_model, out_dir_r, char_names or [],
                                        lora_steps=getattr(args, "lora_steps", 800),
-                                       lora_rank=getattr(args, "lora_rank", 16))
+                                       lora_rank=getattr(args, "lora_rank", 16),
+                                       train_base_model=getattr(args, "lora_train_base_model", None) or None)
             else:
                 _web_log("  ⚠ No characters found to train LoRAs for. Generate or "
                          "select fighters first (Characters page).")
@@ -4933,7 +4955,8 @@ async function pollJob(){
                              f"{', '.join(env_names)}")
                     env_lora_map = stage_env_loras(client, image_model, out_dir_r, env_names or [],
                                                    lora_steps=getattr(args, "env_lora_steps", 800),
-                                                   lora_rank=getattr(args, "env_lora_rank", 16))
+                                                   lora_rank=getattr(args, "env_lora_rank", 16),
+                                                   train_base_model=getattr(args, "lora_train_base_model", None) or None)
                 else:
                     _web_log("  ⚠ No environments found to train LoRAs for.")
 
@@ -5242,6 +5265,11 @@ OUTPUT LAYOUT
                           help="LoRA rank (default: 16).")
     cons_grp.add_argument("--lora-weight", type=float, default=0.85, metavar="F",
                           help="Weight applied to each character LoRA at generation (default: 0.85).")
+    cons_grp.add_argument("--lora-train-base-model", default="", metavar="MODEL",
+                          help="Separate UNet-based SD1.x/SDXL model (models.json key or HF id/path) "
+                               "to TRAIN LoRAs against, when the generation image model is a "
+                               "transformer/DiT (Z-Image, Flux, SD3) this trainer can't target. "
+                               "Generation still uses --image-model. Empty = train on --image-model.")
     cons_grp.add_argument("--no-env-loras", action="store_true",
                           help="Do not train/apply per-environment identity LoRAs when the "
                                "'lora' strategy is active (by default environments get LoRAs too).")
@@ -5393,12 +5421,14 @@ OUTPUT LAYOUT
     if "lora" in consistency and not args.skip_videos and (char_names or []):
         lora_map = stage_loras(client, image_model, out_dir, char_names or [],
                                lora_steps=getattr(args, "lora_steps", 800),
-                               lora_rank=getattr(args, "lora_rank", 16))
+                               lora_rank=getattr(args, "lora_rank", 16),
+                               train_base_model=getattr(args, "lora_train_base_model", None) or None)
     if ("lora" in consistency and not args.skip_videos
             and not getattr(args, "no_env_loras", False) and (env_names or [])):
         env_lora_map = stage_env_loras(client, image_model, out_dir, env_names or [],
                                        lora_steps=getattr(args, "env_lora_steps", 800),
-                                       lora_rank=getattr(args, "env_lora_rank", 16))
+                                       lora_rank=getattr(args, "env_lora_rank", 16),
+                                       train_base_model=getattr(args, "lora_train_base_model", None) or None)
 
     # ── Stage 3: Videos ────────────────────────────────────────────────────────
     if not args.skip_videos:

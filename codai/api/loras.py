@@ -131,6 +131,10 @@ def _require_api_auth(request: Request) -> None:
 class LoraTrainRequest(BaseModel):
     name: str                              # output LoRA name (folder)
     base_model: str                        # image model key (models.json) or HF id / path
+    # Optional separate UNet-based SD1.x/SDXL model to train the LoRA against,
+    # when `base_model` (the generation model) is a transformer/DiT (Z-Image,
+    # Flux, SD3) this trainer can't target.  Falls back to base_model if unset.
+    train_base_model: Optional[str] = None
     character: Optional[str] = None        # saved character profile to pull images from
     environment: Optional[str] = None      # OR saved environment profile to pull images from
     images: Optional[List[str]] = None     # OR explicit base64/data-uri images
@@ -148,7 +152,7 @@ class LoraTrainRequest(BaseModel):
 def _resolve_base_model_path(base_model: str) -> str:
     """Resolve an image model key (or path/HF id) to a diffusers model directory."""
     try:
-        from codai.api.state import multi_model_manager
+        from codai.models.manager import multi_model_manager
         for key in (f"image:{base_model}", base_model):
             cfg = multi_model_manager.config.get(key)
             if cfg:
@@ -222,7 +226,9 @@ def _train_lora_sync(req: LoraTrainRequest) -> dict:
     from transformers import CLIPTextModel, CLIPTokenizer
 
     name = req.name
-    base_path = _resolve_base_model_path(req.base_model)
+    # Train against a dedicated UNet model when provided (the generation model
+    # may be a DiT this trainer can't target); otherwise use base_model.
+    base_path = _resolve_base_model_path(req.train_base_model or req.base_model)
     steps = max(50, min(5000, int(req.steps or 800)))
     rank = max(2, min(128, int(req.rank or 16)))
     resolution = int(req.resolution or 512)
@@ -247,7 +253,7 @@ def _train_lora_sync(req: LoraTrainRequest) -> dict:
 
     # Free VRAM: evict every resident model so training has the whole GPU.
     try:
-        from codai.api.state import multi_model_manager
+        from codai.models.manager import multi_model_manager
         multi_model_manager.unload_all_models()
     except Exception as e:
         print(f"  [lora] could not unload models before training: {e}")
@@ -256,6 +262,22 @@ def _train_lora_sync(req: LoraTrainRequest) -> dict:
     weight_dtype = torch.float32  # train in fp32 for stability
 
     _set_progress(status="preparing", message=f"loading base model: {base_path}")
+
+    # This DreamBooth-LoRA trainer only supports UNet-based SD1.x / SDXL
+    # pipelines.  Transformer/DiT models (Z-Image, Flux, SD3, …) have a
+    # `transformer/` subfolder and no `unet/`; loading their non-CLIP tokenizer
+    # as a CLIPTokenizer crashes deep inside transformers.  Detect that up front
+    # and fail with an actionable message instead.
+    import os as _os
+    _has_unet = _os.path.isdir(_os.path.join(base_path, "unet"))
+    _has_transformer = _os.path.isdir(_os.path.join(base_path, "transformer"))
+    if _has_transformer and not _has_unet:
+        raise ValueError(
+            f"LoRA training base model '{base_path}' is a transformer/DiT "
+            f"architecture (has 'transformer/', no 'unet/'). This trainer only "
+            f"supports UNet-based SD1.x/SDXL models. Configure an SD1.x or SDXL "
+            f"image model as the LoRA training base."
+        )
 
     # Detect SDXL by attempting to load a second tokenizer.
     is_sdxl = False
@@ -537,6 +559,7 @@ def _write_meta(name, req, base_path, n_images, arch, instance_prompt):
     meta = {
         "name": name,
         "base_model": req.base_model,
+        "train_base_model": req.train_base_model or req.base_model,
         "base_path": base_path,
         "arch": arch,
         "instance_prompt": instance_prompt,
