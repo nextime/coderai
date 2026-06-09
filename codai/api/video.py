@@ -147,12 +147,144 @@ def _save_file(data: bytes, ext: str, http_request) -> dict:
         return {f"b64_{ext}": base64.b64encode(data).decode()}
 
 
-def _frames_to_mp4(frames, fps: int) -> bytes:
+def _encode_mp4_pyav(frames, fps: int, crf: int) -> bytes:
+    """Encode RGB frames to H.264 MP4 via PyAV with an explicit CRF (quality).
+
+    CRF is libx264's quality knob: lower = higher quality / bigger file
+    (0=lossless, ~18 visually lossless, 23 default, 28 small). PyAV gives us
+    direct codec-option control that imageio's mimsave does not expose.
+    """
+    import av, numpy as np
+    with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+        path = tmp.name
+    container = av.open(path, mode='w')
+    try:
+        h, w = frames[0].shape[:2]
+        stream = container.add_stream('libx264', rate=int(fps) or 1)
+        stream.width = int(w)
+        stream.height = int(h)
+        stream.pix_fmt = 'yuv420p'
+        stream.options = {'crf': str(int(crf))}
+        for f in frames:
+            arr = f if f.dtype == np.uint8 else np.clip(f, 0, 255).astype(np.uint8)
+            if arr.ndim == 2:  # grayscale → rgb
+                arr = np.stack([arr] * 3, axis=-1)
+            vframe = av.VideoFrame.from_ndarray(arr[..., :3], format='rgb24')
+            for pkt in stream.encode(vframe):
+                container.mux(pkt)
+        for pkt in stream.encode():  # flush
+            container.mux(pkt)
+    finally:
+        container.close()
+    with open(path, 'rb') as fh:
+        data = fh.read()
+    os.unlink(path)
+    return data
+
+
+def _enc_dbg(msg: str) -> None:
+    """Verbose encode-path logging (only when --debug is active)."""
+    try:
+        from codai.api.state import get_global_debug
+        if get_global_debug():
+            print(f"  [mp4-encode] {msg}")
+    except Exception:
+        pass
+
+
+def _frames_to_mp4(frames, fps: int, crf: Optional[int] = None) -> bytes:
     import imageio, numpy as np
-    frames = [np.array(f) for f in frames]
+    frames = [np.asarray(f) for f in frames]
+
+    # Diffusion pipelines emit float32 frames in [0, 1]. Both PyAV and imageio
+    # want uint8 [0, 255]; if we hand them floats, imageio re-converts and logs
+    # "Lossy conversion from float32 to uint8" ONCE PER FRAME, flooding the log.
+    # Convert ourselves (correct + quiet). Some pipelines already give uint8 or
+    # float in [0, 255]; detect the range from the global max.
+    if frames:
+        f0 = frames[0]
+        if np.issubdtype(f0.dtype, np.floating):
+            try:
+                gmax = max((float(f.max()) for f in frames if f.size), default=1.0)
+            except ValueError:
+                gmax = 1.0
+            scale = 255.0 if gmax <= 1.0 + 1e-3 else 1.0
+            frames = [np.clip(f * scale, 0, 255).round().astype(np.uint8) for f in frames]
+        elif f0.dtype != np.uint8:
+            frames = [np.clip(f, 0, 255).astype(np.uint8) for f in frames]
+
+    # Report whether the optional imageio-ffmpeg plugin is available — it lets the
+    # imageio path honour quality kwargs (the default PyAV plugin does not).
+    try:
+        import imageio_ffmpeg as _iioff
+        _enc_dbg(f"imageio-ffmpeg available (v{getattr(_iioff, '__version__', '?')})")
+        _have_iioff = True
+    except Exception as e:
+        _enc_dbg(f"imageio-ffmpeg NOT installed ({type(e).__name__}); "
+                 f"PyAV is the only imageio mp4 backend")
+        _have_iioff = False
+
+    # When a per-model CRF (quality) is configured, encode via PyAV directly so
+    # the quality knob is actually applied (mimsave can't pass CRF either way).
+    if crf is not None:
+        try:
+            _enc_dbg(f"encoding via PyAV with crf={crf}")
+            data = _encode_mp4_pyav(frames, fps, crf)
+            _enc_dbg(f"PyAV crf={crf} encode OK ({len(data)} bytes)")
+            return data
+        except Exception as e:
+            # ALWAYS surface this (not just in debug).  Distinguish "av not
+            # installed" from other errors.  We still honour CRF below via the
+            # imageio FFMPEG plugin's output_params.
+            import traceback
+            _kind = ("PyAV (av) not installed" if isinstance(e, ImportError)
+                     else type(e).__name__)
+            print(f"  [mp4-encode] PyAV crf encode FAILED — {_kind}: {e} "
+                  f"— falling back to imageio-ffmpeg")
+            _enc_dbg("PyAV traceback:\n" + traceback.format_exc())
+
     with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
         tmp_path = tmp.name
-    imageio.mimsave(tmp_path, frames, fps=fps, codec='libx264', quality=8)
+    # imageio's MP4 backend differs by version/install.  When a CRF is configured
+    # we use the FFMPEG plugin, which honours it via output_params; otherwise we
+    # fall back through codec/quality kwargs (the PyAV plugin only takes codec).
+    if crf is not None:
+        _crf_params = ['-crf', str(int(crf))]
+        _attempts = [
+            # Force the FFMPEG plugin so output_params (the CRF) is applied.
+            dict(format='FFMPEG', fps=fps, codec='libx264', output_params=_crf_params),
+            dict(fps=fps, codec='libx264', output_params=_crf_params),
+            # Last resort — produce a video even if CRF couldn't be applied.
+            dict(fps=fps, codec='libx264', quality=8),
+            dict(fps=fps, codec='libx264'),
+            dict(fps=fps),
+        ]
+    else:
+        _attempts = [
+            dict(fps=fps, codec='libx264', quality=8),  # imageio-ffmpeg
+            dict(fps=fps, codec='libx264'),             # PyAV (codec only)
+            dict(fps=fps),                              # minimal
+        ]
+    last_err = None
+    used = None
+    for kw in _attempts:
+        try:
+            imageio.mimsave(tmp_path, frames, **kw)
+            used = kw
+            last_err = None
+            break
+        except Exception as e:  # TypeError (kwarg rejected) or plugin/runtime error
+            _enc_dbg(f"imageio.mimsave rejected/failed kwargs={kw}: {type(e).__name__}: {e}")
+            last_err = e
+            continue
+    if last_err is not None:
+        print(f"  [mp4-encode] imageio.mimsave failed on all kwarg sets: {last_err}")
+        raise last_err
+    if crf is not None and 'output_params' not in used:
+        print(f"  [mp4-encode] WARNING: CRF {crf} could NOT be applied via imageio "
+              f"(used kwargs={used}); output uses default quality")
+    else:
+        _enc_dbg(f"imageio.mimsave OK with kwargs={used}")
     with open(tmp_path, 'rb') as f:
         data = f.read()
     os.unlink(tmp_path)
@@ -193,6 +325,20 @@ def _detect_pipeline_class(model_name: str, mode: str):
             return I2VGenXLPipeline
         if 'animatediff' in n or 'animateddiff' in n:
             return AnimateDiffPipeline
+        if 'wan' in n:
+            # Wan ships separate t2v and i2v transformers; pick the i2v pipeline
+            # for the keyframe bridge when an init image is supplied.
+            if mode in ('i2v', 'ti2v'):
+                try:
+                    from diffusers import WanImageToVideoPipeline
+                    return WanImageToVideoPipeline
+                except ImportError:
+                    pass
+            try:
+                from diffusers import WanPipeline
+                return WanPipeline
+            except ImportError:
+                pass
     except ImportError:
         pass
     try:
@@ -416,18 +562,39 @@ def _load_sdcpp_video_model(model_path: str, offload: str = None, model_cfg: dic
         kwargs['lora_model_dir'] = _os2.path.dirname(lora_path) or '.'
         print(f"  [sd.cpp] lora_path: {lora_path} → lora_model_dir: {kwargs['lora_model_dir']}")
 
+    _load_errors = []
+
     @_sd_cpp.sd_log_callback
     def _log_cb(level, text, data):
         if text:
             line = text.decode('utf-8', errors='replace').rstrip()
             if line:
                 print(f"  [sd.cpp] {line}", flush=True)
+                # Capture fatal load errors so we can raise instead of returning
+                # a broken object with a NULL internal pointer.
+                if any(k in line for k in (
+                    'load tensors from model loader failed',
+                    'failed to read tensor info',
+                    'failed to load model',
+                )):
+                    _load_errors.append(line)
 
     _sd_cpp.sd_set_log_callback(_log_cb, None)
     try:
         model = StableDiffusion(**kwargs)
     finally:
         _sd_cpp.sd_set_log_callback(None, None)
+
+    if _load_errors:
+        hint = ""
+        if 'No text encoders' in ''.join(_load_errors) or _is_wan_dit:
+            hint = (
+                " This GGUF contains only the diffusion model weights. "
+                "Configure t5xxl_path (and optionally vae_path) in the model's "
+                "CoderAI settings to point at the separate text-encoder and VAE files."
+            )
+        raise RuntimeError(f"sd.cpp failed to load model: {_load_errors[-1]}.{hint}")
+
     return model
 
 
@@ -472,6 +639,56 @@ def _generate_sdcpp_video(sd_model, request, model_cfg=None):
     return list(frames), fps
 
 
+def _free_pipeline_vram(pipe) -> None:
+    """Thoroughly release a diffusers pipeline's GPU memory.
+
+    Quantized (bitsandbytes) and device_map pipelines REJECT `.to('cpu')`, so a
+    naive move doesn't free VRAM and leaves the weights resident — the cause of
+    the OOM death spiral where every subsequent request OOMs on load. Remove
+    accelerate offload hooks, break component references, then collect + empty
+    the CUDA cache so the next load starts from clean VRAM.
+    """
+    import gc as _gc
+    try:
+        import torch as _t
+    except Exception:
+        _t = None
+    try:
+        if pipe is not None:
+            _comps = getattr(pipe, 'components', {}) or {}
+            try:
+                from accelerate.hooks import remove_hook_from_submodules
+                for _c in _comps.values():
+                    if hasattr(_c, 'modules'):
+                        try:
+                            remove_hook_from_submodules(_c)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            for _cn in list(_comps):
+                try:
+                    setattr(pipe, _cn, None)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    for _ in range(3):
+        _gc.collect()
+    if _t is not None:
+        try:
+            if _t.cuda.is_available():
+                _t.cuda.synchronize()
+                _t.cuda.empty_cache()
+        except Exception:
+            pass
+    try:
+        from codai.models.manager import _trim_cpu_ram
+        _trim_cpu_ram()
+    except Exception:
+        pass
+
+
 def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str = None, model_cfg: dict = None):
     # GGUF models go through stable-diffusion.cpp, not diffusers
     from codai.api.images import _is_gguf_model
@@ -482,47 +699,400 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
     PClass = _detect_pipeline_class(model_name, mode)
     if PClass is None:
         raise RuntimeError("diffusers not installed: pip install diffusers")
-    precision = getattr(global_args, 'image_precision', 'bf16') if global_args else 'bf16'
+    # Per-model precision wins; fall back to bfloat16 for video (NOT the global
+    # image_precision, which may be f32 for image models and is wrong for video).
+    _model_precision = (model_cfg or {}).get('precision') or 'bf16'
     dtype_map = {'bf16': torch.bfloat16, 'f16': torch.float16, 'f32': torch.float32}
-    torch_dtype = dtype_map.get(precision, torch.bfloat16)
+    torch_dtype = dtype_map.get(_model_precision, torch.bfloat16)
+
+    # ── Quantization (from per-model config) ─────────────────────────────────
+    # Per-component overrides ('component_quantization' map) win; otherwise the
+    # global load_in_4bit/8bit flag is applied to every heavy component (the
+    # diffusion backbone transformer*/unet AND text encoder(s) — e.g. Wan2.2's
+    # UMT5 text_encoder is ~11 GB in bf16 and must be quantized to fit on-GPU).
+    from codai.models.hf_loading import (
+        build_pipeline_quant_config, build_gguf_pipeline_components)
+    _quant_config, _quant_desc = build_pipeline_quant_config(
+        model_name, model_cfg, torch_dtype)
+    if _quant_config is not None:
+        print(f"  Video quantization: {_quant_desc}")
+    # GGUF-quantized components (Q5_K/Q6_K etc.) are loaded from their .gguf
+    # files and injected into the pipeline as pre-built components.
+    _gguf_components, _gguf_desc = build_gguf_pipeline_components(
+        model_name, model_cfg, torch_dtype)
+    if _gguf_components:
+        print(f"  Video GGUF components: {_gguf_desc}")
+
+    def _with_quant(kw: dict) -> dict:
+        """Inject quantization_config + GGUF components into from_pretrained kwargs."""
+        if _quant_config is not None:
+            kw = {**kw, 'quantization_config': _quant_config}
+        if _gguf_components:
+            kw = {**kw, **_gguf_components}
+        return kw
     # Explicit parameter wins; fall back to global CLI arg
     if offload is None:
         offload = getattr(global_args, 'offload_strategy', None) if global_args else None
     # Normalise UI values to diffusers vocabulary
     if offload == 'cpu':
         offload = 'model'
+    elif offload in ('disk', 'offload'):
+        offload = 'disk'
 
-    # Lower the GIL switch interval so the asyncio event loop thread wins the GIL
-    # more often during Python-heavy component loading (diffusers from_pretrained
-    # holds the GIL for extended stretches while instantiating pipeline components).
-    _old_interval = sys.getswitchinterval()
-    sys.setswitchinterval(0.001)
-    try:
-        for attempt in range(3):
-            try:
-                time.sleep(0)  # yield GIL before heavy loading begins
-                pipe = PClass.from_pretrained(model_name, torch_dtype=torch_dtype)
-                time.sleep(0)  # yield GIL before GPU transfer
-                if offload == 'sequential' or attempt >= 2:
-                    pipe.enable_sequential_cpu_offload()
-                elif offload == 'model' or attempt >= 1:
-                    pipe.enable_model_cpu_offload()
-                else:
-                    pipe = pipe.to(device)
-                return pipe
-            except RuntimeError as e:
-                if 'out of memory' in str(e).lower() and attempt < 2:
-                    gc.collect()
+    # Resolve offload directory for disk-offload fallback.
+    _offload_dir = (
+        (model_cfg or {}).get('offload_dir')
+        or (getattr(global_args, 'offload_dir', None) if global_args else None)
+        or os.path.join(os.path.expanduser('~'), '.cache', 'coderai', 'offload')
+    )
+
+    import psutil as _psutil
+
+    def _is_oom(exc: Exception) -> bool:
+        s = str(exc).lower()
+        return 'out of memory' in s or 'cannot allocate' in s or 'killed' in s
+
+    pipe = None  # bound here so _clear_mem can release a failed attempt's pipe
+
+    def _clear_mem():
+        # CRITICAL: drop the partial pipeline from the FAILED attempt before the
+        # next strategy allocates a new one. Without this, a from_pretrained that
+        # loaded components and then OOM'd (e.g. on .to(device)) leaves the whole
+        # pipeline referenced by `pipe`, so the next attempt holds TWO copies and
+        # OOMs again — the VRAM death spiral. Remove accelerate offload hooks and
+        # break component references so the GPU tensors are actually collectable.
+        nonlocal pipe
+        try:
+            if pipe is not None:
+                _comps = getattr(pipe, 'components', {}) or {}
+                try:
+                    from accelerate.hooks import remove_hook_from_submodules
+                    for _comp in _comps.values():
+                        if hasattr(_comp, 'modules'):  # an nn.Module component
+                            try:
+                                remove_hook_from_submodules(_comp)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                for _cn in list(_comps):
                     try:
-                        import torch as _torch
-                        if _torch.cuda.is_available():
-                            _torch.cuda.empty_cache()
+                        setattr(pipe, _cn, None)
                     except Exception:
                         pass
+        finally:
+            pipe = None
+        gc.collect()
+        gc.collect()
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def _mem_snapshot(label: str = "") -> dict:
+        """Collect and print GPU VRAM / CPU RAM / disk state."""
+        snap = {}
+        try:
+            vm = _psutil.virtual_memory()
+            snap['ram_total_gb'] = vm.total / 1e9
+            snap['ram_used_gb']  = vm.used  / 1e9
+            snap['ram_free_gb']  = vm.available / 1e9
+        except Exception:
+            snap['ram_free_gb'] = 0
+        try:
+            if torch.cuda.is_available():
+                free_v, total_v = torch.cuda.mem_get_info()
+                snap['vram_total_gb'] = total_v / 1e9
+                snap['vram_used_gb']  = (total_v - free_v) / 1e9
+                snap['vram_free_gb']  = free_v / 1e9
+        except Exception:
+            pass
+        try:
+            du = _psutil.disk_usage(_offload_dir if os.path.exists(_offload_dir) else '/')
+            snap['disk_free_gb'] = du.free / 1e9
+            snap['disk_used_gb'] = du.used / 1e9
+        except Exception:
+            pass
+
+        parts = []
+        if 'vram_free_gb' in snap:
+            parts.append(f"VRAM {snap['vram_used_gb']:.1f}/{snap['vram_total_gb']:.1f} GB"
+                         f" ({snap['vram_free_gb']:.1f} GB free)")
+        if 'ram_free_gb' in snap:
+            parts.append(f"RAM {snap['ram_used_gb']:.1f}/{snap['ram_total_gb']:.1f} GB"
+                         f" ({snap['ram_free_gb']:.1f} GB free)")
+        if 'disk_free_gb' in snap:
+            parts.append(f"disk {snap['disk_free_gb']:.1f} GB free")
+        tag = f"[{label}] " if label else ""
+        print(f"  {tag}Memory: {' | '.join(parts)}")
+        return snap
+
+    def _report_device_map(pipe) -> None:
+        """Print a summary of which layers landed on which device."""
+        device_counts: dict = {}
+        # Diffusers pipelines expose components dict
+        components = getattr(pipe, 'components', {})
+        for comp_name, comp in components.items():
+            if comp is None or not hasattr(comp, 'hf_device_map'):
+                continue
+            dm = comp.hf_device_map  # dict: layer_name → device
+            for layer, dev in dm.items():
+                dev_str = str(dev)
+                device_counts[dev_str] = device_counts.get(dev_str, 0) + 1
+        if device_counts:
+            summary = ', '.join(f"{d}: {n} layers" for d, n in sorted(device_counts.items()))
+            print(f"  Device map: {summary}")
+        else:
+            # Try the pipeline-level hf_device_map
+            dm = getattr(pipe, 'hf_device_map', None)
+            if dm:
+                by_dev: dict = {}
+                for layer, dev in dm.items():
+                    dev_str = str(dev)
+                    by_dev[dev_str] = by_dev.get(dev_str, 0) + 1
+                summary = ', '.join(f"{d}: {n} layers" for d, n in sorted(by_dev.items()))
+                print(f"  Device map: {summary}")
+
+    def _report_offload_dir_size() -> None:
+        """Print how much disk space the offload directory is using."""
+        if not os.path.isdir(_offload_dir):
+            return
+        try:
+            total = sum(
+                os.path.getsize(os.path.join(root, f))
+                for root, _, files in os.walk(_offload_dir)
+                for f in files
+            )
+            print(f"  Offload dir: {_offload_dir} — {total / 1e9:.2f} GB on disk")
+        except Exception:
+            pass
+
+    def _enable_vae_memory_opts(pipe) -> None:
+        """Enable VAE tiling + slicing on a diffusers video pipeline.
+
+        The VAE decode (turning denoised latents into RGB frames) is the single
+        biggest VRAM spike in video generation — it happens AFTER the whole
+        denoise loop, so an OOM there throws away a completed generation and
+        forces an expensive full-pipeline reload + retry.  Tiling/slicing splits
+        that decode into chunks, cutting the peak VRAM with negligible quality
+        impact.  Model-agnostic: only calls the methods that exist.  Controlled
+        by the per-model `vae_tiling` config (default ON for video); set it to
+        false to disable for max-quality decode when VRAM is plentiful.
+        """
+        if not (model_cfg or {}).get('vae_tiling', True):
+            _enc_dbg("VAE tiling disabled by config (vae_tiling=false)")
+            return
+        enabled = []
+        for meth in ('enable_vae_tiling', 'enable_vae_slicing'):
+            fn = getattr(pipe, meth, None)
+            if callable(fn):
+                try:
+                    fn()
+                    enabled.append(meth.replace('enable_vae_', ''))
+                except Exception as _e:
+                    _enc_dbg(f"{meth} failed: {_e}")
+        # Some pipelines only expose these on the .vae submodule.
+        if not enabled:
+            vae = getattr(pipe, 'vae', None)
+            for meth in ('enable_tiling', 'enable_slicing'):
+                fn = getattr(vae, meth, None) if vae is not None else None
+                if callable(fn):
+                    try:
+                        fn()
+                        enabled.append(meth.replace('enable_', ''))
+                    except Exception as _e:
+                        _enc_dbg(f"vae.{meth} failed: {_e}")
+        if enabled:
+            print(f"  VAE memory opt: {' + '.join(enabled)} enabled "
+                  f"(reduces decode-time VRAM spike)")
+        else:
+            _enc_dbg("no VAE tiling/slicing methods available on this pipeline")
+
+    def _report_loaded(pipe, strategy: str) -> None:
+        """Print a post-load summary: strategy, device placement, memory state."""
+        _enable_vae_memory_opts(pipe)
+        print(f"  ✓ Video pipeline loaded — strategy: {strategy}")
+        _report_device_map(pipe)
+        _report_offload_dir_size()
+        _mem_snapshot("after load")
+
+    # NOTE: we deliberately do NOT lower sys.setswitchinterval here.  A previous
+    # version set it to 0.001s to keep the asyncio loop responsive during the
+    # GIL-heavy diffusers from_pretrained, but forcing a GIL switch every 1 ms for
+    # the whole (multi-minute) load caused severe scheduler thrashing — CPU load
+    # average > 10 and a sluggish machine.  torch releases the GIL during the
+    # actual tensor work, and the load already runs in an executor thread, so the
+    # default switch interval is the right choice.
+    _old_interval = sys.getswitchinterval()
+    try:
+        # ── Balanced GPU+CPU strategy (explicit or auto-selected) ────────────
+        # Uses device_map='balanced' with a configurable GPU-VRAM cap so all
+        # available GPU is filled first and only the remainder spills to CPU
+        # RAM (and disk if needed). This is the preferred strategy when the
+        # model won't fit entirely in VRAM but should maximise GPU utilisation.
+        # `gpu_percent` (0–100) controls what fraction of FREE VRAM to occupy.
+        _gpu_pct = float((model_cfg or {}).get('balanced_gpu_percent', 80))
+        try:
+            if torch.cuda.is_available():
+                _free_v, _ = torch.cuda.mem_get_info()
+                _avail_gpu_gb = (_free_v / 1e9) * (_gpu_pct / 100.0)
+            else:
+                _avail_gpu_gb = 0.0
+        except Exception:
+            _avail_gpu_gb = 0.0
+        _cpu_avail_gb = min(48, max(4, int(
+            _psutil.virtual_memory().available * 0.60 / 1e9)))
+
+        if offload == 'balanced':
+            _mem_snapshot("before balanced GPU+CPU load")
+            print(f"  Video load strategy: balanced GPU+CPU "
+                  f"({_gpu_pct:.0f}% GPU → {_avail_gpu_gb:.1f} GiB / "
+                  f"CPU {_cpu_avail_gb} GiB / overflow → {_offload_dir})")
+            os.makedirs(_offload_dir, exist_ok=True)
+            try:
+                pipe = PClass.from_pretrained(**_with_quant(dict(
+                    pretrained_model_name_or_path=model_name,
+                    torch_dtype=torch_dtype,
+                    device_map='balanced',
+                    max_memory={0: f'{_avail_gpu_gb:.2f}GiB',
+                                'cpu': f'{_cpu_avail_gb}GiB'},
+                    offload_folder=_offload_dir,
+                    offload_buffers=True,
+                    low_cpu_mem_usage=True,
+                )))
+            except (TypeError, ValueError):
+                pipe = PClass.from_pretrained(**_with_quant(dict(
+                    pretrained_model_name_or_path=model_name,
+                    torch_dtype=torch_dtype, low_cpu_mem_usage=True)))
+                pipe.enable_model_cpu_offload()
+            _report_loaded(pipe, f"balanced {_gpu_pct:.0f}%GPU+CPU")
+            return pipe
+
+        # ── Attempt 0: full GPU ──────────────────────────────────────────────
+        if offload not in ('model', 'sequential', 'disk', 'balanced'):
+            _mem_snapshot("before full-GPU load")
+            _q = " + quantized" if _quant_config is not None else ""
+            print(f"  Video load strategy: full GPU ({torch_dtype}{_q})")
+            try:
+                time.sleep(0)
+                if _quant_config is not None:
+                    # Quantized weights load directly to GPU via device_map;
+                    # bitsandbytes models cannot be moved with .to() afterwards.
+                    pipe = PClass.from_pretrained(**_with_quant(dict(
+                        pretrained_model_name_or_path=model_name,
+                        torch_dtype=torch_dtype,
+                        device_map='cuda',
+                        low_cpu_mem_usage=True)))
+                else:
+                    pipe = PClass.from_pretrained(
+                        model_name, torch_dtype=torch_dtype, low_cpu_mem_usage=True)
                     time.sleep(0)
-                    continue
-                raise
+                    pipe = pipe.to(device)
+                _report_loaded(pipe, "full GPU" + _q)
+                return pipe
+            except (RuntimeError, MemoryError) as e:
+                if not _is_oom(e):
+                    raise
+                print(f"  Video: full-GPU OOM ({e}) — trying model CPU offload…")
+                _clear_mem()
+
+        # ── Attempt 1: model CPU offload ─────────────────────────────────────
+        if offload not in ('sequential', 'disk'):
+            _mem_snapshot("before model-CPU-offload load")
+            print(f"  Video load strategy: model CPU offload"
+                  f" (each module GPU↔CPU during forward pass)")
+            try:
+                time.sleep(0)
+                pipe = PClass.from_pretrained(**_with_quant(dict(
+                    pretrained_model_name_or_path=model_name,
+                    torch_dtype=torch_dtype, low_cpu_mem_usage=True)))
+                pipe.enable_model_cpu_offload()
+                _report_loaded(pipe, "model CPU offload")
+                return pipe
+            except (RuntimeError, MemoryError) as e:
+                if not _is_oom(e):
+                    raise
+                print(f"  Video: model CPU offload OOM ({e})"
+                      f" — trying GPU+CPU+disk offload…")
+                _clear_mem()
+
+        # ── Attempt 2: GPU + CPU + disk offload via device_map='auto' ──────────
+        os.makedirs(_offload_dir, exist_ok=True)
+        _cpu_gb = min(32, max(2, int(_psutil.virtual_memory().available * 0.50 / 1e9)))
+        if offload != 'disk':
+            _mem_snapshot("before GPU+CPU+disk offload")
+            print(f"  Video load strategy: GPU+CPU+disk offload"
+                  f" — GPU 2 GiB / CPU {_cpu_gb} GiB / overflow → {_offload_dir}")
+            try:
+                time.sleep(0)
+                try:
+                    # diffusers PIPELINES only accept device_map='balanced'
+                    # (not 'auto', which is a transformers-model value).
+                    pipe = PClass.from_pretrained(**_with_quant(dict(
+                        pretrained_model_name_or_path=model_name,
+                        torch_dtype=torch_dtype,
+                        device_map='balanced',
+                        max_memory={0: '2GiB', 'cpu': f'{_cpu_gb}GiB'},
+                        offload_folder=_offload_dir,
+                        offload_buffers=True,
+                        low_cpu_mem_usage=True,
+                    )))
+                except (TypeError, ValueError):
+                    # device_map unsupported/invalid for this pipeline → load on
+                    # CPU then stream each module GPU↔CPU during the forward pass.
+                    pipe = PClass.from_pretrained(**_with_quant(dict(
+                        pretrained_model_name_or_path=model_name,
+                        torch_dtype=torch_dtype, low_cpu_mem_usage=True)))
+                    pipe.enable_sequential_cpu_offload()
+                _report_loaded(pipe, f"GPU 2 GiB + CPU {_cpu_gb} GiB + disk")
+                return pipe
+            except (RuntimeError, MemoryError) as e:
+                if not _is_oom(e):
+                    raise
+                print(f"  Video: GPU+CPU+disk OOM ({e}) — trying minimal-RAM disk offload…")
+                _clear_mem()
+                _cpu_gb = min(8, max(2, int(_psutil.virtual_memory().available * 0.40 / 1e9)))
+
+        # ── Attempt 3: minimal RAM, maximum disk offload ──────────────────────
+        _mem_snapshot("before pure-disk offload")
+        print(f"  Video load strategy: pure disk offload"
+              f" — GPU 2 GiB / CPU {_cpu_gb} GiB / everything else on disk"
+              f" (slow — offload dir: {_offload_dir})")
+        try:
+            pipe = PClass.from_pretrained(**_with_quant(dict(
+                pretrained_model_name_or_path=model_name,
+                torch_dtype=torch_dtype,
+                device_map='balanced',
+                max_memory={0: '2GiB', 'cpu': f'{_cpu_gb}GiB'},
+                offload_folder=_offload_dir,
+                offload_buffers=True,
+                low_cpu_mem_usage=True,
+            )))
+        except (TypeError, ValueError):
+            pipe = PClass.from_pretrained(**_with_quant(dict(
+                pretrained_model_name_or_path=model_name,
+                torch_dtype=torch_dtype, low_cpu_mem_usage=True)))
+            pipe.enable_sequential_cpu_offload()
+            try:
+                from accelerate.hooks import AlignDevicesHook
+                for comp in (pipe.components.values() if hasattr(pipe, 'components') else []):
+                    for m in (comp.modules() if hasattr(comp, 'modules') else []):
+                        hook = getattr(m, '_hf_hook', None)
+                        if isinstance(hook, AlignDevicesHook) and hasattr(hook, 'offload_buffers'):
+                            hook.offload_buffers = True
+            except Exception:
+                pass
+        except (RuntimeError, MemoryError):
+            # Even the last-resort strategy OOM'd — release any partial pipeline
+            # so the failure doesn't leave leaked VRAM for the next request.
+            _clear_mem()
+            raise
+        _report_loaded(pipe, f"pure disk (CPU {_cpu_gb} GiB cap)")
+        return pipe
     finally:
+        # Restore (no-op unless something else changed it mid-load).
         sys.setswitchinterval(_old_interval)
 
 
@@ -610,21 +1180,123 @@ def _resolve_character_inputs(request) -> tuple[List[str], List[str]]:
     return images, names
 
 
+def _pipeline_supports_ip_adapter(pipe) -> bool:
+    """Return True if the pipeline's __call__ accepts ip_adapter_image."""
+    import inspect
+    try:
+        sig = inspect.signature(pipe.__call__)
+        return 'ip_adapter_image' in sig.parameters
+    except Exception:
+        return False
+
+
 def _apply_character_refs(kw: dict, character_references: List[str], strength: float,
-                           names: Optional[List[str]] = None):
-    """Apply character reference images to pipeline kwargs."""
+                           names: Optional[List[str]] = None, pipe=None):
+    """Apply character reference images to pipeline kwargs when supported."""
     if not character_references:
+        return
+    # Only inject ip_adapter_image if the pipeline actually accepts it.
+    # Models like WanPipeline don't support IP-Adapter; for those we rely
+    # solely on the character-name text prompt hint added by the caller.
+    if pipe is not None and not _pipeline_supports_ip_adapter(pipe):
         return
     imgs = [_pil_from_b64(r) for r in character_references]
     kw['ip_adapter_image'] = imgs[0] if len(imgs) == 1 else imgs
     kw['ip_adapter_scale'] = strength
 
 
+def _unload_video_loras(pipe):
+    """Remove any LoRA adapters so a cached pipeline is clean for the next request."""
+    try:
+        if hasattr(pipe, 'unload_lora_weights'):
+            pipe.unload_lora_weights()
+    except Exception as e:
+        print(f"  [video][lora] unload failed: {e}")
+    try:
+        pipe._coderai_active_loras = ()
+    except Exception:
+        pass
+
+
+def _lora_signature(loras) -> tuple:
+    """Normalized identity of a requested LoRA set: ((model, name, weight), ...).
+
+    Two requests with the same signature need the same adapters at the same
+    weights, so the already-loaded adapters can be reused as-is.
+    """
+    if not loras:
+        return ()
+    sig = []
+    for i, lora in enumerate(loras):
+        model = getattr(lora, 'model', None) or (lora.get('model') if isinstance(lora, dict) else None)
+        if not model:
+            continue
+        name = (getattr(lora, 'name', None) if not isinstance(lora, dict) else lora.get('name')) or f"lora_{i}"
+        w = getattr(lora, 'weight', None) if not isinstance(lora, dict) else lora.get('weight')
+        sig.append((str(model), str(name), float(w if w is not None else 1.0)))
+    return tuple(sig)
+
+
+def _sync_video_loras(pipe, loras) -> None:
+    """Make the pipeline's active LoRA adapters match `loras`, reusing what is
+    already loaded when the request asks for the exact same set.
+
+    The video model stays cached across clips, and consecutive clips of one match
+    typically request the identical fighter+environment LoRAs. Reloading them from
+    disk every clip is wasted I/O + fusion latency, so we cache the active set on
+    the pipe object (`_coderai_active_loras`) and only swap when it actually
+    changes. A different set (or no LoRAs) triggers a clean unload + reload.
+    """
+    desired = _lora_signature(loras)
+    active = getattr(pipe, '_coderai_active_loras', ())
+    if desired == active:
+        if desired:
+            print(f"  [video][lora] reusing active adapters {[s[1] for s in desired]} (no reload)")
+        return
+    # Set changed → drop whatever is loaded, then load the new set (if any).
+    if active:
+        _unload_video_loras(pipe)
+    if not desired:
+        return
+    if not hasattr(pipe, 'load_lora_weights'):
+        print("  [video][lora] pipeline does not support LoRA — skipping")
+        return
+    names, weights = [], []
+    try:
+        for model, name, w in desired:
+            pipe.load_lora_weights(model, adapter_name=name)
+            names.append(name)
+            weights.append(w)
+        if names:
+            pipe.set_adapters(names, weights)
+            pipe._coderai_active_loras = desired
+            print(f"  [video][lora] applied: {names} weights={weights}")
+    except Exception as e:
+        print(f"  [video][lora] could not apply LoRA weights: {e}")
+        # Partial load — clear so the next request starts clean.
+        _unload_video_loras(pipe)
+
+
 def _run_pipeline(pipe, kw: dict):
     result = pipe(**kw)
-    frames_raw = getattr(result, 'frames', None) or result[0]
-    if isinstance(frames_raw, list) and isinstance(frames_raw[0], list):
-        return frames_raw[0]
+    # NB: `getattr(result, 'frames', None) or result[0]` is WRONG — when .frames
+    # is a numpy array, `bool(array)` raises "truth value of an array ... is
+    # ambiguous". Check for None explicitly instead of using `or`.
+    frames_raw = getattr(result, 'frames', None)
+    if frames_raw is None:
+        frames_raw = result[0]
+    # Unwrap a batch dimension: frames can be [[frame, frame, ...]] (list of
+    # one video) or a numpy array shaped (batch, frames, H, W, C).
+    if isinstance(frames_raw, list):
+        if frames_raw and isinstance(frames_raw[0], list):
+            return frames_raw[0]
+        return frames_raw
+    try:
+        import numpy as _np
+        if isinstance(frames_raw, _np.ndarray) and frames_raw.ndim == 5:
+            frames_raw = frames_raw[0]  # drop batch dim
+    except Exception:
+        pass
     return list(frames_raw)
 
 
@@ -641,6 +1313,13 @@ def _generate_video(pipe, request: VideoGenerationRequest):
 
     def _vid_step_cb(pipe, step_index, timestep, callback_kwargs):
         _vid_progress_step(step_index + 1)
+        # Mid-generation thermal checkpoint: pause between denoise steps if the
+        # CPU/GPU went over the limit during this (multi-minute) generation.
+        try:
+            from codai.models.thermal import checkpoint as _thermal_checkpoint
+            _thermal_checkpoint(context="video-gen")
+        except Exception:
+            pass
         return callback_kwargs
 
     try:
@@ -652,8 +1331,9 @@ def _generate_video(pipe, request: VideoGenerationRequest):
 
     char_images, char_names = _resolve_character_inputs(request)
     if char_images:
-        _apply_character_refs(kw, char_images, request.character_strength or 0.8, char_names)
-        # Prepend character names to prompt for better conditioning
+        _apply_character_refs(kw, char_images, request.character_strength or 0.8, char_names, pipe=pipe)
+        # Always prepend character names to prompt for text conditioning
+        # (sole mechanism for pipelines that don't support IP-Adapter)
         if char_names and kw.get('prompt'):
             names_hint = ', '.join(char_names)
             kw['prompt'] = f"{names_hint}. {kw['prompt']}"
@@ -680,6 +1360,11 @@ def _generate_video(pipe, request: VideoGenerationRequest):
         if request.strength is not None:
             kw['strength'] = request.strength
 
+    # Per-request LoRA adapters (e.g. per-character identity LoRAs). Sync the
+    # pipeline's adapters to this request's set, REUSING them if identical to the
+    # previous clip's (common within a match) and only swapping when they differ.
+    # Left loaded after the run so the next clip with the same set pays nothing.
+    _sync_video_loras(pipe, getattr(request, 'loras', None))
     frames = _run_pipeline(pipe, kw)
     _vid_progress_done()
     return frames, fps
@@ -1159,7 +1844,21 @@ async def video_generations(request: VideoGenerationRequest,
         elif request.video:
             request.mode = 'v2v'
 
-    model_info = multi_model_manager.request_model(request.model, model_type="video")
+    # Run in a thread: request_model may block while waiting for a busy text
+    # model to finish its in-flight request before evicting it.  Blocking here
+    # on the event loop would deadlock that very request.
+    # Reserve VRAM for any per-request LoRA adapters so eviction frees enough
+    # headroom for base weights + adapters before the pipeline loads.
+    _lora_extra_gb = 0.0
+    if getattr(request, 'loras', None):
+        try:
+            _lora_extra_gb = multi_model_manager._lora_vram_gb(request.loras)
+        except Exception:
+            _lora_extra_gb = 0.0
+
+    model_info = await asyncio.to_thread(
+        multi_model_manager.request_model, request.model, "video",
+        extra_vram_gb=_lora_extra_gb)
     model_name = model_info.get('model_name')
     if not model_name:
         err = model_info.get('error', f"Model '{request.model}' not found")
@@ -1167,18 +1866,68 @@ async def video_generations(request: VideoGenerationRequest,
 
     model_key = model_info['model_key']
     pipe = model_info.get('model_object')
+    # Always define _model_cfg — it's used later regardless of whether we load now.
+    _model_cfg = model_info.get('config') or {}
+
+    # Refuse to load onto a poisoned CUDA context — it would just re-assert.
+    if getattr(multi_model_manager, 'cuda_context_poisoned', False):
+        raise HTTPException(status_code=503, detail=(
+            "CUDA context corrupted by an earlier device-side assert "
+            f"({multi_model_manager.cuda_poison_reason}). Restart coderai to recover."))
+
+    # Always resolve the device up front — the OOM-retry path below also needs
+    # it, and when the pipeline is already cached the `if pipe is None` block
+    # (where it used to be set) is skipped, which caused an UnboundLocalError
+    # ("cannot access local variable 'device'") in the retry.
+    device = _derive_device()
 
     if pipe is None:
-        device = _derive_device()
-        _model_cfg = model_info.get('config') or {}
         _offload = _model_cfg.get('offload_strategy') or None
+        # Auto-select "balanced" strategy when the model (including runtime
+        # reserve: KV/activation spike, VAE decode) exceeds available VRAM even
+        # after eviction. Going straight to "balanced" (GPU-first + CPU spill)
+        # avoids the expensive OOM → free → reload cycle that wastes ~1 hr of
+        # shard reloading only to end up at the same place. The GPU cap is 80%
+        # of free VRAM (or the per-model balanced_gpu_percent if configured) so
+        # we leave breathing room for activations and the decode spike.
+        if _offload is None:
+            try:
+                import torch as _t
+                if _t.cuda.is_available():
+                    _free_v, _ = _t.cuda.mem_get_info()
+                    _free_gb = _free_v / 1e9
+                    _need_gb = multi_model_manager._get_model_used_vram_gb(
+                        model_key, model_name)
+                    if _need_gb > 0 and _free_gb < _need_gb:
+                        _gpu_pct = float(_model_cfg.get('balanced_gpu_percent', 80))
+                        print(f"  VRAM insufficient for full-GPU load "
+                              f"({_need_gb:.1f} GB needed, {_free_gb:.1f} GB free) "
+                              f"— auto-selecting balanced strategy "
+                              f"({_gpu_pct:.0f}% GPU + CPU spill)")
+                        _offload = 'balanced'
+            except Exception:
+                pass
+        # Snapshot free VRAM so we can record the real footprint after load.
+        _vram_before = multi_model_manager.vram_before_load()
         try:
             pipe = await asyncio.get_event_loop().run_in_executor(
                 None, _load_video_pipeline, model_name, device, request.mode, _offload, _model_cfg)
         except Exception as e:
+            multi_model_manager._mark_cuda_poisoned_if_fatal(e)
+            if getattr(multi_model_manager, 'cuda_context_poisoned', False):
+                raise HTTPException(status_code=503, detail=(
+                    "CUDA context corrupted (device-side assert) while loading the "
+                    "video model. Restart coderai to recover. "
+                    f"Original error: {str(e).splitlines()[0]}"))
             raise HTTPException(status_code=500, detail=f"Failed to load video model: {e}")
         multi_model_manager.models[model_key] = pipe
         multi_model_manager.current_model_key = model_key
+        # Record the real VRAM used. record_vram_delta only persists when no
+        # used_vram_gb is configured (it writes the separate measured_vram_gb).
+        try:
+            multi_model_manager.record_vram_delta(model_key, _vram_before)
+        except Exception:
+            pass
 
     if getattr(request, 'disable_safety_checker', False):
         _disable_safety_checker(pipe)
@@ -1199,13 +1948,62 @@ async def video_generations(request: VideoGenerationRequest,
                 None, _generate_video, pipe, request)
     except Exception as e:
         _vid_progress_done()
-        raise HTTPException(status_code=500, detail=f"Video generation failed: {e}")
+        _err_str = str(e).lower()
+        _is_oom = "out of memory" in _err_str or ("cuda" in _err_str and "memory" in _err_str)
+        # On OOM: free the GPU pipeline, reload with CPU offload, and retry once.
+        if _is_oom and not _is_sdcpp_video:
+            import gc, torch as _torch, psutil as _ps
+            # Choose retry offload strategy based on current free RAM.
+            # enable_model_cpu_offload() loads ALL weights into RAM first — if RAM
+            # is already tight that triggers another OOM kill.  Use sequential+disk
+            # offload instead when free RAM < 2× the pipeline's last known RAM usage.
+            _free_ram_gb = _ps.virtual_memory().available / 1e9
+            _retry_strategy = 'model' if _free_ram_gb > 20 else 'sequential'
+            print(f"Video generation OOM — freeing pipeline, retrying with "
+                  f"'{_retry_strategy}' offload "
+                  f"({_free_ram_gb:.1f} GB RAM free)…")
+            multi_model_manager.models.pop(model_key, None)
+            multi_model_manager.model_pools.pop(model_key, None)
+            # Fully release the OOM'd pipeline's VRAM before reloading — a naive
+            # .to('cpu') silently fails on quantized/device_map pipelines, which
+            # is what leaks VRAM and snowballs into the OOM death spiral.
+            _free_pipeline_vram(pipe)
+            pipe = None
+            try:
+                pipe = await asyncio.get_event_loop().run_in_executor(
+                    None, _load_video_pipeline, model_name, device, request.mode,
+                    _retry_strategy, _model_cfg)
+                multi_model_manager.models[model_key] = pipe
+                multi_model_manager.current_model_key = model_key
+                frames, fps = await asyncio.get_event_loop().run_in_executor(
+                    None, _generate_video, pipe, request)
+            except Exception as e2:
+                multi_model_manager.models.pop(model_key, None)
+                multi_model_manager.model_pools.pop(model_key, None)
+                # Release the failed retry pipeline too, so the NEXT request
+                # starts from clean VRAM instead of inheriting the leak.
+                _free_pipeline_vram(pipe)
+                pipe = None
+                raise HTTPException(status_code=500, detail=f"Video generation failed (OOM retry): {e2}")
+        else:
+            # Non-OOM failure: evict the cached pipeline so the next request
+            # attempts a clean reload rather than reusing a broken object.
+            multi_model_manager.models.pop(model_key, None)
+            multi_model_manager.model_pools.pop(model_key, None)
+            _free_pipeline_vram(pipe)
+            pipe = None
+            raise HTTPException(status_code=500, detail=f"Video generation failed: {e}")
 
-    # Encode raw frames to MP4
+    # Encode raw frames to MP4 (per-model output quality via CRF when configured).
     try:
         import imageio, numpy as np
         frame_np = [np.array(f) for f in frames]
-        mp4_bytes = _frames_to_mp4(frame_np, fps)
+        _crf = (_model_cfg or {}).get('output_crf')
+        try:
+            _crf = int(_crf) if _crf is not None else None
+        except (TypeError, ValueError):
+            _crf = None
+        mp4_bytes = _frames_to_mp4(frame_np, fps, crf=_crf)
     except ImportError:
         raise HTTPException(status_code=500,
                             detail="imageio[ffmpeg] required: pip install imageio[ffmpeg]")
