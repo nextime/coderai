@@ -1214,6 +1214,30 @@ def _write_concat(clips: list, out_path: str, label: str):
 # Character-consistency helpers (keyframe bridge + LoRA)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _reassemble_finals(video_dir: Path, match_name: str,
+                       short_target: float = 45.0, long_target: float = 70.0) -> int:
+    """Rebuild a match's short/long videos from its existing clip files on disk
+    (ffmpeg concat only — no model). Returns the number of clips used."""
+    clip_files = sorted(video_dir.glob(f"{match_name}_clip*.mp4"))
+    clips = []
+    for p in clip_files:
+        dur = get_video_duration(str(p)) or 0.0
+        clips.append((str(p), dur if dur > 0 else 5.0))
+    if not clips:
+        return 0
+    short_clips, accum, pos = [], 0.0, 0
+    while accum < short_target and clips:
+        path, dur = clips[pos % len(clips)]
+        short_clips.append((path, dur))
+        accum += dur
+        pos += 1
+    _write_concat(short_clips, str(video_dir / f"{match_name}_short.mp4"),
+                  f"short (~{short_target:.0f}s)")
+    _write_concat(clips, str(video_dir / f"{match_name}_long.mp4"),
+                  f"long  (~{long_target:.0f}s)")
+    return len(clips)
+
+
 def _clip_stem_fight(match_name: str, idx: int) -> str:
     return f"{match_name}_clip{idx:02d}"
 
@@ -2026,6 +2050,235 @@ def launch_web_ui(default_args):
         except Exception as exc:
             _fail(str(exc))
 
+    def _run_train_lora_job(job_id: str, kind: str, name: str, steps: int, rank: int):
+        """Train one profile's identity LoRA (server-side, blocking) while
+        polling the server's progress so the profile page shows live step
+        counts. On success records the path in loras.json / env_loras.json."""
+        with _jobs_lock:
+            _state["jobs"][job_id] = {"status": "running", "progress": 2,
+                                      "output": None, "error": None,
+                                      "_msg": "starting…"}
+
+        def _prog(pct, msg=""):
+            with _jobs_lock:
+                _state["jobs"][job_id]["progress"] = max(2, min(99, int(pct)))
+                if msg:
+                    _state["jobs"][job_id]["_msg"] = msg
+
+        def _fail(msg):
+            with _jobs_lock:
+                _state["jobs"][job_id].update({"status": "error", "error": msg})
+
+        try:
+            client = CoderAIClient(default_args.base_url,
+                                   getattr(default_args, "api_key", None))
+            _prog(4, "selecting image model…")
+            model = getattr(default_args, "image_model", None)
+            if not model:
+                try:
+                    model = pick_model(client, "image", None)
+                except Exception as e:
+                    _fail(f"no image model available: {e}")
+                    return
+
+            # Server-side training pulls reference images from the CoderAI copy
+            # of the profile — make sure the local profile is uploaded first, or
+            # training would fail instantly with "no training images".
+            _prog(5, "ensuring profile is on CoderAI…")
+            try:
+                _ensure_in_coderai(client, kind, name, out_dir)
+            except Exception:
+                pass
+
+            prefix = "fighter_" if kind == "character" else "env_"
+            lora_name = f"{prefix}{name}"
+            _web_log(f"  🧠 Training {kind} LoRA '{lora_name}' "
+                     f"({steps} steps, rank {rank})…")
+
+            # Run the blocking train call in an inner thread; poll progress here.
+            result, err = {}, {}
+            def _do():
+                try:
+                    kwargs = dict(name=lora_name, base_model=model,
+                                  steps=int(steps), rank=int(rank))
+                    kwargs[kind] = name
+                    result["res"] = client.train_lora(**kwargs)
+                except Exception as e:
+                    err["e"] = str(e)
+            t = threading.Thread(target=_do, daemon=True)
+            t.start()
+            _prog(6, "training…")
+            while t.is_alive():
+                time.sleep(1.5)
+                try:
+                    p = client.lora_progress()
+                except Exception:
+                    continue
+                if p.get("name") and p.get("name") != lora_name:
+                    continue
+                total = p.get("total") or steps
+                step = p.get("step") or 0
+                pct = 6 + int(90 * step / max(1, total))
+                _prog(pct, p.get("message") or p.get("status") or "training")
+            t.join()
+
+            if err:
+                _web_log(f"  ✗ LoRA training failed for {name}: {err['e']}")
+                _fail(err["e"])
+                return
+            res = result.get("res") or {}
+            path = res.get("path")
+            if not path:
+                _fail(f"training returned no path: {res}")
+                return
+
+            # Record the trained LoRA in the on-disk map so video/keyframe runs reuse it.
+            map_file = out_dir / ("loras.json" if kind == "character" else "env_loras.json")
+            try:
+                lmap = json.loads(map_file.read_text()) if map_file.exists() else {}
+            except Exception:
+                lmap = {}
+            lmap[name] = path
+            try:
+                map_file.write_text(json.dumps(lmap, indent=2))
+            except Exception:
+                pass
+            _web_log(f"  ✓ LoRA trained → {path}")
+            with _jobs_lock:
+                _state["jobs"][job_id].update({
+                    "status": "done", "progress": 100, "path": path,
+                    "_msg": "training complete",
+                })
+        except Exception as exc:
+            _fail(str(exc))
+
+    def _run_match_job(job_id: str, scope: str, params: dict):
+        """Regenerate part of a match: re-render clips (video model), re-render
+        outcome outputs, or reassemble the final short/long videos from existing
+        clips (no model). Detailed progress streams to the Run-page log."""
+        with _jobs_lock:
+            _state["jobs"][job_id] = {"status": "running", "progress": 3,
+                                      "output": None, "error": None,
+                                      "_msg": "starting…"}
+
+        def _prog(pct, msg=""):
+            with _jobs_lock:
+                _state["jobs"][job_id]["progress"] = max(2, min(99, int(pct)))
+                if msg:
+                    _state["jobs"][job_id]["_msg"] = msg
+
+        def _fail(msg):
+            with _jobs_lock:
+                _state["jobs"][job_id].update({"status": "error", "error": msg})
+
+        def _done(msg):
+            with _jobs_lock:
+                _state["jobs"][job_id].update({"status": "done", "progress": 100,
+                                               "_msg": msg})
+
+        def _load_map(fname):
+            fp = out_dir / fname
+            if fp.exists():
+                try:
+                    return json.loads(fp.read_text()) or {}
+                except Exception:
+                    return {}
+            return {}
+
+        try:
+            import sys as _sys
+            _sys.modules[__name__]._log = _patched_log  # stream detail to web log
+            vdir = out_dir / "videos"
+            pf = vdir / "prompts.json"
+            data = {}
+            if pf.exists():
+                try:
+                    data = json.loads(pf.read_text())
+                except Exception:
+                    data = {}
+            fight_plan = data.get("fight_plan", [])
+            outcome_plan = data.get("outcome_plan", [])
+            fps = int(data.get("fps") or getattr(default_args, "fps", 8))
+            match_name = params.get("match")
+
+            # ── Reassemble only: no model needed ───────────────────────────────
+            if scope == "reassemble":
+                m = next((x for x in fight_plan if x.get("match_name") == match_name), {})
+                st = float(m.get("short_target", 45)); lt = float(m.get("long_target", 70))
+                _prog(25, "reassembling final videos…")
+                n = _reassemble_finals(vdir, match_name, st, lt)
+                if n == 0:
+                    _fail("no clips found to reassemble")
+                    return
+                _done(f"reassembled from {n} clip(s)")
+                return
+
+            # ── Render scopes: need the video model + consistency settings ─────
+            client = CoderAIClient(default_args.base_url,
+                                   getattr(default_args, "api_key", None))
+            _prog(5, "selecting video model…")
+            video_model = getattr(default_args, "video_model", None)
+            if not video_model:
+                try:
+                    video_model = pick_model(client, "video", None)
+                except Exception as e:
+                    _fail(f"no video model available: {e}")
+                    return
+            consistency = parse_consistency(getattr(default_args, "consistency", "keyframe"))
+            lora_map = _load_map("loras.json")
+            env_lora_map = _load_map("env_loras.json")
+            keyframe_dir = vdir / "keyframes" if "keyframe" in consistency else None
+            clip_delay = float(getattr(default_args, "clip_delay", 5.0))
+            lw = float(getattr(default_args, "lora_weight", 0.85))
+            elw = float(getattr(default_args, "env_lora_weight", 0.8))
+
+            if scope in ("match-clips", "clip"):
+                m = next((x for x in fight_plan if x.get("match_name") == match_name), None)
+                if not m:
+                    _fail("match not found in prompts.json — render it from the Run page first")
+                    return
+                mm = dict(m)
+                if scope == "clip":
+                    idx = int(params.get("idx"))
+                    mm["clips"] = [c for c in m["clips"] if int(c["idx"]) == idx]
+                    if not mm["clips"]:
+                        _fail("clip not found in prompts.json")
+                        return
+                _prog(8, f"rendering {len(mm['clips'])} clip(s) — see Run log for detail…")
+                _stage_videos_render(
+                    client, video_model, vdir, [mm], [], 1, 0, fps, clip_delay,
+                    consistency=consistency, lora_map=lora_map,
+                    keyframe_dir=keyframe_dir, lora_weight=lw,
+                    env_lora_map=env_lora_map, env_lora_weight=elw)
+                _done(f"re-rendered {len(mm['clips'])} clip(s)")
+                return
+
+            if scope in ("outcomes", "outcome"):
+                fighter = params.get("fighter")
+                if scope == "outcome":
+                    target = f"{fighter}_{params.get('outcome')}"
+                    sel = [o for o in outcome_plan
+                           if _clip_stem_outcome(o["fighter"], o["outcome"]) == target]
+                elif fighter:
+                    sel = [o for o in outcome_plan if o["fighter"] == fighter]
+                else:
+                    sel = list(outcome_plan)
+                if not sel:
+                    _fail("no matching outputs in prompts.json")
+                    return
+                _prog(8, f"rendering {len(sel)} output clip(s) — see Run log for detail…")
+                _stage_videos_render(
+                    client, video_model, vdir, [], sel, 0, len(sel), fps, clip_delay,
+                    consistency=consistency, lora_map=lora_map,
+                    keyframe_dir=keyframe_dir, lora_weight=lw,
+                    env_lora_map=env_lora_map, env_lora_weight=elw)
+                _done(f"re-rendered {len(sel)} output(s)")
+                return
+
+            _fail(f"unknown scope: {scope}")
+        except Exception as exc:
+            _fail(str(exc))
+
     def _web_log(msg: str):
         """Override _log so output goes to both stdout and the web log queue."""
         print(msg, flush=True)
@@ -2132,11 +2385,65 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
 .pf-actions{display:flex;gap:.5rem;align-items:center;margin-top:.7rem}
 """
 
+    # Shared modal dialog + promise-based helpers (uiConfirm/uiAlert/uiPrompt),
+    # injected into every page so we never use the browser's alert/confirm/prompt.
+    # Plain string (not an f-string): its braces are literal JS/HTML.
+    _modal_block = """
+<div class=modal-bg id=ui-modal>
+  <div class=modal>
+    <h3 id=ui-modal-title></h3>
+    <div id=ui-modal-body style="font-size:.86rem;color:#cfcfcf;white-space:pre-wrap"></div>
+    <div id=ui-modal-input-wrap style="display:none;margin-top:.7rem">
+      <input type=text id=ui-modal-input autocomplete=off>
+    </div>
+    <div style="display:flex;gap:.5rem;margin-top:1.1rem;justify-content:flex-end">
+      <button class="btn btn-secondary" id=ui-modal-cancel type=button>Cancel</button>
+      <button class="btn btn-primary" id=ui-modal-ok type=button>OK</button>
+    </div>
+  </div>
+</div>
+<script>
+(function(){
+  const bg=document.getElementById('ui-modal');
+  const titleEl=document.getElementById('ui-modal-title');
+  const bodyEl=document.getElementById('ui-modal-body');
+  const inWrap=document.getElementById('ui-modal-input-wrap');
+  const inEl=document.getElementById('ui-modal-input');
+  const okBtn=document.getElementById('ui-modal-ok');
+  const cancelBtn=document.getElementById('ui-modal-cancel');
+  let _res=null, _hasInput=false;
+  function done(val){ bg.classList.remove('open'); const r=_res; _res=null; if(r) r(val); }
+  function open(o){
+    return new Promise(res=>{
+      _res=res; _hasInput=(o.input!==undefined);
+      titleEl.textContent=o.title||'';
+      bodyEl.textContent=o.message||'';
+      okBtn.textContent=o.okText||'OK';
+      okBtn.className='btn '+(o.danger?'btn-danger':'btn-primary');
+      cancelBtn.style.display=(o.cancel===false)?'none':'';
+      if(_hasInput){ inWrap.style.display='block'; inEl.value=o.input||'';
+        setTimeout(()=>{inEl.focus();inEl.select();},40); }
+      else { inWrap.style.display='none'; }
+      bg.classList.add('open');
+    });
+  }
+  okBtn.onclick=()=>done(_hasInput?inEl.value:true);
+  cancelBtn.onclick=()=>done(_hasInput?null:false);
+  bg.onclick=e=>{ if(e.target===bg) done(_hasInput?null:false); };
+  inEl.addEventListener('keydown',e=>{ if(e.key==='Enter'){e.preventDefault();okBtn.click();} });
+  document.addEventListener('keydown',e=>{ if(bg.classList.contains('open')&&e.key==='Escape') cancelBtn.click(); });
+  window.uiConfirm=(message,o)=>open(Object.assign({title:'Confirm',message:message,okText:'OK'},o||{}));
+  window.uiAlert=(message,o)=>open(Object.assign({title:'Notice',message:message,okText:'OK',cancel:false},o||{}));
+  window.uiPrompt=(message,def,o)=>open(Object.assign({title:'Input',message:message,input:(def||''),okText:'Save'},o||{}));
+})();
+</script>"""
+
     def _page(title, body, active="run"):
         nav_items = [
             ("run", "/", "▶ Run"),
             ("characters", "/characters", "👤 Characters"),
             ("environments", "/environments", "🏞 Environments"),
+            ("matches", "/matches", "🥊 Matches"),
             ("gallery", "/gallery", "🎬 Gallery"),
         ]
         nav = "".join(
@@ -2149,6 +2456,7 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
 <style>{_CSS}</style></head><body>
 <div class=nav><span>⚔ Township Fighters</span>{nav}</div>
 <div class=container>{body}</div>
+{_modal_block}
 </body></html>"""
 
     def _run_page_html(args_ns):
@@ -2377,7 +2685,8 @@ async function saveConfig(){{
   // Relative paths are written inside the output directory. When launched with
   // -c/--config, the default below is that same config path (overwrite-in-place).
   const def = {_save_default_js};
-  const path = prompt('Save configuration to file (relative paths go inside the output dir):', def);
+  const path = await uiPrompt('Save configuration to file (relative paths go inside the output dir):', def,
+    {{title:'Save configuration', okText:'Save'}});
   if(path === null) return;  // cancelled
   const fd = new FormData(document.getElementById('run-form'));
   fd.set('path', path.trim() || def);
@@ -2491,6 +2800,12 @@ fetch('/status').then(r=>r.json()).then(d=>{{
         import html as _html
         label = "Characters" if kind == "character" else "Environments"
         profiles = _list_profiles(kind)
+        # Which profiles already have a trained LoRA (from the on-disk map).
+        _lora_file = out_dir / ("loras.json" if kind == "character" else "env_loras.json")
+        try:
+            _lora_map = json.loads(_lora_file.read_text()) if _lora_file.exists() else {}
+        except Exception:
+            _lora_map = {}
 
         def esc(v):
             return _html.escape(str(v if v is not None else ""), quote=True)
@@ -2577,6 +2892,17 @@ fetch('/status').then(r=>r.json()).then(d=>{{
                 f'onclick="uploadRefs(\'{kind}\',\'{esc(name)}\')">⬆ Upload references</button>'
                 f'    <span class=pf-upload-status style="font-size:.76rem;color:#7ea8f7"></span>'
                 f'  </div>'
+                f'  <div class=pf-actions style="border-top:1px solid #222;padding-top:.6rem;margin-top:.6rem">'
+                f'    <span style="font-size:.78rem;color:{"#7ed87e" if (_lora_map.get(name)) else "#888"}">'
+                f'Identity LoRA: {"trained ✓" if (_lora_map.get(name)) else "not trained"}</span>'
+                f'    <label style="margin:0;font-size:.78rem">steps <input type=number data-lora=steps '
+                f'value=800 min=50 max=5000 step=50 style="width:66px;display:inline-block"></label>'
+                f'    <label style="margin:0;font-size:.78rem">rank <input type=number data-lora=rank '
+                f'value=16 min=2 max=128 style="width:54px;display:inline-block"></label>'
+                f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+                f'onclick="trainLora(\'{kind}\',\'{esc(name)}\')">🧠 {"Retrain" if (_lora_map.get(name)) else "Train"} LoRA</button>'
+                f'    <span class=pf-lora-status style="font-size:.76rem;color:#7ea8f7"></span>'
+                f'  </div>'
                 f'</div>'
             )
 
@@ -2603,21 +2929,23 @@ async function saveProfile(kind,name){
   }catch(e){st.style.color='#e07070'; st.textContent='✗ '+e;}
 }
 async function delProfile(kind,name){
-  if(!confirm('Remove "'+name+'" and all its images? This deletes the local profile'
-    +' and removes it from CoderAI. This cannot be undone.'))return;
+  if(!(await uiConfirm('Remove "'+name+'" and all its images? This deletes the local profile'
+    +' and removes it from CoderAI. This cannot be undone.',
+    {title:'Remove profile', okText:'Remove', danger:true})))return;
   const fd=new FormData(); fd.append('kind',kind); fd.append('name',name);
   const r=await fetch('/profile/delete',{method:'POST',body:fd});
   const j=await r.json();
-  if(j.error){alert('Delete failed: '+j.error); return;}
+  if(j.error){await uiAlert('Delete failed: '+j.error,{title:'Error'}); return;}
   const el=document.getElementById('pf-'+kind+'-'+name);
   if(el) el.remove();
 }
 async function delImg(kind,name,file){
-  if(!confirm('Delete image "'+file+'"?'))return;
+  if(!(await uiConfirm('Delete image "'+file+'"?',
+    {title:'Delete image', okText:'Delete', danger:true})))return;
   const fd=new FormData(); fd.append('kind',kind); fd.append('name',name); fd.append('file',file);
   const r=await fetch('/profile/delete-image',{method:'POST',body:fd});
   const j=await r.json();
-  if(j.error){alert('Delete failed: '+j.error); return;}
+  if(j.error){await uiAlert('Delete failed: '+j.error,{title:'Error'}); return;}
   location.reload();
 }
 async function regenProfile(kind,name){
@@ -2654,6 +2982,37 @@ async function regenProfile(kind,name){
   };
   setTimeout(poll,800);
 }
+async function trainLora(kind,name){
+  const root=document.getElementById('pf-'+kind+'-'+name);
+  const st=root.querySelector('.pf-lora-status');
+  const steps=parseInt(root.querySelector('[data-lora=steps]').value||'800',10);
+  const rank=parseInt(root.querySelector('[data-lora=rank]').value||'16',10);
+  if(!(await uiConfirm('Train identity LoRA for "'+name+'" ('+steps+' steps)? '
+    +'This evicts loaded models and can take several minutes.',
+    {title:'Train LoRA', okText:'Train'})))return;
+  const fd=new FormData();
+  fd.append('kind',kind); fd.append('name',name);
+  fd.append('steps',steps); fd.append('rank',rank);
+  st.style.color='#aaa'; st.textContent='Starting…';
+  let j;
+  try{ j=await (await fetch('/profile/train-lora',{method:'POST',body:fd})).json(); }
+  catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; return; }
+  if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
+  const jobId=j.job_id;
+  st.style.color='#7ea8f7';
+  const poll=async()=>{
+    let d;
+    try{ d=await (await fetch('/job/'+jobId)).json(); }
+    catch(e){ setTimeout(poll,2000); return; }
+    const pct=d.progress||0;
+    if(d.status==='running'){ st.textContent='⏳ '+(d._msg||('training… '+pct+'%'))+' ('+pct+'%)'; setTimeout(poll,1500); }
+    else if(d.status==='done'){
+      st.style.color='#7ed87e'; st.textContent='✓ LoRA trained — reloading…';
+      setTimeout(()=>location.reload(),1000);
+    } else { st.style.color='#e07070'; st.textContent='✗ '+(d.error||'failed'); }
+  };
+  setTimeout(poll,900);
+}
 async function uploadRefs(kind,name){
   const root=document.getElementById('pf-'+kind+'-'+name);
   const inp=root.querySelector('[data-upload=files]');
@@ -2682,6 +3041,182 @@ async function uploadRefs(kind,name){
                 f'<p class=hint style="margin-bottom:.8rem">Edit a profile’s fields and Save, or '
                 f'Remove it entirely. Changes apply to the local output folder and are synced to CoderAI.</p>'
                 f'{inner}{script}')
+
+    def _matches_html():
+        import html as _html
+        vdir = out_dir / "videos"
+
+        def esc(v):
+            return _html.escape(str(v if v is not None else ""), quote=True)
+
+        # Load the saved plan (for fighters/env + which clips belong to a match).
+        plan = {}
+        pf = vdir / "prompts.json"
+        if pf.exists():
+            try:
+                plan = json.loads(pf.read_text())
+            except Exception:
+                plan = {}
+        fight_by_name = {m.get("match_name"): m for m in plan.get("fight_plan", [])}
+
+        # Group the rendered files on disk.
+        matches = {}     # match_name -> {"short":p,"long":p,"clips":[p,...]}
+        outcomes = []    # outcome .mp4 files
+        if vdir.exists():
+            for v in sorted(vdir.glob("*.mp4")):
+                stem = v.stem
+                if stem.endswith("_short") or stem.endswith("_long"):
+                    mn, kind = stem.rsplit("_", 1)
+                    matches.setdefault(mn, {}).setdefault("finals", {})[kind] = v
+                elif "_clip" in stem:
+                    mn = stem.split("_clip")[0]
+                    matches.setdefault(mn, {}).setdefault("clips", []).append(v)
+                else:
+                    outcomes.append(v)
+        # Matches referenced in the plan but not yet rendered also show up.
+        for mn in fight_by_name:
+            matches.setdefault(mn, {})
+
+        def _vid(relpath, height=150):
+            url = "/media/" + str(relpath).replace("\\", "/")
+            return (f'<video src="{esc(url)}" controls preload=metadata '
+                    f'style="width:100%;height:{height}px;object-fit:cover;'
+                    f'border-radius:6px;background:#111"></video>')
+
+        cards = []
+        for mn in sorted(matches):
+            info = matches[mn]
+            meta = fight_by_name.get(mn, {})
+            finals = info.get("finals", {})
+            clips = sorted(info.get("clips", []), key=lambda p: p.name)
+            f1, f2 = meta.get("f1", ""), meta.get("f2", "")
+            env = meta.get("env", "")
+            title = f"{f1} vs {f2}" if f1 else mn.replace("match_", "").replace("_", " ")
+
+            finals_html = ""
+            for k in ("short", "long"):
+                if k in finals:
+                    rel = finals[k].relative_to(out_dir)
+                    finals_html += (f'<div style="flex:1;min-width:200px">'
+                                    f'<div class=hint style="margin-bottom:.2rem">{k} ({_dur_str(finals[k])})</div>'
+                                    f'{_vid(rel)}</div>')
+            if not finals_html:
+                finals_html = '<span class=hint>No assembled videos yet.</span>'
+
+            clips_html = "".join(
+                f'<div style="width:150px">'
+                f'{_vid(c.relative_to(out_dir), height=96)}'
+                f'<div class=hint style="text-align:center">clip {esc(c.stem.split("_clip")[-1])}'
+                f' · <a href="#" onclick="reMatch(event,\'clip\',{{match:\'{esc(mn)}\',idx:\'{esc(c.stem.split("_clip")[-1])}\'}})" '
+                f'style="color:#7eb8f7">re-render</a></div>'
+                f'</div>'
+                for c in clips
+            ) or '<span class=hint>No clips rendered.</span>'
+
+            cards.append(
+                f'<div class=card id="match-{esc(mn)}">'
+                f'  <div class=pf-head><span class=pf-name>🥊 {esc(title)}</span>'
+                f'  <span class=hint>{esc(env)} · {len(clips)} clip(s)</span></div>'
+                f'  <div class=section-title style="margin:.5rem 0 .3rem">Final videos</div>'
+                f'  <div style="display:flex;gap:.6rem;flex-wrap:wrap">{finals_html}</div>'
+                f'  <div class=section-title style="margin:.7rem 0 .3rem">Single clips</div>'
+                f'  <div style="display:flex;gap:.5rem;flex-wrap:wrap">{clips_html}</div>'
+                f'  <div class=pf-actions style="border-top:1px solid #222;padding-top:.6rem;margin-top:.7rem">'
+                f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+                f'onclick="reMatch(event,\'match-clips\',{{match:\'{esc(mn)}\'}})">♻ Re-render all clips</button>'
+                f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+                f'onclick="reMatch(event,\'reassemble\',{{match:\'{esc(mn)}\'}})">🎞 Reassemble finals</button>'
+                f'    <span class=match-status style="font-size:.76rem;color:#7ea8f7"></span>'
+                f'  </div>'
+                f'</div>'
+            )
+
+        # Outcome clips ("outputs"), grouped by fighter.
+        out_by_fighter = {}
+        for v in outcomes:
+            fighter = v.stem.rsplit("_", 1)[0] if "_" in v.stem else v.stem
+            out_by_fighter.setdefault(fighter, []).append(v)
+        out_cards = []
+        for fighter in sorted(out_by_fighter):
+            vids = sorted(out_by_fighter[fighter], key=lambda p: p.name)
+            grid = "".join(
+                f'<div style="width:150px">{_vid(v.relative_to(out_dir), height=96)}'
+                f'<div class=hint style="text-align:center">{esc(v.stem.split("_",1)[-1])}'
+                f' · <a href="#" onclick="reMatch(event,\'outcome\',{{fighter:\'{esc(fighter)}\',outcome:\'{esc(v.stem.split("_",1)[-1])}\'}})" '
+                f'style="color:#7eb8f7">re-render</a></div></div>'
+                for v in vids
+            )
+            out_cards.append(
+                f'<div class=card id="out-{esc(fighter)}">'
+                f'  <div class=pf-head><span class=pf-name>🎬 {esc(fighter)} — outputs</span>'
+                f'  <span class=hint>{len(vids)} clip(s)</span></div>'
+                f'  <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.4rem">{grid}</div>'
+                f'  <div class=pf-actions style="border-top:1px solid #222;padding-top:.6rem;margin-top:.7rem">'
+                f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+                f'onclick="reMatch(event,\'outcomes\',{{fighter:\'{esc(fighter)}\'}})">♻ Re-render {esc(fighter)} outputs</button>'
+                f'    <span class=match-status style="font-size:.76rem;color:#7ea8f7"></span>'
+                f'  </div>'
+                f'</div>'
+            )
+
+        body = ""
+        if cards:
+            body += "".join(cards)
+        if out_cards:
+            body += ('<div class=section-title style="margin:1.2rem 0 .4rem;font-size:1rem">'
+                     'Outcome clips (outputs)</div>' + "".join(out_cards))
+        if not body:
+            body = ('<div class=card style="color:#666">No matches found yet. Render '
+                    'videos from the Run page first (or run the Videos step).</div>')
+
+        script = """
+<script>
+async function reMatch(ev, scope, params){
+  if(ev) ev.preventDefault();
+  const labels={'match-clips':'Re-render ALL clips of this match (uses the video model, can take a while)?',
+                'clip':'Re-render this single clip?',
+                'reassemble':'Reassemble the final short/long videos from the existing clips? (fast, no model)',
+                'outcomes':'Re-render all output clips for this fighter (uses the video model)?',
+                'outcome':'Re-render this output clip?'};
+  if(!(await uiConfirm(labels[scope]||'Proceed?',
+       {title:'Regenerate', okText:(scope==='reassemble'?'Reassemble':'Re-render'),
+        danger:(scope!=='reassemble')})))return;
+  // Locate the status span of the card that triggered this.
+  const card = ev && ev.target ? ev.target.closest('.card') : null;
+  const st = card ? card.querySelector('.match-status') : null;
+  const setSt=(c,t)=>{ if(st){ st.style.color=c; st.textContent=t; } };
+  const fd=new FormData(); fd.append('scope',scope);
+  for(const k in params) fd.append(k, params[k]);
+  setSt('#aaa','Starting…');
+  let j;
+  try{ j=await (await fetch('/matches/render',{method:'POST',body:fd})).json(); }
+  catch(e){ setSt('#e07070','✗ '+e); return; }
+  if(j.error){ setSt('#e07070','✗ '+j.error); return; }
+  const jobId=j.job_id;
+  const poll=async()=>{
+    let d;
+    try{ d=await (await fetch('/job/'+jobId)).json(); }
+    catch(e){ setTimeout(poll,2000); return; }
+    const pct=d.progress||0;
+    if(d.status==='running'){ setSt('#7ea8f7','⏳ '+(d._msg||('working… '+pct+'%'))+' ('+pct+'%)'); setTimeout(poll,1500); }
+    else if(d.status==='done'){ setSt('#7ed87e','✓ '+(d._msg||'done')+' — reloading…'); setTimeout(()=>location.reload(),1200); }
+    else { setSt('#e07070','✗ '+(d.error||'failed')); }
+  };
+  setTimeout(poll,900);
+}
+</script>"""
+
+        return (f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                f'<h1>Matches</h1>'
+                f'<a href="/matches" class="btn btn-secondary" style="font-size:.8rem">↻ Refresh</a></div>'
+                f'<p class=hint style="margin-bottom:.8rem">Final videos, single clips and outcome '
+                f'outputs per match. Re-render clips/outputs with the video model, or reassemble the '
+                f'final short/long videos from existing clips (no model).</p>'
+                f'{body}{script}')
+
+    def _dur_str(p: Path) -> str:
+        d = get_video_duration(str(p)) or 0
+        return f"{d:.0f}s" if d else "?"
 
     def _gallery_html(out_path: Path):
         sections = []
@@ -2893,6 +3428,10 @@ async function pollJob(){
                 html = _page("Environments", _profiles_html("environment"), "environments")
                 self._send(200, "text/html; charset=utf-8", html)
 
+            elif path == "/matches":
+                html = _page("Matches", _matches_html(), "matches")
+                self._send(200, "text/html; charset=utf-8", html)
+
             elif path == "/gallery":
                 html = _page("Gallery", _gallery_html(out_dir), "gallery")
                 self._send(200, "text/html; charset=utf-8", html)
@@ -3039,6 +3578,81 @@ async function pollJob(){
                 job_id = _u.uuid4().hex[:12]
                 threading.Thread(target=_run_regen_job,
                                  args=(job_id, kind, name, count, guide),
+                                 daemon=True).start()
+                self._send(200, "application/json", _j.dumps({"job_id": job_id}))
+                return
+
+            if path == "/profile/train-lora":
+                import json as _j, uuid as _u
+                clen = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(clen)
+                ctype = self.headers.get("Content-Type", "")
+                if "multipart/form-data" in ctype:
+                    boundary = ctype.split("boundary=")[-1].strip().encode()
+                    form = _parse_multipart(raw, boundary)
+                else:
+                    form = dict(urllib.parse.parse_qsl(raw.decode(errors="replace")))
+
+                def _fv(k, default=""):
+                    v = form.get(k)
+                    if v is None: return default
+                    return v if isinstance(v, str) else v.decode(errors="replace")
+
+                kind = _fv("kind"); name = _fv("name")
+                if (kind not in ("character", "environment") or not name
+                        or "/" in name or "\\" in name or ".." in name):
+                    self._send(400, "application/json",
+                               _j.dumps({"error": "invalid kind/name"}))
+                    return
+                try:
+                    steps = max(50, min(5000, int(_fv("steps", "800") or 800)))
+                except ValueError:
+                    steps = 800
+                try:
+                    rank = max(2, min(128, int(_fv("rank", "16") or 16)))
+                except ValueError:
+                    rank = 16
+                job_id = _u.uuid4().hex[:12]
+                threading.Thread(target=_run_train_lora_job,
+                                 args=(job_id, kind, name, steps, rank),
+                                 daemon=True).start()
+                self._send(200, "application/json", _j.dumps({"job_id": job_id}))
+                return
+
+            if path == "/matches/render":
+                import json as _j, uuid as _u
+                clen = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(clen)
+                ctype = self.headers.get("Content-Type", "")
+                if "multipart/form-data" in ctype:
+                    boundary = ctype.split("boundary=")[-1].strip().encode()
+                    form = _parse_multipart(raw, boundary)
+                else:
+                    form = dict(urllib.parse.parse_qsl(raw.decode(errors="replace")))
+
+                def _fv(k, default=""):
+                    v = form.get(k)
+                    if v is None: return default
+                    return v if isinstance(v, str) else v.decode(errors="replace")
+
+                scope = _fv("scope")
+                if scope not in ("match-clips", "clip", "reassemble", "outcomes", "outcome"):
+                    self._send(400, "application/json",
+                               _j.dumps({"error": "invalid scope"}))
+                    return
+                params = {}
+                for k in ("match", "idx", "fighter", "outcome"):
+                    val = _fv(k)
+                    if val:
+                        # Guard path-like fields against traversal.
+                        if k in ("match", "fighter") and ("/" in val or "\\" in val or ".." in val):
+                            self._send(400, "application/json",
+                                       _j.dumps({"error": f"invalid {k}"}))
+                            return
+                        params[k] = val
+                job_id = _u.uuid4().hex[:12]
+                threading.Thread(target=_run_match_job,
+                                 args=(job_id, scope, params),
                                  daemon=True).start()
                 self._send(200, "application/json", _j.dumps({"job_id": job_id}))
                 return
@@ -3276,6 +3890,14 @@ async function pollJob(){
                     "only_assets": sc == "assets",
                     "web_port": port,
                 }
+                # Apply the changed connection/model settings to the live session
+                # immediately, so subsequent per-profile jobs (regenerate, train
+                # LoRA) and runs use them — not the values from script launch.
+                for _k in ("base_url", "api_key", "image_model",
+                           "video_model", "text_model"):
+                    setattr(default_args, _k, cfg.get(_k))
+                _web_log(f"  ⚙ Settings applied (image model: "
+                         f"{cfg.get('image_model') or 'auto'})")
                 # Resolve the target path. Relative paths land inside out_dir;
                 # the filename is sanitised to its basename for relative saves to
                 # avoid writing outside the output tree from the browser.
@@ -3406,6 +4028,12 @@ async function pollJob(){
             ns.only_assets      = (os_mode == "assets")
             ns.cli_mode = True
             ns.web_port = port
+
+            # Apply the submitted connection/model settings to the live session
+            # so later per-profile jobs (regenerate, train LoRA) use them too.
+            for _k in ("base_url", "api_key", "image_model",
+                       "video_model", "text_model"):
+                setattr(default_args, _k, getattr(ns, _k, None))
 
             # Apply the same shortcut logic as CLI
             if ns.only_characters:
@@ -3658,19 +4286,33 @@ async function pollJob(){
         _no_env_loras = getattr(args, "no_env_loras", False)
         _env_lora_weight = getattr(args, "env_lora_weight", 0.8)
 
-        # Train LoRAs when requested (full run with lora strategy, or the LoRA step).
-        if "lora" in consistency and (char_names or []) and (only_loras or not args.skip_videos):
-            lora_map = stage_loras(client, image_model, out_dir_r, char_names or [],
-                                   lora_steps=getattr(args, "lora_steps", 800),
-                                   lora_rank=getattr(args, "lora_rank", 16))
-        if ("lora" in consistency and not _no_env_loras and (env_names or [])
-                and (only_loras or not args.skip_videos)):
-            env_lora_map = stage_env_loras(client, image_model, out_dir_r, env_names or [],
-                                           lora_steps=getattr(args, "env_lora_steps", 800),
-                                           lora_rank=getattr(args, "env_lora_rank", 16))
+        # Train LoRAs when requested. The explicit "Train LoRAs" step (only_loras)
+        # always trains regardless of the consistency strategy — the user asked
+        # for it directly. A full run trains only when 'lora' is in consistency.
+        _want_lora = only_loras or ("lora" in consistency and not args.skip_videos)
+        if _want_lora:
+            if char_names:
+                _web_log(f"  Training character LoRAs for {len(char_names)} fighter(s): "
+                         f"{', '.join(char_names)}")
+                lora_map = stage_loras(client, image_model, out_dir_r, char_names or [],
+                                       lora_steps=getattr(args, "lora_steps", 800),
+                                       lora_rank=getattr(args, "lora_rank", 16))
+            else:
+                _web_log("  ⚠ No characters found to train LoRAs for. Generate or "
+                         "select fighters first (Characters page).")
+            if not _no_env_loras:
+                if env_names:
+                    _web_log(f"  Training environment LoRAs for {len(env_names)} location(s): "
+                             f"{', '.join(env_names)}")
+                    env_lora_map = stage_env_loras(client, image_model, out_dir_r, env_names or [],
+                                                   lora_steps=getattr(args, "env_lora_steps", 800),
+                                                   lora_rank=getattr(args, "env_lora_rank", 16))
+                else:
+                    _web_log("  ⚠ No environments found to train LoRAs for.")
 
         if only_loras:
-            _web_log("\n✓ LoRA step complete.")
+            _web_log(f"\n✓ LoRA step complete. "
+                     f"Characters: {len(lora_map)} | Environments: {len(env_lora_map)}")
         elif only_keyframes:
             stage_videos(
                 client, video_model, out_dir_r,
