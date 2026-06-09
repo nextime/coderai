@@ -2503,7 +2503,13 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
 .pf-name{font-weight:700;color:#f5a623;font-size:1.05rem}
 .pf-thumbs{display:flex;gap:.4rem;flex-wrap:wrap;margin:.5rem 0}
 .pf-thumb{position:relative;width:92px;height:92px}
-.pf-thumb img{width:92px;height:92px;object-fit:cover;border-radius:4px;background:#111}
+.pf-thumb img{width:92px;height:92px;object-fit:cover;border-radius:4px;background:#111;cursor:zoom-in}
+/* image lightbox (click a thumbnail to enlarge) */
+.lightbox-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.9);z-index:200;
+             align-items:center;justify-content:center;cursor:zoom-out;padding:1.5rem}
+.lightbox-bg.open{display:flex}
+.lightbox-bg img{max-width:95vw;max-height:95vh;object-fit:contain;border-radius:8px;
+                 box-shadow:0 0 40px rgba(0,0,0,.8)}
 .pf-thumb-del{position:absolute;top:2px;right:2px;background:rgba(192,57,43,.92);color:#fff;
               border:none;border-radius:3px;cursor:pointer;font-size:.7rem;
               width:18px;height:18px;line-height:1;padding:0}
@@ -2565,6 +2571,27 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
 })();
 </script>"""
 
+    # Shared image lightbox: call showImg(src, alt) to enlarge any image; click
+    # the backdrop or press Escape to close. Injected into every page.
+    _lightbox_block = """
+<div class=lightbox-bg id=img-lightbox onclick="this.classList.remove('open')">
+  <img id=img-lightbox-img src="" alt="">
+</div>
+<script>
+(function(){
+  window.showImg=function(src,alt){
+    var bg=document.getElementById('img-lightbox');
+    var im=document.getElementById('img-lightbox-img');
+    if(!bg||!im) return;
+    im.src=src; im.alt=alt||'';
+    bg.classList.add('open');
+  };
+  document.addEventListener('keydown',function(e){
+    if(e.key==='Escape'){var bg=document.getElementById('img-lightbox'); if(bg) bg.classList.remove('open');}
+  });
+})();
+</script>"""
+
     def _page(title, body, active="run"):
         nav_items = [
             ("run", "/", "▶ Run"),
@@ -2585,6 +2612,7 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
 <div class=nav><span>⚔ Township Fighters</span>{nav}</div>
 <div class=container>{body}</div>
 {_modal_block}
+{_lightbox_block}
 </body></html>"""
 
     def _run_page_html(args_ns):
@@ -2949,7 +2977,8 @@ fetch('/status').then(r=>r.json()).then(d=>{{
             meta = p["meta"]
             thumbs = "".join(
                 f'<div class=pf-thumb>'
-                f'<img src="/media/{kind}s/{esc(name)}/{esc(img)}" loading=lazy alt="{esc(img)}">'
+                f'<img src="/media/{kind}s/{esc(name)}/{esc(img)}" loading=lazy alt="{esc(img)}" '
+                f'title="Click to enlarge" onclick="showImg(this.src, this.alt)">'
                 f'<button class=pf-thumb-del title="Delete this image" '
                 f'onclick="delImg(\'{kind}\',\'{esc(name)}\',\'{esc(img)}\')">✕</button>'
                 f'</div>'
