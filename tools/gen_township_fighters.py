@@ -3806,6 +3806,21 @@ async function pollJob(){
     class _Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, fmt, *args): pass  # suppress access log
 
+        def handle_one_request(self):
+            # Browsers routinely abort media (video seek/scrub) and SSE
+            # connections mid-response; that surfaces as BrokenPipe/ConnReset.
+            # Swallow those so they don't spam the terminal with tracebacks.
+            try:
+                super().handle_one_request()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
+
+        def finish(self):
+            try:
+                super().finish()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+
         def _send(self, code, ctype, body):
             if isinstance(body, str): body = body.encode()
             self.send_response(code)
