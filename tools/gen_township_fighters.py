@@ -2557,9 +2557,14 @@ def launch_web_ui(default_args):
                     # starving the progress endpoint) — keep the UI visibly alive.
                     _prog(6, f"preparing — loading model… ({_et})")
                     continue
-                # Trainings are serialized by the queue, so trust the active job's
-                # progress even if the reported name doesn't line up — a strict
-                # name match would otherwise freeze the bar at 6% forever.
+                # The server has ONE global training progress (jobs run one at a
+                # time via the queue). Only mirror it onto THIS card when it's
+                # reporting OUR LoRA; otherwise another job is training and we're
+                # still queued — show that instead of its progress.
+                pname = p.get("name") or ""
+                if pname and pname != lora_name:
+                    _prog(4, f"queued — '{pname}' training first… ({_et})")
+                    continue
                 status = (p.get("status") or "").strip()
                 total = p.get("total") or steps
                 step = p.get("step") or 0
