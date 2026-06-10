@@ -5086,7 +5086,7 @@ async function pollJob(){
 
                 scope = _fv("scope")
                 if scope not in ("match-clips", "clip", "reassemble", "outcomes",
-                                 "outcome", "enhance"):
+                                 "outcome", "enhance", "keyframes", "keyframe"):
                     self._send(400, "application/json",
                                _j.dumps({"error": "invalid scope"}))
                     return
