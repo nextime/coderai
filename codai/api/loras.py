@@ -372,17 +372,69 @@ def _release_base_cache(needed_gb: float = 0.0) -> float:
     if not _train_lock.acquire(blocking=False):
         return 0.0
     try:
+        had = False
         with _base_lock:
-            if _base_cache["components"] is None:
-                return 0.0
+            had = _base_cache["components"] is not None
+        with _wan_lock:
+            had = had or _wan_cache["experts"] is not None
+        if not had:
+            return 0.0
         before = _free_vram_gb()
         _drop_base_cache()
+        _drop_wan_cache()   # the Wan transformer(s) sit on GPU between jobs
         return max(0.0, _free_vram_gb() - before)
     finally:
         _train_lock.release()
 
 
-# Let the model manager reclaim this cache when a generation needs VRAM.
+# ── Wan video-DiT base cache ─────────────────────────────────────────────────
+# The Wan transformer expert(s) are very expensive to load (a 14B A14B model can
+# take tens of minutes). Keep them resident between consecutive trainings against
+# the same base so a back-to-back job skips the reload. Unlike the SD base (held
+# on CPU), 4-bit Wan transformers can't move off the GPU, so they hold VRAM
+# between jobs — the external releaser above drops them the moment a generation
+# needs the GPU.
+_wan_lock = threading.RLock()
+_wan_cache = {"path": None, "quantize": None, "experts": None, "boundary": None}
+
+
+def _drop_wan_cache_locked() -> None:
+    exp = _wan_cache.get("experts")
+    if exp:
+        for _, tr in exp:
+            try:
+                tr.delete_adapters("default")
+            except Exception:
+                pass
+    _wan_cache.update(path=None, quantize=None, experts=None, boundary=None)
+
+
+def _drop_wan_cache() -> None:
+    with _wan_lock:
+        had = _wan_cache.get("experts") is not None
+        _drop_wan_cache_locked()
+    if had:
+        _free_train_vram()
+
+
+def _acquire_wan_experts(base_path, quantize, load_fn):
+    """Return cached Wan (experts, boundary) for base_path, loading via load_fn()
+    on a miss. A change of base_path/quantize drops the previous cache first."""
+    with _wan_lock:
+        c = _wan_cache
+        if (c["experts"] is not None and c["path"] == base_path
+                and c["quantize"] == quantize):
+            _dbg_lora(f"reusing cached Wan transformer(s): {base_path}")
+            return c["experts"], c["boundary"]
+        if c["experts"] is not None:
+            _dbg_lora(f"Wan base changed ({c['path']} → {base_path}); dropping cache")
+            _drop_wan_cache_locked()
+        experts, boundary = load_fn()
+        c.update(path=base_path, quantize=quantize, experts=experts, boundary=boundary)
+        return experts, boundary
+
+
+# Let the model manager reclaim these caches when a generation needs VRAM.
 try:
     from codai.models.manager import multi_model_manager as _mmm
     _mmm.register_external_vram_releaser(_release_base_cache)
@@ -906,24 +958,32 @@ def _train_wan(req, base_path, images, instance_prompt,
             tr = tr.to(device)
         return tr
 
-    experts = [("transformer", _load_transformer("transformer"))]
-    if _os.path.isdir(_os.path.join(base_path, "transformer_2")):
-        experts.append(("transformer_2", _load_transformer("transformer_2")))
+    def _load_experts():
+        exp = [("transformer", _load_transformer("transformer"))]
+        if _os.path.isdir(_os.path.join(base_path, "transformer_2")):
+            exp.append(("transformer_2", _load_transformer("transformer_2")))
+        b = getattr(exp[0][1].config, "boundary_ratio", None)
+        return exp, b
 
-    boundary = getattr(experts[0][1].config, "boundary_ratio", None)
+    # Reuse the transformer(s) across consecutive trainings against the same base.
+    experts, boundary = _acquire_wan_experts(base_path, quantize, _load_experts)
+
     lora_cfg = PeftLoraConfig(
         r=rank, lora_alpha=rank, init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
     lora_params = []
+    hook_handles = []
     for _, tr in experts:
         tr.requires_grad_(False)
         tr.add_adapter(lora_cfg, adapter_name="default")
         try:
             tr.enable_gradient_checkpointing()
             # Make checkpointing track grads through a frozen/quantized base.
-            tr.patch_embedding.register_forward_hook(
-                lambda m, i, o: o.requires_grad_(True))
+            # Keep the handle so the hook is removed at job end — the transformer
+            # is cached and reused, so hooks must not accumulate across jobs.
+            hook_handles.append(tr.patch_embedding.register_forward_hook(
+                lambda m, i, o: o.requires_grad_(True)))
         except Exception:
             pass
         tr.train()
@@ -972,9 +1032,11 @@ def _train_wan(req, base_path, images, instance_prompt,
         optimizer.step()
         optimizer.zero_grad()
 
+        # Report progress every step so the web UI bar advances smoothly (cheap
+        # dict update); throttle the terminal debug print to every 10 steps.
+        _set_progress(step=step + 1,
+                      message=f"step {step+1}/{steps} loss={loss.item():.4f}")
         if step % 10 == 0 or step == steps - 1:
-            _set_progress(step=step + 1,
-                          message=f"step {step+1}/{steps} loss={loss.item():.4f}")
             _dbg_lora(f"Wan step {step+1}/{steps} loss={loss.item():.4f}")
         try:
             from codai.models.thermal import checkpoint as _thermal_checkpoint
@@ -1004,18 +1066,26 @@ def _train_wan(req, base_path, images, instance_prompt,
                                       safe_serialization=True, **save_kwargs)
     _write_meta(name, req, base_path, len(images), "wan", instance_prompt)
 
-    # ── 5. Tear down: drop adapters + free VRAM for the next request ───────────
+    # ── 5. Tear down THIS job's adapter, but KEEP the transformer(s) cached so a
+    # next training against the same base skips the (very slow) reload. Remove the
+    # gradient-checkpoint hooks and the adapter; the experts stay resident on the
+    # GPU (the external releaser drops them if a generation needs the VRAM).
+    for h in hook_handles:
+        try:
+            h.remove()
+        except Exception:
+            pass
     for _, tr in experts:
         try:
             tr.delete_adapters("default")
         except Exception:
             pass
         try:
-            tr.to("cpu")
+            tr.eval()
         except Exception:
-            pass  # 4-bit modules can't move; just drop the refs below
+            pass
     try:
-        del optimizer, lora_params, latents_list, encoder_hidden_states, experts
+        del optimizer, lora_params, latents_list, encoder_hidden_states
     except Exception:
         pass
     _free_train_vram()
@@ -1070,12 +1140,13 @@ def _train_lora_blocking(req: LoraTrainRequest) -> dict:
         import traceback
         traceback.print_exc()
         # On error the base may be in a half-moved / inconsistent state — drop the
-        # cache entirely (and reclaim its VRAM) rather than reuse it.
+        # caches entirely (and reclaim their VRAM) rather than reuse them.
         try:
             _set_progress(active=False, status="error", message="training failed")
         except Exception:
             pass
         _drop_base_cache()
+        _drop_wan_cache()
         raise
     finally:
         _train_lock.release()
