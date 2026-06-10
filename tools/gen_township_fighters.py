@@ -1684,6 +1684,21 @@ def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: P
     use_ip = "ipadapter" in consistency or "keyframe" in consistency
     use_lora = "lora" in consistency
 
+    # Map match_name -> [f1, f2] so an outcome keyframe attaches BOTH match
+    # fighters' LoRAs (+ env), like the clips do — not just the single fighter
+    # the scene is named after. Read the saved plan too, so a single-outcome
+    # regen (fight_plan == []) can still resolve the pair.
+    _mf_map = {}
+    for m in fight_plan:
+        _mf_map[m.get("match_name")] = [x for x in (m.get("f1"), m.get("f2")) if x]
+    try:
+        _saved = json.loads((Path(keyframe_dir).parent / "prompts.json").read_text())
+        for m in _saved.get("fight_plan", []):
+            _mf_map.setdefault(m.get("match_name"),
+                               [x for x in (m.get("f1"), m.get("f2")) if x])
+    except Exception:
+        pass
+
     # Flatten all clips into (stem, prompt, fighters, env) jobs.
     jobs = []
     for m in fight_plan:
@@ -1691,8 +1706,11 @@ def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: P
             jobs.append((_clip_stem_fight(m["match_name"], c["idx"]),
                          c["prompt"], [m["f1"], m["f2"]], m.get("env")))
     for o in outcome_plan:
+        _of = _mf_map.get(o.get("match_name")) or [o["fighter"]]
+        if o["fighter"] not in _of:
+            _of = [o["fighter"]] + _of
         jobs.append((_clip_stem_outcome(o["fighter"], o["outcome"], o.get("match_name")),
-                     o["prompt"], [o["fighter"]], o.get("env")))
+                     o["prompt"], _of, o.get("env")))
 
     _log(f"\n  ── Keyframe phase — {len(jobs)} keyframe image(s) (image model) ──")
     made, skipped, failed = 0, 0, 0
@@ -2020,6 +2038,21 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
     video_slug = _model_slug(video_model)
     use_lora = "lora" in consistency
 
+    # Map match_name -> [f1, f2] so an outcome clip (which belongs to a match)
+    # can attach BOTH fighters' LoRAs + the environment, not just the single
+    # fighter the scene is named after. Read from the saved plan too, so this
+    # still resolves when re-rendering outcomes alone (fight_plan == []).
+    _mf_map = {}
+    for _m in fight_plan:
+        _mf_map[_m.get("match_name")] = [x for x in (_m.get("f1"), _m.get("f2")) if x]
+    try:
+        _saved = json.loads((Path(video_dir) / "prompts.json").read_text())
+        for _m in _saved.get("fight_plan", []):
+            _mf_map.setdefault(_m.get("match_name"),
+                               [x for x in (_m.get("f1"), _m.get("f2")) if x])
+    except Exception:
+        pass
+
     _total_clips = sum(len(m.get("clips", [])) for m in fight_plan) + len(outcome_plan)
     _done_clips = 0
     _gidx = 0  # running index over the combined clip sequence
@@ -2158,10 +2191,16 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         out_path = str(video_dir / f"{clip_name}.mp4")
         _log(f"\n  [{oi+1}/{total_outcomes}] {clip_name}  ({o['target_s']:.0f}s, env={o['env']})")
         _clip("start")
+        # Attach BOTH match fighters' LoRAs (+ env) — an outcome scene still
+        # belongs to the match. Fall back to the single fighter for legacy
+        # outcomes whose match can't be resolved.
+        _ofighters = _mf_map.get(o.get("match_name")) or [o["fighter"]]
+        if o["fighter"] not in _ofighters:
+            _ofighters = [o["fighter"]] + _ofighters
         ok, dur, is_fatal = _render(
             f"{clip_name} outcome clip",
             o["prompt"], [o["fighter"]], o["env"], o["nf"], out_path,
-            stem=clip_name, fighters=[o["fighter"]])
+            stem=clip_name, fighters=_ofighters)
         if is_fatal:
             fatal = True
             _clip("end", False)
@@ -4521,6 +4560,8 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             f'onclick="reMatch(event,\'reassemble\',{{match:\'{_esc(name)}\'}})">🎞 Reassemble finals</button>'
             f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="reMatch(event,\'outcomes\',{{match:\'{_esc(name)}\'}})">♻ Re-render all outcomes</button>'
+            f'  </div>'
+            f'  <div class=pf-actions style="margin-top:.4rem">'
             f'    <a class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem;text-decoration:none" '
             f'href="/match/keyframes?name={_esc(name)}">🖼 Keyframes ▸</a>'
             f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
