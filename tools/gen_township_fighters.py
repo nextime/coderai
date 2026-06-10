@@ -2834,7 +2834,10 @@ def launch_web_ui(default_args):
             # click "Re-render" afterwards to rebuild the clip from the new
             # keyframe. scope "keyframes" = whole match; "keyframe" = one clip
             # (idx) or one outcome (fighter+outcome).
-            if scope in ("keyframes", "keyframe"):
+            if scope in ("keyframes", "keyframes-missing", "keyframe"):
+                # "keyframes-missing" only fills in keyframes that don't exist yet
+                # (no delete); "keyframes"/"keyframe" delete then regenerate.
+                missing_only = (scope == "keyframes-missing")
                 image_model = getattr(default_args, "image_model", None)
                 if not image_model:
                     try:
@@ -2846,8 +2849,8 @@ def launch_web_ui(default_args):
                 m = next((x for x in fight_plan
                           if x.get("match_name") == match_name), None)
                 # Build the (filtered) fight/outcome plans + the list of stems to
-                # drop so _generate_keyframes (which keeps existing PNGs) remakes
-                # exactly those.
+                # (re)make. _generate_keyframes keeps existing PNGs, so deleting a
+                # stem first forces a remake; leaving it forces a fill-in.
                 fp, op, stems = [], [], []
                 if scope == "keyframe" and params.get("fighter") and params.get("outcome"):
                     fr, oc = params.get("fighter"), params.get("outcome")
@@ -2872,10 +2875,10 @@ def launch_web_ui(default_args):
                             return
                     fp = [mm]
                     stems = [_clip_stem_fight(match_name, c["idx"]) for c in mm["clips"]]
-                    # "Regenerate all" (whole match) also covers this match's
-                    # OUTCOME keyframes — not just the clips. Per-clip regen
-                    # (scope == "keyframe" with idx) stays clip-only.
-                    if scope == "keyframes":
+                    # Whole-match scopes also cover this match's OUTCOME keyframes —
+                    # not just the clips. Per-clip regen (scope == "keyframe" with
+                    # idx) stays clip-only.
+                    if scope in ("keyframes", "keyframes-missing"):
                         _mf = {mm.get("f1"), mm.get("f2")} - {None}
                         for o in outcome_plan:
                             if o.get("match_name"):
@@ -2886,14 +2889,22 @@ def launch_web_ui(default_args):
                             op.append(o)
                             stems.append(_clip_stem_outcome(
                                 o["fighter"], o["outcome"], o.get("match_name")))
-                _set_items([f"keyframe {s}" for s in stems])
-                for i, s in enumerate(stems):
+                # In missing-only mode, narrow progress items to the absent ones.
+                work = ([s for s in stems if not (kdir / f"{s}.png").exists()]
+                        if missing_only else stems)
+                if missing_only and not work:
+                    _done("no missing keyframes — all present")
+                    return
+                _set_items([f"keyframe {s}" for s in work])
+                for i, s in enumerate(work):
                     _item(i, "start")
-                    try:
-                        (kdir / f"{s}.png").unlink()
-                    except Exception:
-                        pass
-                _prog(10, f"regenerating {len(stems)} keyframe(s)…")
+                    if not missing_only:
+                        try:
+                            (kdir / f"{s}.png").unlink()
+                        except Exception:
+                            pass
+                _prog(10, ("filling in {n} missing keyframe(s)…" if missing_only
+                           else "regenerating {n} keyframe(s)…").format(n=len(work)))
                 try:
                     _generate_keyframes(
                         client, image_model, kdir, fp, op,
@@ -2906,10 +2917,11 @@ def launch_web_ui(default_args):
                     _fail(f"keyframe regeneration failed: {e}")
                     return
                 # Mark each item done/failed by whether its PNG now exists.
-                for i, s in enumerate(stems):
+                for i, s in enumerate(work):
                     _item(i, "end", (kdir / f"{s}.png").exists())
-                made = sum(1 for s in stems if (kdir / f"{s}.png").exists())
-                _done(f"regenerated {made}/{len(stems)} keyframe(s) — "
+                made = sum(1 for s in work if (kdir / f"{s}.png").exists())
+                _done(f"{'generated' if missing_only else 'regenerated'} "
+                      f"{made}/{len(work)} keyframe(s) — "
                       f"now click Re-render to rebuild the video(s)")
                 return
 
@@ -4152,11 +4164,13 @@ async function reMatch(ev, scope, params){
                 'outcomes':'Re-render all output clips for this fighter (uses the video model)?',
                 'outcome':'Re-render this output clip?',
                 'keyframes':'Regenerate ALL keyframe images for this match (uses the image model)? Existing keyframes are replaced; the clip videos are NOT re-rendered — click Re-render afterwards.',
+                'keyframes-missing':'Generate only the MISSING keyframe images for this match (uses the image model)? Existing keyframes are kept; nothing is re-rendered.',
                 'keyframe':'Regenerate this keyframe image (uses the image model)? The clip video is NOT re-rendered — click Re-render afterwards.'};
-  const kf=(scope==='keyframes'||scope==='keyframe');
+  const kf=(scope==='keyframes'||scope==='keyframe'||scope==='keyframes-missing');
+  const kfMiss=(scope==='keyframes-missing');
   if(!(await uiConfirm(labels[scope]||'Proceed?',
-       {title:(kf?'Regenerate keyframes':'Regenerate'),
-        okText:(scope==='reassemble'?'Reassemble':(kf?'Regenerate':'Re-render')),
+       {title:(kfMiss?'Generate missing keyframes':(kf?'Regenerate keyframes':'Regenerate')),
+        okText:(scope==='reassemble'?'Reassemble':(kfMiss?'Generate missing':(kf?'Regenerate':'Re-render'))),
         danger:(scope!=='reassemble'&&!kf)})))return;
   const stEl=_findStatus(ev);
   const setSt=(c,t)=>{ if(stEl){ stEl.style.color=c; stEl.textContent=t; } };
@@ -4510,6 +4524,8 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             f'    <a class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem;text-decoration:none" '
             f'href="/match/keyframes?name={_esc(name)}">🖼 Keyframes ▸</a>'
             f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="reMatch(event,\'keyframes-missing\',{{match:\'{_esc(name)}\'}})">➕ Missing keyframes</button>'
+            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="reMatch(event,\'keyframes\',{{match:\'{_esc(name)}\'}})">🖼 Regenerate keyframes</button>'
             f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="delVid(event,\'keyframes\',{{match:\'{_esc(name)}\'}})">🧹 Clear keyframes</button>'
@@ -4647,6 +4663,8 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             f'<b>Re-render</b> the matching clip(s) on the match page to rebuild '
             f'the video from the new keyframe.</p>'
             f'  <div class=pf-actions>'
+            f'    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="reMatch(event,\'keyframes-missing\',{{match:\'{_esc(name)}\'}})">➕ Generate missing</button>'
             f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="reMatch(event,\'keyframes\',{{match:\'{_esc(name)}\'}})">🖼 Regenerate all</button>'
             f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
@@ -5223,7 +5241,8 @@ async function pollJob(){
 
                 scope = _fv("scope")
                 if scope not in ("match-clips", "clip", "reassemble", "outcomes",
-                                 "outcome", "enhance", "keyframes", "keyframe"):
+                                 "outcome", "enhance", "keyframes",
+                                 "keyframes-missing", "keyframe"):
                     self._send(400, "application/json",
                                _j.dumps({"error": "invalid scope"}))
                     return
