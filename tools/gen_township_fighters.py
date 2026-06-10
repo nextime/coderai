@@ -2872,6 +2872,20 @@ def launch_web_ui(default_args):
                             return
                     fp = [mm]
                     stems = [_clip_stem_fight(match_name, c["idx"]) for c in mm["clips"]]
+                    # "Regenerate all" (whole match) also covers this match's
+                    # OUTCOME keyframes — not just the clips. Per-clip regen
+                    # (scope == "keyframe" with idx) stays clip-only.
+                    if scope == "keyframes":
+                        _mf = {mm.get("f1"), mm.get("f2")} - {None}
+                        for o in outcome_plan:
+                            if o.get("match_name"):
+                                if o.get("match_name") != match_name:
+                                    continue
+                            elif o.get("fighter") not in _mf:
+                                continue
+                            op.append(o)
+                            stems.append(_clip_stem_outcome(
+                                o["fighter"], o["outcome"], o.get("match_name")))
                 _set_items([f"keyframe {s}" for s in stems])
                 for i, s in enumerate(stems):
                     _item(i, "start")
@@ -4493,6 +4507,8 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             f'onclick="reMatch(event,\'reassemble\',{{match:\'{_esc(name)}\'}})">🎞 Reassemble finals</button>'
             f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="reMatch(event,\'outcomes\',{{match:\'{_esc(name)}\'}})">♻ Re-render all outcomes</button>'
+            f'    <a class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem;text-decoration:none" '
+            f'href="/match/keyframes?name={_esc(name)}">🖼 Keyframes ▸</a>'
             f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="reMatch(event,\'keyframes\',{{match:\'{_esc(name)}\'}})">🖼 Regenerate keyframes</button>'
             f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
@@ -4526,6 +4542,121 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             f'<div style="display:flex;gap:.6rem;flex-wrap:wrap">{clip_tiles_html}</div>'
             f'<div class=section-title style="margin:.9rem 0 .3rem">Outcomes '
             f'<span class=hint>(per fighter — edit prompt, Save match, then Re-render)</span></div>'
+            f'{outcomes_html}'
+            f'</div>{_match_js}'
+        )
+
+    def _match_keyframes_html(name=None):
+        """Dedicated keyframes view for a match: a thumbnail per clip + outcome
+        keyframe, each with regenerate (image model) and clear buttons, plus
+        match-level regenerate-all / clear-all. Reuses the same reMatch/delVid
+        endpoints as the match detail page."""
+        vdir, plan, fight_by_name, matches, _legacy = _scan_matches()
+        back = (f'<a href="/match?name={_esc(name or "")}" '
+                f'style="font-size:.85rem">‹ Back to match</a>')
+        if not name or name not in matches:
+            return f'<div class=card style="color:#666">Match not found. {back}</div>'
+        meta = fight_by_name.get(name, {})
+        info = matches[name]
+        kdir = vdir / "keyframes"
+        f1, f2 = meta.get("f1", ""), meta.get("f2", "")
+        title = (f"{f1} vs {f2}" if f1
+                 else name.replace("match_", "").replace("_", " "))
+
+        def _kf_tile(label, stem, regen_params):
+            png = kdir / f"{stem}.png"
+            if png.exists() and png.stat().st_size > 0:
+                url = "/media/" + str(png.relative_to(out_dir)).replace("\\", "/")
+                # cache-bust on mtime so a regenerated keyframe shows immediately
+                img = (f'<a href="{url}?t={int(png.stat().st_mtime)}" target=_blank>'
+                       f'<img src="{url}?t={int(png.stat().st_mtime)}" loading=lazy '
+                       f'alt="{_esc(stem)}" style="width:100%;border-radius:6px;'
+                       f'display:block"></a>')
+                clr = (f'<button class="btn btn-danger" '
+                       f'style="font-size:.72rem;padding:.2rem .55rem" '
+                       f'onclick="delVid(event,\'keyframe\',{regen_params})">🗑</button>')
+            else:
+                img = ('<div class=hint style="height:120px;display:flex;'
+                       'align-items:center;justify-content:center;'
+                       'background:#1b1b1b;border-radius:6px">no keyframe</div>')
+                clr = ''
+            return (
+                f'<div class=card style="width:215px">'
+                f'  <div class=hint style="display:flex;justify-content:space-between;'
+                f'align-items:center;margin-bottom:.25rem">'
+                f'<span>{_esc(label)}</span>'
+                f'<span><a href="#" style="color:#c79bf0" '
+                f'title="Regenerate this keyframe (image model)" '
+                f'onclick="reMatch(event,\'keyframe\',{regen_params})">↻ regenerate</a> '
+                f'{clr}</span></div>'
+                f'  {img}'
+                f'</div>'
+            )
+
+        # Clip keyframes (saved plan order, fall back to rendered files).
+        plan_clips = meta.get("clips", [])
+        clip_idxs = ([c["idx"] for c in plan_clips] if plan_clips
+                     else sorted(int(p.stem.split("_clip")[-1])
+                                 for p in info.get("clips", [])
+                                 if p.stem.split("_clip")[-1].isdigit()))
+        clip_tiles = "".join(
+            _kf_tile(f"clip {idx:02d}", _clip_stem_fight(name, idx),
+                     f'{{match:\'{_esc(name)}\',idx:\'{idx}\'}}')
+            for idx in clip_idxs) or '<span class=hint>No clips planned.</span>'
+
+        # Outcome keyframes (per participating fighter).
+        _mf = {f1, f2} - {""}
+        plan_out = [o for o in plan.get("outcome_plan", [])
+                    if (o.get("match_name") == name
+                        or (not o.get("match_name") and o.get("fighter") in _mf))]
+        out_groups = []
+        for fr in [x for x in (f1, f2) if x]:
+            # Only outcomes that are actually planned can be (re)generated.
+            ocs = [o for o in plan_out if o.get("fighter") == fr]
+            if not ocs:
+                continue
+            tiles = []
+            for o in ocs:
+                oc = o.get("outcome")
+                # Use the plan entry's actual match_name (may be None → legacy
+                # "<fighter>_<outcome>" stem) so this matches the file the
+                # generator writes; a "or name" fallback here would look for a
+                # "<match>_<fighter>_<outcome>" that never gets created.
+                stem = _clip_stem_outcome(fr, oc, o.get("match_name"))
+                tiles.append(_kf_tile(
+                    _esc(oc), stem,
+                    f'{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\','
+                    f'outcome:\'{_esc(oc)}\'}}'))
+            out_groups.append(
+                f'<div style="margin-top:.5rem"><div class=hint '
+                f'style="font-weight:700;color:#bbb">{_esc(fr)}</div>'
+                f'<div style="display:flex;gap:.5rem;flex-wrap:wrap;'
+                f'margin-top:.25rem">{"".join(tiles)}</div></div>')
+        outcomes_html = ("".join(out_groups)
+                         or '<span class=hint>No outcomes for this match.</span>')
+
+        return (
+            f'<div id=detail data-match="{_esc(name)}">{back}'
+            f'<div style="display:flex;justify-content:space-between;'
+            f'align-items:center;margin:.4rem 0">'
+            f'<h1>🖼 Keyframes — {_esc(title)}</h1>'
+            f'<span id=detail-status style="font-size:.8rem;color:#7ea8f7"></span></div>'
+            f'<div class=card>'
+            f'  <p class=hint style="margin:0 0 .5rem">Keyframes are the image→video '
+            f'bridge stills. Regenerate one (or all) with the image model, then '
+            f'<b>Re-render</b> the matching clip(s) on the match page to rebuild '
+            f'the video from the new keyframe.</p>'
+            f'  <div class=pf-actions>'
+            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="reMatch(event,\'keyframes\',{{match:\'{_esc(name)}\'}})">🖼 Regenerate all</button>'
+            f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="delVid(event,\'keyframes\',{{match:\'{_esc(name)}\'}})">🧹 Clear all</button>'
+            f'  </div>'
+            f'</div>'
+            f'<div id=match-progress class=hidden></div>'
+            f'<div class=section-title style="margin:.7rem 0 .3rem">Clip keyframes</div>'
+            f'<div style="display:flex;gap:.5rem;flex-wrap:wrap">{clip_tiles}</div>'
+            f'<div class=section-title style="margin:.9rem 0 .3rem">Outcome keyframes</div>'
             f'{outcomes_html}'
             f'</div>{_match_js}'
         )
@@ -4853,6 +4984,12 @@ async function pollJob(){
                 nm = qs.get("name", [None])[0]
                 fr = qs.get("fighter", [None])[0]
                 html = _page("Match", _match_detail_html(nm, fr), "matches")
+                self._send(200, "text/html; charset=utf-8", html)
+
+            elif path == "/match/keyframes":
+                qs = urllib.parse.parse_qs(parsed.query)
+                nm = qs.get("name", [None])[0]
+                html = _page("Keyframes", _match_keyframes_html(nm), "matches")
                 self._send(200, "text/html; charset=utf-8", html)
 
             elif path == "/prompts":
@@ -5305,16 +5442,25 @@ async function pollJob(){
                         self._send(400, "application/json", _j.dumps({"error": "invalid file"})); return
                     _rm(vdir / fn)
                 elif scope == "keyframes":
-                    # Clear ALL keyframe PNGs for a match (its clips + its outcomes).
+                    # Clear ALL keyframe PNGs for a match (its clips + its outcomes,
+                    # whether or not the matching video was rendered).
                     mn = _fv("match")
                     if not _safe(mn):
                         self._send(400, "application/json", _j.dumps({"error": "invalid match"})); return
                     kdir = vdir / "keyframes"
                     for p in kdir.glob(f"{mn}_clip*.png"):
                         _rm(p)
-                    _, _, _, _matches_map, _ = _scan_matches()
+                    _, _plan, _fbn, _matches_map, _ = _scan_matches()
+                    # Rendered outcomes (have an mp4).
                     for (_f, _o, _p) in _matches_map.get(mn, {}).get("outcomes", []):
                         _rm(kdir / f"{Path(_p).stem}.png")
+                    # Planned outcomes (may have a keyframe but no rendered video).
+                    _meta = _fbn.get(mn, {})
+                    _mf = {_meta.get("f1"), _meta.get("f2")} - {None}
+                    for o in _plan.get("outcome_plan", []):
+                        if o.get("match_name") == mn or (
+                                not o.get("match_name") and o.get("fighter") in _mf):
+                            _rm(kdir / f"{_clip_stem_outcome(o['fighter'], o['outcome'], o.get('match_name'))}.png")
                 elif scope == "keyframe":
                     # Clear one clip's (match+idx) or one outcome's (fighter+outcome) keyframe.
                     mn = _fv("match")
