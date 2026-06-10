@@ -64,6 +64,94 @@ _progress = {
 }
 _train_lock = threading.Lock()
 
+# ── Multi-client job registry ─────────────────────────────────────────────────
+# Training is serialized server-wide (one GPU job at a time), but several clients
+# may submit concurrently. Each submission gets a unique job_id and is recorded
+# here so a client only ever polls *its own* job (no cross-user spillover). The
+# registry is mirrored to disk so a recovering client (after a server OR client
+# restart) can re-attach by job_id / session token. `_active_job_id` names the
+# job currently executing, so _set_progress can mirror live progress into it.
+_jobs_lock = threading.Lock()
+_jobs: dict = {}                  # job_id -> record
+_active_job_id: Optional[str] = None
+_bg_tasks: set = set()            # strong refs to detached train tasks
+_JOB_ACTIVE_STATES = ("queued", "preparing", "training", "saving")
+_MIRROR_FIELDS = ("active", "name", "step", "total", "status", "message",
+                  "started_at", "path")
+_last_job_persist = 0.0
+
+
+def _jobs_file() -> str:
+    return os.path.join(_loras_dir(), "_train_jobs.json")
+
+
+def _persist_jobs_locked(force: bool = False) -> None:
+    """Write the registry to disk. Throttled to ~5s unless forced (status change)
+    so per-step progress updates don't hammer the disk."""
+    global _last_job_persist
+    now = time.time()
+    if not force and (now - _last_job_persist) < 5.0:
+        return
+    _last_job_persist = now
+    try:
+        p = _jobs_file()
+        tmp = p + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_jobs, f)
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+
+def _new_job(job_id: str, **fields) -> None:
+    with _jobs_lock:
+        rec = {"job_id": job_id, "updated_at": time.time()}
+        rec.update(fields)
+        _jobs[job_id] = rec
+        _persist_jobs_locked(force=True)
+
+
+def _update_job(job_id: Optional[str], force: bool = False, **fields) -> None:
+    if not job_id:
+        return
+    with _jobs_lock:
+        rec = _jobs.get(job_id)
+        if rec is None:
+            rec = {"job_id": job_id}
+            _jobs[job_id] = rec
+        # A status change is significant — persist immediately.
+        if "status" in fields and fields["status"] != rec.get("status"):
+            force = True
+        rec.update(fields)
+        rec["updated_at"] = time.time()
+        _persist_jobs_locked(force=force)
+
+
+def _load_jobs_on_start() -> None:
+    """Load the persisted registry and mark any job that was mid-flight when the
+    process died as 'interrupted' (its in-memory GPU training is gone). Clients
+    polling such a job learn it must be resubmitted (server resumes from the last
+    on-disk checkpoint)."""
+    global _jobs
+    try:
+        with open(_jobs_file()) as f:
+            data = json.load(f)
+    except Exception:
+        return
+    if not isinstance(data, dict):
+        return
+    changed = False
+    for rec in data.values():
+        if rec.get("status") in _JOB_ACTIVE_STATES:
+            rec["status"] = "interrupted"
+            rec["active"] = False
+            rec["message"] = "interrupted by server restart — resubmit to resume"
+            changed = True
+    with _jobs_lock:
+        _jobs = data
+        if changed:
+            _persist_jobs_locked(force=True)
+
 
 def set_global_args(args):
     global _LORAS_DIR
@@ -76,6 +164,7 @@ def set_global_args(args):
         root = None
     _LORAS_DIR = os.path.join(root, 'loras') if root else str(default_loras_dir())
     os.makedirs(_LORAS_DIR, exist_ok=True)
+    _load_jobs_on_start()
 
 
 def _loras_dir() -> str:
@@ -153,6 +242,15 @@ class LoraTrainRequest(BaseModel):
     learning_rate: Optional[float] = 1e-4
     resolution: Optional[int] = 512
     seed: Optional[int] = 42
+    # Run the job asynchronously: the POST returns immediately with a job_id and
+    # the client polls /v1/loras/progress?job=<id>. Avoids long read-timeouts on
+    # multi-hour video trainings. Default True keeps blocking behaviour for old
+    # clients that expect the result inline.
+    wait: Optional[bool] = True
+    # Caller-supplied session token. Recorded with the job so the owning client —
+    # and only it — can recover its job(s) after a restart. Auto-generated if
+    # omitted.
+    session: Optional[str] = None
     model_config = ConfigDict(extra="allow")
 
 
@@ -246,6 +344,13 @@ def _gather_images(req: LoraTrainRequest):
 def _set_progress(**kw):
     with _progress_lock:
         _progress.update(kw)
+        job_id = _active_job_id
+    # Mirror live progress into the executing job's record so its owner (and only
+    # its owner) can poll it by job_id.
+    if job_id:
+        mirror = {k: kw[k] for k in kw if k in _MIRROR_FIELDS}
+        if mirror:
+            _update_job(job_id, **mirror)
 
 
 def _lora_debug_enabled() -> bool:
@@ -293,6 +398,83 @@ def _free_train_vram() -> None:
         _dbg_lora(f"freed training VRAM — {_free_vram_gb():.1f} GB now free")
     except Exception:
         pass
+
+
+# ── Mid-training checkpoints (resume across restarts) ─────────────────────────
+# Every _CKPT_EVERY steps we snapshot the raw PEFT adapter state(s) + a
+# train_state.json into the LoRA's own folder (name-scoped, so two clients
+# training different LoRAs never collide). If the process dies, the next
+# submission for the same name/base/target/rank reloads the snapshot and
+# continues from the saved step instead of restarting from scratch. Optimizer
+# momentum is not restored (re-warms in a few steps); the trained weights — the
+# expensive part — are preserved. The snapshot records the owning session so a
+# resume can verify ownership.
+_CKPT_EVERY = 100
+
+
+def _train_state_path(name: str) -> str:
+    return os.path.join(_lora_dir(name), "train_state.json")
+
+
+def _save_train_checkpoint(name: str, state: dict, peft_states: dict) -> None:
+    from safetensors.torch import save_file
+    d = _lora_dir(name)
+    os.makedirs(d, exist_ok=True)
+    try:
+        for key, sd in peft_states.items():
+            cpu_sd = {k: v.detach().to("cpu") for k, v in sd.items()}
+            save_file(cpu_sd, os.path.join(d, f"_ckpt_{key}.safetensors"))
+        tmp = _train_state_path(name) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, _train_state_path(name))
+    except Exception as e:
+        _dbg_lora(f"checkpoint save failed for '{name}': {e}")
+
+
+def _load_train_state(name: str, *, base_path: str, target: str,
+                      rank: int, session: Optional[str] = None) -> Optional[dict]:
+    """Return a valid resumable checkpoint state for `name`, or None. Validates
+    that base/target/rank match (and session, when provided) so we never resume
+    one config's weights into another's run."""
+    p = _train_state_path(name)
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p) as f:
+            st = json.load(f)
+    except Exception:
+        return None
+    if (st.get("base_path") != base_path or st.get("target") != target
+            or int(st.get("rank", -1)) != int(rank)):
+        return None
+    if session is not None and st.get("session") not in (None, session):
+        return None
+    step = int(st.get("step", 0))
+    if step <= 0 or step >= int(st.get("total", 0)):
+        return None
+    return st
+
+
+def _apply_peft_checkpoint(name: str, key: str, model) -> None:
+    from safetensors.torch import load_file
+    from peft import set_peft_model_state_dict
+    f = os.path.join(_lora_dir(name), f"_ckpt_{key}.safetensors")
+    if not os.path.isfile(f):
+        raise FileNotFoundError(f)
+    set_peft_model_state_dict(model, load_file(f), adapter_name="default")
+
+
+def _clear_train_checkpoint(name: str) -> None:
+    d = _lora_dir(name)
+    if not os.path.isdir(d):
+        return
+    for fn in os.listdir(d):
+        if fn.startswith("_ckpt_") or fn == "train_state.json":
+            try:
+                os.remove(os.path.join(d, fn))
+            except Exception:
+                pass
 
 
 # ── Training base-model cache ────────────────────────────────────────────────
@@ -633,6 +815,21 @@ def _train_sd15(req, base_path, images, instance_prompt,
     lora_params = [p for p in unet.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(lora_params, lr=lr)
 
+    # Resume from a mid-training checkpoint if one survives a prior restart.
+    start_step = 0
+    _ck = _load_train_state(name, base_path=base_path, target="image", rank=rank,
+                            session=getattr(req, "session", None))
+    if _ck:
+        try:
+            _apply_peft_checkpoint(name, "default", unet)
+            start_step = int(_ck["step"])
+            _set_progress(step=start_step,
+                          message=f"resuming from step {start_step}/{steps}")
+            _dbg_lora(f"resumed SD1.5 '{name}' from checkpoint step {start_step}")
+        except Exception as e:
+            print(f"  [lora] could not resume '{name}': {e}; starting fresh")
+            start_step = 0
+
     # Pre-encode latents and the (single) instance-prompt embedding.
     latents_list = _make_dataset(images, [tokenizer], [text_encoder], instance_prompt,
                                  resolution, vae, device, torch.float32, is_sdxl=False)
@@ -654,7 +851,7 @@ def _train_sd15(req, base_path, images, instance_prompt,
     _set_progress(status="training", message="training (SD1.5)")
     unet.train()
     n = len(latents_list)
-    for step in range(steps):
+    for step in range(start_step, steps):
         latents = latents_list[step % n].to(device)
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
@@ -676,6 +873,12 @@ def _train_sd15(req, base_path, images, instance_prompt,
         if step % 10 == 0 or step == steps - 1:
             _set_progress(step=step + 1, message=f"step {step+1}/{steps} loss={loss.item():.4f}")
             _dbg_lora(f"SD1.5 step {step+1}/{steps} loss={loss.item():.4f}")
+        if (step + 1) % _CKPT_EVERY == 0 and step + 1 < steps:
+            _save_train_checkpoint(name,
+                {"name": name, "base_path": base_path, "target": "image",
+                 "rank": rank, "step": step + 1, "total": steps, "seed": seed,
+                 "session": getattr(req, "session", None)},
+                {"default": get_peft_model_state_dict(unet)})
         # Mid-training thermal checkpoint (pauses if CPU/GPU too hot).
         try:
             from codai.models.thermal import checkpoint as _thermal_checkpoint
@@ -691,6 +894,7 @@ def _train_sd15(req, base_path, images, instance_prompt,
                                               unet_lora_layers=unet_lora,
                                               safe_serialization=True)
     _write_meta(name, req, base_path, len(images), "sd15", instance_prompt)
+    _clear_train_checkpoint(name)
 
     # Job done: drop this job's adapter + transients and move the UNet back to
     # CPU. The base stays cached on CPU (reused by the next job); no VRAM is held
@@ -754,6 +958,21 @@ def _train_sdxl(req, base_path, images, instance_prompt,
     lora_params = [p for p in unet.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(lora_params, lr=lr)
 
+    # Resume from a mid-training checkpoint if one survives a prior restart.
+    start_step = 0
+    _ck = _load_train_state(name, base_path=base_path, target="image", rank=rank,
+                            session=getattr(req, "session", None))
+    if _ck:
+        try:
+            _apply_peft_checkpoint(name, "default", unet)
+            start_step = int(_ck["step"])
+            _set_progress(step=start_step,
+                          message=f"resuming from step {start_step}/{steps}")
+            _dbg_lora(f"resumed SDXL '{name}' from checkpoint step {start_step}")
+        except Exception as e:
+            print(f"  [lora] could not resume '{name}': {e}; starting fresh")
+            start_step = 0
+
     tfm = transforms.Compose([
         transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
         transforms.CenterCrop(resolution),
@@ -802,7 +1021,7 @@ def _train_sdxl(req, base_path, images, instance_prompt,
     _set_progress(status="training", message="training (SDXL)")
     unet.train()
     n = len(latents_list)
-    for step in range(steps):
+    for step in range(start_step, steps):
         latents = latents_list[step % n].to(device)
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
@@ -825,6 +1044,12 @@ def _train_sdxl(req, base_path, images, instance_prompt,
         if step % 10 == 0 or step == steps - 1:
             _set_progress(step=step + 1, message=f"step {step+1}/{steps} loss={loss.item():.4f}")
             _dbg_lora(f"SDXL step {step+1}/{steps} loss={loss.item():.4f}")
+        if (step + 1) % _CKPT_EVERY == 0 and step + 1 < steps:
+            _save_train_checkpoint(name,
+                {"name": name, "base_path": base_path, "target": "image",
+                 "rank": rank, "step": step + 1, "total": steps, "seed": seed,
+                 "session": getattr(req, "session", None)},
+                {"default": get_peft_model_state_dict(unet)})
         try:
             from codai.models.thermal import checkpoint as _thermal_checkpoint
             _thermal_checkpoint(context="lora-train", throttle_seconds=2.0)
@@ -839,6 +1064,7 @@ def _train_sdxl(req, base_path, images, instance_prompt,
                                                 unet_lora_layers=unet_lora,
                                                 safe_serialization=True)
     _write_meta(name, req, base_path, len(images), "sdxl", instance_prompt)
+    _clear_train_checkpoint(name)
 
     # Job done: drop this job's adapter + transients and move the UNet back to
     # CPU. The base stays cached on CPU for the next job; no VRAM held afterwards
@@ -1009,6 +1235,25 @@ def _train_wan(req, base_path, images, instance_prompt,
                             detail="Wan LoRA: no trainable adapter params were created")
     optimizer = torch.optim.AdamW(lora_params, lr=lr)
 
+    # Resume from a mid-training checkpoint if one survives a prior restart. This
+    # is the big win for Wan: the A14B base reload alone is ~27 min, and training
+    # runs for hours — a reboot otherwise throws all of it away.
+    start_step = 0
+    _ck = _load_train_state(name, base_path=base_path, target="video", rank=rank,
+                            session=getattr(req, "session", None))
+    if _ck:
+        try:
+            _apply_peft_checkpoint(name, "t", experts[0][1])
+            if len(experts) > 1:
+                _apply_peft_checkpoint(name, "t2", experts[1][1])
+            start_step = int(_ck["step"])
+            _set_progress(step=start_step,
+                          message=f"resuming from step {start_step}/{steps}")
+            _dbg_lora(f"resumed Wan '{name}' from checkpoint step {start_step}")
+        except Exception as e:
+            print(f"  [lora] could not resume Wan '{name}': {e}; starting fresh")
+            start_step = 0
+
     try:
         sched = FlowMatchEulerDiscreteScheduler.from_pretrained(base_path, subfolder="scheduler")
         shift = float(getattr(sched.config, "shift", 3.0) or 3.0)
@@ -1024,7 +1269,7 @@ def _train_wan(req, base_path, images, instance_prompt,
 
     _set_progress(status="training", message="training (Wan video LoRA)")
     n = len(latents_list)
-    for step in range(steps):
+    for step in range(start_step, steps):
         x0 = latents_list[step % n].to(device, dtype=compute_dtype)
         noise = torch.randn_like(x0)
         # Rectified-flow timestep with Wan resolution shift applied to sigma.
@@ -1054,6 +1299,15 @@ def _train_wan(req, base_path, images, instance_prompt,
                       message=f"step {step+1}/{steps} loss={loss.item():.4f}")
         if step % 10 == 0 or step == steps - 1:
             _dbg_lora(f"Wan step {step+1}/{steps} loss={loss.item():.4f}")
+        if (step + 1) % _CKPT_EVERY == 0 and step + 1 < steps:
+            _ckpt_states = {"t": get_peft_model_state_dict(experts[0][1])}
+            if len(experts) > 1:
+                _ckpt_states["t2"] = get_peft_model_state_dict(experts[1][1])
+            _save_train_checkpoint(name,
+                {"name": name, "base_path": base_path, "target": "video",
+                 "rank": rank, "step": step + 1, "total": steps, "seed": seed,
+                 "session": getattr(req, "session", None)},
+                _ckpt_states)
         try:
             from codai.models.thermal import checkpoint as _thermal_checkpoint
             _thermal_checkpoint(context="lora-train", throttle_seconds=2.0)
@@ -1081,6 +1335,7 @@ def _train_wan(req, base_path, images, instance_prompt,
         WanPipeline.save_lora_weights(save_directory=save_dir,
                                       safe_serialization=True, **save_kwargs)
     _write_meta(name, req, base_path, len(images), "wan", instance_prompt)
+    _clear_train_checkpoint(name)
 
     # ── 5. Tear down THIS job's adapter, but KEEP the transformer(s) cached so a
     # next training against the same base skips the (very slow) reload. Remove the
@@ -1142,17 +1397,25 @@ def _write_meta(name, req, base_path, n_images, arch, instance_prompt):
 _TRAIN_MODEL_KEY = "lora-train"
 
 
-def _train_lora_blocking(req: LoraTrainRequest) -> dict:
+def _train_lora_blocking(req: LoraTrainRequest, job_id: Optional[str] = None) -> dict:
     """Run one training job to completion (called inside a worker thread).
 
     Holds _train_lock for the job's duration so a second training never overlaps
     (also the signal _release_base_cache uses to know a job is in flight). The
     central queue already serializes us, so this acquire returns immediately.
+    `_active_job_id` is set so live progress mirrors into this job's record (and
+    only this job's) for its owner to poll.
     """
+    global _active_job_id
     _train_lock.acquire()
+    _active_job_id = job_id
     try:
-        return _train_lora_sync(req)
-    except Exception:
+        result = _train_lora_sync(req)
+        if job_id:
+            _update_job(job_id, status="done", active=False, force=True,
+                        message="done", path=result.get("path"))
+        return result
+    except Exception as e:
         import traceback
         traceback.print_exc()
         # On error the base may be in a half-moved / inconsistent state — drop the
@@ -1161,18 +1424,40 @@ def _train_lora_blocking(req: LoraTrainRequest) -> dict:
             _set_progress(active=False, status="error", message="training failed")
         except Exception:
             pass
+        if job_id:
+            _update_job(job_id, status="error", active=False, force=True,
+                        message=f"training failed: {e}"[:300])
         _drop_base_cache()
         _drop_wan_cache()
         raise
     finally:
+        _active_job_id = None
         _train_lock.release()
+
+
+async def _run_train_job(req: LoraTrainRequest, job_id: str) -> dict:
+    """Acquire a scheduler slot, then run the blocking job in a worker thread.
+    Used for both the inline (wait=True) and detached (wait=False) paths so the
+    queue serialization and job bookkeeping are identical."""
+    import asyncio
+    request_id = f"lora-train-{job_id}"
+    lease = await queue_manager.acquire(request_id, _TRAIN_MODEL_KEY)
+    try:
+        return await asyncio.to_thread(_train_lora_blocking, req, job_id)
+    finally:
+        await queue_manager.release(lease)
 
 
 @router.post("/v1/loras/train")
 async def train_lora(req: LoraTrainRequest, _auth=Depends(_require_api_auth)):
-    """Train a LoRA (blocking). Admitted through the central request scheduler,
-    so concurrent training requests queue and run one after another (instead of
-    being rejected) alongside all other model requests."""
+    """Train a LoRA. Admitted through the central request scheduler so concurrent
+    trainings queue and run one-at-a-time alongside all other model requests.
+
+    With `wait=false` the call returns immediately with a `job_id`; the client
+    polls /v1/loras/progress?job=<job_id>. The job keeps running on the server
+    regardless of the client — so a client that dies/restarts can re-attach by
+    job_id (or list its session's jobs with ?session=<token>) rather than
+    restarting the training."""
     import asyncio
     import uuid
     if not req.name or '/' in req.name or '..' in req.name:
@@ -1180,23 +1465,72 @@ async def train_lora(req: LoraTrainRequest, _auth=Depends(_require_api_auth)):
     if not req.base_model:
         raise HTTPException(status_code=400, detail="base_model is required")
 
-    request_id = f"lora-train-{uuid.uuid4().hex[:8]}"
-    # Wait for a scheduler slot (queues behind other in-flight work; the constant
-    # model key keeps trainings strictly one-at-a-time).
-    lease = await queue_manager.acquire(request_id, _TRAIN_MODEL_KEY)
+    session = req.session or f"sess-{uuid.uuid4().hex[:12]}"
+    req.session = session
+    job_id = f"job-{uuid.uuid4().hex[:12]}"
+    _new_job(job_id, session=session, name=req.name, base_model=req.base_model,
+             target=(req.target or "image"), status="queued", active=True,
+             step=0, total=req.steps or 0, message="queued",
+             started_at=time.time(), path=None)
+
+    if not req.wait:
+        # Detach: run independently of this request's lifetime. Keep a strong
+        # reference so the loop doesn't garbage-collect (cancel) the task.
+        task = asyncio.create_task(_detached_train(req, job_id))
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
+        return {"ok": True, "async": True, "job_id": job_id, "session": session,
+                "status": "queued"}
+
     try:
-        result = await asyncio.to_thread(_train_lora_blocking, req)
+        result = await _run_train_job(req, job_id)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LoRA training failed: {e}")
-    finally:
-        await queue_manager.release(lease)
-    return {"ok": True, **result}
+    return {"ok": True, "job_id": job_id, "session": session, **result}
+
+
+async def _detached_train(req: LoraTrainRequest, job_id: str) -> None:
+    """Background runner for wait=false jobs. Errors are recorded on the job
+    record (the client polls for them); nothing is raised to a waiting request."""
+    try:
+        await _run_train_job(req, job_id)
+    except Exception as e:
+        _update_job(job_id, status="error", active=False, force=True,
+                    message=f"training failed: {e}"[:300])
 
 
 @router.get("/v1/loras/progress")
-async def lora_progress():
+async def lora_progress(job: Optional[str] = None, session: Optional[str] = None):
+    """Training progress.
+
+    - `?job=<job_id>`  → that job's record (a client polls only its own job).
+    - `?session=<tok>` → the most recent job for that session (recovery after a
+      client restart that lost the job_id).
+    - neither          → the global active-job snapshot (back-compat).
+    """
+    if job:
+        with _jobs_lock:
+            rec = _jobs.get(job)
+            rec = dict(rec) if rec else None
+        if rec is None:
+            return {"active": False, "status": "unknown", "job_id": job,
+                    "name": None, "step": 0, "total": 0,
+                    "message": "no such job"}
+        return rec
+    if session:
+        with _jobs_lock:
+            mine = [dict(r) for r in _jobs.values() if r.get("session") == session]
+        if not mine:
+            return {"active": False, "status": "unknown", "session": session,
+                    "name": None, "step": 0, "total": 0,
+                    "message": "no jobs for session"}
+        # Prefer an active job; otherwise the most recently updated.
+        active = [r for r in mine if r.get("status") in _JOB_ACTIVE_STATES]
+        pick = (active or mine)
+        pick.sort(key=lambda r: r.get("updated_at", 0))
+        return pick[-1]
     with _progress_lock:
         return dict(_progress)
 

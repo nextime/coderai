@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Optional
 
@@ -560,8 +561,9 @@ class CoderAIClient:
         if api_key:
             self.session.headers["Authorization"] = f"Bearer {api_key}"
 
-    def _post(self, path: str, body: dict) -> dict:
-        r = self.session.post(f"{self.base}{path}", json=body, timeout=self.timeout)
+    def _post(self, path: str, body: dict, timeout: int = None) -> dict:
+        r = self.session.post(f"{self.base}{path}", json=body,
+                              timeout=timeout if timeout is not None else self.timeout)
         if not r.ok:
             raise RuntimeError(f"POST {path} → {r.status_code}: {r.text[:400]}")
         return r.json()
@@ -696,7 +698,8 @@ class CoderAIClient:
                    environment: str = None, images: list = None,
                    steps: int = 800, rank: int = 16,
                    resolution: int = 512, train_base_model: str = None,
-                   target: str = "image", quantize_4bit: bool = True) -> dict:
+                   target: str = "image", quantize_4bit: bool = True,
+                   wait: bool = True, session: str = None) -> dict:
         """Train a per-character or per-environment LoRA on the server.
         Blocks until complete.
 
@@ -705,7 +708,9 @@ class CoderAIClient:
         so it loads directly on the video pipeline."""
         body = {"name": name, "base_model": base_model,
                 "steps": int(steps), "rank": int(rank), "resolution": int(resolution),
-                "target": target}
+                "target": target, "wait": bool(wait)}
+        if session:
+            body["session"] = session
         if target == "video":
             body["quantize_4bit"] = bool(quantize_4bit)
         if train_base_model:
@@ -716,7 +721,11 @@ class CoderAIClient:
             body["environment"] = environment
         if images:
             body["images"] = images
-        return self._post("/v1/loras/train", body)
+        # Video DiT training (e.g. Wan A14B) can take many hours including the
+        # one-off model load; image LoRA is quicker. Allow a long ceiling so the
+        # blocking POST doesn't read-timeout while the server is still training.
+        train_timeout = 24 * 3600 if target == "video" else 4 * 3600
+        return self._post("/v1/loras/train", body, timeout=train_timeout)
 
     def list_loras(self) -> list:
         try:
@@ -724,9 +733,14 @@ class CoderAIClient:
         except Exception:
             return []
 
-    def lora_progress(self) -> dict:
+    def lora_progress(self, job: str = None, session: str = None) -> dict:
         try:
-            return self._get("/v1/loras/progress")
+            q = ""
+            if job:
+                q = f"?job={urllib.parse.quote(job)}"
+            elif session:
+                q = f"?session={urllib.parse.quote(session)}"
+            return self._get(f"/v1/loras/progress{q}")
         except Exception:
             return {}
 
@@ -1379,6 +1393,51 @@ def _load_json_map(path: Path) -> dict:
     except Exception:
         pass
     return {}
+
+
+# ── Training session token + per-LoRA server job tracking ─────────────────────
+# A stable per-output session token lets the server tag this client's training
+# jobs so we (and only we) can recover them after a restart — no spillover into
+# another user's concurrent run. Per-LoRA server job_ids are persisted so that
+# after a township restart we re-attach to a still-running server job instead of
+# launching a duplicate (the server keeps training regardless of this client).
+def _session_token(out_dir: Path) -> str:
+    p = Path(out_dir) / ".train_session"
+    try:
+        if p.exists():
+            tok = p.read_text().strip()
+            if tok:
+                return tok
+    except Exception:
+        pass
+    import uuid as _uuid
+    tok = f"township-{_uuid.uuid4().hex[:12]}"
+    try:
+        p.write_text(tok)
+    except Exception:
+        pass
+    return tok
+
+
+def _train_jobs_file(out_dir: Path) -> Path:
+    return Path(out_dir) / "lora_train_jobs.json"
+
+
+def _get_lora_job_id(out_dir: Path, lora_name: str):
+    return _load_json_map(_train_jobs_file(out_dir)).get(lora_name)
+
+
+def _set_lora_job_id(out_dir: Path, lora_name: str, job_id):
+    f = _train_jobs_file(out_dir)
+    m = _load_json_map(f)
+    if job_id:
+        m[lora_name] = job_id
+    else:
+        m.pop(lora_name, None)
+    try:
+        f.write_text(json.dumps(m, indent=2))
+    except Exception:
+        pass
 
 
 def _lora_specs_for(fighters: list, lora_map: dict, weight: float) -> list:
@@ -2525,67 +2584,114 @@ def launch_web_ui(default_args):
                      f"'{lora_name}' ({steps} steps, rank {rank})"
                      + (f" against {model}" if is_video else "") + "…")
 
-            # Run the blocking train call in an inner thread; poll progress here.
-            result, err = {}, {}
-            def _do():
-                try:
-                    kwargs = dict(name=lora_name, base_model=model,
-                                  steps=int(steps), rank=int(rank))
-                    if is_video:
-                        kwargs["target"] = "video"
-                    else:
-                        _tbm = getattr(default_args, "lora_train_base_model", None) or None
-                        if _tbm:
-                            kwargs["train_base_model"] = _tbm
-                    kwargs[kind] = name
-                    result["res"] = client.train_lora(**kwargs)
-                except Exception as e:
-                    err["e"] = str(e)
-            t = threading.Thread(target=_do, daemon=True)
-            t.start()
+            # Kick the training off ASYNCHRONOUSLY (wait=False): the server runs
+            # it independently and we poll its job record. This (a) avoids HTTP
+            # read-timeouts on multi-hour video trainings, and (b) survives a
+            # township restart — the server keeps training and we re-attach by
+            # job_id rather than launching a duplicate. The session token tags the
+            # job as ours so recovery never picks up another client's job.
+            session = _session_token(out_dir)
+            _ACTIVE = ("queued", "preparing", "training", "saving")
+
+            def _kickoff():
+                kwargs = dict(name=lora_name, base_model=model,
+                              steps=int(steps), rank=int(rank),
+                              wait=False, session=session)
+                if is_video:
+                    kwargs["target"] = "video"
+                else:
+                    _tbm = getattr(default_args, "lora_train_base_model", None) or None
+                    if _tbm:
+                        kwargs["train_base_model"] = _tbm
+                kwargs[kind] = name
+                resp = client.train_lora(**kwargs)
+                jid = resp.get("job_id")
+                _set_lora_job_id(out_dir, lora_name, jid)
+                return jid
+
+            # Re-attach to an existing server job if we have one recorded and the
+            # server still knows it (running OR finished while we were away).
+            job = _get_lora_job_id(out_dir, lora_name)
+            if job:
+                pj = client.lora_progress(job=job)
+                jstatus = (pj.get("status") or "").strip()
+                if jstatus == "done" and pj.get("path"):
+                    _web_log(f"  ↻ Re-attached: '{lora_name}' already trained.")
+                elif jstatus in _ACTIVE:
+                    _web_log(f"  ↻ Re-attached to running job for '{lora_name}'.")
+                else:
+                    # interrupted / error / unknown → resubmit (server resumes
+                    # from its last on-disk checkpoint if one exists).
+                    _web_log(f"  ↻ Previous job for '{lora_name}' was "
+                             f"'{jstatus or 'lost'}' — resubmitting (resumes from "
+                             f"checkpoint)…")
+                    job = _kickoff()
+            else:
+                job = _kickoff()
+
             _start_ts = time.time()
             _prog(6, "preparing…")
-            while t.is_alive():
+            path = None
+            err_msg = None
+            _resubmits = 0
+            while True:
                 time.sleep(1.5)
                 _elapsed = int(time.time() - _start_ts)
                 _mm, _ss = divmod(_elapsed, 60)
                 _et = f"{_mm}m{_ss:02d}s" if _mm else f"{_ss}s"
                 try:
-                    p = client.lora_progress()
+                    p = client.lora_progress(job=job)
                 except Exception:
                     # Server busy (large video models can load for many minutes,
                     # starving the progress endpoint) — keep the UI visibly alive.
                     _prog(6, f"preparing — loading model… ({_et})")
                     continue
-                # The server has ONE global training progress (jobs run one at a
-                # time via the queue). Only mirror it onto THIS card when it's
-                # reporting OUR LoRA; otherwise another job is training and we're
-                # still queued — show that instead of its progress.
-                pname = p.get("name") or ""
-                if pname and pname != lora_name:
-                    _prog(4, f"queued — '{pname}' training first… ({_et})")
-                    continue
                 status = (p.get("status") or "").strip()
+                if status == "done":
+                    path = p.get("path")
+                    break
+                if status == "error":
+                    err_msg = p.get("message") or "training failed"
+                    break
+                if status in ("interrupted", "unknown"):
+                    # Server restarted (or forgot the job) mid-train. Resubmit
+                    # once to resume from checkpoint; give up if it keeps dying.
+                    if _resubmits < 2:
+                        _resubmits += 1
+                        _web_log(f"  ↻ Server job '{status}' — resubmitting "
+                                 f"'{lora_name}' (resume #{_resubmits})…")
+                        try:
+                            job = _kickoff()
+                        except Exception as e:
+                            err_msg = f"resubmit failed: {e}"
+                            break
+                        _prog(6, f"resuming after interruption… ({_et})")
+                        continue
+                    err_msg = f"training {status} and could not be resumed"
+                    break
                 total = p.get("total") or steps
                 step = p.get("step") or 0
-                if status in ("preparing", "saving") or not step:
-                    # No training steps yet (model loading / encoding / saving).
+                if status == "queued":
+                    # Our job is admitted but another training holds the GPU.
+                    _prog(4, f"queued — waiting for GPU… ({_et})")
+                elif status in ("preparing", "saving") or not step:
                     _prog(6, (p.get("message") or status or "preparing")
                              + f" ({_et})")
                 else:
                     pct = 6 + int(90 * step / max(1, total))
                     _prog(pct, p.get("message") or status or "training")
-            t.join()
 
-            if err:
-                _web_log(f"  ✗ LoRA training failed for {name}: {err['e']}")
-                _fail(err["e"])
+            if err_msg:
+                _web_log(f"  ✗ LoRA training failed for {name}: {err_msg}")
+                _set_lora_job_id(out_dir, lora_name, None)
+                _fail(err_msg)
                 return
-            res = result.get("res") or {}
-            path = res.get("path")
             if not path:
-                _fail(f"training returned no path: {res}")
+                _set_lora_job_id(out_dir, lora_name, None)
+                _fail("training returned no path")
                 return
+            # Done — clear the recorded job so a future retrain starts clean.
+            _set_lora_job_id(out_dir, lora_name, None)
 
             # Record the trained LoRA in the on-disk map so video/keyframe runs
             # reuse it. Image LoRAs → loras.json/env_loras.json (flat name→path).
@@ -2720,6 +2826,78 @@ def launch_web_ui(default_args):
             clip_delay = float(getattr(default_args, "clip_delay", 5.0))
             lw = float(getattr(default_args, "lora_weight", 0.85))
             elw = float(getattr(default_args, "env_lora_weight", 0.8))
+
+            # ── Regenerate keyframes (image model) ─────────────────────────────
+            # Deletes the targeted keyframe PNG(s) then regenerates them so a
+            # subsequent clip re-render uses fresh keyframes (e.g. after a LoRA
+            # retrain or profile edit). Does NOT re-render the video itself —
+            # click "Re-render" afterwards to rebuild the clip from the new
+            # keyframe. scope "keyframes" = whole match; "keyframe" = one clip
+            # (idx) or one outcome (fighter+outcome).
+            if scope in ("keyframes", "keyframe"):
+                image_model = getattr(default_args, "image_model", None)
+                if not image_model:
+                    try:
+                        image_model = pick_model(client, "image", None)
+                    except Exception as e:
+                        _fail(f"no image model available: {e}")
+                        return
+                kdir = vdir / "keyframes"
+                m = next((x for x in fight_plan
+                          if x.get("match_name") == match_name), None)
+                # Build the (filtered) fight/outcome plans + the list of stems to
+                # drop so _generate_keyframes (which keeps existing PNGs) remakes
+                # exactly those.
+                fp, op, stems = [], [], []
+                if scope == "keyframe" and params.get("fighter") and params.get("outcome"):
+                    fr, oc = params.get("fighter"), params.get("outcome")
+                    o = next((x for x in outcome_plan
+                              if x.get("fighter") == fr and x.get("outcome") == oc
+                              and (x.get("match_name") in (None, match_name))), None)
+                    if not o:
+                        _fail("outcome not found in prompts.json")
+                        return
+                    op = [o]
+                    stems = [_clip_stem_outcome(fr, oc, o.get("match_name"))]
+                else:
+                    if not m:
+                        _fail("match not found in prompts.json — render it first")
+                        return
+                    mm = dict(m)
+                    if scope == "keyframe":
+                        idx = int(params.get("idx"))
+                        mm["clips"] = [c for c in m["clips"] if int(c["idx"]) == idx]
+                        if not mm["clips"]:
+                            _fail("clip not found in prompts.json")
+                            return
+                    fp = [mm]
+                    stems = [_clip_stem_fight(match_name, c["idx"]) for c in mm["clips"]]
+                _set_items([f"keyframe {s}" for s in stems])
+                for i, s in enumerate(stems):
+                    _item(i, "start")
+                    try:
+                        (kdir / f"{s}.png").unlink()
+                    except Exception:
+                        pass
+                _prog(10, f"regenerating {len(stems)} keyframe(s)…")
+                try:
+                    _generate_keyframes(
+                        client, image_model, kdir, fp, op,
+                        consistency | {"keyframe"}, lora_map,
+                        float(getattr(default_args, "character_strength", 0.7)),
+                        int(getattr(default_args, "keyframe_steps", 28)),
+                        getattr(default_args, "keyframe_size", "512x512"), lw,
+                        env_lora_map=env_lora_map, env_lora_weight=elw)
+                except Exception as e:
+                    _fail(f"keyframe regeneration failed: {e}")
+                    return
+                # Mark each item done/failed by whether its PNG now exists.
+                for i, s in enumerate(stems):
+                    _item(i, "end", (kdir / f"{s}.png").exists())
+                made = sum(1 for s in stems if (kdir / f"{s}.png").exists())
+                _done(f"regenerated {made}/{len(stems)} keyframe(s) — "
+                      f"now click Re-render to rebuild the video(s)")
+                return
 
             # ── Enhance: upscale / raise-FPS existing finals + outcome videos ──
             if scope == "enhance":
@@ -3958,10 +4136,14 @@ async function reMatch(ev, scope, params){
                 'clip':'Re-render this single clip?',
                 'reassemble':'Reassemble the final short/long videos from the existing clips? (fast, no model)',
                 'outcomes':'Re-render all output clips for this fighter (uses the video model)?',
-                'outcome':'Re-render this output clip?'};
+                'outcome':'Re-render this output clip?',
+                'keyframes':'Regenerate ALL keyframe images for this match (uses the image model)? Existing keyframes are replaced; the clip videos are NOT re-rendered — click Re-render afterwards.',
+                'keyframe':'Regenerate this keyframe image (uses the image model)? The clip video is NOT re-rendered — click Re-render afterwards.'};
+  const kf=(scope==='keyframes'||scope==='keyframe');
   if(!(await uiConfirm(labels[scope]||'Proceed?',
-       {title:'Regenerate', okText:(scope==='reassemble'?'Reassemble':'Re-render'),
-        danger:(scope!=='reassemble')})))return;
+       {title:(kf?'Regenerate keyframes':'Regenerate'),
+        okText:(scope==='reassemble'?'Reassemble':(kf?'Regenerate':'Re-render')),
+        danger:(scope!=='reassemble'&&!kf)})))return;
   const stEl=_findStatus(ev);
   const setSt=(c,t)=>{ if(stEl){ stEl.style.color=c; stEl.textContent=t; } };
   const fd=new FormData(); fd.append('scope',scope);
@@ -4003,7 +4185,9 @@ async function delVid(ev, scope, params){
                 'final':'Delete this assembled video file?',
                 'match':'Delete ALL video files for this match (clips + finals)? The plan/prompts are kept so you can re-render.',
                 'output':'Delete this output video file?',
-                'outputs':'Delete ALL output video files for this fighter?'};
+                'outputs':'Delete ALL output video files for this fighter?',
+                'keyframes':'Clear ALL keyframe images for this match? The next re-render will run keyframe-free until you regenerate them.',
+                'keyframe':'Clear this keyframe image? The next re-render of it will run keyframe-free until you regenerate it.'};
   if(!(await uiConfirm(labels[scope]||'Delete?',{title:'Remove videos', okText:'Delete', danger:true})))return;
   const stEl=_findStatus(ev);
   const setSt=(c,t)=>{ if(stEl){ stEl.style.color=c; stEl.textContent=t; } };
@@ -4226,7 +4410,10 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
                 f'<div class=card style="width:230px">'
                 f'  <div class=hint style="display:flex;justify-content:space-between;align-items:center">'
                 f'<span>clip {idx:02d}</span>'
-                f'<span><a href="#" style="color:#7eb8f7" '
+                f'<span>'
+                f'<a href="#" style="color:#c79bf0" title="Regenerate this keyframe (image model)" '
+                f'onclick="reMatch(event,\'keyframe\',{{match:\'{_esc(name)}\',idx:\'{idx}\'}})">kf↻</a> '
+                f'<a href="#" style="color:#7eb8f7" '
                 f'onclick="reMatch(event,\'clip\',{{match:\'{_esc(name)}\',idx:\'{idx}\'}})">re-render</a> {rm_html}</span></div>'
                 f'  {vid_html}'
                 f'  <textarea data-clip="{idx}" rows=2 style="margin-top:.3rem">{_esc(c.get("prompt",""))}</textarea>'
@@ -4260,7 +4447,10 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
                     f'<div class=card style="width:215px">'
                     f'  <div class=hint style="display:flex;justify-content:space-between;align-items:center">'
                     f'<span>{_esc(oc)}</span>'
-                    f'<span><a href="#" style="color:#7eb8f7" '
+                    f'<span>'
+                    f'<a href="#" style="color:#c79bf0" title="Regenerate this keyframe (image model)" '
+                    f'onclick="reMatch(event,\'keyframe\',{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\',outcome:\'{_esc(oc)}\'}})">kf↻</a> '
+                    f'<a href="#" style="color:#7eb8f7" '
                     f'onclick="reMatch(event,\'outcome\',{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\',outcome:\'{_esc(oc)}\'}})">{act}</a> {rm}</span></div>'
                     f'  {vid}'
                     f'  <textarea data-outc="{_esc(fr)}|{_esc(oc)}" rows=2 style="margin-top:.3rem">{_esc(o.get("prompt",""))}</textarea>'
@@ -4303,6 +4493,10 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             f'onclick="reMatch(event,\'reassemble\',{{match:\'{_esc(name)}\'}})">🎞 Reassemble finals</button>'
             f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="reMatch(event,\'outcomes\',{{match:\'{_esc(name)}\'}})">♻ Re-render all outcomes</button>'
+            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="reMatch(event,\'keyframes\',{{match:\'{_esc(name)}\'}})">🖼 Regenerate keyframes</button>'
+            f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="delVid(event,\'keyframes\',{{match:\'{_esc(name)}\'}})">🧹 Clear keyframes</button>'
             f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="delVid(event,\'match\',{{match:\'{_esc(name)}\'}})">🗑 Remove all videos</button>'
             f'  </div>'
@@ -5110,6 +5304,35 @@ async function pollJob(){
                     if not _safe(fn) or not fn.endswith(".mp4"):
                         self._send(400, "application/json", _j.dumps({"error": "invalid file"})); return
                     _rm(vdir / fn)
+                elif scope == "keyframes":
+                    # Clear ALL keyframe PNGs for a match (its clips + its outcomes).
+                    mn = _fv("match")
+                    if not _safe(mn):
+                        self._send(400, "application/json", _j.dumps({"error": "invalid match"})); return
+                    kdir = vdir / "keyframes"
+                    for p in kdir.glob(f"{mn}_clip*.png"):
+                        _rm(p)
+                    _, _, _, _matches_map, _ = _scan_matches()
+                    for (_f, _o, _p) in _matches_map.get(mn, {}).get("outcomes", []):
+                        _rm(kdir / f"{Path(_p).stem}.png")
+                elif scope == "keyframe":
+                    # Clear one clip's (match+idx) or one outcome's (fighter+outcome) keyframe.
+                    mn = _fv("match")
+                    kdir = vdir / "keyframes"
+                    fr, oc = _fv("fighter"), _fv("outcome")
+                    if fr and oc:
+                        if not _safe(fr) or not _safe(oc):
+                            self._send(400, "application/json", _j.dumps({"error": "invalid args"})); return
+                        stem = f"{mn}_{fr}_{oc}" if (mn and _safe(mn)) else f"{fr}_{oc}"
+                        _rm(kdir / f"{stem}.png")
+                    else:
+                        idx = _fv("idx")
+                        if not _safe(mn):
+                            self._send(400, "application/json", _j.dumps({"error": "invalid match"})); return
+                        try:
+                            _rm(kdir / f"{mn}_clip{int(idx):02d}.png")
+                        except ValueError:
+                            self._send(400, "application/json", _j.dumps({"error": "invalid idx"})); return
                 else:
                     self._send(400, "application/json", _j.dumps({"error": "invalid scope"})); return
                 self._send(200, "application/json", _j.dumps({"ok": True, "removed": removed}))

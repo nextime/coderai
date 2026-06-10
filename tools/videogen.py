@@ -72,6 +72,54 @@ def safe_slug(value: str) -> str:
     return value.strip("_-. ") or f"item_{uuid.uuid4().hex[:8]}"
 
 
+def load_json_map(path: Path) -> dict[str, Any]:
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def session_token(out_dir: Path) -> str:
+    path = out_dir / ".train_session"
+    try:
+        if path.exists():
+            token = path.read_text(encoding="utf-8").strip()
+            if token:
+                return token
+    except Exception:
+        pass
+    token = f"videogen-{uuid.uuid4().hex[:12]}"
+    try:
+        path.write_text(token, encoding="utf-8")
+    except Exception:
+        pass
+    return token
+
+
+def lora_jobs_file(out_dir: Path) -> Path:
+    return out_dir / "lora_train_jobs.json"
+
+
+def get_lora_job_id(out_dir: Path, lora_name: str) -> str | None:
+    return load_json_map(lora_jobs_file(out_dir)).get(lora_name)
+
+
+def set_lora_job_id(out_dir: Path, lora_name: str, job_id: str | None) -> None:
+    path = lora_jobs_file(out_dir)
+    data = load_json_map(path)
+    if job_id:
+        data[lora_name] = job_id
+    else:
+        data.pop(lora_name, None)
+    try:
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def data_uri_for_file(path: Path, mime: str | None = None) -> str:
     if mime is None:
         mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
@@ -150,6 +198,20 @@ def mux_background_audio(video_path: Path, audio_path: Path, out_path: Path, mus
     ])
 
 
+def extract_video_frames(video_path: Path, out_dir: Path, max_frames: int = 6) -> list[Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    duration = max(0.1, video_duration(video_path))
+    count = max(1, int(max_frames))
+    frames = []
+    for idx in range(count):
+        ts = duration * (idx + 0.5) / count
+        out = out_dir / f"{video_path.stem}_frame_{idx:02d}.png"
+        run_cmd([ffmpeg(), "-y", "-ss", f"{ts:.3f}", "-i", str(video_path), "-frames:v", "1", str(out)])
+        if out.exists() and out.stat().st_size:
+            frames.append(out)
+    return frames
+
+
 class CoderAIClient:
     def __init__(self, base_url: str, api_key: str | None = None, timeout: int = 7200):
         self.base = base_url.rstrip("/")
@@ -158,14 +220,20 @@ class CoderAIClient:
         if api_key:
             self.session.headers["Authorization"] = f"Bearer {api_key}"
 
-    def _get(self, path: str) -> dict[str, Any]:
-        resp = self.session.get(f"{self.base}{path}", timeout=60)
+    def _get(self, path: str, timeout: int = 60) -> dict[str, Any]:
+        resp = self.session.get(f"{self.base}{path}", timeout=timeout)
         if not resp.ok:
             raise RuntimeError(f"GET {path} -> {resp.status_code}: {resp.text[:800]}")
         return resp.json()
 
     def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         resp = self.session.post(f"{self.base}{path}", json=body, timeout=self.timeout)
+        if not resp.ok:
+            raise RuntimeError(f"POST {path} -> {resp.status_code}: {resp.text[:1200]}")
+        return resp.json()
+
+    def _post_multipart(self, path: str, data: dict[str, Any], files: dict[str, Any]) -> dict[str, Any]:
+        resp = self.session.post(f"{self.base}{path}", data=data, files=files, timeout=self.timeout)
         if not resp.ok:
             raise RuntimeError(f"POST {path} -> {resp.status_code}: {resp.text[:1200]}")
         return resp.json()
@@ -205,6 +273,51 @@ class CoderAIClient:
             return self._get("/v1/environments").get("environments", [])
         except Exception:
             return []
+
+    def list_voices(self) -> list[dict[str, Any]]:
+        try:
+            return self._get("/v1/audio/voices").get("voices", [])
+        except Exception:
+            return []
+
+    def list_loras(self) -> list[dict[str, Any]]:
+        try:
+            return self._get("/v1/loras").get("loras", [])
+        except Exception:
+            return []
+
+    def create_voice(self, name: str, description: str, transcript: str, audio_path: Path) -> dict[str, Any]:
+        mime = mimetypes.guess_type(audio_path.name)[0] or "audio/wav"
+        with audio_path.open("rb") as handle:
+            return self._post_multipart(
+                "/v1/audio/voices",
+                {"name": name, "description": description, "transcript": transcript},
+                {"audio": (audio_path.name, handle, mime)},
+            )
+
+    def extract_voice(self, name: str, description: str, transcript: str, media_path: Path) -> dict[str, Any]:
+        mime = mimetypes.guess_type(media_path.name)[0] or "application/octet-stream"
+        key = "video" if mime.startswith("video/") or media_path.suffix.lower() in {".mp4", ".mov", ".webm", ".mkv"} else "audio"
+        return self._post("/v1/audio/voices/extract", {
+            "name": name,
+            "description": description,
+            "transcript": transcript,
+            key: data_uri_for_file(media_path, mime),
+        })
+
+    def train_lora(self, body: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/v1/loras/train", body)
+
+    def lora_progress(self, job: str | None = None, session: str | None = None) -> dict[str, Any]:
+        query = ""
+        if job:
+            query = f"?job={urllib.parse.quote(job)}"
+        elif session:
+            query = f"?session={urllib.parse.quote(session)}"
+        try:
+            return self._get(f"/v1/loras/progress{query}", timeout=30)
+        except Exception:
+            return {}
 
     def get_profile_images(self, kind: str, name: str) -> list[str]:
         plural = "characters" if kind == "character" else "environments"
@@ -424,7 +537,167 @@ class VideoGenApp:
         return {
             "characters": [v for k, v in sorted(chars.items()) if k],
             "environments": [v for k, v in sorted(envs.items()) if k],
+            "voices": self.client.list_voices(),
+            "loras": self.client.list_loras(),
         }
+
+    def start_lora_job(self, payload: dict[str, Any]) -> str:
+        job_id = f"lora-{uuid.uuid4().hex[:10]}"
+        with self.lock:
+            self.jobs[job_id] = {"status": "queued", "progress": 0, "kind": "lora"}
+        thread = threading.Thread(target=self._lora_job, args=(job_id, payload), daemon=True)
+        thread.start()
+        return job_id
+
+    def _lora_job(self, job_id: str, payload: dict[str, Any]) -> None:
+        name = safe_slug(payload.get("name") or "movie_style")
+        base_model = payload.get("base_model") or self.args.video_model or pick_model(self.client.list_models(), "video_generation")
+        target = payload.get("target") or "video"
+        media_paths = [Path(p.strip()) for p in (payload.get("media_paths") or "").splitlines() if p.strip()]
+        style_prompt = payload.get("style_prompt") or f"{name} cinematic style"
+        instance_prompt = payload.get("instance_prompt") or f"in {name} style, {style_prompt}"
+        frames_per_video = int(payload.get("frames_per_video") or 6)
+        try:
+            if not base_model:
+                raise RuntimeError("No base model configured for LoRA training")
+            self._job_update(job_id, status="running", progress=5, message="collecting training media")
+            train_dir = self.out_dir / "lora_training" / name
+            frame_dir = train_dir / "frames"
+            train_dir.mkdir(parents=True, exist_ok=True)
+            images: list[str] = []
+            scene_manifest = []
+            for idx, path in enumerate(media_paths):
+                if not path.exists() or not path.is_file():
+                    self.emit(f"Skipping missing LoRA media: {path}")
+                    continue
+                ext = path.suffix.lower()
+                scene_manifest.append({"path": str(path), "description": payload.get("scene_description") or ""})
+                if ext in {".png", ".jpg", ".jpeg", ".webp"}:
+                    images.append(data_uri_for_file(path, mimetypes.guess_type(path.name)[0] or "image/png"))
+                elif ext in {".mp4", ".mov", ".webm", ".mkv"}:
+                    self.emit(f"Extracting frames from {path.name}")
+                    for frame in extract_video_frames(path, frame_dir / safe_slug(path.stem), frames_per_video):
+                        images.append(data_uri_for_file(frame, "image/png"))
+            if not images:
+                raise RuntimeError("No image frames found. Add image files or videos to train from.")
+            (train_dir / "manifest.json").write_text(json.dumps({"name": name, "style_prompt": style_prompt, "scenes": scene_manifest}, indent=2), encoding="utf-8")
+            self.emit(f"Training {target} LoRA '{name}' from {len(images)} image/frame sample(s)")
+            self._job_update(job_id, progress=25, message="training LoRA")
+            train_body = {
+                "name": name,
+                "base_model": base_model,
+                "train_base_model": payload.get("train_base_model") or None,
+                "target": target,
+                "images": images,
+                "instance_prompt": instance_prompt,
+                "steps": int(payload.get("steps") or 800),
+                "rank": int(payload.get("rank") or 16),
+                "learning_rate": float(payload.get("learning_rate") or 1e-4),
+                "resolution": int(payload.get("resolution") or 512),
+                "seed": int(payload.get("seed") or 42),
+                "num_frames": int(payload.get("num_frames") or 1),
+                "quantize_4bit": bool(payload.get("quantize_4bit", True)),
+                "wait": False,
+                "session": session_token(self.out_dir),
+            }
+            path = self._attach_or_start_lora(job_id, name, train_body)
+            self.emit(f"LoRA ready: {name}" + (f" -> {path}" if path else ""))
+            set_lora_job_id(self.out_dir, name, None)
+            self._job_update(job_id, status="done", progress=100, message="done", name=name, path=path)
+        except Exception as exc:
+            self.emit(f"LoRA training failed: {exc}")
+            self._job_update(job_id, status="error", error=str(exc), message=str(exc))
+
+    def _attach_or_start_lora(self, ui_job_id: str, lora_name: str, train_body: dict[str, Any]) -> str | None:
+        active_states = {"queued", "preparing", "training", "saving"}
+
+        def kickoff() -> str:
+            resp = self.client.train_lora({k: v for k, v in train_body.items() if v is not None})
+            server_job = resp.get("job_id")
+            if not server_job:
+                raise RuntimeError(f"LoRA training did not return a job_id: {resp}")
+            set_lora_job_id(self.out_dir, lora_name, server_job)
+            return server_job
+
+        server_job = get_lora_job_id(self.out_dir, lora_name)
+        if server_job:
+            progress = self.client.lora_progress(job=server_job)
+            status = (progress.get("status") or "").strip()
+            if status == "done" and progress.get("path"):
+                self.emit(f"Re-attached: LoRA '{lora_name}' was already trained")
+                return progress.get("path")
+            if status in active_states:
+                self.emit(f"Re-attached to running LoRA job for '{lora_name}'")
+            else:
+                self.emit(f"Previous LoRA job for '{lora_name}' was '{status or 'lost'}'; resubmitting to resume from checkpoint")
+                server_job = kickoff()
+        else:
+            server_job = kickoff()
+
+        started = time.time()
+        resubmits = 0
+        while True:
+            if self._is_cancelled(ui_job_id):
+                raise RuntimeError("cancelled")
+            time.sleep(2.0)
+            elapsed = int(time.time() - started)
+            mm, ss = divmod(elapsed, 60)
+            et = f"{mm}m{ss:02d}s" if mm else f"{ss}s"
+            progress = self.client.lora_progress(job=server_job)
+            status = (progress.get("status") or "").strip()
+            if status == "done":
+                return progress.get("path")
+            if status == "error":
+                raise RuntimeError(progress.get("message") or "LoRA training failed")
+            if status in {"interrupted", "unknown", ""}:
+                if resubmits < 2:
+                    resubmits += 1
+                    self.emit(f"LoRA job '{status or 'unknown'}' for '{lora_name}'; resubmitting resume #{resubmits}")
+                    server_job = kickoff()
+                    self._job_update(ui_job_id, progress=30, message=f"resuming after interruption ({et})")
+                    continue
+                raise RuntimeError(f"training {status or 'unknown'} and could not be resumed")
+            total = progress.get("total") or train_body.get("steps") or 1
+            step = progress.get("step") or 0
+            if status == "queued":
+                pct = 25
+                msg = f"queued - waiting for GPU ({et})"
+            elif status in {"preparing", "saving"} or not step:
+                pct = 30 if status != "saving" else 94
+                msg = f"{progress.get('message') or status or 'preparing'} ({et})"
+            else:
+                pct = 30 + int(64 * step / max(1, total))
+                msg = progress.get("message") or f"training {step}/{total} ({et})"
+            self._job_update(ui_job_id, progress=min(98, pct), message=msg, server_job=server_job)
+
+    def start_voice_job(self, payload: dict[str, Any]) -> str:
+        job_id = f"voice-{uuid.uuid4().hex[:10]}"
+        with self.lock:
+            self.jobs[job_id] = {"status": "queued", "progress": 0, "kind": "voice"}
+        thread = threading.Thread(target=self._voice_job, args=(job_id, payload), daemon=True)
+        thread.start()
+        return job_id
+
+    def _voice_job(self, job_id: str, payload: dict[str, Any]) -> None:
+        name = safe_slug(payload.get("name") or "voice")
+        description = payload.get("description") or ""
+        transcript = payload.get("transcript") or ""
+        media_path = Path(payload.get("media_path") or "")
+        try:
+            self._job_update(job_id, status="running", progress=5, message="validating reference media")
+            if not media_path.exists() or not media_path.is_file():
+                raise RuntimeError(f"Reference audio/video file not found: {media_path}")
+            self.emit(f"Creating cloned voice profile '{name}' from {media_path.name}")
+            self._job_update(job_id, progress=25, message="uploading reference media")
+            if payload.get("extract", True):
+                self.client.extract_voice(name, description, transcript, media_path)
+            else:
+                self.client.create_voice(name, description, transcript, media_path)
+            self.emit(f"Voice profile ready: {name}")
+            self._job_update(job_id, status="done", progress=100, message="done", name=name)
+        except Exception as exc:
+            self.emit(f"Voice job failed: {exc}")
+            self._job_update(job_id, status="error", error=str(exc), message=str(exc))
 
     def start_profile_job(self, payload: dict[str, Any]) -> str:
         job_id = f"profile-{uuid.uuid4().hex[:10]}"
@@ -480,9 +753,31 @@ class VideoGenApp:
         job_id = f"movie-{uuid.uuid4().hex[:10]}"
         with self.lock:
             self.jobs[job_id] = {"status": "queued", "progress": 0, "movie": payload.get("title") or "movie"}
-        thread = threading.Thread(target=self._movie_job, args=(job_id, payload), daemon=True)
+        target = self._movie_batch_job if int(payload.get("movie_count") or 1) > 1 else self._movie_job
+        thread = threading.Thread(target=target, args=(job_id, payload), daemon=True)
         thread.start()
         return job_id
+
+    def _movie_batch_job(self, job_id: str, payload: dict[str, Any]) -> None:
+        count = max(1, int(payload.get("movie_count") or 1))
+        outputs = []
+        base_title = payload.get("title") or "untitled_movie"
+        for idx in range(count):
+            if self._is_cancelled(job_id):
+                self._job_update(job_id, status="error", error="cancelled", message="cancelled")
+                return
+            variant = dict(payload)
+            variant["movie_count"] = 1
+            variant["title"] = f"{base_title}_variant_{idx + 1:02d}"
+            self.emit(f"Rendering movie variant {idx + 1}/{count}")
+            self._movie_job(job_id, variant)
+            with self.lock:
+                job = dict(self.jobs.get(job_id, {}))
+            if job.get("status") == "error":
+                return
+            if job.get("output_url"):
+                outputs.append(job["output_url"])
+        self._job_update(job_id, status="done", progress=100, message=f"rendered {len(outputs)} movie variant(s)", outputs=outputs, output_url=outputs[-1] if outputs else None)
 
     def _movie_job(self, job_id: str, payload: dict[str, Any]) -> None:
         title = payload.get("title") or "untitled_movie"
@@ -508,6 +803,7 @@ class VideoGenApp:
             height = int(payload.get("height") or 432)
             default_frames = int(payload.get("num_frames") or 32)
             use_keyframes = bool(payload.get("use_keyframes"))
+            selected_loras = self._selected_loras(payload)
             clip_paths: list[Path] = []
             total = len(clips)
             self.emit(f"Starting movie '{title}' with {total} clip(s)")
@@ -540,15 +836,20 @@ class VideoGenApp:
                     body["environment_profiles"] = environments
                 if clip.get("camera_motion"):
                     body["camera_motion"] = clip.get("camera_motion")
+                if selected_loras:
+                    body["loras"] = selected_loras
                 if clip.get("dialogues"):
                     body["dialogs"] = self._normalize_dialogues(clip.get("dialogues"))
                     body["lip_sync"] = bool(clip.get("lip_sync", True))
+                    body["lip_sync_method"] = clip.get("lip_sync_method") or payload.get("lip_sync_method") or "wav2lip"
                     body["generate_subtitles"] = bool(clip.get("subtitles", True))
                     body["burn_subtitles"] = bool(clip.get("burn_subtitles", False))
                 if clip.get("speech_text"):
                     body["tts_text"] = clip.get("speech_text")
                     body["tts_voice"] = clip.get("speech_voice") or payload.get("default_voice") or "af_sarah"
+                    body["tts_speed"] = float(clip.get("speech_speed") or 1.0)
                     body["lip_sync"] = bool(clip.get("lip_sync", True))
+                    body["lip_sync_method"] = clip.get("lip_sync_method") or payload.get("lip_sync_method") or "wav2lip"
                     body["add_audio"] = True
                     body["audio_type"] = "speech"
                 if clip.get("music_prompt") or clip.get("sfx_prompt"):
@@ -600,6 +901,23 @@ class VideoGenApp:
             self.emit(f"Movie failed: {exc}")
             self._job_update(job_id, status="error", error=str(exc), message=str(exc))
 
+    def _selected_loras(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        requested = payload.get("loras") or []
+        if not requested:
+            return []
+        by_name = {item.get("name"): item for item in self.client.list_loras() if item.get("name")}
+        out = []
+        for item in requested:
+            if isinstance(item, str):
+                name, weight = item, float(payload.get("lora_weight") or 0.8)
+            else:
+                name, weight = item.get("name") or item.get("model"), float(item.get("weight") or payload.get("lora_weight") or 0.8)
+            info = by_name.get(name, {})
+            model = info.get("path") or name
+            if model:
+                out.append({"model": model, "weight": weight, "name": name})
+        return out
+
     def _build_clip_prompt(self, movie: dict[str, Any], clip: dict[str, Any], characters: list[str], environments: list[str]) -> str:
         parts = []
         if movie.get("style"):
@@ -642,6 +960,7 @@ class VideoGenApp:
                 "text": row.get("text"),
                 "start_time": row.get("start_time") if row.get("start_time") not in ("", None) else None,
                 "lip_sync": bool(row.get("lip_sync", True)),
+                "lang": row.get("lang") or None,
                 "speed": float(row.get("speed") or 1.0),
             })
         return out
@@ -673,7 +992,7 @@ HTML_PAGE = r"""
 </style>
 </head>
 <body>
-<header><h1>CoderAI VideoGen Studio</h1><div class="sub">Manage reusable characters and environments, write a multi-clip movie prompt, then render clips with speech, lip-sync, music, and sound effects.</div></header>
+<header><h1>CoderAI VideoGen Studio</h1><div class="sub">Manage reusable characters, environments, cloned voices, and multi-clip movies with realistic dialogue, lip-sync, music, and sound effects.</div></header>
 <div class="wrap">
   <aside class="card">
     <h2>Connection</h2>
@@ -681,7 +1000,7 @@ HTML_PAGE = r"""
     <label>Image model</label><select id="image_model"></select>
     <label>Video model</label><select id="video_model"></select>
     <label>Audio/Music model</label><select id="audio_model"></select>
-    <label>TTS voice id</label><input id="default_voice" value="af_sarah">
+    <label>Default voice / cloned profile</label><input id="default_voice" list="voice_list" value="af_sarah"><datalist id="voice_list"></datalist>
     <hr style="border-color:var(--line);border-style:solid none none;margin:16px 0">
     <h2>Live Log</h2>
     <div class="log" id="log"></div>
@@ -691,11 +1010,12 @@ HTML_PAGE = r"""
     <div class="tabs">
       <button class="tab active" data-tab="profiles">Profiles</button>
       <button class="tab" data-tab="movie">Movie Builder</button>
+      <button class="tab" data-tab="loras">Style LoRAs</button>
       <button class="tab" data-tab="gallery">Gallery</button>
     </div>
 
     <section id="profiles" class="section active">
-      <h2>Characters and Environments</h2>
+      <h2>Characters, Environments, and Voices</h2>
       <div class="row">
         <div class="card">
           <h3>Create Character</h3>
@@ -714,8 +1034,17 @@ HTML_PAGE = r"""
           <button class="btn" onclick="createProfile('environment')">Generate Environment</button>
         </div>
       </div>
+      <div class="card" style="margin-top:12px">
+        <h3>Create Cloned Voice</h3>
+        <div class="muted">Use a clean 5-30 second reference clip plus an exact transcript for realistic cloned dialogue. Audio or video files are accepted.</div>
+        <div class="row"><div><label>Voice name</label><input id="voice_name" placeholder="alice_voice"></div><div><label>Reference audio/video path</label><input id="voice_media" placeholder="/path/to/reference.wav"></div></div>
+        <label>Description</label><input id="voice_desc" placeholder="Warm, calm adult voice; close mic">
+        <label>Exact reference transcript</label><textarea id="voice_transcript" placeholder="The exact words spoken in the reference clip. Required for best F5-TTS cloning."></textarea>
+        <button class="btn" onclick="createVoice()">Create Cloned Voice</button>
+      </div>
       <h3>Saved Characters</h3><div class="grid" id="chars"></div>
       <h3>Saved Environments</h3><div class="grid" id="envs"></div>
+      <h3>Saved Voices</h3><div class="grid" id="voices"></div>
     </section>
 
     <section id="movie" class="section">
@@ -724,6 +1053,8 @@ HTML_PAGE = r"""
         <div><label>Title</label><input id="title" value="my_little_movie"></div>
         <div><label>Visual style</label><input id="style" value="cinematic, coherent character identity, natural motion, detailed lighting"></div>
       </div>
+      <label>Style LoRAs to apply</label><select id="movie_loras" multiple size="5"></select>
+      <div class="row"><div><label>LoRA weight</label><input id="movie_lora_weight" type="number" step="0.05" value="0.8"></div><div><label>Movie variants to produce</label><input id="movie_count" type="number" min="1" value="1"></div></div>
       <div class="row">
         <div><label>Width</label><input id="width" type="number" value="768"></div>
         <div><label>Height</label><input id="height" type="number" value="432"></div>
@@ -738,10 +1069,26 @@ HTML_PAGE = r"""
       </div>
       <label>Global negative prompt</label><input id="negative_prompt" value="flicker, morphing faces, extra limbs, low quality, unreadable text">
       <label><input id="use_keyframes" type="checkbox" style="width:auto"> Generate keyframe image before each video clip for stronger character/environment consistency</label>
+      <label>Lip-sync method</label><select id="lip_sync_method"><option value="wav2lip">wav2lip</option><option value="sadtalker">sadtalker</option></select>
       <label>Final soundtrack prompt (optional; mixed under assembled movie)</label><textarea id="soundtrack_prompt" placeholder="tense orchestral pulse with soft percussion, no vocals"></textarea>
       <div id="clips"></div>
       <button class="btn secondary" onclick="addClip()">Add Clip</button>
       <button class="btn" onclick="startMovie()">Render Movie</button>
+    </section>
+
+    <section id="loras" class="section">
+      <h2>Style LoRA Training</h2>
+      <div class="muted">Train a reusable style LoRA from image/video scene references. Add stills or videos, describe the visual style, then choose the trained LoRA in Movie Builder to produce one or more movies in that style.</div>
+      <div class="card" style="margin-top:12px">
+        <div class="row"><div><label>LoRA name</label><input id="lora_name" placeholder="noir_rain_style"></div><div><label>Target</label><select id="lora_target"><option value="video">video</option><option value="image">image</option></select></div></div>
+        <label>Training media paths, one per line</label><textarea id="lora_media" placeholder="/path/to/style_reference_01.png&#10;/path/to/scene_clip.mp4"></textarea>
+        <label>Scene/style description</label><textarea id="lora_style" placeholder="Describe the scene language: lighting, lens, color palette, texture, movement, costumes, production design..."></textarea>
+        <label>Instance prompt/token</label><input id="lora_instance" placeholder="in noir_rain_style cinematic style">
+        <div class="row"><div><label>Steps</label><input id="lora_steps" type="number" value="800"></div><div><label>Rank</label><input id="lora_rank" type="number" value="16"></div></div>
+        <div class="row"><div><label>Resolution</label><input id="lora_resolution" type="number" value="512"></div><div><label>Frames per video sample</label><input id="lora_frames" type="number" value="6"></div></div>
+        <button class="btn" onclick="trainLora()">Train Style LoRA</button>
+      </div>
+      <h3>Available LoRAs</h3><div class="grid" id="loras_grid"></div>
     </section>
 
     <section id="gallery" class="section">
@@ -752,7 +1099,7 @@ HTML_PAGE = r"""
   </main>
 </div>
 <script>
-let models=[], profiles={characters:[], environments:[]};
+let models=[], profiles={characters:[], environments:[], voices:[], loras:[]};
 function $(id){return document.getElementById(id)}
 function esc(s){return String(s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 async function api(path, opts={}){let r=await fetch(path,{headers:{'Content-Type':'application/json'},...opts}); if(!r.ok) throw new Error(await r.text()); return await r.json()}
@@ -760,8 +1107,14 @@ function fillSelect(sel, cap, def){let s=$(sel); s.innerHTML=''; let filtered=mo
 async function loadModels(){let d=await api('/api/models'); models=d.models||[]; fillSelect('image_model','image_generation',d.defaults.image_model); fillSelect('video_model','video_generation',d.defaults.video_model); fillSelect('audio_model','audio_generation',d.defaults.audio_model); $('conn').textContent=`Connected: ${models.length} model(s)`}
 async function loadProfiles(){profiles=await api('/api/profiles'); renderProfiles()}
 function profileCard(p,kind){return `<div class="profile"><img src="${p.thumbnail||''}" onerror="this.style.display='none'"><div class="p"><b>${esc(p.name)}</b><div class="muted">${esc(p.description||'')}</div><span class="pill">${kind}</span><span class="pill">${p.image_count||0} refs</span><span class="pill">${p.local?'local':'server'}</span></div></div>`}
-function renderProfiles(){$('chars').innerHTML=profiles.characters.map(p=>profileCard(p,'character')).join('')||'<div class="muted">No characters yet.</div>'; $('envs').innerHTML=profiles.environments.map(p=>profileCard(p,'environment')).join('')||'<div class="muted">No environments yet.</div>'; renderClipSelectors()}
+function voiceCard(v){return `<div class="profile"><div class="p"><b>${esc(v.name)}</b><div class="muted">${esc(v.description||'')}</div><span class="pill">cloned voice</span><span class="pill">${esc(v.audio_ext||'audio')}</span></div></div>`}
+function loraCard(l){return `<div class="profile"><div class="p"><b>${esc(l.name)}</b><div class="muted">${esc(l.instance_prompt||l.path||'')}</div><span class="pill">${esc(l.target||'lora')}</span><span class="pill">rank ${esc(l.rank||'')}</span></div></div>`}
+function renderVoiceList(){let voices=['af_sarah','af_sky','af_bella','am_adam','am_michael','en-US-JennyNeural',...(profiles.voices||[]).map(v=>v.name)].filter(Boolean); $('voice_list').innerHTML=[...new Set(voices)].map(v=>`<option value="${esc(v)}"></option>`).join('')}
+function renderLoraList(){let opts=(profiles.loras||[]).map(l=>`<option value="${esc(l.name)}">${esc(l.name)}${l.target?' ('+esc(l.target)+')':''}</option>`).join(''); $('movie_loras').innerHTML=opts; $('loras_grid').innerHTML=(profiles.loras||[]).map(loraCard).join('')||'<div class="muted">No style LoRAs yet. Train one from media references.</div>'}
+function renderProfiles(){$('chars').innerHTML=profiles.characters.map(p=>profileCard(p,'character')).join('')||'<div class="muted">No characters yet.</div>'; $('envs').innerHTML=profiles.environments.map(p=>profileCard(p,'environment')).join('')||'<div class="muted">No environments yet.</div>'; $('voices').innerHTML=(profiles.voices||[]).map(voiceCard).join('')||'<div class="muted">No cloned voices yet. Create one from a reference clip.</div>'; renderVoiceList(); renderLoraList(); renderClipSelectors()}
 async function createProfile(kind){let isChar=kind==='character'; let name=$(isChar?'char_name':'env_name').value; let desc=$(isChar?'char_desc':'env_desc').value; let prompt=$(isChar?'char_prompt':'env_prompt').value||desc; let n=$(isChar?'char_n':'env_n').value; let [w,h]=($(isChar?'char_size':'env_size').value||'512x512').split('x').map(x=>parseInt(x,10)); let model=$('image_model').value; let d=await api('/api/profile/start',{method:'POST',body:JSON.stringify({kind,name,description:desc,prompt,model,n,width:w,height:h})}); watchJob(d.job_id);}
+async function createVoice(){let d=await api('/api/voice/start',{method:'POST',body:JSON.stringify({name:$('voice_name').value,description:$('voice_desc').value,transcript:$('voice_transcript').value,media_path:$('voice_media').value,extract:true})}); watchJob(d.job_id)}
+async function trainLora(){let d=await api('/api/lora/start',{method:'POST',body:JSON.stringify({name:$('lora_name').value,base_model:$('video_model').value,target:$('lora_target').value,media_paths:$('lora_media').value,style_prompt:$('lora_style').value,scene_description:$('lora_style').value,instance_prompt:$('lora_instance').value,steps:$('lora_steps').value,rank:$('lora_rank').value,resolution:$('lora_resolution').value,frames_per_video:$('lora_frames').value,quantize_4bit:true})}); watchJob(d.job_id)}
 function options(items){return items.map(p=>`<option value="${esc(p.name)}">${esc(p.name)}</option>`).join('')}
 function addClip(data={}){let idx=document.querySelectorAll('.clip').length+1; let div=document.createElement('div'); div.className='clip'; div.innerHTML=`<div class="clip-head"><h3>Clip ${idx}</h3><button class="btn bad" onclick="this.closest('.clip').remove()">Remove</button></div>
 <label>Clip title</label><input class="c_title" value="${esc(data.title||'Shot '+idx)}">
@@ -769,15 +1122,16 @@ function addClip(data={}){let idx=document.querySelectorAll('.clip').length+1; l
 <div class="row"><div><label>Characters</label><select class="c_chars" multiple size="5">${options(profiles.characters)}</select></div><div><label>Environments</label><select class="c_envs" multiple size="5">${options(profiles.environments)}</select></div></div>
 <div class="row"><div><label>Camera motion</label><input class="c_camera" placeholder="zoom-in, pan-left, handheld..."></div><div><label>Mood/action</label><input class="c_action" placeholder="what happens in this clip"></div></div>
 <label>Speech text (simple one-speaker; optional)</label><input class="c_speech" placeholder="Line spoken in this shot">
-<div class="row"><div><label>Speech voice</label><input class="c_voice" value="${esc($('default_voice').value||'af_sarah')}"></div><div><label><input class="c_lipsync" type="checkbox" checked style="width:auto"> Lip-sync speech/dialogue</label></div></div>
+<div class="row"><div><label>Speech voice / cloned profile</label><input class="c_voice" list="voice_list" value="${esc($('default_voice').value||'af_sarah')}"></div><div><label>Speech speed</label><input class="c_speed" type="number" step="0.05" value="1.0"></div></div>
+<label><input class="c_lipsync" type="checkbox" checked style="width:auto"> Lip-sync speech/dialogue</label>
 <h3>Multi-character dialogue</h3><div class="dialogues"></div><button class="btn secondary" onclick="addDialogue(this)">Add Dialogue Line</button>
 <label>Music prompt for this clip</label><input class="c_music" placeholder="short local music bed for this clip">
 <label>Sound effects prompt for this clip</label><input class="c_sfx" placeholder="rain, footsteps, door creak, city ambience">
 </div>`; $('clips').appendChild(div); renderClipSelectors(div)}
 function renderClipSelectors(root=document){for(let s of root.querySelectorAll('.c_chars')){let vals=[...s.selectedOptions].map(o=>o.value); s.innerHTML=options(profiles.characters); for(let o of s.options) if(vals.includes(o.value)) o.selected=true} for(let s of root.querySelectorAll('.c_envs')){let vals=[...s.selectedOptions].map(o=>o.value); s.innerHTML=options(profiles.environments); for(let o of s.options) if(vals.includes(o.value)) o.selected=true} for(let s of root.querySelectorAll('.d_char')){let val=s.value; s.innerHTML='<option value="">(none)</option>'+options(profiles.characters); s.value=val}}
-function addDialogue(btn){let box=btn.closest('.clip').querySelector('.dialogues'); let row=document.createElement('div'); row.className='dialogue'; row.innerHTML=`<select class="d_char"><option value="">(none)</option>${options(profiles.characters)}</select><input class="d_voice" placeholder="voice/profile" value="${esc($('default_voice').value||'af_sarah')}"><input class="d_text" placeholder="dialogue text"><input class="d_start" placeholder="start s"><button class="btn bad" onclick="this.parentElement.remove()">x</button>`; box.appendChild(row)}
+function addDialogue(btn){let box=btn.closest('.clip').querySelector('.dialogues'); let row=document.createElement('div'); row.className='dialogue'; row.innerHTML=`<select class="d_char"><option value="">(none)</option>${options(profiles.characters)}</select><input class="d_voice" list="voice_list" placeholder="voice/profile" value="${esc($('default_voice').value||'af_sarah')}"><input class="d_text" placeholder="dialogue text"><input class="d_start" placeholder="start s"><input class="d_speed" type="number" step="0.05" value="1.0"><button class="btn bad" onclick="this.parentElement.remove()">x</button>`; box.appendChild(row)}
 function selected(sel){return [...sel.selectedOptions].map(o=>o.value)}
-function collectMovie(){let clips=[...document.querySelectorAll('.clip')].map(c=>({title:c.querySelector('.c_title').value,prompt:c.querySelector('.c_prompt').value,characters:selected(c.querySelector('.c_chars')),environments:selected(c.querySelector('.c_envs')),camera_motion:c.querySelector('.c_camera').value,action:c.querySelector('.c_action').value,speech_text:c.querySelector('.c_speech').value,speech_voice:c.querySelector('.c_voice').value,lip_sync:c.querySelector('.c_lipsync').checked,music_prompt:c.querySelector('.c_music').value,sfx_prompt:c.querySelector('.c_sfx').value,dialogues:[...c.querySelectorAll('.dialogue')].map(d=>({character:d.querySelector('.d_char').value,voice:d.querySelector('.d_voice').value,text:d.querySelector('.d_text').value,start_time:d.querySelector('.d_start').value}))})); return {title:$('title').value,style:$('style').value,image_model:$('image_model').value,video_model:$('video_model').value,audio_model:$('audio_model').value,default_voice:$('default_voice').value,width:+$('width').value,height:+$('height').value,fps:+$('fps').value,num_frames:+$('num_frames').value,steps:+$('steps').value,guidance_scale:+$('guidance_scale').value,negative_prompt:$('negative_prompt').value,use_keyframes:$('use_keyframes').checked,soundtrack_prompt:$('soundtrack_prompt').value,clips}}
+function collectMovie(){let clips=[...document.querySelectorAll('.clip')].map(c=>({title:c.querySelector('.c_title').value,prompt:c.querySelector('.c_prompt').value,characters:selected(c.querySelector('.c_chars')),environments:selected(c.querySelector('.c_envs')),camera_motion:c.querySelector('.c_camera').value,action:c.querySelector('.c_action').value,speech_text:c.querySelector('.c_speech').value,speech_voice:c.querySelector('.c_voice').value,speech_speed:c.querySelector('.c_speed').value,lip_sync:c.querySelector('.c_lipsync').checked,lip_sync_method:$('lip_sync_method').value,music_prompt:c.querySelector('.c_music').value,sfx_prompt:c.querySelector('.c_sfx').value,dialogues:[...c.querySelectorAll('.dialogue')].map(d=>({character:d.querySelector('.d_char').value,voice:d.querySelector('.d_voice').value,text:d.querySelector('.d_text').value,start_time:d.querySelector('.d_start').value,speed:d.querySelector('.d_speed').value,lip_sync:c.querySelector('.c_lipsync').checked}))})); return {title:$('title').value,style:$('style').value,image_model:$('image_model').value,video_model:$('video_model').value,audio_model:$('audio_model').value,default_voice:$('default_voice').value,lip_sync_method:$('lip_sync_method').value,width:+$('width').value,height:+$('height').value,fps:+$('fps').value,num_frames:+$('num_frames').value,steps:+$('steps').value,guidance_scale:+$('guidance_scale').value,negative_prompt:$('negative_prompt').value,use_keyframes:$('use_keyframes').checked,soundtrack_prompt:$('soundtrack_prompt').value,loras:selected($('movie_loras')).map(n=>({name:n,weight:+$('movie_lora_weight').value})),lora_weight:+$('movie_lora_weight').value,movie_count:+$('movie_count').value,clips}}
 async function startMovie(){let d=await api('/api/movie/start',{method:'POST',body:JSON.stringify(collectMovie())}); watchJob(d.job_id)}
 async function watchJob(id){$('jobout').innerHTML=`<p>Job <span class="pill">${id}</span></p>`; let timer=setInterval(async()=>{let j=await api('/api/job/'+id); $('jobout').innerHTML=`<p><span class="pill">${esc(j.status)}</span> ${j.progress||0}% ${esc(j.message||'')}</p>`+(j.output_url?`<p><a href="${j.output_url}" target="_blank">Open output</a></p>`:'')+(j.error?`<p style="color:var(--bad)">${esc(j.error)}</p>`:''); if(j.status==='done'||j.status==='error'){clearInterval(timer); loadProfiles(); loadGallery()}},1500)}
 async function loadGallery(){let d=await api('/api/gallery'); $('gallery_grid').innerHTML=(d.items||[]).map(it=>`<div class="profile">${it.type==='video'?`<video src="${it.url}" controls style="width:100%;height:130px;background:#000"></video>`:`<img src="${it.url}">`}<div class="p"><b>${esc(it.name)}</b><br><a href="${it.url}" target="_blank">open</a></div></div>`).join('')||'<div class="muted">No media yet.</div>'}
@@ -871,6 +1225,10 @@ def make_handler(app: VideoGenApp):
                 payload = self._read_json()
                 if path == "/api/profile/start":
                     self._json({"job_id": app.start_profile_job(payload)})
+                elif path == "/api/voice/start":
+                    self._json({"job_id": app.start_voice_job(payload)})
+                elif path == "/api/lora/start":
+                    self._json({"job_id": app.start_lora_job(payload)})
                 elif path == "/api/movie/start":
                     self._json({"job_id": app.start_movie_job(payload)})
                 elif path.startswith("/api/job/") and path.endswith("/cancel"):
@@ -909,6 +1267,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="CoderAI base URL")
     parser.add_argument("--api-key", default=DEFAULT_API_KEY, help="Bearer token for CoderAI")
     parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR, help="Local output directory")
+    parser.add_argument("--host", default="0.0.0.0", help="Web UI listen host (default: 0.0.0.0)")
     parser.add_argument("--web-port", type=int, default=7790, help="Local web UI port")
     parser.add_argument("--image-model", default="", help="Default image model")
     parser.add_argument("--video-model", default="", help="Default video model")
@@ -921,8 +1280,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     app = VideoGenApp(args)
-    server = ThreadedHTTPServer(("127.0.0.1", args.web_port), make_handler(app))
-    url = f"http://127.0.0.1:{args.web_port}"
+    server = ThreadedHTTPServer((args.host, args.web_port), make_handler(app))
+    url = f"http://{args.host}:{args.web_port}"
     log(f"VideoGen Studio running at {url}")
     log(f"CoderAI: {args.base_url}")
     log(f"Output: {Path(args.out_dir).resolve()}")
