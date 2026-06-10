@@ -2543,19 +2543,33 @@ def launch_web_ui(default_args):
                     err["e"] = str(e)
             t = threading.Thread(target=_do, daemon=True)
             t.start()
-            _prog(6, "training…")
+            _start_ts = time.time()
+            _prog(6, "preparing…")
             while t.is_alive():
                 time.sleep(1.5)
+                _elapsed = int(time.time() - _start_ts)
+                _mm, _ss = divmod(_elapsed, 60)
+                _et = f"{_mm}m{_ss:02d}s" if _mm else f"{_ss}s"
                 try:
                     p = client.lora_progress()
                 except Exception:
+                    # Server busy (large video models can load for many minutes,
+                    # starving the progress endpoint) — keep the UI visibly alive.
+                    _prog(6, f"preparing — loading model… ({_et})")
                     continue
-                if p.get("name") and p.get("name") != lora_name:
-                    continue
+                # Trainings are serialized by the queue, so trust the active job's
+                # progress even if the reported name doesn't line up — a strict
+                # name match would otherwise freeze the bar at 6% forever.
+                status = (p.get("status") or "").strip()
                 total = p.get("total") or steps
                 step = p.get("step") or 0
-                pct = 6 + int(90 * step / max(1, total))
-                _prog(pct, p.get("message") or p.get("status") or "training")
+                if status in ("preparing", "saving") or not step:
+                    # No training steps yet (model loading / encoding / saving).
+                    _prog(6, (p.get("message") or status or "preparing")
+                             + f" ({_et})")
+                else:
+                    pct = 6 + int(90 * step / max(1, total))
+                    _prog(pct, p.get("message") or status or "training")
             t.join()
 
             if err:
@@ -3473,6 +3487,27 @@ fetch('/status').then(r=>r.json()).then(d=>{{
             out.append({"name": d.name, "meta": meta, "images": imgs})
         return out
 
+    _video_model_cache = {"id": None}
+
+    def _current_video_model() -> str:
+        """The video model the UI/generation will actually use: the configured
+        --video-model if set, else the server's auto-picked one (cached). Training
+        tags video LoRAs with this model's slug, so the profile page must resolve
+        it the same way to detect them."""
+        vm = getattr(default_args, "video_model", None)
+        if vm:
+            return vm
+        if _video_model_cache["id"]:
+            return _video_model_cache["id"]
+        try:
+            client = CoderAIClient(default_args.base_url,
+                                   getattr(default_args, "api_key", None))
+            vm = pick_model(client, "video", None)
+        except Exception:
+            vm = ""
+        _video_model_cache["id"] = vm or ""
+        return _video_model_cache["id"]
+
     def _profiles_html(kind: str):
         import html as _html
         label = "Characters" if kind == "character" else "Environments"
@@ -3488,7 +3523,7 @@ fetch('/status').then(r=>r.json()).then(d=>{{
         _vlora_file = out_dir / ("video_loras.json" if kind == "character"
                                  else "env_video_loras.json")
         _vlora_map = _load_json_map(_vlora_file)
-        _vslug = _model_slug(getattr(default_args, "video_model", None) or "")
+        _vslug = _model_slug(_current_video_model())
 
         def esc(v):
             return _html.escape(str(v if v is not None else ""), quote=True)
@@ -3497,6 +3532,25 @@ fetch('/status').then(r=>r.json()).then(d=>{{
         for p in profiles:
             name = p["name"]
             meta = p["meta"]
+            # Video LoRA status: prefer a match for the current video model, but
+            # still report a LoRA trained for a DIFFERENT model so it never looks
+            # untrained just because the active model can't be resolved.
+            _ventry = _vlora_map.get(name)
+            _vcur = _video_lora_path(_ventry, _vslug)
+            _vslugs = (sorted(k for k, v in _ventry.items() if v)
+                       if isinstance(_ventry, dict) else
+                       (["(legacy)"] if isinstance(_ventry, str) and _ventry else []))
+            if _vcur:
+                _vstate = ("#7ed87e", f"trained ✓ ({esc(_vslug)})", "Retrain")
+            elif _vslugs:
+                _vstate = ("#d8b84a",
+                           "trained for: " + esc(", ".join(_vslugs))
+                           + (f" — not for {esc(_vslug)}" if _vslug else ""),
+                           "Train")
+            else:
+                _vstate = ("#888",
+                           f"not trained ({esc(_vslug or 'no video model')})", "Train")
+            _vcolor, _vlabel, _vbtn = _vstate
             thumbs = "".join(
                 f'<div class=pf-thumb>'
                 f'<img src="/media/{kind}s/{esc(name)}/{esc(img)}" loading=lazy alt="{esc(img)}" '
@@ -3589,16 +3643,14 @@ fetch('/status').then(r=>r.json()).then(d=>{{
                 f'  </div>'
                 # Video (Wan) LoRA — separate, tagged with the current video model.
                 f'  <div class=pf-actions style="border-top:1px solid #222;padding-top:.6rem;margin-top:.6rem">'
-                f'    <span style="font-size:.78rem;color:{"#7ed87e" if _video_lora_path(_vlora_map.get(name), _vslug) else "#888"}">'
-                f'Video LoRA ({esc(_vslug or "no video model")}): '
-                f'{"trained ✓" if _video_lora_path(_vlora_map.get(name), _vslug) else "not trained"}</span>'
+                f'    <span style="font-size:.78rem;color:{_vcolor}">Video LoRA: {_vlabel}</span>'
                 f'    <label style="margin:0;font-size:.78rem">steps <input type=number data-vlora=steps '
                 f'value=800 min=50 max=5000 step=50 style="width:66px;display:inline-block"></label>'
                 f'    <label style="margin:0;font-size:.78rem">rank <input type=number data-vlora=rank '
                 f'value=16 min=2 max=128 style="width:54px;display:inline-block"></label>'
                 f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
                 f'onclick="trainLora(\'{kind}\',\'{esc(name)}\',\'video\')">🎬 '
-                f'{"Retrain" if _video_lora_path(_vlora_map.get(name), _vslug) else "Train"} video LoRA</button>'
+                f'{_vbtn} video LoRA</button>'
                 f'    <span class=pf-vlora-status style="font-size:.76rem;color:#7ea8f7"></span>'
                 f'  </div>'
                 f'</div>'
@@ -4125,6 +4177,22 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
         env = meta.get("env", "")
         title = f"{f1} vs {f2}" if f1 else name.replace("match_", "").replace("_", " ")
 
+        # Selectable rosters: locally-saved profiles + the built-in pools, so a
+        # match's fighters/environment can be SWITCHED before re-rendering.
+        _char_opts = sorted({p["name"] for p in _list_profiles("character")}
+                            | {f["name"] for f in FIGHTER_POOL})
+        _env_opts = sorted({p["name"] for p in _list_profiles("environment")}
+                           | {e["name"] for e in ENVIRONMENT_POOL})
+
+        def _field_select(field, current, options):
+            opts = list(options)
+            if current and current not in opts:
+                opts = [current] + opts
+            inner = "".join(
+                f'<option value="{_esc(o)}"{" selected" if o == current else ""}>'
+                f'{_esc(o)}</option>' for o in opts)
+            return f'<select data-field={field}>{inner}</select>'
+
         finals_html = ""
         for k in ("short", "long"):
             if k in finals:
@@ -4208,10 +4276,13 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             # edit meta
             f'<div class=card>'
             f'  <div class=row3>'
-            f'    <div><label>Fighter 1</label><input type=text data-field=f1 value="{_esc(f1)}"></div>'
-            f'    <div><label>Fighter 2</label><input type=text data-field=f2 value="{_esc(f2)}"></div>'
-            f'    <div><label>Environment</label><input type=text data-field=env value="{_esc(env)}"></div>'
+            f'    <div><label>Fighter 1</label>{_field_select("f1", f1, _char_opts)}</div>'
+            f'    <div><label>Fighter 2</label>{_field_select("f2", f2, _char_opts)}</div>'
+            f'    <div><label>Environment</label>{_field_select("env", env, _env_opts)}</div>'
             f'  </div>'
+            f'  <p class=hint style="margin-top:.25rem">Switch fighters/environment, then '
+            f'<b>Save match</b> and re-render. Tip: also re-render the clip prompts so '
+            f'their text matches the new fighters/location.</p>'
             f'  <div class=row style="margin-top:.4rem">'
             f'    <div><label>Short target (s)</label><input type=number data-field=short_target '
             f'value="{_esc(meta.get("short_target",45))}"></div>'
@@ -4917,7 +4988,12 @@ async function pollJob(){
                             self._send(404, "application/json", _j.dumps({"error": "match not in prompts.json"})); return
                         if "f1" in form: m["f1"] = _fv("f1") or m.get("f1")
                         if "f2" in form: m["f2"] = _fv("f2") or m.get("f2")
-                        if "env" in form: m["env"] = _fv("env") or None
+                        if "env" in form:
+                            _new_env = _fv("env") or None
+                            if _new_env != m.get("env"):
+                                m["env"] = _new_env
+                                m["env_desc"] = (_env_description(_new_env)
+                                                 if _new_env else "African township")
                         for _tk in ("short_target", "long_target"):
                             if _tk in form:
                                 try: m[_tk] = float(_fv(_tk))
