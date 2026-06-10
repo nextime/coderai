@@ -1,0 +1,288 @@
+# AI.PROMPT — coderai architecture notes for AI assistants
+
+This file records non-obvious architecture and invariants that AI assistants
+(and humans) must respect when working on coderai. Read it before changing model
+loading, configuration handling, or VRAM/eviction logic.
+
+================================================================================
+## Configuration is the single source of truth
+================================================================================
+
+Every model's behaviour comes from its entry in `~/.coderai/models.json`.
+Loaders MUST read settings from the per-model configuration, NOT from CLI args
+(`global_args`). CLI flags are not used to configure per-model behaviour.
+
+### Uniform models.json schema
+Every model entry — regardless of type — carries the same base fields:
+
+    load_in_4bit, load_in_8bit      # quantization (bitsandbytes)
+    flash_attention                 # NOTE: key is 'flash_attention', NOT 'flash_attn'
+    offload_strategy                # 'auto' | 'none' | 'cpu' | 'sequential' | 'model' | 'disk'
+    offload_dir                     # disk-offload directory
+    max_gpu_percent                 # cap GPU budget 0-100
+    manual_ram_gb                   # explicit CPU RAM budget
+    no_ram                          # GPU-only, no CPU spill
+    n_ctx                           # context size. NOTE: key is 'n_ctx', NOT 'context_size'
+    n_gpu_layers
+    used_vram_gb                    # raw (full-precision) VRAM estimate
+    precision                       # 'bf16' | 'f16' | 'f32'
+
+### Key-name traps (caused silent config-ignored bugs)
+- Use `flash_attention`  (legacy code wrongly read `flash_attn`)
+- Use `n_ctx`            (legacy code wrongly read `context_size`)
+Always read the canonical key first, with the legacy key only as a fallback.
+
+================================================================================
+## Where config is translated and applied
+================================================================================
+
+### main.py :: build_kwargs_from_config(model_cfg, model_type)
+Emits a COMMON BASE of kwargs (quant/offload/flash/memory/n_gpu_layers) for
+EVERY type, plus type-specific extras, plus the original entry as `_raw_cfg`.
+No model type may be left without the common base.
+
+### codai/models/hf_loading.py  (shared helper — transformers / HF pipeline)
+Translates a model config into `from_pretrained` kwargs:
+- `build_from_pretrained_kwargs(cfg)` → torch_dtype, transformers
+  `BitsAndBytesConfig` (4-bit nf4 / 8-bit), `device_map='auto'` + `max_memory`
+  (GPU→CPU split), `offload_folder` (disk overflow), `attn_implementation`.
+- `build_quantization_config(cfg)` → transformers BitsAndBytesConfig or None.
+- `pipeline_device_kwargs(cfg)` → kwargs for HF `pipeline(...)` (uses model_kwargs).
+- `resolve_dtype(cfg, default)` → torch dtype from `precision`.
+Used by: spatial (depth/segmentation), embedding, audio_gen (AudioLDM2).
+
+### diffusers loaders (image, video, audioldm)
+Two shared helpers in `codai/models/hf_loading.py`, both keyed off the per-model
+`component_quantization` map (e.g. `{"transformer":"4bit","text_encoder":"8bit",
+"vae":"none"}`):
+- `build_pipeline_quant_config(model_name, cfg, dtype)` → diffusers
+  `PipelineQuantizationConfig` (`quant_mapping`) for in-place quantization.
+  Supported per-component modes:
+    * "4bit"/"8bit" → bitsandbytes (always available)
+    * "2bit"       → optimum-quanto int2 (needs `pip install optimum-quanto`;
+                     skipped with a warning if missing — bnb CANNOT do 2-bit)
+    * "none"/omitted → full precision
+  diffusers BnB for transformer/unet/vae; transformers BnB/Quanto for
+  text_encoder*. No override → global `load_in_4bit`/`8bit` on all heavy
+  components (MUST include UMT5 `text_encoder` for Wan2.2 or it won't fit GPU).
+- `build_gguf_pipeline_components(model_name, cfg, dtype)` → for any
+  `component_quantization` value that is a `*.gguf` path/URL, loads that
+  component via `<Class>.from_single_file(..., GGUFQuantizationConfig)` and
+  returns it to be injected as a pipeline kwarg (e.g. `transformer=<model>`).
+  This is the ONLY way to get 5-bit/6-bit (Q5_K/Q6_K) — they don't exist in
+  bnb/quanto; needs a pre-quantized GGUF file + the `gguf` lib. diffusers
+  components only.
+- Components discovered from `DiffusionPipeline.load_config(model_name)`.
+- Configurable in models.json (`component_quantization`) and the Admin UI
+  (Per-component quantization section: Default/2-bit/4-bit/8-bit/GGUF-file/None
+  per component).
+- bitsandbytes = 4/8-bit ONLY. 2-bit = quanto. 5/6-bit = GGUF files only.
+IMPORTANT: bitsandbytes-quantized pipelines/models are placed on GPU during
+`from_pretrained` and CANNOT be moved with `.to()` afterwards — load via
+`device_map` and skip the explicit `.to(device)` when a quant config is active.
+
+### text / vision
+Go through `codai/backends/cuda.py :: NvidiaBackend.load_model`, which already
+reads `flash_attn`, `load_in_4bit`, `load_in_8bit`, `offload_strategy`,
+`max_gpu_percent`, `no_ram`, `offload_dir` from kwargs.
+
+================================================================================
+## Loading strategy (GPU-max, then spill)
+================================================================================
+
+The GPU should always be used as much as possible, then spill to CPU RAM, then
+to disk. Never go straight to CPU unless explicitly configured (`no_ram=True`
+or `offload_strategy='none'` means GPU-only; pure-CPU is a last resort only when
+no CUDA device exists or every GPU+RAM+disk attempt failed).
+
+GPU budget is capped at `min(total × fraction, free_vram − 512MB headroom)` so
+we never request more VRAM than is physically free; overflow goes to CPU/disk
+via `device_map='auto'` + `max_memory` + `offload_folder`.
+
+bitsandbytes quantization requires CUDA; on CPU-only hosts it is skipped
+gracefully. MusicGen (audiocraft `get_pretrained`) exposes no quant hook and is
+the one loader left unquantized.
+
+================================================================================
+## VRAM estimate & eviction
+================================================================================
+
+### codai/models/manager.py :: _get_model_used_vram_gb
+Priority: measured delta (ground truth, factors already baked in) > explicit
+`used_vram_gb` (raw full-precision — quant/offload factors ARE applied on top) >
+local file size > HF cache size. Quantization factor: ÷4 (4-bit), ÷2 (8-bit).
+This is why a 4-bit Wan2.2 no longer reports a bogus ~151 GB.
+
+### Universal eviction invariant
+ANY model of ANY type, before loading when not already resident, must call
+`manager.ensure_vram_for(model_key, resolved_name)` — which evicts other models
+(one or more, LRU first) until there is enough free VRAM. This is wired into
+EVERY load branch of `request_model` (per-model "on-request", per-model "load",
+legacy "loadall", and the ondemand fallback). Do not add a new load path that
+returns `already_loaded: False` without calling `ensure_vram_for` first — that
+was the bug where a "load"-mode text model came back on CPU because the video
+model that displaced it was never evicted.
+
+### codai/models/manager.py :: _evict_models_for_vram(needed_gb)
+Evicts LRU-first ONLY until `free_vram >= needed_gb`, so multiple small models
+COEXIST in VRAM when they fit together. Eviction is synchronous (cleanup +
+`cuda.empty_cache()` complete before returning) so load/unload happens one at a
+time. Accelerate device_map models: call
+`accelerate.hooks.remove_hook_from_submodules(model)` BEFORE moving to CPU,
+otherwise the dispatch hooks keep CUDA tensors alive and VRAM is never freed.
+
+NEVER evict a BUSY model (one with ref_count > 0 in its ModelInstancePool —
+i.e. actively serving a request). Moving its weights off the GPU mid-forward-
+pass crashes the in-flight request with a CUDA device-side assert and poisons
+the context. `_evict_models_for_vram` checks `_is_key_busy(key)` and
+`_wait_until_idle(key)` before evicting; busy non-active models are skipped, the
+active model is waited on. `_evict_key` calls `pool.cleanup_all()` so EVERY
+instance (not just the primary) is freed. Because eviction can BLOCK waiting for
+a model to go idle, callers MUST invoke `request_model` off the event loop
+(`await asyncio.to_thread(...)`) — text and video endpoints already do — or the
+wait deadlocks the very request it is waiting on.
+
+================================================================================
+## Flash-Attention-2 requires the whole model on GPU
+================================================================================
+
+FA2 kernels are CUDA-only and assume every layer is resident on one CUDA device.
+If the model is split GPU+CPU (accelerate offload), FA2 triggers a CUDA
+device-side assert that corrupts the process. Therefore `backends/cuda.py` only
+enables FA2 when the model fits fully in free GPU VRAM, or the user forced
+full-GPU residence (`no_ram=True` or `offload_strategy='none'`). Otherwise it
+falls back to `attn_implementation='sdpa'` (which handles mixed devices and still
+uses flash kernels for GPU-resident layers). The manager passes
+`expected_vram_gb` (= `_get_model_used_vram_gb`) into `load_model` so the backend
+can make this decision. The three UI flash checkboxes (`flash_attention`,
+`sdcpp_flash_attn`, `sdcpp_diffusion_flash_attn`) are OR'd into FA2 intent for
+transformers models, since the sdcpp flags are no-ops for HF models.
+
+================================================================================
+## CUDA device-side assert poisons the whole process — fail fast
+================================================================================
+
+A CUDA "device-side assert triggered" / "illegal memory access" / "CUDA error"
+corrupts the CUDA context PROCESS-WIDE. Every subsequent GPU op then fails with
+the same async assert echo. It is UNRECOVERABLE in-process — the server must be
+restarted. `MultiModelManager._mark_cuda_poisoned_if_fatal(err)` sets
+`cuda_context_poisoned`; `request_model`, the text retry loop, and the video
+endpoint all check it and fail fast with HTTP 503 + "Restart coderai to recover"
+instead of retrying dozens of times. Do NOT add retry loops that re-load onto a
+poisoned context.
+
+================================================================================
+## VRAM is not freed after eviction without expandable_segments
+================================================================================
+
+`codai/__init__.py` sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+BEFORE torch is imported (honouring any pre-set value). This is REQUIRED, not
+optional. Symptom without it: after evicting a model, params move to CPU
+(`memory_allocated` drops) but `torch.cuda.memory_reserved()` stays high and
+`torch.cuda.empty_cache()` frees almost nothing — VRAM stays ~full and the next
+model can't load. Root cause: HF/accelerate keeps the tied embedding/lm_head
+weight (a single ~2 GB live tensor) in `tied_params_map`; the default CUDA
+allocator cannot return a segment that contains ANY live block, so that one
+tensor pins the whole ~18 GB segment. expandable_segments lets the allocator
+return the freed pages around it. Do not remove this env var; do not set CUDA
+config after torch initializes (it is read once at first CUDA use).
+
+`NvidiaBackend.cleanup` also: removes accelerate hooks, walks every submodule
+moving raw `_parameters`/`_buffers` to CPU (model.to('cpu') is a silent no-op on
+dispatched models), and breaks lingering list/dict references to this model's
+GPU tensors (scoped by storage data_ptr so coexisting models are untouched).
+
+================================================================================
+## Chat generation: turn-boundary stop + enable_thinking (model-agnostic)
+================================================================================
+
+This is NOT a Qwen-only server. Keep model-specific handling minimal and
+detection-based. Two helpers in `backends/cuda.py` handle chat generation
+generically:
+
+- `_eos_token_ids()` — returns eos_token_id PLUS any known turn-end token that
+  ACTUALLY EXISTS in this model's vocab (<|im_end|>, <|eot_id|>, <|end|>,
+  <end_of_turn>, …). Each is added only if `convert_tokens_to_ids` returns a
+  real (non-unk) id, so a Llama/Mistral/etc. model just doesn't get <|im_end|>.
+  Without this, models whose turn ends with <|im_end|> (not the eos
+  <|endoftext|>) never stop and hallucinate extra assistant/user turns.
+- `_build_chat_prompt(messages, enable_thinking, add_generation_prompt)` — uses
+  the MODEL'S OWN `tokenizer.apply_chat_template` when it has one (correct
+  special tokens + proper enable_thinking handling), falling back to the legacy
+  formatter otherwise. `enable_thinking` is passed to the template only if it
+  accepts the kwarg (TypeError → retry without), so non-thinking models are
+  unaffected. enable_thinking threads from the request:
+  text.py(reasoning_enabled) → ModelManager.generate_chat[_stream] →
+  NvidiaBackend. Default False (suppress reasoning); True keeps <think> blocks
+  for callers that ask. Do NOT hardcode model-family tokens in generation paths
+  — gate on vocab presence / template support.
+
+================================================================================
+## Thermal protection (model-agnostic, config-driven)
+================================================================================
+
+A long sequence of heavy generations can drive CPU/GPU hot enough that the
+machine's own protection powers it off. `codai/models/thermal.py` guards against
+this: before serving a request against a loaded model it waits until temps are
+safe.
+
+- Single choke point: `MultiModelManager.request_model()` calls
+  `thermal.wait_until_safe()` right after the CUDA-poison check, so EVERY request
+  type (text/image/video/audio/tts/embedding/spatial) is covered once.
+- Mid-generation checkpoints (`thermal.checkpoint(context, throttle_seconds)`)
+  pause long runs that overheat AFTER the pre-request check passed: diffusion
+  step callbacks (`_vid_step_cb` / image `_step_cb`) call it per denoise step;
+  HF text generation adds a `StoppingCriteria` (via `_make_thermal_criteria()`
+  in backends/cuda.py) that runs ON the generate thread — blocking the streamer
+  CONSUMER loop would NOT pause the GPU (generation runs in a separate thread).
+  GGUF/llama.cpp text (backends/vulkan.py) uses the same idea via a llama.cpp
+  `StoppingCriteriaList` (`_make_llama_thermal_criteria()`) passed to every
+  create_(chat_)completion call — llama.cpp evaluates it synchronously per token.
+  Throttled (≈2 s) for high-frequency token loops; unthrottled for per-step.
+- Config lives in config.json `thermal` (ThermalConfig): cpu_enabled, gpu_enabled
+  (default True each), cpu_high/cpu_resume, gpu_high/gpu_resume (default 90/87),
+  poll_seconds (default 5). Editable live in the admin Settings page — saving
+  pushes values onto global_args so no restart is needed.
+- Hysteresis: pause when temp >= *high*, resume only once temp <= *resume*
+  (resume < high). A sensor that can't be read is treated as safe (never blocks).
+- Readers: GPU via nvidia-smi (then rocm-smi, then psutil amdgpu); CPU via psutil
+  (k10temp/coretemp), then /sys/class/thermal, then `sensors`. 2s reading cache.
+- ASYNC REQUIREMENT: the wait is a blocking time.sleep, so request_model MUST
+  always be invoked via `asyncio.to_thread(...)` from async endpoints — never
+  call it directly in an async handler, or the cooldown stalls the event loop
+  and the whole server stops accepting requests. All api/*.py call sites already
+  do this; keep it that way for any new endpoint.
+
+================================================================================
+## Invariants checklist when adding/altering a model loader
+================================================================================
+
+1. Read settings from the per-model config, never from CLI/global_args.
+2. Use the canonical keys (`flash_attention`, `n_ctx`).
+3. transformers/HF-pipeline model → use codai/models/hf_loading helpers.
+   diffusers model → use PipelineQuantizationConfig.
+4. Honour quantization, offload_strategy, offload_dir, max_gpu_percent, no_ram,
+   manual_ram_gb, precision, flash_attention.
+5. Do not `.to()` a quantized model/pipeline; place it via device_map.
+6. Maximize GPU first, then CPU RAM, then disk; CPU-only is last resort.
+7. Never break VRAM coexistence — evict only the minimum needed.
+8. FA2 only when the model fits fully on GPU; else use SDPA (offload-safe).
+9. On a CUDA device-side assert, fail fast (503) — never retry onto a poisoned
+   context; the server must be restarted.
+10. Keep `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (set in
+    codai/__init__.py before torch import) — without it, evicted-model VRAM is
+    never returned to the driver.
+11. Eviction must free CPU RAM too, not just VRAM: cleanup calls
+    `_trim_cpu_ram()` (glibc malloc_trim) so the evicted model's host-side copy /
+    offloaded weights are returned to the OS and swap is reclaimed — otherwise
+    RSS creeps up across evict/load cycles.
+12. CPU threads are capped to HALF the cores (when >= 8) in codai/__init__.py
+    (OMP/MKL/OpenBLAS env before torch import) so model loading / 4-bit dequant
+    never saturates the machine. Do NOT lower sys.setswitchinterval during long
+    loads — it caused GIL scheduler thrashing (load avg > 10).
+13. request_model() must ALWAYS be called via asyncio.to_thread from async
+    endpoints — it can block (thermal cooldown, waiting for a busy model). A
+    direct call stalls the event loop.
+14. Thermal protection is config-driven and model-agnostic (config.json
+    `thermal`). Don't special-case it per model/backend; it only reads temps and
+    sleeps. Honour the enable flags and high/resume hysteresis.

@@ -99,9 +99,10 @@ async def create_speech(request: TTSRequest, http_request: Request = None):
         return {"audio": audio_base64}
 
     # Use the manager to resolve the model and manage VRAM
-    model_info = multi_model_manager.request_model(
+    model_info = await asyncio.to_thread(
+        multi_model_manager.request_model,
         requested_model=request.model,
-        model_type="tts"
+        model_type="tts",
     )
     
     # Check if the model was rejected as not allowed

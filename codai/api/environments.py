@@ -39,7 +39,32 @@ import tempfile
 import time
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+
+def _require_api_auth(request: Request) -> None:
+    """Raise 401 if auth is enabled and the request carries no valid credential."""
+    try:
+        from codai.admin import routes as _admin_routes
+        sm = _admin_routes.session_manager
+    except Exception:
+        return
+    if sm is None:
+        return
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        if sm.verify_token(auth[7:].strip()):
+            return
+    cookie = request.cookies.get("session", "")
+    if cookie.endswith(".MUST_CHANGE"):
+        cookie = cookie[:-12]
+    if cookie and sm.validate_session(cookie):
+        return
+    raise HTTPException(
+        status_code=401,
+        detail={"message": "Invalid API key. Provide a valid Bearer token.",
+                "type": "invalid_request_error", "code": "invalid_api_key"},
+    )
 from pydantic import BaseModel, ConfigDict
 
 from codai.platform_paths import default_environments_dir, legacy_style_config_dir
@@ -283,7 +308,7 @@ def resolve_environment_profiles(profile_names: List[str]) -> List[str]:
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/v1/environments")
-async def save_environment(req: EnvironmentSaveRequest):
+async def save_environment(req: EnvironmentSaveRequest, _auth=Depends(_require_api_auth)):
     """Save or update a named environment profile."""
     if not req.name or '/' in req.name or '..' in req.name:
         raise HTTPException(status_code=400, detail="Invalid environment name")
@@ -294,13 +319,13 @@ async def save_environment(req: EnvironmentSaveRequest):
 
 
 @router.get("/v1/environments")
-async def list_environments():
+async def list_environments(_auth=Depends(_require_api_auth)):
     """List all saved environment profiles (metadata only)."""
     return {"environments": _list_environments()}
 
 
 @router.get("/v1/environments/{name}")
-async def get_environment(name: str):
+async def get_environment(name: str, _auth=Depends(_require_api_auth)):
     """Get an environment profile including its reference images as base64."""
     meta = _load_environment_meta(name)
     if not meta:
@@ -316,7 +341,7 @@ async def get_environment(name: str):
 
 
 @router.delete("/v1/environments/{name}")
-async def delete_environment(name: str):
+async def delete_environment(name: str, _auth=Depends(_require_api_auth)):
     """Delete an environment profile."""
     edir = _env_dir(name)
     if not os.path.isdir(edir):
@@ -327,7 +352,7 @@ async def delete_environment(name: str):
 
 
 @router.patch("/v1/environments/{name}")
-async def patch_environment(name: str, req: EnvironmentPatchRequest):
+async def patch_environment(name: str, req: EnvironmentPatchRequest, _auth=Depends(_require_api_auth)):
     """Update an environment profile: description, add images, or remove images by index."""
     meta = _load_environment_meta(name)
     if not meta:
@@ -398,28 +423,24 @@ async def generate_environment(req: EnvironmentGenerateRequest, request: Request
     if req.steps:
         payload["steps"] = req.steps
 
-    auth_header = request.headers.get("authorization", "")
-    headers = {"Content-Type": "application/json"}
-    if auth_header:
-        headers["Authorization"] = auth_header
-
     try:
-        from httpx import AsyncClient, ASGITransport
-        async with AsyncClient(
-            transport=ASGITransport(app=request.app),
-            base_url="http://internal",
-            timeout=300,
-        ) as client:
-            r = await client.post("/v1/images/generations", json=payload, headers=headers)
-
-        if not r.is_success:
+        import json as _json
+        from codai.broker.asgi_bridge import execute_internal_request
+        resp = await execute_internal_request(
+            request.app,
+            method="POST",
+            path="/v1/images/generations",
+            headers={"Content-Type": "application/json"},
+            body=_json.dumps(payload).encode(),
+        )
+        if resp["status_code"] >= 400:
             try:
-                detail = r.json().get("detail", r.text)
+                detail = _json.loads(resp["body"]).get("detail", resp["body"].decode())
             except Exception:
-                detail = r.text
-            raise HTTPException(status_code=r.status_code, detail=f"Image generation failed: {detail}")
+                detail = resp["body"].decode()
+            raise HTTPException(status_code=resp["status_code"], detail=f"Image generation failed: {detail}")
 
-        images_data = r.json().get("data", [])
+        images_data = _json.loads(resp["body"]).get("data", [])
     except HTTPException:
         raise
     except Exception as e:

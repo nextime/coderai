@@ -283,25 +283,69 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     # Continue with original implementation for 'auto' parser
     # Get the model for this request
     requested_model = request.model
-    
-    # Use the manager to resolve the model and manage VRAM (handles ondemand unloading)
-    model_info = multi_model_manager.request_model(
-        requested_model=requested_model,
-        model_type="text"
-    )
-    
-    # Check if the model was rejected as not allowed
-    if model_info.get('error'):
-        raise HTTPException(status_code=404, detail=model_info['error'])
-    
-    # Acquire the least-busy instance (increments ref-count; released on response completion)
-    _model_key = model_info.get('model_key')
+
+    # Resolve and load the model, waiting if another model is currently loading.
+    # Retries up to ~5 minutes (60 × 5s) so requests queue behind long video loads
+    # rather than failing immediately with "No model loaded".
+    _MAX_WAIT_TRIES = 60
+    _model_key = None
     _instance_idx = None
-    _acq = multi_model_manager.acquire_model_instance(_model_key) if _model_key else None
-    if _acq:
-        _instance_idx, mm = _acq
-    else:
-        mm = multi_model_manager.get_model_for_request(requested_model)
+    mm = None
+    model_info = {}
+
+    for _attempt in range(_MAX_WAIT_TRIES):
+        # Fail fast on a corrupted CUDA context — retrying 60× is pointless.
+        if getattr(multi_model_manager, 'cuda_context_poisoned', False):
+            raise HTTPException(status_code=503, detail=(
+                "CUDA context corrupted by an earlier device-side assert "
+                f"({multi_model_manager.cuda_poison_reason}). Restart coderai to recover."))
+
+        # If another model is loading, yield the event loop and wait for it to finish.
+        if not multi_model_manager._model_ready_event.is_set():
+            print(f"Text model '{requested_model}': waiting for model load to complete "
+                  f"(attempt {_attempt + 1}/{_MAX_WAIT_TRIES})…")
+            await asyncio.to_thread(
+                multi_model_manager._model_ready_event.wait, 30.0
+            )
+            await asyncio.sleep(0)
+
+        # In a thread: request_model may block waiting for a busy model to go
+        # idle before evicting it; blocking the event loop here would deadlock.
+        model_info = await asyncio.to_thread(
+            multi_model_manager.request_model,
+            requested_model,
+            "text",
+        )
+        if model_info.get('error'):
+            # CUDA-poison errors are unrecoverable → 503; others (unknown model) → 404.
+            _status = 503 if 'CUDA context corrupted' in str(model_info['error']) else 404
+            raise HTTPException(status_code=_status, detail=model_info['error'])
+
+        _model_key = model_info.get('model_key')
+        _candidate = None
+        _acq = multi_model_manager.acquire_model_instance(_model_key) if _model_key else None
+        if _acq:
+            _instance_idx, _candidate = _acq
+            # Guard against stale pool entries (model evicted but pool not cleared)
+            if hasattr(_candidate, 'backend') and _candidate.backend is None:
+                multi_model_manager.release_model_instance(_model_key, _instance_idx)
+                _instance_idx = None
+                _candidate = None
+        if _candidate is None:
+            _candidate = multi_model_manager.get_model_for_request(requested_model)
+        if _candidate is None and model_manager.backend is not None:
+            _candidate = model_manager
+        # Validate the candidate has a working backend before accepting it
+        if _candidate is not None:
+            if hasattr(_candidate, 'backend') and _candidate.backend is None:
+                _candidate = None
+        if _candidate is not None:
+            mm = _candidate
+            break
+
+        print(f"Text model '{requested_model}' not ready, retrying in 5s "
+              f"(attempt {_attempt + 1}/{_MAX_WAIT_TRIES})…")
+        await asyncio.sleep(5)
 
     def _release_instance():
         if _instance_idx is not None and _model_key:
@@ -309,12 +353,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
 
     if mm is None:
         _release_instance()
-        if model_manager.backend is not None:
-            current_manager = model_manager
-        else:
-            raise HTTPException(status_code=503, detail="Model not loaded")
-    else:
-        current_manager = mm
+        raise HTTPException(status_code=503,
+                            detail=f"Model '{requested_model}' could not be loaded after waiting. "
+                                   "Another model may be using all available VRAM.")
+    current_manager = mm
 
     # Inject system prompt if --system-prompt flag was provided
     messages = request.messages
@@ -1161,6 +1203,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     tool_parser,
                     request.response_format,
                     _prefix_key,
+                    enable_thinking=reasoning_enabled,
                 ):
                     yield chunk
             finally:
@@ -1182,6 +1225,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 tool_parser,
                 request.response_format,
                 force_reasoning_args,
+                enable_thinking=reasoning_enabled,
             )
         finally:
             _release_instance()
@@ -1198,6 +1242,7 @@ async def stream_chat_response(
     tool_parser: ToolCallParser,
     response_format: Optional[Dict] = None,
     prefix_key: str = "",
+    enable_thinking: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Stream chat completion response with queue notifications."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -1327,6 +1372,7 @@ async def stream_chat_response(
             stop=stop,
             tools=tools,
             response_format=response_format,
+            enable_thinking=enable_thinking,
         ):
             chunk_count += 1
             # Always filter malformed content (regex-based, works per-chunk)
@@ -1547,6 +1593,7 @@ async def generate_chat_response(
     tool_parser: ToolCallParser,
     response_format: Optional[Dict] = None,
     force_reasoning_args: Optional[List[str]] = None,
+    enable_thinking: bool = False,
 ) -> Dict:
     """Generate non-streaming chat completion response."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -1583,6 +1630,7 @@ async def generate_chat_response(
             stop=stop,
             tools=tools,
             response_format=response_format,
+            enable_thinking=enable_thinking,
         )
         
         # Always filter out malformed content
@@ -1748,9 +1796,12 @@ async def completions(request: CompletionRequest):
     requested_model = request.model
     
     # Use the manager to resolve the model and manage VRAM (handles ondemand unloading)
-    model_info = multi_model_manager.request_model(
+    # In a thread: request_model may block (thermal cooldown / waiting for a busy
+    # model) and we must not stall the event loop.
+    model_info = await asyncio.to_thread(
+        multi_model_manager.request_model,
         requested_model=requested_model,
-        model_type="text"
+        model_type="text",
     )
     
     # Check if the model was rejected as not allowed

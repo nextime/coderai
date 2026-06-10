@@ -109,6 +109,24 @@ class ArchiveConfig:
 
 
 @dataclass
+class ThermalConfig:
+    """Thermal-protection configuration.
+
+    Before running a request against a loaded model, wait until CPU/GPU
+    temperatures are within safe limits so a long sequence of heavy
+    generations can't overheat the machine and trip its power-off protection.
+    Thresholds are in degrees Celsius. CPU and GPU can be toggled separately.
+    """
+    cpu_enabled: bool = True
+    gpu_enabled: bool = True
+    cpu_high: float = 90.0      # pause when CPU reaches this temperature
+    cpu_resume: float = 87.0    # resume once CPU drops back to/below this
+    gpu_high: float = 90.0      # pause when GPU reaches this temperature
+    gpu_resume: float = 87.0    # resume once GPU drops back to/below this
+    poll_seconds: float = 5.0   # how often to re-check while cooling down
+
+
+@dataclass
 class Config:
     """Main configuration class."""
     version: str = "1.0"
@@ -120,6 +138,7 @@ class Config:
     image: ImageConfig = field(default_factory=ImageConfig)
     whisper: WhisperConfig = field(default_factory=WhisperConfig)
     archive: ArchiveConfig = field(default_factory=ArchiveConfig)
+    thermal: ThermalConfig = field(default_factory=ThermalConfig)
     broker: BrokerConfig = field(default_factory=BrokerConfig)
     system_prompt: Optional[str] = None
     tools_closer_prompt: bool = False
@@ -273,6 +292,7 @@ class ConfigManager:
                 image=ImageConfig(**config_data.get("image", {})),
                 whisper=WhisperConfig(**config_data.get("whisper", {})),
                 archive=ArchiveConfig(**config_data.get("archive", {})),
+                thermal=ThermalConfig(**config_data.get("thermal", {})),
                 broker=BrokerConfig(**config_data.get("broker", {})),
                 system_prompt=config_data.get("system_prompt"),
                 tools_closer_prompt=config_data.get("tools_closer_prompt", False),
@@ -381,6 +401,15 @@ class ConfigManager:
                 "enabled": self.config.archive.enabled,
                 "directory": self.config.archive.directory,
                 "retention": self.config.archive.retention,
+            },
+            "thermal": {
+                "cpu_enabled": self.config.thermal.cpu_enabled,
+                "gpu_enabled": self.config.thermal.gpu_enabled,
+                "cpu_high": self.config.thermal.cpu_high,
+                "cpu_resume": self.config.thermal.cpu_resume,
+                "gpu_high": self.config.thermal.gpu_high,
+                "gpu_resume": self.config.thermal.gpu_resume,
+                "poll_seconds": self.config.thermal.poll_seconds,
             },
             "broker": {
                 "enabled": self.config.broker.enabled,

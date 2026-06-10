@@ -112,6 +112,10 @@ def default_environments_dir() -> Path:
     return ensure_dir(legacy_style_config_dir() / "environments")
 
 
+def default_loras_dir() -> Path:
+    return ensure_dir(legacy_style_config_dir() / "loras")
+
+
 def default_whisper_server_path() -> str:
     if os.name == "nt":
         local = _windows_dir("LOCALAPPDATA", _home_dir() / "AppData" / "Local")

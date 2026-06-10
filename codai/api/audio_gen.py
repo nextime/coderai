@@ -119,11 +119,35 @@ def _load_musicgen(model_name: str, device: str):
     return model
 
 
-def _load_audioldm(model_name: str, device: str):
+def _load_audioldm(model_name: str, device: str, model_config: dict = None):
     import torch
     from diffusers import AudioLDM2Pipeline
-    pipe = AudioLDM2Pipeline.from_pretrained(model_name, torch_dtype=torch.float16)
-    pipe = pipe.to(device)
+    from codai.models.hf_loading import resolve_dtype
+    dtype = resolve_dtype(model_config, default='f16')
+    _xtra = {}
+    # Apply 4-bit/8-bit quantization to the diffusion backbone when configured.
+    _mc = model_config or {}
+    if _mc.get('load_in_4bit') or _mc.get('load_in_8bit'):
+        _bits = 4 if _mc.get('load_in_4bit') else 8
+        try:
+            from diffusers.quantizers import PipelineQuantizationConfig
+            _qk = ({'load_in_4bit': True, 'bnb_4bit_compute_dtype': dtype}
+                   if _mc.get('load_in_4bit') else {'load_in_8bit': True})
+            _xtra['quantization_config'] = PipelineQuantizationConfig(
+                quant_backend=f"bitsandbytes_{_bits}bit",
+                quant_kwargs=_qk,
+                components_to_quantize=["transformer", "unet"],
+            )
+            print(f"AudioLDM quantization: {_bits}-bit (bitsandbytes)")
+        except Exception as e:
+            print(f"AudioLDM quantization unavailable: {e}")
+    pipe = AudioLDM2Pipeline.from_pretrained(model_name, torch_dtype=dtype, **_xtra)
+    # CPU offload when configured; otherwise place on device (skip for quantized).
+    _off = _mc.get('offload_strategy')
+    if _off in ('cpu', 'sequential', 'model', 'disk') and hasattr(pipe, 'enable_model_cpu_offload'):
+        pipe.enable_model_cpu_offload()
+    elif 'quantization_config' not in _xtra:
+        pipe = pipe.to(device)
     return pipe
 
 
@@ -224,7 +248,8 @@ async def audio_generate(request: AudioGenerationRequest, http_request: Request 
     Compatible models: MusicGen, AudioGen, AudioLDM2, StableAudio.
     """
     _aud_progress_loading(request.model or "audio")
-    model_info = multi_model_manager.request_model(request.model, model_type="audio_gen")
+    model_info = await asyncio.to_thread(
+        multi_model_manager.request_model, request.model, model_type="audio_gen")
     model_name = model_info.get('model_name')
     if not model_name:
         err = model_info.get('error', f"Model '{request.model}' not found")
@@ -236,13 +261,14 @@ async def audio_generate(request: AudioGenerationRequest, http_request: Request 
     if pipe is None:
         device = _derive_device()
         model_type = _detect_audio_gen_type(model_name)
+        _ag_cfg = model_info.get('config') or {}
         try:
             if model_type in ('musicgen', 'audiogen'):
                 pipe = await asyncio.get_event_loop().run_in_executor(
                     None, _load_musicgen, model_name, device)
             else:
                 pipe = await asyncio.get_event_loop().run_in_executor(
-                    None, _load_audioldm, model_name, device)
+                    None, _load_audioldm, model_name, device, _ag_cfg)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load audio gen model: {e}")
         multi_model_manager.models[model_key] = pipe

@@ -173,6 +173,16 @@ if [ "$BACKEND" = "nvidia" ]; then
         echo -e "${YELLOW}Note: audiocraft not installed (audio generation with MusicGen optional)${NC}"
     }
 
+    # Optional quantization backends for diffusers image/video pipelines:
+    #   optimum-quanto -> enables 2-bit (int2) per-component quantization
+    #   gguf           -> enables loading GGUF-quantized components (Q5_K/Q6_K, etc.)
+    # bitsandbytes (4-bit/8-bit) comes via requirements-nvidia.txt; these add the
+    # extra widths that bitsandbytes cannot do.
+    echo -e "${YELLOW}Installing optional quantization backends (2-bit / GGUF)...${NC}"
+    pip install optimum-quanto gguf || {
+        echo -e "${YELLOW}Note: optimum-quanto/gguf not installed (2-bit and GGUF 5/6-bit quantization optional)${NC}"
+    }
+
     # Install Flash Attention 2 if requested
     if [ "$FLASH" = true ]; then
         echo ""

@@ -20,6 +20,14 @@ from typing import Dict, List, Optional
 from pydantic import BaseModel, ConfigDict
 
 
+class VideoLoraConfig(BaseModel):
+    """A LoRA adapter to apply to the video diffusion pipeline for one request."""
+    model: str                          # path or HF id of the LoRA weights
+    weight: float = 1.0
+    name: Optional[str] = None
+    model_config = ConfigDict(extra="allow")
+
+
 class CharacterDialogLine(BaseModel):
     """One spoken line in a multi-character dialog sequence."""
     character: Optional[str] = None    # character profile name (used for lip-sync face)
@@ -77,6 +85,10 @@ class VideoGenerationRequest(BaseModel):
     character_names: Optional[List[str]] = None       # optional names per reference
     # Named saved profiles to load (resolved server-side)
     character_profiles: Optional[List[str]] = None
+
+    # Per-request LoRA adapters (e.g. trained per-character identity LoRAs).
+    # Applied to diffusers video pipelines that support load_lora_weights.
+    loras: Optional[List[VideoLoraConfig]] = None
 
     # ── Audio generation / manipulation ──────────────────────────────────
     add_audio: Optional[bool] = False

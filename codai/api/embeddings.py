@@ -48,10 +48,16 @@ def _derive_device() -> str:
     return "cuda:0"
 
 
-def _load_embedding_model(model_name: str, device: str):
+def _load_embedding_model(model_name: str, device: str, model_config: dict = None):
+    from codai.models.hf_loading import build_from_pretrained_kwargs
     try:
         from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer(model_name, device=device)
+        # sentence-transformers honours quantization via model_kwargs.
+        fp = build_from_pretrained_kwargs(model_config)
+        st_kwargs = {}
+        if 'quantization_config' in fp:
+            st_kwargs['model_kwargs'] = {'quantization_config': fp['quantization_config']}
+        model = SentenceTransformer(model_name, device=device, **st_kwargs)
         return ('sentence_transformers', model)
     except ImportError:
         pass
@@ -59,8 +65,11 @@ def _load_embedding_model(model_name: str, device: str):
     try:
         from transformers import AutoTokenizer, AutoModel
         import torch
+        fp = build_from_pretrained_kwargs(model_config)
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModel.from_pretrained(model_name).to(device)
+        model = AutoModel.from_pretrained(model_name, **fp)
+        if 'quantization_config' not in fp and 'device_map' not in fp:
+            model = model.to(device)
         return ('transformers', (tokenizer, model, device))
     except Exception as e:
         raise RuntimeError(f"Cannot load embedding model '{model_name}': {e}")
@@ -97,7 +106,8 @@ async def create_embeddings(request: EmbeddingsRequest, http_request: Request = 
     """
     OpenAI-compatible embeddings endpoint.
     """
-    model_info = multi_model_manager.request_model(request.model, model_type="embedding")
+    model_info = await asyncio.to_thread(
+        multi_model_manager.request_model, request.model, model_type="embedding")
     model_name = model_info.get('model_name')
     if not model_name:
         err = model_info.get('error', f"Model '{request.model}' not found")
@@ -108,9 +118,11 @@ async def create_embeddings(request: EmbeddingsRequest, http_request: Request = 
 
     if model_obj is None:
         device = _derive_device()
+        _emb_cfg = (multi_model_manager.config.get(f"embedding:{model_name}")
+                    or multi_model_manager.config.get(model_name) or {})
         try:
             model_obj = await asyncio.get_event_loop().run_in_executor(
-                None, _load_embedding_model, model_name, device)
+                None, _load_embedding_model, model_name, device, _emb_cfg)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load embedding model: {e}")
         multi_model_manager.models[model_key] = model_obj

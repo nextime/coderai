@@ -18,6 +18,7 @@
 Audio transcription endpoint for the codai API.
 """
 
+import asyncio
 import io
 import os
 import tempfile
@@ -143,7 +144,8 @@ async def create_transcription(
         else multi_model_manager.whisper_servers.get(model)
     )
     if whisper_server is not None:
-        multi_model_manager.request_model(requested_model=model, model_type="audio")
+        await asyncio.to_thread(
+            multi_model_manager.request_model, requested_model=model, model_type="audio")
         if not whisper_server.is_running():
             whisper_server.start(
                 getattr(whisper_server, "_model_path", None),
@@ -166,7 +168,8 @@ async def create_transcription(
         return _format_response(response_format, result.get("text", ""), [])
 
     # Use the manager to resolve the model and manage VRAM
-    model_info = multi_model_manager.request_model(
+    model_info = await asyncio.to_thread(
+        multi_model_manager.request_model,
         requested_model=model,
         model_type="audio"
     )

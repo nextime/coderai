@@ -102,6 +102,57 @@
   </div>
 </div>
 
+<!-- Thermal protection -->
+<div class="card mb-0" style="margin-top:1rem">
+  <div class="card-title">Thermal Protection</div>
+  <span class="form-hint" style="display:block;margin-bottom:.75rem">
+    Before serving a request against a loaded model, wait until temperatures are
+    safe so a long sequence of heavy generations can't overheat the machine and
+    trip its power-off protection. The wait is non-blocking (other requests keep
+    being accepted) and takes effect immediately on save. Temperatures in °C.
+  </span>
+
+  <div class="form-row">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-therm-gpu-enabled" onchange="toggleThermalFields()">
+      <span style="font-size:13px;font-weight:500">Enable GPU temperature protection</span>
+    </label>
+  </div>
+  <div id="therm-gpu-fields" class="form-row" style="display:grid;grid-template-columns:1fr 1fr;gap:1rem">
+    <div>
+      <label class="form-label">Pause when GPU reaches (°C)</label>
+      <input type="number" id="s-therm-gpu-high" class="form-input" min="40" max="120" step="1" placeholder="90">
+    </div>
+    <div>
+      <label class="form-label">Resume when GPU drops to (°C)</label>
+      <input type="number" id="s-therm-gpu-resume" class="form-input" min="30" max="120" step="1" placeholder="87">
+    </div>
+  </div>
+
+  <div class="form-row" style="margin-top:.5rem">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-therm-cpu-enabled" onchange="toggleThermalFields()">
+      <span style="font-size:13px;font-weight:500">Enable CPU temperature protection</span>
+    </label>
+  </div>
+  <div id="therm-cpu-fields" class="form-row" style="display:grid;grid-template-columns:1fr 1fr;gap:1rem">
+    <div>
+      <label class="form-label">Pause when CPU reaches (°C)</label>
+      <input type="number" id="s-therm-cpu-high" class="form-input" min="40" max="120" step="1" placeholder="90">
+    </div>
+    <div>
+      <label class="form-label">Resume when CPU drops to (°C)</label>
+      <input type="number" id="s-therm-cpu-resume" class="form-input" min="30" max="120" step="1" placeholder="87">
+    </div>
+  </div>
+
+  <div class="form-row" style="margin:0">
+    <label class="form-label">Re-check interval while cooling down (seconds)</label>
+    <input type="number" id="s-therm-poll" class="form-input" style="max-width:200px" min="1" max="120" step="1" placeholder="5">
+    <span class="form-hint">How often to re-read temperatures while waiting for cooldown.</span>
+  </div>
+</div>
+
 <div class="card mb-0" style="margin-top:1rem">
   <div class="card-title">AISBF Broker</div>
   <div class="form-row">
@@ -210,6 +261,13 @@ function toggleBrokerFields(){
   }
 }
 
+function toggleThermalFields(){
+  document.getElementById('therm-gpu-fields').style.display =
+    document.getElementById('s-therm-gpu-enabled').checked ? 'grid' : 'none';
+  document.getElementById('therm-cpu-fields').style.display =
+    document.getElementById('s-therm-cpu-enabled').checked ? 'grid' : 'none';
+}
+
 function showAlert(type, msg){
   const el = document.getElementById('settings-alert');
   el.className = 'alert alert-' + (type === 'error' ? 'error' : 'info');
@@ -260,6 +318,16 @@ async function loadSettings(){
     document.getElementById('s-broker-reconnect-max').value = broker.reconnect_max_delay_seconds ?? 60;
     document.getElementById('s-broker-ws-ping').value = broker.websocket_ping_interval ?? 20;
     toggleBrokerFields();
+    // Thermal protection
+    const therm = d.thermal || {};
+    document.getElementById('s-therm-gpu-enabled').checked = therm.gpu_enabled !== false;
+    document.getElementById('s-therm-cpu-enabled').checked = therm.cpu_enabled !== false;
+    document.getElementById('s-therm-gpu-high').value = therm.gpu_high ?? 90;
+    document.getElementById('s-therm-gpu-resume').value = therm.gpu_resume ?? 87;
+    document.getElementById('s-therm-cpu-high').value = therm.cpu_high ?? 90;
+    document.getElementById('s-therm-cpu-resume').value = therm.cpu_resume ?? 87;
+    document.getElementById('s-therm-poll').value = therm.poll_seconds ?? 5;
+    toggleThermalFields();
   }catch(e){ showAlert('error','Failed to load settings: '+e.message); }
 }
 
@@ -286,6 +354,15 @@ async function saveSettings(){
       directory: document.getElementById('s-arc-dir').value.trim(),
       retention: document.getElementById('s-arc-retention').value,
     },
+    thermal:{
+      gpu_enabled: document.getElementById('s-therm-gpu-enabled').checked,
+      cpu_enabled: document.getElementById('s-therm-cpu-enabled').checked,
+      gpu_high:   parseFloat(document.getElementById('s-therm-gpu-high').value)   || 90,
+      gpu_resume: parseFloat(document.getElementById('s-therm-gpu-resume').value) || 87,
+      cpu_high:   parseFloat(document.getElementById('s-therm-cpu-high').value)   || 90,
+      cpu_resume: parseFloat(document.getElementById('s-therm-cpu-resume').value) || 87,
+      poll_seconds: parseFloat(document.getElementById('s-therm-poll').value) || 5,
+    },
     broker:{
       enabled: document.getElementById('s-broker-enabled').checked,
       base_url: document.getElementById('s-broker-base-url').value.trim(),
@@ -310,7 +387,7 @@ async function saveSettings(){
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(data)
     });
-    if(r.ok) showAlert('info','Settings saved. Archive changes take effect immediately; restart CoderAI for other changes.');
+    if(r.ok) showAlert('info','Settings saved. Archive and thermal-protection changes take effect immediately; restart CoderAI for other changes.');
     else{ const e=await r.json(); showAlert('error', e.detail||'Save failed'); }
   }catch(e){ showAlert('error','Error: '+e.message); }
 }

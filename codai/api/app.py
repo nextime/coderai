@@ -139,6 +139,7 @@ from codai.api.voice_clone import router as voice_clone_router
 from codai.api.voice_convert import router as voice_convert_router
 from codai.api.faceswap import router as faceswap_router
 from codai.api.characters import router as characters_router
+from codai.api.loras import router as loras_router
 from codai.api.spatial import router as spatial_router
 from codai.api.environments import router as environments_router
 from codai.admin.routes import router as admin_router
@@ -203,6 +204,7 @@ app.include_router(voice_clone_router)
 app.include_router(voice_convert_router)
 app.include_router(faceswap_router)
 app.include_router(characters_router)
+app.include_router(loras_router)
 app.include_router(environments_router)
 app.include_router(spatial_router)
 app.include_router(admin_router)

@@ -38,6 +38,34 @@ try:
 except (ImportError, AttributeError):
     _grammar_guided_gen = False
 
+
+def _make_llama_thermal_criteria():
+    """A llama.cpp StoppingCriteriaList that pauses generation while too hot.
+
+    llama-cpp-python evaluates stopping criteria synchronously per token inside
+    create_(chat_)completion, so blocking here pauses the GPU forward pass —
+    mid-generation thermal protection for the GGUF/Vulkan/llama.cpp backend.
+    The criterion never stops generation (returns False) and is throttled so it
+    doesn't read sensors on every token. Returns None if unavailable.
+    """
+    try:
+        from llama_cpp import StoppingCriteriaList
+    except Exception:
+        return None
+
+    def _pause(input_ids, logits):
+        try:
+            from codai.models.thermal import checkpoint
+            checkpoint(context="text-gen", throttle_seconds=2.0)
+        except Exception:
+            pass
+        return False
+
+    try:
+        return StoppingCriteriaList([_pause])
+    except Exception:
+        return None
+
 try:
     from llama_cpp import Llama
     from llama_cpp.llama_chat_format import ChatFormatterResponse
@@ -699,6 +727,7 @@ class VulkanBackend(ModelBackend):
         
         try:
             result = self.model.create_completion(
+                stopping_criteria=_make_llama_thermal_criteria(),
                 prompt=prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -717,6 +746,7 @@ class VulkanBackend(ModelBackend):
                 print(f"Warning: Grammar-guided generation failed: {e}, falling back to normal generation")
                 try:
                     result = self.model.create_completion(
+                        stopping_criteria=_make_llama_thermal_criteria(),
                         prompt=prompt,
                         max_tokens=max_tokens,
                         temperature=temperature,
@@ -803,6 +833,7 @@ class VulkanBackend(ModelBackend):
             prompt_len = len(prompt) if isinstance(prompt, str) else 0
             
             for chunk in self.model.create_completion(
+                stopping_criteria=_make_llama_thermal_criteria(),
                 prompt=prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -842,6 +873,7 @@ class VulkanBackend(ModelBackend):
                     prompt_len = len(prompt) if isinstance(prompt, str) else 0
                     
                     for chunk in self.model.create_completion(
+                        stopping_criteria=_make_llama_thermal_criteria(),
                         prompt=prompt,
                         max_tokens=max_tokens,
                         temperature=temperature,
@@ -911,6 +943,7 @@ class VulkanBackend(ModelBackend):
                 prompt_len = len(prompt)
                 
                 for chunk in self.model.create_completion(
+                    stopping_criteria=_make_llama_thermal_criteria(),
                     prompt=prompt,
                     max_tokens=max_tokens,
                     temperature=temperature,
@@ -937,6 +970,7 @@ class VulkanBackend(ModelBackend):
             return {"stream": generate_stream(), "content": ""}
         else:
             result = self.model.create_completion(
+                stopping_criteria=_make_llama_thermal_criteria(),
                 prompt=prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -1052,6 +1086,9 @@ class VulkanBackend(ModelBackend):
             kwargs['stop'] = stop
         if response_format and response_format.get('type') == 'json_object':
             kwargs['response_format'] = {'type': 'json_object'}
+        _tc = _make_llama_thermal_criteria()
+        if _tc is not None:
+            kwargs['stopping_criteria'] = _tc
 
         result = self.model.create_chat_completion(**kwargs)
         usage = result.get('usage', {})
@@ -1077,6 +1114,9 @@ class VulkanBackend(ModelBackend):
         )
         if stop:
             kwargs['stop'] = stop
+        _tc = _make_llama_thermal_criteria()
+        if _tc is not None:
+            kwargs['stopping_criteria'] = _tc
 
         prompt_tokens = 0
         completion_tokens = 0

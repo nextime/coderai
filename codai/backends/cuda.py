@@ -44,6 +44,31 @@ except (ImportError, AttributeError):
     _grammar_guided_gen = False
 
 
+def _make_thermal_criteria():
+    """A StoppingCriteria that pauses generation while the CPU/GPU is too hot.
+
+    It runs ON the generation thread (between token forward passes), so blocking
+    here actually pauses GPU work — unlike the streamer consumer loop, which is
+    decoupled. Returns False so it never ends generation; throttled so it doesn't
+    read sensors on every token. Returns None if transformers is unavailable.
+    """
+    try:
+        from transformers import StoppingCriteria
+    except Exception:
+        return None
+
+    class _ThermalPause(StoppingCriteria):
+        def __call__(self, input_ids, scores, **kwargs):
+            try:
+                from codai.models.thermal import checkpoint
+                checkpoint(context="text-gen", throttle_seconds=2.0)
+            except Exception:
+                pass
+            return False
+
+    return _ThermalPause()
+
+
 class NvidiaBackend(ModelBackend):
     """Backend for NVIDIA GPUs using HuggingFace Transformers."""
     
@@ -201,6 +226,36 @@ class NvidiaBackend(ModelBackend):
                         raise e
             raise
     
+    def _make_bnb_config(self, model_name: str, load_in_4bit: bool, load_in_8bit: bool):
+        """Build a transformers BitsAndBytesConfig (the modern quant API).
+
+        Passing load_in_4bit/load_in_8bit as direct from_pretrained kwargs is
+        removed in recent transformers and raises TypeError — which previously
+        forced a silent fallback to FULL-PRECISION loading (the model then no
+        longer fit on the GPU, offloaded to CPU, and leaked VRAM on eviction).
+        Always go through quantization_config instead.
+        """
+        ml = model_name.lower()
+        if 'qwen3.5' in ml and ('a3b' in ml or 'moe' in ml):
+            print(f"Warning: {model_name} does not support bitsandbytes quantization")
+            return None
+        try:
+            import bitsandbytes as bnb  # noqa: F401
+            import torch
+            from transformers import BitsAndBytesConfig
+        except ImportError:
+            print("Warning: bitsandbytes not installed. Quantization disabled.")
+            return None
+        print(f"Using {4 if load_in_4bit else 8}-bit quantization")
+        if load_in_4bit:
+            return BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type='nf4',
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+            )
+        return BitsAndBytesConfig(load_in_8bit=True)
+
     def _is_moe_model(self, model_name: str) -> bool:
         """Check if model is a MoE model."""
         moe_indicators = ['moe', 'mixtral', 'qwen3_5_moe', 'qwen3.5_moe', 'expert', 'a3b']
@@ -317,7 +372,8 @@ class NvidiaBackend(ModelBackend):
         flash_attn = kwargs.get('flash_attn', False)
         offload_strategy = kwargs.get('offload_strategy', 'auto')
         max_gpu_percent = kwargs.get('max_gpu_percent', None)
-        
+        expected_vram_gb = kwargs.get('expected_vram_gb') or 0
+
         # Check for --no-ram mode
         no_ram = kwargs.get('no_ram', False)
         if not no_ram:
@@ -328,12 +384,37 @@ class NvidiaBackend(ModelBackend):
                     no_ram = True
             except Exception:
                 pass
-        
+
         self._pending_ram_gb = manual_ram_gb
-        
+
         print(f"Loading HuggingFace model: {model_name}")
-        
-        self.use_flash_attn = flash_attn
+
+        # Flash-Attention-2 requires the ENTIRE model resident on a single CUDA
+        # device.  If the model will be split across GPU+CPU (offloading), FA2
+        # triggers a device-side assert that corrupts the whole CUDA context.
+        # So FA2 is only safe when the model fits fully in free GPU VRAM, or the
+        # user forced full-GPU residence (no_ram / offload_strategy='none').
+        self._fa2_safe = True
+        if flash_attn:
+            _full_gpu_forced = no_ram or offload_strategy == 'none'
+            if not _full_gpu_forced:
+                try:
+                    import torch as _t
+                    if _t.cuda.is_available() and expected_vram_gb > 0:
+                        _free, _ = _t.cuda.mem_get_info(0)
+                        _free_gb = _free / 1e9
+                        # expected_vram_gb already includes ~15% overhead; the
+                        # model must fit entirely on GPU for FA2 to be safe.
+                        if expected_vram_gb > _free_gb:
+                            self._fa2_safe = False
+                            print(f"  Flash Attention 2 disabled: model needs "
+                                  f"~{expected_vram_gb:.1f} GB but only {_free_gb:.1f} GB "
+                                  f"GPU free → will offload to CPU (FA2 needs full-GPU "
+                                  f"residence). Using SDPA instead.")
+                except Exception:
+                    pass
+
+        self.use_flash_attn = flash_attn and self._fa2_safe
         self.check_flash_attn_support()
         
         self.device = self._detect_device()
@@ -368,16 +449,9 @@ class NvidiaBackend(ModelBackend):
             
             # Still allow quantization in no-ram mode (reduces VRAM usage)
             if load_in_4bit or load_in_8bit:
-                if 'qwen3.5' in model_name.lower() and ('a3b' in model_name.lower() or 'moe' in model_name.lower()):
-                    print(f"  Warning: {model_name} does not support bitsandbytes quantization")
-                else:
-                    try:
-                        import bitsandbytes as bnb
-                        print(f"  Using {4 if load_in_4bit else 8}-bit quantization")
-                        load_kwargs['load_in_4bit'] = load_in_4bit
-                        load_kwargs['load_in_8bit'] = load_in_8bit
-                    except ImportError:
-                        print("  Warning: bitsandbytes not installed. Quantization disabled.")
+                _qc = self._make_bnb_config(model_name, load_in_4bit, load_in_8bit)
+                if _qc is not None:
+                    load_kwargs['quantization_config'] = _qc
             
             try:
                 model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
@@ -404,17 +478,10 @@ class NvidiaBackend(ModelBackend):
         load_kwargs = {'trust_remote_code': True}
         
         if load_in_4bit or load_in_8bit:
-            if 'qwen3.5' in model_name.lower() and ('a3b' in model_name.lower() or 'moe' in model_name.lower()):
-                print(f"Warning: {model_name} does not support bitsandbytes quantization")
-            else:
-                try:
-                    import bitsandbytes as bnb
-                    print(f"Using {4 if load_in_4bit else 8}-bit quantization")
-                    load_kwargs['load_in_4bit'] = load_in_4bit
-                    load_kwargs['load_in_8bit'] = load_in_8bit
-                except ImportError:
-                    print("Warning: bitsandbytes not installed. Quantization disabled.")
-        
+            _qc = self._make_bnb_config(model_name, load_in_4bit, load_in_8bit)
+            if _qc is not None:
+                load_kwargs['quantization_config'] = _qc
+
         if self.device == "cuda":
             load_kwargs['dtype'] = torch.float16
         else:
@@ -427,7 +494,12 @@ class NvidiaBackend(ModelBackend):
         if self.use_flash_attn and self.flash_attn_available:
             load_kwargs['attn_implementation'] = "flash_attention_2"
             print("Using Flash Attention 2")
-        
+        else:
+            # SDPA safely handles GPU+CPU split models and still uses flash
+            # kernels for the GPU-resident layers — the safe default when the
+            # model is offloaded (FA2 would device-side-assert here).
+            load_kwargs['attn_implementation'] = "sdpa"
+
         model = None
         vram_percentages = self._get_vram_percentages_for_gpu(model_name, offload_strategy, max_gpu_percent)
         
@@ -450,40 +522,86 @@ class NvidiaBackend(ModelBackend):
                 )
         else:
             first_vram_pct = vram_percentages[0] if vram_percentages else 0.93
-            
+
             for vram_pct in vram_percentages:
                 if self.device != "cuda":
-                    load_kwargs['device_map'] = None
-                    print("Loading model in CPU-only mode...")
-                    model = self._try_load_model(model_name, load_kwargs, self.device)
-                    if model is not None:
-                        break
-                
+                    # No CUDA device — go straight to CPU+disk loading below.
+                    break
+
                 if vram_pct > 0:
+                    # Build max_memory: GPU budget capped at actual FREE VRAM so
+                    # we never try to allocate more than what's physically available.
+                    # Excess layers overflow to CPU RAM automatically via device_map.
                     max_memory = self._get_gpu_memory_map_with_limit(vram_pct)
                     load_kwargs['max_memory'] = max_memory
                     load_kwargs['device_map'] = 'auto'
-                    print(f"\nTrying with GPU limit: {vram_pct*100:.0f}% VRAM")
-                    
+                    _gpu_gb = max_memory.get(0, 0) / 1e9
+                    _cpu_gb = max_memory.get('cpu', 0) / 1e9
+                    print(f"\nTrying GPU {_gpu_gb:.1f} GB + CPU {_cpu_gb:.1f} GB"
+                          f" (device_map=auto, {vram_pct*100:.0f}% VRAM cap)")
+
                     model = self._try_load_model(model_name, load_kwargs, self.device)
-                    
+
                     if model is not None:
-                        print(f"  ✓ Model loaded successfully with {vram_pct*100:.0f}% GPU VRAM limit")
+                        print(f"  ✓ Model loaded — GPU {_gpu_gb:.1f} GB / CPU {_cpu_gb:.1f} GB")
                         if vram_pct < first_vram_pct:
-                            print(f"  (Reduced from {first_vram_pct*100:.0f}% due to memory constraints)")
+                            print(f"  (Reduced GPU cap from {first_vram_pct*100:.0f}%"
+                                  f" due to memory constraints)")
                         break
                     else:
-                        print(f"  ✗ Out of memory with {vram_pct*100:.0f}% GPU VRAM, trying lower limit...")
+                        print(f"  ✗ OOM at GPU {_gpu_gb:.1f} GB, trying lower GPU cap…")
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                 else:
-                    print("\nFalling back to CPU-only mode...")
-                    load_kwargs['max_memory'] = {0: 0, 'cpu': int((manual_ram_gb or 48) * 1e9)}
-                    load_kwargs['device_map'] = 'auto'
-                    model = self._try_load_model(model_name, load_kwargs, "cpu")
+                    # vram_pct == 0: GPU (all free VRAM) + CPU RAM + disk overflow.
+                    # Use every byte of GPU that's free, then spill to CPU RAM, then
+                    # disk — NEVER leave GPU idle when loading this fallback level.
+                    import psutil as _psutil
+                    _free_vram = 0
+                    if torch.cuda.is_available():
+                        try:
+                            _free_vram, _ = torch.cuda.mem_get_info(0)
+                        except Exception:
+                            pass
+                    _headroom = 512 * 1024 * 1024
+                    _gpu_budget = max(0, _free_vram - _headroom)
+                    _free_ram = _psutil.virtual_memory().available
+                    _cpu_budget = max(int(2e9), int(_free_ram * 0.80))
+                    _disk_dir = offload_dir or os.path.join(
+                        os.path.expanduser('~'), '.cache', 'coderai', 'offload')
+                    os.makedirs(_disk_dir, exist_ok=True)
+                    print(f"\nGPU {_gpu_budget/1e9:.1f} GB + CPU {_cpu_budget/1e9:.1f} GB"
+                          f" + disk ({_disk_dir})")
+                    _spill_kwargs = {
+                        **load_kwargs,
+                        'device_map': 'auto',
+                        'max_memory': {0: _gpu_budget, 'cpu': _cpu_budget},
+                        'offload_folder': _disk_dir,
+                        'offload_buffers': True,
+                    }
+                    model = self._try_load_model(model_name, _spill_kwargs, self.device)
                     if model is not None:
-                        print("  ✓ Model loaded successfully on CPU")
+                        print(f"  ✓ Model loaded — GPU {_gpu_budget/1e9:.1f} GB"
+                              f" / CPU {_cpu_budget/1e9:.1f} GB / disk overflow")
                         break
+
+            # Absolute last resort: pure CPU without device_map.
+            # Only reached when CUDA is unavailable or all GPU+RAM+disk paths failed.
+            # Uses device_map=None to avoid accelerate hooks that assume CUDA.
+            if model is None:
+                print("\nFalling back to pure CPU (no GPU available)…")
+                cpu_kwargs = {
+                    'trust_remote_code': True,
+                    'torch_dtype': torch.float32,
+                    'low_cpu_mem_usage': True,
+                }
+                if offload_dir:
+                    cpu_kwargs['offload_folder'] = offload_dir
+                if self.use_flash_attn and self.flash_attn_available:
+                    cpu_kwargs['attn_implementation'] = "flash_attention_2"
+                model = self._try_load_model(model_name, cpu_kwargs, "cpu")
+                if model is not None:
+                    print("  ✓ Model loaded on CPU (no GPU)")
         
         if model is None:
             raise RuntimeError("Failed to load model: Out of memory even with minimum GPU usage")
@@ -499,17 +617,29 @@ class NvidiaBackend(ModelBackend):
         print(f"Model capabilities: {caps}")
     
     def _get_gpu_memory_map_with_limit(self, vram_fraction: float) -> Dict:
-        """Get max_memory dict with specified VRAM fraction limit."""
+        """Get max_memory dict for device_map='auto'.
+
+        GPU budget = min(total × fraction, free − 512 MB headroom).
+        Capping at free VRAM ensures we never ask accelerate to allocate more
+        than what's physically available; layers that exceed the GPU budget
+        spill to CPU RAM automatically via device_map.
+        """
         import torch
         max_memory = {}
-        
+
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
                 props = torch.cuda.get_device_properties(i)
                 total_vram = props.total_memory
-                usable_vram = int(total_vram * vram_fraction)
-                max_memory[i] = usable_vram
-        
+                try:
+                    free_vram, _ = torch.cuda.mem_get_info(i)
+                except Exception:
+                    free_vram = total_vram
+                headroom = 512 * 1024 * 1024  # 512 MB for CUDA driver overhead
+                limit_by_fraction = int(total_vram * vram_fraction)
+                limit_by_free     = max(0, free_vram - headroom)
+                max_memory[i] = min(limit_by_fraction, limit_by_free)
+
         manual_ram_gb = getattr(self, '_pending_ram_gb', None)
         if manual_ram_gb:
             max_memory['cpu'] = int(manual_ram_gb * 1e9)
@@ -518,7 +648,7 @@ class NvidiaBackend(ModelBackend):
             available_ram = psutil.virtual_memory().available
             usable_ram = max(0, available_ram - int(4e9))
             max_memory['cpu'] = usable_ram
-        
+
         return max_memory
     
     def format_messages(self, messages: List[ChatMessage]) -> str:
@@ -835,19 +965,24 @@ class NvidiaBackend(ModelBackend):
         if repeat_penalty != 1.0:
             generation_kwargs["repetition_penalty"] = repeat_penalty
         
+        # Mid-generation thermal checkpoint (runs on the generate thread).
+        _criteria = []
+        _therm = _make_thermal_criteria()
+        if _therm is not None:
+            _criteria.append(_therm)
         if stop:
             class StopOnSequence(StoppingCriteria):
                 def __init__(self, stop_sequences, tokenizer):
                     self.stop_sequences = stop_sequences
                     self.tokenizer = tokenizer
-                
+
                 def __call__(self, input_ids, scores, **kwargs):
                     decoded = self.tokenizer.decode(input_ids[0][-20:], skip_special_tokens=True)
                     return any(seq in decoded for seq in self.stop_sequences)
-            
-            generation_kwargs["stopping_criteria"] = StoppingCriteriaList([
-                StopOnSequence(stop, self.tokenizer)
-            ])
+
+            _criteria.append(StopOnSequence(stop, self.tokenizer))
+        if _criteria:
+            generation_kwargs["stopping_criteria"] = StoppingCriteriaList(_criteria)
         
         generation_error = None
         
@@ -890,9 +1025,19 @@ class NvidiaBackend(ModelBackend):
             _time.time() - self._kv_timestamp < self._kv_ttl
         )
 
+    def _model_on_cuda(self) -> bool:
+        """Return True only when the model's first parameter is actually on a CUDA device."""
+        try:
+            return next(self.model.parameters()).is_cuda
+        except StopIteration:
+            return False
+
     def _build_kv_prefix(self, prefix_text: str):
         """Forward-pass on prefix_text to populate the KV state."""
         import torch
+        # KV prefix caching requires CUDA tensors; skip on CPU-mode models.
+        if not self._model_on_cuda():
+            raise RuntimeError("KV prefix cache requires CUDA; model is on CPU")
         inputs = self.tokenizer(
             prefix_text, return_tensors="pt", add_special_tokens=False
         )
@@ -910,6 +1055,8 @@ class NvidiaBackend(ModelBackend):
     def invalidate_kv_cache(self) -> None:
         """Discard the cached KV state (call on model unload/swap)."""
         self._kv_prefix_text = None
+        if self._kv_past_key_values is not None:
+            del self._kv_past_key_values
         self._kv_past_key_values = None
         self._kv_prefix_len = 0
         self._kv_timestamp = 0.0
@@ -934,8 +1081,67 @@ class NvidiaBackend(ModelBackend):
         ]
         return self.format_messages(chat_msgs)
 
+    def _eos_token_ids(self):
+        """All token ids that should END generation — including the chat turn
+        boundary.  Qwen's turn ends with <|im_end|>, but tokenizer.eos_token_id is
+        <|endoftext|>; without im_end the model never stops and hallucinates extra
+        'assistant'/'user' turns.  Returns a list (HF generate accepts a list)."""
+        ids = set()
+        try:
+            if self.tokenizer.eos_token_id is not None:
+                ids.add(int(self.tokenizer.eos_token_id))
+        except Exception:
+            pass
+        for tok in ('<|im_end|>', '<|eot_id|>', '<|end|>', '<|endoftext|>',
+                    '<|end_of_text|>', '<end_of_turn>'):
+            try:
+                tid = self.tokenizer.convert_tokens_to_ids(tok)
+                if isinstance(tid, int) and tid >= 0 and tid != getattr(
+                        self.tokenizer, 'unk_token_id', None):
+                    ids.add(tid)
+            except Exception:
+                pass
+        return list(ids) if ids else self.tokenizer.eos_token_id
+
+    def _build_chat_prompt(self, messages, enable_thinking: bool = False,
+                           add_generation_prompt: bool = True) -> str:
+        """Build the prompt string using the MODEL's own chat template when it has
+        one (correct special tokens + proper `enable_thinking` handling for Qwen3).
+        Falls back to the legacy custom formatter when no template is available.
+
+        `enable_thinking=True` keeps reasoning <think> blocks available for callers
+        that ask for them; `False` (default) suppresses them via the template.
+        """
+        tmpl = getattr(self.tokenizer, 'chat_template', None)
+        if tmpl:
+            # Normalise to plain {role, content} dicts for apply_chat_template.
+            norm = []
+            for m in messages:
+                if isinstance(m, dict):
+                    norm.append({'role': m.get('role'), 'content': m.get('content') or ''})
+                else:
+                    norm.append({'role': getattr(m, 'role', None),
+                                 'content': getattr(m, 'content', '') or ''})
+            try:
+                return self.tokenizer.apply_chat_template(
+                    norm, tokenize=False,
+                    add_generation_prompt=add_generation_prompt,
+                    enable_thinking=enable_thinking)
+            except TypeError:
+                # Tokenizer's template doesn't accept enable_thinking — use plain.
+                try:
+                    return self.tokenizer.apply_chat_template(
+                        norm, tokenize=False,
+                        add_generation_prompt=add_generation_prompt)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        return self._format_messages_to_str(messages)
+
     def generate_chat(self, messages, max_tokens=None, temperature=0.7,
-                      top_p=1.0, stop=None, tools=None, response_format=None) -> str:
+                      top_p=1.0, stop=None, tools=None, response_format=None,
+                      enable_thinking=False) -> str:
         """
         Non-streaming chat generation with KV prefix caching.
 
@@ -947,7 +1153,8 @@ class NvidiaBackend(ModelBackend):
         if max_tokens is None:
             max_tokens = 512
 
-        full_prompt = self._format_messages_to_str(messages)
+        full_prompt = self._build_chat_prompt(messages, enable_thinking=enable_thinking,
+                                              add_generation_prompt=True)
         total_input_ids = self.tokenizer(full_prompt, return_tensors="pt")['input_ids']
         total_prompt_len = int(total_input_ids.shape[1])
 
@@ -961,8 +1168,9 @@ class NvidiaBackend(ModelBackend):
         past_kv = None
         cached_len = 0
 
-        if prefix_msgs:
-            prefix_text = self._format_messages_to_str(prefix_msgs)
+        if prefix_msgs and self._model_on_cuda():
+            prefix_text = self._build_chat_prompt(
+                prefix_msgs, enable_thinking=enable_thinking, add_generation_prompt=False)
             if self._kv_cache_valid() and self._kv_prefix_text == prefix_text:
                 past_kv = self._kv_past_key_values
                 cached_len = self._kv_prefix_len
@@ -981,9 +1189,15 @@ class NvidiaBackend(ModelBackend):
             top_p=top_p if do_sample else None,
             do_sample=do_sample,
             pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
+            eos_token_id=self._eos_token_ids(),
             use_cache=True,
         )
+        # Mid-generation thermal checkpoint (runs on the generate thread, so it
+        # pauses GPU work between tokens when the CPU/GPU is too hot).
+        _therm = _make_thermal_criteria()
+        if _therm is not None:
+            from transformers import StoppingCriteriaList
+            gen_kwargs["stopping_criteria"] = StoppingCriteriaList([_therm])
 
         generated_text = ""
         try:
@@ -1014,7 +1228,12 @@ class NvidiaBackend(ModelBackend):
             generated_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
         except Exception as e:
             print(f"Warning: KV-cached generate_chat failed ({e}), retrying without cache")
+            self.invalidate_kv_cache()
             cached_len = 0
+            # Determine if the error is a CUDA device-placement issue; if so, also
+            # disable the internal KV cache which accumulates mixed-device tensors.
+            _is_device_error = "is_cuda" in str(e) or "device" in str(e).lower()
+            _fallback_kwargs = {**gen_kwargs, 'use_cache': not _is_device_error}
             try:
                 total_input_ids = self.tokenizer(
                     full_prompt, return_tensors="pt"
@@ -1024,13 +1243,34 @@ class NvidiaBackend(ModelBackend):
                     outputs = self.model.generate(
                         input_ids=total_input_ids,
                         attention_mask=attn_mask,
-                        **gen_kwargs,
+                        **_fallback_kwargs,
                     )
                 new_tokens = outputs[0][total_prompt_len:]
                 generated_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
             except Exception as e2:
                 print(f"Error: generate_chat fallback failed: {e2}")
-                generated_text = ""
+                # Last resort: disable internal KV cache entirely
+                if _fallback_kwargs.get('use_cache', True):
+                    try:
+                        no_cache_kwargs = {**gen_kwargs, 'use_cache': False}
+                        total_input_ids = self.tokenizer(
+                            full_prompt, return_tensors="pt"
+                        )['input_ids'].to(self.model.device)
+                        attn_mask = torch.ones_like(total_input_ids)
+                        with torch.no_grad():
+                            outputs = self.model.generate(
+                                input_ids=total_input_ids,
+                                attention_mask=attn_mask,
+                                **no_cache_kwargs,
+                            )
+                        new_tokens = outputs[0][total_prompt_len:]
+                        generated_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+                        print("generate_chat: recovered with use_cache=False")
+                    except Exception as e3:
+                        print(f"Error: generate_chat no-cache fallback failed: {e3}")
+                        generated_text = ""
+                else:
+                    generated_text = ""
 
         try:
             comp_len = len(self.tokenizer.encode(generated_text)) if generated_text else 0
@@ -1046,7 +1286,8 @@ class NvidiaBackend(ModelBackend):
 
     async def generate_chat_stream(self, messages, max_tokens=None,
                                    temperature=0.7, top_p=1.0, stop=None,
-                                   tools=None, response_format=None):
+                                   tools=None, response_format=None,
+                                   enable_thinking=False):
         """
         Streaming chat generation with KV prefix caching.
         Uses the same prefix-cache strategy as generate_chat.
@@ -1058,7 +1299,8 @@ class NvidiaBackend(ModelBackend):
         if max_tokens is None:
             max_tokens = 512
 
-        full_prompt = self._format_messages_to_str(messages)
+        full_prompt = self._build_chat_prompt(messages, enable_thinking=enable_thinking,
+                                              add_generation_prompt=True)
         total_input_ids = self.tokenizer(full_prompt, return_tensors="pt")['input_ids']
         total_prompt_len = int(total_input_ids.shape[1])
 
@@ -1070,8 +1312,9 @@ class NvidiaBackend(ModelBackend):
         past_kv = None
         cached_len = 0
 
-        if prefix_msgs:
-            prefix_text = self._format_messages_to_str(prefix_msgs)
+        if prefix_msgs and self._model_on_cuda():
+            prefix_text = self._build_chat_prompt(
+                prefix_msgs, enable_thinking=enable_thinking, add_generation_prompt=False)
             if self._kv_cache_valid() and self._kv_prefix_text == prefix_text:
                 past_kv = self._kv_past_key_values
                 cached_len = self._kv_prefix_len
@@ -1109,11 +1352,16 @@ class NvidiaBackend(ModelBackend):
             do_sample=do_sample,
             streamer=streamer,
             pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
+            eos_token_id=self._eos_token_ids(),
             use_cache=True,
             **extra_gen,
         )
 
+        # Mid-generation thermal checkpoint (runs on the generate thread).
+        _criteria = []
+        _therm = _make_thermal_criteria()
+        if _therm is not None:
+            _criteria.append(_therm)
         if stop:
             class _StopOnSeq(StoppingCriteria):
                 def __init__(self, seqs, tok):
@@ -1122,9 +1370,9 @@ class NvidiaBackend(ModelBackend):
                 def __call__(self, input_ids, scores, **kw):
                     decoded = self.tok.decode(input_ids[0][-20:], skip_special_tokens=True)
                     return any(s in decoded for s in self.seqs)
-            gen_kwargs['stopping_criteria'] = StoppingCriteriaList(
-                [_StopOnSeq(stop, self.tokenizer)]
-            )
+            _criteria.append(_StopOnSeq(stop, self.tokenizer))
+        if _criteria:
+            gen_kwargs['stopping_criteria'] = StoppingCriteriaList(_criteria)
 
         gen_error = [None]
         comp_tokens = [0]
@@ -1155,21 +1403,206 @@ class NvidiaBackend(ModelBackend):
 
         if gen_error[0]:
             print(f"Warning: KV-cached stream generation error: {gen_error[0]}")
+            self.invalidate_kv_cache()
 
     def get_model_name(self) -> str:
         return self.model_name or "unknown"
     
     def cleanup(self) -> None:
-        import torch
+        import torch, gc
+        try:
+            from codai.api.state import get_global_debug
+            _dbg = bool(get_global_debug())
+        except Exception:
+            _dbg = False
+
+        def _vram_gb():
+            try:
+                if torch.cuda.is_available():
+                    free, total = torch.cuda.mem_get_info()
+                    return (total - free) / 1e9
+            except Exception:
+                pass
+            return -1.0
+
+        def _cuda_param_gb():
+            tot = 0
+            try:
+                for p in self.model.parameters():
+                    if p.data.is_cuda:
+                        tot += p.data.numel() * p.data.element_size()
+                for b in self.model.buffers():
+                    if b.data.is_cuda:
+                        tot += b.data.numel() * b.data.element_size()
+            except Exception:
+                pass
+            return tot / 1e9
+
+        _v0 = _vram_gb()
         self.invalidate_kv_cache()
         if self.model is not None:
+            _pg0 = _cuda_param_gb() if _dbg else 0.0
+            # Record the GPU storage pointers of THIS model's tensors so we can,
+            # after moving them to CPU, break any lingering external references
+            # (e.g. accelerate's tied_params_map, which keeps tied embedding /
+            # lm_head weights alive on the GPU and fragments the allocator so
+            # empty_cache() can't release the surrounding memory).  Scoped by
+            # data_ptr so we never touch a different (coexisting) model.
+            _orig_cuda_ptrs = set()
+            try:
+                for _p in self.model.parameters():
+                    if _p.data.is_cuda:
+                        _orig_cuda_ptrs.add(_p.data.untyped_storage().data_ptr())
+                for _b in self.model.buffers():
+                    if _b.data.is_cuda:
+                        _orig_cuda_ptrs.add(_b.data.untyped_storage().data_ptr())
+            except Exception:
+                pass
+
+            # Strip accelerate dispatch hooks AND their offload bookkeeping, which
+            # hold references to the original CUDA tensors.  Must happen before we
+            # move tensors, or the hooks keep the GPU copies alive.
+            try:
+                from accelerate.hooks import remove_hook_from_submodules
+                remove_hook_from_submodules(self.model)
+            except Exception:
+                pass
+            # Walk every submodule and move its raw _parameters/_buffers storage to
+            # CPU directly.  This reaches tensors that model.parameters() may skip
+            # (e.g. when wrapped by accelerate) and does NOT rely on model.to('cpu'),
+            # which is a silent no-op on dispatched models.
+            try:
+                import torch as _t
+                for _mod in self.model.modules():
+                    for _d in (_mod._parameters, _mod._buffers):
+                        for _name, _t_obj in list(_d.items()):
+                            if _t_obj is None:
+                                continue
+                            try:
+                                if getattr(_t_obj, 'is_cuda', False):
+                                    _d[_name] = _t_obj.to('cpu')
+                                # accelerate stores params as nn.Parameter; keep type
+                                elif hasattr(_t_obj, 'data') and getattr(_t_obj.data, 'is_cuda', False):
+                                    _t_obj.data = _t_obj.data.to('cpu')
+                            except Exception:
+                                pass
+                    # Drop per-module accelerate hook state that pins CUDA tensors.
+                    for _attr in ('_hf_hook', '_old_forward'):
+                        if hasattr(_mod, _attr):
+                            try:
+                                delattr(_mod, _attr)
+                            except Exception:
+                                pass
+            except Exception as e:
+                print(f"  cleanup: module-walk move issue: {e}")
+            for _attr in ('hf_device_map', '_hf_hook'):
+                try:
+                    if hasattr(self.model, _attr):
+                        delattr(self.model, _attr)
+                except Exception:
+                    pass
+            if _dbg:
+                print(f"  cleanup: CUDA param bytes {_pg0:.1f} → {_cuda_param_gb():.1f} GB")
             del self.model
-            del self.tokenizer
             self.model = None
+
+            # Break lingering references to THIS model's original GPU tensors that
+            # outlive the model (accelerate tied_params_map lists, stray caches).
+            # Only tensors whose storage pointer we recorded above are touched, so
+            # other models loaded alongside are never affected.
+            if _orig_cuda_ptrs:
+                try:
+                    broken = 0
+                    for obj in gc.get_objects():
+                        if not (isinstance(obj, torch.Tensor) and obj.is_cuda):
+                            continue
+                        try:
+                            if obj.untyped_storage().data_ptr() not in _orig_cuda_ptrs:
+                                continue
+                        except Exception:
+                            continue
+                        # Null this tensor out of any list/dict that still holds it.
+                        for ref in gc.get_referrers(obj):
+                            try:
+                                if isinstance(ref, list):
+                                    for i, it in enumerate(ref):
+                                        if it is obj:
+                                            ref[i] = None
+                                            broken += 1
+                                elif isinstance(ref, dict):
+                                    for k, v in list(ref.items()):
+                                        if v is obj:
+                                            ref[k] = None
+                                            broken += 1
+                            except Exception:
+                                pass
+                    if _dbg and broken:
+                        print(f"  cleanup: broke {broken} external GPU-tensor reference(s)")
+                except Exception:
+                    pass
+        if self.tokenizer is not None:
+            del self.tokenizer
             self.tokenizer = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-    
+        # Force Python GC before emptying the CUDA allocator pool so that all
+        # Python-held tensor references (closures, local vars, etc.) are dropped.
+        for _ in range(3):
+            gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        # Release the model's host-side memory back to the OS (and any swap it
+        # was paged into) so RSS doesn't creep up across model swaps.
+        try:
+            from codai.models.manager import _trim_cpu_ram
+            _trim_cpu_ram()
+        except Exception:
+            pass
+        _v1 = _vram_gb()
+        if _v0 >= 0 and _v1 >= 0:
+            print(f"  cleanup: freed {_v0 - _v1:.1f} GB VRAM (now {_v1:.1f} GB used)")
+            if _dbg:
+                try:
+                    _alloc = torch.cuda.memory_allocated() / 1e9
+                    _resv = torch.cuda.memory_reserved() / 1e9
+                    print(f"  cleanup: torch allocated={_alloc:.1f} GB "
+                          f"reserved={_resv:.1f} GB (driver used={_v1:.1f} GB)")
+                except Exception:
+                    pass
+                # If a large chunk is still resident, name what's holding CUDA tensors.
+                if (_v0 - _v1) < 1.0 and _v1 > 2.0:
+                    try:
+                        biggest = []
+                        total = 0.0
+                        seen = set()
+                        for obj in gc.get_objects():
+                            try:
+                                if isinstance(obj, torch.Tensor) and obj.is_cuda:
+                                    if id(obj) in seen:
+                                        continue
+                                    seen.add(id(obj))
+                                    gb = obj.numel() * obj.element_size() / 1e9
+                                    total += gb
+                                    if gb > 0.05:
+                                        rtypes = []
+                                        for r in gc.get_referrers(obj)[:4]:
+                                            rt = type(r).__name__
+                                            if rt == 'dict':
+                                                try:
+                                                    rt = f"dict{list(r.keys())[:3]}"
+                                                except Exception:
+                                                    pass
+                                            rtypes.append(rt)
+                                        biggest.append((gb, tuple(obj.shape), rtypes))
+                            except Exception:
+                                continue
+                        biggest.sort(reverse=True)
+                        print(f"  cleanup-leak: {total:.1f} GB still in CUDA tensors; top holders:")
+                        for gb, shape, rtypes in biggest[:6]:
+                            print(f"    {gb:.2f} GB shape={shape} referrers={rtypes}")
+                    except Exception as e:
+                        print(f"  cleanup-leak scan failed: {e}")
+
     def get_context_size(self) -> int:
         """Return the model's context window size."""
         if self.model is not None and hasattr(self.model, 'config'):

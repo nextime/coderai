@@ -26,3 +26,6 @@ test_*.py
 
 # Local git worktrees
 .worktrees/
+
+# Generated township fighter outputs
+township_output/

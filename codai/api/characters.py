@@ -37,8 +37,37 @@ import tempfile
 import time
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
+
+
+def _require_api_auth(request: Request) -> None:
+    """Raise 401 if auth is enabled and the request carries no valid credential."""
+    try:
+        from codai.admin import routes as _admin_routes
+        sm = _admin_routes.session_manager
+    except Exception:
+        return  # auth subsystem unavailable — allow through
+    if sm is None:
+        return  # auth not configured on this instance
+
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        token = auth[7:].strip()
+        if sm.verify_token(token):
+            return
+
+    cookie = request.cookies.get("session", "")
+    if cookie.endswith(".MUST_CHANGE"):
+        cookie = cookie[:-12]
+    if cookie and sm.validate_session(cookie):
+        return
+
+    raise HTTPException(
+        status_code=401,
+        detail={"message": "Invalid API key. Provide a valid Bearer token.",
+                "type": "invalid_request_error", "code": "invalid_api_key"},
+    )
 
 from codai.platform_paths import default_characters_dir, legacy_style_config_dir
 
@@ -211,7 +240,12 @@ def _decode_source(data: str) -> bytes:
 
 
 def _detect_faces_cv2(img_bytes: bytes):
-    """Return list of (x,y,w,h) face rects using Haar cascade, or [] if cv2 unavailable."""
+    """
+    Return list of (x,y,w,h) face rects, largest first.
+    Tries MediaPipe (most accurate), then OpenCV DNN, then Haar cascade as fallback.
+    Detections smaller than 2% of image area are discarded as false positives.
+    Returns [] if no library is available or no plausible face is found.
+    """
     try:
         import cv2
         import numpy as np
@@ -219,19 +253,56 @@ def _detect_faces_cv2(img_bytes: bytes):
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
             return []
+        ih, iw = img.shape[:2]
+        img_area = ih * iw
+        min_face_area = img_area * 0.02  # reject anything < 2% of image
+
+        # ── Try MediaPipe first (most accurate, no model download needed) ──
+        try:
+            import mediapipe as mp
+            mp_face = mp.solutions.face_detection
+            with mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.5) as det:
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                results = det.process(rgb)
+            if results.detections:
+                rects = []
+                for d in results.detections:
+                    bb = d.location_data.relative_bounding_box
+                    x = int(bb.xmin * iw)
+                    y = int(bb.ymin * ih)
+                    w = int(bb.width * iw)
+                    h = int(bb.height * ih)
+                    if w * h >= min_face_area:
+                        rects.append((x, y, w, h))
+                if rects:
+                    rects.sort(key=lambda r: r[2]*r[3], reverse=True)
+                    return rects
+        except ImportError:
+            pass
+
+        # ── Haar cascade fallback (stricter parameters to reduce false positives) ──
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
         cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
         cascade = cv2.CascadeClassifier(cascade_path)
-        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+        # minSize scaled to image: at least 8% of the shorter dimension
+        min_dim = int(min(iw, ih) * 0.08)
+        faces = cascade.detectMultiScale(
+            gray, scaleFactor=1.05, minNeighbors=8,
+            minSize=(max(40, min_dim), max(40, min_dim)),
+        )
         if len(faces) == 0:
             return []
-        return [(int(x), int(y), int(w), int(h)) for x, y, w, h in faces]
+        rects = [(int(x), int(y), int(w), int(h)) for x, y, w, h in faces
+                 if int(w) * int(h) >= min_face_area]
+        rects.sort(key=lambda r: r[2]*r[3], reverse=True)
+        return rects
     except Exception:
         return []
 
 
 def _crop_face(img_bytes: bytes, rect) -> Optional[bytes]:
-    """Crop a face rect (with padding) from an image, return PNG bytes."""
+    """Crop a face rect with generous padding (head-and-shoulders), return PNG bytes."""
     try:
         import cv2
         import numpy as np
@@ -241,11 +312,15 @@ def _crop_face(img_bytes: bytes, rect) -> Optional[bytes]:
         if img is None:
             return None
         ih, iw = img.shape[:2]
-        pad = int(max(w, h) * 0.4)
-        x1 = max(0, x - pad)
-        y1 = max(0, y - pad)
-        x2 = min(iw, x + w + pad)
-        y2 = min(ih, y + h + pad)
+        side = max(w, h)
+        # More padding on top to include hair/forehead, less at bottom
+        pad_sides = int(side * 0.5)
+        pad_top   = int(side * 0.7)
+        pad_bot   = int(side * 0.4)
+        x1 = max(0, x - pad_sides)
+        y1 = max(0, y - pad_top)
+        x2 = min(iw, x + w + pad_sides)
+        y2 = min(ih, y + h + pad_bot)
         crop = img[y1:y2, x1:x2]
         ok, buf = cv2.imencode('.png', crop)
         return bytes(buf) if ok else None
@@ -274,7 +349,7 @@ def _extract_from_image(img_bytes: bytes) -> List[bytes]:
         crops = [c for f in faces for c in [_crop_face(img_bytes, f)] if c]
         if crops:
             return crops
-    # No face detected — use whole image as reference
+    # No face detected (or all detections filtered as false positives) — use whole image
     try:
         from PIL import Image as PILImage
         img = PILImage.open(io.BytesIO(img_bytes)).convert('RGB')
@@ -345,7 +420,7 @@ def resolve_character_profiles(profile_names: List[str]) -> List[str]:
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/v1/characters")
-async def save_character(req: CharacterSaveRequest):
+async def save_character(req: CharacterSaveRequest, _auth=Depends(_require_api_auth)):
     """Save or update a named character profile."""
     if not req.name or '/' in req.name or '..' in req.name:
         raise HTTPException(status_code=400, detail="Invalid character name")
@@ -356,13 +431,13 @@ async def save_character(req: CharacterSaveRequest):
 
 
 @router.get("/v1/characters")
-async def list_characters():
+async def list_characters(_auth=Depends(_require_api_auth)):
     """List all saved character profiles (metadata only, no images)."""
     return {"characters": _list_characters()}
 
 
 @router.get("/v1/characters/{name}")
-async def get_character(name: str):
+async def get_character(name: str, _auth=Depends(_require_api_auth)):
     """Get a character profile including its reference images as base64."""
     meta = _load_character_meta(name)
     if not meta:
@@ -378,7 +453,7 @@ async def get_character(name: str):
 
 
 @router.delete("/v1/characters/{name}")
-async def delete_character(name: str):
+async def delete_character(name: str, _auth=Depends(_require_api_auth)):
     """Delete a character profile."""
     cdir = _char_dir(name)
     if not os.path.isdir(cdir):
@@ -389,7 +464,7 @@ async def delete_character(name: str):
 
 
 @router.patch("/v1/characters/{name}")
-async def patch_character(name: str, req: CharacterPatchRequest):
+async def patch_character(name: str, req: CharacterPatchRequest, _auth=Depends(_require_api_auth)):
     """Update a character profile: description, add images, or remove images by index."""
     meta = _load_character_meta(name)
     if not meta:
@@ -462,29 +537,24 @@ async def generate_character(req: CharacterGenerateRequest, request: Request):
     if req.steps:
         payload["steps"] = req.steps
 
-    # Forward the caller's auth token so rate-limit / auth middleware passes
-    auth_header = request.headers.get("authorization", "")
-    headers = {"Content-Type": "application/json"}
-    if auth_header:
-        headers["Authorization"] = auth_header
-
     try:
-        from httpx import AsyncClient, ASGITransport
-        async with AsyncClient(
-            transport=ASGITransport(app=request.app),
-            base_url="http://internal",
-            timeout=300,
-        ) as client:
-            r = await client.post("/v1/images/generations", json=payload, headers=headers)
-
-        if not r.is_success:
+        import json as _json
+        from codai.broker.asgi_bridge import execute_internal_request
+        resp = await execute_internal_request(
+            request.app,
+            method="POST",
+            path="/v1/images/generations",
+            headers={"Content-Type": "application/json"},
+            body=_json.dumps(payload).encode(),
+        )
+        if resp["status_code"] >= 400:
             try:
-                detail = r.json().get("detail", r.text)
+                detail = _json.loads(resp["body"]).get("detail", resp["body"].decode())
             except Exception:
-                detail = r.text
-            raise HTTPException(status_code=r.status_code, detail=f"Image generation failed: {detail}")
+                detail = resp["body"].decode()
+            raise HTTPException(status_code=resp["status_code"], detail=f"Image generation failed: {detail}")
 
-        images_data = r.json().get("data", [])
+        images_data = _json.loads(resp["body"]).get("data", [])
     except HTTPException:
         raise
     except Exception as e:
