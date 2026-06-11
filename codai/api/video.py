@@ -1361,6 +1361,107 @@ def _run_pipeline(pipe, kw: dict):
     return list(frames_raw)
 
 
+def _wan_in_channels(pipe):
+    """Input-channel count of a Wan pipeline's transformer patch-embed.
+
+    16 → text-to-video (t2v) transformer; 36 → image-to-video (i2v, which packs
+    16 noise + 16 image + 4 mask latent channels). Returns None if undetermined.
+    """
+    t = getattr(pipe, 'transformer', None)
+    if t is None:
+        return None
+    cfg = getattr(t, 'config', None)
+    ic = getattr(cfg, 'in_channels', None) if cfg is not None else None
+    if ic:
+        try:
+            return int(ic)
+        except Exception:
+            pass
+    # Authoritative fallback: the conv weight shape [out, in, ...].
+    w = getattr(getattr(t, 'patch_embedding', None), 'weight', None)
+    try:
+        if w is not None and w.ndim >= 2:
+            return int(w.shape[1])
+    except Exception:
+        pass
+    return None
+
+
+def _maybe_t2v_fallback(pipe, kw, mode):
+    """If an image-to-video Wan pipeline is backed by a text-to-video transformer
+    (16 in-channels), rebuild it as a plain WanPipeline that REUSES the same
+    components and run as t2v with the keyframe dropped — instead of crashing on a
+    16-vs-36 channel mismatch. Returns (pipe_to_use, mode).
+
+    The rebuilt t2v view shares the transformer/VAE/text-encoder objects, so any
+    fused acceleration and per-request LoRAs applied to that transformer carry
+    over unchanged. The view is cached on the i2v pipe so repeated clips reuse it
+    (keeping _sync_video_loras' adapter dedup intact across a match).
+    """
+    if type(pipe).__name__ != 'WanImageToVideoPipeline' or 'image' not in kw:
+        return pipe, mode
+    if _wan_in_channels(pipe) != 16:
+        return pipe, mode  # genuine i2v model — leave it alone
+    view = getattr(pipe, '_coderai_t2v_view', None)
+    if view is None:
+        try:
+            import inspect
+            from diffusers import WanPipeline
+            allowed = set(inspect.signature(WanPipeline.__init__).parameters)
+            comps = {k: v for k, v in pipe.components.items()
+                     if k in allowed and v is not None}
+            view = WanPipeline(**comps)
+            if getattr(pipe, '_coderai_accel', None) is not None:
+                view._coderai_accel = pipe._coderai_accel
+            pipe._coderai_t2v_view = view
+            print("  [video] model is text-to-video (transformer in_channels=16) but "
+                  "i2v/ti2v was requested — running t2v, keyframe ignored")
+        except Exception as e:
+            print(f"  [video] t2v fallback failed ({e}); attempting i2v as requested")
+            return pipe, mode
+    kw.pop('image', None)
+    return view, 't2v'
+
+
+def _maybe_i2v_fallback(pipe, kw, mode):
+    """Reverse of _maybe_t2v_fallback: if a t2v request (no init image) lands on a
+    WanPipeline whose transformer is actually image-to-video (36 in-channels), the
+    t2v forward would mismatch (it builds 16-channel input). Rebuild as a
+    WanImageToVideoPipeline reusing the same components (image_encoder/processor
+    are optional and simply absent here) and seed it with a neutral gray frame so
+    the prompt still drives the clip. Returns (pipe_to_use, mode).
+
+    This is a graceful degrade — an i2v model without a real keyframe can't lock a
+    first frame, so the neutral seed yields essentially prompt-driven output.
+    """
+    if type(pipe).__name__ != 'WanPipeline' or 'image' in kw:
+        return pipe, mode
+    if _wan_in_channels(pipe) != 36:
+        return pipe, mode  # genuine t2v model — fine as-is
+    view = getattr(pipe, '_coderai_i2v_view', None)
+    if view is None:
+        try:
+            import inspect
+            from diffusers import WanImageToVideoPipeline
+            allowed = set(inspect.signature(WanImageToVideoPipeline.__init__).parameters)
+            comps = {k: v for k, v in pipe.components.items()
+                     if k in allowed and v is not None}
+            view = WanImageToVideoPipeline(**comps)
+            if getattr(pipe, '_coderai_accel', None) is not None:
+                view._coderai_accel = pipe._coderai_accel
+            pipe._coderai_i2v_view = view
+            print("  [video] model is image-to-video (transformer in_channels=36) but "
+                  "t2v was requested — seeding a neutral frame (prompt-driven)")
+        except Exception as e:
+            print(f"  [video] i2v fallback failed ({e}); attempting t2v as requested")
+            return pipe, mode
+    from PIL import Image as _Image
+    w = int(kw.get('width') or 512)
+    h = int(kw.get('height') or 512)
+    kw['image'] = _Image.new('RGB', (w, h), (128, 128, 128))
+    return view, 'ti2v'
+
+
 def _generate_video(pipe, request: VideoGenerationRequest):
     mode = request.mode or ('i2v' if (request.image or request.init_image)
                              else 'v2v' if request.video else 't2v')
@@ -1430,6 +1531,16 @@ def _generate_video(pipe, request: VideoGenerationRequest):
         kw['video'] = _decode_b64_or_url(request.video)
         if request.strength is not None:
             kw['strength'] = request.strength
+
+    # Graceful pipeline/model fallbacks for Wan, in case the requested mode and the
+    # model's actual capability disagree (selecting the pipeline class by request
+    # mode can mismatch the transformer's input channels):
+    #   * ti2v/i2v request on a t2v model (16-ch) → run t2v, drop the keyframe.
+    #   * t2v request on an i2v model (36-ch)     → run i2v with a neutral seed frame.
+    # Both rebuild a sibling pipeline that REUSES the same components, so fused
+    # acceleration and per-request LoRAs on the shared transformer carry over.
+    pipe, mode = _maybe_t2v_fallback(pipe, kw, mode)
+    pipe, mode = _maybe_i2v_fallback(pipe, kw, mode)
 
     # Per-request LoRA adapters (e.g. per-character identity LoRAs). Sync the
     # pipeline's adapters to this request's set, REUSING them if identical to the
