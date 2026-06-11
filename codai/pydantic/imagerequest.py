@@ -22,7 +22,16 @@ from pydantic import BaseModel, ConfigDict
 
 
 class LoraConfig(BaseModel):
-    model: str
+    """A LoRA adapter for one image request. Weights may be supplied (resolved
+    server-side, in priority) via `id` ("name:<registered>" or "sha256:<hex>"),
+    inline `file`/`data` base64, a `url`, or the legacy `model`/`path` (local path
+    / HF id) — so a remote client needn't share the server's filesystem."""
+    model: Optional[str] = None
+    path: Optional[str] = None
+    id: Optional[str] = None
+    url: Optional[str] = None
+    file: Optional[str] = None
+    data: Optional[str] = None
     weight: float = 1.0
     name: Optional[str] = None
     model_config = ConfigDict(extra="allow")

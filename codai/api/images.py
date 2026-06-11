@@ -1250,6 +1250,11 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
         # headroom for base weights + adapters before the pipeline loads.
         _lora_extra_gb = 0.0
         if getattr(request, 'loras', None):
+            # Resolve id/url/inline-file LoRA refs to local paths now (clean 400 on
+            # a missing blob / unknown name) before any model work; _apply_loras
+            # then reads lora.model as usual.
+            from codai.api.loras import resolve_request_loras
+            resolve_request_loras(request.loras)
             try:
                 _lora_extra_gb = multi_model_manager._lora_vram_gb(request.loras)
             except Exception:

@@ -21,10 +21,21 @@ from pydantic import BaseModel, ConfigDict
 
 
 class VideoLoraConfig(BaseModel):
-    """A LoRA adapter to apply to the video diffusion pipeline for one request."""
-    model: str                          # path or HF id of the LoRA weights
+    """A LoRA adapter to apply to the video diffusion pipeline for one request.
+
+    The weights may be supplied in several ways (resolved server-side, in this
+    priority): `id` ("name:<registered>" trained LoRA, or "sha256:<hex>" uploaded
+    blob), inline `file`/`data` base64, a `url` to download, or the legacy
+    `model`/`path` local path / HF id. This lets a client on a different machine
+    use a LoRA without sharing a filesystem with the server."""
+    model: Optional[str] = None         # legacy: local path or HF id of the weights
+    path: Optional[str] = None          # alias of model
+    id: Optional[str] = None            # "name:<registered>" or "sha256:<hex>"
+    url: Optional[str] = None           # http(s) URL the server downloads
+    file: Optional[str] = None          # base64 of the .safetensors (or data: URI)
+    data: Optional[str] = None          # alias of file
     weight: float = 1.0
-    name: Optional[str] = None
+    name: Optional[str] = None          # adapter name
     model_config = ConfigDict(extra="allow")
 
 

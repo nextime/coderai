@@ -1922,6 +1922,11 @@ async def video_generations(request: VideoGenerationRequest,
     # headroom for base weights + adapters before the pipeline loads.
     _lora_extra_gb = 0.0
     if getattr(request, 'loras', None):
+        # Resolve any id/url/inline-file LoRA refs to concrete local paths now, in
+        # the async handler, so a missing blob / unknown name returns a clean 400
+        # before we touch the model. Downstream code then reads lora.model as usual.
+        from codai.api.loras import resolve_request_loras
+        resolve_request_loras(request.loras)
         try:
             _lora_extra_gb = multi_model_manager._lora_vram_gb(request.loras)
         except Exception:

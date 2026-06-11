@@ -1440,13 +1440,46 @@ def _set_lora_job_id(out_dir: Path, lora_name: str, job_id):
         pass
 
 
+def _lora_name_ref(path: str):
+    """Derive the server-side registered LoRA name from a trained-LoRA path.
+
+    LoRAs are trained on the coderai server, which saves them under
+    <loras_dir>/<registered_name>/pytorch_lora_weights.safetensors and returns
+    that path. The *registered name* (the directory holding the weights) is a
+    filesystem-path-independent handle the server can resolve no matter where it
+    runs — so we reference LoRAs by `id: "name:<registered>"` instead of a raw
+    path that's only meaningful if client and server share a disk. Returns None
+    when the path doesn't look like a trained-LoRA layout."""
+    if not path:
+        return None
+    p = str(path).rstrip("/\\")
+    base = os.path.basename(p)
+    if base.lower().endswith((".safetensors", ".bin", ".pt", ".ckpt")):
+        reg = os.path.basename(os.path.dirname(p))
+    else:
+        reg = base  # path is the LoRA directory itself
+    return f"name:{reg}" if reg else None
+
+
+def _lora_spec(path: str, weight: float, name: str) -> dict:
+    """One `loras` request entry. References the server-registered LoRA by name
+    (works even when client and server are on different machines) and keeps the
+    raw path as a legacy fallback for co-located setups."""
+    spec = {"weight": float(weight), "name": name}
+    ref = _lora_name_ref(path)
+    if ref:
+        spec["id"] = ref
+    spec["model"] = path  # fallback: used only if the id can't be resolved
+    return spec
+
+
 def _lora_specs_for(fighters: list, lora_map: dict, weight: float) -> list:
     """Build the `loras` request list for the fighters appearing in a clip."""
     specs = []
     for f in fighters:
         path = (lora_map or {}).get(f)
         if path:
-            specs.append({"model": path, "weight": float(weight), "name": f})
+            specs.append(_lora_spec(path, weight, f))
     return specs
 
 
@@ -1456,7 +1489,7 @@ def _env_lora_specs_for(env: str, env_lora_map: dict, weight: float) -> list:
         return []
     path = (env_lora_map or {}).get(env)
     if path:
-        return [{"model": path, "weight": float(weight), "name": f"env_{env}"}]
+        return [_lora_spec(path, weight, f"env_{env}")]
     return []
 
 
@@ -1478,7 +1511,7 @@ def _video_lora_specs_for(fighters: list, vmap: dict, slug: str, weight: float) 
     for f in fighters:
         path = _video_lora_path((vmap or {}).get(f), slug)
         if path:
-            specs.append({"model": path, "weight": float(weight), "name": f})
+            specs.append(_lora_spec(path, weight, f))
     return specs
 
 
@@ -1487,7 +1520,7 @@ def _env_video_lora_specs_for(env: str, env_vmap: dict, slug: str, weight: float
         return []
     path = _video_lora_path((env_vmap or {}).get(env), slug)
     if path:
-        return [{"model": path, "weight": float(weight), "name": f"env_{env}"}]
+        return [_lora_spec(path, weight, f"env_{env}")]
     return []
 
 

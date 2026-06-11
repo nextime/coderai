@@ -190,6 +190,149 @@ def _lora_weight_file(name: str) -> Optional[str]:
     return None
 
 
+# ── Content-addressed LoRA blob store ─────────────────────────────────────────
+# Lets clients on a *different* machine supply a LoRA without sharing a
+# filesystem: upload the file once (POST /v1/loras/upload), then reference it by
+# its sha256 in generation requests. Identical files dedupe automatically, so a
+# match's env/fighter LoRAs are transmitted at most once.
+
+def _lora_blob_dir() -> str:
+    d = os.path.join(_loras_dir(), "_blobs")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _lora_blob_path(h: str) -> str:
+    """Local path for a blob given its hex sha256 (accepts an optional
+    'sha256:' prefix). Returns the path whether or not the file exists yet."""
+    h = (h or "").strip()
+    if h.lower().startswith("sha256:"):
+        h = h[7:]
+    h = h.lower()
+    return os.path.join(_lora_blob_dir(), f"{h}.safetensors")
+
+
+def lora_blob_exists(h: str) -> bool:
+    return os.path.isfile(_lora_blob_path(h))
+
+
+def save_lora_blob(data: bytes) -> tuple:
+    """Write `data` to the content-addressed store. Returns (hex_sha256, existed)."""
+    import hashlib
+    h = hashlib.sha256(data).hexdigest()
+    p = _lora_blob_path(h)
+    if os.path.isfile(p):
+        return h, True
+    tmp = p + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, p)
+    return h, False
+
+
+def _spec_get(spec, key):
+    """Read a field from a LoRA spec that may be a dict OR a pydantic object."""
+    if isinstance(spec, dict):
+        return spec.get(key)
+    return getattr(spec, key, None)
+
+
+def _strip_data_uri(s: str) -> str:
+    """Drop a leading 'data:...;base64,' prefix if present."""
+    if isinstance(s, str) and s.startswith("data:"):
+        comma = s.find(",")
+        if comma != -1:
+            return s[comma + 1:]
+    return s
+
+
+def resolve_lora_ref(spec) -> Optional[str]:
+    """Resolve a LoRA request spec to a concrete local path (or HF id) usable by
+    diffusers' load_lora_weights().
+
+    Accepts, in priority order, on a dict or LoraConfig/VideoLoraConfig object:
+      * id   — "name:<registered>" (a trained LoRA on this server),
+               "sha256:<hex>" or a bare 64-char hex (an uploaded blob)
+      * file / data — base64 (optionally a data: URI) of the .safetensors bytes;
+               stored in the blob cache and used from there
+      * url  — http(s) URL the server downloads (and caches by content hash)
+      * model / path — a local path or HuggingFace repo id (legacy behaviour)
+
+    Raises HTTPException(400) when a ref is given but cannot be resolved.
+    """
+    if spec is None:
+        return None
+
+    # 1. id reference
+    ref_id = _spec_get(spec, "id")
+    if ref_id:
+        ref_id = str(ref_id).strip()
+        if ref_id.startswith("name:"):
+            name = ref_id[5:].strip()
+            wf = _lora_weight_file(name) or (
+                _lora_dir(name) if os.path.isdir(_lora_dir(name)) else None)
+            if not wf:
+                raise HTTPException(status_code=400,
+                                    detail=f"LoRA '{name}' not found on server")
+            return wf
+        # sha256:<hex> or bare hex
+        h = ref_id[7:] if ref_id.lower().startswith("sha256:") else ref_id
+        if lora_blob_exists(h):
+            return _lora_blob_path(h)
+        raise HTTPException(
+            status_code=400,
+            detail=f"LoRA blob '{ref_id}' not on server — upload it via "
+                   f"POST /v1/loras/upload first")
+
+    # 2. inline base64 file
+    blob = _spec_get(spec, "file") or _spec_get(spec, "data")
+    if blob:
+        import base64
+        try:
+            raw = base64.b64decode(_strip_data_uri(str(blob)))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"invalid base64 LoRA file: {e}")
+        h, _ = save_lora_blob(raw)
+        return _lora_blob_path(h)
+
+    # 3. url
+    url = _spec_get(spec, "url")
+    if url:
+        import urllib.request
+        try:
+            with urllib.request.urlopen(str(url)) as resp:
+                raw = resp.read()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"could not download LoRA from {url}: {e}")
+        h, _ = save_lora_blob(raw)
+        return _lora_blob_path(h)
+
+    # 4. legacy path / HF id
+    return _spec_get(spec, "model") or _spec_get(spec, "path")
+
+
+def resolve_request_loras(loras) -> None:
+    """Resolve every LoRA spec in a request's `loras` list to a concrete local
+    path IN PLACE, writing it back onto each spec's `model` field. Call this in
+    the async request handler (before the heavy generation work) so a missing
+    blob / unknown name surfaces as a clean HTTP 400. After this, downstream code
+    that reads `lora.model` (signature dedup, VRAM estimate, load_lora_weights)
+    works unchanged regardless of how the client supplied the weights."""
+    if not loras:
+        return
+    for lora in loras:
+        path = resolve_lora_ref(lora)
+        if not path:
+            continue
+        if isinstance(lora, dict):
+            lora["model"] = path
+        else:
+            try:
+                lora.model = path
+            except Exception:
+                pass
+
+
 def _require_api_auth(request: Request) -> None:
     """Raise 401 if auth is enabled and the request carries no valid credential."""
     try:
@@ -1533,6 +1676,53 @@ async def lora_progress(job: Optional[str] = None, session: Optional[str] = None
         return pick[-1]
     with _progress_lock:
         return dict(_progress)
+
+
+@router.post("/v1/loras/upload")
+async def upload_lora(request: Request, _auth=Depends(_require_api_auth)):
+    """Upload a LoRA file into the content-addressed store so a remote client can
+    use it without sharing a filesystem.
+
+    Accepts the file as multipart/form-data (field `file`), as JSON
+    {"file": "<base64>"} (optionally a data: URI), or as a raw request body.
+    Returns {id: "sha256:<hex>", bytes, existed}. Reference the returned id as
+    {"id": "<id>", "weight": ...} in image/video generation requests."""
+    ctype = request.headers.get("content-type", "")
+    data = b""
+    if "multipart/form-data" in ctype:
+        form = await request.form()
+        up = form.get("file")
+        if up is None:
+            raise HTTPException(status_code=400, detail="multipart upload missing 'file' field")
+        data = await up.read() if hasattr(up, "read") else bytes(up)
+    elif "application/json" in ctype:
+        body = await request.json()
+        blob = body.get("file") or body.get("data")
+        if not blob:
+            raise HTTPException(status_code=400, detail="JSON upload missing 'file'/'data' (base64)")
+        import base64
+        try:
+            data = base64.b64decode(_strip_data_uri(str(blob)))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"invalid base64: {e}")
+    else:
+        data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty upload")
+    h, existed = save_lora_blob(data)
+    return {"id": f"sha256:{h}", "bytes": len(data), "existed": existed}
+
+
+@router.get("/v1/loras/blob/{hash}")
+async def lora_blob_info(hash: str, _auth=Depends(_require_api_auth)):
+    """Existence check for an uploaded LoRA blob. 200 with metadata when present,
+    404 when absent — lets a client skip re-uploading a file the server already
+    has. `hash` may be a hex sha256 or 'sha256:<hex>'."""
+    if not lora_blob_exists(hash):
+        raise HTTPException(status_code=404, detail="blob not found")
+    p = _lora_blob_path(hash)
+    return {"id": f"sha256:{os.path.basename(p)[:-len('.safetensors')]}",
+            "bytes": os.path.getsize(p), "exists": True}
 
 
 @router.get("/v1/loras")
