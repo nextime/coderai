@@ -331,6 +331,22 @@ def _disable_safety_checker(pipe):
     return pipe
 
 
+def _apply_image_acceleration(pipeline, model_config):
+    """Fuse a configured acceleration/distillation LoRA (Lightning / Turbo / LCM /
+    Hyper-SD) into a freshly loaded diffusers image pipeline. No-op when no
+    acceleration is configured. Failures are caught inside apply_accel_to_pipeline."""
+    try:
+        from codai.models.acceleration import resolve_acceleration, apply_accel_to_pipeline
+        accel = resolve_acceleration(model_config)
+        if accel:
+            print(f"  [image][accel] applying {accel.get('preset')} "
+                  f"(steps={accel.get('steps')}, guidance={accel.get('guidance_scale')})")
+            apply_accel_to_pipeline(pipeline, accel)
+    except Exception as e:
+        print(f"  [image][accel] skipped: {e}")
+    return pipeline
+
+
 def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = None):
     """
     Try to load a model using the diffusers library.
@@ -443,7 +459,7 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                 if _img_quant_config is None:
                     raise  # only quantized pipelines may reject .to()
             print(f"--no-ram: Diffusers model loaded on {cuda_device}")
-            return pipeline
+            return _apply_image_acceleration(pipeline, _mc)
         except Exception as e:
             raise RuntimeError(
                 f"--no-ram: Failed to load diffusers model entirely on GPU ({cuda_device}). "
@@ -590,8 +606,8 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                 if load_attempt >= max_attempts:
                     raise
                 pipeline = None
-    
-    return pipeline
+
+    return _apply_image_acceleration(pipeline, _mc)
 
 
 async def _apply_vae_override(pipeline, vae_model_id: str):
@@ -725,9 +741,17 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
         generator = torch.Generator(device=pipeline.device).manual_seed(seed)
 
     quality = request.quality or "standard"
-    num_steps = request.steps if request.steps else (30 if quality == "standard" else 50)
+    # Acceleration/distillation defaults (Lightning / Turbo / LCM / Hyper-SD): when
+    # the loaded pipeline has a fused distill LoRA, default to its low step-count /
+    # guidance. The request always wins if it specified steps/guidance.
+    _accel = getattr(pipeline, '_coderai_accel', None)
+    _accel_steps = _accel.get('steps') if _accel else None
+    _accel_cfg = _accel.get('guidance_scale') if _accel else None
+    num_steps = request.steps if request.steps else (
+        _accel_steps if _accel_steps else (30 if quality == "standard" else 50))
     cfg_scale = request.guidance_scale if request.guidance_scale else (
-        getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0
+        _accel_cfg if _accel_cfg is not None else
+        (getattr(global_args, 'image_cfg_scale', 7.5) if quality == "standard" else 9.0)
     )
 
     _progress_reset(num_steps)
@@ -950,10 +974,11 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
     }
 
 
-async def _generate_with_sdcpp(sd_model, request, global_args, http_request=None):
+async def _generate_with_sdcpp(sd_model, request, global_args, http_request=None,
+                               model_config=None):
     """Generate images using stable-diffusion-cpp-python."""
     import time
-    
+
     # Parse size
     width, height = 512, 512
     if request.size:
@@ -964,9 +989,28 @@ async def _generate_with_sdcpp(sd_model, request, global_args, http_request=None
                 height = int(parts[1])
             except ValueError:
                 pass
-    
+
+    # Acceleration/distillation defaults (Lightning / Turbo / LCM): sd.cpp can't
+    # fuse a diffusers LoRA, but honour the preset's low step-count / guidance and
+    # inject the distill LoRA via the "<lora:name:weight>" prompt syntax when a
+    # lora_model_dir is configured.
+    from codai.models.acceleration import resolve_acceleration
+    _accel = resolve_acceleration(model_config)
+    _accel_steps = _accel.get('steps') if _accel else None
+    _accel_cfg = _accel.get('guidance_scale') if _accel else None
     # Use default steps for fast generation
-    steps = request.steps if request.steps else 4
+    steps = request.steps if request.steps else (_accel_steps or 4)
+    cfg_scale = request.guidance_scale or _accel_cfg or get_cfg_scale()
+
+    prompt = request.prompt
+    if _accel and _accel.get('lora') and (model_config or {}).get('lora_model_dir'):
+        from codai.models.acceleration import _split_lora_ref
+        _repo, _wn = _split_lora_ref(_accel['lora'])
+        _lname = (_wn or _repo).rsplit('/', 1)[-1]
+        for _suf in ('.safetensors', '.ckpt', '.pt', '.bin'):
+            if _lname.endswith(_suf):
+                _lname = _lname[: -len(_suf)]
+        prompt = f"{prompt} <lora:{_lname}:{_accel.get('lora_weight') or 1.0}>"
 
     _progress_reset(steps)
 
@@ -979,11 +1023,11 @@ async def _generate_with_sdcpp(sd_model, request, global_args, http_request=None
     try:
         result = await asyncio.to_thread(
             sd_model.generate_image,
-            prompt=request.prompt,
+            prompt=prompt,
             negative_prompt='',
             width=width,
             height=height,
-            cfg_scale=get_cfg_scale(),
+            cfg_scale=cfg_scale,
             sample_steps=steps,
             seed=seed if seed is not None else 42,
             batch_count=request.n if request.n else 1,
@@ -992,11 +1036,11 @@ async def _generate_with_sdcpp(sd_model, request, global_args, http_request=None
     except TypeError:
         result = await asyncio.to_thread(
             sd_model.generate_image,
-            prompt=request.prompt,
+            prompt=prompt,
             negative_prompt='',
             width=width,
             height=height,
-            cfg_scale=get_cfg_scale(),
+            cfg_scale=cfg_scale,
             sample_steps=steps,
             seed=seed if seed is not None else 42,
             batch_count=request.n if request.n else 1,
@@ -1266,7 +1310,10 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
         if pipeline is not None:
             if is_sdcpp:
                 print(f"Using cached sd.cpp model for generation")
-                return await _generate_with_sdcpp(pipeline, request, global_args, http_request)
+                _sdcpp_cfg = (multi_model_manager.config.get(model_key)
+                              or multi_model_manager.config.get(model_name) or {})
+                return await _generate_with_sdcpp(pipeline, request, global_args,
+                                                  http_request, model_config=_sdcpp_cfg)
             else:
                 # Assume it's a diffusers pipeline
                 print(f"Using cached diffusers pipeline for generation")
@@ -1335,7 +1382,8 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                         pass
                     print(f"Loaded sd.cpp model: {model_name}")
                     
-                    return await _generate_with_sdcpp(sd_model, request, global_args, http_request)
+                    return await _generate_with_sdcpp(sd_model, request, global_args,
+                                                      http_request, model_config=cfg)
             else:
                 sdcpp_error = f"Model '{model_name}' is not a local file, cannot use sd.cpp"
                 print(sdcpp_error)

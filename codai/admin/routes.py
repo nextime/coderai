@@ -1939,7 +1939,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "lora_train_base_model",
                 "max_vram", "sdcpp_flash_attn", "sdcpp_diffusion_flash_attn", "vae_tiling",
                 "component_quantization", "output_crf", "force_vram_update",
-                "balanced_gpu_percent"):
+                "balanced_gpu_percent", "acceleration"):
         if key in data:
             entry[key] = data[key]
 
@@ -1968,6 +1968,18 @@ async def api_model_configure(request: Request, username: str = Depends(require_
     except Exception as e:
         print(f"  [admin] live config apply failed (restart to apply): {e}")
     return {"success": True, "applied_live": applied}
+
+
+@router.get("/admin/api/accel-presets")
+async def api_accel_presets(username: str = Depends(require_admin)):
+    """Return the acceleration/distillation preset catalog (Lightning / Turbo /
+    LCM / Hyper-SD) so the model-config UI dropdown stays in sync with the Python
+    source of truth in codai/models/acceleration.py."""
+    try:
+        from codai.models.acceleration import ACCEL_PRESETS
+        return {"presets": ACCEL_PRESETS}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # --- System endpoints ---

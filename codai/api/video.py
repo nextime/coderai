@@ -603,7 +603,27 @@ def _generate_sdcpp_video(sd_model, request, model_cfg=None):
     mode = request.mode or 't2v'
     fps = request.fps or 8
     num_frames = request.num_frames or 25
-    steps = request.num_inference_steps or 20
+
+    # Acceleration/distillation defaults (sd.cpp can't fuse a diffusers LoRA, but
+    # we can still honour the preset's low step-count / guidance, and inject the
+    # distill LoRA via sd.cpp's "<lora:name:weight>" prompt syntax when a
+    # lora_model_dir is configured).
+    from codai.models.acceleration import resolve_acceleration
+    _accel = resolve_acceleration(model_cfg)
+    _accel_steps = _accel.get('steps') if _accel else None
+    _accel_cfg = _accel.get('guidance_scale') if _accel else None
+    steps = request.num_inference_steps or _accel_steps or 20
+    cfg_scale = request.guidance_scale or _accel_cfg or 7.0
+
+    prompt = request.prompt or ''
+    if _accel and _accel.get('lora') and (model_cfg or {}).get('lora_model_dir'):
+        from codai.models.acceleration import _split_lora_ref
+        _repo, _wn = _split_lora_ref(_accel['lora'])
+        _lname = (_wn or _repo).rsplit('/', 1)[-1]
+        for _suf in ('.safetensors', '.ckpt', '.pt', '.bin'):
+            if _lname.endswith(_suf):
+                _lname = _lname[: -len(_suf)]
+        prompt = f"{prompt} <lora:{_lname}:{_accel.get('lora_weight') or 1.0}>"
 
     _vid_progress_reset(steps)
 
@@ -611,13 +631,13 @@ def _generate_sdcpp_video(sd_model, request, model_cfg=None):
         _vid_progress_step(step)
 
     kw = {
-        'prompt':          request.prompt or '',
+        'prompt':          prompt,
         'negative_prompt': request.negative_prompt or '',
         'width':           request.width or 512,
         'height':          request.height or 512,
         'video_frames':    num_frames,
         'sample_steps':    steps,
-        'cfg_scale':       request.guidance_scale or 7.0,
+        'cfg_scale':       cfg_scale,
         'seed':            request.seed if request.seed is not None else -1,
         'progress_callback': _progress_cb,
     }
@@ -933,7 +953,7 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
         # RAM (and disk if needed). This is the preferred strategy when the
         # model won't fit entirely in VRAM but should maximise GPU utilisation.
         # `gpu_percent` (0–100) controls what fraction of FREE VRAM to occupy.
-        _gpu_pct = float((model_cfg or {}).get('balanced_gpu_percent', 80))
+        _gpu_pct = float((model_cfg or {}).get('balanced_gpu_percent') or 80)
         try:
             if torch.cuda.is_available():
                 _free_v, _ = torch.cuda.mem_get_info()
@@ -1346,6 +1366,16 @@ def _generate_video(pipe, request: VideoGenerationRequest):
                              else 'v2v' if request.video else 't2v')
     fps = request.fps or 8
     kw = _build_call_kwargs(request)
+    # Acceleration/distillation defaults (Lightning / Lightx2v): when the model has
+    # a fused distill LoRA, default to its low step-count / guidance instead of the
+    # standard 25 steps / 7.5 CFG. The request always wins if it set these — note
+    # _build_call_kwargs only populates them when the request specified them, so
+    # setdefault below correctly leaves an explicit request value untouched.
+    _accel = getattr(pipe, '_coderai_accel', None)
+    if _accel:
+        from codai.models.acceleration import accel_call_defaults
+        for _k, _v in accel_call_defaults(_accel).items():
+            kw.setdefault(_k, _v)
     kw.setdefault('num_inference_steps', 25)
     kw.setdefault('guidance_scale', 7.5)
     kw.setdefault('num_frames', 16)
@@ -1940,7 +1970,7 @@ async def video_generations(request: VideoGenerationRequest,
                     _need_gb = multi_model_manager._get_model_used_vram_gb(
                         model_key, model_name)
                     if _need_gb > 0 and _free_gb < _need_gb:
-                        _gpu_pct = float(_model_cfg.get('balanced_gpu_percent', 80))
+                        _gpu_pct = float(_model_cfg.get('balanced_gpu_percent') or 80)
                         print(f"  VRAM insufficient for full-GPU load "
                               f"({_need_gb:.1f} GB needed, {_free_gb:.1f} GB free) "
                               f"— auto-selecting balanced strategy "
@@ -1961,6 +1991,24 @@ async def video_generations(request: VideoGenerationRequest,
                     "video model. Restart coderai to recover. "
                     f"Original error: {str(e).splitlines()[0]}"))
             raise HTTPException(status_code=500, detail=f"Failed to load video model: {e}")
+        # Fuse any configured acceleration/distillation LoRA (Lightning / Lightx2v /
+        # LCM) into the freshly loaded pipeline. Done once at load; cached pipes keep
+        # it. No-op for sd.cpp pipes and when no acceleration is configured.
+        try:
+            from codai.models.acceleration import resolve_acceleration, apply_accel_to_pipeline
+            _accel = resolve_acceleration(_model_cfg)
+            _accel_is_sdcpp = False
+            try:
+                from stable_diffusion_cpp import StableDiffusion as _SDc
+                _accel_is_sdcpp = isinstance(pipe, _SDc)
+            except ImportError:
+                pass
+            if _accel and not _accel_is_sdcpp:
+                print(f"  [video][accel] applying {_accel.get('preset')} "
+                      f"(steps={_accel.get('steps')}, guidance={_accel.get('guidance_scale')})")
+                apply_accel_to_pipeline(pipe, _accel)
+        except Exception as _e:
+            print(f"  [video][accel] skipped: {_e}")
         multi_model_manager.models[model_key] = pipe
         multi_model_manager.current_model_key = model_key
         # Record the real VRAM used. record_vram_delta only persists when no

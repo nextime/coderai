@@ -160,6 +160,7 @@ def build_runtime_kwargs(model_cfg, model_type):
         kwargs['seed'] = model_cfg.get('seed')
         kwargs['vae_tiling'] = model_cfg.get('vae_tiling', False)
         kwargs['clip_on_cpu'] = model_cfg.get('clip_on_cpu', False)
+        kwargs['acceleration'] = model_cfg.get('acceleration')
     elif model_type == "audio":
         kwargs['ctx'] = model_cfg.get('context_ms')
         kwargs['offload'] = model_cfg.get('offload') or model_cfg.get('offload_strategy')
@@ -172,6 +173,7 @@ def build_runtime_kwargs(model_cfg, model_type):
         kwargs['vae_tiling'] = model_cfg.get('vae_tiling', True)
         kwargs['balanced_gpu_percent'] = model_cfg.get('balanced_gpu_percent', 80)
         kwargs['output_crf'] = model_cfg.get('output_crf')
+        kwargs['acceleration'] = model_cfg.get('acceleration')
     return kwargs
 
 

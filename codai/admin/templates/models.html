@@ -689,6 +689,49 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <span class="form-hint">When the model won't fit entirely in VRAM, fill this % of free VRAM then spill the rest to CPU RAM. Also the cap used by auto-balanced fallback.</span>
       </div>
 
+      <!-- Acceleration / distillation (Lightning / Turbo / LCM / Hyper-SD) — image & video -->
+      <div id="cfg-accel-section" style="display:none">
+        <div class="card-title" style="margin-top:1.25rem">Acceleration / Distillation
+          <span class="muted" style="font-weight:normal">(Lightning / Turbo / LCM / Hyper-SD — image &amp; video)</span></div>
+        <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px;margin:.4rem 0">
+          <input type="checkbox" id="cfg-accel-enabled" onchange="onAccelToggle()"> Enable acceleration
+          <span class="muted">fuse a distill LoRA and run in few steps at low guidance</span></label>
+        <div id="cfg-accel-fields" style="display:none">
+          <div class="form-row" style="max-width:420px">
+            <label class="form-label">Preset</label>
+            <select id="cfg-accel-preset" class="form-input" onchange="onAccelPreset()">
+              <option value="custom">Custom (set fields manually)</option>
+            </select>
+          </div>
+          <div class="form-row" style="max-width:560px">
+            <label class="form-label">Distill LoRA <span class="muted">(path or HF repo, optionally repo:weight_name.safetensors; blank for turbo full-models)</span></label>
+            <input type="text" id="cfg-accel-lora" class="form-input" placeholder="e.g. ByteDance/SDXL-Lightning:sdxl_lightning_4step_lora.safetensors">
+          </div>
+          <div style="display:flex;gap:1rem;flex-wrap:wrap">
+            <div class="form-row" style="max-width:130px">
+              <label class="form-label">LoRA weight</label>
+              <input type="number" id="cfg-accel-weight" class="form-input" min="0" max="2" step="0.05" placeholder="1.0">
+            </div>
+            <div class="form-row" style="max-width:120px">
+              <label class="form-label">Steps</label>
+              <input type="number" id="cfg-accel-steps" class="form-input" min="1" max="50" step="1" placeholder="4">
+            </div>
+            <div class="form-row" style="max-width:130px">
+              <label class="form-label">Guidance</label>
+              <input type="number" id="cfg-accel-guidance" class="form-input" min="0" max="15" step="0.5" placeholder="1.0">
+            </div>
+            <div class="form-row" style="max-width:150px">
+              <label class="form-label">Flow shift <span class="muted">(Wan)</span></label>
+              <input type="number" id="cfg-accel-flowshift" class="form-input" min="0" max="20" step="0.5" placeholder="(none)">
+            </div>
+            <div class="form-row" style="max-width:200px">
+              <label class="form-label">Scheduler <span class="muted">(optional)</span></label>
+              <input type="text" id="cfg-accel-scheduler" class="form-input" placeholder="e.g. LCMScheduler">
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- components -->
       <div class="card-title" style="margin-top:1.25rem">Components</div>
       <div class="form-row">
@@ -2225,6 +2268,10 @@ async function refreshLocal(){
 loadGlobalSettings();
 refreshLocal();
 
+// Toggle the acceleration section as image/video model types are checked/unchecked.
+document.querySelectorAll('.cfg-type-cb').forEach(cb =>
+  cb.addEventListener('change', () => _refreshAccelVisibility()));
+
 // ── Deep-link from Studio: /admin/models?tab=search&q=...&pipeline=...&gguf=...
 // ── or: /admin/models?local_cap=CAPABILITY — highlight local models with that capability
 (function applyDeepLink(){
@@ -2630,7 +2677,95 @@ function openCfgModal(idx, cfgIdx){
   _setCompField('lora',       s.lora_path       || '');
   document.getElementById('cfg-lora-dir').value = s.lora_model_dir || '';
   document.getElementById('cfg-lora-train-base').value = s.lora_train_base_model || '';
+  _populateAccel(s.acceleration);
   openModal('cfg-modal');
+}
+
+// ---- Acceleration / distillation (Lightning / Turbo / LCM / Hyper-SD) ----
+let _accelPresets = null;
+async function _loadAccelPresets(){
+  if (_accelPresets) return _accelPresets;
+  try {
+    const r = await fetch(ROOT_PATH + '/admin/api/accel-presets');
+    const d = await r.json();
+    _accelPresets = d.presets || {};
+  } catch(e){ _accelPresets = {}; }
+  return _accelPresets;
+}
+function _accelAppliesTo(){
+  // Which families the current model-type selection allows (image / video).
+  const types = new Set([...document.querySelectorAll('.cfg-type-cb:checked')].map(cb=>cb.value));
+  const out = new Set();
+  if (types.has('image_models')) out.add('image');
+  if (types.has('video_models')) out.add('video');
+  return out;
+}
+function _refreshAccelVisibility(){
+  const section = document.getElementById('cfg-accel-section');
+  if (!section) return;
+  const applies = _accelAppliesTo();
+  section.style.display = applies.size ? '' : 'none';
+  // Rebuild the preset dropdown filtered to the applicable families.
+  const sel = document.getElementById('cfg-accel-preset');
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = '<option value="custom">Custom (set fields manually)</option>';
+  const presets = _accelPresets || {};
+  Object.keys(presets).forEach(k=>{
+    const p = presets[k];
+    const at = p.applies_to || [];
+    if (!applies.size || at.some(a=>applies.has(a))){
+      const o = document.createElement('option');
+      o.value = k; o.textContent = p.label || k;
+      sel.appendChild(o);
+    }
+  });
+  // Preserve the previously selected preset if still present.
+  if ([...sel.options].some(o=>o.value===cur)) sel.value = cur;
+}
+function onAccelToggle(){
+  const on = document.getElementById('cfg-accel-enabled').checked;
+  document.getElementById('cfg-accel-fields').style.display = on ? '' : 'none';
+}
+function onAccelPreset(){
+  const key = document.getElementById('cfg-accel-preset').value;
+  const p = (_accelPresets || {})[key];
+  if (!p) return;  // "custom" — leave fields as-is
+  document.getElementById('cfg-accel-lora').value = p.lora || '';
+  document.getElementById('cfg-accel-weight').value = p.lora_weight != null ? p.lora_weight : '';
+  document.getElementById('cfg-accel-steps').value = p.steps != null ? p.steps : '';
+  document.getElementById('cfg-accel-guidance').value = p.guidance_scale != null ? p.guidance_scale : '';
+  document.getElementById('cfg-accel-flowshift').value = p.flow_shift != null ? p.flow_shift : '';
+  document.getElementById('cfg-accel-scheduler').value = p.scheduler || '';
+}
+async function _populateAccel(a){
+  await _loadAccelPresets();
+  _refreshAccelVisibility();
+  a = a || {};
+  document.getElementById('cfg-accel-enabled').checked = !!a.enabled;
+  const sel = document.getElementById('cfg-accel-preset');
+  sel.value = [...sel.options].some(o=>o.value===(a.preset||'')) ? a.preset : 'custom';
+  document.getElementById('cfg-accel-lora').value = a.lora || '';
+  document.getElementById('cfg-accel-weight').value = a.lora_weight != null ? a.lora_weight : '';
+  document.getElementById('cfg-accel-steps').value = a.steps != null ? a.steps : '';
+  document.getElementById('cfg-accel-guidance').value = a.guidance_scale != null ? a.guidance_scale : '';
+  document.getElementById('cfg-accel-flowshift').value = a.flow_shift != null ? a.flow_shift : '';
+  document.getElementById('cfg-accel-scheduler').value = a.scheduler || '';
+  onAccelToggle();
+}
+function _collectAccel(){
+  if (!document.getElementById('cfg-accel-enabled').checked) return null;
+  const num = id => { const v = document.getElementById(id).value.trim(); return v === '' ? null : parseFloat(v); };
+  return {
+    enabled: true,
+    preset: document.getElementById('cfg-accel-preset').value || 'custom',
+    lora: document.getElementById('cfg-accel-lora').value.trim() || null,
+    lora_weight: num('cfg-accel-weight'),
+    steps: num('cfg-accel-steps'),
+    guidance_scale: num('cfg-accel-guidance'),
+    flow_shift: num('cfg-accel-flowshift'),
+    scheduler: document.getElementById('cfg-accel-scheduler').value.trim() || '',
+  };
 }
 
 function _updatePreloadAllVisibility() {
@@ -2730,6 +2865,7 @@ async function saveModelConfig(){
                           ? null : parseInt(document.getElementById('cfg-output-crf').value)),
     balanced_gpu_percent: (document.getElementById('cfg-balanced-gpu-pct').value.trim() === ''
                           ? null : parseFloat(document.getElementById('cfg-balanced-gpu-pct').value)),
+    acceleration:      _collectAccel(),
   };
   try{
     const r = await fetch(ROOT_PATH + '/admin/api/model-configure',{
