@@ -19,12 +19,39 @@ Request logging middleware for the codai API.
 """
 
 import json
+import re
 import time
 from collections import deque
 from fastapi import Request
 
 # In-memory ring buffer of recent API requests (max 50)
 _activity: deque = deque(maxlen=50)
+
+# Number of leading characters of a base64/data-URI blob to keep in debug output.
+_BLOB_PREVIEW_CHARS = 48
+# A string is treated as a binary blob (and truncated) when it is a data: URI, or
+# when it is long and made up only of base64 characters (real prompts contain
+# spaces/punctuation, so they never match this).
+_B64_RE = re.compile(r'^[A-Za-z0-9+/=\s]+$')
+
+
+def _is_blob(s: str) -> bool:
+    if s.startswith("data:"):
+        return True
+    return len(s) > 256 and bool(_B64_RE.match(s[:256]))
+
+
+def _redact_blobs(obj):
+    """Recursively copy a JSON-ish value, truncating base64/data-URI blobs (e.g.
+    init_image, image, mask, character_references) to their first few bytes so the
+    debug log stays readable instead of dumping tens of KB of base64."""
+    if isinstance(obj, dict):
+        return {k: _redact_blobs(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact_blobs(v) for v in obj]
+    if isinstance(obj, str) and _is_blob(obj):
+        return f"{obj[:_BLOB_PREVIEW_CHARS]}…[{len(obj)} chars total, truncated]"
+    return obj
 
 
 def get_recent_activity():
@@ -91,7 +118,7 @@ async def log_requests(request: Request, call_next):
                     print(f"\n{'='*80}")
                     print(f"=== FULL REQUEST DEBUG ===")
                     print(f"Method: {request.method}  URL: {request.url}")
-                    print(json.dumps(parsed, indent=2))
+                    print(json.dumps(_redact_blobs(parsed), indent=2))
                     print(f"{'='*80}\n")
             except Exception as e:
                 if global_debug:

@@ -36,6 +36,7 @@ transformers>=4.35.0
 accelerate>=0.24.0
 diffusers>=0.25.0  # For Stable Diffusion image generation
 safetensors>=0.4.0  # Required by diffusers
+ftfy>=6.0  # Prompt text cleaning for diffusers Wan/T5 pipelines (prompt_clean)
 # stable-diffusion-cpp-python is installed by build.sh with CMAKE_ARGS to fix the libwebm submodule issue
 
 # System resource detection
