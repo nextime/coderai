@@ -153,6 +153,24 @@
   </div>
 </div>
 
+<!-- Background jobs -->
+<div class="card mb-0" style="margin-top:1rem">
+  <div class="card-title">Background Jobs</div>
+  <span class="form-hint" style="display:block;margin-bottom:.75rem">
+    Controls how interrupted LoRA training is handled when CoderAI restarts.
+    Equivalent to the <code>--no-resume-jobs</code> launch flag.
+  </span>
+  <div class="form-row" style="margin:0">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-jobs-resume">
+      <span style="font-size:13px;font-weight:500">Resume interrupted training on restart</span>
+    </label>
+    <span class="form-hint">When off, a training job that was running at restart is marked
+      <em>cancelled</em> instead of resuming. Its checkpoint is kept, so you can still
+      restart it manually from the Tasks page.</span>
+  </div>
+</div>
+
 <div class="card mb-0" style="margin-top:1rem">
   <div class="card-title">AISBF Broker</div>
   <div class="form-row">
@@ -328,6 +346,9 @@ async function loadSettings(){
     document.getElementById('s-therm-cpu-resume').value = therm.cpu_resume ?? 87;
     document.getElementById('s-therm-poll').value = therm.poll_seconds ?? 5;
     toggleThermalFields();
+    // Background jobs
+    const jobs = d.jobs || {};
+    document.getElementById('s-jobs-resume').checked = jobs.resume_on_restart !== false;
   }catch(e){ showAlert('error','Failed to load settings: '+e.message); }
 }
 
@@ -362,6 +383,9 @@ async function saveSettings(){
       cpu_high:   parseFloat(document.getElementById('s-therm-cpu-high').value)   || 90,
       cpu_resume: parseFloat(document.getElementById('s-therm-cpu-resume').value) || 87,
       poll_seconds: parseFloat(document.getElementById('s-therm-poll').value) || 5,
+    },
+    jobs:{
+      resume_on_restart: document.getElementById('s-jobs-resume').checked,
     },
     broker:{
       enabled: document.getElementById('s-broker-enabled').checked,

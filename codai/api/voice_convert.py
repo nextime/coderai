@@ -94,7 +94,7 @@ class VoiceConvertRequest(BaseModel):
     model_config = ConfigDict(extra='allow')
 
 
-@router.post('/v1/audio/convert')
+@router.post('/v1/audio/convert', summary="Voice conversion (speech-to-speech)")
 async def convert_voice(request: VoiceConvertRequest, http_request: Request = None):
     """
     Voice conversion: preserves pitch/melody/expression, changes only timbre.

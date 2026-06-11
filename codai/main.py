@@ -147,6 +147,8 @@ def build_runtime_kwargs(model_cfg, model_type):
     }
     if model_type == "text":
         kwargs['ctx'] = model_cfg.get('n_ctx', model_cfg.get('context_size'))
+        kwargs['cache_type_k'] = model_cfg.get('cache_type_k')
+        kwargs['cache_type_v'] = model_cfg.get('cache_type_v')
     elif model_type == "image":
         kwargs['llm_path'] = model_cfg.get('llm_path')
         kwargs['vae_path'] = model_cfg.get('vae_path')
@@ -865,9 +867,16 @@ def main():
     from codai.api.characters import set_global_args as set_chars_global_args
     set_chars_global_args(global_args)
 
-    # Set LoRA training module global args
-    from codai.api.loras import set_global_args as set_loras_global_args
+    # Set LoRA training module global args. Resolve job-recovery first (the
+    # --no-resume-jobs flag overrides the persisted config setting), then call
+    # set_global_args, which runs _load_jobs_on_start and honours the flag.
+    from codai.api.loras import (set_global_args as set_loras_global_args,
+                                 set_resume_enabled as set_loras_resume_enabled)
+    _resume_jobs = bool(getattr(config.jobs, "resume_on_restart", True)) and not getattr(args, "no_resume_jobs", False)
+    set_loras_resume_enabled(_resume_jobs)
     set_loras_global_args(global_args)
+    if not _resume_jobs:
+        print("LoRA job recovery: DISABLED (interrupted training will be cancelled on restart)")
 
     # Set environment profiles module global args
     from codai.api.environments import set_global_args as set_envs_global_args

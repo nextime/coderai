@@ -35,8 +35,60 @@ Semantics (per sensor, when enabled):
 import os
 import shutil
 import subprocess
+import threading
 import time
 from typing import Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Cooldown state (published for the admin Tasks view)
+# ---------------------------------------------------------------------------
+# A thermal pause is a *global* hardware event: every worker that reaches a
+# checkpoint blocks until temps recover. We publish a single process-wide state
+# so the Tasks page can show that running work is paused for cooldown. A waiter
+# counter (not a bool) keeps the state correct when several workers pause at
+# once — the state is "active" while any worker is still cooling.
+_cooldown_lock = threading.Lock()
+_cooldown_waiters = 0
+_cooldown_state: dict = {
+    "active": False, "since": 0.0, "waited": 0.0,
+    "gpu": None, "cpu": None, "message": "",
+}
+
+
+def get_cooldown_state() -> dict:
+    """Snapshot of the current thermal cooldown (see module note). ``active`` is
+    True while at least one worker is paused waiting for the hardware to cool."""
+    with _cooldown_lock:
+        return dict(_cooldown_state)
+
+
+def _cooldown_enter() -> None:
+    global _cooldown_waiters
+    with _cooldown_lock:
+        _cooldown_waiters += 1
+        _cooldown_state["active"] = True
+        if not _cooldown_state.get("since"):
+            _cooldown_state["since"] = time.time()
+
+
+def _cooldown_update(gpu, cpu, waited, message) -> None:
+    with _cooldown_lock:
+        _cooldown_state["gpu"] = gpu
+        _cooldown_state["cpu"] = cpu
+        _cooldown_state["waited"] = waited
+        _cooldown_state["message"] = message
+
+
+def _cooldown_exit() -> None:
+    global _cooldown_waiters
+    with _cooldown_lock:
+        _cooldown_waiters = max(0, _cooldown_waiters - 1)
+        if _cooldown_waiters == 0:
+            _cooldown_state.update({
+                "active": False, "since": 0.0, "waited": 0.0,
+                "gpu": None, "cpu": None, "message": "",
+            })
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +248,57 @@ def read_cpu_temp() -> Optional[float]:
         return val
     val = _read_cpu_temp_uncached()
     _cpu_cache = (now, val)
+    return val
+
+
+_gpu_util_cache: Tuple[float, Optional[float]] = (0.0, None)
+
+
+def _read_gpu_util_uncached() -> Optional[float]:
+    """Hottest GPU utilization in %, or None if unreadable."""
+    if _NVIDIA_SMI:
+        out = _run([
+            _NVIDIA_SMI,
+            "--query-gpu=utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ])
+        if out:
+            vals = []
+            for line in out.splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        vals.append(float(line))
+                    except ValueError:
+                        pass
+            if vals:
+                return max(vals)
+    if _ROCM_SMI:
+        out = _run([_ROCM_SMI, "--showuse"])
+        if out:
+            vals = []
+            for line in out.splitlines():
+                low = line.lower()
+                if "gpu use" in low and "%" in line:
+                    for tok in line.replace("%", " ").split():
+                        try:
+                            vals.append(float(tok))
+                        except ValueError:
+                            continue
+            if vals:
+                return max(vals)
+    return None
+
+
+def read_gpu_util() -> Optional[float]:
+    """GPU utilization % (cached ~2s), or None if unreadable."""
+    global _gpu_util_cache
+    now = time.monotonic()
+    ts, val = _gpu_util_cache
+    if now - ts < _CACHE_TTL:
+        return val
+    val = _read_gpu_util_uncached()
+    _gpu_util_cache = (now, val)
     return val
 
 
@@ -372,25 +475,30 @@ def wait_until_safe(settings: Optional[ThermalSettings] = None,
           f"until cooldown (GPU<={settings.gpu_resume:.0f}°C / "
           f"CPU<={settings.cpu_resume:.0f}°C)")
     waited = 0.0
-    while True:
-        # Re-evaluate against resume thresholds (lower than trigger → hysteresis).
-        # CPU temps are noisy, so average a few samples for the resume decision
-        # (the pause check above stays single-read to react fast to spikes).
-        gt = read_gpu_temp() if settings.gpu_enabled else None
-        ct = read_cpu_temp_avg() if settings.cpu_enabled else None
-        still = []
-        if gt is not None and gt > settings.gpu_resume:
-            still.append(("GPU", gt, settings.gpu_resume))
-        if ct is not None and ct > settings.cpu_resume:
-            still.append(("CPU", ct, settings.cpu_resume))
-        _dbg(f"cooldown{desc} {int(waited)}s: GPU {_fmt(gt)} CPU {_fmt(ct)} (avg-3) "
-             f"(still hot: {[s[0] for s in still] or 'none'})")
-        if not still:
-            break
-        msg = ", ".join(f"{lbl} {t:.0f}°C>{r:.0f}°C" for lbl, t, r in still)
-        print(f"[thermal] Cooling{desc}: {msg} — waiting "
-              f"({int(waited)}s elapsed)")
-        time.sleep(settings.poll_seconds)
-        waited += settings.poll_seconds
+    _cooldown_enter()
+    try:
+        while True:
+            # Re-evaluate against resume thresholds (lower than trigger → hysteresis).
+            # CPU temps are noisy, so average a few samples for the resume decision
+            # (the pause check above stays single-read to react fast to spikes).
+            gt = read_gpu_temp() if settings.gpu_enabled else None
+            ct = read_cpu_temp_avg() if settings.cpu_enabled else None
+            still = []
+            if gt is not None and gt > settings.gpu_resume:
+                still.append(("GPU", gt, settings.gpu_resume))
+            if ct is not None and ct > settings.cpu_resume:
+                still.append(("CPU", ct, settings.cpu_resume))
+            _dbg(f"cooldown{desc} {int(waited)}s: GPU {_fmt(gt)} CPU {_fmt(ct)} (avg-3) "
+                 f"(still hot: {[s[0] for s in still] or 'none'})")
+            if not still:
+                break
+            msg = ", ".join(f"{lbl} {t:.0f}°C>{r:.0f}°C" for lbl, t, r in still)
+            _cooldown_update(gt, ct, waited, msg)
+            print(f"[thermal] Cooling{desc}: {msg} — waiting "
+                  f"({int(waited)}s elapsed)")
+            time.sleep(settings.poll_seconds)
+            waited += settings.poll_seconds
+    finally:
+        _cooldown_exit()
     print(f"[thermal] Temperatures back within safe limits{desc} — resuming "
           f"after {int(waited)}s")

@@ -45,6 +45,7 @@ from pydantic import BaseModel, ConfigDict
 
 from codai.platform_paths import default_loras_dir
 from codai.queue.manager import queue_manager
+from codai.tasks import task_registry, TaskCancelled
 
 router = APIRouter()
 
@@ -75,7 +76,19 @@ _jobs_lock = threading.Lock()
 _jobs: dict = {}                  # job_id -> record
 _active_job_id: Optional[str] = None
 _bg_tasks: set = set()            # strong refs to detached train tasks
+# Job ids with a pending cancel. Survives the window before a queued job's task
+# is registered (the worker checks this set right after acquiring the GPU lock).
+_cancel_requested: set = set()
+# Job ids that must resume from their checkpoint even when global recovery is off
+# (an explicit manual Restart from the Tasks page).
+_force_resume_jobs: set = set()
 _JOB_ACTIVE_STATES = ("queued", "preparing", "training", "saving")
+# Cap on retained *terminal* (done/cancelled/error/interrupted) job records so the
+# persisted registry can't grow without bound. Active jobs are always kept; the
+# oldest terminal records beyond this many are pruned (with their sidecar request
+# files). A removed job is deleted outright (remove_job); this just bounds the
+# slow accumulation of finished ones nobody removed by hand.
+_JOB_HISTORY_MAX = 200
 _MIRROR_FIELDS = ("active", "name", "step", "total", "status", "message",
                   "started_at", "path")
 _last_job_persist = 0.0
@@ -83,6 +96,25 @@ _last_job_persist = 0.0
 
 def _jobs_file() -> str:
     return os.path.join(_loras_dir(), "_train_jobs.json")
+
+
+def _prune_jobs_locked() -> None:
+    """Drop the oldest terminal job records beyond _JOB_HISTORY_MAX. Caller holds
+    _jobs_lock. Also removes each pruned job's persisted request sidecar."""
+    terminal = [(jid, r) for jid, r in _jobs.items()
+                if r.get("status") not in _JOB_ACTIVE_STATES]
+    excess = len(terminal) - _JOB_HISTORY_MAX
+    if excess <= 0:
+        return
+    terminal.sort(key=lambda kv: kv[1].get("updated_at") or kv[1].get("started_at") or 0)
+    for jid, _ in terminal[:excess]:
+        _jobs.pop(jid, None)
+        try:
+            p = _job_req_path(jid)
+            if os.path.isfile(p):
+                os.remove(p)
+        except Exception:
+            pass
 
 
 def _persist_jobs_locked(force: bool = False) -> None:
@@ -93,6 +125,7 @@ def _persist_jobs_locked(force: bool = False) -> None:
     if not force and (now - _last_job_persist) < 5.0:
         return
     _last_job_persist = now
+    _prune_jobs_locked()
     try:
         p = _jobs_file()
         tmp = p + ".tmp"
@@ -127,11 +160,29 @@ def _update_job(job_id: Optional[str], force: bool = False, **fields) -> None:
         _persist_jobs_locked(force=force)
 
 
+# When False (set via --no-resume-jobs or config.jobs.resume_on_restart=false),
+# interrupted training is NOT recovered on restart: mid-flight jobs are marked
+# 'cancelled' (not 'interrupted') and the per-job checkpoint auto-resume is
+# disabled. Checkpoints are kept on disk, so a job can still be restarted
+# manually (Tasks page) — that path passes resume=True explicitly.
+_RESUME_ENABLED: bool = True
+
+
+def set_resume_enabled(enabled: bool) -> None:
+    """Enable/disable interrupted-training recovery on restart. Call before
+    set_global_args() (which runs _load_jobs_on_start)."""
+    global _RESUME_ENABLED
+    _RESUME_ENABLED = bool(enabled)
+
+
 def _load_jobs_on_start() -> None:
-    """Load the persisted registry and mark any job that was mid-flight when the
-    process died as 'interrupted' (its in-memory GPU training is gone). Clients
-    polling such a job learn it must be resubmitted (server resumes from the last
-    on-disk checkpoint)."""
+    """Load the persisted registry and reconcile jobs that were mid-flight when
+    the process died (their in-memory GPU training is gone).
+
+    With recovery enabled they become 'interrupted' — a polling client resubmits
+    and the server resumes from the last on-disk checkpoint. With recovery
+    disabled (--no-resume-jobs / config) they become 'cancelled' and are not
+    auto-resumed; checkpoints are kept so they can be restarted manually."""
     global _jobs
     try:
         with open(_jobs_file()) as f:
@@ -143,9 +194,13 @@ def _load_jobs_on_start() -> None:
     changed = False
     for rec in data.values():
         if rec.get("status") in _JOB_ACTIVE_STATES:
-            rec["status"] = "interrupted"
+            if _RESUME_ENABLED:
+                rec["status"] = "interrupted"
+                rec["message"] = "interrupted by server restart — resubmit to resume"
+            else:
+                rec["status"] = "cancelled"
+                rec["message"] = "cancelled — recovery disabled on restart (checkpoint kept)"
             rec["active"] = False
-            rec["message"] = "interrupted by server restart — resubmit to resume"
             changed = True
     with _jobs_lock:
         _jobs = data
@@ -494,6 +549,129 @@ def _set_progress(**kw):
         mirror = {k: kw[k] for k in kw if k in _MIRROR_FIELDS}
         if mirror:
             _update_job(job_id, **mirror)
+        # Mirror step/total into the live task registry (task id == job id).
+        if "step" in kw or "total" in kw:
+            task_registry.step(job_id, kw.get("step", 0), kw.get("total"))
+        if "message" in kw:
+            task_registry.update(job_id, message=str(kw["message"])[:200])
+
+
+def _check_train_cancel() -> None:
+    """Raise TaskCancelled if the running training job was cancelled, or block
+    while it is paused. Called each training step; the task id is the active job
+    id. The pause wait stays responsive to cancellation."""
+    jid = _active_job_id
+    if jid and (jid in _cancel_requested or task_registry.is_cancelled(jid)):
+        raise TaskCancelled(jid)
+    # Cooperative pause: block here (in the training thread) while paused.
+    if jid:
+        was_paused = task_registry.is_paused(jid)
+        if was_paused:
+            _update_job(jid, force=True, message="paused")
+        task_registry.wait_if_paused(jid)
+        if was_paused:
+            _update_job(jid, force=True, message="training")
+
+
+def _job_req_path(job_id: str) -> str:
+    """Per-job sidecar file holding the full training request, so a job can be
+    restarted (resumed from its checkpoint) after the original client is gone.
+    Kept separate from _train_jobs.json so inline base64 images don't bloat the
+    registry that's rewritten on every progress tick."""
+    return os.path.join(_loras_dir(), "_jobs", f"{job_id}.json")
+
+
+def _save_job_request(job_id: str, req) -> None:
+    try:
+        os.makedirs(os.path.dirname(_job_req_path(job_id)), exist_ok=True)
+        data = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+        with open(_job_req_path(job_id), "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"  [lora] could not persist request for {job_id}: {e}")
+
+
+def _load_job_request(job_id: str):
+    try:
+        with open(_job_req_path(job_id)) as f:
+            return LoraTrainRequest(**json.load(f))
+    except Exception:
+        return None
+
+
+def list_jobs() -> list:
+    """Snapshot of all training jobs (newest first) for the Tasks view."""
+    with _jobs_lock:
+        recs = [dict(r) for r in _jobs.values()]
+    recs.sort(key=lambda r: r.get("started_at") or r.get("updated_at") or 0, reverse=True)
+    return recs
+
+
+def remove_job(job_id: str) -> bool:
+    """Dismiss a finished/cancelled/errored training job from the view. Refuses a
+    job that is still active (cancel it first → returns False). Drops the job
+    record + its saved request sidecar; the trained LoRA weights and any training
+    checkpoint on disk are kept."""
+    with _jobs_lock:
+        rec = _jobs.get(job_id)
+        if rec is None:
+            return False
+        if rec.get("status") in _JOB_ACTIVE_STATES:
+            return False
+        _jobs.pop(job_id, None)
+        _persist_jobs_locked(force=True)
+    try:
+        p = _job_req_path(job_id)
+        if os.path.isfile(p):
+            os.remove(p)
+    except Exception:
+        pass
+    _cancel_requested.discard(job_id)
+    _force_resume_jobs.discard(job_id)
+    task_registry.remove(job_id)
+    return True
+
+
+def cancel_job(job_id: str) -> bool:
+    """Cancel a queued or running training job. Running jobs stop at the next
+    step; queued jobs are marked cancelled immediately (and aborted before any
+    GPU work if they later acquire the lock). Checkpoints are kept."""
+    with _jobs_lock:
+        rec = _jobs.get(job_id)
+        status = rec.get("status") if rec else None
+    if rec is None:
+        return False
+    _cancel_requested.add(job_id)
+    task_registry.cancel(job_id)  # no-op if the task isn't registered yet
+    if status in ("queued", "interrupted", "preparing"):
+        _update_job(job_id, status="cancelled", active=False, force=True,
+                    message="cancelled")
+    return True
+
+
+def restart_job(job_id: str) -> Optional[str]:
+    """Restart a finished/cancelled/interrupted training job, resuming from its
+    last on-disk checkpoint. Returns the (same) job_id on success, None if the
+    request payload could not be recovered."""
+    import asyncio
+    req = _load_job_request(job_id)
+    if req is None:
+        return None
+    _force_resume_jobs.add(job_id)
+    _cancel_requested.discard(job_id)
+    _update_job(job_id, status="queued", active=True, force=True,
+                message="restarting (resume from checkpoint)", step=0)
+    task = asyncio.create_task(_detached_train(req, job_id))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return job_id
+
+
+def _resume_allowed(req) -> bool:
+    """Whether to auto-resume this training from its on-disk checkpoint. True when
+    recovery is enabled globally, or when this is an explicit manual restart
+    (restart_job adds the job id to _force_resume_jobs)."""
+    return _RESUME_ENABLED or (_active_job_id in _force_resume_jobs)
 
 
 def _lora_debug_enabled() -> bool:
@@ -961,7 +1139,7 @@ def _train_sd15(req, base_path, images, instance_prompt,
     # Resume from a mid-training checkpoint if one survives a prior restart.
     start_step = 0
     _ck = _load_train_state(name, base_path=base_path, target="image", rank=rank,
-                            session=getattr(req, "session", None))
+                            session=getattr(req, "session", None)) if _resume_allowed(req) else None
     if _ck:
         try:
             _apply_peft_checkpoint(name, "default", unet)
@@ -995,6 +1173,7 @@ def _train_sd15(req, base_path, images, instance_prompt,
     unet.train()
     n = len(latents_list)
     for step in range(start_step, steps):
+        _check_train_cancel()
         latents = latents_list[step % n].to(device)
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
@@ -1104,7 +1283,7 @@ def _train_sdxl(req, base_path, images, instance_prompt,
     # Resume from a mid-training checkpoint if one survives a prior restart.
     start_step = 0
     _ck = _load_train_state(name, base_path=base_path, target="image", rank=rank,
-                            session=getattr(req, "session", None))
+                            session=getattr(req, "session", None)) if _resume_allowed(req) else None
     if _ck:
         try:
             _apply_peft_checkpoint(name, "default", unet)
@@ -1165,6 +1344,7 @@ def _train_sdxl(req, base_path, images, instance_prompt,
     unet.train()
     n = len(latents_list)
     for step in range(start_step, steps):
+        _check_train_cancel()
         latents = latents_list[step % n].to(device)
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
@@ -1383,7 +1563,7 @@ def _train_wan(req, base_path, images, instance_prompt,
     # runs for hours — a reboot otherwise throws all of it away.
     start_step = 0
     _ck = _load_train_state(name, base_path=base_path, target="video", rank=rank,
-                            session=getattr(req, "session", None))
+                            session=getattr(req, "session", None)) if _resume_allowed(req) else None
     if _ck:
         try:
             _apply_peft_checkpoint(name, "t", experts[0][1])
@@ -1410,9 +1590,34 @@ def _train_wan(req, base_path, images, instance_prompt,
             return experts[0][1] if t_val >= float(boundary) else experts[1][1]
         return experts[0][1]
 
+    def _tr_in_channels(tr):
+        """Channels the transformer's patch_embedding expects."""
+        try:
+            c = getattr(getattr(tr, "config", None), "in_channels", None)
+            if c:
+                return int(c)
+        except Exception:
+            pass
+        try:
+            return int(tr.patch_embedding.weight.shape[1])
+        except Exception:
+            return None
+
+    # I2V transformers (in_channels=36 = 16 noise + 16 image-cond + 4 mask) expect a
+    # wider input than the bare VAE latent (z_dim, typically 16). We have no init-image
+    # conditioning during identity-LoRA training, so feed the well-defined "no condition"
+    # case: zero-pad the noise latent up to in_channels (zero image latents + zero mask).
+    # The transformer still outputs z_dim channels, so the flow-matching target/loss is
+    # unchanged, and the attention-projection LoRA it trains applies during real i2v too.
+    _want_in_ch = _tr_in_channels(experts[0][1])
+    if _want_in_ch and _want_in_ch > z_dim:
+        _dbg_lora(f"Wan I2V transformer wants {_want_in_ch} in-channels; zero-padding "
+                  f"the {z_dim}-channel latent (no-init-image training regime)")
+
     _set_progress(status="training", message="training (Wan video LoRA)")
     n = len(latents_list)
     for step in range(start_step, steps):
+        _check_train_cancel()
         x0 = latents_list[step % n].to(device, dtype=compute_dtype)
         noise = torch.randn_like(x0)
         # Rectified-flow timestep with Wan resolution shift applied to sigma.
@@ -1427,7 +1632,14 @@ def _train_wan(req, base_path, images, instance_prompt,
         target = (noise.float() - x0f).to(compute_dtype)  # flow-matching velocity
         timestep = (sigma * num_train_t).to(torch.float32)  # cast internally by Wan
         tr = _pick_expert(float(sigma.item()))
-        pred = tr(hidden_states=x_t, timestep=timestep,
+        # Pad to the transformer's expected in_channels for I2V models (see note above).
+        x_in = x_t
+        want_ch = _tr_in_channels(tr) or x_t.shape[1]
+        if want_ch > x_t.shape[1]:
+            pad = torch.zeros((x_t.shape[0], want_ch - x_t.shape[1], *x_t.shape[2:]),
+                              device=x_t.device, dtype=x_t.dtype)
+            x_in = torch.cat([x_t, pad], dim=1)
+        pred = tr(hidden_states=x_in, timestep=timestep,
                   encoder_hidden_states=encoder_hidden_states.to(device),
                   return_dict=False)[0]
         loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
@@ -1552,12 +1764,45 @@ def _train_lora_blocking(req: LoraTrainRequest, job_id: Optional[str] = None) ->
     global _active_job_id
     _train_lock.acquire()
     _active_job_id = job_id
+    # Live cancellable task (id == job id). Registered here, when the job actually
+    # starts on the GPU, so its progress mirrors via _set_progress.
+    if job_id:
+        task_registry.register("training", title=getattr(req, "name", "") or "",
+                               model=getattr(req, "base_model", "") or "",
+                               total=getattr(req, "steps", 0) or 0,
+                               job_id=job_id, task_id=job_id, restartable=True,
+                               status="running")
+        task_registry.start(job_id)
+        # A job cancelled while still queued aborts before any GPU work.
+        try:
+            _check_train_cancel()
+        except TaskCancelled:
+            _update_job(job_id, status="cancelled", active=False, force=True,
+                        message="cancelled before start")
+            _active_job_id = None
+            _train_lock.release()
+            raise
     try:
         result = _train_lora_sync(req)
         if job_id:
             _update_job(job_id, status="done", active=False, force=True,
                         message="done", path=result.get("path"))
+            task_registry.finish(job_id, "done")
         return result
+    except TaskCancelled:
+        # Cooperative cancel from the training loop — not an error.
+        try:
+            _set_progress(active=False, status="cancelled", message="cancelled")
+        except Exception:
+            pass
+        if job_id:
+            _update_job(job_id, status="cancelled", active=False, force=True,
+                        message="cancelled by user")
+            task_registry.finish(job_id, "cancelled")
+        # The base/wan caches may hold a half-applied adapter — drop them.
+        _drop_base_cache()
+        _drop_wan_cache()
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -1570,11 +1815,15 @@ def _train_lora_blocking(req: LoraTrainRequest, job_id: Optional[str] = None) ->
         if job_id:
             _update_job(job_id, status="error", active=False, force=True,
                         message=f"training failed: {e}"[:300])
+            task_registry.finish(job_id, "error", f"{e}"[:200])
         _drop_base_cache()
         _drop_wan_cache()
         raise
     finally:
         _active_job_id = None
+        if job_id:
+            _cancel_requested.discard(job_id)
+            _force_resume_jobs.discard(job_id)
         _train_lock.release()
 
 
@@ -1591,7 +1840,7 @@ async def _run_train_job(req: LoraTrainRequest, job_id: str) -> dict:
         await queue_manager.release(lease)
 
 
-@router.post("/v1/loras/train")
+@router.post("/v1/loras/train", summary="Train a new LoRA")
 async def train_lora(req: LoraTrainRequest, _auth=Depends(_require_api_auth)):
     """Train a LoRA. Admitted through the central request scheduler so concurrent
     trainings queue and run one-at-a-time alongside all other model requests.
@@ -1615,6 +1864,9 @@ async def train_lora(req: LoraTrainRequest, _auth=Depends(_require_api_auth)):
              target=(req.target or "image"), status="queued", active=True,
              step=0, total=req.steps or 0, message="queued",
              started_at=time.time(), path=None)
+    # Persist the full request so the job can be restarted later (Tasks page)
+    # without the original client.
+    _save_job_request(job_id, req)
 
     if not req.wait:
         # Detach: run independently of this request's lifetime. Keep a strong
@@ -1639,12 +1891,15 @@ async def _detached_train(req: LoraTrainRequest, job_id: str) -> None:
     record (the client polls for them); nothing is raised to a waiting request."""
     try:
         await _run_train_job(req, job_id)
+    except TaskCancelled:
+        # Already recorded as 'cancelled' by _train_lora_blocking — don't clobber.
+        pass
     except Exception as e:
         _update_job(job_id, status="error", active=False, force=True,
                     message=f"training failed: {e}"[:300])
 
 
-@router.get("/v1/loras/progress")
+@router.get("/v1/loras/progress", summary="LoRA training progress")
 async def lora_progress(job: Optional[str] = None, session: Optional[str] = None):
     """Training progress.
 
@@ -1678,7 +1933,7 @@ async def lora_progress(job: Optional[str] = None, session: Optional[str] = None
         return dict(_progress)
 
 
-@router.post("/v1/loras/upload")
+@router.post("/v1/loras/upload", summary="Upload LoRA weights (content-addressed)")
 async def upload_lora(request: Request, _auth=Depends(_require_api_auth)):
     """Upload a LoRA file into the content-addressed store so a remote client can
     use it without sharing a filesystem.
@@ -1713,7 +1968,7 @@ async def upload_lora(request: Request, _auth=Depends(_require_api_auth)):
     return {"id": f"sha256:{h}", "bytes": len(data), "existed": existed}
 
 
-@router.get("/v1/loras/blob/{hash}")
+@router.get("/v1/loras/blob/{hash}", summary="Check an uploaded LoRA blob exists")
 async def lora_blob_info(hash: str, _auth=Depends(_require_api_auth)):
     """Existence check for an uploaded LoRA blob. 200 with metadata when present,
     404 when absent — lets a client skip re-uploading a file the server already
@@ -1725,8 +1980,14 @@ async def lora_blob_info(hash: str, _auth=Depends(_require_api_auth)):
             "bytes": os.path.getsize(p), "exists": True}
 
 
-@router.get("/v1/loras")
+@router.get("/v1/loras", summary="List registered LoRAs")
 async def list_loras(_auth=Depends(_require_api_auth)):
+    """List every trained/registered LoRA in the registry.
+
+    Returns one entry per LoRA with its `name`, on-disk weight `path` and any saved
+    metadata (base model, target, training params). These names can be referenced from
+    image/video requests via `loras: [{"id": "name:<name>"}]`.
+    """
     out = []
     d = _loras_dir()
     if os.path.isdir(d):
@@ -1746,8 +2007,9 @@ async def list_loras(_auth=Depends(_require_api_auth)):
     return {"loras": out}
 
 
-@router.get("/v1/loras/{name}")
+@router.get("/v1/loras/{name}", summary="Get a registered LoRA")
 async def get_lora(name: str, _auth=Depends(_require_api_auth)):
+    """Fetch one registered LoRA by name, including its weight path and metadata."""
     wf = _lora_weight_file(name)
     if not wf:
         raise HTTPException(status_code=404, detail=f"LoRA '{name}' not found")
@@ -1762,8 +2024,9 @@ async def get_lora(name: str, _auth=Depends(_require_api_auth)):
     return {"name": name, "path": wf, **meta}
 
 
-@router.delete("/v1/loras/{name}")
+@router.delete("/v1/loras/{name}", summary="Delete a registered LoRA")
 async def delete_lora(name: str, _auth=Depends(_require_api_auth)):
+    """Delete a registered LoRA and all its files from the registry."""
     d = _lora_dir(name)
     if not os.path.isdir(d):
         raise HTTPException(status_code=404, detail=f"LoRA '{name}' not found")

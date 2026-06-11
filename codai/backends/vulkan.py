@@ -78,6 +78,40 @@ except ImportError:
     _llama_cpp = None
 
 
+# Friendly KV-cache quant names → llama.cpp GGML type. q8_0 is near-lossless and
+# the safe default; the q5/q4 types trade a little accuracy for ~2x less KV VRAM.
+_KV_TYPE_ALIASES = {
+    'f16': 'GGML_TYPE_F16', 'fp16': 'GGML_TYPE_F16', 'f32': 'GGML_TYPE_F32',
+    'q8_0': 'GGML_TYPE_Q8_0', 'q8': 'GGML_TYPE_Q8_0', 'q8_1': 'GGML_TYPE_Q8_1',
+    'q5_0': 'GGML_TYPE_Q5_0', 'q5_1': 'GGML_TYPE_Q5_1', 'q5': 'GGML_TYPE_Q5_1',
+    'q4_0': 'GGML_TYPE_Q4_0', 'q4_1': 'GGML_TYPE_Q4_1', 'q4': 'GGML_TYPE_Q4_1',
+    'iq4_nl': 'GGML_TYPE_IQ4_NL',
+}
+
+# Sub-8-bit KV types that llama.cpp can only use with flash attention enabled.
+_KV_NEEDS_FLASH = {'q5_0', 'q5_1', 'q5', 'q4_0', 'q4_1', 'q4', 'iq4_nl'}
+
+
+def _ggml_kv_type(name):
+    """Map a KV-cache quant name to the llama.cpp GGML type int, or None.
+
+    Returns None for falsy / unknown / 'none' / 'auto' values (→ keep the
+    llama.cpp default, f16). Unknown names log a warning instead of failing."""
+    if not name or _llama_cpp is None:
+        return None
+    key = str(name).strip().lower().replace('-', '_').replace(' ', '')
+    if key in ('', 'none', 'auto', 'default', 'f16default'):
+        return None
+    const = _KV_TYPE_ALIASES.get(key)
+    if const is None:
+        print(f"  KV cache type '{name}' not recognized — using default (f16)")
+        return None
+    val = getattr(_llama_cpp, const, None)
+    if val is None:
+        print(f"  KV cache type '{name}' unsupported by this llama.cpp build — using f16")
+    return val
+
+
 def _install_layer_log_callback():
     """Replace llama.cpp's log callback with one that prints load-time layer/buffer
     messages directly to stdout.  Returns the callback object — keep a reference
@@ -613,7 +647,33 @@ class VulkanBackend(ModelBackend):
             llama_kwargs['rope_freq_base'] = kwargs['rope_freq_base']
         if 'rope_freq_scale' in kwargs:
             llama_kwargs['rope_freq_scale'] = kwargs['rope_freq_scale']
-        
+
+        # KV-cache quantization (llama.cpp type_k / type_v). Shrinks the KV cache
+        # so long contexts fit in less VRAM. Read from the per-model config, with
+        # the raw models.json entry as a fallback (carried in _raw_cfg).
+        _raw_cfg = kwargs.get('_raw_cfg') or {}
+        _ck = kwargs.get('cache_type_k', _raw_cfg.get('cache_type_k'))
+        _cv = kwargs.get('cache_type_v', _raw_cfg.get('cache_type_v'))
+        _flash = bool(kwargs.get('flash_attn', _raw_cfg.get('flash_attn',
+                      _raw_cfg.get('flash_attention', False))))
+        _tk = _ggml_kv_type(_ck)
+        _tv = _ggml_kv_type(_cv)
+        if _tk is not None:
+            llama_kwargs['type_k'] = _tk
+        if _tv is not None:
+            llama_kwargs['type_v'] = _tv
+        # A quantized V cache below 8 bits requires flash attention in llama.cpp;
+        # auto-enable it (with a note) so the config "just works".
+        _v_needs_flash = str(_cv or '').strip().lower().replace('-', '_') in _KV_NEEDS_FLASH
+        if (_tk is not None or _tv is not None):
+            if _v_needs_flash and not _flash:
+                _flash = True
+                print("  KV cache: sub-8-bit V cache needs flash attention — enabling it")
+            if _flash:
+                llama_kwargs['flash_attn'] = True
+            print(f"  KV cache: type_k={_ck or 'f16'}  type_v={_cv or 'f16'}"
+                  f"{'  (flash_attn on)' if _flash else ''}")
+
         # Force CUDA if requested
         if self.force_cuda:
             # Set environment variable to force CUDA

@@ -67,34 +67,32 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str
-    messages: List[ChatMessage]
-    temperature: float = 0.7
-    top_p: float = 1.0
-    n: int = 1
-    max_tokens: Optional[int] = None
-    stream: bool = False
-    stop: Optional[Union[str, List[str]]] = None
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
-    repeat_penalty: float = 1.0
-    tools: Optional[List[Tool]] = None
-    tool_choice: Optional[Union[str, Dict]] = "auto"
-    # Extra fields that clients may send but we ignore
-    seed: Optional[int] = None
-    logprobs: Optional[bool] = None
-    top_logprobs: Optional[int] = None
-    response_format: Optional[Dict] = None
-    user: Optional[str] = None
-    # Enable thinking/reasoning mode for supported models
-    enable_thinking: Optional[bool] = False
-    
+    model: str = Field(..., description="Text/chat model id to use.")
+    messages: List[ChatMessage] = Field(..., description="Conversation messages (roles: system/user/assistant/tool). Content may include text and image parts for vision models.")
+    temperature: float = Field(0.7, description="Sampling temperature; higher = more random.")
+    top_p: float = Field(1.0, description="Nucleus sampling probability mass.")
+    n: int = Field(1, description="Number of completions to generate.")
+    max_tokens: Optional[int] = Field(None, description="Max tokens to generate (model default if omitted).")
+    stream: bool = Field(False, description="Stream the response as Server-Sent Events.")
+    stop: Optional[Union[str, List[str]]] = Field(None, description="Stop sequence(s) that end generation.")
+    presence_penalty: float = Field(0.0, description="Penalize tokens already present (encourages new topics).")
+    frequency_penalty: float = Field(0.0, description="Penalize frequent tokens (reduces repetition).")
+    repeat_penalty: float = Field(1.0, description="llama.cpp repetition penalty.")
+    tools: Optional[List[Tool]] = Field(None, description="Tool/function definitions the model may call.")
+    tool_choice: Optional[Union[str, Dict]] = Field("auto", description="Tool selection: 'auto', 'none', or a specific tool.")
+    seed: Optional[int] = Field(None, description="Random seed for reproducibility.")
+    logprobs: Optional[bool] = Field(None, description="Return token log-probabilities (if supported).")
+    top_logprobs: Optional[int] = Field(None, description="Number of top log-probs to return per token.")
+    response_format: Optional[Dict] = Field(None, description="Structured-output format, e.g. {'type': 'json_object'}.")
+    user: Optional[str] = Field(None, description="Opaque end-user identifier (passthrough).")
+    enable_thinking: Optional[bool] = Field(False, description="Enable thinking/reasoning mode for models that support it.")
+
     model_config = ConfigDict(extra="allow")  # Allow extra fields to prevent 422 errors
 
 
 class CompletionRequest(BaseModel):
-    model: str
-    prompt: Union[str, List[str]]
+    model: str = Field(..., description="Text model id to use.")
+    prompt: Union[str, List[str]] = Field(..., description="Prompt text (or list of prompts) to complete.")
     temperature: float = 0.7
     top_p: float = 1.0
     n: int = 1

@@ -189,25 +189,25 @@ if admin_static_dir.exists():
     app.mount("/static/admin", StaticFiles(directory=str(admin_static_dir)), name="admin_static")
 
 # Include routers from submodules
-app.include_router(transcriptions_router)
-app.include_router(images_router)
-app.include_router(tts_router)
-app.include_router(text_router)
-app.include_router(video_router)
-app.include_router(audio_gen_router)
-app.include_router(audio_stems_router)
-app.include_router(audio_clean_router)
-app.include_router(embeddings_router)
-app.include_router(pipelines_router)
-app.include_router(custom_pipelines_router)
-app.include_router(voice_clone_router)
-app.include_router(voice_convert_router)
-app.include_router(faceswap_router)
-app.include_router(characters_router)
-app.include_router(loras_router)
-app.include_router(environments_router)
-app.include_router(spatial_router)
-app.include_router(admin_router)
+app.include_router(transcriptions_router, tags=["Audio"])
+app.include_router(images_router, tags=["Images"])
+app.include_router(tts_router, tags=["Audio"])
+app.include_router(text_router, tags=["Text"])
+app.include_router(video_router, tags=["Video"])
+app.include_router(audio_gen_router, tags=["Audio"])
+app.include_router(audio_stems_router, tags=["Audio"])
+app.include_router(audio_clean_router, tags=["Audio"])
+app.include_router(embeddings_router, tags=["Embeddings"])
+app.include_router(pipelines_router, tags=["Pipelines"])
+app.include_router(custom_pipelines_router, tags=["Pipelines"])
+app.include_router(voice_clone_router, tags=["Audio"])
+app.include_router(voice_convert_router, tags=["Audio"])
+app.include_router(faceswap_router, tags=["Images"])
+app.include_router(characters_router, tags=["Characters"])
+app.include_router(loras_router, tags=["LoRAs"])
+app.include_router(environments_router, tags=["Environments"])
+app.include_router(spatial_router, tags=["Spatial / 3D"])
+app.include_router(admin_router, tags=["Admin"])
 
 
 @app.exception_handler(401)
@@ -222,20 +222,35 @@ async def unauthorized_redirect(request: Request, exc: HTTPException):
     return JSONResponse(status_code=401, content={"detail": exc.detail})
 
 
-@app.get("/v1/models", response_model=ModelList)
+from codai.tasks import TaskCancelled, task_registry
+
+
+@app.exception_handler(TaskCancelled)
+async def task_cancelled_handler(request: Request, exc: TaskCancelled):
+    """A worker observed its task was cancelled and unwound. Finish the task
+    (cancelled) and return 499 (client-closed-request style). The task id is
+    carried on the exception so any generation/training worker can simply
+    `raise` without bookkeeping."""
+    tid = exc.args[0] if exc.args else None
+    if tid:
+        task_registry.finish(tid, "cancelled", "cancelled by user")
+    return JSONResponse(status_code=499, content={"detail": "Task cancelled", "task_id": tid})
+
+
+@app.get("/v1/models", response_model=ModelList, summary="List available models", tags=["Core"])
 async def list_models():
     """List available models."""
     models = multi_model_manager.list_models()
     return ModelList(data=models)
 
 
-@app.get("/coderai/capabilities")
+@app.get("/coderai/capabilities", summary="Server capability document", tags=["Core"])
 async def get_broker_capabilities():
     """Return broker capability metadata."""
     return build_capabilities_document(hardware=build_hardware_summary())
 
 
-@app.get("/v1/files/{filename}")
+@app.get("/v1/files/{filename}", summary="Download a generated file", tags=["Files"])
 async def get_file(filename: str):
     """Serve uploaded/generated files."""
     if not global_file_path:
@@ -256,7 +271,7 @@ _VIDEO_EXTS = {'.mp4', '.webm', '.avi', '.mov'}
 _AUDIO_EXTS = {'.wav', '.mp3', '.ogg', '.flac', '.aac', '.m4a'}
 
 
-@app.get("/v1/archive")
+@app.get("/v1/archive", summary="List archived generations", tags=["Files"])
 async def list_archive(request: Request):
     """List all generated files in the output directory."""
     if not global_file_path or not os.path.isdir(global_file_path):
@@ -292,7 +307,7 @@ async def list_archive(request: Request):
     return {"files": files}
 
 
-@app.delete("/v1/archive/{filename}")
+@app.delete("/v1/archive/{filename}", summary="Delete an archived file", tags=["Files"])
 async def delete_archive_file(filename: str):
     """Delete a generated file from the output directory."""
     if not global_file_path:

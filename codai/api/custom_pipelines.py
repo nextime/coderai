@@ -380,7 +380,7 @@ class AudioMusicDubRequest(BaseModel):
     model_config = ConfigDict(extra='allow')
 
 
-@router.get('/v1/pipelines/custom')
+@router.get('/v1/pipelines/custom', summary="List saved custom pipelines")
 async def list_custom_pipelines():
     """List all saved custom pipeline definitions."""
     from codai.admin.routes import config_manager
@@ -389,7 +389,7 @@ async def list_custom_pipelines():
     return {'pipelines': config_manager.pipelines_data}
 
 
-@router.get('/v1/pipelines/step-types')
+@router.get('/v1/pipelines/step-types', summary="List available pipeline step types")
 async def list_step_types():
     """List available step types with their parameter schemas."""
     return {
@@ -400,7 +400,7 @@ async def list_step_types():
     }
 
 
-@router.post('/v1/pipelines/custom')
+@router.post('/v1/pipelines/custom', summary="Create a custom pipeline")
 async def create_custom_pipeline(pipeline: PipelineDefinition):
     """Save a new custom pipeline definition."""
     from codai.admin.routes import config_manager
@@ -416,7 +416,7 @@ async def create_custom_pipeline(pipeline: PipelineDefinition):
     return {'created': True, 'pipeline': data}
 
 
-@router.put('/v1/pipelines/custom/{pipeline_id}')
+@router.put('/v1/pipelines/custom/{pipeline_id}', summary="Update a custom pipeline")
 async def update_custom_pipeline(pipeline_id: str, pipeline: PipelineDefinition):
     """Update an existing custom pipeline."""
     from codai.admin.routes import config_manager
@@ -433,7 +433,7 @@ async def update_custom_pipeline(pipeline_id: str, pipeline: PipelineDefinition)
     return {'updated': True, 'pipeline': data}
 
 
-@router.delete('/v1/pipelines/custom/{pipeline_id}')
+@router.delete('/v1/pipelines/custom/{pipeline_id}', summary="Delete a custom pipeline")
 async def delete_custom_pipeline(pipeline_id: str):
     """Delete a custom pipeline."""
     from codai.admin.routes import config_manager
@@ -447,7 +447,7 @@ async def delete_custom_pipeline(pipeline_id: str):
     return {'deleted': True, 'id': pipeline_id}
 
 
-@router.post('/v1/pipelines/custom/{pipeline_id}/run')
+@router.post('/v1/pipelines/custom/{pipeline_id}/run', summary="Run a saved custom pipeline")
 async def run_custom_pipeline(pipeline_id: str, body: PipelineRunRequest, http_request: Request = None):
     """Execute a saved custom pipeline."""
     from codai.admin.routes import config_manager
@@ -459,14 +459,20 @@ async def run_custom_pipeline(pipeline_id: str, body: PipelineRunRequest, http_r
     return await _execute_pipeline(pipeline_def, body.input or '', http_request)
 
 
-@router.post('/v1/pipelines/run')
+@router.post('/v1/pipelines/run', summary="Run an inline pipeline definition")
 async def run_inline_pipeline(pipeline: PipelineDefinition, http_request: Request = None):
     """Execute an inline pipeline definition without saving it."""
     return await _execute_pipeline(pipeline.model_dump(), '', http_request)
 
 
-@router.post('/v1/pipelines/audio-understand')
+@router.post('/v1/pipelines/audio-understand', summary="Transcribe and analyze audio")
 async def run_audio_understanding(request: AudioUnderstandRequest, http_request: Request = None):
+    """Transcribe and analyze an audio clip in one pass.
+
+    Convenience pipeline that transcribes the input audio and then reasons over the
+    transcript (summary/understanding) using the configured text model. Returns the
+    transcript together with the model's analysis.
+    """
     if not request.audio:
         raise HTTPException(status_code=400, detail='Provide audio input')
 
@@ -543,8 +549,14 @@ async def run_full_music_dub(request: AudioMusicDubRequest, http_request: Reques
     }
 
 
-@router.post('/v1/pipelines/audio-music-dub')
+@router.post('/v1/pipelines/audio-music-dub', summary="Dub a song into another language")
 async def run_audio_music_dub(request: AudioMusicDubRequest, http_request: Request = None):
+    """Dub a song into another language while preserving the backing music.
+
+    Splits the track into vocals and instrumental, transcribes and translates the
+    lyrics, re-sings/voice-converts the translated vocals, then remixes them over the
+    original instrumental. Returns every intermediate stem plus the final mixed result.
+    """
     if not request.audio:
         raise HTTPException(status_code=400, detail='Provide audio input')
 

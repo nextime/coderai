@@ -27,6 +27,7 @@
         <a href="{{ root_path }}/docs" class="nav-link" target="_blank">API Docs</a>
         {% if is_admin|default(false) %}
         <a href="{{ root_path }}/admin/models" class="nav-link {% if '/models' in request.url.path %}active{% endif %}">Models</a>
+        <a href="{{ root_path }}/admin/tasks" class="nav-link {% if '/tasks' in request.url.path %}active{% endif %}">Tasks</a>
         <a href="{{ root_path }}/admin/tokens" class="nav-link {% if '/tokens' in request.url.path %}active{% endif %}">Tokens</a>
         <a href="{{ root_path }}/admin/users" class="nav-link {% if '/users' in request.url.path %}active{% endif %}">Users</a>
         <a href="{{ root_path }}/admin/archive" class="nav-link {% if '/archive' in request.url.path %}active{% endif %}">Archive</a>

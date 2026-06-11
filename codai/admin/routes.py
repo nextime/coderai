@@ -167,7 +167,7 @@ def require_admin(request: Request) -> str:
     return username
 
 
-@router.get("/login", response_class=HTMLResponse)
+@router.get("/login", response_class=HTMLResponse, summary="Admin login page")
 async def login_page(request: Request):
     """Display login page."""
     # If already logged in, redirect to dashboard
@@ -178,7 +178,7 @@ async def login_page(request: Request):
     return _tmpl(request, "login.html", {"error": None})
 
 
-@router.post("/login")
+@router.post("/login", summary="Authenticate admin login")
 async def login(
     request: Request,
     username: str = Form(...),
@@ -211,7 +211,7 @@ async def login(
     return response
 
 
-@router.get("/logout")
+@router.get("/logout", summary="Log out")
 async def logout(request: Request):
     """Handle logout."""
     if session_manager:
@@ -223,7 +223,7 @@ async def logout(request: Request):
     return response
 
 
-@router.get("/admin/change-password", response_class=HTMLResponse)
+@router.get("/admin/change-password", response_class=HTMLResponse, summary="Change-password page")
 async def change_password_page(request: Request, username: str = Depends(require_auth)):
     user = session_manager.get_user(username)
     must_change = user.get("must_change_password", False) if user else False
@@ -235,7 +235,7 @@ async def change_password_page(request: Request, username: str = Depends(require
     })
 
 
-@router.post("/admin/change-password")
+@router.post("/admin/change-password", summary="Change admin password")
 async def change_password(
     request: Request,
     old_password: Optional[str] = Form(None),
@@ -271,7 +271,7 @@ async def change_password(
     return RedirectResponse(url=_url(request, "/admin"), status_code=302)
 
 
-@router.get("/admin", response_class=HTMLResponse)
+@router.get("/admin", response_class=HTMLResponse, summary="Admin dashboard")
 async def admin_dashboard(request: Request, username: str = Depends(require_auth)):
     is_admin = session_manager.is_admin(username)
     return _tmpl(request, "dashboard.html", {
@@ -279,7 +279,7 @@ async def admin_dashboard(request: Request, username: str = Depends(require_auth
     })
 
 
-@router.get("/admin/models", response_class=HTMLResponse)
+@router.get("/admin/models", response_class=HTMLResponse, summary="Models admin page")
 async def models_page(request: Request, username: str = Depends(require_admin)):
     return _tmpl(request, "models.html", {
         "username": username,
@@ -288,12 +288,12 @@ async def models_page(request: Request, username: str = Depends(require_admin)):
     })
 
 
-@router.get("/admin/tokens", response_class=HTMLResponse)
+@router.get("/admin/tokens", response_class=HTMLResponse, summary="API tokens admin page")
 async def tokens_page(request: Request, username: str = Depends(require_admin)):
     return _tmpl(request, "tokens.html", {"username": username, "is_admin": True})
 
 
-@router.get("/admin/users", response_class=HTMLResponse)
+@router.get("/admin/users", response_class=HTMLResponse, summary="Users admin page")
 async def users_page(request: Request, username: str = Depends(require_admin)):
     users = session_manager.list_users()
     return _tmpl(request, "users.html", {
@@ -301,7 +301,12 @@ async def users_page(request: Request, username: str = Depends(require_admin)):
     })
 
 
-@router.get("/chat", response_class=HTMLResponse)
+@router.get("/admin/tasks", response_class=HTMLResponse, summary="Tasks admin page")
+async def tasks_page(request: Request, username: str = Depends(require_admin)):
+    return _tmpl(request, "tasks.html", {"username": username, "is_admin": True})
+
+
+@router.get("/chat", response_class=HTMLResponse, summary="Studio (chat) page")
 async def chat_page(request: Request, username: str = Depends(require_auth)):
     return _tmpl(request, "chat.html", {
         "username": username, "is_admin": session_manager.is_admin(username),
@@ -309,7 +314,7 @@ async def chat_page(request: Request, username: str = Depends(require_auth)):
 
 
 # API endpoints for admin operations
-@router.get("/admin/api/status")
+@router.get("/admin/api/status", summary="Server and model status")
 async def api_status(username: str = Depends(require_auth)):
     """Get system status."""
     from codai.models.manager import multi_model_manager
@@ -486,7 +491,7 @@ async def api_status(username: str = Depends(require_auth)):
     }
 
 
-@router.post("/admin/api/users")
+@router.post("/admin/api/users", summary="Create a user")
 async def api_create_user(
     request: Request,
     username: str = Depends(require_admin)
@@ -507,7 +512,7 @@ async def api_create_user(
     return {"success": True}
 
 
-@router.delete("/admin/api/users/{user_id}")
+@router.delete("/admin/api/users/{user_id}", summary="Delete a user")
 async def api_delete_user(
     user_id: int,
     username: str = Depends(require_admin)
@@ -528,7 +533,7 @@ async def api_delete_user(
 
 # --- Token management endpoints ---
 
-@router.get("/admin/api/tokens", response_model=list)
+@router.get("/admin/api/tokens", response_model=list, summary="List API tokens")
 async def api_list_tokens(username: str = Depends(require_admin)):
     """List all API tokens."""
     auth_data = session_manager._load_auth_data()
@@ -545,7 +550,7 @@ async def api_list_tokens(username: str = Depends(require_admin)):
     return tokens
 
 
-@router.post("/admin/api/tokens")
+@router.post("/admin/api/tokens", summary="Create an API token")
 async def api_create_token(request: Request, username: str = Depends(require_admin)):
     """Create a new API token."""
     data = await request.json()
@@ -580,7 +585,7 @@ async def api_create_token(request: Request, username: str = Depends(require_adm
     }
 
 
-@router.delete("/admin/api/tokens/{token_id}")
+@router.delete("/admin/api/tokens/{token_id}", summary="Revoke an API token")
 async def api_delete_token(token_id: int, username: str = Depends(require_admin)):
     """Delete an API token."""
     auth_data = session_manager._load_auth_data()
@@ -598,7 +603,7 @@ async def api_delete_token(token_id: int, username: str = Depends(require_admin)
 
 # --- Models management endpoints ---
 
-@router.get("/admin/api/models")
+@router.get("/admin/api/models", summary="List configured models")
 async def api_list_models(username: str = Depends(require_admin)):
     """List all configured models with details."""
     models_data = session_manager._load_auth_data()  # TODO: move to ModelManager
@@ -921,7 +926,7 @@ def _run_download_thread(session_id: str, model_id: str, file_pattern: str, pq):
         _t.Thread(target=_gc, daemon=True).start()
 
 
-@router.post("/admin/api/model-download")
+@router.post("/admin/api/model-download", summary="Download a model")
 async def api_download_model(
     request: Request,
     username: str = Depends(require_admin)
@@ -947,7 +952,7 @@ async def api_download_model(
     return {"session_id": session_id}
 
 
-@router.get("/admin/api/download-stream/{session_id}")
+@router.get("/admin/api/download-stream/{session_id}", summary="Stream model download progress")
 async def api_download_stream(
     session_id: str,
     request: Request,
@@ -982,7 +987,7 @@ async def api_download_stream(
     )
 
 
-@router.delete("/admin/api/models/{model_identifier}")
+@router.delete("/admin/api/models/{model_identifier}", summary="Remove a configured model")
 async def api_delete_model(
     model_identifier: str,
     username: str = Depends(require_admin)
@@ -1001,7 +1006,7 @@ async def api_delete_model(
 
 # --- Download status / cache management ---
 
-@router.get("/admin/api/hf-files")
+@router.get("/admin/api/hf-files", summary="List files in a Hugging Face repo")
 async def api_hf_repo_files(repo_id: str, username: str = Depends(require_admin)):
     """Return the file list for a HuggingFace repo with name and size metadata."""
     import asyncio
@@ -1023,13 +1028,13 @@ async def api_hf_repo_files(repo_id: str, username: str = Depends(require_admin)
     return await asyncio.to_thread(_fetch)
 
 
-@router.get("/admin/api/downloads")
+@router.get("/admin/api/downloads", summary="List active downloads")
 async def api_list_downloads(username: str = Depends(require_admin)):
     """Return status of all active and recently completed download sessions."""
     return list(_download_status.values())
 
 
-@router.post("/admin/api/download-cancel/{session_id}")
+@router.post("/admin/api/download-cancel/{session_id}", summary="Cancel a download")
 async def api_cancel_download(session_id: str, username: str = Depends(require_admin)):
     """Request cancellation of an active download session."""
     if session_id not in _download_sessions and session_id not in _download_status:
@@ -1038,7 +1043,7 @@ async def api_cancel_download(session_id: str, username: str = Depends(require_a
     return {"success": True}
 
 
-@router.post("/admin/api/model-upload")
+@router.post("/admin/api/model-upload", summary="Upload a model file")
 async def api_model_upload(request: Request, username: str = Depends(require_admin)):
     """Upload a GGUF model file in chunks."""
     from codai.models.cache import get_model_cache_dir
@@ -1480,28 +1485,28 @@ def _do_delete_model(model_id: str, cache_type: str) -> dict:
     return {"success": False, "detail": "Unknown cache_type"}
 
 
-@router.get("/admin/api/cached-models")
+@router.get("/admin/api/cached-models", summary="List cached models")
 async def api_cached_models(username: str = Depends(require_admin)):
     """Scan both caches and return all locally stored models."""
     import asyncio
     return await asyncio.to_thread(_scan_caches)
 
 
-@router.get("/admin/api/cache-stats")
+@router.get("/admin/api/cache-stats", summary="Model cache statistics")
 async def api_cache_stats(username: str = Depends(require_admin)):
     """Return disk-usage statistics for each cache."""
     import asyncio
     return await asyncio.to_thread(_get_cache_stats)
 
 
-@router.delete("/admin/api/cache")
+@router.delete("/admin/api/cache", summary="Clear the model cache")
 async def api_clear_cache(cache_type: str = "all", username: str = Depends(require_admin)):
     """Bulk-delete cache. cache_type: all | hf | gguf"""
     import asyncio
     return await asyncio.to_thread(_do_clear_cache, cache_type)
 
 
-@router.delete("/admin/api/cached-models/{model_id:path}")
+@router.delete("/admin/api/cached-models/{model_id:path}", summary="Evict a cached model")
 async def api_delete_cached_model(
     model_id: str,
     cache_type: str = "hf",
@@ -1512,7 +1517,7 @@ async def api_delete_cached_model(
     return await asyncio.to_thread(_do_delete_model, model_id, cache_type)
 
 
-@router.post("/admin/api/model-enable")
+@router.post("/admin/api/model-enable", summary="Enable a model")
 async def api_model_enable(request: Request, username: str = Depends(require_admin)):
     """Register a cached model in models.json so CoderAI can use it."""
     if config_manager is None:
@@ -1532,7 +1537,7 @@ async def api_model_enable(request: Request, username: str = Depends(require_adm
     return {"success": True}
 
 
-@router.post("/admin/api/model-disable")
+@router.post("/admin/api/model-disable", summary="Disable a model")
 async def api_model_disable(request: Request, username: str = Depends(require_admin)):
     """Remove a model from models.json (keeps it cached locally)."""
     if config_manager is None:
@@ -1568,7 +1573,7 @@ async def api_model_disable(request: Request, username: str = Depends(require_ad
     return {"success": True}
 
 
-@router.get("/admin/api/model-loaded-status")
+@router.get("/admin/api/model-loaded-status", summary="Model load status")
 async def api_model_loaded_status(username: str = Depends(require_admin)):
     """Return loaded model keys with per-model instance pool info."""
     from codai.models.manager import multi_model_manager
@@ -1593,7 +1598,7 @@ async def api_model_loaded_status(username: str = Depends(require_admin)):
     return {"loaded": loaded, "instances": instance_pools, "configured_max": configured_max}
 
 
-@router.post("/admin/api/model-load")
+@router.post("/admin/api/model-load", summary="Load a model into memory")
 async def api_model_load(request: Request, username: str = Depends(require_admin)):
     """Load a configured model into VRAM (same VRAM checks as a real request)."""
     from codai.models.manager import multi_model_manager
@@ -1755,7 +1760,7 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/admin/api/model-unload")
+@router.post("/admin/api/model-unload", summary="Unload a model")
 async def api_model_unload(request: Request, username: str = Depends(require_admin)):
     """Unload a model from VRAM (keeps it available for on-request reload)."""
     import gc
@@ -1799,7 +1804,7 @@ async def api_model_unload(request: Request, username: str = Depends(require_adm
     return {"success": True, "was_loaded": True}
 
 
-@router.post("/admin/api/model-configure")
+@router.post("/admin/api/model-configure", summary="Update a model's configuration")
 async def api_model_configure(request: Request, username: str = Depends(require_admin)):
     """Save per-model configuration and register/update in models.json."""
     if config_manager is None:
@@ -1939,7 +1944,8 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "lora_train_base_model",
                 "max_vram", "sdcpp_flash_attn", "sdcpp_diffusion_flash_attn", "vae_tiling",
                 "component_quantization", "output_crf", "force_vram_update",
-                "balanced_gpu_percent", "acceleration"):
+                "balanced_gpu_percent", "acceleration",
+                "cache_type_k", "cache_type_v", "turboquant"):
         if key in data:
             entry[key] = data[key]
 
@@ -1970,7 +1976,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
     return {"success": True, "applied_live": applied}
 
 
-@router.get("/admin/api/accel-presets")
+@router.get("/admin/api/accel-presets", summary="List acceleration / distillation presets")
 async def api_accel_presets(username: str = Depends(require_admin)):
     """Return the acceleration/distillation preset catalog (Lightning / Turbo /
     LCM / Hyper-SD) so the model-config UI dropdown stays in sync with the Python
@@ -1982,9 +1988,264 @@ async def api_accel_presets(username: str = Depends(require_admin)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/admin/api/turboquant-info", summary="TurboQuant backend availability")
+async def api_turboquant_info(username: str = Depends(require_admin)):
+    """Report which TurboQuant embedding-quantization backends are available so
+    the model-config UI can offer 'builtin' (always) and 'library' (turboquant-py
+    when installed)."""
+    try:
+        from codai.models import turboquant as _tq
+        return {
+            "builtin": True,
+            "library": _tq.have_library(),
+            "library_package": "turboquant-py",
+            "bit_widths": [8, 6, 4, 2],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Task / queue management ---
+
+@router.get("/admin/api/tasks", summary="List active and recent tasks")
+async def api_tasks(username: str = Depends(require_admin)):
+    """Unified live view of long-running work: in-flight / recent generations
+    (image, video, audio, text) from the task registry, durable LoRA training
+    jobs, and queued requests waiting for a slot. The Tasks page polls this."""
+    from codai.tasks import task_registry
+    from codai.api.loras import list_jobs
+    from codai.queue.manager import queue_manager
+
+    tasks = []
+    seen = set()
+
+    # Training jobs are authoritative (persisted, survive restarts).
+    for j in list_jobs():
+        jid = j.get("job_id")
+        if not jid:
+            continue
+        seen.add(jid)
+        status = j.get("status") or "unknown"
+        norm = "running" if status in ("preparing", "training", "saving") else status
+        active = norm in ("queued", "running")
+        tasks.append({
+            "id": jid,
+            "kind": "training",
+            "title": j.get("name") or "",
+            "model": j.get("base_model") or "",
+            "status": norm,
+            "step": j.get("step") or 0,
+            "total": j.get("total") or 0,
+            "message": j.get("message") or "",
+            "started_at": j.get("started_at"),
+            "active": active,
+            "cancellable": active,
+            "pausable": norm == "running",
+            "paused": bool(task_registry.is_paused(jid)),
+            "restartable": status in ("cancelled", "error", "interrupted", "done"),
+        })
+
+    # Generations + anything else from the live registry (skip training dupes).
+    for t in task_registry.list():
+        if t["id"] in seen or t.get("kind") == "training":
+            continue
+        seen.add(t["id"])
+        t = dict(t)
+        t["cancellable"] = bool(t.get("cancellable", True) and t.get("active", False))
+        t["pausable"] = (t.get("status") == "running")
+        t["restartable"] = False
+        tasks.append(t)
+
+    # Queued requests waiting for a free slot/model (e.g. text) not shown yet.
+    for w in queue_manager.list_waiting():
+        rid = w.get("request_id")
+        if not rid or rid in seen or rid.startswith("lora-train-"):
+            continue
+        seen.add(rid)
+        tasks.append({
+            "id": rid,
+            "kind": "text" if rid.startswith("req-") else "request",
+            "title": "",
+            "model": w.get("model_key") or "",
+            "status": "queued",
+            "step": 0, "total": 0,
+            "message": "waiting for a free slot",
+            "started_at": w.get("enqueued_at"),
+            "active": True,
+            "cancellable": False,
+            "restartable": False,
+        })
+
+    # Successfully-finished work is dropped from the live list — a "done" job is
+    # no longer actionable, so it shouldn't clutter the view. Terminal-but-notable
+    # states (cancelled / error / interrupted) stay, so they can be inspected,
+    # restarted, or removed manually.
+    tasks = [t for t in tasks if t.get("status") != "done"]
+
+    # A thermal pause is global hardware state: while cooling, every running
+    # worker is blocked at its next checkpoint. Surface it on the running tasks
+    # and as a top-level banner so the Tasks page shows "cooling down".
+    cooling = {"active": False}
+    try:
+        from codai.models import thermal
+        cs = thermal.get_cooldown_state()
+        if cs.get("active"):
+            parts = []
+            if cs.get("gpu") is not None:
+                parts.append(f"GPU {cs['gpu']:.0f}°C")
+            if cs.get("cpu") is not None:
+                parts.append(f"CPU {cs['cpu']:.0f}°C")
+            waited = int(cs.get("waited") or 0)
+            detail = ", ".join(parts)
+            label = "Cooling down" + (f" — {detail}" if detail else "")
+            if waited:
+                label += f" ({waited}s)"
+            cooling = {"active": True, "message": label,
+                       "gpu": cs.get("gpu"), "cpu": cs.get("cpu"), "waited": waited}
+            for t in tasks:
+                if t.get("active") and t.get("status") == "running":
+                    t["cooling"] = True
+                    t["cooling_message"] = label
+    except Exception:
+        pass
+
+    return {"tasks": tasks, "queue": queue_manager.get_metrics(), "thermal": cooling}
+
+
+def _read_vram_info() -> Optional[dict]:
+    """Best-effort {used, total, gpu} in GB. CUDA via torch, else AMD/Intel sysfs."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info()
+            return {"used": (total - free) / 1e9, "total": total / 1e9,
+                    "gpu": torch.cuda.get_device_name(0)}
+    except Exception:
+        pass
+    try:
+        import glob as _glob
+        for card in sorted(_glob.glob("/sys/class/drm/card[0-9]")):
+            dev = card + "/device"
+            tot = dev + "/mem_info_vram_total"
+            if not os.path.exists(tot):
+                continue
+            total_b = int(open(tot).read())
+            used_b = int(open(dev + "/mem_info_vram_used").read())
+            return {"used": used_b / 1e9, "total": total_b / 1e9, "gpu": ""}
+    except Exception:
+        pass
+    return None
+
+
+@router.get("/admin/api/system-stats", summary="Live CPU / GPU / RAM / VRAM usage and temperatures")
+async def api_system_stats(username: str = Depends(require_admin)):
+    """Lightweight hardware telemetry for the Tasks page header: CPU & GPU
+    utilization and temperature, plus RAM and VRAM usage. All fields are
+    best-effort and may be null when a sensor/metric is unavailable."""
+    from codai.models import thermal
+
+    cpu = {"util": None, "temp": thermal.read_cpu_temp()}
+    ram = None
+    try:
+        import psutil
+        cpu["util"] = psutil.cpu_percent(interval=None)
+        vm = psutil.virtual_memory()
+        ram = {"used": vm.used / 1e9, "total": vm.total / 1e9, "percent": vm.percent}
+    except Exception:
+        pass
+
+    gpu = {"util": thermal.read_gpu_util(), "temp": thermal.read_gpu_temp()}
+    vram = _read_vram_info()
+    if vram and vram.get("total"):
+        vram["percent"] = round(vram["used"] / vram["total"] * 100, 1)
+        if gpu.get("gpu") is None:
+            gpu["name"] = vram.get("gpu") or ""
+
+    return {"cpu": cpu, "gpu": gpu, "ram": ram, "vram": vram}
+
+
+def _do_task_cancel(task_id: str) -> bool:
+    """Cancel a task by id. Training ids route through loras.cancel_job (handles
+    queued vs running + the durable job record); everything else goes through the
+    in-memory task registry."""
+    from codai.tasks import task_registry
+    from codai.api.loras import cancel_job
+    if cancel_job(task_id):
+        return True
+    return task_registry.cancel(task_id)
+
+
+@router.post("/admin/api/tasks/{task_id}/cancel", summary="Cancel a task")
+async def api_task_cancel(task_id: str, username: str = Depends(require_admin)):
+    """Cancel a queued or running task. Running generations/training stop at the
+    next step boundary; queued items are dropped before they start."""
+    if not _do_task_cancel(task_id):
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"ok": True, "task_id": task_id, "action": "cancel"}
+
+
+@router.post("/admin/api/tasks/{task_id}/interrupt", summary="Interrupt a running task")
+async def api_task_interrupt(task_id: str, username: str = Depends(require_admin)):
+    """Alias of cancel for a running task."""
+    if not _do_task_cancel(task_id):
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"ok": True, "task_id": task_id, "action": "interrupt"}
+
+
+@router.delete("/admin/api/tasks/{task_id}", summary="Remove a finished task")
+async def api_task_remove(task_id: str, username: str = Depends(require_admin)):
+    """Dismiss a finished/cancelled/errored task from the Tasks view. Refuses to
+    remove a task that is still active — cancel it first."""
+    from codai.tasks import task_registry
+    from codai.api.loras import remove_job
+    # Training job (durable record) first.
+    if remove_job(task_id):
+        return {"ok": True, "task_id": task_id, "removed": True}
+    # Otherwise a live registry (generation) task — only when it's not active.
+    t = task_registry.get(task_id)
+    if t is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if t.get("active"):
+        raise HTTPException(status_code=409, detail="Task is still active — cancel it first")
+    task_registry.remove(task_id)
+    return {"ok": True, "task_id": task_id, "removed": True}
+
+
+@router.post("/admin/api/tasks/{task_id}/pause", summary="Pause a running task")
+async def api_task_pause(task_id: str, username: str = Depends(require_admin)):
+    """Pause a running task. It suspends at the next step boundary (holding the
+    model/GPU) until resumed. Works for generations and LoRA training."""
+    from codai.tasks import task_registry
+    if not task_registry.pause(task_id):
+        raise HTTPException(status_code=404,
+                            detail="Task not found or not running")
+    return {"ok": True, "task_id": task_id, "action": "pause"}
+
+
+@router.post("/admin/api/tasks/{task_id}/resume", summary="Resume a paused task")
+async def api_task_resume(task_id: str, username: str = Depends(require_admin)):
+    """Resume a task previously paused from the Tasks page."""
+    from codai.tasks import task_registry
+    if not task_registry.resume(task_id):
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"ok": True, "task_id": task_id, "action": "resume"}
+
+
+@router.post("/admin/api/tasks/{task_id}/restart", summary="Restart a training task")
+async def api_task_restart(task_id: str, username: str = Depends(require_admin)):
+    """Restart a finished/cancelled/interrupted LoRA training job, resuming from
+    its last on-disk checkpoint (only training tasks are restartable)."""
+    from codai.api.loras import restart_job
+    jid = restart_job(task_id)
+    if not jid:
+        raise HTTPException(status_code=400,
+                            detail="Task is not restartable (training jobs only, and the saved request must exist)")
+    return {"ok": True, "job_id": jid, "status": "queued"}
+
+
 # --- System endpoints ---
 
-@router.post("/admin/api/system/reload")
+@router.post("/admin/api/system/reload", summary="Reload server configuration")
 async def api_reload_config(username: str = Depends(require_admin)):
     """Reload configuration from disk."""
     try:
@@ -2010,12 +2271,12 @@ from datetime import datetime
 
 # --- Settings page ---
 
-@router.get("/admin/settings", response_class=HTMLResponse)
+@router.get("/admin/settings", response_class=HTMLResponse, summary="Settings page")
 async def settings_page(request: Request, username: str = Depends(require_admin)):
     return _tmpl(request, "settings.html", {"username": username, "is_admin": True})
 
 
-@router.get("/admin/api/settings")
+@router.get("/admin/api/settings", summary="Get server settings")
 async def api_get_settings(username: str = Depends(require_admin)):
     """Return current config.json as JSON."""
     if config_manager is None or config_manager.config is None:
@@ -2072,6 +2333,9 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "gpu_resume": c.thermal.gpu_resume,
             "poll_seconds": c.thermal.poll_seconds,
         },
+        "jobs": {
+            "resume_on_restart": c.jobs.resume_on_restart,
+        },
         "broker": {
             "enabled": c.broker.enabled,
             "base_url": c.broker.base_url,
@@ -2097,7 +2361,7 @@ async def api_get_settings(username: str = Depends(require_admin)):
     }
 
 
-@router.post("/admin/api/settings")
+@router.post("/admin/api/settings", summary="Update server settings")
 async def api_save_settings(request: Request, username: str = Depends(require_admin)):
     """Update and persist config.json from submitted JSON. Only sections present in the payload are updated."""
     if config_manager is None or config_manager.config is None:
@@ -2204,6 +2468,17 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         except Exception:
             pass
 
+    if "jobs" in data:
+        jb = data["jobs"]
+        c.jobs.resume_on_restart = bool(jb.get("resume_on_restart", c.jobs.resume_on_restart))
+        # Apply live so the change takes effect on the next restart-recovery pass
+        # without needing a server restart to re-read config.
+        try:
+            from codai.api.loras import set_resume_enabled
+            set_resume_enabled(c.jobs.resume_on_restart)
+        except Exception:
+            pass
+
     if "broker" in data:
         bro = data["broker"]
         c.broker.enabled = bool(bro.get("enabled", c.broker.enabled))
@@ -2243,12 +2518,12 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
 # Archive management
 # =============================================================================
 
-@router.get("/admin/archive", response_class=HTMLResponse)
+@router.get("/admin/archive", response_class=HTMLResponse, summary="Archive page")
 async def archive_page(request: Request, username: str = Depends(require_admin)):
     return _tmpl(request, "archive.html", {"username": username, "is_admin": True})
 
 
-@router.get("/admin/api/archive")
+@router.get("/admin/api/archive", summary="List archived generations")
 async def api_archive_list(
     limit: int = 50,
     offset: int = 0,
@@ -2260,7 +2535,7 @@ async def api_archive_list(
     return {"entries": entries, "total": total}
 
 
-@router.get("/admin/api/archive/{gen_id}")
+@router.get("/admin/api/archive/{gen_id}", summary="Get an archived generation")
 async def api_archive_get(gen_id: str, username: str = Depends(require_admin)):
     from codai.api.archive import archive_manager
     entry = archive_manager.get_entry(gen_id)
@@ -2269,7 +2544,7 @@ async def api_archive_get(gen_id: str, username: str = Depends(require_admin)):
     return entry
 
 
-@router.delete("/admin/api/archive/{gen_id}")
+@router.delete("/admin/api/archive/{gen_id}", summary="Delete an archived generation")
 async def api_archive_delete(gen_id: str, username: str = Depends(require_admin)):
     from codai.api.archive import archive_manager
     if not archive_manager.delete_entry(gen_id):
@@ -2277,7 +2552,7 @@ async def api_archive_delete(gen_id: str, username: str = Depends(require_admin)
     return {"success": True}
 
 
-@router.get("/admin/api/archive/{gen_id}/files/{filename}")
+@router.get("/admin/api/archive/{gen_id}/files/{filename}", summary="Download an archived file")
 async def api_archive_file(
     gen_id: str,
     filename: str,
@@ -2293,7 +2568,7 @@ async def api_archive_file(
     return FileResponse(path, media_type=media_type)
 
 
-@router.get("/admin/api/archive-settings")
+@router.get("/admin/api/archive-settings", summary="Get archive settings")
 async def api_archive_settings_get(username: str = Depends(require_admin)):
     if config_manager is None or config_manager.config is None:
         raise HTTPException(status_code=503, detail="Config not ready")
@@ -2325,7 +2600,7 @@ def _hf_file_size(sibling: dict) -> int:
     return lfs.get("size") or sibling.get("size") or 0
 
 
-@router.get("/admin/api/hf-search")
+@router.get("/admin/api/hf-search", summary="Search Hugging Face models")
 async def api_hf_search(
     q: str = "",
     gguf_mode: str = "gguf",   # "gguf" | "all" | "no-gguf"
@@ -2482,7 +2757,7 @@ async def api_hf_search(
         raise HTTPException(status_code=502, detail=f"HuggingFace API error: {e}")
 
 
-@router.get("/admin/api/hf-model-files")
+@router.get("/admin/api/hf-model-files", summary="List Hugging Face model files")
 async def api_hf_model_files(model_id: str, username: str = Depends(require_admin)):
     """Return GGUF files (name, size, VRAM estimate, quant type) for an HF model repo."""
     import urllib.request
@@ -2523,13 +2798,13 @@ async def api_hf_model_files(model_id: str, username: str = Depends(require_admi
 # Character profile management proxy (admin UI)
 # =============================================================================
 
-@router.get("/admin/api/characters")
+@router.get("/admin/api/characters", summary="List characters")
 async def api_list_characters(username: str = Depends(require_auth)):
     from codai.api.characters import _list_characters
     return {"characters": _list_characters()}
 
 
-@router.get("/admin/api/characters/{name}")
+@router.get("/admin/api/characters/{name}", summary="Get a character")
 async def api_get_character(name: str, username: str = Depends(require_auth)):
     from codai.api.characters import _load_character_meta, _load_character_images
     meta = _load_character_meta(name)
@@ -2545,7 +2820,7 @@ async def api_get_character(name: str, username: str = Depends(require_auth)):
     }
 
 
-@router.get("/admin/api/characters/{name}/thumbnail")
+@router.get("/admin/api/characters/{name}/thumbnail", summary="Character thumbnail")
 async def api_character_thumbnail(name: str, username: str = Depends(require_auth)):
     import os as _os
     from codai.api.characters import _char_dir, _load_character_meta
@@ -2563,7 +2838,7 @@ async def api_character_thumbnail(name: str, username: str = Depends(require_aut
     raise HTTPException(status_code=404)
 
 
-@router.delete("/admin/api/characters/{name}")
+@router.delete("/admin/api/characters/{name}", summary="Delete a character")
 async def api_delete_character(name: str, username: str = Depends(require_auth)):
     import os as _os, shutil
     from codai.api.characters import _char_dir
@@ -2578,13 +2853,13 @@ async def api_delete_character(name: str, username: str = Depends(require_auth))
 # Environment profile management proxy (admin UI)
 # =============================================================================
 
-@router.get("/admin/api/environments")
+@router.get("/admin/api/environments", summary="List environments")
 async def api_list_environments(username: str = Depends(require_auth)):
     from codai.api.environments import _list_environments
     return {"environments": _list_environments()}
 
 
-@router.get("/admin/api/environments/{name}")
+@router.get("/admin/api/environments/{name}", summary="Get an environment")
 async def api_get_environment(name: str, username: str = Depends(require_auth)):
     from codai.api.environments import _load_environment_meta, _load_environment_images
     meta = _load_environment_meta(name)
@@ -2600,7 +2875,7 @@ async def api_get_environment(name: str, username: str = Depends(require_auth)):
     }
 
 
-@router.get("/admin/api/environments/{name}/thumbnail")
+@router.get("/admin/api/environments/{name}/thumbnail", summary="Environment thumbnail")
 async def api_environment_thumbnail(name: str, username: str = Depends(require_auth)):
     import os as _os
     from codai.api.environments import _env_dir, _load_environment_meta
@@ -2618,7 +2893,7 @@ async def api_environment_thumbnail(name: str, username: str = Depends(require_a
     raise HTTPException(status_code=404)
 
 
-@router.delete("/admin/api/environments/{name}")
+@router.delete("/admin/api/environments/{name}", summary="Delete an environment")
 async def api_delete_environment(name: str, username: str = Depends(require_auth)):
     import os as _os, shutil
     from codai.api.environments import _env_dir
@@ -2633,13 +2908,13 @@ async def api_delete_environment(name: str, username: str = Depends(require_auth
 # Voice profile management proxy (admin UI)
 # =============================================================================
 
-@router.get("/admin/api/voices")
+@router.get("/admin/api/voices", summary="List voices")
 async def api_list_voices(username: str = Depends(require_auth)):
     from codai.api.voice_clone import _list_voices
     return {"voices": _list_voices()}
 
 
-@router.get("/admin/api/voices/{name}")
+@router.get("/admin/api/voices/{name}", summary="Get a voice")
 async def api_get_voice(name: str, username: str = Depends(require_auth)):
     from codai.api.voice_clone import _load_voice
     meta = _load_voice(name)
@@ -2648,7 +2923,7 @@ async def api_get_voice(name: str, username: str = Depends(require_auth)):
     return {"voice": meta}
 
 
-@router.delete("/admin/api/voices/{name}")
+@router.delete("/admin/api/voices/{name}", summary="Delete a voice")
 async def api_delete_voice(name: str, username: str = Depends(require_auth)):
     import os as _os, shutil
     from codai.api.voice_clone import _voice_path
@@ -2659,7 +2934,7 @@ async def api_delete_voice(name: str, username: str = Depends(require_auth)):
     return {"deleted": True, "name": name}
 
 
-@router.get("/admin/api/hf-model-info")
+@router.get("/admin/api/hf-model-info", summary="Get Hugging Face model info")
 async def api_hf_model_info(model_id: str, username: str = Depends(require_admin)):
     """Full metadata for a single HuggingFace model repo."""
     import urllib.request

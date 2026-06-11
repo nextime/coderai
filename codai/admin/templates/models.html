@@ -616,6 +616,28 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           <label class="form-label">Context size</label>
           <input type="number" id="cfg-n-ctx" class="form-input" min="128" step="128" value="2048">
         </div>
+        <div class="form-row" style="margin:0" id="cfg-kv-k-row">
+          <label class="form-label">KV cache — Keys <span class="muted">(GGUF text; shrinks KV VRAM)</span></label>
+          <select id="cfg-cache-type-k" class="form-input">
+            <option value="">Default (f16)</option>
+            <option value="q8_0">q8_0 (near-lossless, ~2×)</option>
+            <option value="q5_1">q5_1</option>
+            <option value="q5_0">q5_0</option>
+            <option value="q4_1">q4_1 (smallest)</option>
+            <option value="q4_0">q4_0 (smallest)</option>
+          </select>
+        </div>
+        <div class="form-row" style="margin:0" id="cfg-kv-v-row">
+          <label class="form-label">KV cache — Values <span class="muted">(sub-8-bit needs Flash Attn)</span></label>
+          <select id="cfg-cache-type-v" class="form-input">
+            <option value="">Default (f16)</option>
+            <option value="q8_0">q8_0 (near-lossless, ~2×)</option>
+            <option value="q5_1">q5_1</option>
+            <option value="q5_0">q5_0</option>
+            <option value="q4_1">q4_1 (smallest)</option>
+            <option value="q4_0">q4_0 (smallest)</option>
+          </select>
+        </div>
         <div class="form-row" style="margin:0">
           <label class="form-label">Max GPU % <span class="muted">(optional)</span></label>
           <input type="number" id="cfg-max-gpu" class="form-input" min="1" max="100" placeholder="e.g. 90">
@@ -729,6 +751,36 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
               <input type="text" id="cfg-accel-scheduler" class="form-input" placeholder="e.g. LCMScheduler">
             </div>
           </div>
+        </div>
+      </div>
+
+      <!-- TurboQuant embedding vector quantization (embedding models) -->
+      <div id="cfg-turboquant-section" style="display:none">
+        <div class="card-title" style="margin-top:1.25rem">TurboQuant <span class="muted" style="font-weight:normal">(embedding vector quantization — data-free, inner-product preserving)</span></div>
+        <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px;margin:.4rem 0">
+          <input type="checkbox" id="cfg-tq-enabled" onchange="onTurboQuantToggle()"> Enable TurboQuant
+          <span class="muted">compress embeddings to 2–8 bits/coord for smaller vector stores</span></label>
+        <div id="cfg-tq-fields" style="display:none">
+          <div style="display:flex;gap:1rem;flex-wrap:wrap">
+            <div class="form-row" style="max-width:260px">
+              <label class="form-label">Backend</label>
+              <select id="cfg-tq-backend" class="form-input">
+                <option value="builtin">Built-in (NumPy, always available)</option>
+                <option value="library">turboquant-py library (QJL)</option>
+              </select>
+              <span class="form-hint" id="cfg-tq-backend-hint"></span>
+            </div>
+            <div class="form-row" style="max-width:200px">
+              <label class="form-label">Default bits</label>
+              <select id="cfg-tq-bits" class="form-input">
+                <option value="8">8-bit (near-lossless, 3×)</option>
+                <option value="6">6-bit</option>
+                <option value="4">4-bit (6×)</option>
+                <option value="2">2-bit (12×)</option>
+              </select>
+            </div>
+          </div>
+          <span class="form-hint">A request's <code>quantization</code> field (e.g. <code>turbo4</code>) overrides the default bits. With <code>encoding_format:"base64"</code> the response is compact packed bytes; otherwise it returns the lossy reconstruction as floats.</span>
         </div>
       </div>
 
@@ -2268,9 +2320,9 @@ async function refreshLocal(){
 loadGlobalSettings();
 refreshLocal();
 
-// Toggle the acceleration section as image/video model types are checked/unchecked.
+// Toggle the acceleration / TurboQuant sections as model types are checked/unchecked.
 document.querySelectorAll('.cfg-type-cb').forEach(cb =>
-  cb.addEventListener('change', () => _refreshAccelVisibility()));
+  cb.addEventListener('change', () => { _refreshAccelVisibility(); _refreshTurboQuantVisibility(); }));
 
 // ── Deep-link from Studio: /admin/models?tab=search&q=...&pipeline=...&gguf=...
 // ── or: /admin/models?local_cap=CAPABILITY — highlight local models with that capability
@@ -2633,6 +2685,8 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-force-vram-update').checked = !!s.force_vram_update;
   document.getElementById('cfg-gpu-layers').value = s.n_gpu_layers !== undefined ? s.n_gpu_layers : -1;
   document.getElementById('cfg-n-ctx').value = nCtxForEst;
+  document.getElementById('cfg-cache-type-k').value = s.cache_type_k || '';
+  document.getElementById('cfg-cache-type-v').value = s.cache_type_v || '';
   document.getElementById('cfg-max-instances').value = s.max_instances != null ? s.max_instances : 1;
   document.getElementById('cfg-preload-all-instances').checked = !!s.preload_all_instances;
   _updatePreloadAllVisibility();
@@ -2678,6 +2732,7 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-lora-dir').value = s.lora_model_dir || '';
   document.getElementById('cfg-lora-train-base').value = s.lora_train_base_model || '';
   _populateAccel(s.acceleration);
+  _populateTurboQuant(s.turboquant);
   openModal('cfg-modal');
 }
 
@@ -2768,6 +2823,56 @@ function _collectAccel(){
   };
 }
 
+// ---- TurboQuant (embedding vector quantization) ----
+let _tqInfo = null;
+async function _loadTurboQuantInfo(){
+  if (_tqInfo) return _tqInfo;
+  try {
+    const r = await fetch(ROOT_PATH + '/admin/api/turboquant-info');
+    _tqInfo = await r.json();
+  } catch(e){ _tqInfo = {builtin:true, library:false}; }
+  return _tqInfo;
+}
+function _turboQuantApplies(){
+  return [...document.querySelectorAll('.cfg-type-cb:checked')]
+    .some(cb => cb.value === 'embedding_models');
+}
+function _refreshTurboQuantVisibility(){
+  const section = document.getElementById('cfg-turboquant-section');
+  if (section) section.style.display = _turboQuantApplies() ? '' : 'none';
+}
+function onTurboQuantToggle(){
+  const on = document.getElementById('cfg-tq-enabled').checked;
+  document.getElementById('cfg-tq-fields').style.display = on ? '' : 'none';
+}
+async function _populateTurboQuant(t){
+  await _loadTurboQuantInfo();
+  _refreshTurboQuantVisibility();
+  // Reflect library availability in the backend dropdown + hint.
+  const libOpt = document.querySelector('#cfg-tq-backend option[value="library"]');
+  const hint = document.getElementById('cfg-tq-backend-hint');
+  const libOk = !!(_tqInfo && _tqInfo.library);
+  if (libOpt){ libOpt.disabled = !libOk; libOpt.textContent =
+    'turboquant-py library (QJL)' + (libOk ? '' : ' — not installed'); }
+  if (hint) hint.textContent = libOk
+    ? 'turboquant-py detected.'
+    : 'Install "turboquant-py[torch]" to enable the library backend.';
+  t = t || {};
+  document.getElementById('cfg-tq-enabled').checked = !!t.enabled;
+  document.getElementById('cfg-tq-backend').value =
+    (t.backend === 'library' && libOk) ? 'library' : 'builtin';
+  document.getElementById('cfg-tq-bits').value = String(t.bits || 8);
+  onTurboQuantToggle();
+}
+function _collectTurboQuant(){
+  if (!document.getElementById('cfg-tq-enabled').checked) return null;
+  return {
+    enabled: true,
+    backend: document.getElementById('cfg-tq-backend').value || 'builtin',
+    bits: parseInt(document.getElementById('cfg-tq-bits').value) || 8,
+  };
+}
+
 function _updatePreloadAllVisibility() {
   const loadMode = document.getElementById('cfg-load-mode').value;
   const maxInst = parseInt(document.getElementById('cfg-max-instances').value) || 1;
@@ -2834,6 +2939,8 @@ async function saveModelConfig(){
     preload_all_instances: document.getElementById('cfg-preload-all-instances').checked,
     n_gpu_layers:      parseInt(document.getElementById('cfg-gpu-layers').value) || -1,
     n_ctx:             parseInt(document.getElementById('cfg-n-ctx').value) || 2048,
+    cache_type_k:      document.getElementById('cfg-cache-type-k').value || null,
+    cache_type_v:      document.getElementById('cfg-cache-type-v').value || null,
     max_gpu_percent:   isNaN(maxGpu) ? null : maxGpu,
     manual_ram_gb:     isNaN(ramGb) ? null : ramGb,
     load_in_4bit:      document.getElementById('cfg-4bit').checked,
@@ -2866,6 +2973,7 @@ async function saveModelConfig(){
     balanced_gpu_percent: (document.getElementById('cfg-balanced-gpu-pct').value.trim() === ''
                           ? null : parseFloat(document.getElementById('cfg-balanced-gpu-pct').value)),
     acceleration:      _collectAccel(),
+    turboquant:        _collectTurboQuant(),
   };
   try{
     const r = await fetch(ROOT_PATH + '/admin/api/model-configure',{

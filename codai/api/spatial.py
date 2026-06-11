@@ -499,7 +499,7 @@ class ImageTo3DRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-@router.post("/v1/images/to3d")
+@router.post("/v1/images/to3d", summary="Image to 3D model")
 async def image_to_3d(request: ImageTo3DRequest, http_request: Request = None):
     """Convert a 2D image to a 3D representation.
 
@@ -567,7 +567,7 @@ class ImageFrom3DRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-@router.post("/v1/images/from3d")
+@router.post("/v1/images/from3d", summary="Render a 3D model to an image")
 async def image_from_3d(request: ImageFrom3DRequest, http_request: Request = None):
     """Render a 3D model (GLB/OBJ) to a 2D PNG image from a specified camera angle."""
     raw = _decode_b64(request.model_data)
@@ -600,7 +600,7 @@ class VideoTo3DRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-@router.post("/v1/video/to3d")
+@router.post("/v1/video/to3d", summary="Video to 3D model")
 async def video_to_3d(request: VideoTo3DRequest, http_request: Request = None):
     """Convert a 2D video to a 3D video frame-by-frame.
 
@@ -641,7 +641,7 @@ class VideoFrom3DRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-@router.post("/v1/video/from3d")
+@router.post("/v1/video/from3d", summary="Render a 3D model to a video")
 async def video_from_3d(request: VideoFrom3DRequest, http_request: Request = None):
     """Render a 3D model as a 360° turntable video."""
     raw = _decode_b64(request.model_data)
@@ -674,7 +674,7 @@ class Generate3DRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-@router.post("/v1/3d/generate")
+@router.post("/v1/3d/generate", summary="Generate a 3D model from a prompt")
 async def generate_3d(request: Generate3DRequest, http_request: Request = None):
     """Generate a 3D model (GLB) from a text prompt and/or an image.
 

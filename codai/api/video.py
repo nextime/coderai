@@ -45,6 +45,7 @@ from codai.pydantic.videorequest import (
     CharacterDialogLine,
 )
 from codai.api.images import _disable_safety_checker
+from codai.tasks import task_registry, TaskCancelled
 
 router = APIRouter()
 
@@ -627,7 +628,15 @@ def _generate_sdcpp_video(sd_model, request, model_cfg=None):
 
     _vid_progress_reset(steps)
 
+    # sd.cpp runs the whole diffusion in one C call → not interruptible mid-step;
+    # register for visibility + step progress (cancel applies once back in Python).
+    _tid = task_registry.register(
+        "video", title=(prompt or mode or "")[:80],
+        model=getattr(request, 'model', '') or '', total=steps)
+    task_registry.start(_tid)
+
     def _progress_cb(step: int, total: int, elapsed: float):
+        task_registry.step(_tid, step)
         _vid_progress_step(step)
 
     kw = {
@@ -654,8 +663,14 @@ def _generate_sdcpp_video(sd_model, request, model_cfg=None):
         kw['init_image'] = _pil_from_b64(init_src)
         kw['end_image']  = _pil_from_b64(request.end_image)
 
-    frames = sd_model.generate_video(**kw)
+    try:
+        frames = sd_model.generate_video(**kw)
+    except Exception as e:
+        task_registry.finish(_tid, "error", str(e)[:200])
+        _vid_progress_done()
+        raise
     _vid_progress_done()
+    task_registry.finish(_tid, "done")
     return list(frames), fps
 
 
@@ -1483,7 +1498,17 @@ def _generate_video(pipe, request: VideoGenerationRequest):
 
     _vid_progress_reset(kw['num_inference_steps'])
 
+    _tid = task_registry.register(
+        "video", title=(request.prompt or mode or "")[:80],
+        model=getattr(request, 'model', '') or '', total=kw['num_inference_steps'])
+    task_registry.start(_tid)
+
     def _vid_step_cb(pipe, step_index, timestep, callback_kwargs):
+        # Cooperative cancellation: abort at the next step boundary if cancelled.
+        task_registry.raise_if_cancelled(_tid)
+        # Cooperative pause: block here while the user has paused this task.
+        task_registry.wait_if_paused(_tid)
+        task_registry.step(_tid, step_index + 1)
         _vid_progress_step(step_index + 1)
         # Mid-generation thermal checkpoint: pause between denoise steps if the
         # CPU/GPU went over the limit during this (multi-minute) generation.
@@ -1547,8 +1572,17 @@ def _generate_video(pipe, request: VideoGenerationRequest):
     # previous clip's (common within a match) and only swapping when they differ.
     # Left loaded after the run so the next clip with the same set pays nothing.
     _sync_video_loras(pipe, getattr(request, 'loras', None))
-    frames = _run_pipeline(pipe, kw)
+    try:
+        frames = _run_pipeline(pipe, kw)
+    except TaskCancelled:
+        _vid_progress_done()
+        raise  # global handler finishes the task (cancelled) + returns HTTP 499
+    except Exception as e:
+        task_registry.finish(_tid, "error", str(e)[:200])
+        _vid_progress_done()
+        raise
     _vid_progress_done()
+    task_registry.finish(_tid, "done")
     return frames, fps
 
 
@@ -1979,7 +2013,7 @@ def _translate_srt(srt_path: str, target_lang: str, temps: list) -> str:
 # Progress endpoint
 # =============================================================================
 
-@router.get("/v1/video/progress")
+@router.get("/v1/video/progress", summary="Video generation progress")
 async def get_video_progress():
     """Return current video generation step progress including speed."""
     elapsed = time.monotonic() - _vid_progress["started_at"] if _vid_progress["active"] else 0.0
@@ -2000,7 +2034,7 @@ async def get_video_progress():
 # Main generation endpoint
 # =============================================================================
 
-@router.post("/v1/video/generations", response_model=VideoGenerationResponse)
+@router.post("/v1/video/generations", response_model=VideoGenerationResponse, summary="Generate video")
 async def video_generations(request: VideoGenerationRequest,
                              http_request: Request = None):
     """
@@ -2269,7 +2303,7 @@ async def video_generations(request: VideoGenerationRequest,
 # Video upscale endpoint
 # =============================================================================
 
-@router.post("/v1/video/upscale")
+@router.post("/v1/video/upscale", summary="Upscale a video")
 async def video_upscale(request: VideoUpscaleRequest, http_request: Request = None):
     """
     Upscale a video using ffmpeg lanczos or Real-ESRGAN.
@@ -2299,7 +2333,7 @@ async def video_upscale(request: VideoUpscaleRequest, http_request: Request = No
 # Subtitle generation endpoint
 # =============================================================================
 
-@router.post("/v1/video/subtitle")
+@router.post("/v1/video/subtitle", summary="Subtitle / caption a video")
 async def video_subtitle(request: VideoSubtitleRequest, http_request: Request = None):
     """
     Generate subtitles for a video.
@@ -2353,7 +2387,7 @@ async def video_subtitle(request: VideoSubtitleRequest, http_request: Request = 
 # Frame interpolation endpoint
 # =============================================================================
 
-@router.post("/v1/video/interpolate")
+@router.post("/v1/video/interpolate", summary="Interpolate video frames")
 async def video_interpolate(request: VideoInterpolateRequest, http_request: Request = None):
     """
     Increase video FPS via frame interpolation.
@@ -2400,7 +2434,7 @@ async def video_interpolate(request: VideoInterpolateRequest, http_request: Requ
 # Video dubbing endpoint
 # =============================================================================
 
-@router.post("/v1/video/dub")
+@router.post("/v1/video/dub", summary="Dub a video")
 async def video_dub(request: VideoDubRequest, http_request: Request = None):
     """
     Translate and re-dub a video.

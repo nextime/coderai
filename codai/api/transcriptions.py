@@ -119,7 +119,7 @@ def _format_response(fmt: str, text: str, segments: list):
 router = APIRouter()
 
 
-@router.post("/v1/audio/transcriptions")
+@router.post("/v1/audio/transcriptions", summary="Transcribe audio to text")
 async def create_transcription(
     model: str = Form(...),
     file: UploadFile = File(...),

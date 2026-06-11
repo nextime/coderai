@@ -247,4 +247,11 @@ configuration directory (--config DIR, default: OS-specific CoderAI directory). 
         action="store_true",
         help="List available Vulkan GPU devices and exit",
     )
+    parser.add_argument(
+        "--no-resume-jobs",
+        action="store_true",
+        help="Do not resume/recover interrupted LoRA training jobs on restart. "
+             "Mid-flight jobs are marked 'cancelled' (checkpoints are kept, so they "
+             "can still be restarted manually from the Tasks page).",
+    )
     return parser.parse_args()

@@ -166,8 +166,15 @@ class AudioStemRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-@router.post("/v1/audio/stems")
+@router.post("/v1/audio/stems", summary="Separate audio into stems")
 async def separate_stems(request: AudioStemRequest, http_request: Request = None):
+    """Split a track into its component stems (source separation).
+
+    Separates an input clip according to `stem_mode` (e.g. vocals/instrumental, or a
+    full 4-stem split). Uses an ML separation provider when available, falling back to
+    an ffmpeg-based best-effort split when `fallback_mode` is set. Returns one audio
+    output per stem along with the backend and quality tier used.
+    """
     try:
         audio_bytes = _decode_audio(request.audio)
     except Exception as exc:

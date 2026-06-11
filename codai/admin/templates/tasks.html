@@ -1,0 +1,226 @@
+{% extends "base.html" %}
+{% block title %}Tasks — CoderAI{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Tasks</h1>
+    <p>Live view of generations and LoRA training. Cancel, interrupt, or restart a job.</p>
+  </div>
+  <div class="header-actions">
+    <span id="queue-summary" class="dim small"></span>
+  </div>
+</div>
+
+<div id="thermal-banner" style="display:none;margin:0 0 1rem;padding:.6rem .85rem;border-radius:8px;
+     background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.4);color:#f59e0b;font-size:13px">
+  <span style="font-weight:600">❄ Thermal cooldown</span>
+  <span id="thermal-banner-msg" class="mono"></span>
+  — running work is paused until the hardware cools.
+</div>
+
+<!-- Live hardware telemetry -->
+<div id="sys-stats" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+     gap:.75rem;margin:0 0 1.25rem">
+  <div class="sys-tile" id="tile-cpu"></div>
+  <div class="sys-tile" id="tile-gpu"></div>
+  <div class="sys-tile" id="tile-ram"></div>
+  <div class="sys-tile" id="tile-vram"></div>
+</div>
+
+<style>
+.sys-tile{border:1px solid var(--border,#2a2a2a);border-radius:10px;padding:.7rem .85rem;
+  background:var(--card-bg,rgba(255,255,255,.02))}
+.sys-tile .sys-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:.45rem}
+.sys-tile .sys-name{font-size:12px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:var(--text-muted,#9aa0a6)}
+.sys-tile .sys-val{font-size:13px;font-weight:600}
+.sys-tile .sys-sub{font-size:11px;color:var(--text-muted,#9aa0a6);margin-top:.35rem;display:flex;justify-content:space-between}
+.sys-bar{height:8px;border-radius:5px;background:rgba(127,127,127,.18);overflow:hidden}
+.sys-bar > span{display:block;height:100%;border-radius:5px;transition:width .4s ease,background .4s ease}
+.sys-ok > span{background:#22c55e}.sys-warn > span{background:#f59e0b}.sys-hot > span{background:#ef4444}
+.sys-temp-ok{color:#22c55e}.sys-temp-warn{color:#f59e0b}.sys-temp-hot{color:#ef4444}
+</style>
+
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Type</th><th>Name / Model</th><th>Status</th>
+        <th style="width:220px">Progress</th><th>Started</th><th style="text-align:right">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="tasks-body">
+      <tr class="empty-row"><td colspan="6">No tasks yet</td></tr>
+    </tbody>
+  </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function esc(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function fmtTime(s) {
+  if (!s) return '';
+  try {
+    // started_at is unix seconds (float) from the server.
+    const d = new Date(s * 1000);
+    return d.toLocaleTimeString(undefined, {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  } catch { return ''; }
+}
+
+const KIND_LABEL = {training:'Training', image:'Image', video:'Video', audio:'Audio', text:'Text', pipeline:'Pipeline', request:'Request'};
+const STATUS_BADGE = {
+  running:'badge-admin', queued:'badge-user', done:'badge-ok', error:'badge-err',
+  cancelled:'badge-user', interrupted:'badge-warn'
+};
+
+function progressBar(t) {
+  const total = t.total || 0, step = t.step || 0;
+  if (!total) {
+    return t.status === 'running' ? '<span class="dim small">working…</span>' : '<span class="dim small">—</span>';
+  }
+  const pct = Math.max(0, Math.min(100, Math.round(step / total * 100)));
+  return `<div class="progress"><div class="progress-fill" style="width:${pct}%"></div></div>
+          <span class="dim small">${step}/${total} (${pct}%)</span>`;
+}
+
+function actions(t) {
+  const btns = [];
+  if (t.paused) {
+    btns.push(`<button class="btn btn-primary btn-sm" onclick="taskAction('${esc(t.id)}','resume')">Resume</button>`);
+  } else if (t.pausable) {
+    btns.push(`<button class="btn btn-ghost btn-sm" onclick="taskAction('${esc(t.id)}','pause')">Pause</button>`);
+  }
+  if (t.cancellable) {
+    const label = t.status === 'running' ? 'Interrupt' : 'Cancel';
+    const act = t.status === 'running' ? 'interrupt' : 'cancel';
+    btns.push(`<button class="btn btn-danger btn-sm" onclick="taskAction('${esc(t.id)}','${act}')">${label}</button>`);
+  }
+  if (t.restartable) {
+    btns.push(`<button class="btn btn-ghost btn-sm" onclick="taskAction('${esc(t.id)}','restart')">Restart</button>`);
+  }
+  if (!t.active) {
+    btns.push(`<button class="btn btn-ghost btn-sm" onclick="removeTask('${esc(t.id)}')">Remove</button>`);
+  }
+  return btns.join(' ') || '<span class="dim small">—</span>';
+}
+
+// ---- Live hardware telemetry ----
+function _utilClass(pct){ return pct == null ? 'sys-ok' : (pct >= 90 ? 'sys-hot' : pct >= 70 ? 'sys-warn' : 'sys-ok'); }
+function _tempClass(t){ return t == null ? '' : (t >= 90 ? 'sys-temp-hot' : t >= 80 ? 'sys-temp-warn' : 'sys-temp-ok'); }
+function _bar(pct){
+  const p = pct == null ? 0 : Math.max(0, Math.min(100, pct));
+  return `<div class="sys-bar ${_utilClass(pct)}"><span style="width:${p}%"></span></div>`;
+}
+function _utilTile(name, pct, temp){
+  const valTxt = pct == null ? 'n/a' : `${Math.round(pct)}%`;
+  const tempTxt = temp == null ? '<span class="dim">temp n/a</span>'
+    : `<span class="${_tempClass(temp)}">${Math.round(temp)}°C</span>`;
+  return `<div class="sys-head"><span class="sys-name">${name}</span><span class="sys-val">${valTxt}</span></div>`
+    + _bar(pct) + `<div class="sys-sub"><span>utilization</span>${tempTxt}</div>`;
+}
+function _memTile(name, used, total, pct){
+  const valTxt = (used == null || total == null) ? 'n/a' : `${used.toFixed(1)} / ${total.toFixed(1)} GB`;
+  const p = pct != null ? pct : (used != null && total ? used/total*100 : null);
+  return `<div class="sys-head"><span class="sys-name">${name}</span><span class="sys-val">${valTxt}</span></div>`
+    + _bar(p) + `<div class="sys-sub"><span>${p == null ? '' : Math.round(p)+'% used'}</span><span></span></div>`;
+}
+async function loadSystemStats(){
+  try {
+    const s = await fetch(ROOT_PATH + '/admin/api/system-stats').then(r => r.json());
+    const cpu = s.cpu || {}, gpu = s.gpu || {}, ram = s.ram || {}, vram = s.vram || {};
+    document.getElementById('tile-cpu').innerHTML = _utilTile('CPU', cpu.util, cpu.temp);
+    document.getElementById('tile-gpu').innerHTML = _utilTile('GPU', gpu.util, gpu.temp);
+    document.getElementById('tile-ram').innerHTML = _memTile('RAM', ram.used, ram.total, ram.percent);
+    document.getElementById('tile-vram').innerHTML =
+      _memTile('VRAM', vram.used, vram.total, vram.percent);
+  } catch(e){ /* keep last render on transient errors */ }
+}
+
+let _refreshing = false;
+async function loadTasks() {
+  if (_refreshing) return;
+  _refreshing = true;
+  try {
+    const data = await fetch(ROOT_PATH + '/admin/api/tasks').then(r => r.json());
+    const tasks = data.tasks || [];
+    const q = data.queue || {};
+    document.getElementById('queue-summary').textContent =
+      `${q.active || 0} active · ${q.waiting || 0} waiting · max ${q.max_parallel_requests || 0} parallel`;
+
+    const therm = data.thermal || {};
+    const banner = document.getElementById('thermal-banner');
+    if (therm.active) {
+      document.getElementById('thermal-banner-msg').textContent = ' ' + (therm.message || '');
+      banner.style.display = '';
+    } else {
+      banner.style.display = 'none';
+    }
+
+    const tbody = document.getElementById('tasks-body');
+    if (!tasks.length) {
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="6">No tasks yet</td></tr>';
+      return;
+    }
+    tbody.innerHTML = tasks.map(t => {
+      const badge = STATUS_BADGE[t.status] || 'badge-dim';
+      const title = t.title || '(untitled)';
+      let statusCell;
+      if (t.cooling) {
+        statusCell = `<span class="badge badge-warn">❄ Cooling down</span>`
+          + `<div class="dim small">${esc(t.cooling_message || 'paused for thermal cooldown')}</div>`;
+      } else if (t.paused) {
+        statusCell = `<span class="badge badge-warn">⏸ Paused</span>`
+          + `<div class="dim small">suspended — click Resume to continue</div>`;
+      } else {
+        statusCell = `<span class="badge ${badge}">${esc(t.status)}</span>`
+          + (t.message ? `<div class="dim small">${esc(t.message)}</div>` : '');
+      }
+      return `<tr>
+        <td><span class="badge badge-user">${esc(KIND_LABEL[t.kind] || t.kind)}</span></td>
+        <td><div class="td-name">${esc(title)}</div><div class="dim small mono">${esc(t.model || '')}</div></td>
+        <td>${statusCell}</td>
+        <td>${progressBar(t)}</td>
+        <td class="dim small">${fmtTime(t.started_at)}</td>
+        <td style="text-align:right">${actions(t)}</td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    // transient fetch errors during a model swap are fine; keep last render.
+  } finally {
+    _refreshing = false;
+  }
+}
+
+async function taskAction(id, action) {
+  const verb = {cancel:'Cancel', interrupt:'Interrupt', restart:'Restart', pause:'Pause', resume:'Resume'}[action] || action;
+  // Only confirm destructive actions; pause/resume/restart act immediately.
+  if ((action === 'cancel' || action === 'interrupt') && !confirm(`${verb} this task?`)) return;
+  try {
+    const r = await fetch(ROOT_PATH + '/admin/api/tasks/' + encodeURIComponent(id) + '/' + action, {method:'POST'});
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      alert(e.detail || (verb + ' failed'));
+    }
+  } catch (e) { alert(e.message); }
+  loadTasks();
+}
+
+async function removeTask(id) {
+  try {
+    const r = await fetch(ROOT_PATH + '/admin/api/tasks/' + encodeURIComponent(id), {method:'DELETE'});
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      alert(e.detail || 'Remove failed');
+    }
+  } catch (e) { alert(e.message); }
+  loadTasks();
+}
+
+loadTasks();
+loadSystemStats();
+setInterval(loadTasks, 2000);
+setInterval(loadSystemStats, 2000);
+</script>
+{% endblock %}

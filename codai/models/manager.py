@@ -790,6 +790,17 @@ class MultiModelManager:
                 # build_kwargs_from_config populates it from the model's
                 # 'flash_attention' setting; CLI/global is NOT consulted here.
                 kwargs['flash_attn'] = bool(config.get('flash_attn', False))
+                # KV-cache quantization (llama.cpp type_k/type_v) — pass through
+                # to the backend, with the raw models.json entry as a fallback.
+                _raw = config.get('_raw_cfg') if isinstance(config.get('_raw_cfg'), dict) else {}
+                for _kvk in ('cache_type_k', 'cache_type_v'):
+                    _kvv = config.get(_kvk)
+                    if _kvv is None:
+                        _kvv = _raw.get(_kvk)
+                    if _kvv:
+                        kwargs[_kvk] = _kvv
+                if _raw and '_raw_cfg' not in kwargs:
+                    kwargs['_raw_cfg'] = _raw
                 no_ram = _cfg_or_global('no_ram', 'no_ram', False)
                 kwargs['no_ram'] = bool(no_ram)
                 offload_strategy = _cfg_or_global('offload_strategy', 'offload_strategy', 'auto')
@@ -872,6 +883,17 @@ class MultiModelManager:
                 # build_kwargs_from_config populates it from the model's
                 # 'flash_attention' setting; CLI/global is NOT consulted here.
                 kwargs['flash_attn'] = bool(config.get('flash_attn', False))
+                # KV-cache quantization (llama.cpp type_k/type_v) — pass through
+                # to the backend, with the raw models.json entry as a fallback.
+                _raw = config.get('_raw_cfg') if isinstance(config.get('_raw_cfg'), dict) else {}
+                for _kvk in ('cache_type_k', 'cache_type_v'):
+                    _kvv = config.get(_kvk)
+                    if _kvv is None:
+                        _kvv = _raw.get(_kvk)
+                    if _kvv:
+                        kwargs[_kvk] = _kvv
+                if _raw and '_raw_cfg' not in kwargs:
+                    kwargs['_raw_cfg'] = _raw
                 no_ram = _cfg_or_global('no_ram', 'no_ram', False)
                 kwargs['no_ram'] = bool(no_ram)
                 offload_strategy = _cfg_or_global('offload_strategy', 'offload_strategy', 'auto')
