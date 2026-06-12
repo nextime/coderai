@@ -1134,6 +1134,45 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
                     _clear_mem()
             return None
 
+        def _load_group_offload():
+            """Block-level group offloading with CUDA-stream prefetch: keeps only a
+            few transformer blocks resident and overlaps the next block's CPU→GPU
+            copy with compute, so it's much faster than sequential at similar VRAM.
+            Applied per heavy component; the small VAE stays resident for decode.
+            Assigns the outer `pipe`. Raises on OOM / if nothing could be offloaded."""
+            nonlocal pipe
+            from diffusers.hooks import apply_group_offloading
+            _mem_snapshot("before group offload load")
+            print("  Video load strategy: group offload + stream "
+                  "(block-level GPU↔CPU with prefetch)")
+            pipe = PClass.from_pretrained(**_with_quant(dict(
+                pretrained_model_name_or_path=model_name,
+                torch_dtype=torch_dtype, low_cpu_mem_usage=True)))
+            _onload, _offl = torch.device('cuda'), torch.device('cpu')
+            _applied = []
+            for _cn in ('transformer', 'transformer_2', 'text_encoder', 'text_encoder_2'):
+                _comp = getattr(pipe, _cn, None)
+                if _comp is None or not hasattr(_comp, 'parameters'):
+                    continue
+                try:
+                    apply_group_offloading(
+                        _comp, onload_device=_onload, offload_device=_offl,
+                        offload_type='block_level', num_blocks_per_group=1,
+                        use_stream=True, low_cpu_mem_usage=True)
+                    _applied.append(_cn)
+                except Exception as _ge:
+                    print(f"  [group-offload] {_cn} not offloaded ({_ge})")
+            if not _applied:
+                raise RuntimeError("group offloading applied to no components "
+                                   "(incompatible — e.g. bitsandbytes-quantized weights)")
+            try:
+                if getattr(pipe, 'vae', None) is not None:
+                    pipe.vae.to(_onload)
+            except Exception:
+                pass
+            _report_loaded(pipe, f"group offload + stream ({','.join(_applied)})")
+            return pipe
+
         def _load_sequential():
             """Most aggressive fit: stream each submodule GPU↔CPU during the
             forward pass (slowest, lowest VRAM). Assigns the outer `pipe`. Raises
@@ -1148,6 +1187,26 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
             pipe.enable_sequential_cpu_offload()
             _report_loaded(pipe, "sequential CPU offload")
             return pipe
+
+        def _try_group_then_sequential():
+            """Group offload (stream), then sequential CPU offload on OOM/incompat.
+            Returns the pipe, or None (caller falls through to disk offload)."""
+            try:
+                return _load_group_offload()
+            except (RuntimeError, MemoryError) as _e:
+                if not _is_oom(_e) and 'no components' not in str(_e):
+                    raise
+                print(f"  Video: group offload unavailable/OOM ({str(_e).splitlines()[0]}) "
+                      f"— trying sequential CPU offload…")
+                _clear_mem()
+            try:
+                return _load_sequential()
+            except (RuntimeError, MemoryError) as _e:
+                if not _is_oom(_e):
+                    raise
+                print(f"  Video: sequential CPU offload OOM ({_e}) — trying disk offload…")
+                _clear_mem()
+            return None
 
         def _try_balanced_then_sequential():
             """Balanced chain (configured% → 60 → 40), then sequential CPU offload
@@ -1174,7 +1233,7 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
             # Even sequential OOM'd → continue to the disk-offload attempts.
 
         # ── Attempt 0: full GPU ──────────────────────────────────────────────
-        if offload not in ('model', 'sequential', 'disk', 'balanced'):
+        if offload not in ('model', 'group', 'sequential', 'disk', 'balanced'):
             _mem_snapshot("before full-GPU load")
             _q = " + quantized" if _quant_config is not None else ""
             print(f"  Video load strategy: full GPU ({torch_dtype}{_q})")
@@ -1198,19 +1257,15 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
             except (RuntimeError, MemoryError) as e:
                 if not _is_oom(e):
                     raise
-                print(f"  Video: full-GPU OOM ({e}) — falling back to balanced "
-                      f"GPU+CPU (starting at {_gpu_pct:.0f}% GPU)…")
-                _clear_mem()
-                # Graceful degrade: balanced at the configured %, then 60%, then
-                # 40%, then sequential CPU offload, before the slower disk paths.
-                pipe = _try_balanced_then_sequential()
-                if pipe is not None:
-                    return pipe
-                print("  Video: balanced + sequential all OOM — trying disk offload…")
+                # Auto degrade: prefer model CPU offload (only the active expert
+                # resident — near full-GPU speed and fits this two-expert model),
+                # then group offload + stream, then sequential, then disk. Balanced
+                # is reserved for an explicit offload_strategy=balanced.
+                print(f"  Video: full-GPU OOM ({e}) — trying model CPU offload…")
                 _clear_mem()
 
         # ── Attempt 1: model CPU offload ─────────────────────────────────────
-        if offload not in ('sequential', 'disk'):
+        if offload not in ('group', 'sequential', 'disk'):
             _mem_snapshot("before model-CPU-offload load")
             print(f"  Video load strategy: model CPU offload"
                   f" (each module GPU↔CPU during forward pass)")
@@ -1226,8 +1281,27 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
                 if not _is_oom(e):
                     raise
                 print(f"  Video: model CPU offload OOM ({e})"
-                      f" — trying GPU+CPU+disk offload…")
+                      f" — trying group offload + stream…")
                 _clear_mem()
+
+        # ── Attempt 1.5: group offload + stream → sequential ─────────────────
+        # Block-level offloading with CUDA-stream prefetch: lowest VRAM after
+        # sequential but hides the transfer behind compute. Runs for auto (after
+        # model offload) and for an explicit offload_strategy=group; on OOM or
+        # incompatibility (e.g. bitsandbytes weights) it drops to sequential.
+        if offload == 'sequential':
+            try:
+                return _load_sequential()
+            except (RuntimeError, MemoryError) as e:
+                if not _is_oom(e):
+                    raise
+                print(f"  Video: sequential CPU offload OOM ({e}) — trying disk offload…")
+                _clear_mem()
+        elif offload != 'disk':
+            pipe = _try_group_then_sequential()
+            if pipe is not None:
+                return pipe
+            _clear_mem()
 
         # ── Attempt 2: GPU + CPU + disk offload via device_map='auto' ──────────
         os.makedirs(_offload_dir, exist_ok=True)
@@ -1417,9 +1491,26 @@ def _apply_character_refs(kw: dict, character_references: List[str], strength: f
 
 
 def _unload_video_loras(pipe):
-    """Remove any LoRA adapters so a cached pipeline is clean for the next request."""
+    """Remove per-request LoRA adapters so a cached pipeline is clean for the next
+    request — but PRESERVE the acceleration/distill adapters (Lightning), which are
+    kept as permanent runtime adapters (never fused) and must survive every swap.
+    """
+    accel = set(getattr(pipe, '_coderai_accel_adapters', []) or [])
     try:
-        if hasattr(pipe, 'unload_lora_weights'):
+        if accel:
+            # Delete only the per-request adapters; keep the accel ones, then
+            # re-activate accel alone so the pipe is in a clean accel-only state.
+            present = _present_adapters(pipe)
+            to_delete = [a for a in present if a not in accel]
+            if to_delete and hasattr(pipe, 'delete_adapters'):
+                pipe.delete_adapters(to_delete)
+            try:
+                pipe.set_adapters(
+                    list(accel),
+                    [getattr(pipe, '_coderai_accel_weight', 1.0)] * len(accel))
+            except Exception:
+                pass
+        elif hasattr(pipe, 'unload_lora_weights'):
             pipe.unload_lora_weights()
     except Exception as e:
         print(f"  [video][lora] unload failed: {e}")
@@ -1530,10 +1621,19 @@ def _sync_video_loras(pipe, loras) -> None:
         _unload_video_loras(pipe)
         pipe._coderai_active_loras = desired  # _unload reset it; restore for dedup
         return
+    # Always re-include the acceleration/distill adapters (kept as runtime
+    # adapters, never fused) alongside the per-request LoRAs — otherwise this
+    # set_adapters would deactivate the distill LoRA and the 4-step preset would
+    # collapse the clip to a solid colour.
+    _accel = list(getattr(pipe, '_coderai_accel_adapters', []) or [])
+    _accel_w = getattr(pipe, '_coderai_accel_weight', 1.0)
+    _names = _accel + [n for n, _ in loaded]
+    _weights = [_accel_w] * len(_accel) + [w for _, w in loaded]
     try:
-        pipe.set_adapters([n for n, _ in loaded], [w for _, w in loaded])
+        pipe.set_adapters(_names, _weights)
         print(f"  [video][lora] applied: {[n for n, _ in loaded]} "
-              f"weights={[w for _, w in loaded]}")
+              f"weights={[w for _, w in loaded]}"
+              + (f" (+ accel {_accel})" if _accel else ""))
     except Exception as e:
         print(f"  [video][lora] could not activate LoRA weights: {e}")
         _unload_video_loras(pipe)
@@ -2300,19 +2400,27 @@ async def video_generations(request: VideoGenerationRequest,
 
     if pipe is None:
         _offload = _model_cfg.get('offload_strategy') or None
-        # 'auto' (the default) means "let coderai pick from available VRAM" — it is
-        # NOT a diffusers strategy, and passing it through lands on the full-GPU
-        # path that then disk-thrashes. Normalise it to None so the VRAM check
-        # below decides between full-GPU and balanced GPU+CPU.
-        if _offload == 'auto':
+        # Two auto modes (neither is a diffusers strategy — both are normalised to
+        # None so the VRAM check below picks the concrete strategy):
+        #   * 'auto' — when the peak footprint exceeds free VRAM, go STRAIGHT to
+        #     `model` CPU offload (no full-GPU gamble).
+        #   * 'auto-borderline' — same, EXCEPT when the model only marginally
+        #     overshoots (within _BORDERLINE_GB), try full-GPU first to keep both
+        #     experts resident and actually use the free VRAM; it falls back to
+        #     model offload on OOM. Best when the estimate is conservative and the
+        #     model very likely fits.
+        _auto_borderline = (_offload == 'auto-borderline')
+        if _offload in ('auto', 'auto-borderline'):
             _offload = None
-        # Auto-select "balanced" strategy when the model (including runtime
-        # reserve: KV/activation spike, VAE decode) exceeds available VRAM even
-        # after eviction. Going straight to "balanced" (GPU-first + CPU spill)
-        # avoids the expensive OOM → free → reload cycle that wastes ~1 hr of
-        # shard reloading only to end up at the same place. The GPU cap is 80%
-        # of free VRAM (or the per-model balanced_gpu_percent if configured) so
-        # we leave breathing room for activations and the decode spike.
+        # Auto-select the strategy from how the model's PEAK footprint compares
+        # to free VRAM after eviction:
+        #   * peak fits  → full GPU (fastest).
+        #   * peak doesn't fit → `model` CPU offload directly (active component on
+        #     GPU, inactive ones on CPU — near full-GPU speed). We do NOT gamble on
+        #     a full-GPU load that OOMs at the decode/activation peak only to fall
+        #     back anyway, and we do NOT jump to the slow balanced+disk path.
+        #     `_load_video_pipeline`'s ladder still escalates model → group →
+        #     sequential → disk if even model offload can't fit (truly huge model).
         if _offload is None:
             try:
                 import torch as _t
@@ -2322,27 +2430,29 @@ async def video_generations(request: VideoGenerationRequest,
                     # `_get_model_used_vram_gb` is the *measured total* footprint —
                     # it already includes the runtime/activation reserve AND the
                     # fused acceleration LoRA (it's measured after fusion). So do
-                    # NOT re-add those (that over-counts and wrongly forces the
-                    # slow balanced+disk path). Per-request LoRAs are extra.
+                    # NOT re-add those. Per-request LoRAs are extra.
                     _base_gb = multi_model_manager._get_model_used_vram_gb(
                         model_key, model_name)
-                    # full-GPU only needs the WEIGHTS to fit at load time (the
-                    # bundled ~runtime reserve is a gen-time allowance, and the
-                    # full-GPU path has its own OOM→offload fallback). Keep a
-                    # headroom margin so a model that *marginally* fits uses the
-                    # much faster full-GPU strategy rather than balanced+disk.
                     _need_gb = _base_gb + _lora_extra_gb
-                    _margin = 2.5  # ≈ the bundled runtime reserve
-                    if _base_gb > 0 and _free_gb < (_need_gb - _margin):
-                        _gpu_pct = float(_model_cfg.get('balanced_gpu_percent') or 80)
-                        print(f"  VRAM well short for full-GPU load "
-                              f"({_need_gb:.1f} GB measured need + LoRA; "
-                              f"{_free_gb:.1f} GB free) — auto-selecting balanced "
-                              f"strategy ({_gpu_pct:.0f}% GPU + CPU spill)")
-                        _offload = 'balanced'
-                    else:
+                    _BORDERLINE_GB = 3.0  # how far over free VRAM still counts as "borderline"
+                    _over_gb = _need_gb - _free_gb
+                    if _base_gb > 0 and _free_gb < _need_gb:
+                        if _auto_borderline and _over_gb <= _BORDERLINE_GB:
+                            # Marginal overshoot + the estimate is conservative → try
+                            # full-GPU first (keeps both experts resident, uses the
+                            # free VRAM). Leaving _offload=None routes to the loader's
+                            # full-GPU attempt, which falls back to model offload on OOM.
+                            print(f"  Peak VRAM need {_need_gb:.1f} GB marginally over "
+                                  f"{_free_gb:.1f} GB free (+{_over_gb:.1f} GB, borderline) "
+                                  f"— trying full GPU first (falls back to model offload on OOM)")
+                        else:
+                            print(f"  Peak VRAM need {_need_gb:.1f} GB > {_free_gb:.1f} GB "
+                                  f"free — auto-selecting `model` CPU offload "
+                                  f"(active component on GPU, near full-GPU speed)")
+                            _offload = 'model'
+                    elif _base_gb > 0:
                         print(f"  Full-GPU load looks viable "
-                              f"({_need_gb:.1f} GB measured need, {_free_gb:.1f} GB "
+                              f"({_need_gb:.1f} GB peak need, {_free_gb:.1f} GB "
                               f"free) — using full GPU (it falls back to offload on OOM)")
             except Exception:
                 pass

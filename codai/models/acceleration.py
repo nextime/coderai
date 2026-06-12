@@ -325,32 +325,31 @@ def apply_accel_to_pipeline(pipe, accel: Optional[dict]) -> None:
             raise RuntimeError("no distill adapter registered on the pipeline")
         try:
             pipe.set_adapters(loaded_adapters, [weight] * len(loaded_adapters))
+        except Exception as e:
+            log.warning("[accel] could not activate distill adapters %s: %s",
+                        loaded_adapters, e)
+        # Keep the distill LoRA(s) as ACTIVE RUNTIME ADAPTERS rather than fusing.
+        #
+        # Fusing merges the adapter into the base weights. For a bitsandbytes 4-bit
+        # model under CPU/disk offload the weights live on the CPU, so fuse_lora has
+        # to dequantize → merge → requantize every Linear on the CPU — minutes-to-
+        # hours per 14B expert, which looks exactly like a hang (high CPU, empty
+        # VRAM, no progress). Runtime adapters instead apply at forward time on
+        # whichever device the module is currently on (the GPU during the pass), at
+        # negligible cost, and `set_adapters` natively covers transformer_2 — so the
+        # low-noise expert is distilled too (the old fuse path needed an explicit
+        # components=[...,"transformer_2"] or it collapsed to a solid colour).
+        #
+        # `_sync_video_loras` preserves these accel adapters across per-request LoRA
+        # swaps and re-includes them in every set_adapters call.
+        pipe._coderai_accel_adapters = list(loaded_adapters)
+        pipe._coderai_accel_weight = weight
+        try:
+            pipe._coderai_accel_fused = True  # accel is effective (distilled preset applies)
         except Exception:
             pass
-        # Bake them in, then drop the adapter handles so per-request LoRAs are clean.
-        # CRITICAL: diffusers' Wan fuse_lora defaults to components=["transformer"],
-        # so without naming transformer_2 the low-noise expert's distill adapter is
-        # never fused — and the subsequent unload strips it off, leaving that expert
-        # undistilled. At 4 steps that collapses the clip to a solid colour. Fuse
-        # BOTH experts explicitly.
-        _fuse_components = ["transformer"]
-        if has_t2:
-            _fuse_components.append("transformer_2")
-        try:
-            pipe.fuse_lora(components=_fuse_components, lora_scale=weight)
-        except TypeError:
-            # Older diffusers without the `components` kwarg — best effort.
-            pipe.fuse_lora(lora_scale=weight)
-        try:
-            pipe.unload_lora_weights()
-        except Exception:
-            pass
-        try:
-            pipe._coderai_accel_fused = True
-        except Exception:
-            pass
-        log.info("[accel] fused distillation LoRA(s) %s (weight=%s) into %s%s",
-                 loaded_adapters, weight, type(pipe).__name__,
+        log.info("[accel] activated distillation LoRA(s) %s (weight=%s, runtime adapters) "
+                 "on %s%s", loaded_adapters, weight, type(pipe).__name__,
                  " (both experts)" if len(loaded_adapters) > 1 else "")
     except Exception as e:
         log.warning("[accel] failed to fuse acceleration LoRA (high=%s low=%s): %s "

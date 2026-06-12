@@ -671,15 +671,17 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <div class="form-row" style="margin:0">
           <label class="form-label">Strategy</label>
           <select id="cfg-offload-strategy" class="form-input">
-            <option value="auto">Auto (pick from free VRAM)</option>
+            <option value="auto">Auto (over-VRAM → straight to model offload)</option>
+            <option value="auto-borderline">Auto borderline-aware (try full-GPU if marginally over)</option>
             <option value="none">None (GPU only)</option>
+            <option value="model">CPU offload (model — active component on GPU)</option>
+            <option value="group">Group offload + stream (block-level, prefetched)</option>
             <option value="balanced">Balanced (fill GPU, spill to CPU → disk)</option>
-            <option value="model">CPU offload (model — module-by-module)</option>
             <option value="sequential">CPU offload (sequential — most aggressive)</option>
             <option value="cpu">CPU RAM (legacy)</option>
             <option value="disk">Disk</option>
           </select>
-          <span class="form-hint">Auto picks full-GPU when the weights fit, else Balanced. Pick <b>Balanced</b> + lower the GPU % below for a model that's just over VRAM; <b>model</b>/<b>sequential</b> keep less on GPU (slower, but the safest fit).</span>
+          <span class="form-hint"><b>Auto</b> goes straight to <b>model</b> offload when the model's peak exceeds free VRAM (no full-GPU gamble). <b>Auto borderline-aware</b> is the same, except when the model only marginally overshoots (≤3 GB) it tries full-GPU first to keep both experts resident and use the free VRAM, falling back to model offload on OOM. <b>model</b> keeps only the active component on GPU (best for two-expert Wan2.2 — near full-GPU speed). <b>group</b> streams blocks with prefetch (lowest VRAM, fast; incompatible with bitsandbytes 4-bit → falls back to sequential). <b>balanced</b> fills GPU to the % below then spills.</span>
         </div>
         <div class="form-row" style="margin:0">
           <label class="form-label">Offload directory</label>

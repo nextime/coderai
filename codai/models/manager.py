@@ -1892,26 +1892,62 @@ class MultiModelManager:
         return 1.0
 
     def _effective_quant_multiplier(self, cfg: dict,
-                                    load_in_4bit: bool, load_in_8bit: bool) -> float:
+                                    load_in_4bit: bool, load_in_8bit: bool,
+                                    model_key: str = None,
+                                    resolved_name: str = None) -> float:
         """Fraction of full-precision weight size that stays resident.
 
-        Per-component quantization wins when present: the big weight-bearing
-        components (transformer(s), unet, text encoders) dominate, so we assume
-        the quantized components carry ~80 % of the weight and the rest (VAE,
-        etc.) stays dense. Falls back to the global 4/8-bit flags.
+        When per-component quantization is configured AND the model's real
+        per-component parameter shares can be scanned from disk, weight each
+        component's quant divisor by its ACTUAL share of the parameters — so a
+        pipeline that is e.g. 99 % 4-bit (Wan2.2: two 14B experts + text encoder
+        quantized, only a 0.13B VAE dense) is estimated at ~0.28× rather than the
+        blunt 0.475× a fixed 70/30 split would give (which inflated 25.8 GB →
+        42.7 GB and forced needless offload). Falls back to a fixed-share
+        heuristic, then to the global 4/8-bit flags.
         """
         comp_q = cfg.get("component_quantization") or {}
+
+        def _comp_divisor(name: str) -> float:
+            # VAEs are conv-only → bitsandbytes/quanto can't quantize them; they
+            # stay dense regardless of what the config asks for.
+            low = str(name).lower()
+            if low == 'vae' or low.endswith('_vae') or low.startswith('vae'):
+                return 1.0
+            if name in comp_q:
+                return self._quant_divisor(comp_q[name])
+            if load_in_4bit:
+                return 4.0
+            if load_in_8bit:
+                return 2.0
+            return 1.0
+
+        # --- Preferred: weight by real per-component parameter shares ---
+        shares = {}
+        if comp_q and model_key:
+            try:
+                shares = self._component_param_shares(model_key, resolved_name, cfg)
+            except Exception:
+                shares = {}
+        if shares:
+            total = sum(shares.values())
+            if total > 0:
+                mult = 0.0
+                for comp, numel in shares.items():
+                    div = _comp_divisor(comp)
+                    eff = (1.0 / div) if div > 1.0 else 1.0
+                    mult += (numel / total) * eff
+                # bitsandbytes keeps fp32 absmax + scale tensors and fp16 compute
+                # buffers alongside the packed 4-bit weights (~+12 %).
+                return mult * 1.12
+
         divisors = [self._quant_divisor(v) for v in comp_q.values()]
         divisors = [d for d in divisors if d > 1.0]
         if divisors:
             avg_div = sum(divisors) / len(divisors)
-            # Lean slightly HIGH: assume ~70 % of the footprint is shrunk by
-            # quantization and ~30 % (VAE, embeddings, fp16 compute buffers,
-            # bitsandbytes scale/absmax tensors) stays dense. Better to slightly
-            # over-estimate and evict enough than to under-estimate and OOM —
-            # but not so high it exceeds the card and forces needless offload.
-            # (e.g. all-4bit → ~0.475× raw, ×1.15 overhead ≈ 0.55× → ~+10% over
-            # the measured resident size.)
+            # No per-component scan available: assume ~70 % of the footprint is
+            # shrunk by quantization and ~30 % (VAE, embeddings, fp16 compute
+            # buffers, bitsandbytes scale/absmax tensors) stays dense.
             quantized_share = 0.7
             return quantized_share / avg_div + (1.0 - quantized_share)
         if load_in_4bit:
@@ -2041,6 +2077,80 @@ class MultiModelManager:
 
         self._storage_dtype_cache[ck] = result
         return result
+
+    # component (top-level subfolder) -> total params, per model. Cached.
+    _component_shares_cache: Dict[str, Dict[str, int]] = {}
+
+    def _component_param_shares(self, model_key: str, resolved_name: str,
+                                cfg: dict) -> Dict[str, int]:
+        """Map each pipeline component → its parameter count (numel).
+
+        Groups every ``.safetensors`` file by its TOP-LEVEL subfolder name
+        (``transformer``, ``transformer_2``, ``text_encoder``, ``vae`` …) — i.e.
+        the diffusers component layout — and sums the parameters per component.
+        Used to weight the effective quantization multiplier by each component's
+        real share of the model, so a pipeline that is 99 % quantized isn't
+        treated as if 30 % stays dense. Returns {} when it can't be determined.
+        """
+        ck = resolved_name or model_key
+        cached = self._component_shares_cache.get(ck)
+        if cached is not None:
+            return cached
+
+        import os
+        shares: Dict[str, int] = {}
+        candidates = []
+        for v in (resolved_name, cfg.get('path'), cfg.get('model_path'), cfg.get('model')):
+            if v and isinstance(v, str):
+                candidates.append(v)
+
+        def _record(root_dir: str, file_path: str):
+            rel = os.path.relpath(file_path, root_dir)
+            comp = rel.split(os.sep)[0]
+            # Files at the pipeline root (no subfolder) → bucket as 'root'.
+            if comp.endswith('.safetensors'):
+                comp = 'root'
+            numel, _ = self._safetensors_numel_bytes(os.path.realpath(file_path))
+            if numel > 0:
+                shares[comp] = shares.get(comp, 0) + numel
+
+        try:
+            scanned = False
+            for c in candidates:
+                if os.path.isdir(c):
+                    for r, _, files in os.walk(c):
+                        for fn in files:
+                            if fn.endswith('.safetensors'):
+                                _record(c, os.path.join(r, fn))
+                    scanned = True
+                    break
+            if not scanned:
+                from huggingface_hub import scan_cache_dir
+                from codai.models.cache import get_all_cache_dirs, is_huggingface_model_id
+                hf_dir = get_all_cache_dirs().get("huggingface")
+                for c in candidates:
+                    repo_id = c.split(":", 1)[1] if ":" in c else c
+                    if not (hf_dir and is_huggingface_model_id(repo_id)):
+                        continue
+                    info = scan_cache_dir(hf_dir)
+                    for repo in info.repos:
+                        if repo.repo_id != repo_id:
+                            continue
+                        revs = sorted(repo.revisions,
+                                      key=lambda rv: rv.last_modified, reverse=True)
+                        if revs:
+                            snap = str(revs[0].snapshot_path)
+                            for fobj in revs[0].files:
+                                fp = str(fobj.file_path)
+                                if fp.endswith('.safetensors'):
+                                    _record(snap, fp)
+                    if shares:
+                        break
+        except Exception:
+            shares = {}
+
+        self._component_shares_cache[ck] = shares
+        return shares
 
     @staticmethod
     def _load_bytes_per_elem(cfg: dict) -> float:
@@ -2189,7 +2299,7 @@ class MultiModelManager:
         # diffusion pipeline whose transformer/text_encoder are 4-bit isn't
         # wildly over-estimated at full precision.
         quant_mult = self._effective_quant_multiplier(
-            cfg, load_in_4bit, load_in_8bit)
+            cfg, load_in_4bit, load_in_8bit, model_key, resolved_name)
 
         # Precision normalization: used_vram_gb / disk-scan baselines are STORAGE
         # sizes at the on-disk dtype (e.g. Wan2.2 ships fp32 → 4 bytes/elem), but
