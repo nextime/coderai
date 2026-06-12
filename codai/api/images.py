@@ -1370,7 +1370,14 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
         is_gguf = _is_gguf_model(model_name)
         diffusers_error = None
         sdcpp_error = None
-        
+
+        # Show the load as a (non-cancellable) Tasks-page entry spanning both
+        # backend attempts; finished done on success, error only if all fail.
+        from codai.tasks import task_registry as _treg
+        _ltid = _treg.register("loading", title=f"Loading {model_name}",
+                               model=model_key, status="running",
+                               cancellable=False, pausable=False)
+
         # Try diffusers first (for non-GGUF models)
         if not is_gguf:
             try:
@@ -1391,6 +1398,7 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                         pass
                     print(f"Loaded diffusers model: {model_name}")
 
+                    _treg.finish(_ltid, "done")
                     return await _generate_with_diffusers(pipeline, request, global_args, http_request)
                     
             except ImportError as e:
@@ -1426,7 +1434,8 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                     except Exception:
                         pass
                     print(f"Loaded sd.cpp model: {model_name}")
-                    
+
+                    _treg.finish(_ltid, "done")
                     return await _generate_with_sdcpp(sd_model, request, global_args,
                                                       http_request, model_config=cfg)
             else:
@@ -1449,6 +1458,7 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
         if sdcpp_error:
             error_details.append(f"sd.cpp: {sdcpp_error}")
         
+        _treg.finish(_ltid, "error", "; ".join(error_details) or "no compatible backend")
         raise HTTPException(
             status_code=400,
             detail=f"Failed to load image model '{model_name}'. Errors: {'; '.join(error_details) if error_details else 'No compatible backend found'}"

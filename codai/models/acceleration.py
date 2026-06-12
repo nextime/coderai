@@ -52,7 +52,15 @@ ACCEL_PRESETS: dict = {
         "label": "Wan2.2 Lightning (4-step DMD)",
         "family": "wan",
         "applies_to": ["video"],
-        "lora": "lightx2v/Wan2.2-Lightning",
+        # Wan2.2 A14B is a two-expert MoE: the distill LoRA must be fused into BOTH
+        # the high-noise (transformer) and low-noise (transformer_2) experts, or the
+        # clip collapses to a solid colour at 4 steps. These default to the locally
+        # installed lightx2v/Wan2.2-Lightning weights (resolved from cache — not a
+        # download); override per model in the Acceleration config for T2V or a
+        # different rank/version. `lora` stays None because the two experts differ.
+        "lora": None,
+        "lora_high": "lightx2v/Wan2.2-Lightning:Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors",
+        "lora_low": "lightx2v/Wan2.2-Lightning:Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors",
         "lora_weight": 1.0,
         "steps": 4,
         "guidance_scale": 1.0,
@@ -175,6 +183,12 @@ def resolve_acceleration(model_cfg: Optional[dict]) -> Optional[dict]:
     out = {
         "preset": preset_key or "custom",
         "lora": _pick("lora"),
+        # Wan2.2 A14B is a two-expert MoE: the distill LoRA differs for the
+        # high-noise (transformer) and low-noise (transformer_2) experts. When
+        # these are set they take precedence over the single `lora` per expert;
+        # otherwise the single `lora` is applied to BOTH experts.
+        "lora_high": _pick("lora_high"),
+        "lora_low": _pick("lora_low"),
         "lora_weight": _pick("lora_weight", 1.0),
         "steps": _pick("steps"),
         "guidance_scale": _pick("guidance_scale"),
@@ -255,35 +269,94 @@ def apply_accel_to_pipeline(pipe, accel: Optional[dict]) -> None:
             log.warning("[accel] flow_shift apply failed: %s", e)
 
     # 3. Fuse the distill LoRA (when one is configured — turbo has none).
-    lora_ref = accel.get("lora")
-    if not lora_ref:
+    #    `_coderai_accel_fused` records whether a distill LoRA actually baked in,
+    #    so the generator only drops to the preset's low step count when the model
+    #    is genuinely distilled (running 4 steps un-distilled collapses the video
+    #    to a solid colour — exactly the Wan2.2 dual-expert failure mode).
+    try:
+        pipe._coderai_accel_fused = False
+    except Exception:
+        pass
+
+    has_t2 = getattr(pipe, "transformer_2", None) is not None
+    lora_high = accel.get("lora_high") or accel.get("lora")
+    lora_low = accel.get("lora_low") or accel.get("lora")
+    if not lora_high and not lora_low:
+        # No LoRA (e.g. a full distilled model like SDXL-Turbo) — treat as distilled.
+        try:
+            pipe._coderai_accel_fused = True
+        except Exception:
+            pass
         return
     if not hasattr(pipe, "load_lora_weights"):
         log.warning("[accel] pipeline %s has no load_lora_weights — cannot fuse "
                     "acceleration LoRA", type(pipe).__name__)
         return
-    repo, weight_name = _split_lora_ref(lora_ref)
+
     weight = float(accel.get("lora_weight") or 1.0)
-    try:
-        load_kwargs = {"adapter_name": "__accel__"}
+
+    def _load_one(ref, into_t2: bool, adapter: str) -> bool:
+        repo, weight_name = _split_lora_ref(ref)
+        kw = {"adapter_name": adapter}
         if weight_name:
-            load_kwargs["weight_name"] = weight_name
-        pipe.load_lora_weights(repo, **load_kwargs)
+            kw["weight_name"] = weight_name
+        if into_t2:
+            kw["load_into_transformer_2"] = True
+        pipe.load_lora_weights(repo, **kw)
+        return True
+
+    loaded_adapters = []
+    try:
+        # High-noise expert (transformer) — always.
+        if lora_high and _load_one(lora_high, False, "__accel__"):
+            loaded_adapters.append("__accel__")
+        # Low-noise expert (transformer_2) — only on dual-expert Wan2.2 models.
+        if has_t2 and lora_low:
+            try:
+                if _load_one(lora_low, True, "__accel_2__"):
+                    loaded_adapters.append("__accel_2__")
+            except Exception as e2:
+                log.warning("[accel] could not load distill LoRA into transformer_2 "
+                            "(%s) — low-noise expert stays un-distilled", e2)
+        elif has_t2 and not lora_low:
+            log.warning("[accel] model has a second expert (transformer_2) but no "
+                        "low-noise distill LoRA — set acceleration.lora_low")
+        if not loaded_adapters:
+            raise RuntimeError("no distill adapter registered on the pipeline")
         try:
-            pipe.set_adapters(["__accel__"], [weight])
+            pipe.set_adapters(loaded_adapters, [weight] * len(loaded_adapters))
         except Exception:
             pass
-        # Bake it in, then drop the adapter handle so per-request LoRAs are clean.
-        pipe.fuse_lora(lora_scale=weight)
+        # Bake them in, then drop the adapter handles so per-request LoRAs are clean.
+        # CRITICAL: diffusers' Wan fuse_lora defaults to components=["transformer"],
+        # so without naming transformer_2 the low-noise expert's distill adapter is
+        # never fused — and the subsequent unload strips it off, leaving that expert
+        # undistilled. At 4 steps that collapses the clip to a solid colour. Fuse
+        # BOTH experts explicitly.
+        _fuse_components = ["transformer"]
+        if has_t2:
+            _fuse_components.append("transformer_2")
+        try:
+            pipe.fuse_lora(components=_fuse_components, lora_scale=weight)
+        except TypeError:
+            # Older diffusers without the `components` kwarg — best effort.
+            pipe.fuse_lora(lora_scale=weight)
         try:
             pipe.unload_lora_weights()
         except Exception:
             pass
-        log.info("[accel] fused distillation LoRA %s (weight=%s) into %s",
-                 repo, weight, type(pipe).__name__)
+        try:
+            pipe._coderai_accel_fused = True
+        except Exception:
+            pass
+        log.info("[accel] fused distillation LoRA(s) %s (weight=%s) into %s%s",
+                 loaded_adapters, weight, type(pipe).__name__,
+                 " (both experts)" if len(loaded_adapters) > 1 else "")
     except Exception as e:
-        log.warning("[accel] failed to fuse acceleration LoRA %s: %s — generating "
-                    "without acceleration", lora_ref, e)
+        log.warning("[accel] failed to fuse acceleration LoRA (high=%s low=%s): %s "
+                    "— generating WITHOUT acceleration (step count will fall back to "
+                    "a safe default, not the preset's distilled count)",
+                    lora_high, lora_low, e)
 
 
 def accel_call_defaults(accel: Optional[dict]) -> dict:

@@ -671,13 +671,15 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <div class="form-row" style="margin:0">
           <label class="form-label">Strategy</label>
           <select id="cfg-offload-strategy" class="form-input">
-            <option value="auto">Auto</option>
-            <option value="model">CPU offload (model)</option>
-            <option value="sequential">CPU offload (sequential)</option>
+            <option value="auto">Auto (pick from free VRAM)</option>
+            <option value="none">None (GPU only)</option>
+            <option value="balanced">Balanced (fill GPU, spill to CPU → disk)</option>
+            <option value="model">CPU offload (model — module-by-module)</option>
+            <option value="sequential">CPU offload (sequential — most aggressive)</option>
             <option value="cpu">CPU RAM (legacy)</option>
             <option value="disk">Disk</option>
-            <option value="none">None (GPU only)</option>
           </select>
+          <span class="form-hint">Auto picks full-GPU when the weights fit, else Balanced. Pick <b>Balanced</b> + lower the GPU % below for a model that's just over VRAM; <b>model</b>/<b>sequential</b> keep less on GPU (slower, but the safest fit).</span>
         </div>
         <div class="form-row" style="margin:0">
           <label class="form-label">Offload directory</label>
@@ -728,6 +730,12 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           <div class="form-row" style="max-width:560px">
             <label class="form-label">Distill LoRA <span class="muted">(path or HF repo, optionally repo:weight_name.safetensors; blank for turbo full-models)</span></label>
             <input type="text" id="cfg-accel-lora" class="form-input" placeholder="e.g. ByteDance/SDXL-Lightning:sdxl_lightning_4step_lora.safetensors">
+          </div>
+          <div class="form-row" style="max-width:560px">
+            <label class="form-label">Distill LoRA — high/low noise <span class="muted">(Wan2.2 A14B two-expert only; overrides the single LoRA per expert)</span></label>
+            <input type="text" id="cfg-accel-lora-high" class="form-input" placeholder="high-noise → transformer  (e.g. repo:..._high_noise_..._4step.safetensors)">
+            <input type="text" id="cfg-accel-lora-low" class="form-input" style="margin-top:.4rem" placeholder="low-noise → transformer_2  (e.g. repo:..._low_noise_..._4step.safetensors)">
+            <span class="form-hint">Wan2.2 A14B has two experts; the distill LoRA must be fused into <b>both</b> or the clip collapses to a solid colour at 4 steps. Leave blank to apply the single LoRA above to both.</span>
           </div>
           <div style="display:flex;gap:1rem;flex-wrap:wrap">
             <div class="form-row" style="max-width:130px">
@@ -2801,6 +2809,8 @@ async function _populateAccel(a){
   const sel = document.getElementById('cfg-accel-preset');
   sel.value = [...sel.options].some(o=>o.value===(a.preset||'')) ? a.preset : 'custom';
   document.getElementById('cfg-accel-lora').value = a.lora || '';
+  document.getElementById('cfg-accel-lora-high').value = a.lora_high || '';
+  document.getElementById('cfg-accel-lora-low').value = a.lora_low || '';
   document.getElementById('cfg-accel-weight').value = a.lora_weight != null ? a.lora_weight : '';
   document.getElementById('cfg-accel-steps').value = a.steps != null ? a.steps : '';
   document.getElementById('cfg-accel-guidance').value = a.guidance_scale != null ? a.guidance_scale : '';
@@ -2815,6 +2825,8 @@ function _collectAccel(){
     enabled: true,
     preset: document.getElementById('cfg-accel-preset').value || 'custom',
     lora: document.getElementById('cfg-accel-lora').value.trim() || null,
+    lora_high: document.getElementById('cfg-accel-lora-high').value.trim() || null,
+    lora_low: document.getElementById('cfg-accel-lora-low').value.trim() || null,
     lora_weight: num('cfg-accel-weight'),
     steps: num('cfg-accel-steps'),
     guidance_scale: num('cfg-accel-guidance'),

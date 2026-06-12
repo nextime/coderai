@@ -1709,10 +1709,21 @@ def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: P
                         fight_plan: list, outcome_plan: list, consistency: set,
                         lora_map: dict, char_strength: float, keyframe_steps: int,
                         keyframe_size: str, lora_weight: float,
-                        env_lora_map: dict = None, env_lora_weight: float = 0.8):
+                        env_lora_map: dict = None, env_lora_weight: float = 0.8,
+                        kf_cb=None):
     """Generate one keyframe still per clip (image model). Saved as PNG keyed by
     the clip's output stem so the render phase can pick them up as init images.
-    Resumable: existing PNGs are kept."""
+    Resumable: existing PNGs are kept.
+
+    kf_cb(stem, phase, ok) — optional; fired so callers (the web match-render job)
+    can show per-image progress. phase is "start" (this keyframe begins) or "end"
+    (finished, ok=True/False); a reused/existing PNG fires "end" with ok=True."""
+    def _kf(stem, phase, ok=None):
+        if kf_cb:
+            try:
+                kf_cb(stem, phase, ok)
+            except Exception:
+                pass
     keyframe_dir.mkdir(parents=True, exist_ok=True)
     use_ip = "ipadapter" in consistency or "keyframe" in consistency
     use_lora = "lora" in consistency
@@ -1751,7 +1762,9 @@ def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: P
         out_png = keyframe_dir / f"{stem}.png"
         if out_png.exists() and out_png.stat().st_size > 0:
             skipped += 1
+            _kf(stem, "end", True)   # already present — show it as done
             continue
+        _kf(stem, "start")
         profiles = list(fighters) if use_ip else None
         loras = None
         if use_lora:
@@ -1771,8 +1784,10 @@ def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: P
             )
             out_png.write_bytes(img)
             made += 1
+            _kf(stem, "end", True)
         except Exception as e:
             failed += 1
+            _kf(stem, "end", False)
             _log(f"    ✗ keyframe {stem} failed: {e}")
     _log(f"  ── Keyframes: {made} new, {skipped} reused, {failed} failed ──")
 
@@ -2968,13 +2983,30 @@ def launch_web_ui(default_args):
                     _done("no missing keyframes — all present")
                     return
                 _set_items([f"keyframe {s}" for s in work])
-                for i, s in enumerate(work):
-                    _item(i, "start")
-                    if not missing_only:
+                _kf_idx = {s: i for i, s in enumerate(work)}
+                # Delete the targeted PNGs first so they're actually regenerated
+                # (missing-only keeps existing ones → reported done by the callback).
+                if not missing_only:
+                    for s in work:
                         try:
                             (kdir / f"{s}.png").unlink()
                         except Exception:
                             pass
+                # Per-image progress: _generate_keyframes fires kf_cb as each
+                # keyframe starts/finishes, so the bars advance image-by-image
+                # instead of all flipping at the end.
+                _kf_done = [0]
+
+                def _kf_cb(stem, phase, ok=None):
+                    i = _kf_idx.get(stem)
+                    if i is None:
+                        return
+                    _item(i, phase, ok)
+                    if phase == "end":
+                        _kf_done[0] += 1
+                        _prog(10 + int(88 * _kf_done[0] / max(1, len(work))),
+                              f"keyframe {_kf_done[0]}/{len(work)} done")
+
                 _prog(10, ("filling in {n} missing keyframe(s)…" if missing_only
                            else "regenerating {n} keyframe(s)…").format(n=len(work)))
                 try:
@@ -2984,11 +3016,13 @@ def launch_web_ui(default_args):
                         float(getattr(default_args, "character_strength", 0.7)),
                         int(getattr(default_args, "keyframe_steps", 28)),
                         getattr(default_args, "keyframe_size", "512x512"), lw,
-                        env_lora_map=env_lora_map, env_lora_weight=elw)
+                        env_lora_map=env_lora_map, env_lora_weight=elw,
+                        kf_cb=_kf_cb)
                 except Exception as e:
                     _fail(f"keyframe regeneration failed: {e}")
                     return
-                # Mark each item done/failed by whether its PNG now exists.
+                # Safety net: resolve any item the callback didn't (e.g. a stem
+                # _generate_keyframes never visited) by whether its PNG now exists.
                 for i, s in enumerate(work):
                     _item(i, "end", (kdir / f"{s}.png").exists())
                 made = sum(1 for s in work if (kdir / f"{s}.png").exists())

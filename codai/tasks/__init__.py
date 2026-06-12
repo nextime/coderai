@@ -23,6 +23,7 @@ from codai.tasks.registry import (
     task_registry,
     raise_if_cancelled,
     wait_if_paused,
+    loading_task,
 )
 
 __all__ = [
@@ -32,4 +33,5 @@ __all__ = [
     "task_registry",
     "raise_if_cancelled",
     "wait_if_paused",
+    "loading_task",
 ]

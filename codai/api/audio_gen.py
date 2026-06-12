@@ -266,13 +266,15 @@ async def audio_generate(request: AudioGenerationRequest, http_request: Request 
         device = _derive_device()
         model_type = _detect_audio_gen_type(model_name)
         _ag_cfg = model_info.get('config') or {}
+        from codai.tasks import loading_task
         try:
-            if model_type in ('musicgen', 'audiogen'):
-                pipe = await asyncio.get_event_loop().run_in_executor(
-                    None, _load_musicgen, model_name, device)
-            else:
-                pipe = await asyncio.get_event_loop().run_in_executor(
-                    None, _load_audioldm, model_name, device, _ag_cfg)
+            with loading_task(model_name, model_type="audio"):
+                if model_type in ('musicgen', 'audiogen'):
+                    pipe = await asyncio.get_event_loop().run_in_executor(
+                        None, _load_musicgen, model_name, device)
+                else:
+                    pipe = await asyncio.get_event_loop().run_in_executor(
+                        None, _load_audioldm, model_name, device, _ag_cfg)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load audio gen model: {e}")
         multi_model_manager.models[model_key] = pipe

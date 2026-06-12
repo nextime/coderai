@@ -878,6 +878,14 @@ def main():
     if not _resume_jobs:
         print("LoRA job recovery: DISABLED (interrupted training will be cancelled on restart)")
 
+    if getattr(args, "pipeline_cache", False):
+        try:
+            from codai.models.pipeline_cache import cache_root
+            _pc_extra = " (rebuilding this run)" if getattr(args, "rebuild_pipeline_cache", False) else ""
+            print(f"Pipeline cache: ENABLED{_pc_extra} — quantized pipelines cached at {cache_root()}")
+        except Exception:
+            print("Pipeline cache: ENABLED")
+
     # Set environment profiles module global args
     from codai.api.environments import set_global_args as set_envs_global_args
     set_envs_global_args(global_args)
@@ -964,13 +972,18 @@ def main():
     if not _debug_web:
         class _AccessNoiseFilter(logging.Filter):
             # uvicorn.access record args: (client_addr, method, full_path, http_ver, status)
-            _NOISY = ("/v1/loras/progress",)
+            _NOISY_PREFIX = ("/v1/loras/progress",)
+            # Exact-match only, so the live Tasks-page pollers are dropped but the
+            # user-initiated action endpoints (/admin/api/tasks/{id}/pause, …) still log.
+            _NOISY_EXACT = ("/admin/api/tasks", "/admin/api/system-stats")
             def filter(self, record):
                 try:
                     args = record.args
                     if isinstance(args, (tuple, list)) and len(args) >= 3:
                         path = str(args[2]).split("?", 1)[0]
-                        if any(path == p or path.startswith(p) for p in self._NOISY):
+                        if path in self._NOISY_EXACT:
+                            return False
+                        if any(path == p or path.startswith(p) for p in self._NOISY_PREFIX):
                             return False
                 except Exception:
                     pass

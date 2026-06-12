@@ -32,6 +32,7 @@ a task with a ``job_id`` links the two.
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional
 
@@ -60,6 +61,7 @@ class Task:
     ended_at: Optional[float] = None
     cancellable: bool = True
     restartable: bool = False
+    pausable: bool = True
     paused: bool = False
 
     def to_dict(self) -> dict:
@@ -83,13 +85,14 @@ class TaskRegistry:
     def register(self, kind: str, *, title: str = "", model: str = "",
                  total: int = 0, job_id: Optional[str] = None,
                  status: str = "queued", cancellable: bool = True,
-                 restartable: bool = False, task_id: Optional[str] = None) -> str:
+                 restartable: bool = False, pausable: bool = True,
+                 task_id: Optional[str] = None) -> str:
         tid = task_id or f"task-{uuid.uuid4().hex[:12]}"
         with self._lock:
             self._tasks[tid] = Task(
                 id=tid, kind=kind, title=title, model=model, total=total,
                 job_id=job_id, status=status, cancellable=cancellable,
-                restartable=restartable,
+                restartable=restartable, pausable=pausable,
             )
             self._events[tid] = threading.Event()
             self._pause_events[tid] = threading.Event()
@@ -256,3 +259,25 @@ def wait_if_paused(task_id: Optional[str]) -> None:
     Returns immediately when not paused; raises :class:`TaskCancelled` if the
     task is cancelled while paused. A falsy ``task_id`` is a no-op."""
     task_registry.wait_if_paused(task_id)
+
+
+@contextmanager
+def loading_task(model: str, *, model_type: str = "model", title: Optional[str] = None):
+    """Context manager that shows a model load as a Tasks-page entry.
+
+    Model loading can't be paused or cancelled (it's a single blocking
+    ``from_pretrained`` / ``Llama(...)`` call), so the task is registered
+    non-cancellable and non-pausable — the Tasks UI shows it with no action
+    buttons. The task finishes ``done`` on success or ``error`` on exception.
+    Re-entrant guard: a nested load of the same model_key reuses no task; each
+    call is independent (loads don't nest in practice)."""
+    label = title or f"Loading {model}"
+    tid = task_registry.register(
+        "loading", title=label, model=model or "", status="running",
+        cancellable=False, restartable=False, pausable=False)
+    try:
+        yield tid
+        task_registry.finish(tid, "done")
+    except BaseException as e:  # noqa: BLE001 — record then re-raise
+        task_registry.finish(tid, "error", str(e)[:200] or e.__class__.__name__)
+        raise

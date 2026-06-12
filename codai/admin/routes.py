@@ -2052,7 +2052,7 @@ async def api_tasks(username: str = Depends(require_admin)):
         seen.add(t["id"])
         t = dict(t)
         t["cancellable"] = bool(t.get("cancellable", True) and t.get("active", False))
-        t["pausable"] = (t.get("status") == "running")
+        t["pausable"] = bool(t.get("pausable", True) and t.get("status") == "running")
         t["restartable"] = False
         tasks.append(t)
 

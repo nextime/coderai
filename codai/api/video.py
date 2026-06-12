@@ -724,6 +724,66 @@ def _free_pipeline_vram(pipe) -> None:
         pass
 
 
+def _lora_file_size_gb(ref) -> float:
+    """Size (GB) of a distill LoRA ref ('repo:weight' / local path) from cache."""
+    if not ref:
+        return 0.0
+    try:
+        import os
+        from codai.models.acceleration import _split_lora_ref
+        if os.path.isfile(ref):
+            return os.path.getsize(ref) / 1e9
+        repo, weight = _split_lora_ref(ref)
+        if repo and os.path.isfile(repo):
+            return os.path.getsize(repo) / 1e9
+        if repo and weight:
+            from huggingface_hub import try_to_load_from_cache
+            p = try_to_load_from_cache(repo, weight)
+            if isinstance(p, str) and os.path.isfile(p):
+                return os.path.getsize(p) / 1e9
+    except Exception:
+        pass
+    return 0.0
+
+
+def _accel_vram_gb(model_cfg: dict) -> float:
+    """VRAM the fused acceleration/distill LoRA(s) add. Sums the actual cached
+    file sizes when known (both Wan2.2 experts), else a conservative reserve when
+    acceleration is enabled but the size can't be resolved."""
+    try:
+        from codai.models.acceleration import resolve_acceleration
+        a = resolve_acceleration(model_cfg)
+        if not a:
+            return 0.0
+        refs = [r for r in (a.get('lora_high'), a.get('lora_low'), a.get('lora')) if r]
+        refs = list(dict.fromkeys(refs))  # a single LoRA on both experts counts once
+        total, known = 0.0, False
+        for r in refs:
+            sz = _lora_file_size_gb(r)
+            if sz > 0:
+                total += sz
+                known = True
+        if known:
+            return total
+        return 2.5 if refs else 0.0  # accel on but size unknown → reserve
+    except Exception:
+        return 0.0
+
+
+def _video_runtime_reserve_gb(request) -> float:
+    """Rough VRAM headroom for the denoise activations + VAE-decode spike, which
+    scales with frame count × resolution. Keeps the auto-offload decision from
+    being too optimistic for long/high-res clips."""
+    try:
+        nf = int(getattr(request, 'num_frames', None) or 16)
+        w = int(getattr(request, 'width', None) or 512)
+        h = int(getattr(request, 'height', None) or 512)
+        base = 3.0 * (nf / 16.0) * ((w * h) / (512.0 * 512.0))
+        return max(2.0, min(12.0, base))
+    except Exception:
+        return 3.0
+
+
 def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str = None, model_cfg: dict = None):
     # GGUF models go through stable-diffusion.cpp, not diffusers
     from codai.api.images import _is_gguf_model
@@ -740,6 +800,30 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
     dtype_map = {'bf16': torch.bfloat16, 'f16': torch.float16, 'f32': torch.float32}
     torch_dtype = dtype_map.get(_model_precision, torch.bfloat16)
 
+    # ── Pipeline disk cache (--pipeline-cache) ───────────────────────────────
+    # When a previously-built, quantized pipeline is cached on disk, load the
+    # pre-quantized weights from there (no re-download / re-quantization). The
+    # cache holds the BASE pipeline only — the acceleration LoRA is re-fused by
+    # the caller per load — so the source just swaps from the HF id to the cache
+    # dir and the quantization config is skipped (the saved components carry it).
+    _orig_model_name = model_name
+    _pc_save_path = None
+    _loading_from_cache = False
+    try:
+        from codai.models import pipeline_cache as _pcache
+        if _pcache.enabled():
+            _pc_path = _pcache.path(model_name, model_cfg)
+            if _pcache.valid(_pc_path):
+                print(f"  [pipeline-cache] HIT — loading pre-quantized pipeline "
+                      f"from {_pc_path}")
+                model_name = _pc_path
+                _loading_from_cache = True
+            else:
+                _pc_save_path = _pc_path
+                print(f"  [pipeline-cache] MISS — will build, then cache for next start")
+    except Exception as _pce:
+        print(f"  [pipeline-cache] unavailable ({_pce})")
+
     # ── Quantization (from per-model config) ─────────────────────────────────
     # Per-component overrides ('component_quantization' map) win; otherwise the
     # global load_in_4bit/8bit flag is applied to every heavy component (the
@@ -747,16 +831,22 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
     # UMT5 text_encoder is ~11 GB in bf16 and must be quantized to fit on-GPU).
     from codai.models.hf_loading import (
         build_pipeline_quant_config, build_gguf_pipeline_components)
-    _quant_config, _quant_desc = build_pipeline_quant_config(
-        model_name, model_cfg, torch_dtype)
-    if _quant_config is not None:
-        print(f"  Video quantization: {_quant_desc}")
-    # GGUF-quantized components (Q5_K/Q6_K etc.) are loaded from their .gguf
-    # files and injected into the pipeline as pre-built components.
-    _gguf_components, _gguf_desc = build_gguf_pipeline_components(
-        model_name, model_cfg, torch_dtype)
-    if _gguf_components:
-        print(f"  Video GGUF components: {_gguf_desc}")
+    if _loading_from_cache:
+        # Cached components already carry their quantization config; don't rebuild
+        # it (and don't re-inject GGUF components — they were baked into the cache).
+        _quant_config, _quant_desc = None, ''
+        _gguf_components, _gguf_desc = {}, ''
+    else:
+        _quant_config, _quant_desc = build_pipeline_quant_config(
+            model_name, model_cfg, torch_dtype)
+        if _quant_config is not None:
+            print(f"  Video quantization: {_quant_desc}")
+        # GGUF-quantized components (Q5_K/Q6_K etc.) are loaded from their .gguf
+        # files and injected into the pipeline as pre-built components.
+        _gguf_components, _gguf_desc = build_gguf_pipeline_components(
+            model_name, model_cfg, torch_dtype)
+        if _gguf_components:
+            print(f"  Video GGUF components: {_gguf_desc}")
 
     def _with_quant(kw: dict) -> dict:
         """Inject quantization_config + GGUF components into from_pretrained kwargs."""
@@ -952,6 +1042,16 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
         _report_device_map(pipe)
         _report_offload_dir_size()
         _mem_snapshot("after load")
+        # Persist the freshly-built quantized pipeline to the disk cache so the
+        # next start can skip the rebuild. Only on a cache MISS (we didn't load
+        # from it) and when --pipeline-cache is on. Best-effort; never fatal.
+        if _pc_save_path and not _loading_from_cache:
+            try:
+                from codai.models import pipeline_cache as _pcache
+                _pcache.save(pipe, _pc_save_path,
+                             model_name=_orig_model_name, model_cfg=model_cfg)
+            except Exception as _se:
+                print(f"  [pipeline-cache] save skipped ({_se})")
 
     # NOTE: we deliberately do NOT lower sys.setswitchinterval here.  A previous
     # version set it to 0.001s to keep the asyncio loop responsive during the
@@ -968,22 +1068,25 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
         # RAM (and disk if needed). This is the preferred strategy when the
         # model won't fit entirely in VRAM but should maximise GPU utilisation.
         # `gpu_percent` (0–100) controls what fraction of FREE VRAM to occupy.
+        # Configured GPU cap for balanced (per-model balanced_gpu_percent, else 80).
+        # This is the STARTING cap for the balanced chain; on OOM it steps down.
         _gpu_pct = float((model_cfg or {}).get('balanced_gpu_percent') or 80)
-        try:
-            if torch.cuda.is_available():
-                _free_v, _ = torch.cuda.mem_get_info()
-                _avail_gpu_gb = (_free_v / 1e9) * (_gpu_pct / 100.0)
-            else:
-                _avail_gpu_gb = 0.0
-        except Exception:
-            _avail_gpu_gb = 0.0
-        _cpu_avail_gb = min(48, max(4, int(
-            _psutil.virtual_memory().available * 0.60 / 1e9)))
 
-        if offload == 'balanced':
-            _mem_snapshot("before balanced GPU+CPU load")
+        def _load_balanced(gpu_pct: float):
+            """device_map='balanced' capping GPU at gpu_pct% of free VRAM, spilling
+            to CPU then disk. Assigns the outer `pipe` so a failed attempt's VRAM
+            is reclaimable via _clear_mem. Raises (RuntimeError/MemoryError) on OOM."""
+            nonlocal pipe
+            try:
+                _free_v2, _ = torch.cuda.mem_get_info() if torch.cuda.is_available() else (0, 0)
+                _avail_gpu_gb = (_free_v2 / 1e9) * (gpu_pct / 100.0)
+            except Exception:
+                _avail_gpu_gb = 0.0
+            _cpu_avail_gb = min(48, max(4, int(
+                _psutil.virtual_memory().available * 0.60 / 1e9)))
+            _mem_snapshot(f"before balanced {gpu_pct:.0f}% GPU+CPU load")
             print(f"  Video load strategy: balanced GPU+CPU "
-                  f"({_gpu_pct:.0f}% GPU → {_avail_gpu_gb:.1f} GiB / "
+                  f"({gpu_pct:.0f}% GPU → {_avail_gpu_gb:.1f} GiB / "
                   f"CPU {_cpu_avail_gb} GiB / overflow → {_offload_dir})")
             os.makedirs(_offload_dir, exist_ok=True)
             try:
@@ -998,12 +1101,77 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
                     low_cpu_mem_usage=True,
                 )))
             except (TypeError, ValueError):
+                # Pipeline doesn't accept device_map — fall to model CPU offload.
                 pipe = PClass.from_pretrained(**_with_quant(dict(
                     pretrained_model_name_or_path=model_name,
                     torch_dtype=torch_dtype, low_cpu_mem_usage=True)))
                 pipe.enable_model_cpu_offload()
-            _report_loaded(pipe, f"balanced {_gpu_pct:.0f}%GPU+CPU")
+            _report_loaded(pipe, f"balanced {gpu_pct:.0f}%GPU+CPU")
             return pipe
+
+        def _try_balanced_chain():
+            """Try balanced starting at the configured GPU %, stepping down through
+            60% then 40% on OOM. Returns the pipe, or None if every step OOM'd
+            (caller then falls through to model/sequential/disk offload)."""
+            # Start at the configured cap, then step down through the standard
+            # checkpoints (80/60/40) that sit below it. So 90% → 90,80,60,40;
+            # 80% → 80,60,40; 70% → 70,60,40; 50% → 50,40.
+            _pcts = sorted({_gpu_pct} | {p for p in (80.0, 60.0, 40.0)
+                                         if p < _gpu_pct}, reverse=True)
+            for _i, _pct in enumerate(_pcts):
+                try:
+                    return _load_balanced(_pct)
+                except (RuntimeError, MemoryError) as _e:
+                    if not _is_oom(_e):
+                        raise
+                    _nxt = _pcts[_i + 1] if _i + 1 < len(_pcts) else None
+                    if _nxt is not None:
+                        print(f"  Video: balanced {_pct:.0f}% GPU OOM — "
+                              f"retrying at {_nxt:.0f}% GPU…")
+                    else:
+                        print(f"  Video: balanced {_pct:.0f}% GPU OOM — "
+                              f"falling back to sequential CPU offload…")
+                    _clear_mem()
+            return None
+
+        def _load_sequential():
+            """Most aggressive fit: stream each submodule GPU↔CPU during the
+            forward pass (slowest, lowest VRAM). Assigns the outer `pipe`. Raises
+            on OOM."""
+            nonlocal pipe
+            _mem_snapshot("before sequential CPU offload load")
+            print("  Video load strategy: sequential CPU offload "
+                  "(each submodule GPU↔CPU during forward; slowest, lowest VRAM)")
+            pipe = PClass.from_pretrained(**_with_quant(dict(
+                pretrained_model_name_or_path=model_name,
+                torch_dtype=torch_dtype, low_cpu_mem_usage=True)))
+            pipe.enable_sequential_cpu_offload()
+            _report_loaded(pipe, "sequential CPU offload")
+            return pipe
+
+        def _try_balanced_then_sequential():
+            """Balanced chain (configured% → 60 → 40), then sequential CPU offload
+            if all balanced steps OOM. Returns the pipe, or None if even sequential
+            OOMs (caller falls through to the disk-offload attempts)."""
+            p = _try_balanced_chain()
+            if p is not None:
+                return p
+            _clear_mem()
+            try:
+                return _load_sequential()
+            except (RuntimeError, MemoryError) as _e:
+                if not _is_oom(_e):
+                    raise
+                print(f"  Video: sequential CPU offload OOM ({_e}) — "
+                      f"trying disk offload…")
+                _clear_mem()
+            return None
+
+        if offload == 'balanced':
+            pipe = _try_balanced_then_sequential()
+            if pipe is not None:
+                return pipe
+            # Even sequential OOM'd → continue to the disk-offload attempts.
 
         # ── Attempt 0: full GPU ──────────────────────────────────────────────
         if offload not in ('model', 'sequential', 'disk', 'balanced'):
@@ -1030,7 +1198,15 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
             except (RuntimeError, MemoryError) as e:
                 if not _is_oom(e):
                     raise
-                print(f"  Video: full-GPU OOM ({e}) — trying model CPU offload…")
+                print(f"  Video: full-GPU OOM ({e}) — falling back to balanced "
+                      f"GPU+CPU (starting at {_gpu_pct:.0f}% GPU)…")
+                _clear_mem()
+                # Graceful degrade: balanced at the configured %, then 60%, then
+                # 40%, then sequential CPU offload, before the slower disk paths.
+                pipe = _try_balanced_then_sequential()
+                if pipe is not None:
+                    return pipe
+                print("  Video: balanced + sequential all OOM — trying disk offload…")
                 _clear_mem()
 
         # ── Attempt 1: model CPU offload ─────────────────────────────────────
@@ -1323,12 +1499,23 @@ def _sync_video_loras(pipe, loras) -> None:
                       or getattr(pipe, 'unet', None) or pipe).__name__
     loaded = []  # (name, weight) that actually registered on the model
     before = _present_adapters(pipe)
+    # Wan2.2 A14B is a two-expert MoE — a LoRA loaded only into `transformer`
+    # leaves the low-noise expert (transformer_2) un-adapted, so the concept
+    # fades out as denoising hands over to it. Load into both when present.
+    _has_t2 = getattr(pipe, 'transformer_2', None) is not None
     for model, name, w in desired:
         try:
             pipe.load_lora_weights(model, adapter_name=name)
         except Exception as e:
             print(f"  [video][lora] failed to load '{name}': {e}")
             continue
+        if _has_t2:
+            try:
+                pipe.load_lora_weights(model, adapter_name=name,
+                                       load_into_transformer_2=True)
+            except Exception as e:
+                print(f"  [video][lora] '{name}' not loaded into transformer_2 "
+                      f"(low-noise expert): {e}")
         now = _present_adapters(pipe)
         if name in now and name not in before:
             loaded.append((name, w))
@@ -1488,10 +1675,19 @@ def _generate_video(pipe, request: VideoGenerationRequest):
     # _build_call_kwargs only populates them when the request specified them, so
     # setdefault below correctly leaves an explicit request value untouched.
     _accel = getattr(pipe, '_coderai_accel', None)
-    if _accel:
+    # Only trust the preset's low step-count / guidance when the distill LoRA
+    # actually fused. If it didn't (e.g. the Wan2.2 low-noise expert never got its
+    # LoRA, or the ref failed to load), running 4 steps un-distilled collapses the
+    # video to a solid colour — so fall back to a safe step count instead.
+    _accel_fused = getattr(pipe, '_coderai_accel_fused', None)
+    if _accel and _accel_fused is not False:
         from codai.models.acceleration import accel_call_defaults
         for _k, _v in accel_call_defaults(_accel).items():
             kw.setdefault(_k, _v)
+    elif _accel and _accel_fused is False:
+        print("  [video][accel] distill LoRA not fused — ignoring the preset's "
+              "low step count and using safe defaults (25 steps) to avoid a "
+              "collapsed/solid-colour result")
     kw.setdefault('num_inference_steps', 25)
     kw.setdefault('guidance_scale', 7.5)
     kw.setdefault('num_frames', 16)
@@ -2104,6 +2300,12 @@ async def video_generations(request: VideoGenerationRequest,
 
     if pipe is None:
         _offload = _model_cfg.get('offload_strategy') or None
+        # 'auto' (the default) means "let coderai pick from available VRAM" — it is
+        # NOT a diffusers strategy, and passing it through lands on the full-GPU
+        # path that then disk-thrashes. Normalise it to None so the VRAM check
+        # below decides between full-GPU and balanced GPU+CPU.
+        if _offload == 'auto':
+            _offload = None
         # Auto-select "balanced" strategy when the model (including runtime
         # reserve: KV/activation spike, VAE decode) exceeds available VRAM even
         # after eviction. Going straight to "balanced" (GPU-first + CPU spill)
@@ -2117,22 +2319,40 @@ async def video_generations(request: VideoGenerationRequest,
                 if _t.cuda.is_available():
                     _free_v, _ = _t.cuda.mem_get_info()
                     _free_gb = _free_v / 1e9
-                    _need_gb = multi_model_manager._get_model_used_vram_gb(
+                    # `_get_model_used_vram_gb` is the *measured total* footprint —
+                    # it already includes the runtime/activation reserve AND the
+                    # fused acceleration LoRA (it's measured after fusion). So do
+                    # NOT re-add those (that over-counts and wrongly forces the
+                    # slow balanced+disk path). Per-request LoRAs are extra.
+                    _base_gb = multi_model_manager._get_model_used_vram_gb(
                         model_key, model_name)
-                    if _need_gb > 0 and _free_gb < _need_gb:
+                    # full-GPU only needs the WEIGHTS to fit at load time (the
+                    # bundled ~runtime reserve is a gen-time allowance, and the
+                    # full-GPU path has its own OOM→offload fallback). Keep a
+                    # headroom margin so a model that *marginally* fits uses the
+                    # much faster full-GPU strategy rather than balanced+disk.
+                    _need_gb = _base_gb + _lora_extra_gb
+                    _margin = 2.5  # ≈ the bundled runtime reserve
+                    if _base_gb > 0 and _free_gb < (_need_gb - _margin):
                         _gpu_pct = float(_model_cfg.get('balanced_gpu_percent') or 80)
-                        print(f"  VRAM insufficient for full-GPU load "
-                              f"({_need_gb:.1f} GB needed, {_free_gb:.1f} GB free) "
-                              f"— auto-selecting balanced strategy "
-                              f"({_gpu_pct:.0f}% GPU + CPU spill)")
+                        print(f"  VRAM well short for full-GPU load "
+                              f"({_need_gb:.1f} GB measured need + LoRA; "
+                              f"{_free_gb:.1f} GB free) — auto-selecting balanced "
+                              f"strategy ({_gpu_pct:.0f}% GPU + CPU spill)")
                         _offload = 'balanced'
+                    else:
+                        print(f"  Full-GPU load looks viable "
+                              f"({_need_gb:.1f} GB measured need, {_free_gb:.1f} GB "
+                              f"free) — using full GPU (it falls back to offload on OOM)")
             except Exception:
                 pass
         # Snapshot free VRAM so we can record the real footprint after load.
         _vram_before = multi_model_manager.vram_before_load()
+        from codai.tasks import loading_task
         try:
-            pipe = await asyncio.get_event_loop().run_in_executor(
-                None, _load_video_pipeline, model_name, device, request.mode, _offload, _model_cfg)
+            with loading_task(model_name, model_type="video"):
+                pipe = await asyncio.get_event_loop().run_in_executor(
+                    None, _load_video_pipeline, model_name, device, request.mode, _offload, _model_cfg)
         except Exception as e:
             multi_model_manager._mark_cuda_poisoned_if_fatal(e)
             if getattr(multi_model_manager, 'cuda_context_poisoned', False):
@@ -2140,7 +2360,24 @@ async def video_generations(request: VideoGenerationRequest,
                     "CUDA context corrupted (device-side assert) while loading the "
                     "video model. Restart coderai to recover. "
                     f"Original error: {str(e).splitlines()[0]}"))
-            raise HTTPException(status_code=500, detail=f"Failed to load video model: {e}")
+            # Self-heal: a failed load from a (possibly stale/corrupt) pipeline
+            # cache should drop the cache and rebuild once rather than wedging.
+            _retried_fresh = False
+            try:
+                from codai.models import pipeline_cache as _pcache
+                if _pcache.enabled() and _pcache.valid(_pcache.path(model_name, _model_cfg)):
+                    print(f"  [pipeline-cache] load failed ({str(e).splitlines()[0]}) "
+                          f"— invalidating cache and rebuilding")
+                    _pcache.invalidate(model_name, _model_cfg)
+                    with loading_task(model_name, model_type="video"):
+                        pipe = await asyncio.get_event_loop().run_in_executor(
+                            None, _load_video_pipeline, model_name, device,
+                            request.mode, _offload, _model_cfg)
+                    _retried_fresh = True
+            except Exception:
+                _retried_fresh = False
+            if not _retried_fresh:
+                raise HTTPException(status_code=500, detail=f"Failed to load video model: {e}")
         # Fuse any configured acceleration/distillation LoRA (Lightning / Lightx2v /
         # LCM) into the freshly loaded pipeline. Done once at load; cached pipes keep
         # it. No-op for sd.cpp pipes and when no acceleration is configured.

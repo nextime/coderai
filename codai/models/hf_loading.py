@@ -182,12 +182,26 @@ def build_pipeline_quant_config(model_name: str, cfg: Optional[Dict[str, Any]], 
                        bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True)
         return BnB(load_in_8bit=True)
 
+    def _bnb_incompatible(name: str) -> bool:
+        # bitsandbytes (4/8-bit) and optimum-quanto (2-bit) only quantize
+        # nn.Linear. A fully-convolutional component (the VAE) has no Linear
+        # layers, so applying them triggers a hard "no linear modules were found"
+        # error. Such components must stay full precision (a smaller VAE comes
+        # from a GGUF VAE instead, handled separately).
+        n = (name or '').lower()
+        return n == 'vae' or n.endswith('_vae') or n.startswith('vae')
+
     quant_mapping: Dict[str, Any] = {}
     descs = []
     if comp_q:
         for name, raw_mode in comp_q.items():
             mode = _normalize_quant_mode(raw_mode)  # GGUF/none → None here
             if mode is None:
+                continue
+            if _bnb_incompatible(name):
+                print(f"  Skipping {mode} for '{name}': it has no Linear layers "
+                      f"(conv-only) — bitsandbytes/quanto cannot quantize it; "
+                      f"leaving full precision (use a GGUF VAE to shrink the VAE).")
                 continue
             cfg_obj = _mk(comp_lib.get(name, 'diffusers'), mode)
             if cfg_obj is not None:
@@ -198,6 +212,8 @@ def build_pipeline_quant_config(model_name: str, cfg: Optional[Dict[str, Any]], 
         targets = [n for n in comp_lib if _is_heavy(n)] or \
             ['transformer', 'transformer_2', 'text_encoder', 'unet']
         for name in targets:
+            if _bnb_incompatible(name):
+                continue
             cfg_obj = _mk(comp_lib.get(name, 'diffusers'), mode)
             if cfg_obj is not None:
                 quant_mapping[name] = cfg_obj

@@ -121,9 +121,11 @@ async def create_embeddings(request: EmbeddingsRequest, http_request: Request = 
 
     if model_obj is None:
         device = _derive_device()
+        from codai.tasks import loading_task
         try:
-            model_obj = await asyncio.get_event_loop().run_in_executor(
-                None, _load_embedding_model, model_name, device, _emb_cfg)
+            with loading_task(model_name, model_type="embedding"):
+                model_obj = await asyncio.get_event_loop().run_in_executor(
+                    None, _load_embedding_model, model_name, device, _emb_cfg)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load embedding model: {e}")
         multi_model_manager.models[model_key] = model_obj

@@ -817,7 +817,9 @@ class MultiModelManager:
                 print(f"Loading default model on demand: {self.default_model}")
                 _snap = self.vram_before_load()
                 kwargs['expected_vram_gb'] = self._get_model_used_vram_gb(self.default_model)
-                model_manager.load_model(self.default_model, backend_type=backend_type, **kwargs)
+                from codai.tasks import loading_task
+                with loading_task(self.default_model, model_type="text"):
+                    model_manager.load_model(self.default_model, backend_type=backend_type, **kwargs)
                 self.add_model(self.default_model, model_manager)
                 self.record_vram_delta(self.default_model, _snap)
                 self.current_model_key = self.default_model
@@ -916,7 +918,9 @@ class MultiModelManager:
                 # it can decide whether Flash-Attention-2 is safe (FA2 requires the
                 # whole model on GPU; it device-side-asserts when layers offload).
                 kwargs['expected_vram_gb'] = self._get_model_used_vram_gb(model_name)
-                model_manager.load_model(model_name, backend_type=backend_type, **kwargs)
+                from codai.tasks import loading_task
+                with loading_task(model_name, model_type="text"):
+                    model_manager.load_model(model_name, backend_type=backend_type, **kwargs)
                 self.add_model(model_name, model_manager)
                 self.record_vram_delta(model_name, _snap)
                 self.current_model_key = model_name
