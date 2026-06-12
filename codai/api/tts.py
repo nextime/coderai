@@ -64,7 +64,7 @@ class TTSResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-@router.post("/v1/audio/speech")
+@router.post("/v1/audio/speech", summary="Text-to-speech synthesis")
 async def create_speech(request: TTSRequest, http_request: Request = None):
     """
     Text-to-speech endpoint (OpenAI-compatible).

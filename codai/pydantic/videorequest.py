@@ -17,7 +17,7 @@
 """Pydantic models for video generation API."""
 
 from typing import Dict, List, Optional
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class VideoLoraConfig(BaseModel):
@@ -28,14 +28,14 @@ class VideoLoraConfig(BaseModel):
     blob), inline `file`/`data` base64, a `url` to download, or the legacy
     `model`/`path` local path / HF id. This lets a client on a different machine
     use a LoRA without sharing a filesystem with the server."""
-    model: Optional[str] = None         # legacy: local path or HF id of the weights
-    path: Optional[str] = None          # alias of model
-    id: Optional[str] = None            # "name:<registered>" or "sha256:<hex>"
-    url: Optional[str] = None           # http(s) URL the server downloads
-    file: Optional[str] = None          # base64 of the .safetensors (or data: URI)
-    data: Optional[str] = None          # alias of file
-    weight: float = 1.0
-    name: Optional[str] = None          # adapter name
+    model: Optional[str] = Field(None, description="Legacy: local path or HF id of the weights (shared-filesystem only).")
+    path: Optional[str] = Field(None, description="Alias of `model` — local path to the .safetensors weights.")
+    id: Optional[str] = Field(None, description='Registry/blob reference: "name:<registered-lora>" or "sha256:<hex>" (from /v1/loras/upload).')
+    url: Optional[str] = Field(None, description="HTTP(S) URL the server downloads and caches.")
+    file: Optional[str] = Field(None, description="Base64 of the .safetensors file (or a data: URI). Sent inline so no shared filesystem is needed.")
+    data: Optional[str] = Field(None, description="Alias of `file` — inline base64 weights.")
+    weight: float = Field(1.0, description="Adapter strength / scale applied when fusing the LoRA.")
+    name: Optional[str] = Field(None, description="Optional adapter name (defaults derived from the reference).")
     model_config = ConfigDict(extra="allow")
 
 
@@ -52,104 +52,98 @@ class CharacterDialogLine(BaseModel):
 
 
 class VideoGenerationRequest(BaseModel):
-    model: str
-    prompt: str = ""
-    negative_prompt: Optional[str] = None
+    model: str = Field(..., description="Model id to generate with (must be a configured video model).")
+    prompt: str = Field("", description="Text prompt describing the video. Optional for pure i2v.")
+    negative_prompt: Optional[str] = Field(None, description="What to avoid in the output.")
 
     # Dimensions
-    width: Optional[int] = 512
-    height: Optional[int] = 512
+    width: Optional[int] = Field(512, description="Output width in pixels.")
+    height: Optional[int] = Field(512, description="Output height in pixels.")
 
     # Temporal
-    num_frames: Optional[int] = None        # model default if None
-    fps: Optional[int] = None               # output FPS
+    num_frames: Optional[int] = Field(None, description="Number of frames to generate (model default if omitted).")
+    fps: Optional[int] = Field(None, description="Output frame rate (model default if omitted).")
 
     # Diffusion
-    num_inference_steps: Optional[int] = None
-    guidance_scale: Optional[float] = None
-    seed: Optional[int] = None
+    num_inference_steps: Optional[int] = Field(None, description="Denoising steps (model/acceleration default if omitted).")
+    guidance_scale: Optional[float] = Field(None, description="Classifier-free guidance scale (model/acceleration default if omitted).")
+    seed: Optional[int] = Field(None, description="Random seed for reproducibility.")
 
-    # Mode
-    # t2v  – text-to-video
-    # i2v  – image-to-video (init_image required)
-    # v2v  – video-to-video (video required)
-    # ti2v – text + init image → video (like i2v but prompt is primary driver)
-    # interp – frame interpolation (init_image + end_image)
-    mode: Optional[str] = "t2v"
+    mode: Optional[str] = Field("t2v", description=(
+        "Generation mode: 't2v' text-to-video; 'i2v' image-to-video (init_image required, "
+        "prompt dropped); 'ti2v' text+init image (prompt is primary driver); 'v2v' "
+        "video-to-video (video required); 'interp' frame interpolation (init_image+end_image). "
+        "The server gracefully falls back between Wan t2v/i2v pipelines when a model only "
+        "supports one."))
 
     # Input media (base64 or URL)
-    image: Optional[str] = None             # alias for init_image
-    init_image: Optional[str] = None        # first/reference frame
-    end_image: Optional[str] = None         # last frame (for interp mode)
-    video: Optional[str] = None             # input video (v2v / audio manipulation)
-    strength: Optional[float] = None        # denoising strength for v2v
+    image: Optional[str] = Field(None, description="Alias for init_image (base64 or URL).")
+    init_image: Optional[str] = Field(None, description="First/reference frame for i2v/ti2v (base64 or URL).")
+    end_image: Optional[str] = Field(None, description="Last frame, for 'interp' mode (base64 or URL).")
+    video: Optional[str] = Field(None, description="Input video for v2v / audio manipulation (base64 or URL).")
+    strength: Optional[float] = Field(None, description="Denoising strength for v2v (0–1).")
 
     # Camera motion hint
     camera_motion: Optional[str] = None     # zoom-in | zoom-out | pan-left | pan-right | tilt-up | tilt-down | rotate
 
     # ── Character consistency ─────────────────────────────────────────────
-    # Each entry: {"name": "Alice", "images": ["b64...", ...]}
-    characters: Optional[List[dict]] = None
-    # Legacy flat list of base64/URL reference images (still accepted)
-    character_references: Optional[List[str]] = None
-    character_strength: Optional[float] = 0.8
-    character_names: Optional[List[str]] = None       # optional names per reference
-    # Named saved profiles to load (resolved server-side)
-    character_profiles: Optional[List[str]] = None
+    characters: Optional[List[dict]] = Field(None, description='Per-character references, each {"name": "Alice", "images": ["b64...", ...]}.')
+    character_references: Optional[List[str]] = Field(None, description="Legacy flat list of base64/URL reference images.")
+    character_strength: Optional[float] = Field(0.8, description="IP-Adapter scale for character references.")
+    character_names: Optional[List[str]] = Field(None, description="Optional names aligned with character_references.")
+    character_profiles: Optional[List[str]] = Field(None, description="Saved character profile names to load (resolved server-side).")
 
-    # Per-request LoRA adapters (e.g. trained per-character identity LoRAs).
-    # Applied to diffusers video pipelines that support load_lora_weights.
-    loras: Optional[List[VideoLoraConfig]] = None
+    loras: Optional[List[VideoLoraConfig]] = Field(None, description="Per-request LoRA adapters (e.g. trained per-character identity LoRAs) fused into the pipeline.")
 
     # ── Audio generation / manipulation ──────────────────────────────────
-    add_audio: Optional[bool] = False
-    audio_type: Optional[str] = None        # music | speech | sfx | ambient
-    audio_prompt: Optional[str] = None      # prompt for music/sfx generation
-    audio_file: Optional[str] = None        # existing audio to add (base64/URL)
-    tts_text: Optional[str] = None          # text for speech synthesis
-    tts_voice: Optional[str] = None         # TTS voice id
-    tts_speed: Optional[float] = 1.0
-    sync_audio: Optional[bool] = False      # sync audio timing to video
-    lip_sync: Optional[bool] = False        # warp mouth to match audio
-    lip_sync_method: Optional[str] = "wav2lip"  # wav2lip | sadtalker
+    add_audio: Optional[bool] = Field(False, description="Add an audio track to the generated video.")
+    audio_type: Optional[str] = Field(None, description="Audio to generate/add: 'music', 'speech', 'sfx' or 'ambient'.")
+    audio_prompt: Optional[str] = Field(None, description="Prompt for generated music/sfx.")
+    audio_file: Optional[str] = Field(None, description="Existing audio to add (base64/URL).")
+    tts_text: Optional[str] = Field(None, description="Text to synthesize as speech.")
+    tts_voice: Optional[str] = Field(None, description="TTS voice id for synthesized speech.")
+    tts_speed: Optional[float] = Field(1.0, description="TTS speaking speed multiplier.")
+    sync_audio: Optional[bool] = Field(False, description="Sync audio timing to the video.")
+    lip_sync: Optional[bool] = Field(False, description="Warp the mouth to match the audio.")
+    lip_sync_method: Optional[str] = Field("wav2lip", description="Lip-sync engine: 'wav2lip' or 'sadtalker'.")
 
     # ── Multi-character dialog ────────────────────────────────────────────
-    dialogs: Optional[List[CharacterDialogLine]] = None
+    dialogs: Optional[List[CharacterDialogLine]] = Field(None, description="Ordered spoken lines for multi-character dialog with per-line voice/lip-sync.")
 
     # ── Subtitles ────────────────────────────────────────────────────────
-    generate_subtitles: Optional[bool] = False
-    burn_subtitles: Optional[bool] = False
-    subtitle_language: Optional[str] = None   # source language hint
-    translate_subtitles: Optional[bool] = False
-    subtitle_target_lang: Optional[str] = None
-    subtitle_style: Optional[str] = "default"  # default | karaoke | minimal
-    whisper_model: Optional[str] = None       # which whisper variant to use
+    generate_subtitles: Optional[bool] = Field(False, description="Generate subtitles (SRT) for the video.")
+    burn_subtitles: Optional[bool] = Field(False, description="Burn the subtitles into the video frames.")
+    subtitle_language: Optional[str] = Field(None, description="Source language hint for subtitle transcription.")
+    translate_subtitles: Optional[bool] = Field(False, description="Translate subtitles to subtitle_target_lang.")
+    subtitle_target_lang: Optional[str] = Field(None, description="Target language for translated subtitles.")
+    subtitle_style: Optional[str] = Field("default", description="Subtitle style: 'default', 'karaoke' or 'minimal'.")
+    whisper_model: Optional[str] = Field(None, description="Whisper variant used for transcription.")
 
     # ── Video dubbing ─────────────────────────────────────────────────────
-    dub_video: Optional[bool] = False
-    dub_target_lang: Optional[str] = None
-    dub_source_lang: Optional[str] = None
-    voice_clone: Optional[bool] = False       # clone original speaker voice
+    dub_video: Optional[bool] = Field(False, description="Dub the video's speech into another language.")
+    dub_target_lang: Optional[str] = Field(None, description="Target language for dubbing.")
+    dub_source_lang: Optional[str] = Field(None, description="Source language of the original speech.")
+    voice_clone: Optional[bool] = Field(False, description="Clone the original speaker's voice when dubbing.")
 
     # ── Post-processing ───────────────────────────────────────────────────
-    upscale_output: Optional[bool] = False
-    upscale_factor: Optional[int] = 2
-    interpolate_output: Optional[bool] = False  # increase FPS after generation
-    fps_multiplier: Optional[int] = 2           # e.g. 2 → 2× FPS via frame interp
-    convert_to_3d: Optional[bool] = False
-    depth_method: Optional[str] = "midas"       # midas | zoe | depth-anything
+    upscale_output: Optional[bool] = Field(False, description="Upscale the generated video.")
+    upscale_factor: Optional[int] = Field(2, description="Upscaling factor.")
+    interpolate_output: Optional[bool] = Field(False, description="Increase FPS via frame interpolation after generation.")
+    fps_multiplier: Optional[int] = Field(2, description="FPS multiplier for interpolation (e.g. 2 → 2× FPS).")
+    convert_to_3d: Optional[bool] = Field(False, description="Produce a depth-based 3D/stereo version.")
+    depth_method: Optional[str] = Field("midas", description="Depth estimator: 'midas', 'zoe' or 'depth-anything'.")
 
     # ── Memory / offload ─────────────────────────────────────────────────
-    offload_strategy: Optional[str] = None   # sequential | model | none
+    offload_strategy: Optional[str] = Field(None, description="VRAM offload strategy: 'sequential', 'model' or 'none'.")
 
-    # Nulls pipeline safety_checker / safety_concept so uncensored fine-tunes
-    # are not blocked. Has no effect on models without a safety checker.
-    disable_safety_checker: Optional[bool] = False
+    disable_safety_checker: Optional[bool] = Field(False, description=(
+        "Null out the diffusers safety_checker/safety_concept so uncensored fine-tunes "
+        "are not blocked. No effect on models that ship no safety checker (SDXL/Flux/Wan)."))
 
     # ── Output ───────────────────────────────────────────────────────────
-    response_format: Optional[str] = "url"   # url | b64_mp4
-    n: int = 1
-    user: Optional[str] = None
+    response_format: Optional[str] = Field("url", description="How to return the result: 'url' or 'b64_mp4'.")
+    n: int = Field(1, description="Number of videos to generate.")
+    user: Optional[str] = Field(None, description="Opaque end-user identifier (passthrough).")
 
     model_config = ConfigDict(extra="allow")
 

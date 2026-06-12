@@ -37,6 +37,7 @@ from pydantic import BaseModel, ConfigDict
 from codai.models.manager import multi_model_manager
 from codai.pydantic.imagerequest import ImageGenerationRequest
 from codai.api.state import get_load_mode
+from codai.tasks import task_registry, TaskCancelled
 
 
 # =============================================================================
@@ -756,6 +757,13 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
 
     _progress_reset(num_steps)
 
+    # Register this generation as a cancellable task (live view + cooperative
+    # cancel via the step callback below).
+    _tid = task_registry.register(
+        "image", title=(request.prompt or "")[:80],
+        model=getattr(request, 'model', '') or '', total=num_steps)
+    task_registry.start(_tid)
+
     # ------------------------------------------------------------------
     # Prompt embedding cache
     # Try to encode the prompt once and reuse the embeddings.
@@ -830,6 +838,11 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
             embed_kwargs = {}
 
     def _step_cb(pipe, step_index, timestep, callback_kwargs):
+        # Cooperative cancellation: abort at the next step boundary if cancelled.
+        task_registry.raise_if_cancelled(_tid)
+        # Cooperative pause: block here while the user has paused this task.
+        task_registry.wait_if_paused(_tid)
+        task_registry.step(_tid, step_index + 1)
         _progress_step(step_index + 1)
         # Mid-generation thermal checkpoint: pause between denoise steps if too hot.
         try:
@@ -912,10 +925,21 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
 
     try:
         result = await asyncio.to_thread(pipeline, **call_kwargs)
+    except TaskCancelled:
+        _progress_done()
+        raise  # global handler finishes the task (cancelled) + returns HTTP 499
     except TypeError:
         # Older pipeline that doesn't support callback_on_step_end
         call_kwargs.pop('callback_on_step_end', None)
-        result = await asyncio.to_thread(pipeline, **call_kwargs)
+        try:
+            result = await asyncio.to_thread(pipeline, **call_kwargs)
+        except TaskCancelled:
+            _progress_done()
+            raise
+    except Exception as e:
+        task_registry.finish(_tid, "error", str(e)[:200])
+        _progress_done()
+        raise
     finally:
         _progress_done()
 
@@ -967,6 +991,7 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
         except Exception:
             pass
 
+    task_registry.finish(_tid, "done")
     return {
         "created": timestamp,
         "data": images,
@@ -1014,7 +1039,17 @@ async def _generate_with_sdcpp(sd_model, request, global_args, http_request=None
 
     _progress_reset(steps)
 
+    # sd.cpp runs the whole diffusion inside one C call, so it can't be aborted
+    # mid-step (raising from its progress callback won't reliably unwind the C
+    # extension). We still register the task for visibility + step progress; a
+    # cancel takes effect when control returns to Python.
+    _tid = task_registry.register(
+        "image", title=(request.prompt or "")[:80],
+        model=getattr(request, 'model', '') or '', total=steps)
+    task_registry.start(_tid)
+
     def _sdcpp_progress(step: int, total: int, elapsed: float):
+        task_registry.step(_tid, step)
         _progress_step(step)
 
     # Use request seed if provided, otherwise use CLI default seed
@@ -1045,9 +1080,13 @@ async def _generate_with_sdcpp(sd_model, request, global_args, http_request=None
             seed=seed if seed is not None else 42,
             batch_count=request.n if request.n else 1,
         )
+    except Exception as e:
+        task_registry.finish(_tid, "error", str(e)[:200])
+        _progress_done()
+        raise
     finally:
         _progress_done()
-    
+
     # Small delay to let Vulkan driver settle after generation
     time.sleep(0.1)
     
@@ -1087,6 +1126,7 @@ async def _generate_with_sdcpp(sd_model, request, global_args, http_request=None
         except Exception:
             pass
 
+    task_registry.finish(_tid, "done")
     return {
         "created": int(time.time()),
         "data": images
@@ -1185,7 +1225,7 @@ def _load_sdcpp_model(model_path: str, global_args, model_config: dict = None):
 router = APIRouter()
 
 
-@router.get("/v1/images/progress")
+@router.get("/v1/images/progress", summary="Image generation progress")
 async def get_image_progress():
     """Return current image generation step progress including speed."""
     elapsed = _time.monotonic() - _gen_progress["started_at"] if _gen_progress["active"] else 0.0
@@ -1202,7 +1242,7 @@ async def get_image_progress():
     }
 
 
-@router.post("/v1/images/generations")
+@router.post("/v1/images/generations", summary="Generate images (text-to-image)")
 async def create_image_generation(request: ImageGenerationRequest, http_request: Request = None):
     """
     Image generation endpoint (OpenAI-compatible).
@@ -1330,7 +1370,14 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
         is_gguf = _is_gguf_model(model_name)
         diffusers_error = None
         sdcpp_error = None
-        
+
+        # Show the load as a (non-cancellable) Tasks-page entry spanning both
+        # backend attempts; finished done on success, error only if all fail.
+        from codai.tasks import task_registry as _treg
+        _ltid = _treg.register("loading", title=f"Loading {model_name}",
+                               model=model_key, status="running",
+                               cancellable=False, pausable=False)
+
         # Try diffusers first (for non-GGUF models)
         if not is_gguf:
             try:
@@ -1351,6 +1398,7 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                         pass
                     print(f"Loaded diffusers model: {model_name}")
 
+                    _treg.finish(_ltid, "done")
                     return await _generate_with_diffusers(pipeline, request, global_args, http_request)
                     
             except ImportError as e:
@@ -1386,7 +1434,8 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
                     except Exception:
                         pass
                     print(f"Loaded sd.cpp model: {model_name}")
-                    
+
+                    _treg.finish(_ltid, "done")
                     return await _generate_with_sdcpp(sd_model, request, global_args,
                                                       http_request, model_config=cfg)
             else:
@@ -1409,6 +1458,7 @@ async def create_image_generation(request: ImageGenerationRequest, http_request:
         if sdcpp_error:
             error_details.append(f"sd.cpp: {sdcpp_error}")
         
+        _treg.finish(_ltid, "error", "; ".join(error_details) or "no compatible backend")
         raise HTTPException(
             status_code=400,
             detail=f"Failed to load image model '{model_name}'. Errors: {'; '.join(error_details) if error_details else 'No compatible backend found'}"
@@ -1497,7 +1547,7 @@ def _load_img2img_pipeline(model_name: str, global_args):
             raise
 
 
-@router.post("/v1/images/edits")
+@router.post("/v1/images/edits", summary="Edit an image (instruction / img2img)")
 async def create_image_edit(request: ImageEditRequest, http_request: Request = None):
     """
     Image-to-image editing endpoint (OpenAI-compatible).
@@ -1638,7 +1688,7 @@ def _load_inpaint_pipeline(model_name: str, global_args):
             raise
 
 
-@router.post("/v1/images/inpaint")
+@router.post("/v1/images/inpaint", summary="Inpaint a masked region")
 async def create_image_inpaint(request: ImageInpaintRequest, http_request: Request = None):
     """Inpaint a masked region of an image (OpenAI-compatible extension)."""
     global global_args
@@ -1750,7 +1800,7 @@ def _run_upscale(upscaler, image_bytes: bytes, scale: int):
     return img.resize((w * scale, h * scale), PILImage.LANCZOS)
 
 
-@router.post("/v1/images/upscale")
+@router.post("/v1/images/upscale", summary="Upscale an image")
 async def create_image_upscale(request: ImageUpscaleRequest, http_request: Request = None):
     """Upscale an image using Real-ESRGAN or PIL LANCZOS fallback."""
     global global_args
@@ -1862,7 +1912,7 @@ def _resolve_spatial_model(requested: Optional[str], capability: str) -> Optiona
     return None
 
 
-@router.post("/v1/images/depth")
+@router.post("/v1/images/depth", summary="Estimate a depth map")
 async def create_image_depth(request: ImageDepthRequest, http_request: Request = None):
     """Estimate depth map from an image."""
     global global_args
@@ -1968,7 +2018,7 @@ def _run_segmentation(seg_model, image_bytes: bytes, points, boxes):
         return PILImage.fromarray(out)
 
 
-@router.post("/v1/images/segment")
+@router.post("/v1/images/segment", summary="Segment an image")
 async def create_image_segment(request: ImageSegmentRequest, http_request: Request = None):
     """Segment objects in an image using SAM or similar models."""
     global global_args
@@ -2035,7 +2085,7 @@ def _run_deblur(image_bytes: bytes, strength: float) -> "PILImage.Image":
     return PILImage.fromarray((sharpened * 255).astype(np.uint8))
 
 
-@router.post("/v1/images/deblur")
+@router.post("/v1/images/deblur", summary="Deblur an image")
 async def create_image_deblur(request: ImageDeblurRequest, http_request: Request = None):
     """Remove blur from an image using Wiener deconvolution and unsharp masking."""
     raw = base64.b64decode(request.image.split(',', 1)[-1] if ',' in request.image else request.image)
@@ -2093,7 +2143,7 @@ def _run_unpixelate(image_bytes: bytes, scale: int, model_path: Optional[str]) -
     return PILImage.fromarray(out_arr)
 
 
-@router.post("/v1/images/unpixelate")
+@router.post("/v1/images/unpixelate", summary="Restore a pixelated image")
 async def create_image_unpixelate(request: ImageUnpixelateRequest, http_request: Request = None):
     """Remove pixelation / upscale with detail recovery using Real-ESRGAN."""
     raw = base64.b64decode(request.image.split(',', 1)[-1] if ',' in request.image else request.image)
@@ -2155,7 +2205,7 @@ def _generate_clothing_mask(img_arr) -> "np.ndarray":
     return fg_mask
 
 
-@router.post("/v1/images/outfit")
+@router.post("/v1/images/outfit", summary="Change outfit / clothing")
 async def create_image_outfit(request: ImageOutfitRequest, http_request: Request = None):
     """Change the outfit/clothing in an image or video using inpainting."""
     global global_args

@@ -101,7 +101,7 @@ def _embed_texts(model_obj, texts: List[str], dimensions=None) -> List[List[floa
     return results
 
 
-@router.post("/v1/embeddings", response_model=EmbeddingsResponse)
+@router.post("/v1/embeddings", response_model=EmbeddingsResponse, summary="Create embeddings")
 async def create_embeddings(request: EmbeddingsRequest, http_request: Request = None):
     """
     OpenAI-compatible embeddings endpoint.
@@ -116,13 +116,16 @@ async def create_embeddings(request: EmbeddingsRequest, http_request: Request = 
     model_key = model_info['model_key']
     model_obj = model_info.get('model_object')
 
+    _emb_cfg = (multi_model_manager.config.get(f"embedding:{model_name}")
+                or multi_model_manager.config.get(model_name) or {})
+
     if model_obj is None:
         device = _derive_device()
-        _emb_cfg = (multi_model_manager.config.get(f"embedding:{model_name}")
-                    or multi_model_manager.config.get(model_name) or {})
+        from codai.tasks import loading_task
         try:
-            model_obj = await asyncio.get_event_loop().run_in_executor(
-                None, _load_embedding_model, model_name, device, _emb_cfg)
+            with loading_task(model_name, model_type="embedding"):
+                model_obj = await asyncio.get_event_loop().run_in_executor(
+                    None, _load_embedding_model, model_name, device, _emb_cfg)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load embedding model: {e}")
         multi_model_manager.models[model_key] = model_obj
@@ -136,7 +139,59 @@ async def create_embeddings(request: EmbeddingsRequest, http_request: Request = 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
 
-    if request.encoding_format == 'base64':
+    # Optional TurboQuant vector quantization (data-free, inner-product preserving).
+    # The per-model config block (turboquant: {enabled, backend, bits}) is the
+    # source of truth for enable/disable + which implementation to use; the
+    # per-request `quantization` field triggers it and can override the bit width.
+    from codai.models import turboquant as _tq
+    _raw = _emb_cfg.get('_raw_cfg') if isinstance(_emb_cfg.get('_raw_cfg'), dict) else {}
+    tq_cfg = _emb_cfg.get('turboquant') or _raw.get('turboquant') or {}
+    tq_enabled = tq_cfg.get('enabled', None)         # None = no explicit model setting
+    tq_backend = (tq_cfg.get('backend') or 'builtin')
+
+    quant_meta = None
+    quant_bits = None
+    req_spec = getattr(request, 'quantization', None)
+    if not req_spec and tq_enabled and tq_cfg.get('bits'):
+        req_spec = f"turbo{tq_cfg.get('bits')}"   # model-configured default
+    if req_spec:
+        if tq_enabled is False:
+            raise HTTPException(
+                status_code=400,
+                detail="TurboQuant is disabled for this model (enable it in the "
+                       "model configuration).")
+        quant_bits = _tq._parse_quant_spec(req_spec)
+        if quant_bits is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported quantization '{req_spec}' "
+                       "(use 'turbo'/'turbo8'/'turbo6'/'turbo4'/'turbo2')")
+
+    if quant_bits is not None and request.encoding_format == 'base64':
+        # Compact wire form: each embedding is base64 of [f16 norm][packed codes].
+        # The compact packing is the built-in wire format regardless of backend
+        # (the upstream library exposes its own opaque store, not per-vector blobs).
+        blobs, meta = await asyncio.get_event_loop().run_in_executor(
+            None, _tq.quantize_base64, vectors, quant_bits)
+        data = [EmbeddingObject(index=i, embedding=b) for i, b in enumerate(blobs)]
+        quant_meta = {
+            "method": meta.method, "bits": meta.bits, "seed": meta.seed,
+            "dim": meta.dim, "dim_padded": meta.dim_padded, "radius": meta.radius,
+            "bytes_per_vector": meta.bytes_per_vector, "backend": "builtin",
+            "layout": "base64([float16 norm][packbits(rotated b-bit codes, MSB-first per numpy.packbits)])",
+        }
+    elif quant_bits is not None:
+        # Lossy reconstruction returned as plain floats (quantized-store fidelity).
+        try:
+            vectors = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: _tq.reconstruct(vectors, quant_bits, backend=tq_backend))
+        except RuntimeError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        data = [EmbeddingObject(index=i, embedding=v) for i, v in enumerate(vectors)]
+        eff_backend = tq_backend if tq_backend != 'auto' else _tq.backend_name()
+        quant_meta = {"method": "turboquant", "bits": quant_bits,
+                      "encoding": "float-reconstruction", "backend": eff_backend}
+    elif request.encoding_format == 'base64':
         import struct
         data = [EmbeddingObject(
             index=i,
@@ -146,8 +201,11 @@ async def create_embeddings(request: EmbeddingsRequest, http_request: Request = 
         data = [EmbeddingObject(index=i, embedding=v) for i, v in enumerate(vectors)]
 
     total_tokens = sum(len(t.split()) for t in texts)
-    return EmbeddingsResponse(
+    resp = EmbeddingsResponse(
         data=data,
         model=request.model,
         usage={"prompt_tokens": total_tokens, "total_tokens": total_tokens},
     )
+    if quant_meta is not None:
+        resp.quantization = quant_meta
+    return resp

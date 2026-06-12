@@ -247,4 +247,25 @@ configuration directory (--config DIR, default: OS-specific CoderAI directory). 
         action="store_true",
         help="List available Vulkan GPU devices and exit",
     )
+    parser.add_argument(
+        "--no-resume-jobs",
+        action="store_true",
+        help="Do not resume/recover interrupted LoRA training jobs on restart. "
+             "Mid-flight jobs are marked 'cancelled' (checkpoints are kept, so they "
+             "can still be restarted manually from the Tasks page).",
+    )
+    parser.add_argument(
+        "--pipeline-cache",
+        action="store_true",
+        help="Cache quantized diffusers pipelines to disk after the first build "
+             "and reload them from that cache on later starts — skipping the "
+             "expensive re-download/re-quantization (e.g. the Wan2.2 A14B). The "
+             "fast acceleration LoRA fuse is re-applied per load. Uses extra disk.",
+    )
+    parser.add_argument(
+        "--rebuild-pipeline-cache",
+        action="store_true",
+        help="Ignore any existing pipeline cache and rebuild it from scratch this "
+             "run (use after changing a model's quantization/precision config).",
+    )
     return parser.parse_args()

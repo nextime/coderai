@@ -31,6 +31,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from codai.models.manager import multi_model_manager
 from codai.pydantic.audiogenrequest import AudioGenerationRequest, AudioGenerationResponse
+from codai.tasks import task_registry, TaskCancelled
 
 router = APIRouter()
 
@@ -160,7 +161,7 @@ def _detect_audio_gen_type(model_name: str) -> str:
     return 'musicgen'
 
 
-def _generate_audio(pipe, model_name: str, request: AudioGenerationRequest):
+def _generate_audio(pipe, model_name: str, request: AudioGenerationRequest, task_id=None):
     """Run generation and return (audio_bytes, ext)."""
     import numpy as np, io as _io
 
@@ -191,6 +192,9 @@ def _generate_audio(pipe, model_name: str, request: AudioGenerationRequest):
         _aud_progress_reset(num_steps, unit="it")
 
         def _aud_step_cb(pipe, step_index, timestep, callback_kwargs):
+            task_registry.raise_if_cancelled(task_id)
+            task_registry.wait_if_paused(task_id)
+            task_registry.step(task_id, step_index + 1)
             _aud_progress_step(step_index + 1)
             return callback_kwargs
 
@@ -222,7 +226,7 @@ def _decode_b64_or_url(data: str) -> bytes:
     return base64.b64decode(data)
 
 
-@router.get("/v1/audio/progress")
+@router.get("/v1/audio/progress", summary="Audio generation progress")
 async def get_audio_progress():
     """Return current audio generation progress including speed."""
     elapsed = time.monotonic() - _aud_progress["started_at"] if _aud_progress["active"] else 0.0
@@ -241,7 +245,7 @@ async def get_audio_progress():
     }
 
 
-@router.post("/v1/audio/generate", response_model=AudioGenerationResponse)
+@router.post("/v1/audio/generate", response_model=AudioGenerationResponse, summary="Generate audio, music or SFX")
 async def audio_generate(request: AudioGenerationRequest, http_request: Request = None):
     """
     Generate music, sound effects, or ambient audio.
@@ -262,26 +266,36 @@ async def audio_generate(request: AudioGenerationRequest, http_request: Request 
         device = _derive_device()
         model_type = _detect_audio_gen_type(model_name)
         _ag_cfg = model_info.get('config') or {}
+        from codai.tasks import loading_task
         try:
-            if model_type in ('musicgen', 'audiogen'):
-                pipe = await asyncio.get_event_loop().run_in_executor(
-                    None, _load_musicgen, model_name, device)
-            else:
-                pipe = await asyncio.get_event_loop().run_in_executor(
-                    None, _load_audioldm, model_name, device, _ag_cfg)
+            with loading_task(model_name, model_type="audio"):
+                if model_type in ('musicgen', 'audiogen'):
+                    pipe = await asyncio.get_event_loop().run_in_executor(
+                        None, _load_musicgen, model_name, device)
+                else:
+                    pipe = await asyncio.get_event_loop().run_in_executor(
+                        None, _load_audioldm, model_name, device, _ag_cfg)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load audio gen model: {e}")
         multi_model_manager.models[model_key] = pipe
         multi_model_manager.current_model_key = model_key
 
+    _tid = task_registry.register(
+        "audio", title=(request.prompt or "")[:80], model=model_name or "")
+    task_registry.start(_tid)
     try:
         audio_bytes, ext = await asyncio.get_event_loop().run_in_executor(
-            None, _generate_audio, pipe, model_name, request)
+            None, _generate_audio, pipe, model_name, request, _tid)
+    except TaskCancelled:
+        _aud_progress_done()
+        raise  # global handler finishes the task (cancelled) + returns HTTP 499
     except Exception as e:
+        task_registry.finish(_tid, "error", str(e)[:200])
         _aud_progress_done()
         raise HTTPException(status_code=500, detail=f"Audio generation failed: {e}")
     finally:
         _aud_progress_done()
+    task_registry.finish(_tid, "done")
 
     result = _save_audio_response(audio_bytes, ext, http_request)
 

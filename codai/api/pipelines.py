@@ -117,7 +117,7 @@ class ImageToVideoPipelineRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-@router.post("/v1/pipelines/image-to-video")
+@router.post("/v1/pipelines/image-to-video", summary="Image-to-video pipeline")
 async def pipeline_image_to_video(request: ImageToVideoPipelineRequest, http_request: Request = None):
     """Generate an image then animate it into a video."""
     steps = []
@@ -197,7 +197,7 @@ class VideoDubPipelineRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-@router.post("/v1/pipelines/video-dub")
+@router.post("/v1/pipelines/video-dub", summary="Video dubbing pipeline")
 async def pipeline_video_dub(request: VideoDubPipelineRequest, http_request: Request = None):
     """Transcribe → translate → TTS dub → burn subtitles."""
     body = {
@@ -240,7 +240,7 @@ class StoryPipelineRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-@router.post("/v1/pipelines/story")
+@router.post("/v1/pipelines/story", summary="Story pipeline (multi-scene)")
 async def pipeline_story(request: StoryPipelineRequest, http_request: Request = None):
     """LLM generates script → image per scene → animate first scene → optional TTS narration."""
     n = min(request.num_scenes or 3, 6)
@@ -377,7 +377,7 @@ class AudioDubPipelineRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-@router.post("/v1/pipelines/audio-dub")
+@router.post("/v1/pipelines/audio-dub", summary="Audio dubbing pipeline")
 async def pipeline_audio_dub(request: AudioDubPipelineRequest, http_request: Request = None):
     """Transcribe → (translate) → clone voice → replace audio track."""
     import os, tempfile, subprocess, base64

@@ -419,7 +419,7 @@ def resolve_character_profiles(profile_names: List[str]) -> List[str]:
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@router.post("/v1/characters")
+@router.post("/v1/characters", summary="Create or replace a character profile")
 async def save_character(req: CharacterSaveRequest, _auth=Depends(_require_api_auth)):
     """Save or update a named character profile."""
     if not req.name or '/' in req.name or '..' in req.name:
@@ -430,13 +430,13 @@ async def save_character(req: CharacterSaveRequest, _auth=Depends(_require_api_a
     return {"ok": True, "name": meta['name'], "image_count": meta['image_count']}
 
 
-@router.get("/v1/characters")
+@router.get("/v1/characters", summary="List character profiles")
 async def list_characters(_auth=Depends(_require_api_auth)):
     """List all saved character profiles (metadata only, no images)."""
     return {"characters": _list_characters()}
 
 
-@router.get("/v1/characters/{name}")
+@router.get("/v1/characters/{name}", summary="Get a character profile")
 async def get_character(name: str, _auth=Depends(_require_api_auth)):
     """Get a character profile including its reference images as base64."""
     meta = _load_character_meta(name)
@@ -452,7 +452,7 @@ async def get_character(name: str, _auth=Depends(_require_api_auth)):
     }
 
 
-@router.delete("/v1/characters/{name}")
+@router.delete("/v1/characters/{name}", summary="Delete a character profile")
 async def delete_character(name: str, _auth=Depends(_require_api_auth)):
     """Delete a character profile."""
     cdir = _char_dir(name)
@@ -463,7 +463,7 @@ async def delete_character(name: str, _auth=Depends(_require_api_auth)):
     return {"ok": True, "name": name}
 
 
-@router.patch("/v1/characters/{name}")
+@router.patch("/v1/characters/{name}", summary="Update a character profile")
 async def patch_character(name: str, req: CharacterPatchRequest, _auth=Depends(_require_api_auth)):
     """Update a character profile: description, add images, or remove images by index."""
     meta = _load_character_meta(name)
@@ -512,7 +512,7 @@ async def patch_character(name: str, req: CharacterPatchRequest, _auth=Depends(_
     return {"ok": True, "name": name, "image_count": meta['image_count']}
 
 
-@router.post("/v1/characters/generate")
+@router.post("/v1/characters/generate", summary="Generate character reference images")
 async def generate_character(req: CharacterGenerateRequest, request: Request):
     """
     Generate a character profile from a text prompt.
@@ -585,7 +585,7 @@ async def generate_character(req: CharacterGenerateRequest, request: Request):
     return {"ok": True, "name": meta["name"], "image_count": meta["image_count"]}
 
 
-@router.post("/v1/characters/extract")
+@router.post("/v1/characters/extract", summary="Extract a character from media")
 async def extract_character(req: CharacterExtractRequest):
     """
     Extract a character profile from source images and/or videos.

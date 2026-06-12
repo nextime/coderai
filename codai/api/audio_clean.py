@@ -116,8 +116,15 @@ class AudioCleanupRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-@router.post("/v1/audio/cleanup")
+@router.post("/v1/audio/cleanup", summary="Clean / restore audio")
 async def cleanup_audio(request: AudioCleanupRequest, http_request: Request = None):
+    """Restore/clean a noisy audio clip.
+
+    Applies any combination of noise reduction, loudness normalization, mains-hum
+    removal and click/crackle repair. Uses an ML restoration backend when available,
+    falling back to an ffmpeg-based best-effort path when `fallback_mode` is set.
+    Returns the cleaned audio plus the backend and quality tier that were used.
+    """
     try:
         audio_bytes = _decode_audio(request.audio)
     except Exception as exc:

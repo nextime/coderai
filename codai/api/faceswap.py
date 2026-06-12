@@ -144,7 +144,7 @@ class FaceSwapRequest(BaseModel):
 # Endpoint
 # ---------------------------------------------------------------------------
 
-@router.post('/v1/images/faceswap')
+@router.post('/v1/images/faceswap', summary="Swap faces between images")
 async def faceswap(request: FaceSwapRequest, http_request: Request = None):
     """
     Swap the face from source_face into every face found in target.

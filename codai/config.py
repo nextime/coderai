@@ -127,6 +127,17 @@ class ThermalConfig:
 
 
 @dataclass
+class JobsConfig:
+    """Background-job (LoRA training) configuration."""
+    # When True, an interrupted training job (process restart) is left
+    # 'interrupted' so it can resume from its on-disk checkpoint. When False,
+    # such jobs are marked 'cancelled' on startup and not auto-resumed (their
+    # checkpoints are kept, so they can be restarted manually from the Tasks
+    # page). The --no-resume-jobs CLI flag forces this off for one run.
+    resume_on_restart: bool = True
+
+
+@dataclass
 class Config:
     """Main configuration class."""
     version: str = "1.0"
@@ -139,6 +150,7 @@ class Config:
     whisper: WhisperConfig = field(default_factory=WhisperConfig)
     archive: ArchiveConfig = field(default_factory=ArchiveConfig)
     thermal: ThermalConfig = field(default_factory=ThermalConfig)
+    jobs: JobsConfig = field(default_factory=JobsConfig)
     broker: BrokerConfig = field(default_factory=BrokerConfig)
     system_prompt: Optional[str] = None
     tools_closer_prompt: bool = False
@@ -293,6 +305,7 @@ class ConfigManager:
                 whisper=WhisperConfig(**config_data.get("whisper", {})),
                 archive=ArchiveConfig(**config_data.get("archive", {})),
                 thermal=ThermalConfig(**config_data.get("thermal", {})),
+                jobs=JobsConfig(**config_data.get("jobs", {})),
                 broker=BrokerConfig(**config_data.get("broker", {})),
                 system_prompt=config_data.get("system_prompt"),
                 tools_closer_prompt=config_data.get("tools_closer_prompt", False),
@@ -410,6 +423,9 @@ class ConfigManager:
                 "gpu_high": self.config.thermal.gpu_high,
                 "gpu_resume": self.config.thermal.gpu_resume,
                 "poll_seconds": self.config.thermal.poll_seconds,
+            },
+            "jobs": {
+                "resume_on_restart": self.config.jobs.resume_on_restart,
             },
             "broker": {
                 "enabled": self.config.broker.enabled,

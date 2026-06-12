@@ -307,7 +307,7 @@ def resolve_environment_profiles(profile_names: List[str]) -> List[str]:
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@router.post("/v1/environments")
+@router.post("/v1/environments", summary="Create or replace an environment profile")
 async def save_environment(req: EnvironmentSaveRequest, _auth=Depends(_require_api_auth)):
     """Save or update a named environment profile."""
     if not req.name or '/' in req.name or '..' in req.name:
@@ -318,13 +318,13 @@ async def save_environment(req: EnvironmentSaveRequest, _auth=Depends(_require_a
     return {"ok": True, "name": meta['name'], "image_count": meta['image_count']}
 
 
-@router.get("/v1/environments")
+@router.get("/v1/environments", summary="List environment profiles")
 async def list_environments(_auth=Depends(_require_api_auth)):
     """List all saved environment profiles (metadata only)."""
     return {"environments": _list_environments()}
 
 
-@router.get("/v1/environments/{name}")
+@router.get("/v1/environments/{name}", summary="Get an environment profile")
 async def get_environment(name: str, _auth=Depends(_require_api_auth)):
     """Get an environment profile including its reference images as base64."""
     meta = _load_environment_meta(name)
@@ -340,7 +340,7 @@ async def get_environment(name: str, _auth=Depends(_require_api_auth)):
     }
 
 
-@router.delete("/v1/environments/{name}")
+@router.delete("/v1/environments/{name}", summary="Delete an environment profile")
 async def delete_environment(name: str, _auth=Depends(_require_api_auth)):
     """Delete an environment profile."""
     edir = _env_dir(name)
@@ -351,7 +351,7 @@ async def delete_environment(name: str, _auth=Depends(_require_api_auth)):
     return {"ok": True, "name": name}
 
 
-@router.patch("/v1/environments/{name}")
+@router.patch("/v1/environments/{name}", summary="Update an environment profile")
 async def patch_environment(name: str, req: EnvironmentPatchRequest, _auth=Depends(_require_api_auth)):
     """Update an environment profile: description, add images, or remove images by index."""
     meta = _load_environment_meta(name)
@@ -398,7 +398,7 @@ async def patch_environment(name: str, req: EnvironmentPatchRequest, _auth=Depen
     return {"ok": True, "name": name, "image_count": meta['image_count']}
 
 
-@router.post("/v1/environments/generate")
+@router.post("/v1/environments/generate", summary="Generate environment reference images")
 async def generate_environment(req: EnvironmentGenerateRequest, request: Request):
     """
     Generate an environment profile from a text prompt.
@@ -471,7 +471,7 @@ async def generate_environment(req: EnvironmentGenerateRequest, request: Request
     return {"ok": True, "name": meta["name"], "image_count": meta["image_count"]}
 
 
-@router.post("/v1/environments/extract")
+@router.post("/v1/environments/extract", summary="Extract an environment from media")
 async def extract_environment(req: EnvironmentExtractRequest):
     """
     Extract an environment profile from source images and/or videos.

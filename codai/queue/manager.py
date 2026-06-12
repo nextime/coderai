@@ -169,6 +169,23 @@ class QueueManager:
                     return index
             return 0
 
+    def list_waiting(self) -> list:
+        """Best-effort snapshot of queued (waiting) requests for the Tasks view.
+        Read without the async lock — fine for a read-only UI snapshot."""
+        out = []
+        for w in list(self.waiting):
+            out.append({
+                "request_id": w.request_id,
+                "model_key": w.model_key,
+                "enqueued_at": w.enqueued_at,
+            })
+        return out
+
+    def list_active(self) -> list:
+        """Best-effort snapshot of in-flight leases for the Tasks view."""
+        return [{"request_id": rid, "model_key": lease.model_key}
+                for rid, lease in list(self.active_leases.items())]
+
     def get_metrics(self) -> Dict[str, object]:
         return {
             "active": len(self.active_leases),

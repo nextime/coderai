@@ -4,6 +4,11 @@ This document describes the full HTTP API exposed by CoderAI, including OpenAI-c
 
 The API is implemented with FastAPI in `codai/api/app.py` and routers under `codai/api/`, with admin routes under `codai/admin/routes.py`.
 
+Interactive, always-up-to-date OpenAPI docs are served by the running server at
+`/docs` (Swagger UI, linked as **API Docs** in the admin nav) and `/redoc`, with the
+raw schema at `/openapi.json`. Every endpoint there carries a tag, summary, and
+per-field descriptions generated from the code.
+
 ## Base URL
 
 Default local server:
@@ -377,9 +382,9 @@ Request fields:
 | `response_format` | string | `url` | `url` or `b64_json` |
 | `seed` | integer/null | random | Deterministic seed |
 | `negative_prompt` | string/null | `null` | Negative prompt |
-| `disable_safety_checker` | boolean | `false` | Disable safety checker where supported |
+| `disable_safety_checker` | boolean | `false` | Null the diffusers safety checker (only affects SD 1.x/2.x; SDXL/Flux ship none) |
 | `vae_model` | string/null | `null` | Per-request VAE override |
-| `loras` | array/null | `null` | LoRA adapters `{model, weight, name}` |
+| `loras` | array/null | `null` | LoRA adapters — see [LoRA references](#lora-references-in-requests) for all supported fields |
 | `character_profiles` | string[]/null | `null` | Saved character profile names |
 | `character_references` | string[]/null | `null` | Inline reference images |
 | `character_strength` | number | `0.6` | IP-Adapter/reference strength |
@@ -403,14 +408,15 @@ curl -s "$CODERAI_URL/v1/images/generations" \
   }' | jq
 ```
 
-LoRA example:
+LoRA example (the weights can also be sent inline or by registry id — see
+[LoRA references](#lora-references-in-requests)):
 
 ```json
 {
   "model": "image-model",
   "prompt": "portrait of <character-token> as a space pilot",
   "loras": [
-    {"model": "/home/me/loras/space_uniform.safetensors", "weight": 0.8, "name": "uniform"}
+    {"id": "name:space_uniform", "weight": 0.8, "name": "uniform"}
   ]
 }
 ```
@@ -603,14 +609,15 @@ Primary fields:
 | `num_inference_steps` | integer/null | model default | Diffusion steps |
 | `guidance_scale` | number/null | model default | CFG/guidance |
 | `seed` | integer/null | random | Seed |
-| `mode` | string | `t2v` | `t2v`, `i2v`, `v2v`, `ti2v`, `interp` |
+| `mode` | string | `t2v` | `t2v`, `i2v` (init_image, prompt dropped), `ti2v` (init_image + prompt), `v2v`, `interp`. The server gracefully falls back between Wan t2v/i2v pipelines when a model supports only one. |
 | `image` / `init_image` | string/null | `null` | Initial/reference frame |
 | `end_image` | string/null | `null` | End frame for interpolation |
 | `video` | string/null | `null` | Input video for v2v/post-processing |
 | `strength` | number/null | `null` | Denoising strength |
 | `camera_motion` | string/null | `null` | `zoom-in`, `pan-left`, etc. |
 | `character_profiles` | string[]/null | `null` | Saved character profiles |
-| `loras` | array/null | `null` | Video LoRA adapters |
+| `loras` | array/null | `null` | Video LoRA adapters — see [LoRA references](#lora-references-in-requests) |
+| `disable_safety_checker` | boolean | `false` | Null the diffusers safety checker (no effect on models without one, e.g. Wan) |
 | `response_format` | string | `url` | `url` or `b64_mp4` |
 
 Text-to-video example:
@@ -1046,6 +1053,7 @@ Request fields:
 | `image` | string/string[]/null | `null` | Optional image input(s) for multimodal embeddings |
 | `encoding_format` | string | `float` | `float` or `base64` |
 | `dimensions` | integer/null | `null` | Optional truncation size |
+| `quantization` | string/null | `null` | TurboQuant vector quantization: `turbo`/`turbo8`/`turbo6`/`turbo4`/`turbo2` |
 
 Example:
 
@@ -1083,6 +1091,41 @@ Multimodal embedding example:
   "image": "data:image/png;base64,...",
   "encoding_format": "base64"
 }
+```
+
+### TurboQuant embedding quantization
+
+TurboQuant ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) is a data-free,
+inner-product-preserving vector quantizer: it randomly rotates each embedding so its
+coordinates concentrate, then applies a per-coordinate scalar quantizer. Quantized
+vectors keep their dot products / cosine similarity, so they can be stored 3–12×
+smaller in a vector DB. Set `quantization` to enable it:
+
+- `turbo`/`turbo8` = 8-bit (near-lossless, ~3×), `turbo6`, `turbo4` (~6×), `turbo2` (~12×).
+- With `encoding_format: "float"` (default) the response returns the **lossy
+  reconstructed** float vectors (same shape) — drop-in, behaves like a quantized store.
+- With `encoding_format: "base64"` each `embedding` is the **compact packed bytes**
+  (`[float16 norm][packbits(b-bit rotated codes)]`), and the response carries a
+  top-level `quantization` block (`bits`, `seed`, `dim`, `dim_padded`, `radius`,
+  `bytes_per_vector`, `layout`) describing how to decode them.
+
+The implementation backend is chosen per embedding model in the admin **Models**
+config (TurboQuant section): `builtin` (NumPy, always available) or `library`
+(the optional `turboquant-py[torch]` package, which adds the paper's QJL stage).
+TurboQuant must be enabled for the model, or a request `quantization` is rejected
+with HTTP 400. Selecting the `library` backend when the package is not installed
+also returns HTTP 400 rather than silently degrading.
+
+```bash
+curl -s "$CODERAI_URL/v1/embeddings" \
+  -H "Authorization: Bearer $CODERAI_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "BAAI/bge-small-en-v1.5",
+    "input": ["first document", "second document"],
+    "quantization": "turbo4",
+    "encoding_format": "base64"
+  }' | jq
 ```
 
 ## Character Profiles
@@ -1282,19 +1325,70 @@ curl -s "$CODERAI_URL/v1/loras/progress" \
 
 ### LoRA Registry
 
-- `GET /v1/loras`
-- `GET /v1/loras/{name}`
-- `DELETE /v1/loras/{name}`
+- `GET /v1/loras` — list registered LoRAs (name, weight path, metadata)
+- `GET /v1/loras/{name}` — fetch one registered LoRA
+- `DELETE /v1/loras/{name}` — delete a registered LoRA
 
-Use a trained LoRA in image/video requests:
+### Upload LoRA Weights
+
+`POST /v1/loras/upload`
+
+Upload a LoRA file into a **content-addressed (sha256) blob store** so a client on a
+different machine can use it without sharing the server's filesystem. Accepts the file
+in three ways:
+
+- **multipart/form-data** with a `file` field,
+- **JSON** `{"file": "<base64>"}` (a `data:` URI is also accepted; `data` is an alias),
+- a **raw** request body (the bytes of the `.safetensors`).
+
+Returns `{"id": "sha256:<hex>", "bytes": <n>, "existed": <bool>}`. Reference the returned
+`id` in any image/video request via `"loras": [{"id": "sha256:<hex>", "weight": ...}]`.
+
+```bash
+curl -s "$CODERAI_URL/v1/loras/upload" \
+  -H "Authorization: Bearer $CODERAI_TOKEN" \
+  -F "file=@./alice_identity.safetensors" | jq
+# → {"id":"sha256:1f3b…","bytes":18874368,"existed":false}
+```
+
+### Check Uploaded Blob
+
+`GET /v1/loras/blob/{hash}`
+
+Existence check for an uploaded blob — `200` with `{id, bytes, exists}` when present,
+`404` when absent — so a client can skip re-uploading a file the server already has.
+`hash` may be a bare hex sha256 or `sha256:<hex>`.
+
+### LoRA references in requests
+
+The `loras` array in image (`/v1/images/generations`) and video
+(`/v1/video/generations`) requests accepts LoRA weights supplied in several ways. The
+server resolves each entry in this **priority order**:
+
+| Field | Example | Meaning |
+|---|---|---|
+| `id` | `"name:alice_identity"` | A registered/trained LoRA by name |
+| `id` | `"sha256:1f3b…"` | An uploaded blob (from `/v1/loras/upload`) |
+| `file` / `data` | `"<base64>"` or `data:` URI | Inline weights, sent with the request |
+| `url` | `"https://…/lora.safetensors"` | Server downloads and caches it |
+| `model` / `path` | `"/path/to/lora.safetensors"` or HF id | Legacy local path / HF id (shared filesystem only) |
+
+Common fields: `weight` (float, scale; default `1.0`) and `name` (optional adapter name).
 
 ```json
 {
   "model": "image-model",
   "prompt": "alice_person in a cyberpunk alley",
-  "loras": [{"model": "alice_identity", "weight": 0.85}]
+  "loras": [
+    {"id": "name:alice_identity", "weight": 0.85},
+    {"id": "sha256:1f3b9c…", "weight": 0.6, "name": "jacket"}
+  ]
 }
 ```
+
+> The previous `{"model": "alice_identity"}` form still works, but prefer `id`
+> (`"name:<registered>"`) or an uploaded `sha256:` blob so requests don't depend on the
+> client and server sharing a filesystem.
 
 ## 2D / 3D / Spatial APIs
 
@@ -1706,7 +1800,8 @@ curl -s "$CODERAI_URL/admin/api/tokens" \
 | `GET` | `/admin/api/model-loaded-status` | none | Loaded model / pool info |
 | `POST` | `/admin/api/model-load` | `{path}` | Load model now |
 | `POST` | `/admin/api/model-unload` | `{path}` | Unload model |
-| `POST` | `/admin/api/model-configure` | model config JSON | Configure model |
+| `POST` | `/admin/api/model-configure` | model config JSON | Configure model (incl. the `acceleration` block — see [Acceleration and Distillation](#acceleration-and-distillation)) |
+| `GET` | `/admin/api/accel-presets` | none | Catalog of acceleration/distillation presets (Lightning, Lightx2v, Turbo, LCM, Hyper-SD) |
 
 Download with SSE progress:
 
@@ -1767,6 +1862,76 @@ Logged-in users can access profile metadata through admin routes:
 | `GET` | `/admin/api/voices` | List voice profiles |
 | `GET` | `/admin/api/voices/{name}` | Voice detail |
 | `DELETE` | `/admin/api/voices/{name}` | Delete voice |
+
+## Acceleration and Distillation
+
+Image and video models can be configured to use a **distillation adapter** (Lightning,
+Lightx2v / phased DMD, SDXL-Turbo, LCM-LoRA, Hyper-SD). When enabled, the distill LoRA
+is **fused into the pipeline at load time** and the correct low step-count / low-guidance
+/ scheduler defaults are applied at generation time — cutting inference from ~25–50 steps
+to **1–8 steps at guidance ≈ 1.0** (a 5–10× speedup). It is orthogonal to per-request
+character LoRAs, which still apply on top.
+
+This is **per-model configuration** (set via `POST /admin/api/model-configure` or the
+admin Models page), not a per-request field. The catalog of presets is served by
+`GET /admin/api/accel-presets`.
+
+The `acceleration` block in a model's config:
+
+```json
+"acceleration": {
+  "enabled": true,
+  "preset": "wan22_lightning_4step",
+  "lora": "lightx2v/Wan2.2-Lightning",
+  "lora_weight": 1.0,
+  "steps": 4,
+  "guidance_scale": 1.0,
+  "flow_shift": 5.0,
+  "scheduler": ""
+}
+```
+
+- `enabled` — `false` or an absent block means no change to current behaviour.
+- `preset` — a catalog key (below) or `"custom"`. When not `"custom"`, unset fields are
+  filled from the preset; any explicit field overrides it.
+- `lora` — distill LoRA path or HF repo (`repo` or `repo:weight_name.safetensors`).
+  `null` for full-model presets such as SDXL-Turbo.
+- `steps` / `guidance_scale` — defaults applied when the request omits them.
+- `flow_shift` — optional Wan flow-match scheduler shift.
+- `scheduler` — optional scheduler class override (e.g. `LCMScheduler`).
+
+Preset catalog (`GET /admin/api/accel-presets`):
+
+| Preset key | Applies to | Steps | Guidance | Notes |
+|---|---|---:|---:|---|
+| `wan22_lightning_4step` | video | 4 | 1.0 | Wan2.2 Lightning (4-step DMD) |
+| `wan21_lightx2v_4step` | video | 4 | 1.0 | Wan2.1 Lightx2v (4-step) |
+| `sdxl_lightning_4step` | image | 4 | 1.0 | SDXL-Lightning (4-step) |
+| `sdxl_lightning_8step` | image | 8 | 1.0 | SDXL-Lightning (8-step) |
+| `sdxl_turbo` | image | 4 | 1.0 | SDXL-Turbo (full model, 1–4 step) |
+| `sdxl_lcm` | image | 6 | 1.5 | SDXL LCM-LoRA (`LCMScheduler`) |
+| `hyper_sdxl_8step` | image | 8 | 1.0 | Hyper-SD SDXL (8-step) |
+| `sd15_lcm` | image | 6 | 1.5 | SD1.5 LCM-LoRA (`LCMScheduler`) |
+
+> The preset LoRA repo ids are best-effort defaults; override `lora` (and any numeric
+> field) per model. A LoRA-fuse failure is logged and generation proceeds un-accelerated.
+> sd.cpp models get the step/guidance defaults and optional `<lora:…>` prompt injection
+> (more limited than diffusers).
+
+### KV-cache quantization (GGUF text models)
+
+GGUF/llama.cpp text models can quantize the **KV cache** to fit longer contexts in
+less VRAM. This is **per-model configuration** (set via `POST /admin/api/model-configure`
+or the admin Models UI), independent of the weight-quantization flags:
+
+```json
+"cache_type_k": "q8_0",
+"cache_type_v": "q8_0"
+```
+
+Accepted values: `q8_0` (near-lossless, ~2× smaller KV), `q5_1`, `q5_0`, `q4_1`,
+`q4_0` (smallest), or omit/blank for the default `f16`. A sub-8-bit **value** cache
+(`q5_*`/`q4_*`) requires flash attention; CoderAI auto-enables it for that model.
 
 ## AISBF / Broker Integration
 

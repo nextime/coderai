@@ -185,13 +185,13 @@ class VoicePatchRequest(BaseModel):
 # Voice profile management
 # ---------------------------------------------------------------------------
 
-@router.get("/v1/audio/voices")
+@router.get("/v1/audio/voices", summary="List voice profiles")
 async def list_voices():
     """List all saved voice profiles."""
     return {"voices": _list_voices()}
 
 
-@router.post("/v1/audio/voices")
+@router.post("/v1/audio/voices", summary="Create a voice profile")
 async def create_voice(
     name: str = Form(...),
     transcript: str = Form(...),
@@ -216,7 +216,7 @@ async def create_voice(
     return {"created": True, "voice": meta}
 
 
-@router.delete("/v1/audio/voices/{name}")
+@router.delete("/v1/audio/voices/{name}", summary="Delete a voice profile")
 async def delete_voice(name: str):
     """Delete a saved voice profile."""
     import shutil
@@ -227,7 +227,7 @@ async def delete_voice(name: str):
     return {"deleted": True, "name": name}
 
 
-@router.patch("/v1/audio/voices/{name}")
+@router.patch("/v1/audio/voices/{name}", summary="Update a voice profile")
 async def patch_voice(name: str, req: VoicePatchRequest):
     """Update description, transcript, or reference audio of a saved voice profile."""
     meta = _load_voice(name)
@@ -259,7 +259,7 @@ async def patch_voice(name: str, req: VoicePatchRequest):
     return {"updated": True, "voice": meta}
 
 
-@router.get("/v1/audio/voices/{name}")
+@router.get("/v1/audio/voices/{name}", summary="Get a voice profile")
 async def get_voice(name: str):
     """Get a single voice profile metadata."""
     meta = _load_voice(name)
@@ -268,7 +268,7 @@ async def get_voice(name: str):
     return {"voice": meta}
 
 
-@router.post("/v1/audio/voices/extract")
+@router.post("/v1/audio/voices/extract", summary="Extract a voice profile from a sample")
 async def extract_voice(req: VoiceExtractRequest):
     """
     Extract a voice profile from a source audio or video file.
@@ -358,7 +358,7 @@ class VoiceCloneRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-@router.post("/v1/audio/clone")
+@router.post("/v1/audio/clone", summary="Clone a voice / synthesize cloned speech")
 async def clone_voice(request: VoiceCloneRequest, http_request: Request = None):
     """
     Synthesize speech in a cloned voice using F5-TTS.

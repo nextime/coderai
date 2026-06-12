@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 # Import from codai modules
 from codai.models.manager import ModelManager, WhisperServerManager, MultiModelManager, model_manager, multi_model_manager
 from codai.queue.manager import QueueManager, queue_manager
+from codai.tasks import task_registry
 from codai.api.prompt_cache import prompt_cache_manager
 from codai.pydantic.textrequest import ChatCompletionRequest, ToolFunction, Tool
 from codai.models.parser import filter_malformed_content, filter_repetition, format_tools_for_prompt, cleanup_control_tokens, OpenAIFormatter, ModelParserAdapter, ToolCallParser
@@ -92,7 +93,7 @@ def set_grammar_guided_gen(enabled: bool):
 router = APIRouter()
 
 
-@router.post("/v1/chat/completions")
+@router.post("/v1/chat/completions", summary="Chat completions")
 async def chat_completions(request: ChatCompletionRequest, http_request: Request = None):
     """Chat completions endpoint with streaming and tool support."""
     
@@ -1248,7 +1249,8 @@ async def stream_chat_response(
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     request_id = f"req-{uuid.uuid4().hex[:8]}"
-    
+    _tid = None
+
     generated_text = ""
     
     # Check if model is loaded - if not, notify waiting clients
@@ -1320,6 +1322,9 @@ async def stream_chat_response(
     
     # Mark as starting processing
     await queue_manager.start_processing(request_id, model_name)
+    _tid = task_registry.register("text", title=(model_name or "chat"),
+                                  model=model_name or "", task_id=request_id)
+    task_registry.start(_tid)
     
     # Send "Model starting" message
     data = {
@@ -1374,6 +1379,9 @@ async def stream_chat_response(
             response_format=response_format,
             enable_thinking=enable_thinking,
         ):
+            # Cooperative cancellation: stop streaming if the task was cancelled.
+            if task_registry.is_cancelled(_tid):
+                break
             chunk_count += 1
             # Always filter malformed content (regex-based, works per-chunk)
             filtered_chunk = filter_malformed_content(chunk)
@@ -1580,6 +1588,9 @@ async def stream_chat_response(
     finally:
         # Always clean up queue state
         await queue_manager.finish_processing()
+        if _tid:
+            task_registry.finish(
+                _tid, "cancelled" if task_registry.is_cancelled(_tid) else "done")
 
 async def generate_chat_response(
     messages: List[Dict],
@@ -1789,7 +1800,7 @@ async def generate_chat_response(
 from codai.pydantic.textrequest import CompletionRequest
 
 
-@router.post("/v1/completions")
+@router.post("/v1/completions", summary="Legacy text completions")
 async def completions(request: CompletionRequest):
     """Legacy text completions endpoint (for backward compatibility)."""
     # Get the model for this request

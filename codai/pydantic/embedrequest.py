@@ -17,16 +17,17 @@
 """Pydantic models for embeddings API."""
 
 from typing import Dict, List, Optional, Union
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class EmbeddingsRequest(BaseModel):
-    model: str
-    input: Union[str, List[str]]           # text(s) to embed
-    image: Optional[Union[str, List[str]]] = None  # base64/URL image(s) for multimodal embed
-    encoding_format: Optional[str] = "float"       # float | base64
-    dimensions: Optional[int] = None               # truncate to N dims if supported
-    user: Optional[str] = None
+    model: str = Field(..., description="Embedding model id to use.")
+    input: Union[str, List[str]] = Field(..., description="Text or list of texts to embed.")
+    image: Optional[Union[str, List[str]]] = Field(None, description="Base64/URL image(s) for multimodal embedding models.")
+    encoding_format: Optional[str] = Field("float", description="Return embeddings as 'float' arrays or 'base64'.")
+    dimensions: Optional[int] = Field(None, description="Truncate embeddings to N dimensions (if the model supports it).")
+    quantization: Optional[str] = Field(None, description="Optional TurboQuant vector quantization: 'turbo' (8-bit), 'turbo8', 'turbo6', 'turbo4' or 'turbo2'. With encoding_format='float' the (lossy) reconstructed vectors are returned; with 'base64' the compact packed bytes are returned plus a 'quantization' metadata block describing how to decode them.")
+    user: Optional[str] = Field(None, description="Opaque end-user identifier (passthrough).")
     model_config = ConfigDict(extra="allow")
 
 
