@@ -19,6 +19,13 @@
   — running work is paused until the hardware cools.
 </div>
 
+<div id="throttle-banner" style="display:none;margin:0 0 1rem;padding:.6rem .85rem;border-radius:8px;
+     background:rgba(56,189,248,.10);border:1px solid rgba(56,189,248,.4);color:#38bdf8;font-size:13px">
+  <span style="font-weight:600">🐢 CPU soft-throttle</span>
+  <span id="throttle-banner-msg" class="mono"></span>
+  — generation is being gently slowed to keep the CPU below its pause limit.
+</div>
+
 <!-- Live hardware telemetry -->
 <div id="sys-stats" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
      gap:.75rem;margin:0 0 1.25rem">
@@ -165,6 +172,16 @@ async function loadTasks() {
       banner.style.display = 'none';
     }
 
+    const soft = data.soft_throttle || {};
+    const sbanner = document.getElementById('throttle-banner');
+    // Hide the soft-throttle banner during a hard cooldown (the pause supersedes it).
+    if (soft.active && !therm.active) {
+      document.getElementById('throttle-banner-msg').textContent = ' ' + (soft.message || '');
+      sbanner.style.display = '';
+    } else {
+      sbanner.style.display = 'none';
+    }
+
     const tbody = document.getElementById('tasks-body');
     if (!tasks.length) {
       tbody.innerHTML = '<tr class="empty-row"><td colspan="6">No tasks yet</td></tr>';
@@ -177,6 +194,10 @@ async function loadTasks() {
       if (t.cooling) {
         statusCell = `<span class="badge badge-warn">❄ Cooling down</span>`
           + `<div class="dim small">${esc(t.cooling_message || 'paused for thermal cooldown')}</div>`;
+      } else if (t.throttling) {
+        statusCell = `<span class="badge ${badge}">${esc(t.status)}</span>`
+          + ` <span class="badge badge-user">🐢 throttling</span>`
+          + `<div class="dim small">${esc(t.throttle_message || 'CPU soft-throttle')}</div>`;
       } else if (t.paused) {
         statusCell = `<span class="badge badge-warn">⏸ Paused</span>`
           + `<div class="dim small">suspended — click Resume to continue</div>`;

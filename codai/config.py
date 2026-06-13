@@ -124,6 +124,13 @@ class ThermalConfig:
     gpu_high: float = 90.0      # pause when GPU reaches this temperature
     gpu_resume: float = 87.0    # resume once GPU drops back to/below this
     poll_seconds: float = 5.0   # how often to re-check while cooling down
+    # Proactive soft-throttle: before a hard pause, when a sensor enters the warm
+    # band [soft_throttle_temp, *_high) insert a short per-step sleep (scaled by
+    # how close to the pause threshold) so the temperature climbs slower and the
+    # hard cooldown is rarely hit. Caps the heat-rate of a single pegged core.
+    soft_throttle_enabled: bool = False
+    soft_throttle_temp: float = 80.0       # engage at/above this temperature (°C)
+    soft_throttle_max_sleep: float = 3.0   # max seconds to sleep/checkpoint at the limit
 
 
 @dataclass
@@ -423,6 +430,9 @@ class ConfigManager:
                 "gpu_high": self.config.thermal.gpu_high,
                 "gpu_resume": self.config.thermal.gpu_resume,
                 "poll_seconds": self.config.thermal.poll_seconds,
+                "soft_throttle_enabled": self.config.thermal.soft_throttle_enabled,
+                "soft_throttle_temp": self.config.thermal.soft_throttle_temp,
+                "soft_throttle_max_sleep": self.config.thermal.soft_throttle_max_sleep,
             },
             "jobs": {
                 "resume_on_restart": self.config.jobs.resume_on_restart,

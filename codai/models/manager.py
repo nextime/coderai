@@ -2464,6 +2464,52 @@ class MultiModelManager:
             _time.sleep(0.25)
         return True
 
+    def unload_model(self, key: str) -> bool:
+        """Fully unload ONE model by key: drop it from the cache + instance pool and
+        free its VRAM/host RAM. Used when a config change (e.g. acceleration, which
+        is fused at load time) needs the next request to reload the model fresh.
+
+        Waits briefly if the model is mid-request; returns True if a model was
+        actually unloaded."""
+        if key not in self.models and key not in self.model_pools:
+            return False
+        if self._is_key_busy(key):
+            if not self._wait_until_idle(key):
+                print(f"  unload_model: '{key}' still busy — not unloaded")
+                return False
+        model_obj = self.models.pop(key, None)
+        self.models_in_vram.discard(key)
+        if self.current_model_key == key:
+            self.current_model_key = None
+        if self.active_in_vram == key:
+            self.active_in_vram = None
+        pool = self.model_pools.pop(key, None)
+        if pool is not None:
+            try:
+                pool.cleanup_all()
+            except Exception as e:
+                print(f"  Warning cleaning pool for '{key}': {e}")
+        if model_obj is not None:
+            try:
+                if hasattr(model_obj, 'cleanup'):
+                    model_obj.cleanup()
+                elif hasattr(model_obj, 'to'):
+                    model_obj.to('cpu')
+            except Exception as e:
+                print(f"  Warning during unload of '{key}': {e}")
+        del model_obj
+        for _ in range(3):
+            gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        _trim_cpu_ram()
+        return True
+
     def _evict_models_for_vram(self, needed_gb: float):
         """Unload loaded models (LRU first) until we have at least needed_gb free VRAM.
 

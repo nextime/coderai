@@ -204,15 +204,41 @@ def apply_model_entry_live(entry, model_types) -> int:
     mid = entry.get("path") or entry.get("id") or ""
     if not mid:
         return 0
+    def _accel_sig(c):
+        """Stable signature of a config's acceleration so we can tell whether a
+        save toggled/changed it. Returns 'off' when acceleration is absent."""
+        try:
+            from codai.models.acceleration import resolve_acceleration
+            import json as _json
+            a = resolve_acceleration(c)
+            return _json.dumps(a, sort_keys=True, default=str) if a else "off"
+        except Exception:
+            return "off"
+
     updated = 0
     for cat in (model_types or []):
         tp = _CATEGORY_TYPE_PREFIX.get(cat)
         if not tp:
             continue
         type_str, prefix = tp
+        key = f"{prefix}{mid}"
+        old_cfg = multi_model_manager.config.get(key)
         cfg = build_runtime_model_cfg(entry, type_str)
-        multi_model_manager.config[f"{prefix}{mid}"] = cfg
+        multi_model_manager.config[key] = cfg
         updated += 1
+        # Acceleration (Lightning/Lightx2v/LCM distill LoRA + scheduler) is FUSED
+        # into the pipeline at load time, so it can't be toggled on an already
+        # loaded model. If the save changed it and the model is loaded, evict it
+        # so the NEXT request for this model reloads with the new acceleration —
+        # applied immediately, no server restart.
+        try:
+            if (key in multi_model_manager.models
+                    and _accel_sig(old_cfg) != _accel_sig(cfg)):
+                if multi_model_manager.unload_model(key):
+                    print(f"  [admin] acceleration changed for {key} — model "
+                          f"evicted; next request reloads with the new setting")
+        except Exception as _e:
+            print(f"  [admin] accel-evict skipped for {key}: {_e}")
         alias = entry.get("alias")
         if alias:
             try:
@@ -766,6 +792,9 @@ def main():
     global_args.thermal_gpu_high = config.thermal.gpu_high
     global_args.thermal_gpu_resume = config.thermal.gpu_resume
     global_args.thermal_poll_seconds = config.thermal.poll_seconds
+    global_args.thermal_soft_throttle_enabled = config.thermal.soft_throttle_enabled
+    global_args.thermal_soft_throttle_temp = config.thermal.soft_throttle_temp
+    global_args.thermal_soft_throttle_max_sleep = config.thermal.soft_throttle_max_sleep
     global_args.n_gpu_layers = config.vulkan.n_gpu_layers
     global_args.n_ctx = [config.vulkan.n_ctx]
     global_args.vulkan_device = config.vulkan.device_id

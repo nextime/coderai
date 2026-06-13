@@ -146,10 +146,32 @@
     </div>
   </div>
 
-  <div class="form-row" style="margin:0">
+  <div class="form-row" style="margin:0 0 .75rem">
     <label class="form-label">Re-check interval while cooling down (seconds)</label>
     <input type="number" id="s-therm-poll" class="form-input" style="max-width:200px" min="1" max="120" step="1" placeholder="5">
     <span class="form-hint">How often to re-read temperatures while waiting for cooldown.</span>
+  </div>
+
+  <div class="form-row" style="margin:0;border-top:1px solid var(--border,#2a2a2a);padding-top:.75rem">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-therm-soft-enabled" onchange="toggleThermalFields()">
+      <span style="font-size:13px;font-weight:500">Enable CPU soft-throttle</span>
+    </label>
+    <span class="form-hint" style="display:block;margin-top:.35rem">
+      Before the hard pause, gently slow generation (short per-step sleeps) once the
+      CPU enters the warm band, so its temperature climbs slower and the full
+      cooldown is rarely hit. CPU only — GPU is unaffected.
+    </span>
+  </div>
+  <div id="therm-soft-fields" class="form-row" style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:.5rem">
+    <div>
+      <label class="form-label">Engage above CPU temp (°C)</label>
+      <input type="number" id="s-therm-soft-temp" class="form-input" min="40" max="120" step="1" placeholder="80">
+    </div>
+    <div>
+      <label class="form-label">Max slow-down per step (seconds)</label>
+      <input type="number" id="s-therm-soft-sleep" class="form-input" min="0" max="30" step="0.5" placeholder="3">
+    </div>
   </div>
 </div>
 
@@ -284,6 +306,8 @@ function toggleThermalFields(){
     document.getElementById('s-therm-gpu-enabled').checked ? 'grid' : 'none';
   document.getElementById('therm-cpu-fields').style.display =
     document.getElementById('s-therm-cpu-enabled').checked ? 'grid' : 'none';
+  document.getElementById('therm-soft-fields').style.display =
+    document.getElementById('s-therm-soft-enabled').checked ? 'grid' : 'none';
 }
 
 function showAlert(type, msg){
@@ -345,6 +369,9 @@ async function loadSettings(){
     document.getElementById('s-therm-cpu-high').value = therm.cpu_high ?? 90;
     document.getElementById('s-therm-cpu-resume').value = therm.cpu_resume ?? 87;
     document.getElementById('s-therm-poll').value = therm.poll_seconds ?? 5;
+    document.getElementById('s-therm-soft-enabled').checked = !!therm.soft_throttle_enabled;
+    document.getElementById('s-therm-soft-temp').value = therm.soft_throttle_temp ?? 80;
+    document.getElementById('s-therm-soft-sleep').value = therm.soft_throttle_max_sleep ?? 3;
     toggleThermalFields();
     // Background jobs
     const jobs = d.jobs || {};
@@ -383,6 +410,9 @@ async function saveSettings(){
       cpu_high:   parseFloat(document.getElementById('s-therm-cpu-high').value)   || 90,
       cpu_resume: parseFloat(document.getElementById('s-therm-cpu-resume').value) || 87,
       poll_seconds: parseFloat(document.getElementById('s-therm-poll').value) || 5,
+      soft_throttle_enabled: document.getElementById('s-therm-soft-enabled').checked,
+      soft_throttle_temp: parseFloat(document.getElementById('s-therm-soft-temp').value) || 80,
+      soft_throttle_max_sleep: parseFloat(document.getElementById('s-therm-soft-sleep').value) || 0,
     },
     jobs:{
       resume_on_restart: document.getElementById('s-jobs-resume').checked,

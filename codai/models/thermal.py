@@ -63,6 +63,25 @@ def get_cooldown_state() -> dict:
         return dict(_cooldown_state)
 
 
+def soft_throttle_status() -> dict:
+    """Current proactive CPU soft-throttle status, computed LIVE from the CPU temp
+    and settings (so the Tasks page reflects reality regardless of when the last
+    per-step checkpoint fired — video steps can be tens of seconds apart).
+
+    ``active`` is True when soft-throttle is enabled and the CPU sits in the warm
+    band [soft_temp, cpu_high). The caller (Tasks API) additionally gates this on
+    there being a running generation, since throttling only happens during work.
+    CPU-only by design."""
+    s = _settings_from_global_args()
+    if not s.soft_enabled or not s.cpu_enabled or s.soft_max_sleep <= 0:
+        return {"active": False}
+    cpu_t = read_cpu_temp()
+    if cpu_t is None or cpu_t < s.soft_temp or cpu_t >= s.cpu_high:
+        return {"active": False}
+    return {"active": True, "cpu": cpu_t, "sleep": _soft_throttle_sleep(s, cpu_t),
+            "engage": s.soft_temp, "cpu_high": s.cpu_high}
+
+
 def _cooldown_active() -> bool:
     """True while at least one worker is in the cooldown wait loop. Used so that
     other parallel workers join the pause (cross-worker hysteresis) instead of
@@ -423,12 +442,14 @@ class ThermalSettings:
         "cpu_enabled", "gpu_enabled",
         "cpu_high", "cpu_resume", "gpu_high", "gpu_resume",
         "poll_seconds",
+        "soft_enabled", "soft_temp", "soft_max_sleep",
     )
 
     def __init__(self, cpu_enabled=True, gpu_enabled=True,
                  cpu_high=90.0, cpu_resume=87.0,
                  gpu_high=90.0, gpu_resume=87.0,
-                 poll_seconds=5.0):
+                 poll_seconds=5.0,
+                 soft_enabled=False, soft_temp=80.0, soft_max_sleep=3.0):
         self.cpu_enabled = bool(cpu_enabled)
         self.gpu_enabled = bool(gpu_enabled)
         self.cpu_high = float(cpu_high)
@@ -436,6 +457,9 @@ class ThermalSettings:
         self.gpu_high = float(gpu_high)
         self.gpu_resume = float(gpu_resume)
         self.poll_seconds = max(1.0, float(poll_seconds))
+        self.soft_enabled = bool(soft_enabled)
+        self.soft_temp = float(soft_temp)
+        self.soft_max_sleep = max(0.0, float(soft_max_sleep))
 
 
 def _settings_from_global_args() -> ThermalSettings:
@@ -456,7 +480,27 @@ def _settings_from_global_args() -> ThermalSettings:
         gpu_high=g("thermal_gpu_high", 90.0),
         gpu_resume=g("thermal_gpu_resume", 87.0),
         poll_seconds=g("thermal_poll_seconds", 5.0),
+        soft_enabled=g("thermal_soft_throttle_enabled", False),
+        soft_temp=g("thermal_soft_throttle_temp", 80.0),
+        soft_max_sleep=g("thermal_soft_throttle_max_sleep", 3.0),
     )
+
+
+def _soft_throttle_sleep(settings: "ThermalSettings", cpu_t) -> float:
+    """Seconds to sleep at this checkpoint for proactive CPU soft-throttling.
+
+    0 unless the CPU is in its warm band [soft_temp, cpu_high). Scales linearly
+    from 0 at soft_temp to soft_max_sleep just below the CPU pause threshold.
+    CPU-ONLY by design — GPU heat is left entirely to the hard cooldown."""
+    if (not settings.soft_enabled or settings.soft_max_sleep <= 0
+            or not settings.cpu_enabled or cpu_t is None):
+        return 0.0
+    t0 = settings.soft_temp
+    if cpu_t < t0:
+        return 0.0
+    span = max(1.0, settings.cpu_high - t0)
+    frac = min(1.0, max(0.0, (cpu_t - t0) / span))
+    return settings.soft_max_sleep * frac
 
 
 _last_checkpoint: dict = {}
@@ -527,7 +571,18 @@ def wait_until_safe(settings: Optional[ThermalSettings] = None,
            (settings.cpu_enabled and cpu_t is not None and cpu_t > settings.cpu_resume):
             joined = True
     if not hot and not joined:
-        _dbg(f"within safe limits — serving immediately{desc0}")
+        # Proactive soft-throttle (CPU only): not hot enough to hard-pause, but if
+        # the CPU is in the warm band [soft_temp, cpu_high) sleep a little (scaled
+        # by how close to the pause threshold) so its temperature climbs slower and
+        # we rarely hit the full cooldown. Caps the heat-rate of a single pegged
+        # core. GPU heat is handled solely by the hard cooldown.
+        _sleep = _soft_throttle_sleep(settings, cpu_t)
+        if _sleep > 0:
+            _dbg(f"soft-throttle{desc0}: sleeping {_sleep:.2f}s "
+                 f"(GPU {_fmt(gpu_t)} CPU {_fmt(cpu_t)}, engage>={settings.soft_temp:.0f})")
+            time.sleep(_sleep)
+        else:
+            _dbg(f"within safe limits — serving immediately{desc0}")
         return
 
     # Enter cooldown: wait until *every* triggered sensor is at/below resume.

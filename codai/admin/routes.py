@@ -1988,6 +1988,81 @@ async def api_accel_presets(username: str = Depends(require_admin)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/admin/api/accel-loras", summary="List cached distill-LoRA files for acceleration")
+async def api_accel_loras(username: str = Depends(require_admin)):
+    """Scan the HF cache for distill / step-distillation LoRA repos and return each
+    repo's ``.safetensors`` files, pre-classified into high-noise / low-noise (for
+    Wan2.2's two experts) so the model-config UI can offer cascading dropdowns:
+    pick the distill model first, then the high/low (or single) LoRA from it.
+
+    A repo qualifies if its id matches a distill keyword (lightning/lightx2v/lcm/
+    hyper/turbo/distill/dmd) or is referenced by an ACCEL_PRESETS entry."""
+    import os
+    import re as _re
+    out: list = []
+    try:
+        from codai.models.acceleration import ACCEL_PRESETS
+        from codai.models.cache import get_all_cache_dirs
+        from huggingface_hub import scan_cache_dir
+
+        # Repos named by presets are always relevant (the `repo:file` head before ':').
+        preset_repos = set()
+        for p in (ACCEL_PRESETS or {}).values():
+            for k in ("lora", "lora_high", "lora_low"):
+                ref = p.get(k)
+                if ref and ":" in str(ref):
+                    preset_repos.add(str(ref).split(":", 1)[0])
+                elif ref:
+                    preset_repos.add(str(ref))
+
+        kw = _re.compile(r"light(ning|x2v)|lcm|hyper[-_ ]?sd|turbo|distill|dmd|seko",
+                         _re.IGNORECASE)
+        _hi = _re.compile(r"high[-_ ]?noise", _re.IGNORECASE)
+        _lo = _re.compile(r"low[-_ ]?noise", _re.IGNORECASE)
+        # A file is a distill LoRA (vs a full model's component weights like
+        # vae/transformer/text_encoder) if its path names a LoRA or noise level.
+        _loraname = _re.compile(r"lora|noise|light(ning|x2v)|lcm|hyper|distill|dmd",
+                                _re.IGNORECASE)
+
+        hf_dir = (get_all_cache_dirs() or {}).get("huggingface")
+        info = scan_cache_dir(hf_dir) if hf_dir else scan_cache_dir()
+        for repo in info.repos:
+            rid = repo.repo_id
+            in_preset = rid in preset_repos
+            if not (in_preset or kw.search(rid)):
+                continue
+            # Newest revision's snapshot → relative .safetensors paths. Keep only
+            # LoRA-looking files, unless the repo is a curated preset repo (then
+            # trust all its safetensors). This drops full-model component weights
+            # from repos that merely match a keyword (e.g. "*-Turbo" base models).
+            rev = max(repo.revisions, key=lambda r: (r.last_modified or 0), default=None)
+            if rev is None:
+                continue
+            snap = str(rev.snapshot_path)
+            files = []
+            for f in rev.files:
+                fp = str(f.file_path)
+                if not fp.endswith(".safetensors"):
+                    continue
+                rel = os.path.relpath(fp, snap).replace(os.sep, "/")
+                if in_preset or _loraname.search(rel):
+                    files.append(rel)
+            if not files:
+                continue
+            files.sort()
+            out.append({
+                "repo": rid,
+                "files": files,
+                "high": [f for f in files if _hi.search(f)],
+                "low":  [f for f in files if _lo.search(f)],
+            })
+        out.sort(key=lambda m: m["repo"].lower())
+    except Exception as e:
+        # Cache scan is best-effort; the UI falls back to the free-text fields.
+        return {"models": [], "error": str(e)}
+    return {"models": out}
+
+
 @router.get("/admin/api/turboquant-info", summary="TurboQuant backend availability")
 async def api_turboquant_info(username: str = Depends(require_admin)):
     """Report which TurboQuant embedding-quantization backends are available so
@@ -2109,7 +2184,41 @@ async def api_tasks(username: str = Depends(require_admin)):
     except Exception:
         pass
 
-    return {"tasks": tasks, "queue": queue_manager.get_metrics(), "thermal": cooling}
+    # Proactive CPU soft-throttle (distinct from the hard cooldown): generations
+    # are being gently slowed because the CPU is in its warm band. Computed live
+    # from the CPU temp, and only shown when something is actually running (idle
+    # warmth isn't being throttled). Suppressed during a hard cooldown.
+    soft = {"active": False}
+    try:
+        from codai.models import thermal as _therm
+        _any_running = any(t.get("status") == "running" for t in tasks)
+        ss = _therm.soft_throttle_status()
+        if ss.get("active") and _any_running and not cooling.get("active"):
+            _cpu = ss.get("cpu")
+            _slp = ss.get("sleep") or 0
+            label = "CPU soft-throttle"
+            if _cpu is not None:
+                label += f" — CPU {_cpu:.0f}°C"
+            if _slp:
+                label += f" (+{_slp:.1f}s/step)"
+            soft = {"active": True, "message": label, "cpu": _cpu, "sleep": _slp}
+            for t in tasks:
+                if (t.get("active") and t.get("status") == "running"
+                        and not t.get("cooling")):
+                    t["throttling"] = True
+                    t["throttle_message"] = label
+    except Exception:
+        pass
+
+    # The queue-summary header must reflect ALL model activity, not just requests
+    # that flow through queue_manager (text/pipelines/training). Image/video/audio
+    # generations run their own paths and live only in the task registry, so derive
+    # active/waiting from the unified `tasks` list; keep max_parallel from the
+    # queue manager.
+    queue = dict(queue_manager.get_metrics())
+    queue["active"] = sum(1 for t in tasks if t.get("status") == "running")
+    queue["waiting"] = sum(1 for t in tasks if t.get("status") == "queued")
+    return {"tasks": tasks, "queue": queue, "thermal": cooling, "soft_throttle": soft}
 
 
 def _read_vram_info() -> Optional[dict]:
@@ -2336,6 +2445,9 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "gpu_high": c.thermal.gpu_high,
             "gpu_resume": c.thermal.gpu_resume,
             "poll_seconds": c.thermal.poll_seconds,
+            "soft_throttle_enabled": c.thermal.soft_throttle_enabled,
+            "soft_throttle_temp": c.thermal.soft_throttle_temp,
+            "soft_throttle_max_sleep": c.thermal.soft_throttle_max_sleep,
         },
         "jobs": {
             "resume_on_restart": c.jobs.resume_on_restart,
@@ -2457,6 +2569,9 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         c.thermal.gpu_high = float(th.get("gpu_high", c.thermal.gpu_high))
         c.thermal.gpu_resume = float(th.get("gpu_resume", c.thermal.gpu_resume))
         c.thermal.poll_seconds = max(1.0, float(th.get("poll_seconds", c.thermal.poll_seconds)))
+        c.thermal.soft_throttle_enabled = bool(th.get("soft_throttle_enabled", c.thermal.soft_throttle_enabled))
+        c.thermal.soft_throttle_temp = float(th.get("soft_throttle_temp", c.thermal.soft_throttle_temp))
+        c.thermal.soft_throttle_max_sleep = max(0.0, float(th.get("soft_throttle_max_sleep", c.thermal.soft_throttle_max_sleep)))
         # Push to the live global_args so changes apply without a restart.
         try:
             from codai.api.state import get_global_args
@@ -2469,6 +2584,9 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
                 ga.thermal_gpu_high = c.thermal.gpu_high
                 ga.thermal_gpu_resume = c.thermal.gpu_resume
                 ga.thermal_poll_seconds = c.thermal.poll_seconds
+                ga.thermal_soft_throttle_enabled = c.thermal.soft_throttle_enabled
+                ga.thermal_soft_throttle_temp = c.thermal.soft_throttle_temp
+                ga.thermal_soft_throttle_max_sleep = c.thermal.soft_throttle_max_sleep
         except Exception:
             pass
 

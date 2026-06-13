@@ -32,11 +32,17 @@ def _log(*args, **kwargs):
     print(*args, **kwargs, flush=True)
 
 
-def _run_with_spinner(label: str, fn, *args, **kwargs):
+def _run_with_spinner(label: str, fn, *args, poll_fn=None, step_cb=None, **kwargs):
     """
     Run fn(*args, **kwargs) in a background thread while printing a live
     elapsed-time ticker on stdout so the user knows the script is alive.
     Returns the function's return value, or re-raises any exception it threw.
+
+    ``poll_fn`` (optional): a zero-arg callable returning the server's live
+    generation-progress dict (``current``/``total``/``pct``/``it_per_s``/``phase``)
+    — e.g. ``client.video_progress``. When given, the spinner shows the real
+    diffusion step ("step 12/25 (48%) 1.3it/s") and each sample is forwarded to
+    ``step_cb(progress_dict)`` so a web caller can drive a per-clip step bar.
     """
     result_box = [None]
     exc_box    = [None]
@@ -54,12 +60,33 @@ def _run_with_spinner(label: str, fn, *args, **kwargs):
     idx = 0
     while t.is_alive():
         elapsed = time.monotonic() - start
-        sys.stdout.write(f"\r    {spinner[idx % len(spinner)]} {label}  {elapsed:.0f}s elapsed…")
+        step_txt = ""
+        if poll_fn is not None:
+            try:
+                p = poll_fn() or {}
+            except Exception:
+                p = {}
+            if p.get("active") and (p.get("total") or 0) > 0:
+                cur, tot = int(p.get("current") or 0), int(p.get("total") or 0)
+                pct = int(p.get("pct") or 0)
+                its = p.get("it_per_s") or 0
+                phase = p.get("phase") or ""
+                step_txt = (f" · {phase} {cur}/{tot} ({pct}%)"
+                            + (f" {its:.2f}it/s" if its else ""))
+            elif p.get("phase") == "loading":
+                step_txt = " · loading model…"
+            if step_cb is not None:
+                try:
+                    step_cb(p)
+                except Exception:
+                    pass
+        sys.stdout.write(f"\r    {spinner[idx % len(spinner)]} {label}  "
+                         f"{elapsed:.0f}s{step_txt}…    ")
         sys.stdout.flush()
         idx += 1
         t.join(timeout=1.0)
     # Clear the spinner line
-    sys.stdout.write("\r" + " " * 72 + "\r")
+    sys.stdout.write("\r" + " " * 96 + "\r")
     sys.stdout.flush()
 
     if exc_box[0] is not None:
@@ -766,6 +793,21 @@ class CoderAIClient:
         except Exception:
             return {}
 
+    def image_progress(self) -> dict:
+        """Live diffusion-step progress of the in-flight image generation
+        (keyframes / character / environment refs). Best-effort; {} on error."""
+        try:
+            return self._get("/v1/images/progress") or {}
+        except Exception:
+            return {}
+
+    def video_progress(self) -> dict:
+        """Live diffusion-step progress of the in-flight video clip. {} on error."""
+        try:
+            return self._get("/v1/video/progress") or {}
+        except Exception:
+            return {}
+
     def chat_complete(self, model: str, system: str, user: str,
                       max_tokens: int = 400) -> str:
         import re as _re
@@ -1025,12 +1067,38 @@ class PromptGenerator:
 # Video utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
-def concat_videos(clip_paths: list, out_path: str):
+def concat_videos(clip_paths: list, out_path: str, reencode: bool = False,
+                  fps: int = None):
+    """Concatenate clips with the ffmpeg concat demuxer.
+
+    ``reencode=False`` stream-copies (fast) — fine for the final short/long
+    assembly where each segment is a separate shot and a cut between them is
+    expected.
+
+    ``reencode=True`` RE-ENCODES with a constant frame rate. Use it to join the
+    sub-renders of ONE chained shot: stream-copying mp4s that carry B-frames /
+    an edit list / reset PTS makes players FREEZE on a segment's first frame for
+    its whole duration (the "first half is a static image" bug). Re-encoding
+    regenerates clean, monotonic, constant-rate timestamps so the join is truly
+    seamless. Falls back to stream copy if the encoder is unavailable."""
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
         for p in clip_paths:
             f.write(f"file '{os.path.abspath(p)}'\n")
         list_path = f.name
     try:
+        if reencode:
+            cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+                   "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                   "-pix_fmt", "yuv420p", "-vsync", "cfr"]
+            if fps:
+                cmd += ["-r", str(int(fps))]
+            cmd += ["-movflags", "+faststart", out_path]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True)
+                return
+            except subprocess.CalledProcessError as e:
+                _log(f"    ⚠ seamless re-encode concat failed ({e.stderr.decode(errors='replace')[:120] if e.stderr else e}); "
+                     f"falling back to stream copy")
         subprocess.run(
             ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
              "-i", list_path, "-c", "copy", out_path],
@@ -1203,6 +1271,7 @@ def stage_characters(client: CoderAIClient, image_model: str, out_dir: Path,
                 name=name, prompt=fighter["prompt"],
                 description=fighter["description"], model=image_model,
                 n=max(1, int(n_refs or 4)),
+                poll_fn=client.image_progress,
             )
             _log(f"    ✓ {d.get('image_count', '?')} reference images saved in CoderAI")
             # Fetch and save locally
@@ -1285,6 +1354,7 @@ def stage_environments(client: CoderAIClient, image_model: str, out_dir: Path,
                 name=name, prompt=env["prompt"],
                 description=env["description"], model=image_model,
                 n=max(1, int(n_refs or 3)), size="768x512",
+                poll_fn=client.image_progress,
             )
             _log(f"    ✓ {d.get('image_count', '?')} reference images saved in CoderAI")
             images = client.fetch_profile_images("environment", name)
@@ -1917,6 +1987,8 @@ def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: P
                 character_profiles=profiles, loras=loras,
                 character_strength=char_strength, size=keyframe_size,
                 steps=keyframe_steps,
+                poll_fn=client.image_progress,
+                step_cb=(lambda prog, _s=stem: _kf(_s, "step", prog)),
             )
             out_png.write_bytes(img)
             made += 1
@@ -2298,6 +2370,15 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
             except Exception:
                 pass
 
+    def _step(prog):
+        """Forward a live diffusion-step progress dict for the CURRENT clip to the
+        web UI (per-clip step bar). No-op without a clip_cb."""
+        if clip_cb and prog:
+            try:
+                clip_cb(_gidx, "step", prog)
+            except Exception:
+                pass
+
     def _keyframe_bytes(stem: str):
         if not keyframe_dir:
             return None
@@ -2315,7 +2396,7 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                             MODEL_MAX_FRAMES))
 
     def _render_once(label, prompt, profiles, env, nf, out_path,
-                     fighters=None, init_override=None):
+                     fighters=None, init_override=None, step_cb=None):
         """One model generation → out_path. `init_override` (PNG bytes) wins over
         any keyframe; pass it to chain a sub-render onto the previous one's last
         frame. Returns (ok, duration_or_None, fatal)."""
@@ -2343,6 +2424,7 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                 num_frames=nf, fps=fps, seed=random.randint(0, 2**31),
                 width=_vw, height=_vh,
                 init_image=init_image, loras=loras,
+                poll_fn=client.video_progress, step_cb=step_cb,
             )
             Path(out_path).write_bytes(mp4)
             return True, (get_video_duration(out_path) or None), False
@@ -2357,7 +2439,8 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
             time.sleep(backoff)
             return False, None, False
 
-    def _render(label, prompt, profiles, env, nf, out_path, stem=None, fighters=None):
+    def _render(label, prompt, profiles, env, nf, out_path, stem=None, fighters=None,
+                step_cb=None):
         """Render one CLIP, splitting into chained sub-renders when the budget
         exceeds the single-render cap. The parts are concatenated into out_path as
         one continuous shot and discarded, so callers (and the Matches page) still
@@ -2366,7 +2449,8 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         budget = _split_frame_budget(int(nf), _chunk_max)
         if len(budget) == 1:
             return _render_once(label, prompt, profiles, env, budget[0], out_path,
-                                fighters=fighters, init_override=keyframe)
+                                fighters=fighters, init_override=keyframe,
+                                step_cb=step_cb)
         # Chained multi-part shot: part 0 starts from the clip keyframe; each later
         # part is seeded by the previous part's last frame → seamless single take.
         # Parts live in a throwaway temp dir (NOT video_dir) so a crash can't leave
@@ -2381,10 +2465,15 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
             for pi, pn in enumerate(budget):
                 part_path = os.path.join(tmpd, f"part{pi:02d}.mp4")
                 seed_img = keyframe if pi == 0 else (prev_last or keyframe)
+                # Tag each part's step updates with part N/total so the UI can show
+                # "concatenating shot — part 2/3" alongside the diffusion step.
+                _pcb = ((lambda prog, _p=pi + 1, _n=len(budget):
+                         step_cb({**(prog or {}), "part": _p, "parts": _n}))
+                        if step_cb else None)
                 ok, _dur, is_fatal = _render_once(
                     f"{label} [part {pi+1}/{len(budget)}, {pn}f]",
                     prompt, profiles, env, pn, part_path,
-                    fighters=fighters, init_override=seed_img)
+                    fighters=fighters, init_override=seed_img, step_cb=_pcb)
                 if not ok:
                     return False, None, is_fatal
                 parts.append(part_path)
@@ -2392,7 +2481,10 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                 if pi < len(budget) - 1 and prev_last is None:
                     _log("    ⚠ could not read part's last frame — next part falls "
                          "back to the clip keyframe (possible visible seam)")
-            concat_videos(parts, out_path)
+            # Re-encode the join: stream-copying the parts makes players freeze on
+            # each part's first frame for its duration (static-first-half bug). The
+            # parts are one continuous shot, so a clean CFR re-encode is correct.
+            concat_videos(parts, out_path, reencode=True, fps=fps)
             return True, (get_video_duration(out_path) or None), False
         finally:
             _sh.rmtree(tmpd, ignore_errors=True)
@@ -2433,7 +2525,7 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
             ok, dur, is_fatal = _render(
                 f"clip {c['idx']:02d} — {m['f1']} vs {m['f2']}",
                 c["prompt"], [m["f1"], m["f2"]], m["env"], _nf, str(clip_path),
-                stem=clip_stem, fighters=[m["f1"], m["f2"]])
+                stem=clip_stem, fighters=[m["f1"], m["f2"]], step_cb=_step)
             if is_fatal:
                 fatal = True
                 _clip("end", False)
@@ -2502,7 +2594,7 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         ok, dur, is_fatal = _render(
             f"{clip_name} outcome clip",
             o["prompt"], [o["fighter"]], o["env"], _onf, out_path,
-            stem=clip_name, fighters=_ofighters)
+            stem=clip_name, fighters=_ofighters, step_cb=_step)
         if is_fatal:
             fatal = True
             _clip("end", False)
@@ -3103,11 +3195,29 @@ def launch_web_ui(default_args):
                     {"label": lbl, "status": "pending"} for lbl in labels]
 
         def _item(gidx, phase, ok=None):
-            st = "rendering" if phase == "start" else ("done" if ok else "failed")
             with _jobs_lock:
                 items = _state["jobs"][job_id].get("items") or []
-                if 0 <= gidx < len(items):
-                    items[gidx]["status"] = st
+                if not (0 <= gidx < len(items)):
+                    return
+                if phase == "step":
+                    # `ok` carries the live progress dict (current/total/pct/
+                    # it_per_s, plus part/parts when the clip is a chained shot).
+                    prog = ok or {}
+                    if (prog.get("total") or 0) > 0:
+                        items[gidx]["step"] = {
+                            "cur": int(prog.get("current") or 0),
+                            "tot": int(prog.get("total") or 0),
+                            "pct": int(prog.get("pct") or 0),
+                            "its": round(float(prog.get("it_per_s") or 0), 2),
+                            "phase": prog.get("phase") or "",
+                            "part": int(prog.get("part") or 0),
+                            "parts": int(prog.get("parts") or 0),
+                        }
+                    return
+                items[gidx]["status"] = (
+                    "rendering" if phase == "start" else ("done" if ok else "failed"))
+                if phase != "start":
+                    items[gidx].pop("step", None)  # clear step bar on completion
 
         def _load_map(fname):
             fp = out_dir / fname
@@ -4642,12 +4752,22 @@ function _renderMatchBars(wrap, d){
     h+='<div class=prg-items>';
     for(const it of items){
       const s=it.status||'pending';
-      let w='0%', cls='';
-      if(s==='rendering'){ w='100%'; cls=' striped'; }
+      let w='0%', cls='', sub=s;
+      if(s==='rendering'){
+        const st=it.step;
+        if(st && st.tot>0){
+          // Real diffusion-step progress (and part X/Y when this clip is a
+          // chained single shot made of several concatenated generations).
+          w=st.pct+'%';
+          const partTxt=(st.parts>1)?('shot part '+st.part+'/'+st.parts+' · '):'';
+          const itsTxt=st.its?(' · '+st.its+'it/s'):'';
+          sub=partTxt+(st.phase||'step')+' '+st.cur+'/'+st.tot+' ('+st.pct+'%)'+itsTxt;
+        } else { w='100%'; cls=' striped'; sub='starting…'; }
+      }
       else if(s==='done'){ w='100%'; cls=' ok'; }
       else if(s==='failed'){ w='100%'; cls=' fail'; }
       const icon=s==='done'?'✓':(s==='failed'?'✗':(s==='rendering'?'⏳':'·'));
-      h+='<div class=prg-item><div class=prg-ilabel>'+icon+' '+_esch(it.label)+' — '+s+'</div>'
+      h+='<div class=prg-item><div class=prg-ilabel>'+icon+' '+_esch(it.label)+' — '+_esch(sub)+'</div>'
         +'<div class=progress-bar><div class="progress-fill'+cls+'" style="width:'+w+'"></div></div></div>';
     }
     h+='</div>';

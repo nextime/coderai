@@ -730,12 +730,22 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             </select>
           </div>
           <div class="form-row" style="max-width:560px">
-            <label class="form-label">Distill LoRA <span class="muted">(path or HF repo, optionally repo:weight_name.safetensors; blank for turbo full-models)</span></label>
+            <label class="form-label">Distill model <span class="muted">(cached — pick to fill the LoRA fields below)</span></label>
+            <select id="cfg-accel-distill" class="form-input" onchange="onAccelDistill()">
+              <option value="">— manual / pick a preset —</option>
+            </select>
+            <span class="form-hint" id="cfg-accel-distill-hint">Lists distill-LoRA repos found in the local cache. Choose one, then pick its high/low (or single) LoRA below.</span>
+          </div>
+          <div class="form-row" style="max-width:560px">
+            <label class="form-label">Distill LoRA <span class="muted">(single — path or repo:weight_name.safetensors; blank for turbo full-models)</span></label>
+            <select id="cfg-accel-lora-sel" class="form-input" style="display:none;margin-bottom:.4rem" onchange="onAccelLoraPick('lora')"></select>
             <input type="text" id="cfg-accel-lora" class="form-input" placeholder="e.g. ByteDance/SDXL-Lightning:sdxl_lightning_4step_lora.safetensors">
           </div>
           <div class="form-row" style="max-width:560px">
             <label class="form-label">Distill LoRA — high/low noise <span class="muted">(Wan2.2 A14B two-expert only; overrides the single LoRA per expert)</span></label>
+            <select id="cfg-accel-lora-high-sel" class="form-input" style="display:none;margin-bottom:.3rem" onchange="onAccelLoraPick('high')"></select>
             <input type="text" id="cfg-accel-lora-high" class="form-input" placeholder="high-noise → transformer  (e.g. repo:..._high_noise_..._4step.safetensors)">
+            <select id="cfg-accel-lora-low-sel" class="form-input" style="display:none;margin:.4rem 0 .3rem" onchange="onAccelLoraPick('low')"></select>
             <input type="text" id="cfg-accel-lora-low" class="form-input" style="margin-top:.4rem" placeholder="low-noise → transformer_2  (e.g. repo:..._low_noise_..._4step.safetensors)">
             <span class="form-hint">Wan2.2 A14B has two experts; the distill LoRA must be fused into <b>both</b> or the clip collapses to a solid colour at 4 steps. Leave blank to apply the single LoRA above to both.</span>
           </div>
@@ -2797,15 +2807,103 @@ function onAccelPreset(){
   const p = (_accelPresets || {})[key];
   if (!p) return;  // "custom" — leave fields as-is
   document.getElementById('cfg-accel-lora').value = p.lora || '';
+  document.getElementById('cfg-accel-lora-high').value = p.lora_high || '';
+  document.getElementById('cfg-accel-lora-low').value = p.lora_low || '';
   document.getElementById('cfg-accel-weight').value = p.lora_weight != null ? p.lora_weight : '';
   document.getElementById('cfg-accel-steps').value = p.steps != null ? p.steps : '';
   document.getElementById('cfg-accel-guidance').value = p.guidance_scale != null ? p.guidance_scale : '';
   document.getElementById('cfg-accel-flowshift').value = p.flow_shift != null ? p.flow_shift : '';
   document.getElementById('cfg-accel-scheduler').value = p.scheduler || '';
+  _syncAccelDistillFromFields();
+}
+
+// ---- Cascading distill-LoRA pickers (cached files) ----
+let _accelLoras = null;
+async function _loadAccelLoras(){
+  if (_accelLoras) return _accelLoras;
+  try {
+    const r = await fetch(ROOT_PATH + '/admin/api/accel-loras');
+    const d = await r.json();
+    _accelLoras = d.models || [];
+  } catch(e){ _accelLoras = []; }
+  return _accelLoras;
+}
+function _refreshAccelDistill(){
+  const sel = document.getElementById('cfg-accel-distill');
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">— manual / pick a preset —</option>';
+  (_accelLoras || []).forEach(m=>{
+    const o = document.createElement('option');
+    o.value = m.repo;
+    o.textContent = m.repo + '  (' + m.files.length + ' file' + (m.files.length===1?'':'s') + ')';
+    sel.appendChild(o);
+  });
+  if ([...sel.options].some(o=>o.value===cur)) sel.value = cur;
+  const hint = document.getElementById('cfg-accel-distill-hint');
+  if (hint && !(_accelLoras || []).length){
+    hint.textContent = 'No distill-LoRA repos found in the local cache — use a preset or type the path/repo manually below.';
+  }
+}
+function _fillAccelSel(selId, repo, files, keep){
+  const sel = document.getElementById(selId);
+  if (!sel) return;
+  sel.innerHTML = '<option value="">— choose —</option>';
+  (files || []).forEach(f=>{
+    const o = document.createElement('option');
+    o.value = repo + ':' + f; o.textContent = f;
+    sel.appendChild(o);
+  });
+  sel.style.display = (files && files.length) ? '' : 'none';
+  if (keep && [...sel.options].some(o=>o.value===keep)) sel.value = keep;
+}
+function onAccelDistill(){
+  const repo = document.getElementById('cfg-accel-distill').value;
+  const m = (_accelLoras || []).find(x=>x.repo===repo);
+  if (!m){
+    ['cfg-accel-lora-sel','cfg-accel-lora-high-sel','cfg-accel-lora-low-sel'].forEach(id=>{
+      const s=document.getElementById(id); if(s){ s.innerHTML=''; s.style.display='none'; }
+    });
+    return;
+  }
+  // Single-LoRA dropdown = all files; high/low = classified subsets (fall back to
+  // all files when the repo doesn't name them by noise level).
+  _fillAccelSel('cfg-accel-lora-sel', repo, m.files);
+  _fillAccelSel('cfg-accel-lora-high-sel', repo, (m.high && m.high.length) ? m.high : m.files);
+  _fillAccelSel('cfg-accel-lora-low-sel', repo, (m.low && m.low.length) ? m.low : m.files);
+}
+function onAccelLoraPick(kind){
+  const tmap = {lora:'cfg-accel-lora', high:'cfg-accel-lora-high', low:'cfg-accel-lora-low'};
+  const smap = {lora:'cfg-accel-lora-sel', high:'cfg-accel-lora-high-sel', low:'cfg-accel-lora-low-sel'};
+  const v = document.getElementById(smap[kind]).value;
+  if (v) document.getElementById(tmap[kind]).value = v;
+}
+// On load (or after a preset fill), preselect the distill model + dropdowns from
+// whatever repo the current high/single LoRA field points at.
+function _syncAccelDistillFromFields(){
+  const sel = document.getElementById('cfg-accel-distill');
+  if (!sel) return;
+  const refHigh = (document.getElementById('cfg-accel-lora-high').value || '').trim();
+  const refLow  = (document.getElementById('cfg-accel-lora-low').value || '').trim();
+  const refOne  = (document.getElementById('cfg-accel-lora').value || '').trim();
+  const ref = refHigh || refOne || refLow;
+  const repo = ref.includes(':') ? ref.split(':')[0] : ref;
+  if (repo && [...sel.options].some(o=>o.value===repo)){
+    sel.value = repo;
+    onAccelDistill();
+    const m = (_accelLoras || []).find(x=>x.repo===repo);
+    if (m){
+      _fillAccelSel('cfg-accel-lora-sel', repo, m.files, refOne);
+      _fillAccelSel('cfg-accel-lora-high-sel', repo, (m.high&&m.high.length)?m.high:m.files, refHigh);
+      _fillAccelSel('cfg-accel-lora-low-sel', repo, (m.low&&m.low.length)?m.low:m.files, refLow);
+    }
+  }
 }
 async function _populateAccel(a){
   await _loadAccelPresets();
+  await _loadAccelLoras();
   _refreshAccelVisibility();
+  _refreshAccelDistill();
   a = a || {};
   document.getElementById('cfg-accel-enabled').checked = !!a.enabled;
   const sel = document.getElementById('cfg-accel-preset');
@@ -2818,6 +2916,7 @@ async function _populateAccel(a){
   document.getElementById('cfg-accel-guidance').value = a.guidance_scale != null ? a.guidance_scale : '';
   document.getElementById('cfg-accel-flowshift').value = a.flow_shift != null ? a.flow_shift : '';
   document.getElementById('cfg-accel-scheduler').value = a.scheduler || '';
+  _syncAccelDistillFromFields();
   onAccelToggle();
 }
 function _collectAccel(){
