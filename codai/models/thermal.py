@@ -63,6 +63,14 @@ def get_cooldown_state() -> dict:
         return dict(_cooldown_state)
 
 
+def _cooldown_active() -> bool:
+    """True while at least one worker is in the cooldown wait loop. Used so that
+    other parallel workers join the pause (cross-worker hysteresis) instead of
+    racing ahead the instant their own single read dips below the high trigger."""
+    with _cooldown_lock:
+        return _cooldown_waiters > 0
+
+
 def _cooldown_enter() -> None:
     global _cooldown_waiters
     with _cooldown_lock:
@@ -302,6 +310,49 @@ def read_gpu_util() -> Optional[float]:
     return val
 
 
+# Persistent psutil.Process handles, so cpu_percent() can report usage *since the
+# previous call* without blocking. Keyed by pid.
+_proc_cpu_cache: dict = {}
+
+
+def read_process_tree_cpu() -> Optional[float]:
+    """CPU% of the coderai process tree (this process + all children).
+
+    Scale is 100% PER CORE: a single fully-used core is 100%, so the value ranges
+    0 .. 100*cpu_count (e.g. 24 cores → up to 2400%). Non-blocking — it measures
+    usage since the previous call (the Tasks page polls every ~2 s), so the very
+    first reading after start is ~0 and corrects on the next poll. Torch runs its
+    compute on threads inside THIS process, so the main process already accounts
+    for generation load; children cover ffmpeg/subprocess work.
+    """
+    try:
+        import psutil
+    except Exception:
+        return None
+    try:
+        root = psutil.Process()
+        procs = [root] + root.children(recursive=True)
+    except Exception:
+        return None
+    live: dict = {}
+    total = 0.0
+    for p in procs:
+        try:
+            pid = p.pid
+            cached = _proc_cpu_cache.get(pid)
+            if cached is None:
+                p.cpu_percent(None)        # prime; contributes ~0 this round
+                live[pid] = p
+            else:
+                total += cached.cpu_percent(None)   # usage since last call
+                live[pid] = cached
+        except Exception:
+            pass
+    _proc_cpu_cache.clear()
+    _proc_cpu_cache.update(live)
+    return round(total, 1)
+
+
 def read_cpu_temp_avg(samples: int = 3, max_seconds: float = 3.0) -> Optional[float]:
     """Averaged CPU temperature for stable resume/cooldown decisions.
 
@@ -463,17 +514,35 @@ def wait_until_safe(settings: Optional[ThermalSettings] = None,
         hot.append(("GPU", gpu_t, settings.gpu_resume))
     if settings.cpu_enabled and cpu_t is not None and cpu_t >= settings.cpu_high:
         hot.append(("CPU", cpu_t, settings.cpu_resume))
-    if not hot:
+
+    # Cross-worker hysteresis: a thermal pause is a GLOBAL hardware event. When a
+    # parallel worker is already cooling down, every OTHER running generation must
+    # back off too — otherwise the others keep the box hot and the first worker
+    # can never reach the (lower) resume threshold. So even when our own single
+    # read is below the high trigger, join the pause while temps are still above
+    # the resume line and a cooldown is already in progress.
+    joined = False
+    if not hot and _cooldown_active():
+        if (settings.gpu_enabled and gpu_t is not None and gpu_t > settings.gpu_resume) or \
+           (settings.cpu_enabled and cpu_t is not None and cpu_t > settings.cpu_resume):
+            joined = True
+    if not hot and not joined:
         _dbg(f"within safe limits — serving immediately{desc0}")
         return
 
     # Enter cooldown: wait until *every* triggered sensor is at/below resume.
     desc = f" ({context})" if context else ""
-    trig = ", ".join(f"{lbl} {t:.0f}°C>={settings.gpu_high if lbl=='GPU' else settings.cpu_high:.0f}°C"
-                     for lbl, t, _ in hot)
-    print(f"[thermal] Hardware too hot{desc}: {trig} — pausing requests "
-          f"until cooldown (GPU<={settings.gpu_resume:.0f}°C / "
-          f"CPU<={settings.cpu_resume:.0f}°C)")
+    if hot:
+        trig = ", ".join(f"{lbl} {t:.0f}°C>={settings.gpu_high if lbl=='GPU' else settings.cpu_high:.0f}°C"
+                         for lbl, t, _ in hot)
+        print(f"[thermal] Hardware too hot{desc}: {trig} — pausing requests "
+              f"until cooldown (GPU<={settings.gpu_resume:.0f}°C / "
+              f"CPU<={settings.cpu_resume:.0f}°C)")
+    else:
+        # Joined an already-active cooldown started by another parallel worker.
+        print(f"[thermal] Joining active cooldown{desc} — another generation is "
+              f"paused; backing off until temps reach resume "
+              f"(GPU<={settings.gpu_resume:.0f}°C / CPU<={settings.cpu_resume:.0f}°C)")
     waited = 0.0
     _cooldown_enter()
     try:

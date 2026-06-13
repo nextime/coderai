@@ -341,6 +341,28 @@ ENVIRONMENT_POOL = [
 # Static fallback shot prompts (used when LLM is not available)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Trailing style/motion cue appended to every fight-clip prompt. The motion words
+# ("fast-paced, rapid explosive motion, dynamic action") push the I2V model toward
+# more movement per clip — it tends to produce gentle, slow motion otherwise,
+# especially when anchored to a keyframe. Kept here so the planner and the per-match
+# Re-plan stay in sync.
+FIGHT_PROMPT_SUFFIX = ("African township free fight, fast-paced, rapid explosive "
+                       "motion, dynamic action, cinematic, consistent characters, "
+                       "wardrobe and setting")
+
+
+def _continuity_clause(env_name: str) -> str:
+    """Deterministic wardrobe + environment continuity phrase appended to EVERY
+    clip and outcome prompt of a match. Because each clip (and each chained
+    sub-render within it) and every outcome carries the same clause, the whole
+    match keeps the same outfits and location — the strongest lever for cross-clip
+    consistency since it doesn't rely on the LLM remembering."""
+    loc = (env_name or "").replace("_", " ").strip()
+    where = f"the same {loc}" if loc else "the same township location"
+    return ("each fighter keeps the EXACT SAME outfit, colours, hair and "
+            f"accessories throughout, fighting in {where} with the same "
+            "background, surfaces and crowd in every shot")
+
 FIGHT_SHOT_TEMPLATES = [
     "exchanging heavy blows at close range, both fighters connecting, crowd erupting",
     "delivering a powerful uppercut, opponent's head snapping back on impact",
@@ -805,7 +827,7 @@ class CoderAIClient:
                             character_profiles: list = None,
                             environment_name: str = None,
                             num_frames: int = 49, fps: int = 8,
-                            width: int = 512, height: int = 512,
+                            width: int = 832, height: int = 480,
                             seed: int = None,
                             init_image: bytes = None,
                             loras: list = None) -> bytes:
@@ -852,13 +874,29 @@ class CoderAIClient:
 _LLM_SYSTEM = """\
 You are a creative director writing vivid video-generation prompts for African street fighting scenes.
 Each prompt must be ONE sentence, 15-35 words, cinematic and specific.
+Emphasize FAST, continuous, explosive motion — rapid strikes, quick footwork, dynamic momentum and \
+follow-through; describe action mid-movement, never static, posed, or slow-motion.
 Vary camera angles (close-up, wide, low angle, over-shoulder), lighting (dusk, generator light, \
 noon sun, spotlight), and action (strikes, clinch, footwork, takedown, ground work, crowd reaction).
+Always refer to each fighter by their NAME (given in the user message), not only by their description.
+WARDROBE CONTINUITY (critical): every clip of a match — and every chained part within a clip, plus the \
+outcome clips — must show each fighter in the IDENTICAL outfit: the same garments, exact same colours, \
+same hair and accessories given in their description. Restate the key clothing details so they stay \
+constant; NEVER change, add, remove, or restyle clothing, and never switch a fighter to different \
+shorts/gloves/colours between shots.
+ENVIRONMENT CONTINUITY (critical): stay in the ONE given location for the whole match — the same \
+ring/yard/street, the same surfaces, walls, structures, lighting and crowd. Describe the same place \
+every time; never move the fight to a different setting between clips or outcomes.
 Do NOT use generic phrases like "high quality" or "realistic". Return ONLY the prompt, no quotes."""
 
 _LLM_OUTCOME_SYSTEM = """\
 You are a creative director writing vivid 15-25 word video-generation prompts for fight outcome moments.
 Be specific about body language, expression, lighting, and atmosphere.
+Refer to the fighter by their NAME (given in the user message).
+WARDROBE + LOCATION CONTINUITY (critical): the outcome happens in the SAME match — keep the fighter in \
+the IDENTICAL outfit (same garments, exact colours, hair, accessories) described, and in the SAME \
+location as the fight, with consistent background, surfaces and lighting. Never change clothing or move \
+to a different place.
 Return ONLY the prompt, no quotes or explanation."""
 
 # Snapshot the built-in defaults now that every template/system prompt is
@@ -902,8 +940,10 @@ class PromptGenerator:
                 try:
                     used_hint = (f"\nAvoid repeating these actions: {'; '.join(avoid_set)}."
                                  if avoid_set else "")
-                    f1_desc = self.char_descriptions.get(f1, f1)
-                    f2_desc = self.char_descriptions.get(f2, f2)
+                    _d1 = self.char_descriptions.get(f1, "")
+                    _d2 = self.char_descriptions.get(f2, "")
+                    f1_desc = f"{f1} ({_d1})" if _d1 else f1
+                    f2_desc = f"{f2} ({_d2})" if _d2 else f2
                     prompt = self.client.chat_complete(
                         model=self.model,
                         system=_LLM_SYSTEM,
@@ -911,7 +951,8 @@ class PromptGenerator:
                             f"Fighter 1: {f1_desc}. Fighter 2: {f2_desc}. "
                             f"Location: {env_desc}. "
                             f"{match_context}{used_hint}\n"
-                            "Write one fight action shot prompt."
+                            "Write one fight action shot prompt. Refer to each "
+                            "fighter by their NAME (not just their description)."
                         ),
                         max_tokens=120,
                     ).strip()
@@ -950,13 +991,15 @@ class PromptGenerator:
             for attempt in range(2):
                 try:
                     used_hint = f" Avoid: {'; '.join(_avoid)}." if _avoid else ""
-                    f_desc = self.char_descriptions.get(fighter, fighter)
+                    _df = self.char_descriptions.get(fighter, "")
+                    f_desc = f"{fighter} ({_df})" if _df else fighter
                     prompt = self.client.chat_complete(
                         model=self.model,
                         system=_LLM_OUTCOME_SYSTEM,
                         user=(
                             f"Fighter: {f_desc}. Outcome: {outcome_labels.get(outcome, outcome)}. "
-                            f"Location: {env_desc}.{used_hint} Write one outcome moment prompt."
+                            f"Location: {env_desc}.{used_hint} Write one outcome moment prompt. "
+                            "Refer to the fighter by their NAME."
                         ),
                         max_tokens=100,
                     ).strip()
@@ -1009,6 +1052,81 @@ def get_video_duration(path: str) -> float:
         return 0.0
 
 
+def _split_frame_budget(total: int, chunk_max: int) -> list:
+    """Split a clip's total frame budget into chained sub-renders, each
+    ≤ chunk_max, distributed as EVENLY as possible (so there's no tiny trailing
+    part). Returns [total] when it already fits in one render."""
+    total = max(1, int(total))
+    chunk_max = max(1, int(chunk_max))
+    if total <= chunk_max:
+        return [total]
+    import math as _math
+    n = _math.ceil(total / chunk_max)
+    base, rem = divmod(total, n)
+    return [base + (1 if i < rem else 0) for i in range(n)]
+
+
+def _last_frame_png(mp4_path: str) -> Optional[bytes]:
+    """Extract the final frame of a clip as PNG bytes (used to seed the next
+    chained sub-render so the join is seamless). Returns None on failure."""
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+            tmp = tf.name
+        # -sseof -1 reads the last ~1s; -update 1 keeps overwriting so the file
+        # left on disk is the LAST decoded frame — exact and cheap for short clips.
+        subprocess.run(
+            ["ffmpeg", "-y", "-sseof", "-1", "-i", mp4_path,
+             "-update", "1", "-q:v", "2", tmp],
+            check=True, capture_output=True,
+        )
+        data = Path(tmp).read_bytes()
+        return data or None
+    except Exception:
+        return None
+    finally:
+        if tmp:
+            try: os.unlink(tmp)
+            except Exception: pass
+
+
+# Wan2.2-A14B is trained for clips up to ~81 frames; beyond that temporal
+# coherence breaks down (the frames visibly "jump") in a SINGLE generation.
+MODEL_MAX_FRAMES = 81
+
+# A planned clip can be LONGER than one model call: when it exceeds the
+# single-render cap (SINGLE_CLIP_MAX_FRAMES) it is rendered as several chained
+# sub-renders (each ≤ the cap) and concatenated into one continuous shot — the
+# last frame of each part seeds the next. So the planned clip length may run up
+# to MAX_PLANNED_FRAMES even though no single model call exceeds the cap.
+SINGLE_CLIP_MAX_FRAMES = 50      # max frames in ONE model generation (≤ MODEL_MAX_FRAMES)
+MAX_PLANNED_FRAMES = 480         # ceiling for a whole (possibly chained) clip
+
+# Per fight-clip frame budget. Frame count (not seconds) is the real control: it's
+# the model's motion budget and is fps-independent, so a clip is CLIP_*_FRAMES
+# frames played at the chosen fps → duration = frames / fps (e.g. 50-70 frames at
+# 16 fps ≈ 3.1-4.4 s).
+CLIP_MIN_FRAMES = 50
+CLIP_MAX_FRAMES = 70
+
+
+def _clip_frame_range(lo, hi):
+    """Normalize a (min, max) fight-clip frame budget from config: clamp to
+    [8, MAX_PLANNED_FRAMES] and ensure lo <= hi, so bad UI input can't break the
+    planner (random.randint requires lo <= hi). A clip longer than one model call
+    is split + chained at render time, so the ceiling is MAX_PLANNED_FRAMES, not
+    the per-render MODEL_MAX_FRAMES."""
+    try:
+        lo = int(lo); hi = int(hi)
+    except (TypeError, ValueError):
+        lo, hi = CLIP_MIN_FRAMES, CLIP_MAX_FRAMES
+    lo = max(8, min(lo, MAX_PLANNED_FRAMES))
+    hi = max(8, min(hi, MAX_PLANNED_FRAMES))
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
 def frames_for_seconds(seconds: float, fps: int = 8) -> int:
     return max(8, int(seconds * fps))
 
@@ -1049,7 +1167,8 @@ def resolve_fighters(client: CoderAIClient, args, out_dir: Path) -> list:
 
 def stage_characters(client: CoderAIClient, image_model: str, out_dir: Path,
                      region_filter: Optional[str] = None,
-                     include_female: bool = False) -> list:
+                     include_female: bool = False,
+                     max_count: int = 0, n_refs: int = 4) -> list:
     _log("\n" + "═" * 60)
     _log("  STAGE 1 — Characters")
     _log("═" * 60)
@@ -1063,6 +1182,10 @@ def stage_characters(client: CoderAIClient, image_model: str, out_dir: Path,
             pool = filtered
         else:
             _log(f"  No fighters match region filter '{region_filter}', using full pool")
+    # Cap how many fighters to generate (0 = whole filtered pool).
+    if max_count and max_count > 0 and len(pool) > max_count:
+        _log(f"  Limiting to first {max_count} of {len(pool)} pooled fighter(s)")
+        pool = pool[:max_count]
 
     _log(f"  Pool: {len(pool)} fighter(s)"
          + ("" if include_female else "  (male only — use --include-female to add female fighters)"))
@@ -1078,7 +1201,8 @@ def stage_characters(client: CoderAIClient, image_model: str, out_dir: Path,
                 f"generating character '{name}'",
                 client.generate_character,
                 name=name, prompt=fighter["prompt"],
-                description=fighter["description"], model=image_model, n=4,
+                description=fighter["description"], model=image_model,
+                n=max(1, int(n_refs or 4)),
             )
             _log(f"    ✓ {d.get('image_count', '?')} reference images saved in CoderAI")
             # Fetch and save locally
@@ -1130,7 +1254,8 @@ def resolve_environments(client: CoderAIClient, args, out_dir: Path) -> list:
 
 
 def stage_environments(client: CoderAIClient, image_model: str, out_dir: Path,
-                       region_filter: Optional[str] = None) -> list:
+                       region_filter: Optional[str] = None,
+                       max_count: int = 0, n_refs: int = 3) -> list:
     _log("\n" + "═" * 60)
     _log("  STAGE 2 — Environments")
     _log("═" * 60)
@@ -1142,6 +1267,10 @@ def stage_environments(client: CoderAIClient, image_model: str, out_dir: Path,
             pool = filtered
         else:
             _log(f"  No environments match region filter '{region_filter}', using full pool")
+    # Cap how many environments to generate (0 = whole filtered pool).
+    if max_count and max_count > 0 and len(pool) > max_count:
+        _log(f"  Limiting to first {max_count} of {len(pool)} pooled environment(s)")
+        pool = pool[:max_count]
 
     done, failed = [], []
     for i, env in enumerate(pool, 1):
@@ -1155,7 +1284,7 @@ def stage_environments(client: CoderAIClient, image_model: str, out_dir: Path,
                 client.generate_environment,
                 name=name, prompt=env["prompt"],
                 description=env["description"], model=image_model,
-                n=3, size="768x512",
+                n=max(1, int(n_refs or 3)), size="768x512",
             )
             _log(f"    ✓ {d.get('image_count', '?')} reference images saved in CoderAI")
             images = client.fetch_profile_images("environment", name)
@@ -1228,8 +1357,8 @@ def parse_consistency(spec: str) -> set:
 CONFIG_FIELDS = [
     "base_url", "api_key", "image_model", "video_model", "text_model",
     "no_llm", "out_dir", "fps", "clip_delay", "region", "include_female",
-    "skip_characters", "reuse_fighters", "fighters",
-    "skip_environments", "reuse_environments", "environments",
+    "skip_characters", "reuse_fighters", "fighters", "num_fighters", "char_refs",
+    "skip_environments", "reuse_environments", "environments", "num_environments", "env_refs",
     "skip_videos", "only_outcomes", "matches",
     "only_characters", "only_environments", "only_assets",
     "only_prompts", "only_videos",
@@ -1237,7 +1366,10 @@ CONFIG_FIELDS = [
     "character_strength", "lora_steps", "lora_rank", "lora_weight",
     "lora_train_base_model",
     "no_env_loras", "env_lora_steps", "env_lora_rank", "env_lora_weight",
-    "video_loras",
+    "video_loras", "video_lora_scale", "video_size",
+    "clip_min_frames", "clip_max_frames", "single_clip_max_frames",
+    "outcome_min_frames", "outcome_max_frames",
+    "short_min", "short_max", "long_min", "long_max",
     "upscale_factor", "fps_multiplier",
     "web_port",
 ]
@@ -1271,16 +1403,20 @@ def load_config(path: str) -> dict:
 
 
 def _fighter_desc_hint(name: str, char_descriptions: dict) -> str:
-    """Return a compact visual hint for embedding in a video prompt."""
+    """Return a compact "name (visual traits)" hint for embedding in a prompt.
+
+    The NAME is always kept: it identifies the fighter in the clip prompt and is
+    the token the per-fighter LoRA + character_profiles anchor identity to. The
+    short description (first few traits) just guides appearance.
+    """
     desc = char_descriptions.get(name, "")
     if not desc:
         return name
-    # Strip weight-class prefix ("Heavyweight from Soweto, " → keep the rest)
-    # but keep it short — drop anything after the 3rd comma.
+    # Keep up to 3 key visual traits (drop anything after the 3rd comma) and
+    # prefix the name so the prompt still says WHO this is.
     parts = [p.strip() for p in desc.split(",")]
-    # Keep up to 3 key visual traits (skip pure location/weight-class words)
     visual = ", ".join(parts[:3])
-    return f"{visual}"
+    return f"{name} ({visual})"
 
 
 def _write_concat(clips: list, out_path: str, label: str):
@@ -1801,10 +1937,18 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
                  char_descriptions: dict = None,
                  consistency: set = None, image_model: str = None,
                  lora_map: dict = None, char_strength: float = 0.7,
-                 keyframe_steps: int = 28, keyframe_size: str = "512x512",
+                 keyframe_steps: int = 28, keyframe_size: str = "832x480",
                  lora_weight: float = 0.85, keyframes_only: bool = False,
                  env_lora_map: dict = None, env_lora_weight: float = 0.8,
-                 upscale_factor: int = 0, fps_multiplier: int = 0):
+                 upscale_factor: int = 0, fps_multiplier: int = 0,
+                 video_lora_scale: float = 1.0,
+                 clip_min_frames: int = CLIP_MIN_FRAMES,
+                 clip_max_frames: int = CLIP_MAX_FRAMES,
+                 video_size: str = "832x480",
+                 short_min: float = 40.0, short_max: float = 50.0,
+                 long_min: float = 65.0, long_max: float = 75.0,
+                 single_clip_max_frames: int = SINGLE_CLIP_MAX_FRAMES,
+                 outcome_min_frames: int = 40, outcome_max_frames: int = 70):
     _log("\n" + "═" * 60)
     _log("  STAGE 3 — Videos")
     _log("═" * 60)
@@ -1881,7 +2025,9 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
             keyframe_dir=keyframe_dir if use_keyframe else None,
             lora_weight=lora_weight,
             env_lora_map=env_lora_map or {}, env_lora_weight=env_lora_weight,
-            video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map)
+            video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map,
+            video_lora_scale=video_lora_scale, video_size=video_size,
+            single_clip_max_frames=single_clip_max_frames)
         _stage_enhance_videos(client, video_model, video_dir, fight_plan,
                               outcome_plan, upscale_factor, fps_multiplier)
         return
@@ -1934,24 +2080,35 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
 
     # Fight-match plan: each match holds a list of clip specs.
     fight_plan = []
+    _cf_lo, _cf_hi = _clip_frame_range(clip_min_frames, clip_max_frames)
+    # Final-assembly duration targets (seconds). The LONG target drives how many
+    # clips the planner produces: it keeps adding clips (each nf/fps seconds of
+    # playback) until their summed duration reaches the long target, so the long
+    # cut is always filled. The SHORT target is the highlight length.
+    _slo, _shi = sorted((float(short_min), float(short_max)))
+    _llo, _lhi = sorted((float(long_min), float(long_max)))
     for f1, f2 in pairs:
-        short_target = random.uniform(40, 50)
-        long_target  = random.uniform(65, 75)
+        short_target = random.uniform(_slo, _shi)
+        long_target  = random.uniform(_llo, _lhi)
         env = random.choice(env_names) if env_names else None
         env_desc = _env_description(env) if env else "African township"
         clips_spec, planned, ci = [], 0.0, 0
         while planned < long_target:
-            clip_seconds = min(long_target - planned, random.uniform(4, 8))
             round_num = ci // 3 + 1
             intensity = ("early exchanges" if round_num == 1
                          else "midpoint battle" if round_num == 2
                          else "climactic final exchange")
+            # Budget frames directly (the model's motion budget, fps-independent),
+            # within the configured range. Duration = frames / playback fps.
+            _nf = random.randint(_cf_lo, _cf_hi)
+            clip_seconds = round(_nf / max(1, fps), 2)
             clips_spec.append({
                 "idx": ci, "clip_seconds": clip_seconds,
-                "nf": frames_for_seconds(clip_seconds, fps),
+                "nf": _nf,
                 "intensity": intensity, "shot": None, "prompt": None,
             })
-            planned += clip_seconds
+            # Accumulate playback duration so the match reaches long_target.
+            planned += _nf / max(1, fps)
             ci += 1
         fight_plan.append({
             "f1": f1, "f2": f2, "env": env, "env_desc": env_desc,
@@ -1964,15 +2121,20 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
     # outcome — so each match has its own (different) outcome scenes.
     outcomes = ["win", "ko_win", "retire", "draw"]
     outcome_plan = []
+    # Outcome clips budget frames directly (like fight clips) within their own
+    # configurable range; longer-than-one-render outcomes are split + chained the
+    # same way at render time. Duration = frames / playback fps.
+    _of_lo, _of_hi = _clip_frame_range(outcome_min_frames, outcome_max_frames)
     for m in fight_plan:
         for fighter in (m["f1"], m["f2"]):
             for outcome in outcomes:
-                target_s = random.uniform(10, 15)
+                _onf = random.randint(_of_lo, _of_hi)
                 outcome_plan.append({
                     "match_name": m["match_name"],
                     "fighter": fighter, "outcome": outcome,
                     "env": m["env"], "env_desc": m["env_desc"],
-                    "target_s": target_s, "nf": frames_for_seconds(target_s, fps),
+                    "target_s": round(_onf / max(1, fps), 2),
+                    "nf": _onf,
                     "shot": None, "prompt": None,
                 })
 
@@ -2002,7 +2164,8 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
             f1_hint = _fighter_desc_hint(m['f1'], char_descriptions)
             f2_hint = _fighter_desc_hint(m['f2'], char_descriptions)
             c["prompt"] = (
-                f"{f1_hint} vs {f2_hint} — {shot} — African township free fight, cinematic"
+                f"{f1_hint} vs {f2_hint} — {shot} — {_continuity_clause(m.get('env'))} "
+                f"— {FIGHT_PROMPT_SUFFIX}"
             )
             match_avoid.append(shot[:60])
             _log(f"  │  [{_pidx}/{_ptot}] {m['f1']} vs {m['f2']} clip{c['idx']:02d}: {shot}")
@@ -2011,7 +2174,8 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
         shot = prompter.outcome_shot(o["fighter"], o["outcome"], o["env_desc"])
         o["shot"] = shot
         f_hint = _fighter_desc_hint(o["fighter"], char_descriptions)
-        o["prompt"] = f"{f_hint} — {shot} — African township fight, cinematic"
+        o["prompt"] = (f"{f_hint} — {shot} — {_continuity_clause(o.get('env'))} "
+                       f"— African township fight, cinematic")
         _log(f"  │  [{_pidx}/{_ptot}] {o['fighter']} {o['outcome']}: {shot}")
     _log("  ── Phase A complete — all prompts written ──")
 
@@ -2053,7 +2217,9 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
         keyframe_dir=keyframe_dir if use_keyframe else None,
         lora_weight=lora_weight,
         env_lora_map=env_lora_map or {}, env_lora_weight=env_lora_weight,
-        video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map)
+        video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map,
+        video_lora_scale=video_lora_scale, video_size=video_size,
+        single_clip_max_frames=single_clip_max_frames)
     _stage_enhance_videos(client, video_model, video_dir, fight_plan,
                           outcome_plan, upscale_factor, fps_multiplier)
 
@@ -2063,7 +2229,10 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                          consistency=None, lora_map=None, keyframe_dir=None,
                          lora_weight=0.85, env_lora_map=None, env_lora_weight=0.8,
                          progress_cb=None, clip_cb=None,
-                         video_lora_map=None, env_video_lora_map=None):
+                         video_lora_map=None, env_video_lora_map=None,
+                         assemble_finals=True, video_lora_scale=1.0,
+                         video_size="832x480",
+                         single_clip_max_frames=SINGLE_CLIP_MAX_FRAMES):
     """PHASE 3 — render ALL videos from pre-written prompts (video model stays loaded).
 
     progress_cb(done, total, label) — optional; called after each clip finishes so
@@ -2085,6 +2254,14 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
     env_video_lora_map = env_video_lora_map or {}
     video_slug = _model_slug(video_model)
     use_lora = "lora" in consistency
+    # Wan2.2 is trained on 16:9 (canonical 832×480 / 1280×720); square 512 is
+    # off-distribution and worsens motion + colour drift. Render at the native
+    # aspect; the keyframe (init_image) is generated at the same size so the I2V
+    # anchor isn't stretched/letterboxed.
+    try:
+        _vw, _vh = (int(x) for x in str(video_size).lower().split("x", 1))
+    except Exception:
+        _vw, _vh = 832, 480
 
     # Map match_name -> [f1, f2] so an outcome clip (which belongs to a match)
     # can attach BOTH fighters' LoRAs + the environment, not just the single
@@ -2132,23 +2309,39 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                 return None
         return None
 
-    def _render(label, prompt, profiles, env, nf, out_path, stem=None, fighters=None):
-        """Render one clip; returns (ok, duration_or_None, fatal)."""
-        init_image = _keyframe_bytes(stem) if stem else None
+    # Max frames per SINGLE model generation. A clip whose budget exceeds this is
+    # rendered as several chained sub-renders and concatenated into ONE shot.
+    _chunk_max = max(8, min(int(single_clip_max_frames or SINGLE_CLIP_MAX_FRAMES),
+                            MODEL_MAX_FRAMES))
+
+    def _render_once(label, prompt, profiles, env, nf, out_path,
+                     fighters=None, init_override=None):
+        """One model generation → out_path. `init_override` (PNG bytes) wins over
+        any keyframe; pass it to chain a sub-render onto the previous one's last
+        frame. Returns (ok, duration_or_None, fatal)."""
+        init_image = init_override
         loras = None
         if use_lora:
             # Video-DiT LoRAs trained for THIS video model (image LoRAs can't apply
             # to a Wan video transformer — they live on the keyframe path instead).
+            # `video_lora_scale` dials the character+env LoRA influence DOWN at
+            # video time only (keyframe LoRA weight is untouched): stacking several
+            # base-trained LoRAs at full weight on a distilled Wan2.2 expert can
+            # desaturate/over-smooth the clip, so a scale < 1 trades identity
+            # strength for cleaner colour/motion.
+            _cw = lora_weight * video_lora_scale
+            _ew = env_lora_weight * video_lora_scale
             loras = (_video_lora_specs_for(fighters or profiles or [],
-                                           video_lora_map, video_slug, lora_weight)
+                                           video_lora_map, video_slug, _cw)
                      + _env_video_lora_specs_for(env, env_video_lora_map,
-                                                 video_slug, env_lora_weight)) or None
+                                                 video_slug, _ew)) or None
         try:
             mp4 = _run_with_spinner(
                 label, client.generate_video_clip,
                 prompt=prompt, model=video_model,
                 character_profiles=profiles, environment_name=env,
                 num_frames=nf, fps=fps, seed=random.randint(0, 2**31),
+                width=_vw, height=_vh,
                 init_image=init_image, loras=loras,
             )
             Path(out_path).write_bytes(mp4)
@@ -2163,6 +2356,46 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
             _log(f"    ✗ failed: {e}  (waiting {backoff:.0f}s)")
             time.sleep(backoff)
             return False, None, False
+
+    def _render(label, prompt, profiles, env, nf, out_path, stem=None, fighters=None):
+        """Render one CLIP, splitting into chained sub-renders when the budget
+        exceeds the single-render cap. The parts are concatenated into out_path as
+        one continuous shot and discarded, so callers (and the Matches page) still
+        see exactly one file per planned clip. Returns (ok, duration, fatal)."""
+        keyframe = _keyframe_bytes(stem) if stem else None
+        budget = _split_frame_budget(int(nf), _chunk_max)
+        if len(budget) == 1:
+            return _render_once(label, prompt, profiles, env, budget[0], out_path,
+                                fighters=fighters, init_override=keyframe)
+        # Chained multi-part shot: part 0 starts from the clip keyframe; each later
+        # part is seeded by the previous part's last frame → seamless single take.
+        # Parts live in a throwaway temp dir (NOT video_dir) so a crash can't leave
+        # stray files for _scan_matches to mis-parse; only the concatenated result
+        # lands at out_path.
+        import shutil as _sh
+        _log(f"    ↪ {nf}f > {_chunk_max}f/render — chaining {len(budget)} parts "
+             f"{budget} into one shot")
+        tmpd = tempfile.mkdtemp(prefix="twshot_")
+        parts, prev_last = [], None
+        try:
+            for pi, pn in enumerate(budget):
+                part_path = os.path.join(tmpd, f"part{pi:02d}.mp4")
+                seed_img = keyframe if pi == 0 else (prev_last or keyframe)
+                ok, _dur, is_fatal = _render_once(
+                    f"{label} [part {pi+1}/{len(budget)}, {pn}f]",
+                    prompt, profiles, env, pn, part_path,
+                    fighters=fighters, init_override=seed_img)
+                if not ok:
+                    return False, None, is_fatal
+                parts.append(part_path)
+                prev_last = _last_frame_png(part_path)
+                if pi < len(budget) - 1 and prev_last is None:
+                    _log("    ⚠ could not read part's last frame — next part falls "
+                         "back to the clip keyframe (possible visible seam)")
+            concat_videos(parts, out_path)
+            return True, (get_video_duration(out_path) or None), False
+        finally:
+            _sh.rmtree(tmpd, ignore_errors=True)
 
     fatal = False
     rendered_clips = 0
@@ -2183,11 +2416,23 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                 time.sleep(clip_delay)
             clip_stem = _clip_stem_fight(m['match_name'], c['idx'])
             clip_path = video_dir / f"{clip_stem}.mp4"
-            _log(f"  │  clip {c['idx']:02d}  {c['clip_seconds']:.1f}s / {c['nf']}f")
+            # Frame COUNT is the model's motion budget — it must NOT scale with the
+            # playback fps. If it did, a higher fps just spreads the same motion over
+            # proportionally more frames: identical playback seconds (still slow) and
+            # often past the model's safe length (>~81 → temporal "jumps"). Use the
+            # budget baked at prompt time, capped to the model max, and play it at the
+            # (higher) encode fps so the SAME motion renders in LESS time = faster,
+            # natural speed. Duration = nf / fps.
+            # The full planned budget reaches _render, which splits + chains it
+            # into ≤single-render-cap parts when it exceeds one model call.
+            _nf = int(c.get("nf") or frames_for_seconds(c["clip_seconds"], 8))
+            _nf = min(_nf, MAX_PLANNED_FRAMES)
+            _log(f"  │  clip {c['idx']:02d}  {c['clip_seconds']:.1f}s → {_nf}f @ {fps}fps "
+                 f"= {_nf/max(1,fps):.1f}s")
             _clip("start")
             ok, dur, is_fatal = _render(
                 f"clip {c['idx']:02d} — {m['f1']} vs {m['f2']}",
-                c["prompt"], [m["f1"], m["f2"]], m["env"], c["nf"], str(clip_path),
+                c["prompt"], [m["f1"], m["f2"]], m["env"], _nf, str(clip_path),
                 stem=clip_stem, fighters=[m["f1"], m["f2"]])
             if is_fatal:
                 fatal = True
@@ -2215,16 +2460,23 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
             continue
 
         # Assemble short + long concats from the actual rendered clips.
-        short_clips, short_accum, pos = [], 0.0, 0
-        while short_accum < m["short_target"] and clips:
-            path, dur = clips[pos % len(clips)]
-            short_clips.append((path, dur))
-            short_accum += dur
-            pos += 1
-        _write_concat(short_clips, str(video_dir / f"{m['match_name']}_short.mp4"),
-                      f"short (~{m['short_target']:.0f}s)")
-        _write_concat(clips, str(video_dir / f"{m['match_name']}_long.mp4"),
-                      f"long  (~{m['long_target']:.0f}s)")
+        # Skipped when only a subset was rendered (e.g. regenerating ONE clip):
+        # the `clips` accumulator would hold just that clip and clobber the
+        # existing full short/long videos. Use "Reassemble finals" to rebuild
+        # them from all clips on disk afterwards.
+        if assemble_finals:
+            short_clips, short_accum, pos = [], 0.0, 0
+            while short_accum < m["short_target"] and clips:
+                path, dur = clips[pos % len(clips)]
+                short_clips.append((path, dur))
+                short_accum += dur
+                pos += 1
+            _write_concat(short_clips, str(video_dir / f"{m['match_name']}_short.mp4"),
+                          f"short (~{m['short_target']:.0f}s)")
+            _write_concat(clips, str(video_dir / f"{m['match_name']}_long.mp4"),
+                          f"long  (~{m['long_target']:.0f}s)")
+        else:
+            _log(f"  └─ (skipping short/long reassembly — subset render)")
         _log(f"  └─ match {i+1}/{total_matches} done  ({len(clips)} clips)")
 
     # 3b. Per-fighter outcome clips
@@ -2245,9 +2497,11 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         _ofighters = _mf_map.get(o.get("match_name")) or [o["fighter"]]
         if o["fighter"] not in _ofighters:
             _ofighters = [o["fighter"]] + _ofighters
+        _onf = int(o.get("nf") or frames_for_seconds(o["target_s"], 8))
+        _onf = min(_onf, MAX_PLANNED_FRAMES)
         ok, dur, is_fatal = _render(
             f"{clip_name} outcome clip",
-            o["prompt"], [o["fighter"]], o["env"], o["nf"], out_path,
+            o["prompt"], [o["fighter"]], o["env"], _onf, out_path,
             stem=clip_name, fighters=_ofighters)
         if is_fatal:
             fatal = True
@@ -2353,7 +2607,6 @@ def launch_web_ui(default_args):
 
     Serves on http://localhost:<port> using only the stdlib. The UI has:
       /            — settings form + Start button + live log
-      /gallery     — media browser (all produced images/videos)
       /media/<...> — raw file serving for images and videos
       /stream      — SSE endpoint for live log output
       /status      — JSON: {"running": bool, "done": bool}
@@ -2878,7 +3131,14 @@ def launch_web_ui(default_args):
                     data = {}
             fight_plan = data.get("fight_plan", [])
             outcome_plan = data.get("outcome_plan", [])
-            fps = int(data.get("fps") or getattr(default_args, "fps", 8))
+            # fps is a playback/render choice, not baked content: let the LIVE
+            # config win so changing it (e.g. 8→16 to fix slow-motion) applies to
+            # re-renders without regenerating prompts. Falls back to the value
+            # stored in prompts.json, then 8. The per-clip frame count is
+            # recomputed from each clip's stored seconds at this fps in
+            # _stage_videos_render, so duration stays constant and motion is
+            # rendered at the model's native rate.
+            fps = int(getattr(default_args, "fps", 0) or data.get("fps") or 8)
             match_name = params.get("match")
 
             # ── Reassemble only: no model needed ───────────────────────────────
@@ -2891,6 +3151,77 @@ def launch_web_ui(default_args):
                     _fail("no clips found to reassemble")
                     return
                 _done(f"reassembled from {n} clip(s)")
+                return
+
+            # ── Re-plan a match's prompts (text model only; no video model) ────
+            # Rebuilds JUST this match's fight-clip list — the count scales with the
+            # current playback fps (faster fps → more, shorter clips) — and rewrites
+            # each clip's prompt. Other matches, the outcome clips, and any already-
+            # rendered clip files are left untouched (hit Re-render afterwards). This
+            # is the per-match equivalent of a "Prompts only" run.
+            if scope in ("replan", "prompts"):
+                m = next((x for x in fight_plan if x.get("match_name") == match_name), None)
+                if not m:
+                    _fail("match not found in prompts.json")
+                    return
+                _prog(8, "preparing text model…")
+                client = CoderAIClient(default_args.base_url,
+                                       getattr(default_args, "api_key", None))
+                text_model = getattr(default_args, "text_model", None)
+                char_descriptions = _build_char_descriptions(out_dir)
+                prompter = PromptGenerator(client, text_model,
+                                           char_descriptions=char_descriptions)
+                long_target = float(m.get("long_target", 70))
+                _cf_lo, _cf_hi = _clip_frame_range(
+                    getattr(default_args, "clip_min_frames", CLIP_MIN_FRAMES),
+                    getattr(default_args, "clip_max_frames", CLIP_MAX_FRAMES))
+                _prog(12, f"re-planning clips for {match_name} @ {fps}fps "
+                          f"({_cf_lo}-{_cf_hi}f/clip)…")
+                # Rebuild the clip list with the same planner the full run uses:
+                # frame budget within the configured range, match length counted in
+                # PLAYBACK seconds (nf/fps).
+                new_clips, planned, ci = [], 0.0, 0
+                while planned < long_target:
+                    round_num = ci // 3 + 1
+                    intensity = ("early exchanges" if round_num == 1
+                                 else "midpoint battle" if round_num == 2
+                                 else "climactic final exchange")
+                    _nf = random.randint(_cf_lo, _cf_hi)
+                    clip_seconds = round(_nf / max(1, fps), 2)
+                    new_clips.append({"idx": ci, "clip_seconds": clip_seconds,
+                                      "nf": _nf, "intensity": intensity,
+                                      "shot": None, "prompt": None})
+                    planned += _nf / max(1, fps)
+                    ci += 1
+                # Write a fresh, varied prompt for each new clip.
+                f1_hint = _fighter_desc_hint(m["f1"], char_descriptions)
+                f2_hint = _fighter_desc_hint(m["f2"], char_descriptions)
+                match_avoid = []
+                for i, c in enumerate(new_clips):
+                    shot = prompter.fight_shot(
+                        m["f1"], m["f2"], m["env_desc"],
+                        match_context=f"Match stage: {c['intensity']}. ",
+                        avoid=match_avoid)
+                    c["shot"] = shot
+                    c["prompt"] = (f"{f1_hint} vs {f2_hint} — {shot} "
+                                   f"— {_continuity_clause(m.get('env'))} "
+                                   f"— {FIGHT_PROMPT_SUFFIX}")
+                    match_avoid.append(shot[:60])
+                    _prog(12 + int(84 * (i + 1) / max(1, len(new_clips))),
+                          f"clip {i+1}/{len(new_clips)} prompt written")
+                m["clips"] = new_clips
+                # Persist: this match's entry is updated in-place inside fight_plan;
+                # everything else (other matches, outcomes, fps) is preserved.
+                try:
+                    pf.write_text(json.dumps(
+                        {"fight_plan": fight_plan, "outcome_plan": outcome_plan,
+                         "fps": data.get("fps") or fps}, indent=2))
+                except Exception as e:
+                    _fail(f"could not save prompts.json: {e}")
+                    return
+                _done(f"re-planned {len(new_clips)} clip(s) for {match_name} "
+                      f"@ {fps}fps — now REGENERATE KEYFRAMES (the old ones match the "
+                      f"previous prompts), THEN Re-render")
                 return
 
             # ── Render scopes: need the video model + consistency settings ─────
@@ -2913,6 +3244,10 @@ def launch_web_ui(default_args):
             clip_delay = float(getattr(default_args, "clip_delay", 5.0))
             lw = float(getattr(default_args, "lora_weight", 0.85))
             elw = float(getattr(default_args, "env_lora_weight", 0.8))
+            vls = float(getattr(default_args, "video_lora_scale", 1.0))
+            vsz = str(getattr(default_args, "video_size", "832x480") or "832x480")
+            scm = int(getattr(default_args, "single_clip_max_frames", SINGLE_CLIP_MAX_FRAMES)
+                      or SINGLE_CLIP_MAX_FRAMES)
 
             # ── Regenerate keyframes (image model) ─────────────────────────────
             # Deletes the targeted keyframe PNG(s) then regenerates them so a
@@ -3015,7 +3350,7 @@ def launch_web_ui(default_args):
                         consistency | {"keyframe"}, lora_map,
                         float(getattr(default_args, "character_strength", 0.7)),
                         int(getattr(default_args, "keyframe_steps", 28)),
-                        getattr(default_args, "keyframe_size", "512x512"), lw,
+                        getattr(default_args, "keyframe_size", "832x480"), lw,
                         env_lora_map=env_lora_map, env_lora_weight=elw,
                         kf_cb=_kf_cb)
                 except Exception as e:
@@ -3109,14 +3444,23 @@ def launch_web_ui(default_args):
                     _prog(pct, f"clip {done}/{total} done"
                                + (f" — {label}" if label else ""))
 
+                # A single-clip regenerate must NOT touch the assembled finals
+                # (it would rebuild short/long from just the one clip). Re-rendering
+                # ALL of a match's clips ("match-clips") does reassemble.
+                _assemble = (scope != "clip")
                 _stage_videos_render(
                     client, video_model, vdir, [mm], [], 1, 0, fps, clip_delay,
                     consistency=consistency, lora_map=lora_map,
                     keyframe_dir=keyframe_dir, lora_weight=lw,
                     env_lora_map=env_lora_map, env_lora_weight=elw,
                     progress_cb=_cb, clip_cb=_item,
-                    video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map)
-                _done(f"re-rendered {len(mm['clips'])} clip(s)")
+                    video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map,
+                    assemble_finals=_assemble, video_lora_scale=vls, video_size=vsz,
+                    single_clip_max_frames=scm)
+                msg = f"re-rendered {len(mm['clips'])} clip(s)"
+                if scope == "clip":
+                    msg += " — click “Reassemble finals” to rebuild short/long"
+                _done(msg)
                 return
 
             if scope in ("outcomes", "outcome"):
@@ -3172,7 +3516,9 @@ def launch_web_ui(default_args):
                     keyframe_dir=keyframe_dir, lora_weight=lw,
                     env_lora_map=env_lora_map, env_lora_weight=elw,
                     progress_cb=_cb, clip_cb=_item,
-                    video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map)
+                    video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map,
+                    video_lora_scale=vls, video_size=vsz,
+                    single_clip_max_frames=scm)
                 _done(f"re-rendered {len(sel)} output(s)")
                 return
 
@@ -3240,20 +3586,8 @@ input[type=checkbox]{width:auto;accent-color:#f5a623;margin-right:.3rem}
 .status-idle{background:#333;color:#888}
 .status-run{background:#1a4a1a;color:#7ed87e}
 .status-done{background:#1a1a4a;color:#7ea8f7}
-.gallery-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.75rem}
-.media-card{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:6px;overflow:hidden}
-.media-card img{width:100%;display:block;height:160px;object-fit:cover;background:#111}
-.media-card video{width:100%;display:block;height:160px;object-fit:cover;background:#111}
-.media-card .mc-label{padding:.4rem .5rem;font-size:.72rem;color:#999;
-                       white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .section-title{font-size:.85rem;font-weight:700;color:#aaa;
                text-transform:uppercase;letter-spacing:.05em;margin:1rem 0 .4rem}
-.mc-actions{display:flex;gap:.3rem;padding:.3rem .4rem;border-top:1px solid #222;flex-wrap:wrap}
-.mc-actions button{font-size:.68rem;padding:.18rem .45rem;border-radius:3px;border:none;
-                   cursor:pointer;background:#2a2a2a;color:#ccc;font-weight:500}
-.mc-actions button:hover{background:#3a3a3a;color:#fff}
-.mc-actions button.active{background:#1a3a1a;color:#7ed87e}
-.mc-info{font-size:.67rem;color:#555;padding:.15rem .45rem .3rem;font-family:monospace}
 /* modal */
 .modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100;
           align-items:center;justify-content:center}
@@ -3420,7 +3754,6 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
             ("environments", "/environments", "🏞 Environments"),
             ("matches", "/matches", "🥊 Matches"),
             ("prompts", "/prompts", "✍ Prompts"),
-            ("gallery", "/gallery", "🎬 Gallery"),
         ]
         nav = "".join(
             f'<a href="{href}" style="{"color:#f5a623;font-weight:700" if k==active else ""}">{label}</a>'
@@ -3497,9 +3830,6 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
     <div><label>Region filter <span class=hint>(kampala, soweto, jinja… or blank)</span></label>
          <input name=region type=text value="{_v('region') or ''}"></div>
   </div>
-  <div style="margin-top:.6rem">
-    <label><input type=checkbox name=include_female{_c('include_female')}> Include female fighters</label>
-  </div>
 </div>
 
 <div class=card>
@@ -3515,6 +3845,15 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
     <label>Fighter names <span class=hint>(comma-separated)</span></label>
     <input name=fighters type=text value="{_v('fighters') or ''}">
   </div>
+  <div class=row style="margin-top:.6rem">
+    <div><label>How many fighters <span class=hint>(0 = whole pool)</span></label>
+         <input name=num_fighters type=number min=0 max=99 value="{_v('num_fighters', 0)}"></div>
+    <div><label>Reference images / character <span class=hint>(more = healthier LoRA)</span></label>
+         <input name=char_refs type=number min=1 max=40 value="{_v('char_refs', 4)}"></div>
+    <div style="display:flex;align-items:flex-end">
+      <label><input type=checkbox name=include_female{_c('include_female')}> Include female fighters</label>
+    </div>
+  </div>
 </div>
 
 <div class=card>
@@ -3529,6 +3868,12 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
   <div id=env_names_row style="display:{"block" if env_mode=="environments" else "none"};margin-top:.4rem">
     <label>Environment names <span class=hint>(comma-separated)</span></label>
     <input name=environments type=text value="{_v('environments') or ''}">
+  </div>
+  <div class=row style="margin-top:.6rem">
+    <div><label>How many environments <span class=hint>(0 = whole pool)</span></label>
+         <input name=num_environments type=number min=0 max=99 value="{_v('num_environments', 0)}"></div>
+    <div><label>Reference images / environment</label>
+         <input name=env_refs type=number min=1 max=40 value="{_v('env_refs', 3)}"></div>
   </div>
 </div>
 
@@ -3568,7 +3913,7 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
   <label style="margin-top:.75rem">Video stage mode</label>
   <select name=stage3_mode>
     <option value=full{"selected" if stage3_mode=="full" else ""}>Full (prompts + render)</option>
-    <option value=only_prompts{"selected" if stage3_mode=="only_prompts" else ""}>Prompts only (no render)</option>
+    <option value=only_prompts{"selected" if stage3_mode=="only_prompts" else ""}>Matches prompts only (no render)</option>
     <option value=only_videos{"selected" if stage3_mode=="only_videos" else ""}>Videos only (use saved prompts)</option>
   </select>
   <label style="margin-top:.75rem">Run scope</label>
@@ -3596,9 +3941,13 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
       <div><label>Keyframe steps</label>
            <input name=keyframe_steps type=number min=8 max=80 value="{_v('keyframe_steps', 28)}"></div>
       <div><label>Keyframe size <span class=hint>(WxH)</span></label>
-           <input name=keyframe_size type=text value="{_v('keyframe_size','512x512')}"></div>
+           <input name=keyframe_size type=text value="{_v('keyframe_size','832x480')}"></div>
       <div><label>Character strength <span class=hint>(IP-Adapter 0-1)</span></label>
            <input name=character_strength type=number min=0 max=1 step=0.05 value="{_v('character_strength', 0.7)}"></div>
+    </div>
+    <div class=row>
+      <div><label>Video size <span class=hint>(WxH — Wan native 832x480 / 1280x720)</span></label>
+           <input name=video_size type=text value="{_v('video_size','832x480')}"></div>
     </div>
   </div>
   <div id=lora_fields style="margin-top:.6rem">
@@ -3616,6 +3965,25 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
       <div><label>LoRA weight <span class=hint>(at generation)</span></label>
            <input name=lora_weight type=number min=0 max=2 step=0.05 value="{_v('lora_weight', 0.85)}"></div>
     </div>
+    <details style="margin:.5rem 0 .2rem">
+      <summary class=hint style="cursor:pointer">📐 Suggested training values (match steps to image count)</summary>
+      <table style="width:100%;border-collapse:collapse;font-size:.74rem;margin-top:.4rem">
+        <thead><tr style="color:#aaa;text-align:left">
+          <th style="padding:.25rem .4rem;border-bottom:1px solid #333">Ref images</th>
+          <th style="padding:.25rem .4rem;border-bottom:1px solid #333">Train steps</th>
+          <th style="padding:.25rem .4rem;border-bottom:1px solid #333">LoRA weight</th>
+        </tr></thead>
+        <tbody style="color:#cfcfcf">
+          <tr><td style="padding:.22rem .4rem">4</td><td style="padding:.22rem .4rem">300–450</td><td style="padding:.22rem .4rem">0.70–0.85</td></tr>
+          <tr><td style="padding:.22rem .4rem">10–15</td><td style="padding:.22rem .4rem">700–900</td><td style="padding:.22rem .4rem">0.80–1.00</td></tr>
+          <tr><td style="padding:.22rem .4rem">20+</td><td style="padding:.22rem .4rem">1000–1500</td><td style="padding:.22rem .4rem">0.90–1.00</td></tr>
+        </tbody>
+      </table>
+      <p class=hint style="margin:.3rem 0 0">Aim for ~60–120 steps per image. Too many steps for few
+      images <b>overfits</b> — fix it by lowering steps or adding reference images, not by training
+      harder. The <b>Video LoRA scale</b> (~0.45) is a <i>separate</i> lever: it tames colour/motion
+      from stacking LoRAs on the distilled Wan expert and is needed regardless of training amount.</p>
+    </details>
     <div style="margin-top:.6rem">
       <label><input type=checkbox name=env_loras{"" if _v('no_env_loras') else " checked"}> Also train per-environment LoRAs <span class=hint>(lock each location’s look)</span></label>
       <label><input type=checkbox name=video_loras{" checked" if _v('video_loras') else ""}> Also train Wan VIDEO LoRAs <span class=hint>(per fighter/env, trained against the video model — heavy)</span></label>
@@ -3627,6 +3995,35 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
            <input name=env_lora_rank type=number min=2 max=128 value="{_v('env_lora_rank', 16)}"></div>
       <div><label>Env LoRA weight <span class=hint>(at generation)</span></label>
            <input name=env_lora_weight type=number min=0 max=2 step=0.05 value="{_v('env_lora_weight', 0.8)}"></div>
+      <div><label>Video LoRA scale <span class=hint>(×char+env weight, video only)</span></label>
+           <input name=video_lora_scale type=number min=0 max=2 step=0.05 value="{_v('video_lora_scale', 1.0)}"></div>
+    </div>
+    <div class=row3 style="margin-top:.4rem">
+      <div><label>Clip min frames <span class=hint>(per fight clip)</span></label>
+           <input name=clip_min_frames type=number min=8 max=480 value="{_v('clip_min_frames', 50)}"></div>
+      <div><label>Clip max frames <span class=hint>(dur = frames÷fps; >cap splits into one shot)</span></label>
+           <input name=clip_max_frames type=number min=8 max=480 value="{_v('clip_max_frames', 70)}"></div>
+      <div><label>Single-render cap <span class=hint>(≤81; longer = chained parts)</span></label>
+           <input name=single_clip_max_frames type=number min=8 max=81 value="{_v('single_clip_max_frames', 50)}"></div>
+    </div>
+    <div class=row3 style="margin-top:.4rem">
+      <div><label>Outcome min frames</label>
+           <input name=outcome_min_frames type=number min=8 max=480 value="{_v('outcome_min_frames', 40)}"></div>
+      <div><label>Outcome max frames <span class=hint>(split + chained like clips)</span></label>
+           <input name=outcome_max_frames type=number min=8 max=480 value="{_v('outcome_max_frames', 70)}"></div>
+      <div></div>
+    </div>
+    <div class=row style="margin-top:.4rem">
+      <div><label>Short final assembly <span class=hint>(seconds, min–max)</span></label>
+        <div style="display:flex;gap:.4rem">
+          <input name=short_min type=number min=5 max=600 step=1 value="{_v('short_min', 40)}">
+          <input name=short_max type=number min=5 max=600 step=1 value="{_v('short_max', 50)}">
+        </div></div>
+      <div><label>Long final assembly <span class=hint>(seconds, min–max — sets clip count)</span></label>
+        <div style="display:flex;gap:.4rem">
+          <input name=long_min type=number min=5 max=1200 step=1 value="{_v('long_min', 65)}">
+          <input name=long_max type=number min=5 max=1200 step=1 value="{_v('long_max', 75)}">
+        </div></div>
     </div>
   </div>
 </div>
@@ -3643,7 +4040,7 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
   <div style="display:flex;gap:.4rem;margin-top:.35rem;flex-wrap:wrap">
     <button class="btn btn-secondary" type=button onclick="runStep('characters')">1 · Characters</button>
     <button class="btn btn-secondary" type=button onclick="runStep('environments')">2 · Environments</button>
-    <button class="btn btn-secondary" type=button onclick="runStep('prompts')">3 · Prompts</button>
+    <button class="btn btn-secondary" type=button onclick="runStep('prompts')" title="Build the match plan + write all clip/outcome prompts (no keyframes, no video render). Matches appear on the Matches page.">3 · Generate matches prompts</button>
     <button class="btn btn-secondary" type=button onclick="runStep('loras')">4 · Train LoRAs</button>
     <button class="btn btn-secondary" type=button onclick="runStep('video-loras')">4b · Train Video LoRAs</button>
     <button class="btn btn-secondary" type=button onclick="runStep('keyframes')">5 · Keyframes</button>
@@ -3905,6 +4302,16 @@ fetch('/status').then(r=>r.json()).then(d=>{{
             extra_html = (f'<div class=row3 style="margin-top:.4rem">{"".join(extra_rows)}</div>'
                           if extra_rows else "")
 
+            # LoRA train defaults mirror the Run-page configuration so a profile
+            # created by a run trains with the same steps/rank you set there.
+            # Characters use lora_steps/rank; environments use env_lora_steps/rank.
+            if kind == "character":
+                _def_lora_steps = int(getattr(default_args, "lora_steps", 800) or 800)
+                _def_lora_rank  = int(getattr(default_args, "lora_rank", 16) or 16)
+            else:
+                _def_lora_steps = int(getattr(default_args, "env_lora_steps", 800) or 800)
+                _def_lora_rank  = int(getattr(default_args, "env_lora_rank", 16) or 16)
+
             cards.append(
                 f'<div class=card id="pf-{kind}-{esc(name)}">'
                 f'  <div class=pf-head>'
@@ -3949,9 +4356,9 @@ fetch('/status').then(r=>r.json()).then(d=>{{
                 f'    <span style="font-size:.78rem;color:{"#7ed87e" if (_lora_map.get(name)) else "#888"}">'
                 f'Identity LoRA: {"trained ✓" if (_lora_map.get(name)) else "not trained"}</span>'
                 f'    <label style="margin:0;font-size:.78rem">steps <input type=number data-lora=steps '
-                f'value=800 min=50 max=5000 step=50 style="width:66px;display:inline-block"></label>'
+                f'value={_def_lora_steps} min=50 max=5000 step=50 style="width:66px;display:inline-block"></label>'
                 f'    <label style="margin:0;font-size:.78rem">rank <input type=number data-lora=rank '
-                f'value=16 min=2 max=128 style="width:54px;display:inline-block"></label>'
+                f'value={_def_lora_rank} min=2 max=128 style="width:54px;display:inline-block"></label>'
                 f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
                 f'onclick="trainLora(\'{kind}\',\'{esc(name)}\')">🧠 {"Retrain" if (_lora_map.get(name)) else "Train"} image LoRA</button>'
                 f'    <span class=pf-lora-status style="font-size:.76rem;color:#7ea8f7"></span>'
@@ -3960,9 +4367,9 @@ fetch('/status').then(r=>r.json()).then(d=>{{
                 f'  <div class=pf-actions style="border-top:1px solid #222;padding-top:.6rem;margin-top:.6rem">'
                 f'    <span style="font-size:.78rem;color:{_vcolor}">Video LoRA: {_vlabel}</span>'
                 f'    <label style="margin:0;font-size:.78rem">steps <input type=number data-vlora=steps '
-                f'value=800 min=50 max=5000 step=50 style="width:66px;display:inline-block"></label>'
+                f'value={_def_lora_steps} min=50 max=5000 step=50 style="width:66px;display:inline-block"></label>'
                 f'    <label style="margin:0;font-size:.78rem">rank <input type=number data-vlora=rank '
-                f'value=16 min=2 max=128 style="width:54px;display:inline-block"></label>'
+                f'value={_def_lora_rank} min=2 max=128 style="width:54px;display:inline-block"></label>'
                 f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
                 f'onclick="trainLora(\'{kind}\',\'{esc(name)}\',\'video\')">🎬 '
                 f'{_vbtn} video LoRA</button>'
@@ -4271,13 +4678,15 @@ async function reMatch(ev, scope, params){
                 'outcome':'Re-render this output clip?',
                 'keyframes':'Regenerate ALL keyframe images for this match (uses the image model)? Existing keyframes are replaced; the clip videos are NOT re-rendered — click Re-render afterwards.',
                 'keyframes-missing':'Generate only the MISSING keyframe images for this match (uses the image model)? Existing keyframes are kept; nothing is re-rendered.',
-                'keyframe':'Regenerate this keyframe image (uses the image model)? The clip video is NOT re-rendered — click Re-render afterwards.'};
+                'keyframe':'Regenerate this keyframe image (uses the image model)? The clip video is NOT re-rendered — click Re-render afterwards.',
+                'replan':'Re-plan this match: rebuild its clip list and rewrite all clip prompts (frame budget from the Clip min/max frames settings). Only this match changes — other matches and outcomes are untouched. AFTERWARDS, in order: 1) Regenerate keyframes (the old keyframes match the PREVIOUS prompts and would anchor the video to the wrong image — causing static/low-motion clips), 2) Re-render all clips, 3) Reassemble finals.'};
   const kf=(scope==='keyframes'||scope==='keyframe'||scope==='keyframes-missing');
   const kfMiss=(scope==='keyframes-missing');
+  const isReplan=(scope==='replan');
   if(!(await uiConfirm(labels[scope]||'Proceed?',
-       {title:(kfMiss?'Generate missing keyframes':(kf?'Regenerate keyframes':'Regenerate')),
-        okText:(scope==='reassemble'?'Reassemble':(kfMiss?'Generate missing':(kf?'Regenerate':'Re-render'))),
-        danger:(scope!=='reassemble'&&!kf)})))return;
+       {title:(isReplan?'Re-plan match prompts':(kfMiss?'Generate missing keyframes':(kf?'Regenerate keyframes':'Regenerate'))),
+        okText:(scope==='reassemble'?'Reassemble':(isReplan?'Re-plan':(kfMiss?'Generate missing':(kf?'Regenerate':'Re-render')))),
+        danger:(scope!=='reassemble'&&!kf&&!isReplan)})))return;
   const stEl=_findStatus(ev);
   const setSt=(c,t)=>{ if(stEl){ stEl.style.color=c; stEl.textContent=t; } };
   const fd=new FormData(); fd.append('scope',scope);
@@ -4321,7 +4730,8 @@ async function delVid(ev, scope, params){
                 'output':'Delete this output video file?',
                 'outputs':'Delete ALL output video files for this fighter?',
                 'keyframes':'Clear ALL keyframe images for this match? The next re-render will run keyframe-free until you regenerate them.',
-                'keyframe':'Clear this keyframe image? The next re-render of it will run keyframe-free until you regenerate it.'};
+                'keyframe':'Clear this keyframe image? The next re-render of it will run keyframe-free until you regenerate it.',
+                'match-purge':'Remove this match COMPLETELY — every clip, final, outcome, keyframe AND its entry in the plan (prompts.json)? This cannot be undone.'};
   if(!(await uiConfirm(labels[scope]||'Delete?',{title:'Remove videos', okText:'Delete', danger:true})))return;
   const stEl=_findStatus(ev);
   const setSt=(c,t)=>{ if(stEl){ stEl.style.color=c; stEl.textContent=t; } };
@@ -4331,6 +4741,11 @@ async function delVid(ev, scope, params){
   try{ j=await (await fetch('/matches/delete',{method:'POST',body:fd})).json(); }
   catch(e){ setSt('#e07070','✗ '+e); return; }
   if(j.error){ setSt('#e07070','✗ '+j.error); return; }
+  if(scope==='match-purge'){
+    setSt('#7ed87e','✓ match removed ('+(j.removed||0)+' file(s)) — returning to Matches…');
+    setTimeout(()=>{ location.href = (window.ROOT_PATH||'') + '/matches'; },700);
+    return;
+  }
   setSt('#7ed87e','✓ removed '+(j.removed||0)+' file(s) — reloading…');
   setTimeout(()=>location.reload(),700);
 }
@@ -4441,6 +4856,9 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
                 f'href="/match?name={_esc(mn)}">Open ▸</a>'
                 f'  <button class="btn btn-danger" style="font-size:.8rem;padding:.35rem .8rem" '
                 f'onclick="delVid(event,\'match\',{{match:\'{_esc(mn)}\'}})">🗑 Remove videos</button>'
+                f'  <button class="btn btn-danger" style="font-size:.8rem;padding:.35rem .8rem" '
+                f'onclick="delVid(event,\'match-purge\',{{match:\'{_esc(mn)}\'}})" '
+                f'title="Remove this match completely — files, keyframes and plan entry">🧨 Remove</button>'
                 f'</div>'
             )
 
@@ -4622,6 +5040,9 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             f'    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="saveMatch(event,\'{_esc(name)}\')">💾 Save match</button>'
             f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="reMatch(event,\'replan\',{{match:\'{_esc(name)}\'}})" '
+            f'title="Rebuild this match\'s clip list + prompts at the current fps (more, shorter clips at higher fps). No video model.">📝 Re-plan prompts</button>'
+            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="reMatch(event,\'match-clips\',{{match:\'{_esc(name)}\'}})">♻ Re-render all clips</button>'
             f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="reMatch(event,\'reassemble\',{{match:\'{_esc(name)}\'}})">🎞 Reassemble finals</button>'
@@ -4639,6 +5060,10 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             f'onclick="delVid(event,\'keyframes\',{{match:\'{_esc(name)}\'}})">🧹 Clear keyframes</button>'
             f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="delVid(event,\'match\',{{match:\'{_esc(name)}\'}})">🗑 Remove all videos</button>'
+            f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="delVid(event,\'match-purge\',{{match:\'{_esc(name)}\'}})" '
+            f'title="Remove this match completely — files, keyframes, and its entry in the plan">'
+            f'🧨 Remove match completely</button>'
             f'  </div>'
             f'</div>'
             # ── Enhance (upscale / raise FPS) ──
@@ -4876,186 +5301,6 @@ async function resetPrompts(ev){
                 f'Matches page. Changes apply to future runs/regenerations.</p>'
                 f'{body}{script}')
 
-    def _gallery_html(out_path: Path):
-        sections = []
-
-        def _video_card(f):
-            rel  = f.relative_to(out_path)
-            url  = "/media/" + str(rel).replace("\\", "/")
-            name = f.name
-            rel_str = str(rel).replace("\\", "/")
-            probe = _probe_video(f)
-            info = ""
-            if probe:
-                w,h,fps = probe.get("width",0),probe.get("height",0),probe.get("fps",0)
-                dur = probe.get("duration",0)
-                info = f'{w}×{h}  {fps}fps  {dur:.1f}s'
-            escaped = rel_str.replace("'", "\\'")
-            return (
-                f'<div class=media-card>'
-                f'<video src="{url}" controls preload=metadata></video>'
-                f'<div class=mc-label title="{name}">{name}</div>'
-                f'{"<div class=mc-info>"+info+"</div>" if info else ""}'
-                f'<div class=mc-actions>'
-                f'  <button onclick="openProc(\'{escaped}\',\'upscale\',2)">⬆ 2×</button>'
-                f'  <button onclick="openProc(\'{escaped}\',\'upscale\',4)">⬆ 4×</button>'
-                f'  <button onclick="openProc(\'{escaped}\',\'fps\',null)">🎞 FPS</button>'
-                f'  <button onclick="openProc(\'{escaped}\',\'upscale_fps\',null)">⬆+🎞 Both</button>'
-                f'</div>'
-                f'</div>'
-            )
-
-        def _image_card(f):
-            rel = f.relative_to(out_path)
-            url = "/media/" + str(rel).replace("\\","/")
-            name = f.name
-            return (f'<div class=media-card>'
-                    f'<img src="{url}" loading=lazy alt="{name}">'
-                    f'<div class=mc-label title="{name}">{name}</div>'
-                    f'</div>')
-
-        def _vid_cards(files):
-            return "".join(_video_card(f) for f in sorted(files))
-
-        def _img_cards(files):
-            return "".join(_image_card(f) for f in sorted(files))
-
-        # Characters
-        char_dir = out_path / "characters"
-        if char_dir.exists():
-            imgs = list(char_dir.rglob("*.png")) + list(char_dir.rglob("*.jpg")) + list(char_dir.rglob("*.webp"))
-            if imgs:
-                sections.append(f'<div class=section-title>Characters ({len(imgs)} images)</div>'
-                                 f'<div class=gallery-grid>{_img_cards(imgs)}</div>')
-
-        # Environments
-        env_dir = out_path / "environments"
-        if env_dir.exists():
-            imgs = list(env_dir.rglob("*.png")) + list(env_dir.rglob("*.jpg")) + list(env_dir.rglob("*.webp"))
-            if imgs:
-                sections.append(f'<div class=section-title>Environments ({len(imgs)} images)</div>'
-                                 f'<div class=gallery-grid>{_img_cards(imgs)}</div>')
-
-        # Videos — concatenated first, then individual clips, then outcomes
-        vid_dir = out_path / "videos"
-        if vid_dir.exists():
-            all_vids = list(vid_dir.glob("*.mp4"))
-            concat   = [v for v in all_vids if v.stem.endswith(("_short","_long"))]
-            clips    = [v for v in all_vids if "_clip" in v.stem]
-            outcomes = [v for v in all_vids
-                        if not v.stem.endswith(("_short","_long")) and "_clip" not in v.stem]
-            if concat:
-                sections.append(f'<div class=section-title>Assembled matches ({len(concat)})</div>'
-                                 f'<div class=gallery-grid>{_vid_cards(concat)}</div>')
-            if outcomes:
-                sections.append(f'<div class=section-title>Outcome clips ({len(outcomes)})</div>'
-                                 f'<div class=gallery-grid>{_vid_cards(outcomes)}</div>')
-            if clips:
-                sections.append(f'<div class=section-title>Fight clips ({len(clips)})</div>'
-                                 f'<div class=gallery-grid>{_vid_cards(clips)}</div>')
-
-        if not sections:
-            body_inner = '<div class=card style="color:#666">No media found yet. Run the generator to produce content.</div>'
-        else:
-            body_inner = "".join(sections)
-
-        modal = """
-<div class=modal-bg id=proc-modal onclick="if(event.target===this)closeProc()">
-  <div class=modal>
-    <h3 id=modal-title>Process video</h3>
-    <div id=modal-body></div>
-    <div style="display:flex;gap:.5rem;margin-top:.9rem">
-      <button class="btn btn-primary" id=modal-go onclick="submitProc()">Process</button>
-      <button class="btn btn-secondary" onclick="closeProc()">Cancel</button>
-    </div>
-    <div class=progress-bar id=modal-pbar style="display:none"><div class=progress-fill id=modal-pfill style="width:0%"></div></div>
-    <div class=job-status id=modal-status></div>
-  </div>
-</div>
-<script>
-let _curFile=null,_curOp=null,_curJobId=null,_pollTimer=null;
-const FPS_OPTIONS=[12,16,24,30,60];
-function openProc(file,op,param){
-  _curFile=file; _curOp=op;
-  const title=document.getElementById('modal-title');
-  const body=document.getElementById('modal-body');
-  document.getElementById('modal-status').textContent='';
-  document.getElementById('modal-status').className='job-status';
-  document.getElementById('modal-pbar').style.display='none';
-  document.getElementById('modal-pfill').style.width='0%';
-  document.getElementById('modal-go').disabled=false;
-  if(op==='upscale'){
-    title.textContent=`Upscale ${param}×`;
-    body.innerHTML=`<p style="font-size:.82rem;color:#aaa">Scale video to ${param}× resolution using CoderAI's video super-resolution endpoint. Output saved as a new file alongside the original.</p>`;
-    _curOp='upscale'; _curJobId=null;
-    document.getElementById('modal-go').onclick=()=>submitProc(param);
-  } else if(op==='fps'){
-    title.textContent='Raise FPS';
-    body.innerHTML=`<label>Target FPS</label><select id=fps-sel>${FPS_OPTIONS.map(f=>'<option value='+f+(f===24?' selected':'')+'>'+f+' fps</option>').join('')}</select><p style="font-size:.75rem;color:#666;margin-top:.4rem">Uses CoderAI's frame interpolation endpoint (RIFE when available, ffmpeg minterpolate fallback). Longer videos take a few minutes.</p>`;
-    document.getElementById('modal-go').onclick=()=>submitProc(parseInt(document.getElementById('fps-sel').value));
-  } else if(op==='upscale_fps'){
-    title.textContent='Upscale + Raise FPS';
-    body.innerHTML=`<div class=row2>
-      <div><label>Upscale</label><select id=us-sel><option value=2>2×</option><option value=4>4×</option></select></div>
-      <div><label>Target FPS</label><select id=fps-sel2>${FPS_OPTIONS.map(f=>'<option value='+f+(f===24?' selected':'')+'>'+f+' fps</option>').join('')}</select></div>
-    </div><p style="font-size:.75rem;color:#666;margin-top:.4rem">Upscales via CoderAI, then interpolates FPS via CoderAI in two sequential requests. This takes longer than either step alone.</p>`;
-    document.getElementById('modal-go').onclick=()=>submitProc([
-      parseInt(document.getElementById('us-sel').value),
-      parseInt(document.getElementById('fps-sel2').value)
-    ]);
-  }
-  document.getElementById('proc-modal').classList.add('open');
-}
-function closeProc(){
-  document.getElementById('proc-modal').classList.remove('open');
-  if(_pollTimer){clearInterval(_pollTimer);_pollTimer=null;}
-}
-async function submitProc(param){
-  document.getElementById('modal-go').disabled=true;
-  document.getElementById('modal-status').textContent='Starting…';
-  document.getElementById('modal-pbar').style.display='block';
-  const fd=new FormData();
-  fd.append('file',_curFile);
-  fd.append('op',_curOp);
-  fd.append('param',JSON.stringify(param));
-  const r=await fetch('/process',{method:'POST',body:fd});
-  const j=await r.json();
-  if(j.error){
-    document.getElementById('modal-status').textContent='✗ '+j.error;
-    document.getElementById('modal-status').className='job-status error';
-    document.getElementById('modal-go').disabled=false;
-    return;
-  }
-  _curJobId=j.job_id;
-  _pollTimer=setInterval(pollJob,1200);
-}
-async function pollJob(){
-  if(!_curJobId)return;
-  const r=await fetch('/job/'+_curJobId);
-  const j=await r.json();
-  const pct=j.progress||0;
-  document.getElementById('modal-pfill').style.width=pct+'%';
-  document.getElementById('modal-status').textContent=
-    j.status==='running'?(j._msg||`Sending to CoderAI… ${pct}%`):
-    j.status==='done'?`✓ Done → ${j.output_name}`:
-    `✗ ${j.error||'failed'}`;
-  document.getElementById('modal-status').className='job-status'+(j.status==='done'?' done':j.status==='error'?' error':'');
-  if(j.status!=='running'){
-    clearInterval(_pollTimer);_pollTimer=null;
-    document.getElementById('modal-go').disabled=false;
-    if(j.status==='done'){
-      // add a download/view link
-      const st=document.getElementById('modal-status');
-      st.innerHTML+=` <a href="/media/${j.output}" target=_blank style="color:#7eb8f7">▶ View</a>`;
-    }
-  }
-}
-</script>"""
-        return (f'<h1>Gallery</h1>'
-                f'<div style="margin-bottom:.5rem;display:flex;justify-content:flex-end">'
-                f'<a href=/gallery class="btn btn-secondary" style="font-size:.8rem">↻ Refresh</a></div>'
-                f'{body_inner}{modal}')
-
     # ── HTTP handler ────────────────────────────────────────────────────────
 
     class _Handler(http.server.BaseHTTPRequestHandler):
@@ -5120,10 +5365,6 @@ async function pollJob(){
 
             elif path == "/prompts":
                 html = _page("Prompts", _prompts_html(), "prompts")
-                self._send(200, "text/html; charset=utf-8", html)
-
-            elif path == "/gallery":
-                html = _page("Gallery", _gallery_html(out_dir), "gallery")
                 self._send(200, "text/html; charset=utf-8", html)
 
             elif path == "/status":
@@ -5350,7 +5591,7 @@ async function pollJob(){
                 scope = _fv("scope")
                 if scope not in ("match-clips", "clip", "reassemble", "outcomes",
                                  "outcome", "enhance", "keyframes",
-                                 "keyframes-missing", "keyframe"):
+                                 "keyframes-missing", "keyframe", "replan"):
                     self._send(400, "application/json",
                                _j.dumps({"error": "invalid scope"}))
                     return
@@ -5606,6 +5847,49 @@ async function pollJob(){
                             _rm(kdir / f"{mn}_clip{int(idx):02d}.png")
                         except ValueError:
                             self._send(400, "application/json", _j.dumps({"error": "invalid idx"})); return
+                elif scope == "match-purge":
+                    # Remove a match COMPLETELY: every video file, every keyframe,
+                    # AND its entry in prompts.json (the plan + this match's
+                    # per-match outcomes). Legacy GLOBAL per-fighter outcomes are
+                    # left intact — they're shared with the fighter's other matches.
+                    mn = _fv("match")
+                    if not _safe(mn):
+                        self._send(400, "application/json", _j.dumps({"error": "invalid match"})); return
+                    kdir = vdir / "keyframes"
+                    _, _plan, _fbn, _matches_map, _ = _scan_matches()
+                    _info = _matches_map.get(mn, {})
+                    # 1. Video files: finals (short/long), clips, outcomes.
+                    for _p in list(_info.get("finals", {}).values()):
+                        _rm(_p)
+                    for _p in _info.get("clips", []):
+                        _rm(_p)
+                    for (_f, _o, _p) in _info.get("outcomes", []):
+                        _rm(_p)
+                    # 2. Keyframes: clip keyframes + this match's outcome keyframes.
+                    for p in kdir.glob(f"{mn}_clip*.png"):
+                        _rm(p)
+                    for (_f, _o, _p) in _info.get("outcomes", []):
+                        _rm(kdir / f"{Path(_p).stem}.png")
+                    _meta = _fbn.get(mn, {})
+                    _mf = {_meta.get("f1"), _meta.get("f2")} - {None}
+                    for o in _plan.get("outcome_plan", []):
+                        if o.get("match_name") == mn:
+                            _rm(kdir / f"{_clip_stem_outcome(o['fighter'], o['outcome'], o.get('match_name'))}.png")
+                    # 3. Strip the match from prompts.json (plan + its per-match outcomes).
+                    try:
+                        if prompts_file.exists():
+                            _data = json.loads(prompts_file.read_text())
+                            _before = len(_data.get("fight_plan", []))
+                            _data["fight_plan"] = [x for x in _data.get("fight_plan", [])
+                                                   if x.get("match_name") != mn]
+                            _data["outcome_plan"] = [o for o in _data.get("outcome_plan", [])
+                                                     if o.get("match_name") != mn]
+                            if len(_data.get("fight_plan", [])) != _before:
+                                prompts_file.write_text(json.dumps(_data, indent=2))
+                    except Exception as e:
+                        self._send(500, "application/json",
+                                   _j.dumps({"error": f"removed files but could not update "
+                                                      f"prompts.json: {e}"})); return
                 else:
                     self._send(400, "application/json", _j.dumps({"error": "invalid scope"})); return
                 self._send(200, "application/json", _j.dumps({"ok": True, "removed": removed}))
@@ -5815,6 +6099,10 @@ async function pollJob(){
                     "out_dir": _fv("out_dir", "./township_output"),
                     "region": _s(_fv("region")),
                     "include_female": "include_female" in form,
+                    "num_fighters": int(_fv("num_fighters", "0") or 0),
+                    "num_environments": int(_fv("num_environments", "0") or 0),
+                    "char_refs": int(_fv("char_refs", "4") or 4),
+                    "env_refs": int(_fv("env_refs", "3") or 3),
                     "fps": int(_fv("fps", "8") or 8),
                     "clip_delay": float(_fv("clip_delay", "5") or 5),
                     "upscale_factor": int(_fv("upscale_factor", "0") or 0),
@@ -5824,7 +6112,7 @@ async function pollJob(){
                     "only_outcomes": "only_outcomes" in form,
                     "consistency": _fv("consistency", "keyframe"),
                     "keyframe_steps": int(_fv("keyframe_steps", "28") or 28),
-                    "keyframe_size": _fv("keyframe_size", "512x512"),
+                    "keyframe_size": _fv("keyframe_size", "832x480"),
                     "character_strength": float(_fv("character_strength", "0.7") or 0.7),
                     "lora_steps": int(_fv("lora_steps", "800") or 800),
                     "lora_rank": int(_fv("lora_rank", "16") or 16),
@@ -5834,6 +6122,17 @@ async function pollJob(){
                     "env_lora_steps": int(_fv("env_lora_steps", "800") or 800),
                     "env_lora_rank": int(_fv("env_lora_rank", "16") or 16),
                     "env_lora_weight": float(_fv("env_lora_weight", "0.8") or 0.8),
+                    "video_lora_scale": float(_fv("video_lora_scale", "1.0") or 1.0),
+                    "video_size": _fv("video_size", "832x480") or "832x480",
+                    "clip_min_frames": int(_fv("clip_min_frames", "50") or 50),
+                    "clip_max_frames": int(_fv("clip_max_frames", "70") or 70),
+                    "single_clip_max_frames": int(_fv("single_clip_max_frames", "50") or 50),
+                    "outcome_min_frames": int(_fv("outcome_min_frames", "40") or 40),
+                    "outcome_max_frames": int(_fv("outcome_max_frames", "70") or 70),
+                    "short_min": float(_fv("short_min", "40") or 40),
+                    "short_max": float(_fv("short_max", "50") or 50),
+                    "long_min": float(_fv("long_min", "65") or 65),
+                    "long_max": float(_fv("long_max", "75") or 75),
                     "skip_characters": cm == "skip",
                     "reuse_fighters": cm == "reuse",
                     "fighters": _s(_fv("fighters")) if cm == "fighters" else None,
@@ -5847,12 +6146,14 @@ async function pollJob(){
                     "only_assets": sc == "assets",
                     "web_port": port,
                 }
-                # Apply the changed connection/model settings to the live session
-                # immediately, so subsequent per-profile jobs (regenerate, train
-                # LoRA) and runs use them — not the values from script launch.
-                for _k in ("base_url", "api_key", "image_model",
-                           "video_model", "text_model", "lora_train_base_model"):
-                    setattr(default_args, _k, cfg.get(_k))
+                # Apply ALL saved settings to the live session immediately, so
+                # subsequent per-profile jobs (regenerate, train LoRA), runs, AND a
+                # page reload all reflect what was just saved. The Run page renders
+                # from default_args, so updating only the connection keys (the old
+                # behaviour) made every other field — e.g. video_lora_scale — snap
+                # back to its launch value on reload even though the file was saved.
+                for _k, _val in cfg.items():
+                    setattr(default_args, _k, _val)
                 _web_log(f"  ⚙ Settings applied (image model: "
                          f"{cfg.get('image_model') or 'auto'})")
                 # Resolve the target path. Relative paths land inside out_dir;
@@ -5946,6 +6247,10 @@ async function pollJob(){
             ns.out_dir      = _fv("out_dir", "./township_output")
             ns.region       = _fv("region") or None
             ns.include_female = "include_female" in form
+            ns.num_fighters    = int(_fv("num_fighters", "0") or 0)
+            ns.num_environments = int(_fv("num_environments", "0") or 0)
+            ns.char_refs        = int(_fv("char_refs", "4") or 4)
+            ns.env_refs         = int(_fv("env_refs", "3") or 3)
             ns.fps          = int(_fv("fps", "8"))
             ns.clip_delay   = float(_fv("clip_delay", "5.0"))
             ns.upscale_factor = int(_fv("upscale_factor", "0") or 0)
@@ -5956,7 +6261,7 @@ async function pollJob(){
             # consistency config
             ns.consistency       = _fv("consistency", "keyframe")
             ns.keyframe_steps    = int(_fv("keyframe_steps", "28"))
-            ns.keyframe_size     = _fv("keyframe_size", "512x512")
+            ns.keyframe_size     = _fv("keyframe_size", "832x480")
             ns.character_strength = float(_fv("character_strength", "0.7"))
             ns.lora_steps        = int(_fv("lora_steps", "800"))
             ns.lora_rank         = int(_fv("lora_rank", "16"))
@@ -5967,6 +6272,17 @@ async function pollJob(){
             ns.env_lora_steps    = int(_fv("env_lora_steps", "800"))
             ns.env_lora_rank     = int(_fv("env_lora_rank", "16"))
             ns.env_lora_weight   = float(_fv("env_lora_weight", "0.8"))
+            ns.video_lora_scale  = float(_fv("video_lora_scale", "1.0"))
+            ns.video_size        = _fv("video_size", "832x480") or "832x480"
+            ns.clip_min_frames   = int(_fv("clip_min_frames", "50"))
+            ns.clip_max_frames   = int(_fv("clip_max_frames", "70"))
+            ns.single_clip_max_frames = int(_fv("single_clip_max_frames", "50"))
+            ns.outcome_min_frames = int(_fv("outcome_min_frames", "40"))
+            ns.outcome_max_frames = int(_fv("outcome_max_frames", "70"))
+            ns.short_min         = float(_fv("short_min", "40"))
+            ns.short_max         = float(_fv("short_max", "50"))
+            ns.long_min          = float(_fv("long_min", "65"))
+            ns.long_max          = float(_fv("long_max", "75"))
             # char mode
             cm = _fv("char_mode", "generate")
             ns.skip_characters  = (cm == "skip")
@@ -6042,7 +6358,7 @@ async function pollJob(){
             _STEP_LABELS = {
                 "characters":   "Step 1 · Generate Characters",
                 "environments": "Step 2 · Generate Environments",
-                "prompts":      "Step 3 · Write Video Prompts",
+                "prompts":      "Step 3 · Generate Matches Prompts",
                 "loras":        "Step 4 · Train Character LoRAs",
                 "video-loras":  "Step · Train Video (Wan) LoRAs",
                 "keyframes":    "Step 5 · Generate Keyframes",
@@ -6219,7 +6535,9 @@ async function pollJob(){
         else:
             char_names = stage_characters(client, image_model, out_dir_r,
                                           region_filter=args.region,
-                                          include_female=args.include_female)
+                                          include_female=args.include_female,
+                                          max_count=int(getattr(args, "num_fighters", 0) or 0),
+                                          n_refs=int(getattr(args, "char_refs", 4) or 4))
 
         env_names = None
         if args.environments or args.reuse_environments:
@@ -6234,7 +6552,9 @@ async function pollJob(){
                 env_names = [e["name"] for e in ENVIRONMENT_POOL]
                 _web_log(f"  Skipping generation, assuming pool names: {', '.join(env_names)}")
         else:
-            env_names = stage_environments(client, image_model, out_dir_r, region_filter=args.region)
+            env_names = stage_environments(client, image_model, out_dir_r, region_filter=args.region,
+                                           max_count=int(getattr(args, "num_environments", 0) or 0),
+                                           n_refs=int(getattr(args, "env_refs", 3) or 3))
 
         only_loras = getattr(args, "only_loras", False)
         only_keyframes = getattr(args, "only_keyframes", False)
@@ -6317,9 +6637,13 @@ async function pollJob(){
                 consistency=consistency, image_model=image_model, lora_map=lora_map,
                 char_strength=getattr(args, "character_strength", 0.7),
                 keyframe_steps=getattr(args, "keyframe_steps", 28),
-                keyframe_size=getattr(args, "keyframe_size", "512x512"),
+                keyframe_size=getattr(args, "keyframe_size", "832x480"),
                 lora_weight=getattr(args, "lora_weight", 0.85),
                 env_lora_map=env_lora_map, env_lora_weight=_env_lora_weight,
+                video_lora_scale=getattr(args, "video_lora_scale", 1.0),
+                video_size=getattr(args, "video_size", "832x480"),
+                clip_min_frames=getattr(args, "clip_min_frames", CLIP_MIN_FRAMES),
+                clip_max_frames=getattr(args, "clip_max_frames", CLIP_MAX_FRAMES),
                 keyframes_only=True,
             )
             _web_log("\n✓ Keyframe step complete.")
@@ -6340,9 +6664,20 @@ async function pollJob(){
                 lora_map=lora_map,
                 char_strength=getattr(args, "character_strength", 0.7),
                 keyframe_steps=getattr(args, "keyframe_steps", 28),
-                keyframe_size=getattr(args, "keyframe_size", "512x512"),
+                keyframe_size=getattr(args, "keyframe_size", "832x480"),
                 lora_weight=getattr(args, "lora_weight", 0.85),
+                clip_min_frames=getattr(args, "clip_min_frames", CLIP_MIN_FRAMES),
+                clip_max_frames=getattr(args, "clip_max_frames", CLIP_MAX_FRAMES),
                 env_lora_map=env_lora_map, env_lora_weight=_env_lora_weight,
+                video_lora_scale=getattr(args, "video_lora_scale", 1.0),
+                video_size=getattr(args, "video_size", "832x480"),
+                short_min=getattr(args, "short_min", 40.0),
+                short_max=getattr(args, "short_max", 50.0),
+                long_min=getattr(args, "long_min", 65.0),
+                long_max=getattr(args, "long_max", 75.0),
+                single_clip_max_frames=getattr(args, "single_clip_max_frames", SINGLE_CLIP_MAX_FRAMES),
+                outcome_min_frames=getattr(args, "outcome_min_frames", 40),
+                outcome_max_frames=getattr(args, "outcome_max_frames", 70),
                 upscale_factor=getattr(args, "upscale_factor", 0),
                 fps_multiplier=getattr(args, "fps_multiplier", 0),
             )
@@ -6553,6 +6888,11 @@ OUTPUT LAYOUT
                           help="Skip Stage 1 and reuse ALL existing character profiles already in CoderAI.")
     char_grp.add_argument("--fighters", default=None, metavar="NAME,NAME,...",
                           help="Comma-separated fighter profile names to use (skip generation).")
+    parser.add_argument("--num-fighters", type=int, default=0, metavar="N",
+                        help="How many fighters to generate from the pool (0 = whole pool).")
+    parser.add_argument("--char-refs", type=int, default=4, metavar="N",
+                        help="Reference images generated per character (default: 4). More = a "
+                             "healthier LoRA at higher training steps; see the steps/weight guide.")
 
     # Environment control
     env_grp = parser.add_mutually_exclusive_group()
@@ -6562,6 +6902,10 @@ OUTPUT LAYOUT
                          help="Skip Stage 2 and reuse ALL existing environment profiles already in CoderAI.")
     env_grp.add_argument("--environments", default=None, metavar="NAME,NAME,...",
                          help="Comma-separated environment profile names to use (skip generation).")
+    parser.add_argument("--num-environments", type=int, default=0, metavar="N",
+                        help="How many environments to generate from the pool (0 = whole pool).")
+    parser.add_argument("--env-refs", type=int, default=3, metavar="N",
+                        help="Reference images generated per environment (default: 3).")
 
     parser.add_argument("--skip-videos", action="store_true",
                         help="Skip Stage 3 — only generate characters and/or environments.")
@@ -6607,8 +6951,11 @@ OUTPUT LAYOUT
              "Default: keyframe")
     cons_grp.add_argument("--keyframe-steps", type=int, default=28, metavar="N",
                           help="Inference steps for keyframe image generation (default: 28).")
-    cons_grp.add_argument("--keyframe-size", default="512x512", metavar="WxH",
-                          help="Keyframe image resolution (default: 512x512).")
+    cons_grp.add_argument("--keyframe-size", default="832x480", metavar="WxH",
+                          help="Keyframe image resolution (default: 832x480, 16:9 to match Wan).")
+    cons_grp.add_argument("--video-size", default="832x480", metavar="WxH",
+                          help="Video clip resolution (default: 832x480 — Wan2.2 native 16:9; "
+                               "also 1280x720 for 720p).")
     cons_grp.add_argument("--character-strength", type=float, default=0.7, metavar="F",
                           help="IP-Adapter character reference strength 0-1 (default: 0.7).")
     cons_grp.add_argument("--lora-steps", type=int, default=800, metavar="N",
@@ -6631,6 +6978,41 @@ OUTPUT LAYOUT
                           help="Environment LoRA rank (default: 16).")
     cons_grp.add_argument("--env-lora-weight", type=float, default=0.8, metavar="F",
                           help="Weight applied to each environment LoRA at generation (default: 0.8).")
+    cons_grp.add_argument("--clip-min-frames", type=int, default=CLIP_MIN_FRAMES, metavar="N",
+                          help=f"Minimum frames per fight clip (default: {CLIP_MIN_FRAMES}). Clip "
+                               "duration = frames / fps; kept within the model's safe length "
+                               f"(≤{MODEL_MAX_FRAMES}).")
+    cons_grp.add_argument("--clip-max-frames", type=int, default=CLIP_MAX_FRAMES, metavar="N",
+                          help=f"Maximum frames per fight clip (default: {CLIP_MAX_FRAMES}). A clip "
+                               f"longer than --single-clip-max-frames is split into chained, "
+                               f"concatenated sub-renders (one continuous shot).")
+    cons_grp.add_argument("--single-clip-max-frames", type=int, default=SINGLE_CLIP_MAX_FRAMES,
+                          metavar="N",
+                          help=f"Max frames in ONE model generation (default: {SINGLE_CLIP_MAX_FRAMES}, "
+                               f"≤{MODEL_MAX_FRAMES}). Clips/outcomes longer than this are rendered as "
+                               f"multiple parts chained via each part's last frame and concatenated "
+                               f"into a single shot; the parts are discarded.")
+    cons_grp.add_argument("--outcome-min-frames", type=int, default=40, metavar="N",
+                          help="Minimum frames per outcome clip (default: 40).")
+    cons_grp.add_argument("--outcome-max-frames", type=int, default=70, metavar="N",
+                          help="Maximum frames per outcome clip (default: 70). Split + chained the "
+                               "same way when longer than --single-clip-max-frames.")
+    cons_grp.add_argument("--short-min", type=float, default=40.0, metavar="SEC",
+                          help="Minimum duration (s) of the SHORT final assembly (default: 40).")
+    cons_grp.add_argument("--short-max", type=float, default=50.0, metavar="SEC",
+                          help="Maximum duration (s) of the SHORT final assembly (default: 50).")
+    cons_grp.add_argument("--long-min", type=float, default=65.0, metavar="SEC",
+                          help="Minimum duration (s) of the LONG final assembly (default: 65). "
+                               "The clip count per match is derived from this target and the fps "
+                               "so the long cut is always filled.")
+    cons_grp.add_argument("--long-max", type=float, default=75.0, metavar="SEC",
+                          help="Maximum duration (s) of the LONG final assembly (default: 75).")
+    cons_grp.add_argument("--video-lora-scale", type=float, default=1.0, metavar="F",
+                          help="Multiplier applied to the character + environment LoRA weights "
+                               "at VIDEO render time only (keyframe LoRA weight is unaffected; "
+                               "default: 1.0). Lower it (e.g. 0.5-0.7) when stacked LoRAs on a "
+                               "distilled Wan2.2 expert desaturate or over-smooth the clip — it "
+                               "trades identity strength for cleaner colour and motion.")
     cons_grp.add_argument("--video-loras", action="store_true",
                           help="Also train Wan VIDEO LoRAs (per fighter + environment) against the "
                                "configured --video-model. Stored separately (tagged with the model) "
@@ -6756,7 +7138,9 @@ OUTPUT LAYOUT
     else:
         char_names = stage_characters(client, image_model, out_dir,
                                       region_filter=args.region,
-                                      include_female=args.include_female)
+                                      include_female=args.include_female,
+                                      max_count=int(getattr(args, "num_fighters", 0) or 0),
+                                      n_refs=int(getattr(args, "char_refs", 4) or 4))
 
     # ── Stage 2: Environments ──────────────────────────────────────────────────
     env_names = None
@@ -6772,7 +7156,9 @@ OUTPUT LAYOUT
             env_names = [e["name"] for e in ENVIRONMENT_POOL]
             _log(f"  Skipping generation, assuming pool names: {', '.join(env_names)}")
     else:
-        env_names = stage_environments(client, image_model, out_dir, region_filter=args.region)
+        env_names = stage_environments(client, image_model, out_dir, region_filter=args.region,
+                                       max_count=int(getattr(args, "num_environments", 0) or 0),
+                                       n_refs=int(getattr(args, "env_refs", 3) or 3))
 
     # ── Stage 2.5: LoRA training (image base model) — characters + environments ─
     lora_map = {}
@@ -6822,10 +7208,21 @@ OUTPUT LAYOUT
             lora_map=lora_map,
             char_strength=getattr(args, "character_strength", 0.7),
             keyframe_steps=getattr(args, "keyframe_steps", 28),
-            keyframe_size=getattr(args, "keyframe_size", "512x512"),
+            keyframe_size=getattr(args, "keyframe_size", "832x480"),
+            clip_min_frames=getattr(args, "clip_min_frames", CLIP_MIN_FRAMES),
+            clip_max_frames=getattr(args, "clip_max_frames", CLIP_MAX_FRAMES),
             lora_weight=getattr(args, "lora_weight", 0.85),
             env_lora_map=env_lora_map,
             env_lora_weight=getattr(args, "env_lora_weight", 0.8),
+            video_lora_scale=getattr(args, "video_lora_scale", 1.0),
+            video_size=getattr(args, "video_size", "832x480"),
+            short_min=getattr(args, "short_min", 40.0),
+            short_max=getattr(args, "short_max", 50.0),
+            long_min=getattr(args, "long_min", 65.0),
+            long_max=getattr(args, "long_max", 75.0),
+            single_clip_max_frames=getattr(args, "single_clip_max_frames", SINGLE_CLIP_MAX_FRAMES),
+            outcome_min_frames=getattr(args, "outcome_min_frames", 40),
+            outcome_max_frames=getattr(args, "outcome_max_frames", 70),
             upscale_factor=getattr(args, "upscale_factor", 0),
             fps_multiplier=getattr(args, "fps_multiplier", 0),
         )

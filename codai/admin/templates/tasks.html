@@ -107,18 +107,25 @@ function actions(t) {
 }
 
 // ---- Live hardware telemetry ----
-function _utilClass(pct){ return pct == null ? 'sys-ok' : (pct >= 90 ? 'sys-hot' : pct >= 70 ? 'sys-warn' : 'sys-ok'); }
+// `frac` is a 0-100 fraction OF CAPACITY (the bar fill + colour are driven by it).
+function _utilClass(frac){ return frac == null ? 'sys-ok' : (frac >= 90 ? 'sys-hot' : frac >= 70 ? 'sys-warn' : 'sys-ok'); }
 function _tempClass(t){ return t == null ? '' : (t >= 90 ? 'sys-temp-hot' : t >= 80 ? 'sys-temp-warn' : 'sys-temp-ok'); }
-function _bar(pct){
-  const p = pct == null ? 0 : Math.max(0, Math.min(100, pct));
-  return `<div class="sys-bar ${_utilClass(pct)}"><span style="width:${p}%"></span></div>`;
+function _bar(frac){
+  const p = frac == null ? 0 : Math.max(0, Math.min(100, frac));
+  return `<div class="sys-bar ${_utilClass(frac)}"><span style="width:${p}%"></span></div>`;
 }
-function _utilTile(name, pct, temp){
+// `max` = full-scale value for the bar (default 100). The CPU tile passes
+// cores*100 so the displayed % can run 0..cores*100 (100% per core) while the bar
+// still fills 0..100% of total capacity.
+function _utilTile(name, pct, temp, max){
+  const full = max || 100;
+  const frac = pct == null ? null : (pct / full * 100);
   const valTxt = pct == null ? 'n/a' : `${Math.round(pct)}%`;
+  const subTxt = (max && max > 100) ? `utilization (max ${max}%)` : 'utilization';
   const tempTxt = temp == null ? '<span class="dim">temp n/a</span>'
     : `<span class="${_tempClass(temp)}">${Math.round(temp)}°C</span>`;
   return `<div class="sys-head"><span class="sys-name">${name}</span><span class="sys-val">${valTxt}</span></div>`
-    + _bar(pct) + `<div class="sys-sub"><span>utilization</span>${tempTxt}</div>`;
+    + _bar(frac) + `<div class="sys-sub"><span>${subTxt}</span>${tempTxt}</div>`;
 }
 function _memTile(name, used, total, pct){
   const valTxt = (used == null || total == null) ? 'n/a' : `${used.toFixed(1)} / ${total.toFixed(1)} GB`;
@@ -130,7 +137,7 @@ async function loadSystemStats(){
   try {
     const s = await fetch(ROOT_PATH + '/admin/api/system-stats').then(r => r.json());
     const cpu = s.cpu || {}, gpu = s.gpu || {}, ram = s.ram || {}, vram = s.vram || {};
-    document.getElementById('tile-cpu').innerHTML = _utilTile('CPU', cpu.util, cpu.temp);
+    document.getElementById('tile-cpu').innerHTML = _utilTile('CPU', cpu.util, cpu.temp, (cpu.cores || 1) * 100);
     document.getElementById('tile-gpu').innerHTML = _utilTile('GPU', gpu.util, gpu.temp);
     document.getElementById('tile-ram').innerHTML = _memTile('RAM', ram.used, ram.total, ram.percent);
     document.getElementById('tile-vram').innerHTML =

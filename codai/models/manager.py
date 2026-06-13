@@ -1642,14 +1642,25 @@ class MultiModelManager:
         """Call immediately before loading a model; returns a snapshot for delta measurement."""
         return self._free_vram_snapshot()
 
-    def record_vram_delta(self, model_key: str, free_before: float) -> None:
+    def record_vram_delta(self, model_key: str, free_before: float,
+                          offloaded: bool = False) -> None:
         """Call immediately after a model finishes loading to record actual VRAM consumed.
 
         If the measured value exceeds the stored estimate by more than 10%, the real
         value is written back into the model config and persisted to models.json so
         future eviction decisions use the accurate figure.
+
+        ``offloaded`` MUST be True when the model was loaded with any CPU/disk
+        offload strategy (model/sequential/group/balanced/disk). In that case the
+        weights are not resident on the GPU, so the measured delta is a tiny,
+        meaningless lower bound — recording it would clobber a real full-GPU
+        measurement and make the next start under-estimate the footprint, pick a
+        full-GPU load, and OOM. So we skip recording entirely and keep the prior
+        estimate/measurement intact.
         """
         if free_before < 0:
+            return
+        if offloaded:
             return
         free_after = self._free_vram_snapshot()
         if free_after < 0:

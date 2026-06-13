@@ -124,6 +124,22 @@ class TaskRegistry:
             if total is not None:
                 t.total = int(total)
 
+    def current_loading_task(self) -> Optional[str]:
+        """Id of the most-recently-started running ``loading`` task, if any.
+
+        Used by the tqdm progress capture (which runs in the load's executor
+        thread, with no handle to the task id) to publish shard/component
+        progress onto the live loading entry."""
+        with self._lock:
+            best = None
+            best_t = -1.0
+            for tid, t in self._tasks.items():
+                if t.kind == "loading" and t.status == "running":
+                    st = t.started_at or t.created_at or 0.0
+                    if st >= best_t:
+                        best_t, best = st, tid
+            return best
+
     def finish(self, tid: str, status: str = "done", message: str = "") -> None:
         with self._lock:
             t = self._tasks.get(tid)
@@ -261,6 +277,92 @@ def wait_if_paused(task_id: Optional[str]) -> None:
     task_registry.wait_if_paused(task_id)
 
 
+# --- tqdm progress capture for model loads ---------------------------------
+# diffusers / transformers / huggingface_hub emit their load progress through
+# tqdm ("Loading checkpoint shards", "Loading pipeline components", "Loading
+# weights", download bars). We monkeypatch the base tqdm class for the duration
+# of a load so those bars publish step/total/desc onto the live `loading` task —
+# turning the Tasks-page "working…" into the same detailed progress the terminal
+# shows. Ref-counted so concurrent/nested loads share one patch.
+_tqdm_patch_lock = threading.Lock()
+_tqdm_patch_depth = 0
+_tqdm_orig: Dict[str, object] = {}
+
+
+def _publish_loading_progress(desc, n, total):
+    tid = task_registry.current_loading_task()
+    if not tid:
+        return
+    try:
+        n = int(n or 0)
+        total = int(total or 0)
+    except (TypeError, ValueError):
+        return
+    # tqdm may store the desc with a trailing ": " (set_description) — normalise.
+    desc = (str(desc).strip().rstrip(":").strip() if desc else "") or "Loading"
+    # Step only counts up to total; the message carries the human-readable phase.
+    task_registry.step(tid, n, total if total > 0 else None)
+    msg = f"{desc}: {n}/{total}" if total > 0 else desc
+    task_registry.update(tid, message=msg)
+
+
+def _install_tqdm_capture():
+    global _tqdm_patch_depth
+    with _tqdm_patch_lock:
+        _tqdm_patch_depth += 1
+        if _tqdm_patch_depth > 1:
+            return
+        try:
+            from tqdm import std as _tqdm_std
+        except Exception:
+            return
+        cls = _tqdm_std.tqdm
+        _tqdm_orig['update'] = cls.update
+        _tqdm_orig['close'] = cls.close
+        _tqdm_orig['cls'] = cls
+
+        def _patched_update(self, n=1):
+            r = _tqdm_orig['update'](self, n)
+            try:
+                if not getattr(self, 'disable', False):
+                    _publish_loading_progress(
+                        getattr(self, 'desc', ''), getattr(self, 'n', 0),
+                        getattr(self, 'total', 0))
+            except Exception:
+                pass
+            return r
+
+        def _patched_close(self):
+            try:
+                if not getattr(self, 'disable', False) and getattr(self, 'total', 0):
+                    _publish_loading_progress(
+                        getattr(self, 'desc', ''), getattr(self, 'total', 0),
+                        getattr(self, 'total', 0))
+            except Exception:
+                pass
+            return _tqdm_orig['close'](self)
+
+        cls.update = _patched_update
+        cls.close = _patched_close
+
+
+def _remove_tqdm_capture():
+    global _tqdm_patch_depth
+    with _tqdm_patch_lock:
+        if _tqdm_patch_depth <= 0:
+            return
+        _tqdm_patch_depth -= 1
+        if _tqdm_patch_depth > 0:
+            return
+        cls = _tqdm_orig.get('cls')
+        if cls is not None:
+            if 'update' in _tqdm_orig:
+                cls.update = _tqdm_orig['update']
+            if 'close' in _tqdm_orig:
+                cls.close = _tqdm_orig['close']
+        _tqdm_orig.clear()
+
+
 @contextmanager
 def loading_task(model: str, *, model_type: str = "model", title: Optional[str] = None):
     """Context manager that shows a model load as a Tasks-page entry.
@@ -268,16 +370,21 @@ def loading_task(model: str, *, model_type: str = "model", title: Optional[str] 
     Model loading can't be paused or cancelled (it's a single blocking
     ``from_pretrained`` / ``Llama(...)`` call), so the task is registered
     non-cancellable and non-pausable — the Tasks UI shows it with no action
-    buttons. The task finishes ``done`` on success or ``error`` on exception.
-    Re-entrant guard: a nested load of the same model_key reuses no task; each
-    call is independent (loads don't nest in practice)."""
+    buttons. While the context is active, tqdm progress bars emitted by
+    diffusers/transformers/hf_hub are captured and published onto the task as
+    step/total + a phase message ("Loading checkpoint shards: 7/12"), so the UI
+    mirrors the terminal instead of a bare "working…". The task finishes ``done``
+    on success or ``error`` on exception."""
     label = title or f"Loading {model}"
     tid = task_registry.register(
         "loading", title=label, model=model or "", status="running",
         cancellable=False, restartable=False, pausable=False)
+    _install_tqdm_capture()
     try:
         yield tid
         task_registry.finish(tid, "done")
     except BaseException as e:  # noqa: BLE001 — record then re-raise
         task_registry.finish(tid, "error", str(e)[:200] or e.__class__.__name__)
         raise
+    finally:
+        _remove_tqdm_capture()

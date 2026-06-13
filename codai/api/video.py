@@ -701,11 +701,21 @@ def _free_pipeline_vram(pipe) -> None:
                             pass
             except Exception:
                 pass
+            _c = None  # drop the loop leftover ref to the last component
             for _cn in list(_comps):
                 try:
                     setattr(pipe, _cn, None)
                 except Exception:
                     pass
+            # CRITICAL: `_comps` (and `_c` above) hold STRONG refs to every
+            # component (transformer/transformer_2/text_encoder/vae). They stay
+            # in this function's scope through the gc.collect()/empty_cache()
+            # below, so without clearing them first the weights are never
+            # actually released — empty_cache() reclaims nothing, the GPU stays
+            # full, and the offload-reload retry OOMs on a 0.4 GB-free card,
+            # cascading through every fallback (each a full ~30-min reload).
+            _comps.clear()
+            _comps = None
     except Exception:
         pass
     for _ in range(3):
@@ -1038,6 +1048,14 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
     def _report_loaded(pipe, strategy: str) -> None:
         """Print a post-load summary: strategy, device placement, memory state."""
         _enable_vae_memory_opts(pipe)
+        # Record the actual strategy used (after any OOM fallbacks) so the caller
+        # knows whether the post-load VRAM delta reflects the FULL model footprint
+        # (full GPU) or just the slice that happens to be resident under offload
+        # (which must NOT overwrite a real measurement — see record_vram_delta).
+        try:
+            pipe._coderai_load_strategy = strategy
+        except Exception:
+            pass
         print(f"  ✓ Video pipeline loaded — strategy: {strategy}")
         _report_device_map(pipe)
         _report_offload_dir_size()
@@ -2510,8 +2528,15 @@ async def video_generations(request: VideoGenerationRequest,
         multi_model_manager.current_model_key = model_key
         # Record the real VRAM used. record_vram_delta only persists when no
         # used_vram_gb is configured (it writes the separate measured_vram_gb).
+        # Under ANY offload strategy the weights live on CPU/disk, so the GPU
+        # delta is a meaningless ~0 — never let it overwrite a real full-GPU
+        # measurement (that bug saved measured_vram_gb=0.05 and made the next
+        # start mis-pick full-GPU and OOM-cascade).
         try:
-            multi_model_manager.record_vram_delta(model_key, _vram_before)
+            _strat = str(getattr(pipe, '_coderai_load_strategy', '') or '')
+            _was_offloaded = bool(_strat) and not _strat.startswith('full GPU')
+            multi_model_manager.record_vram_delta(
+                model_key, _vram_before, offloaded=_was_offloaded)
         except Exception:
             pass
 

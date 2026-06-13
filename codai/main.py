@@ -748,6 +748,12 @@ def main():
     global_args.ram = config.offload.manual_ram_gb
     global_args.offload_strategy = config.offload.strategy
     global_args.no_ram = config.offload.no_ram
+    # Pipeline disk-cache flags must be carried onto global_args — pipeline_cache.
+    # enabled()/_force_rebuild() read them via get_global_args(). Without this the
+    # cache silently never engages (the startup banner reads the raw args, so it
+    # still claims "enabled", masking the gap).
+    global_args.pipeline_cache = getattr(args, "pipeline_cache", False)
+    global_args.rebuild_pipeline_cache = getattr(args, "rebuild_pipeline_cache", False)
     global_args.load_in_4bit = config.offload.load_in_4bit
     global_args.load_in_8bit = config.offload.load_in_8bit
     global_args.flash_attn = config.offload.flash_attention

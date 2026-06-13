@@ -482,7 +482,7 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
                 # Needed VRAM for this model (config used_vram_gb, with quant/offload
                 # factors applied) — 0 when it can't be determined.
                 _key = None
-                for _k in (model_key, model_name, f"image:{model_name}"):
+                for _k in (f"image:{model_name}", model_name):
                     if _k in _mmm.config:
                         _key = _k
                         break

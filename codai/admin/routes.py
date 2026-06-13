@@ -2144,11 +2144,15 @@ async def api_system_stats(username: str = Depends(require_admin)):
     best-effort and may be null when a sensor/metric is unavailable."""
     from codai.models import thermal
 
-    cpu = {"util": None, "temp": thermal.read_cpu_temp()}
+    # CPU tile = coderai process-tree usage, scaled 100% PER CORE (0..100*cores),
+    # not the all-core average (which reads misleadingly low when work is on a few
+    # cores). `cores` lets the UI scale the bar to full capacity = cores*100%.
+    cpu = {"util": thermal.read_process_tree_cpu(), "temp": thermal.read_cpu_temp(),
+           "cores": None}
     ram = None
     try:
         import psutil
-        cpu["util"] = psutil.cpu_percent(interval=None)
+        cpu["cores"] = psutil.cpu_count()
         vm = psutil.virtual_memory()
         ram = {"used": vm.used / 1e9, "total": vm.total / 1e9, "percent": vm.percent}
     except Exception:
