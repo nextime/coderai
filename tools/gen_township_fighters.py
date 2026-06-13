@@ -3594,8 +3594,36 @@ def launch_web_ui(default_args):
                         return o.get("match_name") == match_name
                     return o.get("fighter") in _mf  # legacy per-fighter outcome
 
-                # ── Phase 1/3 — re-plan prompts (fight clips + this match's outcomes)
-                _prog(4, "phase 1/3 — re-planning prompts…")
+                # Which outcomes belong to this match (stems are stable across the
+                # re-plan, so this is computed once, up front).
+                match_outcomes = [o for o in outcome_plan if _belongs(o)]
+
+                # ── Clean slate — remove this match's existing keyframes + clips ──
+                # A whole-match regen starts fresh: delete this match's keyframes,
+                # clip videos, outcome videos and assembled finals first, so a
+                # changed clip count can't leave orphaned files behind (e.g. a stale
+                # clip that _reassemble_finals would glob into the finals).
+                _prog(2, "removing this match's existing keyframes + clips…")
+                _kfdir = vdir / "keyframes"
+                _removed = 0
+                _victims = list(vdir.glob(f"{match_name}_clip*.mp4"))
+                _victims += list(_kfdir.glob(f"{match_name}_clip*.png"))
+                _victims += [vdir / f"{match_name}_short.mp4",
+                             vdir / f"{match_name}_long.mp4"]
+                for o in match_outcomes:
+                    _stem = _clip_stem_outcome(o["fighter"], o["outcome"], o.get("match_name"))
+                    _victims += [vdir / f"{_stem}.mp4", _kfdir / f"{_stem}.png"]
+                for _p in _victims:
+                    try:
+                        if _p.exists():
+                            _p.unlink()
+                            _removed += 1
+                    except Exception:
+                        pass
+                _log(f"  [full] cleared {_removed} existing file(s) for {match_name}")
+
+                # ── Phase 1/4 — re-plan prompts (fight clips + this match's outcomes)
+                _prog(4, "phase 1/4 — re-planning prompts…")
                 prompter = PromptGenerator(client, text_model,
                                            char_descriptions=char_descriptions)
                 long_target = float(m.get("long_target", 70))
@@ -3635,7 +3663,6 @@ def launch_web_ui(default_args):
                 m["clips"] = new_clips
                 # Re-plan this match's outcome prompts too, forcing the match's
                 # location so keyframes + clips stay in one consistent setting.
-                match_outcomes = [o for o in outcome_plan if _belongs(o)]
                 for o in match_outcomes:
                     if m.get("env"):
                         o["env"] = m.get("env")
@@ -3657,7 +3684,7 @@ def launch_web_ui(default_args):
                     _fail(f"could not save prompts.json: {e}")
                     return
 
-                # ── Phase 2/3 — regenerate every keyframe (clips + outcomes) ──────
+                # ── Phase 2/4 — regenerate every keyframe (clips + outcomes) ──────
                 kdir = vdir / "keyframes"
                 mm = dict(m)
                 kf_stems = [_clip_stem_fight(match_name, c["idx"]) for c in mm["clips"]]
@@ -3682,7 +3709,7 @@ def launch_web_ui(default_args):
                         _prog(20 + int(28 * _kf_done[0] / max(1, len(kf_stems))),
                               f"keyframe {_kf_done[0]}/{len(kf_stems)} done")
 
-                _prog(20, f"phase 2/3 — regenerating {len(kf_stems)} keyframe(s)…")
+                _prog(20, f"phase 2/4 — regenerating {len(kf_stems)} keyframe(s)…")
                 try:
                     _generate_keyframes(
                         client, image_model, kdir, [mm], match_outcomes,
@@ -3698,16 +3725,19 @@ def launch_web_ui(default_args):
                 for i, s in enumerate(kf_stems):
                     _item(i, "end", (kdir / f"{s}.png").exists())
 
-                # ── Phase 3/3 — render all clips + outcomes, then assemble ───────
+                # ── Phase 3/4 — render all clips + outcomes (NO assembly yet) ────
+                # assemble_finals=False so the short/long finals are NOT built here:
+                # the user wants assembly as the explicit LAST step, after outcomes.
+                # (_stage_videos_render renders clips then outcomes in this one call.)
                 _set_items([f"clip {int(c['idx']):02d}" for c in mm["clips"]]
                            + [_clip_stem_outcome(o["fighter"], o["outcome"], o.get("match_name"))
                               for o in match_outcomes])
 
                 def _full_cb(done, total, label):
-                    _prog(52 + int(46 * done / max(1, total)),
+                    _prog(52 + int(40 * done / max(1, total)),
                           f"render {done}/{total} done" + (f" — {label}" if label else ""))
 
-                _prog(52, f"phase 3/3 — rendering {len(mm['clips'])} clip(s) "
+                _prog(52, f"phase 3/4 — rendering {len(mm['clips'])} clip(s) "
                           f"+ {len(match_outcomes)} outcome(s)…")
                 _stage_videos_render(
                     client, video_model, vdir, [mm], match_outcomes,
@@ -3717,10 +3747,17 @@ def launch_web_ui(default_args):
                     env_lora_map=env_lora_map, env_lora_weight=elw,
                     progress_cb=_full_cb, clip_cb=_item,
                     video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map,
-                    assemble_finals=True, video_lora_scale=vls, video_size=vsz,
+                    assemble_finals=False, video_lora_scale=vls, video_size=vsz,
                     single_clip_max_frames=scm)
+
+                # ── Phase 4/4 — assemble the final short/long videos (last) ──────
+                _prog(94, "phase 4/4 — assembling final videos…")
+                st = float(m.get("short_target", 45))
+                lt = float(m.get("long_target", 70))
+                n_assembled = _reassemble_finals(vdir, match_name, st, lt)
                 _done(f"regenerated match {match_name} end to end — "
-                      f"{len(mm['clips'])} clip(s), {len(match_outcomes)} outcome(s), finals reassembled")
+                      f"{len(mm['clips'])} clip(s), {len(match_outcomes)} outcome(s), "
+                      f"finals assembled from {n_assembled} clip(s)")
                 return
 
             # ── Regenerate keyframes (image model) ─────────────────────────────
