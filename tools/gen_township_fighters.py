@@ -1426,7 +1426,7 @@ def parse_consistency(spec: str) -> set:
 # port is preserved). --save / --config / --cli-mode are deliberately excluded.
 CONFIG_FIELDS = [
     "base_url", "api_key", "image_model", "video_model", "text_model",
-    "no_llm", "out_dir", "fps", "clip_delay", "region", "include_female",
+    "no_llm", "out_dir", "fps", "playback_fps", "clip_delay", "region", "include_female",
     "skip_characters", "reuse_fighters", "fighters", "num_fighters", "char_refs",
     "skip_environments", "reuse_environments", "environments", "num_environments", "env_refs",
     "skip_videos", "only_outcomes", "matches",
@@ -2020,7 +2020,15 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
                  short_min: float = 40.0, short_max: float = 50.0,
                  long_min: float = 65.0, long_max: float = 75.0,
                  single_clip_max_frames: int = SINGLE_CLIP_MAX_FRAMES,
-                 outcome_min_frames: int = 40, outcome_max_frames: int = 70):
+                 outcome_min_frames: int = 40, outcome_max_frames: int = 70,
+                 playback_fps: int = 0):
+    # PLAYBACK fps decouples the encode/play rate from the model's frame budget:
+    # Wan generates a fixed number of frames regardless of fps, so encoding the
+    # same frames at a HIGHER rate plays them faster (less slow-motion). Used for
+    # the mp4 encode AND the clip-count math, so the finals reach the target
+    # length at the real playback speed. 0 = keep the generation fps.
+    if playback_fps and int(playback_fps) > 0:
+        fps = int(playback_fps)
     _log("\n" + "═" * 60)
     _log("  STAGE 3 — Videos")
     _log("═" * 60)
@@ -2304,7 +2312,8 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                          video_lora_map=None, env_video_lora_map=None,
                          assemble_finals=True, video_lora_scale=1.0,
                          video_size="832x480",
-                         single_clip_max_frames=SINGLE_CLIP_MAX_FRAMES):
+                         single_clip_max_frames=SINGLE_CLIP_MAX_FRAMES,
+                         playback_fps=0):
     """PHASE 3 — render ALL videos from pre-written prompts (video model stays loaded).
 
     progress_cb(done, total, label) — optional; called after each clip finishes so
@@ -2317,6 +2326,10 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
     this video model's slug) — image LoRAs don't apply to a Wan video DiT, so they
     are used only for keyframes, not here.
     """
+    # Playback fps override (see stage_videos): encode + duration use the play
+    # rate, the model's frame budget is unchanged. 0 = keep the generation fps.
+    if playback_fps and int(playback_fps) > 0:
+        fps = int(playback_fps)
     _log("\n  ── Phase B — rendering all videos (video model) ──")
     render_start = time.monotonic()
     consistency = consistency or {"prompt"}
@@ -3265,6 +3278,11 @@ def launch_web_ui(default_args):
             # _stage_videos_render, so duration stays constant and motion is
             # rendered at the model's native rate.
             fps = int(getattr(default_args, "fps", 0) or data.get("fps") or 8)
+            # Playback-fps override: a higher play rate speeds up the (slow) Wan
+            # motion and drives the clip count so finals reach the target length.
+            _pfps = int(getattr(default_args, "playback_fps", 0) or 0)
+            if _pfps > 0:
+                fps = _pfps
             match_name = params.get("match")
 
             # ── Reassemble only: no model needed ───────────────────────────────
@@ -4008,8 +4026,10 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
   <div class=row>
     <div><label>Number of fight matches</label>
          <input name=matches type=number min=0 max=50 value="{_v('matches', 6)}"></div>
-    <div><label>FPS</label>
-         <input name=fps type=number min=1 max=30 value="{_v('fps', 8)}"></div>
+    <div><label>Generation FPS <span class=hint>(base)</span></label>
+         <input name=fps type=number min=1 max=60 value="{_v('fps', 8)}"></div>
+    <div><label>Playback FPS <span class=hint>(0 = same; higher = faster motion)</span></label>
+         <input name=playback_fps type=number min=0 max=60 value="{_v('playback_fps', 0)}"></div>
   </div>
   <div class=row style="margin-top:.4rem">
     <div><label>Clip delay between requests (seconds)</label>
@@ -6240,6 +6260,7 @@ async function resetPrompts(ev){
                     "char_refs": int(_fv("char_refs", "4") or 4),
                     "env_refs": int(_fv("env_refs", "3") or 3),
                     "fps": int(_fv("fps", "8") or 8),
+                    "playback_fps": int(_fv("playback_fps", "0") or 0),
                     "clip_delay": float(_fv("clip_delay", "5") or 5),
                     "upscale_factor": int(_fv("upscale_factor", "0") or 0),
                     "fps_multiplier": int(_fv("fps_multiplier", "0") or 0),
@@ -6388,6 +6409,7 @@ async function resetPrompts(ev){
             ns.char_refs        = int(_fv("char_refs", "4") or 4)
             ns.env_refs         = int(_fv("env_refs", "3") or 3)
             ns.fps          = int(_fv("fps", "8"))
+            ns.playback_fps = int(_fv("playback_fps", "0") or 0)
             ns.clip_delay   = float(_fv("clip_delay", "5.0"))
             ns.upscale_factor = int(_fv("upscale_factor", "0") or 0)
             ns.fps_multiplier = int(_fv("fps_multiplier", "0") or 0)
@@ -6814,6 +6836,7 @@ async function resetPrompts(ev){
                 single_clip_max_frames=getattr(args, "single_clip_max_frames", SINGLE_CLIP_MAX_FRAMES),
                 outcome_min_frames=getattr(args, "outcome_min_frames", 40),
                 outcome_max_frames=getattr(args, "outcome_max_frames", 70),
+                playback_fps=getattr(args, "playback_fps", 0),
                 upscale_factor=getattr(args, "upscale_factor", 0),
                 fps_multiplier=getattr(args, "fps_multiplier", 0),
             )
@@ -7004,7 +7027,12 @@ OUTPUT LAYOUT
     parser.add_argument("--out-dir",   default="./township_output", metavar="DIR",
                         help="Output directory (default: ./township_output)")
     parser.add_argument("--fps",       type=int, default=8, metavar="N",
-                        help="Video FPS (default: 8). Higher = smoother, much slower.")
+                        help="Generation/base FPS (default: 8).")
+    parser.add_argument("--playback-fps", type=int, default=0, metavar="N",
+                        help="Playback FPS for the encoded clips (0 = same as --fps). Wan makes a "
+                             "fixed number of frames regardless of fps, so a HIGHER playback fps "
+                             "plays them faster (less slow-motion). The clip count is planned on "
+                             "this rate so the finals reach their target length at real speed.")
     parser.add_argument("--clip-delay", type=float, default=5.0, metavar="SECONDS",
                         help="Seconds between video clip requests (default: 5). Raise if rate-limited.")
     parser.add_argument("--upscale-factor", type=int, default=0, choices=[0, 2, 4], metavar="N",
@@ -7359,6 +7387,7 @@ OUTPUT LAYOUT
             single_clip_max_frames=getattr(args, "single_clip_max_frames", SINGLE_CLIP_MAX_FRAMES),
             outcome_min_frames=getattr(args, "outcome_min_frames", 40),
             outcome_max_frames=getattr(args, "outcome_max_frames", 70),
+            playback_fps=getattr(args, "playback_fps", 0),
             upscale_factor=getattr(args, "upscale_factor", 0),
             fps_multiplier=getattr(args, "fps_multiplier", 0),
         )

@@ -1007,7 +1007,14 @@ def main():
     if not _debug_web:
         class _AccessNoiseFilter(logging.Filter):
             # uvicorn.access record args: (client_addr, method, full_path, http_ver, status)
-            _NOISY_PREFIX = ("/v1/loras/progress",)
+            # All the generation-progress pollers (hit ~1/s while work runs) are
+            # noise unless --debug-web is set.
+            _NOISY_PREFIX = (
+                "/v1/loras/progress",
+                "/v1/video/progress",
+                "/v1/images/progress",
+                "/v1/audio/progress",
+            )
             # Exact-match only, so the live Tasks-page pollers are dropped but the
             # user-initiated action endpoints (/admin/api/tasks/{id}/pause, …) still log.
             _NOISY_EXACT = ("/admin/api/tasks", "/admin/api/system-stats")
