@@ -31,10 +31,23 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 
+# Lightweight, read-only generation-progress polls. Clients (e.g. the township
+# script) poll these ~once/second WHILE a generation runs, so they must be exempt
+# from BOTH auth and rate limiting — otherwise the polls consume the rate budget
+# and the actual generation request gets 429'd (and the polls themselves 429,
+# leaving the step bar stuck).
+_PROGRESS_PATHS = {
+    "/v1/images/progress",
+    "/v1/video/progress",
+    "/v1/audio/progress",
+    "/v1/loras/progress",
+}
+
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Reject /v1/ API requests that lack a valid Bearer token or active web session."""
 
-    _EXEMPT_PATHS = {"/v1/images/progress"}
+    _EXEMPT_PATHS = _PROGRESS_PATHS
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
@@ -121,7 +134,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return ""
 
     # Lightweight polling endpoints that must never be rate-limited
-    _EXEMPT_PATHS = {"/v1/images/progress"}
+    _EXEMPT_PATHS = _PROGRESS_PATHS
 
     async def dispatch(self, request: Request, call_next):
         if not RATE_LIMITING_ENABLED:

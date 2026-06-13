@@ -2416,28 +2416,44 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                                            video_lora_map, video_slug, _cw)
                      + _env_video_lora_specs_for(env, env_video_lora_map,
                                                  video_slug, _ew)) or None
-        try:
-            mp4 = _run_with_spinner(
-                label, client.generate_video_clip,
-                prompt=prompt, model=video_model,
-                character_profiles=profiles, environment_name=env,
-                num_frames=nf, fps=fps, seed=random.randint(0, 2**31),
-                width=_vw, height=_vh,
-                init_image=init_image, loras=loras,
-                poll_fn=client.video_progress, step_cb=step_cb,
-            )
-            Path(out_path).write_bytes(mp4)
-            return True, (get_video_duration(out_path) or None), False
-        except Exception as e:
-            if _is_fatal(e):
-                _log(f"    ✗ Fatal: {e}")
-                return False, None, True
-            err_str = str(e)
-            is_rate_limit = "429" in err_str or "rate limit" in err_str.lower()
-            backoff = clip_delay * (4 if is_rate_limit else 2)
-            _log(f"    ✗ failed: {e}  (waiting {backoff:.0f}s)")
-            time.sleep(backoff)
-            return False, None, False
+        # Rate-limit (429) is transient — the server is just busy — so back off and
+        # RETRY the same render instead of abandoning the clip. Only a genuine
+        # error (or too many 429s) marks the clip failed.
+        _rl_attempts = 0
+        _RL_MAX = 40
+        while True:
+            try:
+                mp4 = _run_with_spinner(
+                    label, client.generate_video_clip,
+                    prompt=prompt, model=video_model,
+                    character_profiles=profiles, environment_name=env,
+                    num_frames=nf, fps=fps, seed=random.randint(0, 2**31),
+                    width=_vw, height=_vh,
+                    init_image=init_image, loras=loras,
+                    poll_fn=client.video_progress, step_cb=step_cb,
+                )
+                Path(out_path).write_bytes(mp4)
+                return True, (get_video_duration(out_path) or None), False
+            except Exception as e:
+                if _is_fatal(e):
+                    _log(f"    ✗ Fatal: {e}")
+                    return False, None, True
+                err_str = str(e)
+                is_rate_limit = "429" in err_str or "rate limit" in err_str.lower()
+                if is_rate_limit:
+                    _rl_attempts += 1
+                    if _rl_attempts > _RL_MAX:
+                        _log(f"    ✗ still rate-limited after {_RL_MAX} retries — giving up on this clip")
+                        return False, None, False
+                    backoff = min(clip_delay * 4, 60)
+                    _log(f"    ⏳ rate limited (429) — backing off {backoff:.0f}s and "
+                         f"retrying (attempt {_rl_attempts}/{_RL_MAX})")
+                    time.sleep(backoff)
+                    continue  # retry — do NOT fail the clip on a 429
+                backoff = clip_delay * 2
+                _log(f"    ✗ failed: {e}  (waiting {backoff:.0f}s)")
+                time.sleep(backoff)
+                return False, None, False
 
     def _render(label, prompt, profiles, env, nf, out_path, stem=None, fighters=None,
                 step_cb=None):
