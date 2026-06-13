@@ -72,9 +72,10 @@ class VideoGenerationRequest(BaseModel):
     mode: Optional[str] = Field("t2v", description=(
         "Generation mode: 't2v' text-to-video; 'i2v' image-to-video (init_image required, "
         "prompt dropped); 'ti2v' text+init image (prompt is primary driver); 'v2v' "
-        "video-to-video (video required); 'interp' frame interpolation (init_image+end_image). "
-        "The server gracefully falls back between Wan t2v/i2v pipelines when a model only "
-        "supports one."))
+        "video-to-video (video required); 'interp' frame interpolation (init_image+end_image); "
+        "'extend' VACE frame-tail continuation (cond_frames = the previous clip's last frames; "
+        "requires a VACE model). The server gracefully falls back between Wan t2v/i2v pipelines "
+        "when a model only supports one."))
 
     # Input media (base64 or URL)
     image: Optional[str] = Field(None, description="Alias for init_image (base64 or URL).")
@@ -82,6 +83,10 @@ class VideoGenerationRequest(BaseModel):
     end_image: Optional[str] = Field(None, description="Last frame, for 'interp' mode (base64 or URL).")
     video: Optional[str] = Field(None, description="Input video for v2v / audio manipulation (base64 or URL).")
     strength: Optional[float] = Field(None, description="Denoising strength for v2v (0–1).")
+    cond_frames: Optional[List[str]] = Field(None, description=(
+        "Ordered conditioning frames (base64/URL) for 'extend' mode on a VACE model: the tail "
+        "of the previous clip. The model conditions on these (their real motion gives velocity) "
+        "and generates num_frames NEW frames continuing forward; only the new frames are returned."))
 
     # Camera motion hint
     camera_motion: Optional[str] = None     # zoom-in | zoom-out | pan-left | pan-right | tilt-up | tilt-down | rotate

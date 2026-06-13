@@ -327,6 +327,16 @@ def _detect_pipeline_class(model_name: str, mode: str):
         if 'animatediff' in n or 'animateddiff' in n:
             return AnimateDiffPipeline
         if 'wan' in n:
+            # VACE (incl. Wan2.2-VACE-Fun) is an all-in-one control model loaded by
+            # its own pipeline — used for frame-tail continuation ('extend'), and it
+            # also serves plain t2v/i2v via masked conditioning. It must win over the
+            # t2v/i2v pipeline classes regardless of the requested mode.
+            if 'vace' in n:
+                try:
+                    from diffusers import WanVACEPipeline
+                    return WanVACEPipeline
+                except ImportError:
+                    pass
             # Wan ships separate t2v and i2v transformers; pick the i2v pipeline
             # for the keyframe bridge when an init image is supplied.
             if mode in ('i2v', 'ti2v'):
@@ -1658,6 +1668,36 @@ def _sync_video_loras(pipe, loras) -> None:
         pipe._coderai_active_loras = desired
 
 
+def _snap_wan_frames(n: int) -> int:
+    """Snap a frame count to the Wan VAE's temporal grid (4k+1). The VACE
+    video/mask lists must be exactly num_frames long, and the pipeline expects a
+    4k+1 count, so we round to the nearest valid value (min 5)."""
+    n = max(5, int(n))
+    k = round((n - 1) / 4)
+    return max(5, k * 4 + 1)
+
+
+def _build_vace_conditioning(cond_frames, num_frames: int, width: int, height: int):
+    """Build the (video, mask) lists a WanVACE pipeline expects.
+
+    `cond_frames` are the leading conditioning frames (the previous clip's tail for
+    'extend', or a single keyframe for i2v): the model is conditioned on them and
+    generates the remaining frames forward. Per the VACE convention the mask is an
+    'L' image per frame — BLACK (0) = condition on this frame, WHITE (255) =
+    generate it — and unknown frames are gray placeholders in `video`.
+    """
+    from PIL import Image as _Image
+    cond = [f.convert('RGB').resize((width, height)) for f in cond_frames]
+    k = len(cond)
+    k = min(k, num_frames)
+    gray = _Image.new('RGB', (width, height), (128, 128, 128))
+    black = _Image.new('L', (width, height), 0)    # condition
+    white = _Image.new('L', (width, height), 255)  # generate
+    video = cond[:k] + [gray] * (num_frames - k)
+    mask = [black] * k + [white] * (num_frames - k)
+    return video, mask
+
+
 def _run_pipeline(pipe, kw: dict):
     result = pipe(**kw)
     # NB: `getattr(result, 'frames', None) or result[0]` is WRONG — when .frames
@@ -1851,7 +1891,39 @@ def _generate_video(pipe, request: VideoGenerationRequest):
 
     init_src = request.init_image or request.image
 
-    if mode == 'i2v' and init_src:
+    # VACE pipelines (e.g. Wan2.2-VACE-Fun) condition via a (video, mask) pair, not
+    # an `image` kwarg. They power 'extend' (frame-tail continuation — the real fix
+    # for the chained-clip boomerang, since the model sees several real frames of
+    # motion and carries it forward) and also serve i2v/ti2v/t2v via masking.
+    is_vace = type(pipe).__name__ == 'WanVACEPipeline'
+    _vace_trim = 0  # frames to drop from the output start (the re-rendered tail)
+
+    if is_vace:
+        w = int(kw.get('width') or 512)
+        h = int(kw.get('height') or 512)
+        cond_b64 = list(getattr(request, 'cond_frames', None) or [])
+        new_frames = int(kw.get('num_frames') or 16)
+        if mode == 'extend' and cond_b64:
+            cond = [_pil_from_b64(x) for x in cond_b64]
+            k = min(len(cond), max(1, new_frames - 1))
+            cond = cond[-k:]
+            total = _snap_wan_frames(k + new_frames)
+            kw['video'], kw['mask'] = _build_vace_conditioning(cond, total, w, h)
+            kw['num_frames'] = total
+            _vace_trim = k  # caller keeps only the freshly generated continuation
+        elif init_src:
+            # Keyframe-anchored (i2v/ti2v): condition on the single init frame.
+            total = _snap_wan_frames(new_frames)
+            kw['video'], kw['mask'] = _build_vace_conditioning(
+                [_pil_from_b64(init_src)], total, w, h)
+            kw['num_frames'] = total
+        else:
+            # Pure t2v on VACE: snap frame count, leave video/mask unset (free gen).
+            kw['num_frames'] = _snap_wan_frames(new_frames)
+        kw.pop('image', None)
+        kw.pop('image_end', None)
+
+    elif mode == 'i2v' and init_src:
         kw['image'] = _pil_from_b64(init_src)
         kw.pop('prompt', None)  # SVD doesn't take text
 
@@ -1878,8 +1950,12 @@ def _generate_video(pipe, request: VideoGenerationRequest):
     #   * t2v request on an i2v model (36-ch)     → run i2v with a neutral seed frame.
     # Both rebuild a sibling pipeline that REUSES the same components, so fused
     # acceleration and per-request LoRAs on the shared transformer carry over.
-    pipe, mode = _maybe_t2v_fallback(pipe, kw, mode)
-    pipe, mode = _maybe_i2v_fallback(pipe, kw, mode)
+    # The t2v/i2v fallbacks rebuild sibling Wan *I2V/T2V* pipelines (by transformer
+    # in-channels); they don't apply to a VACE pipeline, which conditions via the
+    # (video, mask) pair instead of an `image` kwarg.
+    if not is_vace:
+        pipe, mode = _maybe_t2v_fallback(pipe, kw, mode)
+        pipe, mode = _maybe_i2v_fallback(pipe, kw, mode)
 
     # Per-request LoRA adapters (e.g. per-character identity LoRAs). Sync the
     # pipeline's adapters to this request's set, REUSING them if identical to the
@@ -1897,6 +1973,13 @@ def _generate_video(pipe, request: VideoGenerationRequest):
         raise
     _vid_progress_done()
     task_registry.finish(_tid, "done")
+    # VACE 'extend' re-renders the conditioning tail as the first _vace_trim frames;
+    # drop them so only the fresh forward continuation is returned.
+    if _vace_trim:
+        try:
+            frames = frames[_vace_trim:]
+        except Exception:
+            pass
     return frames, fps
 
 

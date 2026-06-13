@@ -374,8 +374,9 @@ ENVIRONMENT_POOL = [
 # especially when anchored to a keyframe. Kept here so the planner and the per-match
 # Re-plan stay in sync.
 FIGHT_PROMPT_SUFFIX = ("African township free fight, fast-paced, rapid explosive "
-                       "motion, dynamic action, cinematic, consistent characters, "
-                       "wardrobe and setting")
+                       "motion, dynamic action, continuous forward motion that never "
+                       "reverses, rewinds or loops back, cinematic, consistent "
+                       "characters, wardrobe and setting")
 
 
 def _continuity_clause(env_name: str) -> str:
@@ -391,21 +392,36 @@ def _continuity_clause(env_name: str) -> str:
             "background, surfaces and crowd in every shot")
 
 FIGHT_SHOT_TEMPLATES = [
-    "exchanging heavy blows at close range, both fighters connecting, crowd erupting",
-    "delivering a powerful uppercut, opponent's head snapping back on impact",
-    "grappling and clinching against the ropes, sweat flying, crowd pushing forward",
-    "dodging a hook and countering with a fast body shot, fluid athletic movement",
-    "thrown back against the ropes, covering up desperately, absorbing punishment",
-    "landing an explosive four-punch combination, each blow landing clean",
-    "circling cautiously, both fighters reading each other, tension building",
-    "throwing a spinning heel kick, opponent barely ducking under it",
-    "ground-and-pound sequence, dominant position, crowd on their feet",
-    "catching an overhand right, knees buckling, clutching for a clinch to survive",
-    "breaking from a clinch, both fighters throwing wild hooks simultaneously",
-    "landing a clean liver shot, opponent visibly hurt, doubling over",
-    "referee warning both fighters, tempers flaring, crowd booing and cheering",
-    "slipping inside a jab and returning a sharp elbow, street-fight style",
-    "both fighters bloodied and exhausted, still throwing hard in the final seconds",
+    "landing a thudding low leg kick that buckles the opponent's lead leg, crowd erupting",
+    "launching a spinning back-kick into the body, opponent folding over the impact",
+    "exploding forward with a flying knee to the jaw, blood spraying from the nose",
+    "shooting in for a double-leg takedown and slamming the opponent to the dirt",
+    "raining down ground-and-pound from full mount, opponent's face bloodied and covering up",
+    "throwing a sharp elbow in the clinch, opening a cut over the opponent's eyebrow",
+    "snapping a high head kick that grazes the ducking opponent, sweat flying",
+    "driving knees into the body against the fence, opponent grunting and giving ground",
+    "catching a kick and countering with a takedown into side control, crowd on their feet",
+    "delivering a powerful uppercut, opponent's head snapping back, blood on the lip",
+    "sprawling out of a takedown and scrambling back up to throwing a knee",
+    "locking in a tight guillotine choke as the opponent thrashes to escape",
+    "stuffing a shot and landing a brutal knee to the head, opponent staggering",
+    "exchanging heavy hooks and overhands at close range, both fighters connecting",
+    "slipping inside and returning a slashing elbow, both fighters bloodied and still swinging",
+]
+
+# Rotating technique focus passed one-per-clip to the prompt writer so a match
+# doesn't collapse into "all punches". The planner cycles through these (shuffled)
+# so consecutive clips emphasise different MMA disciplines — the strongest lever
+# against boxing-only monotony since the LLM otherwise gravitates to punches.
+FIGHT_ACTION_FOCUS = [
+    "a kicking exchange (low leg kicks, body kicks, high kicks or push kicks)",
+    "knees and elbows in a tight clinch against the wall or fence",
+    "a takedown, slam or throw driving the fight to the ground",
+    "ground-and-pound or a scramble for position on the floor",
+    "a submission attempt (choke, armbar or guillotine) and the escape",
+    "a spinning or flying technique (spinning back-kick, spinning elbow, flying knee)",
+    "fast boxing combinations mixed with head movement and counters",
+    "a defensive sequence — sprawl, slip and counter back to offence",
 ]
 
 WIN_SHOT_TEMPLATES = {
@@ -872,10 +888,18 @@ class CoderAIClient:
                             width: int = 832, height: int = 480,
                             seed: int = None,
                             init_image: bytes = None,
-                            loras: list = None) -> bytes:
-        # When a keyframe image is supplied, drive the model as text+image→video
-        # (ti2v) so the first frame already shows the right fighters.
-        mode = "ti2v" if init_image else "t2v"
+                            loras: list = None,
+                            cond_frames: list = None) -> bytes:
+        # `cond_frames` (a list of PNG byte tails from the previous chained part)
+        # drives VACE 'extend' continuation: the model sees real motion and carries
+        # it FORWARD, fixing the forward-then-rewind boomerang of single-frame
+        # seeding. Otherwise, a keyframe image drives text+image→video (ti2v).
+        if cond_frames:
+            mode = "extend"
+        elif init_image:
+            mode = "ti2v"
+        else:
+            mode = "t2v"
         body = {
             "model": model, "prompt": prompt,
             "num_frames": num_frames, "fps": fps,
@@ -890,6 +914,11 @@ class CoderAIClient:
             body["seed"] = seed
         if init_image:
             body["init_image"] = "data:image/png;base64," + base64.b64encode(init_image).decode()
+        if cond_frames:
+            body["cond_frames"] = [
+                "data:image/png;base64," + base64.b64encode(f).decode()
+                for f in cond_frames
+            ]
         if loras:
             body["loras"] = loras
 
@@ -916,10 +945,20 @@ class CoderAIClient:
 _LLM_SYSTEM = """\
 You are a creative director writing vivid video-generation prompts for African street fighting scenes.
 Each prompt must be ONE sentence, 15-35 words, cinematic and specific.
-Emphasize FAST, continuous, explosive motion — rapid strikes, quick footwork, dynamic momentum and \
-follow-through; describe action mid-movement, never static, posed, or slow-motion.
+Emphasize FAST, continuous, explosive motion — describe action mid-movement, never static, posed, or \
+slow-motion. The motion must PROGRESS FORWARD in one direction through the clip: no reversing, no \
+rewinding, no looping back to the starting pose, no boomerang or back-and-forth motion.
+This is a full MMA / no-rules street fight, NOT boxing — do NOT default to only punches. Across clips \
+draw widely from the WHOLE arsenal: head and body punches, but also high kicks, low leg kicks, push \
+kicks, spinning back-kicks, flying knees, knees in the clinch, elbow strikes, takedowns and slams, \
+sprawls, ground-and-pound, mount and guard scrambles, chokes and submission attempts, throws, \
+shoulder charges and dirty street-fighting. Each prompt should center on a DIFFERENT technique than \
+the recent ones — favour kicks, knees, elbows, grappling and ground work over plain punches.
+Make it gritty and visceral: it is fine and encouraged to SOMETIMES (not every clip) show blood — a \
+bloodied nose or lip, a cut over the eye, blood spray or sweat-and-blood on the face — when a hard \
+blow lands.
 Vary camera angles (close-up, wide, low angle, over-shoulder), lighting (dusk, generator light, \
-noon sun, spotlight), and action (strikes, clinch, footwork, takedown, ground work, crowd reaction).
+noon sun, spotlight).
 Always refer to each fighter by their NAME (given in the user message), not only by their description.
 WARDROBE CONTINUITY (critical): every clip of a match — and every chained part within a clip, plus the \
 outcome clips — must show each fighter in the IDENTICAL outfit: the same garments, exact same colours, \
@@ -959,7 +998,7 @@ class PromptGenerator:
         self._used_outcome: dict[str, list[str]] = {}
 
     def fight_shot(self, f1: str, f2: str, env_desc: str, match_context: str = "",
-                   avoid: list = None) -> str:
+                   avoid: list = None, action_focus: str = "") -> str:
         """Generate a unique fight shot prompt.
 
         `avoid` is an explicit list of actions to steer away from — used to pass
@@ -982,6 +1021,8 @@ class PromptGenerator:
                 try:
                     used_hint = (f"\nAvoid repeating these actions: {'; '.join(avoid_set)}."
                                  if avoid_set else "")
+                    focus_hint = (f"\nThis clip should focus on {action_focus}."
+                                  if action_focus else "")
                     _d1 = self.char_descriptions.get(f1, "")
                     _d2 = self.char_descriptions.get(f2, "")
                     f1_desc = f"{f1} ({_d1})" if _d1 else f1
@@ -992,7 +1033,7 @@ class PromptGenerator:
                         user=(
                             f"Fighter 1: {f1_desc}. Fighter 2: {f2_desc}. "
                             f"Location: {env_desc}. "
-                            f"{match_context}{used_hint}\n"
+                            f"{match_context}{used_hint}{focus_hint}\n"
                             "Write one fight action shot prompt. Refer to each "
                             "fighter by their NAME (not just their description)."
                         ),
@@ -1158,6 +1199,35 @@ def _last_frame_png(mp4_path: str) -> Optional[bytes]:
             except Exception: pass
 
 
+def _last_frames_png(mp4_path: str, k: int) -> list:
+    """Extract the LAST `k` frames of a clip as a list of PNG bytes, in order
+    (oldest → newest). Used to seed a VACE 'extend' continuation with real motion
+    so the join carries velocity forward instead of boomeranging. Returns [] on
+    failure (caller falls back to single-frame seeding)."""
+    if k <= 1:
+        one = _last_frame_png(mp4_path)
+        return [one] if one else []
+    tmpd = None
+    try:
+        tmpd = tempfile.mkdtemp(prefix="twtail_")
+        # Pull the last ~2s, write each decoded frame, then keep the final k.
+        subprocess.run(
+            ["ffmpeg", "-y", "-sseof", "-2", "-i", mp4_path,
+             "-q:v", "2", os.path.join(tmpd, "f_%04d.png")],
+            check=True, capture_output=True,
+        )
+        files = sorted(Path(tmpd).glob("f_*.png"))
+        files = files[-k:]
+        frames = [p.read_bytes() for p in files]
+        return [f for f in frames if f]
+    except Exception:
+        return []
+    finally:
+        if tmpd:
+            import shutil as _sh
+            _sh.rmtree(tmpd, ignore_errors=True)
+
+
 # Wan2.2-A14B is trained for clips up to ~81 frames; beyond that temporal
 # coherence breaks down (the frames visibly "jump") in a SINGLE generation.
 MODEL_MAX_FRAMES = 81
@@ -1169,6 +1239,11 @@ MODEL_MAX_FRAMES = 81
 # to MAX_PLANNED_FRAMES even though no single model call exceeds the cap.
 SINGLE_CLIP_MAX_FRAMES = 50      # max frames in ONE model generation (≤ MODEL_MAX_FRAMES)
 MAX_PLANNED_FRAMES = 480         # ceiling for a whole (possibly chained) clip
+
+# Number of trailing frames of the previous chained part fed to a VACE model as
+# 'extend' conditioning. More frames = stronger motion-continuity (kills the
+# forward/rewind boomerang) but more conditioning cost; ~5 carries velocity well.
+VACE_TAIL_FRAMES = 5
 
 # Per fight-clip frame budget. Frame count (not seconds) is the real control: it's
 # the model's motion budget and is fps-independent, so a clip is CLIP_*_FRAMES
@@ -1402,6 +1477,60 @@ def _build_char_descriptions(out_dir: Path) -> dict:
                 except Exception:
                     pass
     return desc
+
+
+# Clothing nouns to lift the fighter's fixed outfit out of their profile prompt,
+# so every keyframe can state it explicitly (the LoRA/IP-Adapter alone drift).
+_CLOTHING_WORDS = (
+    "shorts", "trunks", "singlet", "vest", "gloves", "wraps", "hand wraps",
+    "sports bra", "bra", "tank top", "tank", "t-shirt", "shirt", "hoodie",
+    "boots", "headgear", "headband", "bandana", "jersey", "tracksuit", "kit",
+    "trousers", "pants", "leggings", "belt", "gi", "kimono", "sneakers",
+)
+
+
+def _extract_outfit(prompt_text: str) -> str:
+    """Pull the wardrobe phrase(s) out of a profile prompt (e.g. 'worn boxing
+    shorts', 'boxing singlet', 'sports bra and MMA shorts'). Returns '' when none
+    are found. Comma/semicolon/period clauses that mention a clothing noun are
+    kept (up to two), so the colour/material adjectives stay attached."""
+    import re as _re
+    out, seen = [], set()
+    for part in _re.split(r"[,.;]", prompt_text or ""):
+        p = part.strip()
+        pl = p.lower()
+        if not p:
+            continue
+        if any(w in pl for w in _CLOTHING_WORDS):
+            key = pl
+            if key not in seen:
+                seen.add(key)
+                out.append(p)
+    return ", ".join(out[:2])
+
+
+def _build_char_outfits(out_dir: Path) -> dict:
+    """Return {name: outfit_phrase} from each fighter's profile PROMPT (the
+    `prompt` field carries clothing; `description` usually doesn't). Merges
+    FIGHTER_POOL + locally saved meta.json so user-created fighters are covered."""
+    outfits = {}
+    for f in FIGHTER_POOL:
+        o = _extract_outfit(f.get("prompt", ""))
+        if o:
+            outfits[f["name"]] = o
+    chars_dir = out_dir / "characters"
+    if chars_dir.exists():
+        for d in chars_dir.iterdir():
+            meta_path = d / "meta.json"
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text())
+                    o = _extract_outfit(meta.get("prompt", "") or meta.get("description", ""))
+                    if o:
+                        outfits[d.name] = o
+                except Exception:
+                    pass
+    return outfits
 
 
 _VALID_CONSISTENCY = {"prompt", "ipadapter", "keyframe", "lora"}
@@ -1933,6 +2062,12 @@ def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: P
     keyframe_dir.mkdir(parents=True, exist_ok=True)
     use_ip = "ipadapter" in consistency or "keyframe" in consistency
     use_lora = "lora" in consistency
+    # Each fighter's fixed outfit (lifted from their profile prompt). Stated
+    # EXPLICITLY in every keyframe prompt so the image model paints the right
+    # clothes instead of drifting — the keyframe then anchors the I2V clip, so
+    # this is the strongest lever for wardrobe consistency.
+    _out_dir = keyframe_dir.parent.parent
+    _outfits = _build_char_outfits(_out_dir)
 
     # Map match_name -> [f1, f2] so an outcome keyframe attaches BOTH match
     # fighters' LoRAs (+ env), like the clips do — not just the single fighter
@@ -1977,6 +2112,15 @@ def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: P
             loras = (_lora_specs_for(fighters, lora_map, lora_weight)
                      + _env_lora_specs_for(env, env_lora_map, env_lora_weight)) or None
         kf_prompt = prompt
+        # Force each fighter's exact outfit up front so the keyframe paints the
+        # right clothes (e.g. "khumalo wearing boxing singlet; dlamini wearing
+        # worn boxing shorts"). The wardrobe lead beats a trailing mention.
+        _wardrobe = "; ".join(f"{n} wearing {_outfits[n]}"
+                              for n in fighters if _outfits.get(n))
+        if _wardrobe:
+            kf_prompt = (f"{_wardrobe}. {kf_prompt} "
+                         f"— each fighter in their exact same outfit, same colours, "
+                         f"consistent wardrobe")
         if env:
             kf_prompt = f"[{env} location] " + kf_prompt
         try:
@@ -2234,12 +2378,17 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
         # shots already written for the SAME match, so a 12-clip fight stays
         # varied throughout (not just within the global recent-5 window).
         match_avoid = []
-        for c in m["clips"]:
+        # Shuffled technique cycle so consecutive clips emphasise different
+        # disciplines (kicks, clinch, ground, submissions…) instead of all punches.
+        _focus_cycle = list(FIGHT_ACTION_FOCUS)
+        random.shuffle(_focus_cycle)
+        for _ci, c in enumerate(m["clips"]):
             _pidx += 1
             shot = prompter.fight_shot(
                 m["f1"], m["f2"], m["env_desc"],
                 match_context=f"Match stage: {c['intensity']}. ",
-                avoid=match_avoid)
+                avoid=match_avoid,
+                action_focus=_focus_cycle[_ci % len(_focus_cycle)])
             c["shot"] = shot
             f1_hint = _fighter_desc_hint(m['f1'], char_descriptions)
             f2_hint = _fighter_desc_hint(m['f2'], char_descriptions)
@@ -2409,11 +2558,13 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                             MODEL_MAX_FRAMES))
 
     def _render_once(label, prompt, profiles, env, nf, out_path,
-                     fighters=None, init_override=None, step_cb=None):
+                     fighters=None, init_override=None, step_cb=None,
+                     cond_frames=None):
         """One model generation → out_path. `init_override` (PNG bytes) wins over
         any keyframe; pass it to chain a sub-render onto the previous one's last
-        frame. Returns (ok, duration_or_None, fatal)."""
-        init_image = init_override
+        frame. `cond_frames` (list of PNG byte tails) instead drives VACE 'extend'
+        continuation. Returns (ok, duration_or_None, fatal)."""
+        init_image = None if cond_frames else init_override
         loras = None
         if use_lora:
             # Video-DiT LoRAs trained for THIS video model (image LoRAs can't apply
@@ -2442,7 +2593,7 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                     character_profiles=profiles, environment_name=env,
                     num_frames=nf, fps=fps, seed=random.randint(0, 2**31),
                     width=_vw, height=_vh,
-                    init_image=init_image, loras=loras,
+                    init_image=init_image, loras=loras, cond_frames=cond_frames,
                     poll_fn=client.video_progress, step_cb=step_cb,
                 )
                 Path(out_path).write_bytes(mp4)
@@ -2486,29 +2637,49 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         # stray files for _scan_matches to mis-parse; only the concatenated result
         # lands at out_path.
         import shutil as _sh
+        # A VACE model continues a chained part from the previous part's FRAME TAIL
+        # (real motion → carries velocity forward), the proper fix for the
+        # single-frame "boomerang". Non-VACE models fall back to single last-frame
+        # seeding + the forward-motion prompt nudge.
+        _vace = "vace" in (video_model or "").lower()
         _log(f"    ↪ {nf}f > {_chunk_max}f/render — chaining {len(budget)} parts "
-             f"{budget} into one shot")
+             f"{budget} into one shot" + ("  [VACE frame-tail extend]" if _vace else ""))
         tmpd = tempfile.mkdtemp(prefix="twshot_")
-        parts, prev_last = [], None
+        parts, prev_last, prev_tail = [], None, None
         try:
             for pi, pn in enumerate(budget):
                 part_path = os.path.join(tmpd, f"part{pi:02d}.mp4")
-                seed_img = keyframe if pi == 0 else (prev_last or keyframe)
                 # Tag each part's step updates with part N/total so the UI can show
                 # "concatenating shot — part 2/3" alongside the diffusion step.
                 _pcb = ((lambda prog, _p=pi + 1, _n=len(budget):
                          step_cb({**(prog or {}), "part": _p, "parts": _n}))
                         if step_cb else None)
+                # Seeding for this part:
+                #   • part 0  → the clip keyframe (single image).
+                #   • VACE    → the previous part's frame tail (motion continuation).
+                #   • else    → the previous part's last frame (single image) + the
+                #               forward-motion prompt nudge to discourage rewinding.
+                seed_img = keyframe if pi == 0 else (prev_last or keyframe)
+                cond_frames = prev_tail if (_vace and pi > 0) else None
+                if cond_frames:
+                    seed_img = None  # VACE conditions via the tail, not an init frame
+                part_prompt = prompt if pi == 0 else (
+                    "Continuing seamlessly from the previous moment, the fight keeps "
+                    "moving FORWARD into the next action — new strikes and movement that "
+                    "advance the exchange. " + prompt)
                 ok, _dur, is_fatal = _render_once(
                     f"{label} [part {pi+1}/{len(budget)}, {pn}f]",
-                    prompt, profiles, env, pn, part_path,
-                    fighters=fighters, init_override=seed_img, step_cb=_pcb)
+                    part_prompt, profiles, env, pn, part_path,
+                    fighters=fighters, init_override=seed_img, step_cb=_pcb,
+                    cond_frames=cond_frames)
                 if not ok:
                     return False, None, is_fatal
                 parts.append(part_path)
+                # Prepare seeds for the NEXT part.
                 prev_last = _last_frame_png(part_path)
-                if pi < len(budget) - 1 and prev_last is None:
-                    _log("    ⚠ could not read part's last frame — next part falls "
+                prev_tail = _last_frames_png(part_path, VACE_TAIL_FRAMES) if _vace else None
+                if pi < len(budget) - 1 and not prev_last and not prev_tail:
+                    _log("    ⚠ could not read part's tail — next part falls "
                          "back to the clip keyframe (possible visible seam)")
             # Re-encode the join: stream-copying the parts makes players freeze on
             # each part's first frame for its duration (static-first-half bug). The
@@ -3341,11 +3512,14 @@ def launch_web_ui(default_args):
                 f1_hint = _fighter_desc_hint(m["f1"], char_descriptions)
                 f2_hint = _fighter_desc_hint(m["f2"], char_descriptions)
                 match_avoid = []
+                _focus_cycle = list(FIGHT_ACTION_FOCUS)
+                random.shuffle(_focus_cycle)
                 for i, c in enumerate(new_clips):
                     shot = prompter.fight_shot(
                         m["f1"], m["f2"], m["env_desc"],
                         match_context=f"Match stage: {c['intensity']}. ",
-                        avoid=match_avoid)
+                        avoid=match_avoid,
+                        action_focus=_focus_cycle[i % len(_focus_cycle)])
                     c["shot"] = shot
                     c["prompt"] = (f"{f1_hint} vs {f2_hint} — {shot} "
                                    f"— {_continuity_clause(m.get('env'))} "

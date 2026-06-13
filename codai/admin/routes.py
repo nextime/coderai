@@ -45,6 +45,7 @@ config_manager = None  # set via set_config_manager()
 _download_sessions: dict = {}
 _download_status: dict = {}   # session_id → latest progress state (survives SSE disconnect)
 _download_cancelled: set = set()  # session_ids the user has requested to cancel
+_download_procs: dict = {}    # session_id → multiprocessing.Process running the download
 
 
 def get_active_download_model_ids() -> set:
@@ -749,7 +750,9 @@ def _make_tqdm_class(pq, status=None, session_id=None, cache_dir=None):
 
 
 def _run_download_thread(session_id: str, model_id: str, file_pattern: str, pq):
-    """Background thread: download model via HF snapshot_download and stream progress events."""
+    """Supervisor thread: spawn a child process that performs the download and
+    relay its progress events onto the SSE queue `pq`. Running the download out of
+    process is what makes it cancellable — see the inline note below."""
     import time
     import os
 
@@ -776,149 +779,67 @@ def _run_download_thread(session_id: str, model_id: str, file_pattern: str, pq):
         elif t == "info":
             status["last_info"] = evt.get("message", "")
 
+    # Run the actual download in a SEPARATE SUBPROCESS so it can be cancelled
+    # reliably. huggingface_hub fetches each file over several parallel chunk
+    # connections (and, with Xet, a separate transfer path) that ignore any
+    # in-thread stop flag, so a daemon thread can't be interrupted — but
+    # terminating a process tears every connection down at once. We launch a clean
+    # `python -m codai.admin.download_worker` (NOT multiprocessing: the spawn start
+    # method re-imports the parent's __main__, i.e. the server launcher, which
+    # hangs re-initialising the whole server). The child streams progress events as
+    # JSON lines on stdout, which we relay onto this session's SSE queue.
+    import subprocess as _sp
+    import sys as _sys
+
+    proc = _sp.Popen(
+        [_sys.executable, "-m", "codai.admin.download_worker", model_id, file_pattern or ""],
+        stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True, bufsize=1,
+    )
+    _download_procs[session_id] = proc
+
+    terminal = None  # set to "done"/"error" once the child reports a final event
     try:
-        from codai.models.cache import is_huggingface_model_id, get_model_cache_dir, get_hf_hub_cache_dir
-        from huggingface_hub import snapshot_download
-
-        if is_huggingface_model_id(model_id):
-            # GGUF files always land in the GGUF cache (flat); everything else
-            # (full repos, transformers checkpoints, diffusers, …) goes in the HF cache.
-            is_gguf_download = file_pattern and '.gguf' in file_pattern.lower()
-
-            if is_gguf_download:
-                gguf_cache = get_model_cache_dir()
-                dl_cache_dir = gguf_cache
-            else:
-                dl_cache_dir = get_hf_hub_cache_dir()
-
-            # Pre-check disk space using HF file-size metadata
-            expected_bytes = _get_hf_expected_size(model_id, file_pattern)
-            _check_disk_space(dl_cache_dir, expected_bytes)
-
-            tqdm_cls = _make_tqdm_class(pq, status=status, session_id=session_id, cache_dir=dl_cache_dir)
-
-            if is_gguf_download:
-                import fnmatch as _fnmatch
-                import shutil as _shutil
-                from huggingface_hub import list_repo_files, hf_hub_download
-
-                # If pattern has no wildcards and looks like an exact filename, skip listing.
-                _is_exact = ('*' not in file_pattern and '?' not in file_pattern
-                             and file_pattern.lower().endswith('.gguf'))
-                if _is_exact:
-                    matching = [file_pattern]
-                else:
-                    # Resolve the pattern to actual filenames in the repo
-                    if file_pattern.startswith('.'):
-                        pat = f"*{file_pattern}"
-                    elif '/' in file_pattern:
-                        pat = file_pattern
-                    else:
-                        pat = f"*{file_pattern}"
-
-                    all_repo_files = list(list_repo_files(model_id))
-                    matching = [
-                        f for f in all_repo_files
-                        if _fnmatch.fnmatch(f, pat) or _fnmatch.fnmatch(os.path.basename(f), pat)
-                    ]
-                    if not matching:
-                        push({"type": "error", "message": f"No files matching {file_pattern!r} found in {model_id}"})
-                        return
-
-                last_dest = gguf_cache
-                for hf_filename in matching:
-                    basename = os.path.basename(hf_filename)
-                    push({"type": "info", "message": f"Downloading {basename} from {model_id}…"})
-                    dl_path = hf_hub_download(
-                        repo_id=model_id,
-                        filename=hf_filename,
-                        local_dir=gguf_cache,
-                        tqdm_class=tqdm_cls,
-                    )
-                    # hf_hub_download preserves subfolder structure; flatten to cache root
-                    flat_dest = os.path.join(gguf_cache, basename)
-                    if os.path.abspath(dl_path) != os.path.abspath(flat_dest) and os.path.isfile(dl_path):
-                        _shutil.move(dl_path, flat_dest)
-                    last_dest = flat_dest
-                path = last_dest
-
-            elif file_pattern:
-                # Non-GGUF pattern — use snapshot into HF cache
-                if file_pattern.startswith('.'):
-                    allow = [f"*{file_pattern}"]
-                elif '/' in file_pattern:
-                    allow = [file_pattern]
-                else:
-                    allow = [f"*{file_pattern}"]
-                push({"type": "info", "message": f"Downloading {allow[0]} from {model_id}…"})
-                path = snapshot_download(model_id, cache_dir=dl_cache_dir, allow_patterns=allow, tqdm_class=tqdm_cls)
-            else:
-                push({"type": "info", "message": f"Downloading full repository {model_id}…"})
-                path = snapshot_download(model_id, cache_dir=dl_cache_dir, tqdm_class=tqdm_cls)
-
-        else:
-            # Direct URL download (non-HF source)
-            import requests as _req
-            import hashlib
-
-            dl_cache_dir = get_model_cache_dir()
-            _check_disk_space(dl_cache_dir)  # basic free-space sanity check before connecting
-
-            url_path = model_id.split('?')[0]
-            filename = os.path.basename(url_path) or "model.bin"
-            url_hash = hashlib.sha256(model_id.encode()).hexdigest()
-            dest = os.path.join(dl_cache_dir, f"{url_hash}_{filename}")
-
-            if os.path.exists(dest):
-                push({"type": "done", "path": dest})
-                return
-
-            resp = _req.get(model_id, stream=True, timeout=60, allow_redirects=True)
-            resp.raise_for_status()
-            total = int(resp.headers.get('content-length', 0))
-            if total:
-                _check_disk_space(dl_cache_dir, total)
-            push({"type": "start", "filename": filename, "total": total})
-
-            tqdm_cls = _make_tqdm_class(pq, status=status, session_id=session_id, cache_dir=dl_cache_dir)
-            downloaded = 0
-            start_t = time.time()
-            last_evt = 0.0
-            with open(dest, 'wb') as f:
-                for chunk in resp.iter_content(chunk_size=524288):
-                    if chunk:
-                        if session_id in _download_cancelled:
-                            raise RuntimeError("Download cancelled by user")
-                        # Check disk space roughly every 64 MB
-                        if downloaded % (64 * 1024 * 1024) < len(chunk):
-                            _check_disk_space(dl_cache_dir)
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        now = time.time()
-                        if now - last_evt >= 0.25:
-                            last_evt = now
-                            elapsed = (now - start_t) or 0.001
-                            rate = downloaded / elapsed
-                            eta = (total - downloaded) / rate if rate and total else None
-                            push({
-                                "type": "progress", "filename": filename,
-                                "downloaded": downloaded, "total": total,
-                                "percent": round(downloaded / total * 100, 1) if total else 0,
-                                "rate": round(rate),
-                                "eta": round(eta) if eta is not None else None,
-                            })
-            path = dest
-
-        push({"type": "done", "path": str(path)})
-
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = _j.loads(line)
+            except Exception:
+                # Non-JSON output (warnings / tracebacks) → surface as info.
+                push({"type": "info", "message": line})
+                continue
+            etype = evt.get("type")
+            push(evt)
+            if etype in ("done", "error"):
+                terminal = etype
     except Exception as exc:
-        if session_id in _download_cancelled:
-            pq.put({"type": "cancelled", "message": "Download cancelled by user"})
-            _download_status.get(session_id, {}).update({"status": "cancelled"})
-        else:
-            push({"type": "error", "message": str(exc)})
+        push({"type": "error", "message": str(exc)})
     finally:
+        # Ensure the child is gone (cancel, crash, or normal exit).
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        _download_procs.pop(session_id, None)
+
+        if terminal is None:
+            # Child ended without a done/error event → cancelled or died.
+            if session_id in _download_cancelled:
+                pq.put({"type": "cancelled", "message": "Download cancelled by user"})
+                _download_status.get(session_id, {}).update({"status": "cancelled"})
+            else:
+                push({"type": "error", "message": "Download process exited unexpectedly"})
+
         _download_cancelled.discard(session_id)
+
         def _gc():
             time.sleep(300)
             _download_sessions.pop(session_id, None)
@@ -971,7 +892,7 @@ async def api_download_stream(
             try:
                 evt = await loop.run_in_executor(None, lambda: pq.get(timeout=2))
                 yield f"data: {_j.dumps(evt)}\n\n"
-                if evt.get("type") in ("done", "error"):
+                if evt.get("type") in ("done", "error", "cancelled"):
                     break
             except _q.Empty:
                 yield 'data: {"type":"keepalive"}\n\n'
@@ -1036,11 +957,36 @@ async def api_list_downloads(username: str = Depends(require_admin)):
 
 @router.post("/admin/api/download-cancel/{session_id}", summary="Cancel a download")
 async def api_cancel_download(session_id: str, username: str = Depends(require_admin)):
-    """Request cancellation of an active download session."""
+    """Cancel an active download by terminating its worker process immediately.
+
+    Flagging the session (so the supervisor classifies it as cancelled, not
+    failed) and killing the child process tears down every HF chunk connection at
+    once — the supervisor's relay loop then exits cleanly."""
     if session_id not in _download_sessions and session_id not in _download_status:
         raise HTTPException(status_code=404, detail="Download session not found")
     _download_cancelled.add(session_id)
+    proc = _download_procs.get(session_id)
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
     return {"success": True}
+
+
+@router.post("/admin/api/download-cancel-all", summary="Cancel all active downloads")
+async def api_cancel_all_downloads(username: str = Depends(require_admin)):
+    """Cancel every active download at once (terminates all worker processes)."""
+    sessions = list(_download_procs.keys())
+    for sid in sessions:
+        _download_cancelled.add(sid)
+        proc = _download_procs.get(sid)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+    return {"success": True, "cancelled": len(sessions)}
 
 
 @router.post("/admin/api/model-upload", summary="Upload a model file")
