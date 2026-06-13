@@ -3567,6 +3567,162 @@ def launch_web_ui(default_args):
             scm = int(getattr(default_args, "single_clip_max_frames", SINGLE_CLIP_MAX_FRAMES)
                       or SINGLE_CLIP_MAX_FRAMES)
 
+            # ── Full match regeneration (text → image → video, end to end) ─────
+            # One click rebuilds EVERYTHING for this match in order: re-plan the
+            # fight-clip + outcome prompts, regenerate all keyframes, then re-render
+            # all clips + outcomes and reassemble the finals. Other matches are left
+            # untouched. Uses the text, image AND video models, so it's the slowest
+            # action — but it's the "just redo this whole match" button.
+            if scope == "full":
+                m = next((x for x in fight_plan if x.get("match_name") == match_name), None)
+                if not m:
+                    _fail("match not found in prompts.json — render it from the Run page first")
+                    return
+                image_model = getattr(default_args, "image_model", None)
+                if not image_model:
+                    try:
+                        image_model = pick_model(client, "image", None)
+                    except Exception as e:
+                        _fail(f"no image model available: {e}")
+                        return
+                text_model = getattr(default_args, "text_model", None)
+                char_descriptions = _build_char_descriptions(out_dir)
+                _mf = {m.get("f1"), m.get("f2")} - {None}
+
+                def _belongs(o):
+                    if o.get("match_name"):
+                        return o.get("match_name") == match_name
+                    return o.get("fighter") in _mf  # legacy per-fighter outcome
+
+                # ── Phase 1/3 — re-plan prompts (fight clips + this match's outcomes)
+                _prog(4, "phase 1/3 — re-planning prompts…")
+                prompter = PromptGenerator(client, text_model,
+                                           char_descriptions=char_descriptions)
+                long_target = float(m.get("long_target", 70))
+                _cf_lo, _cf_hi = _clip_frame_range(
+                    getattr(default_args, "clip_min_frames", CLIP_MIN_FRAMES),
+                    getattr(default_args, "clip_max_frames", CLIP_MAX_FRAMES))
+                new_clips, planned, ci = [], 0.0, 0
+                while planned < long_target:
+                    round_num = ci // 3 + 1
+                    intensity = ("early exchanges" if round_num == 1
+                                 else "midpoint battle" if round_num == 2
+                                 else "climactic final exchange")
+                    _nf = random.randint(_cf_lo, _cf_hi)
+                    new_clips.append({"idx": ci, "clip_seconds": round(_nf / max(1, fps), 2),
+                                      "nf": _nf, "intensity": intensity,
+                                      "shot": None, "prompt": None})
+                    planned += _nf / max(1, fps)
+                    ci += 1
+                f1_hint = _fighter_desc_hint(m["f1"], char_descriptions)
+                f2_hint = _fighter_desc_hint(m["f2"], char_descriptions)
+                match_avoid = []
+                _focus_cycle = list(FIGHT_ACTION_FOCUS)
+                random.shuffle(_focus_cycle)
+                for i, c in enumerate(new_clips):
+                    shot = prompter.fight_shot(
+                        m["f1"], m["f2"], m["env_desc"],
+                        match_context=f"Match stage: {c['intensity']}. ",
+                        avoid=match_avoid,
+                        action_focus=_focus_cycle[i % len(_focus_cycle)])
+                    c["shot"] = shot
+                    c["prompt"] = (f"{f1_hint} vs {f2_hint} — {shot} "
+                                   f"— {_continuity_clause(m.get('env'))} "
+                                   f"— {FIGHT_PROMPT_SUFFIX}")
+                    match_avoid.append(shot[:60])
+                    _prog(4 + int(14 * (i + 1) / max(1, len(new_clips))),
+                          f"clip {i+1}/{len(new_clips)} prompt written")
+                m["clips"] = new_clips
+                # Re-plan this match's outcome prompts too, forcing the match's
+                # location so keyframes + clips stay in one consistent setting.
+                match_outcomes = [o for o in outcome_plan if _belongs(o)]
+                for o in match_outcomes:
+                    if m.get("env"):
+                        o["env"] = m.get("env")
+                        o["env_desc"] = m.get("env_desc", o.get("env_desc"))
+                    try:
+                        o["shot"] = prompter.outcome_shot(
+                            o["fighter"], o["outcome"], o.get("env_desc") or "")
+                        f_hint = _fighter_desc_hint(o["fighter"], char_descriptions)
+                        o["prompt"] = (f"{f_hint} — {o['shot']} "
+                                       f"— {_continuity_clause(o.get('env'))} "
+                                       f"— African township fight, cinematic")
+                    except Exception:
+                        pass
+                try:
+                    pf.write_text(json.dumps(
+                        {"fight_plan": fight_plan, "outcome_plan": outcome_plan,
+                         "fps": data.get("fps") or fps}, indent=2))
+                except Exception as e:
+                    _fail(f"could not save prompts.json: {e}")
+                    return
+
+                # ── Phase 2/3 — regenerate every keyframe (clips + outcomes) ──────
+                kdir = vdir / "keyframes"
+                mm = dict(m)
+                kf_stems = [_clip_stem_fight(match_name, c["idx"]) for c in mm["clips"]]
+                kf_stems += [_clip_stem_outcome(o["fighter"], o["outcome"], o.get("match_name"))
+                             for o in match_outcomes]
+                _set_items([f"keyframe {s}" for s in kf_stems])
+                _kf_idx = {s: i for i, s in enumerate(kf_stems)}
+                _kf_done = [0]
+                for s in kf_stems:
+                    try:
+                        (kdir / f"{s}.png").unlink()
+                    except Exception:
+                        pass
+
+                def _kf_cb(stem, phase, ok=None):
+                    i = _kf_idx.get(stem)
+                    if i is None:
+                        return
+                    _item(i, phase, ok)
+                    if phase == "end":
+                        _kf_done[0] += 1
+                        _prog(20 + int(28 * _kf_done[0] / max(1, len(kf_stems))),
+                              f"keyframe {_kf_done[0]}/{len(kf_stems)} done")
+
+                _prog(20, f"phase 2/3 — regenerating {len(kf_stems)} keyframe(s)…")
+                try:
+                    _generate_keyframes(
+                        client, image_model, kdir, [mm], match_outcomes,
+                        consistency | {"keyframe"}, lora_map,
+                        float(getattr(default_args, "character_strength", 0.7)),
+                        int(getattr(default_args, "keyframe_steps", 28)),
+                        getattr(default_args, "keyframe_size", "832x480"), lw,
+                        env_lora_map=env_lora_map, env_lora_weight=elw,
+                        kf_cb=_kf_cb)
+                except Exception as e:
+                    _fail(f"keyframe regeneration failed: {e}")
+                    return
+                for i, s in enumerate(kf_stems):
+                    _item(i, "end", (kdir / f"{s}.png").exists())
+
+                # ── Phase 3/3 — render all clips + outcomes, then assemble ───────
+                _set_items([f"clip {int(c['idx']):02d}" for c in mm["clips"]]
+                           + [_clip_stem_outcome(o["fighter"], o["outcome"], o.get("match_name"))
+                              for o in match_outcomes])
+
+                def _full_cb(done, total, label):
+                    _prog(52 + int(46 * done / max(1, total)),
+                          f"render {done}/{total} done" + (f" — {label}" if label else ""))
+
+                _prog(52, f"phase 3/3 — rendering {len(mm['clips'])} clip(s) "
+                          f"+ {len(match_outcomes)} outcome(s)…")
+                _stage_videos_render(
+                    client, video_model, vdir, [mm], match_outcomes,
+                    1, len(match_outcomes), fps, clip_delay,
+                    consistency=consistency, lora_map=lora_map,
+                    keyframe_dir=keyframe_dir, lora_weight=lw,
+                    env_lora_map=env_lora_map, env_lora_weight=elw,
+                    progress_cb=_full_cb, clip_cb=_item,
+                    video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map,
+                    assemble_finals=True, video_lora_scale=vls, video_size=vsz,
+                    single_clip_max_frames=scm)
+                _done(f"regenerated match {match_name} end to end — "
+                      f"{len(mm['clips'])} clip(s), {len(match_outcomes)} outcome(s), finals reassembled")
+                return
+
             # ── Regenerate keyframes (image model) ─────────────────────────────
             # Deletes the targeted keyframe PNG(s) then regenerates them so a
             # subsequent clip re-render uses fresh keyframes (e.g. after a LoRA
@@ -5001,7 +5157,8 @@ function _pollMatchBars(jobId, setSt, wrap){
 }
 async function reMatch(ev, scope, params){
   if(ev) ev.preventDefault();
-  const labels={'match-clips':'Re-render ALL clips of this match (uses the video model, can take a while)?',
+  const labels={'full':'Regenerate this ENTIRE match end to end — re-plan all prompts, regenerate every keyframe, re-render all clips + outcomes, then reassemble the finals. Uses the text, image AND video models, so this is the slowest action. Other matches are untouched; the existing prompts, keyframes and clips for this match are replaced.',
+                'match-clips':'Re-render ALL clips of this match (uses the video model, can take a while)?',
                 'clip':'Re-render this single clip?',
                 'reassemble':'Reassemble the final short/long videos from the existing clips? (fast, no model)',
                 'outcomes':'Re-render all output clips for this fighter (uses the video model)?',
@@ -5013,9 +5170,10 @@ async function reMatch(ev, scope, params){
   const kf=(scope==='keyframes'||scope==='keyframe'||scope==='keyframes-missing');
   const kfMiss=(scope==='keyframes-missing');
   const isReplan=(scope==='replan');
+  const isFull=(scope==='full');
   if(!(await uiConfirm(labels[scope]||'Proceed?',
-       {title:(isReplan?'Re-plan match prompts':(kfMiss?'Generate missing keyframes':(kf?'Regenerate keyframes':'Regenerate'))),
-        okText:(scope==='reassemble'?'Reassemble':(isReplan?'Re-plan':(kfMiss?'Generate missing':(kf?'Regenerate':'Re-render')))),
+       {title:(isFull?'Regenerate whole match':(isReplan?'Re-plan match prompts':(kfMiss?'Generate missing keyframes':(kf?'Regenerate keyframes':'Regenerate')))),
+        okText:(isFull?'Regenerate match':(scope==='reassemble'?'Reassemble':(isReplan?'Re-plan':(kfMiss?'Generate missing':(kf?'Regenerate':'Re-render'))))),
         danger:(scope!=='reassemble'&&!kf&&!isReplan)})))return;
   const stEl=_findStatus(ev);
   const setSt=(c,t)=>{ if(stEl){ stEl.style.color=c; stEl.textContent=t; } };
@@ -5369,6 +5527,9 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             f'  <div class=pf-actions style="margin-top:.6rem">'
             f'    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="saveMatch(event,\'{_esc(name)}\')">💾 Save match</button>'
+            f'    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem;background:#7a3da8;border-color:#7a3da8" '
+            f'onclick="reMatch(event,\'full\',{{match:\'{_esc(name)}\'}})" '
+            f'title="Regenerate this whole match end to end: prompts → keyframes → clips → outcomes → finals. Uses text, image and video models.">♻ Regenerate whole match</button>'
             f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="reMatch(event,\'replan\',{{match:\'{_esc(name)}\'}})" '
             f'title="Rebuild this match\'s clip list + prompts at the current fps (more, shorter clips at higher fps). No video model.">📝 Re-plan prompts</button>'
@@ -5919,7 +6080,7 @@ async function resetPrompts(ev){
                     return v if isinstance(v, str) else v.decode(errors="replace")
 
                 scope = _fv("scope")
-                if scope not in ("match-clips", "clip", "reassemble", "outcomes",
+                if scope not in ("full", "match-clips", "clip", "reassemble", "outcomes",
                                  "outcome", "enhance", "keyframes",
                                  "keyframes-missing", "keyframe", "replan"):
                     self._send(400, "application/json",
