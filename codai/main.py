@@ -272,6 +272,24 @@ def main():
     config_mgr = ConfigManager(config_dir)
     config = config_mgr.load()
 
+    # Configure the temporary-working-files directory as early as possible (before
+    # any tempfile.* call). CLI --tmp overrides config.tmp_dir. Setting both
+    # tempfile.tempdir and TMPDIR/TMP/TEMP makes every tempfile.* call AND child
+    # processes (ffmpeg, rife) use it — so 4x upscaling doesn't fill a small /tmp.
+    _tmp_dir = getattr(args, "tmp", None) or getattr(config, "tmp_dir", None)
+    if _tmp_dir:
+        try:
+            _tmp_dir = os.path.abspath(os.path.expanduser(_tmp_dir))
+            os.makedirs(_tmp_dir, exist_ok=True)
+            import tempfile as _tempfile
+            _tempfile.tempdir = _tmp_dir
+            os.environ["TMPDIR"] = _tmp_dir
+            os.environ["TMP"] = _tmp_dir
+            os.environ["TEMP"] = _tmp_dir
+            print(f"Temporary working directory: {_tmp_dir}")
+        except Exception as _e:
+            print(f"WARNING: could not use tmp dir '{_tmp_dir}': {_e} — using OS default")
+
     # Apply cache directory overrides from config before any cache module is used.
     # We set env vars AND patch huggingface_hub.constants in case the library was
     # already imported (constants are computed once at import time from env vars).

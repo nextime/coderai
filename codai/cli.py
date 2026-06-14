@@ -185,6 +185,16 @@ configuration directory (--config DIR, default: OS-specific CoderAI directory). 
         help=f"Configuration directory (default: {default_config})",
     )
     parser.add_argument(
+        "--tmp",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="Base directory for temporary working files (frame extraction, "
+             "upscaling, interpolation). Overrides config.tmp_dir. Use a large "
+             "volume when /tmp is small — 4x upscaling can exhaust a small /tmp "
+             "('No space left on device').",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug mode - dumps full request/response to stdout for troubleshooting",

@@ -162,7 +162,7 @@ class VideoGenerationResponse(BaseModel):
 # ── Standalone operation requests ─────────────────────────────────────────────
 
 class VideoUpscaleRequest(BaseModel):
-    model: str
+    model: Optional[str] = None         # omit → server auto-selects a configured upscaler
     video: str                          # base64/URL input video
     upscale_factor: Optional[int] = 2
     response_format: Optional[str] = "url"
@@ -182,7 +182,7 @@ class VideoSubtitleRequest(BaseModel):
 
 
 class VideoInterpolateRequest(BaseModel):
-    model: str
+    model: Optional[str] = None          # interpolation runs via RIFE/ffmpeg; model is advisory
     video: Optional[str] = None          # base64/URL input video  (mutually exclusive with init/end)
     init_image: Optional[str] = None     # first frame
     end_image: Optional[str] = None      # last frame

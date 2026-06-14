@@ -1759,28 +1759,173 @@ class ImageUpscaleRequest(BaseModel):
         extra = "allow"
 
 
+def _resolve_esrgan_weights(model_name: str):
+    """Return local weights for an (Real-)ESRGAN model id. Accepts a local .pth /
+    .safetensors file, a local directory containing one, or a Hugging Face repo id
+    (the weights are downloaded via the HF cache). diffusers-style repos ship the
+    RRDBNet weights as `diffusion_pytorch_model.safetensors` + a `config.json`, so
+    we also fetch the config alongside. Returns the weights path, or None."""
+    import os
+    if os.path.isfile(model_name) and model_name.lower().endswith(('.pth', '.safetensors')):
+        return model_name
+    if os.path.isdir(model_name):
+        cands = [f for f in sorted(os.listdir(model_name))
+                 if f.lower().endswith(('.pth', '.safetensors'))]
+        # Prefer .pth, then a full (non-fp16) safetensors.
+        cands.sort(key=lambda f: (not f.lower().endswith('.pth'), '.fp16.' in f.lower(), len(f)))
+        return os.path.join(model_name, cands[0]) if cands else None
+    # Treat as an HF repo id → find and fetch a weight file (.pth or .safetensors).
+    try:
+        from huggingface_hub import list_repo_files, hf_hub_download
+        files = list_repo_files(model_name)
+        weights = [f for f in files if f.lower().endswith(('.pth', '.safetensors'))]
+        if not weights:
+            return None
+        # Prefer: real .pth > full safetensors > fp16 safetensors; then a
+        # general-purpose x4plus over anime/x2 specialised; then shorter name.
+        def _rank(f):
+            fl = f.lower()
+            return (not fl.endswith('.pth'), '.fp16.' in fl,
+                    'anime' in fl, 'x2' in fl, len(f))
+        weights.sort(key=_rank)
+        wp = hf_hub_download(model_name, weights[0])
+        # Best-effort: co-locate config.json (diffusers repos carry the arch there).
+        if 'config.json' in files:
+            try:
+                hf_hub_download(model_name, 'config.json')
+            except Exception:
+                pass
+        return wp
+    except Exception:
+        return None
+
+
+def _esrgan_state_dict(weights_path: str):
+    """Load an (Real-)ESRGAN RRDBNet state dict from a .pth or .safetensors file,
+    unwrapping the `params_ema` / `params` container used by the original .pth
+    checkpoints (diffusers safetensors store the bare RRDBNet keys)."""
+    if weights_path.lower().endswith('.safetensors'):
+        from safetensors.torch import load_file
+        return load_file(weights_path)
+    import torch
+    loadnet = torch.load(weights_path, map_location='cpu')
+    if isinstance(loadnet, dict) and 'params_ema' in loadnet:
+        return loadnet['params_ema']
+    if isinstance(loadnet, dict) and 'params' in loadnet:
+        return loadnet['params']
+    return loadnet
+
+
+def _build_realesrgan(weights_path: str, device):
+    """Build a RealESRGANer from .pth or .safetensors weights. The RRDBNet
+    architecture + native scale come from a sibling config.json when present
+    (diffusers repos), otherwise they are inferred from the filename."""
+    import os, json, hashlib, tempfile
+    from basicsr.archs.rrdbnet_arch import RRDBNet
+    from realesrgan import RealESRGANer
+
+    num_in_ch, num_out_ch, num_feat, num_grow_ch, num_block, scale = 3, 3, 64, 32, 23, 4
+    cfg_path = os.path.join(os.path.dirname(weights_path), 'config.json')
+    cfg = None
+    if os.path.isfile(cfg_path):
+        try:
+            cfg = json.load(open(cfg_path))
+        except Exception:
+            cfg = None
+    if cfg:
+        num_in_ch = int(cfg.get('num_in_ch', num_in_ch))
+        num_out_ch = int(cfg.get('num_out_ch', num_out_ch))
+        num_feat = int(cfg.get('num_feat', num_feat))
+        num_grow_ch = int(cfg.get('num_grow_ch', num_grow_ch))
+        num_block = int(cfg.get('num_block', num_block))
+        scale = int(cfg.get('scale', scale))
+    else:
+        fn = os.path.basename(weights_path).lower()
+        if 'anime' in fn or '6b' in fn:        # RealESRGAN_x4plus_anime_6B
+            num_block, scale = 6, 4
+        elif 'x2' in fn:                        # RealESRGAN_x2plus
+            num_block, scale = 23, 2
+        else:                                   # RealESRGAN_x4plus (default)
+            num_block, scale = 23, 4
+
+    model_obj = RRDBNet(num_in_ch=num_in_ch, num_out_ch=num_out_ch, num_feat=num_feat,
+                        num_block=num_block, num_grow_ch=num_grow_ch, scale=scale)
+
+    # RealESRGANer always torch.load()s model_path; a .safetensors won't load that
+    # way, so convert once to a cached .pth wrapped as {'params_ema': sd}.
+    load_path = weights_path
+    if weights_path.lower().endswith('.safetensors'):
+        import torch
+        sd = _esrgan_state_dict(weights_path)
+        h = hashlib.sha1(os.path.abspath(weights_path).encode()).hexdigest()[:16]
+        load_path = os.path.join(tempfile.gettempdir(), f"realesrgan_{h}.pth")
+        if not os.path.isfile(load_path):
+            torch.save({'params_ema': sd}, load_path)
+
+    half = 'cuda' in str(device)
+    # tile>0 keeps VRAM bounded on large frames (no visible seams at this size).
+    return RealESRGANer(scale=scale, model_path=load_path, model=model_obj,
+                        tile=512, tile_pad=10, pre_pad=0, half=half, device=device)
+
+
+# Private cache of loaded super-resolution upscalers, keyed by resolved model id.
+# Deliberately NOT stored in multi_model_manager.models — that registry is keyed
+# by real model ids, so a synthetic 'upscale:<id>' key there makes a later
+# request_model() resolve to the bogus key and try to (re)load it.
+_UPSCALER_CACHE: dict = {}
+
+
 def _load_upscaler(model_name: str, global_args):
+    import logging
+    _log = logging.getLogger(__name__)
     device = _derive_diffusers_device(global_args)
     n = model_name.lower()
     try:
-        from diffusers import StableDiffusionUpscalePipeline
-        if 'upscal' in n or 'esrgan' in n:
-            pipe = StableDiffusionUpscalePipeline.from_pretrained(model_name)
+        import torch
+        _dtype = torch.float16 if 'cuda' in str(device) else torch.float32
+    except Exception:
+        _dtype = None
+    _kw = {} if _dtype is None else {"torch_dtype": _dtype}
+
+    # 1. Real-ESRGAN / ESRGAN — GAN super-resolution from a .pth (fast, one
+    #    forward pass per frame; ideal for video). Resolves local or HF weights.
+    if 'esrgan' in n:
+        try:
+            wp = _resolve_esrgan_weights(model_name)
+            if wp:
+                return ('realesrgan', _build_realesrgan(wp, device))
+            _log.warning("no .pth weights found for ESRGAN model '%s'", model_name)
+        except Exception as e:
+            _log.warning("Real-ESRGAN load failed for '%s': %s", model_name, e)
+
+    # 2. Latent upscaler (StableDiffusionLatentUpscalePipeline, fixed ×2).
+    if 'latent' in n and ('upscal' in n or 'x2' in n):
+        try:
+            from diffusers import StableDiffusionLatentUpscalePipeline
+            pipe = StableDiffusionLatentUpscalePipeline.from_pretrained(model_name, **_kw)
+            return ('diffusers_latent', pipe.to(device))
+        except Exception as e:
+            _log.warning("latent upscaler load failed for '%s': %s", model_name, e)
+
+    # 3. x4 SD super-res upscaler (StableDiffusionUpscalePipeline).
+    if 'upscal' in n:
+        try:
+            from diffusers import StableDiffusionUpscalePipeline
+            pipe = StableDiffusionUpscalePipeline.from_pretrained(model_name, **_kw)
             return ('diffusers', pipe.to(device))
-    except Exception:
-        pass
-    # Try basicsr / Real-ESRGAN
-    try:
-        from basicsr.archs.rrdbnet_arch import RRDBNet
-        from realesrgan import RealESRGANer
-        model_obj = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
-                            num_block=23, num_grow_ch=32, scale=4)
-        upsampler = RealESRGANer(scale=4, model_path=model_name,
-                                  model=model_obj, device=device)
-        return ('realesrgan', upsampler)
-    except Exception:
-        pass
-    # Fallback: PIL LANCZOS
+        except Exception:
+            pass
+        # Generic fallback: let diffusers pick the right pipeline class.
+        try:
+            from diffusers import DiffusionPipeline
+            pipe = DiffusionPipeline.from_pretrained(model_name, **_kw)
+            cls = type(pipe).__name__.lower()
+            kind = 'diffusers_latent' if 'latent' in cls else 'diffusers'
+            return (kind, pipe.to(device))
+        except Exception as e:
+            _log.warning("diffusers upscaler load failed for '%s': %s", model_name, e)
+
+    # Not a recognised upscaler — callers treat 'pil' as "no real model".
     return ('pil', None)
 
 
@@ -1792,6 +1937,12 @@ def _run_upscale(upscaler, image_bytes: bytes, scale: int):
     if backend == 'realesrgan':
         out_arr, _ = model.enhance(np.array(img), outscale=scale)
         return PILImage.fromarray(out_arr)
+    if backend == 'diffusers_latent':
+        # Latent upscaler: fixed ×2; needs guidance_scale=0 for an unconditioned
+        # detail-preserving upscale of an arbitrary input image.
+        result = model(prompt="", image=img, num_inference_steps=20,
+                       guidance_scale=0)
+        return result.images[0]
     if backend == 'diffusers':
         result = model(prompt="", image=img, num_inference_steps=20)
         return result.images[0]
@@ -1808,15 +1959,15 @@ async def create_image_upscale(request: ImageUpscaleRequest, http_request: Reque
     model_info = await asyncio.to_thread(
         multi_model_manager.request_model, request.model, model_type="image")
     model_name = model_info.get('model_name') or request.model
-    model_key = f"upscale:{model_name}"
-    upscaler = multi_model_manager.models.get(model_key)
+    upscaler = _UPSCALER_CACHE.get(model_name)
     if upscaler is None:
         try:
             upscaler = await asyncio.get_event_loop().run_in_executor(
                 None, _load_upscaler, model_name, global_args)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load upscaler: {e}")
-        multi_model_manager.models[model_key] = upscaler
+        if upscaler[0] != 'pil':
+            _UPSCALER_CACHE[model_name] = upscaler
     raw = base64.b64decode(request.image.split(',', 1)[-1] if ',' in request.image else request.image)
     try:
         out_img = await asyncio.get_event_loop().run_in_executor(

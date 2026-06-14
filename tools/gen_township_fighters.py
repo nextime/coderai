@@ -392,58 +392,87 @@ def _continuity_clause(env_name: str) -> str:
             "background, surfaces and crowd in every shot")
 
 FIGHT_SHOT_TEMPLATES = [
-    "landing a thudding low leg kick that buckles the opponent's lead leg, crowd erupting",
-    "launching a spinning back-kick into the body, opponent folding over the impact",
-    "exploding forward with a flying knee to the jaw, blood spraying from the nose",
-    "shooting in for a double-leg takedown and slamming the opponent to the dirt",
-    "raining down ground-and-pound from full mount, opponent's face bloodied and covering up",
-    "throwing a sharp elbow in the clinch, opening a cut over the opponent's eyebrow",
-    "snapping a high head kick that grazes the ducking opponent, sweat flying",
-    "driving knees into the body against the fence, opponent grunting and giving ground",
-    "catching a kick and countering with a takedown into side control, crowd on their feet",
-    "delivering a powerful uppercut, opponent's head snapping back, blood on the lip",
-    "sprawling out of a takedown and scrambling back up to throwing a knee",
-    "locking in a tight guillotine choke as the opponent thrashes to escape",
-    "stuffing a shot and landing a brutal knee to the head, opponent staggering",
-    "exchanging heavy hooks and overhands at close range, both fighters connecting",
-    "slipping inside and returning a slashing elbow, both fighters bloodied and still swinging",
+    "exploding forward with a brutal low leg kick that buckles the opponent's lead leg, camera tracking the impact as the crowd erupts",
+    "launching a spinning back-kick deep into the body, opponent folding over it, slow whip-pan following the spin",
+    "detonating a flying knee flush on the jaw, blood and sweat spraying, low-angle shot punching up at the violence",
+    "shooting in for a double-leg and slamming the opponent into the dirt, dust kicking up, camera dropping with the takedown",
+    "raining down savage ground-and-pound from full mount, opponent's face bloodied and turtling, tight overhead close-up",
+    "ripping a slashing elbow in the clinch that splits the brow open, blood sheeting down, hard cut to the wound",
+    "snapping a head kick that whips across the ducking opponent's skull, sweat flying, wide low-angle framing the arc",
+    "driving knee after knee into the body against the fence, opponent crumpling, handheld camera shaking with each blow",
+    "catching a kick and crashing the opponent down into side control, crowd surging, sweeping pan to the mount",
+    "uncorking a thunderous uppercut, the opponent's head snapping back, teeth and spit flying, super-slow impact frame",
+    "sprawling hard out of a shot then ripping upward with a knee to the face, fast whip up from the floor",
+    "cinching a tight guillotine as the opponent thrashes and turns purple, camera circling the desperate escape",
+    "stuffing a takedown and spiking a brutal knee to the temple, opponent collapsing, low tracking shot",
+    "trading bombs at point-blank range, both fighters splitting each other open, crowd roaring, shaky close-up",
+    "slipping inside and answering with a flying elbow, both men bloodied and still swinging, dramatic dusk backlight",
+    "stomping forward behind a vicious push kick that folds the opponent into the cars, wide establishing crane move",
+    "ripping a body-head hook combo that drops the opponent to a knee, blood on the concrete, orbiting camera",
 ]
 
 # Rotating technique focus passed one-per-clip to the prompt writer so a match
 # doesn't collapse into "all punches". The planner cycles through these (shuffled)
-# so consecutive clips emphasise different MMA disciplines — the strongest lever
-# against boxing-only monotony since the LLM otherwise gravitates to punches.
+# so consecutive clips emphasise different MMA disciplines AND camera language —
+# the strongest lever against boxing-only, static-shot monotony.
 FIGHT_ACTION_FOCUS = [
-    "a kicking exchange (low leg kicks, body kicks, high kicks or push kicks)",
-    "knees and elbows in a tight clinch against the wall or fence",
-    "a takedown, slam or throw driving the fight to the ground",
-    "ground-and-pound or a scramble for position on the floor",
-    "a submission attempt (choke, armbar or guillotine) and the escape",
-    "a spinning or flying technique (spinning back-kick, spinning elbow, flying knee)",
-    "fast boxing combinations mixed with head movement and counters",
-    "a defensive sequence — sprawl, slip and counter back to offence",
+    "a brutal kicking exchange (low leg kicks, body kicks, head kicks, push kicks) — shoot it with a low tracking angle following the strikes",
+    "knees and elbows tearing flesh in a tight clinch against the wall or fence — tight handheld close-up on the impacts",
+    "a violent takedown, slam or throw driving the fight to the ground — drop the camera with the slam",
+    "merciless ground-and-pound or a desperate scramble on the floor — overhead and over-shoulder coverage",
+    "a fight-ending submission attempt (choke, armbar, guillotine) and the frantic escape — slow orbit around the lock",
+    "an explosive spinning or flying technique (spinning back-kick, spinning elbow, flying knee) — whip-pan that follows the rotation",
+    "blistering boxing combinations with head movement and brutal counters — fast push-in on the cleanest shots",
+    "a defensive sequence — sprawl, slip, then a savage counter back to offence — reverse-angle reveal of the counter",
 ]
 
-WIN_SHOT_TEMPLATES = {
+# The decisive FINISH that ends the bout — the first clip of every outcome video.
+# Keyed by outcome; the victory celebration is in WIN_SHOT_TEMPLATES.
+FINISH_SHOT_TEMPLATES = {
     "win": [
-        "raising both fists to the sky in victory, crowd surging forward, referee holding hand up",
-        "falling to knees in triumph, tears of joy, cornerman rushing in to celebrate",
-        "pointing to the crowd with a wide grin, sweat and blood on face, victorious",
+        "unloading a final overwhelming flurry, the opponent reeling against the ropes as the bell saves them",
+        "pinning the exhausted opponent down with relentless ground-and-pound until the final horn",
+        "landing the last clean, dominant combination that seals the decision, opponent backpedalling",
     ],
     "ko_win": [
-        "standing over knocked-out opponent, arms raised, crowd going absolutely wild",
-        "walking to neutral corner after the finish, calm and dominant, referee waving it off",
-        "roaring at the crowd with fist raised as opponent lies motionless behind them",
+        "detonating one final brutal knockout blow, the opponent going stiff and crashing face-first to the ground",
+        "catching the opponent flush with a head kick that drops them unconscious, body folding to the dirt",
+        "finishing with a thunderous flying knee, the opponent collapsing in a heap as the crowd gasps",
     ],
     "retire": [
-        "sitting slumped on corner stool, trainer applying ice pack, head bowed in defeat",
-        "being helped to corner by trainer, unable to continue, crowd respectfully quiet",
-        "shaking head slowly as trainer calls it off, emotional moment, cornerman embracing",
+        "battering the opponent until they turn away and wave it off, unable to continue, sinking to a knee",
+        "breaking the opponent's will with a savage body assault, their corner hurling in the towel",
+        "overwhelming the opponent who signals surrender and slumps, beaten, against the fence",
     ],
     "draw": [
-        "both fighters standing exhausted side by side, referee raising both hands simultaneously",
-        "two fighters embracing grudgingly, both bloodied, respect after a brutal even contest",
-        "both men looking at each other with grudging respect as announcer reads split decision",
+        "both fighters trading their last savage blows to the final second, bloodied, exhausted, neither giving an inch",
+        "a furious final exchange of hooks and knees, both men staggering but still swinging at the horn",
+        "two spent warriors emptying the tank in a brutal last flurry as the bell ends an even war",
+    ],
+}
+
+# The VICTORY / decision moment — the SECOND clip of every outcome video:
+# the winning fighter and the referee raising their arm.
+WIN_SHOT_TEMPLATES = {
+    "win": [
+        "the referee grabbing the winner's wrist and thrusting their arm to the sky as the crowd surges forward",
+        "the victor dropping to their knees then rising as the referee lifts their arm, sweat and blood glistening",
+        "the winner pointing to the roaring crowd before the referee hoists their arm high in triumph",
+    ],
+    "ko_win": [
+        "standing over the knocked-out opponent, arms thrown up, referee waving it off then raising the winner's arm, crowd going wild",
+        "roaring at the crowd with both fists up as the referee lifts the victor's arm over the motionless opponent",
+        "the winner climbing the fence in triumph then dropping down as the referee raises their arm",
+    ],
+    "retire": [
+        "the referee raising the winner's arm in victory while the beaten opponent's corner consoles them",
+        "the victor calmly raising a bloodied fist as the referee lifts their arm and the crowd applauds",
+        "the winner bowing to the crowd before the referee hoists their arm, the retired opponent slumped behind",
+    ],
+    "draw": [
+        "the referee stepping between both fighters and raising BOTH their arms simultaneously, both bloodied and spent",
+        "the two exhausted warriors clasping hands as the referee lifts both their arms, crowd applauding the war",
+        "both men nodding in grudging respect as the referee raises both their arms to a roaring crowd",
     ],
 }
 
@@ -467,6 +496,8 @@ def prompts_config_snapshot() -> dict:
         "fight_shot_templates": list(m.FIGHT_SHOT_TEMPLATES),
         "win_shot_templates": {k: list(m.WIN_SHOT_TEMPLATES.get(k, []))
                                for k in _PROMPT_OUTCOMES},
+        "finish_shot_templates": {k: list(m.FINISH_SHOT_TEMPLATES.get(k, []))
+                                  for k in _PROMPT_OUTCOMES},
     }
 
 
@@ -494,6 +525,15 @@ def apply_prompts_config(cfg: dict) -> None:
                 if cleaned:
                     merged[k] = cleaned
         m.WIN_SHOT_TEMPLATES = merged
+    fnt = cfg.get("finish_shot_templates")
+    if isinstance(fnt, dict):
+        merged = {k: list(v) for k, v in m.FINISH_SHOT_TEMPLATES.items()}
+        for k in _PROMPT_OUTCOMES:
+            if isinstance(fnt.get(k), list):
+                cleaned = [str(s).strip() for s in fnt[k] if str(s).strip()]
+                if cleaned:
+                    merged[k] = cleaned
+        m.FINISH_SHOT_TEMPLATES = merged
 
 
 def _prompts_config_path(out_dir) -> Path:
@@ -859,11 +899,16 @@ class CoderAIClient:
 
     def upscale_video(self, video_bytes: bytes, factor: int = 2,
                       model: str = None) -> bytes:
-        """POST to /v1/video/upscale and return the upscaled video bytes."""
+        """POST to /v1/video/upscale and return the upscaled video bytes.
+
+        Requests `response_format=url` so the (large, super-resolved) result is
+        saved server-side and streamed back over a plain HTTP GET instead of being
+        base64-inflated into the JSON body. The server falls back to b64 when it
+        has no file path configured; _video_bytes handles both."""
         body = {
             "video": "data:video/mp4;base64," + base64.b64encode(video_bytes).decode(),
             "upscale_factor": factor,
-            "response_format": "b64_mp4",
+            "response_format": "url",
         }
         if model:
             body["model"] = model
@@ -871,11 +916,14 @@ class CoderAIClient:
 
     def interpolate_video(self, video_bytes: bytes, fps_multiplier: int = 2,
                           model: str = None) -> bytes:
-        """POST to /v1/video/interpolate and return the interpolated video bytes."""
+        """POST to /v1/video/interpolate and return the interpolated video bytes.
+
+        Uses `response_format=url` (streamed GET) for the large result; see
+        upscale_video. Falls back to b64 transparently."""
         body = {
             "video": "data:video/mp4;base64," + base64.b64encode(video_bytes).decode(),
             "fps_multiplier": fps_multiplier,
-            "response_format": "b64_mp4",
+            "response_format": "url",
         }
         if model:
             body["model"] = model
@@ -943,9 +991,9 @@ class CoderAIClient:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _LLM_SYSTEM = """\
-You are a creative director writing vivid video-generation prompts for African street fighting scenes.
-Each prompt must be ONE sentence, 15-35 words, cinematic and specific.
-Emphasize FAST, continuous, explosive motion — describe action mid-movement, never static, posed, or \
+You are a creative director writing vivid, BRUTAL video-generation prompts for African street fighting scenes.
+Each prompt must be ONE sentence, 18-38 words, cinematic, specific and full of action.
+Emphasize FAST, continuous, explosive, savage motion — describe action mid-movement, never static, posed, or \
 slow-motion. The motion must PROGRESS FORWARD in one direction through the clip: no reversing, no \
 rewinding, no looping back to the starting pose, no boomerang or back-and-forth motion.
 This is a full MMA / no-rules street fight, NOT boxing — do NOT default to only punches. Across clips \
@@ -954,11 +1002,14 @@ kicks, spinning back-kicks, flying knees, knees in the clinch, elbow strikes, ta
 sprawls, ground-and-pound, mount and guard scrambles, chokes and submission attempts, throws, \
 shoulder charges and dirty street-fighting. Each prompt should center on a DIFFERENT technique than \
 the recent ones — favour kicks, knees, elbows, grappling and ground work over plain punches.
-Make it gritty and visceral: it is fine and encouraged to SOMETIMES (not every clip) show blood — a \
-bloodied nose or lip, a cut over the eye, blood spray or sweat-and-blood on the face — when a hard \
-blow lands.
-Vary camera angles (close-up, wide, low angle, over-shoulder), lighting (dusk, generator light, \
-noon sun, spotlight).
+Make it gritty, visceral and BRUTAL: it is encouraged to OFTEN (but not every clip) show the damage — a \
+bloodied nose or lip, a split brow, blood spray, sweat-and-blood on the face, a stagger or knockdown — \
+when a hard blow lands.
+ALWAYS specify CAMERA WORK in the prompt: describe the camera move and angle — a low tracking shot, a \
+fast whip-pan following a spin, a tight handheld close-up shaking on impact, an overhead ground shot, \
+an over-the-shoulder angle, a slow orbit around a submission, a crane/wide establishing move, or a \
+dramatic push-in on the cleanest strike. The camera should feel kinetic and dynamic, never locked off.
+Vary lighting (dusk, generator light, noon sun, harsh spotlight, headlights, fire-barrel glow).
 Always refer to each fighter by their NAME (given in the user message), not only by their description.
 WARDROBE CONTINUITY (critical): every clip of a match — and every chained part within a clip, plus the \
 outcome clips — must show each fighter in the IDENTICAL outfit: the same garments, exact same colours, \
@@ -971,10 +1022,18 @@ every time; never move the fight to a different setting between clips or outcome
 Do NOT use generic phrases like "high quality" or "realistic". Return ONLY the prompt, no quotes."""
 
 _LLM_OUTCOME_SYSTEM = """\
-You are a creative director writing vivid 15-25 word video-generation prompts for fight outcome moments.
-Be specific about body language, expression, lighting, and atmosphere.
-Refer to the fighter by their NAME (given in the user message).
-WARDROBE + LOCATION CONTINUITY (critical): the outcome happens in the SAME match — keep the fighter in \
+You are a creative director writing vivid 18-30 word video-generation prompts for the END of a brutal fight.
+An outcome video is made of TWO consecutive shots and you write ONE of them at a time (the user tells you which):
+  • the FINISH — the last decisive action that ENDS the fight: the knockout blow landing and the loser \
+crashing down, the fight-ending submission, the final overwhelming flurry, or the beaten fighter / their \
+corner signalling they cannot continue. Describe FORWARD, explosive, savage motion, with dynamic camera \
+work (low angle, whip-pan, handheld push-in) — this is the climax, make it hit hard.
+  • the VICTORY — immediately after: the WINNING fighter and the REFEREE raising the winner's arm in \
+victory (for a draw, the referee raises BOTH fighters' arms). Show triumph, exhaustion, the roaring crowd, \
+and the referee's raised-arm gesture explicitly, with a celebratory camera move (push-in, crane, orbit).
+Be specific about body language, expression, lighting, atmosphere and CAMERA movement.
+Refer to fighters by their NAME (given in the user message).
+WARDROBE + LOCATION CONTINUITY (critical): the outcome happens in the SAME match — keep each fighter in \
 the IDENTICAL outfit (same garments, exact colours, hair, accessories) described, and in the SAME \
 location as the fight, with consistent background, surfaces and lighting. Never change clothing or move \
 to a different place.
@@ -1058,33 +1117,54 @@ class PromptGenerator:
         self._used_fight.append(choice)
         return choice
 
-    def outcome_shot(self, fighter: str, outcome: str, env_desc: str) -> str:
-        """Generate a unique outcome shot prompt."""
-        templates = WIN_SHOT_TEMPLATES.get(outcome, WIN_SHOT_TEMPLATES["win"])
-        used = self._used_outcome.setdefault(outcome, [])
+    def outcome_shot(self, fighter: str, outcome: str, env_desc: str,
+                     role: str = "finish", opponent: str = None) -> str:
+        """Generate a unique outcome shot prompt for one clip of an outcome video.
+
+        `role` selects which of the two outcome clips this is:
+          • "finish" / "final_exchange" → the decisive fight-ending action.
+          • "victory" / "draw_decision" → the winner + referee raising the arm.
+        `opponent` is the other fighter's name, woven into the description so the
+        finish/celebration reads as a real two-fighter moment.
+        """
+        is_finish = role in ("finish", "final_exchange")
+        src = FINISH_SHOT_TEMPLATES if is_finish else WIN_SHOT_TEMPLATES
+        templates = src.get(outcome, src["win"])
+        used = self._used_outcome.setdefault(f"{outcome}:{role}", [])
+        opp = opponent or "the opponent"
 
         if self.model:
-            outcome_labels = {
-                "win": "winning by decision — arm raised by referee",
-                "ko_win": "winning by knockout — opponent is down",
-                "retire": "losing — corner retiring them from the bout",
-                "draw": "both fighters in a draw — referee raises both hands",
+            finish_labels = {
+                "win": f"the FINISH — {fighter} ending the bout with a final overwhelming flurry as {opp} is overwhelmed",
+                "ko_win": f"the FINISH — {fighter} landing the brutal knockout blow that drops {opp} unconscious to the ground",
+                "retire": f"the FINISH — {fighter} battering {opp} until {opp} or their corner signals they cannot continue",
+                "draw": f"the FINISH — a final all-out exchange where {fighter} and {opp} trade brutal blows to the last second",
             }
+            victory_labels = {
+                "win": f"the VICTORY — the referee raising {fighter}'s arm as the winner over a beaten {opp}",
+                "ko_win": f"the VICTORY — {fighter} celebrating over the knocked-out {opp} as the referee raises {fighter}'s arm",
+                "retire": f"the VICTORY — the referee raising {fighter}'s arm in victory while {opp}'s corner consoles them",
+                "draw": f"the VICTORY — the referee raising BOTH {fighter}'s and {opp}'s arms after an even, brutal war",
+            }
+            labels = finish_labels if is_finish else victory_labels
             _avoid = used[-2:]
             for attempt in range(2):
                 try:
                     used_hint = f" Avoid: {'; '.join(_avoid)}." if _avoid else ""
                     _df = self.char_descriptions.get(fighter, "")
                     f_desc = f"{fighter} ({_df})" if _df else fighter
+                    _do = self.char_descriptions.get(opponent or "", "")
+                    o_desc = f"{opponent} ({_do})" if (opponent and _do) else (opponent or "")
+                    opp_line = f"Opponent: {o_desc}. " if o_desc else ""
                     prompt = self.client.chat_complete(
                         model=self.model,
                         system=_LLM_OUTCOME_SYSTEM,
                         user=(
-                            f"Fighter: {f_desc}. Outcome: {outcome_labels.get(outcome, outcome)}. "
-                            f"Location: {env_desc}.{used_hint} Write one outcome moment prompt. "
-                            "Refer to the fighter by their NAME."
+                            f"Fighter: {f_desc}. {opp_line}Shot to write: {labels.get(outcome, outcome)}. "
+                            f"Location: {env_desc}.{used_hint} Write this ONE outcome shot prompt. "
+                            "Refer to the fighters by their NAME and include dynamic camera work."
                         ),
-                        max_tokens=100,
+                        max_tokens=110,
                     ).strip()
                     if len(prompt) < 8:
                         raise ValueError(f"LLM returned too-short response: {prompt!r}")
@@ -1533,6 +1613,191 @@ def _build_char_outfits(out_dir: Path) -> dict:
     return outfits
 
 
+# Fighter profiles name a garment but rarely a COLOUR ("boxing singlet", "MMA
+# shorts"), and some name no recognisable garment at all ("free fighting attire").
+# Without an explicit, fixed colour the image model invents a new one for every
+# keyframe, so a fighter's kit changes shot to shot. We therefore lock a
+# deterministic colour per fighter (stable hash of the name) and a default
+# garment, persisted to wardrobe.json so it stays identical across a whole match
+# AND is editable by the user.
+_OUTFIT_COLORS = [
+    "crimson red", "royal blue", "emerald green", "golden yellow",
+    "black and white", "burnt orange", "deep purple", "teal",
+    "scarlet and black", "navy blue", "maroon", "forest green",
+    "bright red", "electric blue", "lime green", "charcoal grey",
+]
+_COLOR_WORDS = {
+    "red", "blue", "green", "yellow", "orange", "purple", "black", "white",
+    "teal", "maroon", "navy", "crimson", "scarlet", "gold", "golden", "silver",
+    "grey", "gray", "pink", "brown", "violet", "indigo", "turquoise", "cyan",
+    "magenta", "lime", "olive", "beige", "tan", "khaki",
+}
+_DEFAULT_GARMENT = "fight shorts"  # when the profile names no recognisable garment
+# Every word used in a palette colour, so _strip_colors removes the whole phrase
+# (incl. modifiers like 'royal'/'emerald'/'charcoal' that aren't standalone colour
+# words) and a reshuffle can't leave a stray modifier behind.
+_PALETTE_TOKENS = {t for c in _OUTFIT_COLORS for t in c.lower().split()}
+
+
+def _has_color(text: str) -> bool:
+    tl = (text or "").lower()
+    return any(w in tl.split() or w in tl for w in _COLOR_WORDS)
+
+
+def _color_for(name: str) -> str:
+    """Deterministic colour for a fighter so an un-coloured garment is rendered
+    in the SAME colour in every keyframe (no shot-to-shot drift)."""
+    import hashlib
+    h = int(hashlib.md5((name or "").encode("utf-8")).hexdigest(), 16)
+    return _OUTFIT_COLORS[h % len(_OUTFIT_COLORS)]
+
+
+def _distinct_color(name: str, used: set) -> str:
+    """A fighter's locked colour, preferring its deterministic hash colour but
+    walking to the next FREE palette colour when that one is already taken — so no
+    two fighters share a colour (up to the palette size). Distinct colours matter
+    because two fighters share one keyframe; identical colours invite the image
+    model to swap/blend their kits."""
+    pref = _color_for(name)
+    start = _OUTFIT_COLORS.index(pref) if pref in _OUTFIT_COLORS else 0
+    n = len(_OUTFIT_COLORS)
+    for k in range(n):
+        c = _OUTFIT_COLORS[(start + k) % n]
+        if c not in used:
+            return c
+    return pref  # palette exhausted — accept a repeat
+
+
+def _canonical_outfit(name: str, profile_text: str, used: set = None) -> str:
+    """A fighter's locked outfit phrase, always with a colour. Uses the garment
+    extracted from the profile (or a default), and prepends a colour when none is
+    stated — a distinct one when `used` (already-assigned colours) is given."""
+    garment = _extract_outfit(profile_text) or _DEFAULT_GARMENT
+    if not _has_color(garment):
+        color = _distinct_color(name, used) if used is not None else _color_for(name)
+        garment = f"{color} {garment}"
+    return garment
+
+
+def _load_wardrobe(out_dir: Path) -> dict:
+    """Canonical {name: outfit} with colours locked, persisted to wardrobe.json so
+    every keyframe of a match dresses each fighter identically — and the user can
+    edit it. Built from fighter profiles on first use; newly-seen fighters are
+    merged in without overwriting existing (possibly user-edited) entries. New
+    fighters are given a colour distinct from those already assigned."""
+    wf = out_dir / "wardrobe.json"
+    saved = {}
+    if wf.exists():
+        try:
+            saved = json.loads(wf.read_text())
+        except Exception:
+            saved = {}
+    merged = dict(saved)
+    # Colours already in use (from existing/edited entries) so freshly-added
+    # fighters pick a different one.
+    used = {c for c in _OUTFIT_COLORS
+            for v in merged.values() if c in str(v or "").lower()}
+    # All known fighters: built-in pool + locally saved characters.
+    sources = {f["name"]: f.get("prompt", "") for f in FIGHTER_POOL}
+    chars_dir = out_dir / "characters"
+    if chars_dir.exists():
+        for d in chars_dir.iterdir():
+            mp = d / "meta.json"
+            if mp.exists():
+                try:
+                    meta = json.loads(mp.read_text())
+                    sources[d.name] = meta.get("prompt", "") or meta.get("description", "")
+                except Exception:
+                    pass
+    # Deterministic order so colour assignment is stable across runs.
+    for nm in sorted(sources):
+        if nm not in merged or not str(merged.get(nm) or "").strip():
+            outfit = _canonical_outfit(nm, sources[nm], used)
+            merged[nm] = outfit
+            for c in _OUTFIT_COLORS:
+                if c in outfit.lower():
+                    used.add(c)
+                    break
+    if merged != saved:
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            wf.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n")
+        except Exception:
+            pass
+    return merged
+
+
+def _save_wardrobe(out_dir: Path, wardrobe: dict) -> None:
+    """Persist a {name: outfit} wardrobe map to wardrobe.json (UI editor save)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    clean = {str(k): str(v).strip() for k, v in (wardrobe or {}).items()
+             if str(v).strip()}
+    (out_dir / "wardrobe.json").write_text(
+        json.dumps(clean, indent=2, sort_keys=True) + "\n")
+
+
+def _strip_colors(text: str) -> str:
+    """Drop colour words (and the connector 'and') from an outfit phrase, leaving
+    just the garment, e.g. 'black and white fight shorts' → 'fight shorts'. Strips
+    every token used in the palette too (e.g. 'royal', 'emerald', 'charcoal') so a
+    reshuffle doesn't leave a stray colour modifier behind."""
+    drop = _COLOR_WORDS | _PALETTE_TOKENS | {"and"}
+    toks = [t for t in str(text or "").split() if t.lower() not in drop]
+    return " ".join(toks).strip()
+
+
+def _reshuffle_wardrobe(out_dir: Path) -> dict:
+    """Reassign a DISTINCT colour to every fighter while keeping each one's garment.
+    Fixes colour clashes (two fighters sharing a colour) in one click; overwrites
+    manually-set colours but preserves garments."""
+    w = _load_wardrobe(out_dir)
+    used, new = set(), {}
+    for nm in sorted(w):
+        garment = _strip_colors(w[nm]) or _DEFAULT_GARMENT
+        color = _distinct_color(nm, used)
+        used.add(color)
+        new[nm] = f"{color} {garment}".strip()
+    _save_wardrobe(out_dir, new)
+    return new
+
+
+def _compose_kf_prompt(base_prompt: str, fighters: list, env: str,
+                       env_desc: str, outfits: dict) -> str:
+    """Build the keyframe image prompt from a clip/outcome's base prompt:
+    a wardrobe lead with locked colours (so clothing stays consistent) plus an
+    explicit environment clause using the FULL env description (not just the bare
+    name), so the still actually lands in the right location.
+
+    With TWO fighters in one frame the image model is prone to attribute leakage —
+    painting fighter A's colour onto fighter B. We therefore (a) state each
+    fighter's outfit up front, (b) restate the colour→fighter binding at the end,
+    and (c) explicitly say the two kits are DIFFERENT colours and must not be
+    swapped. We deliberately avoid the phrase "same colours" on a single still:
+    it reads as "both fighters the same colour" and causes the very bleed we want
+    to prevent (per-keyframe colour stability comes from reusing the SAME locked
+    wardrobe string everywhere, not from telling the model "same")."""
+    kf = base_prompt or ""
+    worn = [(n, outfits[n]) for n in fighters if outfits.get(n)]
+    if worn:
+        wardrobe = "; ".join(f"{n} wearing {o}" for n, o in worn)
+        if len(worn) >= 2:
+            binding = ("; ".join(f"{n}'s outfit is {o}" for n, o in worn[:2]))
+            tail = f" — {binding}; "
+            # Only claim "different colours" when they ACTUALLY differ (two fighters
+            # sharing a locked colour is a wardrobe.json clash the user can fix).
+            if worn[0][1].strip().lower() != worn[1][1].strip().lower():
+                tail += ("the two fighters wear clearly different colours, ")
+            tail += ("keep each fighter's outfit colour bound to that fighter, "
+                     "do not swap, mix or blend their colours")
+        else:
+            tail = f" — keep {worn[0][0]}'s exact outfit and colour ({worn[0][1]})"
+        kf = f"{wardrobe}. {kf}{tail}"
+    loc = (env_desc or "").strip() or (f"{env} location" if env else "")
+    if loc:
+        kf = f"[location: {loc}] " + kf
+    return kf
+
+
 _VALID_CONSISTENCY = {"prompt", "ipadapter", "keyframe", "lora"}
 
 
@@ -1555,6 +1820,7 @@ def parse_consistency(spec: str) -> set:
 # port is preserved). --save / --config / --cli-mode are deliberately excluded.
 CONFIG_FIELDS = [
     "base_url", "api_key", "image_model", "video_model", "text_model",
+    "upscale_model", "upscale_model_2x", "upscale_model_4x",
     "no_llm", "out_dir", "fps", "playback_fps", "clip_delay", "region", "include_female",
     "skip_characters", "reuse_fighters", "fighters", "num_fighters", "char_refs",
     "skip_environments", "reuse_environments", "environments", "num_environments", "env_refs",
@@ -1662,6 +1928,25 @@ def _reassemble_finals(video_dir: Path, match_name: str,
     return len(clips)
 
 
+def _upscale_model_for(obj, factor) -> str:
+    """Pick the configured upscale model for a given factor (2 or 4).
+
+    Looks up the factor-specific field (`upscale_model_2x` / `upscale_model_4x`),
+    falling back to the generic `upscale_model`, then to '' (→ the server
+    auto-selects a configured upscaler). `obj` may be an argparse Namespace or a
+    dict (config)."""
+    def _g(name):
+        if isinstance(obj, dict):
+            return obj.get(name)
+        return getattr(obj, name, None)
+    try:
+        f = int(factor)
+    except Exception:
+        f = 0
+    specific = _g(f"upscale_model_{f}x") if f in (2, 4) else None
+    return ((specific or _g("upscale_model") or "")).strip()
+
+
 def _enhance_suffix(upscale: int, fps_mult: int) -> str:
     """Filename suffix describing the enhancement, e.g. '_2x', '_3xfps', '_2x_2xfps'."""
     parts = []
@@ -1672,25 +1957,127 @@ def _enhance_suffix(upscale: int, fps_mult: int) -> str:
     return ("_" + "_".join(parts)) if parts else ""
 
 
-def _enhance_video_file(client, model: str, src: Path,
-                        upscale: int = 0, fps_mult: int = 0) -> Optional[Path]:
+def _video_variants(p: Path) -> list:
+    """Return [(label, Path)] for a base video: the original first, then any
+    enhanced siblings (`<stem>_2x.mp4`, `<stem>_2x_2xfps.mp4`, `<stem>_3xfps.mp4`,
+    …) produced by the post-process enhancer. Labels are human-readable, e.g.
+    'original', '2× upscaled', '2× + 2×fps'. Non-enhancement siblings are
+    ignored. Sorted by an 'enhancement weight' so richer variants come later."""
+    import re as _re
+    out = [("original", p, 0)]
+    stem = p.stem
+    for sib in p.parent.glob(f"{stem}_*{p.suffix}"):
+        if sib == p:
+            continue
+        suf = sib.stem[len(stem) + 1:]
+        toks = suf.split("_")
+        if not toks or not all(_re.fullmatch(r"\d+x(fps)?", t) for t in toks):
+            continue
+        weight, labels = 0, []
+        for t in toks:
+            n = int(_re.match(r"\d+", t).group())
+            if t.endswith("xfps"):
+                labels.append(f"{n}×fps"); weight += n
+            else:
+                labels.append(f"{n}× upscaled"); weight += n * 10
+        out.append((" + ".join(labels), sib, weight))
+    out.sort(key=lambda t: t[2])
+    return [(lbl, pth) for (lbl, pth, _w) in out]
+
+
+def _op_with_progress(client, phases, blocking_call, progress_cb=None) -> bytes:
+    """Run `blocking_call()` while polling CoderAI's /v1/video/progress in a
+    background thread, feeding `progress_cb(cur, total, it_per_s, phase)` live
+    frame progress whenever the server's phase is one of `phases`. The callback's
+    4th arg (phase) is optional for back-compat with 3-arg callbacks."""
+    if not progress_cb:
+        return blocking_call()
+    import threading, inspect
+    try:
+        _nargs = len(inspect.signature(progress_cb).parameters)
+    except (TypeError, ValueError):
+        _nargs = 3
+    stop = threading.Event()
+
+    def _emit(cur, total, ips, phase):
+        try:
+            if _nargs >= 4:
+                progress_cb(cur, total, ips, phase)
+            else:
+                progress_cb(cur, total, ips)
+        except Exception:
+            pass
+
+    def _poll():
+        last = -1
+        while not stop.is_set():
+            try:
+                pr = client.video_progress()
+            except Exception:
+                pr = {}
+            if pr.get("phase") in phases and pr.get("total"):
+                cur = pr.get("current", 0)
+                if cur != last:
+                    last = cur
+                    _emit(cur, pr.get("total", 0), pr.get("it_per_s", 0), pr.get("phase"))
+            stop.wait(0.4)
+
+    t = threading.Thread(target=_poll, daemon=True)
+    t.start()
+    try:
+        return blocking_call()
+    finally:
+        stop.set()
+        t.join(timeout=1)
+
+
+def _upscale_with_progress(client, data: bytes, factor: int, model,
+                           progress_cb=None) -> bytes:
+    """Upscale while streaming per-frame progress (phase 'upscaling')."""
+    return _op_with_progress(client, ("upscaling",),
+                             lambda: client.upscale_video(data, factor, model),
+                             progress_cb)
+
+
+def _interpolate_with_progress(client, data: bytes, fps_mult: int,
+                               progress_cb=None) -> bytes:
+    """Raise FPS while streaming progress (phase 'interpolating'). RIFE if the
+    server has it, else ffmpeg minterpolate — both now report frame progress."""
+    return _op_with_progress(client, ("interpolating",),
+                             lambda: client.interpolate_video(data, fps_mult, None),
+                             progress_cb)
+
+
+def _enhance_video_file(client, upscale_model: str, src: Path,
+                        upscale: int = 0, fps_mult: int = 0,
+                        force: bool = False, progress_cb=None) -> Optional[Path]:
     """Upscale (2x/4x) and/or raise FPS of one video, writing a NEW file alongside
     the original (e.g. match_short_2x_2xfps.mp4). Returns the new path, or None if
-    nothing to do. Skips re-doing an already-enhanced output that is newer."""
+    nothing to do. Skips re-doing an already-enhanced output that is newer —
+    unless `force` is set, which always re-enhances from the ORIGINAL `src`
+    (overwriting the existing enhanced file).
+
+    Upscaling is a real AI super-resolution op on CoderAI. `upscale_model` is
+    optional: when blank, CoderAI auto-selects a configured AI upscaler (e.g.
+    Real-ESRGAN). There is no CPU/ffmpeg fallback — if nothing is configured the
+    server returns an error. Frame interpolation uses CoderAI's RIFE neural
+    interpolator."""
     suffix = _enhance_suffix(upscale, fps_mult)
     if not suffix:
         return None
     out = src.with_name(src.stem + suffix + src.suffix)
-    if out.exists() and out.stat().st_mtime >= src.stat().st_mtime:
+    if not force and out.exists() and out.stat().st_mtime >= src.stat().st_mtime:
         _log(f"    ↻ already enhanced: {out.name}")
         return out
     data = src.read_bytes()
     if upscale in (2, 4):
-        _log(f"    ⬆ upscaling {src.name} ×{upscale}…")
-        data = client.upscale_video(data, upscale, model)
+        um = (upscale_model or "").strip() or None
+        _log(f"    ⬆ upscaling {src.name} ×{upscale}"
+             f"{(' via ' + um) if um else ' (CoderAI auto-select)'}…")
+        data = _upscale_with_progress(client, data, upscale, um, progress_cb)
     if fps_mult and fps_mult > 1:
         _log(f"    ⏩ raising FPS of {src.name} ×{fps_mult}…")
-        data = client.interpolate_video(data, fps_mult, model)
+        data = _interpolate_with_progress(client, data, fps_mult, progress_cb)
     out.write_bytes(data)
     _log(f"    ✓ enhanced → {out.name}  ({get_video_duration(str(out)):.1f}s)")
     return out
@@ -1707,6 +2094,50 @@ def _clip_stem_outcome(fighter: str, outcome: str, match_name: str = None) -> st
     if match_name:
         return f"{match_name}_{fighter}_{outcome}"
     return f"{fighter}_{outcome}"
+
+
+def _outcome_segments_spec(outcome: str):
+    """The clips that compose an outcome VIDEO and how the frame budget splits.
+
+    Every outcome is a two-shot sequence: the decisive finish first, then the
+    referee raising the winner's arm. Returns [(role, frame_fraction), ...]."""
+    if outcome == "draw":
+        return [("final_exchange", 0.55), ("draw_decision", 0.45)]
+    return [("finish", 0.6), ("victory", 0.4)]
+
+
+def _plan_outcome_shots(prompter, o: dict, char_descriptions: dict,
+                        opponent: str = None) -> None:
+    """(Re)generate the multi-clip `shots` for one outcome entry in place.
+
+    Each outcome video is assembled from a decisive FINISH clip (how the match
+    ends — KO, retirement, the last action) followed by a VICTORY clip (the
+    winner + referee raising their arm; both arms for a draw). The total frame
+    budget (`o['nf']`) is split across the clips per _outcome_segments_spec.
+
+    For back-compat, o['shot'] / o['prompt'] mirror the FIRST (finish) clip —
+    they still feed the outcome keyframe and the editable prompt shown in the UI.
+    """
+    opponent = opponent or o.get("opponent")
+    spec = _outcome_segments_spec(o.get("outcome", "win"))
+    total = int(o.get("nf") or 0) or 48
+    f_hint = _fighter_desc_hint(o.get("fighter", ""), char_descriptions)
+    cont = _continuity_clause(o.get("env"))
+    shots, allocated = [], 0
+    for i, (role, frac) in enumerate(spec):
+        nf = (total - allocated) if i == len(spec) - 1 else max(8, int(round(total * frac)))
+        allocated += nf
+        shot = prompter.outcome_shot(o["fighter"], o["outcome"],
+                                     o.get("env_desc") or "", role=role,
+                                     opponent=opponent)
+        prompt = (f"{f_hint} — {shot} — {cont} "
+                  "— African township fight, cinematic, dynamic camera, brutal")
+        shots.append({"role": role, "shot": shot, "prompt": prompt, "nf": int(nf)})
+    o["shots"] = shots
+    if opponent:
+        o["opponent"] = opponent
+    o["shot"] = shots[0]["shot"]
+    o["prompt"] = shots[0]["prompt"]
 
 
 def _model_slug(model_id: str) -> str:
@@ -2045,14 +2476,17 @@ def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: P
                         lora_map: dict, char_strength: float, keyframe_steps: int,
                         keyframe_size: str, lora_weight: float,
                         env_lora_map: dict = None, env_lora_weight: float = 0.8,
-                        kf_cb=None):
+                        kf_cb=None, cancel_check=None):
     """Generate one keyframe still per clip (image model). Saved as PNG keyed by
     the clip's output stem so the render phase can pick them up as init images.
     Resumable: existing PNGs are kept.
 
     kf_cb(stem, phase, ok) — optional; fired so callers (the web match-render job)
     can show per-image progress. phase is "start" (this keyframe begins) or "end"
-    (finished, ok=True/False); a reused/existing PNG fires "end" with ok=True."""
+    (finished, ok=True/False); a reused/existing PNG fires "end" with ok=True.
+
+    cancel_check() — optional; polled before each keyframe. When it returns true the
+    run stops gracefully (keyframes already written are kept)."""
     def _kf(stem, phase, ok=None):
         if kf_cb:
             try:
@@ -2067,39 +2501,58 @@ def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: P
     # clothes instead of drifting — the keyframe then anchors the I2V clip, so
     # this is the strongest lever for wardrobe consistency.
     _out_dir = keyframe_dir.parent.parent
-    _outfits = _build_char_outfits(_out_dir)
+    _outfits = _load_wardrobe(_out_dir)
 
     # Map match_name -> [f1, f2] so an outcome keyframe attaches BOTH match
     # fighters' LoRAs (+ env), like the clips do — not just the single fighter
     # the scene is named after. Read the saved plan too, so a single-outcome
     # regen (fight_plan == []) can still resolve the pair.
-    _mf_map = {}
+    # Also map match_name -> (env, env_desc) so an outcome keyframe uses the
+    # MATCH's current location, not a stale snapshot stored on the outcome entry
+    # (the two diverge when the match env is changed in the UI — the match is
+    # updated but the outcome entries are not). The match is authoritative.
+    _mf_map, _menv_map = {}, {}
     for m in fight_plan:
         _mf_map[m.get("match_name")] = [x for x in (m.get("f1"), m.get("f2")) if x]
+        _menv_map[m.get("match_name")] = (m.get("env"), m.get("env_desc"))
     try:
         _saved = json.loads((Path(keyframe_dir).parent / "prompts.json").read_text())
         for m in _saved.get("fight_plan", []):
             _mf_map.setdefault(m.get("match_name"),
                                [x for x in (m.get("f1"), m.get("f2")) if x])
+            _menv_map.setdefault(m.get("match_name"),
+                                 (m.get("env"), m.get("env_desc")))
     except Exception:
         pass
 
-    # Flatten all clips into (stem, prompt, fighters, env) jobs.
+    # Flatten all clips into (stem, prompt, fighters, env, env_desc, kf_override)
+    # jobs. kf_override is a user-edited keyframe prompt stored on the entry; when
+    # present it is used VERBATIM (otherwise the prompt is composed from the base
+    # prompt + locked wardrobe + environment).
     jobs = []
     for m in fight_plan:
         for c in m["clips"]:
             jobs.append((_clip_stem_fight(m["match_name"], c["idx"]),
-                         c["prompt"], [m["f1"], m["f2"]], m.get("env")))
+                         c["prompt"], [m["f1"], m["f2"]], m.get("env"),
+                         m.get("env_desc"), c.get("kf_prompt")))
     for o in outcome_plan:
         _of = _mf_map.get(o.get("match_name")) or [o["fighter"]]
         if o["fighter"] not in _of:
             _of = [o["fighter"]] + _of
+        # Prefer the match's current env over the outcome's stored snapshot.
+        _menv, _menvd = _menv_map.get(o.get("match_name"), (None, None))
+        _oenv = _menv if _menv is not None else o.get("env")
+        _oenvd = _menvd if _menv is not None else o.get("env_desc")
         jobs.append((_clip_stem_outcome(o["fighter"], o["outcome"], o.get("match_name")),
-                     o["prompt"], _of, o.get("env")))
+                     o["prompt"], _of, _oenv, _oenvd, o.get("kf_prompt")))
 
     _log(f"\n  ── Keyframe phase — {len(jobs)} keyframe image(s) (image model) ──")
     made, skipped, failed = 0, 0, 0
-    for k, (stem, prompt, fighters, env) in enumerate(jobs, 1):
+    for k, (stem, prompt, fighters, env, env_desc, kf_override) in enumerate(jobs, 1):
+        if cancel_check and cancel_check():
+            _log(f"  ⏹ Keyframe generation cancelled by user "
+                 f"({made} made, {skipped} reused so far)")
+            break
         out_png = keyframe_dir / f"{stem}.png"
         if out_png.exists() and out_png.stat().st_size > 0:
             skipped += 1
@@ -2111,18 +2564,13 @@ def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: P
         if use_lora:
             loras = (_lora_specs_for(fighters, lora_map, lora_weight)
                      + _env_lora_specs_for(env, env_lora_map, env_lora_weight)) or None
-        kf_prompt = prompt
-        # Force each fighter's exact outfit up front so the keyframe paints the
-        # right clothes (e.g. "khumalo wearing boxing singlet; dlamini wearing
-        # worn boxing shorts"). The wardrobe lead beats a trailing mention.
-        _wardrobe = "; ".join(f"{n} wearing {_outfits[n]}"
-                              for n in fighters if _outfits.get(n))
-        if _wardrobe:
-            kf_prompt = (f"{_wardrobe}. {kf_prompt} "
-                         f"— each fighter in their exact same outfit, same colours, "
-                         f"consistent wardrobe")
-        if env:
-            kf_prompt = f"[{env} location] " + kf_prompt
+        # A user-edited keyframe prompt (stored on the entry) wins verbatim;
+        # otherwise compose from the base prompt + locked wardrobe (each fighter's
+        # fixed, coloured outfit) + the full environment description.
+        if kf_override and str(kf_override).strip():
+            kf_prompt = str(kf_override)
+        else:
+            kf_prompt = _compose_kf_prompt(prompt, fighters, env, env_desc, _outfits)
         try:
             img = _run_with_spinner(
                 f"keyframe {k}/{len(jobs)} — {stem}",
@@ -2164,8 +2612,8 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
                  short_min: float = 40.0, short_max: float = 50.0,
                  long_min: float = 65.0, long_max: float = 75.0,
                  single_clip_max_frames: int = SINGLE_CLIP_MAX_FRAMES,
-                 outcome_min_frames: int = 40, outcome_max_frames: int = 70,
-                 playback_fps: int = 0):
+                 outcome_min_frames: int = 96, outcome_max_frames: int = 150,
+                 playback_fps: int = 0, upscale_model: str = None):
     # PLAYBACK fps decouples the encode/play rate from the model's frame budget:
     # Wan generates a fixed number of frames regardless of fps, so encoding the
     # same frames at a HIGHER rate plays them faster (less slow-motion). Used for
@@ -2252,7 +2700,7 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
             video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map,
             video_lora_scale=video_lora_scale, video_size=video_size,
             single_clip_max_frames=single_clip_max_frames)
-        _stage_enhance_videos(client, video_model, video_dir, fight_plan,
+        _stage_enhance_videos(client, upscale_model, video_dir, fight_plan,
                               outcome_plan, upscale_factor, fps_multiplier)
         return
 
@@ -2341,26 +2789,35 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
             "clips": clips_spec,
         })
 
-    # Outcome-clip plan: per MATCH, one clip per participating fighter per
-    # outcome — so each match has its own (different) outcome scenes.
-    outcomes = ["win", "ko_win", "retire", "draw"]
+    # Outcome-clip plan: per MATCH, the DECISIVE outcomes (win / ko_win / retire)
+    # are per-fighter (each fighter can win or lose), but a DRAW concerns BOTH
+    # fighters so there is exactly ONE draw per match (not one per fighter).
+    # Each outcome is a two-clip video (finish → victory) assembled at render time.
+    decisive_outcomes = ["win", "ko_win", "retire"]
     outcome_plan = []
     # Outcome clips budget frames directly (like fight clips) within their own
-    # configurable range; longer-than-one-render outcomes are split + chained the
-    # same way at render time. Duration = frames / playback fps.
+    # configurable range; the total is split across the finish + victory clips and
+    # each is chained the same way at render time. Duration = frames / playback fps.
     _of_lo, _of_hi = _clip_frame_range(outcome_min_frames, outcome_max_frames)
+
+    def _new_outcome(m, fighter, outcome, opponent):
+        _onf = random.randint(_of_lo, _of_hi)
+        return {
+            "match_name": m["match_name"],
+            "fighter": fighter, "outcome": outcome, "opponent": opponent,
+            "env": m["env"], "env_desc": m["env_desc"],
+            "target_s": round(_onf / max(1, fps), 2),
+            "nf": _onf,
+            "shot": None, "prompt": None, "shots": None,
+        }
+
     for m in fight_plan:
         for fighter in (m["f1"], m["f2"]):
-            for outcome in outcomes:
-                _onf = random.randint(_of_lo, _of_hi)
-                outcome_plan.append({
-                    "match_name": m["match_name"],
-                    "fighter": fighter, "outcome": outcome,
-                    "env": m["env"], "env_desc": m["env_desc"],
-                    "target_s": round(_onf / max(1, fps), 2),
-                    "nf": _onf,
-                    "shot": None, "prompt": None,
-                })
+            _opp = m["f2"] if fighter == m["f1"] else m["f1"]
+            for outcome in decisive_outcomes:
+                outcome_plan.append(_new_outcome(m, fighter, outcome, _opp))
+        # Exactly one draw per match (represents both fighters), named after f1.
+        outcome_plan.append(_new_outcome(m, m["f1"], "draw", m["f2"]))
 
     total_matches = len(fight_plan)
     total_fight_clips = sum(len(m["clips"]) for m in fight_plan)
@@ -2400,12 +2857,9 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
             _log(f"  │  [{_pidx}/{_ptot}] {m['f1']} vs {m['f2']} clip{c['idx']:02d}: {shot}")
     for o in outcome_plan:
         _pidx += 1
-        shot = prompter.outcome_shot(o["fighter"], o["outcome"], o["env_desc"])
-        o["shot"] = shot
-        f_hint = _fighter_desc_hint(o["fighter"], char_descriptions)
-        o["prompt"] = (f"{f_hint} — {shot} — {_continuity_clause(o.get('env'))} "
-                       f"— African township fight, cinematic")
-        _log(f"  │  [{_pidx}/{_ptot}] {o['fighter']} {o['outcome']}: {shot}")
+        _plan_outcome_shots(prompter, o, char_descriptions, o.get("opponent"))
+        _roles = " → ".join(s["role"] for s in o.get("shots", []))
+        _log(f"  │  [{_pidx}/{_ptot}] {o['fighter']} {o['outcome']} ({_roles}): {o['shot']}")
     _log("  ── Phase A complete — all prompts written ──")
 
     # Persist the plan + prompts so a later run can render without re-prompting
@@ -2449,7 +2903,7 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
         video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map,
         video_lora_scale=video_lora_scale, video_size=video_size,
         single_clip_max_frames=single_clip_max_frames)
-    _stage_enhance_videos(client, video_model, video_dir, fight_plan,
+    _stage_enhance_videos(client, upscale_model, video_dir, fight_plan,
                           outcome_plan, upscale_factor, fps_multiplier)
 
 
@@ -2462,7 +2916,7 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                          assemble_finals=True, video_lora_scale=1.0,
                          video_size="832x480",
                          single_clip_max_frames=SINGLE_CLIP_MAX_FRAMES,
-                         playback_fps=0):
+                         playback_fps=0, cancel_check=None):
     """PHASE 3 — render ALL videos from pre-written prompts (video model stays loaded).
 
     progress_cb(done, total, label) — optional; called after each clip finishes so
@@ -2620,15 +3074,31 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                 return False, None, False
 
     def _render(label, prompt, profiles, env, nf, out_path, stem=None, fighters=None,
-                step_cb=None):
+                step_cb=None, segments=None):
         """Render one CLIP, splitting into chained sub-renders when the budget
         exceeds the single-render cap. The parts are concatenated into out_path as
         one continuous shot and discarded, so callers (and the Matches page) still
-        see exactly one file per planned clip. Returns (ok, duration, fatal)."""
+        see exactly one file per planned clip. Returns (ok, duration, fatal).
+
+        `segments` (optional) is a list of (prompt, frames) describing a SEQUENCE
+        of distinct shots to render back-to-back into one continuous video — e.g.
+        an outcome's finish clip then its victory clip. Each segment uses its OWN
+        prompt verbatim (a deliberate new action) but seeds from the previous
+        shot's last frame / VACE tail for visual continuity. When omitted, the
+        single (prompt, nf) is rendered as before."""
         keyframe = _keyframe_bytes(stem) if stem else None
-        budget = _split_frame_budget(int(nf), _chunk_max)
-        if len(budget) == 1:
-            return _render_once(label, prompt, profiles, env, budget[0], out_path,
+        # Build a flat list of parts: (segment_prompt, frames, is_segment_start).
+        if segments:
+            seglist = [(str(sp), int(sn)) for sp, sn in segments if int(sn) > 0]
+        else:
+            seglist = [(prompt, int(nf))]
+        parts_plan = []
+        for sp, sn in seglist:
+            for bi, bn in enumerate(_split_frame_budget(sn, _chunk_max)):
+                parts_plan.append((sp, bn, bi == 0))
+        if len(parts_plan) == 1:
+            sp, bn, _ = parts_plan[0]
+            return _render_once(label, sp, profiles, env, bn, out_path,
                                 fighters=fighters, init_override=keyframe,
                                 step_cb=step_cb)
         # Chained multi-part shot: part 0 starts from the clip keyframe; each later
@@ -2642,16 +3112,19 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         # single-frame "boomerang". Non-VACE models fall back to single last-frame
         # seeding + the forward-motion prompt nudge.
         _vace = "vace" in (video_model or "").lower()
-        _log(f"    ↪ {nf}f > {_chunk_max}f/render — chaining {len(budget)} parts "
-             f"{budget} into one shot" + ("  [VACE frame-tail extend]" if _vace else ""))
+        _nparts = len(parts_plan)
+        _budget = [p[1] for p in parts_plan]
+        _log(f"    ↪ chaining {_nparts} parts {_budget} into one shot"
+             + ("  [multi-shot sequence]" if segments and len(seglist) > 1 else "")
+             + ("  [VACE frame-tail extend]" if _vace else ""))
         tmpd = tempfile.mkdtemp(prefix="twshot_")
         parts, prev_last, prev_tail = [], None, None
         try:
-            for pi, pn in enumerate(budget):
+            for pi, (seg_prompt, pn, seg_start) in enumerate(parts_plan):
                 part_path = os.path.join(tmpd, f"part{pi:02d}.mp4")
                 # Tag each part's step updates with part N/total so the UI can show
                 # "concatenating shot — part 2/3" alongside the diffusion step.
-                _pcb = ((lambda prog, _p=pi + 1, _n=len(budget):
+                _pcb = ((lambda prog, _p=pi + 1, _n=_nparts:
                          step_cb({**(prog or {}), "part": _p, "parts": _n}))
                         if step_cb else None)
                 # Seeding for this part:
@@ -2663,12 +3136,20 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                 cond_frames = prev_tail if (_vace and pi > 0) else None
                 if cond_frames:
                     seed_img = None  # VACE conditions via the tail, not an init frame
-                part_prompt = prompt if pi == 0 else (
-                    "Continuing seamlessly from the previous moment, the fight keeps "
-                    "moving FORWARD into the next action — new strikes and movement that "
-                    "advance the exchange. " + prompt)
+                if pi == 0:
+                    part_prompt = seg_prompt
+                elif seg_start:
+                    # A new deliberate shot in the sequence — use its own prompt
+                    # verbatim, but flow on from the previous shot's last frame.
+                    part_prompt = ("Continuing in the same unbroken shot from the "
+                                   "previous moment, the scene now moves into: "
+                                   + seg_prompt)
+                else:
+                    part_prompt = (
+                        "Continuing seamlessly from the previous moment, the action keeps "
+                        "moving FORWARD — new movement that advances the moment. " + seg_prompt)
                 ok, _dur, is_fatal = _render_once(
-                    f"{label} [part {pi+1}/{len(budget)}, {pn}f]",
+                    f"{label} [part {pi+1}/{_nparts}, {pn}f]",
                     part_prompt, profiles, env, pn, part_path,
                     fighters=fighters, init_override=seed_img, step_cb=_pcb,
                     cond_frames=cond_frames)
@@ -2678,7 +3159,7 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                 # Prepare seeds for the NEXT part.
                 prev_last = _last_frame_png(part_path)
                 prev_tail = _last_frames_png(part_path, VACE_TAIL_FRAMES) if _vace else None
-                if pi < len(budget) - 1 and not prev_last and not prev_tail:
+                if pi < _nparts - 1 and not prev_last and not prev_tail:
                     _log("    ⚠ could not read part's tail — next part falls "
                          "back to the clip keyframe (possible visible seam)")
             # Re-encode the join: stream-copying the parts makes players freeze on
@@ -2690,11 +3171,18 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
             _sh.rmtree(tmpd, ignore_errors=True)
 
     fatal = False
+    cancelled = False
     rendered_clips = 0
+
+    def _is_cancelled():
+        try:
+            return bool(cancel_check and cancel_check())
+        except Exception:
+            return False
 
     # 3a. Fight matches
     for i, m in enumerate(fight_plan):
-        if fatal:
+        if fatal or cancelled:
             break
         elapsed = time.monotonic() - render_start
         _log(f"\n  ┌─ Match {i+1}/{total_matches}: {m['f1']} vs {m['f2']}  "
@@ -2703,6 +3191,10 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         consecutive_failures = 0
         for c in m["clips"]:
             if fatal:
+                break
+            if _is_cancelled():
+                cancelled = True
+                _log("  ⏹ Clip rendering cancelled by user")
                 break
             if rendered_clips > 0:
                 time.sleep(clip_delay)
@@ -2756,7 +3248,7 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         # the `clips` accumulator would hold just that clip and clobber the
         # existing full short/long videos. Use "Reassemble finals" to rebuild
         # them from all clips on disk afterwards.
-        if assemble_finals:
+        if assemble_finals and not cancelled:
             short_clips, short_accum, pos = [], 0.0, 0
             while short_accum < m["short_target"] and clips:
                 path, dur = clips[pos % len(clips)]
@@ -2777,6 +3269,10 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         if fatal:
             _log("  ✗ Aborting remaining outcome clips (fatal error)")
             break
+        if cancelled or _is_cancelled():
+            cancelled = True
+            _log("  ⏹ Outcome rendering cancelled by user")
+            break
         if rendered_clips > 0:
             time.sleep(clip_delay)
         clip_name = _clip_stem_outcome(o['fighter'], o['outcome'], o.get('match_name'))
@@ -2791,10 +3287,21 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
             _ofighters = [o["fighter"]] + _ofighters
         _onf = int(o.get("nf") or frames_for_seconds(o["target_s"], 8))
         _onf = min(_onf, MAX_PLANNED_FRAMES)
+        # An outcome video is a SEQUENCE of shots (finish → victory). Render them
+        # back-to-back into one continuous clip via `segments`; legacy single-prompt
+        # outcomes (no shots) fall back to the one-prompt path.
+        _oshots = o.get("shots") or None
+        _segments = None
+        if _oshots:
+            _segments = [(s.get("prompt") or o["prompt"], int(s.get("nf") or 0))
+                         for s in _oshots if int(s.get("nf") or 0) > 0]
+            _onf = sum(n for _, n in _segments) or _onf
+            _roles = " → ".join(s.get("role", "?") for s in _oshots)
+            _log(f"      ({len(_segments)}-shot sequence: {_roles})")
         ok, dur, is_fatal = _render(
             f"{clip_name} outcome clip",
             o["prompt"], [o["fighter"]], o["env"], _onf, out_path,
-            stem=clip_name, fighters=_ofighters, step_cb=_step)
+            stem=clip_name, fighters=_ofighters, step_cb=_step, segments=_segments)
         if is_fatal:
             fatal = True
             _clip("end", False)
@@ -2827,7 +3334,7 @@ def _enhance_targets(video_dir: Path, fight_plan: list, outcome_plan: list) -> l
     return targets
 
 
-def _stage_enhance_videos(client, video_model, video_dir, fight_plan, outcome_plan,
+def _stage_enhance_videos(client, upscale_model, video_dir, fight_plan, outcome_plan,
                           upscale: int = 0, fps_mult: int = 0,
                           progress_cb=None, clip_cb=None) -> int:
     """PHASE C — upscale / raise-FPS the final + outcome videos (new files alongside).
@@ -2851,7 +3358,13 @@ def _stage_enhance_videos(client, video_model, video_dir, fight_plan, outcome_pl
             except Exception: pass
         ok = False
         try:
-            _enhance_video_file(client, video_model, src, upscale, fps_mult)
+            def _frame_cb(cur, tot, ips, _name=src.name):
+                _ips = f" ({ips}/s)" if ips else ""
+                print(f"\r      🔍 {_name}: upscaling frame {cur}/{tot}{_ips}    ",
+                      end="", flush=True)
+            _enhance_video_file(client, upscale_model, src, upscale, fps_mult,
+                                progress_cb=_frame_cb)
+            print()  # finish the \r progress line
             ok = True
             done += 1
         except Exception as e:
@@ -2999,6 +3512,13 @@ def launch_web_ui(default_args):
             with _jobs_lock:
                 _state["jobs"][job_id].update({"status": "error", "error": msg})
 
+        # Pick the configured upscale model for whichever factor this op uses.
+        try:
+            _scale = int(param[0]) if op == "upscale_fps" else int(param)
+        except Exception:
+            _scale = 0
+        _um = _upscale_model_for(default_args, _scale) or None
+
         try:
             video_bytes = fpath.read_bytes()
 
@@ -3006,7 +3526,7 @@ def launch_web_ui(default_args):
                 scale = int(param)
                 out_path = fpath.parent / f"{stem}_x{scale}{suffix}"
                 _set_progress(10, f"Sending to CoderAI for {scale}× upscale…")
-                result = client.upscale_video(video_bytes, factor=scale)
+                result = client.upscale_video(video_bytes, factor=scale, model=_um)
                 out_path.write_bytes(result)
                 _finish(out_path)
 
@@ -3027,7 +3547,7 @@ def launch_web_ui(default_args):
                 # Step 1: upscale
                 out_up = fpath.parent / f"{stem}_x{scale}_fps{target_fps}{suffix}"
                 _set_progress(10, f"Step 1/2 — {scale}× upscale via CoderAI…")
-                upscaled = client.upscale_video(video_bytes, factor=scale)
+                upscaled = client.upscale_video(video_bytes, factor=scale, model=_um)
                 _set_progress(55, f"Step 2/2 — FPS interpolation to {target_fps}fps via CoderAI…")
                 # compute multiplier from the source clip's FPS
                 probe  = _probe_video(fpath)
@@ -3366,7 +3886,21 @@ def launch_web_ui(default_args):
             _state["jobs"][job_id] = {"status": "running", "progress": 3,
                                       "output": None, "error": None,
                                       "_msg": "starting…", "jtype": "match",
-                                      "scope": scope, "match": params.get("match")}
+                                      "scope": scope, "match": params.get("match"),
+                                      "cancel": False, "cancellable": True}
+
+        def _cancelled():
+            with _jobs_lock:
+                return bool(_state["jobs"].get(job_id, {}).get("cancel"))
+
+        def _cancel_done(msg):
+            with _jobs_lock:
+                j = _state["jobs"][job_id]
+                for it in j.get("items", []):
+                    if it.get("status") in ("pending", "rendering"):
+                        it["status"] = "skipped"
+                j.update({"status": "done", "cancelled": True,
+                          "progress": 100, "_msg": msg})
 
         def _prog(pct, msg=""):
             with _jobs_lock:
@@ -3482,7 +4016,16 @@ def launch_web_ui(default_args):
                 _prog(8, "preparing text model…")
                 client = CoderAIClient(default_args.base_url,
                                        getattr(default_args, "api_key", None))
-                text_model = getattr(default_args, "text_model", None)
+                # Auto-select a text model like a fresh run (config text_model is
+                # usually null) so prompts are LLM-generated, not static templates.
+                text_model = None
+                if not getattr(default_args, "no_llm", False):
+                    try:
+                        text_model = pick_model(client, "text",
+                                                getattr(default_args, "text_model", None))
+                    except Exception as e:
+                        _log(f"  [replan] no text model ({e}); using template prompts")
+                        text_model = getattr(default_args, "text_model", None)
                 char_descriptions = _build_char_descriptions(out_dir)
                 prompter = PromptGenerator(client, text_model,
                                            char_descriptions=char_descriptions)
@@ -3515,6 +4058,9 @@ def launch_web_ui(default_args):
                 _focus_cycle = list(FIGHT_ACTION_FOCUS)
                 random.shuffle(_focus_cycle)
                 for i, c in enumerate(new_clips):
+                    if _cancelled():
+                        _cancel_done("⏹ cancelled — re-plan stopped (prompts unchanged)")
+                        return
                     shot = prompter.fight_shot(
                         m["f1"], m["f2"], m["env_desc"],
                         match_context=f"Match stage: {c['intensity']}. ",
@@ -3585,7 +4131,17 @@ def launch_web_ui(default_args):
                     except Exception as e:
                         _fail(f"no image model available: {e}")
                         return
-                text_model = getattr(default_args, "text_model", None)
+                # Auto-select a text model exactly like a fresh run (config's
+                # text_model is usually null) so prompts are regenerated by the LLM,
+                # not the static fallback templates. Honour the no_llm toggle.
+                text_model = None
+                if not getattr(default_args, "no_llm", False):
+                    try:
+                        text_model = pick_model(client, "text",
+                                                getattr(default_args, "text_model", None))
+                    except Exception as e:
+                        _log(f"  [full] no text model ({e}); using template prompts")
+                        text_model = getattr(default_args, "text_model", None)
                 char_descriptions = _build_char_descriptions(out_dir)
                 _mf = {m.get("f1"), m.get("f2")} - {None}
 
@@ -3648,6 +4204,9 @@ def launch_web_ui(default_args):
                 _focus_cycle = list(FIGHT_ACTION_FOCUS)
                 random.shuffle(_focus_cycle)
                 for i, c in enumerate(new_clips):
+                    if _cancelled():
+                        _cancel_done("⏹ cancelled during prompt planning — nothing rendered")
+                        return
                     shot = prompter.fight_shot(
                         m["f1"], m["f2"], m["env_desc"],
                         match_context=f"Match stage: {c['intensity']}. ",
@@ -3667,13 +4226,9 @@ def launch_web_ui(default_args):
                     if m.get("env"):
                         o["env"] = m.get("env")
                         o["env_desc"] = m.get("env_desc", o.get("env_desc"))
+                    _opp = m.get("f2") if o.get("fighter") == m.get("f1") else m.get("f1")
                     try:
-                        o["shot"] = prompter.outcome_shot(
-                            o["fighter"], o["outcome"], o.get("env_desc") or "")
-                        f_hint = _fighter_desc_hint(o["fighter"], char_descriptions)
-                        o["prompt"] = (f"{f_hint} — {o['shot']} "
-                                       f"— {_continuity_clause(o.get('env'))} "
-                                       f"— African township fight, cinematic")
+                        _plan_outcome_shots(prompter, o, char_descriptions, _opp)
                     except Exception:
                         pass
                 try:
@@ -3718,12 +4273,15 @@ def launch_web_ui(default_args):
                         int(getattr(default_args, "keyframe_steps", 28)),
                         getattr(default_args, "keyframe_size", "832x480"), lw,
                         env_lora_map=env_lora_map, env_lora_weight=elw,
-                        kf_cb=_kf_cb)
+                        kf_cb=_kf_cb, cancel_check=_cancelled)
                 except Exception as e:
                     _fail(f"keyframe regeneration failed: {e}")
                     return
                 for i, s in enumerate(kf_stems):
                     _item(i, "end", (kdir / f"{s}.png").exists())
+                if _cancelled():
+                    _cancel_done("⏹ cancelled after keyframes — clips not rendered")
+                    return
 
                 # ── Phase 3/4 — render all clips + outcomes (NO assembly yet) ────
                 # assemble_finals=False so the short/long finals are NOT built here:
@@ -3748,7 +4306,10 @@ def launch_web_ui(default_args):
                     progress_cb=_full_cb, clip_cb=_item,
                     video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map,
                     assemble_finals=False, video_lora_scale=vls, video_size=vsz,
-                    single_clip_max_frames=scm)
+                    single_clip_max_frames=scm, cancel_check=_cancelled)
+                if _cancelled():
+                    _cancel_done("⏹ cancelled during render — finals not assembled")
+                    return
 
                 # ── Phase 4/4 — assemble the final short/long videos (last) ──────
                 _prog(94, "phase 4/4 — assembling final videos…")
@@ -3863,7 +4424,7 @@ def launch_web_ui(default_args):
                         int(getattr(default_args, "keyframe_steps", 28)),
                         getattr(default_args, "keyframe_size", "832x480"), lw,
                         env_lora_map=env_lora_map, env_lora_weight=elw,
-                        kf_cb=_kf_cb)
+                        kf_cb=_kf_cb, cancel_check=_cancelled)
                 except Exception as e:
                     _fail(f"keyframe regeneration failed: {e}")
                     return
@@ -3872,6 +4433,10 @@ def launch_web_ui(default_args):
                 for i, s in enumerate(work):
                     _item(i, "end", (kdir / f"{s}.png").exists())
                 made = sum(1 for s in work if (kdir / f"{s}.png").exists())
+                if _cancelled():
+                    _cancel_done(f"⏹ cancelled — {made}/{len(work)} keyframe(s) done "
+                                 f"before stopping")
+                    return
                 _done(f"{'generated' if missing_only else 'regenerated'} "
                       f"{made}/{len(work)} keyframe(s) — "
                       f"now click Re-render to rebuild the video(s)")
@@ -3890,6 +4455,8 @@ def launch_web_ui(default_args):
                 if upscale not in (2, 4) and (not fps_mult or fps_mult <= 1):
                     _fail("nothing selected — choose Upscale 2x/4x and/or a FPS multiplier")
                     return
+                upscale_model = _upscale_model_for(default_args, upscale) or None
+                force = str(params.get("force") or "").lower() in ("1", "true", "yes", "on")
                 target = params.get("target") or "all"
                 m = next((x for x in fight_plan if x.get("match_name") == match_name), {})
                 mf = {m.get("f1"), m.get("f2")} - {None}
@@ -3924,7 +4491,14 @@ def launch_web_ui(default_args):
                     _item(i, "start")
                     ok = False
                     try:
-                        _enhance_video_file(client, video_model, src, upscale, fps_mult)
+                        def _frame_cb(cur, tot, ips, _i=i):
+                            _item(_i, "step", {
+                                "current": cur, "total": tot,
+                                "pct": int(cur / tot * 100) if tot else 0,
+                                "it_per_s": ips, "phase": "upscaling"})
+                        _enhance_video_file(client, upscale_model, src, upscale,
+                                            fps_mult, force=force,
+                                            progress_cb=_frame_cb)
                         ok = True
                     except Exception as e:
                         _dbg = str(e)
@@ -3967,7 +4541,10 @@ def launch_web_ui(default_args):
                     progress_cb=_cb, clip_cb=_item,
                     video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map,
                     assemble_finals=_assemble, video_lora_scale=vls, video_size=vsz,
-                    single_clip_max_frames=scm)
+                    single_clip_max_frames=scm, cancel_check=_cancelled)
+                if _cancelled():
+                    _cancel_done("⏹ cancelled — stopped after the current clip")
+                    return
                 msg = f"re-rendered {len(mm['clips'])} clip(s)"
                 if scope == "clip":
                     msg += " — click “Reassemble finals” to rebuild short/long"
@@ -4029,7 +4606,10 @@ def launch_web_ui(default_args):
                     progress_cb=_cb, clip_cb=_item,
                     video_lora_map=video_lora_map, env_video_lora_map=env_video_lora_map,
                     video_lora_scale=vls, video_size=vsz,
-                    single_clip_max_frames=scm)
+                    single_clip_max_frames=scm, cancel_check=_cancelled)
+                if _cancelled():
+                    _cancel_done("⏹ cancelled — stopped after the current output")
+                    return
                 _done(f"re-rendered {len(sel)} output(s)")
                 return
 
@@ -4241,6 +4821,17 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
     v.onloadedmetadata=function(){ if(t>0){ try{ v.currentTime=t; }catch(e){} } };
     var p=v.play(); if(p&&p.catch) p.catch(function(){});
   };
+  // Swap which variant (original / upscaled / higher-fps) the inline player uses.
+  window.swapVid=function(sel){
+    if(!sel) return;
+    var wrap=sel.closest('.vplayer'); if(!wrap) return;
+    var v=wrap.querySelector('video'); if(!v) return;
+    var was=!v.paused; var t=0; try{ t=v.currentTime||0; }catch(e){}
+    v.src=sel.value;
+    try{ v.load(); }catch(e){}
+    v.onloadedmetadata=function(){ if(t>0){ try{ v.currentTime=t; }catch(e){} } };
+    if(was){ var p=v.play(); if(p&&p.catch) p.catch(function(){}); }
+  };
   window.closeVid=function(){
     var bg=document.getElementById('vid-lightbox');
     var v=document.getElementById('vid-lightbox-vid');
@@ -4264,6 +4855,7 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
             ("characters", "/characters", "👤 Characters"),
             ("environments", "/environments", "🏞 Environments"),
             ("matches", "/matches", "🥊 Matches"),
+            ("wardrobe", "/wardrobe", "👕 Wardrobe"),
             ("prompts", "/prompts", "✍ Prompts"),
         ]
         nav = "".join(
@@ -4327,6 +4919,11 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
     <div><label>Image model</label><input name=image_model type=text value="{_v('image_model') or ''}"></div>
     <div><label>Video model</label><input name=video_model type=text value="{_v('video_model') or ''}"></div>
     <div><label>Text / LLM model</label><input name=text_model type=text value="{_v('text_model') or ''}"></div>
+  </div>
+  <div class=row3 style="margin-top:.6rem">
+    <div><label>2× upscale model <span class=hint>(AI super-res used when 2× is picked; blank = use generic/auto)</span></label><input name=upscale_model_2x type=text value="{_v('upscale_model_2x') or ''}"></div>
+    <div><label>4× upscale model <span class=hint>(used when 4× is picked; blank = use generic/auto)</span></label><input name=upscale_model_4x type=text value="{_v('upscale_model_4x') or ''}"></div>
+    <div><label>Upscale model <span class=hint>(generic fallback; blank = CoderAI auto-selects)</span></label><input name=upscale_model type=text value="{_v('upscale_model') or ''}"></div>
   </div>
   <div style="margin-top:.6rem">
     <label><input type=checkbox name=no_llm{_c('no_llm')}> Disable LLM prompt generation</label>
@@ -4520,10 +5117,10 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
            <input name=single_clip_max_frames type=number min=8 max=81 value="{_v('single_clip_max_frames', 50)}"></div>
     </div>
     <div class=row3 style="margin-top:.4rem">
-      <div><label>Outcome min frames</label>
-           <input name=outcome_min_frames type=number min=8 max=480 value="{_v('outcome_min_frames', 40)}"></div>
-      <div><label>Outcome max frames <span class=hint>(split + chained like clips)</span></label>
-           <input name=outcome_max_frames type=number min=8 max=480 value="{_v('outcome_max_frames', 70)}"></div>
+      <div><label>Outcome min frames <span class=hint>(total: finish + victory)</span></label>
+           <input name=outcome_min_frames type=number min=8 max=480 value="{_v('outcome_min_frames', 96)}"></div>
+      <div><label>Outcome max frames <span class=hint>(split across the 2 outcome clips, then chained)</span></label>
+           <input name=outcome_max_frames type=number min=8 max=480 value="{_v('outcome_max_frames', 150)}"></div>
       <div></div>
     </div>
     <div class=row style="margin-top:.4rem">
@@ -5117,13 +5714,64 @@ async function uploadRefs(kind,name){
         import html as _html
         return _html.escape(str(v if v is not None else ""), quote=True)
 
-    def _vid_tag(p: Path, h=180):
-        url = "/media/" + str(p.relative_to(out_dir)).replace("\\", "/")
-        return (f'<video src="{_esc(url)}" controls preload=none '
-                f'onplay="window.showVid&&showVid(this)" '
-                f'title="Press play to enlarge" '
-                f'style="width:100%;height:{h}px;object-fit:cover;cursor:zoom-in;'
-                f'border-radius:6px;background:#111"></video>')
+    def _vid_tag(p: Path, h=180, poster: Path = None):
+        # Default to the highest enhanced variant when one exists (variants are
+        # sorted weakest→strongest, original first), so the player shows the best
+        # available quality up front; the dropdown still lets you pick others.
+        variants = _video_variants(p)
+        default = variants[-1][1] if len(variants) > 1 else p
+        url = "/media/" + str(default.relative_to(out_dir)).replace("\\", "/")
+        pa = ""
+        if poster is not None and poster.exists() and poster.stat().st_size > 0:
+            purl = "/media/" + str(poster.relative_to(out_dir)).replace("\\", "/")
+            pa = f' poster="{_esc(purl)}?t={int(poster.stat().st_mtime)}"'
+        video = (f'<video src="{_esc(url)}" controls preload=none{pa} '
+                 f'onplay="window.showVid&&showVid(this)" '
+                 f'title="Press play to enlarge" '
+                 f'style="width:100%;height:{h}px;object-fit:cover;cursor:zoom-in;'
+                 f'border-radius:6px;background:#111"></video>')
+        # When enhanced variants exist, offer a selector to switch the source.
+        sel = ""
+        if len(variants) > 1:
+            opts = "".join(
+                f'<option value="{_esc("/media/" + str(vp.relative_to(out_dir)).replace(chr(92), "/"))}"'
+                f'{" selected" if vp == default else ""}>{_esc(lbl)}</option>'
+                for lbl, vp in variants)
+            sel = (f'<select onchange="window.swapVid&&swapVid(this)" '
+                   f'title="Choose which version to play" '
+                   f'style="width:100%;margin-bottom:.25rem;font-size:.74rem;'
+                   f'padding:.15rem .3rem">{opts}</select>')
+        return f'<div class=vplayer>{sel}{video}</div>'
+
+    def _kf_img_tag(kf: Path, h=120):
+        """A keyframe still used as a preview when a clip/outcome isn't rendered."""
+        if not (kf and kf.exists() and kf.stat().st_size > 0):
+            return None
+        url = "/media/" + str(kf.relative_to(out_dir)).replace("\\", "/")
+        return (f'<img src="{_esc(url)}?t={int(kf.stat().st_mtime)}" loading=lazy '
+                f'title="Keyframe preview (not yet rendered)" '
+                f'style="width:100%;height:{h}px;object-fit:cover;border-radius:6px;'
+                f'background:#111;opacity:.85">')
+
+    # Keyframes page: save the per-keyframe prompt overrides (empty box clears the
+    # override → the prompt is auto-composed from wardrobe + environment again).
+    _kf_prompt_js = """
+<script>
+async function saveKfPrompts(ev, name){
+  const root=document.getElementById('detail');
+  const st=document.getElementById('detail-status');
+  const setSt=(c,t)=>{ st.style.color=c; st.textContent=t; };
+  const fd=new FormData(); fd.append('mode','kfprompts'); fd.append('name',name);
+  root.querySelectorAll('[data-kfclip]').forEach(el=>fd.append('kfclip_'+el.getAttribute('data-kfclip'), el.value));
+  root.querySelectorAll('[data-kfoutc]').forEach(el=>fd.append('kfoutc_'+el.getAttribute('data-kfoutc'), el.value));
+  setSt('#aaa','Saving…');
+  try{
+    const j=await (await fetch('/matches/save',{method:'POST',body:fd})).json();
+    if(j.error){ setSt('#e07070','✗ '+j.error); return; }
+    setSt('#7ed87e','✓ Saved — now Regenerate the keyframe(s)');
+  }catch(e){ setSt('#e07070','✗ '+e); }
+}
+</script>"""
 
     # Shared JS for the Matches list + detail pages (regenerate / save / remove).
     _match_js = """
@@ -5145,10 +5793,17 @@ function _pollJob(jobId, setSt){
   setTimeout(poll,900);
 }
 function _esch(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-function _renderMatchBars(wrap, d){
+function _renderMatchBars(wrap, d, jobId){
   if(!wrap) return;
   const pct=d.progress||0;
-  let h='<div class=prg-global><div class=prg-label>Overall — '+pct+'%</div>'
+  const canCancel=(d.status==='running' && d.cancellable && jobId);
+  // No inline onclick (its nested quotes are mangled by the server-side string
+  // emit) — the handler is attached after innerHTML below.
+  const cancelBtn=canCancel
+    ? '<button class="btn btn-danger" id="cancel-'+jobId+'" '
+      +'style="font-size:.72rem;padding:.15rem .6rem;float:right">⏹ Cancel</button>'
+    : '';
+  let h='<div class=prg-global><div class=prg-label>'+cancelBtn+'Overall — '+pct+'%</div>'
        +'<div class=progress-bar><div class=progress-fill style="width:'+pct+'%"></div></div></div>';
   const items=d.items||[];
   if(items.length){
@@ -5169,7 +5824,8 @@ function _renderMatchBars(wrap, d){
       }
       else if(s==='done'){ w='100%'; cls=' ok'; }
       else if(s==='failed'){ w='100%'; cls=' fail'; }
-      const icon=s==='done'?'✓':(s==='failed'?'✗':(s==='rendering'?'⏳':'·'));
+      else if(s==='skipped'){ w='0%'; sub='skipped'; }
+      const icon=s==='done'?'✓':(s==='failed'?'✗':(s==='rendering'?'⏳':(s==='skipped'?'⏹':'·')));
       h+='<div class=prg-item><div class=prg-ilabel>'+icon+' '+_esch(it.label)+' — '+_esch(sub)+'</div>'
         +'<div class=progress-bar><div class="progress-fill'+cls+'" style="width:'+w+'"></div></div></div>';
     }
@@ -5177,6 +5833,10 @@ function _renderMatchBars(wrap, d){
   }
   wrap.innerHTML=h;
   wrap.classList.remove('hidden');
+  if(canCancel){
+    const cb=document.getElementById('cancel-'+jobId);
+    if(cb) cb.onclick=()=>cancelJob(jobId);
+  }
 }
 // Detail-page poller: drives the text status AND the visual progress bars.
 function _pollMatchBars(jobId, setSt, wrap){
@@ -5184,13 +5844,25 @@ function _pollMatchBars(jobId, setSt, wrap){
     let d;
     try{ d=await (await fetch('/job/'+jobId)).json(); }
     catch(e){ setTimeout(poll,2000); return; }
-    _renderMatchBars(wrap, d);
+    _renderMatchBars(wrap, d, jobId);
     const pct=d.progress||0;
     if(d.status==='running'){ setSt('#7ea8f7','⏳ '+(d._msg||'working…')+' ('+pct+'%)'); setTimeout(poll,1200); }
-    else if(d.status==='done'){ setSt('#7ed87e','✓ '+(d._msg||'done')+' — reloading…'); setTimeout(()=>location.reload(),1600); }
+    else if(d.status==='done'){
+      if(d.cancelled){ setSt('#e0a060', (d._msg||'⏹ cancelled')+' — reloading…'); }
+      else { setSt('#7ed87e','✓ '+(d._msg||'done')+' — reloading…'); }
+      setTimeout(()=>location.reload(),1600);
+    }
     else { setSt('#e07070','✗ '+(d.error||'failed')); }
   };
   setTimeout(poll,500);
+}
+async function cancelJob(jobId){
+  const b=document.getElementById('cancel-'+jobId);
+  if(b){ b.disabled=true; b.textContent='⏹ Stopping…'; }
+  try{ await fetch('/job/cancel',{method:'POST',
+       headers:{'Content-Type':'application/x-www-form-urlencoded'},
+       body:'job_id='+encodeURIComponent(jobId)}); }
+  catch(e){ if(b){ b.disabled=false; b.textContent='⏹ Cancel'; } }
 }
 async function reMatch(ev, scope, params){
   if(ev) ev.preventDefault();
@@ -5229,15 +5901,18 @@ async function enhanceMatch(ev, target, match){
   if(ev) ev.preventDefault();
   const up=(document.getElementById('enh-upscale')||{}).value||'0';
   const fps=(document.getElementById('enh-fps')||{}).value||'0';
+  const force=!!(document.getElementById('enh-force')||{}).checked;
   if(up==='0' && (fps==='0'||fps==='1')){ alert('Pick an Upscale factor and/or a FPS multiplier first.'); return; }
   const tlabel={finals:'final videos',outcomes:'outcome videos',all:'finals + outcomes'}[target]||target;
   const bits=[]; if(up!=='0') bits.push('upscale '+up+'×'); if(fps!=='0'&&fps!=='1') bits.push('FPS '+fps+'×');
-  if(!(await uiConfirm('Enhance '+tlabel+' ('+bits.join(', ')+')? New files are written alongside the originals.',
+  if(force) bits.push('force re-enhance');
+  if(!(await uiConfirm('Enhance '+tlabel+' ('+bits.join(', ')+')? '+(force?'Existing enhanced files will be overwritten from the originals.':'New files are written alongside the originals.'),
        {title:'Enhance videos', okText:'Enhance'})))return;
   const stEl=document.getElementById('detail-status');
   const setSt=(c,t)=>{ if(stEl){ stEl.style.color=c; stEl.textContent=t; } };
   const fd=new FormData(); fd.append('scope','enhance'); fd.append('match',match);
   fd.append('target',target); fd.append('upscale',up); fd.append('fps',fps);
+  fd.append('force',force?'1':'0');
   setSt('#aaa','Starting…');
   let j;
   try{ j=await (await fetch('/matches/render',{method:'POST',body:fd})).json(); }
@@ -5256,6 +5931,7 @@ async function delVid(ev, scope, params){
                 'outputs':'Delete ALL output video files for this fighter?',
                 'keyframes':'Clear ALL keyframe images for this match? The next re-render will run keyframe-free until you regenerate them.',
                 'keyframe':'Clear this keyframe image? The next re-render of it will run keyframe-free until you regenerate it.',
+                'enhanced':'Remove only the UPSCALED / higher-FPS versions for this match (the *_2x / *_NxfpS files)? The originals are kept.',
                 'match-purge':'Remove this match COMPLETELY — every clip, final, outcome, keyframe AND its entry in the plan (prompts.json)? This cannot be undone.'};
   if(!(await uiConfirm(labels[scope]||'Delete?',{title:'Remove videos', okText:'Delete', danger:true})))return;
   const stEl=_findStatus(ev);
@@ -5459,13 +6135,23 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
                 f'{_esc(o)}</option>' for o in opts)
             return f'<select data-field={field}>{inner}</select>'
 
+        # Keyframes live alongside the videos; used as previews / posters below.
+        kdir = vdir / "keyframes"
+        def _kf_path(stem):
+            return kdir / f"{stem}.png"
+        # The first planned clip's keyframe stands in as the poster for finals.
+        _first_idx = (plan_clips[0]["idx"] if plan_clips
+                      else (min(clip_files) if clip_files else None))
+        _finals_poster = (_kf_path(_clip_stem_fight(name, _first_idx))
+                          if _first_idx is not None else None)
+
         finals_html = ""
         for k in ("short", "long"):
             if k in finals:
                 finals_html += (
                     f'<div style="flex:1;min-width:220px">'
                     f'<div class=hint style="margin-bottom:.2rem">{k} ({_dur_str(finals[k])})</div>'
-                    f'{_vid_tag(finals[k])}'
+                    f'{_vid_tag(finals[k], poster=_finals_poster)}'
                     f'<div style="margin-top:.3rem"><button class="btn btn-danger" '
                     f'style="font-size:.76rem;padding:.25rem .7rem" '
                     f'onclick="delVid(event,\'final\',{{match:\'{_esc(name)}\',which:\'{k}\'}})">🗑 Remove {k}</button></div>'
@@ -5479,7 +6165,12 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
         for c in (plan_clips or [{"idx": i, "prompt": ""} for i in idxs]):
             idx = c["idx"]
             vp = clip_files.get(idx)
-            vid_html = _vid_tag(vp, 120) if vp else '<div class=hint>not rendered</div>'
+            kfp = _kf_path(_clip_stem_fight(name, idx))
+            if vp:
+                vid_html = _vid_tag(vp, 120, poster=kfp)
+            else:
+                vid_html = (_kf_img_tag(kfp, 120)
+                            or '<div class=hint>not rendered</div>')
             rm_html = (f'<button class="btn btn-danger" style="font-size:.72rem;padding:.2rem .55rem" '
                        f'onclick="delVid(event,\'clip\',{{match:\'{_esc(name)}\',idx:\'{idx}\'}})">🗑</button>'
                        if vp else '')
@@ -5505,38 +6196,62 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
                     if (o.get("match_name") == name
                         or (not o.get("match_name") and o.get("fighter") in _mfighters))}
         out_fighters = [x for x in (f1, f2) if x]
-        # Include any fighters that appear in rendered/planned outcomes but not in meta.
+        # Include any fighters that appear in rendered/planned DECISIVE outcomes but
+        # not in meta (the draw is handled once for the match, below).
         for (fr, _oc) in list(rendered_out) + list(plan_out):
-            if fr not in out_fighters:
+            if _oc != "draw" and fr not in out_fighters:
                 out_fighters.append(fr)
+
+        def _otile(fr, oc):
+            """One outcome card (the per-shot textareas live under the keyframe page;
+            here we show the assembled video / keyframe + the finish prompt)."""
+            p = rendered_out.get((fr, oc))
+            o = plan_out.get((fr, oc), {})
+            kfp = _kf_path(_clip_stem_outcome(fr, oc, o.get("match_name")))
+            if p:
+                vid = _vid_tag(p, 110, poster=kfp)
+            else:
+                vid = (_kf_img_tag(kfp, 110) or '<div class=hint>not rendered</div>')
+            rm = (f'<button class="btn btn-danger" style="font-size:.72rem;padding:.2rem .55rem" '
+                  f'onclick="delVid(event,\'output\',{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\',outcome:\'{_esc(oc)}\'}})">🗑</button>'
+                  if p else '')
+            act = "re-render" if p else "render"
+            # Show the two-shot sequence (finish → victory) as a hint so it's clear
+            # the outcome video is assembled from those clips.
+            _roles = " → ".join(s.get("role", "?") for s in (o.get("shots") or []))
+            _seq = (f'<div class=hint style="font-size:.66rem;color:#8aa">{_esc(_roles)}</div>'
+                    if _roles else '')
+            return (
+                f'<div class=card style="width:215px">'
+                f'  <div class=hint style="display:flex;justify-content:space-between;align-items:center">'
+                f'<span>{_esc(oc)}</span>'
+                f'<span>'
+                f'<a href="#" style="color:#c79bf0" title="Regenerate this keyframe (image model)" '
+                f'onclick="reMatch(event,\'keyframe\',{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\',outcome:\'{_esc(oc)}\'}})">kf↻</a> '
+                f'<a href="#" style="color:#7eb8f7" '
+                f'onclick="reMatch(event,\'outcome\',{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\',outcome:\'{_esc(oc)}\'}})">{act}</a> {rm}</span></div>'
+                f'  {vid}{_seq}'
+                f'  <textarea data-outc="{_esc(fr)}|{_esc(oc)}" rows=2 style="margin-top:.3rem">{_esc(o.get("prompt",""))}</textarea>'
+                f'</div>'
+            )
+
         outcome_groups = []
         for fr in out_fighters:
-            tiles = []
-            for oc in _PROMPT_OUTCOMES:
-                p = rendered_out.get((fr, oc))
-                o = plan_out.get((fr, oc), {})
-                vid = _vid_tag(p, 110) if p else '<div class=hint>not rendered</div>'
-                rm = (f'<button class="btn btn-danger" style="font-size:.72rem;padding:.2rem .55rem" '
-                      f'onclick="delVid(event,\'output\',{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\',outcome:\'{_esc(oc)}\'}})">🗑</button>'
-                      if p else '')
-                act = "re-render" if p else "render"
-                tiles.append(
-                    f'<div class=card style="width:215px">'
-                    f'  <div class=hint style="display:flex;justify-content:space-between;align-items:center">'
-                    f'<span>{_esc(oc)}</span>'
-                    f'<span>'
-                    f'<a href="#" style="color:#c79bf0" title="Regenerate this keyframe (image model)" '
-                    f'onclick="reMatch(event,\'keyframe\',{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\',outcome:\'{_esc(oc)}\'}})">kf↻</a> '
-                    f'<a href="#" style="color:#7eb8f7" '
-                    f'onclick="reMatch(event,\'outcome\',{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\',outcome:\'{_esc(oc)}\'}})">{act}</a> {rm}</span></div>'
-                    f'  {vid}'
-                    f'  <textarea data-outc="{_esc(fr)}|{_esc(oc)}" rows=2 style="margin-top:.3rem">{_esc(o.get("prompt",""))}</textarea>'
-                    f'</div>'
-                )
+            tiles = [_otile(fr, oc) for oc in ("win", "ko_win", "retire")]
             outcome_groups.append(
                 f'<div style="margin-top:.5rem"><div class=hint style="font-weight:700;color:#bbb">'
                 f'{_esc(fr)}</div>'
                 f'<div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.25rem">{"".join(tiles)}</div></div>'
+            )
+        # Exactly ONE draw per match (it concerns both fighters). Show it under the
+        # fighter it's stored on (the owner; defaults to f1).
+        draw_owner = next((fr for (fr, oc) in list(rendered_out) + list(plan_out)
+                           if oc == "draw"), f1 or (out_fighters[0] if out_fighters else ""))
+        if draw_owner:
+            outcome_groups.append(
+                f'<div style="margin-top:.5rem"><div class=hint style="font-weight:700;color:#bbb">'
+                f'Match result — draw <span style="font-weight:400">({_esc(draw_owner)})</span></div>'
+                f'<div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.25rem">{_otile(draw_owner, "draw")}</div></div>'
             )
         outcomes_html = "".join(outcome_groups) or '<span class=hint>No outcomes planned for this match.</span>'
 
@@ -5602,12 +6317,19 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             f'  <div style="min-width:130px"><label>Raise FPS</label>'
             f'    <select id=enh-fps><option value=0>none</option>'
             f'      <option value=2>2×</option><option value=3>3×</option><option value=4>4×</option></select></div>'
+            f'  <label style="display:flex;align-items:center;gap:.35rem;font-size:.82rem;white-space:nowrap" '
+            f'title="Re-run from the original video, overwriting any existing *_2x/_NxfpS file (otherwise an up-to-date enhanced file is skipped).">'
+            f'<input type=checkbox id=enh-force> Force re-enhance</label>'
             f'  <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="enhanceMatch(event,\'finals\',\'{_esc(name)}\')">✨ Enhance finals</button>'
             f'  <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="enhanceMatch(event,\'outcomes\',\'{_esc(name)}\')">✨ Enhance outcomes</button>'
             f'  <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="enhanceMatch(event,\'all\',\'{_esc(name)}\')">✨ Enhance all</button>'
+            f'  <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="delVid(event,\'enhanced\',{{match:\'{_esc(name)}\'}})" '
+            f'title="Delete only the upscaled / higher-FPS versions (the *_2x / *_NxfpS files); originals are kept.">'
+            f'🗑 Remove upscaled versions</button>'
             f'  <span class=hint style="flex-basis:100%;margin-top:.1rem">Writes new '
             f'<code>*_2x</code>/<code>*_NxfpS</code> files alongside the originals (non-destructive).</span>'
             f'</div>'
@@ -5639,8 +6361,13 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
         f1, f2 = meta.get("f1", ""), meta.get("f2", "")
         title = (f"{f1} vs {f2}" if f1
                  else name.replace("match_", "").replace("_", " "))
+        # Wardrobe + environment used to compose the keyframe prompt shown below
+        # each thumbnail, so the user sees (and can edit) exactly what is used.
+        outfits = _load_wardrobe(out_dir)
+        m_env, m_env_desc = meta.get("env", ""), meta.get("env_desc", "")
+        m_fighters = [x for x in (f1, f2) if x]
 
-        def _kf_tile(label, stem, regen_params):
+        def _kf_tile(label, stem, regen_params, kf_text, data_attr):
             png = kdir / f"{stem}.png"
             if png.exists() and png.stat().st_size > 0:
                 url = "/media/" + str(png.relative_to(out_dir)).replace("\\", "/")
@@ -5667,6 +6394,10 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
                 f'onclick="reMatch(event,\'keyframe\',{regen_params})">↻ regenerate</a> '
                 f'{clr}</span></div>'
                 f'  {img}'
+                f'  <textarea {data_attr} rows=3 placeholder="(auto — wardrobe + '
+                f'environment)" style="margin-top:.3rem;font-size:.72rem" '
+                f'title="Prompt used to generate this keyframe. Edit + Save, then '
+                f'Regenerate.">{_esc(kf_text)}</textarea>'
                 f'</div>'
             )
 
@@ -5676,9 +6407,18 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
                      else sorted(int(p.stem.split("_clip")[-1])
                                  for p in info.get("clips", [])
                                  if p.stem.split("_clip")[-1].isdigit()))
+        _clip_by_idx = {c["idx"]: c for c in plan_clips}
+
+        def _clip_kf_text(idx):
+            c = _clip_by_idx.get(idx, {})
+            return (c.get("kf_prompt")
+                    or _compose_kf_prompt(c.get("prompt", ""), m_fighters,
+                                          m_env, m_env_desc, outfits))
+
         clip_tiles = "".join(
             _kf_tile(f"clip {idx:02d}", _clip_stem_fight(name, idx),
-                     f'{{match:\'{_esc(name)}\',idx:\'{idx}\'}}')
+                     f'{{match:\'{_esc(name)}\',idx:\'{idx}\'}}',
+                     _clip_kf_text(idx), f'data-kfclip="{idx}"')
             for idx in clip_idxs) or '<span class=hint>No clips planned.</span>'
 
         # Outcome keyframes (per participating fighter).
@@ -5700,10 +6440,18 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
                 # generator writes; a "or name" fallback here would look for a
                 # "<match>_<fighter>_<outcome>" that never gets created.
                 stem = _clip_stem_outcome(fr, oc, o.get("match_name"))
+                # The match is authoritative for location (outcome snapshots can be
+                # stale) — match _generate_keyframes so the shown default is real.
+                o_env = m_env or o.get("env")
+                o_envd = m_env_desc or o.get("env_desc")
+                kf_text = (o.get("kf_prompt")
+                           or _compose_kf_prompt(o.get("prompt", ""), m_fighters,
+                                                 o_env, o_envd, outfits))
                 tiles.append(_kf_tile(
                     _esc(oc), stem,
                     f'{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\','
-                    f'outcome:\'{_esc(oc)}\'}}'))
+                    f'outcome:\'{_esc(oc)}\'}}',
+                    kf_text, f'data-kfoutc="{_esc(fr)}|{_esc(oc)}"'))
             out_groups.append(
                 f'<div style="margin-top:.5rem"><div class=hint '
                 f'style="font-weight:700;color:#bbb">{_esc(fr)}</div>'
@@ -5720,10 +6468,15 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             f'<span id=detail-status style="font-size:.8rem;color:#7ea8f7"></span></div>'
             f'<div class=card>'
             f'  <p class=hint style="margin:0 0 .5rem">Keyframes are the image→video '
-            f'bridge stills. Regenerate one (or all) with the image model, then '
-            f'<b>Re-render</b> the matching clip(s) on the match page to rebuild '
-            f'the video from the new keyframe.</p>'
+            f'bridge stills. The text under each thumbnail is the <b>prompt used to '
+            f'generate that keyframe</b> — edit it, hit <b>Save keyframe prompts</b>, '
+            f'then <b>Regenerate</b>. Empty boxes are auto-composed from each '
+            f'fighter\'s locked wardrobe (<code>wardrobe.json</code>) + the match '
+            f'environment, so clothing colours and location stay consistent. After '
+            f'regenerating, <b>Re-render</b> the matching clip on the match page.</p>'
             f'  <div class=pf-actions>'
+            f'    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem;background:#2d7a4a;border-color:#2d7a4a" '
+            f'onclick="saveKfPrompts(event,\'{_esc(name)}\')">💾 Save keyframe prompts</button>'
             f'    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="reMatch(event,\'keyframes-missing\',{{match:\'{_esc(name)}\'}})">➕ Generate missing</button>'
             f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
@@ -5737,8 +6490,118 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             f'<div style="display:flex;gap:.5rem;flex-wrap:wrap">{clip_tiles}</div>'
             f'<div class=section-title style="margin:.9rem 0 .3rem">Outcome keyframes</div>'
             f'{outcomes_html}'
-            f'</div>{_match_js}'
+            f'</div>{_match_js}{_kf_prompt_js}'
         )
+
+    def _wardrobe_html():
+        """Edit each fighter's locked outfit (wardrobe.json). Every keyframe of a
+        match dresses the fighter in this exact phrase, so editing it here fixes
+        clothing colours/garments consistently across the whole match. Colour
+        clashes (two fighters sharing a colour) are flagged."""
+        wardrobe = _load_wardrobe(out_dir)
+
+        # Which palette/colour word each outfit uses, to flag clashes.
+        def _color_of(o):
+            ol = str(o or "").lower()
+            for c in _OUTFIT_COLORS:
+                if c in ol:
+                    return c
+            for w in ol.split():
+                if w in _COLOR_WORDS:
+                    return w
+            return None
+
+        color_of = {nm: _color_of(o) for nm, o in wardrobe.items()}
+        from collections import Counter as _Counter
+        counts = _Counter(c for c in color_of.values() if c)
+        clashes = {c for c, n in counts.items() if n > 1}
+
+        rows = []
+        for nm in sorted(wardrobe):
+            o = wardrobe[nm]
+            clash = color_of.get(nm) in clashes
+            warn = (' <span class=hint style="color:#e0a060">⚠ shares colour</span>'
+                    if clash else '')
+            bstyle = 'border-color:#e0a060;' if clash else ''
+            rows.append(
+                f'<div class=card style="display:flex;gap:.7rem;align-items:center;'
+                f'padding:.5rem .7rem">'
+                f'  <label style="min-width:150px;font-weight:700;margin:0">'
+                f'{_esc(nm)}</label>'
+                f'  <input data-wf="{_esc(nm)}" value="{_esc(o)}" '
+                f'style="flex:1;{bstyle}">{warn}'
+                f'</div>')
+        rows_html = "".join(rows) or '<span class=hint>No fighters found.</span>'
+
+        clash_note = ''
+        if clashes:
+            clash_note = (
+                f'<div class=card style="border-color:#e0a060">'
+                f'<b style="color:#e0a060">⚠ {len(clashes)} colour clash'
+                f'{"es" if len(clashes) > 1 else ""}</b> — two or more fighters '
+                f'share a colour, which makes the image model swap their kits in a '
+                f'match. Give them distinct colours, or hit '
+                f'<b>Reshuffle distinct colours</b>.</div>')
+
+        body = (
+            f'<div id=wf-root>'
+            f'{clash_note}'
+            f'<div style="display:flex;flex-direction:column;gap:.4rem">{rows_html}</div>'
+            f'<div class=pf-actions style="margin-top:.7rem">'
+            f'  <button class="btn btn-primary" style="font-size:.85rem;padding:.4rem 1rem" '
+            f'onclick="saveWardrobe(event)">💾 Save wardrobe</button>'
+            f'  <button class="btn btn-secondary" style="font-size:.85rem;padding:.4rem 1rem" '
+            f'onclick="reshuffleWardrobe(event)" '
+            f'title="Give every fighter a distinct colour, keeping their garment">'
+            f'🎨 Reshuffle distinct colours</button>'
+            f'  <span id=wf-status style="font-size:.8rem;color:#7ea8f7"></span>'
+            f'</div>'
+            f'</div>'
+        )
+
+        script = """
+<script>
+function _gatherWardrobe(){
+  const m={};
+  document.querySelectorAll('[data-wf]').forEach(el=>{
+    const v=el.value.trim(); if(v) m[el.getAttribute('data-wf')]=v; });
+  return m;
+}
+async function saveWardrobe(ev){
+  const st=document.getElementById('wf-status');
+  const set=(c,t)=>{st.style.color=c;st.textContent=t;};
+  set('#aaa','Saving…');
+  const fd=new FormData(); fd.append('wardrobe', JSON.stringify(_gatherWardrobe()));
+  try{
+    const j=await (await fetch('/wardrobe/save',{method:'POST',body:fd})).json();
+    if(j.error){ set('#e07070','✗ '+j.error); return; }
+    set('#7ed87e','✓ Saved — regenerate the match keyframes to apply');
+    setTimeout(()=>location.reload(),900);
+  }catch(e){ set('#e07070','✗ '+e); }
+}
+async function reshuffleWardrobe(ev){
+  if(!(await uiConfirm('Give every fighter a distinct colour (keeping each garment)? '
+      +'This overwrites colours you set manually.',
+      {title:'Reshuffle colours', okText:'Reshuffle'})))return;
+  const st=document.getElementById('wf-status');
+  const fd=new FormData(); fd.append('reshuffle','1');
+  try{
+    const j=await (await fetch('/wardrobe/save',{method:'POST',body:fd})).json();
+    if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
+    location.reload();
+  }catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; }
+}
+</script>"""
+
+        return (f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                f'<h1>👕 Wardrobe</h1></div>'
+                f'<p class=hint style="margin-bottom:.8rem">Each fighter\'s <b>locked '
+                f'outfit</b>. The same phrase is written into every keyframe of a match, '
+                f'so clothing colours stay consistent shot to shot. Include a colour '
+                f'(e.g. <code>navy blue boxing shorts</code>) and keep the two fighters '
+                f'in a match clearly different. After editing, <b>Regenerate keyframes</b> '
+                f'on the match to apply.</p>'
+                f'{body}{script}')
 
     def _prompts_html():
         """Edit the global prompt templates used by the script (LLM system
@@ -5750,8 +6613,11 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
                     f'{_esc(value)}</textarea>')
 
         wst = cfg["win_shot_templates"]
+        fnt = cfg.get("finish_shot_templates", {})
         outcome_blocks = "".join(
-            f'<label>{_esc(k)} outcome templates <span class=hint>(one per line)</span></label>'
+            f'<label>{_esc(k)} — FINISH templates <span class=hint>(decisive ending action; one per line)</span></label>'
+            f'{ta("finish::"+k, chr(10).join(fnt.get(k, [])), 4)}'
+            f'<label>{_esc(k)} — VICTORY templates <span class=hint>(referee raising the arm; one per line)</span></label>'
             f'{ta("win::"+k, chr(10).join(wst.get(k, [])), 4)}'
             for k in _PROMPT_OUTCOMES
         )
@@ -5789,11 +6655,12 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
 <script>
 function _gatherPrompts(){
   const root=document.getElementById('pf-root');
-  const cfg={llm_system:'',llm_outcome_system:'',fight_shot_templates:[],win_shot_templates:{}};
+  const cfg={llm_system:'',llm_outcome_system:'',fight_shot_templates:[],win_shot_templates:{},finish_shot_templates:{}};
   root.querySelectorAll('[data-pf]').forEach(el=>{
     const f=el.getAttribute('data-pf'); const v=el.value;
     if(f==='llm_system'||f==='llm_outcome_system'){ cfg[f]=v; }
     else if(f==='fight_shot_templates'){ cfg.fight_shot_templates=v.split('\\n').map(s=>s.trim()).filter(Boolean); }
+    else if(f.startsWith('finish::')){ cfg.finish_shot_templates[f.slice(8)]=v.split('\\n').map(s=>s.trim()).filter(Boolean); }
     else if(f.startsWith('win::')){ cfg.win_shot_templates[f.slice(5)]=v.split('\\n').map(s=>s.trim()).filter(Boolean); }
   });
   return cfg;
@@ -5890,6 +6757,9 @@ async function resetPrompts(ev){
                 nm = qs.get("name", [None])[0]
                 html = _page("Keyframes", _match_keyframes_html(nm), "matches")
                 self._send(200, "text/html; charset=utf-8", html)
+
+            elif path == "/wardrobe":
+                html = _page("Wardrobe", _wardrobe_html(), "wardrobe")
 
             elif path == "/prompts":
                 html = _page("Prompts", _prompts_html(), "prompts")
@@ -6028,6 +6898,24 @@ async function resetPrompts(ev){
                 self._send(200, "application/json", _j.dumps({"ok": True}))
                 return
 
+            # Cancel a single in-flight job (graceful: stops after the current
+            # clip/keyframe/output). The job's loop polls this flag.
+            if path == "/job/cancel":
+                import json as _j
+                clen = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(clen)
+                form = dict(urllib.parse.parse_qsl(raw.decode(errors="replace")))
+                jid = (form.get("job_id") or "").strip()
+                with _jobs_lock:
+                    j = _state["jobs"].get(jid)
+                    if j is None:
+                        self._send(404, "application/json", _j.dumps({"error": "no such job"})); return
+                    if j.get("status") == "running":
+                        j["cancel"] = True
+                        j["_msg"] = "⏹ cancelling — finishing the current item…"
+                self._send(200, "application/json", _j.dumps({"ok": True}))
+                return
+
             if path == "/profile/regenerate":
                 import json as _j, uuid as _u
                 clen = int(self.headers.get("Content-Length", 0))
@@ -6140,6 +7028,46 @@ async function resetPrompts(ev){
                 self._send(200, "application/json", _j.dumps({"job_id": job_id}))
                 return
 
+            if path == "/wardrobe/save":
+                import json as _j
+                clen = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(clen)
+                ctype = self.headers.get("Content-Type", "")
+                if "multipart/form-data" in ctype:
+                    boundary = ctype.split("boundary=")[-1].strip().encode()
+                    form = _parse_multipart(raw, boundary)
+                else:
+                    form = dict(urllib.parse.parse_qsl(raw.decode(errors="replace")))
+
+                def _fv(k, default=""):
+                    v = form.get(k)
+                    if v is None: return default
+                    return v if isinstance(v, str) else v.decode(errors="replace")
+
+                if _fv("reshuffle"):
+                    try:
+                        _reshuffle_wardrobe(out_dir)
+                    except Exception as e:
+                        self._send(500, "application/json", _j.dumps({"error": f"cannot reshuffle: {e}"}))
+                        return
+                    self._send(200, "application/json", _j.dumps({"ok": True}))
+                    return
+                try:
+                    wmap = _j.loads(_fv("wardrobe", "{}"))
+                except Exception as e:
+                    self._send(400, "application/json", _j.dumps({"error": f"bad wardrobe: {e}"}))
+                    return
+                if not isinstance(wmap, dict):
+                    self._send(400, "application/json", _j.dumps({"error": "wardrobe must be an object"}))
+                    return
+                try:
+                    _save_wardrobe(out_dir, wmap)
+                except Exception as e:
+                    self._send(500, "application/json", _j.dumps({"error": f"cannot save: {e}"}))
+                    return
+                self._send(200, "application/json", _j.dumps({"ok": True}))
+                return
+
             if path == "/prompts/save":
                 import json as _j
                 clen = int(self.headers.get("Content-Length", 0))
@@ -6226,6 +7154,12 @@ async function resetPrompts(ev){
                                 m["env"] = _new_env
                                 m["env_desc"] = (_env_description(_new_env)
                                                  if _new_env else "African township")
+                                # Keep this match's outcome entries in sync so their
+                                # keyframes/renders use the new location too.
+                                for _o in data.get("outcome_plan", []):
+                                    if _o.get("match_name") == nm:
+                                        _o["env"] = m["env"]
+                                        _o["env_desc"] = m["env_desc"]
                         for _tk in ("short_target", "long_target"):
                             if _tk in form:
                                 try: m[_tk] = float(_fv(_tk))
@@ -6254,6 +7188,10 @@ async function resetPrompts(ev){
                                      if m.get("env") else "African township"}
                                 data.setdefault("outcome_plan", []).append(o)
                             o["prompt"] = _fv(fk)
+                            # Keep the FINISH shot in sync so the multi-clip render
+                            # picks up the manual edit (the first segment's prompt).
+                            if isinstance(o.get("shots"), list) and o["shots"]:
+                                o["shots"][0]["prompt"] = o["prompt"]
                     elif mode == "outputs":
                         fr = _fv("fighter")
                         if not _safe(fr):
@@ -6263,6 +7201,48 @@ async function resetPrompts(ev){
                                 key = f"out_{o['outcome']}"
                                 if key in form:
                                     o["prompt"] = _fv(key)
+                                    if isinstance(o.get("shots"), list) and o["shots"]:
+                                        o["shots"][0]["prompt"] = o["prompt"]
+                    elif mode == "kfprompts":
+                        # Per-keyframe prompt overrides. A submitted value equal to
+                        # the freshly-composed default (or blank) CLEARS the override,
+                        # so that keyframe keeps auto-tracking wardrobe/environment.
+                        nm = _fv("name")
+                        if not _safe(nm):
+                            self._send(400, "application/json", _j.dumps({"error": "invalid name"})); return
+                        m = next((x for x in data.get("fight_plan", []) if x.get("match_name") == nm), None)
+                        if not m:
+                            self._send(404, "application/json", _j.dumps({"error": "match not in prompts.json"})); return
+                        _outfits = _load_wardrobe(out_dir)
+                        _mf = [x for x in (m.get("f1"), m.get("f2")) if x]
+
+                        def _apply_kf(entry, base, env, env_desc, submitted):
+                            default = _compose_kf_prompt(base, _mf, env, env_desc, _outfits)
+                            if not submitted.strip() or submitted.strip() == default.strip():
+                                entry.pop("kf_prompt", None)
+                            else:
+                                entry["kf_prompt"] = submitted
+
+                        for c in m.get("clips", []):
+                            key = f"kfclip_{c['idx']}"
+                            if key in form:
+                                _apply_kf(c, c.get("prompt", ""), m.get("env"),
+                                          m.get("env_desc"), _fv(key))
+                        for fk in list(form.keys()):
+                            if not fk.startswith("kfoutc_"):
+                                continue
+                            fr_o, _, oc_o = fk[7:].rpartition("|")
+                            if not fr_o or not oc_o:
+                                continue
+                            o = next((x for x in data.get("outcome_plan", [])
+                                      if x.get("fighter") == fr_o
+                                      and x.get("outcome") == oc_o
+                                      and (x.get("match_name") in (None, nm))), None)
+                            if o is None:
+                                continue
+                            _apply_kf(o, o.get("prompt", ""),
+                                      m.get("env") or o.get("env"),
+                                      m.get("env_desc") or o.get("env_desc"), _fv(fk))
                     else:
                         self._send(400, "application/json", _j.dumps({"error": "invalid mode"})); return
                     try:
@@ -6375,6 +7355,23 @@ async function resetPrompts(ev){
                             _rm(kdir / f"{mn}_clip{int(idx):02d}.png")
                         except ValueError:
                             self._send(400, "application/json", _j.dumps({"error": "invalid idx"})); return
+                elif scope == "enhanced":
+                    # Remove ONLY the post-process enhanced variants (the
+                    # *_2x / *_NxfpS files) for a match — finals, clips and
+                    # outcomes — keeping every original intact.
+                    mn = _fv("match")
+                    if not _safe(mn):
+                        self._send(400, "application/json", _j.dumps({"error": "invalid match"})); return
+                    _, _, _, _matches_map, _ = _scan_matches()
+                    _info = _matches_map.get(mn, {})
+                    _bases = list(_info.get("finals", {}).values())
+                    _bases += list(_info.get("clips", []))
+                    _bases += [_p for (_f, _o, _p) in _info.get("outcomes", [])]
+                    for _base in _bases:
+                        # _video_variants returns the original first, then enhanced
+                        # siblings — drop everything except the original.
+                        for _lbl, _vp in _video_variants(_base)[1:]:
+                            _rm(_vp)
                 elif scope == "match-purge":
                     # Remove a match COMPLETELY: every video file, every keyframe,
                     # AND its entry in prompts.json (the plan + this match's
@@ -6623,6 +7620,9 @@ async function resetPrompts(ev){
                     "image_model": _s(_fv("image_model")),
                     "video_model": _s(_fv("video_model")),
                     "text_model": _s(_fv("text_model")),
+                    "upscale_model": _s(_fv("upscale_model")),
+                    "upscale_model_2x": _s(_fv("upscale_model_2x")),
+                    "upscale_model_4x": _s(_fv("upscale_model_4x")),
                     "no_llm": "no_llm" in form,
                     "out_dir": _fv("out_dir", "./township_output"),
                     "region": _s(_fv("region")),
@@ -6656,8 +7656,8 @@ async function resetPrompts(ev){
                     "clip_min_frames": int(_fv("clip_min_frames", "50") or 50),
                     "clip_max_frames": int(_fv("clip_max_frames", "70") or 70),
                     "single_clip_max_frames": int(_fv("single_clip_max_frames", "50") or 50),
-                    "outcome_min_frames": int(_fv("outcome_min_frames", "40") or 40),
-                    "outcome_max_frames": int(_fv("outcome_max_frames", "70") or 70),
+                    "outcome_min_frames": int(_fv("outcome_min_frames", "96") or 96),
+                    "outcome_max_frames": int(_fv("outcome_max_frames", "150") or 150),
                     "short_min": float(_fv("short_min", "40") or 40),
                     "short_max": float(_fv("short_max", "50") or 50),
                     "long_min": float(_fv("long_min", "65") or 65),
@@ -6772,6 +7772,9 @@ async function resetPrompts(ev){
             ns.image_model  = _fv("image_model") or None
             ns.video_model  = _fv("video_model") or None
             ns.text_model   = _fv("text_model") or None
+            ns.upscale_model = _fv("upscale_model") or None
+            ns.upscale_model_2x = _fv("upscale_model_2x") or None
+            ns.upscale_model_4x = _fv("upscale_model_4x") or None
             ns.no_llm       = "no_llm" in form
             ns.out_dir      = _fv("out_dir", "./township_output")
             ns.region       = _fv("region") or None
@@ -6807,8 +7810,8 @@ async function resetPrompts(ev){
             ns.clip_min_frames   = int(_fv("clip_min_frames", "50"))
             ns.clip_max_frames   = int(_fv("clip_max_frames", "70"))
             ns.single_clip_max_frames = int(_fv("single_clip_max_frames", "50"))
-            ns.outcome_min_frames = int(_fv("outcome_min_frames", "40"))
-            ns.outcome_max_frames = int(_fv("outcome_max_frames", "70"))
+            ns.outcome_min_frames = int(_fv("outcome_min_frames", "96"))
+            ns.outcome_max_frames = int(_fv("outcome_max_frames", "150"))
             ns.short_min         = float(_fv("short_min", "40"))
             ns.short_max         = float(_fv("short_max", "50"))
             ns.long_min          = float(_fv("long_min", "65"))
@@ -6838,7 +7841,9 @@ async function resetPrompts(ev){
             # Apply the submitted connection/model settings to the live session
             # so later per-profile jobs (regenerate, train LoRA) use them too.
             for _k in ("base_url", "api_key", "image_model",
-                       "video_model", "text_model", "lora_train_base_model"):
+                       "video_model", "text_model", "upscale_model",
+                       "upscale_model_2x", "upscale_model_4x",
+                       "lora_train_base_model"):
                 setattr(default_args, _k, getattr(ns, _k, None))
 
             # Apply the same shortcut logic as CLI
@@ -7206,11 +8211,12 @@ async function resetPrompts(ev){
                 long_min=getattr(args, "long_min", 65.0),
                 long_max=getattr(args, "long_max", 75.0),
                 single_clip_max_frames=getattr(args, "single_clip_max_frames", SINGLE_CLIP_MAX_FRAMES),
-                outcome_min_frames=getattr(args, "outcome_min_frames", 40),
-                outcome_max_frames=getattr(args, "outcome_max_frames", 70),
+                outcome_min_frames=getattr(args, "outcome_min_frames", 96),
+                outcome_max_frames=getattr(args, "outcome_max_frames", 150),
                 playback_fps=getattr(args, "playback_fps", 0),
                 upscale_factor=getattr(args, "upscale_factor", 0),
                 fps_multiplier=getattr(args, "fps_multiplier", 0),
+                upscale_model=_upscale_model_for(args, getattr(args, "upscale_factor", 0)) or None,
             )
 
         _web_log("\n✓ Done.")
@@ -7268,7 +8274,10 @@ WHAT THIS SCRIPT DOES
   Stage 3 – Videos
     a) Fight matches — one short (40-50s) and one long (65-75s) version per
        pair, composed from multiple 4-8s clips. Same clips are reused for both.
-    b) Outcome clips — 10-15s per fighter: win, ko_win, retire, draw.
+    b) Outcome videos — win / ko_win / retire per fighter, plus ONE draw per
+       match. Each is a two-shot sequence: the decisive FINISH (KO, retirement,
+       last action) then the VICTORY (winner + referee raising the arm), assembled
+       into one clip. Length via --outcome-min/max-frames.
     Prompts are generated by an LLM (--text-model) for maximum variety, or
     fall back to a static template pool if no text model is configured.
 
@@ -7392,6 +8401,17 @@ OUTPUT LAYOUT
                         help="Image generation model. Auto-selected if omitted.")
     parser.add_argument("--video-model", default=None, metavar="MODEL_ID",
                         help="Video generation model. Auto-selected if omitted.")
+    parser.add_argument("--upscale-model", default=None, metavar="MODEL_ID",
+                        help="Generic AI super-resolution model (e.g. Real-ESRGAN) for "
+                             "--upscale-factor. Fallback when no factor-specific model is set. "
+                             "Optional: if omitted, CoderAI auto-selects a configured upscaler. "
+                             "There is no ffmpeg fallback.")
+    parser.add_argument("--upscale-model-2x", default=None, metavar="MODEL_ID",
+                        help="Upscale model used specifically when the 2× factor is chosen "
+                             "(overrides --upscale-model for 2×).")
+    parser.add_argument("--upscale-model-4x", default=None, metavar="MODEL_ID",
+                        help="Upscale model used specifically when the 4× factor is chosen "
+                             "(overrides --upscale-model for 4×).")
     parser.add_argument("--text-model",  default=None, metavar="MODEL_ID",
                         help="LLM for prompt generation (recommended for variety). Auto-selected if omitted.")
     parser.add_argument("--no-llm", action="store_true",
@@ -7528,11 +8548,14 @@ OUTPUT LAYOUT
                                f"≤{MODEL_MAX_FRAMES}). Clips/outcomes longer than this are rendered as "
                                f"multiple parts chained via each part's last frame and concatenated "
                                f"into a single shot; the parts are discarded.")
-    cons_grp.add_argument("--outcome-min-frames", type=int, default=40, metavar="N",
-                          help="Minimum frames per outcome clip (default: 40).")
-    cons_grp.add_argument("--outcome-max-frames", type=int, default=70, metavar="N",
-                          help="Maximum frames per outcome clip (default: 70). Split + chained the "
-                               "same way when longer than --single-clip-max-frames.")
+    cons_grp.add_argument("--outcome-min-frames", type=int, default=96, metavar="N",
+                          help="Minimum TOTAL frames per outcome video (default: 96). An outcome is "
+                               "a two-clip sequence (finish → victory); this budget is split across "
+                               "them.")
+    cons_grp.add_argument("--outcome-max-frames", type=int, default=150, metavar="N",
+                          help="Maximum TOTAL frames per outcome video (default: 150). Split across the "
+                               "finish + victory clips, each chained when longer than "
+                               "--single-clip-max-frames.")
     cons_grp.add_argument("--short-min", type=float, default=40.0, metavar="SEC",
                           help="Minimum duration (s) of the SHORT final assembly (default: 40).")
     cons_grp.add_argument("--short-max", type=float, default=50.0, metavar="SEC",
@@ -7757,11 +8780,12 @@ OUTPUT LAYOUT
             long_min=getattr(args, "long_min", 65.0),
             long_max=getattr(args, "long_max", 75.0),
             single_clip_max_frames=getattr(args, "single_clip_max_frames", SINGLE_CLIP_MAX_FRAMES),
-            outcome_min_frames=getattr(args, "outcome_min_frames", 40),
-            outcome_max_frames=getattr(args, "outcome_max_frames", 70),
+            outcome_min_frames=getattr(args, "outcome_min_frames", 96),
+            outcome_max_frames=getattr(args, "outcome_max_frames", 150),
             playback_fps=getattr(args, "playback_fps", 0),
             upscale_factor=getattr(args, "upscale_factor", 0),
             fps_multiplier=getattr(args, "fps_multiplier", 0),
+            upscale_model=getattr(args, "upscale_model", None),
         )
 
     _log("\n✓ Done.")

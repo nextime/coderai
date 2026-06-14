@@ -1994,7 +1994,17 @@ def _postprocess_video(mp4_bytes: bytes, request: VideoGenerationRequest,
     temp_paths.append(path)
 
     if request.upscale_output:
-        path = _ffmpeg_upscale(path, request.upscale_factor or 2, temp_paths)
+        model_name = (getattr(request, 'upscale_model', None) or '').strip() \
+            or multi_model_manager.find_capable_model(
+                "video_upscaling", "image_upscaling") or ''
+        if not model_name:
+            raise HTTPException(
+                status_code=400,
+                detail="upscale_output requested but no AI upscaling model is "
+                       "configured — add a Real-ESRGAN / SwinIR / diffusers "
+                       "upscaler on the model page. There is no ffmpeg fallback.")
+        path = _model_upscale_video(model_name, path,
+                                    request.upscale_factor or 2, temp_paths)
 
     if request.interpolate_output and request.fps_multiplier:
         path = _rife_interpolate(path, request.fps_multiplier, temp_paths)
@@ -2035,40 +2045,340 @@ def _ffmpeg_upscale(path: str, factor: int, temps: list) -> str:
     return out
 
 
+def _video_fps(path: str) -> float:
+    """Return the video's frame rate via ffprobe (falls back to 8.0)."""
+    try:
+        r = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
+             '-show_entries', 'stream=r_frame_rate',
+             '-of', 'default=noprint_wrappers=1:nokey=1', path],
+            capture_output=True, text=True)
+        num, _, den = r.stdout.strip().partition('/')
+        fps = float(num) / float(den) if den else float(num)
+        return fps if fps > 0 else 8.0
+    except Exception:
+        return 8.0
+
+
+def _model_upscale_video(model_name: str, in_path: str, factor: int,
+                         temps: list):
+    """Super-resolve a video frame-by-frame with the configured upscaler model.
+
+    Resolves ``model_name`` through the model manager (so it loads / evicts and
+    shows up in the model page exactly like any other model), then runs the
+    Real-ESRGAN / diffusers upscaler on every frame and reassembles the clip at
+    its original FPS, preserving audio. Returns the output path.
+
+    Raises on any failure so the caller can fall back to ffmpeg.
+    """
+    import logging
+    from codai.api.images import _load_upscaler, _run_upscale, _UPSCALER_CACHE
+    _log = logging.getLogger(__name__)
+
+    # Resolve the upscaler through the manager (thermal + VRAM accounting) but DO
+    # NOT store the loaded object in manager.models — that registry is keyed by
+    # real model ids, and a synthetic 'upscale:<id>' key there makes a later
+    # request_model() resolve to the bogus key and try to reload it. Keep our own
+    # private cache instead.
+    info = multi_model_manager.request_model(model_name, model_type="image")
+    if info.get('error'):
+        raise RuntimeError(info['error'])
+    resolved = info.get('model_name') or model_name
+    upscaler = _UPSCALER_CACHE.get(resolved)
+    if upscaler is None:
+        upscaler = _load_upscaler(resolved, global_args)
+    backend = upscaler[0]
+    if backend == 'pil':
+        # No real super-res model resolved → AI-or-fail (no ffmpeg upscale).
+        raise RuntimeError(
+            f"'{resolved}' is not a video/image upscaling model")
+    # Cache only a real, loaded upscaler so it's reused across frames/requests.
+    _UPSCALER_CACHE[resolved] = upscaler
+
+    fps = _video_fps(in_path)
+    frames_dir = tempfile.mkdtemp()
+    out_dir = tempfile.mkdtemp()
+    temps += [frames_dir, out_dir]
+    r = subprocess.run(['ffmpeg', '-y', '-i', in_path, f'{frames_dir}/%08d.png'],
+                       capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"frame extraction failed: {r.stderr.decode(errors='replace')}")
+
+    import glob
+    frame_files = sorted(glob.glob(f'{frames_dir}/*.png'))
+    if not frame_files:
+        raise RuntimeError("no frames extracted from video")
+    _log.info("video upscale ×%d via %s (%s) — %d frames",
+              factor, resolved, backend, len(frame_files))
+    # Register as a first-class task so it shows in the CoderAI task list and can
+    # be paused/cancelled like any other model job. (Thermal protection already
+    # ran at request_model() time, same as every other model.)
+    _tid = task_registry.register(
+        "upscale", title=f"Upscale ×{factor} ({len(frame_files)} frames)",
+        model=resolved, total=len(frame_files))
+    task_registry.start(_tid)
+    # Publish per-frame progress through the shared video-progress channel so
+    # clients polling /v1/video/progress can show "frame X/Y" while we work.
+    _vid_progress_reset(len(frame_files))
+    _vid_progress["phase"] = "upscaling"
+    _vid_progress["model"] = resolved
+    # Re-check thermals periodically through the frame loop: request_model()
+    # only waited once at job start, but an upscale runs the GPU hard for many
+    # frames over minutes, so a long clip could heat up mid-run. Pause to cool
+    # every _THERMAL_EVERY frames, exactly like a fresh request would.
+    _THERMAL_EVERY = 32
+    try:
+        from codai.models.thermal import wait_until_safe as _wait_until_safe
+    except Exception:
+        _wait_until_safe = None
+    try:
+        for i, fp in enumerate(frame_files):
+            task_registry.raise_if_cancelled(_tid)
+            task_registry.wait_if_paused(_tid)
+            if _wait_until_safe and i and i % _THERMAL_EVERY == 0:
+                try:
+                    _wait_until_safe(context=f"upscale:{resolved}")
+                except Exception:
+                    pass  # never let thermal monitoring block the upscale
+            with open(fp, 'rb') as f:
+                out_img = _run_upscale(upscaler, f.read(), factor)
+            out_img.save(os.path.join(out_dir, os.path.basename(fp)))
+            task_registry.step(_tid, i + 1)
+            _vid_progress_step(i + 1)
+    except TaskCancelled:
+        task_registry.finish(_tid, "cancelled")
+        raise
+    except Exception as e:
+        task_registry.finish(_tid, "error", str(e)[:200])
+        raise
+    else:
+        task_registry.finish(_tid, "done")
+    finally:
+        _vid_progress_done()
+
+    out = tempfile.mktemp(suffix='_up.mp4')
+    temps.append(out)
+    cmd = ['ffmpeg', '-y', '-framerate', f'{fps}', '-i', f'{out_dir}/%08d.png']
+    # Carry the original audio track if present.
+    cmd += ['-i', in_path, '-map', '0:v:0', '-map', '1:a:0?',
+            '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'copy',
+            '-shortest', out]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"reassembly failed: {r.stderr.decode(errors='replace')}")
+    return out
+
+
+def _count_video_frames(path: str) -> int:
+    """Best-effort total frame count of a video (0 if unknown)."""
+    try:
+        r = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+             '-count_packets', '-show_entries', 'stream=nb_read_packets',
+             '-of', 'csv=p=0', path], capture_output=True, text=True)
+        return int(r.stdout.strip())
+    except Exception:
+        return 0
+
+
+def _find_rife_binary():
+    """Locate the rife-ncnn-vulkan executable: PATH first, then the common
+    user/system install dirs (the prebuilt release may not be on the server's
+    PATH). Returns the path or None."""
+    import shutil
+    exe = shutil.which('rife-ncnn-vulkan')
+    if exe:
+        return exe
+    for d in (os.path.expanduser('~/.local/share/rife-ncnn-vulkan'),
+              os.path.expanduser('~/.local/bin'),
+              '/opt/rife-ncnn-vulkan', '/usr/local/share/rife-ncnn-vulkan',
+              '/usr/local/bin'):
+        p = os.path.join(d, 'rife-ncnn-vulkan')
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+_RIFE_GPU_CACHE: dict = {"id": None}
+
+
+def _rife_list_devices(rife_bin: str) -> dict:
+    """Enumerate the Vulkan devices rife sees, as {ncnn_index: name}. rife prints
+    these (e.g. '[0 NVIDIA GeForce RTX 3090]') on stderr when it inits the GPU, so
+    we trigger a tiny 2-frame run and parse them. ncnn's own indexing (not raw
+    Vulkan order) is what -g expects, which is exactly what this captures."""
+    import tempfile as _tf, re, glob as _glob
+    from PIL import Image as _Img
+    devs = {}
+    try:
+        d_in, d_out = _tf.mkdtemp(), _tf.mkdtemp()
+        _Img.new('RGB', (16, 16)).save(os.path.join(d_in, '00000001.png'))
+        _Img.new('RGB', (16, 16), (255, 255, 255)).save(os.path.join(d_in, '00000002.png'))
+        root = os.path.dirname(os.path.realpath(rife_bin))
+        md = os.path.join(root, 'rife-v4')
+        r = subprocess.run([rife_bin, '-i', d_in, '-o', d_out, '-n', '2',
+                            '-m', md if os.path.isdir(md) else 'rife-v4'],
+                           capture_output=True, text=True, timeout=120)
+        for line in (r.stderr or '').splitlines():
+            m = re.match(r'\[(\d+)\s+(.+?)\]', line.strip())
+            if m:
+                devs.setdefault(int(m.group(1)), m.group(2).strip())
+        for f in _glob.glob(os.path.join(d_out, '*')):
+            try: os.remove(f)
+            except Exception: pass
+    except Exception:
+        pass
+    return devs
+
+
+def _rife_gpu_id(rife_bin: str) -> int:
+    """Vulkan/ncnn device id rife should run on — resolved to the SAME physical
+    GPU coderai uses (by matching the CUDA device name to rife's device list),
+    not a hardcoded index. Falls back to the first real (non-CPU) GPU, then to the
+    configured index. Cached after the first resolve."""
+    if _RIFE_GPU_CACHE["id"] is not None:
+        return _RIFE_GPU_CACHE["id"]
+
+    # The GPU coderai actually runs its diffusers/upscaler models on.
+    cuda_idx, target = 0, None
+    try:
+        v = getattr(global_args, 'image_vulkan_device', None)
+        if v is None:
+            v = getattr(global_args, 'vulkan_device', 0)
+        cuda_idx = int(v or 0)
+    except Exception:
+        cuda_idx = 0
+    try:
+        import torch
+        if torch.cuda.is_available():
+            target = torch.cuda.get_device_name(cuda_idx)
+    except Exception:
+        target = None
+
+    devs = _rife_list_devices(rife_bin)
+    gid = None
+    if devs and target:
+        t = target.strip().lower()
+        # Exact name match first, then a loose token match (e.g. '3090').
+        for i, name in sorted(devs.items()):
+            if name.strip().lower() == t:
+                gid = i; break
+        if gid is None:
+            tok = t.split()[-1] if t.split() else t
+            for i, name in sorted(devs.items()):
+                if tok and tok in name.lower():
+                    gid = i; break
+    if gid is None and devs:
+        # No name match → first non-software, non-CPU device.
+        for i, name in sorted(devs.items()):
+            nl = name.lower()
+            if 'llvmpipe' not in nl and 'software' not in nl and 'cpu' not in nl:
+                gid = i; break
+    if gid is None:
+        gid = cuda_idx  # last resort: the configured index
+    import logging
+    logging.getLogger(__name__).info(
+        "rife GPU resolved to ncnn device %s (%s) matching coderai GPU '%s'",
+        gid, devs.get(gid, '?'), target or 'unknown')
+    _RIFE_GPU_CACHE["id"] = gid
+    return gid
+
+
 def _rife_interpolate(path: str, multiplier: int, temps: list) -> str:
+    """Raise a video's FPS via the RIFE neural frame interpolator (AI, on the GPU).
+
+    AI-or-fail by design: there is NO ffmpeg/minterpolate fallback. If no neural
+    interpolator is available the call raises so the caller surfaces the error,
+    exactly like the AI upscaler — interpolation must be a real AI op on CoderAI."""
     out = tempfile.mktemp(suffix='_rife.mp4')
     temps.append(out)
-    import logging, shutil
+    import logging
     _log = logging.getLogger(__name__)
-    if shutil.which('rife-ncnn-vulkan'):
+
+    rife_bin = _find_rife_binary()
+    if not rife_bin:
+        raise RuntimeError(
+            "No AI frame interpolator available: 'rife-ncnn-vulkan' is not installed. "
+            "FPS interpolation must run on an AI model (no ffmpeg fallback) — install "
+            "rife-ncnn-vulkan, or disable FPS interpolation (fps_multiplier).")
+    # The release ships its model folders next to the binary; resolve an absolute
+    # model path so it's found regardless of the server's CWD.
+    _rife_root = os.path.dirname(os.path.realpath(rife_bin))
+    _model_dir = os.path.join(_rife_root, 'rife-v4')
+    _model_arg = _model_dir if os.path.isdir(_model_dir) else 'rife-v4'
+
+    in_frames = _count_video_frames(path)
+    out_frames = in_frames * multiplier if in_frames else 0
+
+    # Thermal parity: pause if the machine is hot before a heavy interpolation
+    # (same guard request_model() applies to model loads).
+    try:
+        from codai.models.thermal import wait_until_safe
+        wait_until_safe(context=f"interpolate:x{multiplier}")
+    except Exception:
+        pass
+
+    _tid = task_registry.register(
+        "interpolate", title=f"Interpolate ×{multiplier} FPS"
+        + (f" ({out_frames} frames)" if out_frames else ""),
+        model="rife-ncnn-vulkan", total=out_frames or 1)
+    task_registry.start(_tid)
+    try:
         frames_dir = tempfile.mkdtemp()
         out_dir = tempfile.mkdtemp()
         temps += [frames_dir, out_dir]
+        # ffmpeg here only extracts/encodes frames (a muxer), never interpolates —
+        # the actual interpolation is done by the RIFE neural network.
         r = subprocess.run(['ffmpeg', '-y', '-i', path, f'{frames_dir}/%08d.png'],
                            capture_output=True)
         if r.returncode != 0:
-            _log.warning("ffmpeg frame extraction failed: %s", r.stderr.decode(errors='replace'))
-        else:
-            r = subprocess.run(['rife-ncnn-vulkan', '-i', frames_dir, '-o', out_dir,
-                                '-m', 'rife-v4'], capture_output=True)
-            if r.returncode != 0:
-                _log.warning("rife-ncnn-vulkan failed: %s", r.stderr.decode(errors='replace'))
-            else:
-                r = subprocess.run(['ffmpeg', '-y', '-r', str(multiplier * 8), '-i',
-                                    f'{out_dir}/%08d.png', '-c:v', 'libx264', out],
-                                   capture_output=True)
-                if r.returncode != 0:
-                    _log.warning("ffmpeg reassembly failed: %s", r.stderr.decode(errors='replace'))
-                elif os.path.exists(out):
-                    return out
-    # Simple ffmpeg minterpolate fallback
-    cmd = ['ffmpeg', '-y', '-i', path, '-filter:v',
-           f'minterpolate=fps={multiplier * 8}', '-c:a', 'copy', out]
-    r = subprocess.run(cmd, capture_output=True)
-    if r.returncode != 0:
-        _log.warning("ffmpeg minterpolate failed: %s", r.stderr.decode(errors='replace'))
-        return path
-    return out
+            raise RuntimeError(
+                f"frame extraction failed: {r.stderr.decode(errors='replace')}")
+        # Watch the output frame dir so the (opaque) rife subprocess still
+        # reports progress as it writes interpolated frames.
+        _vid_progress_reset(max(1, out_frames))
+        _vid_progress["phase"] = "interpolating"
+        import threading, glob as _glob
+        _stop = threading.Event()
+
+        def _watch():
+            while not _stop.is_set():
+                n = len(_glob.glob(f'{out_dir}/*.png'))
+                _vid_progress_step(min(n, out_frames) if out_frames else n)
+                if out_frames:
+                    try: task_registry.step(_tid, min(n, out_frames))
+                    except Exception: pass
+                _stop.wait(0.5)
+        _w = threading.Thread(target=_watch, daemon=True); _w.start()
+        # -n sets the exact target frame count so any multiplier works (rife's
+        # default only doubles); -g pins the GPU to the configured NVIDIA device.
+        _cmd = [rife_bin, '-i', frames_dir, '-o', out_dir, '-m', _model_arg,
+                '-g', str(_rife_gpu_id(rife_bin))]
+        if out_frames:
+            _cmd += ['-n', str(out_frames)]
+        r = subprocess.run(_cmd, capture_output=True)
+        _stop.set(); _w.join(timeout=1)
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"rife-ncnn-vulkan failed: {r.stderr.decode(errors='replace')}")
+        r = subprocess.run(['ffmpeg', '-y', '-r', str(multiplier * 8), '-i',
+                            f'{out_dir}/%08d.png', '-c:v', 'libx264', out],
+                           capture_output=True)
+        if r.returncode != 0 or not os.path.exists(out):
+            raise RuntimeError(
+                f"reassembly failed: {r.stderr.decode(errors='replace')}")
+        task_registry.finish(_tid, "done")
+        return out
+    except TaskCancelled:
+        task_registry.finish(_tid, "cancelled")
+        raise
+    except Exception as e:
+        task_registry.finish(_tid, "error", str(e)[:200])
+        raise
+    finally:
+        _vid_progress_done()
 
 
 def _add_audio_to_video(path: str, request: VideoGenerationRequest,
@@ -2761,22 +3071,56 @@ async def video_generations(request: VideoGenerationRequest,
 @router.post("/v1/video/upscale", summary="Upscale a video")
 async def video_upscale(request: VideoUpscaleRequest, http_request: Request = None):
     """
-    Upscale a video using ffmpeg lanczos or Real-ESRGAN.
-    The model field can be 'realesrgan' or any registered video_upscaling model.
+    Upscale a video with a real super-resolution model.
+
+    If ``model`` is given it must name an AI upscaler (Real-ESRGAN / SwinIR / a
+    diffusers upscaler, etc.). If it is omitted, the server auto-selects the
+    first configured model with a video/image upscaling capability. The model is
+    loaded through the model manager — exactly like any other model on the model
+    page — and run on the GPU frame-by-frame. There is **no ffmpeg/CPU
+    fallback**: if no usable upscaling model is configured the request fails so
+    the caller knows the operation did not run.
     """
     raw = _decode_b64_or_url(request.video)
+    factor = request.upscale_factor or 2
+    model_name = (request.model or "").strip()
+    if not model_name:
+        # No model supplied — let CoderAI pick a configured upscaler.
+        model_name = multi_model_manager.find_capable_model(
+            "video_upscaling", "image_upscaling") or ""
+    if not model_name:
+        raise HTTPException(
+            status_code=400,
+            detail="no AI upscaling model is configured — add a Real-ESRGAN / "
+                   "SwinIR / diffusers upscaler on the model page. There is no "
+                   "ffmpeg fallback.")
     temps = []
-    try:
+
+    def _do_upscale():
         in_path = _tmp_write(raw, '.mp4')
         temps.append(in_path)
-        out_path = await asyncio.get_event_loop().run_in_executor(
-            None, _ffmpeg_upscale, in_path, request.upscale_factor or 2, temps)
+        return _model_upscale_video(model_name, in_path, factor, temps)
+
+    try:
+        try:
+            out_path = await asyncio.get_event_loop().run_in_executor(
+                None, _do_upscale)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"video upscale failed for model '{model_name}': {e}")
         with open(out_path, 'rb') as f:
             out_bytes = f.read()
     finally:
+        import shutil
         for t in temps:
             try:
-                os.unlink(t)
+                if os.path.isdir(t):
+                    shutil.rmtree(t, ignore_errors=True)
+                else:
+                    os.unlink(t)
             except Exception:
                 pass
 

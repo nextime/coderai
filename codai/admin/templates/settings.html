@@ -68,6 +68,11 @@
     <input type="text" id="s-offload-dir" class="form-input" placeholder="./offload">
     <span class="form-hint">Models will inherit this as default when configured</span>
   </div>
+  <div class="form-row" style="margin-top:.75rem">
+    <label class="form-label">Temporary working directory <span class="muted">(default: system /tmp)</span></label>
+    <input type="text" id="s-tmp-dir" class="form-input" placeholder="e.g. /data/tmp">
+    <span class="form-hint">Scratch space for frame extraction, upscaling and interpolation. Point it at a large volume — 4× upscaling can exhaust a small /tmp ("No space left on device"). Applied live on save.</span>
+  </div>
 </div>
 
 <!-- Archive -->
@@ -330,6 +335,7 @@ async function loadSettings(){
     document.getElementById('s-hf-cache').value   = d.models?.hf_cache_dir ?? '';
     document.getElementById('s-gguf-cache').value = d.models?.gguf_cache_dir ?? '';
     document.getElementById('s-offload-dir').value = d.offload?.directory ?? './offload';
+    document.getElementById('s-tmp-dir').value = d.tmp_dir ?? '';
     toggleHttps();
     // Archive
     const arc = d.archive || {};
@@ -397,6 +403,7 @@ async function saveSettings(){
     offload:{
       directory: document.getElementById('s-offload-dir').value.trim() || './offload',
     },
+    tmp_dir: strOrNull('s-tmp-dir'),
     archive:{
       enabled: document.getElementById('s-arc-enabled').checked,
       directory: document.getElementById('s-arc-dir').value.trim(),

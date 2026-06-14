@@ -163,6 +163,11 @@ class Config:
     tools_closer_prompt: bool = False
     grammar_guided: bool = False
     file_path: Optional[str] = None
+    # Base directory for temporary working files (frame extraction, upscaling,
+    # interpolation, etc.). None/empty = the OS default (usually /tmp). Point it at
+    # a large-capacity volume when /tmp is small — 4× upscaling extracts many large
+    # frames and can exhaust a small /tmp ("No space left on device").
+    tmp_dir: Optional[str] = None
     hf_chat_templates: list = field(default_factory=list)
     reasoning_options: list = field(default_factory=list)
     parser: str = "auto"
@@ -318,6 +323,7 @@ class ConfigManager:
                 tools_closer_prompt=config_data.get("tools_closer_prompt", False),
                 grammar_guided=config_data.get("grammar_guided", False),
                 file_path=config_data.get("file_path"),
+                tmp_dir=config_data.get("tmp_dir"),
                 hf_chat_templates=config_data.get("hf_chat_templates", []),
                 reasoning_options=config_data.get("reasoning_options", []),
                 parser=config_data.get("parser", "auto")
@@ -457,6 +463,7 @@ class ConfigManager:
             "tools_closer_prompt": self.config.tools_closer_prompt,
             "grammar_guided": self.config.grammar_guided,
             "file_path": self.config.file_path,
+            "tmp_dir": self.config.tmp_dir,
             "hf_chat_templates": self.config.hf_chat_templates,
             "reasoning_options": self.config.reasoning_options,
             "parser": self.config.parser

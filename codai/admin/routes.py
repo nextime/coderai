@@ -2420,6 +2420,7 @@ async def api_get_settings(username: str = Depends(require_admin)):
         "tools_closer_prompt": c.tools_closer_prompt,
         "grammar_guided": c.grammar_guided,
         "parser": c.parser,
+        "tmp_dir": c.tmp_dir,
     }
 
 
@@ -2491,6 +2492,20 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         c.grammar_guided = bool(data["grammar_guided"])
     if "parser" in data:
         c.parser = data["parser"]
+    if "tmp_dir" in data:
+        # Persisted now and applied live so it takes effect without a restart.
+        c.tmp_dir = (data["tmp_dir"] or "").strip() or None
+        if c.tmp_dir:
+            try:
+                import tempfile as _tf, os as _os
+                _td = _os.path.abspath(_os.path.expanduser(c.tmp_dir))
+                _os.makedirs(_td, exist_ok=True)
+                _tf.tempdir = _td
+                _os.environ["TMPDIR"] = _td
+                _os.environ["TMP"] = _td
+                _os.environ["TEMP"] = _td
+            except Exception:
+                pass
 
     if "archive" in data:
         import os as _os

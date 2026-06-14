@@ -3263,6 +3263,22 @@ class MultiModelManager:
             return self.models.get(self.default_model)
         return None
     
+    def find_capable_model(self, *capabilities: str) -> Optional[str]:
+        """Return the id of the first configured model whose capabilities include
+        any of the requested ones, in the priority order given. Used to auto-pick
+        a default for endpoints that have no per-type default list (e.g. video
+        upscaling). Returns None when nothing configured matches."""
+        try:
+            infos = self.list_models()
+        except Exception:
+            return None
+        for want in capabilities:
+            for info in infos:
+                caps = getattr(info, "capabilities", None) or []
+                if want in caps:
+                    return info.id
+        return None
+
     def list_models(self) -> List[ModelInfo]:
         """List all available models (configured + runtime aliases) with type/capability metadata."""
         from codai.models.capabilities import detect_model_capabilities, ModelCapabilities
