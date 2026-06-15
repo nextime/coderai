@@ -1,0 +1,150 @@
+ARG CUDA_VERSION=12.4.1
+ARG UBUNTU_VERSION=22.04
+
+FROM scratch AS build_meta
+COPY .packaging-cache/build-manifest.json /build-manifest.json
+
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
+
+ARG PYTHON_VERSION=3.13.5
+ARG PBS_RELEASE=20250612
+ARG UV_VERSION=0.7.13
+ARG WHISPERCPP_REF=master
+ARG LLAMA_CPP_PYTHON_VERSION=
+ARG SD_CPP_PYTHON_VERSION=
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PIP_NO_CACHE_DIR=1 \
+    UV_SYSTEM_PYTHON=1 \
+    FORCE_CMAKE=1 \
+    CMAKE_BUILD_PARALLEL_LEVEL=4 \
+    MAX_JOBS=4
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      cmake \
+      curl \
+      git \
+      libgomp1 \
+      libvulkan-dev \
+      ninja-build \
+      patchelf \
+      pkg-config \
+      zstd \
+      vulkan-tools \
+      glslang-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    curl -fsSL -o /tmp/python.tar.gz \
+      "https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_RELEASE}/cpython-${PYTHON_VERSION}+${PBS_RELEASE}-x86_64-unknown-linux-gnu-install_only.tar.gz"; \
+    mkdir -p /opt/coderai; \
+    tar -xzf /tmp/python.tar.gz -C /opt/coderai; \
+    rm /tmp/python.tar.gz; \
+    /opt/coderai/python/bin/python3 --version
+
+ENV PYTHONHOME=/opt/coderai/python \
+    PATH=/opt/coderai/python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz" \
+      | tar -xz -C /usr/local/bin --strip-components=1 uv-x86_64-unknown-linux-gnu/uv
+
+RUN uv pip install --python /opt/coderai/python/bin/python3 --upgrade pip setuptools wheel scikit-build-core cmake ninja numpy pybind11
+
+RUN mkdir -p /opt/wheels
+
+RUN set -eux; \
+    pkg="llama-cpp-python${LLAMA_CPP_PYTHON_VERSION:+==${LLAMA_CPP_PYTHON_VERSION}}"; \
+    CMAKE_ARGS="-DGGML_CUDA=ON -DGGML_VULKAN=ON" \
+      uv pip wheel --python /opt/coderai/python/bin/python3 --wheel-dir /opt/wheels --no-deps --no-cache "$pkg"
+
+RUN set -eux; \
+    pkg="stable-diffusion-cpp-python${SD_CPP_PYTHON_VERSION:+==${SD_CPP_PYTHON_VERSION}}"; \
+    CMAKE_ARGS="-DSD_CUDA=ON -DSD_VULKAN=ON -DSD_WEBM=OFF" \
+      uv pip wheel --python /opt/coderai/python/bin/python3 --wheel-dir /opt/wheels --no-deps --no-cache "$pkg" || \
+    CMAKE_ARGS="-DSD_CUDA=ON -DSD_WEBM=OFF" \
+      uv pip wheel --python /opt/coderai/python/bin/python3 --wheel-dir /opt/wheels --no-deps --no-cache "$pkg"
+
+RUN set -eux; \
+    git clone --depth 1 --branch "$WHISPERCPP_REF" https://github.com/ggerganov/whisper.cpp /tmp/whisper.cpp || \
+    git clone --depth 1 https://github.com/ggerganov/whisper.cpp /tmp/whisper.cpp; \
+    if [ -d /tmp/whisper.cpp/bindings/python ]; then \
+      CMAKE_ARGS="-DWHISPER_VULKAN=ON -DGGML_VULKAN=ON -DGGML_CUDA=ON" \
+        uv pip wheel --python /opt/coderai/python/bin/python3 --wheel-dir /opt/wheels --no-deps --no-cache /tmp/whisper.cpp/bindings/python || \
+      CMAKE_ARGS="-DWHISPER_VULKAN=ON -DGGML_VULKAN=ON" \
+        uv pip wheel --python /opt/coderai/python/bin/python3 --wheel-dir /opt/wheels --no-deps --no-cache /tmp/whisper.cpp/bindings/python || \
+      uv pip wheel --python /opt/coderai/python/bin/python3 --wheel-dir /opt/wheels --no-deps --no-cache whispercpp; \
+    else \
+      uv pip wheel --python /opt/coderai/python/bin/python3 --wheel-dir /opt/wheels --no-deps --no-cache whispercpp; \
+    fi
+
+WORKDIR /opt/coderai/app
+COPY packaging/common/requirements-oci.txt /tmp/requirements-oci.txt
+COPY requirements.txt /tmp/requirements.txt
+COPY requirements-nvidia.txt /tmp/requirements-nvidia.txt
+COPY requirements-vulkan.txt /tmp/requirements-vulkan.txt
+COPY . /opt/coderai/app
+
+RUN uv pip install --python /opt/coderai/python/bin/python3 \
+      --find-links /opt/wheels \
+      -r /tmp/requirements-oci.txt \
+    && rm -rf /root/.cache/uv /tmp/requirements*.txt
+
+RUN set -eux; \
+    chmod +x /opt/coderai/app/coderai; \
+    mkdir -p /config /models /cache /opt/coderai/app/models; \
+    rm -rf \
+      /opt/coderai/app/.git \
+      /opt/coderai/app/venv* \
+      /opt/coderai/app/.venv \
+      /opt/coderai/app/township_output \
+      /opt/coderai/app/offload \
+      /opt/coderai/app/dist \
+      /opt/coderai/app/.packaging-cache; \
+    find /opt/coderai/python -type d \( -name __pycache__ -o -name tests -o -name test \) -prune -exec rm -rf '{}' +; \
+    find /opt/coderai/app -type d -name __pycache__ -prune -exec rm -rf '{}' +
+
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
+
+ARG PYTHON_VERSION=3.13.5
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONHOME=/opt/coderai/python \
+    PATH=/opt/coderai/python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/cache/huggingface \
+    HUGGINGFACE_HUB_CACHE=/cache/huggingface/hub \
+    TRANSFORMERS_CACHE=/cache/huggingface/transformers \
+    DIFFUSERS_CACHE=/cache/diffusers \
+    CODERAI_CONFIG_DIR=/config \
+    CODERAI_MODELS_DIR=/models \
+    CODERAI_CACHE_DIR=/cache \
+    CODERAI_HOST=0.0.0.0 \
+    CODERAI_PORT=8776
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      ffmpeg \
+      git \
+      libgomp1 \
+      libgl1 \
+      libglib2.0-0 \
+      libsndfile1 \
+      libvulkan1 \
+      mesa-vulkan-drivers \
+      openssl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/coderai /opt/coderai
+COPY --from=build_meta /build-manifest.json /opt/coderai/BUILD-MANIFEST.json
+COPY packaging/linux/launcher/coderai-oci /usr/local/bin/coderai
+
+RUN set -eux; \
+    chmod +x /usr/local/bin/coderai; \
+    mkdir -p /config /models /cache
+
+VOLUME ["/config", "/models", "/cache"]
+EXPOSE 8776
+ENTRYPOINT ["/usr/local/bin/coderai"]

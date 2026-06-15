@@ -187,6 +187,7 @@ class VideoInterpolateRequest(BaseModel):
     init_image: Optional[str] = None     # first frame
     end_image: Optional[str] = None      # last frame
     fps_multiplier: Optional[int] = 2
+    output_fps: Optional[int] = None     # encode the result at this fps (None = source_fps × multiplier, preserves duration)
     response_format: Optional[str] = "url"
     model_config = ConfigDict(extra="allow")
 

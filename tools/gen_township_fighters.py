@@ -395,26 +395,33 @@ FIGHT_SHOT_TEMPLATES = [
     "exploding forward with a brutal low leg kick that buckles the opponent's lead leg, camera tracking the impact as the crowd erupts",
     "launching a spinning back-kick deep into the body, opponent folding over it, slow whip-pan following the spin",
     "detonating a flying knee flush on the jaw, blood and sweat spraying, low-angle shot punching up at the violence",
+    "running two steps up a wall and springing off into a cartwheel kick, heel cracking across the opponent's jaw, sweeping crane shot",
+    "vaulting over a parked car and dropping a flying elbow onto the opponent below, dust bursting up, dramatic overhead angle",
+    "back-flipping clear of a wild swing then landing into a spinning hook kick, capoeira-smooth, orbiting low camera",
     "shooting in for a double-leg and slamming the opponent into the dirt, dust kicking up, camera dropping with the takedown",
     "raining down savage ground-and-pound from full mount, opponent's face bloodied and turtling, tight overhead close-up",
     "ripping a slashing elbow in the clinch that splits the brow open, blood sheeting down, hard cut to the wound",
+    "springboarding off a stack of crates into a flying knee, the opponent blasted backward into the market stalls, wide scenic shot",
     "snapping a head kick that whips across the ducking opponent's skull, sweat flying, wide low-angle framing the arc",
-    "driving knee after knee into the body against the fence, opponent crumpling, handheld camera shaking with each blow",
+    "cartwheeling sideways to dodge then whipping a no-hands spinning heel kick, crowd gasping, slow-motion arc, golden dusk light",
+    "scaling a fighter and spinning into a hurricanrana takedown, both crashing through a fruit cart, debris flying, sweeping pan",
     "catching a kick and crashing the opponent down into side control, crowd surging, sweeping pan to the mount",
     "uncorking a thunderous uppercut, the opponent's head snapping back, teeth and spit flying, super-slow impact frame",
-    "sprawling hard out of a shot then ripping upward with a knee to the face, fast whip up from the floor",
+    "sprawling hard out of a shot then exploding upward into a flying knee, fast whip up from the floor against the firelight",
+    "leaping off a low rooftop into a diving punch, the two crashing together amid scattering crowd, epic high-angle establishing shot",
     "cinching a tight guillotine as the opponent thrashes and turns purple, camera circling the desperate escape",
     "stuffing a takedown and spiking a brutal knee to the temple, opponent collapsing, low tracking shot",
+    "kipping up off the ground straight into a spinning elbow, blood spraying across the neon-lit puddles, dynamic orbit",
     "trading bombs at point-blank range, both fighters splitting each other open, crowd roaring, shaky close-up",
-    "slipping inside and answering with a flying elbow, both men bloodied and still swinging, dramatic dusk backlight",
-    "stomping forward behind a vicious push kick that folds the opponent into the cars, wide establishing crane move",
+    "wall-running along the corrugated fence and launching a missile drop-kick, opponent folding, sweeping kinetic camera",
+    "stomping forward behind a vicious push kick that folds the opponent into the stacked cars, wide establishing crane move",
     "ripping a body-head hook combo that drops the opponent to a knee, blood on the concrete, orbiting camera",
 ]
 
 # Rotating technique focus passed one-per-clip to the prompt writer so a match
 # doesn't collapse into "all punches". The planner cycles through these (shuffled)
-# so consecutive clips emphasise different MMA disciplines AND camera language —
-# the strongest lever against boxing-only, static-shot monotony.
+# so consecutive clips emphasise different MMA disciplines, ACROBATICS and camera
+# language — the strongest lever against boxing-only, static-shot monotony.
 FIGHT_ACTION_FOCUS = [
     "a brutal kicking exchange (low leg kicks, body kicks, head kicks, push kicks) — shoot it with a low tracking angle following the strikes",
     "knees and elbows tearing flesh in a tight clinch against the wall or fence — tight handheld close-up on the impacts",
@@ -422,8 +429,10 @@ FIGHT_ACTION_FOCUS = [
     "merciless ground-and-pound or a desperate scramble on the floor — overhead and over-shoulder coverage",
     "a fight-ending submission attempt (choke, armbar, guillotine) and the frantic escape — slow orbit around the lock",
     "an explosive spinning or flying technique (spinning back-kick, spinning elbow, flying knee) — whip-pan that follows the rotation",
+    "an ACROBATIC aerial move — wall-run, cartwheel kick, backflip evasion, springboard or no-hands capoeira spin — captured with a sweeping crane or orbit",
+    "using the SCENERY as a weapon — vaulting a car, leaping off crates/a low rooftop, smashing through market stalls or a fence — wide cinematic establishing shot",
     "blistering boxing combinations with head movement and brutal counters — fast push-in on the cleanest shots",
-    "a defensive sequence — sprawl, slip, then a savage counter back to offence — reverse-angle reveal of the counter",
+    "a defensive sequence — duck, roll, kip-up — then a savage acrobatic counter back to offence — reverse-angle reveal of the counter",
 ]
 
 # The decisive FINISH that ends the bout — the first clip of every outcome video.
@@ -440,9 +449,9 @@ FINISH_SHOT_TEMPLATES = {
         "finishing with a thunderous flying knee, the opponent collapsing in a heap as the crowd gasps",
     ],
     "retire": [
-        "battering the opponent until they turn away and wave it off, unable to continue, sinking to a knee",
-        "breaking the opponent's will with a savage body assault, their corner hurling in the towel",
-        "overwhelming the opponent who signals surrender and slumps, beaten, against the fence",
+        "the beaten opponent turning their back and walking away toward their corner to quit, refusing to keep fighting",
+        "the opponent waving it off, shaking their head and trudging out of the fight to retire as the winner stands tall",
+        "the opponent raising a hand in surrender and walking away, done, unable to continue",
     ],
     "draw": [
         "both fighters trading their last savage blows to the final second, bloodied, exhausted, neither giving an inch",
@@ -455,19 +464,19 @@ FINISH_SHOT_TEMPLATES = {
 # the winning fighter and the referee raising their arm.
 WIN_SHOT_TEMPLATES = {
     "win": [
-        "the referee grabbing the winner's wrist and thrusting their arm to the sky as the crowd surges forward",
+        "the lone winner center-frame as the referee grabs their wrist and thrusts their arm to the sky, crowd surging",
         "the victor dropping to their knees then rising as the referee lifts their arm, sweat and blood glistening",
         "the winner pointing to the roaring crowd before the referee hoists their arm high in triumph",
     ],
     "ko_win": [
-        "standing over the knocked-out opponent, arms thrown up, referee waving it off then raising the winner's arm, crowd going wild",
-        "roaring at the crowd with both fists up as the referee lifts the victor's arm over the motionless opponent",
-        "the winner climbing the fence in triumph then dropping down as the referee raises their arm",
+        "the winner roaring with both fists raised as the referee lifts their arm in victory, crowd going wild",
+        "the victor climbing the fence in triumph then dropping down as the referee raises their arm",
+        "the winner pacing with arms thrown up before the referee grabs their wrist and hoists it skyward",
     ],
     "retire": [
-        "the referee raising the winner's arm in victory while the beaten opponent's corner consoles them",
-        "the victor calmly raising a bloodied fist as the referee lifts their arm and the crowd applauds",
-        "the winner bowing to the crowd before the referee hoists their arm, the retired opponent slumped behind",
+        "the winner calmly raising a bloodied fist as the referee lifts their arm and the crowd applauds",
+        "the victor bowing to the crowd before the referee hoists their arm high in triumph",
+        "the winner standing tall as the referee grabs their wrist and thrusts their arm to the sky",
     ],
     "draw": [
         "the referee stepping between both fighters and raising BOTH their arms simultaneously, both bloodied and spent",
@@ -915,11 +924,12 @@ class CoderAIClient:
         return self._video_bytes(self._post("/v1/video/upscale", body))
 
     def interpolate_video(self, video_bytes: bytes, fps_multiplier: int = 2,
-                          model: str = None) -> bytes:
+                          model: str = None, output_fps: int = None) -> bytes:
         """POST to /v1/video/interpolate and return the interpolated video bytes.
 
         Uses `response_format=url` (streamed GET) for the large result; see
-        upscale_video. Falls back to b64 transparently."""
+        upscale_video. Falls back to b64 transparently. `output_fps` overrides the
+        final encode fps (None = source × multiplier, preserves duration)."""
         body = {
             "video": "data:video/mp4;base64," + base64.b64encode(video_bytes).decode(),
             "fps_multiplier": fps_multiplier,
@@ -927,6 +937,8 @@ class CoderAIClient:
         }
         if model:
             body["model"] = model
+        if output_fps:
+            body["output_fps"] = int(output_fps)
         return self._video_bytes(self._post("/v1/video/interpolate", body))
 
     def generate_video_clip(self, prompt: str, model: str,
@@ -1002,14 +1014,24 @@ kicks, spinning back-kicks, flying knees, knees in the clinch, elbow strikes, ta
 sprawls, ground-and-pound, mount and guard scrambles, chokes and submission attempts, throws, \
 shoulder charges and dirty street-fighting. Each prompt should center on a DIFFERENT technique than \
 the recent ones — favour kicks, knees, elbows, grappling and ground work over plain punches.
+BE ACROBATIC and SPECTACULAR: many clips should feature athletic, gravity-defying movement — wall-runs, \
+cartwheel and tornado kicks, backflip and roll evasions, kip-ups, springboards off walls/crates/cars, \
+no-hands capoeira spins, flying/diving attacks, hurricanrana and aerial takedowns, parkour vaults. The \
+fighters are explosive, agile and stylish, not flat-footed.
+USE THE SCENERY: make fighters interact with the township environment as part of the action — vaulting \
+parked cars, leaping off low rooftops or stacked crates, crashing through market stalls and fruit carts, \
+bouncing off corrugated fences and shack walls, kicking up dust, scattering the pressing crowd. The \
+setting is a living, destructible playground, not a flat empty floor.
 Make it gritty, visceral and BRUTAL: it is encouraged to OFTEN (but not every clip) show the damage — a \
 bloodied nose or lip, a split brow, blood spray, sweat-and-blood on the face, a stagger or knockdown — \
 when a hard blow lands.
-ALWAYS specify CAMERA WORK in the prompt: describe the camera move and angle — a low tracking shot, a \
-fast whip-pan following a spin, a tight handheld close-up shaking on impact, an overhead ground shot, \
-an over-the-shoulder angle, a slow orbit around a submission, a crane/wide establishing move, or a \
-dramatic push-in on the cleanest strike. The camera should feel kinetic and dynamic, never locked off.
-Vary lighting (dusk, generator light, noon sun, harsh spotlight, headlights, fire-barrel glow).
+ALWAYS specify CAMERA WORK in the prompt: describe a kinetic camera move and angle — a low tracking shot, \
+a fast whip-pan following a spin, a sweeping crane/orbit around an aerial move, a tight handheld close-up \
+shaking on impact, an overhead ground shot, an over-the-shoulder angle, a wide scenic establishing move, \
+or a dramatic push-in on the cleanest strike. The camera should feel kinetic and dynamic, never locked off.
+Make every shot feel SCENIC and cinematic — rich depth, dramatic lighting and atmosphere (dust, smoke, \
+sparks, swirling crowd). Vary lighting (dusk, generator light, noon sun, harsh spotlight, headlights, \
+fire-barrel glow).
 Always refer to each fighter by their NAME (given in the user message), not only by their description.
 WARDROBE CONTINUITY (critical): every clip of a match — and every chained part within a clip, plus the \
 outcome clips — must show each fighter in the IDENTICAL outfit: the same garments, exact same colours, \
@@ -1137,13 +1159,15 @@ class PromptGenerator:
             finish_labels = {
                 "win": f"the FINISH — {fighter} ending the bout with a final overwhelming flurry as {opp} is overwhelmed",
                 "ko_win": f"the FINISH — {fighter} landing the brutal knockout blow that drops {opp} unconscious to the ground",
-                "retire": f"the FINISH — {fighter} battering {opp} until {opp} or their corner signals they cannot continue",
+                "retire": f"the FINISH — {opp} backing away, turning their back and walking off to retire, refusing to continue, while {fighter} stands tall",
                 "draw": f"the FINISH — a final all-out exchange where {fighter} and {opp} trade brutal blows to the last second",
             }
+            # Victory clip features ONLY the winner + referee (no opponent) — except
+            # a draw, which raises both fighters' arms.
             victory_labels = {
-                "win": f"the VICTORY — the referee raising {fighter}'s arm as the winner over a beaten {opp}",
-                "ko_win": f"the VICTORY — {fighter} celebrating over the knocked-out {opp} as the referee raises {fighter}'s arm",
-                "retire": f"the VICTORY — the referee raising {fighter}'s arm in victory while {opp}'s corner consoles them",
+                "win": f"the VICTORY — {fighter} alone in frame as the referee raises {fighter}'s arm as the winner, crowd roaring",
+                "ko_win": f"the VICTORY — {fighter} celebrating with fists raised as the referee raises {fighter}'s arm, crowd going wild",
+                "retire": f"the VICTORY — the referee raising {fighter}'s arm in victory as {fighter} salutes the crowd",
                 "draw": f"the VICTORY — the referee raising BOTH {fighter}'s and {opp}'s arms after an even, brutal war",
             }
             labels = finish_labels if is_finish else victory_labels
@@ -1155,7 +1179,10 @@ class PromptGenerator:
                     f_desc = f"{fighter} ({_df})" if _df else fighter
                     _do = self.char_descriptions.get(opponent or "", "")
                     o_desc = f"{opponent} ({_do})" if (opponent and _do) else (opponent or "")
-                    opp_line = f"Opponent: {o_desc}. " if o_desc else ""
+                    # The victory clip features only the winner (except a draw), so
+                    # don't feed the opponent into a non-draw victory shot.
+                    _include_opp = is_finish or outcome == "draw"
+                    opp_line = (f"Opponent: {o_desc}. " if (o_desc and _include_opp) else "")
                     prompt = self.client.chat_complete(
                         model=self.model,
                         system=_LLM_OUTCOME_SYSTEM,
@@ -1182,6 +1209,157 @@ class PromptGenerator:
         choice = random.choice(available)
         used.append(choice)
         return choice
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Form auto-generation — invent a fresh character / referee / environment (or a
+# match pairing) with the text model so the create forms can be one-click filled
+# and then reviewed/edited before submitting.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_AUTOGEN_CHAR_SYS = (
+    "You invent original characters for an African-township street-fighting video "
+    "generator. Reply with ONE compact JSON object and nothing else — no prose, no "
+    "code fence.")
+_AUTOGEN_ENV_SYS = (
+    "You invent original locations for an African-township street-fighting video "
+    "generator. Reply with ONE compact JSON object and nothing else — no prose, no "
+    "code fence.")
+
+_NAME_SYL = ["kha", "lo", "ndlo", "vu", "dla", "mini", "nko", "si", "mbe", "ki",
+             "zu", "lu", "tha", "bo", "jek", "sa", "nta", "ba", "we", "do", "ma",
+             "se", "thi", "za", "nge", "qa"]
+
+
+def _gen_name_token() -> str:
+    return "".join(random.choice(_NAME_SYL) for _ in range(random.randint(2, 3)))
+
+
+def _slugify_name(s: str) -> str:
+    import re as _re
+    s = (s or "").strip().lower().replace(" ", "_")
+    s = _re.sub(r"[^a-z0-9_]+", "_", s).strip("_")
+    return s
+
+
+def _unique_name(base: str, taken: set) -> str:
+    base = base or "new"
+    if base not in taken:
+        return base
+    i = 2
+    while f"{base}_{i}" in taken:
+        i += 1
+    return f"{base}_{i}"
+
+
+def _extract_json_obj(text: str) -> dict:
+    """Best-effort parse of a JSON object from an LLM reply (handles ``` fences and
+    surrounding prose)."""
+    import re as _re
+    if not text:
+        return {}
+    t = text.strip()
+    t = _re.sub(r"^```(?:json)?\s*", "", t)
+    t = _re.sub(r"\s*```$", "", t)
+    m = _re.search(r"\{.*\}", t, _re.DOTALL)
+    if m:
+        t = m.group(0)
+    try:
+        obj = json.loads(t)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _autogen_profile_payload(client, text_model, kind: str, role: str,
+                             existing_names) -> dict:
+    """Invent a fresh profile's form fields. Uses the text model when available,
+    falling back to template synthesis so the button always returns something
+    editable. Returns {name, region, gender?, description, prompt, role?}."""
+    role = (role or "fighter").strip().lower()
+    taken = set(existing_names or [])
+    avoid = ", ".join(sorted(taken)[:40]) or "(none yet)"
+    payload = {}
+    if client and text_model:
+        try:
+            if kind == "environment":
+                user = (
+                    "Invent a NEW gritty African-township fight LOCATION. "
+                    f"Do NOT reuse these names: {avoid}. JSON keys: "
+                    "name (short lowercase slug, words joined by _), "
+                    "region (a township or city), "
+                    "description (one vivid sentence on the place + mood + light), "
+                    "prompt (a detailed image-generation prompt for the empty "
+                    "location, cinematic, realistic, gritty). Return ONLY the JSON.")
+                payload = _extract_json_obj(client.chat_complete(
+                    model=text_model, system=_AUTOGEN_ENV_SYS, user=user,
+                    max_tokens=320))
+            elif role == "referee":
+                user = (
+                    "Invent a NEW fight REFEREE / official (NOT a fighter). "
+                    f"Do NOT reuse these names: {avoid}. JSON keys: "
+                    "name (short lowercase slug), region (a township or city), "
+                    "gender (male/female), "
+                    "description (one sentence: build, age, demeanour — an official, "
+                    "not a competitor), "
+                    "prompt (a detailed portrait image-generation prompt of the "
+                    "referee wearing a black-and-white striped referee shirt, "
+                    "authoritative, realistic; NOT in fight kit). Return ONLY JSON.")
+                payload = _extract_json_obj(client.chat_complete(
+                    model=text_model, system=_AUTOGEN_CHAR_SYS, user=user,
+                    max_tokens=320))
+            else:
+                user = (
+                    "Invent a NEW African-township street FIGHTER. "
+                    f"Do NOT reuse these names: {avoid}. JSON keys: "
+                    "name (short lowercase surname-like slug), "
+                    "region (a township or city), gender (male/female), "
+                    "description (one vivid sentence: weight class, build, hair, a "
+                    "distinguishing mark), "
+                    "prompt (a detailed portrait image-generation prompt ending with "
+                    "'African township fighter', realistic, dramatic lighting). "
+                    "Return ONLY the JSON.")
+                payload = _extract_json_obj(client.chat_complete(
+                    model=text_model, system=_AUTOGEN_CHAR_SYS, user=user,
+                    max_tokens=320))
+        except Exception:
+            payload = {}
+
+    out = {}
+    # Name — slugified, made unique against what already exists.
+    _nm = _slugify_name(payload.get("name") or "")
+    if not _nm:
+        if kind == "environment":
+            _nm = f"{_gen_name_token()}_spot"
+        elif role == "referee":
+            _nm = f"ref_{_gen_name_token()}"
+        else:
+            _nm = _gen_name_token()
+    out["name"] = _unique_name(_nm, taken)
+
+    if kind == "environment":
+        _src = random.choice(ENVIRONMENT_POOL)
+        out["region"] = str(payload.get("region") or _src["region"]).strip()
+        out["description"] = str(payload.get("description") or _src["description"]).strip()
+        out["prompt"] = str(payload.get("prompt") or _src["prompt"]).strip()
+    else:
+        _src = random.choice(FIGHTER_POOL)
+        out["region"] = str(payload.get("region") or _src["region"]).strip()
+        out["gender"] = str(payload.get("gender") or _src.get("gender", "male")).strip() or "male"
+        if role == "referee":
+            out["role"] = "referee"
+            out["description"] = str(
+                payload.get("description")
+                or "Veteran fight referee, calm and authoritative.").strip()
+            out["prompt"] = str(
+                payload.get("prompt")
+                or (f"Portrait of an African fight referee wearing {REFEREE_WARDROBE}, "
+                    "authoritative stance, realistic, dramatic lighting, NOT a fighter")
+            ).strip()
+        else:
+            out["description"] = str(payload.get("description") or _src["description"]).strip()
+            out["prompt"] = str(payload.get("prompt") or _src["prompt"]).strip()
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1679,6 +1857,53 @@ def _canonical_outfit(name: str, profile_text: str, used: set = None) -> str:
     return garment
 
 
+# A referee is a non-fighter official who appears in the VICTORY clip of an outcome
+# (raising the winner's arm / handing over a cup). Refs are stored as ordinary
+# `character` profiles so the server's image + LoRA pipeline works on them, but are
+# tagged meta["role"]=="referee" so they are kept OUT of the fighter pools and
+# dressed in an official's uniform instead of coloured fight kit.
+REFEREE_WARDROBE = ("a black-and-white vertically striped referee shirt, "
+                    "black trousers and an official's whistle")
+
+
+def _is_referee_meta(meta: dict) -> bool:
+    return str((meta or {}).get("role", "")).strip().lower() == "referee"
+
+
+def _list_character_roles(out_dir: Path) -> dict:
+    """{name: role} for locally-saved characters; role defaults to 'fighter'."""
+    roles = {}
+    base = Path(out_dir) / "characters"
+    if base.exists():
+        for d in base.iterdir():
+            mp = d / "meta.json"
+            if not mp.exists():
+                continue
+            try:
+                meta = json.loads(mp.read_text())
+            except Exception:
+                meta = {}
+            roles[d.name] = "referee" if _is_referee_meta(meta) else "fighter"
+    return roles
+
+
+def _referee_names(out_dir: Path) -> list:
+    """Names of locally-saved referee profiles (sorted, deterministic)."""
+    return sorted(n for n, r in _list_character_roles(out_dir).items()
+                  if r == "referee")
+
+
+def _referee_for(out_dir: Path, key: str = "") -> Optional[str]:
+    """Pick a referee profile to officiate a scene. Deterministic per `key` (e.g.
+    the match name) so the same match always gets the same ref; None if none exist."""
+    refs = _referee_names(out_dir)
+    if not refs:
+        return None
+    if not key:
+        return refs[0]
+    return refs[hash(key) % len(refs)]
+
+
 def _load_wardrobe(out_dir: Path) -> dict:
     """Canonical {name: outfit} with colours locked, persisted to wardrobe.json so
     every keyframe of a match dresses each fighter identically — and the user can
@@ -1699,6 +1924,7 @@ def _load_wardrobe(out_dir: Path) -> dict:
             for v in merged.values() if c in str(v or "").lower()}
     # All known fighters: built-in pool + locally saved characters.
     sources = {f["name"]: f.get("prompt", "") for f in FIGHTER_POOL}
+    referees = set()
     chars_dir = out_dir / "characters"
     if chars_dir.exists():
         for d in chars_dir.iterdir():
@@ -1707,11 +1933,18 @@ def _load_wardrobe(out_dir: Path) -> dict:
                 try:
                     meta = json.loads(mp.read_text())
                     sources[d.name] = meta.get("prompt", "") or meta.get("description", "")
+                    if _is_referee_meta(meta):
+                        referees.add(d.name)
                 except Exception:
                     pass
     # Deterministic order so colour assignment is stable across runs.
     for nm in sorted(sources):
         if nm not in merged or not str(merged.get(nm) or "").strip():
+            # Referees wear a fixed official's uniform (no coloured fight kit, no
+            # palette colour reserved for them).
+            if nm in referees:
+                merged[nm] = REFEREE_WARDROBE
+                continue
             outfit = _canonical_outfit(nm, sources[nm], used)
             merged[nm] = outfit
             for c in _OUTFIT_COLORS:
@@ -1820,7 +2053,7 @@ def parse_consistency(spec: str) -> set:
 # port is preserved). --save / --config / --cli-mode are deliberately excluded.
 CONFIG_FIELDS = [
     "base_url", "api_key", "image_model", "video_model", "text_model",
-    "upscale_model", "upscale_model_2x", "upscale_model_4x",
+    "upscale_model", "upscale_model_2x", "upscale_model_4x", "interpolation_model",
     "no_llm", "out_dir", "fps", "playback_fps", "clip_delay", "region", "include_female",
     "skip_characters", "reuse_fighters", "fighters", "num_fighters", "char_refs",
     "skip_environments", "reuse_environments", "environments", "num_environments", "env_refs",
@@ -1923,7 +2156,17 @@ def _reassemble_finals(video_dir: Path, match_name: str,
         pos += 1
     _write_concat(short_clips, str(video_dir / f"{match_name}_short.mp4"),
                   f"short (~{short_target:.0f}s)")
-    _write_concat(clips, str(video_dir / f"{match_name}_long.mp4"),
+    # Long = the WHOLE match in order; if the rendered clips don't sum to the
+    # long target (clips can render a touch short), pad by repeating from the
+    # start so the final still covers the target length.
+    long_clips = list(clips)
+    accum, pos = sum(d for _, d in long_clips), 0
+    while accum < long_target and clips:
+        path, dur = clips[pos % len(clips)]
+        long_clips.append((path, dur))
+        accum += dur
+        pos += 1
+    _write_concat(long_clips, str(video_dir / f"{match_name}_long.mp4"),
                   f"long  (~{long_target:.0f}s)")
     return len(clips)
 
@@ -2040,17 +2283,21 @@ def _upscale_with_progress(client, data: bytes, factor: int, model,
 
 
 def _interpolate_with_progress(client, data: bytes, fps_mult: int,
-                               progress_cb=None) -> bytes:
-    """Raise FPS while streaming progress (phase 'interpolating'). RIFE if the
-    server has it, else ffmpeg minterpolate — both now report frame progress."""
+                               model=None, progress_cb=None, output_fps=None) -> bytes:
+    """Raise FPS while streaming progress (phase 'interpolating'). `model` is the
+    in-process interpolation model (RIFE/FILM); blank → CoderAI auto-selects a
+    configured one. `output_fps` overrides the final play rate."""
     return _op_with_progress(client, ("interpolating",),
-                             lambda: client.interpolate_video(data, fps_mult, None),
+                             lambda: client.interpolate_video(data, fps_mult, model,
+                                                              output_fps=output_fps),
                              progress_cb)
 
 
 def _enhance_video_file(client, upscale_model: str, src: Path,
                         upscale: int = 0, fps_mult: int = 0,
-                        force: bool = False, progress_cb=None) -> Optional[Path]:
+                        force: bool = False, progress_cb=None,
+                        interpolation_model: str = None,
+                        final_fps: int = None) -> Optional[Path]:
     """Upscale (2x/4x) and/or raise FPS of one video, writing a NEW file alongside
     the original (e.g. match_short_2x_2xfps.mp4). Returns the new path, or None if
     nothing to do. Skips re-doing an already-enhanced output that is newer —
@@ -2069,6 +2316,14 @@ def _enhance_video_file(client, upscale_model: str, src: Path,
     if not force and out.exists() and out.stat().st_mtime >= src.stat().st_mtime:
         _log(f"    ↻ already enhanced: {out.name}")
         return out
+    # Forced re-enhance: delete the stale output first so it's a clean recreate
+    # (and a mid-way failure can't leave an old file masquerading as fresh).
+    if force and out.exists():
+        try:
+            out.unlink()
+            _log(f"    🗑 removed old {out.name} (force re-enhance)")
+        except Exception:
+            pass
     data = src.read_bytes()
     if upscale in (2, 4):
         um = (upscale_model or "").strip() or None
@@ -2076,8 +2331,13 @@ def _enhance_video_file(client, upscale_model: str, src: Path,
              f"{(' via ' + um) if um else ' (CoderAI auto-select)'}…")
         data = _upscale_with_progress(client, data, upscale, um, progress_cb)
     if fps_mult and fps_mult > 1:
-        _log(f"    ⏩ raising FPS of {src.name} ×{fps_mult}…")
-        data = _interpolate_with_progress(client, data, fps_mult, progress_cb)
+        _im = (interpolation_model or "").strip() or None
+        _of = int(final_fps) if final_fps else None
+        _log(f"    ⏩ raising FPS of {src.name} ×{fps_mult}"
+             f"{(' via ' + _im) if _im else ' (CoderAI auto-select)'}"
+             f"{(' → ' + str(_of) + 'fps') if _of else ''}…")
+        data = _interpolate_with_progress(client, data, fps_mult, _im, progress_cb,
+                                          output_fps=_of)
     out.write_bytes(data)
     _log(f"    ✓ enhanced → {out.name}  ({get_video_duration(str(out)):.1f}s)")
     return out
@@ -2094,6 +2354,43 @@ def _clip_stem_outcome(fighter: str, outcome: str, match_name: str = None) -> st
     if match_name:
         return f"{match_name}_{fighter}_{outcome}"
     return f"{fighter}_{outcome}"
+
+
+def _outcome_seg_stem(base: str, i: int) -> str:
+    """Per-segment keyframe stem for an outcome video. Segment 0 keeps the legacy
+    base stem (back-compat with the old single-keyframe outcomes); later segments
+    append _s<i>. Each outcome clip (finish, then victory) gets its OWN keyframe so
+    the victory shot is anchored to a real referee-raising-the-arm image instead of
+    drifting off the finish frame."""
+    return base if i == 0 else f"{base}_s{i}"
+
+
+def _outcome_kf_stems(o: dict) -> list:
+    """All keyframe stems an outcome produces — one per shot/segment (finish, then
+    victory). Legacy outcomes without `shots` yield the single base stem."""
+    base = _clip_stem_outcome(o["fighter"], o["outcome"], o.get("match_name"))
+    n = len(o.get("shots") or []) or 1
+    return [_outcome_seg_stem(base, i) for i in range(n)]
+
+
+def _dedupe_match_draws(outcome_plan: list, match_name: str, mf: set) -> list:
+    """Return outcome_plan with at MOST ONE draw for the given match.
+
+    A draw means both fighters are declared joint winners, so there is exactly one
+    draw per match — never one per fighter. Older plans (or plans built before this
+    rule) can carry a draw for each fighter; this removes the extras in place,
+    keeping the first. Non-draw outcomes and other matches are untouched."""
+    seen_draw = False
+    kept = []
+    for o in outcome_plan:
+        belongs = ((o.get("match_name") == match_name) if o.get("match_name")
+                   else (o.get("fighter") in mf))
+        if belongs and o.get("outcome") == "draw":
+            if seen_draw:
+                continue  # drop the duplicate draw
+            seen_draw = True
+        kept.append(o)
+    return kept
 
 
 def _outcome_segments_spec(outcome: str):
@@ -2511,10 +2808,11 @@ def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: P
     # MATCH's current location, not a stale snapshot stored on the outcome entry
     # (the two diverge when the match env is changed in the UI — the match is
     # updated but the outcome entries are not). The match is authoritative.
-    _mf_map, _menv_map = {}, {}
+    _mf_map, _menv_map, _mref_map = {}, {}, {}
     for m in fight_plan:
         _mf_map[m.get("match_name")] = [x for x in (m.get("f1"), m.get("f2")) if x]
         _menv_map[m.get("match_name")] = (m.get("env"), m.get("env_desc"))
+        _mref_map[m.get("match_name")] = m.get("referee")
     try:
         _saved = json.loads((Path(keyframe_dir).parent / "prompts.json").read_text())
         for m in _saved.get("fight_plan", []):
@@ -2522,6 +2820,7 @@ def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: P
                                [x for x in (m.get("f1"), m.get("f2")) if x])
             _menv_map.setdefault(m.get("match_name"),
                                  (m.get("env"), m.get("env_desc")))
+            _mref_map.setdefault(m.get("match_name"), m.get("referee"))
     except Exception:
         pass
 
@@ -2543,8 +2842,34 @@ def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: P
         _menv, _menvd = _menv_map.get(o.get("match_name"), (None, None))
         _oenv = _menv if _menv is not None else o.get("env")
         _oenvd = _menvd if _menv is not None else o.get("env_desc")
-        jobs.append((_clip_stem_outcome(o["fighter"], o["outcome"], o.get("match_name")),
-                     o["prompt"], _of, _oenv, _oenvd, o.get("kf_prompt")))
+        _base = _clip_stem_outcome(o["fighter"], o["outcome"], o.get("match_name"))
+        # The VICTORY shot is officiated by a referee — attach the referee profile
+        # (IP-adapter + LoRA, like a fighter) so the official appears consistently
+        # raising the winner's arm. The FINISH shot stays fighters-only. Prefer the
+        # referee chosen for this match; fall back to any available referee profile.
+        _ref = (_mref_map.get(o.get("match_name"))
+                or _referee_for(_out_dir, o.get("match_name") or o.get("fighter", "")))
+        _victory_roles = {"victory", "draw_decision"}
+        # One keyframe PER outcome shot (finish, then victory) so each clip of the
+        # outcome video anchors to its own image. Legacy outcomes without `shots`
+        # produce the single base keyframe as before.
+        _oshots = o.get("shots") or None
+        _is_draw = o.get("outcome") == "draw"
+        if _oshots:
+            for si, s in enumerate(_oshots):
+                if s.get("role") in _victory_roles:
+                    # Victory clip: only the WINNER appears for a decisive result
+                    # (the loser is out of frame); a draw raises BOTH fighters' arms.
+                    _jf = list(_of) if _is_draw else [o["fighter"]]
+                    if _ref and _ref not in _jf:
+                        _jf.append(_ref)
+                else:
+                    _jf = list(_of)  # finish clip = both fighters
+                jobs.append((_outcome_seg_stem(_base, si),
+                             s.get("prompt") or o["prompt"], _jf, _oenv, _oenvd,
+                             s.get("kf_prompt")))
+        else:
+            jobs.append((_base, o["prompt"], _of, _oenv, _oenvd, o.get("kf_prompt")))
 
     _log(f"\n  ── Keyframe phase — {len(jobs)} keyframe image(s) (image model) ──")
     made, skipped, failed = 0, 0, 0
@@ -2613,7 +2938,8 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
                  long_min: float = 65.0, long_max: float = 75.0,
                  single_clip_max_frames: int = SINGLE_CLIP_MAX_FRAMES,
                  outcome_min_frames: int = 96, outcome_max_frames: int = 150,
-                 playback_fps: int = 0, upscale_model: str = None):
+                 playback_fps: int = 0, upscale_model: str = None,
+                 interpolation_model: str = None):
     # PLAYBACK fps decouples the encode/play rate from the model's frame budget:
     # Wan generates a fixed number of frames regardless of fps, so encoding the
     # same frames at a HIGHER rate plays them faster (less slow-motion). Used for
@@ -2701,7 +3027,8 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
             video_lora_scale=video_lora_scale, video_size=video_size,
             single_clip_max_frames=single_clip_max_frames)
         _stage_enhance_videos(client, upscale_model, video_dir, fight_plan,
-                              outcome_plan, upscale_factor, fps_multiplier)
+                              outcome_plan, upscale_factor, fps_multiplier,
+                              interpolation_model=interpolation_model)
         return
 
     # =========================================================================
@@ -2904,7 +3231,8 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
         video_lora_scale=video_lora_scale, video_size=video_size,
         single_clip_max_frames=single_clip_max_frames)
     _stage_enhance_videos(client, upscale_model, video_dir, fight_plan,
-                          outcome_plan, upscale_factor, fps_multiplier)
+                          outcome_plan, upscale_factor, fps_multiplier,
+                          interpolation_model=interpolation_model)
 
 
 def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_plan,
@@ -3080,26 +3408,37 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         one continuous shot and discarded, so callers (and the Matches page) still
         see exactly one file per planned clip. Returns (ok, duration, fatal).
 
-        `segments` (optional) is a list of (prompt, frames) describing a SEQUENCE
-        of distinct shots to render back-to-back into one continuous video — e.g.
-        an outcome's finish clip then its victory clip. Each segment uses its OWN
-        prompt verbatim (a deliberate new action) but seeds from the previous
-        shot's last frame / VACE tail for visual continuity. When omitted, the
-        single (prompt, nf) is rendered as before."""
+        `segments` (optional) is a list of (prompt, frames[, seg_stem]) describing a
+        SEQUENCE of distinct shots to render back-to-back into one continuous video —
+        e.g. an outcome's finish clip then its victory clip. Each segment uses its
+        OWN prompt verbatim (a deliberate new action). When a segment carries its own
+        keyframe stem (seg_stem), that segment is ANCHORED to its own keyframe image
+        (a clean cut into a new, correctly-composed shot — e.g. the referee raising
+        the winner's arm); otherwise it seeds from the previous shot's last frame /
+        VACE tail for visual continuity. When omitted, the single (prompt, nf) is
+        rendered as before."""
         keyframe = _keyframe_bytes(stem) if stem else None
-        # Build a flat list of parts: (segment_prompt, frames, is_segment_start).
+        # Build a flat list of parts: (segment_prompt, frames, is_segment_start,
+        # segment_keyframe_bytes). The segment keyframe (if any) anchors that
+        # segment's first part to its own image instead of chaining from the prior.
         if segments:
-            seglist = [(str(sp), int(sn)) for sp, sn in segments if int(sn) > 0]
+            seglist = []
+            for seg in segments:
+                sp, sn = seg[0], seg[1]
+                sstem = seg[2] if len(seg) > 2 else None
+                if int(sn) > 0:
+                    seglist.append((str(sp), int(sn), sstem))
         else:
-            seglist = [(prompt, int(nf))]
+            seglist = [(prompt, int(nf), stem)]
         parts_plan = []
-        for sp, sn in seglist:
+        for sp, sn, sstem in seglist:
+            seg_kf = _keyframe_bytes(sstem) if sstem else None
             for bi, bn in enumerate(_split_frame_budget(sn, _chunk_max)):
-                parts_plan.append((sp, bn, bi == 0))
+                parts_plan.append((sp, bn, bi == 0, seg_kf))
         if len(parts_plan) == 1:
-            sp, bn, _ = parts_plan[0]
+            sp, bn, _, seg_kf = parts_plan[0]
             return _render_once(label, sp, profiles, env, bn, out_path,
-                                fighters=fighters, init_override=keyframe,
+                                fighters=fighters, init_override=(seg_kf or keyframe),
                                 step_cb=step_cb)
         # Chained multi-part shot: part 0 starts from the clip keyframe; each later
         # part is seeded by the previous part's last frame → seamless single take.
@@ -3120,7 +3459,7 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         tmpd = tempfile.mkdtemp(prefix="twshot_")
         parts, prev_last, prev_tail = [], None, None
         try:
-            for pi, (seg_prompt, pn, seg_start) in enumerate(parts_plan):
+            for pi, (seg_prompt, pn, seg_start, seg_kf) in enumerate(parts_plan):
                 part_path = os.path.join(tmpd, f"part{pi:02d}.mp4")
                 # Tag each part's step updates with part N/total so the UI can show
                 # "concatenating shot — part 2/3" alongside the diffusion step.
@@ -3128,15 +3467,25 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                          step_cb({**(prog or {}), "part": _p, "parts": _n}))
                         if step_cb else None)
                 # Seeding for this part:
-                #   • part 0  → the clip keyframe (single image).
+                #   • segment start WITH its own keyframe → anchor to that keyframe
+                #     (a clean cut into a new, correctly-composed shot).
+                #   • part 0 (no segment keyframe) → the clip keyframe.
                 #   • VACE    → the previous part's frame tail (motion continuation).
                 #   • else    → the previous part's last frame (single image) + the
                 #               forward-motion prompt nudge to discourage rewinding.
-                seed_img = keyframe if pi == 0 else (prev_last or keyframe)
-                cond_frames = prev_tail if (_vace and pi > 0) else None
-                if cond_frames:
-                    seed_img = None  # VACE conditions via the tail, not an init frame
-                if pi == 0:
+                anchored = bool(seg_start and seg_kf is not None)
+                if anchored:
+                    seed_img = seg_kf
+                    cond_frames = None
+                else:
+                    seed_img = keyframe if pi == 0 else (prev_last or keyframe)
+                    cond_frames = prev_tail if (_vace and pi > 0) else None
+                    if cond_frames:
+                        seed_img = None  # VACE conditions via the tail, not an init frame
+                if pi == 0 or anchored:
+                    # First part, or a segment anchored to its own keyframe → render
+                    # the shot's own prompt verbatim (a deliberate, freshly-composed
+                    # shot, not a continuation).
                     part_prompt = seg_prompt
                 elif seg_start:
                     # A new deliberate shot in the sequence — use its own prompt
@@ -3257,7 +3606,17 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                 pos += 1
             _write_concat(short_clips, str(video_dir / f"{m['match_name']}_short.mp4"),
                           f"short (~{m['short_target']:.0f}s)")
-            _write_concat(clips, str(video_dir / f"{m['match_name']}_long.mp4"),
+            # Long = the whole match in order, padded by repeating from the start
+            # if the rendered clips don't sum to the long target, so the final
+            # always covers the configured length.
+            long_clips = list(clips)
+            long_accum, lpos = sum(d for _, d in long_clips), 0
+            while long_accum < m["long_target"] and clips:
+                path, dur = clips[lpos % len(clips)]
+                long_clips.append((path, dur))
+                long_accum += dur
+                lpos += 1
+            _write_concat(long_clips, str(video_dir / f"{m['match_name']}_long.mp4"),
                           f"long  (~{m['long_target']:.0f}s)")
         else:
             _log(f"  └─ (skipping short/long reassembly — subset render)")
@@ -3293,9 +3652,12 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         _oshots = o.get("shots") or None
         _segments = None
         if _oshots:
-            _segments = [(s.get("prompt") or o["prompt"], int(s.get("nf") or 0))
-                         for s in _oshots if int(s.get("nf") or 0) > 0]
-            _onf = sum(n for _, n in _segments) or _onf
+            # Each segment carries its OWN keyframe stem (finish, then victory) so
+            # the render anchors every outcome clip to its dedicated image.
+            _segments = [(s.get("prompt") or o["prompt"], int(s.get("nf") or 0),
+                          _outcome_seg_stem(clip_name, si))
+                         for si, s in enumerate(_oshots) if int(s.get("nf") or 0) > 0]
+            _onf = sum(n for _, n, _ in _segments) or _onf
             _roles = " → ".join(s.get("role", "?") for s in _oshots)
             _log(f"      ({len(_segments)}-shot sequence: {_roles})")
         ok, dur, is_fatal = _render(
@@ -3336,7 +3698,9 @@ def _enhance_targets(video_dir: Path, fight_plan: list, outcome_plan: list) -> l
 
 def _stage_enhance_videos(client, upscale_model, video_dir, fight_plan, outcome_plan,
                           upscale: int = 0, fps_mult: int = 0,
-                          progress_cb=None, clip_cb=None) -> int:
+                          progress_cb=None, clip_cb=None,
+                          interpolation_model: str = None,
+                          final_fps: int = None) -> int:
     """PHASE C — upscale / raise-FPS the final + outcome videos (new files alongside).
     Returns the number of videos enhanced. Callbacks mirror _stage_videos_render."""
     if upscale not in (2, 4) and (not fps_mult or fps_mult <= 1):
@@ -3358,12 +3722,15 @@ def _stage_enhance_videos(client, upscale_model, video_dir, fight_plan, outcome_
             except Exception: pass
         ok = False
         try:
-            def _frame_cb(cur, tot, ips, _name=src.name):
+            def _frame_cb(cur, tot, ips, phase="upscaling", _name=src.name):
                 _ips = f" ({ips}/s)" if ips else ""
-                print(f"\r      🔍 {_name}: upscaling frame {cur}/{tot}{_ips}    ",
+                _ph = "interpolating" if str(phase).startswith("interp") else "upscaling"
+                print(f"\r      🔍 {_name}: {_ph} frame {cur}/{tot}{_ips}    ",
                       end="", flush=True)
             _enhance_video_file(client, upscale_model, src, upscale, fps_mult,
-                                progress_cb=_frame_cb)
+                                progress_cb=_frame_cb,
+                                interpolation_model=interpolation_model,
+                                final_fps=final_fps)
             print()  # finish the \r progress line
             ok = True
             done += 1
@@ -3443,6 +3810,57 @@ def launch_web_ui(default_args):
     _sse_lock = threading.Lock()
     _jobs_lock = threading.Lock()
 
+    # ── Single-worker generation queue ────────────────────────────────────────
+    # Every coderai-bound generation job (profile create/regen, LoRA train, match
+    # keyframes/clips/outcomes, new match) is funnelled through ONE worker thread so
+    # the requests reach the server ONE AT A TIME instead of all at once. coderai
+    # loads models on demand, so firing several concurrently makes it thrash AND
+    # makes the UI progress flip between jobs. A job is registered as "queued" the
+    # instant it is submitted (so the UI immediately shows it was accepted) and the
+    # worker flips it to "running" when it actually starts.
+    _gen_q: "_queue_mod.Queue" = _queue_mod.Queue()
+
+    def _enqueue_gen(job_id: str, fn, *args, jtype="gen", kind=None, name=None,
+                     match=None, scope=None, cancellable=False, **kwargs):
+        """Register a job as queued and hand it to the single generation worker.
+        The target fn is responsible for (re)initialising the job entry to a
+        running state when it actually executes."""
+        ahead = _gen_q.unfinished_tasks  # queued + in-progress, before this one
+        with _jobs_lock:
+            _state["jobs"][job_id] = {
+                "status": "queued", "progress": 0, "output": None, "error": None,
+                "jtype": jtype, "kind": kind, "name": name, "match": match,
+                "scope": scope, "cancellable": cancellable, "cancel": False,
+                "_msg": ("⏳ queued — starting…" if ahead <= 0
+                         else f"⏳ queued — {ahead} generation(s) ahead…"),
+            }
+        _gen_q.put((job_id, fn, args, kwargs))
+        return job_id
+
+    def _gen_worker():
+        while True:
+            job_id, fn, args, kwargs = _gen_q.get()
+            try:
+                # Skip a job cancelled while it was still waiting in the queue.
+                with _jobs_lock:
+                    j = _state["jobs"].get(job_id)
+                    if j and j.get("cancel"):
+                        j.update({"status": "done", "cancelled": True,
+                                  "progress": 100,
+                                  "_msg": "⏹ cancelled before it started"})
+                        _gen_q.task_done()
+                        continue
+                fn(*args, **kwargs)
+            except Exception as e:
+                with _jobs_lock:
+                    if job_id in _state["jobs"]:
+                        _state["jobs"][job_id].update(
+                            {"status": "error", "error": f"worker error: {e}"})
+            finally:
+                _gen_q.task_done()
+
+    threading.Thread(target=_gen_worker, daemon=True, name="gen-worker").start()
+
     def _ffmpeg_exe():
         """Return an ffmpeg binary path, preferring the system one."""
         import shutil as _sh
@@ -3518,6 +3936,7 @@ def launch_web_ui(default_args):
         except Exception:
             _scale = 0
         _um = _upscale_model_for(default_args, _scale) or None
+        _im = (getattr(default_args, "interpolation_model", None) or None)
 
         try:
             video_bytes = fpath.read_bytes()
@@ -3538,7 +3957,7 @@ def launch_web_ui(default_args):
                 mult = max(2, round(target / src_fps))
                 out_path = fpath.parent / f"{stem}_fps{target}{suffix}"
                 _set_progress(10, f"Sending to CoderAI for FPS interpolation (×{mult})…")
-                result = client.interpolate_video(video_bytes, fps_multiplier=mult)
+                result = client.interpolate_video(video_bytes, fps_multiplier=mult, model=_im)
                 out_path.write_bytes(result)
                 _finish(out_path)
 
@@ -3553,7 +3972,7 @@ def launch_web_ui(default_args):
                 probe  = _probe_video(fpath)
                 src_fps = probe.get("fps", 8) or 8
                 mult = max(2, round(target_fps / src_fps))
-                result = client.interpolate_video(upscaled, fps_multiplier=mult)
+                result = client.interpolate_video(upscaled, fps_multiplier=mult, model=_im)
                 out_up.write_bytes(result)
                 _finish(out_up)
 
@@ -3665,6 +4084,276 @@ def launch_web_ui(default_args):
                     "added": len(added_uris), "synced": synced,
                     "_msg": f"added {len(added_uris)} image(s)",
                 })
+        except Exception as exc:
+            _fail(str(exc))
+
+    def _run_create_profile_job(job_id: str, kind: str, name: str, meta: dict,
+                                count: int):
+        """Create a BRAND-NEW character/environment profile: generate reference
+        images server-side, fetch them and save the profile locally (+ CoderAI)."""
+        with _jobs_lock:
+            _state["jobs"][job_id] = {"status": "running", "progress": 3,
+                                      "output": None, "error": None,
+                                      "_msg": "starting…", "added": 0,
+                                      "kind": kind, "name": name, "jtype": "create"}
+
+        def _prog(pct, msg=""):
+            with _jobs_lock:
+                _state["jobs"][job_id]["progress"] = pct
+                if msg:
+                    _state["jobs"][job_id]["_msg"] = msg
+            if msg:
+                print(f"  [create {name}] {msg}", flush=True)
+
+        def _fail(msg):
+            with _jobs_lock:
+                _state["jobs"][job_id].update({"status": "error", "error": msg})
+
+        try:
+            base = out_dir / (kind + "s") / name
+            if base.exists():
+                _fail("a profile with that name already exists")
+                return
+            prompt = (meta.get("prompt") or meta.get("description") or name).strip()
+            description = (meta.get("description") or "").strip()
+            # A referee is generated as a character but explicitly dressed as a fight
+            # official (striped shirt) rather than in fight kit, so the reference
+            # images — and every keyframe that uses this profile — read as a referee.
+            if _is_referee_meta(meta):
+                _ref_look = (f"a fight referee / official wearing {REFEREE_WARDROBE}, "
+                             "authoritative posture, NOT a fighter, no fight kit")
+                prompt = f"{prompt}, {_ref_look}" if prompt and prompt != name else _ref_look
+                if not description:
+                    description = "Fight referee / official."
+            size = "768x512" if kind == "environment" else "512x512"
+            client = CoderAIClient(default_args.base_url,
+                                   getattr(default_args, "api_key", None))
+            _prog(8, "selecting image model…")
+            model = getattr(default_args, "image_model", None)
+            if not model:
+                try:
+                    model = pick_model(client, "image", None)
+                except Exception as e:
+                    _fail(f"no image model available: {e}")
+                    return
+            _prog(15, f"generating {count} reference image(s)…")
+            try:
+                if kind == "character":
+                    client.generate_character(name=name, prompt=prompt,
+                                              description=description, model=model,
+                                              n=count, size=size)
+                else:
+                    client.generate_environment(name=name, prompt=prompt,
+                                                description=description, model=model,
+                                                n=count, size=size)
+            except Exception as e:
+                _fail(f"generation failed: {e}")
+                return
+            _prog(85, "fetching reference images…")
+            try:
+                images = client.fetch_profile_images(kind, name)
+            except Exception as e:
+                _fail(f"could not fetch images: {e}")
+                return
+            if not images:
+                _fail("no images were generated")
+                return
+            full_meta = dict(meta)
+            full_meta.update({"name": name, "prompt": prompt,
+                              "description": description})
+            _save_profile_locally(out_dir, kind, name, full_meta, images)
+            with _jobs_lock:
+                _state["jobs"][job_id].update({
+                    "status": "done", "progress": 100,
+                    "added": len(images),
+                    "_msg": f"created '{name}' with {len(images)} image(s)",
+                })
+        except Exception as exc:
+            _fail(str(exc))
+
+    def _run_new_match_job(job_id: str, f1: str, f2: str, env: str,
+                           prompts_only: bool, referee: str = ""):
+        """Create a NEW match (fresh pairing) in prompts.json. prompts_only writes
+        the fight-clip + outcome prompts and stops; otherwise it hands off to the
+        full end-to-end render (text→image→video) for the new match."""
+        with _jobs_lock:
+            _state["jobs"][job_id] = {"status": "running", "progress": 3,
+                                      "output": None, "error": None,
+                                      "_msg": "starting…", "jtype": "match",
+                                      "scope": ("prompts" if prompts_only else "full"),
+                                      "match": None, "cancel": False,
+                                      "cancellable": True}
+
+        def _cancelled():
+            with _jobs_lock:
+                return bool(_state["jobs"].get(job_id, {}).get("cancel"))
+
+        def _prog(pct, msg=""):
+            with _jobs_lock:
+                _state["jobs"][job_id]["progress"] = max(2, min(99, int(pct)))
+                if msg:
+                    _state["jobs"][job_id]["_msg"] = msg
+            if msg:
+                print(f"  [new-match] {msg}", flush=True)
+
+        def _fail(msg):
+            with _jobs_lock:
+                _state["jobs"][job_id].update({"status": "error", "error": msg})
+
+        def _done(msg):
+            with _jobs_lock:
+                _state["jobs"][job_id].update({"status": "done", "progress": 100,
+                                               "_msg": msg})
+
+        try:
+            import sys as _sys
+            _sys.modules[__name__]._log = _patched_log  # stream detail to web log
+            vdir = out_dir / "videos"
+            vdir.mkdir(parents=True, exist_ok=True)
+            pf = vdir / "prompts.json"
+            data = {}
+            if pf.exists():
+                try:
+                    data = json.loads(pf.read_text()) or {}
+                except Exception:
+                    data = {}
+            fight_plan = data.get("fight_plan", [])
+            outcome_plan = data.get("outcome_plan", [])
+            fps = int(getattr(default_args, "fps", 0) or data.get("fps") or 8)
+
+            # Unique match name (same scheme the full run uses).
+            used = {m.get("match_name") for m in fight_plan}
+            mbase = f"match_{f1}_vs_{f2}"
+            name, n = mbase, 2
+            while name in used:
+                name = f"{mbase}_{n}"
+                n += 1
+
+            env_desc = _env_description(env) if env else "African township"
+            _slo, _shi = sorted((float(getattr(default_args, "short_min", 40.0)),
+                                 float(getattr(default_args, "short_max", 50.0))))
+            _llo, _lhi = sorted((float(getattr(default_args, "long_min", 65.0)),
+                                 float(getattr(default_args, "long_max", 75.0))))
+            m = {"f1": f1, "f2": f2, "env": env or None, "env_desc": env_desc,
+                 "match_name": name,
+                 "referee": referee or None,
+                 "short_target": random.uniform(_slo, _shi),
+                 "long_target": random.uniform(_llo, _lhi),
+                 "clips": []}
+            fight_plan.append(m)
+
+            _of_lo, _of_hi = _clip_frame_range(
+                int(getattr(default_args, "outcome_min_frames", 96) or 96),
+                int(getattr(default_args, "outcome_max_frames", 150) or 150))
+
+            def _new_outcome(fighter, outcome, opp):
+                _onf = random.randint(_of_lo, _of_hi)
+                return {"match_name": name, "fighter": fighter, "outcome": outcome,
+                        "opponent": opp, "env": m["env"], "env_desc": env_desc,
+                        "target_s": round(_onf / max(1, fps), 2), "nf": _onf,
+                        "shot": None, "prompt": None, "shots": None}
+
+            for fighter in (f1, f2):
+                _opp = f2 if fighter == f1 else f1
+                for outcome in ("win", "ko_win", "retire"):
+                    outcome_plan.append(_new_outcome(fighter, outcome, _opp))
+            outcome_plan.append(_new_outcome(f1, "draw", f2))
+
+            try:
+                pf.write_text(json.dumps(
+                    {"fight_plan": fight_plan, "outcome_plan": outcome_plan,
+                     "fps": data.get("fps") or fps}, indent=2))
+            except Exception as e:
+                _fail(f"could not save prompts.json: {e}")
+                return
+            with _jobs_lock:
+                _state["jobs"][job_id]["match"] = name
+
+            if not prompts_only:
+                # Hand the new (skeleton) match to the end-to-end pipeline, reusing
+                # the SAME job id so the UI keeps polling one job. scope "full"
+                # re-plans the prompts, regenerates keyframes, renders every clip +
+                # outcome and assembles the finals.
+                _prog(6, f"created {name} — running full match render…")
+                _run_match_job(job_id, "full", {"match": name})
+                return
+
+            # ── Prompts-only: write the fight-clip + outcome prompts and stop. ────
+            _prog(8, "preparing text model…")
+            client = CoderAIClient(default_args.base_url,
+                                   getattr(default_args, "api_key", None))
+            text_model = None
+            if not getattr(default_args, "no_llm", False):
+                try:
+                    text_model = pick_model(client, "text",
+                                            getattr(default_args, "text_model", None))
+                except Exception as e:
+                    _log(f"  [new-match] no text model ({e}); using template prompts")
+                    text_model = getattr(default_args, "text_model", None)
+            char_descriptions = _build_char_descriptions(out_dir)
+            prompter = PromptGenerator(client, text_model,
+                                       char_descriptions=char_descriptions)
+            _cf_lo, _cf_hi = _clip_frame_range(
+                getattr(default_args, "clip_min_frames", CLIP_MIN_FRAMES),
+                getattr(default_args, "clip_max_frames", CLIP_MAX_FRAMES))
+            long_target = float(m["long_target"])
+            new_clips, planned, ci = [], 0.0, 0
+            while planned < long_target:
+                round_num = ci // 3 + 1
+                intensity = ("early exchanges" if round_num == 1
+                             else "midpoint battle" if round_num == 2
+                             else "climactic final exchange")
+                _nf = random.randint(_cf_lo, _cf_hi)
+                new_clips.append({"idx": ci, "clip_seconds": round(_nf / max(1, fps), 2),
+                                  "nf": _nf, "intensity": intensity,
+                                  "shot": None, "prompt": None})
+                planned += _nf / max(1, fps)
+                ci += 1
+            f1_hint = _fighter_desc_hint(f1, char_descriptions)
+            f2_hint = _fighter_desc_hint(f2, char_descriptions)
+            match_avoid = []
+            _focus_cycle = list(FIGHT_ACTION_FOCUS)
+            random.shuffle(_focus_cycle)
+            for i, c in enumerate(new_clips):
+                if _cancelled():
+                    _fail("cancelled before prompts were complete")
+                    return
+                shot = prompter.fight_shot(
+                    f1, f2, env_desc,
+                    match_context=f"Match stage: {c['intensity']}. ",
+                    avoid=match_avoid,
+                    action_focus=_focus_cycle[i % len(_focus_cycle)])
+                c["shot"] = shot
+                c["prompt"] = (f"{f1_hint} vs {f2_hint} — {shot} "
+                               f"— {_continuity_clause(env or None)} "
+                               f"— {FIGHT_PROMPT_SUFFIX}")
+                match_avoid.append(shot[:60])
+                _prog(8 + int(60 * (i + 1) / max(1, len(new_clips))),
+                      f"clip {i+1}/{len(new_clips)} prompt written")
+            m["clips"] = new_clips
+            # Outcome prompts for the new match.
+            match_outcomes = [o for o in outcome_plan if o.get("match_name") == name]
+            for j, o in enumerate(match_outcomes):
+                if _cancelled():
+                    _fail("cancelled before prompts were complete")
+                    return
+                _opp = f2 if o.get("fighter") == f1 else f1
+                try:
+                    _plan_outcome_shots(prompter, o, char_descriptions, _opp)
+                except Exception:
+                    pass
+                _prog(68 + int(28 * (j + 1) / max(1, len(match_outcomes))),
+                      f"outcome {j+1}/{len(match_outcomes)} prompt written")
+            try:
+                pf.write_text(json.dumps(
+                    {"fight_plan": fight_plan, "outcome_plan": outcome_plan,
+                     "fps": data.get("fps") or fps}, indent=2))
+            except Exception as e:
+                _fail(f"could not save prompts.json: {e}")
+                return
+            _done(f"created match {name}: {len(new_clips)} clip prompt(s) + "
+                  f"{len(match_outcomes)} outcome prompt(s) written — now generate "
+                  f"keyframes and render from the match page")
         except Exception as exc:
             _fail(str(exc))
 
@@ -3989,6 +4678,12 @@ def launch_web_ui(default_args):
             if _pfps > 0:
                 fps = _pfps
             match_name = params.get("match")
+            # Per-match playback-fps override (set in the match interface) wins over
+            # the global rate, so each match can target its own final play rate.
+            _mobj = next((x for x in fight_plan
+                          if x.get("match_name") == match_name), None)
+            if _mobj and int(_mobj.get("playback_fps") or 0) > 0:
+                fps = int(_mobj["playback_fps"])
 
             # ── Reassemble only: no model needed ───────────────────────────────
             if scope == "reassemble":
@@ -4088,6 +4783,69 @@ def launch_web_ui(default_args):
                       f"previous prompts), THEN Re-render")
                 return
 
+            # ── Re-plan ONLY this match's outcome prompts (text model) ──────────
+            # Rewrites the finish + victory shots for every outcome of the match,
+            # leaving the fight-clip prompts untouched.
+            if scope == "replan-outcomes":
+                m = next((x for x in fight_plan if x.get("match_name") == match_name), None)
+                if not m:
+                    _fail("match not found in prompts.json")
+                    return
+                _prog(8, "preparing text model…")
+                client = CoderAIClient(default_args.base_url,
+                                       getattr(default_args, "api_key", None))
+                text_model = None
+                if not getattr(default_args, "no_llm", False):
+                    try:
+                        text_model = pick_model(client, "text",
+                                                getattr(default_args, "text_model", None))
+                    except Exception as e:
+                        _log(f"  [replan-outcomes] no text model ({e}); using templates")
+                        text_model = getattr(default_args, "text_model", None)
+                char_descriptions = _build_char_descriptions(out_dir)
+                prompter = PromptGenerator(client, text_model,
+                                           char_descriptions=char_descriptions)
+                _mf = {m.get("f1"), m.get("f2")} - {None}
+                # A draw concerns both fighters → keep exactly one (fixes legacy
+                # plans that stored a draw per fighter).
+                outcome_plan = _dedupe_match_draws(outcome_plan, match_name, _mf)
+
+                def _belongs(o):
+                    if o.get("match_name"):
+                        return o.get("match_name") == match_name
+                    return o.get("fighter") in _mf
+                match_outcomes = [o for o in outcome_plan if _belongs(o)]
+                if not match_outcomes:
+                    _fail("no outcomes found for this match")
+                    return
+                for j, o in enumerate(match_outcomes):
+                    if _cancelled():
+                        _cancel_done("⏹ cancelled — outcome prompts unchanged")
+                        return
+                    # Force the match's current location so outcome keyframes + clips
+                    # stay in one consistent setting.
+                    if m.get("env"):
+                        o["env"] = m.get("env")
+                        o["env_desc"] = m.get("env_desc", o.get("env_desc"))
+                    _opp = m.get("f2") if o.get("fighter") == m.get("f1") else m.get("f1")
+                    try:
+                        _plan_outcome_shots(prompter, o, char_descriptions, _opp)
+                    except Exception as e:
+                        _log(f"  [replan-outcomes] {o.get('fighter')} {o.get('outcome')}: {e}")
+                    _prog(8 + int(88 * (j + 1) / max(1, len(match_outcomes))),
+                          f"outcome {j+1}/{len(match_outcomes)} prompt written")
+                try:
+                    pf.write_text(json.dumps(
+                        {"fight_plan": fight_plan, "outcome_plan": outcome_plan,
+                         "fps": data.get("fps") or fps}, indent=2))
+                except Exception as e:
+                    _fail(f"could not save prompts.json: {e}")
+                    return
+                _done(f"re-planned {len(match_outcomes)} outcome prompt(s) for "
+                      f"{match_name} — now REGENERATE the outcome KEYFRAMES, THEN "
+                      f"re-render the outcomes")
+                return
+
             # ── Render scopes: need the video model + consistency settings ─────
             client = CoderAIClient(default_args.base_url,
                                    getattr(default_args, "api_key", None))
@@ -4144,6 +4902,9 @@ def launch_web_ui(default_args):
                         text_model = getattr(default_args, "text_model", None)
                 char_descriptions = _build_char_descriptions(out_dir)
                 _mf = {m.get("f1"), m.get("f2")} - {None}
+                # A draw concerns both fighters → keep exactly one (fixes legacy
+                # plans that stored a draw per fighter).
+                outcome_plan = _dedupe_match_draws(outcome_plan, match_name, _mf)
 
                 def _belongs(o):
                     if o.get("match_name"):
@@ -4243,8 +5004,7 @@ def launch_web_ui(default_args):
                 kdir = vdir / "keyframes"
                 mm = dict(m)
                 kf_stems = [_clip_stem_fight(match_name, c["idx"]) for c in mm["clips"]]
-                kf_stems += [_clip_stem_outcome(o["fighter"], o["outcome"], o.get("match_name"))
-                             for o in match_outcomes]
+                kf_stems += [s for o in match_outcomes for s in _outcome_kf_stems(o)]
                 _set_items([f"keyframe {s}" for s in kf_stems])
                 _kf_idx = {s: i for i, s in enumerate(kf_stems)}
                 _kf_done = [0]
@@ -4355,7 +5115,21 @@ def launch_web_ui(default_args):
                         _fail("outcome not found in prompts.json")
                         return
                     op = [o]
-                    stems = [_clip_stem_outcome(fr, oc, o.get("match_name"))]
+                    # Regenerate every segment keyframe for the outcome (finish +
+                    # victory), or just one when a `seg` index is given. _generate_
+                    # keyframes skips PNGs that already exist, so deleting only the
+                    # targeted stem(s) below limits the remake to them.
+                    _all_stems = _outcome_kf_stems(o)
+                    _seg = params.get("seg")
+                    if _seg is not None and str(_seg) != "":
+                        try:
+                            _si = int(_seg)
+                        except (TypeError, ValueError):
+                            _si = -1
+                        stems = ([_all_stems[_si]] if 0 <= _si < len(_all_stems)
+                                 else _all_stems)
+                    else:
+                        stems = _all_stems
                 else:
                     if not m:
                         _fail("match not found in prompts.json — render it first")
@@ -4381,8 +5155,7 @@ def launch_web_ui(default_args):
                             elif o.get("fighter") not in _mf:
                                 continue
                             op.append(o)
-                            stems.append(_clip_stem_outcome(
-                                o["fighter"], o["outcome"], o.get("match_name")))
+                            stems.extend(_outcome_kf_stems(o))
                 # In missing-only mode, narrow progress items to the absent ones.
                 work = ([s for s in stems if not (kdir / f"{s}.png").exists()]
                         if missing_only else stems)
@@ -4456,9 +5229,16 @@ def launch_web_ui(default_args):
                     _fail("nothing selected — choose Upscale 2x/4x and/or a FPS multiplier")
                     return
                 upscale_model = _upscale_model_for(default_args, upscale) or None
+                interpolation_model = (getattr(default_args, "interpolation_model", None) or None)
                 force = str(params.get("force") or "").lower() in ("1", "true", "yes", "on")
                 target = params.get("target") or "all"
                 m = next((x for x in fight_plan if x.get("match_name") == match_name), {})
+                # Final playtime fps override from the enhance form (blank/0 =
+                # source × multiplier, which preserves duration).
+                try:
+                    final_fps = int(params.get("final_fps") or 0) or None
+                except Exception:
+                    final_fps = None
                 mf = {m.get("f1"), m.get("f2")} - {None}
                 srcs = []
                 if target in ("finals", "all"):
@@ -4491,14 +5271,16 @@ def launch_web_ui(default_args):
                     _item(i, "start")
                     ok = False
                     try:
-                        def _frame_cb(cur, tot, ips, _i=i):
+                        def _frame_cb(cur, tot, ips, phase="upscaling", _i=i):
                             _item(_i, "step", {
                                 "current": cur, "total": tot,
                                 "pct": int(cur / tot * 100) if tot else 0,
-                                "it_per_s": ips, "phase": "upscaling"})
+                                "it_per_s": ips, "phase": phase})
                         _enhance_video_file(client, upscale_model, src, upscale,
                                             fps_mult, force=force,
-                                            progress_cb=_frame_cb)
+                                            progress_cb=_frame_cb,
+                                            interpolation_model=interpolation_model,
+                                            final_fps=final_fps)
                         ok = True
                     except Exception as e:
                         _dbg = str(e)
@@ -4864,6 +5646,7 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
         )
         return f"""<!doctype html><html lang=en><head>
 <meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<link rel=icon type=image/x-icon href="/favicon.ico">
 <title>{title} — Township Fighters</title>
 <style>{_CSS}</style></head><body>
 <div class=nav><span>⚔ Township Fighters</span>{nav}</div>
@@ -4900,6 +5683,16 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
                       "environments" if _v("only_environments") else
                       "assets" if _v("only_assets") else "all")
 
+        # Autocomplete the "specific names" fields with the characters/environments
+        # that actually exist (locally saved profiles).
+        import html as _html
+        _char_dl = "".join(
+            f'<option value="{_html.escape(p["name"], quote=True)}">'
+            for p in _list_profiles("character") if not _is_referee_meta(p["meta"]))
+        _env_dl = "".join(
+            f'<option value="{_html.escape(p["name"], quote=True)}">'
+            for p in _list_profiles("environment"))
+
         return f"""
 <h1>Run settings</h1>
 <form id=run-form method=post action=/start>
@@ -4924,6 +5717,10 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
     <div><label>2× upscale model <span class=hint>(AI super-res used when 2× is picked; blank = use generic/auto)</span></label><input name=upscale_model_2x type=text value="{_v('upscale_model_2x') or ''}"></div>
     <div><label>4× upscale model <span class=hint>(used when 4× is picked; blank = use generic/auto)</span></label><input name=upscale_model_4x type=text value="{_v('upscale_model_4x') or ''}"></div>
     <div><label>Upscale model <span class=hint>(generic fallback; blank = CoderAI auto-selects)</span></label><input name=upscale_model type=text value="{_v('upscale_model') or ''}"></div>
+  </div>
+  <div class=row3 style="margin-top:.6rem">
+    <div><label>Interpolation model <span class=hint>(AI FPS interpolation, RIFE/FILM; blank = CoderAI auto-selects)</span></label><input name=interpolation_model type=text value="{_v('interpolation_model') or ''}"></div>
+    <div></div><div></div>
   </div>
   <div style="margin-top:.6rem">
     <label><input type=checkbox name=no_llm{_c('no_llm')}> Disable LLM prompt generation</label>
@@ -4950,8 +5747,9 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
     <option value=fighters{"selected" if char_mode=="fighters" else ""}>Use specific names</option>
   </select>
   <div id=char_names_row style="display:{"block" if char_mode=="fighters" else "none"};margin-top:.4rem">
-    <label>Fighter names <span class=hint>(comma-separated)</span></label>
-    <input name=fighters type=text value="{_v('fighters') or ''}">
+    <label>Fighter names <span class=hint>(comma-separated — type to autocomplete existing)</span></label>
+    <input name=fighters type=text value="{_v('fighters') or ''}" list=existing_chars>
+    <datalist id=existing_chars>{_char_dl}</datalist>
   </div>
   <div class=row style="margin-top:.6rem">
     <div><label>How many fighters <span class=hint>(0 = whole pool)</span></label>
@@ -4974,8 +5772,9 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
     <option value=environments{"selected" if env_mode=="environments" else ""}>Use specific names</option>
   </select>
   <div id=env_names_row style="display:{"block" if env_mode=="environments" else "none"};margin-top:.4rem">
-    <label>Environment names <span class=hint>(comma-separated)</span></label>
-    <input name=environments type=text value="{_v('environments') or ''}">
+    <label>Environment names <span class=hint>(comma-separated — type to autocomplete existing)</span></label>
+    <input name=environments type=text value="{_v('environments') or ''}" list=existing_envs>
+    <datalist id=existing_envs>{_env_dl}</datalist>
   </div>
   <div class=row style="margin-top:.6rem">
     <div><label>How many environments <span class=hint>(0 = whole pool)</span></label>
@@ -5425,7 +6224,12 @@ fetch('/status').then(r=>r.json()).then(d=>{{
             cards.append(
                 f'<div class=card id="pf-{kind}-{esc(name)}">'
                 f'  <div class=pf-head>'
-                f'    <span class=pf-name>{esc(name)}</span>'
+                f'    <span class=pf-name>{esc(name)}'
+                + (' <span style="font-size:.66rem;font-weight:700;color:#1b1b1b;'
+                   'background:#d8b84a;border-radius:4px;padding:.05rem .4rem;'
+                   'vertical-align:middle">REFEREE</span>'
+                   if (kind == "character" and _is_referee_meta(meta)) else '')
+                + f'</span>'
                 f'    <span class=hint>{len(p["images"])} image(s)</span>'
                 f'  </div>'
                 f'  <div class=pf-thumbs>{thumbs}</div>'
@@ -5555,7 +6359,8 @@ function pollRegen(jobId, st){
     try{ d=await (await fetch('/job/'+jobId)).json(); }
     catch(e){ setTimeout(poll,1500); return; }
     const pct=d.progress||0;
-    if(d.status==='running'){ st.textContent='⏳ '+(d._msg||('working… '+pct+'%')); setTimeout(poll,1200); }
+    if(d.status==='queued'){ st.textContent=d._msg||'⏳ queued…'; setTimeout(poll,1200); }
+    else if(d.status==='running'){ st.textContent='⏳ '+(d._msg||('working… '+pct+'%')); setTimeout(poll,1200); }
     else if(d.status==='done'){
       st.style.color='#7ed87e';
       st.textContent='✓ added '+(d.added||0)+' image(s)'+(d.synced===false?' (local only)':'')+' — reloading…';
@@ -5599,7 +6404,8 @@ function pollTrain(jobId, st){
     try{ d=await (await fetch('/job/'+jobId)).json(); }
     catch(e){ setTimeout(poll,2000); return; }
     const pct=d.progress||0;
-    if(d.status==='running'){ st.textContent='⏳ '+(d._msg||('training… '+pct+'%'))+' ('+pct+'%)'; setTimeout(poll,1500); }
+    if(d.status==='queued'){ st.textContent=d._msg||'⏳ queued…'; setTimeout(poll,1200); }
+    else if(d.status==='running'){ st.textContent='⏳ '+(d._msg||('training… '+pct+'%'))+' ('+pct+'%)'; setTimeout(poll,1500); }
     else if(d.status==='done'){
       st.style.color='#7ed87e'; st.textContent='✓ LoRA trained — reloading…';
       setTimeout(()=>location.reload(),1000);
@@ -5647,13 +6453,90 @@ async function uploadRefs(kind,name){
     setTimeout(()=>location.reload(),800);
   }catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; }
 }
+async function autogenProfile(kind){
+  const root=document.getElementById('new-'+kind);
+  const st=root.querySelector('.nf-status');
+  const roleEl=root.querySelector('[data-new=role]');
+  const role=roleEl?roleEl.value:'fighter';
+  const fd=new FormData(); fd.append('kind',kind); fd.append('role',role);
+  st.style.color='#aaa'; st.textContent='✨ Inventing '+(role==='referee'?'referee':kind)+'…';
+  let j;
+  try{ const r=await fetch('/profile/autogen',{method:'POST',body:fd}); j=await r.json(); }
+  catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; return; }
+  if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
+  const f=j.fields||{};
+  Object.keys(f).forEach(k=>{
+    const el=root.querySelector('[data-new='+k+']');
+    if(el && f[k]!=null && f[k]!=='') el.value=f[k];
+  });
+  st.style.color='#7ed87e'; st.textContent='✓ Filled — review/edit, then Create';
+}
+async function createProfile(kind){
+  const root=document.getElementById('new-'+kind);
+  const st=root.querySelector('.nf-status');
+  const name=(root.querySelector('[data-new=name]').value||'').trim();
+  if(!name){ st.style.color='#e07070'; st.textContent='Enter a name first'; return; }
+  const fd=new FormData();
+  fd.append('kind',kind); fd.append('name',name);
+  root.querySelectorAll('[data-new]').forEach(el=>{
+    const k=el.getAttribute('data-new'); if(k!=='name') fd.append(k,el.value);
+  });
+  st.style.color='#aaa'; st.textContent='Starting…';
+  let j;
+  try{
+    const r=await fetch('/profile/create',{method:'POST',body:fd});
+    j=await r.json();
+  }catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; return; }
+  if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
+  pollRegen(j.job_id, st);
+}
 </script>"""
+        # Form to create a brand-new profile (generates reference images server-side).
+        _gender_row = (
+            '<div><label>Gender</label>'
+            '<input type=text data-new=gender value="male"></div>'
+            '<div><label>Role <span class=hint>(referee = official, not a fighter)</span></label>'
+            '<select data-new=role>'
+            '<option value="fighter">fighter</option>'
+            '<option value="referee">referee</option>'
+            '</select></div>'
+        ) if kind == "character" else ""
+        new_form = (
+            f'<details class=card style="margin-bottom:1rem" id="new-{kind}">'
+            f'  <summary style="cursor:pointer;font-weight:600">➕ New {label[:-1].lower()}</summary>'
+            f'  <div class=row style="margin-top:.6rem">'
+            f'    <div><label>Name</label><input type=text data-new=name '
+            f'placeholder="unique name"></div>'
+            f'    <div><label>Region</label><input type=text data-new=region></div>'
+            f'    {_gender_row}'
+            f'  </div>'
+            f'  <label>Description</label>'
+            f'  <textarea data-new=description rows=2></textarea>'
+            f'  <label>Prompt <span class=hint>(drives image generation)</span></label>'
+            f'  <textarea data-new=prompt rows=3></textarea>'
+            f'  <div class=pf-actions style="margin-top:.5rem">'
+            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            + (f'title="Pick fighter/referee above first, then auto-fill the form with '
+               f'the text model" '
+               if kind == "character" else 'title="Auto-fill the form with the text model" ')
+            + f'onclick="autogenProfile(\'{kind}\')">✨ Autogenerate</button>'
+            f'    <label style="margin:0;font-size:.78rem">Generate <input type=number '
+            f'data-new=count value=4 min=1 max=8 style="width:54px;display:inline-block"> '
+            f'reference image(s)</label>'
+            f'    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="createProfile(\'{kind}\')">✅ Create {label[:-1].lower()}</button>'
+            f'    <span class="nf-status pf-regen-status" style="font-size:.76rem;color:#7ea8f7"></span>'
+            f'  </div>'
+            f'  <p class=hint style="margin:.4rem 0 0">“Autogenerate” fills the fields '
+            f'above with the text model so you can review and edit them before creating.</p>'
+            f'</details>'
+        )
         return (f'<div style="display:flex;justify-content:space-between;align-items:center">'
                 f'<h1>{label}</h1>'
                 f'<a href="/{kind}s" class="btn btn-secondary" style="font-size:.8rem">↻ Refresh</a></div>'
                 f'<p class=hint style="margin-bottom:.8rem">Edit a profile’s fields and Save, or '
                 f'Remove it entirely. Changes apply to the local output folder and are synced to CoderAI.</p>'
-                f'{inner}{script}')
+                f'{new_form}{inner}{script}')
 
     def _scan_matches():
         """Return (vdir, plan, fight_by_name, matches, legacy_outcomes).
@@ -5786,7 +6669,8 @@ function _pollJob(jobId, setSt){
     try{ d=await (await fetch('/job/'+jobId)).json(); }
     catch(e){ setTimeout(poll,2000); return; }
     const pct=d.progress||0;
-    if(d.status==='running'){ setSt('#7ea8f7','⏳ '+(d._msg||('working… '+pct+'%'))+' ('+pct+'%)'); setTimeout(poll,1500); }
+    if(d.status==='queued'){ setSt('#7ea8f7', d._msg||'⏳ queued…'); setTimeout(poll,1200); }
+    else if(d.status==='running'){ setSt('#7ea8f7','⏳ '+(d._msg||('working… '+pct+'%'))+' ('+pct+'%)'); setTimeout(poll,1500); }
     else if(d.status==='done'){ setSt('#7ed87e','✓ '+(d._msg||'done')+' — reloading…'); setTimeout(()=>location.reload(),1200); }
     else { setSt('#e07070','✗ '+(d.error||'failed')); }
   };
@@ -5803,8 +6687,9 @@ function _renderMatchBars(wrap, d, jobId){
     ? '<button class="btn btn-danger" id="cancel-'+jobId+'" '
       +'style="font-size:.72rem;padding:.15rem .6rem;float:right">⏹ Cancel</button>'
     : '';
-  let h='<div class=prg-global><div class=prg-label>'+cancelBtn+'Overall — '+pct+'%</div>'
-       +'<div class=progress-bar><div class=progress-fill style="width:'+pct+'%"></div></div></div>';
+  const head=(d.status==='queued')?_esch(d._msg||'⏳ queued…'):('Overall — '+pct+'%');
+  let h='<div class=prg-global><div class=prg-label>'+cancelBtn+head+'</div>'
+       +'<div class=progress-bar><div class="progress-fill'+(d.status==='queued'?' striped':'')+'" style="width:'+(d.status==='queued'?100:pct)+'%"></div></div></div>';
   const items=d.items||[];
   if(items.length){
     h+='<div class=prg-items>';
@@ -5856,6 +6741,47 @@ function _pollMatchBars(jobId, setSt, wrap){
   };
   setTimeout(poll,500);
 }
+// Single persistent monitor for the match-detail progress area. Instead of one
+// poller per job (which makes two queued jobs fight over the shared bars and the
+// status text — the "blinking" bug), ONE monitor polls /active-jobs, renders the
+// currently-RUNNING job for this match and notes how many are queued behind it.
+// Jobs are serialised server-side so only one runs at a time; this just reflects
+// that single source of truth.
+let _matchMonOn=false;
+function startMatchMonitor(match, setSt){
+  if(_matchMonOn) return;
+  _matchMonOn=true;
+  const wrap=document.getElementById('match-progress');
+  let sawActive=false;
+  const tick=async()=>{
+    let data;
+    try{ data=await (await fetch('/active-jobs')).json(); }
+    catch(e){ setTimeout(tick,2000); return; }
+    const mine=(data.jobs||[]).filter(j=>j.jtype==='match' && (j.match||'')===match);
+    const running=mine.find(j=>j.status==='running');
+    const queued=mine.filter(j=>j.status==='queued');
+    if(running){
+      sawActive=true;
+      if(wrap){ wrap.classList.remove('hidden'); _renderMatchBars(wrap, running, running.job_id); }
+      let t='⏳ '+(running._msg||'working…')+' ('+(running.progress||0)+'%)';
+      if(queued.length) t+=' · '+queued.length+' queued';
+      if(setSt) setSt('#7ea8f7',t);
+      setTimeout(tick,1200);
+    } else if(queued.length){
+      sawActive=true;
+      if(wrap){ wrap.classList.remove('hidden'); _renderMatchBars(wrap, queued[0], queued[0].job_id); }
+      if(setSt) setSt('#7ea8f7','⏳ queued — '+queued.length+' waiting to start…');
+      setTimeout(tick,1200);
+    } else {
+      _matchMonOn=false;
+      if(sawActive){
+        if(setSt) setSt('#7ed87e','✓ done — reloading…');
+        setTimeout(()=>location.reload(),1300);
+      }
+    }
+  };
+  setTimeout(tick,300);
+}
 async function cancelJob(jobId){
   const b=document.getElementById('cancel-'+jobId);
   if(b){ b.disabled=true; b.textContent='⏹ Stopping…'; }
@@ -5875,10 +6801,11 @@ async function reMatch(ev, scope, params){
                 'keyframes':'Regenerate ALL keyframe images for this match (uses the image model)? Existing keyframes are replaced; the clip videos are NOT re-rendered — click Re-render afterwards.',
                 'keyframes-missing':'Generate only the MISSING keyframe images for this match (uses the image model)? Existing keyframes are kept; nothing is re-rendered.',
                 'keyframe':'Regenerate this keyframe image (uses the image model)? The clip video is NOT re-rendered — click Re-render afterwards.',
-                'replan':'Re-plan this match: rebuild its clip list and rewrite all clip prompts (frame budget from the Clip min/max frames settings). Only this match changes — other matches and outcomes are untouched. AFTERWARDS, in order: 1) Regenerate keyframes (the old keyframes match the PREVIOUS prompts and would anchor the video to the wrong image — causing static/low-motion clips), 2) Re-render all clips, 3) Reassemble finals.'};
+                'replan':'Re-plan this match: rebuild its clip list and rewrite all clip prompts (frame budget from the Clip min/max frames settings). Only this match changes — other matches and outcomes are untouched. AFTERWARDS, in order: 1) Regenerate keyframes (the old keyframes match the PREVIOUS prompts and would anchor the video to the wrong image — causing static/low-motion clips), 2) Re-render all clips, 3) Reassemble finals.',
+                'replan-outcomes':'Rewrite ONLY this match\\'s outcome prompts (the finish + victory shots for win / ko / retire / draw). The fight-clip prompts are left untouched. AFTERWARDS regenerate the outcome keyframes, then re-render the outcomes.'};
   const kf=(scope==='keyframes'||scope==='keyframe'||scope==='keyframes-missing');
   const kfMiss=(scope==='keyframes-missing');
-  const isReplan=(scope==='replan');
+  const isReplan=(scope==='replan'||scope==='replan-outcomes');
   const isFull=(scope==='full');
   if(!(await uiConfirm(labels[scope]||'Proceed?',
        {title:(isFull?'Regenerate whole match':(isReplan?'Re-plan match prompts':(kfMiss?'Generate missing keyframes':(kf?'Regenerate keyframes':'Regenerate')))),
@@ -5893,14 +6820,32 @@ async function reMatch(ev, scope, params){
   try{ j=await (await fetch('/matches/render',{method:'POST',body:fd})).json(); }
   catch(e){ setSt('#e07070','✗ '+e); return; }
   if(j.error){ setSt('#e07070','✗ '+j.error); return; }
+  const det=document.getElementById('detail');
   const wrap=document.getElementById('match-progress');
-  if(wrap && scope!=='reassemble'){ wrap.innerHTML=''; wrap.classList.remove('hidden'); _pollMatchBars(j.job_id, setSt, wrap); }
-  else { _pollJob(j.job_id, setSt); }
+  if(det && wrap){
+    // Detail page: a SINGLE monitor drives the shared bars + status from the
+    // server's job queue, so a second request submitted while one is running just
+    // shows up as "queued" instead of fighting over the display.
+    setSt('#7ea8f7','✓ '+(j.queued_msg||'submitted')+' — '+(scope==='reassemble'?'assembling…':'queued/running…'));
+    startMatchMonitor(det.getAttribute('data-match'), setSt);
+  } else {
+    _pollJob(j.job_id, setSt);
+  }
+}
+function _enhRecalcFps(){
+  // Auto-fill Final FPS = Render FPS × Raise-FPS multiplier (preserves duration);
+  // ×0/none → just the render fps. The user can still edit the field afterwards.
+  const sel=document.getElementById('enh-fps'); const out=document.getElementById('enh-final-fps');
+  if(!sel||!out) return;
+  const base=parseInt(sel.getAttribute('data-render-fps'))||0;
+  const mult=parseInt(sel.value)||0;
+  out.value = (mult>1) ? base*mult : base;
 }
 async function enhanceMatch(ev, target, match){
   if(ev) ev.preventDefault();
   const up=(document.getElementById('enh-upscale')||{}).value||'0';
   const fps=(document.getElementById('enh-fps')||{}).value||'0';
+  const finalFps=(document.getElementById('enh-final-fps')||{}).value||'0';
   const force=!!(document.getElementById('enh-force')||{}).checked;
   if(up==='0' && (fps==='0'||fps==='1')){ alert('Pick an Upscale factor and/or a FPS multiplier first.'); return; }
   const tlabel={finals:'final videos',outcomes:'outcome videos',all:'finals + outcomes'}[target]||target;
@@ -5912,15 +6857,20 @@ async function enhanceMatch(ev, target, match){
   const setSt=(c,t)=>{ if(stEl){ stEl.style.color=c; stEl.textContent=t; } };
   const fd=new FormData(); fd.append('scope','enhance'); fd.append('match',match);
   fd.append('target',target); fd.append('upscale',up); fd.append('fps',fps);
-  fd.append('force',force?'1':'0');
+  fd.append('final_fps',finalFps); fd.append('force',force?'1':'0');
   setSt('#aaa','Starting…');
   let j;
   try{ j=await (await fetch('/matches/render',{method:'POST',body:fd})).json(); }
   catch(e){ setSt('#e07070','✗ '+e); return; }
   if(j.error){ setSt('#e07070','✗ '+j.error); return; }
+  const det=document.getElementById('detail');
   const wrap=document.getElementById('match-progress');
-  if(wrap){ wrap.innerHTML=''; wrap.classList.remove('hidden'); _pollMatchBars(j.job_id, setSt, wrap); }
-  else { _pollJob(j.job_id, setSt); }
+  if(det && wrap){
+    setSt('#7ea8f7','✓ submitted — queued/running…');
+    startMatchMonitor(det.getAttribute('data-match'), setSt);
+  } else {
+    _pollJob(j.job_id, setSt);
+  }
 }
 async function delVid(ev, scope, params){
   if(ev) ev.preventDefault();
@@ -5928,7 +6878,7 @@ async function delVid(ev, scope, params){
                 'final':'Delete this assembled video file?',
                 'match':'Delete ALL video files for this match (clips + finals)? The plan/prompts are kept so you can re-render.',
                 'output':'Delete this output video file?',
-                'outputs':'Delete ALL output video files for this fighter?',
+                'outputs':'Delete ALL outcome video files for this match (and their upscaled variants)? Clips and finals are kept.',
                 'keyframes':'Clear ALL keyframe images for this match? The next re-render will run keyframe-free until you regenerate them.',
                 'keyframe':'Clear this keyframe image? The next re-render of it will run keyframe-free until you regenerate it.',
                 'enhanced':'Remove only the UPSCALED / higher-FPS versions for this match (the *_2x / *_NxfpS files)? The originals are kept.',
@@ -5955,7 +6905,7 @@ async function saveMatch(ev, name){
   const st=document.getElementById('detail-status');
   const setSt=(c,t)=>{ st.style.color=c; st.textContent=t; };
   const fd=new FormData(); fd.append('mode','match'); fd.append('name',name);
-  ['f1','f2','env','short_target','long_target'].forEach(k=>{
+  ['f1','f2','env','referee','short_target','long_target','playback_fps'].forEach(k=>{
     const el=root.querySelector('[data-field="'+k+'"]'); if(el) fd.append(k, el.value);
   });
   root.querySelectorAll('[data-clip]').forEach(el=>fd.append('clip_'+el.getAttribute('data-clip'), el.value));
@@ -5986,24 +6936,26 @@ async function resumeMatchJobs(){
   let data;
   try{ data=await (await fetch('/active-jobs')).json(); }
   catch(e){ return; }
+  const det=document.getElementById('detail');
+  const detMatch=det?det.getAttribute('data-match'):null;
+  let monStarted=false;
   for(const j of (data.jobs||[])){
     if(j.jtype!=='match') continue;
-    const det=document.getElementById('detail');
-    if(det && det.getAttribute('data-match')===j.match){
+    if(det && detMatch===j.match){
+      // Detail page for this match: hand off to the single monitor (once).
+      if(monStarted) continue;
+      monStarted=true;
       const stEl=document.getElementById('detail-status');
-      if(!stEl) continue;
-      const setSt=(c,t)=>{ stEl.style.color=c; stEl.textContent=t; };
-      setSt('#7ea8f7','⏳ '+(j._msg||'rendering…')+' ('+(j.progress||0)+'%)');
-      const wrap=document.getElementById('match-progress');
-      if(wrap && j.scope!=='reassemble'){ _pollMatchBars(j.job_id, setSt, wrap); }
-      else { _pollJob(j.job_id, setSt); }
+      const setSt=(c,t)=>{ if(stEl){ stEl.style.color=c; stEl.textContent=t; } };
+      startMatchMonitor(detMatch, setSt);
     } else {
       const card=document.querySelector('.match-card[data-match="'+(j.match||'')+'"]');
       if(!card) continue;
       const stEl=card.querySelector('.match-status');
       if(!stEl) continue;
       const setSt=(c,t)=>{ stEl.style.color=c; stEl.textContent=t; };
-      setSt('#7ea8f7','⏳ '+(j._msg||'rendering…')+' ('+(j.progress||0)+'%)');
+      setSt('#7ea8f7', j.status==='queued'?(j._msg||'⏳ queued…')
+                       :('⏳ '+(j._msg||'rendering…')+' ('+(j.progress||0)+'%)'));
       _pollJob(j.job_id, setSt);
     }
   }
@@ -6090,12 +7042,107 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             body = ('<div class=card style="color:#666">No matches found yet. Render '
                     'videos from the Run page first (or run the Videos step).</div>')
 
+        # ── New-match form: pick two fighters + an environment, then either build
+        # the whole match end-to-end or just write its prompts. ──────────────────
+        # Populate with the characters/environments that ACTUALLY exist (locally
+        # saved profiles), not the full built-in pool.
+        _char_opts = sorted(p["name"] for p in _list_profiles("character")
+                            if not _is_referee_meta(p["meta"]))
+        _env_opts = sorted(p["name"] for p in _list_profiles("environment"))
+        _ref_opts = sorted(p["name"] for p in _list_profiles("character")
+                           if _is_referee_meta(p["meta"]))
+
+        def _nm_select(field, options, blank=None):
+            opts = ([f'<option value="">{_esc(blank)}</option>'] if blank else [])
+            opts += [f'<option value="{_esc(o)}">{_esc(o)}</option>' for o in options]
+            return f'<select data-nm={field}>{"".join(opts)}</select>'
+
+        new_match = (
+            '<details class=card style="margin-bottom:1rem" id="new-match">'
+            '  <summary style="cursor:pointer;font-weight:600">➕ New match</summary>'
+            '  <div class=row3 style="margin-top:.6rem">'
+            f'    <div><label>Fighter 1</label>{_nm_select("f1", _char_opts)}</div>'
+            f'    <div><label>Fighter 2</label>{_nm_select("f2", _char_opts)}</div>'
+            f'    <div><label>Environment</label>'
+            f'{_nm_select("env", _env_opts, blank="(random / none)")}</div>'
+            '  </div>'
+            '  <div class=row style="margin-top:.4rem">'
+            f'    <div><label>Referee <span class=hint>(officiates the outcome '
+            f'victory clips)</span></label>'
+            f'{_nm_select("referee", _ref_opts, blank="(auto / any)")}</div>'
+            '  </div>'
+            '  <div class=pf-actions style="margin-top:.6rem">'
+            '    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            'title="Pick a random fighter pairing + environment + referee from your '
+            'existing profiles" onclick="autogenMatch()">✨ Autogenerate</button>'
+            '    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
+            'onclick="newMatch(\'full\')">🎬 Create whole match</button>'
+            '    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            'onclick="newMatch(\'prompts\')">📝 Create prompts only</button>'
+            '    <span class="nm-status" style="font-size:.76rem;color:#7ea8f7"></span>'
+            '  </div>'
+            '  <p class=hint style="margin:.5rem 0 0">“Whole match” runs text→image→video '
+            'end-to-end (slow). “Prompts only” writes the clip + outcome prompts so you '
+            'can review them, then generate keyframes and render from the match page.</p>'
+            '</details>'
+        )
+        new_match_js = """
+<script>
+async function autogenMatch(){
+  const root=document.getElementById('new-match');
+  const st=root.querySelector('.nm-status');
+  st.style.color='#aaa'; st.textContent='✨ Picking a matchup…';
+  let j;
+  try{ const r=await fetch('/matches/autogen',{method:'POST',body:new FormData()}); j=await r.json(); }
+  catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; return; }
+  if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
+  const f=j.fields||{};
+  ['f1','f2','env','referee'].forEach(k=>{
+    const el=root.querySelector('[data-nm='+k+']');
+    if(el && f[k]!=null) el.value=f[k];
+  });
+  st.style.color='#7ed87e'; st.textContent='✓ Filled — review, then Create';
+}
+async function newMatch(mode){
+  const root=document.getElementById('new-match');
+  const st=root.querySelector('.nm-status');
+  const f1=root.querySelector('[data-nm=f1]').value;
+  const f2=root.querySelector('[data-nm=f2]').value;
+  const env=root.querySelector('[data-nm=env]').value;
+  const ref=root.querySelector('[data-nm=referee]').value;
+  if(!f1||!f2){ st.style.color='#e07070'; st.textContent='Pick two fighters'; return; }
+  if(f1===f2){ st.style.color='#e07070'; st.textContent='Pick two different fighters'; return; }
+  const fd=new FormData();
+  fd.append('f1',f1); fd.append('f2',f2); fd.append('env',env); fd.append('mode',mode);
+  fd.append('referee',ref);
+  st.style.color='#aaa'; st.textContent=(mode==='prompts'?'Writing prompts…':'Creating match…');
+  let j;
+  try{ const r=await fetch('/matches/create',{method:'POST',body:fd}); j=await r.json(); }
+  catch(e){ st.style.color='#e07070'; st.textContent='✗ '+e; return; }
+  if(j.error){ st.style.color='#e07070'; st.textContent='✗ '+j.error; return; }
+  pollNewMatch(j.job_id, st);
+}
+function pollNewMatch(jobId, st){
+  st.style.color='#7ea8f7';
+  const poll=async()=>{
+    let d;
+    try{ d=await (await fetch('/job/'+jobId)).json(); }
+    catch(e){ setTimeout(poll,1500); return; }
+    if(d.status==='queued'){ st.textContent=d._msg||'⏳ queued…'; setTimeout(poll,1300); }
+    else if(d.status==='running'){ st.textContent='⏳ '+(d._msg||('working… '+(d.progress||0)+'%')); setTimeout(poll,1500); }
+    else if(d.status==='done'){ st.style.color='#7ed87e'; st.textContent='✓ '+(d._msg||'done')+' — reloading…'; setTimeout(()=>location.reload(),1400); }
+    else { st.style.color='#e07070'; st.textContent='✗ '+(d.error||'failed'); }
+  };
+  setTimeout(poll,800);
+}
+</script>"""
+
         return (f'<div style="display:flex;justify-content:space-between;align-items:center">'
                 f'<h1>Matches</h1>'
                 f'<a href="/matches" class="btn btn-secondary" style="font-size:.8rem">↻ Refresh</a></div>'
                 f'<p class=hint style="margin-bottom:.8rem">Select a match to view, edit and '
                 f'regenerate its clips, finals and outcomes. Videos load on the detail page.</p>'
-                f'{body}{_match_js}')
+                f'{new_match}{body}{_match_js}{new_match_js}')
 
     def _match_detail_html(name=None, fighter=None):
         """Detail view for a single match: embeds that match's videos only, with
@@ -6121,10 +7168,13 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
 
         # Selectable rosters: locally-saved profiles + the built-in pools, so a
         # match's fighters/environment can be SWITCHED before re-rendering.
-        _char_opts = sorted({p["name"] for p in _list_profiles("character")}
-                            | {f["name"] for f in FIGHTER_POOL})
-        _env_opts = sorted({p["name"] for p in _list_profiles("environment")}
-                           | {e["name"] for e in ENVIRONMENT_POOL})
+        # Populate with the characters/environments that ACTUALLY exist (locally
+        # saved profiles), not the full built-in pool.
+        _char_opts = sorted(p["name"] for p in _list_profiles("character")
+                            if not _is_referee_meta(p["meta"]))
+        _env_opts = sorted(p["name"] for p in _list_profiles("environment"))
+        _ref_opts = sorted(p["name"] for p in _list_profiles("character")
+                           if _is_referee_meta(p["meta"]))
 
         def _field_select(field, current, options):
             opts = list(options)
@@ -6134,6 +7184,19 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
                 f'<option value="{_esc(o)}"{" selected" if o == current else ""}>'
                 f'{_esc(o)}</option>' for o in opts)
             return f'<select data-field={field}>{inner}</select>'
+
+        # Referee select with a blank "(auto / any)" option so the match can leave
+        # the choice to whichever referee profile is available.
+        _cur_ref = meta.get("referee") or ""
+        _ref_field_select = (
+            '<select data-field=referee>'
+            f'<option value=""{" selected" if not _cur_ref else ""}>(auto / any)</option>'
+            + ("".join(
+                f'<option value="{_esc(o)}"{" selected" if o == _cur_ref else ""}>'
+                f'{_esc(o)}</option>'
+                for o in (_ref_opts if _cur_ref in _ref_opts or not _cur_ref
+                          else [_cur_ref] + _ref_opts)))
+            + '</select>')
 
         # Keyframes live alongside the videos; used as previews / posters below.
         kdir = vdir / "keyframes"
@@ -6255,6 +7318,18 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             )
         outcomes_html = "".join(outcome_groups) or '<span class=hint>No outcomes planned for this match.</span>'
 
+        # Render fps (clips) + the auto final playtime fps after FPS-boost.
+        _detail_eff_fps = int(getattr(default_args, "playback_fps", 0)
+                              or getattr(default_args, "fps", 0) or 8)
+        _chosen_fps = int(meta.get("playback_fps") or _detail_eff_fps)
+        _detail_mult = int(getattr(default_args, "fps_multiplier", 0) or 0)
+        _auto_final_fps = _chosen_fps * _detail_mult if _detail_mult > 1 else _chosen_fps
+        if _detail_mult > 1:
+            _detail_fps_hint = (f"clips render at {_chosen_fps} fps; FPS-boost ×{_detail_mult} "
+                                f"→ auto final {_auto_final_fps} fps (duration preserved)")
+        else:
+            _detail_fps_hint = "render rate for the clips (no FPS-boost active)"
+
         return (
             f'<div id=detail data-match="{_esc(name or "")}">{back}'
             f'<div style="display:flex;justify-content:space-between;align-items:center;margin:.4rem 0">'
@@ -6267,14 +7342,22 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             f'    <div><label>Fighter 2</label>{_field_select("f2", f2, _char_opts)}</div>'
             f'    <div><label>Environment</label>{_field_select("env", env, _env_opts)}</div>'
             f'  </div>'
+            f'  <div class=row style="margin-top:.4rem">'
+            f'    <div><label>Referee <span class=hint>(officiates the outcome '
+            f'victory clips)</span></label>{_ref_field_select}</div>'
+            f'  </div>'
             f'  <p class=hint style="margin-top:.25rem">Switch fighters/environment, then '
             f'<b>Save match</b> and re-render. Tip: also re-render the clip prompts so '
             f'their text matches the new fighters/location.</p>'
-            f'  <div class=row style="margin-top:.4rem">'
+            f'  <div class=row3 style="margin-top:.4rem">'
             f'    <div><label>Short target (s)</label><input type=number data-field=short_target '
             f'value="{_esc(meta.get("short_target",45))}"></div>'
             f'    <div><label>Long target (s)</label><input type=number data-field=long_target '
             f'value="{_esc(meta.get("long_target",70))}"></div>'
+            f'    <div><label>Render FPS <span class=hint>(clips)</span></label>'
+            f'<input type=number min=0 max=120 data-field=playback_fps '
+            f'value="{_esc(int(meta.get("playback_fps") or _detail_eff_fps))}">'
+            f'<div class=hint>{_detail_fps_hint}</div></div>'
             f'  </div>'
             f'  <div class=pf-actions style="margin-top:.6rem">'
             f'    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
@@ -6285,6 +7368,9 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="reMatch(event,\'replan\',{{match:\'{_esc(name)}\'}})" '
             f'title="Rebuild this match\'s clip list + prompts at the current fps (more, shorter clips at higher fps). No video model.">📝 Re-plan prompts</button>'
+            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="reMatch(event,\'replan-outcomes\',{{match:\'{_esc(name)}\'}})" '
+            f'title="Rewrite ONLY this match\'s outcome prompts (finish + victory shots). Fight-clip prompts are left untouched. No video model.">📝 Re-plan outcome prompts</button>'
             f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="reMatch(event,\'match-clips\',{{match:\'{_esc(name)}\'}})">♻ Re-render all clips</button>'
             f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
@@ -6302,6 +7388,9 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="delVid(event,\'keyframes\',{{match:\'{_esc(name)}\'}})">🧹 Clear keyframes</button>'
             f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="delVid(event,\'outputs\',{{match:\'{_esc(name)}\'}})" '
+            f'title="Remove only this match\'s outcome videos (and their upscaled variants). Clips and finals are kept.">🗑 Remove outcome videos</button>'
+            f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="delVid(event,\'match\',{{match:\'{_esc(name)}\'}})">🗑 Remove all videos</button>'
             f'    <button class="btn btn-danger" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="delVid(event,\'match-purge\',{{match:\'{_esc(name)}\'}})" '
@@ -6315,8 +7404,13 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
             f'    <select id=enh-upscale><option value=0>none</option>'
             f'      <option value=2>2× (super-res)</option><option value=4>4× (super-res)</option></select></div>'
             f'  <div style="min-width:130px"><label>Raise FPS</label>'
-            f'    <select id=enh-fps><option value=0>none</option>'
+            f'    <select id=enh-fps data-render-fps="{_chosen_fps}" onchange="_enhRecalcFps()">'
+            f'      <option value=0>none</option>'
             f'      <option value=2>2×</option><option value=3>3×</option><option value=4>4×</option></select></div>'
+            f'  <div style="min-width:120px"><label>Final FPS <span class=hint>(playtime)</span></label>'
+            f'    <input type=number id=enh-final-fps min=0 max=240 value="{_chosen_fps}" style="width:100%" '
+            f'title="Play rate of the FPS-boosted video. Auto-updates from Render FPS × Raise FPS when you change the multiplier; edit to override (default keeps the same length).">'
+            f'  </div>'
             f'  <label style="display:flex;align-items:center;gap:.35rem;font-size:.82rem;white-space:nowrap" '
             f'title="Re-run from the original video, overwriting any existing *_2x/_NxfpS file (otherwise an up-to-date enhanced file is skipped).">'
             f'<input type=checkbox id=enh-force> Force re-enhance</label>'
@@ -6439,19 +7533,35 @@ document.addEventListener('DOMContentLoaded', resumeMatchJobs);
                 # "<fighter>_<outcome>" stem) so this matches the file the
                 # generator writes; a "or name" fallback here would look for a
                 # "<match>_<fighter>_<outcome>" that never gets created.
-                stem = _clip_stem_outcome(fr, oc, o.get("match_name"))
+                base_stem = _clip_stem_outcome(fr, oc, o.get("match_name"))
                 # The match is authoritative for location (outcome snapshots can be
                 # stale) — match _generate_keyframes so the shown default is real.
                 o_env = m_env or o.get("env")
                 o_envd = m_env_desc or o.get("env_desc")
-                kf_text = (o.get("kf_prompt")
-                           or _compose_kf_prompt(o.get("prompt", ""), m_fighters,
-                                                 o_env, o_envd, outfits))
-                tiles.append(_kf_tile(
-                    _esc(oc), stem,
-                    f'{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\','
-                    f'outcome:\'{_esc(oc)}\'}}',
-                    kf_text, f'data-kfoutc="{_esc(fr)}|{_esc(oc)}"'))
+                # One tile per outcome shot (finish, then victory) — each anchors its
+                # own clip. Legacy outcomes without shots show a single tile.
+                _shots = o.get("shots") or [None]
+                _seg_labels = {"finish": "finish", "final_exchange": "exchange",
+                               "victory": "victory", "draw_decision": "decision"}
+                for si, s in enumerate(_shots):
+                    seg_stem = _outcome_seg_stem(base_stem, si)
+                    if s is not None:
+                        _role = _seg_labels.get(s.get("role"), f"clip {si+1}")
+                        _sp = s.get("prompt") or o.get("prompt", "")
+                        _kf_over = s.get("kf_prompt")
+                    else:
+                        _role = ""
+                        _sp = o.get("prompt", "")
+                        _kf_over = o.get("kf_prompt")
+                    seg_label = f"{oc} · {_role}" if _role else oc
+                    kf_text = (_kf_over
+                               or _compose_kf_prompt(_sp, m_fighters,
+                                                     o_env, o_envd, outfits))
+                    tiles.append(_kf_tile(
+                        seg_label, seg_stem,
+                        f'{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\','
+                        f'outcome:\'{_esc(oc)}\',seg:\'{si}\'}}',
+                        kf_text, f'data-kfoutc="{_esc(fr)}|{_esc(oc)}|{si}"'))
             out_groups.append(
                 f'<div style="margin-top:.5rem"><div class=hint '
                 f'style="font-weight:700;color:#bbb">{_esc(fr)}</div>'
@@ -6729,7 +7839,15 @@ async function resetPrompts(ev){
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path.rstrip("/") or "/"
 
-            if path in ("/", ""):
+            if path == "/favicon.ico":
+                # Bundled icon next to this script (tools/assets/favicon.ico).
+                ico = Path(__file__).resolve().parent / "assets" / "favicon.ico"
+                if ico.exists():
+                    self._send(200, "image/x-icon", ico.read_bytes())
+                else:
+                    self._send(404, "text/plain; charset=utf-8", b"no favicon")
+
+            elif path in ("/", ""):
                 html = _page("Run", _run_page_html(default_args), "run")
                 self._send(200, "text/html; charset=utf-8", html)
 
@@ -6760,6 +7878,7 @@ async function resetPrompts(ev){
 
             elif path == "/wardrobe":
                 html = _page("Wardrobe", _wardrobe_html(), "wardrobe")
+                self._send(200, "text/html; charset=utf-8", html)
 
             elif path == "/prompts":
                 html = _page("Prompts", _prompts_html(), "prompts")
@@ -6821,13 +7940,17 @@ async function resetPrompts(ev){
                 self._send(200, "application/json", _j.dumps(job))
 
             elif path == "/active-jobs":
-                # Running regen/train jobs, so a reloaded Characters/Environments
-                # page can re-attach its progress display to in-flight work.
+                # Running AND queued generation jobs, so a reloaded page (or the
+                # match-detail progress monitor) can re-attach to in-flight work and
+                # show what is queued behind it. Includes the per-item bars so the
+                # monitor can render real progress without binding to one job id.
                 import json as _j
                 active = []
                 with _jobs_lock:
                     for jid, j in _state["jobs"].items():
-                        if j.get("status") == "running" and j.get("jtype") in ("regen", "train", "match"):
+                        if (j.get("status") in ("running", "queued")
+                                and j.get("jtype") in ("regen", "create", "train",
+                                                       "match", "process")):
                             active.append({
                                 "job_id": jid,
                                 "kind": j.get("kind"),
@@ -6836,7 +7959,11 @@ async function resetPrompts(ev){
                                 "target": j.get("target"),
                                 "scope": j.get("scope"),
                                 "match": j.get("match"),
+                                "status": j.get("status"),
                                 "progress": j.get("progress", 0),
+                                "items": j.get("items"),
+                                "cancellable": j.get("cancellable"),
+                                "cancelled": j.get("cancelled"),
                                 "_msg": j.get("_msg", ""),
                             })
                 self._send(200, "application/json", _j.dumps({"jobs": active}))
@@ -6944,9 +8071,158 @@ async function resetPrompts(ev){
                     count = 4
                 guide = _fv("guide", "1") not in ("0", "false", "no", "")
                 job_id = _u.uuid4().hex[:12]
-                threading.Thread(target=_run_regen_job,
-                                 args=(job_id, kind, name, count, guide),
-                                 daemon=True).start()
+                _enqueue_gen(job_id, _run_regen_job, job_id, kind, name, count, guide,
+                             jtype="regen", kind=kind, name=name)
+                self._send(200, "application/json", _j.dumps({"job_id": job_id}))
+                return
+
+            if path == "/profile/create":
+                import json as _j, uuid as _u
+                clen = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(clen)
+                ctype = self.headers.get("Content-Type", "")
+                if "multipart/form-data" in ctype:
+                    boundary = ctype.split("boundary=")[-1].strip().encode()
+                    form = _parse_multipart(raw, boundary)
+                else:
+                    form = dict(urllib.parse.parse_qsl(raw.decode(errors="replace")))
+
+                def _fv(k, default=""):
+                    v = form.get(k)
+                    if v is None: return default
+                    return v if isinstance(v, str) else v.decode(errors="replace")
+
+                kind = _fv("kind"); name = _fv("name").strip()
+                if (kind not in ("character", "environment") or not name
+                        or "/" in name or "\\" in name or ".." in name):
+                    self._send(400, "application/json",
+                               _j.dumps({"error": "invalid kind/name"}))
+                    return
+                if (out_dir / (kind + "s") / name).exists():
+                    self._send(400, "application/json",
+                               _j.dumps({"error": "a profile with that name already exists"}))
+                    return
+                try:
+                    count = max(1, min(8, int(_fv("count", "4") or 4)))
+                except ValueError:
+                    count = 4
+                meta = {"prompt": _fv("prompt"), "description": _fv("description"),
+                        "region": _fv("region")}
+                if kind == "character":
+                    meta["gender"] = _fv("gender", "male") or "male"
+                    # A referee is a character profile tagged so it's kept out of
+                    # the fighter pools and dressed as an official.
+                    if _fv("role", "fighter").strip().lower() == "referee":
+                        meta["role"] = "referee"
+                job_id = _u.uuid4().hex[:12]
+                _enqueue_gen(job_id, _run_create_profile_job, job_id, kind, name,
+                             meta, count, jtype="create", kind=kind, name=name)
+                self._send(200, "application/json", _j.dumps({"job_id": job_id}))
+                return
+
+            if path == "/profile/autogen":
+                # Invent a fresh profile's form fields (name/region/description/
+                # prompt[/gender]) so the create form can be one-click filled and
+                # then reviewed/edited before submitting. Synchronous + fast.
+                import json as _j
+                clen = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(clen)
+                ctype = self.headers.get("Content-Type", "")
+                if "multipart/form-data" in ctype:
+                    boundary = ctype.split("boundary=")[-1].strip().encode()
+                    form = _parse_multipart(raw, boundary)
+                else:
+                    form = dict(urllib.parse.parse_qsl(raw.decode(errors="replace")))
+
+                def _fv(k, default=""):
+                    v = form.get(k)
+                    if v is None: return default
+                    return v if isinstance(v, str) else v.decode(errors="replace")
+
+                kind = _fv("kind")
+                role = _fv("role", "fighter")
+                if kind not in ("character", "environment"):
+                    self._send(400, "application/json",
+                               _j.dumps({"error": "invalid kind"})); return
+                existing = [p["name"] for p in _list_profiles(kind)]
+                client = CoderAIClient(default_args.base_url,
+                                       getattr(default_args, "api_key", None))
+                text_model = None
+                if not getattr(default_args, "no_llm", False):
+                    try:
+                        text_model = pick_model(client, "text",
+                                                getattr(default_args, "text_model", None))
+                    except Exception:
+                        text_model = getattr(default_args, "text_model", None)
+                try:
+                    fields = _autogen_profile_payload(client, text_model, kind,
+                                                      role, existing)
+                except Exception as e:
+                    self._send(500, "application/json",
+                               _j.dumps({"error": f"autogen failed: {e}"})); return
+                self._send(200, "application/json",
+                           _j.dumps({"ok": True, "fields": fields}))
+                return
+
+            if path == "/matches/autogen":
+                # Pick a fresh fighter pairing (+ environment + referee) from the
+                # EXISTING profiles so the new-match form can be one-click filled.
+                import json as _j
+                clen = int(self.headers.get("Content-Length", 0))
+                self.rfile.read(clen)  # body unused
+                _fighters = [p["name"] for p in _list_profiles("character")
+                             if not _is_referee_meta(p["meta"])]
+                _envs = [p["name"] for p in _list_profiles("environment")]
+                _refs = [p["name"] for p in _list_profiles("character")
+                         if _is_referee_meta(p["meta"])]
+                if len(_fighters) < 2:
+                    self._send(400, "application/json",
+                               _j.dumps({"error": "need at least 2 fighter profiles"})); return
+                _pair = random.sample(_fighters, 2)
+                fields = {"f1": _pair[0], "f2": _pair[1],
+                          "env": (random.choice(_envs) if _envs else ""),
+                          "referee": (random.choice(_refs) if _refs else "")}
+                self._send(200, "application/json",
+                           _j.dumps({"ok": True, "fields": fields}))
+                return
+
+            if path == "/matches/create":
+                import json as _j, uuid as _u
+                clen = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(clen)
+                ctype = self.headers.get("Content-Type", "")
+                if "multipart/form-data" in ctype:
+                    boundary = ctype.split("boundary=")[-1].strip().encode()
+                    form = _parse_multipart(raw, boundary)
+                else:
+                    form = dict(urllib.parse.parse_qsl(raw.decode(errors="replace")))
+
+                def _fv(k, default=""):
+                    v = form.get(k)
+                    if v is None: return default
+                    return v if isinstance(v, str) else v.decode(errors="replace")
+
+                f1 = _fv("f1").strip(); f2 = _fv("f2").strip(); env = _fv("env").strip()
+                referee = _fv("referee").strip()
+                for _x in (f1, f2, env, referee):
+                    if "/" in _x or "\\" in _x or ".." in _x:
+                        self._send(400, "application/json",
+                                   _j.dumps({"error": "invalid name"}))
+                        return
+                if not f1 or not f2:
+                    self._send(400, "application/json",
+                               _j.dumps({"error": "two fighters required"}))
+                    return
+                if f1 == f2:
+                    self._send(400, "application/json",
+                               _j.dumps({"error": "pick two different fighters"}))
+                    return
+                prompts_only = _fv("mode") == "prompts"
+                job_id = _u.uuid4().hex[:12]
+                _enqueue_gen(job_id, _run_new_match_job, job_id, f1, f2, env,
+                             prompts_only, referee, jtype="match",
+                             match=None, scope=("prompts" if prompts_only else "full"),
+                             cancellable=True)
                 self._send(200, "application/json", _j.dumps({"job_id": job_id}))
                 return
 
@@ -6982,9 +8258,8 @@ async function resetPrompts(ev){
                     rank = 16
                 target = "video" if _fv("target") == "video" else "image"
                 job_id = _u.uuid4().hex[:12]
-                threading.Thread(target=_run_train_lora_job,
-                                 args=(job_id, kind, name, steps, rank, target),
-                                 daemon=True).start()
+                _enqueue_gen(job_id, _run_train_lora_job, job_id, kind, name, steps,
+                             rank, target, jtype="train", kind=kind, name=name)
                 self._send(200, "application/json", _j.dumps({"job_id": job_id}))
                 return
 
@@ -7007,12 +8282,13 @@ async function resetPrompts(ev){
                 scope = _fv("scope")
                 if scope not in ("full", "match-clips", "clip", "reassemble", "outcomes",
                                  "outcome", "enhance", "keyframes",
-                                 "keyframes-missing", "keyframe", "replan"):
+                                 "keyframes-missing", "keyframe", "replan",
+                                 "replan-outcomes"):
                     self._send(400, "application/json",
                                _j.dumps({"error": "invalid scope"}))
                     return
                 params = {}
-                for k in ("match", "idx", "fighter", "outcome", "target", "upscale", "fps"):
+                for k in ("match", "idx", "fighter", "outcome", "seg", "target", "upscale", "fps", "force", "final_fps"):
                     val = _fv(k)
                     if val:
                         # Guard path-like fields against traversal.
@@ -7022,9 +8298,9 @@ async function resetPrompts(ev){
                             return
                         params[k] = val
                 job_id = _u.uuid4().hex[:12]
-                threading.Thread(target=_run_match_job,
-                                 args=(job_id, scope, params),
-                                 daemon=True).start()
+                _enqueue_gen(job_id, _run_match_job, job_id, scope, params,
+                             jtype="match", match=params.get("match"), scope=scope,
+                             cancellable=True)
                 self._send(200, "application/json", _j.dumps({"job_id": job_id}))
                 return
 
@@ -7148,6 +8424,12 @@ async function resetPrompts(ev){
                             self._send(404, "application/json", _j.dumps({"error": "match not in prompts.json"})); return
                         if "f1" in form: m["f1"] = _fv("f1") or m.get("f1")
                         if "f2" in form: m["f2"] = _fv("f2") or m.get("f2")
+                        if "referee" in form:
+                            # Blank "(auto / any)" clears the explicit choice.
+                            _ref = _fv("referee").strip()
+                            if _ref and not _safe(_ref):
+                                self._send(400, "application/json", _j.dumps({"error": "invalid referee"})); return
+                            m["referee"] = _ref or None
                         if "env" in form:
                             _new_env = _fv("env") or None
                             if _new_env != m.get("env"):
@@ -7164,6 +8446,15 @@ async function resetPrompts(ev){
                             if _tk in form:
                                 try: m[_tk] = float(_fv(_tk))
                                 except ValueError: pass
+                        if "playback_fps" in form:
+                            try:
+                                _pf = int(float(_fv("playback_fps") or 0))
+                                if _pf > 0:
+                                    m["playback_fps"] = _pf
+                                else:
+                                    m.pop("playback_fps", None)
+                            except ValueError:
+                                pass
                         for c in m.get("clips", []):
                             key = f"clip_{c['idx']}"
                             if key in form:
@@ -7231,7 +8522,15 @@ async function resetPrompts(ev){
                         for fk in list(form.keys()):
                             if not fk.startswith("kfoutc_"):
                                 continue
-                            fr_o, _, oc_o = fk[7:].rpartition("|")
+                            # Key is "<fighter>|<outcome>[|<seg>]" — seg selects which
+                            # outcome shot's keyframe prompt (finish/victory) to set.
+                            _payload = fk[7:]
+                            _seg_i = None
+                            _rest, _sep, _tail = _payload.rpartition("|")
+                            if _sep and _tail.isdigit():
+                                _seg_i = int(_tail)
+                                _payload = _rest
+                            fr_o, _, oc_o = _payload.rpartition("|")
                             if not fr_o or not oc_o:
                                 continue
                             o = next((x for x in data.get("outcome_plan", [])
@@ -7240,9 +8539,21 @@ async function resetPrompts(ev){
                                       and (x.get("match_name") in (None, nm))), None)
                             if o is None:
                                 continue
-                            _apply_kf(o, o.get("prompt", ""),
-                                      m.get("env") or o.get("env"),
-                                      m.get("env_desc") or o.get("env_desc"), _fv(fk))
+                            _env = m.get("env") or o.get("env")
+                            _envd = m.get("env_desc") or o.get("env_desc")
+                            _shots = o.get("shots") or None
+                            if _seg_i is not None and _shots and 0 <= _seg_i < len(_shots):
+                                _apply_kf(_shots[_seg_i],
+                                          _shots[_seg_i].get("prompt", ""),
+                                          _env, _envd, _fv(fk))
+                                if _seg_i == 0:
+                                    # Mirror seg 0's override onto the outcome entry so
+                                    # legacy single-keyframe paths stay consistent.
+                                    o["kf_prompt"] = _shots[0].get("kf_prompt")
+                                    if o["kf_prompt"] is None:
+                                        o.pop("kf_prompt", None)
+                            else:
+                                _apply_kf(o, o.get("prompt", ""), _env, _envd, _fv(fk))
                     else:
                         self._send(400, "application/json", _j.dumps({"error": "invalid mode"})); return
                     try:
@@ -7265,58 +8576,65 @@ async function resetPrompts(ev){
                     except Exception:
                         pass
 
+                def _rm_video(p: Path):
+                    # Remove a base video AND its enhanced (upscaled / fps) siblings,
+                    # so deleting a video never leaves an orphaned *_2x / *_NxfpS file.
+                    for _lbl, _vp in _video_variants(p):
+                        _rm(_vp)
+
                 if scope == "clip":
                     mn, idx = _fv("match"), _fv("idx")
                     if not _safe(mn):
                         self._send(400, "application/json", _j.dumps({"error": "invalid match"})); return
                     try:
-                        _rm(vdir / f"{mn}_clip{int(idx):02d}.mp4")
+                        _rm_video(vdir / f"{mn}_clip{int(idx):02d}.mp4")
                     except ValueError:
                         pass
                 elif scope == "final":
                     mn, which = _fv("match"), _fv("which")
                     if not _safe(mn) or which not in ("short", "long"):
                         self._send(400, "application/json", _j.dumps({"error": "invalid args"})); return
-                    _rm(vdir / f"{mn}_{which}.mp4")
+                    _rm_video(vdir / f"{mn}_{which}.mp4")
                 elif scope == "match":
                     mn = _fv("match")
                     if not _safe(mn):
                         self._send(400, "application/json", _j.dumps({"error": "invalid match"})); return
                     # Use the scanner so a sibling match (e.g. "<mn>_2") is not
-                    # caught by a naive "<mn>_*" glob.
+                    # caught by a naive "<mn>_*" glob. _rm_video also sweeps each
+                    # file's enhanced (upscaled / fps) siblings.
                     _, _, _, _matches_map, _ = _scan_matches()
                     _info = _matches_map.get(mn, {})
                     for _p in list(_info.get("finals", {}).values()):
-                        _rm(_p)
+                        _rm_video(_p)
                     for _p in _info.get("clips", []):
-                        _rm(_p)
+                        _rm_video(_p)
                     for (_f, _o, _p) in _info.get("outcomes", []):
-                        _rm(_p)
+                        _rm_video(_p)
                 elif scope == "output":
                     mn, fr, oc = _fv("match"), _fv("fighter"), _fv("outcome")
                     if not _safe(fr) or not _safe(oc):
                         self._send(400, "application/json", _j.dumps({"error": "invalid args"})); return
                     if mn and _safe(mn):
-                        _rm(vdir / f"{mn}_{fr}_{oc}.mp4")        # per-match outcome
+                        _rm_video(vdir / f"{mn}_{fr}_{oc}.mp4")        # per-match outcome
                     else:
-                        _rm(vdir / f"{fr}_{oc}.mp4")             # legacy per-fighter
+                        _rm_video(vdir / f"{fr}_{oc}.mp4")             # legacy per-fighter
                 elif scope == "outputs":
                     mn, fr = _fv("match"), _fv("fighter")
                     if mn and _safe(mn):
                         _, _, _, _matches_map, _ = _scan_matches()
                         for (_f, _o, _p) in _matches_map.get(mn, {}).get("outcomes", []):
-                            _rm(_p)
+                            _rm_video(_p)
                     elif fr and _safe(fr):
                         for p in vdir.glob(f"{fr}_*.mp4"):
                             if "_clip" not in p.stem and not p.stem.startswith("match_"):
-                                _rm(p)
+                                _rm_video(p)
                     else:
                         self._send(400, "application/json", _j.dumps({"error": "invalid args"})); return
                 elif scope == "file":
                     fn = _fv("file")
                     if not _safe(fn) or not fn.endswith(".mp4"):
                         self._send(400, "application/json", _j.dumps({"error": "invalid file"})); return
-                    _rm(vdir / fn)
+                    _rm_video(vdir / fn)
                 elif scope == "keyframes":
                     # Clear ALL keyframe PNGs for a match (its clips + its outcomes,
                     # whether or not the matching video was rendered).
@@ -7327,16 +8645,21 @@ async function resetPrompts(ev){
                     for p in kdir.glob(f"{mn}_clip*.png"):
                         _rm(p)
                     _, _plan, _fbn, _matches_map, _ = _scan_matches()
-                    # Rendered outcomes (have an mp4).
+                    # Rendered outcomes (have an mp4) — clear the base keyframe AND
+                    # its per-segment siblings (finish + victory).
                     for (_f, _o, _p) in _matches_map.get(mn, {}).get("outcomes", []):
-                        _rm(kdir / f"{Path(_p).stem}.png")
+                        _base = Path(_p).stem
+                        _rm(kdir / f"{_base}.png")
+                        for _sp in kdir.glob(f"{_base}_s*.png"):
+                            _rm(_sp)
                     # Planned outcomes (may have a keyframe but no rendered video).
                     _meta = _fbn.get(mn, {})
                     _mf = {_meta.get("f1"), _meta.get("f2")} - {None}
                     for o in _plan.get("outcome_plan", []):
                         if o.get("match_name") == mn or (
                                 not o.get("match_name") and o.get("fighter") in _mf):
-                            _rm(kdir / f"{_clip_stem_outcome(o['fighter'], o['outcome'], o.get('match_name'))}.png")
+                            for _st in _outcome_kf_stems(o):
+                                _rm(kdir / f"{_st}.png")
                 elif scope == "keyframe":
                     # Clear one clip's (match+idx) or one outcome's (fighter+outcome) keyframe.
                     mn = _fv("match")
@@ -7346,7 +8669,19 @@ async function resetPrompts(ev){
                         if not _safe(fr) or not _safe(oc):
                             self._send(400, "application/json", _j.dumps({"error": "invalid args"})); return
                         stem = f"{mn}_{fr}_{oc}" if (mn and _safe(mn)) else f"{fr}_{oc}"
-                        _rm(kdir / f"{stem}.png")
+                        seg = _fv("seg")
+                        if seg is not None and str(seg) != "":
+                            # Clear just one segment's keyframe (finish or victory).
+                            try:
+                                si = int(seg)
+                            except (TypeError, ValueError):
+                                si = -1
+                            _rm(kdir / f"{_outcome_seg_stem(stem, si)}.png")
+                        else:
+                            # Clear the base keyframe AND its per-segment siblings.
+                            _rm(kdir / f"{stem}.png")
+                            for _sp in kdir.glob(f"{stem}_s*.png"):
+                                _rm(_sp)
                     else:
                         idx = _fv("idx")
                         if not _safe(mn):
@@ -7383,23 +8718,28 @@ async function resetPrompts(ev){
                     kdir = vdir / "keyframes"
                     _, _plan, _fbn, _matches_map, _ = _scan_matches()
                     _info = _matches_map.get(mn, {})
-                    # 1. Video files: finals (short/long), clips, outcomes.
+                    # 1. Video files: finals (short/long), clips, outcomes — plus
+                    #    each one's enhanced (upscaled / fps) siblings.
                     for _p in list(_info.get("finals", {}).values()):
-                        _rm(_p)
+                        _rm_video(_p)
                     for _p in _info.get("clips", []):
-                        _rm(_p)
+                        _rm_video(_p)
                     for (_f, _o, _p) in _info.get("outcomes", []):
-                        _rm(_p)
+                        _rm_video(_p)
                     # 2. Keyframes: clip keyframes + this match's outcome keyframes.
                     for p in kdir.glob(f"{mn}_clip*.png"):
                         _rm(p)
                     for (_f, _o, _p) in _info.get("outcomes", []):
-                        _rm(kdir / f"{Path(_p).stem}.png")
+                        _base = Path(_p).stem
+                        _rm(kdir / f"{_base}.png")
+                        for _sp in kdir.glob(f"{_base}_s*.png"):
+                            _rm(_sp)
                     _meta = _fbn.get(mn, {})
                     _mf = {_meta.get("f1"), _meta.get("f2")} - {None}
                     for o in _plan.get("outcome_plan", []):
                         if o.get("match_name") == mn:
-                            _rm(kdir / f"{_clip_stem_outcome(o['fighter'], o['outcome'], o.get('match_name'))}.png")
+                            for _st in _outcome_kf_stems(o):
+                                _rm(kdir / f"{_st}.png")
                     # 3. Strip the match from prompts.json (plan + its per-match outcomes).
                     try:
                         if prompts_file.exists():
@@ -7623,6 +8963,7 @@ async function resetPrompts(ev){
                     "upscale_model": _s(_fv("upscale_model")),
                     "upscale_model_2x": _s(_fv("upscale_model_2x")),
                     "upscale_model_4x": _s(_fv("upscale_model_4x")),
+                    "interpolation_model": _s(_fv("interpolation_model")),
                     "no_llm": "no_llm" in form,
                     "out_dir": _fv("out_dir", "./township_output"),
                     "region": _s(_fv("region")),
@@ -7731,11 +9072,8 @@ async function resetPrompts(ev){
                     self._send(400, "application/json", _j.dumps({"error": f"Unknown op: {op}"}))
                     return
                 job_id = _u.uuid4().hex[:12]
-                threading.Thread(
-                    target=_run_process_job,
-                    args=(job_id, fpath, op, param),
-                    daemon=True
-                ).start()
+                _enqueue_gen(job_id, _run_process_job, job_id, fpath, op, param,
+                             jtype="process")
                 self._send(200, "application/json", _j.dumps({"job_id": job_id}))
                 return
 
@@ -7775,6 +9113,7 @@ async function resetPrompts(ev){
             ns.upscale_model = _fv("upscale_model") or None
             ns.upscale_model_2x = _fv("upscale_model_2x") or None
             ns.upscale_model_4x = _fv("upscale_model_4x") or None
+            ns.interpolation_model = _fv("interpolation_model") or None
             ns.no_llm       = "no_llm" in form
             ns.out_dir      = _fv("out_dir", "./township_output")
             ns.region       = _fv("region") or None
@@ -7842,7 +9181,7 @@ async function resetPrompts(ev){
             # so later per-profile jobs (regenerate, train LoRA) use them too.
             for _k in ("base_url", "api_key", "image_model",
                        "video_model", "text_model", "upscale_model",
-                       "upscale_model_2x", "upscale_model_4x",
+                       "upscale_model_2x", "upscale_model_4x", "interpolation_model",
                        "lora_train_base_model"):
                 setattr(default_args, _k, getattr(ns, _k, None))
 
@@ -8217,6 +9556,7 @@ async function resetPrompts(ev){
                 upscale_factor=getattr(args, "upscale_factor", 0),
                 fps_multiplier=getattr(args, "fps_multiplier", 0),
                 upscale_model=_upscale_model_for(args, getattr(args, "upscale_factor", 0)) or None,
+                interpolation_model=getattr(args, "interpolation_model", None),
             )
 
         _web_log("\n✓ Done.")
@@ -8412,6 +9752,10 @@ OUTPUT LAYOUT
     parser.add_argument("--upscale-model-4x", default=None, metavar="MODEL_ID",
                         help="Upscale model used specifically when the 4× factor is chosen "
                              "(overrides --upscale-model for 4×).")
+    parser.add_argument("--interpolation-model", default=None, metavar="MODEL_ID",
+                        help="AI frame-interpolation model (RIFE/FILM) for FPS raising "
+                             "(--fps-multiplier). Optional: if omitted, CoderAI auto-selects a "
+                             "configured interpolation model. There is no ffmpeg fallback.")
     parser.add_argument("--text-model",  default=None, metavar="MODEL_ID",
                         help="LLM for prompt generation (recommended for variety). Auto-selected if omitted.")
     parser.add_argument("--no-llm", action="store_true",
@@ -8786,6 +10130,7 @@ OUTPUT LAYOUT
             upscale_factor=getattr(args, "upscale_factor", 0),
             fps_multiplier=getattr(args, "fps_multiplier", 0),
             upscale_model=getattr(args, "upscale_model", None),
+            interpolation_model=getattr(args, "interpolation_model", None),
         )
 
     _log("\n✓ Done.")

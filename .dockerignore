@@ -1,0 +1,27 @@
+# Files/directories excluded from Docker build context for local distribution builds.
+.git
+.gitignore
+
+# Local virtualenvs and caches
+venv*
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.cache
+.packaging-cache/*
+!.packaging-cache/build-manifest.json
+
+# Large runtime/generated data
+models
+offload
+township_output
+dist
+dist-package
+*.log
+
+# Build outputs
+build
+*.egg-info

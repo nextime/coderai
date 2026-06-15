@@ -29,3 +29,7 @@ test_*.py
 
 # Generated township fighter outputs
 township_output/
+
+# Packaging build cache + runtime temp (large artifacts)
+.packaging-cache/
+tmp/

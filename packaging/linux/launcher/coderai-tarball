@@ -1,0 +1,29 @@
+#!/usr/bin/env sh
+set -eu
+
+HERE="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+: "${CODERAI_CONFIG_DIR:=$HERE/config}"
+: "${CODERAI_MODELS_DIR:=$HERE/models}"
+: "${CODERAI_CACHE_DIR:=$HERE/cache}"
+: "${CODERAI_HOST:=127.0.0.1}"
+: "${CODERAI_PORT:=8776}"
+
+export PYTHONHOME="$HERE/python"
+export PATH="$HERE/python/bin:$HERE/bin:$PATH"
+export XDG_CONFIG_HOME="$CODERAI_CONFIG_DIR"
+export XDG_DATA_HOME="$CODERAI_MODELS_DIR"
+export XDG_CACHE_HOME="$CODERAI_CACHE_DIR"
+export HF_HOME="${HF_HOME:-$CODERAI_CACHE_DIR/huggingface}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}"
+
+NV="$HERE/python/lib/python3.13/site-packages/nvidia"
+LIBS="$HERE/python/lib:$HERE/local-libs"
+if [ -d "$NV" ]; then
+  for d in "$NV"/*/lib; do
+    [ -d "$d" ] && LIBS="$LIBS:$d"
+  done
+fi
+export LD_LIBRARY_PATH="$LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+mkdir -p "$CODERAI_CONFIG_DIR/coderai" "$CODERAI_MODELS_DIR/coderai" "$CODERAI_CACHE_DIR/coderai"
+exec "$HERE/python/bin/python3" "$HERE/app/coderai" --config "$CODERAI_CONFIG_DIR/coderai" "$@"

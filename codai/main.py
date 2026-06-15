@@ -813,6 +813,9 @@ def main():
     global_args.thermal_soft_throttle_enabled = config.thermal.soft_throttle_enabled
     global_args.thermal_soft_throttle_temp = config.thermal.soft_throttle_temp
     global_args.thermal_soft_throttle_max_sleep = config.thermal.soft_throttle_max_sleep
+    # Video-enhancement external-tool policy (default off → in-process models only).
+    global_args.enhance_allow_ffmpeg = config.enhance.allow_ffmpeg
+    global_args.enhance_allow_rife_ncnn = config.enhance.allow_rife_ncnn
     global_args.n_gpu_layers = config.vulkan.n_gpu_layers
     global_args.n_ctx = [config.vulkan.n_ctx]
     global_args.vulkan_device = config.vulkan.device_id

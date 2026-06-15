@@ -1,0 +1,425 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+VERSIONS_FILE="$ROOT_DIR/packaging/versions.env"
+if [[ -f "$VERSIONS_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$VERSIONS_FILE"
+fi
+
+DOCKER_BIN="${DOCKER:-docker}"
+read -r -a DOCKER_CMD <<< "$DOCKER_BIN"
+IMAGE_TAG="${OCI_IMAGE:-coderai:local}"
+BUILD_MODE="from-scratch"
+VENV_PATH=""
+INCLUDE_LOCAL_LIBS=1
+AUTO_LOCAL_BINS=1
+LOCAL_BINARIES=()
+LOCAL_BINARY_DIRS=()
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./build-oci.sh [IMAGE_TAG]
+  ./build-oci.sh --from-venv [IMAGE_TAG]
+  ./build-oci.sh --venv PATH [IMAGE_TAG]
+
+Options:
+  --from-scratch          Build the full OCI image from pinned packages and native wheels (default).
+  --from-venv             Build from the currently activated virtualenv ($VIRTUAL_ENV).
+  --venv PATH             Build from a specific local virtualenv.
+  --no-local-libs         Do not copy ldd-discovered local native libraries from the venv.
+  --no-auto-local-bins    Do not auto-include known locally compiled helper binaries.
+  --include-local-bin PATH
+                          Copy an extra tested local binary into the image, including its ldd libs.
+                          Can be repeated. Useful for tools such as whisper-server.
+  --include-local-dir PATH
+                          Copy executable files from a local build directory, including ldd libs.
+                          Can be repeated. Useful for local whisper.cpp build/bin directories.
+  -t, --tag TAG           Image tag to create (default: coderai:local or OCI_IMAGE from versions.env).
+  -h, --help              Show this help.
+
+Examples:
+  ./build-oci.sh
+  source venv_all/bin/activate && ./build-oci.sh --from-venv coderai:venv
+  ./build-oci.sh --venv ./venv_all -t coderai:venv
+  ./build-oci.sh --venv ./venv_all --include-local-bin /usr/local/bin/whisper-server -t coderai:venv
+  ./build-oci.sh --venv ./venv_all --include-local-dir ~/whisper.cpp/build/bin -t coderai:venv
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --from-scratch)
+      BUILD_MODE="from-scratch"
+      shift
+      ;;
+    --from-venv)
+      BUILD_MODE="venv"
+      VENV_PATH="${VIRTUAL_ENV:-}"
+      shift
+      ;;
+    --venv)
+      BUILD_MODE="venv"
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --venv requires a path" >&2
+        exit 2
+      fi
+      VENV_PATH="$2"
+      shift 2
+      ;;
+    --no-local-libs)
+      INCLUDE_LOCAL_LIBS=0
+      shift
+      ;;
+    --no-auto-local-bins)
+      AUTO_LOCAL_BINS=0
+      shift
+      ;;
+    --include-local-bin)
+      BUILD_MODE="venv"
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --include-local-bin requires a path" >&2
+        exit 2
+      fi
+      LOCAL_BINARIES+=("$2")
+      shift 2
+      ;;
+    --include-local-dir)
+      BUILD_MODE="venv"
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --include-local-dir requires a path" >&2
+        exit 2
+      fi
+      LOCAL_BINARY_DIRS+=("$2")
+      shift 2
+      ;;
+    -t|--tag)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: $1 requires an image tag" >&2
+        exit 2
+      fi
+      IMAGE_TAG="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "Error: unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      IMAGE_TAG="$1"
+      shift
+      ;;
+  esac
+done
+
+PYTHON_VERSION="${PYTHON_VERSION:-3.13.5}"
+PBS_RELEASE="${PBS_RELEASE:-20250612}"
+UV_VERSION="${UV_VERSION:-0.7.13}"
+CUDA_VERSION="${CUDA_VERSION:-12.4.1}"
+UBUNTU_VERSION="${UBUNTU_VERSION:-22.04}"
+WHISPERCPP_REF="${WHISPERCPP_REF:-master}"
+LLAMA_CPP_PYTHON_VERSION="${LLAMA_CPP_PYTHON_VERSION:-}"
+SD_CPP_PYTHON_VERSION="${SD_CPP_PYTHON_VERSION:-}"
+
+write_build_manifest() {
+  local mode="$1"
+  local manifest_python="${2:-}"
+  local venv_path="${3:-}"
+  local local_bins_joined=""
+  if [[ ${#LOCAL_BINARIES[@]} -gt 0 ]]; then
+    local IFS=:
+    local_bins_joined="${LOCAL_BINARIES[*]}"
+  fi
+  MANIFEST_OUT="$ROOT_DIR/.packaging-cache/build-manifest.json" \
+  PROJECT_ROOT="$ROOT_DIR" \
+  MANIFEST_ARTIFACT="oci-image" \
+  MANIFEST_BUILD_MODE="$mode" \
+  MANIFEST_PYTHON="$manifest_python" \
+  MANIFEST_VENV="$venv_path" \
+  MANIFEST_LOCAL_BINS="$local_bins_joined" \
+  PYTHON_VERSION="$PYTHON_VERSION" \
+  PBS_RELEASE="$PBS_RELEASE" \
+  UV_VERSION="$UV_VERSION" \
+  CUDA_VERSION="$CUDA_VERSION" \
+  UBUNTU_VERSION="$UBUNTU_VERSION" \
+    python3 "$ROOT_DIR/packaging/common/write_manifest.py"
+}
+
+add_local_binary() {
+  local path="$1"
+  local abs_path
+  if [[ ! -x "$path" || ! -f "$path" ]]; then
+    return 0
+  fi
+  abs_path="$(cd "$(dirname "$path")" && pwd)/$(basename "$path")"
+  for existing in "${LOCAL_BINARIES[@]}"; do
+    [[ "$existing" == "$abs_path" ]] && return 0
+  done
+  LOCAL_BINARIES+=("$abs_path")
+}
+
+discover_local_binaries() {
+  [[ "$AUTO_LOCAL_BINS" == "1" ]] || return 0
+
+  # Common locations used by the existing developer build path. Python extension
+  # modules are already copied with the venv; this targets standalone helper
+  # binaries that were compiled locally and tested outside Docker.
+  local candidates=(
+    "/usr/local/bin/whisper-server"
+    "/usr/local/bin/whisper-cli"
+    "$HOME/whisper.cpp/build/bin/whisper-server"
+    "$HOME/whisper.cpp/build/bin/whisper-cli"
+    "$HOME/whisper.cpp/build/bin/main"
+    "$HOME/whisper.cpp/build/bin/server"
+  )
+  local path
+  for path in "${candidates[@]}"; do
+    add_local_binary "$path"
+  done
+}
+
+prepare_venv_bundle() {
+  local venv="$1"
+  local bundle="$2"
+  local include_libs="$3"
+  rm -rf "$bundle"
+  mkdir -p "$bundle/venv" "$bundle/local-libs" "$bundle/local-bin"
+
+  echo "Preparing venv bundle: $bundle"
+  cp -a "$venv/." "$bundle/venv/"
+
+  discover_local_binaries
+
+  local dir_path
+  for dir_path in "${LOCAL_BINARY_DIRS[@]}"; do
+    if [[ ! -d "$dir_path" ]]; then
+      echo "Error: local binary directory does not exist: $dir_path" >&2
+      exit 2
+    fi
+    while IFS= read -r -d '' found_bin; do
+      add_local_binary "$found_bin"
+    done < <(find "$dir_path" -maxdepth 2 -type f -perm -111 -print0)
+  done
+
+  for bin_path in "${LOCAL_BINARIES[@]}"; do
+    if [[ ! -x "$bin_path" ]]; then
+      echo "Error: local binary is not executable: $bin_path" >&2
+      exit 2
+    fi
+    dest_path="$bundle/local-bin/$(basename "$bin_path")"
+    if [[ -e "$dest_path" && "$bin_path" -ef "$dest_path" ]]; then
+      continue
+    fi
+    cp -a --remove-destination "$bin_path" "$dest_path"
+  done
+
+  if [[ ${#LOCAL_BINARIES[@]} -gt 0 ]]; then
+    printf 'Included local compiled binaries:\n'
+    printf '  %s\n' "${LOCAL_BINARIES[@]}"
+  fi
+
+  if [[ "$include_libs" != "1" ]]; then
+    return 0
+  fi
+
+  VENV_BUNDLE="$bundle" VENV_PATH_FOR_LDD="$venv" python3 - <<'PY'
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+bundle = Path(os.environ["VENV_BUNDLE"])
+venv = Path(os.environ["VENV_PATH_FOR_LDD"])
+local_libs = bundle / "local-libs"
+local_bin = bundle / "local-bin"
+
+skip_prefixes = (
+    "/lib/ld-linux",
+    "/lib64/ld-linux",
+)
+skip_names = {
+    "linux-vdso.so.1",
+    "libc.so.6",
+    "libdl.so.2",
+    "libm.so.6",
+    "libpthread.so.0",
+    "librt.so.1",
+    "libutil.so.1",
+    "libresolv.so.2",
+    "libselinux.so.1",
+    "libpcre2-8.so.0",
+    "libacl.so.1",
+    "libattr.so.1",
+    "libz.so.1",
+    "libzstd.so.1",
+    "liblzma.so.5",
+    "libbz2.so.1.0",
+    "libssl.so.3",
+    "libcrypto.so.3",
+    "libgcc_s.so.1",
+    "libstdc++.so.6",
+}
+skip_starts = (
+    "libcuda.so",       # host driver, injected by NVIDIA Container Toolkit
+    "libnvidia-",       # host driver stack
+)
+
+candidates = []
+for root in (venv / "lib", venv / "bin", local_bin):
+    if not root.exists():
+        continue
+    for path in root.rglob("*"):
+        if path.is_file() and (os.access(path, os.X_OK) or ".so" in path.name):
+            candidates.append(path)
+
+libs = set()
+for path in candidates:
+    try:
+        proc = subprocess.run(["ldd", str(path)], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+    except OSError:
+        continue
+    if proc.returncode not in (0, 1):
+        continue
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        dep = None
+        if "=>" in line:
+            rhs = line.split("=>", 1)[1].strip()
+            if rhs.startswith("/"):
+                dep = rhs.split(" (", 1)[0]
+        elif line.startswith("/"):
+            dep = line.split(" (", 1)[0]
+        if not dep:
+            continue
+        dep_path = Path(dep)
+        name = dep_path.name
+        dep_str = str(dep_path)
+        if name in skip_names or any(name.startswith(s) for s in skip_starts):
+            continue
+        if dep_str.startswith(("/lib/", "/lib64/", "/usr/lib/", "/usr/lib64/")) and "site-packages" not in dep_str:
+            continue
+        if any(dep_str.startswith(p) for p in skip_prefixes):
+            continue
+        if dep_path.exists():
+            libs.add(dep_path.resolve())
+
+for src in sorted(libs):
+    dest = local_libs / src.name
+    if not dest.exists():
+        shutil.copy2(src, dest)
+    # Also create the originally requested soname if it differs from the real path name.
+    # ldd usually resolves symlinks; native loaders often ask for the symlink soname.
+    for requested in [p for p in libs if p.name != src.name and p.resolve() == src]:
+        link = local_libs / requested.name
+        if not link.exists():
+            try:
+                link.symlink_to(src.name)
+            except OSError:
+                shutil.copy2(src, link)
+
+print(f"Copied {len(libs)} ldd-discovered native librar{'y' if len(libs) == 1 else 'ies'}")
+PY
+}
+
+if [[ "$BUILD_MODE" == "venv" ]]; then
+  if [[ -z "$VENV_PATH" ]]; then
+    echo "Error: --from-venv requires an activated virtualenv, or use --venv PATH" >&2
+    exit 2
+  fi
+  VENV_PATH="$(cd "$VENV_PATH" && pwd)"
+  if [[ ! -x "$VENV_PATH/bin/python" ]]; then
+    echo "Error: '$VENV_PATH' does not look like a Python virtualenv (missing bin/python)" >&2
+    exit 2
+  fi
+  VENV_PYTHON_MINOR="$($VENV_PATH/bin/python - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)"
+  PBS_PYTHON_MINOR="${PYTHON_VERSION%.*}"
+  if [[ "$VENV_PYTHON_MINOR" != "$PBS_PYTHON_MINOR" ]]; then
+    cat >&2 <<EOF
+Error: venv Python minor ($VENV_PYTHON_MINOR) does not match standalone Python minor ($PBS_PYTHON_MINOR).
+Set PYTHON_VERSION in packaging/versions.env to a python-build-standalone release with the same minor,
+or use a matching virtualenv.
+EOF
+    exit 2
+  fi
+  VENV_CONTEXT="$ROOT_DIR/.packaging-cache/oci-venv-context"
+  prepare_venv_bundle "$VENV_PATH" "$VENV_CONTEXT" "$INCLUDE_LOCAL_LIBS"
+  write_build_manifest "venv" "$VENV_PATH/bin/python" "$VENV_PATH"
+else
+  mkdir -p "$ROOT_DIR/.packaging-cache"
+  write_build_manifest "from-scratch" "" ""
+fi
+
+cat <<EOF
+Building CoderAI OCI image locally
+  image:        $IMAGE_TAG
+  mode:         $BUILD_MODE
+  python:       $PYTHON_VERSION
+  PBS release:  $PBS_RELEASE
+  uv:           $UV_VERSION
+  CUDA:         $CUDA_VERSION
+  Ubuntu base:  $UBUNTU_VERSION
+EOF
+if [[ "$BUILD_MODE" == "venv" ]]; then
+  cat <<EOF
+  venv:         $VENV_PATH
+  venv python:  $VENV_PYTHON_MINOR
+  local libs:   $([[ "$INCLUDE_LOCAL_LIBS" == "1" ]] && echo copied || echo disabled)
+  local bins:   ${#LOCAL_BINARIES[@]}
+EOF
+fi
+
+if [[ "$BUILD_MODE" == "venv" ]]; then
+  "${DOCKER_CMD[@]}" build \
+    -f "$ROOT_DIR/packaging/linux/Dockerfile.oci-venv" \
+    --build-context "local_bundle=$VENV_CONTEXT" \
+    --build-arg PYTHON_VERSION="$PYTHON_VERSION" \
+    --build-arg PBS_RELEASE="$PBS_RELEASE" \
+    --build-arg CUDA_VERSION="$CUDA_VERSION" \
+    --build-arg UBUNTU_VERSION="$UBUNTU_VERSION" \
+    --build-arg VENV_PYTHON_MINOR="$VENV_PYTHON_MINOR" \
+    -t "$IMAGE_TAG" \
+    "$ROOT_DIR"
+else
+  "${DOCKER_CMD[@]}" build \
+    -f "$ROOT_DIR/packaging/linux/Dockerfile.oci" \
+    --build-arg PYTHON_VERSION="$PYTHON_VERSION" \
+    --build-arg PBS_RELEASE="$PBS_RELEASE" \
+    --build-arg UV_VERSION="$UV_VERSION" \
+    --build-arg CUDA_VERSION="$CUDA_VERSION" \
+    --build-arg UBUNTU_VERSION="$UBUNTU_VERSION" \
+    --build-arg WHISPERCPP_REF="$WHISPERCPP_REF" \
+    --build-arg LLAMA_CPP_PYTHON_VERSION="$LLAMA_CPP_PYTHON_VERSION" \
+    --build-arg SD_CPP_PYTHON_VERSION="$SD_CPP_PYTHON_VERSION" \
+    -t "$IMAGE_TAG" \
+    "$ROOT_DIR"
+fi
+
+cat <<EOF
+
+Built $IMAGE_TAG
+
+Run examples:
+  NVIDIA:
+    $DOCKER_BIN run --gpus all --ipc=host -p 8776:8776 -v "\$PWD/coderai-config:/config" -v "\$PWD/coderai-models:/models" -v "\$PWD/coderai-cache:/cache" $IMAGE_TAG
+
+  AMD/Intel Vulkan:
+    $DOCKER_BIN run --device /dev/dri --ipc=host -p 8776:8776 -v "\$PWD/coderai-config:/config" -v "\$PWD/coderai-models:/models" -v "\$PWD/coderai-cache:/cache" $IMAGE_TAG
+
+  CPU:
+    $DOCKER_BIN run --ipc=host -p 8776:8776 -v "\$PWD/coderai-config:/config" -v "\$PWD/coderai-models:/models" -v "\$PWD/coderai-cache:/cache" $IMAGE_TAG
+EOF

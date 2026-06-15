@@ -145,6 +145,17 @@ class JobsConfig:
 
 
 @dataclass
+class EnhanceConfig:
+    """Video enhancement (upscale / FPS interpolation) tool policy.
+
+    By default these run fully in-process on torch models (ESRGAN upscaler, RIFE/
+    FILM interpolator) — no subprocess, no ffmpeg. The flags below OPT IN to the
+    external tools as alternatives when no model is configured/preferred."""
+    allow_ffmpeg: bool = False        # allow ffmpeg (frame I/O / minterpolate) instead of PyAV+model
+    allow_rife_ncnn: bool = False     # allow the external rife-ncnn-vulkan binary instead of a torch model
+
+
+@dataclass
 class Config:
     """Main configuration class."""
     version: str = "1.0"
@@ -158,6 +169,7 @@ class Config:
     archive: ArchiveConfig = field(default_factory=ArchiveConfig)
     thermal: ThermalConfig = field(default_factory=ThermalConfig)
     jobs: JobsConfig = field(default_factory=JobsConfig)
+    enhance: EnhanceConfig = field(default_factory=EnhanceConfig)
     broker: BrokerConfig = field(default_factory=BrokerConfig)
     system_prompt: Optional[str] = None
     tools_closer_prompt: bool = False
@@ -318,6 +330,7 @@ class ConfigManager:
                 archive=ArchiveConfig(**config_data.get("archive", {})),
                 thermal=ThermalConfig(**config_data.get("thermal", {})),
                 jobs=JobsConfig(**config_data.get("jobs", {})),
+                enhance=EnhanceConfig(**config_data.get("enhance", {})),
                 broker=BrokerConfig(**config_data.get("broker", {})),
                 system_prompt=config_data.get("system_prompt"),
                 tools_closer_prompt=config_data.get("tools_closer_prompt", False),
@@ -442,6 +455,10 @@ class ConfigManager:
             },
             "jobs": {
                 "resume_on_restart": self.config.jobs.resume_on_restart,
+            },
+            "enhance": {
+                "allow_ffmpeg": self.config.enhance.allow_ffmpeg,
+                "allow_rife_ncnn": self.config.enhance.allow_rife_ncnn,
             },
             "broker": {
                 "enabled": self.config.broker.enabled,

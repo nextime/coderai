@@ -188,6 +188,17 @@ admin_static_dir = Path(__file__).parent.parent / "admin" / "static"
 if admin_static_dir.exists():
     app.mount("/static/admin", StaticFiles(directory=str(admin_static_dir)), name="admin_static")
 
+# Serve a favicon at the conventional /favicon.ico path so browsers stop 404-ing on it.
+from fastapi.responses import FileResponse, Response as _FaviconResponse
+_favicon_path = admin_static_dir / "favicon.ico"
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    if _favicon_path.exists():
+        return FileResponse(str(_favicon_path), media_type="image/x-icon")
+    return _FaviconResponse(status_code=404)
+
 # Include routers from submodules
 app.include_router(transcriptions_router, tags=["Audio"])
 app.include_router(images_router, tags=["Images"])

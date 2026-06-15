@@ -724,7 +724,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     # Fallback: non-streaming
                     if get_global_debug():
                         print(f"DEBUG: Using non-streaming fallback for first pass")
-                    first_pass_result = current_manager.generate(
+                    first_pass_result = await asyncio.to_thread(
+                        current_manager.generate,
                         prompt=raw_prompt_for_generation,
                         max_tokens=request.max_tokens or 2048,
                         temperature=request.temperature,
@@ -744,7 +745,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 if get_global_debug():
                     print(f"DEBUG: raw_stream_generate second pass, full_prompt length: {len(full_prompt)}")
                 
-                second_pass_result = current_manager.generate(
+                second_pass_result = await asyncio.to_thread(
+                    current_manager.generate,
                     prompt=full_prompt,
                     max_tokens=request.max_tokens or 2048,
                     temperature=request.temperature,
@@ -882,7 +884,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         
         # Non-streaming path (already implemented above)
         # First pass: generate until reasoning close tag
-        first_pass_result = current_manager.generate(
+        first_pass_result = await asyncio.to_thread(
+            current_manager.generate,
             prompt=raw_prompt_for_generation,
             max_tokens=request.max_tokens or 2048,
             temperature=request.temperature,
@@ -991,7 +994,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             generated_text = reasoning_text + (close_tag or "") + final_text
         else:
             # Need second pass to get answer
-            second_pass_result = current_manager.generate(
+            second_pass_result = await asyncio.to_thread(
+                current_manager.generate,
                 prompt=full_prompt,
                 max_tokens=request.max_tokens or 2048,
                 temperature=request.temperature,
@@ -1633,7 +1637,8 @@ async def generate_chat_response(
     
     try:
         # Use generate_chat for proper chat template handling
-        generated_text = current_manager.generate_chat(
+        generated_text = await asyncio.to_thread(
+            current_manager.generate_chat,
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -1966,7 +1971,8 @@ async def generate_completion_response(
     created = int(time.time())
     
     try:
-        generated_text = current_manager.generate(
+        generated_text = await asyncio.to_thread(
+            current_manager.generate,
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,

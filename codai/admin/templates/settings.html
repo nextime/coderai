@@ -75,6 +75,26 @@
   </div>
 </div>
 
+<!-- Video enhancement (upscale / FPS interpolation) -->
+<div class="card mb-0" style="margin-top:1rem">
+  <div class="card-title">Video Enhancement</div>
+  <p class="form-hint" style="margin-bottom:.6rem">Upscaling and FPS interpolation run on in-process torch models by default (ESRGAN upscaler, RIFE/FILM interpolator) — no external tools. Enable these only to fall back to external tools when no model is configured.</p>
+  <div class="form-row" style="margin:0">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-allow-ffmpeg">
+      <span>Allow ffmpeg (frame I/O / minterpolate)</span>
+    </label>
+    <span class="form-hint">Off = use PyAV + models only. On = ffmpeg may be used as a fallback.</span>
+  </div>
+  <div class="form-row" style="margin-top:.5rem">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-allow-rife-ncnn">
+      <span>Allow rife-ncnn-vulkan binary</span>
+    </label>
+    <span class="form-hint">Off = use an in-process RIFE/FILM model. On = the external rife-ncnn-vulkan binary may be used when no model is configured.</span>
+  </div>
+</div>
+
 <!-- Archive -->
 <div class="card mb-0" style="margin-top:1rem">
   <div class="card-title">Generation Archive</div>
@@ -336,6 +356,8 @@ async function loadSettings(){
     document.getElementById('s-gguf-cache').value = d.models?.gguf_cache_dir ?? '';
     document.getElementById('s-offload-dir').value = d.offload?.directory ?? './offload';
     document.getElementById('s-tmp-dir').value = d.tmp_dir ?? '';
+    document.getElementById('s-allow-ffmpeg').checked = !!(d.enhance && d.enhance.allow_ffmpeg);
+    document.getElementById('s-allow-rife-ncnn').checked = !!(d.enhance && d.enhance.allow_rife_ncnn);
     toggleHttps();
     // Archive
     const arc = d.archive || {};
@@ -404,6 +426,10 @@ async function saveSettings(){
       directory: document.getElementById('s-offload-dir').value.trim() || './offload',
     },
     tmp_dir: strOrNull('s-tmp-dir'),
+    enhance:{
+      allow_ffmpeg: document.getElementById('s-allow-ffmpeg').checked,
+      allow_rife_ncnn: document.getElementById('s-allow-rife-ncnn').checked,
+    },
     archive:{
       enabled: document.getElementById('s-arc-enabled').checked,
       directory: document.getElementById('s-arc-dir').value.trim(),

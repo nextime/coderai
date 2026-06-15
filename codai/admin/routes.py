@@ -316,8 +316,15 @@ async def chat_page(request: Request, username: str = Depends(require_auth)):
 
 # API endpoints for admin operations
 @router.get("/admin/api/status", summary="Server and model status")
-async def api_status(username: str = Depends(require_auth)):
-    """Get system status."""
+def api_status(username: str = Depends(require_auth)):
+    """Get system status.
+
+    Defined as a SYNC handler on purpose: it reads VRAM via sysfs / a blocking
+    ``lspci`` subprocess (AMD/Intel) and scans registry/queue state. The Tasks
+    and dashboard pages poll it continuously, so running it on the event loop
+    would freeze the whole web UI while a model loads (llama.cpp's load releases
+    the GIL, so a threadpool worker can still run). FastAPI runs plain ``def``
+    path operations in its threadpool, off the event loop."""
     from codai.models.manager import multi_model_manager
     from codai.api.state import get_load_mode
 
@@ -1571,7 +1578,11 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
                     model_cfg = m if isinstance(m, dict) else {}
                     break
 
-    result = multi_model_manager.request_model(path, model_type if model_type != "text" else None)
+    # Offload to a thread: request_model may block (thermal wait / busy model /
+    # actual load) and would otherwise freeze the whole admin web UI event loop.
+    result = await asyncio.to_thread(
+        multi_model_manager.request_model,
+        path, model_type if model_type != "text" else None)
     if result.get("already_loaded"):
         return {"success": True, "already_loaded": True}
 
@@ -1583,17 +1594,20 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
     free_gb = multi_model_manager._get_free_vram_gb()
     if needed_gb > 0 and free_gb < needed_gb:
         print(f"Admin model-load: need {needed_gb:.1f} GB VRAM, have {free_gb:.1f} GB free — evicting models")
-        multi_model_manager._evict_models_for_vram(needed_gb)
+        await asyncio.to_thread(multi_model_manager._evict_models_for_vram, needed_gb)
     elif needed_gb == 0 and multi_model_manager.models and free_gb < 4.0:
         # Unknown model size but VRAM nearly full — evict everything to avoid OOM on first attempt
         print(f"Admin model-load: unknown model size, only {free_gb:.1f} GB free — evicting models proactively")
-        multi_model_manager.unload_all_models()
+        await asyncio.to_thread(multi_model_manager.unload_all_models)
 
     # Not loaded yet — trigger actual load
     try:
         if model_type == "text":
-            # _load_model_by_name already records the VRAM delta internally
-            mm = multi_model_manager._load_model_by_name(result["model_name"] or path)
+            # In a thread: the GGUF/llama load is heavy and would block the admin
+            # event loop (freezing the whole web UI) if run inline.
+            # _load_model_by_name already records the VRAM delta internally.
+            mm = await asyncio.to_thread(
+                multi_model_manager._load_model_by_name, result["model_name"] or path)
             if mm is None:
                 raise RuntimeError("Model failed to load")
             multi_model_manager.models[result["model_key"] or path] = mm
@@ -1618,15 +1632,15 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
             model_key = f"image:{path}"
             _snap = multi_model_manager.vram_before_load()
             if _is_gguf_model(path):
-                resolved = multi_model_manager.load_model(path)
+                resolved = await asyncio.to_thread(multi_model_manager.load_model, path)
                 import os as _os
                 if resolved and _os.path.isfile(resolved):
-                    sd_model = _load_sdcpp_model(resolved, global_args)
+                    sd_model = await asyncio.to_thread(_load_sdcpp_model, resolved, global_args)
                     if sd_model:
                         multi_model_manager.add_model(model_key, sd_model)
                         multi_model_manager.record_vram_delta(model_key, _snap)
             else:
-                pipeline = _load_diffusers_pipeline(path, global_args)
+                pipeline = await asyncio.to_thread(_load_diffusers_pipeline, path, global_args)
                 if pipeline:
                     multi_model_manager.add_model(model_key, pipeline)
                     multi_model_manager.record_vram_delta(model_key, _snap)
@@ -2029,10 +2043,15 @@ async def api_turboquant_info(username: str = Depends(require_admin)):
 # --- Task / queue management ---
 
 @router.get("/admin/api/tasks", summary="List active and recent tasks")
-async def api_tasks(username: str = Depends(require_admin)):
+def api_tasks(username: str = Depends(require_admin)):
     """Unified live view of long-running work: in-flight / recent generations
     (image, video, audio, text) from the task registry, durable LoRA training
-    jobs, and queued requests waiting for a slot. The Tasks page polls this."""
+    jobs, and queued requests waiting for a slot. The Tasks page polls this.
+
+    SYNC handler on purpose (runs in FastAPI's threadpool, not the event loop):
+    it reads disk job records, queue/registry state and thermal sensors. Keeping
+    it off the event loop means the Tasks page stays responsive while a model is
+    loading (the load releases the GIL during its C call)."""
     from codai.tasks import task_registry
     from codai.api.loras import list_jobs
     from codai.queue.manager import queue_manager
@@ -2193,10 +2212,14 @@ def _read_vram_info() -> Optional[dict]:
 
 
 @router.get("/admin/api/system-stats", summary="Live CPU / GPU / RAM / VRAM usage and temperatures")
-async def api_system_stats(username: str = Depends(require_admin)):
+def api_system_stats(username: str = Depends(require_admin)):
     """Lightweight hardware telemetry for the Tasks page header: CPU & GPU
     utilization and temperature, plus RAM and VRAM usage. All fields are
-    best-effort and may be null when a sensor/metric is unavailable."""
+    best-effort and may be null when a sensor/metric is unavailable.
+
+    SYNC handler on purpose: the temperature/util/VRAM reads hit sysfs and
+    blocking sensor calls, so it runs in FastAPI's threadpool to avoid freezing
+    the event loop (and the Tasks page) while a model is loading."""
     from codai.models import thermal
 
     # CPU tile = coderai process-tree usage, scaled 100% PER CORE (0..100*cores),
@@ -2398,6 +2421,10 @@ async def api_get_settings(username: str = Depends(require_admin)):
         "jobs": {
             "resume_on_restart": c.jobs.resume_on_restart,
         },
+        "enhance": {
+            "allow_ffmpeg": c.enhance.allow_ffmpeg,
+            "allow_rife_ncnn": c.enhance.allow_rife_ncnn,
+        },
         "broker": {
             "enabled": c.broker.enabled,
             "base_url": c.broker.base_url,
@@ -2559,6 +2586,22 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         try:
             from codai.api.loras import set_resume_enabled
             set_resume_enabled(c.jobs.resume_on_restart)
+        except Exception:
+            pass
+
+    if "enhance" in data:
+        en = data["enhance"]
+        if "allow_ffmpeg" in en:
+            c.enhance.allow_ffmpeg = bool(en["allow_ffmpeg"])
+        if "allow_rife_ncnn" in en:
+            c.enhance.allow_rife_ncnn = bool(en["allow_rife_ncnn"])
+        # Apply live to global_args so the video pipeline honours it immediately.
+        try:
+            from codai.api.state import get_global_args
+            ga = get_global_args()
+            if ga is not None:
+                ga.enhance_allow_ffmpeg = c.enhance.allow_ffmpeg
+                ga.enhance_allow_rife_ncnn = c.enhance.allow_rife_ncnn
         except Exception:
             pass
 

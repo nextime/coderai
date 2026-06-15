@@ -1,0 +1,20 @@
+# Runtime dependency set for the local OCI image.
+# Native packages listed here are built in the wheel stage and installed from /opt/wheels.
+
+-r /tmp/requirements.txt
+
+# CUDA/quantization extras that are intentionally optional in source installs but useful
+# in the full Linux container distribution. flash-attn and causal-conv1d stay out of
+# the base image because they are CUDA-arch-sensitive and fragile to build generally.
+bitsandbytes>=0.41.0
+sentencepiece>=0.1.99
+tiktoken>=0.5.0
+tokenizers>=0.15.0
+protobuf>=3.20.0
+optimum-quanto>=0.2.0
+gguf>=0.9.0
+
+# Native wheels are built by packaging/linux/Dockerfile.oci with CUDA+Vulkan enabled.
+llama-cpp-python>=0.2.0
+stable-diffusion-cpp-python>=0.2.0
+whispercpp>=0.0.17

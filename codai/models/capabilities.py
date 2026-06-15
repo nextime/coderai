@@ -133,7 +133,8 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
         return caps
 
     # Video interpolation
-    if any(x in n for x in ['film-net', 'rife', 'flavr', 'dain', 'frame-interp']):
+    if any(x in n for x in ['film-net', 'film_net', 'film', 'rife', 'ifnet',
+                            'flavr', 'dain', 'frame-interp', 'interpolat']):
         caps.video_interpolation = True
         return caps
 

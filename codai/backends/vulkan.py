@@ -143,6 +143,45 @@ def _install_layer_log_callback():
     return _cb  # caller must hold this reference
 
 
+async def _aiter_blocking(sync_iter):
+    """Bridge a blocking (sync) generator onto the asyncio event loop.
+
+    llama.cpp's create_(chat_)completion returns a *synchronous* generator whose
+    first ``next()`` runs the whole prompt prefill and every subsequent ``next()``
+    runs a full token forward pass. Iterating it directly inside an ``async def``
+    runs that work on the event loop and freezes every other HTTP request (the
+    whole web UI) for the duration of a completion.
+
+    This pulls one item at a time from a worker thread via ``asyncio.to_thread``
+    so the loop stays responsive between (and during, since llama.cpp releases the
+    GIL while computing) token steps. Closing the async generator — e.g. on client
+    disconnect or task cancellation — closes the underlying sync generator, which
+    stops llama.cpp at the next token boundary, matching the old inline ``break``.
+    """
+    import asyncio
+    _SENT = object()
+
+    def _next():
+        try:
+            return next(sync_iter)
+        except StopIteration:
+            return _SENT
+
+    try:
+        while True:
+            item = await asyncio.to_thread(_next)
+            if item is _SENT:
+                break
+            yield item
+    finally:
+        close = getattr(sync_iter, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                pass
+
+
 class VulkanBackend(ModelBackend):
     """Backend for Vulkan (AMD GPUs) using llama-cpp-python with GGUF models."""
     
@@ -891,8 +930,8 @@ class VulkanBackend(ModelBackend):
             
             first_chunk = True
             prompt_len = len(prompt) if isinstance(prompt, str) else 0
-            
-            for chunk in self.model.create_completion(
+
+            async for chunk in _aiter_blocking(self.model.create_completion(
                 stopping_criteria=_make_llama_thermal_criteria(),
                 prompt=prompt,
                 max_tokens=max_tokens,
@@ -903,9 +942,9 @@ class VulkanBackend(ModelBackend):
                 stop=stop,
                 stream=True,
                 grammar=use_grammar,
-            ):
+            )):
                 text = chunk['choices'][0].get('text', '')
-                
+
                 if first_chunk:
                     # Skip the prompt text on first chunk
                     # The first chunk includes the full prompt plus the first new token
@@ -931,8 +970,8 @@ class VulkanBackend(ModelBackend):
                 try:
                     first_chunk = True
                     prompt_len = len(prompt) if isinstance(prompt, str) else 0
-                    
-                    for chunk in self.model.create_completion(
+
+                    async for chunk in _aiter_blocking(self.model.create_completion(
                         stopping_criteria=_make_llama_thermal_criteria(),
                         prompt=prompt,
                         max_tokens=max_tokens,
@@ -942,7 +981,7 @@ class VulkanBackend(ModelBackend):
                         repeat_penalty=repeat_penalty,
                         stop=stop,
                         stream=True,
-                    ):
+                    )):
                         text = chunk['choices'][0].get('text', '')
                         
                         if first_chunk:
@@ -1001,8 +1040,8 @@ class VulkanBackend(ModelBackend):
             async def generate_stream():
                 first_chunk = True
                 prompt_len = len(prompt)
-                
-                for chunk in self.model.create_completion(
+
+                async for chunk in _aiter_blocking(self.model.create_completion(
                     stopping_criteria=_make_llama_thermal_criteria(),
                     prompt=prompt,
                     max_tokens=max_tokens,
@@ -1011,7 +1050,7 @@ class VulkanBackend(ModelBackend):
                     repeat_penalty=repeat_penalty,
                     stop=stop,
                     stream=True,
-                ):
+                )):
                     text = chunk['choices'][0].get('text', '')
                     
                     if first_chunk:
@@ -1181,7 +1220,7 @@ class VulkanBackend(ModelBackend):
         prompt_tokens = 0
         completion_tokens = 0
         try:
-            for chunk in self.model.create_chat_completion(**kwargs):
+            async for chunk in _aiter_blocking(self.model.create_chat_completion(**kwargs)):
                 delta = chunk['choices'][0].get('delta', {})
                 text = delta.get('content') or ''
                 if text:

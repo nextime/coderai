@@ -184,6 +184,44 @@ def _encode_mp4_pyav(frames, fps: int, crf: int) -> bytes:
     return data
 
 
+class _Mp4Writer:
+    """Streaming H.264 MP4 writer via PyAV — add(frame) one at a time so a large
+    (e.g. 4×-upscaled) sequence never has to be held fully in memory. In-process,
+    no ffmpeg."""
+    def __init__(self, path: str, fps, crf: int = 18):
+        import av
+        self._av = av
+        self.container = av.open(path, mode='w')
+        self.fps = int(fps) or 1
+        self.crf = int(crf)
+        self.stream = None
+
+    def add(self, arr):
+        import numpy as np
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        if arr.ndim == 2:
+            arr = np.stack([arr] * 3, axis=-1)
+        arr = arr[..., :3]
+        if self.stream is None:
+            h, w = arr.shape[:2]
+            s = self.container.add_stream('libx264', rate=self.fps)
+            s.width, s.height, s.pix_fmt = int(w), int(h), 'yuv420p'
+            s.options = {'crf': str(self.crf)}
+            self.stream = s
+        vframe = self._av.VideoFrame.from_ndarray(arr, format='rgb24')
+        for pkt in self.stream.encode(vframe):
+            self.container.mux(pkt)
+
+    def close(self):
+        try:
+            if self.stream is not None:
+                for pkt in self.stream.encode():
+                    self.container.mux(pkt)
+        finally:
+            self.container.close()
+
+
 def _enc_dbg(msg: str) -> None:
     """Verbose encode-path logging (only when --debug is active)."""
     try:
@@ -2008,7 +2046,9 @@ def _postprocess_video(mp4_bytes: bytes, request: VideoGenerationRequest,
                                     request.upscale_factor or 2, temp_paths)
 
     if request.interpolate_output and request.fps_multiplier:
-        path = _rife_interpolate(path, request.fps_multiplier, temp_paths)
+        # None → auto-select a configured in-process interpolation model.
+        path = _interpolate_video(path, request.fps_multiplier, temp_paths,
+                                  getattr(request, "interpolation_model", None))
 
     if request.add_audio:
         path = _add_audio_to_video(path, request, temp_paths)
@@ -2096,55 +2136,51 @@ def _model_upscale_video(model_name: str, in_path: str, factor: int,
     # Cache only a real, loaded upscaler so it's reused across frames/requests.
     _UPSCALER_CACHE[resolved] = upscaler
 
-    fps = _video_fps(in_path)
-    frames_dir = tempfile.mkdtemp()
-    out_dir = tempfile.mkdtemp()
-    temps += [frames_dir, out_dir]
-    r = subprocess.run(_ffmpeg(['-i', in_path, f'{frames_dir}/%08d.png']),
-                       capture_output=True, preexec_fn=_cpu_affinity_preexec())
-    if r.returncode != 0:
-        raise RuntimeError(
-            f"frame extraction failed: {r.stderr.decode(errors='replace')}")
-
-    import glob
-    frame_files = sorted(glob.glob(f'{frames_dir}/*.png'))
-    if not frame_files:
-        raise RuntimeError("no frames extracted from video")
-    _log.info("video upscale ×%d via %s (%s) — %d frames",
-              factor, resolved, backend, len(frame_files))
+    # Decode frames in-process (PyAV — no ffmpeg subprocess).
+    import io, numpy as np
+    from PIL import Image as _PILImage
+    frames, fps = _decode_video_pyav(in_path)
+    if not frames:
+        raise RuntimeError("no frames decoded from video")
+    n = len(frames)
+    _log.info("video upscale ×%d via %s (%s) — %d frames (in-process)",
+              factor, resolved, backend, n)
     # Register as a first-class task so it shows in the CoderAI task list and can
     # be paused/cancelled like any other model job. (Thermal protection already
     # ran at request_model() time, same as every other model.)
     _tid = task_registry.register(
-        "upscale", title=f"Upscale ×{factor} ({len(frame_files)} frames)",
-        model=resolved, total=len(frame_files))
+        "upscale", title=f"Upscale ×{factor} ({n} frames)",
+        model=resolved, total=n)
     task_registry.start(_tid)
-    # Publish per-frame progress through the shared video-progress channel so
-    # clients polling /v1/video/progress can show "frame X/Y" while we work.
-    _vid_progress_reset(len(frame_files))
+    _vid_progress_reset(n)
     _vid_progress["phase"] = "upscaling"
     _vid_progress["model"] = resolved
-    # Re-check thermals periodically through the frame loop: request_model()
-    # only waited once at job start, but an upscale runs the GPU hard for many
-    # frames over minutes, so a long clip could heat up mid-run. Pause to cool
-    # every _THERMAL_EVERY frames, exactly like a fresh request would.
+    # Re-check thermals periodically through the frame loop (request_model() only
+    # waited once at job start; a long upscale runs the GPU hard for minutes).
     _THERMAL_EVERY = 32
     try:
         from codai.models.thermal import wait_until_safe as _wait_until_safe
     except Exception:
         _wait_until_safe = None
+    # Stream upscaled frames straight into the encoder so the (large, ×factor)
+    # output never has to be fully resident in memory. Audio is not carried in the
+    # pure in-process path (the enhancement targets are silent clips).
+    out = tempfile.mktemp(suffix='_up.mp4')
+    temps.append(out)
+    writer = _Mp4Writer(out, fps)
     try:
-        for i, fp in enumerate(frame_files):
+        for i, arr in enumerate(frames):
             task_registry.raise_if_cancelled(_tid)
             task_registry.wait_if_paused(_tid)
             if _wait_until_safe and i and i % _THERMAL_EVERY == 0:
                 try:
                     _wait_until_safe(context=f"upscale:{resolved}")
                 except Exception:
-                    pass  # never let thermal monitoring block the upscale
-            with open(fp, 'rb') as f:
-                out_img = _run_upscale(upscaler, f.read(), factor)
-            out_img.save(os.path.join(out_dir, os.path.basename(fp)))
+                    pass
+            buf = io.BytesIO()
+            _PILImage.fromarray(arr).save(buf, format="PNG")
+            out_img = _run_upscale(upscaler, buf.getvalue(), factor)
+            writer.add(np.asarray(out_img.convert("RGB")))
             task_registry.step(_tid, i + 1)
             _vid_progress_step(i + 1)
     except TaskCancelled:
@@ -2156,19 +2192,8 @@ def _model_upscale_video(model_name: str, in_path: str, factor: int,
     else:
         task_registry.finish(_tid, "done")
     finally:
+        writer.close()
         _vid_progress_done()
-
-    out = tempfile.mktemp(suffix='_up.mp4')
-    temps.append(out)
-    cmd = _ffmpeg(['-framerate', f'{fps}', '-i', f'{out_dir}/%08d.png'])
-    # Carry the original audio track if present.
-    cmd += ['-i', in_path, '-map', '0:v:0', '-map', '1:a:0?',
-            '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'copy',
-            '-shortest', out]
-    r = subprocess.run(cmd, capture_output=True, preexec_fn=_cpu_affinity_preexec())
-    if r.returncode != 0:
-        raise RuntimeError(
-            f"reassembly failed: {r.stderr.decode(errors='replace')}")
     return out
 
 
@@ -2182,6 +2207,169 @@ def _count_video_frames(path: str) -> int:
         return int(r.stdout.strip())
     except Exception:
         return 0
+
+
+def _enhance_allow_ffmpeg() -> bool:
+    return bool(getattr(global_args, "enhance_allow_ffmpeg", False))
+
+
+def _enhance_allow_rife_ncnn() -> bool:
+    return bool(getattr(global_args, "enhance_allow_rife_ncnn", False))
+
+
+def _decode_video_pyav(path: str):
+    """Decode a video to a list of RGB uint8 frames + its fps, fully in-process
+    via PyAV (no ffmpeg subprocess). Returns (frames, fps)."""
+    import av, numpy as np
+    frames = []
+    container = av.open(path)
+    try:
+        st = container.streams.video[0]
+        fps = float(st.average_rate or st.guessed_rate or 0) or 0.0
+        for frame in container.decode(video=0):
+            frames.append(frame.to_ndarray(format="rgb24"))
+    finally:
+        container.close()
+    if not fps:
+        fps = 8.0
+    return frames, fps
+
+
+# ── In-process frame interpolation (torch models: RIFE / FILM) ────────────────
+_INTERP_CACHE: dict = {}
+
+
+def _resolve_interp_weights(model_name: str):
+    """Local weights path for an interpolation model id, or a HF repo download.
+    Accepts a .pkl/.pth/.safetensors file, a dir containing one, or a HF repo id
+    (prefers a flownet*/rife* weight). Returns a path or None."""
+    import os as _os
+    exts = ('.pkl', '.pth', '.safetensors', '.pt')
+    if _os.path.isfile(model_name) and model_name.lower().endswith(exts):
+        return model_name
+    if _os.path.isdir(model_name):
+        cands = [f for f in sorted(_os.listdir(model_name)) if f.lower().endswith(exts)]
+        cands.sort(key=lambda f: (0 if 'flownet' in f.lower() else 1, len(f)))
+        return _os.path.join(model_name, cands[0]) if cands else None
+    try:
+        from huggingface_hub import list_repo_files, hf_hub_download
+        files = [f for f in list_repo_files(model_name) if f.lower().endswith(exts)]
+        if not files:
+            return None
+        files.sort(key=lambda f: (0 if 'flownet' in f.lower() else
+                                  (1 if 'rife' in f.lower() or 'ifnet' in f.lower() else 2),
+                                  len(f)))
+        return hf_hub_download(model_name, files[0])
+    except Exception:
+        return None
+
+
+def _load_interpolator(model_name: str, device):
+    """Load an in-process interpolation engine. Returns (engine, obj):
+      • ('rife', IFNet)  — RIFE IFNet (default).
+      • ('film', model)  — FILM (if a torch FILM is resolvable).
+    Raises if weights can't be resolved/loaded so the caller can surface it."""
+    key = f"{model_name}@{device}"
+    cached = _INTERP_CACHE.get(key)
+    if cached is not None:
+        return cached
+    n = (model_name or "").lower()
+    wp = _resolve_interp_weights(model_name)
+    if wp is None:
+        raise RuntimeError(f"no interpolation weights found for '{model_name}'")
+    if "film" in n:
+        # FILM torch engine — supported via a HF torch checkpoint when present.
+        from codai.api._film_net import load_film
+        eng = ("film", load_film(wp, device))
+    else:
+        from codai.api._rife_ifnet import load_ifnet
+        eng = ("rife", load_ifnet(wp, device))
+    _INTERP_CACHE[key] = eng
+    return eng
+
+
+def _interp_pair(engine, a, b, depth: int):
+    """Return the ordered intermediate frames between tensors a,b via recursive
+    midpoint bisection (2**depth subdivisions → 2**depth - 1 frames)."""
+    kind, net = engine
+    if depth <= 0:
+        return []
+    if kind == "rife":
+        mid = net.interpolate(a, b)
+    else:
+        mid = net.interpolate(a, b)  # FILM exposes the same t=0.5 interface
+    return _interp_pair(engine, a, mid, depth - 1) + [mid] + _interp_pair(engine, mid, b, depth - 1)
+
+
+def _interpolate_inprocess(path, multiplier, model_name, temps, tid=None, output_fps=None):
+    """Raise FPS with an in-process torch interpolation model (RIFE/FILM). Decodes
+    + encodes with PyAV — no ffmpeg, no subprocess. Returns the output path.
+
+    `output_fps` sets the final encode rate; None = source_fps × multiplier, which
+    preserves the original duration/motion speed."""
+    import torch, numpy as np, math, logging
+    _log = logging.getLogger(__name__)
+    device = _derive_device() if torch.cuda.is_available() else "cpu"
+    engine = _load_interpolator(model_name, device)
+    frames, fps = _decode_video_pyav(path)
+    if len(frames) < 2:
+        raise RuntimeError("need at least 2 frames to interpolate")
+    # Multiplier → bisection depth (powers of two are exact; others round).
+    depth = max(1, int(round(math.log2(max(2, int(multiplier))))))
+    eff_mult = 2 ** depth
+    out_frames_total = (len(frames) - 1) * eff_mult + 1
+
+    _vid_progress_reset(out_frames_total)
+    _vid_progress["phase"] = "interpolating"
+    _vid_progress["model"] = model_name
+
+    _therm = None
+    try:
+        from codai.models.thermal import wait_until_safe as _wus
+        _therm = _wus
+    except Exception:
+        _therm = None
+
+    def _to_t(a):
+        return torch.from_numpy(a.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0).to(device)
+
+    def _to_np(t):
+        return (t[0].permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255).round().astype(np.uint8)
+
+    def _pad(t):
+        _, _, h, w = t.shape
+        ph, pw = (32 - h % 32) % 32, (32 - w % 32) % 32
+        return torch.nn.functional.pad(t, (0, pw, 0, ph), mode="replicate"), h, w
+
+    out = []
+    done = 0
+    for i in range(len(frames) - 1):
+        if tid is not None:
+            task_registry.raise_if_cancelled(tid)
+            task_registry.wait_if_paused(tid)
+        # Re-check thermals through the loop (each pair is several RIFE passes at
+        # higher multipliers); wait_until_safe blocks until the GPU/CPU cool.
+        if _therm and i and i % 4 == 0:
+            try: _therm(context=f"interpolate:{model_name}")
+            except Exception: pass
+        a, h, w = _pad(_to_t(frames[i]))
+        b, _, _ = _pad(_to_t(frames[i + 1]))
+        mids = [_to_np(m[:, :, :h, :w]) for m in _interp_pair(engine, a, b, depth)]
+        out.append(frames[i]); out.extend(mids)
+        done += 1 + len(mids)
+        _vid_progress_step(done)
+        if tid is not None:
+            try: task_registry.step(tid, done)
+            except Exception: pass
+    out.append(frames[-1])
+
+    _enc_fps = int(output_fps) if output_fps else (int(round(fps * eff_mult)) or 1)
+    data = _encode_mp4_pyav(out, max(1, _enc_fps), 18)
+    out_path = tempfile.mktemp(suffix="_interp.mp4")
+    temps.append(out_path)
+    with open(out_path, "wb") as f:
+        f.write(data)
+    return out_path
 
 
 def _cpu_thread_limit() -> int:
@@ -2319,12 +2507,85 @@ def _rife_gpu_id(rife_bin: str) -> int:
     return gid
 
 
-def _rife_interpolate(path: str, multiplier: int, temps: list) -> str:
-    """Raise a video's FPS via the RIFE neural frame interpolator (AI, on the GPU).
+def _ffmpeg_minterpolate(path: str, multiplier: int, temps: list) -> str:
+    """ffmpeg minterpolate FPS raise — GATED behind enhance.allow_ffmpeg (it is a
+    non-model CPU filter). Thread-capped + CPU-pinned. Returns the output path."""
+    out = tempfile.mktemp(suffix='_mint.mp4')
+    temps.append(out)
+    import logging
+    _log = logging.getLogger(__name__)
+    in_fps = _video_fps(path)
+    cmd = _ffmpeg(['-i', path, '-filter:v',
+                   f'minterpolate=fps={int(round(in_fps * multiplier)) or (multiplier * 8)}',
+                   '-c:a', 'copy', out])
+    r = subprocess.run(cmd, capture_output=True, preexec_fn=_cpu_affinity_preexec())
+    if r.returncode != 0 or not os.path.exists(out):
+        raise RuntimeError(f"ffmpeg minterpolate failed: {r.stderr.decode(errors='replace')}")
+    return out
 
-    AI-or-fail by design: there is NO ffmpeg/minterpolate fallback. If no neural
-    interpolator is available the call raises so the caller surfaces the error,
-    exactly like the AI upscaler — interpolation must be a real AI op on CoderAI."""
+
+def _interpolate_video(path: str, multiplier: int, temps: list,
+                       model_name: str = None, output_fps: int = None) -> str:
+    """Raise a video's FPS. Default = an in-process torch interpolation MODEL
+    (RIFE/FILM), decoding/encoding with PyAV — no subprocess, no ffmpeg. The
+    external rife-ncnn-vulkan binary and ffmpeg minterpolate are only used when
+    explicitly enabled in Settings (enhance.allow_rife_ncnn / allow_ffmpeg).
+
+    By default the output is encoded at fps × multiplier so real duration and
+    motion speed are preserved (a 20fps clip ×2 plays at 40fps). `output_fps`
+    overrides that final encode rate."""
+    import logging
+    _log = logging.getLogger(__name__)
+    # 1. In-process model (preferred). Use the requested model, else auto-select a
+    #    configured interpolation model (capability video_interpolation).
+    name = (model_name or "").strip()
+    if not name:
+        try:
+            name = multi_model_manager.find_capable_model("video_interpolation") or ""
+        except Exception:
+            name = ""
+    if name:
+        try:
+            info = multi_model_manager.request_model(name, model_type="image")
+            resolved = (info or {}).get("model_name") or name
+        except Exception:
+            resolved = name
+        in_frames = _count_video_frames(path)
+        depth = max(1, int(round(__import__("math").log2(max(2, int(multiplier))))))
+        out_total = (max(1, in_frames) - 1) * (2 ** depth) + 1
+        tid = task_registry.register(
+            "interpolate", title=f"Interpolate ×{multiplier} FPS ({resolved})",
+            model=resolved, total=out_total)
+        task_registry.start(tid)
+        try:
+            out = _interpolate_inprocess(path, multiplier, resolved, temps, tid,
+                                         output_fps=output_fps)
+        except TaskCancelled:
+            task_registry.finish(tid, "cancelled"); raise
+        except Exception as e:
+            task_registry.finish(tid, "error", str(e)[:200])
+            raise
+        else:
+            task_registry.finish(tid, "done")
+            return out
+        finally:
+            _vid_progress_done()
+    # 2. External tools — only if explicitly enabled in Settings.
+    if _enhance_allow_rife_ncnn() and _find_rife_binary():
+        _log.info("interpolation: no model configured — using enabled rife-ncnn-vulkan")
+        return _rife_ncnn_interpolate(path, multiplier, temps)
+    if _enhance_allow_ffmpeg():
+        _log.info("interpolation: no model configured — using enabled ffmpeg minterpolate")
+        return _ffmpeg_minterpolate(path, multiplier, temps)
+    raise RuntimeError(
+        "No in-process interpolation model is configured and external tools are "
+        "disabled. Configure a RIFE/FILM model (capability 'video_interpolation', "
+        "e.g. AlexWortega/RIFE), or enable ffmpeg / rife-ncnn-vulkan in Settings.")
+
+
+def _rife_ncnn_interpolate(path: str, multiplier: int, temps: list) -> str:
+    """Raise a video's FPS via the EXTERNAL rife-ncnn-vulkan binary. Gated — only
+    reached when enhance.allow_rife_ncnn is enabled and no in-process model is set."""
     out = tempfile.mktemp(suffix='_rife.mp4')
     temps.append(out)
     import logging
@@ -2333,9 +2594,8 @@ def _rife_interpolate(path: str, multiplier: int, temps: list) -> str:
     rife_bin = _find_rife_binary()
     if not rife_bin:
         raise RuntimeError(
-            "No AI frame interpolator available: 'rife-ncnn-vulkan' is not installed. "
-            "FPS interpolation must run on an AI model (no ffmpeg fallback) — install "
-            "rife-ncnn-vulkan, or disable FPS interpolation (fps_multiplier).")
+            "rife-ncnn-vulkan is enabled but not installed. Install it, configure "
+            "an in-process RIFE/FILM model instead, or disable FPS interpolation.")
     # The release ships its model folders next to the binary; resolve an absolute
     # model path so it's found regardless of the server's CWD.
     _rife_root = os.path.dirname(os.path.realpath(rife_bin))
@@ -2398,16 +2658,20 @@ def _rife_interpolate(path: str, multiplier: int, temps: list) -> str:
                                 stderr=subprocess.PIPE, preexec_fn=_aff)
         _stop = threading.Event()
         _paused = {"v": False}
+        # Sample thermals every ~2s (the temp-read cache TTL) rather than the
+        # cooldown poll_seconds (often 5–10s) so we react to GPU spikes fast.
+        _THERM_EVERY = 2.0
 
         def _watch():
-            _last_t = 0.0
+            _last_t, _hot = 0.0, False
+            _g = {"gt": None, "ct": None}
             while not _stop.is_set():
                 n = len(_glob.glob(f'{out_dir}/*.png'))
                 _vid_progress_step(min(n, out_frames) if out_frames else n)
                 if out_frames:
                     try: task_registry.step(_tid, min(n, out_frames))
                     except Exception: pass
-                # Cancellation → kill the process.
+                # Cancellation → resume (so it can die) then kill the process.
                 try:
                     task_registry.raise_if_cancelled(_tid)
                 except TaskCancelled:
@@ -2416,29 +2680,40 @@ def _rife_interpolate(path: str, multiplier: int, temps: list) -> str:
                     _stop.set(); break
                 except Exception:
                     pass
-                # Thermal gate (every poll_seconds): pause/resume the subprocess.
+                # Thermal sample with hysteresis: latch hot at *_high, clear only
+                # once cooled to *_resume.
                 now = _time.monotonic()
-                if _ts is not None and (now - _last_t) >= float(getattr(_ts, "poll_seconds", 5.0)):
+                if _ts is not None and (now - _last_t) >= _THERM_EVERY:
                     _last_t = now
                     gt = _rgt() if (_rgt and _ts.gpu_enabled) else None
                     ct = _rct() if (_rct and _ts.cpu_enabled) else None
-                    too_hot = ((gt is not None and gt >= _ts.gpu_high) or
-                               (ct is not None and ct >= _ts.cpu_high))
-                    cool = ((gt is None or gt <= _ts.gpu_resume) and
-                            (ct is None or ct <= _ts.cpu_resume))
-                    if too_hot and not _paused["v"]:
-                        try:
-                            proc.send_signal(signal.SIGSTOP); _paused["v"] = True
-                            _vid_progress["phase"] = "interpolating (thermal pause)"
+                    _g["gt"], _g["ct"] = gt, ct
+                    if not _hot:
+                        _hot = ((gt is not None and gt >= _ts.gpu_high) or
+                                (ct is not None and ct >= _ts.cpu_high))
+                    else:
+                        _hot = not ((gt is None or gt <= _ts.gpu_resume) and
+                                    (ct is None or ct <= _ts.cpu_resume))
+                # Manual pause (Tasks page) also SIGSTOPs the external process.
+                try: _manual = bool(task_registry.is_paused(_tid))
+                except Exception: _manual = False
+                _should = _hot or _manual
+                if _should and not _paused["v"]:
+                    try:
+                        proc.send_signal(signal.SIGSTOP); _paused["v"] = True
+                        _vid_progress["phase"] = ("interpolating (thermal pause)"
+                                                  if _hot else "interpolating (paused)")
+                        if _hot:
                             import logging
                             logging.getLogger(__name__).warning(
-                                "rife paused — too hot (GPU %s / CPU %s °C)", gt, ct)
-                        except Exception: pass
-                    elif _paused["v"] and cool:
-                        try:
-                            proc.send_signal(signal.SIGCONT); _paused["v"] = False
-                            _vid_progress["phase"] = "interpolating"
-                        except Exception: pass
+                                "rife-ncnn paused — too hot (GPU %s / CPU %s °C)",
+                                _g["gt"], _g["ct"])
+                    except Exception: pass
+                elif not _should and _paused["v"]:
+                    try:
+                        proc.send_signal(signal.SIGCONT); _paused["v"] = False
+                        _vid_progress["phase"] = "interpolating"
+                    except Exception: pass
                 _stop.wait(0.5)
 
         _w = threading.Thread(target=_watch, daemon=True); _w.start()
@@ -3285,21 +3560,23 @@ async def video_interpolate(request: VideoInterpolateRequest, http_request: Requ
             temps.append(in_path)
         elif request.init_image and request.end_image:
             # Build a 2-frame video from the two images, then interpolate
-            from PIL import Image as PILImage
-            import numpy as np, imageio
+            import numpy as np
             img1 = _pil_from_b64(request.init_image)
             img2 = _pil_from_b64(request.end_image)
             in_path = tempfile.mktemp(suffix='.mp4')
             temps.append(in_path)
-            imageio.mimsave(in_path, [np.array(img1), np.array(img2)],
-                            fps=2, codec='libx264')
+            # Build the 2-frame source in-process via PyAV (no ffmpeg).
+            with open(in_path, 'wb') as _fh:
+                _fh.write(_encode_mp4_pyav([np.array(img1.convert('RGB')),
+                                            np.array(img2.convert('RGB'))], 2, 18))
         else:
             raise HTTPException(status_code=400,
                                 detail="Provide either video or init_image + end_image")
 
         mult = request.fps_multiplier or 2
         out_path = await asyncio.get_event_loop().run_in_executor(
-            None, _rife_interpolate, in_path, mult, temps)
+            None, _interpolate_video, in_path, mult, temps, request.model,
+            request.output_fps)
         with open(out_path, 'rb') as f:
             out_bytes = f.read()
 

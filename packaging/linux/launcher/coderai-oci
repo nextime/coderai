@@ -1,0 +1,75 @@
+#!/usr/bin/env sh
+set -eu
+
+# Runtime launcher for the CoderAI OCI image.
+# Keeps config/model/cache state in mounted volumes and exposes the server outside
+# the container by default.
+
+: "${CODERAI_CONFIG_DIR:=/config}"
+: "${CODERAI_MODELS_DIR:=/models}"
+: "${CODERAI_CACHE_DIR:=/cache}"
+: "${CODERAI_HOST:=0.0.0.0}"
+: "${CODERAI_PORT:=8776}"
+
+export PYTHONHOME=/opt/coderai/python
+export PATH="/opt/coderai/python/bin:$PATH"
+export XDG_CONFIG_HOME="$CODERAI_CONFIG_DIR"
+export XDG_DATA_HOME="$CODERAI_MODELS_DIR"
+export XDG_CACHE_HOME="$CODERAI_CACHE_DIR"
+export HF_HOME="${HF_HOME:-$CODERAI_CACHE_DIR/huggingface}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}"
+
+NV="/opt/coderai/python/lib/python3.13/site-packages/nvidia"
+LIBS="/opt/coderai/python/lib:/opt/coderai/local-libs"
+if [ -d "$NV" ]; then
+  for d in "$NV"/*/lib; do
+    [ -d "$d" ] && LIBS="$LIBS:$d"
+  done
+fi
+export LD_LIBRARY_PATH="$LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+mkdir -p "$CODERAI_CONFIG_DIR/coderai" "$CODERAI_MODELS_DIR/coderai" "$CODERAI_CACHE_DIR/coderai"
+CONFIG_DIR="$CODERAI_CONFIG_DIR/coderai"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+
+# Ensure the container binds to all interfaces even when config.json was created
+# by the app default, which uses 127.0.0.1 for local desktop installs.
+if [ ! -f "$CONFIG_FILE" ]; then
+  /opt/coderai/python/bin/python3 - "$CONFIG_FILE" "$CODERAI_HOST" "$CODERAI_PORT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+host = sys.argv[2]
+port = int(sys.argv[3])
+path.write_text(json.dumps({"server": {"host": host, "port": port}}, indent=2) + "\n")
+PY
+else
+  /opt/coderai/python/bin/python3 - "$CONFIG_FILE" "$CODERAI_HOST" "$CODERAI_PORT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+host = sys.argv[2]
+port = int(sys.argv[3])
+try:
+    data = json.loads(path.read_text())
+except Exception:
+    data = {}
+server = data.setdefault("server", {})
+changed = False
+if server.get("host") in (None, "", "127.0.0.1", "localhost") or host != "0.0.0.0":
+    if server.get("host") != host:
+        server["host"] = host
+        changed = True
+if server.get("port") != port:
+    server["port"] = port
+    changed = True
+if changed:
+    path.write_text(json.dumps(data, indent=2) + "\n")
+PY
+fi
+
+exec /opt/coderai/python/bin/python3 /opt/coderai/app/coderai --config "$CONFIG_DIR" "$@"

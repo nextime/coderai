@@ -1,0 +1,105 @@
+ARG CUDA_VERSION=12.4.1
+ARG UBUNTU_VERSION=22.04
+
+FROM scratch AS build_meta
+COPY .packaging-cache/build-manifest.json /build-manifest.json
+
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
+
+ARG PYTHON_VERSION=3.13.5
+ARG PBS_RELEASE=20250612
+ARG VENV_PYTHON_MINOR=3.13
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/cache/huggingface \
+    HUGGINGFACE_HUB_CACHE=/cache/huggingface/hub \
+    TRANSFORMERS_CACHE=/cache/huggingface/transformers \
+    DIFFUSERS_CACHE=/cache/diffusers \
+    CODERAI_CONFIG_DIR=/config \
+    CODERAI_MODELS_DIR=/models \
+    CODERAI_CACHE_DIR=/cache \
+    CODERAI_HOST=0.0.0.0 \
+    CODERAI_PORT=8776
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      ffmpeg \
+      git \
+      libgomp1 \
+      libgl1 \
+      libglib2.0-0 \
+      libsndfile1 \
+      libvulkan1 \
+      mesa-vulkan-drivers \
+      openssl \
+      rsync \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    curl -fsSL -o /tmp/python.tar.gz \
+      "https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_RELEASE}/cpython-${PYTHON_VERSION}+${PBS_RELEASE}-x86_64-unknown-linux-gnu-install_only.tar.gz"; \
+    mkdir -p /opt/coderai; \
+    tar -xzf /tmp/python.tar.gz -C /opt/coderai; \
+    rm /tmp/python.tar.gz; \
+    /opt/coderai/python/bin/python3 --version
+
+ENV PYTHONHOME=/opt/coderai/python \
+    PATH=/opt/coderai/python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# BuildKit named context supplied by packaging/linux/build_oci_image.sh:
+#   --build-context local_bundle=/path/to/.packaging-cache/oci-venv-context
+# The bundle contains the selected venv plus ldd-discovered native libraries from
+# the local machine. GPU drivers are intentionally not bundled; NVIDIA Container
+# Toolkit / host Vulkan ICDs remain the runtime contract.
+COPY --from=local_bundle / /tmp/local-bundle/
+
+RUN set -eux; \
+    target_sp="/opt/coderai/python/lib/python${VENV_PYTHON_MINOR}/site-packages"; \
+    source_sp="/tmp/local-bundle/venv/lib/python${VENV_PYTHON_MINOR}/site-packages"; \
+    test -d "$source_sp"; \
+    mkdir -p "$target_sp"; \
+    rsync -a --delete "$source_sp/" "$target_sp/"; \
+    if [ -d /tmp/local-bundle/venv/bin ]; then \
+      find /tmp/local-bundle/venv/bin -maxdepth 1 -type f ! -name 'python*' ! -name 'activate*' -exec cp -a '{}' /opt/coderai/python/bin/ \;; \
+    fi; \
+    if [ -d /tmp/local-bundle/local-libs ]; then \
+      mkdir -p /opt/coderai/local-libs; \
+      rsync -a /tmp/local-bundle/local-libs/ /opt/coderai/local-libs/; \
+    fi; \
+    if [ -d /tmp/local-bundle/local-bin ]; then \
+      rsync -a /tmp/local-bundle/local-bin/ /usr/local/bin/; \
+      find /usr/local/bin -maxdepth 1 -type f -exec chmod +x '{}' \;; \
+    fi; \
+    rm -rf /tmp/local-bundle; \
+    find /opt/coderai/python -type d \( -name __pycache__ -o -name tests -o -name test \) -prune -exec rm -rf '{}' +
+
+WORKDIR /opt/coderai/app
+COPY . /opt/coderai/app
+COPY --from=build_meta /build-manifest.json /opt/coderai/BUILD-MANIFEST.json
+COPY packaging/linux/launcher/coderai-oci /usr/local/bin/coderai
+
+RUN set -eux; \
+    chmod +x /usr/local/bin/coderai /opt/coderai/app/coderai; \
+    mkdir -p /config /models /cache /opt/coderai/app/models; \
+    rm -rf \
+      /opt/coderai/app/.git \
+      /opt/coderai/app/venv* \
+      /opt/coderai/app/.venv \
+      /opt/coderai/app/township_output \
+      /opt/coderai/app/offload \
+      /opt/coderai/app/dist \
+      /opt/coderai/app/.packaging-cache; \
+    find /opt/coderai/app -type d -name __pycache__ -prune -exec rm -rf '{}' +; \
+    /opt/coderai/python/bin/python3 - <<'PY'
+import importlib.util
+missing = [name for name in ("fastapi", "uvicorn", "torch") if importlib.util.find_spec(name) is None]
+if missing:
+    raise SystemExit(f"venv image is missing required package(s): {', '.join(missing)}")
+PY
+
+VOLUME ["/config", "/models", "/cache"]
+EXPOSE 8776
+ENTRYPOINT ["/usr/local/bin/coderai"]
