@@ -2236,6 +2236,32 @@ def _build_match_clip_specs(fps: int, cf_lo: int, cf_hi: int,
     return specs
 
 
+def _clip_role_fighters(c: dict, f1: str, f2: str):
+    """Resolve the (role, fighters) for a fight-match clip.
+
+    Honour an explicit `role` (+ `fighters`) when present — that's how new-style
+    clips built by `_build_match_clip_specs` carry their identity. Otherwise INFER
+    from position so the first three clips of ANY match (including legacy matches
+    created before the intro feature, whose clips have no role) are the pre-fight
+    intro: clip 0 = fighter-1 entrance, clip 1 = fighter-2 entrance, clip 2 = the
+    referee-officiated face-off, and everything after = the fight."""
+    role = c.get("role")
+    if role:
+        if role == "entrance":
+            return role, list(c.get("fighters") or [f1])
+        if role == "faceoff":
+            return role, list(c.get("fighters") or [f1, f2])
+        return "fight", [f1, f2]
+    idx = int(c.get("idx", 0) or 0)
+    if idx == 0:
+        return "entrance", [f1]
+    if idx == 1:
+        return "entrance", [f2]
+    if idx == 2:
+        return "faceoff", [f1, f2]
+    return "fight", [f1, f2]
+
+
 def _fill_clip_prompt(prompter, c: dict, f1: str, f2: str, env, env_desc: str,
                       char_descriptions: dict, referee: str = None,
                       match_avoid: list = None, focus: str = "") -> str:
@@ -2244,11 +2270,19 @@ def _fill_clip_prompt(prompter, c: dict, f1: str, f2: str, env, env_desc: str,
     role "entrance" → a solo intro for the clip's single fighter; "faceoff" → a
     stare-down between both fighters with the referee signalling START; anything
     else → a normal fight shot (appended to `match_avoid` so the match stays varied).
-    """
-    role = c.get("role", "fight")
+    The resolved role/fighters are PERSISTED onto the clip so the keyframe + render
+    use the same identity, and any stale `kf_prompt` override is cleared so this
+    freshly written prompt drives keyframe generation."""
+    role, fighters = _clip_role_fighters(c, f1, f2)
+    # Persist the resolved identity (so legacy clips upgraded here keep their role),
+    # and drop any prior keyframe-prompt override so the new prompt is authoritative.
+    c["role"] = role
+    if role in ("entrance", "faceoff"):
+        c["fighters"] = list(fighters)
+    c.pop("kf_prompt", None)
     cont = _continuity_clause(env or None)
     if role == "entrance":
-        who = (c.get("fighters") or [f1])[0]
+        who = fighters[0]
         shot = prompter.intro_shot("entrance", who, env_desc=env_desc)
         hint = _fighter_desc_hint(who, char_descriptions)
         c["shot"] = shot
@@ -2591,6 +2625,10 @@ def _plan_outcome_shots(prompter, o: dict, char_descriptions: dict,
         o["opponent"] = opponent
     o["shot"] = shots[0]["shot"]
     o["prompt"] = shots[0]["prompt"]
+    # Freshly written shots carry no per-shot keyframe-prompt override, so the
+    # outcome keyframes recompose from these new prompts. Also drop any stale
+    # entry-level override (legacy no-shots path) for the same reason.
+    o.pop("kf_prompt", None)
 
 
 def _model_slug(model_id: str) -> str:
