@@ -378,6 +378,28 @@ FIGHT_PROMPT_SUFFIX = ("African township free fight, fast-paced, rapid explosive
                        "reverses, rewinds or loops back, cinematic, consistent "
                        "characters, wardrobe and setting")
 
+# Pre-fight intro clips: the OPENING of a match is NOT a fight — two solo fighter
+# entrances followed by a stare-down where the referee signals the start. These
+# carry a non-fight suffix so the model doesn't start throwing strikes early.
+INTRO_PROMPT_SUFFIX = ("African township fight night, cinematic, dramatic, scenic, "
+                       "atmospheric, consistent characters, wardrobe and setting, "
+                       "tension before the fight, NO punches or kicks thrown yet")
+
+ENTRANCE_SHOT_TEMPLATES = [
+    "striding into the arena through a parting roaring crowd, arms raised and chin high, slow heroic low-angle push-in through dust and spotlight haze",
+    "bursting onto the scene pounding their own chest and roaring at the crowd, sweeping crane shot rising over the packed yard",
+    "stalking in slowly, cracking their knuckles and rolling their shoulders with a menacing glare into the lens, tight dramatic push-in",
+    "leaping down off a low wall into the fighting ground and throwing their arms wide to the screaming crowd, dynamic dropping crane shot",
+    "marching through smoke and fire-barrel glow shadow-boxing a few sharp strikes, kinetic tracking shot circling the entrance",
+    "emerging from the crowd with a slow swagger and pointing to the centre of the ground, golden dusk backlight, sweeping orbit",
+]
+
+FACEOFF_SHOT_TEMPLATES = [
+    "standing face to face foreheads almost touching in a tense menacing stare-down, the referee stepping between them and chopping a hand down to START the fight, crowd electric, slow orbit snapping to a push-in",
+    "squaring off chest to chest trading furious words, the referee splitting them apart then sweeping an arm to signal FIGHT, dramatic low-angle shot, crowd roaring",
+    "locked in a furious eye-to-eye stare-down with fists clenched, the referee raising a hand between them and dropping it to launch the bout, tight handheld push-in",
+]
+
 
 def _continuity_clause(env_name: str) -> str:
     """Deterministic wardrobe + environment continuity phrase appended to EVERY
@@ -1061,6 +1083,15 @@ location as the fight, with consistent background, surfaces and lighting. Never 
 to a different place.
 Return ONLY the prompt, no quotes or explanation."""
 
+_LLM_INTRO_SYSTEM = """\
+You are a creative director writing vivid 18-32 word video-generation prompts for the DRAMATIC OPENING of an African township fight night — BEFORE any fighting starts.
+You write ONE of these shot types at a time (the user says which):
+  • an ENTRANCE — ONE fighter ALONE making a bold, scenic, dramatic entrance into the arena: striding or bursting in, playing to the roaring crowd, flexing or shadow-boxing, glaring at the camera. NO opponent in frame and NO actual fighting. Make it a hero shot with a kinetic camera move (low-angle push-in, sweeping crane, orbit) and rich atmosphere (dust, smoke, fire-barrel glow, spotlights).
+  • a FACE-OFF — BOTH fighters squaring off face to face in a tense menacing stare-down, with the REFEREE between them giving the gesture to START the fight (chopping or dropping a hand, sweeping an arm). Show the tension and the referee's start signal explicitly. Still NO punches or kicks thrown yet.
+Always refer to each fighter (and the referee) by their NAME given in the user message.
+WARDROBE + LOCATION CONTINUITY (critical): keep each fighter in the IDENTICAL outfit (same garments, exact colours, hair, accessories) described, in the SAME township location with consistent background, surfaces, lighting and crowd.
+Do NOT use generic phrases like "high quality" or "realistic". Return ONLY the prompt, no quotes."""
+
 # Snapshot the built-in defaults now that every template/system prompt is
 # defined (before any saved override is applied), so the web "Prompts" page can
 # offer a reset-to-defaults.
@@ -1077,6 +1108,7 @@ class PromptGenerator:
         self.char_descriptions: dict = char_descriptions or {}
         self._used_fight: list[str] = []
         self._used_outcome: dict[str, list[str]] = {}
+        self._used_intro: dict[str, list[str]] = {}
 
     def fight_shot(self, f1: str, f2: str, env_desc: str, match_context: str = "",
                    avoid: list = None, action_focus: str = "") -> str:
@@ -1206,6 +1238,65 @@ class PromptGenerator:
         available = [t for t in templates if t not in used]
         if not available:
             available = templates
+        choice = random.choice(available)
+        used.append(choice)
+        return choice
+
+    def intro_shot(self, role: str, f1: str, f2: str = None, env_desc: str = "",
+                   referee: str = None) -> str:
+        """Generate a pre-fight INTRO shot prompt for one opening clip of a match.
+
+        `role`:
+          • "entrance" → ONE fighter (f1) alone making a bold, scenic solo entrance.
+          • "faceoff"  → f1 vs f2 stare-down with the referee signalling START.
+        No fighting happens in these clips — they set the scene before the bout.
+        """
+        is_face = role == "faceoff"
+        src = FACEOFF_SHOT_TEMPLATES if is_face else ENTRANCE_SHOT_TEMPLATES
+        used = self._used_intro.setdefault(role, [])
+
+        if self.model:
+            if is_face:
+                _d1 = self.char_descriptions.get(f1, "")
+                _d2 = self.char_descriptions.get(f2, "")
+                f1d = f"{f1} ({_d1})" if _d1 else f1
+                f2d = f"{f2} ({_d2})" if _d2 else f2
+                ref_line = f" Referee: {referee}." if referee else " A referee."
+                label = (f"a FACE-OFF stare-down between {f1d} and {f2d} with the "
+                         "referee giving the signal to START the fight")
+                user_extra = f"Fighter 1: {f1d}. Fighter 2: {f2d}.{ref_line} "
+            else:
+                _d1 = self.char_descriptions.get(f1, "")
+                f1d = f"{f1} ({_d1})" if _d1 else f1
+                label = f"a bold, dramatic, scenic solo ENTRANCE of {f1d}"
+                user_extra = f"Fighter: {f1d}. "
+            _avoid = used[-2:]
+            for attempt in range(2):
+                try:
+                    used_hint = f" Avoid: {'; '.join(_avoid)}." if _avoid else ""
+                    prompt = self.client.chat_complete(
+                        model=self.model,
+                        system=_LLM_INTRO_SYSTEM,
+                        user=(
+                            f"{user_extra}Shot to write: {label}. Location: {env_desc}."
+                            f"{used_hint} Write this ONE intro shot prompt. Refer to the "
+                            "fighters (and referee) by their NAME."
+                        ),
+                        max_tokens=110,
+                    ).strip()
+                    if len(prompt) < 8:
+                        raise ValueError(f"LLM returned too-short response: {prompt!r}")
+                    used.append(prompt[:60])
+                    return prompt
+                except Exception as e:
+                    if attempt == 0:
+                        _avoid = []  # drop the hint and retry once
+                        continue
+                    _log(f"    (LLM intro prompt failed after retry: {e} — using template)")
+
+        available = [t for t in src if t not in used]
+        if not available:
+            available = src
         choice = random.choice(available)
         used.append(choice)
         return choice
@@ -2117,6 +2208,71 @@ def _fighter_desc_hint(name: str, char_descriptions: dict) -> str:
     return f"{name} ({visual})"
 
 
+def _build_match_clip_specs(fps: int, cf_lo: int, cf_hi: int,
+                            long_target: float, f1: str, f2: str) -> list:
+    """Build a match's ordered clip specs: the pre-fight INTRO (a solo entrance for
+    each fighter, then a referee-officiated face-off), followed by fight clips until
+    `long_target` playback seconds is reached. The intro clips are extra and do NOT
+    count toward `long_target`. Prompts are filled later by `_fill_clip_prompt`."""
+    specs, ci = [], 0
+    for _role, _who in (("entrance", [f1]), ("entrance", [f2]), ("faceoff", [f1, f2])):
+        nf = random.randint(cf_lo, cf_hi)
+        specs.append({"idx": ci, "clip_seconds": round(nf / max(1, fps), 2),
+                      "nf": nf, "intensity": "introduction", "role": _role,
+                      "fighters": list(_who), "shot": None, "prompt": None})
+        ci += 1
+    planned = 0.0
+    while planned < long_target:
+        round_num = (ci - 3) // 3 + 1
+        intensity = ("early exchanges" if round_num == 1
+                     else "midpoint battle" if round_num == 2
+                     else "climactic final exchange")
+        nf = random.randint(cf_lo, cf_hi)
+        specs.append({"idx": ci, "clip_seconds": round(nf / max(1, fps), 2),
+                      "nf": nf, "role": "fight", "intensity": intensity,
+                      "shot": None, "prompt": None})
+        planned += nf / max(1, fps)
+        ci += 1
+    return specs
+
+
+def _fill_clip_prompt(prompter, c: dict, f1: str, f2: str, env, env_desc: str,
+                      char_descriptions: dict, referee: str = None,
+                      match_avoid: list = None, focus: str = "") -> str:
+    """Populate `c['shot']` and `c['prompt']` for one clip according to its role.
+
+    role "entrance" → a solo intro for the clip's single fighter; "faceoff" → a
+    stare-down between both fighters with the referee signalling START; anything
+    else → a normal fight shot (appended to `match_avoid` so the match stays varied).
+    """
+    role = c.get("role", "fight")
+    cont = _continuity_clause(env or None)
+    if role == "entrance":
+        who = (c.get("fighters") or [f1])[0]
+        shot = prompter.intro_shot("entrance", who, env_desc=env_desc)
+        hint = _fighter_desc_hint(who, char_descriptions)
+        c["shot"] = shot
+        c["prompt"] = f"{hint} — {shot} — {cont} — {INTRO_PROMPT_SUFFIX}"
+    elif role == "faceoff":
+        shot = prompter.intro_shot("faceoff", f1, f2, env_desc=env_desc, referee=referee)
+        h1 = _fighter_desc_hint(f1, char_descriptions)
+        h2 = _fighter_desc_hint(f2, char_descriptions)
+        c["shot"] = shot
+        c["prompt"] = f"{h1} vs {h2} — {shot} — {cont} — {INTRO_PROMPT_SUFFIX}"
+    else:
+        shot = prompter.fight_shot(
+            f1, f2, env_desc,
+            match_context=f"Match stage: {c.get('intensity', '')}. ",
+            avoid=match_avoid, action_focus=focus)
+        h1 = _fighter_desc_hint(f1, char_descriptions)
+        h2 = _fighter_desc_hint(f2, char_descriptions)
+        c["shot"] = shot
+        c["prompt"] = f"{h1} vs {h2} — {shot} — {cont} — {FIGHT_PROMPT_SUFFIX}"
+        if match_avoid is not None:
+            match_avoid.append(shot[:60])
+    return c["shot"]
+
+
 def _write_concat(clips: list, out_path: str, label: str):
     paths = [p for p, _ in clips]
     if not paths:
@@ -2831,8 +2987,21 @@ def _generate_keyframes(client: CoderAIClient, image_model: str, keyframe_dir: P
     jobs = []
     for m in fight_plan:
         for c in m["clips"]:
+            # Intro clips appear with only their own participants: a solo entrance
+            # shows ONE fighter; the face-off shows both fighters + the referee.
+            # Fight clips (and legacy clips with no role) show both fighters.
+            _role = c.get("role", "fight")
+            if _role in ("entrance", "faceoff"):
+                _cf = list(c.get("fighters") or [m["f1"], m["f2"]])
+                if _role == "faceoff":
+                    _cref = (m.get("referee")
+                             or _referee_for(_out_dir, m.get("match_name") or m.get("f1", "")))
+                    if _cref and _cref not in _cf:
+                        _cf.append(_cref)
+            else:
+                _cf = [m["f1"], m["f2"]]
             jobs.append((_clip_stem_fight(m["match_name"], c["idx"]),
-                         c["prompt"], [m["f1"], m["f2"]], m.get("env"),
+                         c["prompt"], _cf, m.get("env"),
                          m.get("env_desc"), c.get("kf_prompt")))
     for o in outcome_plan:
         _of = _mf_map.get(o.get("match_name")) or [o["fighter"]]
@@ -3092,8 +3261,25 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
         env = random.choice(env_names) if env_names else None
         env_desc = _env_description(env) if env else "African township"
         clips_spec, planned, ci = [], 0.0, 0
+        # Pre-fight INTRO clips first: a bold solo entrance for EACH fighter, then a
+        # stare-down face-off where the referee signals the start. The real fight
+        # begins only after these. `fighters` records who appears in the clip so the
+        # keyframe + render attach the right profiles (the face-off also gets the
+        # referee, resolved at prompt/render time). These clips are extra — they do
+        # NOT count against the long_target so the fight still fills the cut.
+        for _intro_role, _intro_who in (("entrance", [f1]),
+                                        ("entrance", [f2]),
+                                        ("faceoff",  [f1, f2])):
+            _nf = random.randint(_cf_lo, _cf_hi)
+            clips_spec.append({
+                "idx": ci, "clip_seconds": round(_nf / max(1, fps), 2),
+                "nf": _nf, "intensity": "introduction",
+                "role": _intro_role, "fighters": list(_intro_who),
+                "shot": None, "prompt": None,
+            })
+            ci += 1
         while planned < long_target:
-            round_num = ci // 3 + 1
+            round_num = (ci - 3) // 3 + 1
             intensity = ("early exchanges" if round_num == 1
                          else "midpoint battle" if round_num == 2
                          else "climactic final exchange")
@@ -3103,7 +3289,7 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
             clip_seconds = round(_nf / max(1, fps), 2)
             clips_spec.append({
                 "idx": ci, "clip_seconds": clip_seconds,
-                "nf": _nf,
+                "nf": _nf, "role": "fight",
                 "intensity": intensity, "shot": None, "prompt": None,
             })
             # Accumulate playback duration so the match reaches long_target.
@@ -3166,22 +3352,22 @@ def stage_videos(client: CoderAIClient, video_model: str, out_dir: Path,
         # disciplines (kicks, clinch, ground, submissions…) instead of all punches.
         _focus_cycle = list(FIGHT_ACTION_FOCUS)
         random.shuffle(_focus_cycle)
-        for _ci, c in enumerate(m["clips"]):
+        _ref = m.get("referee") or _referee_for(out_dir, m.get("match_name") or m["f1"])
+        _ffi = 0  # fight-clip index (drives the technique-focus cycle, skips intros)
+        for c in m["clips"]:
             _pidx += 1
-            shot = prompter.fight_shot(
-                m["f1"], m["f2"], m["env_desc"],
-                match_context=f"Match stage: {c['intensity']}. ",
-                avoid=match_avoid,
-                action_focus=_focus_cycle[_ci % len(_focus_cycle)])
-            c["shot"] = shot
-            f1_hint = _fighter_desc_hint(m['f1'], char_descriptions)
-            f2_hint = _fighter_desc_hint(m['f2'], char_descriptions)
-            c["prompt"] = (
-                f"{f1_hint} vs {f2_hint} — {shot} — {_continuity_clause(m.get('env'))} "
-                f"— {FIGHT_PROMPT_SUFFIX}"
-            )
-            match_avoid.append(shot[:60])
-            _log(f"  │  [{_pidx}/{_ptot}] {m['f1']} vs {m['f2']} clip{c['idx']:02d}: {shot}")
+            _role = c.get("role", "fight")
+            _focus = ("" if _role != "fight"
+                      else _focus_cycle[_ffi % len(_focus_cycle)])
+            if _role == "fight":
+                _ffi += 1
+            shot = _fill_clip_prompt(prompter, c, m["f1"], m["f2"], m.get("env"),
+                                     m["env_desc"], char_descriptions, referee=_ref,
+                                     match_avoid=match_avoid, focus=_focus)
+            _who = (f"{(c.get('fighters') or [m['f1']])[0]} entrance" if _role == "entrance"
+                    else f"{m['f1']} vs {m['f2']} face-off" if _role == "faceoff"
+                    else f"{m['f1']} vs {m['f2']}")
+            _log(f"  │  [{_pidx}/{_ptot}] {_who} clip{c['idx']:02d}: {shot}")
     for o in outcome_plan:
         _pidx += 1
         _plan_outcome_shots(prompter, o, char_descriptions, o.get("opponent"))
@@ -3284,13 +3470,17 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
     # fighter the scene is named after. Read from the saved plan too, so this
     # still resolves when re-rendering outcomes alone (fight_plan == []).
     _mf_map = {}
+    _mref_map = {}
+    _out_dir = Path(video_dir).parent.parent
     for _m in fight_plan:
         _mf_map[_m.get("match_name")] = [x for x in (_m.get("f1"), _m.get("f2")) if x]
+        _mref_map[_m.get("match_name")] = _m.get("referee")
     try:
         _saved = json.loads((Path(video_dir) / "prompts.json").read_text())
         for _m in _saved.get("fight_plan", []):
             _mf_map.setdefault(_m.get("match_name"),
                                [x for x in (_m.get("f1"), _m.get("f2")) if x])
+            _mref_map.setdefault(_m.get("match_name"), _m.get("referee"))
     except Exception:
         pass
 
@@ -3560,13 +3750,28 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
             # into ≤single-render-cap parts when it exceeds one model call.
             _nf = int(c.get("nf") or frames_for_seconds(c["clip_seconds"], 8))
             _nf = min(_nf, MAX_PLANNED_FRAMES)
+            # Intro clips appear with only their own participants (solo entrance =
+            # one fighter; face-off = both fighters + referee) so the right profiles
+            # are attached; fight/legacy clips use both fighters.
+            _role = c.get("role", "fight")
+            if _role in ("entrance", "faceoff"):
+                _cf = list(c.get("fighters") or [m["f1"], m["f2"]])
+                if _role == "faceoff":
+                    _cref = (_mref_map.get(m.get("match_name"))
+                             or _referee_for(_out_dir, m.get("match_name") or m.get("f1", "")))
+                    if _cref and _cref not in _cf:
+                        _cf.append(_cref)
+                _clabel = f"{_role} clip {c['idx']:02d} — {'/'.join(_cf)}"
+            else:
+                _cf = [m["f1"], m["f2"]]
+                _clabel = f"clip {c['idx']:02d} — {m['f1']} vs {m['f2']}"
             _log(f"  │  clip {c['idx']:02d}  {c['clip_seconds']:.1f}s → {_nf}f @ {fps}fps "
                  f"= {_nf/max(1,fps):.1f}s")
             _clip("start")
             ok, dur, is_fatal = _render(
-                f"clip {c['idx']:02d} — {m['f1']} vs {m['f2']}",
-                c["prompt"], [m["f1"], m["f2"]], m["env"], _nf, str(clip_path),
-                stem=clip_stem, fighters=[m["f1"], m["f2"]], step_cb=_step)
+                _clabel,
+                c["prompt"], _cf, m["env"], _nf, str(clip_path),
+                stem=clip_stem, fighters=_cf, step_cb=_step)
             if is_fatal:
                 fatal = True
                 _clip("end", False)
@@ -4297,37 +4502,23 @@ def launch_web_ui(default_args):
                 getattr(default_args, "clip_min_frames", CLIP_MIN_FRAMES),
                 getattr(default_args, "clip_max_frames", CLIP_MAX_FRAMES))
             long_target = float(m["long_target"])
-            new_clips, planned, ci = [], 0.0, 0
-            while planned < long_target:
-                round_num = ci // 3 + 1
-                intensity = ("early exchanges" if round_num == 1
-                             else "midpoint battle" if round_num == 2
-                             else "climactic final exchange")
-                _nf = random.randint(_cf_lo, _cf_hi)
-                new_clips.append({"idx": ci, "clip_seconds": round(_nf / max(1, fps), 2),
-                                  "nf": _nf, "intensity": intensity,
-                                  "shot": None, "prompt": None})
-                planned += _nf / max(1, fps)
-                ci += 1
-            f1_hint = _fighter_desc_hint(f1, char_descriptions)
-            f2_hint = _fighter_desc_hint(f2, char_descriptions)
+            new_clips = _build_match_clip_specs(fps, _cf_lo, _cf_hi, long_target, f1, f2)
+            _ref = m.get("referee") or _referee_for(out_dir, name)
             match_avoid = []
             _focus_cycle = list(FIGHT_ACTION_FOCUS)
             random.shuffle(_focus_cycle)
+            _ffi = 0
             for i, c in enumerate(new_clips):
                 if _cancelled():
                     _fail("cancelled before prompts were complete")
                     return
-                shot = prompter.fight_shot(
-                    f1, f2, env_desc,
-                    match_context=f"Match stage: {c['intensity']}. ",
-                    avoid=match_avoid,
-                    action_focus=_focus_cycle[i % len(_focus_cycle)])
-                c["shot"] = shot
-                c["prompt"] = (f"{f1_hint} vs {f2_hint} — {shot} "
-                               f"— {_continuity_clause(env or None)} "
-                               f"— {FIGHT_PROMPT_SUFFIX}")
-                match_avoid.append(shot[:60])
+                _focus = ("" if c.get("role", "fight") != "fight"
+                          else _focus_cycle[_ffi % len(_focus_cycle)])
+                if c.get("role", "fight") == "fight":
+                    _ffi += 1
+                _fill_clip_prompt(prompter, c, f1, f2, env, env_desc,
+                                  char_descriptions, referee=_ref,
+                                  match_avoid=match_avoid, focus=_focus)
                 _prog(8 + int(60 * (i + 1) / max(1, len(new_clips))),
                       f"clip {i+1}/{len(new_clips)} prompt written")
             m["clips"] = new_clips
@@ -4731,41 +4922,28 @@ def launch_web_ui(default_args):
                 _prog(12, f"re-planning clips for {match_name} @ {fps}fps "
                           f"({_cf_lo}-{_cf_hi}f/clip)…")
                 # Rebuild the clip list with the same planner the full run uses:
-                # frame budget within the configured range, match length counted in
-                # PLAYBACK seconds (nf/fps).
-                new_clips, planned, ci = [], 0.0, 0
-                while planned < long_target:
-                    round_num = ci // 3 + 1
-                    intensity = ("early exchanges" if round_num == 1
-                                 else "midpoint battle" if round_num == 2
-                                 else "climactic final exchange")
-                    _nf = random.randint(_cf_lo, _cf_hi)
-                    clip_seconds = round(_nf / max(1, fps), 2)
-                    new_clips.append({"idx": ci, "clip_seconds": clip_seconds,
-                                      "nf": _nf, "intensity": intensity,
-                                      "shot": None, "prompt": None})
-                    planned += _nf / max(1, fps)
-                    ci += 1
+                # intro clips (entrances + face-off) then fight clips, frame budget
+                # within the configured range, match length counted in PLAYBACK
+                # seconds (nf/fps).
+                new_clips = _build_match_clip_specs(
+                    fps, _cf_lo, _cf_hi, long_target, m["f1"], m["f2"])
+                _ref = m.get("referee") or _referee_for(out_dir, match_name)
                 # Write a fresh, varied prompt for each new clip.
-                f1_hint = _fighter_desc_hint(m["f1"], char_descriptions)
-                f2_hint = _fighter_desc_hint(m["f2"], char_descriptions)
                 match_avoid = []
                 _focus_cycle = list(FIGHT_ACTION_FOCUS)
                 random.shuffle(_focus_cycle)
+                _ffi = 0
                 for i, c in enumerate(new_clips):
                     if _cancelled():
                         _cancel_done("⏹ cancelled — re-plan stopped (prompts unchanged)")
                         return
-                    shot = prompter.fight_shot(
-                        m["f1"], m["f2"], m["env_desc"],
-                        match_context=f"Match stage: {c['intensity']}. ",
-                        avoid=match_avoid,
-                        action_focus=_focus_cycle[i % len(_focus_cycle)])
-                    c["shot"] = shot
-                    c["prompt"] = (f"{f1_hint} vs {f2_hint} — {shot} "
-                                   f"— {_continuity_clause(m.get('env'))} "
-                                   f"— {FIGHT_PROMPT_SUFFIX}")
-                    match_avoid.append(shot[:60])
+                    _focus = ("" if c.get("role", "fight") != "fight"
+                              else _focus_cycle[_ffi % len(_focus_cycle)])
+                    if c.get("role", "fight") == "fight":
+                        _ffi += 1
+                    _fill_clip_prompt(prompter, c, m["f1"], m["f2"], m.get("env"),
+                                      m["env_desc"], char_descriptions, referee=_ref,
+                                      match_avoid=match_avoid, focus=_focus)
                     _prog(12 + int(84 * (i + 1) / max(1, len(new_clips))),
                           f"clip {i+1}/{len(new_clips)} prompt written")
                 m["clips"] = new_clips
@@ -4781,6 +4959,64 @@ def launch_web_ui(default_args):
                 _done(f"re-planned {len(new_clips)} clip(s) for {match_name} "
                       f"@ {fps}fps — now REGENERATE KEYFRAMES (the old ones match the "
                       f"previous prompts), THEN Re-render")
+                return
+
+            # ── Re-write ONLY one clip's prompt (text model) ───────────────────
+            # Rewrites a single clip's prompt in place (role-aware: entrance /
+            # face-off / fight), preserving the clip's frame budget and position.
+            # Nothing is rendered — afterwards regenerate that clip's keyframe and
+            # re-render it.
+            if scope == "clip-prompt":
+                m = next((x for x in fight_plan if x.get("match_name") == match_name), None)
+                if not m:
+                    _fail("match not found in prompts.json")
+                    return
+                try:
+                    idx = int(params.get("idx"))
+                except (TypeError, ValueError):
+                    _fail("clip index required")
+                    return
+                c = next((x for x in m.get("clips", []) if int(x["idx"]) == idx), None)
+                if not c:
+                    _fail("clip not found in prompts.json")
+                    return
+                _prog(8, "preparing text model…")
+                client = CoderAIClient(default_args.base_url,
+                                       getattr(default_args, "api_key", None))
+                text_model = None
+                if not getattr(default_args, "no_llm", False):
+                    try:
+                        text_model = pick_model(client, "text",
+                                                getattr(default_args, "text_model", None))
+                    except Exception as e:
+                        _log(f"  [clip-prompt] no text model ({e}); using template prompts")
+                        text_model = getattr(default_args, "text_model", None)
+                char_descriptions = _build_char_descriptions(out_dir)
+                prompter = PromptGenerator(client, text_model,
+                                           char_descriptions=char_descriptions)
+                _ref = m.get("referee") or _referee_for(out_dir, match_name)
+                # Steer a fight-clip rewrite away from this match's OTHER clip shots
+                # so the new prompt stays distinct from its neighbours.
+                _avoid = [str(x.get("shot"))[:60] for x in m.get("clips", [])
+                          if x is not c and x.get("shot")]
+                _focus = (random.choice(FIGHT_ACTION_FOCUS)
+                          if c.get("role", "fight") == "fight" else "")
+                _prog(40, f"rewriting clip {idx:02d} prompt…")
+                if _cancelled():
+                    _cancel_done("⏹ cancelled — clip prompt unchanged")
+                    return
+                _fill_clip_prompt(prompter, c, m["f1"], m["f2"], m.get("env"),
+                                  m["env_desc"], char_descriptions, referee=_ref,
+                                  match_avoid=_avoid, focus=_focus)
+                try:
+                    pf.write_text(json.dumps(
+                        {"fight_plan": fight_plan, "outcome_plan": outcome_plan,
+                         "fps": data.get("fps") or fps}, indent=2))
+                except Exception as e:
+                    _fail(f"could not save prompts.json: {e}")
+                    return
+                _done(f"rewrote clip {idx:02d} prompt for {match_name} — now "
+                      f"regenerate its keyframe (kf↻), then re-render it")
                 return
 
             # ── Re-plan ONLY this match's outcome prompts (text model) ──────────
@@ -4947,37 +5183,24 @@ def launch_web_ui(default_args):
                 _cf_lo, _cf_hi = _clip_frame_range(
                     getattr(default_args, "clip_min_frames", CLIP_MIN_FRAMES),
                     getattr(default_args, "clip_max_frames", CLIP_MAX_FRAMES))
-                new_clips, planned, ci = [], 0.0, 0
-                while planned < long_target:
-                    round_num = ci // 3 + 1
-                    intensity = ("early exchanges" if round_num == 1
-                                 else "midpoint battle" if round_num == 2
-                                 else "climactic final exchange")
-                    _nf = random.randint(_cf_lo, _cf_hi)
-                    new_clips.append({"idx": ci, "clip_seconds": round(_nf / max(1, fps), 2),
-                                      "nf": _nf, "intensity": intensity,
-                                      "shot": None, "prompt": None})
-                    planned += _nf / max(1, fps)
-                    ci += 1
-                f1_hint = _fighter_desc_hint(m["f1"], char_descriptions)
-                f2_hint = _fighter_desc_hint(m["f2"], char_descriptions)
+                new_clips = _build_match_clip_specs(
+                    fps, _cf_lo, _cf_hi, long_target, m["f1"], m["f2"])
+                _ref = m.get("referee") or _referee_for(out_dir, match_name)
                 match_avoid = []
                 _focus_cycle = list(FIGHT_ACTION_FOCUS)
                 random.shuffle(_focus_cycle)
+                _ffi = 0
                 for i, c in enumerate(new_clips):
                     if _cancelled():
                         _cancel_done("⏹ cancelled during prompt planning — nothing rendered")
                         return
-                    shot = prompter.fight_shot(
-                        m["f1"], m["f2"], m["env_desc"],
-                        match_context=f"Match stage: {c['intensity']}. ",
-                        avoid=match_avoid,
-                        action_focus=_focus_cycle[i % len(_focus_cycle)])
-                    c["shot"] = shot
-                    c["prompt"] = (f"{f1_hint} vs {f2_hint} — {shot} "
-                                   f"— {_continuity_clause(m.get('env'))} "
-                                   f"— {FIGHT_PROMPT_SUFFIX}")
-                    match_avoid.append(shot[:60])
+                    _focus = ("" if c.get("role", "fight") != "fight"
+                              else _focus_cycle[_ffi % len(_focus_cycle)])
+                    if c.get("role", "fight") == "fight":
+                        _ffi += 1
+                    _fill_clip_prompt(prompter, c, m["f1"], m["f2"], m.get("env"),
+                                      m["env_desc"], char_descriptions, referee=_ref,
+                                      match_avoid=match_avoid, focus=_focus)
                     _prog(4 + int(14 * (i + 1) / max(1, len(new_clips))),
                           f"clip {i+1}/{len(new_clips)} prompt written")
                 m["clips"] = new_clips
@@ -5072,13 +5295,27 @@ def launch_web_ui(default_args):
                     return
 
                 # ── Phase 4/4 — assemble the final short/long videos (last) ──────
-                _prog(94, "phase 4/4 — assembling final videos…")
+                _prog(90, "phase 4/4 — assembling final videos…")
                 st = float(m.get("short_target", 45))
                 lt = float(m.get("long_target", 70))
                 n_assembled = _reassemble_finals(vdir, match_name, st, lt)
+                # A whole-match regen finishes with a quality pass: 2× AI upscale and
+                # 2× frame interpolation of the final short/long assemblies and the
+                # outcome videos (the per-clip fight videos are left at base res).
+                _enh = 0
+                try:
+                    _prog(94, "phase 4/4 — upscaling ×2 + interpolating ×2 finals + outcomes…")
+                    _um = _upscale_model_for(default_args, 2) or None
+                    _im = (getattr(default_args, "interpolation_model", None) or None)
+                    _enh = _stage_enhance_videos(
+                        client, _um, vdir, [mm], match_outcomes,
+                        upscale=2, fps_mult=2, interpolation_model=_im)
+                except Exception as e:
+                    _log(f"  ⚠ enhance pass failed (finals left at base res): {e}")
                 _done(f"regenerated match {match_name} end to end — "
                       f"{len(mm['clips'])} clip(s), {len(match_outcomes)} outcome(s), "
-                      f"finals assembled from {n_assembled} clip(s)")
+                      f"finals assembled from {n_assembled} clip(s), "
+                      f"{_enh} video(s) upscaled ×2 + interpolated ×2")
                 return
 
             # ── Regenerate keyframes (image model) ─────────────────────────────
@@ -6802,14 +7039,15 @@ async function reMatch(ev, scope, params){
                 'keyframes-missing':'Generate only the MISSING keyframe images for this match (uses the image model)? Existing keyframes are kept; nothing is re-rendered.',
                 'keyframe':'Regenerate this keyframe image (uses the image model)? The clip video is NOT re-rendered — click Re-render afterwards.',
                 'replan':'Re-plan this match: rebuild its clip list and rewrite all clip prompts (frame budget from the Clip min/max frames settings). Only this match changes — other matches and outcomes are untouched. AFTERWARDS, in order: 1) Regenerate keyframes (the old keyframes match the PREVIOUS prompts and would anchor the video to the wrong image — causing static/low-motion clips), 2) Re-render all clips, 3) Reassemble finals.',
-                'replan-outcomes':'Rewrite ONLY this match\\'s outcome prompts (the finish + victory shots for win / ko / retire / draw). The fight-clip prompts are left untouched. AFTERWARDS regenerate the outcome keyframes, then re-render the outcomes.'};
+                'replan-outcomes':'Rewrite ONLY this match\\'s outcome prompts (the finish + victory shots for win / ko / retire / draw). The fight-clip prompts are left untouched. AFTERWARDS regenerate the outcome keyframes, then re-render the outcomes.',
+                'clip-prompt':'Rewrite ONLY this single clip\\'s prompt (text model). The other clips are untouched and nothing is rendered. AFTERWARDS regenerate this clip\\'s keyframe (kf↻), then Re-render it.'};
   const kf=(scope==='keyframes'||scope==='keyframe'||scope==='keyframes-missing');
   const kfMiss=(scope==='keyframes-missing');
-  const isReplan=(scope==='replan'||scope==='replan-outcomes');
+  const isReplan=(scope==='replan'||scope==='replan-outcomes'||scope==='clip-prompt');
   const isFull=(scope==='full');
   if(!(await uiConfirm(labels[scope]||'Proceed?',
-       {title:(isFull?'Regenerate whole match':(isReplan?'Re-plan match prompts':(kfMiss?'Generate missing keyframes':(kf?'Regenerate keyframes':'Regenerate')))),
-        okText:(isFull?'Regenerate match':(scope==='reassemble'?'Reassemble':(isReplan?'Re-plan':(kfMiss?'Generate missing':(kf?'Regenerate':'Re-render'))))),
+       {title:(isFull?'Regenerate whole match':(scope==='clip-prompt'?'Rewrite clip prompt':(isReplan?'Re-plan match prompts':(kfMiss?'Generate missing keyframes':(kf?'Regenerate keyframes':'Regenerate'))))),
+        okText:(isFull?'Regenerate match':(scope==='reassemble'?'Reassemble':(scope==='clip-prompt'?'Rewrite prompt':(isReplan?'Re-plan':(kfMiss?'Generate missing':(kf?'Regenerate':'Re-render')))))),
         danger:(scope!=='reassemble'&&!kf&&!isReplan)})))return;
   const stEl=_findStatus(ev);
   const setSt=(c,t)=>{ if(stEl){ stEl.style.color=c; stEl.textContent=t; } };
@@ -7242,6 +7480,8 @@ function pollNewMatch(jobId, st){
                 f'  <div class=hint style="display:flex;justify-content:space-between;align-items:center">'
                 f'<span>clip {idx:02d}</span>'
                 f'<span>'
+                f'<a href="#" style="color:#9fdca0" title="Rewrite ONLY this clip\'s prompt (text model). Afterwards regenerate its keyframe and re-render." '
+                f'onclick="reMatch(event,\'clip-prompt\',{{match:\'{_esc(name)}\',idx:\'{idx}\'}})">prompt↻</a> '
                 f'<a href="#" style="color:#c79bf0" title="Regenerate this keyframe (image model)" '
                 f'onclick="reMatch(event,\'keyframe\',{{match:\'{_esc(name)}\',idx:\'{idx}\'}})">kf↻</a> '
                 f'<a href="#" style="color:#7eb8f7" '
@@ -8283,7 +8523,7 @@ async function resetPrompts(ev){
                 if scope not in ("full", "match-clips", "clip", "reassemble", "outcomes",
                                  "outcome", "enhance", "keyframes",
                                  "keyframes-missing", "keyframe", "replan",
-                                 "replan-outcomes"):
+                                 "replan-outcomes", "clip-prompt"):
                     self._send(400, "application/json",
                                _j.dumps({"error": "invalid scope"}))
                     return
