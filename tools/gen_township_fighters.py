@@ -378,20 +378,32 @@ FIGHT_PROMPT_SUFFIX = ("African township free fight, fast-paced, rapid explosive
                        "reverses, rewinds or loops back, cinematic, consistent "
                        "characters, wardrobe and setting")
 
-# Pre-fight intro clips: the OPENING of a match is NOT a fight — two solo fighter
-# entrances followed by a stare-down where the referee signals the start. These
-# carry a non-fight suffix so the model doesn't start throwing strikes early.
-INTRO_PROMPT_SUFFIX = ("African township fight night, cinematic, dramatic, scenic, "
-                       "atmospheric, consistent characters, wardrobe and setting, "
-                       "tension before the fight, NO punches or kicks thrown yet")
+# Pre-fight intro clips: the OPENING of a match — two solo fighter entrances
+# followed by a stare-down where the referee signals the start. The ENTRANCE is
+# explosive and threatening (the fighter charges in galvanized, shadow-boxing the
+# air, ready to fight) but there is NO opponent and no blow LANDS; the FACE-OFF is
+# a tense stare-down where the referee launches the bout, no strikes landed yet.
+ENTRANCE_PROMPT_SUFFIX = ("African township fight night entrance, explosive kinetic "
+                          "motion, fierce and threatening, galvanized for victory, "
+                          "pumped up and ready to fight, fast dynamic action, "
+                          "cinematic, consistent character, wardrobe and setting, "
+                          "shadow-boxing the air with no opponent present")
+
+FACEOFF_PROMPT_SUFFIX = ("African township fight night, cinematic, dramatic, intense "
+                         "menacing stare-down, the referee signalling the START, "
+                         "consistent characters, wardrobe and setting, tension before "
+                         "the fight, no strikes landed yet")
+
+# Back-compat alias (older saved data / external callers may reference it).
+INTRO_PROMPT_SUFFIX = ENTRANCE_PROMPT_SUFFIX
 
 ENTRANCE_SHOT_TEMPLATES = [
-    "striding into the arena through a parting roaring crowd, arms raised and chin high, slow heroic low-angle push-in through dust and spotlight haze",
-    "bursting onto the scene pounding their own chest and roaring at the crowd, sweeping crane shot rising over the packed yard",
-    "stalking in slowly, cracking their knuckles and rolling their shoulders with a menacing glare into the lens, tight dramatic push-in",
-    "leaping down off a low wall into the fighting ground and throwing their arms wide to the screaming crowd, dynamic dropping crane shot",
-    "marching through smoke and fire-barrel glow shadow-boxing a few sharp strikes, kinetic tracking shot circling the entrance",
-    "emerging from the crowd with a slow swagger and pointing to the centre of the ground, golden dusk backlight, sweeping orbit",
+    "storming into the arena throwing a blistering flurry of shadow-boxing punches at the air, roaring and snarling at the screaming crowd, fast low-angle tracking push-in through dust and spotlight haze",
+    "charging in and skidding to a stop, pounding their own chest and unleashing a savage shout, eyes blazing with fury, kinetic whip-pan circling the explosive entrance",
+    "bouncing on the balls of their feet firing rapid jab-cross combinations and a high roundhouse kick into the air, fierce galvanized glare into the lens, dynamic orbiting camera",
+    "vaulting over a barrier into the fighting ground, fists pumping, baring teeth and slamming a fist into an open palm, dramatic dropping crane shot, crowd erupting",
+    "stalking in fast through smoke and fire-barrel glow, cracking their neck and knuckles then snapping off a sharp spinning back-kick at the air, menacing snarl, tight handheld push-in",
+    "sprinting in and leaping off a low wall into a shadow-boxed flying knee, landing in a fighting stance with a ferocious roar, sweeping kinetic crane shot over the packed yard",
 ]
 
 FACEOFF_SHOT_TEMPLATES = [
@@ -457,13 +469,30 @@ FIGHT_ACTION_FOCUS = [
     "a defensive sequence — duck, roll, kip-up — then a savage acrobatic counter back to offence — reverse-angle reveal of the counter",
 ]
 
+# Bold MOVING-CAMERA directives. A static keyframe tends to lock the I2V camera,
+# so for a subset of clips one of these is stated PROMINENTLY at the FRONT of the
+# prompt (where the model weights it most) to force real camera movement through
+# the environment instead of a fixed, locked-off frame.
+CAMERA_MOVES = [
+    "The camera sweeps in a fast 360-degree orbit around the fighters",
+    "A sweeping crane shot rises and booms up high over the action",
+    "The camera rushes in with a rapid dolly push-in toward the fighters",
+    "A fast tracking shot races alongside the fighters as they move",
+    "The camera whip-pans hard across the scene following the action",
+    "A low Steadicam glides and weaves through the environment around the fighters",
+    "The camera arcs around the fighters in a dramatic circular dolly move",
+    "An aggressive handheld camera pushes, shakes and weaves through the brawl",
+    "A drone-style camera swoops down through the environment toward the fighters",
+    "The camera cranes down low then pulls back wide revealing the whole arena",
+]
+
 # The decisive FINISH that ends the bout — the first clip of every outcome video.
 # Keyed by outcome; the victory celebration is in WIN_SHOT_TEMPLATES.
 FINISH_SHOT_TEMPLATES = {
     "win": [
-        "unloading a final overwhelming flurry, the opponent reeling against the ropes as the bell saves them",
-        "pinning the exhausted opponent down with relentless ground-and-pound until the final horn",
-        "landing the last clean, dominant combination that seals the decision, opponent backpedalling",
+        "the final bell ringing as both fighters, exhausted and still on their feet, lower their fists — the bout going the full distance to a points decision, no knockout",
+        "trading one last measured exchange as the horn sounds with both still standing and spent, the contest headed to the judges' scorecards",
+        "the closing seconds ticking down, both fighters upright, bloodied and breathing hard, the fight decided on points rather than a finish",
     ],
     "ko_win": [
         "detonating one final brutal knockout blow, the opponent going stiff and crashing face-first to the ground",
@@ -486,9 +515,9 @@ FINISH_SHOT_TEMPLATES = {
 # the winning fighter and the referee raising their arm.
 WIN_SHOT_TEMPLATES = {
     "win": [
-        "the lone winner center-frame as the referee grabs their wrist and thrusts their arm to the sky, crowd surging",
-        "the victor dropping to their knees then rising as the referee lifts their arm, sweat and blood glistening",
-        "the winner pointing to the roaring crowd before the referee hoists their arm high in triumph",
+        "the referee checking the scorecard then stepping in and raising the winner's arm as the points-decision victor, crowd surging",
+        "the referee announcing the judges' decision and thrusting the winner's wrist to the sky as the points winner, sweat and blood glistening",
+        "the referee lifting the winner's arm high after the points decision as the victor nods to the roaring crowd",
     ],
     "ko_win": [
         "the winner roaring with both fists raised as the referee lifts their arm in victory, crowd going wild",
@@ -501,9 +530,9 @@ WIN_SHOT_TEMPLATES = {
         "the winner standing tall as the referee grabs their wrist and thrusts their arm to the sky",
     ],
     "draw": [
-        "the referee stepping between both fighters and raising BOTH their arms simultaneously, both bloodied and spent",
-        "the two exhausted warriors clasping hands as the referee lifts both their arms, crowd applauding the war",
-        "both men nodding in grudging respect as the referee raises both their arms to a roaring crowd",
+        "all THREE in frame — both bloodied fighters side by side with the referee standing between them, the referee gripping a wrist of each and thrusting BOTH fighters' fists high to the sky at once, declaring a draw",
+        "both exhausted fighters and the referee together in shot, the referee raising BOTH fighters' arms simultaneously to signal a draw, the two warriors spent, the crowd applauding the war",
+        "the referee between the two fighters lifting BOTH their fists overhead at the same time as the crowd roars, all three figures clearly in frame, an honourable draw",
     ],
 }
 
@@ -1086,7 +1115,7 @@ Return ONLY the prompt, no quotes or explanation."""
 _LLM_INTRO_SYSTEM = """\
 You are a creative director writing vivid 18-32 word video-generation prompts for the DRAMATIC OPENING of an African township fight night — BEFORE any fighting starts.
 You write ONE of these shot types at a time (the user says which):
-  • an ENTRANCE — ONE fighter ALONE making a bold, scenic, dramatic entrance into the arena: striding or bursting in, playing to the roaring crowd, flexing or shadow-boxing, glaring at the camera. NO opponent in frame and NO actual fighting. Make it a hero shot with a kinetic camera move (low-angle push-in, sweeping crane, orbit) and rich atmosphere (dust, smoke, fire-barrel glow, spotlights).
+  • an ENTRANCE — ONE fighter ALONE EXPLODING into the arena, fierce, threatening and galvanized for victory, pumped up and ready to fight: charging or storming in, throwing fast shadow-boxing punches, kicks or knees AT THE AIR, pounding their chest, roaring and snarling, bouncing on their toes, flexing, glaring savagely into the camera. The motion must be FAST, kinetic and aggressive — never calm or static — but there is NO opponent in frame and no blow LANDS on anyone (they fight the air). Use a dynamic camera move (fast low-angle tracking push-in, whip-pan, sweeping crane, orbit) and rich atmosphere (dust, smoke, fire-barrel glow, spotlights).
   • a FACE-OFF — BOTH fighters squaring off face to face in a tense menacing stare-down, with the REFEREE between them giving the gesture to START the fight (chopping or dropping a hand, sweeping an arm). Show the tension and the referee's start signal explicitly. Still NO punches or kicks thrown yet.
 Always refer to each fighter (and the referee) by their NAME given in the user message.
 WARDROBE + LOCATION CONTINUITY (critical): keep each fighter in the IDENTICAL outfit (same garments, exact colours, hair, accessories) described, in the SAME township location with consistent background, surfaces, lighting and crowd.
@@ -1189,7 +1218,7 @@ class PromptGenerator:
 
         if self.model:
             finish_labels = {
-                "win": f"the FINISH — {fighter} ending the bout with a final overwhelming flurry as {opp} is overwhelmed",
+                "win": f"the FINISH (a POINTS decision, NOT a knockout) — the final bell rings with both {fighter} and {opp} still on their feet, exhausted and spent, the bout having gone the full distance to be decided on the judges' scorecards",
                 "ko_win": f"the FINISH — {fighter} landing the brutal knockout blow that drops {opp} unconscious to the ground",
                 "retire": f"the FINISH — {opp} backing away, turning their back and walking off to retire, refusing to continue, while {fighter} stands tall",
                 "draw": f"the FINISH — a final all-out exchange where {fighter} and {opp} trade brutal blows to the last second",
@@ -1197,10 +1226,10 @@ class PromptGenerator:
             # Victory clip features ONLY the winner + referee (no opponent) — except
             # a draw, which raises both fighters' arms.
             victory_labels = {
-                "win": f"the VICTORY — {fighter} alone in frame as the referee raises {fighter}'s arm as the winner, crowd roaring",
+                "win": f"the VICTORY (a POINTS decision) — the referee checks the scorecard then raises {fighter}'s arm as the points-decision winner, {fighter} alone in frame, crowd roaring",
                 "ko_win": f"the VICTORY — {fighter} celebrating with fists raised as the referee raises {fighter}'s arm, crowd going wild",
                 "retire": f"the VICTORY — the referee raising {fighter}'s arm in victory as {fighter} salutes the crowd",
-                "draw": f"the VICTORY — the referee raising BOTH {fighter}'s and {opp}'s arms after an even, brutal war",
+                "draw": f"the VICTORY (a DRAW) — ALL THREE in frame: {fighter} and {opp} side by side with the REFEREE standing between them, the referee gripping a wrist of each and thrusting BOTH {fighter}'s and {opp}'s fists high to the sky at once to declare the draw",
             }
             labels = finish_labels if is_finish else victory_labels
             _avoid = used[-2:]
@@ -2101,6 +2130,13 @@ def _compose_kf_prompt(base_prompt: str, fighters: list, env: str,
     to prevent (per-keyframe colour stability comes from reusing the SAME locked
     wardrobe string everywhere, not from telling the model "same")."""
     kf = base_prompt or ""
+    # A camera-motion clip's prompt leads with a moving-camera directive ("Bold
+    # moving camera — …. ") that is meaningless for a STILL keyframe and can induce
+    # motion blur — strip it so the keyframe composes a clean, sharp anchor frame.
+    if kf.startswith("Bold moving camera —"):
+        _dot = kf.find(". ")
+        if _dot != -1:
+            kf = kf[_dot + 2:]
     worn = [(n, outfits[n]) for n in fighters if outfits.get(n)]
     if worn:
         wardrobe = "; ".join(f"{n} wearing {o}" for n, o in worn)
@@ -2222,16 +2258,21 @@ def _build_match_clip_specs(fps: int, cf_lo: int, cf_hi: int,
                       "fighters": list(_who), "shot": None, "prompt": None})
         ci += 1
     planned = 0.0
+    _fight_ord = 0
     while planned < long_target:
         round_num = (ci - 3) // 3 + 1
         intensity = ("early exchanges" if round_num == 1
                      else "midpoint battle" if round_num == 2
                      else "climactic final exchange")
         nf = random.randint(cf_lo, cf_hi)
+        # Every other fight clip is a CAMERA-MOTION clip (a bold moving-camera shot
+        # through the environment) so a match isn't all locked-off frames.
         specs.append({"idx": ci, "clip_seconds": round(nf / max(1, fps), 2),
                       "nf": nf, "role": "fight", "intensity": intensity,
+                      "camera": (_fight_ord % 2 == 1),
                       "shot": None, "prompt": None})
         planned += nf / max(1, fps)
+        _fight_ord += 1
         ci += 1
     return specs
 
@@ -2286,13 +2327,13 @@ def _fill_clip_prompt(prompter, c: dict, f1: str, f2: str, env, env_desc: str,
         shot = prompter.intro_shot("entrance", who, env_desc=env_desc)
         hint = _fighter_desc_hint(who, char_descriptions)
         c["shot"] = shot
-        c["prompt"] = f"{hint} — {shot} — {cont} — {INTRO_PROMPT_SUFFIX}"
+        c["prompt"] = f"{hint} — {shot} — {cont} — {ENTRANCE_PROMPT_SUFFIX}"
     elif role == "faceoff":
         shot = prompter.intro_shot("faceoff", f1, f2, env_desc=env_desc, referee=referee)
         h1 = _fighter_desc_hint(f1, char_descriptions)
         h2 = _fighter_desc_hint(f2, char_descriptions)
         c["shot"] = shot
-        c["prompt"] = f"{h1} vs {h2} — {shot} — {cont} — {INTRO_PROMPT_SUFFIX}"
+        c["prompt"] = f"{h1} vs {h2} — {shot} — {cont} — {FACEOFF_PROMPT_SUFFIX}"
     else:
         shot = prompter.fight_shot(
             f1, f2, env_desc,
@@ -2301,7 +2342,20 @@ def _fill_clip_prompt(prompter, c: dict, f1: str, f2: str, env, env_desc: str,
         h1 = _fighter_desc_hint(f1, char_descriptions)
         h2 = _fighter_desc_hint(f2, char_descriptions)
         c["shot"] = shot
-        c["prompt"] = f"{h1} vs {h2} — {shot} — {cont} — {FIGHT_PROMPT_SUFFIX}"
+        # Camera-motion clips lead with a bold moving-camera directive so the I2V
+        # model actually moves the camera through the scene instead of locking off.
+        # Legacy/un-flagged clips get a camera decision assigned here (and persisted)
+        # so regenerating their prompt can add motion to an older match too.
+        is_cam = c.get("camera")
+        if is_cam is None:
+            is_cam = (random.random() < 0.5)
+            c["camera"] = is_cam
+        if is_cam:
+            move = random.choice(CAMERA_MOVES)
+            c["prompt"] = (f"Bold moving camera — {move}. {h1} vs {h2} — {shot} "
+                           f"— {cont} — {FIGHT_PROMPT_SUFFIX}")
+        else:
+            c["prompt"] = f"{h1} vs {h2} — {shot} — {cont} — {FIGHT_PROMPT_SUFFIX}"
         if match_avoid is not None:
             match_avoid.append(shot[:60])
     return c["shot"]
@@ -5151,6 +5205,64 @@ def launch_web_ui(default_args):
                       f"re-render the outcomes")
                 return
 
+            # ── Re-write ONLY one outcome's prompts (text model) ───────────────
+            # Rewrites a single outcome's finish + victory shots in place, leaving
+            # the other outcomes and the fight clips untouched. Nothing is rendered —
+            # afterwards regenerate that outcome's keyframes and re-render it.
+            if scope == "outcome-prompt":
+                m = next((x for x in fight_plan if x.get("match_name") == match_name), None)
+                if not m:
+                    _fail("match not found in prompts.json")
+                    return
+                fr, oc = params.get("fighter"), params.get("outcome")
+                if not fr or not oc:
+                    _fail("fighter and outcome required")
+                    return
+                o = next((x for x in outcome_plan
+                          if x.get("fighter") == fr and x.get("outcome") == oc
+                          and (x.get("match_name") in (None, match_name))), None)
+                if not o:
+                    _fail("outcome not found in prompts.json")
+                    return
+                _prog(8, "preparing text model…")
+                client = CoderAIClient(default_args.base_url,
+                                       getattr(default_args, "api_key", None))
+                text_model = None
+                if not getattr(default_args, "no_llm", False):
+                    try:
+                        text_model = pick_model(client, "text",
+                                                getattr(default_args, "text_model", None))
+                    except Exception as e:
+                        _log(f"  [outcome-prompt] no text model ({e}); using templates")
+                        text_model = getattr(default_args, "text_model", None)
+                char_descriptions = _build_char_descriptions(out_dir)
+                prompter = PromptGenerator(client, text_model,
+                                           char_descriptions=char_descriptions)
+                if _cancelled():
+                    _cancel_done("⏹ cancelled — outcome prompt unchanged")
+                    return
+                # Keep the outcome in the match's current location.
+                if m.get("env"):
+                    o["env"] = m.get("env")
+                    o["env_desc"] = m.get("env_desc", o.get("env_desc"))
+                _opp = m.get("f2") if o.get("fighter") == m.get("f1") else m.get("f1")
+                _prog(40, f"rewriting {fr} {oc} prompts…")
+                try:
+                    _plan_outcome_shots(prompter, o, char_descriptions, _opp)
+                except Exception as e:
+                    _fail(f"could not rewrite outcome prompts: {e}")
+                    return
+                try:
+                    pf.write_text(json.dumps(
+                        {"fight_plan": fight_plan, "outcome_plan": outcome_plan,
+                         "fps": data.get("fps") or fps}, indent=2))
+                except Exception as e:
+                    _fail(f"could not save prompts.json: {e}")
+                    return
+                _done(f"rewrote {fr} {oc} outcome prompts for {match_name} — now "
+                      f"regenerate its keyframes (kf↻), then re-render it")
+                return
+
             # ── Render scopes: need the video model + consistency settings ─────
             client = CoderAIClient(default_args.base_url,
                                    getattr(default_args, "api_key", None))
@@ -6983,15 +7095,31 @@ function _pollJob(jobId, setSt){
   setTimeout(poll,900);
 }
 function _esch(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-function _renderMatchBars(wrap, d, jobId){
+// Short, friendly name for a queued/running match job (by scope) so the queue
+// list reads "Whole match", "All clips", etc. instead of raw scope tokens.
+function _jobScopeLabel(j){
+  const m={'full':'Whole match','match-clips':'All clips','clip':'One clip',
+    'clip-prompt':'Clip prompt','outcomes':'All outcomes','outcome':'One outcome',
+    'outcome-prompt':'Outcome prompt',
+    'keyframes':'All keyframes','keyframes-missing':'Missing keyframes',
+    'keyframe':'One keyframe','replan':'Re-plan prompts',
+    'replan-outcomes':'Outcome prompts','reassemble':'Reassemble','enhance':'Enhance'};
+  return m[(j&&j.scope)||'']||((j&&j.scope)||'task');
+}
+function _renderMatchBars(wrap, d, jobId, queued){
   if(!wrap) return;
   const pct=d.progress||0;
-  const canCancel=(d.status==='running' && d.cancellable && jobId);
+  const qn=(queued&&queued.length)||0;
+  const total=1+qn;
+  // The cancel button stops the WHOLE queue (running job + everything waiting),
+  // so allow it whether this job is running or just queued.
+  const canCancel=((d.status==='running'||d.status==='queued') && d.cancellable && jobId);
+  const cancelLabel=total>1?('⏹ Cancel all ('+total+')'):'⏹ Cancel';
   // No inline onclick (its nested quotes are mangled by the server-side string
   // emit) — the handler is attached after innerHTML below.
   const cancelBtn=canCancel
     ? '<button class="btn btn-danger" id="cancel-'+jobId+'" '
-      +'style="font-size:.72rem;padding:.15rem .6rem;float:right">⏹ Cancel</button>'
+      +'style="font-size:.72rem;padding:.15rem .6rem;float:right">'+cancelLabel+'</button>'
     : '';
   const head=(d.status==='queued')?_esch(d._msg||'⏳ queued…'):('Overall — '+pct+'%');
   let h='<div class=prg-global><div class=prg-label>'+cancelBtn+head+'</div>'
@@ -7022,11 +7150,23 @@ function _renderMatchBars(wrap, d, jobId){
     }
     h+='</div>';
   }
+  // Show what is waiting behind the running job (serialised server-side) so the
+  // queue is visible, not just a count.
+  if(queued && queued.length){
+    h+='<div class=prg-items style="margin-top:.5rem">'
+      +'<div class=prg-label style="opacity:.85">Queued ('+queued.length+')</div>';
+    for(const q of queued){
+      h+='<div class=prg-item><div class=prg-ilabel>⏳ '+_esch(_jobScopeLabel(q))
+        +' — '+_esch(q._msg||'queued…')+'</div>'
+        +'<div class=progress-bar><div class="progress-fill striped" style="width:100%"></div></div></div>';
+    }
+    h+='</div>';
+  }
   wrap.innerHTML=h;
   wrap.classList.remove('hidden');
   if(canCancel){
     const cb=document.getElementById('cancel-'+jobId);
-    if(cb) cb.onclick=()=>cancelJob(jobId);
+    if(cb) cb.onclick=()=>cancelAll();
   }
 }
 // Detail-page poller: drives the text status AND the visual progress bars.
@@ -7054,6 +7194,43 @@ function _pollMatchBars(jobId, setSt, wrap){
 // Jobs are serialised server-side so only one runs at a time; this just reflects
 // that single source of truth.
 let _matchMonOn=false;
+const _cardMon=new Set();
+// Matches-LIST page: ONE monitor per match card (instead of one poller per job,
+// which made a card's status blink between the running job and its queued ones).
+// Reads /active-jobs, shows the running job's progress + how many are queued for
+// that match, and reloads the list when the match's jobs all finish.
+function startMatchCardMonitor(match){
+  if(!match || _cardMon.has(match)) return;
+  _cardMon.add(match);
+  const card=document.querySelector('.match-card[data-match="'+match+'"]');
+  const stEl=card?card.querySelector('.match-status'):null;
+  if(!stEl){ _cardMon.delete(match); return; }
+  const setSt=(c,t)=>{ stEl.style.color=c; stEl.textContent=t; };
+  let sawActive=false;
+  const tick=async()=>{
+    let data;
+    try{ data=await (await fetch('/active-jobs')).json(); }
+    catch(e){ setTimeout(tick,2500); return; }
+    const mine=(data.jobs||[]).filter(j=>j.jtype==='match' && (j.match||'')===match);
+    const running=mine.find(j=>j.status==='running');
+    const queued=mine.filter(j=>j.status==='queued');
+    if(running){
+      sawActive=true;
+      let t='⏳ '+(running._msg||'rendering…')+' ('+(running.progress||0)+'%)';
+      if(queued.length) t+=' · '+queued.length+' queued';
+      setSt('#7ea8f7',t);
+      setTimeout(tick,1500);
+    } else if(queued.length){
+      sawActive=true;
+      setSt('#7ea8f7','⏳ queued — '+queued.length+' waiting to start…');
+      setTimeout(tick,1500);
+    } else {
+      _cardMon.delete(match);
+      if(sawActive){ setSt('#7ed87e','✓ done — reloading…'); setTimeout(()=>location.reload(),1400); }
+    }
+  };
+  setTimeout(tick,300);
+}
 function startMatchMonitor(match, setSt){
   if(_matchMonOn) return;
   _matchMonOn=true;
@@ -7068,14 +7245,15 @@ function startMatchMonitor(match, setSt){
     const queued=mine.filter(j=>j.status==='queued');
     if(running){
       sawActive=true;
-      if(wrap){ wrap.classList.remove('hidden'); _renderMatchBars(wrap, running, running.job_id); }
+      if(wrap){ wrap.classList.remove('hidden'); _renderMatchBars(wrap, running, running.job_id, queued); }
       let t='⏳ '+(running._msg||'working…')+' ('+(running.progress||0)+'%)';
       if(queued.length) t+=' · '+queued.length+' queued';
       if(setSt) setSt('#7ea8f7',t);
       setTimeout(tick,1200);
     } else if(queued.length){
       sawActive=true;
-      if(wrap){ wrap.classList.remove('hidden'); _renderMatchBars(wrap, queued[0], queued[0].job_id); }
+      // Nothing running yet: show the first queued job's bars + the rest behind it.
+      if(wrap){ wrap.classList.remove('hidden'); _renderMatchBars(wrap, queued[0], queued[0].job_id, queued.slice(1)); }
       if(setSt) setSt('#7ea8f7','⏳ queued — '+queued.length+' waiting to start…');
       setTimeout(tick,1200);
     } else {
@@ -7096,6 +7274,18 @@ async function cancelJob(jobId){
        body:'job_id='+encodeURIComponent(jobId)}); }
   catch(e){ if(b){ b.disabled=false; b.textContent='⏹ Cancel'; } }
 }
+// Cancel the WHOLE generation queue: the running job stops after its current
+// item and every queued job is skipped. Used by the progress cancel button.
+async function cancelAll(){
+  document.querySelectorAll('button[id^="cancel-"]').forEach(b=>{
+    b.disabled=true; b.textContent='⏹ Stopping queue…'; });
+  try{ await fetch('/job/cancel-all',{method:'POST',
+       headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:''}); }
+  catch(e){
+    document.querySelectorAll('button[id^="cancel-"]').forEach(b=>{
+      b.disabled=false; b.textContent='⏹ Cancel'; });
+  }
+}
 async function reMatch(ev, scope, params){
   if(ev) ev.preventDefault();
   const labels={'full':'Regenerate this ENTIRE match end to end — re-plan all prompts, regenerate every keyframe, re-render all clips + outcomes, then reassemble the finals. Uses the text, image AND video models, so this is the slowest action. Other matches are untouched; the existing prompts, keyframes and clips for this match are replaced.',
@@ -7109,14 +7299,16 @@ async function reMatch(ev, scope, params){
                 'keyframe':'Regenerate this keyframe image (uses the image model)? The clip video is NOT re-rendered — click Re-render afterwards.',
                 'replan':'Re-plan this match: rebuild its clip list and rewrite all clip prompts (frame budget from the Clip min/max frames settings). Only this match changes — other matches and outcomes are untouched. AFTERWARDS, in order: 1) Regenerate keyframes (the old keyframes match the PREVIOUS prompts and would anchor the video to the wrong image — causing static/low-motion clips), 2) Re-render all clips, 3) Reassemble finals.',
                 'replan-outcomes':'Rewrite ONLY this match\\'s outcome prompts (the finish + victory shots for win / ko / retire / draw). The fight-clip prompts are left untouched. AFTERWARDS regenerate the outcome keyframes, then re-render the outcomes.',
-                'clip-prompt':'Rewrite ONLY this single clip\\'s prompt (text model). The other clips are untouched and nothing is rendered. AFTERWARDS regenerate this clip\\'s keyframe (kf↻), then Re-render it.'};
+                'clip-prompt':'Rewrite ONLY this single clip\\'s prompt (text model). The other clips are untouched and nothing is rendered. AFTERWARDS regenerate this clip\\'s keyframe (kf↻), then Re-render it.',
+                'outcome-prompt':'Rewrite ONLY this single outcome\\'s prompts (its finish + victory shots, text model). The other outcomes and the fight clips are untouched and nothing is rendered. AFTERWARDS regenerate this outcome\\'s keyframes (kf↻), then Re-render it.'};
   const kf=(scope==='keyframes'||scope==='keyframe'||scope==='keyframes-missing');
   const kfMiss=(scope==='keyframes-missing');
-  const isReplan=(scope==='replan'||scope==='replan-outcomes'||scope==='clip-prompt');
+  const isReplan=(scope==='replan'||scope==='replan-outcomes'||scope==='clip-prompt'||scope==='outcome-prompt');
+  const isPrompt=(scope==='clip-prompt'||scope==='outcome-prompt');
   const isFull=(scope==='full');
   if(!(await uiConfirm(labels[scope]||'Proceed?',
-       {title:(isFull?'Regenerate whole match':(scope==='clip-prompt'?'Rewrite clip prompt':(isReplan?'Re-plan match prompts':(kfMiss?'Generate missing keyframes':(kf?'Regenerate keyframes':'Regenerate'))))),
-        okText:(isFull?'Regenerate match':(scope==='reassemble'?'Reassemble':(scope==='clip-prompt'?'Rewrite prompt':(isReplan?'Re-plan':(kfMiss?'Generate missing':(kf?'Regenerate':'Re-render')))))),
+       {title:(isFull?'Regenerate whole match':(isPrompt?'Rewrite prompt':(isReplan?'Re-plan match prompts':(kfMiss?'Generate missing keyframes':(kf?'Regenerate keyframes':'Regenerate'))))),
+        okText:(isFull?'Regenerate match':(scope==='reassemble'?'Reassemble':(isPrompt?'Rewrite prompt':(isReplan?'Re-plan':(kfMiss?'Generate missing':(kf?'Regenerate':'Re-render')))))),
         danger:(scope!=='reassemble'&&!kf&&!isReplan)})))return;
   const stEl=_findStatus(ev);
   const setSt=(c,t)=>{ if(stEl){ stEl.style.color=c; stEl.textContent=t; } };
@@ -7246,6 +7438,10 @@ async function resumeMatchJobs(){
   const det=document.getElementById('detail');
   const detMatch=det?det.getAttribute('data-match'):null;
   let monStarted=false;
+  // Collect the distinct matches that have jobs so the LIST page starts exactly
+  // ONE monitor per card (not one poller per job → no blinking between the
+  // running job and its queued siblings).
+  const cardMatches=new Set();
   for(const j of (data.jobs||[])){
     if(j.jtype!=='match') continue;
     if(det && detMatch===j.match){
@@ -7255,17 +7451,11 @@ async function resumeMatchJobs(){
       const stEl=document.getElementById('detail-status');
       const setSt=(c,t)=>{ if(stEl){ stEl.style.color=c; stEl.textContent=t; } };
       startMatchMonitor(detMatch, setSt);
-    } else {
-      const card=document.querySelector('.match-card[data-match="'+(j.match||'')+'"]');
-      if(!card) continue;
-      const stEl=card.querySelector('.match-status');
-      if(!stEl) continue;
-      const setSt=(c,t)=>{ stEl.style.color=c; stEl.textContent=t; };
-      setSt('#7ea8f7', j.status==='queued'?(j._msg||'⏳ queued…')
-                       :('⏳ '+(j._msg||'rendering…')+' ('+(j.progress||0)+'%)'));
-      _pollJob(j.job_id, setSt);
+    } else if(j.match){
+      cardMatches.add(j.match);
     }
   }
+  for(const mm of cardMatches) startMatchCardMonitor(mm);
 }
 document.addEventListener('DOMContentLoaded', resumeMatchJobs);
 </script>"""
@@ -7598,6 +7788,8 @@ function pollNewMatch(jobId, st){
                 f'  <div class=hint style="display:flex;justify-content:space-between;align-items:center">'
                 f'<span>{_esc(oc)}</span>'
                 f'<span>'
+                f'<a href="#" style="color:#9fdca0" title="Rewrite ONLY this outcome\'s prompts (finish + victory shots, text model). Afterwards regenerate its keyframes and re-render." '
+                f'onclick="reMatch(event,\'outcome-prompt\',{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\',outcome:\'{_esc(oc)}\'}})">prompt↻</a> '
                 f'<a href="#" style="color:#c79bf0" title="Regenerate this keyframe (image model)" '
                 f'onclick="reMatch(event,\'keyframe\',{{match:\'{_esc(name)}\',fighter:\'{_esc(fr)}\',outcome:\'{_esc(oc)}\'}})">kf↻</a> '
                 f'<a href="#" style="color:#7eb8f7" '
@@ -8352,6 +8544,31 @@ async function resetPrompts(ev){
                 self._send(200, "application/json", _j.dumps({"ok": True}))
                 return
 
+            if path == "/job/cancel-all":
+                # Cancel the WHOLE generation queue, not just the active job: flag the
+                # running job to stop after its current item AND every job still
+                # waiting in the queue so the worker skips them. Optionally scoped to
+                # one match (`match` form field); with no match, cancels everything.
+                import json as _j
+                clen = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(clen) if clen else b""
+                form = dict(urllib.parse.parse_qsl(raw.decode(errors="replace")))
+                only_match = (form.get("match") or "").strip()
+                n = 0
+                with _jobs_lock:
+                    for j in _state["jobs"].values():
+                        if j.get("status") not in ("running", "queued"):
+                            continue
+                        if only_match and (j.get("match") or "") != only_match:
+                            continue
+                        j["cancel"] = True
+                        j["_msg"] = ("⏹ cancelling — finishing the current item…"
+                                     if j.get("status") == "running"
+                                     else "⏹ cancelled — will be skipped")
+                        n += 1
+                self._send(200, "application/json", _j.dumps({"ok": True, "cancelled": n}))
+                return
+
             if path == "/profile/regenerate":
                 import json as _j, uuid as _u
                 clen = int(self.headers.get("Content-Length", 0))
@@ -8592,7 +8809,7 @@ async function resetPrompts(ev){
                 if scope not in ("full", "match-clips", "clip", "reassemble", "outcomes",
                                  "outcome", "enhance", "keyframes",
                                  "keyframes-missing", "keyframe", "replan",
-                                 "replan-outcomes", "clip-prompt"):
+                                 "replan-outcomes", "clip-prompt", "outcome-prompt"):
                     self._send(400, "application/json",
                                _j.dumps({"error": "invalid scope"}))
                     return
