@@ -5000,26 +5000,49 @@ def launch_web_ui(default_args):
                 fps = int(_mobj["playback_fps"])
 
             # Auto-fix legacy matches: older plans stored a DRAW per fighter, but a
-            # draw concerns BOTH fighters so there must be exactly ONE per match.
-            # Dedupe (keeping the first) and persist on ANY operation, so the UI and
-            # every regen scope see a single draw — and you can regenerate just the
-            # one draw instead of one per fighter.
+            # draw concerns BOTH fighters so there must be exactly ONE canonical draw
+            # per match — owned by f1 with f2 as opponent (it represents both). On ANY
+            # operation, collapse duplicates to that single canonical entry and ensure
+            # it references both fighters, then persist, so the UI + every regen scope
+            # see one draw for both fighters and you can regenerate just that draw.
             if match_name and _mobj:
-                _mfset = {_mobj.get("f1"), _mobj.get("f2")} - {None}
-                _before = sum(1 for o in outcome_plan
-                              if o.get("outcome") == "draw"
-                              and ((o.get("match_name") == match_name) if o.get("match_name")
-                                   else (o.get("fighter") in _mfset)))
-                if _before > 1:
-                    outcome_plan = _dedupe_match_draws(outcome_plan, match_name, _mfset)
-                    try:
-                        pf.write_text(json.dumps(
-                            {"fight_plan": fight_plan, "outcome_plan": outcome_plan,
-                             "fps": data.get("fps") or fps}, indent=2))
-                        _log(f"  [match] auto-fixed legacy duplicate draw(s) for "
-                             f"{match_name} ({_before} → 1)")
-                    except Exception as _e:
-                        _log(f"  [match] could not persist draw dedupe: {_e}")
+                _f1, _f2 = _mobj.get("f1"), _mobj.get("f2")
+                _mfset = {_f1, _f2} - {None}
+
+                def _is_match_draw(o):
+                    return (o.get("outcome") == "draw"
+                            and ((o.get("match_name") == match_name) if o.get("match_name")
+                                 else (o.get("fighter") in _mfset)))
+                _draws = [o for o in outcome_plan if _is_match_draw(o)]
+                if _draws:
+                    # Prefer an already-f1-owned draw so its rendered files are kept;
+                    # only force the owner to f1 when collapsing duplicates (a lone
+                    # draw keeps its owner so its files aren't orphaned). Either way
+                    # the opponent is the OTHER fighter, so the draw references both.
+                    _keep = next((o for o in _draws if o.get("fighter") == _f1), _draws[0])
+                    _multi = len(_draws) > 1
+                    _owner = _f1 if _multi else _keep.get("fighter")
+                    _opp = _f2 if _owner == _f1 else _f1
+                    _changed = (_multi
+                                or _keep.get("fighter") != _owner
+                                or _keep.get("opponent") != _opp
+                                or _keep.get("match_name") != match_name)
+                    if _changed:
+                        _keep["fighter"] = _owner
+                        _keep["opponent"] = _opp
+                        _keep["match_name"] = match_name
+                        outcome_plan = [o for o in outcome_plan
+                                        if not (_is_match_draw(o) and o is not _keep)]
+                        try:
+                            pf.write_text(json.dumps(
+                                {"fight_plan": fight_plan, "outcome_plan": outcome_plan,
+                                 "fps": data.get("fps") or fps}, indent=2))
+                            _log(f"  [match] normalized draw → one draw for BOTH "
+                                 f"fighters ({_owner} vs {_opp})"
+                                 + (f" — collapsed {len(_draws)} per-fighter draws"
+                                    if _multi else ""))
+                        except Exception as _e:
+                            _log(f"  [match] could not persist draw normalization: {_e}")
 
             # ── Reassemble only: no model needed ───────────────────────────────
             if scope == "reassemble":
@@ -5268,7 +5291,10 @@ def launch_web_ui(default_args):
                     o["env"] = m.get("env")
                     o["env_desc"] = m.get("env_desc", o.get("env_desc"))
                 _opp = m.get("f2") if o.get("fighter") == m.get("f1") else m.get("f1")
-                _prog(40, f"rewriting {fr} {oc} prompts…")
+                # A draw belongs to BOTH fighters — describe it that way in the log.
+                _olabel = (f"{m.get('f1')} vs {m.get('f2')} draw" if oc == "draw"
+                           else f"{fr} {oc}")
+                _prog(40, f"rewriting {_olabel} prompts…")
                 try:
                     _plan_outcome_shots(prompter, o, char_descriptions, _opp)
                 except Exception as e:
@@ -5281,7 +5307,7 @@ def launch_web_ui(default_args):
                 except Exception as e:
                     _fail(f"could not save prompts.json: {e}")
                     return
-                _done(f"rewrote {fr} {oc} outcome prompts for {match_name} — now "
+                _done(f"rewrote {_olabel} outcome prompts for {match_name} — now "
                       f"regenerate its keyframes (kf↻), then re-render it")
                 return
 
