@@ -3598,37 +3598,45 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         one continuous shot and discarded, so callers (and the Matches page) still
         see exactly one file per planned clip. Returns (ok, duration, fatal).
 
-        `segments` (optional) is a list of (prompt, frames[, seg_stem]) describing a
-        SEQUENCE of distinct shots to render back-to-back into one continuous video —
-        e.g. an outcome's finish clip then its victory clip. Each segment uses its
-        OWN prompt verbatim (a deliberate new action). When a segment carries its own
-        keyframe stem (seg_stem), that segment is ANCHORED to its own keyframe image
-        (a clean cut into a new, correctly-composed shot — e.g. the referee raising
-        the winner's arm); otherwise it seeds from the previous shot's last frame /
-        VACE tail for visual continuity. When omitted, the single (prompt, nf) is
-        rendered as before."""
+        `segments` (optional) is a list of (prompt, frames[, seg_stem[, seg_fighters]])
+        describing a SEQUENCE of distinct shots to render back-to-back into one
+        continuous video — e.g. an outcome's finish clip then its victory clip. Each
+        segment uses its OWN prompt verbatim (a deliberate new action). When a segment
+        carries its own keyframe stem (seg_stem), that segment is ANCHORED to its own
+        keyframe image (a clean cut into a new, correctly-composed shot — e.g. the
+        referee raising the winner's arm); otherwise it seeds from the previous shot's
+        last frame / VACE tail for visual continuity. When a segment carries its own
+        `seg_fighters` list, that segment applies exactly those character profiles +
+        LoRAs (e.g. the FINISH shows both fighters, while the VICTORY shows only the
+        winner + the referee). When omitted, the single (prompt, nf) is rendered as
+        before."""
         keyframe = _keyframe_bytes(stem) if stem else None
         # Build a flat list of parts: (segment_prompt, frames, is_segment_start,
-        # segment_keyframe_bytes). The segment keyframe (if any) anchors that
-        # segment's first part to its own image instead of chaining from the prior.
+        # segment_keyframe_bytes, segment_fighters). The segment keyframe (if any)
+        # anchors that segment's first part to its own image instead of chaining from
+        # the prior; the segment fighters (if any) override the clip-level profiles +
+        # LoRAs for that segment.
         if segments:
             seglist = []
             for seg in segments:
                 sp, sn = seg[0], seg[1]
                 sstem = seg[2] if len(seg) > 2 else None
+                sfighters = seg[3] if len(seg) > 3 else None
                 if int(sn) > 0:
-                    seglist.append((str(sp), int(sn), sstem))
+                    seglist.append((str(sp), int(sn), sstem, sfighters))
         else:
-            seglist = [(prompt, int(nf), stem)]
+            seglist = [(prompt, int(nf), stem, None)]
         parts_plan = []
-        for sp, sn, sstem in seglist:
+        for sp, sn, sstem, sfighters in seglist:
             seg_kf = _keyframe_bytes(sstem) if sstem else None
             for bi, bn in enumerate(_split_frame_budget(sn, _chunk_max)):
-                parts_plan.append((sp, bn, bi == 0, seg_kf))
+                parts_plan.append((sp, bn, bi == 0, seg_kf, sfighters))
         if len(parts_plan) == 1:
-            sp, bn, _, seg_kf = parts_plan[0]
-            return _render_once(label, sp, profiles, env, bn, out_path,
-                                fighters=fighters, init_override=(seg_kf or keyframe),
+            sp, bn, _, seg_kf, sfighters = parts_plan[0]
+            _pf = sfighters if sfighters is not None else profiles
+            _ff = sfighters if sfighters is not None else fighters
+            return _render_once(label, sp, _pf, env, bn, out_path,
+                                fighters=_ff, init_override=(seg_kf or keyframe),
                                 step_cb=step_cb)
         # Chained multi-part shot: part 0 starts from the clip keyframe; each later
         # part is seeded by the previous part's last frame → seamless single take.
@@ -3649,7 +3657,7 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         tmpd = tempfile.mkdtemp(prefix="twshot_")
         parts, prev_last, prev_tail = [], None, None
         try:
-            for pi, (seg_prompt, pn, seg_start, seg_kf) in enumerate(parts_plan):
+            for pi, (seg_prompt, pn, seg_start, seg_kf, seg_fighters) in enumerate(parts_plan):
                 part_path = os.path.join(tmpd, f"part{pi:02d}.mp4")
                 # Tag each part's step updates with part N/total so the UI can show
                 # "concatenating shot — part 2/3" alongside the diffusion step.
@@ -3687,10 +3695,14 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
                     part_prompt = (
                         "Continuing seamlessly from the previous moment, the action keeps "
                         "moving FORWARD — new movement that advances the moment. " + seg_prompt)
+                # Per-segment profiles + LoRAs (e.g. victory shot = winner + referee)
+                # override the clip-level ones for this part when provided.
+                _pf = seg_fighters if seg_fighters is not None else profiles
+                _ff = seg_fighters if seg_fighters is not None else fighters
                 ok, _dur, is_fatal = _render_once(
                     f"{label} [part {pi+1}/{_nparts}, {pn}f]",
-                    part_prompt, profiles, env, pn, part_path,
-                    fighters=fighters, init_override=seed_img, step_cb=_pcb,
+                    part_prompt, _pf, env, pn, part_path,
+                    fighters=_ff, init_override=seed_img, step_cb=_pcb,
                     cond_frames=cond_frames)
                 if not ok:
                     return False, None, is_fatal
@@ -3856,13 +3868,32 @@ def _stage_videos_render(client, video_model, video_dir, fight_plan, outcome_pla
         # outcomes (no shots) fall back to the one-prompt path.
         _oshots = o.get("shots") or None
         _segments = None
+        # Referee for this match's victory shot (prefer the chosen one; fall back to
+        # any available referee profile), and whether this is the (both-arms) draw.
+        _oref = (_mref_map.get(o.get("match_name"))
+                 or _referee_for(_out_dir, o.get("match_name") or o.get("fighter", "")))
+        _o_is_draw = o.get("outcome") == "draw"
+        _victory_roles = {"victory", "draw_decision"}
         if _oshots:
             # Each segment carries its OWN keyframe stem (finish, then victory) so
-            # the render anchors every outcome clip to its dedicated image.
-            _segments = [(s.get("prompt") or o["prompt"], int(s.get("nf") or 0),
-                          _outcome_seg_stem(clip_name, si))
-                         for si, s in enumerate(_oshots) if int(s.get("nf") or 0) > 0]
-            _onf = sum(n for _, n, _ in _segments) or _onf
+            # the render anchors every outcome clip to its dedicated image, AND its
+            # OWN fighters so the right profiles + LoRAs apply: the FINISH shows both
+            # fighters; the VICTORY shows only the winner (+ referee) — or both
+            # fighters (+ referee) for a draw.
+            _segments = []
+            for si, s in enumerate(_oshots):
+                _snf = int(s.get("nf") or 0)
+                if _snf <= 0:
+                    continue
+                if s.get("role") in _victory_roles:
+                    _sf = list(_ofighters) if _o_is_draw else [o["fighter"]]
+                    if _oref and _oref not in _sf:
+                        _sf.append(_oref)
+                else:
+                    _sf = list(_ofighters)
+                _segments.append((s.get("prompt") or o["prompt"], _snf,
+                                  _outcome_seg_stem(clip_name, si), _sf))
+            _onf = sum(n for _, n, _, _ in _segments) or _onf
             _roles = " → ".join(s.get("role", "?") for s in _oshots)
             _log(f"      ({len(_segments)}-shot sequence: {_roles})")
         ok, dur, is_fatal = _render(
