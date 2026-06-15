@@ -4999,6 +4999,28 @@ def launch_web_ui(default_args):
             if _mobj and int(_mobj.get("playback_fps") or 0) > 0:
                 fps = int(_mobj["playback_fps"])
 
+            # Auto-fix legacy matches: older plans stored a DRAW per fighter, but a
+            # draw concerns BOTH fighters so there must be exactly ONE per match.
+            # Dedupe (keeping the first) and persist on ANY operation, so the UI and
+            # every regen scope see a single draw — and you can regenerate just the
+            # one draw instead of one per fighter.
+            if match_name and _mobj:
+                _mfset = {_mobj.get("f1"), _mobj.get("f2")} - {None}
+                _before = sum(1 for o in outcome_plan
+                              if o.get("outcome") == "draw"
+                              and ((o.get("match_name") == match_name) if o.get("match_name")
+                                   else (o.get("fighter") in _mfset)))
+                if _before > 1:
+                    outcome_plan = _dedupe_match_draws(outcome_plan, match_name, _mfset)
+                    try:
+                        pf.write_text(json.dumps(
+                            {"fight_plan": fight_plan, "outcome_plan": outcome_plan,
+                             "fps": data.get("fps") or fps}, indent=2))
+                        _log(f"  [match] auto-fixed legacy duplicate draw(s) for "
+                             f"{match_name} ({_before} → 1)")
+                    except Exception as _e:
+                        _log(f"  [match] could not persist draw dedupe: {_e}")
+
             # ── Reassemble only: no model needed ───────────────────────────────
             if scope == "reassemble":
                 m = next((x for x in fight_plan if x.get("match_name") == match_name), {})
