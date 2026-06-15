@@ -427,6 +427,15 @@ def main():
     # Migrate any GGUF files that ended up in the HF cache to the GGUF cache
     _t.Thread(target=_migrate_hf_gguf_to_gguf_cache, daemon=True).start()
 
+    # Start the global host-RAM watcher (leak detection + auto-mitigation). Safe to
+    # start unconditionally: it idles cheaply and reads the cap/watch flags live, so
+    # it begins acting as soon as a max_ram_gb is configured (incl. via live reload).
+    try:
+        from codai.models.ram_monitor import start as _start_ram_monitor
+        _start_ram_monitor()
+    except Exception as _e:
+        logging.getLogger(__name__).debug("RAM monitor not started: %s", _e)
+
     # Import core modules (only after early exits)
     from codai.api import app
     from codai.api.state import (
@@ -802,6 +811,10 @@ def main():
     global_args.load_in_8bit = config.offload.load_in_8bit
     global_args.flash_attn = config.offload.flash_attention
     global_args.max_gpu_percent = config.offload.max_gpu_percent
+    # Global host-RAM cap + leak watch (read live by hf_loading, manager, ram_monitor).
+    global_args.max_ram_gb = config.offload.max_ram_gb
+    global_args.evict_idle_on_ram = config.offload.evict_idle_on_ram
+    global_args.ram_leak_watch = config.offload.ram_leak_watch
     # Thermal protection settings (read live by codai.models.thermal).
     global_args.thermal_cpu_enabled = config.thermal.cpu_enabled
     global_args.thermal_gpu_enabled = config.thermal.gpu_enabled

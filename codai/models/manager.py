@@ -546,7 +546,8 @@ class MultiModelManager:
         self.tool_parser = ModelParserAdapter()
         self.current_model_key: Optional[str] = None
         self.load_mode: str = "ondemand"
-        self.active_in_vram: Optional[str] = None  # most-recently-used model key
+        self._last_used: Dict[str, float] = {}  # model_key -> last-served monotonic ts (LRU)
+        self._active_in_vram: Optional[str] = None  # backing field for active_in_vram property
         self.models_in_vram: set = set()  # all models currently in VRAM
         self.model_aliases: Dict[str, str] = {}
         self.whisper_server: Optional[WhisperServerManager] = None  # legacy single-instance compat
@@ -574,6 +575,19 @@ class MultiModelManager:
         # LoRA trainer caches its SD/SDXL base model between jobs). Each returns
         # the GB it freed (or None). Invoked as a last resort during eviction.
         self._external_vram_releasers: List[Any] = []
+
+    @property
+    def active_in_vram(self) -> Optional[str]:
+        """Most-recently-used model key (None when nothing is active)."""
+        return self._active_in_vram
+
+    @active_in_vram.setter
+    def active_in_vram(self, key: Optional[str]) -> None:
+        # Single chokepoint for "this model was just used" — stamp the LRU clock so
+        # both VRAM and RAM eviction order by true recency, not dict insertion order.
+        self._active_in_vram = key
+        if key:
+            self._last_used[key] = time.monotonic()
 
     def register_external_vram_releaser(self, fn) -> None:
         """Register a callback that frees VRAM held outside the manager.
@@ -2510,6 +2524,146 @@ class MultiModelManager:
         _trim_cpu_ram()
         return True
 
+    def _evict_one(self, key):
+        """Fully unload ONE model by key and free its VRAM + host RAM.
+
+        Shared by VRAM- and RAM-driven eviction. Never pulls a model that is still
+        mid-request; waits briefly first and skips it if it stays busy.
+        """
+        # Make absolutely sure nothing is mid-request on this model before we
+        # pull its tensors off the GPU.
+        if self._is_key_busy(key):
+            if not self._wait_until_idle(key):
+                print(f"  Skipping eviction of '{key}' — still busy after wait")
+                return
+        model_obj = self.models.pop(key, None)
+        self.models_in_vram.discard(key)
+        self._last_used.pop(key, None)
+        # Debug-only: ground-truth the object state before cleanup so an
+        # orphaned/detached backend (VRAM that won't free) is visible.
+        try:
+            from codai.api.state import get_global_debug
+            if get_global_debug():
+                _be = getattr(model_obj, 'backend', '∅')
+                _has_model = (getattr(_be, 'model', None) is not None) if _be not in ('∅', None) else False
+                _pool = self.model_pools.get(key)
+                print(f"  evict-debug '{key}': obj_id={id(model_obj)} "
+                      f"backend={'None' if _be is None else ('missing' if _be=='∅' else 'set')} "
+                      f"backend.model={'set' if _has_model else 'None'} "
+                      f"pool_instances={_pool.count if _pool else 0}")
+        except Exception:
+            pass
+        # Clean every instance in the pool (not just the primary) so extra
+        # instances don't leak VRAM, then drop the pool.
+        pool = self.model_pools.pop(key, None)
+        if pool is not None:
+            try:
+                pool.cleanup_all()
+            except Exception as e:
+                print(f"  Warning cleaning pool for '{key}': {e}")
+        if model_obj is not None:
+            try:
+                if hasattr(model_obj, 'cleanup'):
+                    model_obj.cleanup()
+                elif hasattr(model_obj, 'to'):
+                    # Diffusers pipeline: move all components to CPU explicitly
+                    # before dropping the reference so VRAM is freed promptly.
+                    model_obj.to('cpu')
+            except Exception as e:
+                print(f"  Warning during eviction of '{key}': {e}")
+        del model_obj
+        for _ in range(3):
+            gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        # Return freed CPU heap (the evicted model's host-side copy / offloaded
+        # weights) to the OS, and let the kernel reclaim any swap backing it —
+        # otherwise RSS stays high across evict/load cycles and the machine
+        # slowly fills RAM + swap.
+        _trim_cpu_ram()
+
+    @staticmethod
+    def _get_process_ram_gb() -> float:
+        """Resident-set size of the server process TREE, in GB (0.0 on failure).
+
+        Offloaded weights and worker subprocesses count against the global cap, so
+        sum the parent plus all children (mirrors thermal.read_process_tree_cpu)."""
+        try:
+            import psutil
+            proc = psutil.Process()
+            total = proc.memory_info().rss
+            for child in proc.children(recursive=True):
+                try:
+                    total += child.memory_info().rss
+                except Exception:
+                    pass
+            return total / 1e9
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _ram_cap_gb() -> Optional[float]:
+        """The configured global RAM ceiling in GB, or None when no cap is set."""
+        try:
+            from codai.api.state import get_global_args
+            ga = get_global_args()
+            cap = getattr(ga, 'max_ram_gb', None) if ga else None
+            return float(cap) if cap else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _evict_idle_on_ram_enabled() -> bool:
+        """Whether idle models may be unloaded when over the RAM cap (default True)."""
+        try:
+            from codai.api.state import get_global_args
+            ga = get_global_args()
+            return bool(getattr(ga, 'evict_idle_on_ram', True)) if ga else True
+        except Exception:
+            return True
+
+    def _evict_models_for_ram(self, target_gb: float):
+        """Unload idle models (LRU first) until process-tree RSS drops to target_gb.
+
+        Same safety rules as VRAM eviction: never pulls a busy model, and the active
+        model is only evicted as a last resort once idle."""
+        if target_gb <= 0:
+            return
+        if self._get_process_ram_gb() <= target_gb:
+            return
+        _before = self._get_process_ram_gb()
+        for key in self._lru_order():
+            if key == self.active_in_vram:
+                continue
+            if self._get_process_ram_gb() <= target_gb:
+                break
+            if self._is_key_busy(key):
+                print(f"  '{key}' is busy serving a request — not evicting it (RAM)")
+                continue
+            print(f"RAM eviction: unloading '{key}' to free host RAM "
+                  f"(RSS {self._get_process_ram_gb():.1f} GB > cap target {target_gb:.1f} GB)")
+            self._evict_one(key)
+        # Last resort: the active model, only if idle.
+        if (self._get_process_ram_gb() > target_gb and self.active_in_vram
+                and self.active_in_vram in self.models):
+            _active = self.active_in_vram
+            if not self._is_key_busy(_active) and self._wait_until_idle(_active):
+                print(f"RAM eviction: unloading active model '{_active}' to free host RAM")
+                self._evict_one(_active)
+                self.active_in_vram = None
+        _freed = _before - self._get_process_ram_gb()
+        if _freed > 0.05:
+            print(f"RAM eviction freed {_freed:.1f} GB (RSS now {self._get_process_ram_gb():.1f} GB)")
+
+    def _lru_order(self):
+        """Loaded model keys, least-recently-used first (for eviction)."""
+        return sorted(self.models.keys(), key=lambda k: self._last_used.get(k, 0.0))
+
     def _evict_models_for_vram(self, needed_gb: float):
         """Unload loaded models (LRU first) until we have at least needed_gb free VRAM.
 
@@ -2520,62 +2674,7 @@ class MultiModelManager:
         if needed_gb <= 0:
             return
 
-        def _evict_key(key):
-            # Make absolutely sure nothing is mid-request on this model before we
-            # pull its tensors off the GPU.
-            if self._is_key_busy(key):
-                if not self._wait_until_idle(key):
-                    print(f"  Skipping eviction of '{key}' — still busy after wait")
-                    return
-            model_obj = self.models.pop(key, None)
-            self.models_in_vram.discard(key)
-            # Debug-only: ground-truth the object state before cleanup so an
-            # orphaned/detached backend (VRAM that won't free) is visible.
-            try:
-                from codai.api.state import get_global_debug
-                if get_global_debug():
-                    _be = getattr(model_obj, 'backend', '∅')
-                    _has_model = (getattr(_be, 'model', None) is not None) if _be not in ('∅', None) else False
-                    _pool = self.model_pools.get(key)
-                    print(f"  evict-debug '{key}': obj_id={id(model_obj)} "
-                          f"backend={'None' if _be is None else ('missing' if _be=='∅' else 'set')} "
-                          f"backend.model={'set' if _has_model else 'None'} "
-                          f"pool_instances={_pool.count if _pool else 0}")
-            except Exception:
-                pass
-            # Clean every instance in the pool (not just the primary) so extra
-            # instances don't leak VRAM, then drop the pool.
-            pool = self.model_pools.pop(key, None)
-            if pool is not None:
-                try:
-                    pool.cleanup_all()
-                except Exception as e:
-                    print(f"  Warning cleaning pool for '{key}': {e}")
-            if model_obj is not None:
-                try:
-                    if hasattr(model_obj, 'cleanup'):
-                        model_obj.cleanup()
-                    elif hasattr(model_obj, 'to'):
-                        # Diffusers pipeline: move all components to CPU explicitly
-                        # before dropping the reference so VRAM is freed promptly.
-                        model_obj.to('cpu')
-                except Exception as e:
-                    print(f"  Warning during eviction of '{key}': {e}")
-            del model_obj
-            for _ in range(3):
-                gc.collect()
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
-            # Return freed CPU heap (the evicted model's host-side copy / offloaded
-            # weights) to the OS, and let the kernel reclaim any swap backing it —
-            # otherwise RSS stays high across evict/load cycles and the machine
-            # slowly fills RAM + swap.
-            _trim_cpu_ram()
+        _evict_key = self._evict_one
 
         def _size_label(key: str) -> str:
             m = self._measured_vram_gb.get(key)
@@ -2589,7 +2688,7 @@ class MultiModelManager:
         _free_before = self._get_free_vram_gb()
 
         # First pass: evict idle non-active models in LRU order.
-        for key in list(self.models.keys()):
+        for key in self._lru_order():
             if key == self.active_in_vram:
                 continue
             if self._get_free_vram_gb() >= needed_gb:
@@ -3096,6 +3195,18 @@ class MultiModelManager:
                         except Exception as e:
                             print(f"  Warning: Error cleaning up legacy model_manager: {e}")
         
+        # Global RAM cap: before loading the new model, if host RSS is near the cap
+        # and idle-eviction is enabled, unload idle LRU models to make real RAM room.
+        # Whatever still doesn't fit is handled by the clamped CPU budget in
+        # hf_loading (overflow spills to the disk offload folder).
+        _cap = self._ram_cap_gb()
+        if _cap and self._evict_idle_on_ram_enabled():
+            _rss = self._get_process_ram_gb()
+            if _rss > _cap * 0.9:
+                print(f"Global RAM cap {_cap:.1f} GB — RSS {_rss:.1f} GB near limit; "
+                      f"evicting idle models before load of '{model_key}'")
+                self._evict_models_for_ram(_cap * 0.85)
+
         # Return info for the caller to load the model
         return {
             'model_key': model_key,

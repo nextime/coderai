@@ -352,6 +352,23 @@ def build_from_pretrained_kwargs(
         else:
             cpu_budget = max(0, psutil.virtual_memory().available - int(4e9))
 
+        # Global RAM cap: clamp the CPU-offload budget to the headroom remaining under
+        # the server-wide ceiling, so the overflow spills to the disk offload folder
+        # (set below) instead of pushing process RSS past the cap. Read live from
+        # global_args (same pattern as pipeline_cache). None = no cap (legacy behaviour).
+        try:
+            from codai.api.state import get_global_args as _gga
+            _ga = _gga()
+            _cap = getattr(_ga, 'max_ram_gb', None) if _ga else None
+            if _cap:
+                _used = psutil.Process().memory_info().rss
+                _headroom = int(float(_cap) * 1e9) - _used
+                # Keep a small floor so a single component can still land in RAM; the
+                # rest goes to disk. Never raise the budget above the cap headroom.
+                cpu_budget = max(0, min(cpu_budget, _headroom))
+        except Exception:
+            pass
+
         kwargs['device_map'] = 'auto'
         kwargs['max_memory'] = {0: gpu_budget, 'cpu': cpu_budget}
 

@@ -65,6 +65,13 @@ class OffloadConfig:
     load_in_8bit: bool = False
     manual_ram_gb: Optional[float] = None
     flash_attention: bool = False
+    # Server-wide ceiling on host RAM (process-tree RSS) the server may use, in GB.
+    # None = no global cap (per-load budget = available RAM, as before). When set, new
+    # model loads get a CPU-offload budget clamped to the remaining headroom so the
+    # overflow spills to the offload directory (disk), and idle models can be evicted.
+    max_ram_gb: Optional[float] = None
+    evict_idle_on_ram: bool = True   # unload idle LRU models when over the RAM cap
+    ram_leak_watch: bool = True      # background watcher samples RSS + auto-mitigates
 
 
 @dataclass
@@ -414,7 +421,10 @@ class ConfigManager:
                 "load_in_4bit": self.config.offload.load_in_4bit,
                 "load_in_8bit": self.config.offload.load_in_8bit,
                 "manual_ram_gb": self.config.offload.manual_ram_gb,
-                "flash_attention": self.config.offload.flash_attention
+                "flash_attention": self.config.offload.flash_attention,
+                "max_ram_gb": self.config.offload.max_ram_gb,
+                "evict_idle_on_ram": self.config.offload.evict_idle_on_ram,
+                "ram_leak_watch": self.config.offload.ram_leak_watch
             },
             "vulkan": {
                 "n_gpu_layers": self.config.vulkan.n_gpu_layers,

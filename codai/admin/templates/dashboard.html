@@ -40,6 +40,20 @@
     <div style="font-size:11.5px;color:var(--text-2);margin-top:.2rem;font-family:var(--mono)" id="vram-total-line"></div>
     <div class="stat-sub" id="vram-gpu" style="margin-top:.25rem"></div>
   </div>
+
+  <div class="stat" id="ram-card" style="display:none">
+    <div class="stat-label">RAM</div>
+    <div class="stat-value" id="ram-pct" style="font-size:2rem">—</div>
+    <div class="progress" style="margin-top:.625rem">
+      <div class="progress-fill" id="ram-bar" style="width:0%"></div>
+    </div>
+    <div class="progress-labels" style="color:var(--text-1);font-size:12px;margin-top:.4rem">
+      <span id="ram-used">—</span><span id="ram-free">—</span>
+    </div>
+    <div style="font-size:11.5px;color:var(--text-2);margin-top:.2rem;font-family:var(--mono)" id="ram-total-line"></div>
+    <div class="stat-sub" id="ram-cap" style="margin-top:.25rem"></div>
+    <div class="stat-sub" id="ram-leak" style="margin-top:.25rem;color:var(--danger,#e5484d);font-weight:600;display:none">⚠ RAM leak suspected</div>
+  </div>
 </div>
 
 <div class="card" style="margin-bottom:1rem">
@@ -114,6 +128,33 @@ async function poll() {
       document.getElementById('vram-gpu').textContent = gpuName.length > 32 ? gpuName.slice(0, 32) + '…' : gpuName;
     } else {
       document.getElementById('vram-card').style.display = 'none';
+    }
+
+    if (d.ram && d.ram.total) {
+      document.getElementById('ram-card').style.display = '';
+      const w = d.ram.watch || {};
+      // When a cap is set, show RSS-vs-cap; otherwise system used-vs-total.
+      const cap = w.cap_gb || null;
+      if (cap && w.rss_gb != null) {
+        const pct = Math.min(100, Math.round(w.rss_gb / cap * 100));
+        document.getElementById('ram-pct').textContent = pct + '%';
+        document.getElementById('ram-bar').style.width = pct + '%';
+        document.getElementById('ram-used').textContent = w.rss_gb.toFixed(1) + ' GB server';
+        document.getElementById('ram-free').textContent = (d.ram.free != null ? d.ram.free.toFixed(1) + ' GB free' : '');
+        document.getElementById('ram-total-line').textContent = cap.toFixed(1) + ' GB cap · ' + d.ram.total.toFixed(1) + ' GB total';
+        document.getElementById('ram-cap').textContent = w.last_action ? ('last: ' + w.last_action) : '';
+      } else {
+        const pct = Math.round(d.ram.used / d.ram.total * 100);
+        document.getElementById('ram-pct').textContent = pct + '%';
+        document.getElementById('ram-bar').style.width = pct + '%';
+        document.getElementById('ram-used').textContent = d.ram.used.toFixed(1) + ' GB used';
+        document.getElementById('ram-free').textContent = d.ram.free.toFixed(1) + ' GB free';
+        document.getElementById('ram-total-line').textContent = d.ram.total.toFixed(1) + ' GB total (no cap)';
+        document.getElementById('ram-cap').textContent = '';
+      }
+      document.getElementById('ram-leak').style.display = w.leak_suspected ? '' : 'none';
+    } else {
+      document.getElementById('ram-card').style.display = 'none';
     }
 
     if (d.requests) {

@@ -69,6 +69,25 @@
     <span class="form-hint">Models will inherit this as default when configured</span>
   </div>
   <div class="form-row" style="margin-top:.75rem">
+    <label class="form-label">Max global RAM (GB) <span class="muted">(blank = no cap)</span></label>
+    <input type="number" id="s-max-ram" class="form-input" min="0" step="1" placeholder="e.g. 96">
+    <span class="form-hint">Server-wide ceiling on host RAM (process-tree RSS). New model loads get a CPU-offload budget clamped to the remaining headroom, so the overflow spills to the offload directory (disk) instead of pushing past the limit. Applied live on save.</span>
+  </div>
+  <div class="form-row" style="margin:0">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-evict-idle-ram">
+      <span>Evict idle models when over the RAM limit</span>
+    </label>
+    <span class="form-hint">Unload least-recently-used idle models to free real RAM before forcing disk offload.</span>
+  </div>
+  <div class="form-row" style="margin:0">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-ram-leak-watch">
+      <span>Watch for RAM leaks (auto-mitigate)</span>
+    </label>
+    <span class="form-hint">Background watcher samples RSS; when it keeps climbing while idle or nears the cap it runs gc / CUDA cache release / heap trim and (if enabled) evicts idle models.</span>
+  </div>
+  <div class="form-row" style="margin-top:.75rem">
     <label class="form-label">Temporary working directory <span class="muted">(default: system /tmp)</span></label>
     <input type="text" id="s-tmp-dir" class="form-input" placeholder="e.g. /data/tmp">
     <span class="form-hint">Scratch space for frame extraction, upscaling and interpolation. Point it at a large volume — 4× upscaling can exhaust a small /tmp ("No space left on device"). Applied live on save.</span>
@@ -355,6 +374,9 @@ async function loadSettings(){
     document.getElementById('s-hf-cache').value   = d.models?.hf_cache_dir ?? '';
     document.getElementById('s-gguf-cache').value = d.models?.gguf_cache_dir ?? '';
     document.getElementById('s-offload-dir').value = d.offload?.directory ?? './offload';
+    document.getElementById('s-max-ram').value = d.offload?.max_ram_gb ?? '';
+    document.getElementById('s-evict-idle-ram').checked = d.offload?.evict_idle_on_ram !== false;
+    document.getElementById('s-ram-leak-watch').checked = d.offload?.ram_leak_watch !== false;
     document.getElementById('s-tmp-dir').value = d.tmp_dir ?? '';
     document.getElementById('s-allow-ffmpeg').checked = !!(d.enhance && d.enhance.allow_ffmpeg);
     document.getElementById('s-allow-rife-ncnn').checked = !!(d.enhance && d.enhance.allow_rife_ncnn);
@@ -424,6 +446,9 @@ async function saveSettings(){
     },
     offload:{
       directory: document.getElementById('s-offload-dir').value.trim() || './offload',
+      max_ram_gb: (parseFloat(document.getElementById('s-max-ram').value) || null),
+      evict_idle_on_ram: document.getElementById('s-evict-idle-ram').checked,
+      ram_leak_watch: document.getElementById('s-ram-leak-watch').checked,
     },
     tmp_dir: strOrNull('s-tmp-dir'),
     enhance:{

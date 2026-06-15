@@ -330,6 +330,18 @@ def api_status(username: str = Depends(require_auth)):
 
     loaded_keys = list(multi_model_manager.models.keys())
 
+    # Real-ESRGAN / diffusers upscalers live in a private cache (deliberately not
+    # in multi_model_manager.models — see codai/api/images.py), so the registry
+    # count alone reports 0 models while an upscale job is actively running. Fold
+    # the loaded upscalers in so the dashboard count matches the Tasks page.
+    try:
+        from codai.api.images import _UPSCALER_CACHE as _upscalers
+        for _uk in _upscalers.keys():
+            if _uk not in loaded_keys:
+                loaded_keys.append(_uk)
+    except Exception:
+        pass
+
     # VRAM info
     vram = None
     is_cuda = False
@@ -464,6 +476,26 @@ def api_status(username: str = Depends(require_auth)):
     except Exception:
         pass
 
+    # Host-RAM status: system totals (psutil) + the global-cap watcher snapshot
+    # (process RSS, configured cap, % of cap, leak-suspected flag, last mitigation).
+    ram = None
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        ram = {
+            "total": round(vm.total / 1e9, 2),
+            "used": round((vm.total - vm.available) / 1e9, 2),
+            "free": round(vm.available / 1e9, 2),
+            "percent": vm.percent,
+        }
+        try:
+            from codai.models.ram_monitor import get_status as _ram_status
+            ram["watch"] = _ram_status()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
     # Whisper-server status
     whisper_status = None
     try:
@@ -484,6 +516,7 @@ def api_status(username: str = Depends(require_auth)):
         "enabled_models": enabled_models,
         "enabled_aliases": enabled_aliases,
         "vram": vram,
+        "ram": ram,
         "cuda": is_cuda,
         "requests": {
             "total": req_total,
@@ -2394,6 +2427,9 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "load_in_8bit": c.offload.load_in_8bit,
             "manual_ram_gb": c.offload.manual_ram_gb,
             "flash_attention": c.offload.flash_attention,
+            "max_ram_gb": c.offload.max_ram_gb,
+            "evict_idle_on_ram": c.offload.evict_idle_on_ram,
+            "ram_leak_watch": c.offload.ram_leak_watch,
         },
         "vulkan": {
             "n_gpu_layers": c.vulkan.n_gpu_layers,
@@ -2503,6 +2539,21 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "manual_ram_gb" in off:
             c.offload.manual_ram_gb = off["manual_ram_gb"] or None
         c.offload.flash_attention = bool(off.get("flash_attention", c.offload.flash_attention))
+        if "max_ram_gb" in off:
+            c.offload.max_ram_gb = off["max_ram_gb"] or None
+        c.offload.evict_idle_on_ram = bool(off.get("evict_idle_on_ram", c.offload.evict_idle_on_ram))
+        c.offload.ram_leak_watch = bool(off.get("ram_leak_watch", c.offload.ram_leak_watch))
+        # Push the RAM-cap settings to live global_args so the watcher, per-load
+        # budget clamp and eviction honour them without a restart.
+        try:
+            from codai.api.state import get_global_args
+            ga = get_global_args()
+            if ga is not None:
+                ga.max_ram_gb = c.offload.max_ram_gb
+                ga.evict_idle_on_ram = c.offload.evict_idle_on_ram
+                ga.ram_leak_watch = c.offload.ram_leak_watch
+        except Exception:
+            pass
 
     if "vulkan" in data:
         vk = data["vulkan"]
