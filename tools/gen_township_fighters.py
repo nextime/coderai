@@ -383,11 +383,10 @@ FIGHT_PROMPT_SUFFIX = ("African township free fight, fast-paced, rapid explosive
 # explosive and threatening (the fighter charges in galvanized, shadow-boxing the
 # air, ready to fight) but there is NO opponent and no blow LANDS; the FACE-OFF is
 # a tense stare-down where the referee launches the bout, no strikes landed yet.
-ENTRANCE_PROMPT_SUFFIX = ("African township fight night entrance, explosive kinetic "
-                          "motion, fierce and threatening, galvanized for victory, "
-                          "pumped up and ready to fight, fast dynamic action, "
-                          "cinematic, consistent character, wardrobe and setting, "
-                          "shadow-boxing the air with no opponent present")
+ENTRANCE_PROMPT_SUFFIX = ("African township fight night entrance, confident focused "
+                          "athlete walking out, composed and determined, in character, "
+                          "natural human body language, cinematic, consistent character, "
+                          "wardrobe and setting, warming up alone with no opponent present")
 
 FACEOFF_PROMPT_SUFFIX = ("African township fight night, cinematic, dramatic, intense "
                          "menacing stare-down, the referee signalling the START, "
@@ -398,12 +397,12 @@ FACEOFF_PROMPT_SUFFIX = ("African township fight night, cinematic, dramatic, int
 INTRO_PROMPT_SUFFIX = ENTRANCE_PROMPT_SUFFIX
 
 ENTRANCE_SHOT_TEMPLATES = [
-    "storming into the arena throwing a blistering flurry of shadow-boxing punches at the air, roaring and snarling at the screaming crowd, fast low-angle tracking push-in through dust and spotlight haze",
-    "charging in and skidding to a stop, pounding their own chest and unleashing a savage shout, eyes blazing with fury, kinetic whip-pan circling the explosive entrance",
-    "bouncing on the balls of their feet firing rapid jab-cross combinations and a high roundhouse kick into the air, fierce galvanized glare into the lens, dynamic orbiting camera",
-    "vaulting over a barrier into the fighting ground, fists pumping, baring teeth and slamming a fist into an open palm, dramatic dropping crane shot, crowd erupting",
-    "stalking in fast through smoke and fire-barrel glow, cracking their neck and knuckles then snapping off a sharp spinning back-kick at the air, menacing snarl, tight handheld push-in",
-    "sprinting in and leaping off a low wall into a shadow-boxed flying knee, landing in a fighting stance with a ferocious roar, sweeping kinetic crane shot over the packed yard",
+    "walking out into the arena rolling their shoulders and loosening their neck, calm and focused, giving the crowd a confident nod, slow low-angle tracking push-in through dust and spotlight haze",
+    "striding in and shadow-boxing a few crisp jab-cross combinations to warm up, breathing steady and eyes locked ahead, smooth whip-pan circling the entrance",
+    "bouncing lightly on their toes throwing a couple of relaxed test kicks into the air, settling into their stance with quiet determination, dynamic orbiting camera",
+    "stepping over the barrier into the fighting ground, raising a fist to the cheering crowd with a composed smile, dramatic dropping crane shot",
+    "walking in through smoke and fire-barrel glow, calmly cracking their knuckles and squaring their stance, focused expression, tight handheld push-in",
+    "jogging in and throwing a few smooth combination drills, nodding to their corner with steady confidence, sweeping kinetic crane shot over the packed yard",
 ]
 
 FACEOFF_SHOT_TEMPLATES = [
@@ -426,30 +425,31 @@ def _continuity_clause(env_name: str) -> str:
             "background, surfaces and crowd in every shot")
 
 FIGHT_SHOT_TEMPLATES = [
-    "exploding forward with a brutal low leg kick that buckles the opponent's lead leg, camera tracking the impact as the crowd erupts",
-    "launching a spinning back-kick deep into the body, opponent folding over it, slow whip-pan following the spin",
-    "detonating a flying knee flush on the jaw, blood and sweat spraying, low-angle shot punching up at the violence",
-    "running two steps up a wall and springing off into a cartwheel kick, heel cracking across the opponent's jaw, sweeping crane shot",
-    "vaulting over a parked car and dropping a flying elbow onto the opponent below, dust bursting up, dramatic overhead angle",
-    "back-flipping clear of a wild swing then landing into a spinning hook kick, capoeira-smooth, orbiting low camera",
-    "shooting in for a double-leg and slamming the opponent into the dirt, dust kicking up, camera dropping with the takedown",
-    "raining down savage ground-and-pound from full mount, opponent's face bloodied and turtling, tight overhead close-up",
-    "ripping a slashing elbow in the clinch that splits the brow open, blood sheeting down, hard cut to the wound",
-    "springboarding off a stack of crates into a flying knee, the opponent blasted backward into the market stalls, wide scenic shot",
-    "snapping a head kick that whips across the ducking opponent's skull, sweat flying, wide low-angle framing the arc",
-    "cartwheeling sideways to dodge then whipping a no-hands spinning heel kick, crowd gasping, slow-motion arc, golden dusk light",
-    "scaling a fighter and spinning into a hurricanrana takedown, both crashing through a fruit cart, debris flying, sweeping pan",
+    # Grounded, realistic human MMA — the majority of the rotation.
+    "exploding forward with a hard low leg kick that buckles the opponent's lead leg, camera tracking the impact as the crowd reacts",
+    "ripping a tight body-head hook combination that drops the opponent to a knee, sweat flying, orbiting camera",
+    "snapping a crisp jab-cross-hook combo with sharp head movement, slipping the counter, fast push-in on the cleanest shots",
+    "shooting in for a double-leg and driving the opponent down into the dirt, dust kicking up, camera dropping with the takedown",
+    "raining down ground-and-pound from full mount, the opponent covering up and turtling, tight overhead close-up",
+    "ripping a short elbow in the clinch that splits the brow, blood sheeting down, hard cut to the wound",
+    "landing a thudding body kick that folds the opponent over, then a knee up the middle, low tracking angle",
+    "uncorking a clean uppercut, the opponent's head snapping back, sweat spraying, super-slow impact frame",
     "catching a kick and crashing the opponent down into side control, crowd surging, sweeping pan to the mount",
-    "uncorking a thunderous uppercut, the opponent's head snapping back, teeth and spit flying, super-slow impact frame",
-    "sprawling hard out of a shot then exploding upward into a flying knee, fast whip up from the floor against the firelight",
-    "leaping off a low rooftop into a diving punch, the two crashing together amid scattering crowd, epic high-angle establishing shot",
-    "cinching a tight guillotine as the opponent thrashes and turns purple, camera circling the desperate escape",
-    "stuffing a takedown and spiking a brutal knee to the temple, opponent collapsing, low tracking shot",
-    "kipping up off the ground straight into a spinning elbow, blood spraying across the neon-lit puddles, dynamic orbit",
-    "trading bombs at point-blank range, both fighters splitting each other open, crowd roaring, shaky close-up",
-    "wall-running along the corrugated fence and launching a missile drop-kick, opponent folding, sweeping kinetic camera",
-    "stomping forward behind a vicious push kick that folds the opponent into the stacked cars, wide establishing crane move",
-    "ripping a body-head hook combo that drops the opponent to a knee, blood on the concrete, orbiting camera",
+    "cinching a tight guillotine as the opponent thrashes to escape, camera circling the struggle",
+    "stuffing a takedown and spiking a knee to the body, opponent collapsing back, low tracking shot",
+    "pummeling for underhooks in a grinding clinch against the fence, then a trip to the ground, tight handheld coverage",
+    "stalking forward behind a stiff push kick that backs the opponent into the wall, wide establishing move",
+    "trading punches at close range, both fighters connecting and bleeding, crowd roaring, shaky handheld close-up",
+    "snapping a head kick that whips across the ducking opponent's skull, sweat flying, wide low-angle framing the arc",
+    "slipping a wild swing and firing back a sharp counter cross down the middle, reverse-angle reveal of the counter",
+    "working a takedown into half-guard and grinding out short elbows, gritty overhead and over-shoulder coverage",
+    # Spectacular / acrobatic accents — used sparingly, the minority.
+    "launching a spinning back-kick deep into the body, opponent folding over it, slow whip-pan following the spin",
+    "detonating a flying knee flush on the jaw, sweat spraying, low-angle shot punching up at the action",
+    "running two steps up a wall and springing off into a cartwheel kick, heel cracking across the opponent's jaw, sweeping crane shot",
+    "back-flipping clear of a wild swing then landing into a spinning hook kick, orbiting low camera",
+    "shoving the opponent crashing into a market stall, debris scattering, dust bursting up, wide scenic establishing shot",
+    "kipping up off the ground straight into a spinning elbow, sweat spraying through the firelight, dynamic orbit",
 ]
 
 # Rotating technique focus passed one-per-clip to the prompt writer so a match
@@ -457,16 +457,18 @@ FIGHT_SHOT_TEMPLATES = [
 # so consecutive clips emphasise different MMA disciplines, ACROBATICS and camera
 # language — the strongest lever against boxing-only, static-shot monotony.
 FIGHT_ACTION_FOCUS = [
-    "a brutal kicking exchange (low leg kicks, body kicks, head kicks, push kicks) — shoot it with a low tracking angle following the strikes",
-    "knees and elbows tearing flesh in a tight clinch against the wall or fence — tight handheld close-up on the impacts",
-    "a violent takedown, slam or throw driving the fight to the ground — drop the camera with the slam",
-    "merciless ground-and-pound or a desperate scramble on the floor — overhead and over-shoulder coverage",
-    "a fight-ending submission attempt (choke, armbar, guillotine) and the frantic escape — slow orbit around the lock",
+    "a realistic kicking exchange (low leg kicks, body kicks, head kicks, push kicks) — shoot it with a low tracking angle following the strikes",
+    "knees and elbows in a tight clinch against the wall or fence — tight handheld close-up on the impacts",
+    "a grounded takedown, slam or throw driving the fight to the mat — drop the camera with the slam",
+    "ground-and-pound or a scramble on the floor — overhead and over-shoulder coverage",
+    "a fight-ending submission attempt (choke, armbar, guillotine) and the escape — slow orbit around the lock",
+    "blistering boxing combinations with head movement and counters — fast push-in on the cleanest shots",
+    "a measured striking exchange at range, both fighters feinting, slipping and countering — clean side tracking shot",
+    "dirty clinch work — pummeling for underhooks, short knees and a trip to the ground — tight handheld coverage",
+    "a defensive sequence — slipping, blocking and ducking — then a sharp counter back to offence — reverse-angle reveal of the counter",
     "an explosive spinning or flying technique (spinning back-kick, spinning elbow, flying knee) — whip-pan that follows the rotation",
-    "an ACROBATIC aerial move — wall-run, cartwheel kick, backflip evasion, springboard or no-hands capoeira spin — captured with a sweeping crane or orbit",
-    "using the SCENERY as a weapon — vaulting a car, leaping off crates/a low rooftop, smashing through market stalls or a fence — wide cinematic establishing shot",
-    "blistering boxing combinations with head movement and brutal counters — fast push-in on the cleanest shots",
-    "a defensive sequence — duck, roll, kip-up — then a savage acrobatic counter back to offence — reverse-angle reveal of the counter",
+    "ONE acrobatic accent move — a cartwheel kick, backflip evasion or springboard — used sparingly, captured with a sweeping crane or orbit",
+    "occasionally using the SCENERY — shoving the opponent into a fence, a car or a market stall — wide cinematic establishing shot",
 ]
 
 # Bold MOVING-CAMERA directives. A static keyframe tends to lock the I2V camera,
@@ -1059,20 +1061,21 @@ Each prompt must be ONE sentence, 18-38 words, cinematic, specific and full of a
 Emphasize FAST, continuous, explosive, savage motion — describe action mid-movement, never static, posed, or \
 slow-motion. The motion must PROGRESS FORWARD in one direction through the clip: no reversing, no \
 rewinding, no looping back to the starting pose, no boomerang or back-and-forth motion.
-This is a full MMA / no-rules street fight, NOT boxing — do NOT default to only punches. Across clips \
-draw widely from the WHOLE arsenal: head and body punches, but also high kicks, low leg kicks, push \
-kicks, spinning back-kicks, flying knees, knees in the clinch, elbow strikes, takedowns and slams, \
-sprawls, ground-and-pound, mount and guard scrambles, chokes and submission attempts, throws, \
-shoulder charges and dirty street-fighting. Each prompt should center on a DIFFERENT technique than \
-the recent ones — favour kicks, knees, elbows, grappling and ground work over plain punches.
-BE ACROBATIC and SPECTACULAR: many clips should feature athletic, gravity-defying movement — wall-runs, \
-cartwheel and tornado kicks, backflip and roll evasions, kip-ups, springboards off walls/crates/cars, \
-no-hands capoeira spins, flying/diving attacks, hurricanrana and aerial takedowns, parkour vaults. The \
-fighters are explosive, agile and stylish, not flat-footed.
-USE THE SCENERY: make fighters interact with the township environment as part of the action — vaulting \
-parked cars, leaping off low rooftops or stacked crates, crashing through market stalls and fruit carts, \
-bouncing off corrugated fences and shack walls, kicking up dust, scattering the pressing crowd. The \
-setting is a living, destructible playground, not a flat empty floor.
+This is a full MMA / no-rules fight between two REAL HUMAN athletes — grounded, believable and brutal, \
+NOT superhero or monster choreography. The MAJORITY of clips should be normal, realistic MMA exchanges: \
+boxing combinations with head movement, jabs, crosses, hooks and uppercuts, low leg kicks, body kicks, \
+head kicks, push kicks, knees in the clinch, elbows, takedowns and slams, sprawls, ground-and-pound, \
+mount and guard scrambles, clinch work against the wall, chokes and submission attempts. Do NOT default \
+to only punches — vary the technique across clips, and keep the strikes physically plausible for trained \
+human fighters. Each prompt should center on a DIFFERENT technique than the recent ones.
+OCCASIONALLY (a MINORITY of clips, roughly one in three or four — never most of them) make a shot more \
+spectacular and acrobatic for variety: a spinning back-kick, spinning elbow, flying knee, a cartwheel or \
+tornado kick, a backflip evasion, kip-up or a flashy aerial takedown. Use these as accents, not the norm. \
+Most of the fight stays on the ground as a hard, technical human brawl.
+The township environment can OCCASIONALLY come into play — a fighter shoved into a fence or wall, dust \
+kicking up, the pressing crowd — and now and then (rarely) a bigger scenic moment like crashing into a \
+market stall or going over a parked car. Keep scenery use believable and sparing, not a constant \
+parkour playground.
 Make it gritty, visceral and BRUTAL: it is encouraged to OFTEN (but not every clip) show the damage — a \
 bloodied nose or lip, a split brow, blood spray, sweat-and-blood on the face, a stagger or knockdown — \
 when a hard blow lands.
@@ -1115,7 +1118,7 @@ Return ONLY the prompt, no quotes or explanation."""
 _LLM_INTRO_SYSTEM = """\
 You are a creative director writing vivid 18-32 word video-generation prompts for the DRAMATIC OPENING of an African township fight night — BEFORE any fighting starts.
 You write ONE of these shot types at a time (the user says which):
-  • an ENTRANCE — ONE fighter ALONE EXPLODING into the arena, fierce, threatening and galvanized for victory, pumped up and ready to fight: charging or storming in, throwing fast shadow-boxing punches, kicks or knees AT THE AIR, pounding their chest, roaring and snarling, bouncing on their toes, flexing, glaring savagely into the camera. The motion must be FAST, kinetic and aggressive — never calm or static — but there is NO opponent in frame and no blow LANDS on anyone (they fight the air). Use a dynamic camera move (fast low-angle tracking push-in, whip-pan, sweeping crane, orbit) and rich atmosphere (dust, smoke, fire-barrel glow, spotlights).
+  • an ENTRANCE — ONE fighter ALONE walking out into the arena: a confident, composed, in-character entrance that suits THAT fighter's personality and description. They are a real human athlete, not a monster — keep it grounded and believable: walking or jogging in, loosening up, rolling the shoulders, a few crisp warm-up shadow-boxing punches or test kicks AT THE AIR, bouncing lightly on the toes, a focused or determined look, a confident nod or raised fist to the crowd. Show quiet confidence and readiness, NOT cartoonish rage — avoid roaring, snarling, baring teeth, chest-pounding and savage glaring. There is NO opponent in frame and no blow LANDS on anyone. Use a dynamic camera move (low-angle tracking push-in, whip-pan, sweeping crane, orbit) and rich atmosphere (dust, smoke, fire-barrel glow, spotlights).
   • a FACE-OFF — BOTH fighters squaring off face to face in a tense menacing stare-down, with the REFEREE between them giving the gesture to START the fight (chopping or dropping a hand, sweeping an arm). Show the tension and the referee's start signal explicitly. Still NO punches or kicks thrown yet.
 Always refer to each fighter (and the referee) by their NAME given in the user message.
 WARDROBE + LOCATION CONTINUITY (critical): keep each fighter in the IDENTICAL outfit (same garments, exact colours, hair, accessories) described, in the SAME township location with consistent background, surfaces, lighting and crowd.
