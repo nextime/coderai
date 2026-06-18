@@ -1669,6 +1669,52 @@ async def api_model_disable(request: Request, username: str = Depends(require_ad
     return {"success": True}
 
 
+@router.get("/admin/api/quantize-capabilities", summary="GPTQ/AWQ quantization availability")
+async def api_quantize_capabilities(username: str = Depends(require_admin)):
+    """Report whether fast-kernel (GPTQ/AWQ) quantization is available + any jobs."""
+    from codai.models import quant
+    return {
+        "capabilities": quant.capabilities(),
+        "available": quant.is_available(),
+        "jobs": quant.all_jobs(),
+    }
+
+
+@router.post("/admin/api/model-quantize", summary="Quantize a model to fast-kernel 4-bit")
+async def api_model_quantize(request: Request, username: str = Depends(require_admin)):
+    """Start (or report) an on-demand background GPTQ/AWQ quantization.
+
+    Body: {path|model_id, method?(gptq|awq), bits?(4), group_size?(128)}.
+    Quantization is heavy and slow; it runs in the background and the produced
+    checkpoint is picked up automatically on the model's next load. Falls back to
+    bitsandbytes if the fast kernels are unavailable or the arch is unsupported.
+    """
+    from codai.models import quant
+    data = await request.json()
+    model_id = (data.get("path") or data.get("model_id") or "").strip()
+    if not model_id:
+        raise HTTPException(status_code=400, detail="path/model_id is required")
+    method = (data.get("method") or "gptq").lower()
+    if method not in ("gptq", "awq"):
+        raise HTTPException(status_code=400, detail="method must be 'gptq' or 'awq'")
+    try:
+        bits = int(data.get("bits", 4))
+        group_size = int(data.get("group_size", 128))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="bits/group_size must be integers")
+    job = quant.start_quantization(model_id, method=method, bits=bits, group_size=group_size)
+    return {"success": job.get("status") != "unavailable", "job": job}
+
+
+@router.get("/admin/api/quantize-status", summary="Quantization job status")
+async def api_quantize_status(model_id: str = "", username: str = Depends(require_admin)):
+    """Status for one model's quant job (?model_id=...), or all jobs."""
+    from codai.models import quant
+    if model_id:
+        return {"job": quant.get_job(model_id.strip())}
+    return {"jobs": quant.all_jobs()}
+
+
 @router.get("/admin/api/model-loaded-status", summary="Model load status")
 async def api_model_loaded_status(username: str = Depends(require_admin)):
     """Return loaded model keys with per-model instance pool info."""
@@ -2117,7 +2163,8 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "max_vram", "sdcpp_flash_attn", "sdcpp_diffusion_flash_attn", "vae_tiling",
                 "component_quantization", "output_crf", "force_vram_update",
                 "balanced_gpu_percent", "acceleration",
-                "cache_type_k", "cache_type_v", "turboquant", "engine"):
+                "cache_type_k", "cache_type_v", "turboquant", "engine",
+                "quant_backend", "kv_cache_budget_mb", "kv_cache_slots"):
         if key in data:
             entry[key] = data[key]
 

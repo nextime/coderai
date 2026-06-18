@@ -171,6 +171,14 @@ def _mitigate(rss_gb: float, cap_gb: float, leak: bool, loading: bool = False) -
             actions.append("drop_upscalers")
     except Exception:
         pass
+    # Drop reclaimable KV prefix caches (host-RAM LlamaRAMCache + HF KV slots)
+    # before resorting to evicting whole models — they rebuild on demand.
+    try:
+        from codai.models.manager import _drop_prefix_caches
+        if _drop_prefix_caches():
+            actions.append("drop_prefix_caches")
+    except Exception:
+        pass
     # Still over and eviction is enabled → unload idle LRU models.
     try:
         from codai.models.manager import multi_model_manager as _mm

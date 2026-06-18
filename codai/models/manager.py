@@ -84,9 +84,45 @@ def _trim_cpu_ram() -> None:
         pass
 
 
+def _drop_prefix_caches() -> int:
+    """Release reclaimable KV prefix caches across all loaded text backends.
+
+    The GGUF LlamaRAMCache lives in host RAM and the HF KV slots in VRAM; both are
+    pure caches that can be rebuilt on demand. Dropping them is a cheap rung on the
+    RAM/VRAM-pressure ladder, run before evicting whole models. Returns the number
+    of backends whose cache was cleared.
+    """
+    n = 0
+    try:
+        from codai.models.manager import multi_model_manager as _mm
+    except Exception:
+        return 0
+
+    def _clear(obj):
+        nonlocal n
+        backend = getattr(obj, 'backend', None)
+        fn = getattr(backend, 'clear_prefix_cache', None)
+        if callable(fn):
+            try:
+                fn()
+                n += 1
+            except Exception:
+                pass
+
+    try:
+        for pool in list(getattr(_mm, 'model_pools', {}).values()):
+            for inst in list(getattr(pool, 'instances', [])):
+                _clear(inst)
+        for obj in list(getattr(_mm, 'models', {}).values()):
+            _clear(obj)
+    except Exception:
+        pass
+    return n
+
+
 class ModelManager:
     """Manages the loaded model and tokenizer."""
-    
+
     def __init__(self, backend=None, backend_type=None):
         self.backend = backend
         self.backend_type = backend_type
@@ -502,6 +538,10 @@ class ModelInstancePool:
         self.ref_counts: list = []
         self.max_instances: int = max_instances
         self._lock = threading.Lock()
+        # Session-affinity map: session_key -> instance index. Routes successive
+        # requests of one conversation back to the instance that already holds its
+        # warm KV prefix, instead of the purely load-based least-busy pick.
+        self._affinity: dict = {}
 
     @property
     def count(self) -> int:
@@ -519,14 +559,40 @@ class ModelInstancePool:
             self.ref_counts.append(0)
             return idx
 
-    def acquire(self):
-        """Return (idx, instance) of the least-busy instance, incrementing its ref-count."""
+    def acquire(self, session_key=None):
+        """Return (idx, instance) of the chosen instance, incrementing its ref-count.
+
+        When ``session_key`` is given, prefer the instance this session was last
+        routed to (cache affinity) as long as it isn't markedly busier than the
+        least-busy one; otherwise fall back to the least-busy instance and record
+        the new mapping. With ``session_key=None`` the behaviour is unchanged
+        (pure least-busy).
+        """
         with self._lock:
             if not self.instances:
                 return None
-            idx = min(range(len(self.instances)), key=lambda i: self.ref_counts[i])
+            least = min(range(len(self.instances)), key=lambda i: self.ref_counts[i])
+            idx = least
+            if session_key is not None:
+                pinned = self._affinity.get(session_key)
+                if pinned is not None and 0 <= pinned < len(self.instances):
+                    # Honour affinity unless the pinned instance is busier than the
+                    # least-busy one by more than one in-flight request (keeps a hot
+                    # cache without letting one instance pile up under load).
+                    if self.ref_counts[pinned] <= self.ref_counts[least] + 1:
+                        idx = pinned
+                self._affinity[session_key] = idx
+                self._prune_affinity()
             self.ref_counts[idx] += 1
             return idx, self.instances[idx]
+
+    def _prune_affinity(self) -> None:
+        """Bound the affinity map so it can't grow without limit (caller holds lock)."""
+        _CAP = 512
+        if len(self._affinity) > _CAP:
+            # Drop arbitrary oldest-inserted entries; dicts preserve insertion order.
+            for k in list(self._affinity.keys())[: len(self._affinity) - _CAP]:
+                self._affinity.pop(k, None)
 
     def release(self, idx: int) -> None:
         with self._lock:
@@ -3604,15 +3670,17 @@ class MultiModelManager:
         self.active_in_vram = key
         self.models_in_vram.add(key)
 
-    def acquire_model_instance(self, model_key: str):
-        """Acquire the least-busy instance, incrementing its ref-count.
+    def acquire_model_instance(self, model_key: str, session_key=None):
+        """Acquire an instance, incrementing its ref-count.
 
-        Returns (instance_idx, model_obj) or None if no instance is loaded.
-        Callers MUST call release_model_instance() when done.
+        ``session_key`` (optional) routes successive requests of one conversation
+        back to the instance holding its warm KV prefix; without it the least-busy
+        instance is chosen. Returns (instance_idx, model_obj) or None if no
+        instance is loaded. Callers MUST call release_model_instance() when done.
         """
         pool = self.model_pools.get(model_key)
         if pool and pool.count > 0:
-            return pool.acquire()
+            return pool.acquire(session_key=session_key)
         obj = self.models.get(model_key)
         if obj is not None:
             return 0, obj

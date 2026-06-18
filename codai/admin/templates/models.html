@@ -646,6 +646,15 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           </select>
         </div>
         <div class="form-row" style="margin:0">
+          <p class="muted" style="margin:0;font-size:0.85em;line-height:1.4">
+            <strong>Note:</strong> KV-cache quantization only applies to GGUF models on
+            the llama.cpp backend. HF-transformers models (incl. <strong>gemma</strong> and
+            other sliding-window / hybrid linear-attention architectures) ignore this and
+            keep an fp16 KV cache — their quantized-cache path crashes during generation.
+            For those, lower <strong>n_ctx</strong> to shrink the KV VRAM reserve instead.
+          </p>
+        </div>
+        <div class="form-row" style="margin:0">
           <label class="form-label">Max GPU % <span class="muted">(optional)</span></label>
           <input type="number" id="cfg-max-gpu" class="form-input" min="1" max="100" placeholder="e.g. 90">
         </div>
@@ -659,6 +668,30 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-8bit"> 8-bit quantization</label>
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-flash"> Flash Attention 2</label>
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-noram"> No RAM fallback</label>
+      </div>
+
+      <!-- Fast-kernel 4-bit (GPTQ/AWQ via Marlin) — HF transformers models only -->
+      <div id="cfg-fastquant-wrap" style="margin-top:1rem;padding:.75rem;border:1px solid var(--border);border-radius:6px;background:var(--raised)">
+        <div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
+          <div style="flex:1;min-width:220px">
+            <label class="form-label">Quant backend <span class="muted">(HF transformers)</span></label>
+            <select id="cfg-quant-backend" class="form-input">
+              <option value="auto">Auto — fast checkpoint if present, else bitsandbytes</option>
+              <option value="bnb">bitsandbytes only (NF4)</option>
+              <option value="gptq">GPTQ (Marlin/ExLlama) — needs quantized checkpoint</option>
+              <option value="awq">AWQ (Marlin) — needs quantized checkpoint</option>
+            </select>
+          </div>
+          <div style="display:flex;align-items:flex-end;gap:.5rem">
+            <button type="button" class="btn btn-secondary btn-sm" id="cfg-quantize-btn" onclick="startQuantize()">Quantize to 4-bit</button>
+          </div>
+        </div>
+        <div class="form-hint" id="cfg-quant-status" style="margin-top:.5rem">
+          bitsandbytes NF4 is the slowest 4-bit option. Quantizing to GPTQ/AWQ uses
+          Marlin kernels (2–4× faster) but is a heavy one-time background job; the
+          produced checkpoint is used automatically on the next load. Falls back to
+          bitsandbytes if unavailable or the architecture is unsupported.
+        </div>
       </div>
 
       <!-- Per-component quantization (diffusers image/video pipelines) -->
@@ -2084,6 +2117,88 @@ function _collectComponentQuant(){
   return Object.keys(out).length ? out : null;
 }
 
+// ---- Fast-kernel (GPTQ/AWQ) quantization ----
+let _quantPollTimer = null;
+let _quantCaps = null;
+
+async function _quantGetCaps(){
+  if(_quantCaps) return _quantCaps;
+  try{
+    const r = await fetch('/admin/api/quantize-capabilities');
+    const j = await r.json();
+    _quantCaps = j;
+  }catch(e){ _quantCaps = {available:false, capabilities:{error:String(e)}}; }
+  return _quantCaps;
+}
+
+function _renderQuantStatus(job, caps){
+  const el = document.getElementById('cfg-quant-status');
+  const btn = document.getElementById('cfg-quantize-btn');
+  if(!el) return;
+  if(caps && !caps.available){
+    btn.disabled = true;
+    const err = (caps.capabilities && caps.capabilities.error) || 'GPTQModel not installed';
+    el.innerHTML = `<span style="color:var(--warn,#d97706)">Fast-kernel quantization unavailable — using bitsandbytes. (${esc(err)})</span>`;
+    return;
+  }
+  const kernels = (caps && caps.capabilities && caps.capabilities.backends || []).join(', ');
+  if(job && job.status === 'running'){
+    btn.disabled = true;
+    const pct = Math.round((job.progress||0)*100);
+    el.innerHTML = `<span style="color:var(--accent,#6366f1)">Quantizing… ${pct}% — ${esc(job.message||'')}</span>`;
+  } else if(job && job.status === 'done'){
+    btn.disabled = false;
+    el.innerHTML = `<span style="color:var(--ok,#16a34a)">✓ Quantized checkpoint ready — used automatically on next load.</span> <span class="muted">Kernels: ${esc(kernels)}</span>`;
+  } else if(job && job.status === 'failed'){
+    btn.disabled = false;
+    el.innerHTML = `<span style="color:var(--danger,#dc2626)">Quantization failed: ${esc(job.error||'')}</span> <span class="muted">Falls back to bitsandbytes.</span>`;
+  } else {
+    btn.disabled = false;
+    el.innerHTML = `Marlin/ExLlama 4-bit (2–4× faster than bitsandbytes). One-time background job; checkpoint auto-used on next load. <span class="muted">Kernels: ${esc(kernels||'detecting…')}</span>`;
+  }
+}
+
+async function _refreshQuantStatus(modelPath){
+  if(_quantPollTimer){ clearInterval(_quantPollTimer); _quantPollTimer = null; }
+  const caps = await _quantGetCaps();
+  const path = modelPath || (document.getElementById('cfg-path')||{}).value || '';
+  let job = (caps.jobs && caps.jobs[path]) || null;
+  _renderQuantStatus(job, caps);
+  // Poll while a job is running.
+  if(caps.available){
+    _quantPollTimer = setInterval(async ()=>{
+      try{
+        const r = await fetch('/admin/api/quantize-status?model_id='+encodeURIComponent(path));
+        const j = await r.json();
+        _renderQuantStatus(j.job, caps);
+        if(!j.job || (j.job.status !== 'running')){ clearInterval(_quantPollTimer); _quantPollTimer = null; }
+      }catch(e){ clearInterval(_quantPollTimer); _quantPollTimer = null; }
+    }, 2000);
+  }
+}
+
+async function startQuantize(){
+  const path = (document.getElementById('cfg-path')||{}).value || '';
+  if(!path){ alert('No model selected.'); return; }
+  const method = (document.getElementById('cfg-quant-backend').value === 'awq') ? 'awq' : 'gptq';
+  const el = document.getElementById('cfg-quant-status');
+  if(el) el.innerHTML = '<span class="muted">Starting quantization…</span>';
+  try{
+    const r = await fetch('/admin/api/model-quantize', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path, method})
+    });
+    const j = await r.json();
+    if(!j.success && j.job && j.job.status === 'unavailable'){
+      _renderQuantStatus(null, {available:false, capabilities:j.job.caps||{}});
+      return;
+    }
+    _refreshQuantStatus(path);
+  }catch(e){
+    if(el) el.innerHTML = '<span style="color:var(--danger,#dc2626)">Failed to start: '+esc(String(e))+'</span>';
+  }
+}
+
 function _renderWhisperServerRows(models){
   if(!models.length) return '';
   const rows = models.map(m=>{
@@ -2788,6 +2903,8 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-ram-gb').value = s.manual_ram_gb != null ? s.manual_ram_gb : '';
   document.getElementById('cfg-4bit').checked = !!s.load_in_4bit;
   document.getElementById('cfg-8bit').checked = !!s.load_in_8bit;
+  document.getElementById('cfg-quant-backend').value = s.quant_backend || 'auto';
+  _refreshQuantStatus(m.path);
   _renderComponentQuant(s.component_quantization || {});
   document.getElementById('cfg-flash').checked = !!s.flash_attention;
   document.getElementById('cfg-noram').checked = !!s.no_ram;
@@ -3136,6 +3253,7 @@ async function saveModelConfig(){
     manual_ram_gb:     isNaN(ramGb) ? null : ramGb,
     load_in_4bit:      document.getElementById('cfg-4bit').checked,
     load_in_8bit:      document.getElementById('cfg-8bit').checked,
+    quant_backend:     document.getElementById('cfg-quant-backend').value || 'auto',
     component_quantization: _collectComponentQuant(),
     flash_attention:   document.getElementById('cfg-flash').checked,
     no_ram:            document.getElementById('cfg-noram').checked,

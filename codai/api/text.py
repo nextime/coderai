@@ -81,6 +81,57 @@ def set_global_tools_closer_prompt(tools_closer: bool):
     _set_global_tools_closer_prompt(tools_closer)
 
 
+def _conversation_session_key(request, http_request=None) -> Optional[str]:
+    """Derive a stable per-conversation key for instance/KV-cache affinity.
+
+    Prefers an explicit identifier the client supplies (the OpenAI ``user`` field
+    or an ``X-Session-Id`` header). Otherwise falls back to a hash of the stable
+    opening of the conversation (system prompt + first user turn for chat, or the
+    prompt head for completions) — stable across the turns of one conversation,
+    distinct between conversations. Returns None if nothing usable is available
+    (callers then fall back to least-busy routing). Never raises.
+    """
+    try:
+        # 1) Explicit id wins.
+        if http_request is not None:
+            sid = http_request.headers.get('x-session-id')
+            if sid:
+                return f"sid:{sid}"
+        uid = getattr(request, 'user', None)
+        if uid:
+            return f"user:{uid}"
+
+        # 2) Hash the stable opening of the conversation.
+        import hashlib
+        parts = []
+        msgs = getattr(request, 'messages', None)
+        if msgs:
+            first_user_seen = False
+            for m in msgs:
+                role = getattr(m, 'role', None) or (m.get('role') if isinstance(m, dict) else None)
+                content = getattr(m, 'content', None) or (m.get('content') if isinstance(m, dict) else None)
+                if not isinstance(content, str):
+                    content = str(content)
+                if role == 'system':
+                    parts.append(f"system:{content}")
+                elif role == 'user' and not first_user_seen:
+                    parts.append(f"user:{content}")
+                    first_user_seen = True
+                    break
+        else:
+            prompt = getattr(request, 'prompt', None)
+            if isinstance(prompt, list):
+                prompt = prompt[0] if prompt else ''
+            if prompt:
+                parts.append(str(prompt)[:1024])
+        if not parts:
+            return None
+        digest = hashlib.sha256("\n".join(parts).encode('utf-8', 'ignore')).hexdigest()[:16]
+        return f"hash:{digest}"
+    except Exception:
+        return None
+
+
 def set_grammar_guided_gen(enabled: bool):
     """Set the grammar-guided generation flag (via state module)."""
     _set_grammar_guided_gen(enabled)
@@ -424,7 +475,9 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
 
         _model_key = model_info.get('model_key')
         _candidate = None
-        _acq = multi_model_manager.acquire_model_instance(_model_key) if _model_key else None
+        _session_key = _conversation_session_key(request, http_request)
+        _acq = multi_model_manager.acquire_model_instance(
+            _model_key, session_key=_session_key) if _model_key else None
         if _acq:
             _instance_idx, _candidate = _acq
             # Guard against stale pool entries (model evicted but pool not cleared)
@@ -2072,10 +2125,13 @@ async def completions(request: CompletionRequest):
     if model_info.get('error'):
         raise HTTPException(status_code=404, detail=model_info['error'])
     
-    # Acquire the least-busy instance (increments ref-count; released on response completion)
+    # Acquire an instance (session-affinity when derivable, else least-busy;
+    # increments ref-count; released on response completion).
     _model_key = model_info.get('model_key')
     _instance_idx = None
-    _acq = multi_model_manager.acquire_model_instance(_model_key) if _model_key else None
+    _session_key = _conversation_session_key(request)
+    _acq = multi_model_manager.acquire_model_instance(
+        _model_key, session_key=_session_key) if _model_key else None
     if _acq:
         _instance_idx, mm = _acq
     else:

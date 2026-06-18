@@ -19,6 +19,7 @@
 
 import os
 import json
+import threading
 from typing import AsyncIterator, Optional, Union, List, Dict, Any
 from pathlib import Path
 
@@ -143,7 +144,7 @@ def _install_layer_log_callback():
     return _cb  # caller must hold this reference
 
 
-async def _aiter_blocking(sync_iter):
+async def _aiter_blocking(sync_iter, lock=None):
     """Bridge a blocking (sync) generator onto the asyncio event loop.
 
     llama.cpp's create_(chat_)completion returns a *synchronous* generator whose
@@ -167,6 +168,13 @@ async def _aiter_blocking(sync_iter):
         except StopIteration:
             return _SENT
 
+    # When a per-instance generation lock is supplied, hold it for the whole
+    # iteration so a concurrent request on the same backend can't interleave its
+    # forward passes into this one's KV cache. Acquired in a worker thread so a
+    # contended lock doesn't block the event loop; released from here (a plain
+    # threading.Lock permits cross-thread release).
+    if lock is not None:
+        await asyncio.to_thread(lock.acquire)
     try:
         while True:
             item = await asyncio.to_thread(_next)
@@ -179,6 +187,11 @@ async def _aiter_blocking(sync_iter):
             try:
                 close()
             except Exception:
+                pass
+        if lock is not None:
+            try:
+                lock.release()
+            except RuntimeError:
                 pass
 
 
@@ -198,6 +211,14 @@ class VulkanBackend(ModelBackend):
         if self.force_cuda:
             print("DEBUG: GGUF model will use CUDA backend (forced by --backend nvidia)")
         self._last_usage: dict = {}  # usage from the most recent completion call
+        # Serializes the synchronous forward pass within this one instance. The
+        # instance pool may hand the same backend to two concurrent requests when
+        # all instances are busy; overlapping create_completion calls share one KV
+        # cache and would corrupt each other. Distinct pool instances each have
+        # their own lock, so they still run in parallel. A plain Lock (not RLock)
+        # is used so the streaming path can acquire it in a worker thread and
+        # release it from the event-loop thread.
+        self._gen_lock = threading.Lock()
         self._detect_chat_template()
     
     def _detect_chat_template(self):
@@ -772,10 +793,57 @@ class VulkanBackend(ModelBackend):
         except Exception:
             pass
 
+        # Multi-slot prefix cache. llama-cpp-python's LlamaRAMCache keeps several
+        # past sequences' KV states in host RAM and, on each completion, reloads
+        # the one sharing the longest token prefix with the new prompt (see
+        # Llama._create_completion). This lets two interleaved conversations both
+        # stay "warm" instead of evicting each other — only the changed suffix is
+        # re-evaluated. Bounded by a per-model byte budget so it can't grow without
+        # limit (the states live in CPU RAM, copied back on a slot switch).
+        # kv_cache_budget_mb honours kwargs first, then the raw models.json entry,
+        # mirroring how cache_type_k / flash_attn are resolved above. <=0 disables
+        # it; unset falls back to a sensible default.
+        _DEFAULT_CACHE_MB = 512
+        _budget_mb = kwargs.get('kv_cache_budget_mb', _raw_cfg.get('kv_cache_budget_mb'))
+        self._setup_prefix_cache(_budget_mb if _budget_mb is not None else _DEFAULT_CACHE_MB)
+
         # Try to detect and set up chat template
         self._finalize_chat_template_detection()
         print(f"  chat_template: {self.chat_template}")
-    
+
+    def _setup_prefix_cache(self, budget_mb) -> None:
+        """Attach a multi-slot LlamaRAMCache sized to ``budget_mb`` megabytes."""
+        try:
+            budget = max(0, int(budget_mb)) * 1024 * 1024
+        except (TypeError, ValueError):
+            budget = 512 * 1024 * 1024
+        self._prefix_cache_budget = budget
+        if budget <= 0:
+            print("  Prefix cache : disabled (kv_cache_budget_mb=0)")
+            return
+        try:
+            from llama_cpp import LlamaRAMCache
+            self.model.set_cache(LlamaRAMCache(capacity_bytes=budget))
+            print(f"  Prefix cache : multi-slot RAM cache, budget {budget // (1024*1024)} MB")
+        except Exception as e:
+            print(f"  Prefix cache : could not enable ({e}); relying on single-slot prefix match")
+
+    def clear_prefix_cache(self) -> None:
+        """Release the host-RAM prefix cache (called by the RAM-pressure ladder).
+
+        Re-attaches a fresh, empty LlamaRAMCache at the same budget so caching
+        keeps working after the reclaim — only the stored sequences are dropped.
+        """
+        budget = getattr(self, '_prefix_cache_budget', 0)
+        if not budget or self.model is None:
+            return
+        try:
+            from llama_cpp import LlamaRAMCache
+            with self._gen_lock:
+                self.model.set_cache(LlamaRAMCache(capacity_bytes=budget))
+        except Exception:
+            pass
+
     def generate(
         self,
         prompt: str,
@@ -846,17 +914,18 @@ class VulkanBackend(ModelBackend):
                 pass
         
         try:
-            result = self.model.create_completion(
-                stopping_criteria=_make_llama_thermal_criteria(),
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                repeat_penalty=repeat_penalty,
-                stop=stop,
-                grammar=use_grammar,
-            )
+            with self._gen_lock:
+                result = self.model.create_completion(
+                    stopping_criteria=_make_llama_thermal_criteria(),
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repeat_penalty=repeat_penalty,
+                    stop=stop,
+                    grammar=use_grammar,
+                )
             usage = result.get('usage', {})
             self._store_usage(usage.get('prompt_tokens', 0), usage.get('completion_tokens', 0))
             return result['choices'][0]['text']
@@ -865,16 +934,17 @@ class VulkanBackend(ModelBackend):
             if use_grammar:
                 print(f"Warning: Grammar-guided generation failed: {e}, falling back to normal generation")
                 try:
-                    result = self.model.create_completion(
-                        stopping_criteria=_make_llama_thermal_criteria(),
-                        prompt=prompt,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        top_p=top_p,
-                        top_k=top_k,
-                        repeat_penalty=repeat_penalty,
-                        stop=stop,
-                    )
+                    with self._gen_lock:
+                        result = self.model.create_completion(
+                            stopping_criteria=_make_llama_thermal_criteria(),
+                            prompt=prompt,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            top_p=top_p,
+                            top_k=top_k,
+                            repeat_penalty=repeat_penalty,
+                            stop=stop,
+                        )
                     usage = result.get('usage', {})
                     self._store_usage(usage.get('prompt_tokens', 0), usage.get('completion_tokens', 0))
                     return result['choices'][0]['text']
@@ -963,7 +1033,7 @@ class VulkanBackend(ModelBackend):
                 stop=stop,
                 stream=True,
                 grammar=use_grammar,
-            )):
+            ), lock=self._gen_lock):
                 text = chunk['choices'][0].get('text', '')
 
                 if first_chunk:
@@ -1002,9 +1072,9 @@ class VulkanBackend(ModelBackend):
                         repeat_penalty=repeat_penalty,
                         stop=stop,
                         stream=True,
-                    )):
+                    ), lock=self._gen_lock):
                         text = chunk['choices'][0].get('text', '')
-                        
+
                         if first_chunk:
                             if text and len(text) > prompt_len:
                                 new_text = text[prompt_len:]
@@ -1071,7 +1141,7 @@ class VulkanBackend(ModelBackend):
                     repeat_penalty=repeat_penalty,
                     stop=stop,
                     stream=True,
-                )):
+                ), lock=self._gen_lock):
                     text = chunk['choices'][0].get('text', '')
                     
                     if first_chunk:
@@ -1089,16 +1159,17 @@ class VulkanBackend(ModelBackend):
             
             return {"stream": generate_stream(), "content": ""}
         else:
-            result = self.model.create_completion(
-                stopping_criteria=_make_llama_thermal_criteria(),
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                repeat_penalty=repeat_penalty,
-                stop=stop,
-            )
-            
+            with self._gen_lock:
+                result = self.model.create_completion(
+                    stopping_criteria=_make_llama_thermal_criteria(),
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    repeat_penalty=repeat_penalty,
+                    stop=stop,
+                )
+
             content = result['choices'][0]['text']
             
             return {
@@ -1210,7 +1281,8 @@ class VulkanBackend(ModelBackend):
         if _tc is not None:
             kwargs['stopping_criteria'] = _tc
 
-        result = self.model.create_chat_completion(**kwargs)
+        with self._gen_lock:
+            result = self.model.create_chat_completion(**kwargs)
         usage = result.get('usage', {})
         self._store_usage(
             prompt_tokens=usage.get('prompt_tokens', 0),
@@ -1241,7 +1313,7 @@ class VulkanBackend(ModelBackend):
         prompt_tokens = 0
         completion_tokens = 0
         try:
-            async for chunk in _aiter_blocking(self.model.create_chat_completion(**kwargs)):
+            async for chunk in _aiter_blocking(self.model.create_chat_completion(**kwargs), lock=self._gen_lock):
                 delta = chunk['choices'][0].get('delta', {})
                 text = delta.get('content') or ''
                 if text:

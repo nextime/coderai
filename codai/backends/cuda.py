@@ -18,6 +18,7 @@
 
 import os
 import time as _time
+import threading
 from typing import Optional, List, Dict
 from threading import Thread
 from abc import ABC
@@ -79,13 +80,24 @@ class NvidiaBackend(ModelBackend):
         self.device = None
         self.use_flash_attn = False
         self.flash_attn_available = False
-        # KV prefix cache (single-entry, keyed by formatted prefix text)
-        self._kv_prefix_text: Optional[str] = None
-        self._kv_past_key_values = None   # past_key_values tensor tuple
-        self._kv_prefix_len: int = 0      # token count of the cached prefix
-        self._kv_timestamp: float = 0.0
+        # Multi-slot KV prefix cache. Each slot keeps a pristine prefill cache for
+        # a token prefix; on a new request we reuse the slot sharing the longest
+        # token prefix (so two interleaved conversations stay warm, and an edit in
+        # the middle of the history only re-encodes from the edit point). Slots are
+        # an LRU list (most-recently-used last), each a dict:
+        #   {"ids": list[int], "cache": past_key_values, "length": int, "ts": float}
+        self._kv_slots: list = []
+        self._kv_max_slots: int = 3       # overridden from config (kv_cache_slots)
+        self._kv_min_reuse: int = 16      # don't bother reusing a tiny prefix
         self._kv_ttl: float = 300.0       # 5 min TTL
         self._last_usage: Dict = {}
+        # Serializes generation (prefix-cache build + model.generate) within this
+        # one instance. The instance pool can hand the same backend to two
+        # concurrent requests when all instances are busy; overlapping generate
+        # calls share one KV cache and would corrupt each other. A plain Lock (not
+        # RLock) is used so the streaming path can acquire it in a worker thread
+        # and release it from the event-loop thread.
+        self._gen_lock = threading.Lock()
         
     def check_flash_attn_support(self) -> None:
         """Check and print Flash Attention availability status."""
@@ -281,6 +293,34 @@ class NvidiaBackend(ModelBackend):
         if spec.startswith('q2') or 'int2' in spec or spec == '2':
             return 2
         return 4
+
+    def _warn_kv_quant_ignored(self):
+        """Print an explicit note when an explicit KV-quant request is dropped.
+
+        gemma/sliding-window and hybrid linear-attention models route through HF
+        transformers' quanto/HQQ ``QuantizedCache``, which raises during
+        generation on those architectures — so we force fp16 KV regardless of any
+        ``cache_type_k``/``cache_type_v`` (e.g. q4_0) the user set. Without this
+        line the log just shows ``quant=None`` with no hint that the request was
+        deliberately ignored. (q4_0 KV only applies to GGUF/llama.cpp models.)
+        """
+        spec = str(
+            getattr(self, '_pending_cache_type_k', None)
+            or getattr(self, '_pending_cache_type_v', None)
+            or ''
+        ).lower()
+        if spec in ('', 'f16', 'fp16', 'bf16', 'f32', 'none', 'auto'):
+            return
+        if not self._kv_quant_compatible():
+            why = ('sliding-window/gemma' if self._is_sliding_window_model()
+                   else 'hybrid linear-attention')
+            print(
+                f"  Note: KV-cache quant '{spec}' IGNORED — {why} models use HF "
+                f"transformers' quanto/HQQ QuantizedCache, which crashes on this "
+                f"architecture during generation, so KV stays fp16. q4_0-style KV "
+                f"quantization only applies to GGUF models on the llama.cpp backend. "
+                f"Lower n_ctx to shrink the KV reserve instead."
+            )
 
     def _kv_quant_compatible(self) -> bool:
         """Whether the model supports transformers' quantized KV cache.
@@ -583,8 +623,16 @@ class NvidiaBackend(ModelBackend):
                 bnb_4bit_quant_type='nf4',
                 bnb_4bit_compute_dtype=torch.float16,
                 bnb_4bit_use_double_quant=True,
+                # Required when device_map spills modules to CPU/disk: without it
+                # bitsandbytes refuses any offloaded quantized model and aborts
+                # the load ("set llm_int8_enable_fp32_cpu_offload=True"). Keeps
+                # quantized modules on GPU while non-quantized ones go to CPU/fp32.
+                llm_int8_enable_fp32_cpu_offload=True,
             )
-        return BitsAndBytesConfig(load_in_8bit=True)
+        return BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_enable_fp32_cpu_offload=True,
+        )
 
     def _is_moe_model(self, model_name: str) -> bool:
         """Check if model is a MoE model."""
@@ -706,6 +754,11 @@ class NvidiaBackend(ModelBackend):
         offload_strategy = kwargs.get('offload_strategy', 'auto')
         max_gpu_percent = kwargs.get('max_gpu_percent', None)
         expected_vram_gb = kwargs.get('expected_vram_gb') or 0
+        # _get_model_used_vram_gb() always returns a PEAK estimate (a measured
+        # resident total, or weights + _runtime_reserve_gb), so the auto-fit check
+        # must not re-add the KV/activation reserve. Default True; a caller that
+        # ever passes a weights-only number can override with False.
+        expected_is_total = bool(kwargs.get('expected_vram_is_total', True))
 
         # Check for --no-ram mode
         no_ram = kwargs.get('no_ram', False)
@@ -723,6 +776,45 @@ class NvidiaBackend(ModelBackend):
         self._pending_ctx = kwargs.get('ctx')
         self._pending_cache_type_k = kwargs.get('cache_type_k')
         self._pending_cache_type_v = kwargs.get('cache_type_v')
+
+        # Per-model multi-slot prefix-cache size (number of warm conversations to
+        # keep). <=0 disables prefix caching for this model; unset keeps the
+        # default. Honours kwargs first, then the raw models.json entry.
+        _raw_cfg = kwargs.get('_raw_cfg') or {}
+        _slots = kwargs.get('kv_cache_slots', _raw_cfg.get('kv_cache_slots'))
+        if _slots is not None:
+            try:
+                self._kv_max_slots = max(0, int(_slots))
+            except (TypeError, ValueError):
+                pass
+
+        # GPTQ/AWQ fast-kernel path. quant_backend: auto|bnb|gptq|awq (default auto).
+        # When enabled AND a locally-quantized checkpoint already exists for this
+        # model, load THAT (it carries its own quant config and loads via Marlin/
+        # ExLlama through transformers' native path) instead of the fp16 source +
+        # bitsandbytes. No checkpoint → fall through to the bnb path unchanged
+        # (quantization itself is an explicit, on-demand admin action, never auto).
+        self._loaded_quant_backend = "bnb"
+        quant_backend = str(kwargs.get('quant_backend',
+                                       _raw_cfg.get('quant_backend') or 'auto')).lower()
+        if quant_backend in ('auto', 'gptq', 'awq'):
+            try:
+                from codai.models import quant as _quant
+                if _quant.is_available():
+                    _methods = ('gptq', 'awq') if quant_backend == 'auto' else (quant_backend,)
+                    for _m in _methods:
+                        _ckpt = _quant.find_quantized_checkpoint(model_name, _m)
+                        if _ckpt:
+                            print(f"Using fast-kernel {_m.upper()} checkpoint: {_ckpt}")
+                            model_name = _ckpt
+                            load_in_4bit = load_in_8bit = False  # checkpoint self-quantized
+                            self._loaded_quant_backend = _m
+                            break
+                elif quant_backend in ('gptq', 'awq'):
+                    print(f"  quant_backend={quant_backend} requested but GPTQModel/"
+                          f"fast kernels unavailable — falling back to bitsandbytes")
+            except Exception as _qe:
+                print(f"  GPTQ/AWQ checkpoint lookup failed ({_qe}); using bitsandbytes")
 
         print(f"Loading HuggingFace model: {model_name}")
 
@@ -906,16 +998,27 @@ class NvidiaBackend(ModelBackend):
                     if torch.cuda.is_available() and expected_vram_gb > 0:
                         _free, _ = torch.cuda.mem_get_info(0)
                         _free_gb = _free / 1e9
+                        # expected_vram_gb is already a PEAK estimate: the measured
+                        # path returns a real resident total (KV + activations
+                        # included), and the estimate path adds _runtime_reserve_gb
+                        # on top of the weights. Re-adding the KV reserve + a fixed
+                        # activation pad here double-counted that headroom (e.g. a
+                        # 24.3 GB measured total became a 28.6 GB "need"), which
+                        # pushed models that actually fit straight into device_map
+                        # CPU offload — catastrophic for MoE models (expert thrash).
+                        # Compare the peak directly, only when a measurement isn't
+                        # available fall back to padding the weights estimate.
                         _kv_gb = self._kv_cache_reserve_bytes() / 1e9
-                        _act_gb = 1.5 if _kv_gb > 0 else 0.0
-                        _need_gb = expected_vram_gb + _kv_gb + _act_gb
+                        if expected_is_total:
+                            _need_gb = expected_vram_gb
+                        else:
+                            _need_gb = expected_vram_gb + _kv_gb + (1.5 if _kv_gb > 0 else 0.0)
                         _borderline = 3.0 if offload_strategy == 'auto-borderline' else 0.0
                         _fits = _need_gb <= (_free_gb - 0.5 + _borderline)
                         if _fits:
                             print(f"\n  Auto: peak VRAM need {_need_gb:.1f} GB "
-                                  f"(weights {expected_vram_gb:.1f} + KV {_kv_gb:.1f} "
-                                  f"+ act {_act_gb:.1f}) fits in {_free_gb:.1f} GB free "
-                                  f"— loading full-GPU (no offload)")
+                                  f"({'measured total' if expected_is_total else f'weights {expected_vram_gb:.1f} + KV {_kv_gb:.1f}'}) "
+                                  f"fits in {_free_gb:.1f} GB free — loading full-GPU (no offload)")
                         else:
                             print(f"\n  Auto: peak VRAM need {_need_gb:.1f} GB > "
                                   f"{_free_gb:.1f} GB free — going straight to "
@@ -1078,6 +1181,7 @@ class NvidiaBackend(ModelBackend):
                         f"weight budget {weight_budget/1e9:.1f}→{new_budget/1e9:.1f}GB "
                         f"(rest spills to CPU)"
                     )
+                    self._warn_kv_quant_ignored()
                     weight_budget = new_budget
                 max_memory[i] = weight_budget
 
@@ -1257,9 +1361,9 @@ class NvidiaBackend(ModelBackend):
                 gen_kwargs["repetition_penalty"] = max(presence_penalty, frequency_penalty) if max(presence_penalty, frequency_penalty) > 1.0 else 1.0
         
         try:
-            with torch.no_grad():
+            with self._gen_lock, torch.no_grad():
                 outputs = self.model.generate(**gen_kwargs)
-            
+
             generated_tokens = outputs[0][inputs["input_ids"].shape[1]:]
             return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
         except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
@@ -1268,7 +1372,7 @@ class NvidiaBackend(ModelBackend):
                 print(f"Warning: CUDA OOM during generation. Clearing cache and retrying...")
                 torch.cuda.empty_cache()
                 try:
-                    with torch.no_grad():
+                    with self._gen_lock, torch.no_grad():
                         outputs = self.model.generate(**gen_kwargs)
                     
                     generated_tokens = outputs[0][inputs["input_ids"].shape[1]:]
@@ -1433,7 +1537,8 @@ class NvidiaBackend(ModelBackend):
         def generate_with_error_handling():
             nonlocal generation_error
             try:
-                self.model.generate(**generation_kwargs)
+                with self._gen_lock:
+                    self.model.generate(**generation_kwargs)
             except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
                 error_msg = str(e).lower()
                 if "out of memory" in error_msg or "cuda" in error_msg or "oom" in error_msg:
@@ -1487,12 +1592,6 @@ class NvidiaBackend(ModelBackend):
     # KV prefix cache helpers
     # ------------------------------------------------------------------
 
-    def _kv_cache_valid(self) -> bool:
-        return (
-            self._kv_past_key_values is not None and
-            _time.time() - self._kv_timestamp < self._kv_ttl
-        )
-
     def _model_on_cuda(self) -> bool:
         """Return True only when the model's first parameter is actually on a CUDA device."""
         try:
@@ -1500,33 +1599,135 @@ class NvidiaBackend(ModelBackend):
         except StopIteration:
             return False
 
-    def _build_kv_prefix(self, prefix_text: str):
-        """Forward-pass on prefix_text to populate the KV state."""
+    @staticmethod
+    def _lcp_len(a: list, b: list) -> int:
+        """Length of the longest common prefix of two token-id lists."""
+        n = 0
+        for x, y in zip(a, b):
+            if x != y:
+                break
+            n += 1
+        return n
+
+    def _clone_crop(self, cache, length: int):
+        """Return a deep copy of ``cache`` truncated to ``length`` tokens.
+
+        Generation extends the cache it is handed in place, so we must never pass
+        a stored slot directly — clone it first and let the clone be mutated while
+        the stored prefix stays pristine for the next reuse.
+        """
+        import copy
+        clone = copy.deepcopy(cache)
+        try:
+            if length < clone.get_seq_length():
+                clone.crop(length)
+        except Exception:
+            pass
+        return clone
+
+    def _build_kv_prefix(self, input_ids):
+        """Prefill ``input_ids`` (a [1, P] tensor) and return (past_key_values, P).
+
+        Building from a slice of the request's own ``total_input_ids`` keeps the
+        stored prefix token-aligned with future prompts, so token-level prefix
+        matching is exact (no add_special_tokens / re-render drift).
+        """
         import torch
-        # KV prefix caching requires CUDA tensors; skip on CPU-mode models.
         if not self._model_on_cuda():
             raise RuntimeError("KV prefix cache requires CUDA; model is on CPU")
-        inputs = self.tokenizer(
-            prefix_text, return_tensors="pt", add_special_tokens=False
-        )
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-        with torch.no_grad():
-            out = self.model(**inputs, use_cache=True, return_dict=True)
-        return out.past_key_values, int(inputs['input_ids'].shape[1])
+        input_ids = input_ids.to(self.model.device)
+        attn = torch.ones_like(input_ids)
+        with self._gen_lock, torch.no_grad():
+            out = self.model(input_ids=input_ids, attention_mask=attn,
+                             use_cache=True, return_dict=True)
+        return out.past_key_values, int(input_ids.shape[1])
 
-    def _store_kv(self, prefix_text: str, past_kv, prefix_len: int) -> None:
-        self._kv_prefix_text = prefix_text
-        self._kv_past_key_values = past_kv
-        self._kv_prefix_len = prefix_len
-        self._kv_timestamp = _time.time()
+    def _kv_prune(self) -> None:
+        """Drop expired slots (TTL) and enforce the slot-count cap (evict LRU)."""
+        now = _time.time()
+        self._kv_slots = [s for s in self._kv_slots if now - s["ts"] < self._kv_ttl]
+        while len(self._kv_slots) > max(0, self._kv_max_slots):
+            old = self._kv_slots.pop(0)
+            old.pop("cache", None)
+
+    def _store_kv(self, ids: list, past_kv, length: int) -> None:
+        """Insert/refresh a slot for token prefix ``ids`` (most-recently-used)."""
+        self._kv_slots = [s for s in self._kv_slots if s["ids"] != ids[:s["length"]] or s["length"] != length]
+        self._kv_slots.append({
+            "ids": list(ids[:length]),
+            "cache": past_kv,
+            "length": int(length),
+            "ts": _time.time(),
+        })
+        self._kv_prune()
+
+    def _lookup_kv(self, total_ids: list):
+        """Find the slot sharing the longest token prefix with ``total_ids``.
+
+        Returns (cloned_cache, matched_len) ready to hand to generate() with
+        input_ids = total_input_ids[:, matched_len:], or (None, 0) on a miss.
+        """
+        self._kv_prune()
+        best = None
+        best_m = 0
+        for s in self._kv_slots:
+            m = self._lcp_len(total_ids, s["ids"])
+            if m > best_m:
+                best_m, best = m, s
+        # Need a non-trivial match that still leaves at least one token to decode.
+        if best is None or best_m < self._kv_min_reuse or best_m >= len(total_ids):
+            return None, 0
+        clone = self._clone_crop(best["cache"], best_m)
+        best["ts"] = _time.time()  # mark reused (LRU freshness)
+        return clone, best_m
+
+    def _reuse_or_seed_prefix(self, total_input_ids, total_prompt_len, prefix_msgs,
+                              enable_thinking=False, tools=None):
+        """Return (past_kv, cached_len) for the request's KV prefix.
+
+        First tries a token-level match against the multi-slot cache (reuses an
+        existing conversation's KV, including after a mid-history edit). On a miss
+        it seeds a new slot by prefilling the message-boundary prefix, built from a
+        slice of ``total_input_ids`` so the stored tokens stay aligned with future
+        prompts. Returns (None, 0) when nothing usable could be prepared.
+        """
+        if self._kv_max_slots <= 0:
+            return None, 0
+        total_ids = total_input_ids[0].tolist()
+        # 1) Reuse the warmest matching slot.
+        past_kv, cached_len = self._lookup_kv(total_ids)
+        if past_kv is not None:
+            return past_kv, cached_len
+        # 2) Seed: prefill up to the aligned message-boundary, then keep a pristine
+        #    copy in a slot and hand a clone to the caller for generation.
+        try:
+            prefix_text = self._build_chat_prompt(
+                prefix_msgs, enable_thinking=enable_thinking,
+                add_generation_prompt=False, tools=tools)
+            rendered = self.tokenizer(
+                prefix_text, return_tensors="pt", add_special_tokens=False
+            )['input_ids'][0].tolist()
+            # Aligned boundary = how far the rendered prefix matches the full prompt.
+            boundary = min(self._lcp_len(total_ids, rendered), total_prompt_len - 1)
+            if boundary < self._kv_min_reuse:
+                return None, 0
+            built_kv, boundary = self._build_kv_prefix(total_input_ids[:, :boundary])
+            self._store_kv(total_ids, built_kv, boundary)
+            return self._clone_crop(built_kv, boundary), boundary
+        except Exception as e:
+            print(f"Warning: KV prefix cache build failed: {e}")
+            return None, 0
 
     def invalidate_kv_cache(self) -> None:
-        """Discard the cached KV state (call on model unload/swap)."""
-        self._kv_prefix_text = None
-        if self._kv_past_key_values is not None:
-            del self._kv_past_key_values
-        self._kv_past_key_values = None
-        self._kv_prefix_len = 0
+        """Discard all cached KV state (call on model unload/swap)."""
+        for s in self._kv_slots:
+            s.pop("cache", None)
+        self._kv_slots = []
+
+    def clear_prefix_cache(self) -> None:
+        """Release cached KV slots (called by the RAM/VRAM-pressure ladder)."""
+        with self._gen_lock:
+            self.invalidate_kv_cache()
 
     def _kv_prefix_supported(self) -> bool:
         """Whether this model can safely reuse a manually-prefilled KV cache.
@@ -1600,7 +1801,6 @@ class NvidiaBackend(ModelBackend):
             return free / 1e9 >= min_free_gb
         except Exception:
             return False
-        self._kv_timestamp = 0.0
 
     # ------------------------------------------------------------------
     # Usage tracking
@@ -1887,18 +2087,9 @@ class NvidiaBackend(ModelBackend):
         cached_len = 0
 
         if prefix_msgs and self._model_on_cuda() and self._kv_prefix_supported() and self._kv_prefix_headroom_ok():
-            prefix_text = self._build_chat_prompt(
-                prefix_msgs, enable_thinking=enable_thinking, add_generation_prompt=False, tools=tools)
-            if self._kv_cache_valid() and self._kv_prefix_text == prefix_text:
-                past_kv = self._kv_past_key_values
-                cached_len = self._kv_prefix_len
-            else:
-                try:
-                    past_kv, cached_len = self._build_kv_prefix(prefix_text)
-                    self._store_kv(prefix_text, past_kv, cached_len)
-                except Exception as e:
-                    print(f"Warning: KV prefix cache build failed: {e}")
-                    past_kv, cached_len = None, 0
+            past_kv, cached_len = self._reuse_or_seed_prefix(
+                total_input_ids, total_prompt_len, prefix_msgs,
+                enable_thinking=enable_thinking, tools=tools)
 
         temperature, top_p, do_sample = self._validate_params(temperature, top_p)
         gen_kwargs = dict(
@@ -1925,7 +2116,7 @@ class NvidiaBackend(ModelBackend):
                 full_attn = torch.ones(
                     1, total_prompt_len, dtype=torch.long, device=self.model.device
                 )
-                with torch.no_grad():
+                with self._gen_lock, torch.no_grad():
                     outputs = self.model.generate(
                         input_ids=suffix_ids,
                         past_key_values=past_kv,
@@ -1936,7 +2127,7 @@ class NvidiaBackend(ModelBackend):
             else:
                 cached_len = 0
                 attn_mask = torch.ones_like(total_input_ids)
-                with torch.no_grad():
+                with self._gen_lock, torch.no_grad():
                     outputs = self.model.generate(
                         input_ids=total_input_ids,
                         attention_mask=attn_mask,
@@ -1958,7 +2149,7 @@ class NvidiaBackend(ModelBackend):
                     full_prompt, return_tensors="pt"
                 )['input_ids'].to(self.model.device)
                 attn_mask = torch.ones_like(total_input_ids)
-                with torch.no_grad():
+                with self._gen_lock, torch.no_grad():
                     outputs = self.model.generate(
                         input_ids=total_input_ids,
                         attention_mask=attn_mask,
@@ -1976,7 +2167,7 @@ class NvidiaBackend(ModelBackend):
                             full_prompt, return_tensors="pt"
                         )['input_ids'].to(self.model.device)
                         attn_mask = torch.ones_like(total_input_ids)
-                        with torch.no_grad():
+                        with self._gen_lock, torch.no_grad():
                             outputs = self.model.generate(
                                 input_ids=total_input_ids,
                                 attention_mask=attn_mask,
@@ -2032,18 +2223,9 @@ class NvidiaBackend(ModelBackend):
         cached_len = 0
 
         if prefix_msgs and self._model_on_cuda() and self._kv_prefix_supported() and self._kv_prefix_headroom_ok():
-            prefix_text = self._build_chat_prompt(
-                prefix_msgs, enable_thinking=enable_thinking, add_generation_prompt=False, tools=tools)
-            if self._kv_cache_valid() and self._kv_prefix_text == prefix_text:
-                past_kv = self._kv_past_key_values
-                cached_len = self._kv_prefix_len
-            else:
-                try:
-                    past_kv, cached_len = self._build_kv_prefix(prefix_text)
-                    self._store_kv(prefix_text, past_kv, cached_len)
-                except Exception as e:
-                    print(f"Warning: KV prefix cache build failed (stream): {e}")
-                    past_kv, cached_len = None, 0
+            past_kv, cached_len = self._reuse_or_seed_prefix(
+                total_input_ids, total_prompt_len, prefix_msgs,
+                enable_thinking=enable_thinking, tools=tools)
 
         temperature, top_p, do_sample = self._validate_params(temperature, top_p)
 
@@ -2122,7 +2304,7 @@ class NvidiaBackend(ModelBackend):
 
             def _run():
                 try:
-                    with torch.no_grad():
+                    with self._gen_lock, torch.no_grad():
                         self.model.generate(**gen_kwargs)
                 except Exception as e:
                     gen_error[0] = str(e)
