@@ -1517,6 +1517,7 @@ async def stream_chat_response(
     
     try:
         chunk_count = 0
+        _gen_t0 = None          # wall-clock of the first generated token (for it/s)
         # Buffer for withholding in-progress tool tags from the content stream.
         content_buffer = ""
         # Exact content deltas actually streamed to the client (post-format,
@@ -1560,6 +1561,17 @@ async def stream_chat_response(
             if task_registry.is_cancelled(_tid):
                 break
             chunk_count += 1
+            # Publish live throughput (tokens/s) onto the task for the Tasks page.
+            # The streamer yields ~one token per chunk; refresh every few tokens to
+            # keep the registry lock cold.
+            if _gen_t0 is None:
+                _gen_t0 = time.time()
+            elif chunk_count % 8 == 0:
+                _elapsed = time.time() - _gen_t0
+                if _elapsed > 0:
+                    task_registry.update(
+                        _tid, step=chunk_count,
+                        rate=round(chunk_count / _elapsed, 1))
             # Always filter malformed content (regex-based, works per-chunk)
             filtered_chunk = filter_malformed_content(chunk)
             

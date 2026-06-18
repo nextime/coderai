@@ -96,12 +96,19 @@ const STATUS_BADGE = {
 
 function progressBar(t) {
   const total = t.total || 0, step = t.step || 0;
+  // Live throughput for text generation (tokens/s), shown while running.
+  const rate = (t.rate && t.status === 'running')
+    ? ` <span class="dim small">· ${t.rate} tok/s</span>` : '';
   if (!total) {
-    return t.status === 'running' ? '<span class="dim small">working…</span>' : '<span class="dim small">—</span>';
+    if (t.status === 'running') {
+      const tok = step ? `${step} tok` : 'working…';
+      return `<span class="dim small">${tok}</span>${rate}`;
+    }
+    return '<span class="dim small">—</span>';
   }
   const pct = Math.max(0, Math.min(100, Math.round(step / total * 100)));
   return `<div class="progress"><div class="progress-fill" style="width:${pct}%"></div></div>
-          <span class="dim small">${step}/${total} (${pct}%)</span>`;
+          <span class="dim small">${step}/${total} (${pct}%)</span>${rate}`;
 }
 
 function actions(t) {
