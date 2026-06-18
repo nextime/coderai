@@ -49,13 +49,42 @@ _download_cancelled: set = set()  # session_ids the user has requested to cancel
 _download_procs: dict = {}    # session_id → multiprocessing.Process running the download
 
 
+def _worker_preexec():
+    """Child preexec: die with the parent (PR_SET_PDEATHSIG=SIGKILL).
+
+    Download workers are spawned as plain subprocesses; without this they survive a
+    server/engine restart as orphans, keep holding huggingface_hub's per-blob file
+    lock, and make the next re-download deadlock at 0%. Tying their lifetime to the
+    parent means a restart cleans them up, and the re-download resumes from the
+    ``.incomplete`` blob cleanly."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").prctl(1, 9, 0, 0, 0)  # PR_SET_PDEATHSIG, SIGKILL
+    except Exception:
+        pass
+
+
 def get_active_download_model_ids() -> set:
     """Return the set of model IDs whose download is currently in progress."""
     return {
         s["model_id"]
         for s in _download_status.values()
-        if s.get("status") == "downloading"
+        if s.get("status") in ("starting", "downloading")
     }
+
+
+def _active_download_session(model_id: str, file_pattern: str):
+    """Return the session_id of a live download for this exact (model_id, pattern),
+    or None. Used to dedup re-download clicks: a second worker for a model already
+    downloading would only block on huggingface_hub's per-blob file lock and sit at
+    0% forever, so we attach the new client to the running download instead."""
+    for sid, s in _download_status.items():
+        if (s.get("model_id") == model_id
+                and (s.get("file_pattern") or "") == (file_pattern or "")
+                and s.get("status") in ("starting", "downloading")
+                and sid in _download_sessions):
+            return sid
+    return None
 
 
 def _url(request: Request, path: str) -> str:
@@ -797,7 +826,8 @@ def _run_download_thread(session_id: str, model_id: str, file_pattern: str, pq):
     import time
     import os
 
-    status = {"session_id": session_id, "model_id": model_id, "status": "starting",
+    status = {"session_id": session_id, "model_id": model_id, "file_pattern": file_pattern,
+              "status": "starting",
               "percent": 0, "filename": "", "rate": 0, "eta": None}
     _download_status[session_id] = status
 
@@ -856,6 +886,7 @@ def _run_download_thread(session_id: str, model_id: str, file_pattern: str, pq):
         proc = _sp.Popen(
             [_sys.executable, "-m", "codai.admin.download_worker", model_id, file_pattern or ""],
             stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True, bufsize=1, env=env, cwd=_repo_root,
+            preexec_fn=_worker_preexec if os.name == "posix" else None,
         )
         _download_procs[session_id] = proc
         terminal = None
@@ -939,6 +970,15 @@ async def api_download_model(
 
     if not model_id:
         raise HTTPException(status_code=400, detail="Model ID required")
+
+    # Dedup: if this exact model is already downloading (e.g. the previous attempt
+    # survived a page reload, or the user clicked "download" again), attach to the
+    # live session instead of spawning a second worker. A duplicate worker would
+    # only deadlock on huggingface_hub's per-blob file lock and show 0% forever
+    # while the first worker quietly finishes.
+    existing = _active_download_session(model_id, file_pattern)
+    if existing:
+        return {"session_id": existing, "attached": True}
 
     session_id = str(_uuid.uuid4())
     pq = _q.Queue()

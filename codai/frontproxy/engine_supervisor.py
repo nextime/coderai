@@ -133,6 +133,12 @@ class EngineSupervisor:
         self._poll_thread = None
         self._logs = {}   # engine_id -> deque tail
         self._restart_lock = threading.RLock()
+        # Serialise terminal writes across engine pump threads + track whether the
+        # last thing we printed was an in-place tqdm progress line (so the next
+        # normal line finalises it with a newline).
+        self._log_lock = threading.Lock()
+        self._log_progress_tag = None    # tag currently owning the \r line, or None
+        self._log_last_pct = {}          # tag -> last printed % (non-TTY throttle)
 
     def _assign_models(self, engines) -> None:
         """Give each engine the set of models it owns (via CODERAI_ENGINE_MODELS), so
@@ -330,8 +336,41 @@ class EngineSupervisor:
             if not line:
                 continue
             tail.append(line)
-            print(f"[{tag}] {line}", flush=True)
             self._note_load_progress(engine, line)
+            self._emit_log(tag, line)
+
+    def _emit_log(self, tag, line):
+        """Print an engine log line, rendering tqdm progress bars as a single
+        in-place updating line (carriage return) on a TTY instead of one line per
+        update. On a non-TTY (redirected to a file) we keep newlines but throttle
+        to whole-percent changes so the log isn't flooded."""
+        pm = self._PROGRESS_RE.match(line)
+        is_progress = bool(pm)
+        with self._log_lock:
+            tty = False
+            try:
+                tty = sys.stdout.isatty()
+            except Exception:
+                pass
+            if is_progress and tty:
+                # Overwrite the current line; pad to clear any longer previous one.
+                print(f"\r[{tag}] {line}\033[K", end="", flush=True)
+                self._log_progress_tag = tag
+                return
+            if is_progress:
+                # Non-TTY: only emit when the integer percent advanced.
+                try:
+                    pct = int(round(int(pm.group(2)) / max(1, int(pm.group(3))) * 100))
+                except Exception:
+                    pct = -1
+                if pct == self._log_last_pct.get(tag):
+                    return
+                self._log_last_pct[tag] = pct
+            # A normal line: finalise any in-place progress line first.
+            if self._log_progress_tag is not None:
+                print(flush=True)
+                self._log_progress_tag = None
+            print(f"[{tag}] {line}", flush=True)
 
     def _note_load_progress(self, engine, line):
         """Track model-load progress from the engine's log stream so the front can
