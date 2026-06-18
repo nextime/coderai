@@ -34,6 +34,43 @@ class ServerConfig:
     https_cert_path: Optional[str] = None
     queue_max_size: int = 6
     max_parallel_requests: int = 2
+    # Per-engine overrides for max_parallel_requests, keyed by engine name
+    # (e.g. {"nvidia": 4, "radeon": 1}). Each engine is a separate process and
+    # enforces this on itself, so the default already applies per-engine; the
+    # override lets a bigger card run more concurrently than a smaller one. Blank =
+    # use the default above.
+    max_parallel_requests_overrides: dict = field(default_factory=dict)
+    # ─── Frontend/engine split ───────────────────────────────────────────────
+    # By default coderai boots a thin, always-responsive *front* reverse proxy on
+    # the public host/port and supervises one or more *engine* subprocesses (which
+    # do all GPU/model work) on internal localhost ports. This keeps the web UI
+    # responsive while a model loads or generates. Set single_process=True (or pass
+    # --single-process) to keep the legacy one-process behavior.
+    single_process: bool = False
+    internal_port_base: int = 8780      # first engine binds here; +1 per extra engine
+    engines: int = 0                    # 0 = auto (one per detected GPU, min 1)
+    engine_gpus: Optional[list] = None  # explicit GPU indices, e.g. [0, 1]; None = auto
+    proxy_status_timeout: float = 2.0   # short timeout for UI/status proxying (seconds)
+    proxy_max_inflight: int = 64        # max concurrent proxied requests through the front
+    # Explicit, heterogeneous engine declarations. Auto GPU detection only finds
+    # NVIDIA cards and assumes one backend, and CUDA vs Vulkan device enumeration is
+    # inconsistent — so for mixed setups (e.g. an NVIDIA + a Radeon card, where the
+    # NVIDIA engine also serves GGUF via Vulkan) declare each engine with its own
+    # env block. When non-empty this overrides `engines`/`engine_gpus`. Each item:
+    #   {
+    #     "name": "nvidia",          # label for logs
+    #     "backend": "nvidia",       # nvidia | vulkan (forces this engine's backend)
+    #     "capabilities": [...],     # optional; defaults from backend (see below)
+    #     "env": { "CUDA_VISIBLE_DEVICES": "0", "GGML_VK_VISIBLE_DEVICES": "0",
+    #              "VK_ICD_FILENAMES": "/usr/share/vulkan/icd.d/nvidia_icd.json" }
+    #   }
+    # Default capabilities: nvidia → ["transformers","gguf"]; vulkan → ["gguf"].
+    engine_specs: Optional[list] = None
+    # Preferred engine (by name or backend) when a model is compatible with more
+    # than one — e.g. a GGUF that could run on either an NVIDIA or a Radeon engine.
+    # None = spread to the least-loaded compatible engine. A per-model "engine" set
+    # in models.json overrides this for that model.
+    default_engine: Optional[str] = None
 
 
 @dataclass
@@ -52,6 +89,9 @@ class ModelsConfig:
     hf_cache_dir: Optional[str] = None
     gguf_cache_dir: Optional[str] = None
     max_model_instances: int = 1  # max concurrent instances per model (global default; overridable per-model via "max_instances")
+    # Per-engine overrides for max_model_instances, keyed by engine name
+    # (e.g. {"nvidia": 2, "radeon": 1}). Applied per-engine process; blank = default.
+    max_model_instances_overrides: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -72,6 +112,13 @@ class OffloadConfig:
     max_ram_gb: Optional[float] = None
     evict_idle_on_ram: bool = True   # unload idle LRU models when over the RAM cap
     ram_leak_watch: bool = True      # background watcher samples RSS + auto-mitigates
+    # Leak-watch mitigation tuning. The watcher runs a mitigation ladder when RSS
+    # crosses ram_watch_soft_fraction of the cap (or a leak is suspected). On a
+    # marginal GPU the cross-thread CUDA call in that ladder can be undesirable, so
+    # ram_watch_cuda gates whether mitigation is allowed to call torch.cuda.empty_cache().
+    ram_watch_poll_seconds: float = 15.0    # how often the watcher samples RSS
+    ram_watch_soft_fraction: float = 0.90   # mitigate at/above this fraction of the cap
+    ram_watch_cuda: bool = True             # allow mitigation to call CUDA empty_cache()
 
 
 @dataclass
@@ -130,6 +177,11 @@ class ThermalConfig:
     cpu_resume: float = 87.0    # resume once CPU drops back to/below this
     gpu_high: float = 90.0      # pause when GPU reaches this temperature
     gpu_resume: float = 87.0    # resume once GPU drops back to/below this
+    # Per-vendor GPU threshold overrides, e.g. {"amd": {"high": 95, "resume": 92}}.
+    # A card uses its vendor's override when present, else the gpu_high/gpu_resume
+    # defaults above — so e.g. a Radeon that runs hotter can have a higher limit
+    # than an NVIDIA card. Keyed by vendor: "nvidia" | "amd" | "intel".
+    gpu_overrides: dict = field(default_factory=dict)
     poll_seconds: float = 5.0   # how often to re-check while cooling down
     # Proactive soft-throttle: before a hard pause, when a sensor enters the warm
     # band [soft_throttle_temp, *_high) insert a short per-step sleep (scaled by
@@ -163,6 +215,30 @@ class EnhanceConfig:
 
 
 @dataclass
+class Ds4Config:
+    """DeepSeek V4 via ds4 (antirez/DwarfStar) external-worker configuration.
+
+    ds4 is a native inference engine built specifically for DeepSeek V4 that exposes
+    an OpenAI-compatible HTTP server (``ds4-server``). When ``enabled``, coderai owns
+    the whole lifecycle: on first use it clones + builds ds4, downloads the chosen
+    GGUF weight variant, launches ``ds4-server`` as a managed subprocess, and proxies
+    text requests to it. Any requested model whose name matches ``model_id`` (or
+    contains ``deepseek-v4``) is routed to ds4 instead of the normal backends.
+    """
+    enabled: bool = False
+    repo_url: str = "https://github.com/antirez/ds4"
+    install_dir: Optional[str] = None      # None = ~/.coderai/ds4
+    build_target: str = "auto"             # auto|cuda-generic|cuda-spark|metal|cpu
+    model_variant: str = "q4-imatrix"      # download_model.sh variant
+    model_id: str = "deepseek-v4"          # model id/alias that routes to ds4
+    host: str = "127.0.0.1"
+    port: int = 0                          # 0 = auto-pick a free port
+    ctx: int = 100000                      # ds4-server --ctx context window
+    extra_args: str = ""                   # extra flags passed to ds4-server
+    auto_build: bool = True                # clone+build the binary if it's missing
+
+
+@dataclass
 class Config:
     """Main configuration class."""
     version: str = "1.0"
@@ -177,6 +253,7 @@ class Config:
     thermal: ThermalConfig = field(default_factory=ThermalConfig)
     jobs: JobsConfig = field(default_factory=JobsConfig)
     enhance: EnhanceConfig = field(default_factory=EnhanceConfig)
+    ds4: Ds4Config = field(default_factory=Ds4Config)
     broker: BrokerConfig = field(default_factory=BrokerConfig)
     system_prompt: Optional[str] = None
     tools_closer_prompt: bool = False
@@ -338,6 +415,7 @@ class ConfigManager:
                 thermal=ThermalConfig(**config_data.get("thermal", {})),
                 jobs=JobsConfig(**config_data.get("jobs", {})),
                 enhance=EnhanceConfig(**config_data.get("enhance", {})),
+                ds4=Ds4Config(**config_data.get("ds4", {})),
                 broker=BrokerConfig(**config_data.get("broker", {})),
                 system_prompt=config_data.get("system_prompt"),
                 tools_closer_prompt=config_data.get("tools_closer_prompt", False),
@@ -401,6 +479,15 @@ class ConfigManager:
                 "https_cert_path": self.config.server.https_cert_path,
                 "queue_max_size": self.config.server.queue_max_size,
                 "max_parallel_requests": self.config.server.max_parallel_requests,
+                "max_parallel_requests_overrides": self.config.server.max_parallel_requests_overrides,
+                "single_process": self.config.server.single_process,
+                "internal_port_base": self.config.server.internal_port_base,
+                "engines": self.config.server.engines,
+                "engine_gpus": self.config.server.engine_gpus,
+                "proxy_status_timeout": self.config.server.proxy_status_timeout,
+                "proxy_max_inflight": self.config.server.proxy_max_inflight,
+                "engine_specs": self.config.server.engine_specs,
+                "default_engine": self.config.server.default_engine,
             },
             "backend": {
                 "type": self.config.backend.type,
@@ -412,6 +499,8 @@ class ConfigManager:
                 "default_load_mode": self.config.models.default_load_mode,
                 "hf_cache_dir": self.config.models.hf_cache_dir,
                 "gguf_cache_dir": self.config.models.gguf_cache_dir,
+                "max_model_instances": self.config.models.max_model_instances,
+                "max_model_instances_overrides": self.config.models.max_model_instances_overrides,
             },
             "offload": {
                 "directory": self.config.offload.directory,
@@ -424,7 +513,10 @@ class ConfigManager:
                 "flash_attention": self.config.offload.flash_attention,
                 "max_ram_gb": self.config.offload.max_ram_gb,
                 "evict_idle_on_ram": self.config.offload.evict_idle_on_ram,
-                "ram_leak_watch": self.config.offload.ram_leak_watch
+                "ram_leak_watch": self.config.offload.ram_leak_watch,
+                "ram_watch_poll_seconds": self.config.offload.ram_watch_poll_seconds,
+                "ram_watch_soft_fraction": self.config.offload.ram_watch_soft_fraction,
+                "ram_watch_cuda": self.config.offload.ram_watch_cuda
             },
             "vulkan": {
                 "n_gpu_layers": self.config.vulkan.n_gpu_layers,
@@ -458,6 +550,7 @@ class ConfigManager:
                 "cpu_resume": self.config.thermal.cpu_resume,
                 "gpu_high": self.config.thermal.gpu_high,
                 "gpu_resume": self.config.thermal.gpu_resume,
+                "gpu_overrides": self.config.thermal.gpu_overrides,
                 "poll_seconds": self.config.thermal.poll_seconds,
                 "soft_throttle_enabled": self.config.thermal.soft_throttle_enabled,
                 "soft_throttle_temp": self.config.thermal.soft_throttle_temp,
@@ -469,6 +562,19 @@ class ConfigManager:
             "enhance": {
                 "allow_ffmpeg": self.config.enhance.allow_ffmpeg,
                 "allow_rife_ncnn": self.config.enhance.allow_rife_ncnn,
+            },
+            "ds4": {
+                "enabled": self.config.ds4.enabled,
+                "repo_url": self.config.ds4.repo_url,
+                "install_dir": self.config.ds4.install_dir,
+                "build_target": self.config.ds4.build_target,
+                "model_variant": self.config.ds4.model_variant,
+                "model_id": self.config.ds4.model_id,
+                "host": self.config.ds4.host,
+                "port": self.config.ds4.port,
+                "ctx": self.config.ds4.ctx,
+                "extra_args": self.config.ds4.extra_args,
+                "auto_build": self.config.ds4.auto_build,
             },
             "broker": {
                 "enabled": self.config.broker.enabled,

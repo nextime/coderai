@@ -20,6 +20,12 @@ import os
 import logging
 import threading as _t
 
+# Reduce CUDA allocator fragmentation: expandable segments let large transient
+# allocations (KV cache, attention activations) grow into reserved-but-unallocated
+# memory instead of OOMing on a borderline shortfall. Must be set before torch
+# initialises CUDA; honour an explicit override if the operator already set it.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 # Import configuration from codai modules
 from codai.cli import parse_args
 from codai.config import ConfigManager
@@ -225,6 +231,10 @@ def apply_model_entry_live(entry, model_types) -> int:
         old_cfg = multi_model_manager.config.get(key)
         cfg = build_runtime_model_cfg(entry, type_str)
         multi_model_manager.config[key] = cfg
+        try:
+            multi_model_manager._remember_registered_type(mid, type_str)
+        except Exception:
+            pass
         updated += 1
         # Acceleration (Lightning/Lightx2v/LCM distill LoRA + scheduler) is FUSED
         # into the pipeline at load time, so it can't be toggled on an already
@@ -246,6 +256,45 @@ def apply_model_entry_live(entry, model_types) -> int:
             except Exception:
                 pass
     return updated
+
+
+def _repair_stale_model_paths(config_mgr) -> int:
+    """Rewrite models.json entries whose .gguf file path no longer exists but whose
+    file is present in the GGUF cache (by filename). Returns the number of entries
+    fixed; saves models.json only when something changed."""
+    import glob
+    from codai.models.cache import get_model_cache_dir
+    cache = get_model_cache_dir()
+    if not cache or not os.path.isdir(cache):
+        return 0
+    cats = ("text_models", "gguf_models", "vision_models", "image_models",
+            "audio_models", "tts_models", "video_models", "audio_gen_models",
+            "embedding_models", "spatial_models")
+
+    def _resolve(p):
+        if not p or not str(p).endswith(".gguf") or os.path.exists(p):
+            return None
+        base = os.path.basename(p)
+        cand = os.path.join(cache, base)
+        if os.path.exists(cand):
+            return cand
+        hits = glob.glob(os.path.join(cache, "**", base), recursive=True)
+        return hits[0] if hits else None
+
+    fixed = 0
+    for cat in cats:
+        for m in config_mgr.models_data.get(cat, []):
+            if not isinstance(m, dict):
+                continue
+            for key in ("path", "model_path"):
+                new = _resolve(m.get(key))
+                if new:
+                    print(f"  Repaired model path: {m[key]} -> {new}")
+                    m[key] = new
+                    fixed += 1
+    if fixed:
+        config_mgr.save_models()
+    return fixed
 
 
 def main():
@@ -308,7 +357,20 @@ def main():
             pass
     if config.models.gguf_cache_dir:
         os.environ['CODERAI_CACHE_DIR'] = config.models.gguf_cache_dir
-    
+
+    # Repair stale .gguf paths in models.json: an entry may point at an HF-hub
+    # snapshot path that no longer exists while the file actually lives in the GGUF
+    # cache (downloads route there). Rewrite the entry to the real file so the config
+    # is correct (the GGUF loader has the same fallback, but this fixes it on disk).
+    # The front runs this before spawning engines, so they read the corrected file;
+    # it is idempotent (only writes when something changed).
+    try:
+        _repaired = _repair_stale_model_paths(config_mgr)
+        if _repaired:
+            print(f"Repaired {_repaired} stale model path(s) in models.json")
+    except Exception as _e:
+        logging.getLogger(__name__).debug("model-path repair skipped: %s", _e)
+
     # Configure generation archive
     _arc_dir = config.archive.directory
     if not _arc_dir:
@@ -423,7 +485,44 @@ def main():
         except Exception as e:
             print(f"Error listing devices: {e}")
         sys.exit(0)
-    
+
+    # ─── Frontend/engine split ───────────────────────────────────────────────
+    # Default boot: run the always-responsive front proxy on the public port and
+    # let it supervise engine subprocess(es) that do all GPU/model work. This
+    # process becomes the front and returns here — none of the heavy engine init
+    # below runs in it (so its event loop is never blocked by model work).
+    #   --engine-only     → this process IS an engine: bind an internal localhost
+    #                       port and run the full app below (the front spawns these).
+    #   --single-process  → legacy: one process, full app on the public port.
+    _engine_only = getattr(args, "engine_only", False)
+    _single_process = getattr(args, "single_process", False) or config.server.single_process
+    if not _engine_only and not _single_process:
+        from codai.frontproxy import run_front
+        run_front(config, args)
+        return
+    if _engine_only:
+        # Engines bind plain localhost HTTP; the front owns the public host + TLS.
+        # NOTE: don't mutate config.server here — the settings API reads it, and it
+        # must keep reporting the user's CONFIGURED public host/port/https. The
+        # actual bind target is computed separately at serve time.
+        # The front pins this engine's backend (so a Radeon engine uses Vulkan and
+        # an NVIDIA engine uses CUDA) via CODERAI_ENGINE_BACKEND; honour it over the
+        # shared config.backend.type. Device selection is done by the env block the
+        # front set (CUDA_VISIBLE_DEVICES / GGML_VK_VISIBLE_DEVICES / VK_ICD_FILENAMES).
+        _forced_backend = os.environ.get("CODERAI_ENGINE_BACKEND")
+        if _forced_backend:
+            config.backend.type = _forced_backend
+            print(f"[engine] backend forced to '{_forced_backend}' by the front")
+        # The front owns the AISBF broker (always-responsive, one registration for
+        # the whole node, routes to engines). So no engine runs its own broker
+        # client — that would double-register and stall when the engine loads.
+        if config.broker.enabled:
+            config.broker.enabled = False
+            print("[engine] broker disabled (the front manages the broker)")
+        # Note: model→engine assignment is enforced by the FRONT's router (each model
+        # is routed to its single owner engine), not by pruning models.json here —
+        # so the admin model list (served from the primary) stays complete.
+
     # Migrate any GGUF files that ended up in the HF cache to the GGUF cache
     _t.Thread(target=_migrate_hf_gguf_to_gguf_cache, daemon=True).start()
 
@@ -519,7 +618,15 @@ def main():
     set_load_mode(load_mode)
     multi_model_manager.set_load_mode(load_mode)
     multi_model_manager._global_max_instances = config.models.max_model_instances
-    
+    # Per-engine override of the default instances-per-model, set by the front.
+    _mi = os.environ.get("CODERAI_MAX_MODEL_INSTANCES")
+    if _mi:
+        try:
+            multi_model_manager._global_max_instances = int(_mi)
+            config.models.max_model_instances = int(_mi)
+        except ValueError:
+            pass
+
     print(f"\nLoad mode: {load_mode}")
     if load_mode == "ondemand":
         print("  (pre-load first model, unload/load on switch)")
@@ -556,9 +663,41 @@ def main():
     # Load models from config
     # =========================================================================
     print(f"\n=== Loading Models from Config ===")
-    
+
     models_config = config_mgr.models_data
-    
+    # In an engine the front assigns a SUBSET of models to this engine; register and
+    # pre-load only those (so e.g. whisper-server doesn't start on every engine).
+    # config_mgr.models_data stays full, so the admin model list — served from the
+    # primary engine — remains complete.
+    _assigned_env = os.environ.get("CODERAI_ENGINE_MODELS")
+    if _assigned_env is not None:
+        try:
+            import json as _json
+            _keep = set(_json.loads(_assigned_env))
+
+            def _route_key(m):
+                if isinstance(m, str):
+                    return m
+                if isinstance(m, dict):
+                    return m.get("alias") or m.get("path") or m.get("id")
+                return None
+            _model_cats = ("text_models", "gguf_models", "vision_models", "image_models",
+                           "audio_models", "tts_models", "video_models", "audio_gen_models",
+                           "embedding_models", "spatial_models")
+            models_config = {
+                k: ([m for m in v if _route_key(m) in _keep]
+                    if k in _model_cats and isinstance(v, list) else v)
+                for k, v in config_mgr.models_data.items()
+            }
+            _n = sum(len(models_config.get(c, [])) for c in _model_cats)
+            print(f"[engine] registering {_n} model(s) assigned by the front")
+            # Also restrict /v1/models (list_models) to the assigned subset, so the
+            # per-engine model list matches what it actually serves — config_mgr's
+            # full models_data is untouched (the admin model list stays complete).
+            multi_model_manager.set_assigned_models(keep)
+        except Exception as _e:
+            print(f"[engine] assignment filter failed ({_e}); registering all models")
+
     # Helper to find model config
     def get_model_cfg(model_type, model_id):
         key = f"{model_type}:{model_id}"
@@ -815,6 +954,9 @@ def main():
     global_args.max_ram_gb = config.offload.max_ram_gb
     global_args.evict_idle_on_ram = config.offload.evict_idle_on_ram
     global_args.ram_leak_watch = config.offload.ram_leak_watch
+    global_args.ram_watch_poll_seconds = config.offload.ram_watch_poll_seconds
+    global_args.ram_watch_soft_fraction = config.offload.ram_watch_soft_fraction
+    global_args.ram_watch_cuda = config.offload.ram_watch_cuda
     # Thermal protection settings (read live by codai.models.thermal).
     global_args.thermal_cpu_enabled = config.thermal.cpu_enabled
     global_args.thermal_gpu_enabled = config.thermal.gpu_enabled
@@ -822,6 +964,7 @@ def main():
     global_args.thermal_cpu_resume = config.thermal.cpu_resume
     global_args.thermal_gpu_high = config.thermal.gpu_high
     global_args.thermal_gpu_resume = config.thermal.gpu_resume
+    global_args.thermal_gpu_overrides = config.thermal.gpu_overrides
     global_args.thermal_poll_seconds = config.thermal.poll_seconds
     global_args.thermal_soft_throttle_enabled = config.thermal.soft_throttle_enabled
     global_args.thermal_soft_throttle_temp = config.thermal.soft_throttle_temp
@@ -850,6 +993,7 @@ def main():
     global_args.debug_web = getattr(args, 'debug_web', False)
     global_args.debug_thermal = getattr(args, 'debug_thermal', False)
     global_args.debug_lora = getattr(args, 'debug_lora', False)
+    global_args.debug_requests = getattr(args, 'debug_requests', False)
     global_args.dump = global_dump
     global_args.file_path = config.file_path
     global_args.parser = config.parser
@@ -998,6 +1142,15 @@ def main():
     from codai.queue.manager import queue_manager
     queue_manager.max_size = config.server.queue_max_size
     queue_manager.max_parallel_requests = config.server.max_parallel_requests
+    # In an engine the front may override this engine's concurrency (per-engine
+    # limit) via env, so a bigger card runs more in parallel than a smaller one.
+    _mp = os.environ.get("CODERAI_MAX_PARALLEL")
+    if _mp:
+        try:
+            queue_manager.max_parallel_requests = int(_mp)
+            config.server.max_parallel_requests = int(_mp)
+        except ValueError:
+            pass
 
     # Configure Python logging so broker/API log calls reach the terminal.
     # uvicorn is started with log_config=None to keep our config in place.
@@ -1068,9 +1221,26 @@ def main():
 
     # Start the server
     import uvicorn
-    print(f"\nStarting server on http://{config.server.host}:{config.server.port}")
-    print(f"API docs: http://{config.server.host}:{config.server.port}/docs")
-    print(f"Admin UI: http://{config.server.host}:{config.server.port}/admin")
+    # The bind target: an engine binds 127.0.0.1:<internal-port> with plain HTTP
+    # (the front owns the public host + TLS); single-process uses the configured
+    # public host/port/https. config.server keeps the CONFIGURED values either way
+    # so the settings API reports them correctly.
+    if getattr(args, 'engine_only', False):
+        bind_host = "127.0.0.1"
+        bind_port = int(getattr(args, "internal_port", None)
+                        or config.server.internal_port_base)
+        bind_https = False
+        # Engines are internal workers behind the front — the public API docs / Admin
+        # UI live on the front, so don't advertise them here (it's just confusing).
+        print(f"[engine] serving on http://{bind_host}:{bind_port} "
+              f"(internal — reach it via the front)")
+    else:
+        bind_host = config.server.host
+        bind_port = config.server.port
+        bind_https = config.server.https
+        print(f"\nStarting server on http://{bind_host}:{bind_port}")
+        print(f"API docs: http://{bind_host}:{bind_port}/docs")
+        print(f"Admin UI: http://{bind_host}:{bind_port}/admin")
 
     if model_manager.backend is not None:
         actual_backend = model_manager.backend_type
@@ -1080,7 +1250,20 @@ def main():
 
     _uvi_log_level = "debug" if global_debug else "info"
 
-    if config.server.https:
+    # An engine only ever receives internal front→engine traffic (localhost-only +
+    # token-gated), so its whole access log is internal chatter. Silence it unless
+    # --debug-engine by handing uvicorn a log config with uvicorn.access at WARNING
+    # — done via the config (not a post-hoc setLevel) because uvicorn re-applies its
+    # logging config on run and would otherwise reset the level back to INFO. When
+    # the config is used we pass log_level=None so uvicorn doesn't re-override it.
+    _uvi_log_config = None
+    if getattr(args, 'engine_only', False) and not getattr(args, 'debug_engine_web', False):
+        import copy as _copy
+        _uvi_log_config = _copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+        _uvi_log_config["loggers"]["uvicorn.access"]["level"] = "WARNING"
+    _uvi_ll = None if _uvi_log_config is not None else _uvi_log_level
+
+    if bind_https:
         import ssl
         ssl_keyfile = config.server.https_key_path
         ssl_certfile = config.server.https_cert_path
@@ -1102,17 +1285,17 @@ def main():
             except Exception as e:
                 print(f"Warning: Could not generate certificate: {e}")
                 print("Falling back to HTTP...")
-                uvicorn.run(fastapi_app, host=config.server.host, port=config.server.port,
-                            log_level=_uvi_log_level, log_config=None)
+                uvicorn.run(fastapi_app, host=bind_host, port=bind_port,
+                            log_level=_uvi_ll, log_config=_uvi_log_config)
                 return
 
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_context.load_cert_chain(ssl_certfile, ssl_keyfile)
-        uvicorn.run(fastapi_app, host=config.server.host, port=config.server.port,
-                    ssl_context=ssl_context, log_level=_uvi_log_level, log_config=None)
+        uvicorn.run(fastapi_app, host=bind_host, port=bind_port,
+                    ssl_context=ssl_context, log_level=_uvi_ll, log_config=_uvi_log_config)
     else:
-        uvicorn.run(fastapi_app, host=config.server.host, port=config.server.port,
-                    log_level=_uvi_log_level, log_config=None)
+        uvicorn.run(fastapi_app, host=bind_host, port=bind_port,
+                    log_level=_uvi_ll, log_config=_uvi_log_config)
 
 
 if __name__ == "__main__":

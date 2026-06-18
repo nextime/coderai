@@ -160,6 +160,32 @@ except ImportError:
     pass
 
 
+class _InternalAuthMiddleware:
+    """Reject any HTTP request that doesn't carry the front's internal token.
+
+    Active only when CODERAI_INTERNAL_TOKEN is set (i.e. this process is an engine
+    spawned by the front). It binds 127.0.0.1, but this also blocks anything else on
+    localhost from talking to the engine directly and bypassing the front. In
+    single-process mode the token is unset and this is a no-op."""
+
+    def __init__(self, app):
+        self._app = app
+        self._token = os.environ.get("CODERAI_INTERNAL_TOKEN")
+
+    async def __call__(self, scope, receive, send):
+        if self._token and scope.get("type") == "http":
+            headers = dict(scope.get("headers", []))
+            got = headers.get(b"x-coderai-internal", b"").decode("latin-1")
+            if got != self._token:
+                await send({"type": "http.response.start", "status": 403,
+                            "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body",
+                            "body": b'{"error":"forbidden: engines are reachable only '
+                                    b'through the front proxy"}'})
+                return
+        await self._app(scope, receive, send)
+
+
 class _ForwardedPrefixMiddleware:
     """Populate ASGI root_path from X-Forwarded-Prefix / X-Script-Name headers."""
 
@@ -180,6 +206,9 @@ class _ForwardedPrefixMiddleware:
 
 
 app.add_middleware(_ForwardedPrefixMiddleware)
+# Added last → outermost: the internal-token gate runs before anything else, so a
+# request without the front's token never reaches a route.
+app.add_middleware(_InternalAuthMiddleware)
 
 # Mount static files for admin dashboard
 from fastapi.staticfiles import StaticFiles
@@ -191,6 +220,77 @@ if admin_static_dir.exists():
 # Serve a favicon at the conventional /favicon.ico path so browsers stop 404-ing on it.
 from fastapi.responses import FileResponse, Response as _FaviconResponse
 _favicon_path = admin_static_dir / "favicon.ico"
+
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    """Cheap liveness probe that touches no torch/model state.
+
+    The front proxy's engine supervisor polls this to distinguish a *slow* engine
+    (busy loading a model — the event loop may be blocked, so this can be late but
+    will eventually answer) from a *dead* one (connection refused). It must stay
+    trivial and dependency-free so it returns the instant the loop is free."""
+    import os as _os
+    return {"ok": True, "pid": _os.getpid()}
+
+
+@app.get("/internal/engine-state", include_in_schema=False)
+async def internal_engine_state():
+    """Auth-free engine introspection for the front proxy's router/aggregator.
+
+    Engines bind 127.0.0.1 only, so this is not publicly reachable. Returns which
+    models are resident (for model→engine routing) and this engine's GPU/VRAM (for
+    cross-engine status aggregation). Kept cheap so it answers even mid-generation.
+    """
+    import os as _os
+    try:
+        loaded = list(multi_model_manager.models.keys())
+    except Exception:
+        loaded = []
+    vram = None
+    try:
+        import torch
+        if torch.cuda.is_available():
+            # Sum across every CUDA device this engine can see — an engine may own
+            # more than one GPU (e.g. two NVIDIA cards sharding one large model), so
+            # reporting only device 0 would under-count its VRAM.
+            n = torch.cuda.device_count()
+            used = free = total = 0
+            devs = []
+            for i in range(n):
+                f, t = torch.cuda.mem_get_info(i)
+                used += (t - f); free += f; total += t
+                devs.append({"index": i, "name": torch.cuda.get_device_name(i),
+                             "free": round(f / 1e9, 2), "total": round(t / 1e9, 2)})
+            label = (torch.cuda.get_device_name(0) if n == 1
+                     else f"{n}× CUDA")
+            vram = {"used": round(used / 1e9, 2), "free": round(free / 1e9, 2),
+                    "total": round(total / 1e9, 2), "gpu": label,
+                    "devices": devs, "device_count": n}
+    except Exception:
+        vram = None
+    # Running tasks so the front can show cross-engine activity without needing a
+    # session on this engine (sessions live only on the primary).
+    tasks = []
+    try:
+        from codai.tasks import task_registry
+        tasks = [t for t in task_registry.list()
+                 if t.get("status") in ("running", "queued", "paused")]
+    except Exception:
+        tasks = []
+    # This engine's thermal cooldown state, so the front can show WHICH engine is
+    # cooling (each engine pauses on its own GPUs; CPU pauses everything).
+    cooling = None
+    try:
+        from codai.models import thermal
+        cs = thermal.get_cooldown_state()
+        if cs.get("active"):
+            cooling = {"gpu": cs.get("gpu"), "cpu": cs.get("cpu"),
+                       "message": cs.get("message")}
+    except Exception:
+        cooling = None
+    return {"ok": True, "pid": _os.getpid(), "loaded_models": loaded,
+            "vram": vram, "tasks": tasks, "cooling": cooling}
 
 
 @app.get("/favicon.ico", include_in_schema=False)

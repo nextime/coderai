@@ -21,6 +21,7 @@ from threading import Lock
 from typing import List, Optional
 import json
 import os
+import re
 import time
 
 
@@ -179,11 +180,15 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
         return caps
 
     # ── Image: upscaling (checked before general SD rule to catch SD-family upscalers) ──
-    if any(x in n for x in ['real-esrgan', 'esrgan', 'swinir', 'edsr',
-                              'bsrgan', 'hat-', 'dat-',
+    # 'hat-'/'dat-' are short, ambiguous tokens (e.g. they appear inside
+    # "chat-", "update-"); require a word boundary before them so a text "chat"
+    # model isn't mistaken for the HAT/DAT super-resolution checkpoints.
+    if (any(x in n for x in ['real-esrgan', 'esrgan', 'swinir', 'edsr',
+                              'bsrgan',
                               'x2-upscaler', 'x4-upscaler', 'x2_upscaler', 'x4_upscaler',
                               'latent-upscaler', 'latent_upscaler',
-                              'ldm-super-resolution', 'rcan-', 'sr3-']):
+                              'ldm-super-resolution', 'rcan-', 'sr3-'])
+            or re.search(r'\b[hd]at-', n)):
         caps.image_upscaling = True
         caps.image_to_image = True
         return caps

@@ -182,6 +182,8 @@ discover_local_binaries() {
     "$HOME/whisper.cpp/build/bin/whisper-cli"
     "$HOME/whisper.cpp/build/bin/main"
     "$HOME/whisper.cpp/build/bin/server"
+    "/usr/local/bin/ds4-server"
+    "${CODERAI_DS4_DIR:-$HOME/.coderai/ds4}/ds4-server"
   )
   local path
   for path in "${candidates[@]}"; do

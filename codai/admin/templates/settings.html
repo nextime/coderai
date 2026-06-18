@@ -50,6 +50,40 @@
     <input type="number" id="s-queue-max" class="form-input" placeholder="6" min="1" max="1000" style="max-width:160px">
     <span class="form-hint">Maximum number of concurrent queued requests. Authenticated requests arriving when the queue is full receive a 429 response.</span>
   </div>
+  <div class="form-row" style="margin-top:1rem;margin-bottom:0">
+    <label class="form-label">Engine base port</label>
+    <input type="number" id="s-internal-port-base" class="form-input" placeholder="8780" min="1" max="65535" style="max-width:160px">
+    <span class="form-hint">First internal port for engine subprocesses (the front assigns this and the next free ports). Keep it different from the listen port above. Restart to apply.</span>
+  </div>
+  <div class="form-row" id="default-engine-row" style="margin-top:1rem;margin-bottom:0;display:none">
+    <label class="form-label">Default engine</label>
+    <select id="s-default-engine" class="form-input" style="max-width:260px">
+      <option value="">Auto (least-loaded compatible)</option>
+    </select>
+    <span class="form-hint">When a model can run on more than one card (e.g. a GGUF on either the NVIDIA or Radeon engine), prefer this one. A per-model <em>engine</em> set on the Models page overrides this. Only shown when multiple engines are declared.</span>
+  </div>
+</div>
+
+<!-- Concurrency -->
+<div class="card mb-0" style="margin-top:1rem">
+  <div class="card-title">Concurrency</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem">
+    <div class="form-row" style="margin:0">
+      <label class="form-label">Max parallel requests <span class="muted">(per engine)</span></label>
+      <input type="number" id="s-max-parallel" class="form-input" min="1" max="64" placeholder="2" style="max-width:160px">
+      <span class="form-hint">How many requests each engine runs at once. Each engine is its own process, so this applies per-engine — total concurrency is the sum across engines.</span>
+    </div>
+    <div class="form-row" style="margin:0">
+      <label class="form-label">Max instances per model <span class="muted">(per engine)</span></label>
+      <input type="number" id="s-max-instances" class="form-input" min="1" max="16" placeholder="1" style="max-width:160px">
+      <span class="form-hint">Default number of concurrent copies of one model. Override per model on the Models page.</span>
+    </div>
+  </div>
+  <div id="concurrency-overrides" style="margin-top:.7rem;display:none">
+    <label class="form-label" style="margin-bottom:.3rem">Per-engine overrides <span class="muted">(blank = use the defaults above)</span></label>
+    <span class="form-hint" style="margin-bottom:.4rem">Give a bigger card more concurrency than a smaller one — e.g. more parallel requests on a 24 GB NVIDIA than an 8 GB Radeon.</span>
+    <div id="concurrency-override-rows" style="display:grid;grid-template-columns:110px 1fr 1fr;gap:.5rem;align-items:center"></div>
+  </div>
 </div>
 
 <!-- Storage -->
@@ -86,6 +120,23 @@
       <span>Watch for RAM leaks (auto-mitigate)</span>
     </label>
     <span class="form-hint">Background watcher samples RSS; when it keeps climbing while idle or nears the cap it runs gc / CUDA cache release / heap trim and (if enabled) evicts idle models.</span>
+  </div>
+  <div class="form-row" style="margin:0">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-ram-watch-cuda">
+      <span>Allow CUDA cache release in mitigation</span>
+    </label>
+    <span class="form-hint">When the watcher mitigates, let it call <code>torch.cuda.empty_cache()</code>. Turn this <b>off</b> on a GPU that drops off the bus (Xid 79) to stop the background thread from touching CUDA — host-RAM mitigation (gc / heap trim / idle eviction) still runs. Loads are always skipped regardless.</span>
+  </div>
+  <div class="form-row" style="margin-top:.75rem">
+    <label class="form-label">RAM watch poll interval (s) <span class="muted">(default: 15)</span></label>
+    <input type="number" id="s-ram-watch-poll" class="form-input" min="1" step="1" placeholder="15">
+    <span class="form-hint">How often the watcher samples process-tree RSS.</span>
+  </div>
+  <div class="form-row" style="margin-top:.75rem">
+    <label class="form-label">RAM watch soft threshold <span class="muted">(0–1, default: 0.90)</span></label>
+    <input type="number" id="s-ram-watch-soft" class="form-input" min="0" max="1" step="0.05" placeholder="0.90">
+    <span class="form-hint">Fraction of the RAM cap at which the mitigation ladder engages.</span>
   </div>
   <div class="form-row" style="margin-top:.75rem">
     <label class="form-label">Temporary working directory <span class="muted">(default: system /tmp)</span></label>
@@ -171,6 +222,12 @@
       <label class="form-label">Resume when GPU drops to (°C)</label>
       <input type="number" id="s-therm-gpu-resume" class="form-input" min="30" max="120" step="1" placeholder="87">
     </div>
+  </div>
+  <div id="therm-gpu-overrides" class="form-row" style="margin-top:.5rem;display:none">
+    <label class="form-label" style="margin-bottom:.3rem">Per-card overrides <span class="muted">(optional — blank uses the limits above)</span></label>
+    <span class="form-hint" style="margin-bottom:.4rem">Set a different pause/resume limit per GPU vendor detected on this machine — e.g. let a Radeon run hotter than an NVIDIA card. Each card is judged against its own vendor's limit.</span>
+    <!-- One row per GPU vendor actually present, built from detected hardware. -->
+    <div id="therm-gpu-overrides-rows" style="display:grid;grid-template-columns:90px 1fr 1fr;gap:.5rem;align-items:center"></div>
   </div>
 
   <div class="form-row" style="margin-top:.5rem">
@@ -321,10 +378,148 @@
     </div>
   </div>
 </div>
+
+<!-- DeepSeek V4 (ds4) -->
+<div class="card mb-0" style="margin-top:1rem">
+  <div class="card-title">DeepSeek V4 (ds4)</div>
+  <p class="form-hint" style="margin-bottom:.6rem">Run DeepSeek V4 through antirez's native <a href="https://github.com/antirez/ds4" target="_blank" rel="noopener">ds4 / DwarfStar</a> engine as a managed subprocess. When enabled, requests for a matching model name are proxied to ds4-server. First use clones + builds ds4 and downloads several GB of weights — this is slow and needs lots of RAM (96 GB+).</p>
+  <div class="form-row">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-ds4-enabled" onchange="toggleDs4Fields()">
+      <span style="font-size:13px;font-weight:500">Enable ds4 (DeepSeek V4)</span>
+    </label>
+  </div>
+  <div id="ds4-fields" style="display:none">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;align-items:start">
+      <div class="form-row" style="margin:0">
+        <label class="form-label">Model id / alias</label>
+        <input type="text" id="s-ds4-model-id" class="form-input" placeholder="deepseek-v4">
+        <span class="form-hint">Requests for this id (or any name containing "deepseek-v4") route to ds4.</span>
+      </div>
+      <div class="form-row" style="margin:0">
+        <label class="form-label">Weight variant</label>
+        <select id="s-ds4-variant" class="form-input">
+          <option value="q2-imatrix">q2-imatrix (96/128 GB)</option>
+          <option value="q2-q4-imatrix">q2-q4-imatrix (96/128 GB)</option>
+          <option value="q4-imatrix">q4-imatrix (256 GB+)</option>
+          <option value="pro-q2-imatrix">pro-q2-imatrix (512 GB)</option>
+        </select>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;align-items:start">
+      <div class="form-row" style="margin:0">
+        <label class="form-label">Build target</label>
+        <select id="s-ds4-build-target" class="form-input">
+          <option value="auto">auto-detect</option>
+          <option value="cuda-generic">cuda-generic</option>
+          <option value="cuda-spark">cuda-spark (DGX Spark/GB10)</option>
+          <option value="metal">metal (macOS)</option>
+          <option value="cpu">cpu</option>
+        </select>
+      </div>
+      <div class="form-row" style="margin:0">
+        <label class="form-label">Install dir</label>
+        <input type="text" id="s-ds4-install-dir" class="form-input" placeholder="~/.coderai/ds4">
+      </div>
+    </div>
+    <div class="form-row">
+      <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+        <input type="checkbox" id="s-ds4-auto-build">
+        <span>Auto clone + build the ds4-server binary if missing</span>
+      </label>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 120px 140px;gap:1rem;align-items:start">
+      <div class="form-row" style="margin:0">
+        <label class="form-label">Bind host</label>
+        <input type="text" id="s-ds4-host" class="form-input" placeholder="127.0.0.1">
+      </div>
+      <div class="form-row" style="margin:0">
+        <label class="form-label">Port</label>
+        <input type="number" id="s-ds4-port" class="form-input" min="0" placeholder="0 = auto">
+      </div>
+      <div class="form-row" style="margin:0">
+        <label class="form-label">Context (--ctx)</label>
+        <input type="number" id="s-ds4-ctx" class="form-input" min="1024" placeholder="100000">
+      </div>
+    </div>
+    <div class="form-row">
+      <label class="form-label">Repo URL</label>
+      <input type="text" id="s-ds4-repo-url" class="form-input" placeholder="https://github.com/antirez/ds4">
+    </div>
+    <div class="form-row">
+      <label class="form-label">Extra ds4-server args</label>
+      <input type="text" id="s-ds4-extra-args" class="form-input" placeholder="--kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192">
+    </div>
+  </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
 <script>
+// Build one per-vendor threshold-override row for each GPU vendor actually present
+// on this machine (detected via /admin/api/gpu-stats) — never hardcode the mix.
+const _VENDOR_LABEL = {nvidia:'NVIDIA', amd:'Radeon', intel:'Intel'};
+const _VENDOR_COLOR = {nvidia:'#76b900', amd:'#ed1c24', intel:'#0071c5'};
+async function _buildGpuOverrideRows(overrides){
+  const wrap = document.getElementById('therm-gpu-overrides');
+  const rows = document.getElementById('therm-gpu-overrides-rows');
+  let vendors = [];
+  try {
+    const cards = ((await fetch(ROOT_PATH + '/admin/api/gpu-stats').then(r=>r.json())).cards) || [];
+    vendors = [...new Set(cards.map(c => c.vendor).filter(Boolean))];
+  } catch(e) {}
+  // Also include any vendor that already has a saved override, even if not detected now.
+  Object.keys(overrides || {}).forEach(v => { if(!vendors.includes(v)) vendors.push(v); });
+  if(!vendors.length){ wrap.style.display = 'none'; rows.innerHTML = ''; return; }
+  wrap.style.display = '';
+  rows.innerHTML = vendors.map(v => {
+    const ov = (overrides && overrides[v]) || {};
+    const label = _VENDOR_LABEL[v] || v;
+    const color = _VENDOR_COLOR[v] || 'var(--text-2)';
+    return `<span style="font-size:12px;color:${color}">${label}</span>
+      <input type="number" class="form-input therm-ov" data-vendor="${v}" data-k="high"
+             min="40" max="120" step="1" placeholder="pause °C" value="${ov.high ?? ''}">
+      <input type="number" class="form-input therm-ov" data-vendor="${v}" data-k="resume"
+             min="30" max="120" step="1" placeholder="resume °C" value="${ov.resume ?? ''}">`;
+  }).join('');
+}
+function _collectGpuOverrides(){
+  const ov = {};
+  document.querySelectorAll('#therm-gpu-overrides-rows .therm-ov').forEach(inp => {
+    const v = parseFloat(inp.value);
+    if(isNaN(v)) return;
+    const vendor = inp.dataset.vendor;
+    (ov[vendor] = ov[vendor] || {})[inp.dataset.k] = v;
+  });
+  return ov;
+}
+// Per-engine concurrency overrides — one row per running engine (by name).
+function _buildConcurrencyOverrides(engNames, parOv, instOv){
+  const wrap = document.getElementById('concurrency-overrides');
+  const rows = document.getElementById('concurrency-override-rows');
+  if(!engNames || engNames.length < 2){ wrap.style.display='none'; rows.innerHTML=''; return; }
+  wrap.style.display = '';
+  rows.innerHTML =
+    `<span class="muted" style="font-size:11px">Engine</span>
+     <span class="muted" style="font-size:11px">Max parallel</span>
+     <span class="muted" style="font-size:11px">Max instances</span>` +
+    engNames.map(n => `
+      <span style="font-size:12px">${n}</span>
+      <input type="number" class="form-input conc-par" data-engine="${n}" min="1" max="64" placeholder="default" value="${parOv[n] ?? ''}">
+      <input type="number" class="form-input conc-inst" data-engine="${n}" min="1" max="16" placeholder="default" value="${instOv[n] ?? ''}">`).join('');
+}
+function _collectConcOverrides(cls){
+  const o = {};
+  document.querySelectorAll('#concurrency-override-rows .' + cls).forEach(inp => {
+    const v = parseInt(inp.value);
+    if(!isNaN(v) && v >= 1) o[inp.dataset.engine] = v;
+  });
+  return o;
+}
+function toggleDs4Fields(){
+  document.getElementById('ds4-fields').style.display =
+    document.getElementById('s-ds4-enabled').checked ? 'block' : 'none';
+}
 function toggleHttps(){
   document.getElementById('https-fields').style.display =
     document.getElementById('s-https').checked ? 'block' : 'none';
@@ -371,12 +566,41 @@ async function loadSettings(){
     document.getElementById('s-key').value   = d.server?.https_key_path ?? '';
     document.getElementById('s-cert').value  = d.server?.https_cert_path ?? '';
     document.getElementById('s-queue-max').value = d.server?.queue_max_size ?? 6;
+    document.getElementById('s-internal-port-base').value = d.server?.internal_port_base ?? 8780;
+    // Default engine — surfaced when 2+ engines are running. Sourced from the
+    // front's live engine list so it also covers AUTO-DETECTED engines (no
+    // engine_specs needed); falls back to declared engine_specs names.
+    let engNames = [];
+    try {
+      const er = await fetch(ROOT_PATH + '/admin/api/engines');
+      if (er.ok) engNames = ((await er.json()).engines || []).map(e => e.name);
+    } catch(e) {}
+    if (!engNames.length) engNames = d.server?.engine_names || [];
+    const engRow = document.getElementById('default-engine-row');
+    const engSel = document.getElementById('s-default-engine');
+    if (engNames.length > 1) {
+      engSel.querySelectorAll('option:not([value=""])').forEach(o => o.remove());
+      engNames.forEach(n => { const o=document.createElement('option'); o.value=n; o.textContent=n; engSel.appendChild(o); });
+      engSel.value = d.server?.default_engine || '';
+      engRow.style.display = '';
+    } else {
+      engRow.style.display = 'none';
+    }
+    // Concurrency: defaults + per-engine override rows.
+    document.getElementById('s-max-parallel').value = d.server?.max_parallel_requests ?? 2;
+    document.getElementById('s-max-instances').value = d.models?.max_model_instances ?? 1;
+    _buildConcurrencyOverrides(engNames,
+      d.server?.max_parallel_requests_overrides || {},
+      d.models?.max_model_instances_overrides || {});
     document.getElementById('s-hf-cache').value   = d.models?.hf_cache_dir ?? '';
     document.getElementById('s-gguf-cache').value = d.models?.gguf_cache_dir ?? '';
     document.getElementById('s-offload-dir').value = d.offload?.directory ?? './offload';
     document.getElementById('s-max-ram').value = d.offload?.max_ram_gb ?? '';
     document.getElementById('s-evict-idle-ram').checked = d.offload?.evict_idle_on_ram !== false;
     document.getElementById('s-ram-leak-watch').checked = d.offload?.ram_leak_watch !== false;
+    document.getElementById('s-ram-watch-cuda').checked = d.offload?.ram_watch_cuda !== false;
+    document.getElementById('s-ram-watch-poll').value = d.offload?.ram_watch_poll_seconds ?? '';
+    document.getElementById('s-ram-watch-soft').value = d.offload?.ram_watch_soft_fraction ?? '';
     document.getElementById('s-tmp-dir').value = d.tmp_dir ?? '';
     document.getElementById('s-allow-ffmpeg').checked = !!(d.enhance && d.enhance.allow_ffmpeg);
     document.getElementById('s-allow-rife-ncnn').checked = !!(d.enhance && d.enhance.allow_rife_ncnn);
@@ -416,6 +640,7 @@ async function loadSettings(){
     document.getElementById('s-therm-cpu-enabled').checked = therm.cpu_enabled !== false;
     document.getElementById('s-therm-gpu-high').value = therm.gpu_high ?? 90;
     document.getElementById('s-therm-gpu-resume').value = therm.gpu_resume ?? 87;
+    await _buildGpuOverrideRows(therm.gpu_overrides || {});
     document.getElementById('s-therm-cpu-high').value = therm.cpu_high ?? 90;
     document.getElementById('s-therm-cpu-resume').value = therm.cpu_resume ?? 87;
     document.getElementById('s-therm-poll').value = therm.poll_seconds ?? 5;
@@ -426,6 +651,20 @@ async function loadSettings(){
     // Background jobs
     const jobs = d.jobs || {};
     document.getElementById('s-jobs-resume').checked = jobs.resume_on_restart !== false;
+    // DeepSeek V4 (ds4)
+    const ds4 = d.ds4 || {};
+    document.getElementById('s-ds4-enabled').checked = !!ds4.enabled;
+    document.getElementById('s-ds4-model-id').value = ds4.model_id ?? 'deepseek-v4';
+    document.getElementById('s-ds4-variant').value = ds4.model_variant ?? 'q4-imatrix';
+    document.getElementById('s-ds4-build-target').value = ds4.build_target ?? 'auto';
+    document.getElementById('s-ds4-install-dir').value = ds4.install_dir ?? '';
+    document.getElementById('s-ds4-auto-build').checked = ds4.auto_build !== false;
+    document.getElementById('s-ds4-host').value = ds4.host ?? '127.0.0.1';
+    document.getElementById('s-ds4-port').value = ds4.port ?? 0;
+    document.getElementById('s-ds4-ctx').value = ds4.ctx ?? 100000;
+    document.getElementById('s-ds4-repo-url').value = ds4.repo_url ?? 'https://github.com/antirez/ds4';
+    document.getElementById('s-ds4-extra-args').value = ds4.extra_args ?? '';
+    toggleDs4Fields();
   }catch(e){ showAlert('error','Failed to load settings: '+e.message); }
 }
 
@@ -439,16 +678,25 @@ async function saveSettings(){
       https_key_path:  strOrNull('s-key'),
       https_cert_path: strOrNull('s-cert'),
       queue_max_size: parseInt(document.getElementById('s-queue-max').value) || 6,
+      internal_port_base: parseInt(document.getElementById('s-internal-port-base').value) || 8780,
+      max_parallel_requests: parseInt(document.getElementById('s-max-parallel').value) || 2,
+      max_parallel_requests_overrides: _collectConcOverrides('conc-par'),
+      default_engine: document.getElementById('s-default-engine').value || null,
     },
     models:{
       hf_cache_dir:   strOrNull('s-hf-cache'),
       gguf_cache_dir: strOrNull('s-gguf-cache'),
+      max_model_instances: parseInt(document.getElementById('s-max-instances').value) || 1,
+      max_model_instances_overrides: _collectConcOverrides('conc-inst'),
     },
     offload:{
       directory: document.getElementById('s-offload-dir').value.trim() || './offload',
       max_ram_gb: (parseFloat(document.getElementById('s-max-ram').value) || null),
       evict_idle_on_ram: document.getElementById('s-evict-idle-ram').checked,
       ram_leak_watch: document.getElementById('s-ram-leak-watch').checked,
+      ram_watch_cuda: document.getElementById('s-ram-watch-cuda').checked,
+      ram_watch_poll_seconds: (parseFloat(document.getElementById('s-ram-watch-poll').value) || null),
+      ram_watch_soft_fraction: (parseFloat(document.getElementById('s-ram-watch-soft').value) || null),
     },
     tmp_dir: strOrNull('s-tmp-dir'),
     enhance:{
@@ -465,6 +713,7 @@ async function saveSettings(){
       cpu_enabled: document.getElementById('s-therm-cpu-enabled').checked,
       gpu_high:   parseFloat(document.getElementById('s-therm-gpu-high').value)   || 90,
       gpu_resume: parseFloat(document.getElementById('s-therm-gpu-resume').value) || 87,
+      gpu_overrides: _collectGpuOverrides(),
       cpu_high:   parseFloat(document.getElementById('s-therm-cpu-high').value)   || 90,
       cpu_resume: parseFloat(document.getElementById('s-therm-cpu-resume').value) || 87,
       poll_seconds: parseFloat(document.getElementById('s-therm-poll').value) || 5,
@@ -474,6 +723,19 @@ async function saveSettings(){
     },
     jobs:{
       resume_on_restart: document.getElementById('s-jobs-resume').checked,
+    },
+    ds4:{
+      enabled: document.getElementById('s-ds4-enabled').checked,
+      model_id: document.getElementById('s-ds4-model-id').value.trim() || 'deepseek-v4',
+      model_variant: document.getElementById('s-ds4-variant').value,
+      build_target: document.getElementById('s-ds4-build-target').value,
+      install_dir: document.getElementById('s-ds4-install-dir').value.trim(),
+      auto_build: document.getElementById('s-ds4-auto-build').checked,
+      host: document.getElementById('s-ds4-host').value.trim() || '127.0.0.1',
+      port: parseInt(document.getElementById('s-ds4-port').value) || 0,
+      ctx: parseInt(document.getElementById('s-ds4-ctx').value) || 100000,
+      repo_url: document.getElementById('s-ds4-repo-url').value.trim() || 'https://github.com/antirez/ds4',
+      extra_args: document.getElementById('s-ds4-extra-args').value.trim(),
     },
     broker:{
       enabled: document.getElementById('s-broker-enabled').checked,
@@ -499,7 +761,14 @@ async function saveSettings(){
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(data)
     });
-    if(r.ok) showAlert('info','Settings saved. Archive and thermal-protection changes take effect immediately; restart CoderAI for other changes.');
+    if(r.ok){
+      const d = await r.json().catch(()=>({}));
+      if(d.warnings && d.warnings.length){
+        showAlert('error', 'Saved, but: ' + d.warnings.join(' '));
+      } else {
+        showAlert('info','Settings saved. Archive and thermal-protection changes take effect immediately; restart CoderAI for other changes.');
+      }
+    }
     else{ const e=await r.json(); showAlert('error', e.detail||'Save failed'); }
   }catch(e){ showAlert('error','Error: '+e.message); }
 }

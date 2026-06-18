@@ -577,6 +577,13 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           </select>
         </div>
       </div>
+      <div class="form-row" id="cfg-engine-row" style="margin-top:.75rem;display:none">
+        <label class="form-label">Engine / card</label>
+        <select id="cfg-engine" class="form-input">
+          <option value="">Default (auto — by capability)</option>
+        </select>
+        <span class="form-hint" style="font-size:11px">Pin this model to a specific engine/card. Overrides the default engine. Only shown when multiple engines are running.</span>
+      </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem;margin-top:.75rem">
         <div class="form-row" style="margin:0">
           <label class="form-label">Used VRAM <span class="muted">(GB)</span></label>
@@ -1441,8 +1448,7 @@ function handleProgressEvent(evt){
     showDownloadError(evt.message);
   }else if(evt.type==='cancelled'){
     _dlDone=true;
-    if(_dlEs){_dlEs.close();_dlEs=null;}
-    showDownloadError('Download cancelled');
+    showDownloadCancelled();
   }
   // keepalive: ignore
 }
@@ -1483,7 +1489,7 @@ async function reopenDownload(session_id){
         if(s.rate) document.getElementById('dl-speed').textContent=fmtRate(s.rate);
         if(s.eta!=null) document.getElementById('dl-eta').textContent=fmtEta(s.eta);
         if(s.status==='done'){handleProgressEvent({type:'done'});return;}
-        if(s.status==='cancelled'){showDownloadError('Download cancelled');return;}
+        if(s.status==='cancelled'){_dlDone=true;showDownloadCancelled();return;}
         if(s.status==='error'){showDownloadError(s.error||'Download failed');return;}
       }
     }
@@ -1501,15 +1507,27 @@ async function reopenDownload(session_id){
   };
 }
 
+function showDownloadCancelled(){
+  if(_dlEs){_dlEs.close();_dlEs=null}
+  document.getElementById('dl-form').style.display='block';
+  document.getElementById('dl-progress').style.display='none';
+}
+
 async function stopDownload(session_id){
   if(!confirm('Cancel this download?')) return;
   try{
-    await fetch(ROOT_PATH + '/admin/api/download-cancel/'+session_id, {method:'POST'});
-    if(_dlSessionId===session_id){
-      if(_dlEs){_dlEs.close();_dlEs=null;}
-      _dlDone=true;
-      showDownloadError('Download cancelled');
+    const r = await fetch(ROOT_PATH + '/admin/api/download-cancel/'+session_id, {method:'POST'});
+    if(!r.ok){
+      let detail = r.status+' '+r.statusText;
+      try{ const j = await r.json(); if(j&&j.detail) detail = j.detail; }catch{}
+      alert('Could not cancel download: '+detail);
+      return;
     }
+    if(_dlSessionId===session_id){
+      _dlDone=true;
+      showDownloadCancelled();
+    }
+    pollDownloads(); // refresh the active-downloads strip immediately
   }catch(e){
     alert('Could not cancel download: '+e.message);
   }
@@ -1798,12 +1816,53 @@ let _localModels = [];
 let _ggufFiles = [];
 let _hfModels = [];
 
+// Engine/card hardware info (fetched once); used to tag models with the card they
+// run on when more than one engine is configured.
+let _engineNames = [];
+let _defaultEngine = '';
+async function _loadEngineInfo(){
+  // Live engine names from the front (covers auto-detected engines, not just those
+  // declared in engine_specs); default_engine still comes from settings.
+  try {
+    const er = await fetch(ROOT_PATH + '/admin/api/engines');
+    if (er.ok) _engineNames = ((await er.json()).engines || []).map(e => e.name);
+  } catch(e) {}
+  try {
+    const d = await (await fetch(ROOT_PATH + '/admin/api/settings')).json();
+    if (!_engineNames.length) _engineNames = (d.server && d.server.engine_names) || [];
+    _defaultEngine = (d.server && d.server.default_engine) || '';
+  } catch(e) {}
+}
+// Compact card tag for a model config. Pinned engines show as-is (with 📌);
+// otherwise the engine is inferred from the model's format (transformers/ds4 →
+// nvidia; gguf/whisper → the default engine, or "any"). Hidden when ≤1 engine, so
+// it never widens single-card setups.
+function _engineTagHtml(m, s){
+  if(!_engineNames || _engineNames.length < 2) return '';
+  let eng = ((s && s.engine) || '').trim();
+  let pinned = !!eng;
+  if(!eng){
+    const path = (((m && (m.path || m.id || m.filename)) || '') + '').toLowerCase();
+    const isGguf = path.endsWith('.gguf') || path.includes('gguf');
+    const isWhisper = ((s && s.backend) || '') === 'whisper-server';
+    const isDs4 = path.includes('deepseek-v4');
+    if(isDs4 || (!isGguf && !isWhisper)) eng = 'nvidia';   // ds4/transformers → nvidia
+    else eng = _defaultEngine || 'any';                     // gguf/whisper → default
+  }
+  const lc = eng.toLowerCase();
+  const color = (lc.includes('nv')) ? '#76b900'
+              : (lc.includes('rad') || lc.includes('amd')) ? '#ed1c24'
+              : 'var(--text-3)';
+  const title = pinned ? ('Pinned to engine: ' + eng) : ('Runs on: ' + eng + ' (auto)');
+  return `<span class="badge" title="${esc(title)}" style="font-size:9px;padding:.05rem .3rem;margin:.1rem .1rem 0 0;vertical-align:middle;border:1px solid ${color};color:${color};background:transparent">${esc(eng)}${pinned?' 📌':''}</span>`;
+}
+
 function _renderConfigPills(idx, m) {
   const configs = m.configs || [];
   if (!configs.length) return '';
   const pills = configs.map((c, cfgIdx) => {
     const label = (c.settings && (c.settings.config_name || c.settings.alias)) || `Config ${cfgIdx + 1}`;
-    return `<span class="badge badge-user" style="font-size:10px;cursor:pointer;vertical-align:middle;margin:.1rem .1rem 0 0" onclick="openCfgModal(${idx},${cfgIdx})" title="Edit this configuration">${esc(label)}</span>`;
+    return `<span class="badge badge-user" style="font-size:10px;cursor:pointer;vertical-align:middle;margin:.1rem .1rem 0 0" onclick="openCfgModal(${idx},${cfgIdx})" title="Edit this configuration">${esc(label)}</span>${_engineTagHtml(m, c.settings)}`;
   }).join('');
   const addPill = `<span class="badge" style="font-size:10px;cursor:pointer;vertical-align:middle;margin:.1rem 0 0 0;background:var(--raised);border:1px dashed var(--border);color:var(--text-2)" onclick="openCfgModalNew(${idx})" title="Add another configuration for this model">+ Config</span>`;
   return `<br style="line-height:.5rem">${pills}${addPill}`;
@@ -2338,6 +2397,9 @@ async function refreshLocal(){
 }
 
 loadGlobalSettings();
+// Load engine/card info first so the per-model card tags render on the first paint,
+// then re-render once it's available (covers the fetch resolving after the list).
+_loadEngineInfo().then(() => loadCachedModels());
 refreshLocal();
 
 // Toggle the acceleration / TurboQuant sections as model types are checked/unchecked.
@@ -2731,6 +2793,7 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-noram').checked = !!s.no_ram;
   document.getElementById('cfg-offload-strategy').value = s.offload_strategy || 'auto';
   document.getElementById('cfg-offload-dir').value = s.offload_dir || _defaultOffloadDir;
+  _populateEnginePin(s.engine || '');
   document.getElementById('cfg-sysprompt').value = s.system_prompt || '';
   document.getElementById('cfg-parser').value = s.parser || (!m.in_config ? _autoDetectParser(m.path) : 'auto');
   document.getElementById('cfg-tools').checked = !!s.tools_closer_prompt;
@@ -3027,6 +3090,21 @@ async function removeThisConfig(){
   } catch(e) { alert('Error: ' + e.message); }
 }
 
+// Engine-pin field: populate the datalist from declared engines and only show the
+// row when more than one engine is configured (single-engine setups don't need it).
+async function _populateEnginePin(desired){
+  const row = document.getElementById('cfg-engine-row');
+  const sel = document.getElementById('cfg-engine');
+  try {
+    if (!_engineNames || !_engineNames.length) await _loadEngineInfo();
+    const want = (desired !== undefined) ? desired : sel.value;
+    sel.querySelectorAll('option:not([value=""])').forEach(o => o.remove());
+    _engineNames.forEach(n => { const o=document.createElement('option'); o.value=n; o.textContent=n; sel.appendChild(o); });
+    sel.value = want || '';   // set AFTER options exist so the selection sticks
+    row.style.display = _engineNames.length > 1 ? '' : 'none';
+  } catch(e) { row.style.display = 'none'; }
+}
+
 async function saveModelConfig(){
   const path = document.getElementById('cfg-path').value;
   const maxGpu = parseFloat(document.getElementById('cfg-max-gpu').value);
@@ -3063,6 +3141,7 @@ async function saveModelConfig(){
     no_ram:            document.getElementById('cfg-noram').checked,
     offload_strategy:  document.getElementById('cfg-offload-strategy').value,
     offload_dir:       document.getElementById('cfg-offload-dir').value.trim() || './offload',
+    engine:            document.getElementById('cfg-engine').value.trim() || null,
     system_prompt:     document.getElementById('cfg-sysprompt').value.trim() || null,
     parser:            document.getElementById('cfg-parser').value,
     tools_closer_prompt: document.getElementById('cfg-tools').checked,
@@ -3094,7 +3173,12 @@ async function saveModelConfig(){
       body: JSON.stringify(data)
     });
     const d = await r.json();
-    if(d.success){ closeModal('cfg-modal'); loadCachedModels(); }
+    if(d.success){
+      if (d.warnings && d.warnings.length) {
+        alert('Saved, but check this:\n\n• ' + d.warnings.join('\n• '));
+      }
+      closeModal('cfg-modal'); loadCachedModels();
+    }
     else alert('Error: '+(d.detail||'Unknown'));
   }catch(e){ alert('Error: '+e.message); }
 }

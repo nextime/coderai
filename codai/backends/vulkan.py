@@ -621,6 +621,27 @@ class VulkanBackend(ModelBackend):
             else:
                 raise ValueError(f"Could not cache model from URL: {model_path}")
         
+        # Fallback: a configured .gguf path that no longer exists (e.g. the file was
+        # downloaded into the GGUF cache rather than the HF-hub snapshot the entry
+        # points at, or a stale snapshot hash). Look for the same filename in the
+        # GGUF cache dir before giving up — the model loads without re-editing the
+        # config entry.
+        if model_path.endswith('.gguf') and not os.path.exists(model_path):
+            try:
+                from codai.models.cache import get_model_cache_dir
+                _base = os.path.basename(model_path)
+                _cache = get_model_cache_dir()
+                _cand = os.path.join(_cache, _base)
+                if not os.path.exists(_cand):
+                    import glob as _glob
+                    _hits = _glob.glob(os.path.join(_cache, "**", _base), recursive=True)
+                    _cand = _hits[0] if _hits else _cand
+                if os.path.exists(_cand):
+                    print(f"  Model path missing; resolved from GGUF cache: {_cand}")
+                    model_path = _cand
+            except Exception:
+                pass
+
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model file not found: {model_path}")
         

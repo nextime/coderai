@@ -86,6 +86,105 @@ def set_grammar_guided_gen(enabled: bool):
     _set_grammar_guided_gen(enabled)
 
 
+def _debug_requests_enabled() -> bool:
+    """True when --debug-requests is set (full client<->API payload logging)."""
+    return bool(getattr(global_args, 'debug_requests', False)) if global_args else False
+
+
+def _summarize_tool_calls(tool_calls):
+    """Compact one-line-per-call view of OpenAI tool_calls (dict or pydantic)."""
+    out = []
+    for tc in (tool_calls or []):
+        fn = (tc.get('function') if isinstance(tc, dict) else getattr(tc, 'function', None)) or {}
+        name = fn.get('name', '') if isinstance(fn, dict) else getattr(fn, 'name', '')
+        args = fn.get('arguments', '') if isinstance(fn, dict) else getattr(fn, 'arguments', '')
+        if not isinstance(args, str):
+            try:
+                args = json.dumps(args)
+            except Exception:
+                args = str(args)
+        out.append(f"{name}({args})")
+    return out
+
+
+def log_request_exchange(request):
+    """Dump the incoming chat request (messages + tools) when --debug-requests.
+
+    Shows exactly what an agentic client (opencode, etc.) sends each turn —
+    including whether it replays prior assistant tool_calls and `role:tool`
+    results — so tool-call loops can be diagnosed from the wire, not guesswork."""
+    if not _debug_requests_enabled():
+        return
+    try:
+        print(f"\n{'#'*80}\n# >>> REQUEST  model={getattr(request, 'model', '?')}  "
+              f"stream={getattr(request, 'stream', False)}  "
+              f"tools={len(getattr(request, 'tools', None) or [])}\n{'#'*80}")
+        for i, m in enumerate(getattr(request, 'messages', []) or []):
+            role = getattr(m, 'role', '?')
+            content = getattr(m, 'content', '') or ''
+            if isinstance(content, list):
+                content = json.dumps(content)
+            line = f"[{i}] {role}: {str(content)[:2000]}"
+            tcs = getattr(m, 'tool_calls', None)
+            if tcs:
+                line += "  tool_calls=" + json.dumps(_summarize_tool_calls(tcs))
+            tcid = getattr(m, 'tool_call_id', None)
+            if tcid:
+                line += f"  tool_call_id={tcid}"
+            name = getattr(m, 'name', None)
+            if name:
+                line += f"  name={name}"
+            print(line)
+        tools = getattr(request, 'tools', None) or []
+        if tools:
+            names = []
+            for t in tools:
+                fn = t.get('function', {}) if isinstance(t, dict) else getattr(t, 'function', None)
+                names.append((fn.get('name') if isinstance(fn, dict) else getattr(fn, 'name', '?')))
+            print(f"# tools offered: {names}")
+        print(f"{'#'*80}\n", flush=True)
+    except Exception as e:
+        print(f"[debug-requests] failed to log request: {e}", flush=True)
+
+
+def log_response_exchange(content, tool_calls=None, finish_reason=None,
+                          streamed=False, stage="pre-format"):
+    """Dump the assistant message coderai *extracted* (content + tool_calls) when
+    --debug-requests. This is the model's decision **before** the OpenAI formatter
+    runs — pair it with :func:`log_response_payload` to see what the client gets."""
+    if not _debug_requests_enabled():
+        return
+    try:
+        tag = "STREAM" if streamed else "RESPONSE"
+        print(f"\n{'#'*80}\n# <<< {tag} [{stage}]  finish_reason={finish_reason}\n{'#'*80}")
+        if content:
+            print(f"content: {str(content)[:2000]}")
+        if tool_calls:
+            for c in _summarize_tool_calls(tool_calls):
+                print(f"tool_call: {c}")
+        if not content and not tool_calls:
+            print("(empty)")
+        print(f"{'#'*80}\n", flush=True)
+    except Exception as e:
+        print(f"[debug-requests] failed to log response: {e}", flush=True)
+
+
+def log_response_payload(payload, streamed=False):
+    """Dump the exact payload the client receives (post OpenAI-formatter) when
+    --debug-requests — the SSE chunk dict for streaming or the full JSON body for
+    non-streaming. This is the ground truth of what opencode actually parses, so a
+    formatter that rewrites/drops tool_calls or content is caught here."""
+    if not _debug_requests_enabled():
+        return
+    try:
+        tag = "STREAM CHUNK" if streamed else "RESPONSE BODY"
+        print(f"\n{'#'*80}\n# <<< {tag} [post-format, sent to client]\n{'#'*80}")
+        print(json.dumps(payload, indent=2, default=str)[:4000])
+        print(f"{'#'*80}\n", flush=True)
+    except Exception as e:
+        print(f"[debug-requests] failed to log payload: {e}", flush=True)
+
+
 # =============================================================================
 # Router and Endpoints
 # =============================================================================
@@ -96,7 +195,8 @@ router = APIRouter()
 @router.post("/v1/chat/completions", summary="Chat completions")
 async def chat_completions(request: ChatCompletionRequest, http_request: Request = None):
     """Chat completions endpoint with streaming and tool support."""
-    
+    log_request_exchange(request)
+
     # Check if we should use litellm backend
     parser_type = getattr(global_args, 'parser', 'auto') if global_args else 'auto'
     
@@ -343,6 +443,13 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         if _candidate is not None:
             mm = _candidate
             break
+
+        _load_err = None
+        if _model_key:
+            _load_err = getattr(multi_model_manager, '_last_load_errors', {}).get(_model_key)
+        if _load_err:
+            raise HTTPException(status_code=503, detail=(
+                f"Model '{requested_model}' failed to load: {_load_err}"))
 
         print(f"Text model '{requested_model}' not ready, retrying in 5s "
               f"(attempt {_attempt + 1}/{_MAX_WAIT_TRIES})…")
@@ -1188,8 +1295,9 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             }
         
         from fastapi.responses import JSONResponse
+        log_response_payload(formatted_response, streamed=False)
         return JSONResponse(content=formatted_response, headers=headers)
-    
+
     # Compute prefix key for prompt-aggregation scheduling
     _prefix_key = prompt_cache_manager.get_prefix_key(messages_dict)
 
@@ -1234,6 +1342,65 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             )
         finally:
             _release_instance()
+
+import re as _re
+
+_TOOL_SPAN_RE = _re.compile(r'<(tool|tool_call)\b[\s\S]*?</\1\s*>', _re.IGNORECASE)
+_TOOL_OPEN_RE = _re.compile(r'<(?:tool|tool_call)\b', _re.IGNORECASE)
+_TOOL_OPEN_TAGS = ('<tool>', '<tool_call>')
+# gemma-4 native tool call: `call:NAME{…}` (the <|tool_call> markers are stripped
+# by skip_special_tokens). Once it starts we withhold everything to the end of the
+# stream — the call is surfaced as structured tool_calls after generation.
+_GEMMA_CALL_OPEN_RE = _re.compile(r'call:\s*[A-Za-z_]\w*\s*\{')
+
+
+def _gate_tool_content(buffer: str, final: bool = False):
+    """Split accumulated stream text into (content_to_emit, held_buffer).
+
+    During tool-enabled streaming the model emits ``<tool>{json}</tool>`` spans
+    inline. Those must NOT reach the client as visible ``content`` (they're
+    surfaced separately as structured ``tool_calls``); otherwise the raw tags leak
+    into the chat. This withholds any complete or in-progress tool span, plus a
+    trailing partial ``<`` that could still grow into a tool tag, and streams only
+    the safe text around them. With ``final=True`` any leftover (possibly unclosed)
+    tool span is dropped and the rest emitted.
+    """
+    emit = []
+    # Strip complete tool spans, emitting the text around each.
+    while True:
+        m = _TOOL_SPAN_RE.search(buffer)
+        if not m:
+            break
+        emit.append(buffer[:m.start()])
+        buffer = buffer[m.end():]
+    # An open tag with no close yet → hold from there (a call is in progress).
+    m = _TOOL_OPEN_RE.search(buffer)
+    if m:
+        emit.append(buffer[:m.start()])
+        held = '' if final else buffer[m.start():]
+        return ''.join(emit), held
+    # gemma-4 `call:NAME{…}` — withhold from the call onward (extracted at the end).
+    gm = _GEMMA_CALL_OPEN_RE.search(buffer)
+    if gm:
+        emit.append(buffer[:gm.start()])
+        held = '' if final else buffer[gm.start():]
+        return ''.join(emit), held
+    # Hold back a trailing '<…' that could still become a tool open tag.
+    if not final:
+        lt = buffer.rfind('<')
+        if lt != -1:
+            tail = buffer[lt:].lower()
+            if any(t.startswith(tail) for t in _TOOL_OPEN_TAGS):
+                emit.append(buffer[:lt])
+                return ''.join(emit), buffer[lt:]
+        # Hold a trailing 'call:NAME' (no '{' yet) that may grow into a gemma call.
+        cm = _re.search(r'call:\s*[A-Za-z_]?\w*$', buffer)
+        if cm:
+            emit.append(buffer[:cm.start()])
+            return ''.join(emit), buffer[cm.start():]
+    emit.append(buffer)
+    return ''.join(emit), ''
+
 
 async def stream_chat_response(
     messages: List[Dict],
@@ -1350,7 +1517,13 @@ async def stream_chat_response(
     
     try:
         chunk_count = 0
-        
+        # Buffer for withholding in-progress tool tags from the content stream.
+        content_buffer = ""
+        # Exact content deltas actually streamed to the client (post-format,
+        # post tool-gating) — logged once at the end under --debug-requests so we
+        # see the real reply, not just what we extracted internally.
+        client_sent_content = ""
+
         # Debug: Print what is being passed to the model
         if get_global_debug():
             print(f"\n{'='*80}")
@@ -1398,7 +1571,31 @@ async def stream_chat_response(
             
             # Pass through all content including whitespace - it's essential for message composition
             generated_text += filtered_chunk
-            
+
+            # Live progress under --debug-requests so a non-terminating / looping
+            # generation is visible AS IT HAPPENS — the end-of-stream response logs
+            # below never fire if the model never stops. The front pumps engine
+            # stdout line-by-line, so emit newline-terminated snapshots (every N
+            # chunks) of the accumulated tail; a loop shows up as the same text
+            # repeating across snapshots.
+            if _debug_requests_enabled():
+                if chunk_count == 1:
+                    print(f"# <<< STREAMING [live] model={model_name} "
+                          f"(snapshots every 64 tokens until stop)", flush=True)
+                if chunk_count % 64 == 0:
+                    _tail = generated_text[-220:].replace("\n", "\\n")
+                    print(f"# <<< [live @{chunk_count} tok] …{_tail}", flush=True)
+
+            # When tools are enabled, gate the content so in-progress <tool>…</tool>
+            # spans are never streamed as visible text (they're surfaced as
+            # structured tool_calls after the stream). Without tools, stream as-is.
+            if tools:
+                content_buffer += filtered_chunk
+                filtered_chunk, content_buffer = _gate_tool_content(content_buffer)
+                if not filtered_chunk:
+                    await asyncio.sleep(0)
+                    continue
+
             data = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
@@ -1410,11 +1607,31 @@ async def stream_chat_response(
                     "finish_reason": None,
                 }],
             }
+            client_sent_content += filtered_chunk
             yield f"data: {json.dumps(data)}\n\n"
             # Explicitly flush to ensure data is sent immediately
             await asyncio.sleep(0)
-        
-        
+
+        # Flush any safe trailing text held back by the tool-content gate
+        # (dropping leftover/unclosed tool tags — they become tool_calls below).
+        if tools and content_buffer:
+            tail_content, content_buffer = _gate_tool_content(content_buffer, final=True)
+            if tail_content:
+                data = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": tail_content},
+                        "finish_reason": None,
+                    }],
+                }
+                client_sent_content += tail_content
+                yield f"data: {json.dumps(data)}\n\n"
+
+
         # In debug mode, dump the full generated text
         if get_global_debug():
             print(f"\n{'='*80}")
@@ -1484,6 +1701,9 @@ async def stream_chat_response(
                     print(f"{'='*80}\n")
                 # Tool calls were extracted and stripped from content during streaming
                 # Just send the tool_calls chunk
+                log_response_exchange(generated_text, tool_calls=tool_calls,
+                                      finish_reason="tool_calls", streamed=True,
+                                      stage="pre-format extracted")
                 data = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
@@ -1497,6 +1717,7 @@ async def stream_chat_response(
                         "native_finish_reason": "tool_calls",
                     }],
                 }
+                log_response_payload(data, streamed=True)
                 yield f"data: {json.dumps(data)}\n\n"
             else:
                 # Calculate token counts for usage in final chunk
@@ -1514,7 +1735,12 @@ async def stream_chat_response(
                     "completion_tokens": completion_tokens,
                     "total_tokens": prompt_tokens + completion_tokens,
                 }
+                log_response_exchange(generated_text, finish_reason="stop",
+                                      streamed=True, stage="pre-format extracted")
+                log_response_exchange(client_sent_content, finish_reason="stop",
+                                      streamed=True, stage="post-format sent to client")
                 final_chunk = formatter.format_litellm_chunk("", is_final=True, usage=usage_details, context_size=context_size)
+                log_response_payload(final_chunk, streamed=True)
                 yield f"data: {json.dumps(final_chunk)}\n\n"
         else:
             # Calculate token counts for usage in final chunk
@@ -1571,6 +1797,11 @@ async def stream_chat_response(
                 },
                 "system_fingerprint": None,
             }
+            log_response_exchange(generated_text, finish_reason="stop",
+                                  streamed=True, stage="pre-format extracted")
+            log_response_exchange(client_sent_content, finish_reason="stop",
+                                  streamed=True, stage="post-format sent to client")
+            log_response_payload(final_chunk, streamed=True)
             yield f"data: {json.dumps(final_chunk)}\n\n"
 
         yield "data: [DONE]\n\n"
@@ -1740,6 +1971,10 @@ async def generate_chat_response(
         context_size = current_manager.get_context_size()
         
         # Use OpenAIFormatter for final sanitization
+        log_response_exchange(response_message.get("content", ""),
+                              tool_calls=response_message.get("tool_calls"),
+                              finish_reason=finish_reason, streamed=False,
+                              stage="pre-format extracted")
         formatter = OpenAIFormatter(model_name)
         formatted_response = formatter.format_litellm_full(
             text=response_message.get("content", ""),
@@ -1788,7 +2023,8 @@ async def generate_chat_response(
             print(f"{'='*80}")
             print(json.dumps(formatted_response, indent=2))
             print(f"{'='*80}\n")
-        
+
+        log_response_payload(formatted_response, streamed=False)
         return formatted_response
     except Exception as e:
         print(f"Error during generation: {e}")

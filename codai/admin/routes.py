@@ -16,6 +16,7 @@
 
 """Admin dashboard routes."""
 from pathlib import Path
+import asyncio
 import re
 import shutil
 from typing import Optional
@@ -830,54 +831,93 @@ def _run_download_thread(session_id: str, model_id: str, file_pattern: str, pq):
     # JSON lines on stdout, which we relay onto this session's SSE queue.
     import subprocess as _sp
     import sys as _sys
+    import collections as _collections
+    import pathlib as _pathlib
 
-    proc = _sp.Popen(
-        [_sys.executable, "-m", "codai.admin.download_worker", model_id, file_pattern or ""],
-        stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True, bufsize=1,
-    )
-    _download_procs[session_id] = proc
+    # The worker runs as `python -m codai.admin.download_worker`; when coderai is
+    # run from source (not pip-installed) the child won't find the `codai`
+    # package unless the repo root is on its path. routes.py lives at
+    # <repo>/codai/admin/routes.py, so parents[2] is the repo root.
+    _repo_root = str(_pathlib.Path(__file__).resolve().parents[2])
 
-    terminal = None  # set to "done"/"error" once the child reports a final event
+    def _attempt(disable_xet: bool):
+        """Spawn the worker once; relay its events. Returns (terminal, rc, tail)."""
+        env = dict(os.environ)
+        env["PYTHONPATH"] = _repo_root + (os.pathsep + env["PYTHONPATH"]
+                                          if env.get("PYTHONPATH") else "")
+        # hf_xet (the accelerated transfer) bypasses our tqdm progress hook — so
+        # the bar freezes near 100% while a big file silently downloads — and can
+        # hard-crash the worker (segfault / signal kill) with no traceback. The
+        # plain HTTPS path reports byte-accurate progress and is reliable, so we
+        # default to it unless the operator explicitly opted in (set
+        # HF_HUB_DISABLE_XET=0). A crash retry always disables it.
+        if disable_xet or os.environ.get("HF_HUB_DISABLE_XET") is None:
+            env["HF_HUB_DISABLE_XET"] = "1"
+        proc = _sp.Popen(
+            [_sys.executable, "-m", "codai.admin.download_worker", model_id, file_pattern or ""],
+            stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True, bufsize=1, env=env, cwd=_repo_root,
+        )
+        _download_procs[session_id] = proc
+        terminal = None
+        recent = _collections.deque(maxlen=12)
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    evt = _j.loads(line)
+                except Exception:
+                    # Non-JSON output (warnings / tracebacks) → surface as info
+                    # and keep a tail so a hard crash can report what it printed.
+                    recent.append(line)
+                    push({"type": "info", "message": line})
+                    continue
+                etype = evt.get("type")
+                push(evt)
+                if etype in ("done", "error"):
+                    terminal = etype
+        except Exception as exc:
+            push({"type": "error", "message": str(exc)})
+            terminal = "error"
+        finally:
+            if proc.poll() is None:
+                try:
+                    proc.terminate(); proc.wait(timeout=10)
+                except Exception:
+                    pass
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            _download_procs.pop(session_id, None)
+        return terminal, proc.poll(), " | ".join(list(recent)[-4:]).strip()
+
     try:
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                evt = _j.loads(line)
-            except Exception:
-                # Non-JSON output (warnings / tracebacks) → surface as info.
-                push({"type": "info", "message": line})
-                continue
-            etype = evt.get("type")
-            push(evt)
-            if etype in ("done", "error"):
-                terminal = etype
-    except Exception as exc:
-        push({"type": "error", "message": str(exc)})
-    finally:
-        # Ensure the child is gone (cancel, crash, or normal exit).
-        if proc.poll() is None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=10)
-            except Exception:
-                pass
-        if proc.poll() is None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        _download_procs.pop(session_id, None)
+        terminal, rc, tail = _attempt(disable_xet=False)
+        # A hard crash (no done/error event, not a user cancel) is the classic
+        # hf_xet failure — retry once with Xet disabled before giving up.
+        crashed = (terminal is None and session_id not in _download_cancelled)
+        if crashed and "HF_HUB_DISABLE_XET" not in os.environ:
+            push({"type": "info",
+                  "message": "Transfer crashed; retrying without the Xet accelerator…"})
+            _download_status.get(session_id, {}).update({"status": "downloading", "percent": 0})
+            terminal, rc, tail = _attempt(disable_xet=True)
 
         if terminal is None:
-            # Child ended without a done/error event → cancelled or died.
+            # Still no final event → cancelled or died for good.
             if session_id in _download_cancelled:
                 pq.put({"type": "cancelled", "message": "Download cancelled by user"})
                 _download_status.get(session_id, {}).update({"status": "cancelled"})
             else:
-                push({"type": "error", "message": "Download process exited unexpectedly"})
-
+                detail = f"Download process exited unexpectedly (exit code {rc})"
+                if rc is not None and rc < 0:
+                    detail += f" — killed by signal {-rc} (often out-of-memory)"
+                if tail:
+                    detail += f". Last output: {tail}"
+                push({"type": "error", "message": detail})
+    finally:
         _download_cancelled.discard(session_id)
 
         def _gc():
@@ -1115,7 +1155,28 @@ def _scan_caches() -> dict:
                     continue
                 if p not in configured_settings:
                     configured_settings[p] = (s, cat)
-                all_configs.setdefault(p, []).append({"settings": s, "cat": cat})
+                # A single logical config can be registered under multiple
+                # categories via model_types (for example text+vision). It is
+                # stored once per category in models.json with the same
+                # config_id, but the UI should show it as one editable config,
+                # not duplicate pills that appear to delete each other.
+                _cfg_list = all_configs.setdefault(p, [])
+                _cid = s.get("config_id") if isinstance(s, dict) else None
+                _existing = None
+                if _cid:
+                    for _cfg in _cfg_list:
+                        _settings = _cfg.get("settings") or {}
+                        if isinstance(_settings, dict) and _settings.get("config_id") == _cid:
+                            _existing = _cfg
+                            break
+                if _existing is not None:
+                    _cats = _existing.setdefault("cats", [])
+                    if cat not in _cats:
+                        _cats.append(cat)
+                    if not _existing.get("cat"):
+                        _existing["cat"] = cat
+                else:
+                    _cfg_list.append({"settings": s, "cat": cat, "cats": [cat]})
 
     # Secondary index: basename → (settings_tuple, original_path)
     # Used to reconnect a config to a re-downloaded file that landed at a different path.
@@ -1678,7 +1739,6 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
                     multi_model_manager.add_model(model_key, pipeline)
                     multi_model_manager.record_vram_delta(model_key, _snap)
         elif model_type == "video":
-            import asyncio
             from codai.api.video import _load_video_pipeline, _derive_device
             model_key = f"video:{path}"
             device = _derive_device()
@@ -1693,7 +1753,6 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
             multi_model_manager.models_in_vram.add(model_key)
             multi_model_manager.record_vram_delta(model_key, _snap)
         elif model_type == "audio_gen":
-            import asyncio
             from codai.api.audio_gen import _load_musicgen, _load_audioldm, _detect_audio_gen_type, _derive_device
             model_key = f"audio_gen:{path}"
             device = _derive_device()
@@ -1711,32 +1770,26 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
             multi_model_manager.models_in_vram.add(model_key)
             multi_model_manager.record_vram_delta(model_key, _snap)
         elif model_type == "tts":
-            import asyncio
             model_key = f"tts:{path}"
             _snap = multi_model_manager.vram_before_load()
+            # Use the same backend factory as a real request so every engine is
+            # handled identically — in particular a Parler model boots its managed
+            # worker here, so "loading" it from the interface starts the service.
+            cfg = (multi_model_manager.config.get(model_key)
+                   or multi_model_manager.config.get(f"tts:{path}")
+                   or model_cfg or {})
             def _load_tts():
-                try:
-                    from kokoro import Kokoro
-                    return Kokoro(path)
-                except ImportError:
-                    pass
-                try:
-                    from bark import preload_models
-                    preload_models()
-                    return {"bark": True}
-                except ImportError:
-                    pass
-                return None
+                from codai.api import tts_backends
+                return tts_backends.load_backend(path, path, cfg)
             tts_obj = await asyncio.to_thread(_load_tts)
             if tts_obj is None:
-                raise RuntimeError("No supported TTS backend found (kokoro / bark)")
+                raise RuntimeError("TTS model failed to load")
             multi_model_manager.models[model_key] = tts_obj
             multi_model_manager.current_model_key = model_key
             multi_model_manager.active_in_vram = model_key
             multi_model_manager.models_in_vram.add(model_key)
             multi_model_manager.record_vram_delta(model_key, _snap)
         elif model_type in ("embedding", "spatial", "vision"):
-            import asyncio
             from codai.api.images import _load_diffusers_pipeline
             from codai.api.state import get_global_args
             model_key = f"{model_type}:{path}"
@@ -1795,6 +1848,78 @@ async def api_model_unload(request: Request, username: str = Depends(require_adm
         pass
 
     return {"success": True, "was_loaded": True}
+
+
+def _sanitize_engine_int_overrides(raw) -> dict:
+    """Clean a {engine_name: int} override map: keep positive ints, drop the rest."""
+    out = {}
+    if isinstance(raw, dict):
+        for name, val in raw.items():
+            if val in (None, ""):
+                continue
+            try:
+                iv = int(val)
+            except (TypeError, ValueError):
+                continue
+            if iv >= 1:
+                out[str(name)] = iv
+    return out
+
+
+def _resolve_engine_spec(engine_name: str, engine_specs):
+    """Find the declared engine matching ``engine_name`` (by name or backend)."""
+    for s in (engine_specs or []):
+        if not isinstance(s, dict):
+            continue
+        if (s.get("name") or "").lower() == engine_name.lower() \
+                or (s.get("backend") or "").lower() == engine_name.lower():
+            return s
+    return None
+
+
+def validate_engine_pin(engine_name: str, model_path: str, engine_specs,
+                        model_backend: str = None, ds4_cfg=None) -> list:
+    """Return human-readable warnings if pinning ``model_path`` to ``engine_name``
+    is wrong (unknown engine, or an engine that can't run this model's format).
+
+    Empty list = the pin is fine. Used to *notify* the admin instead of silently
+    ignoring a bad pin (the router would otherwise just fall back)."""
+    engine_name = (engine_name or "").strip()
+    if not engine_name:
+        return []
+    from codai.frontproxy.registry import _DEFAULT_CAPS
+    from codai.frontproxy.router import required_capability
+    specs = engine_specs or []
+    if specs:
+        spec = _resolve_engine_spec(engine_name, specs)
+        if spec is None:
+            names = [s.get("name") for s in specs if isinstance(s, dict) and s.get("name")]
+            return [f"Engine '{engine_name}' is not declared. Known engines: "
+                    f"{', '.join(names) or '(none)'}."]
+        backend = (spec.get("backend") or "auto").lower()
+        caps = set(spec.get("capabilities")
+                   or _DEFAULT_CAPS.get(backend, {"transformers", "gguf"}))
+    else:
+        # Auto-detection: no engine_specs to resolve against — infer the engine's
+        # capabilities from its vendor/backend name so we can still catch an
+        # impossible pin (e.g. a transformers model pinned to the Radeon engine).
+        key = engine_name.lower()
+        backend = {"radeon": "vulkan", "amd": "vulkan", "intel": "vulkan",
+                   "cuda": "nvidia"}.get(key, key)
+        caps = _DEFAULT_CAPS.get(backend)
+        if caps is None:
+            return []   # unknown name, nothing to validate against — accept silently
+        caps = set(caps)
+    req = required_capability(
+        model_path, backend=model_backend,
+        ds4_model_id=getattr(ds4_cfg, "model_id", None) if ds4_cfg else None,
+        ds4_enabled=bool(getattr(ds4_cfg, "enabled", False)) if ds4_cfg else False)
+    if req and req not in caps:
+        return [f"Engine '{engine_name}' (backend '{backend}') can't run this model: "
+                f"it needs '{req}' capability but the engine only provides "
+                f"{sorted(caps)}. The request would fall back to a compatible engine — "
+                f"pick a different engine or adjust the engine's capabilities."]
+    return []
 
 
 @router.post("/admin/api/model-configure", summary="Update a model's configuration")
@@ -1897,6 +2022,11 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         if existing_cid and not is_new_config:
             # Targeted removal: only the entry that shares this config_id
             return existing_cid == config_id
+        if existing_cid and is_new_config:
+            # Adding a new configuration for the same model must preserve modern
+            # sibling configs. Only legacy entries without config_id fall through
+            # to path-based replacement because they cannot be targeted safely.
+            return False
         # Path-based removal (no config_id on either side, or new entry replacing old)
         key = m_entry.get("path", m_entry.get("id", ""))
         return key in paths_to_remove or (fnames_to_remove and _os.path.basename(key) in fnames_to_remove)
@@ -1938,7 +2068,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "max_vram", "sdcpp_flash_attn", "sdcpp_diffusion_flash_attn", "vae_tiling",
                 "component_quantization", "output_crf", "force_vram_update",
                 "balanced_gpu_percent", "acceleration",
-                "cache_type_k", "cache_type_v", "turboquant"):
+                "cache_type_k", "cache_type_v", "turboquant", "engine"):
         if key in data:
             entry[key] = data[key]
 
@@ -1966,7 +2096,15 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         applied = apply_model_entry_live(entry, model_types)
     except Exception as e:
         print(f"  [admin] live config apply failed (restart to apply): {e}")
-    return {"success": True, "applied_live": applied}
+    warnings = []
+    if entry.get("engine"):
+        warnings = validate_engine_pin(
+            entry["engine"], path, config_manager.config.server.engine_specs,
+            model_backend=entry.get("backend"),
+            ds4_cfg=getattr(config_manager.config, "ds4", None))
+        for w in warnings:
+            print(f"  [admin] engine-pin warning: {w}")
+    return {"success": True, "applied_live": applied, "warnings": warnings}
 
 
 @router.get("/admin/api/accel-presets", summary="List acceleration / distillation presets")
@@ -2244,6 +2382,21 @@ def _read_vram_info() -> Optional[dict]:
     return None
 
 
+@router.get("/admin/api/gpu-stats", summary="Per-card GPU utilization, VRAM and temperature")
+def api_gpu_stats(username: str = Depends(require_auth)):
+    """Live stats for EVERY physical GPU installed (NVIDIA via nvidia-smi, AMD via
+    sysfs), independent of which engine owns it. Used by the Tasks page to show
+    per-card VRAM + utilization across all cards. Best-effort; empty if unreadable.
+
+    SYNC handler: it shells out to nvidia-smi / reads sysfs, so it runs in the
+    threadpool rather than on the event loop."""
+    try:
+        from codai.frontproxy.gpu_detect import gpu_stats
+        return {"cards": gpu_stats()}
+    except Exception as e:
+        return {"cards": [], "error": str(e)}
+
+
 @router.get("/admin/api/system-stats", summary="Live CPU / GPU / RAM / VRAM usage and temperatures")
 def api_system_stats(username: str = Depends(require_admin)):
     """Lightweight hardware telemetry for the Tasks page header: CPU & GPU
@@ -2406,6 +2559,12 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "https_cert_path": c.server.https_cert_path,
             "queue_max_size": c.server.queue_max_size,
             "max_parallel_requests": c.server.max_parallel_requests,
+            "max_parallel_requests_overrides": c.server.max_parallel_requests_overrides,
+            "internal_port_base": c.server.internal_port_base,
+            "default_engine": c.server.default_engine,
+            # Engine names available to pick as the default (for the settings UI).
+            "engine_names": [s.get("name") for s in (c.server.engine_specs or [])
+                             if isinstance(s, dict) and s.get("name")],
         },
         "backend": {
             "type": c.backend.type,
@@ -2417,6 +2576,8 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "default_load_mode": c.models.default_load_mode,
             "hf_cache_dir": c.models.hf_cache_dir,
             "gguf_cache_dir": c.models.gguf_cache_dir,
+            "max_model_instances": c.models.max_model_instances,
+            "max_model_instances_overrides": c.models.max_model_instances_overrides,
         },
         "offload": {
             "directory": c.offload.directory,
@@ -2430,6 +2591,9 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "max_ram_gb": c.offload.max_ram_gb,
             "evict_idle_on_ram": c.offload.evict_idle_on_ram,
             "ram_leak_watch": c.offload.ram_leak_watch,
+            "ram_watch_poll_seconds": c.offload.ram_watch_poll_seconds,
+            "ram_watch_soft_fraction": c.offload.ram_watch_soft_fraction,
+            "ram_watch_cuda": c.offload.ram_watch_cuda,
         },
         "vulkan": {
             "n_gpu_layers": c.vulkan.n_gpu_layers,
@@ -2449,6 +2613,7 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "cpu_resume": c.thermal.cpu_resume,
             "gpu_high": c.thermal.gpu_high,
             "gpu_resume": c.thermal.gpu_resume,
+            "gpu_overrides": c.thermal.gpu_overrides,
             "poll_seconds": c.thermal.poll_seconds,
             "soft_throttle_enabled": c.thermal.soft_throttle_enabled,
             "soft_throttle_temp": c.thermal.soft_throttle_temp,
@@ -2460,6 +2625,19 @@ async def api_get_settings(username: str = Depends(require_admin)):
         "enhance": {
             "allow_ffmpeg": c.enhance.allow_ffmpeg,
             "allow_rife_ncnn": c.enhance.allow_rife_ncnn,
+        },
+        "ds4": {
+            "enabled": c.ds4.enabled,
+            "repo_url": c.ds4.repo_url,
+            "install_dir": c.ds4.install_dir,
+            "build_target": c.ds4.build_target,
+            "model_variant": c.ds4.model_variant,
+            "model_id": c.ds4.model_id,
+            "host": c.ds4.host,
+            "port": c.ds4.port,
+            "ctx": c.ds4.ctx,
+            "extra_args": c.ds4.extra_args,
+            "auto_build": c.ds4.auto_build,
         },
         "broker": {
             "enabled": c.broker.enabled,
@@ -2495,6 +2673,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
 
     data = await request.json()
     c = config_manager.config
+    _settings_warnings: list = []
 
     if "server" in data:
         srv = data["server"]
@@ -2511,6 +2690,28 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             c.server.max_parallel_requests = int(srv["max_parallel_requests"])
             from codai.queue.manager import queue_manager
             queue_manager.max_parallel_requests = c.server.max_parallel_requests
+        if "max_parallel_requests_overrides" in srv:
+            c.server.max_parallel_requests_overrides = _sanitize_engine_int_overrides(
+                srv["max_parallel_requests_overrides"])
+        if "internal_port_base" in srv:
+            try:
+                c.server.internal_port_base = max(1, min(65535, int(srv["internal_port_base"])))
+            except (TypeError, ValueError):
+                pass
+        if "default_engine" in srv:
+            c.server.default_engine = (srv.get("default_engine") or "").strip() or None
+            # Only validate against engine_specs when they're explicitly declared.
+            # With auto-detection engine_specs is empty and the engines (nvidia/
+            # radeon/…) are only known to the front, so don't false-warn there — the
+            # front validates the name at routing time and logs if it can't honour it.
+            if (c.server.default_engine and c.server.engine_specs
+                    and _resolve_engine_spec(c.server.default_engine,
+                                             c.server.engine_specs) is None):
+                names = [s.get("name") for s in (c.server.engine_specs or [])
+                         if isinstance(s, dict) and s.get("name")]
+                _settings_warnings.append(
+                    f"Default engine '{c.server.default_engine}' is not declared. "
+                    f"Known engines: {', '.join(names) or '(none)'}.")
 
     if "backend" in data:
         bk = data["backend"]
@@ -2526,6 +2727,14 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             c.models.hf_cache_dir = mdl["hf_cache_dir"] or None
         if "gguf_cache_dir" in mdl:
             c.models.gguf_cache_dir = mdl["gguf_cache_dir"] or None
+        if "max_model_instances" in mdl:
+            try:
+                c.models.max_model_instances = max(1, int(mdl["max_model_instances"]))
+            except (TypeError, ValueError):
+                pass
+        if "max_model_instances_overrides" in mdl:
+            c.models.max_model_instances_overrides = _sanitize_engine_int_overrides(
+                mdl["max_model_instances_overrides"])
 
     if "offload" in data:
         off = data["offload"]
@@ -2543,6 +2752,11 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             c.offload.max_ram_gb = off["max_ram_gb"] or None
         c.offload.evict_idle_on_ram = bool(off.get("evict_idle_on_ram", c.offload.evict_idle_on_ram))
         c.offload.ram_leak_watch = bool(off.get("ram_leak_watch", c.offload.ram_leak_watch))
+        if "ram_watch_poll_seconds" in off:
+            c.offload.ram_watch_poll_seconds = float(off["ram_watch_poll_seconds"] or c.offload.ram_watch_poll_seconds)
+        if "ram_watch_soft_fraction" in off:
+            c.offload.ram_watch_soft_fraction = float(off["ram_watch_soft_fraction"] or c.offload.ram_watch_soft_fraction)
+        c.offload.ram_watch_cuda = bool(off.get("ram_watch_cuda", c.offload.ram_watch_cuda))
         # Push the RAM-cap settings to live global_args so the watcher, per-load
         # budget clamp and eviction honour them without a restart.
         try:
@@ -2552,6 +2766,9 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
                 ga.max_ram_gb = c.offload.max_ram_gb
                 ga.evict_idle_on_ram = c.offload.evict_idle_on_ram
                 ga.ram_leak_watch = c.offload.ram_leak_watch
+                ga.ram_watch_poll_seconds = c.offload.ram_watch_poll_seconds
+                ga.ram_watch_soft_fraction = c.offload.ram_watch_soft_fraction
+                ga.ram_watch_cuda = c.offload.ram_watch_cuda
         except Exception:
             pass
 
@@ -2607,6 +2824,22 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         c.thermal.cpu_resume = float(th.get("cpu_resume", c.thermal.cpu_resume))
         c.thermal.gpu_high = float(th.get("gpu_high", c.thermal.gpu_high))
         c.thermal.gpu_resume = float(th.get("gpu_resume", c.thermal.gpu_resume))
+        if "gpu_overrides" in th and isinstance(th["gpu_overrides"], dict):
+            # Sanitize: {vendor: {high, resume}} with numeric values only.
+            clean = {}
+            for vendor, ov in th["gpu_overrides"].items():
+                if not isinstance(ov, dict):
+                    continue
+                entry = {}
+                for k in ("high", "resume"):
+                    if ov.get(k) not in (None, ""):
+                        try:
+                            entry[k] = float(ov[k])
+                        except (TypeError, ValueError):
+                            pass
+                if entry:
+                    clean[str(vendor).lower()] = entry
+            c.thermal.gpu_overrides = clean
         c.thermal.poll_seconds = max(1.0, float(th.get("poll_seconds", c.thermal.poll_seconds)))
         c.thermal.soft_throttle_enabled = bool(th.get("soft_throttle_enabled", c.thermal.soft_throttle_enabled))
         c.thermal.soft_throttle_temp = float(th.get("soft_throttle_temp", c.thermal.soft_throttle_temp))
@@ -2622,6 +2855,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
                 ga.thermal_cpu_resume = c.thermal.cpu_resume
                 ga.thermal_gpu_high = c.thermal.gpu_high
                 ga.thermal_gpu_resume = c.thermal.gpu_resume
+                ga.thermal_gpu_overrides = c.thermal.gpu_overrides
                 ga.thermal_poll_seconds = c.thermal.poll_seconds
                 ga.thermal_soft_throttle_enabled = c.thermal.soft_throttle_enabled
                 ga.thermal_soft_throttle_temp = c.thermal.soft_throttle_temp
@@ -2656,6 +2890,30 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         except Exception:
             pass
 
+    if "ds4" in data:
+        d = data["ds4"]
+        c.ds4.enabled = bool(d.get("enabled", c.ds4.enabled))
+        if "repo_url" in d:
+            c.ds4.repo_url = (d.get("repo_url") or c.ds4.repo_url or "").strip()
+        if "install_dir" in d:
+            c.ds4.install_dir = (d.get("install_dir") or "").strip() or None
+        if "build_target" in d:
+            c.ds4.build_target = (d.get("build_target") or "auto").strip()
+        if "model_variant" in d:
+            c.ds4.model_variant = (d.get("model_variant") or c.ds4.model_variant).strip()
+        if "model_id" in d:
+            c.ds4.model_id = (d.get("model_id") or c.ds4.model_id or "deepseek-v4").strip()
+        if "host" in d:
+            c.ds4.host = (d.get("host") or "127.0.0.1").strip()
+        if "port" in d:
+            c.ds4.port = int(d.get("port") or 0)
+        if "ctx" in d:
+            c.ds4.ctx = max(1024, int(d.get("ctx") or c.ds4.ctx))
+        if "extra_args" in d:
+            c.ds4.extra_args = (d.get("extra_args") or "").strip()
+        if "auto_build" in d:
+            c.ds4.auto_build = bool(d["auto_build"])
+
     if "broker" in data:
         bro = data["broker"]
         c.broker.enabled = bool(bro.get("enabled", c.broker.enabled))
@@ -2688,7 +2946,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     config_manager.save_config()
-    return {"success": True}
+    return {"success": True, "warnings": _settings_warnings}
 
 
 # =============================================================================

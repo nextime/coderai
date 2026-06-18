@@ -2372,7 +2372,7 @@ const STUDIO_CAPABILITIES = {
     optional:[],
     notes:[
       'Requires <code>insightface</code> and <code>onnxruntime</code>: <code>pip install insightface onnxruntime</code>.',
-      'The <b>inswapper_128.onnx</b> model is <b>auto-downloaded</b> from HuggingFace on first use (<a href="/admin/models?tab=search&q=inswapper&pipeline=&gguf=no-gguf" class="cap-find-link">deepinsight/inswapper<span class="cap-find-icon">↗</span></a>).',
+      'The <b>inswapper_128.onnx</b> model is <b>auto-downloaded</b> from HuggingFace on first use (<a href="' + (window.ROOT_PATH||'') + '/admin/models?tab=search&q=inswapper&pipeline=&gguf=no-gguf" class="cap-find-link">deepinsight/inswapper<span class="cap-find-icon">↗</span></a>).',
       'No AI model selection needed — this feature uses its own dedicated backend.',
     ],
     backendPath: ROOT_PATH + '/v1/images/faceswap',
@@ -2386,7 +2386,7 @@ const STUDIO_CAPABILITIES = {
     optional:[],
     notes:[
       'Requires <code>insightface</code> and <code>onnxruntime</code>: <code>pip install insightface onnxruntime</code>.',
-      'The <b>inswapper_128.onnx</b> model is <b>auto-downloaded</b> from HuggingFace on first use (<a href="/admin/models?tab=search&q=inswapper&pipeline=&gguf=no-gguf" class="cap-find-link">deepinsight/inswapper<span class="cap-find-icon">↗</span></a>).',
+      'The <b>inswapper_128.onnx</b> model is <b>auto-downloaded</b> from HuggingFace on first use (<a href="' + (window.ROOT_PATH||'') + '/admin/models?tab=search&q=inswapper&pipeline=&gguf=no-gguf" class="cap-find-link">deepinsight/inswapper<span class="cap-find-icon">↗</span></a>).',
       'No AI model selection needed — this feature uses its own dedicated backend.',
     ],
     backendPath: ROOT_PATH + '/v1/images/faceswap',
@@ -2461,14 +2461,14 @@ function capSearchUrl(cap) {
   const s = CAP_TO_HF_SEARCH[cap];
   if (!s) return null;
   const p = new URLSearchParams({ tab:'search', q: s.q, pipeline: s.pipeline, gguf: s.gguf });
-  return '/admin/models?' + p.toString();
+  return (window.ROOT_PATH || '') + '/admin/models?' + p.toString();
 }
 function capMissingHtml(caps, label) {
   if (!caps.length) return '';
   const links = caps.map(cap => {
     const chip = `<span class="cap-chip dim">${cap.replace(/_/g,' ')}</span>`;
     if (_localCapSet.has(cap)) {
-      const url = `/admin/models?local_cap=${encodeURIComponent(cap)}`;
+      const url = `${window.ROOT_PATH || ''}/admin/models?local_cap=${encodeURIComponent(cap)}`;
       return `<a href="${url}" class="cap-find-link" title="You have a local model with ${cap.replace(/_/g,' ')} — click to configure it">${chip}<span class="cap-find-icon" style="color:#6ecf7e">↑ configure</span></a>`;
     }
     const url = capSearchUrl(cap);

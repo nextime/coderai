@@ -33,3 +33,7 @@ township_output/
 # Packaging build cache + runtime temp (large artifacts)
 .packaging-cache/
 tmp/
+
+# Video editor sessions + generated media (runtime artifacts)
+video_editor/sessions/
+tools/coderai_media/

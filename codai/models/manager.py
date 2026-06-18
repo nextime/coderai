@@ -16,7 +16,7 @@
 
 """Model manager module - contains ModelManager, WhisperServerManager, and MultiModelManager classes."""
 
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 import os
 import random
 import subprocess
@@ -34,6 +34,36 @@ from codai.backends.vulkan import VulkanBackend
 from codai.models.cache import get_cached_model_path, download_model, get_model_cache_dir, load_model
 from codai.models.utils import FuzzyToolBreaker
 from codai.pydantic.textrequest import ModelInfo
+
+
+def get_active_ds4_config():
+    """Return the active Ds4Config from the server config, or None if unavailable."""
+    try:
+        from codai.admin.routes import config_manager
+        if config_manager is not None and config_manager.config is not None:
+            return config_manager.config.ds4
+    except Exception:
+        pass
+    return None
+
+
+def ds4_should_handle(model_name: str) -> bool:
+    """True when ds4 is enabled and ``model_name`` should be served by ds4-server.
+
+    Matches the configured ``model_id`` (case-insensitive, short-name aware) or any
+    name containing ``deepseek-v4``, so the stock alias works without extra config.
+    """
+    if not model_name:
+        return False
+    cfg = get_active_ds4_config()
+    if cfg is None or not getattr(cfg, "enabled", False):
+        return False
+    name = model_name.lower()
+    short = name.split("/")[-1]
+    mid = (getattr(cfg, "model_id", "") or "").lower()
+    if mid and (name == mid or short == mid):
+        return True
+    return "deepseek-v4" in name
 
 
 def _trim_cpu_ram() -> None:
@@ -128,8 +158,19 @@ class ModelManager:
         
     def load_model(self, model_name: str, backend_type: str = "auto", **kwargs):
         """Load the model with the specified backend."""
+        # DeepSeek V4 via ds4: when enabled, route matching models to the managed
+        # ds4-server proxy instead of the in-process nvidia/vulkan backends.
+        if ds4_should_handle(model_name):
+            from codai.backends.ds4 import Ds4Backend
+            print(f"Routing '{model_name}' to ds4 (DeepSeek V4) backend")
+            self.backend_type = "ds4"
+            self.backend = Ds4Backend(get_active_ds4_config())
+            self.backend.load_model(model_name, **kwargs)
+            self.tool_parser = ModelParserAdapter(model_name=model_name)
+            return
+
         available = detect_available_backends()
-        
+
         # Check if model is a GGUF file
         is_gguf = model_name.endswith('.gguf') or 'gguf' in model_name.lower()
         
@@ -543,6 +584,11 @@ class MultiModelManager:
         self.embedding_models: List[str] = []   # text / multimodal embeddings
         self.spatial_models: List[str] = []     # depth estimation, segmentation, object detection
         self.config: Dict[str, Dict] = {}  # Store model configurations
+        # In the front/engine split, the front assigns a subset of models.json to
+        # this engine. When set, list_models() reports only these (so /v1/models per
+        # engine reflects what it actually serves); None = report all (single-process).
+        self._assigned_model_keys: Optional[set] = None
+        self.model_registered_types: Dict[str, Set[str]] = {}
         self.tool_parser = ModelParserAdapter()
         self.current_model_key: Optional[str] = None
         self.load_mode: str = "ondemand"
@@ -571,6 +617,7 @@ class MultiModelManager:
         self._pending_new_instance: set = set()  # keys awaiting a second+ instance load
         self._global_max_instances: int = 1  # set from config at startup
         self._measured_vram_gb: Dict[str, float] = {}  # actual measured VRAM delta per model key
+        self._last_load_errors: Dict[str, str] = {}  # model_key -> last failed load message
         # Callbacks that free VRAM held *outside* the model manager (e.g. the
         # LoRA trainer caches its SD/SDXL base model between jobs). Each returns
         # the GB it freed (or None). Invoked as a last resort during eviction.
@@ -736,6 +783,7 @@ class MultiModelManager:
         self.default_model = model_name
         self.config[model_name] = config or {}
         self.model_backend_types[model_name] = backend_type
+        self._remember_registered_type(model_name, "text")
 
         # Download/cache the model at startup if it's a URL or HF ID
         resolved_model = self.load_model(model_name)
@@ -834,6 +882,7 @@ class MultiModelManager:
                 from codai.tasks import loading_task
                 with loading_task(self.default_model, model_type="text"):
                     model_manager.load_model(self.default_model, backend_type=backend_type, **kwargs)
+                self._last_load_errors.pop(self.default_model, None)
                 self.add_model(self.default_model, model_manager)
                 self.record_vram_delta(self.default_model, _snap)
                 self.current_model_key = self.default_model
@@ -842,6 +891,7 @@ class MultiModelManager:
                 return model_manager
             except Exception as e:
                 print(f"Error loading model {self.default_model}: {e}")
+                self._last_load_errors[self.default_model] = str(e)
                 self._mark_cuda_poisoned_if_fatal(e)
                 self._model_ready_event.set()
                 return None
@@ -935,6 +985,7 @@ class MultiModelManager:
                 from codai.tasks import loading_task
                 with loading_task(model_name, model_type="text"):
                     model_manager.load_model(model_name, backend_type=backend_type, **kwargs)
+                self._last_load_errors.pop(model_name, None)
                 self.add_model(model_name, model_manager)
                 self.record_vram_delta(model_name, _snap)
                 self.current_model_key = model_name
@@ -944,6 +995,7 @@ class MultiModelManager:
                 return model_manager
             except Exception as e:
                 print(f"Error loading model {model_name}: {e}")
+                self._last_load_errors[model_name] = str(e)
                 self._mark_cuda_poisoned_if_fatal(e)
                 self._model_ready_event.set()   # signal: ready (even on failure)
                 return None
@@ -953,6 +1005,7 @@ class MultiModelManager:
         if model_name not in self.audio_models:
             self.audio_models.append(model_name)
         self.config[f"audio:{model_name}"] = config or {}
+        self._remember_registered_type(model_name, "audio")
 
         if isinstance(config, dict) and config.get("backend") == "whisper-server":
             print(f"Registered whisper-server audio model: {model_name}")
@@ -984,6 +1037,7 @@ class MultiModelManager:
         if model_id not in self.audio_models:
             self.audio_models.append(model_id)
         self.config[f"audio:{model_id}"] = cfg
+        self._remember_registered_type(model_id, "audio")
         # Register alias for round-robin routing
         if alias:
             wsm._alias = alias
@@ -1019,6 +1073,7 @@ class MultiModelManager:
         """Set the text-to-speech model and download/cache it if needed."""
         self.tts_model = model_name
         self.config[f"tts:{model_name}"] = config or {}
+        self._remember_registered_type(model_name, "tts")
 
         # Download/cache the model at startup if it's a URL or HF ID
         resolved_model = self.load_model(model_name)
@@ -1033,6 +1088,7 @@ class MultiModelManager:
         if model_name not in self.image_models:
             self.image_models.append(model_name)
         self.config[f"image:{model_name}"] = config or {}
+        self._remember_registered_type(model_name, "image")
 
         # For image models, we don't download at startup since they may be large
         # and handled by different backends (diffusers vs sd.cpp)
@@ -1044,6 +1100,7 @@ class MultiModelManager:
         if model_name not in self.vision_models:
             self.vision_models.append(model_name)
         self.config[f"vision:{model_name}"] = config or {}
+        self._remember_registered_type(model_name, "vision")
 
         resolved_model = self.load_model(model_name)
         if resolved_model != model_name:
@@ -1057,6 +1114,7 @@ class MultiModelManager:
         if model_name not in self.video_models:
             self.video_models.append(model_name)
         self.config[f"video:{model_name}"] = config or {}
+        self._remember_registered_type(model_name, "video")
         print(f"Registered video model: {model_name}")
 
     def set_audio_gen_model(self, model_name: str, config: Dict = None):
@@ -1064,6 +1122,7 @@ class MultiModelManager:
         if model_name not in self.audio_gen_models:
             self.audio_gen_models.append(model_name)
         self.config[f"audio_gen:{model_name}"] = config or {}
+        self._remember_registered_type(model_name, "audio_gen")
         print(f"Registered audio-gen model: {model_name}")
 
     def set_embedding_model(self, model_name: str, config: Dict = None):
@@ -1071,6 +1130,7 @@ class MultiModelManager:
         if model_name not in self.embedding_models:
             self.embedding_models.append(model_name)
         self.config[f"embedding:{model_name}"] = config or {}
+        self._remember_registered_type(model_name, "embedding")
         print(f"Registered embedding model: {model_name}")
 
     def set_spatial_model(self, model_name: str, config: Dict = None):
@@ -1078,12 +1138,32 @@ class MultiModelManager:
         if model_name not in self.spatial_models:
             self.spatial_models.append(model_name)
         self.config[f"spatial:{model_name}"] = config or {}
+        self._remember_registered_type(model_name, "spatial")
         print(f"Registered spatial model: {model_name}")
 
     def set_model_alias(self, alias: str, model_name: str):
         """Register an alias for a model."""
         self.model_aliases[alias] = model_name
+        for model_type in self._registered_types_for(model_name):
+            self._remember_registered_type(alias, model_type)
     
+    def set_assigned_models(self, keys) -> None:
+        """Restrict list_models() to the front-assigned subset (route-keys: alias /
+        path / id). None = no restriction."""
+        self._assigned_model_keys = set(keys) if keys is not None else None
+
+    def _entry_assigned(self, m) -> bool:
+        """True if a models.json entry is assigned to this engine (or no restriction)."""
+        if self._assigned_model_keys is None:
+            return True
+        if isinstance(m, str):
+            rk = m
+        elif isinstance(m, dict):
+            rk = m.get("alias") or m.get("path") or m.get("id")
+        else:
+            return True
+        return rk in self._assigned_model_keys
+
     def get_all_allowed_identifiers(self) -> set:
         """
         Return the set of all model names, aliases, and identifiers that are
@@ -1204,6 +1284,12 @@ class MultiModelManager:
             r_short = registered.split("/")[-1] if "/" in registered else registered
             return n_short == r_short
 
+        requested_type = self._requested_type_from_registered_types(name)
+        if requested_type:
+            return requested_type
+        if self._registered_types_for(name):
+            return None
+
         if self.default_model and _matches(self.default_model):
             return "text"
         for m in self.image_models:
@@ -1231,6 +1317,115 @@ class MultiModelManager:
                 return "spatial"
         return None
 
+    def _remember_registered_type(self, name: str, model_type: str) -> None:
+        """Remember every configured type for a model identifier and short name."""
+        if not name or not model_type:
+            return
+        for key in {name, name.split("/")[-1] if "/" in name else name}:
+            self.model_registered_types.setdefault(key, set()).add(model_type)
+
+    def _registered_types_for(self, name: str) -> Set[str]:
+        """Return all configured types for a model identifier or its short name."""
+        if not name:
+            return set()
+        short = name.split("/")[-1] if "/" in name else name
+        types = set(self.model_registered_types.get(name, set()))
+        types.update(self.model_registered_types.get(short, set()))
+        for key, vals in self.model_registered_types.items():
+            key_short = key.split("/")[-1] if "/" in key else key
+            if key == name or key_short == short:
+                types.update(vals)
+        # Live admin saves update models.json/config_manager immediately, but an
+        # already-running manager may not have had every category re-registered.
+        # Treat the saved config as authoritative so entries with model_types like
+        # text+image don't get rejected just because the image registration won.
+        types.update(self._registered_types_from_config(name))
+        return types
+
+    def _registered_types_from_config(self, name: str) -> Set[str]:
+        """Infer all configured types for a model from config_manager.models_data."""
+        cat_type = {
+            "text_models": "text",
+            "gguf_models": "text",
+            "vision_models": "vision",
+            "image_models": "image",
+            "audio_models": "audio",
+            "tts_models": "tts",
+            "video_models": "video",
+            "audio_gen_models": "audio_gen",
+            "embedding_models": "embedding",
+            "spatial_models": "spatial",
+        }
+        cfg_cat_type = {
+            "text_models": "text",
+            "gguf_models": "text",
+            "vision_models": "vision",
+            "image_models": "image",
+            "audio_models": "audio",
+            "tts_models": "tts",
+            "video_models": "video",
+            "audio_gen_models": "audio_gen",
+            "embedding_models": "embedding",
+            "spatial_models": "spatial",
+        }
+        found: Set[str] = set()
+        short = name.split("/")[-1] if "/" in name else name
+        try:
+            from codai.admin.routes import config_manager
+            md = config_manager.models_data if config_manager is not None else {}
+        except Exception:
+            return found
+        for cat, entries in md.items():
+            default_type = cat_type.get(cat)
+            if not default_type:
+                continue
+            for entry in entries or []:
+                if isinstance(entry, str):
+                    vals = [entry]
+                    entry_types = [default_type]
+                else:
+                    raw = entry.get("path") or entry.get("id") or ""
+                    alias = entry.get("alias") or ""
+                    vals = [raw, alias]
+                    raw_types = entry.get("model_types") or [entry.get("model_type") or cat]
+                    entry_types = [cfg_cat_type.get(t, default_type) for t in raw_types if cfg_cat_type.get(t, default_type)]
+                for val in vals:
+                    if not val:
+                        continue
+                    val_short = val.split("/")[-1] if "/" in val else val
+                    if val == name or val_short == short:
+                        found.update(entry_types)
+        return found
+
+    def _requested_type_from_registered_types(self, name: str) -> Optional[str]:
+        """Return a single registered type only when the model is not multi-type."""
+        types = self._registered_types_for(name)
+        return next(iter(types)) if len(types) == 1 else None
+
+    def model_supports_type(self, name: str, model_type: Optional[str]) -> bool:
+        """True when a configured multi-type model supports the requested type."""
+        if not model_type:
+            return True
+        types = self._registered_types_for(name)
+        if model_type in types:
+            return True
+        return model_type == "text" and "vision" in types
+
+    def _config_for_model_key(self, model_key: str) -> Dict[str, Any]:
+        """Return config for a key, falling back to compatible multi-type keys."""
+        cfg = self.config.get(model_key, {})
+        if cfg:
+            return cfg
+        if ":" in model_key:
+            _, bare = model_key.split(":", 1)
+            return self.config.get(bare, {})
+        bare = model_key
+        for prefix in ("vision", "image", "audio", "tts", "video", "audio_gen", "embedding", "spatial"):
+            cfg = self.config.get(f"{prefix}:{bare}", {})
+            if cfg:
+                return cfg
+        return {}
+
     def is_allowed_model(self, requested_or_resolved: str, model_type: str = None) -> bool:
         """
         Check if a model name (raw request value *or* resolved name) is one of
@@ -1249,9 +1444,17 @@ class MultiModelManager:
         if not requested_or_resolved:
             return False
 
+        # ds4-served DeepSeek V4 has no models.json entry; accept it for text when
+        # the ds4 worker is enabled and the name matches.
+        if model_type in (None, "text") and ds4_should_handle(requested_or_resolved):
+            return True
+
         # If a model_type is specified, reject models registered under a
         # different type (e.g. an image GGUF requested via /v1/chat/completions).
         if model_type:
+            registered_types = self._registered_types_for(requested_or_resolved)
+            if registered_types and not self.model_supports_type(requested_or_resolved, model_type):
+                return False
             registered_type = self.get_registered_model_type(requested_or_resolved)
             if registered_type is not None and registered_type != model_type:
                 # "vision" models are acceptable for "text" endpoints (multimodal)
@@ -1687,7 +1890,7 @@ class MultiModelManager:
         # the runtime reserve (KV cache / activations / VAE-decode spike) so the
         # value we cache and persist reflects the model's PEAK runtime need — not
         # just its loaded weights — and future eviction frees enough headroom.
-        cfg = self.config.get(model_key, {})
+        cfg = self._config_for_model_key(model_key)
         reserve_gb = self._runtime_reserve_gb(
             cfg if isinstance(cfg, dict) else {}, model_key, delta_gb)
         measured = round(delta_gb + reserve_gb, 3)
@@ -2335,6 +2538,31 @@ class MultiModelManager:
         _load_bpe = self._load_bytes_per_elem(cfg)
         prec_factor = (_load_bpe / _storage_bpe) if _storage_bpe > 0 else 1.0
 
+        # GGUF files are ALREADY quantized on disk and llama.cpp loads the baked-in
+        # quantization — it ignores load_in_4bit/load_in_8bit entirely. The stored
+        # used_vram_gb and file-size baselines already reflect that quantized
+        # footprint, so applying the 4/8-bit quant multiplier (or a storage→load
+        # precision normalization) on top would 2–3× UNDER-estimate the real
+        # resident size and let the loader try to fit a model that doesn't fit.
+        _gguf_path = str(cfg.get("path") or resolved_name or model_key or "")
+        _is_gguf = (_gguf_path.endswith(".gguf") or "gguf" in _gguf_path.lower()
+                    or cfg.get("model_type") == "gguf_models")
+        if _is_gguf:
+            quant_mult = 1.0
+            prec_factor = 1.0
+            # n_gpu_layers controls how much of a GGUF actually lands in VRAM.
+            # With 0 layers on the GPU the weights live in CPU RAM / are mmap'd
+            # from disk, so the GPU only needs compute/KV buffers — don't reserve
+            # the whole model (which would force needless eviction of other
+            # models on every load attempt). A partial positive count is left
+            # conservative since the total layer count isn't known here.
+            try:
+                _ngl = int(cfg.get("n_gpu_layers")) if cfg.get("n_gpu_layers") is not None else -1
+            except (TypeError, ValueError):
+                _ngl = -1
+            if _ngl == 0:
+                quant_mult = 0.0
+
         def _dbg_est(source: str, value: float) -> float:
             try:
                 from codai.api.state import get_global_debug
@@ -2592,7 +2820,41 @@ class MultiModelManager:
         """Resident-set size of the server process TREE, in GB (0.0 on failure).
 
         Offloaded weights and worker subprocesses count against the global cap, so
-        sum the parent plus all children (mirrors thermal.read_process_tree_cpu)."""
+        sum the root process plus all children (mirrors thermal.read_process_tree_cpu).
+
+        Under the front/engine split the host-RAM cap is SHARED, not split: when the
+        front spawned this engine it set CODERAI_FRONT_PID, so the root is the
+        *front* — every engine then measures the same fleet-wide total (front + all
+        engines + their workers) and enforces the single cap against it. In
+        single-process mode the root is just this process, as before."""
+        try:
+            import os
+            import psutil
+            root_pid = os.environ.get("CODERAI_FRONT_PID")
+            proc = None
+            if root_pid:
+                try:
+                    proc = psutil.Process(int(root_pid))
+                except Exception:
+                    proc = None
+            if proc is None:
+                proc = psutil.Process()
+            total = proc.memory_info().rss
+            for child in proc.children(recursive=True):
+                try:
+                    total += child.memory_info().rss
+                except Exception:
+                    pass
+            return total / 1e9
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _get_own_ram_gb() -> float:
+        """RSS of THIS engine's own process tree only (ignores the shared-fleet
+        root), in GB. Used for per-engine *leak* detection so unbounded growth is
+        attributed to the engine that actually has it — unlike the shared cap, which
+        uses the whole fleet (:meth:`_get_process_ram_gb`)."""
         try:
             import psutil
             proc = psutil.Process()
@@ -2978,7 +3240,7 @@ class MultiModelManager:
         # Per-model "load" = pre-loaded (treat as loadall for this model).
         # Per-model "on-request" = load when needed with VRAM management.
         # =====================================================================
-        per_model_cfg = self.config.get(model_key, {})
+        per_model_cfg = self._config_for_model_key(model_key)
         per_model_load_mode = per_model_cfg.get("load_mode")  # "load" | "on-request" | None
 
         if per_model_load_mode == "on-request":
@@ -3467,6 +3729,10 @@ class MultiModelManager:
                             "spatial_models"):
                     mtype = CAT_TYPE.get(cat, "text")
                     for m in md.get(cat, []):
+                        # Only list models the front assigned to THIS engine (so a
+                        # per-engine /v1/models reflects what it actually serves).
+                        if not self._entry_assigned(m):
+                            continue
                         if isinstance(m, str):
                             mid = m
                         else:
@@ -3549,6 +3815,12 @@ class MultiModelManager:
         # --- Custom aliases ---
         for alias in self.model_aliases:
             _add(alias)
+
+        # --- DeepSeek V4 via ds4 (no models.json entry; surfaced when enabled) ---
+        ds4_cfg = get_active_ds4_config()
+        if ds4_cfg is not None and getattr(ds4_cfg, "enabled", False):
+            mid = getattr(ds4_cfg, "model_id", "deepseek-v4") or "deepseek-v4"
+            _add(mid, "text", {"backend": "ds4"})
 
         return models
 

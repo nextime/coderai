@@ -937,12 +937,143 @@ class CommandRParser(BaseParser):
         return results
 
 
+def _parse_gemma_loose_value(s: str, i: int):
+    """Parse one value from gemma's loose object notation starting at index i.
+    Returns (python_value, next_index). Handles "strings", numbers, true/false/
+    null, nested {objects} and [arrays], and bareword fallbacks."""
+    n = len(s)
+    while i < n and s[i] in ' \t\r\n':
+        i += 1
+    if i >= n:
+        return None, i
+    c = s[i]
+    if c == '"':
+        # JSON-style string with escapes.
+        j = i + 1
+        buf = []
+        while j < n:
+            if s[j] == '\\' and j + 1 < n:
+                esc = s[j + 1]
+                buf.append({'n': '\n', 't': '\t', 'r': '\r'}.get(esc, esc))
+                j += 2
+                continue
+            if s[j] == '"':
+                j += 1
+                break
+            buf.append(s[j])
+            j += 1
+        return ''.join(buf), j
+    if c == '{':
+        return _parse_gemma_loose_object(s, i)
+    if c == '[':
+        arr = []
+        j = i + 1
+        while j < n:
+            while j < n and s[j] in ' \t\r\n,':
+                j += 1
+            if j < n and s[j] == ']':
+                j += 1
+                break
+            val, j = _parse_gemma_loose_value(s, j)
+            arr.append(val)
+        return arr, j
+    # Bareword / number / bool / null: read until a delimiter.
+    j = i
+    while j < n and s[j] not in ',}]':
+        j += 1
+    tok = s[i:j].strip()
+    low = tok.lower()
+    if low == 'true':
+        return True, j
+    if low == 'false':
+        return False, j
+    if low in ('null', 'none'):
+        return None, j
+    try:
+        return int(tok), j
+    except ValueError:
+        pass
+    try:
+        return float(tok), j
+    except ValueError:
+        pass
+    return tok, j
+
+
+def _parse_gemma_loose_object(s: str, i: int):
+    """Parse a {key:value,…} object (unquoted keys) starting at the '{' at i.
+    Returns (dict, next_index)."""
+    n = len(s)
+    obj = {}
+    assert s[i] == '{'
+    j = i + 1
+    while j < n:
+        while j < n and s[j] in ' \t\r\n,':
+            j += 1
+        if j < n and s[j] == '}':
+            j += 1
+            break
+        # Read key (bareword or "quoted").
+        if s[j] == '"':
+            key, j = _parse_gemma_loose_value(s, j)
+        else:
+            k = j
+            while j < n and s[j] not in ':}':
+                j += 1
+            key = s[k:j].strip()
+        while j < n and s[j] in ' \t\r\n':
+            j += 1
+        if j < n and s[j] == ':':
+            j += 1
+        val, j = _parse_gemma_loose_value(s, j)
+        if key:
+            obj[key] = val
+    return obj, j
+
+
+def parse_gemma_native_tool_calls(text: str, tool_names=None):
+    """Parse gemma-4's native tool-call format — ``call:NAME{args}`` (optionally
+    wrapped in the ``<|tool_call>…<tool_call|>`` special tokens) — into a list of
+    ``(name, args_dict)``. ``tool_names`` (when given) restricts matches to real
+    tool names so prose containing ``call:`` isn't misread. Exact-duplicate calls
+    are collapsed (a degenerate model loop emits the same call repeatedly)."""
+    if not text or 'call:' not in text:
+        return []
+    out = []
+    seen = set()
+    for m in re.finditer(r'call:\s*([A-Za-z_]\w*)\s*\{', text):
+        name = m.group(1)
+        if tool_names and name not in tool_names:
+            continue
+        brace = m.end() - 1   # index of '{'
+        try:
+            args, _ = _parse_gemma_loose_object(text, brace)
+        except Exception:
+            continue
+        key = (name, json.dumps(args, sort_keys=True, default=str))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((name, args))
+    return out
+
+
 # 7. GEMMA PARSER
 class GemmaParser(BaseParser):
     @validate_tool_output
     def parse(self, text: str) -> List[Dict]:
         results = []
-        
+
+        # gemma-4 native format: call:NAME{args} (the <|tool_call>…<tool_call|>
+        # markers are stripped by skip_special_tokens during decode). Restrict to
+        # declared tool names when we know them, to avoid matching prose.
+        native = parse_gemma_native_tool_calls(
+            text, set(self.tools.keys()) if self.tools else None)
+        for name, args in native:
+            results.append(self._to_oa(name, args))
+        if results:
+            return results
+
         match = re.search(r'{\s*"name":\s*".*?"\s*,\s*"parameters":\s*\{.*?\}\s*\}', text, re.DOTALL)
         if match:
             try:
@@ -950,7 +1081,7 @@ class GemmaParser(BaseParser):
                 results.append(self._to_oa(data["name"], data["parameters"]))
             except:
                 pass
-        
+
         # Fallback: if no tool calls found, try using ToolCallParser
         if not results:
             tool_call_parser = ToolCallParser()
@@ -958,7 +1089,7 @@ class GemmaParser(BaseParser):
             if fallback_calls:
                 print(f"DEBUG GemmaParser: ToolCallParser fallback found {len(fallback_calls)} tool calls")
                 results.extend(fallback_calls)
-        
+
         return results
 
 
@@ -2103,6 +2234,21 @@ class ModelParserAdapter:
         if not text:
             return text
         
+        # gemma-4 native: drop every `call:NAME{…}` span (balanced braces) and the
+        # `thought` channel residue left after skip_special_tokens strips the
+        # <|tool_call>/<|channel> markers.
+        if 'call:' in text:
+            while True:
+                m = re.search(r'call:\s*[A-Za-z_]\w*\s*\{', text)
+                if not m:
+                    break
+                try:
+                    _, end = _parse_gemma_loose_object(text, m.end() - 1)
+                except Exception:
+                    end = m.end()
+                text = text[:m.start()] + text[end:]
+        text = re.sub(r'(?m)^\s*thought\s*$\n?', '', text)
+
         # Custom XML format: <tool><action>...</action><object>...</object><properties>...</properties></tool>
         text = re.sub(r'<tool>\s*<action>.*?</action>\s*<object>.*?</object>\s*<properties>.*?</properties>\s*</tool>', '', text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r'<tool=[^>]+>.*?</tool_call>', '', text, flags=re.DOTALL)

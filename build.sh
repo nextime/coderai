@@ -35,12 +35,13 @@ BACKEND="${1:-all}"
 FLASH=false
 CUSTOM_VENV=""
 PACKAGE=false
+DS4=false
 
 # Parse arguments
 i=1
 for arg in "$@"; do
     case $arg in
-        --flash) 
+        --flash)
             FLASH=true
             ;;
         --venv)
@@ -49,6 +50,9 @@ for arg in "$@"; do
             ;;
         --package)
             PACKAGE=true
+            ;;
+        --ds4)
+            DS4=true
             ;;
     esac
     i=$((i + 1))
@@ -68,6 +72,7 @@ if [[ "$BACKEND" != "nvidia" && "$BACKEND" != "vulkan" && "$BACKEND" != "vulkan-
     echo ""
     echo "Options:"
     echo "  --flash     - Install Flash Attention 2 for faster inference (NVIDIA only)"
+    echo "  --ds4       - Clone + build the ds4 (DeepSeek V4) native engine"
     exit 1
 fi
 
@@ -754,6 +759,35 @@ package_app() {
     echo -e "${GREEN}✓ Packaged executable: dist-package/coderai${NC}"
     echo -e "${YELLOW}Note: The target machine must still provide compatible system GPU/runtime libraries.${NC}"
 }
+
+# Optionally clone + build ds4 (DeepSeek V4 native engine). Opt-in via --ds4.
+# coderai can also auto-build this at runtime on first use, but doing it here lets
+# the OCI/Docker packaging bundle the prebuilt ds4-server binary.
+build_ds4() {
+    local DS4_DIR="${CODERAI_DS4_DIR:-$HOME/.coderai/ds4}"
+    echo -e "${YELLOW}Building ds4 (DeepSeek V4 engine) → $DS4_DIR ...${NC}"
+    if [ ! -e "$DS4_DIR/Makefile" ]; then
+        mkdir -p "$(dirname "$DS4_DIR")"
+        git clone --depth 1 https://github.com/antirez/ds4 "$DS4_DIR" || {
+            echo -e "${YELLOW}Warning: could not clone ds4; skipping.${NC}"; return 0; }
+    fi
+    local TARGET="cpu"
+    if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
+        TARGET="cuda-generic"
+    elif [ "$(uname -s)" = "Darwin" ]; then
+        TARGET=""   # bare `make` builds the macOS Metal backend
+    fi
+    ( cd "$DS4_DIR" && make $TARGET ) || {
+        echo -e "${YELLOW}Warning: ds4 build failed; it can still be built at runtime.${NC}"; return 0; }
+    if [ -x "$DS4_DIR/ds4-server" ]; then
+        echo -e "${GREEN}✓ ds4-server built at $DS4_DIR/ds4-server${NC}"
+        echo -e "${YELLOW}Note: DeepSeek V4 weights are downloaded on first use (multi-GB).${NC}"
+    fi
+}
+
+if [ "$DS4" = true ]; then
+    build_ds4
+fi
 
 # Create .backend file to track which backend was used
 echo "$BACKEND" > .backend
