@@ -561,4 +561,38 @@ class EngineSupervisor:
                     proc.wait(timeout=3)
                 except Exception:
                     pass
+        self._reap_orphan_workers()
         print("[front] all engines stopped", flush=True)
+
+    def _reap_orphan_workers(self) -> None:
+        """SIGKILL any lingering download_worker processes — including orphans
+        (``ppid=1``) left by an earlier instance that crashed or was killed before
+        the parent-death signal could reap them. They hold huggingface_hub's
+        per-blob file lock, so leaving them alive makes the next re-download deadlock
+        at 0%. Scans /proc by cmdline so it catches workers this front never
+        spawned. POSIX-only; a no-op (and harmless) elsewhere."""
+        proc_root = "/proc"
+        if not os.path.isdir(proc_root):
+            return
+        my_pid = os.getpid()
+        killed = 0
+        for entry in os.listdir(proc_root):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid == my_pid:
+                continue
+            try:
+                with open(os.path.join(proc_root, entry, "cmdline"), "rb") as fh:
+                    cmdline = fh.read().replace(b"\x00", b" ").decode("utf-8", "replace")
+            except Exception:
+                continue
+            if "codai.admin.download_worker" not in cmdline:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+            except Exception:
+                pass
+        if killed:
+            print(f"[front] reaped {killed} orphaned download worker(s)", flush=True)
