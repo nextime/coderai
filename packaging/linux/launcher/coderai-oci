@@ -72,4 +72,8 @@ if changed:
 PY
 fi
 
+# Point the server at the shared dedicated temp dir so its janitor prunes it.
+if [ -n "${CODERAI_TMP:-}" ]; then
+  exec /opt/coderai/python/bin/python3 /opt/coderai/app/coderai --config "$CONFIG_DIR" --tmp "$CODERAI_TMP" "$@"
+fi
 exec /opt/coderai/python/bin/python3 /opt/coderai/app/coderai --config "$CONFIG_DIR" "$@"

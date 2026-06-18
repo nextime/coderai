@@ -1102,7 +1102,11 @@ HTML_PAGE = r"""
 let models=[], profiles={characters:[], environments:[], voices:[], loras:[]};
 function $(id){return document.getElementById(id)}
 function esc(s){return String(s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
-async function api(path, opts={}){let r=await fetch(path,{headers:{'Content-Type':'application/json'},...opts}); if(!r.ok) throw new Error(await r.text()); return await r.json()}
+const PREFIX="__ROOT_PREFIX__";
+// Prefix app-local absolute paths (/api, /stream, /media) so they resolve under a
+// reverse-proxy sub-path mount; leaves absolute URLs (http...) and others untouched.
+function U(p){return (p && p.charAt(0)==='/') ? PREFIX+p : p}
+async function api(path, opts={}){let r=await fetch(U(path),{headers:{'Content-Type':'application/json'},...opts}); if(!r.ok) throw new Error(await r.text()); return await r.json()}
 function fillSelect(sel, cap, def){let s=$(sel); s.innerHTML=''; let filtered=models.filter(m=>(m.capabilities||[]).includes(cap)); if(!filtered.length) filtered=models; for(let m of filtered){let o=document.createElement('option'); o.value=m.id; o.textContent=m.id; if(m.id===def) o.selected=true; s.appendChild(o)}}
 async function loadModels(){let d=await api('/api/models'); models=d.models||[]; fillSelect('image_model','image_generation',d.defaults.image_model); fillSelect('video_model','video_generation',d.defaults.video_model); fillSelect('audio_model','audio_generation',d.defaults.audio_model); $('conn').textContent=`Connected: ${models.length} model(s)`}
 async function loadProfiles(){profiles=await api('/api/profiles'); renderProfiles()}
@@ -1133,9 +1137,9 @@ function addDialogue(btn){let box=btn.closest('.clip').querySelector('.dialogues
 function selected(sel){return [...sel.selectedOptions].map(o=>o.value)}
 function collectMovie(){let clips=[...document.querySelectorAll('.clip')].map(c=>({title:c.querySelector('.c_title').value,prompt:c.querySelector('.c_prompt').value,characters:selected(c.querySelector('.c_chars')),environments:selected(c.querySelector('.c_envs')),camera_motion:c.querySelector('.c_camera').value,action:c.querySelector('.c_action').value,speech_text:c.querySelector('.c_speech').value,speech_voice:c.querySelector('.c_voice').value,speech_speed:c.querySelector('.c_speed').value,lip_sync:c.querySelector('.c_lipsync').checked,lip_sync_method:$('lip_sync_method').value,music_prompt:c.querySelector('.c_music').value,sfx_prompt:c.querySelector('.c_sfx').value,dialogues:[...c.querySelectorAll('.dialogue')].map(d=>({character:d.querySelector('.d_char').value,voice:d.querySelector('.d_voice').value,text:d.querySelector('.d_text').value,start_time:d.querySelector('.d_start').value,speed:d.querySelector('.d_speed').value,lip_sync:c.querySelector('.c_lipsync').checked}))})); return {title:$('title').value,style:$('style').value,image_model:$('image_model').value,video_model:$('video_model').value,audio_model:$('audio_model').value,default_voice:$('default_voice').value,lip_sync_method:$('lip_sync_method').value,width:+$('width').value,height:+$('height').value,fps:+$('fps').value,num_frames:+$('num_frames').value,steps:+$('steps').value,guidance_scale:+$('guidance_scale').value,negative_prompt:$('negative_prompt').value,use_keyframes:$('use_keyframes').checked,soundtrack_prompt:$('soundtrack_prompt').value,loras:selected($('movie_loras')).map(n=>({name:n,weight:+$('movie_lora_weight').value})),lora_weight:+$('movie_lora_weight').value,movie_count:+$('movie_count').value,clips}}
 async function startMovie(){let d=await api('/api/movie/start',{method:'POST',body:JSON.stringify(collectMovie())}); watchJob(d.job_id)}
-async function watchJob(id){$('jobout').innerHTML=`<p>Job <span class="pill">${id}</span></p>`; let timer=setInterval(async()=>{let j=await api('/api/job/'+id); $('jobout').innerHTML=`<p><span class="pill">${esc(j.status)}</span> ${j.progress||0}% ${esc(j.message||'')}</p>`+(j.output_url?`<p><a href="${j.output_url}" target="_blank">Open output</a></p>`:'')+(j.error?`<p style="color:var(--bad)">${esc(j.error)}</p>`:''); if(j.status==='done'||j.status==='error'){clearInterval(timer); loadProfiles(); loadGallery()}},1500)}
-async function loadGallery(){let d=await api('/api/gallery'); $('gallery_grid').innerHTML=(d.items||[]).map(it=>`<div class="profile">${it.type==='video'?`<video src="${it.url}" controls style="width:100%;height:130px;background:#000"></video>`:`<img src="${it.url}">`}<div class="p"><b>${esc(it.name)}</b><br><a href="${it.url}" target="_blank">open</a></div></div>`).join('')||'<div class="muted">No media yet.</div>'}
-function connectLog(){let es=new EventSource('/stream'); es.onmessage=e=>{let l=$('log'); l.textContent+=e.data+'\n'; l.scrollTop=l.scrollHeight}}
+async function watchJob(id){$('jobout').innerHTML=`<p>Job <span class="pill">${id}</span></p>`; let timer=setInterval(async()=>{let j=await api('/api/job/'+id); $('jobout').innerHTML=`<p><span class="pill">${esc(j.status)}</span> ${j.progress||0}% ${esc(j.message||'')}</p>`+(j.output_url?`<p><a href="${U(j.output_url)}" target="_blank">Open output</a></p>`:'')+(j.error?`<p style="color:var(--bad)">${esc(j.error)}</p>`:''); if(j.status==='done'||j.status==='error'){clearInterval(timer); loadProfiles(); loadGallery()}},1500)}
+async function loadGallery(){let d=await api('/api/gallery'); $('gallery_grid').innerHTML=(d.items||[]).map(it=>`<div class="profile">${it.type==='video'?`<video src="${U(it.url)}" controls style="width:100%;height:130px;background:#000"></video>`:`<img src="${U(it.url)}">`}<div class="p"><b>${esc(it.name)}</b><br><a href="${U(it.url)}" target="_blank">open</a></div></div>`).join('')||'<div class="muted">No media yet.</div>'}
+function connectLog(){let es=new EventSource(U('/stream')); es.onmessage=e=>{let l=$('log'); l.textContent+=e.data+'\n'; l.scrollTop=l.scrollHeight}}
 document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{document.querySelectorAll('.tab,.section').forEach(x=>x.classList.remove('active')); t.classList.add('active'); $(t.dataset.tab).classList.add('active')})
 loadModels().then(loadProfiles).then(()=>addClip()); loadGallery(); connectLog();
 </script>
@@ -1171,12 +1175,30 @@ def make_handler(app: VideoGenApp):
                 return {}
             return json.loads(self.rfile.read(n).decode("utf-8"))
 
+        # -- reverse-proxy helpers (sub-path mounting) -------------------- #
+        def _public_prefix(self) -> str:
+            """Path prefix this app is mounted under, per reverse-proxy headers.
+            Returns e.g. '/videogen' (no trailing slash) or '' at root."""
+            p = (self.headers.get("X-Forwarded-Prefix")
+                 or self.headers.get("X-Script-Name") or "")
+            p = p.strip().rstrip("/")
+            return p if p.startswith("/") else (("/" + p) if p else "")
+
+        def _route(self, path: str) -> str:
+            """Strip the forwarded prefix so internal routing is mount-agnostic
+            whether or not nginx already stripped it."""
+            pref = self._public_prefix()
+            if pref and (path == pref or path.startswith(pref + "/")):
+                path = path[len(pref):] or "/"
+            return path
+
         def do_GET(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
-            path = parsed.path
+            path = self._route(parsed.path)
             try:
                 if path == "/":
-                    self._send(200, HTML_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+                    html = HTML_PAGE.replace("__ROOT_PREFIX__", self._public_prefix())
+                    self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
                 elif path == "/api/models":
                     self._json(app.models_payload())
                 elif path == "/api/profiles":

@@ -67,6 +67,30 @@ def _make_llama_thermal_criteria():
     except Exception:
         return None
 
+
+_CHAT_SUPPORTS_STOPPING_CRITERIA = None
+
+
+def _chat_supports_stopping_criteria() -> bool:
+    """Whether this llama-cpp-python's create_chat_completion accepts
+    ``stopping_criteria``. Older/newer versions differ: create_completion always
+    takes it, but several create_chat_completion builds do not, raising
+    'unexpected keyword argument'. Checked once via signature inspection."""
+    global _CHAT_SUPPORTS_STOPPING_CRITERIA
+    if _CHAT_SUPPORTS_STOPPING_CRITERIA is None:
+        supported = False
+        try:
+            import inspect
+            from llama_cpp import Llama as _L
+            sig = inspect.signature(_L.create_chat_completion)
+            supported = ("stopping_criteria" in sig.parameters
+                         or any(p.kind == inspect.Parameter.VAR_KEYWORD
+                                for p in sig.parameters.values()))
+        except Exception:
+            supported = False
+        _CHAT_SUPPORTS_STOPPING_CRITERIA = supported
+    return _CHAT_SUPPORTS_STOPPING_CRITERIA
+
 try:
     from llama_cpp import Llama
     from llama_cpp.llama_chat_format import ChatFormatterResponse
@@ -696,7 +720,11 @@ class VulkanBackend(ModelBackend):
             self.n_ctx = 0  # 0 means use model's built-in default in llama.cpp
             print("DEBUG: --no-ram mode: ignoring --n-ctx, using model default context size")
         else:
-            n_ctx = kwargs.get('n_ctx', 2048)
+            # Accept either 'n_ctx' (models.json / GGUF) or 'ctx' (CLI / older
+            # configs); the manager passes both, but be robust to either alone.
+            n_ctx = kwargs.get('n_ctx')
+            if n_ctx is None:
+                n_ctx = kwargs.get('ctx', 2048)
             self.n_ctx = n_ctx
         
         # Set verbose
@@ -775,13 +803,22 @@ class VulkanBackend(ModelBackend):
             print(f"Error loading GGUF model: {e}")
             raise
         finally:
-            # Restore llama.cpp's default (quiet) logging after load
+            # Quiet logging after load — but DO NOT drop to NULL + GC the callback.
+            # ggml keeps the log-callback pointer and may still invoke it during
+            # generation (e.g. gemma's iSWA hybrid cache logs every step), so a
+            # garbage-collected ctypes callback becomes a use-after-free → SIGSEGV
+            # in libffi. Install a persistent no-op callback and keep a strong
+            # reference on self for the model's lifetime.
             if _llama_cpp:
                 try:
-                    _llama_cpp.llama_log_set(None, None)
+                    @_llama_cpp.llama_log_callback
+                    def _quiet_log_cb(level, text, user_data):
+                        pass
+                    _llama_cpp.llama_log_set(_quiet_log_cb, None)
+                    self._log_cb = _quiet_log_cb   # keep alive (prevents GC/UAF)
                 except Exception:
-                    pass
-            _log_cb = None  # release callback
+                    self._log_cb = None
+            _log_cb = None  # the verbose load-phase callback is no longer referenced
 
         # Post-load layer/buffer summary
         try:
@@ -1278,7 +1315,7 @@ class VulkanBackend(ModelBackend):
         if response_format and response_format.get('type') == 'json_object':
             kwargs['response_format'] = {'type': 'json_object'}
         _tc = _make_llama_thermal_criteria()
-        if _tc is not None:
+        if _tc is not None and _chat_supports_stopping_criteria():
             kwargs['stopping_criteria'] = _tc
 
         with self._gen_lock:
@@ -1307,7 +1344,7 @@ class VulkanBackend(ModelBackend):
         if stop:
             kwargs['stop'] = stop
         _tc = _make_llama_thermal_criteria()
-        if _tc is not None:
+        if _tc is not None and _chat_supports_stopping_criteria():
             kwargs['stopping_criteria'] = _tc
 
         prompt_tokens = 0

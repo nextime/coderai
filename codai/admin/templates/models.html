@@ -1211,6 +1211,7 @@ async function doSearch(){
           <div style="display:flex;gap:.3rem;flex-shrink:0">
             <button class="btn btn-ghost btn-sm" onclick="openInfo(${i})">Info</button>
             <button class="btn btn-ghost btn-sm" onclick="toggleFiles(${i})">▾ Files</button>
+            <button class="btn btn-ghost btn-sm" onclick="addKnownFromResult(${i},this)" title="Add to your model list without downloading now — fetch it later with Re-download">+ Add known</button>
             <button class="btn btn-secondary btn-sm" onclick="dlFromResult(${i})">Download</button>
           </div>
         </div>
@@ -1233,6 +1234,36 @@ function dlFromResult(i){
   } else {
     openDownloadFor(m.id, '');  // triggers snapshot download
   }
+}
+
+// Best-effort model_type for a search result, from its detected capabilities.
+function _resultModelType(m){
+  if(looksLikeGguf(m.id, '')) return 'gguf_models';
+  const {categories} = _capabilitiesToTypes(m.capabilities||[]);
+  if(categories.size) return [...categories][0];
+  return 'text_models';
+}
+
+// Register a searched model in config without downloading it now (same end state
+// as "Free disk": appears as missing, with a working Re-download button).
+async function addKnownFromResult(i, btn){
+  const m = _results[i];
+  if(!m) return;
+  const isGguf = looksLikeGguf(m.id, '');
+  if(!await showConfirm('Add without downloading',
+      `Add "${m.id}" to your model list without downloading it now? You can fetch it later with the Re-download button.`,
+      'Add known')) return;
+  try{
+    const r = await fetch(ROOT_PATH + '/admin/api/model-add-known', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({model_id:m.id, source_repo:m.id, model_type:_resultModelType(m), is_gguf:isGguf})
+    });
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok || !d.success){ alert('Error: '+(d.detail||d.error||('HTTP '+r.status))); return; }
+    _cachedSearchIds.add(m.id);
+    if(btn){ btn.textContent = d.already ? '✓ Known' : '✓ Added'; btn.disabled = true; btn.style.color = 'var(--ok,#16a34a)'; }
+    loadCachedModels();  // refresh the Local tab in the background
+  }catch(e){ alert('Error: '+e.message); }
 }
 
 /* ── files panel ─────────────────────────────────────── */
@@ -2334,7 +2365,8 @@ async function loadCachedModels(){
         const idx = _localModels.length;
         _localModels.push({label:m.id, path:m.id, cacheType:'hf', size_gb:m.size_gb||0,
           defaultType:m.model_type||'text_models', settings:m.settings||{}, in_config:m.in_config,
-          capabilities:m.capabilities||[], incomplete:!!m.incomplete, configs:m.configs||[]});
+          capabilities:m.capabilities||[], incomplete:!!m.incomplete, configs:m.configs||[],
+          missing:!!m.missing, source_repo:m.source_repo||m.id});
         const loaded = _loadedKeys.has(m.id) || [..._loadedKeys].some(k=>k.endsWith(':'+m.id)||k===m.id);
         const capBadges = fmtCapabilities(m.capabilities||[]);
         const _hfLm = _localModels[idx];
@@ -2344,21 +2376,24 @@ async function loadCachedModels(){
         const instBadgeHf = m.in_config ? _instanceBadge([m.id], _hfCfgMax) : '';
         const hlHf = _highlightCap && (m.capabilities||[]).includes(_highlightCap);
         const incompleteBadgeHf = m.incomplete ? '<span class="badge" style="background:rgba(255,160,0,.18);color:#b87200;font-size:10px;margin-left:.3rem" title="Download may be incomplete — some files are missing or truncated">⚠ incomplete</span>' : '';
+        const missingBadgeHf = m.missing ? ' <span class="badge" style="background:rgba(220,50,50,.18);color:#e05555;font-size:10px" title="Files removed from disk to free space — re-download to restore">✕ on disk: freed</span>' : '';
         const _hfConfigCount = _hfConfigs.length;
-        return `<tr${hlHf?' class="local-cap-highlight"':''} style="border-top:1px solid var(--border)${hlHf?';background:rgba(110,207,126,.07);outline:2px solid rgba(110,207,126,.25);outline-offset:-1px':''}${m.incomplete?';background:rgba(255,160,0,.04)':''}">
-          <td style="padding:.4rem .25rem;font-family:monospace;font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis" title="${esc(m.id)}">${esc(m.id)}${incompleteBadgeHf}${_quantBadge(m.id)}${_hfConfigPills}</td>
-          <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${fmtGB(m.size_gb)}</td>
-          <td style="text-align:right;padding:.4rem .25rem;color:var(--text-2)">${m.file_count}</td>
+        const rowBgHf = m.missing ? ';background:rgba(220,50,50,.04);outline:1px solid rgba(220,50,50,.2);outline-offset:-1px' : (m.incomplete?';background:rgba(255,160,0,.04)':'');
+        return `<tr${hlHf?' class="local-cap-highlight"':''} style="border-top:1px solid var(--border)${hlHf?';background:rgba(110,207,126,.07);outline:2px solid rgba(110,207,126,.25);outline-offset:-1px':''}${rowBgHf}">
+          <td style="padding:.4rem .25rem;font-family:monospace;font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis" title="${esc(m.id)}">${esc(m.id)}${missingBadgeHf}${incompleteBadgeHf}${_quantBadge(m.id)}${_hfConfigPills}</td>
+          <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${m.missing?'<span class="muted small">—</span>':fmtGB(m.size_gb)}</td>
+          <td style="text-align:right;padding:.4rem .25rem;color:var(--text-2)">${m.missing?'<span class="muted small">—</span>':m.file_count}</td>
           <td style="padding:.4rem .25rem;font-size:11px">${capBadges||'<span class="muted small">—</span>'}</td>
-          <td style="text-align:center;padding:.4rem .25rem">${m.in_config?`<span class="badge badge-ok">enabled${_hfConfigCount>1?` ×${_hfConfigCount}`:''}</span>${instBadgeHf?'<br>'+instBadgeHf:''}`:' <span class="muted small">—</span>'}</td>
+          <td style="text-align:center;padding:.4rem .25rem">${m.in_config?`<span class="badge ${m.missing?'badge-err':'badge-ok'}">enabled${_hfConfigCount>1?` ×${_hfConfigCount}`:''}</span>${instBadgeHf?'<br>'+instBadgeHf:''}`:' <span class="muted small">—</span>'}</td>
           <td style="padding:.4rem .25rem;text-align:right;white-space:nowrap">
-            ${m.in_config?(loaded
+            ${m.in_config&&!m.missing?(loaded
               ?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="unloadModel(${idx})">Unload</button>`
               :`<button class="btn btn-primary btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="loadModel(${idx})">Load now</button>`):''}
             <button class="btn btn-secondary btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openCfgModal(${idx},0)">${m.in_config?'Configure':'Add'}</button>
             ${m.in_config?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="disableModel(${idx})">Remove</button>`:''}
-            <button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openDownloadFor('${esc(m.id)}')" title="Re-download from HuggingFace">⬇ Re-download</button>
-            <button class="btn btn-danger btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="deleteModelConfirm(${idx})">Delete</button>
+            <button class="btn ${m.missing?'btn-warn':'btn-ghost'} btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openDownloadFor('${esc(m.id)}')" title="${m.missing?'Re-download to restore this model':'Re-download from HuggingFace'}">⬇ Re-download</button>
+            ${!m.missing?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="freeDiskConfirm(${idx})" title="Delete files from disk to save space, but keep this model in the list so you can re-download it later">🗑 Free disk</button>`:''}
+            ${!m.missing?`<button class="btn btn-danger btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="deleteModelConfirm(${idx})">Delete</button>`:''}
           </td>
         </tr>`;
       });
@@ -2408,7 +2443,10 @@ async function loadCachedModels(){
         const missingBadge = f.missing ? ' <span class="badge" style="background:rgba(220,50,50,.18);color:#e05555;font-size:10px" title="File not found at configured path — re-download or remove this configuration">✕ file missing</span>' : '';
         const incompleteBadge = f.incomplete ? ' <span class="badge" style="background:rgba(255,160,0,.18);color:#b87200;font-size:10px" title="Download may be incomplete">⚠ incomplete</span>' : '';
         const redownloadTarget  = f.source_repo || '';
-        const redownloadPattern = f.source_repo ? f.filename : '';
+        // Only pass a file pattern when it's a concrete .gguf filename; for
+        // known-but-never-downloaded entries (repo id only) leave it blank so
+        // Re-download opens the browse modal to pick a quant.
+        const redownloadPattern = (f.source_repo && /\.gguf$/i.test(f.filename||'')) ? f.filename : '';
         const configPills = _renderConfigPills(idx, lm);
         const configCount = (lm.configs||[]).length;
         const rowBg = f.missing ? ';background:rgba(220,50,50,.04);outline:1px solid rgba(220,50,50,.2);outline-offset:-1px'
@@ -2427,6 +2465,7 @@ async function loadCachedModels(){
               :`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openDownloadFor('${esc(redownloadTarget)}','${esc(redownloadPattern)}')" title="${redownloadTarget?'Re-download from HuggingFace':'Download a replacement'}">⬇ Re-download</button>`}
             <button class="btn btn-secondary btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openCfgModal(${idx},0)">${f.in_config?'Configure':'Add'}</button>
             ${f.in_config?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="disableModel(${idx})">Remove</button>`:''}
+            ${!f.missing&&(f.in_config||redownloadTarget)?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="freeDiskConfirm(${idx})" title="Delete this file from disk to save space, but keep it in the list so you can re-download it later">🗑 Free disk</button>`:''}
             ${!f.missing?`<button class="btn btn-danger btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="deleteModelConfirm(${idx})">Delete</button>`:''}
           </td>
         </tr>`;
@@ -2666,6 +2705,40 @@ async function deleteModelConfirm(idx){
     // Remove from cache
     const idForUrl = m.path;
     const r = await fetch(ROOT_PATH + '/admin/api/cached-models/'+encodeURIComponent(idForUrl)+'?cache_type='+m.cacheType, {method:'DELETE'});
+    const d = await r.json();
+    if(d.success) refreshLocal();
+    else alert('Error: '+(d.detail||d.error||'Unknown'));
+  }catch(e){alert('Error: '+e.message)}
+}
+
+// Delete a model's files from disk to reclaim space while keeping its config
+// entry, so it can be re-downloaded later. The model then shows as "freed" with
+// a Re-download button.
+async function freeDiskConfirm(idx){
+  const m = _localModels[idx];
+  if(!m){ alert('Error: model not found — please refresh the page.'); return; }
+  // Re-download target: stored source repo, or the model id itself for HF repos.
+  const repo = m.source_repo || (m.cacheType==='hf' ? m.path : '');
+  const warn = repo ? '' : ' Note: no source repository is known for this file, so you may need to locate it manually to re-download.';
+  const extra = m.in_config ? '' : ' It will be added to your model list (marked as freed) so you can re-download it later.';
+  if(!await showConfirm('Free disk space',
+      `Delete "${m.label}" from disk to save space, but keep it in your model list so you can re-download it when needed?${extra}${warn}`,
+      'Free disk')) return;
+  try{
+    // Unconfigured models only appear in the list because they are on disk; register
+    // them first so the entry survives the file deletion and stays re-downloadable.
+    if(!m.in_config){
+      const er = await fetch(ROOT_PATH + '/admin/api/model-enable', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({path:m.path, model_type:m.defaultType||'text_models'})
+      });
+      const ed = await er.json().catch(()=>({}));
+      if(!ed.success){ alert('Error: '+(ed.detail||ed.error||'could not register model for re-download')); return; }
+    }
+    const r = await fetch(ROOT_PATH + '/admin/api/model-free-disk', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path:m.path, cache_type:m.cacheType, source_repo:repo})
+    });
     const d = await r.json();
     if(d.success) refreshLocal();
     else alert('Error: '+(d.detail||d.error||'Unknown'));
@@ -3441,10 +3514,17 @@ async function unloadModel(idx){
   }catch(e){ alert('Error: '+e.message); }
 }
 
-async function disableModel(idx){
+async function disableModel(idx, keepReference){
   const m = _localModels[idx];
   if(!m){ alert('Error: model not found — please refresh the page.'); return; }
-  if(!await showConfirm('Remove model', 'Remove this model from CoderAI config? It will stay in the local cache.', 'Remove')) return;
+  // A freed (missing) model has no files left, so removing its config would make
+  // it vanish entirely. keepReference strips the serving config but re-adds a bare
+  // known reference so it stays in the list and remains re-downloadable.
+  const keep = keepReference || !!m.missing;
+  const msg = keep
+    ? 'Remove this model\'s configuration? It will stay in your list as a known model you can re-download later.'
+    : 'Remove this model from CoderAI config? It will stay in the local cache.';
+  if(!await showConfirm('Remove model', msg, 'Remove')) return;
   try{
     // Collect all paths that are marked in_config for this model (covers quant groups)
     const paths = m.ggufGroup
@@ -3462,6 +3542,15 @@ async function disableModel(idx){
         try{ const d = await r.json(); msg = d.detail || d.error || msg; }catch(_){}
         throw new Error(msg);
       }
+    }
+    if(keep){
+      // Re-add a minimal known reference so the model survives the config removal.
+      const repo = m.source_repo || (m.cacheType==='hf' ? m.path : '');
+      await fetch(ROOT_PATH + '/admin/api/model-add-known', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({model_id: repo || m.path, source_repo: repo || m.path,
+          model_type: m.defaultType || 'text_models', is_gguf: m.cacheType==='gguf'})
+      });
     }
     loadCachedModels();
   }catch(e){ alert('Error: '+e.message); }

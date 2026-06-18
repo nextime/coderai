@@ -1420,6 +1420,37 @@ def _scan_caches() -> dict:
                 "configs": all_configs.get(path, []),
             })
 
+    # Add configured non-GGUF HF models whose files have been evicted from disk
+    # (e.g. via "Free disk"). They are absent from the HF cache scan above, so
+    # surface them here as missing so they keep a Re-download button.
+    from codai.models.cache import is_huggingface_model_id
+    existing_hf_ids = {m["id"] for m in result["hf"]}
+    for path, (settings, mtype) in configured_settings.items():
+        if path in existing_hf_ids:
+            continue
+        s = settings if isinstance(settings, dict) else {}
+        if s.get("backend") == "whisper-server":
+            continue
+        # Only HF-style repo IDs (owner/repo) — skip local paths and GGUF files
+        if os.path.isabs(path) or path.endswith('.gguf') or not is_huggingface_model_id(path):
+            continue
+        # A real local relative path that still exists isn't an evicted model
+        if os.path.exists(path):
+            continue
+        caps = s.get("capabilities") or detect_model_capabilities(path).to_list()
+        result["hf"].append({
+            "id": path,
+            "size_gb": 0, "size_bytes": 0, "revision_count": 0,
+            "files": [], "file_count": 0,
+            "in_config": True, "missing": True,
+            "source_repo": path,
+            "model_type": mtype if mtype and mtype != "gguf_models" else "text_models",
+            "settings": s,
+            "capabilities": caps,
+            "incomplete": False,
+            "configs": all_configs.get(path, []),
+        })
+
     return result
 
 
@@ -1611,6 +1642,96 @@ async def api_delete_cached_model(
     """Delete a specific cached model (HF repo ID or GGUF filename)."""
     import asyncio
     return await asyncio.to_thread(_do_delete_model, model_id, cache_type)
+
+
+@router.post("/admin/api/model-free-disk", summary="Delete a model's files but keep its config")
+async def api_model_free_disk(request: Request, username: str = Depends(require_admin)):
+    """Reclaim disk space by deleting a model's files while keeping its
+    models.json entry, so it can be re-downloaded on demand. The source repo is
+    persisted onto the config entry first so the Re-download button has a target
+    once the file is gone."""
+    if config_manager is None:
+        raise HTTPException(status_code=503, detail="Config manager not initialized")
+    import os as _os, asyncio
+    data = await request.json()
+    path = (data.get("path") or data.get("model_id") or "").strip()
+    cache_type = data.get("cache_type", "gguf")
+    source_repo = (data.get("source_repo") or "").strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+
+    # Persist source_repo onto the matching config entries so re-download works
+    # after the file is deleted (flat GGUF files retain no HF repo info on disk).
+    # Skip when the entry key already IS the repo id (HF models re-download by id).
+    if source_repo and source_repo != path:
+        fname = _os.path.basename(path) if ("/" in path or _os.sep in path) else ""
+        changed = False
+        for cat in ("text_models", "image_models", "audio_models",
+                    "gguf_models", "tts_models", "vision_models", "video_models",
+                    "audio_gen_models", "embedding_models", "spatial_models"):
+            lst = config_manager.models_data.get(cat, [])
+            for i, m in enumerate(lst):
+                key = m if isinstance(m, str) else (m.get("path") or m.get("id") or "")
+                if key == path or (fname and _os.path.basename(key) == fname):
+                    if isinstance(m, str):
+                        lst[i] = {"path": m, "source_repo": source_repo}
+                        changed = True
+                    elif not m.get("source_repo"):
+                        m["source_repo"] = source_repo
+                        changed = True
+        if changed:
+            config_manager.save_models()
+
+    result = await asyncio.to_thread(_do_delete_model, path, cache_type)
+    _broker_notify_models_updated(request)
+    return result
+
+
+@router.post("/admin/api/model-add-known", summary="Register a model in config without downloading")
+async def api_model_add_known(request: Request, username: str = Depends(require_admin)):
+    """Add a model to models.json as a known-but-not-downloaded reference.
+
+    The model then appears in the model list as "missing" with a working
+    Re-download button, without fetching any files now — the same end state as
+    "Free disk", but reached without ever having the files locally."""
+    if config_manager is None:
+        raise HTTPException(status_code=503, detail="Config manager not initialized")
+    import os as _os
+    data = await request.json()
+    model_id = (data.get("model_id") or data.get("path") or "").strip()
+    if not model_id:
+        raise HTTPException(status_code=400, detail="model_id is required")
+    source_repo = (data.get("source_repo") or model_id).strip()
+    model_type = (data.get("model_type") or "").strip()
+    is_gguf = (bool(data.get("is_gguf")) or model_type == "gguf_models"
+               or "gguf" in model_id.lower())
+    valid = {"text_models", "image_models", "audio_models", "gguf_models", "tts_models",
+             "vision_models", "video_models", "audio_gen_models", "embedding_models", "spatial_models"}
+    if is_gguf:
+        model_type = "gguf_models"
+    if model_type not in valid:
+        model_type = "text_models"
+
+    # GGUF entries must persist source_repo so Re-download has a target (flat GGUF
+    # files keep no repo info on disk). Plain HF repos re-download by id, so a bare
+    # path string is enough and surfaces as a missing HF model.
+    if is_gguf:
+        entry = {"path": model_id, "source_repo": source_repo}
+    else:
+        entry = model_id
+
+    # Dedupe across all categories by path / basename so we don't double-add.
+    fname = _os.path.basename(model_id) if ("/" in model_id or _os.sep in model_id) else model_id
+    for cat in valid:
+        for m in config_manager.models_data.get(cat, []):
+            key = m if isinstance(m, str) else (m.get("path") or m.get("id") or "")
+            if key == model_id or (fname and _os.path.basename(key) == fname):
+                return {"success": True, "already": True}
+
+    config_manager.models_data.setdefault(model_type, []).append(entry)
+    config_manager.save_models()
+    _broker_notify_models_updated(request)
+    return {"success": True}
 
 
 @router.post("/admin/api/model-enable", summary="Enable a model")

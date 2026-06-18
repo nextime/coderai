@@ -17,6 +17,22 @@ INCLUDE_LOCAL_LIBS=1
 AUTO_LOCAL_BINS=1
 LOCAL_BINARIES=()
 LOCAL_BINARY_DIRS=()
+# Optional second venv for Parler-TTS (pinned transformers 4.46). Bundled as an
+# overlay whose site-packages is prepended to PYTHONPATH at runtime, shadowing the
+# main stack while torch/etc resolve from it underneath.
+PARLER_VENV="${CODERAI_PARLER_VENV:-$HOME/.coderai/parler_venv}"
+INCLUDE_PARLER=1
+# Isolated lip-sync tools (Python 3.10 venvs + repos + weights) and the ds4 native
+# engine. Bundled so the image replicates the local install. ds4 DeepSeek-V4 GGUF
+# weights are NOT bundled (multi-GB, runtime-downloaded into a volume).
+INCLUDE_TOOLS=1
+# One shared Python 3.10 venv serves both wav2lip and sadtalker (identical torch),
+# halving the torch footprint. Repo code is bundled WITHOUT model weights — those
+# download on first lip-sync use into the /cache volume.
+LIPSYNC_VENV="${CODERAI_LIPSYNC_VENV:-$HOME/.coderai/lipsync_venv}"
+WAV2LIP_DIR="${CODERAI_WAV2LIP_SRC:-$HOME/.coderai/Wav2Lip}"
+SADTALKER_DIR="${CODERAI_SADTALKER_SRC:-$HOME/.coderai/SadTalker}"
+DS4_DIR="${CODERAI_DS4_DIR:-$HOME/.coderai/ds4}"
 
 usage() {
   cat <<'EOF'
@@ -37,6 +53,10 @@ Options:
   --include-local-dir PATH
                           Copy executable files from a local build directory, including ldd libs.
                           Can be repeated. Useful for local whisper.cpp build/bin directories.
+  --parler-venv PATH      Bundle this Parler-TTS venv as an overlay (default:
+                          $CODERAI_PARLER_VENV or ~/.coderai/parler_venv if present).
+  --no-parler             Do not bundle the Parler-TTS venv overlay.
+  --no-tools              Do not bundle the lip-sync (wav2lip/sadtalker) venvs or ds4.
   -t, --tag TAG           Image tag to create (default: coderai:local or OCI_IMAGE from versions.env).
   -h, --help              Show this help.
 
@@ -75,6 +95,24 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-auto-local-bins)
       AUTO_LOCAL_BINS=0
+      shift
+      ;;
+    --parler-venv)
+      BUILD_MODE="venv"
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --parler-venv requires a path" >&2
+        exit 2
+      fi
+      PARLER_VENV="$2"
+      INCLUDE_PARLER=1
+      shift 2
+      ;;
+    --no-parler)
+      INCLUDE_PARLER=0
+      shift
+      ;;
+    --no-tools)
+      INCLUDE_TOOLS=0
       shift
       ;;
     --include-local-bin)
@@ -184,6 +222,8 @@ discover_local_binaries() {
     "$HOME/whisper.cpp/build/bin/server"
     "/usr/local/bin/ds4-server"
     "${CODERAI_DS4_DIR:-$HOME/.coderai/ds4}/ds4-server"
+    "/usr/local/bin/rife-ncnn-vulkan"
+    "$HOME/.local/bin/rife-ncnn-vulkan"
   )
   local path
   for path in "${candidates[@]}"; do
@@ -231,6 +271,50 @@ prepare_venv_bundle() {
     printf '  %s\n' "${LOCAL_BINARIES[@]}"
   fi
 
+  # Parler-TTS overlay venv. Only its site-packages is needed: it was created with
+  # --system-site-packages, so it holds just the pinned overrides (transformers
+  # 4.46, parler_tts, tokenizers, ...); torch/numpy resolve from the main venv.
+  if [[ "$INCLUDE_PARLER" == "1" && -n "$PARLER_VENV" && -d "$PARLER_VENV" ]]; then
+    local parler_sp
+    parler_sp="$PARLER_VENV/lib/python${VENV_PYTHON_MINOR}/site-packages"
+    if [[ -d "$parler_sp" ]]; then
+      mkdir -p "$bundle/parler-venv/site-packages"
+      rsync -a --delete "$parler_sp/" "$bundle/parler-venv/site-packages/"
+      echo "Bundled Parler-TTS overlay from: $parler_sp"
+    else
+      echo "Warning: --parler-venv given but no site-packages at $parler_sp (skipping)" >&2
+    fi
+  fi
+
+  # Isolated lip-sync tools + ds4 engine. The two venvs share one standalone
+  # Python 3.10 (read from a venv's pyvenv.cfg `home`); it's bundled once and the
+  # venvs are re-pointed at it during the image build.
+  if [[ "$INCLUDE_TOOLS" == "1" ]]; then
+    local py310_dir=""
+    if [[ -f "$LIPSYNC_VENV/pyvenv.cfg" ]]; then
+      local home_bin
+      home_bin="$(sed -n 's/^home *= *//p' "$LIPSYNC_VENV/pyvenv.cfg" | head -1)"
+      [[ -n "$home_bin" ]] && py310_dir="$(dirname "$home_bin")"
+    fi
+    if [[ -n "$py310_dir" && -d "$py310_dir" ]]; then
+      mkdir -p "$bundle/py310"
+      rsync -a "$py310_dir/" "$bundle/py310/"
+      echo "Bundled standalone Python 3.10 from: $py310_dir"
+    else
+      echo "Warning: could not locate the py3.10 interpreter for the lip-sync venv" >&2
+    fi
+    local _venv_excl=(--exclude '__pycache__' --exclude '*.pyc' --exclude 'pip/' --exclude '*.dist-info/RECORD')
+    if [[ -d "$LIPSYNC_VENV" ]]; then rsync -a "${_venv_excl[@]}" "$LIPSYNC_VENV/" "$bundle/lipsync_venv/"; echo "Bundled shared lip-sync venv"; fi
+    # Repo CODE ONLY — checkpoints/weights are excluded and download at runtime.
+    if [[ -d "$WAV2LIP_DIR" ]]; then rsync -a --exclude 'checkpoints/' --exclude 'face_detection/detection/sfd/*.pth' "$WAV2LIP_DIR/" "$bundle/Wav2Lip/"; echo "Bundled Wav2Lip code (no weights)"; fi
+    if [[ -d "$SADTALKER_DIR" ]]; then rsync -a --exclude 'checkpoints/*' --exclude 'gfpgan/weights/*' "$SADTALKER_DIR/" "$bundle/SadTalker/"; echo "Bundled SadTalker code (no weights)"; fi
+    # ds4: binary + scripts, minus any downloaded multi-GB GGUF weights.
+    if [[ -d "$DS4_DIR" ]]; then
+      rsync -a --exclude 'gguf/' --exclude '*.gguf' --exclude '*.gguf.*' "$DS4_DIR/" "$bundle/ds4/"
+      echo "Bundled ds4 (binary + scripts, no weights)"
+    fi
+  fi
+
   if [[ "$include_libs" != "1" ]]; then
     return 0
   fi
@@ -245,6 +329,7 @@ bundle = Path(os.environ["VENV_BUNDLE"])
 venv = Path(os.environ["VENV_PATH_FOR_LDD"])
 local_libs = bundle / "local-libs"
 local_bin = bundle / "local-bin"
+parler_sp = bundle / "parler-venv" / "site-packages"
 
 skip_prefixes = (
     "/lib/ld-linux",
@@ -278,7 +363,7 @@ skip_starts = (
 )
 
 candidates = []
-for root in (venv / "lib", venv / "bin", local_bin):
+for root in (venv / "lib", venv / "bin", local_bin, parler_sp):
     if not root.exists():
         continue
     for path in root.rglob("*"):
@@ -415,13 +500,27 @@ cat <<EOF
 
 Built $IMAGE_TAG
 
-Run examples:
+Run examples (run as your own UID; create+own the dirs first):
+  mkdir -p coderai-config coderai-models coderai-cache
+  sudo chown -R "\$(id -u):\$(id -g)" coderai-config coderai-models coderai-cache
+
   NVIDIA:
-    $DOCKER_BIN run --gpus all --ipc=host -p 8776:8776 -v "\$PWD/coderai-config:/config" -v "\$PWD/coderai-models:/models" -v "\$PWD/coderai-cache:/cache" $IMAGE_TAG
+    $DOCKER_BIN run --gpus all --ipc=host -p 8776:8776 --user "\$(id -u):\$(id -g)" -v "\$PWD/coderai-config:/config" -v "\$PWD/coderai-models:/models" -v "\$PWD/coderai-cache:/cache" $IMAGE_TAG
 
   AMD/Intel Vulkan:
-    $DOCKER_BIN run --device /dev/dri --ipc=host -p 8776:8776 -v "\$PWD/coderai-config:/config" -v "\$PWD/coderai-models:/models" -v "\$PWD/coderai-cache:/cache" $IMAGE_TAG
+    $DOCKER_BIN run --device /dev/dri --ipc=host -p 8776:8776 --user "\$(id -u):\$(id -g)" -v "\$PWD/coderai-config:/config" -v "\$PWD/coderai-models:/models" -v "\$PWD/coderai-cache:/cache" $IMAGE_TAG
 
   CPU:
-    $DOCKER_BIN run --ipc=host -p 8776:8776 -v "\$PWD/coderai-config:/config" -v "\$PWD/coderai-models:/models" -v "\$PWD/coderai-cache:/cache" $IMAGE_TAG
+    $DOCKER_BIN run --ipc=host -p 8776:8776 --user "\$(id -u):\$(id -g)" -v "\$PWD/coderai-config:/config" -v "\$PWD/coderai-models:/models" -v "\$PWD/coderai-cache:/cache" $IMAGE_TAG
+
+(Drop --user to run as container-root, or use rootless/userns-remap Docker.)
+
+One published port (8776) fronts everything via nginx:
+  /  server+API+admin   /editor/  video editor   /videogen/  studio   /township/  fighters
+
+External storage: point /models and /cache at a big disk or NFS volume —
+  -v /mnt/bigstorage/coderai/models:/models -v /mnt/bigstorage/coderai/cache:/cache
+Non-root: add  --user "\$(id -u):\$(id -g)"  (mounts must be owned by that UID),
+  or use rootless/userns-remap Docker with no extra flags.
+See packaging/linux/README-RUN.txt (also at /opt/coderai/README-RUN.txt in the image).
 EOF

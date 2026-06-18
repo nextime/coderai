@@ -1058,6 +1058,42 @@ def parse_gemma_native_tool_calls(text: str, tool_names=None):
     return out
 
 
+def parse_xml_wrapped_tool_calls(text: str, tool_names):
+    """Parse ``<NAME>…</NAME>`` tool calls where NAME is a declared tool.
+
+    Some clients (Kilo/Cline/Roo-style) describe tools in the system prompt and
+    instruct the model to emit XML-tagged calls. Models then produce e.g.
+    ``<bash>{"command": "ls"}</bash>`` (JSON args) or ``<bash><command>ls</command>
+    </bash>`` (nested XML params). Neither matches a model's native tool format,
+    so this recovers them into ``(name, args_dict)``. Restricted to real tool
+    names so ordinary tagged prose (``<thinking>`` …) isn't misread."""
+    if not text or not tool_names:
+        return []
+    out, seen = [], set()
+    for name in tool_names:
+        for m in re.finditer(rf'<{re.escape(name)}\s*>(.*?)</{re.escape(name)}\s*>',
+                             text, re.DOTALL):
+            inner = m.group(1).strip()
+            args = None
+            if inner.startswith('{'):
+                try:
+                    args = json.loads(inner)
+                except Exception:
+                    args = None
+            if args is None:
+                params = re.findall(r'<(\w+)\s*>(.*?)</\1\s*>', inner, re.DOTALL)
+                if params:
+                    args = {k: v.strip() for k, v in params}
+            if not isinstance(args, dict):
+                continue
+            key = (name, json.dumps(args, sort_keys=True, default=str))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((name, args))
+    return out
+
+
 # 7. GEMMA PARSER
 class GemmaParser(BaseParser):
     @validate_tool_output
@@ -1081,6 +1117,14 @@ class GemmaParser(BaseParser):
                 results.append(self._to_oa(data["name"], data["parameters"]))
             except:
                 pass
+
+        # XML-tagged tool calls (<bash>{…}</bash>) emitted when the client (Kilo/
+        # Cline-style) prompts for XML tools rather than the model's native format.
+        if not results and self.tools:
+            for name, args in parse_xml_wrapped_tool_calls(text, set(self.tools.keys())):
+                results.append(self._to_oa(name, args))
+            if results:
+                return results
 
         # Fallback: if no tool calls found, try using ToolCallParser
         if not results:

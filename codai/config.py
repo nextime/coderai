@@ -264,6 +264,14 @@ class Config:
     # a large-capacity volume when /tmp is small — 4× upscaling extracts many large
     # frames and can exhaust a small /tmp ("No space left on device").
     tmp_dir: Optional[str] = None
+    # Periodic cleanup of the temporary-working dir (above). A background janitor
+    # deletes entries older than tmp_cleanup_max_age_hours every
+    # tmp_cleanup_interval_minutes. Guards against runaway tmp growth from
+    # delete=False temp files left by interrupted generations. Only runs when a
+    # dedicated tmp_dir is configured (never prunes a bare system /tmp).
+    tmp_cleanup_enabled: bool = True
+    tmp_cleanup_max_age_hours: float = 24.0
+    tmp_cleanup_interval_minutes: float = 60.0
     hf_chat_templates: list = field(default_factory=list)
     reasoning_options: list = field(default_factory=list)
     parser: str = "auto"
@@ -422,6 +430,9 @@ class ConfigManager:
                 grammar_guided=config_data.get("grammar_guided", False),
                 file_path=config_data.get("file_path"),
                 tmp_dir=config_data.get("tmp_dir"),
+                tmp_cleanup_enabled=config_data.get("tmp_cleanup_enabled", True),
+                tmp_cleanup_max_age_hours=config_data.get("tmp_cleanup_max_age_hours", 24.0),
+                tmp_cleanup_interval_minutes=config_data.get("tmp_cleanup_interval_minutes", 60.0),
                 hf_chat_templates=config_data.get("hf_chat_templates", []),
                 reasoning_options=config_data.get("reasoning_options", []),
                 parser=config_data.get("parser", "auto")
@@ -597,6 +608,9 @@ class ConfigManager:
             "grammar_guided": self.config.grammar_guided,
             "file_path": self.config.file_path,
             "tmp_dir": self.config.tmp_dir,
+            "tmp_cleanup_enabled": self.config.tmp_cleanup_enabled,
+            "tmp_cleanup_max_age_hours": self.config.tmp_cleanup_max_age_hours,
+            "tmp_cleanup_interval_minutes": self.config.tmp_cleanup_interval_minutes,
             "hf_chat_templates": self.config.hf_chat_templates,
             "reasoning_options": self.config.reasoning_options,
             "parser": self.config.parser

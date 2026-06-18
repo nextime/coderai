@@ -4709,6 +4709,48 @@ def pick_model(client: CoderAIClient, kind: str, override: str = None) -> str:
 # Web UI
 # ─────────────────────────────────────────────────────────────────────────────
 
+# App route roots that appear as server-rendered URLs and JS fetch targets. Used
+# to make the UI work behind a reverse-proxy sub-path mount (e.g. /township/).
+_MOUNT_ROUTES = ("media", "api", "matches", "match", "characters",
+                 "environments", "wardrobe", "prompts", "stream", "stop",
+                 "job", "favicon.ico")
+
+
+def _mount_html(html: str, prefix: str) -> str:
+    """Rewrite a server-rendered page so it works under reverse-proxy sub-path
+    ``prefix`` (e.g. '/township'). Prepends the prefix to app-route URLs in HTML
+    attributes and injects a fetch/EventSource shim so JS calls are prefixed too.
+    Idempotent: already-prefixed URLs are not matched again."""
+    import re as _re
+    if not prefix:
+        return html
+    routes = "|".join(_MOUNT_ROUTES)
+    # 1) Attribute URLs: href/src/action/poster/value/data-* pointing at a route.
+    attr_re = _re.compile(
+        r'((?:href|src|action|poster|value|data-src|data-url)\s*=\s*["\'])'
+        r'(/(?:' + routes + r')\b)')
+    html = attr_re.sub(lambda m: m.group(1) + prefix + m.group(2), html)
+    # 2) Home/nav link to bare root: href="/" -> href="<prefix>/".
+    html = _re.sub(r'(href\s*=\s*(["\']))/\2',
+                   lambda m: m.group(1) + prefix + '/' + m.group(2), html)
+    # 3) JS shim: prefix root-absolute fetch()/EventSource() URLs at call time.
+    if "/*coderai-mount*/" in html:
+        return html
+    shim = (
+        "<script>/*coderai-mount*/(function(){var P=" + repr(prefix) + ";if(!P)return;"
+        "function fix(u){return (typeof u==='string'&&u.charAt(0)==='/'"
+        "&&u.charAt(1)!=='/'&&u.indexOf(P+'/')!==0&&u!==P)?P+u:u;}"
+        "var of=window.fetch.bind(window);window.fetch=function(u,o){return of(fix(u),o);};"
+        "var OE=window.EventSource;if(OE){var NE=function(u,o){return new OE(fix(u),o);};"
+        "NE.prototype=OE.prototype;window.EventSource=NE;}})();</script>"
+    )
+    if "</head>" in html:
+        html = html.replace("</head>", shim + "</head>", 1)
+    else:
+        html = shim + html
+    return html
+
+
 def launch_web_ui(default_args):
     """Launch a local web interface for Township Fighters content generation.
 
@@ -9152,8 +9194,27 @@ async function resetPrompts(ev){
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
 
+        def _public_prefix(self):
+            """Reverse-proxy sub-path mount prefix (e.g. '/township'), or ''."""
+            p = (self.headers.get("X-Forwarded-Prefix")
+                 or self.headers.get("X-Script-Name") or "")
+            p = p.strip().rstrip("/")
+            return p if p.startswith("/") else (("/" + p) if p else "")
+
+        def _route(self, path):
+            """Strip the forwarded prefix so internal routing is mount-agnostic
+            whether or not nginx already stripped it."""
+            pref = self._public_prefix()
+            if pref and (path == pref or path.startswith(pref + "/")):
+                path = path[len(pref):] or "/"
+            return path
+
         def _send(self, code, ctype, body):
             if isinstance(body, str): body = body.encode()
+            if "text/html" in ctype:
+                pref = self._public_prefix()
+                if pref:
+                    body = _mount_html(body.decode("utf-8", "replace"), pref).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
@@ -9163,7 +9224,7 @@ async function resetPrompts(ev){
 
         def do_GET(self):
             parsed = urllib.parse.urlparse(self.path)
-            path = parsed.path.rstrip("/") or "/"
+            path = self._route(parsed.path).rstrip("/") or "/"
 
             if path == "/favicon.ico":
                 # Bundled icon next to this script (tools/assets/favicon.ico).
@@ -9343,7 +9404,7 @@ async function resetPrompts(ev){
 
         def do_POST(self):
             parsed = urllib.parse.urlparse(self.path)
-            path = parsed.path
+            path = self._route(parsed.path)
 
             if path == "/stop":
                 _state["abort"].set()

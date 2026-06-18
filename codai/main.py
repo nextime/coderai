@@ -339,6 +339,21 @@ def main():
         except Exception as _e:
             print(f"WARNING: could not use tmp dir '{_tmp_dir}': {_e} — using OS default")
 
+    # Periodically reclaim the dedicated tmp dir (abandoned delete=False scratch
+    # from interrupted generations). Only runs against a configured tmp_dir, never
+    # a bare system /tmp. Same mechanism works locally and inside the container.
+    if _tmp_dir and getattr(config, "tmp_cleanup_enabled", True):
+        try:
+            from codai.models.tmp_janitor import start as _start_tmp_janitor
+            _start_tmp_janitor(
+                _tmp_dir,
+                enabled=config.tmp_cleanup_enabled,
+                max_age_hours=getattr(config, "tmp_cleanup_max_age_hours", 24.0),
+                interval_minutes=getattr(config, "tmp_cleanup_interval_minutes", 60.0),
+            )
+        except Exception as _e:
+            print(f"WARNING: tmp janitor failed to start: {_e}")
+
     # Apply cache directory overrides from config before any cache module is used.
     # We set env vars AND patch huggingface_hub.constants in case the library was
     # already imported (constants are computed once at import time from env vars).
@@ -973,7 +988,9 @@ def main():
     global_args.enhance_allow_ffmpeg = config.enhance.allow_ffmpeg
     global_args.enhance_allow_rife_ncnn = config.enhance.allow_rife_ncnn
     global_args.n_gpu_layers = config.vulkan.n_gpu_layers
-    global_args.n_ctx = [config.vulkan.n_ctx]
+    # The global fallback context window. Must be a plain int — it flows into the
+    # llama.cpp backend's n_ctx, which a list would break ('<' int vs list).
+    global_args.n_ctx = config.vulkan.n_ctx
     global_args.vulkan_device = config.vulkan.device_id
     global_args.vulkan_single_gpu = config.vulkan.single_gpu
     global_args.image_sample_method = config.image.sample_method

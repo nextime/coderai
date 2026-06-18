@@ -21,6 +21,18 @@ township_output
 dist
 dist-package
 *.log
+tmp
+debug.log
+CoderAI.gif
+
+# Produced artifacts and tool session/output dirs (mounted as volumes at runtime,
+# never baked into the image)
+video_editor/sessions
+video_editor.config.json
+tools/videogen_output
+tools/township_output
+tools/coderai_media
+samples
 
 # Build outputs
 build

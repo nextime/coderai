@@ -875,7 +875,7 @@ class MultiModelManager:
                 return self._get_least_busy_instance(self.default_model)
             self._pending_new_instance.discard(self.default_model)
 
-            config = self.config.get(self.default_model, {})
+            config = self._config_for_model(self.default_model)
             backend_type = self.model_backend_types.get(self.default_model, "auto")
 
             try:
@@ -902,8 +902,30 @@ class MultiModelManager:
                             return v
                     return default
 
-                ctx = _cfg_or_global('ctx', 'n_ctx')
+                # Context window. The per-model config stores it as 'n_ctx'
+                # (models.json), while older configs/CLI use 'ctx'. Read either,
+                # and pass BOTH kwarg names downstream: the GGUF/llama.cpp backend
+                # reads 'n_ctx', the transformers backend reads 'ctx'.
+                # Context window. The per-model runtime cfg stores it under 'ctx'
+                # (build_runtime_kwargs maps the entry's n_ctx → 'ctx'); 'n_ctx' is
+                # also accepted. The PER-MODEL value must win over the global
+                # vulkan.n_ctx fallback, so check the config keys first.
+                ctx = config.get('ctx')
+                if ctx is None:
+                    ctx = config.get('n_ctx')
+                if ctx is None and _ga is not None:
+                    ctx = getattr(_ga, 'n_ctx', None)
+                # Coerce to a positive int: a stray list/str (e.g. an old global
+                # default wrapped in a list) would otherwise reach llama.cpp and
+                # raise '<' int-vs-list at load.
+                if isinstance(ctx, (list, tuple)):
+                    ctx = ctx[0] if ctx else None
+                try:
+                    ctx = int(ctx) if ctx is not None else None
+                except (TypeError, ValueError):
+                    ctx = None
                 if ctx:
+                    kwargs['n_ctx'] = ctx
                     kwargs['ctx'] = ctx
                 n_gpu_layers = _cfg_or_global('n_gpu_layers', 'n_gpu_layers')
                 if n_gpu_layers is not None:
@@ -974,7 +996,7 @@ class MultiModelManager:
                 return self._get_least_busy_instance(model_name)
             self._pending_new_instance.discard(model_name)
 
-            config = self.config.get(model_name, {})
+            config = self._config_for_model(model_name)
             backend_type = self.model_backend_types.get(model_name, "auto")
 
             try:
@@ -999,8 +1021,30 @@ class MultiModelManager:
                             return v
                     return default
 
-                ctx = _cfg_or_global('ctx', 'n_ctx')
+                # Context window. The per-model config stores it as 'n_ctx'
+                # (models.json), while older configs/CLI use 'ctx'. Read either,
+                # and pass BOTH kwarg names downstream: the GGUF/llama.cpp backend
+                # reads 'n_ctx', the transformers backend reads 'ctx'.
+                # Context window. The per-model runtime cfg stores it under 'ctx'
+                # (build_runtime_kwargs maps the entry's n_ctx → 'ctx'); 'n_ctx' is
+                # also accepted. The PER-MODEL value must win over the global
+                # vulkan.n_ctx fallback, so check the config keys first.
+                ctx = config.get('ctx')
+                if ctx is None:
+                    ctx = config.get('n_ctx')
+                if ctx is None and _ga is not None:
+                    ctx = getattr(_ga, 'n_ctx', None)
+                # Coerce to a positive int: a stray list/str (e.g. an old global
+                # default wrapped in a list) would otherwise reach llama.cpp and
+                # raise '<' int-vs-list at load.
+                if isinstance(ctx, (list, tuple)):
+                    ctx = ctx[0] if ctx else None
+                try:
+                    ctx = int(ctx) if ctx is not None else None
+                except (TypeError, ValueError):
+                    ctx = None
                 if ctx:
+                    kwargs['n_ctx'] = ctx
                     kwargs['ctx'] = ctx
                 n_gpu_layers = _cfg_or_global('n_gpu_layers', 'n_gpu_layers')
                 if n_gpu_layers is not None:
@@ -1043,6 +1087,15 @@ class MultiModelManager:
                 inst_num = pool.count + 1 if pool else 1
                 print(f"Loading model on demand: {model_name}"
                       + (f" (instance {inst_num})" if inst_num > 1 else ""))
+                # Evict resident models to make room before loading (idempotent —
+                # a no-op when request_model already freed enough). Guards the
+                # direct on-demand path, which otherwise loads on top of the
+                # current model and OOMs (e.g. switching to a larger model).
+                if inst_num == 1:
+                    try:
+                        self.ensure_vram_for(model_name)
+                    except Exception as _ev_e:
+                        print(f"  (ensure_vram_for warning: {_ev_e})")
                 _snap = self.vram_before_load()
                 # Tell the backend how much VRAM this model is expected to need so
                 # it can decide whether Flash-Attention-2 is safe (FA2 requires the
@@ -1212,6 +1265,37 @@ class MultiModelManager:
         self.model_aliases[alias] = model_name
         for model_type in self._registered_types_for(model_name):
             self._remember_registered_type(alias, model_type)
+
+    def _config_for_model(self, name) -> dict:
+        """Per-model config dict, tolerant of the id form the caller used.
+
+        ``self.config`` is keyed by the registration id (usually the model's full
+        path), but on-demand loads often arrive as a *basename* (e.g.
+        ``gemma-…​.gguf``). A bare ``self.config.get(basename)`` then misses and
+        returns ``{}``, so every per-model setting (n_ctx, flash_attn, parser,
+        cache quant, …) is silently dropped and global defaults are used. Resolve
+        through: exact id → alias map → basename / basename-without-extension."""
+        if not name:
+            return {}
+        cfg = self.config.get(name)
+        if cfg:
+            return cfg
+        target = self.model_aliases.get(name)
+        if target and target != name:
+            cfg = self.config.get(target)
+            if cfg:
+                return cfg
+        import os
+        base = os.path.basename(str(name))
+        base_noext = base[:-5] if base.endswith(".gguf") else base
+        for key, kcfg in self.config.items():
+            if not kcfg:
+                continue
+            kbase = os.path.basename(str(key))
+            kbase_noext = kbase[:-5] if kbase.endswith(".gguf") else kbase
+            if kbase == base or kbase_noext == base_noext:
+                return kcfg
+        return {}
     
     def set_assigned_models(self, keys) -> None:
         """Restrict list_models() to the front-assigned subset (route-keys: alias /
@@ -2564,7 +2648,12 @@ class MultiModelManager:
         4. HuggingFace hub cache size (dense shards or largest GGUF), adjusted.
         Returns 0 when the requirement cannot be determined.
         """
-        cfg = self.config.get(model_key, {})
+        # Resolve by basename/alias too — a model requested by basename would
+        # otherwise miss self.config (keyed by full path), return 0, and skip the
+        # eviction that makes room for it (→ OOM loading on top of a resident model).
+        cfg = self._config_for_model(model_key)
+        if not cfg and resolved_name:
+            cfg = self._config_for_model(resolved_name)
         # Unwrap a forwarded `_raw_cfg` so we see the ORIGINAL model entry the
         # same way the loaders do (build_kwargs_from_config only copies a few
         # keys to the top level — component_quantization lives ONLY in _raw_cfg).
