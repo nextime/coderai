@@ -341,6 +341,32 @@ class FrontProxy:
                 t["engine"] = e.name
                 merged.append(t)
                 seen.add(t.get("id"))
+        # Synthetic "loading" tasks parsed from the log stream, for any engine that
+        # is loading a model but whose event loop is GIL-blocked (so its real
+        # loading task never reached us). Skip if a real loading task for the same
+        # engine already surfaced above.
+        have_loading = {(t.get("engine"), t.get("model")) for t in merged
+                        if isinstance(t, dict) and t.get("kind") == "loading"}
+        for e in self.registry.all():
+            ld = e.loading
+            if not ld or (e.name, ld.get("model")) in have_loading:
+                continue
+            merged.append({
+                "id": f"loading-{e.name}",
+                "kind": "loading",
+                "title": f"Loading {ld.get('model') or 'model'}",
+                "model": ld.get("model") or "",
+                "status": "running",
+                "step": ld.get("step", 0),
+                "total": ld.get("total", 0),
+                "rate": 0.0,
+                "message": ld.get("message") or "Loading",
+                "engine": e.name,
+                "active": True,
+                "cancellable": False,
+                "pausable": False,
+                "restartable": False,
+            })
         return merged
 
     # -------------------------------------------------------------------- proxy

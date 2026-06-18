@@ -53,6 +53,9 @@ class Engine:
     vram: Optional[dict] = None
     tasks: list = field(default_factory=list)   # running/queued tasks on this engine
     cooling: Optional[dict] = None  # thermal cooldown state, or None when not cooling
+    loading: Optional[dict] = None  # model-load progress parsed from logs (or None);
+                                    # surfaced as a synthetic task while the engine's
+                                    # event loop is GIL-blocked and can't be polled
     last_ok: float = 0.0           # monotonic time of last successful poll
     proc: object = None            # subprocess.Popen (set by the supervisor)
 
