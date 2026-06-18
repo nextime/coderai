@@ -346,6 +346,7 @@ class EngineSupervisor:
         to whole-percent changes so the log isn't flooded."""
         pm = self._PROGRESS_RE.match(line)
         is_progress = bool(pm)
+        ts = time.strftime('%H:%M:%S')
         with self._log_lock:
             tty = False
             try:
@@ -354,7 +355,7 @@ class EngineSupervisor:
                 pass
             if is_progress and tty:
                 # Overwrite the current line; pad to clear any longer previous one.
-                print(f"\r[{tag}] {line}\033[K", end="", flush=True)
+                print(f"\r[{ts}][{tag}] {line}\033[K", end="", flush=True)
                 self._log_progress_tag = tag
                 return
             if is_progress:
@@ -370,7 +371,7 @@ class EngineSupervisor:
             if self._log_progress_tag is not None:
                 print(flush=True)
                 self._log_progress_tag = None
-            print(f"[{tag}] {line}", flush=True)
+            print(f"[{ts}][{tag}] {line}", flush=True)
 
     def _note_load_progress(self, engine, line):
         """Track model-load progress from the engine's log stream so the front can

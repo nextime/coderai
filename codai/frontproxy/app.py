@@ -15,6 +15,7 @@ UI stays live even while an engine is busy loading a model.
 """
 
 import json
+import sys
 import time
 from typing import Optional
 
@@ -518,8 +519,11 @@ def _front_log_config(debug_web: bool):
     import uvicorn
     lc = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
     for fmt in lc.get("formatters", {}).values():
-        if "fmt" in fmt and not fmt["fmt"].startswith("[front]"):
-            fmt["fmt"] = "[front] " + fmt["fmt"]
+        if "fmt" in fmt and not fmt["fmt"].startswith(("[front]", "[%(asctime)s]")):
+            # Prefix each line with an HH:MM:SS timestamp + the [front] tag so it
+            # matches the engine log format ([HH:MM:SS][nvidia] …).
+            fmt["fmt"] = "[%(asctime)s][front] " + fmt["fmt"]
+            fmt["datefmt"] = "%H:%M:%S"
     # Surface codai/broker logs (the broker now runs here) via uvicorn's handler.
     lc.setdefault("loggers", {})
     lc["loggers"]["codai"] = {"handlers": ["default"], "level": "INFO", "propagate": False}
@@ -663,8 +667,52 @@ def _serve_front(app, **uvicorn_kwargs) -> None:
             supervisor.stop_all(grace=5.0)
 
 
+class _TimestampedStdout:
+    """Wrap a text stream so every new line begins with an ``[HH:MM:SS]`` tag.
+
+    Lines that already carry a timestamp — engine lines re-emitted by the
+    supervisor and uvicorn lines, both of which start with ``[`` + a digit — are
+    passed through untouched (no double timestamp), as are in-place tqdm progress
+    updates (which start with a carriage return). Splits only on ``\\n`` so a
+    ``\\r`` inside a progress line is treated as ordinary content, preserving the
+    single-line overwrite rendering. Unknown attributes (isatty/flush/fileno/…)
+    delegate to the wrapped stream so TTY detection and flushing keep working."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._at_line_start = True
+
+    def write(self, s):
+        if not s:
+            return 0
+        ts = f'[{time.strftime("%H:%M:%S")}]'
+        parts = s.split('\n')
+        buf = []
+        for idx, part in enumerate(parts):
+            if idx > 0:
+                buf.append('\n')
+                self._at_line_start = True
+            if not part:
+                continue
+            if self._at_line_start:
+                already_ts = part[:1] == '[' and part[1:2].isdigit()
+                if not part.startswith('\r') and not already_ts:
+                    buf.append(ts)
+                self._at_line_start = False
+            buf.append(part)
+        return self._stream.write(''.join(buf))
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 def run_front(config, args) -> None:
     """Build the front app, start engine supervision, and serve on the public port."""
+    # Timestamp every terminal line the front emits (raw prints, uvicorn logs, and
+    # re-emitted engine output) at HH:MM:SS. Installed before uvicorn binds its log
+    # handlers so they write through the wrapped stream.
+    if not isinstance(sys.stdout, _TimestampedStdout):
+        sys.stdout = _TimestampedStdout(sys.stdout)
     config_dir = getattr(args, "config", None) if args is not None else None
     app = build_app(config, config_dir=config_dir)
     app.state.front.debug_engine = getattr(args, "debug_engine", False)

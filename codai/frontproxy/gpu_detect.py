@@ -25,6 +25,7 @@ directory; nothing imports torch.
 
 import glob
 import os
+import re
 import shutil
 import subprocess
 
@@ -224,6 +225,50 @@ def _nvidia_stats() -> list:
     return cards
 
 
+def _amd_gpu_name(dev: str, base: str) -> str:
+    """Best-effort marketing name for an AMD card given its sysfs ``device`` dir.
+
+    Tries, in order: amdgpu's ``product_name`` sysfs attr (e.g. "Radeon RX 7900
+    XTX"), ``lspci`` for the card's exact PCI address, and the matching
+    ``vulkaninfo`` device name. Falls back to ``AMD GPU (cardN)``."""
+    # 1) amdgpu sysfs product_name (newer kernels expose a clean marketing name).
+    try:
+        with open(os.path.join(dev, "product_name")) as f:
+            name = f.read().strip()
+        if name:
+            return name
+    except OSError:
+        pass
+    # 2) lspci by the card's exact PCI bus address (realpath of the device dir).
+    #    The generic chip name (field 2) is shared across rebrands — e.g.
+    #    "[Radeon RX 470/480/570/580/590]" — but the subsystem/board name (field 4)
+    #    pins the actual model ("Radeon RX 580"), so prefer it when meaningful.
+    pci_addr = os.path.basename(os.path.realpath(dev))
+    if re.match(r"^[0-9a-fA-F]{4}:", pci_addr):
+        lspci = shutil.which("lspci")
+        if lspci:
+            try:
+                out = subprocess.run([lspci, "-mm", "-s", pci_addr],
+                                     capture_output=True, text=True, timeout=5)
+                # -mm quotes each name: "class" "vendor" "device" "subvendor" "subdevice"
+                fields = re.findall(r'"([^"]*)"', out.stdout)
+                board = fields[4] if len(fields) >= 5 else ""
+                # Use the board name unless it's a placeholder ("Device 1234").
+                if board and not re.match(r"^Device\b", board):
+                    return board
+                if len(fields) >= 3 and fields[2]:
+                    # Fall back to the chip name, preferring its [bracketed] part.
+                    m = re.search(r"\[([^\]]+)\]", fields[2])
+                    return m.group(1) if m else fields[2]
+            except Exception:
+                pass
+    # 3) vulkaninfo device name (RADV/AMDVLK expose the marketing name).
+    for d in vulkan_devices():
+        if d.get("vendor") == "amd" and d.get("name"):
+            return d["name"]
+    return f"AMD GPU ({base})"
+
+
 def _amd_stats() -> list:
     """Per-GPU live stats for AMD cards from sysfs (amdgpu). Memory in GB."""
     import re
@@ -259,7 +304,7 @@ def _amd_stats() -> list:
                 break
         cards.append({
             "vendor": "amd", "index": int(base[4:]),
-            "name": f"AMD GPU ({base})",
+            "name": _amd_gpu_name(dev, base),
             "util": float(busy) if busy and busy.isdigit() else None,
             "mem_used": round(int(used) / 1e9, 2) if used and used.isdigit() else None,
             "mem_total": round(int(total) / 1e9, 2) if total and total.isdigit() else None,
