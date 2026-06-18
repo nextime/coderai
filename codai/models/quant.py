@@ -99,11 +99,81 @@ def find_quantized_checkpoint(model_name: str, method: str = "gptq") -> Optional
 
 
 # --------------------------------------------------------------------------------
-# Background quantization job
+# Background quantization job (persisted so status survives a server restart)
 # --------------------------------------------------------------------------------
 
 _jobs: Dict[str, Dict[str, Any]] = {}     # model_name -> job status dict
 _jobs_lock = threading.Lock()
+
+
+def _jobs_file() -> Path:
+    return Path(get_model_cache_dir()) / "quantized" / "jobs.json"
+
+
+def _pid_alive(pid) -> bool:
+    """True if process ``pid`` is still running. Conservative: unknown → alive."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
+    except Exception:
+        return True
+
+
+def _save_jobs_locked() -> None:
+    """Persist the job table to disk. Caller holds ``_jobs_lock``.
+
+    Merges with whatever is on disk so a *different* process's jobs (the front and
+    engines each import this module) aren't erased by a last-writer-wins overwrite.
+    This process's in-memory entries win for keys it owns.
+    """
+    try:
+        import json
+        f = _jobs_file()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        merged = {}
+        try:
+            if f.is_file():
+                disk = json.loads(f.read_text())
+                if isinstance(disk, dict):
+                    merged.update(disk)
+        except Exception:
+            pass
+        merged.update(_jobs)
+        tmp = f.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(merged))
+        tmp.replace(f)
+    except Exception:
+        pass
+
+
+def _load_jobs() -> None:
+    """Load persisted jobs on import. A job left 'running' whose owning process is
+    no longer alive can't still be running → mark interrupted. A job still owned by
+    a live process (another engine, or this one) is left untouched."""
+    try:
+        import json
+        f = _jobs_file()
+        if not f.is_file():
+            return
+        data = json.loads(f.read_text())
+        if not isinstance(data, dict):
+            return
+        for name, job in data.items():
+            if (isinstance(job, dict) and job.get("status") == "running"
+                    and not _pid_alive(job.get("pid"))):
+                job["status"] = "interrupted"
+                job["message"] = "interrupted by server restart"
+            _jobs[name] = job
+    except Exception:
+        pass
 
 
 def get_job(model_name: str) -> Optional[Dict[str, Any]]:
@@ -121,6 +191,10 @@ def _set_job(model_name: str, **fields) -> None:
     with _jobs_lock:
         j = _jobs.setdefault(model_name, {"model": model_name})
         j.update(fields)
+        _save_jobs_locked()
+
+
+_load_jobs()
 
 
 def start_quantization(model_name: str, method: str = "gptq", bits: int = 4,
@@ -149,7 +223,8 @@ def start_quantization(model_name: str, method: str = "gptq", bits: int = 4,
         _jobs[model_name] = {"model": model_name, "method": method, "bits": bits,
                              "status": "running", "progress": 0.0,
                              "message": "starting", "started": time.time(),
-                             "error": None, "output": None}
+                             "pid": os.getpid(), "error": None, "output": None}
+        _save_jobs_locked()
 
     t = threading.Thread(
         target=_quantize_worker,

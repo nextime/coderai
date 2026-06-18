@@ -17,6 +17,15 @@ __pycache__/
 
 # Debug logs
 debug.log
+/logs/
+
+# Runtime model cache (downloads, self-quantized checkpoints, job state).
+# Root-anchored so it never shadows the tracked codai/models/ source package.
+/models/
+
+# Third-party source clone of the GPTQ quantizer — installed into the venv from
+# source; the working tree is not part of this repo (it has its own .git).
+/GPTQModel/
 
 # Test files
 test_*.py

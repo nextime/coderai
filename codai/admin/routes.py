@@ -2449,6 +2449,37 @@ def api_tasks(username: str = Depends(require_admin)):
             "restartable": False,
         })
 
+    # GPTQ/AWQ quantization jobs run in in-process daemon threads (status persisted
+    # to disk so it survives a restart). Surface them alongside downloads/training.
+    try:
+        from codai.models import quant as _quant
+        for _name, _qj in _quant.all_jobs().items():
+            if _name in seen:
+                continue
+            seen.add(_name)
+            _qs = _qj.get("status") or "running"
+            _active = _qs == "running"
+            _pct = int(round((_qj.get("progress") or 0) * 100))
+            _msg = _qj.get("message") or ""
+            if _qj.get("error"):
+                _msg = str(_qj["error"])
+            tasks.append({
+                "id": f"quantize:{_name}",
+                "kind": "quantize",
+                "title": _name,
+                "model": (_qj.get("method") or "gptq").upper(),
+                "status": _qs,
+                "step": _pct, "total": 100, "percent": _pct,
+                "message": _msg,
+                "started_at": _qj.get("started"),
+                "active": _active,
+                "cancellable": False,
+                "pausable": False,
+                "restartable": _qs in ("failed", "interrupted"),
+            })
+    except Exception:
+        pass
+
     # Successfully-finished work is dropped from the live list — a "done" job is
     # no longer actionable, so it shouldn't clutter the view. Terminal-but-notable
     # states (cancelled / error / interrupted) stay, so they can be inspected,
