@@ -88,13 +88,20 @@ function fmtTime(s) {
   } catch { return ''; }
 }
 
-const KIND_LABEL = {training:'Training', image:'Image', video:'Video', upscale:'Upscale', interpolate:'Interpolate', audio:'Audio', text:'Text', tts:'Speech (TTS)', transcription:'Transcription', embedding:'Embedding', spatial:'3D / Spatial', pipeline:'Pipeline', request:'Request', loading:'Loading'};
+const KIND_LABEL = {training:'Training', image:'Image', video:'Video', upscale:'Upscale', interpolate:'Interpolate', audio:'Audio', text:'Text', tts:'Speech (TTS)', transcription:'Transcription', embedding:'Embedding', spatial:'3D / Spatial', pipeline:'Pipeline', request:'Request', loading:'Loading', download:'Download'};
 const STATUS_BADGE = {
   running:'badge-admin', queued:'badge-user', done:'badge-ok', error:'badge-err',
   cancelled:'badge-user', interrupted:'badge-warn'
 };
 
 function progressBar(t) {
+  // Downloads report a 0-100 percent; render a percentage bar (the filename /
+  // rate / ETA detail is shown in the status cell, so it isn't repeated here).
+  if (t.kind === 'download') {
+    const pct = Math.max(0, Math.min(100, Math.round(t.percent || t.step || 0)));
+    return `<div class="progress"><div class="progress-fill" style="width:${pct}%"></div></div>
+            <span class="dim small">${pct}%</span>`;
+  }
   const total = t.total || 0, step = t.step || 0;
   // Live throughput for text generation (tokens/s), shown while running.
   const rate = (t.rate && t.status === 'running')
