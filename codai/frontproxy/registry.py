@@ -20,6 +20,19 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
 
+def _short_stem(key: str) -> str:
+    """Short name for a routable key, with a trailing ``.gguf`` stripped.
+
+    A gguf model's assigned/loaded key is its file path, but ``/v1/models``
+    advertises it (and clients address it) by the filename *without* ``.gguf`` —
+    the automatic alias. Normalizing both sides here lets that alias resolve to
+    the owning engine without the user setting an explicit alias."""
+    short = key.split("/")[-1].split(":")[-1]
+    if short.lower().endswith(".gguf"):
+        short = short[:-5]
+    return short
+
+
 # Default model-format capabilities implied by an engine's backend:
 #   transformers — safetensors/HF models (CUDA only here)
 #   gguf         — llama.cpp models (CUDA or Vulkan)
@@ -149,13 +162,13 @@ class EngineRegistry:
         the same fuzzy spirit the manager uses, but read-only over loaded keys."""
         if not model_key:
             return None
-        short = model_key.split("/")[-1]
+        short = _short_stem(model_key)
         with self._lock:
             for e in self._engines.values():
                 if not e.healthy or not e.can_serve(required_cap):
                     continue
                 for k in e.loaded_models:
-                    if k == model_key or k.split("/")[-1] == short \
+                    if k == model_key or _short_stem(k) == short \
                             or k.endswith(model_key) or model_key.endswith(k.split(":")[-1]):
                         return e
         return None
@@ -168,13 +181,13 @@ class EngineRegistry:
         short-name / alias resolves to the owner."""
         if not model_key:
             return None
-        short = model_key.split("/")[-1]
+        short = _short_stem(model_key)
         with self._lock:
             for e in self._engines.values():
                 if not e.healthy:
                     continue
                 for k in e.assigned_models:
-                    if (k == model_key or k.split("/")[-1] == short
+                    if (k == model_key or _short_stem(k) == short
                             or k.endswith(model_key) or model_key.endswith(k.split("/")[-1])):
                         return e
         return None

@@ -370,7 +370,10 @@ class FrontProxy:
 
     @staticmethod
     def _key_matches_path(key: str, path: str) -> bool:
-        return key == path or key.endswith(f":{path}") or key.endswith(path.split("/")[-1])
+        from codai.frontproxy.registry import _short_stem
+        return (key == path or key.endswith(f":{path}")
+                or key.endswith(path.split("/")[-1])
+                or _short_stem(key) == _short_stem(path))
 
     def _engine_by_name(self, name: Optional[str]):
         if not name:
