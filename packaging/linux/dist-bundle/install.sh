@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# CoderAI Docker distribution installer.
+#
+# Expand the distribution tarball and run this script. It:
+#   1. Loads the bundled image into Docker (docker load).
+#   2. Installs the `coderai-docker` runner:
+#        - root  -> /usr/local/bin/coderai-docker
+#        - user  -> ~/.local/usr/bin/coderai-docker  (and ensures it's on PATH,
+#                   adding it to ~/.bashrc if missing).
+#
+# Usage:  ./install.sh
+# Env:    CONTAINER_ENGINE=docker|podman   (default docker)
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IMAGE_TAR="${IMAGE_TAR:-$HERE/coderai-dist.tar.gz}"
+RUNNER_SRC="${RUNNER_SRC:-$HERE/coderai-docker}"
+ENGINE="${CONTAINER_ENGINE:-docker}"
+
+say(){ printf '%s\n' "$*"; }
+die(){ printf 'Error: %s\n' "$*" >&2; exit 1; }
+
+command -v "$ENGINE" >/dev/null 2>&1 || die "'$ENGINE' not found in PATH — install Docker (or set CONTAINER_ENGINE=podman) first."
+[ -f "$IMAGE_TAR" ]  || die "image tarball not found: $IMAGE_TAR"
+[ -f "$RUNNER_SRC" ] || die "runner script not found: $RUNNER_SRC"
+
+# Decide whether the engine needs sudo for daemon access.
+DK=("$ENGINE")
+if ! "$ENGINE" info >/dev/null 2>&1; then
+  if command -v sudo >/dev/null 2>&1; then
+    DK=(sudo "$ENGINE")
+    say "[install] Docker daemon needs elevated access — using sudo (you may be prompted)."
+  else
+    die "cannot reach the Docker daemon (no permission and no sudo available)."
+  fi
+fi
+
+say "[install] loading image from $IMAGE_TAR — this is large, please wait…"
+"${DK[@]}" load -i "$IMAGE_TAR"
+
+# Pick the install dir by privilege.
+if [ "$(id -u)" -eq 0 ]; then
+  BIN_DIR="/usr/local/bin"
+else
+  BIN_DIR="$HOME/.local/usr/bin"
+fi
+mkdir -p "$BIN_DIR"
+install -m 0755 "$RUNNER_SRC" "$BIN_DIR/coderai-docker"
+say "[install] installed runner: $BIN_DIR/coderai-docker"
+
+# Ensure a user install dir is on PATH (root's /usr/local/bin already is).
+if [ "$(id -u)" -ne 0 ]; then
+  case ":${PATH:-}:" in
+    *":$BIN_DIR:"*)
+      say "[install] $BIN_DIR is already on PATH." ;;
+    *)
+      RC="${HOME}/.bashrc"
+      if [ -f "$RC" ] && grep -Fqs "$BIN_DIR" "$RC"; then
+        say "[install] $RC already references $BIN_DIR; open a new shell or 'source $RC'."
+      else
+        printf '\n# Added by the CoderAI Docker installer\nexport PATH="%s:$PATH"\n' "$BIN_DIR" >> "$RC"
+        say "[install] added $BIN_DIR to PATH in $RC."
+        say "[install] run:  source \"$RC\"   (or open a new terminal) to pick it up now."
+      fi
+      ;;
+  esac
+fi
+
+say ""
+say "Done. Quick start:"
+say "  coderai-docker --nvidia            # or --vulkan / --cpu"
+say "  coderai-docker --help              # all options (local config, --map, --debug, file log)"

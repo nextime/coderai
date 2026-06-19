@@ -9,7 +9,7 @@ if [[ -f "$VERSIONS_FILE" ]]; then
 fi
 
 ENGINE="${CONTAINER_ENGINE:-docker}"
-IMAGE_TAG="${OCI_IMAGE:-coderai:local}"
+IMAGE_TAG="${OCI_IMAGE:-coderai:dist}"
 MODE="cpu"
 PORT="${CODERAI_PORT:-8776}"
 DATA_ROOT="$PWD/coderai-runtime"

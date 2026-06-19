@@ -309,6 +309,17 @@ Multi-stage `Dockerfile.oci-venv`:
 
 Full build (slow, ~15 min — rebuilds the bundle):
   packaging/linux/build_oci_image.sh                      # tags coderai:dist
+  - By DEFAULT it then exports the image and assembles the final distribution
+    bundle (dist/coderai-docker-dist.tar). Pass --no-dist to just build.
+
+Distribution bundle (packaging/linux/make_dist_bundle.sh → dist/coderai-docker-dist.tar):
+  Expands to coderai-docker-dist/{install.sh, coderai-docker, coderai-dist.tar.gz,
+  README.txt}. Staged UNDER dist/ (not /tmp — too small) and the 12 GB image
+  tarball is HARDLINKED into the stage, not copied. install.sh: `docker load`s the
+  image (sudo-fallback for daemon access), then installs the coderai-docker runner
+  to /usr/local/bin (root) or ~/.local/usr/bin (user, added to ~/.bashrc PATH if
+  missing). The runner is run_oci.sh with its default image tag pinned (sed) to
+  whatever was shipped, so it matches the loaded tag.
 Smoke test (no weights, checks services + every bundled binary):
   DOCKER="sudo docker" GPU="--gpus all" PORT=18082 \
     packaging/linux/smoke_test_services.sh coderai:dist

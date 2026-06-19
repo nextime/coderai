@@ -33,6 +33,10 @@ LIPSYNC_VENV="${CODERAI_LIPSYNC_VENV:-$HOME/.coderai/lipsync_venv}"
 WAV2LIP_DIR="${CODERAI_WAV2LIP_SRC:-$HOME/.coderai/Wav2Lip}"
 SADTALKER_DIR="${CODERAI_SADTALKER_SRC:-$HOME/.coderai/SadTalker}"
 DS4_DIR="${CODERAI_DS4_DIR:-$HOME/.coderai/ds4}"
+# After a successful build, export the image and assemble the final distribution
+# bundle (image tarball + install.sh + coderai-docker runner). Disable with
+# --no-dist (just builds the image).
+MAKE_DIST=1
 
 usage() {
   cat <<'EOF'
@@ -58,6 +62,8 @@ Options:
   --no-parler             Do not bundle the Parler-TTS venv overlay.
   --no-tools              Do not bundle the lip-sync (wav2lip/sadtalker) venvs or ds4.
   -t, --tag TAG           Image tag to create (default: coderai:local or OCI_IMAGE from versions.env).
+  --no-dist               Just build the image; skip exporting + bundling for distribution.
+  --dist                  Force building the distribution bundle (default ON).
   -h, --help              Show this help.
 
 Examples:
@@ -140,6 +146,14 @@ while [[ $# -gt 0 ]]; do
       fi
       IMAGE_TAG="$2"
       shift 2
+      ;;
+    --no-dist)
+      MAKE_DIST=0
+      shift
+      ;;
+    --dist)
+      MAKE_DIST=1
+      shift
       ;;
     -h|--help)
       usage
@@ -527,3 +541,12 @@ Non-root: add  --user "\$(id -u):\$(id -g)"  (mounts must be owned by that UID),
   or use rootless/userns-remap Docker with no extra flags.
 See packaging/linux/README-RUN.txt (also at /opt/coderai/README-RUN.txt in the image).
 EOF
+
+# Export the image + assemble the final distribution bundle (image tarball +
+# install.sh + coderai-docker runner) unless disabled with --no-dist.
+if [[ "$MAKE_DIST" == "1" ]]; then
+  echo ""
+  echo "=== Building distribution bundle (use --no-dist to skip) ==="
+  DOCKER="$DOCKER_BIN" IMAGE="$IMAGE_TAG" REFRESH=1 \
+    "$ROOT_DIR/packaging/linux/make_dist_bundle.sh"
+fi
