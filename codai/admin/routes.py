@@ -166,6 +166,54 @@ def _default_whisper_server_path() -> str:
     return shutil.which("whisper-server") or default_whisper_server_path()
 
 
+def _next_free_whisper_port(audio_models, default: int = 8744) -> int:
+    """Lowest 87xx-ish port not already claimed by a whisper-server runner."""
+    used = set()
+    for m in audio_models or []:
+        if isinstance(m, dict) and m.get("backend") == "whisper-server":
+            try:
+                used.add(int(m.get("port")))
+            except (TypeError, ValueError):
+                pass
+    port = default
+    while port in used:
+        port += 1
+    return port
+
+
+def _is_whisper_runner(m) -> bool:
+    """A whisper-server RUNNER (has a model_path) vs a whisper MODEL config (a
+    .gguf entry with backend=whisper-server but no model_path). Runners are the
+    actual subprocess instances; model configs only enable the model."""
+    return (isinstance(m, dict) and m.get("backend") == "whisper-server"
+            and bool(m.get("model_path")))
+
+
+def _sync_whisper_runner(model_path: str, model_entry: dict) -> bool:
+    """Ensure exactly ONE whisper-server runner exists for a whisper gguf model
+    (1:1). Creates it if missing. Returns True if a runner was created."""
+    audio_list = config_manager.models_data.setdefault("audio_models", [])
+    if any(_is_whisper_runner(m) and m.get("model_path") == model_path
+           for m in audio_list):
+        return False
+    runner = {
+        "id": _next_whisper_server_model_id(audio_list),
+        "backend": "whisper-server",
+        "server_path": _default_whisper_server_path(),
+        "model_path": model_path,
+        "port": _next_free_whisper_port(audio_list),
+        "gpu_device": int(model_entry.get("gpu_device", 0) or 0),
+        "load_mode": model_entry.get("load_mode", "on-request"),
+        "model_type": "audio_models",
+        "model_types": ["audio_models"],
+        "alias": (model_entry.get("alias") or "").strip() or "whisper",
+    }
+    if model_entry.get("engine"):
+        runner["engine"] = model_entry["engine"]
+    audio_list.append(runner)
+    return True
+
+
 def get_current_user(request: Request) -> Optional[str]:
     """Get the current logged-in user from session cookie."""
     if session_manager is None:
@@ -1312,14 +1360,12 @@ def _scan_caches() -> dict:
                 if isinstance(m, str):
                     p, s = m, {}
                 else:
-                    # A whisper-server is the RUNNER config (port, gpu, which model)
-                    # and is managed in its own card — it is a different thing from
-                    # the GGUF MODEL config (which configures/enables the model and
-                    # holds the load strategy). So whisper-server entries must NOT
-                    # appear as configs of the backing GGUF file, or the GGUF row's
-                    # config form would become the whisper form. The file still shows
-                    # "loaded" via its model_path key in the loaded-status sets.
-                    if m.get("backend") == "whisper-server":
+                    # A whisper-server RUNNER (has model_path: port/gpu/which-model)
+                    # is managed in its own card, not as a config of the backing GGUF
+                    # file — exclude it. The whisper MODEL config (a .gguf entry with
+                    # backend=whisper-server but no model_path) IS shown on the GGUF
+                    # row as that file's config.
+                    if _is_whisper_runner(m):
                         continue
                     p = m.get("path") or m.get("id") or ""
                     s = m if isinstance(m, dict) else {}
@@ -2014,17 +2060,54 @@ async def api_model_disable(request: Request, username: str = Depends(require_ad
         key = m_entry.get("path") or m_entry.get("id") or ""
         return key == path or (fname and bool(key) and _os.path.basename(key) == fname)
 
+    def _is_runner_of_removed_model(m_entry) -> bool:
+        # Cascade: disabling a whisper gguf MODEL also tears down its runner(s),
+        # which reference the same gguf via model_path. Skip cascade for a targeted
+        # single-config removal (config_id), which addresses one entry only.
+        if config_id or not _is_whisper_runner(m_entry):
+            return False
+        mp = m_entry.get("model_path") or ""
+        return mp == path or (fname and _os.path.basename(mp) == fname)
+
+    removed = []
     changed = False
     for cat in ("text_models", "image_models", "audio_models",
                 "gguf_models", "tts_models", "vision_models", "video_models",
                 "audio_gen_models", "embedding_models", "spatial_models"):
         lst = config_manager.models_data.get(cat, [])
-        new_lst = [m for m in lst if not _matches(m)]
-        if len(new_lst) != len(lst):
-            config_manager.models_data[cat] = new_lst
+        keep = []
+        for m in lst:
+            if _matches(m) or _is_runner_of_removed_model(m):
+                removed.append(m)
+            else:
+                keep.append(m)
+        if len(keep) != len(lst):
+            config_manager.models_data[cat] = keep
             changed = True
     if changed:
         config_manager.save_models()
+
+    # Kill the subprocess + drop the registry entries for every whisper-server
+    # runner we just removed, so the server doesn't linger until a restart.
+    try:
+        from codai.models.manager import multi_model_manager as _mmm
+        for m in removed:
+            if isinstance(m, dict) and m.get("backend") == "whisper-server":
+                mid = m.get("id")
+                wsm = _mmm.whisper_servers.pop(mid, None) if mid else None
+                if wsm is not None:
+                    try:
+                        wsm.stop()
+                    except Exception:
+                        pass
+                for k in (f"audio:{mid}", mid):
+                    if k:
+                        _mmm.models.pop(k, None)
+                        _mmm.model_pools.pop(k, None)
+                        _mmm.models_in_vram.discard(k)
+    except Exception as e:
+        print(f"  [admin] whisper runner teardown failed: {e}")
+
     _broker_notify_models_updated(request)
     return {"success": True}
 
@@ -2599,10 +2682,30 @@ async def api_model_configure(request: Request, username: str = Depends(require_
             model_types = _kept
             entry["model_types"] = model_types
 
+    # A .gguf configured for speech-to-text is a whisper model — it runs via a
+    # whisper-server runner subprocess. Mark the model entry's backend so the
+    # engine doesn't try to load the gguf as a transformers audio model, and so it
+    # stays the MODEL config on the GGUF row (its runner lives in the whisper card).
+    _is_whisper_model = (str(path).lower().endswith(".gguf")
+                         and "audio_models" in model_types
+                         and "speech_to_text" in set(entry.get("capabilities") or []))
+    if _is_whisper_model:
+        entry["backend"] = "whisper-server"
+
     # Add entry to each selected category
     for mtype in model_types:
         config_manager.models_data.setdefault(mtype, []).append(entry)
     config_manager.save_models()
+
+    # Keep exactly one whisper-server runner per whisper gguf model (1:1):
+    # auto-create it on enable. (Disabling the model tears the runner down — see
+    # api_model_disable.)
+    if _is_whisper_model:
+        try:
+            if _sync_whisper_runner(path, entry):
+                config_manager.save_models()
+        except Exception as e:
+            print(f"  [admin] whisper runner auto-create failed: {e}")
 
     # Apply to the running server immediately so config changes (e.g.
     # lora_train_base_model, vae_path, quant flags) take effect without a

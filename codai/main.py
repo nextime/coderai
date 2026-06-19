@@ -780,6 +780,11 @@ def main():
         if not mid:
             continue
         if isinstance(m, dict) and m.get("backend") == "whisper-server":
+            # A whisper-server entry with no model_path is the whisper MODEL config
+            # (it just enables the gguf model); the actual subprocess is its RUNNER
+            # entry (which carries model_path). Only runners get started here.
+            if not m.get("model_path"):
+                continue
             cfg = _model_cfg(m, "audio")
             alias = (m.get("alias") or "").strip() or None
             cfg.update({

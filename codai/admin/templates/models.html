@@ -2356,8 +2356,11 @@ async function loadCachedModels(){
     const r = await fetch(ROOT_PATH + '/admin/api/cached-models');
     if(!r.ok) throw new Error((await r.json()).detail||r.statusText);
     const d = await r.json();
+    // Only whisper-server RUNNERS (they carry a model_path) belong in this card.
+    // A whisper MODEL config (a .gguf entry with backend=whisper-server but no
+    // model_path) is shown on the GGUF row instead, as that file's model config.
     const whisperModels = (await fetch(ROOT_PATH + '/admin/api/models').then(r=>r.ok?r.json():[]))
-      .filter(m => m.backend === 'whisper-server');
+      .filter(m => m.backend === 'whisper-server' && m.model_path);
 
     // HF models
     const hf = d.hf||[];
