@@ -135,10 +135,6 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       <input id="ws-model-path" class="form-input" placeholder="Manual path: /models/ggml-base.bin" style="display:none">
       <input id="ws-port" class="form-input" type="number" value="8744" min="1" max="65535">
       <input id="ws-gpu-device" class="form-input" type="number" value="0" min="0">
-      <select id="ws-load-mode" class="form-input">
-        <option value="on-request">On request</option>
-        <option value="load">Load</option>
-      </select>
     </div>
     <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.75rem;margin-top:.75rem">
       <input id="ws-used-vram" class="form-input" type="number" min="0" step="0.1" placeholder="Used VRAM (optional)">
@@ -440,13 +436,6 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <div class="form-row" style="margin:0">
           <label class="form-label">GPU device</label>
           <input id="wse-gpu-device" class="form-input" type="number" min="0">
-        </div>
-        <div class="form-row" style="margin:0">
-          <label class="form-label">Load mode</label>
-          <select id="wse-load-mode" class="form-input">
-            <option value="on-request">On request</option>
-            <option value="load">Load</option>
-          </select>
         </div>
       </div>
       <div class="form-actions" style="margin-top:1rem">
@@ -2864,7 +2853,6 @@ function _openWhisperServerEdit(m) {
   document.getElementById('wse-server-path').value = s.server_path || defaultWhisperServerPath();
   document.getElementById('wse-port').value = s.port ?? 8744;
   document.getElementById('wse-gpu-device').value = s.gpu_device ?? 0;
-  document.getElementById('wse-load-mode').value = s.load_mode || 'on-request';
 
   // Populate the GGUF select with current options from the add-form's list
   const srcSelect = document.getElementById('ws-gguf-select');
@@ -2897,7 +2885,7 @@ async function saveWhisperServerEdit() {
     model_path,
     port: parseInt(document.getElementById('wse-port').value, 10) || 8744,
     gpu_device: parseInt(document.getElementById('wse-gpu-device').value, 10) || 0,
-    load_mode: document.getElementById('wse-load-mode').value,
+    load_mode: _deriveWhisperLoadMode(model_path),
     alias: document.getElementById('wse-alias').value.trim() || null,
   };
   try {
@@ -3549,19 +3537,29 @@ async function saveModelConfig(){
   }catch(e){ showAlert('Error: '+e.message); }
 }
 
+// Whisper-server models inherit their load mode from the backing GGUF model's
+// config (there's no separate load-mode control on the whisper forms), defaulting
+// to on-request when the file isn't configured as a model yet.
+function _deriveWhisperLoadMode(ggufPath){
+  const f = (_ggufFiles||[]).find(x => x && x.path === ggufPath);
+  const s = (f && (f.settings || (f.configs && f.configs[0] && f.configs[0].settings))) || {};
+  return s.load_mode || 'on-request';
+}
+
 async function addWhisperServerModel(){
   const usedVram = parseFloat(document.getElementById('ws-used-vram').value);
   const modelSource = document.getElementById('ws-model-source').value;
+  const modelPath = getWhisperServerModelPath();
   const payload = {
     model_id: document.getElementById('ws-model-id').value.trim(),
     model_type: 'audio_models',
     backend: 'whisper-server',
     model_source: modelSource,
     server_path: document.getElementById('ws-server-path').value.trim(),
-    model_path: getWhisperServerModelPath(),
+    model_path: modelPath,
     port: parseInt(document.getElementById('ws-port').value, 10) || 8744,
     gpu_device: parseInt(document.getElementById('ws-gpu-device').value, 10) || 0,
-    load_mode: document.getElementById('ws-load-mode').value,
+    load_mode: _deriveWhisperLoadMode(modelPath),
     used_vram_gb: Number.isNaN(usedVram) ? null : usedVram,
     alias: document.getElementById('ws-alias').value.trim() || null,
   };
@@ -3580,7 +3578,6 @@ async function addWhisperServerModel(){
     document.getElementById('ws-model-path').value = '';
     document.getElementById('ws-port').value = '8744';
     document.getElementById('ws-gpu-device').value = '0';
-    document.getElementById('ws-load-mode').value = 'on-request';
     document.getElementById('ws-used-vram').value = '';
     document.getElementById('ws-alias').value = '';
     document.getElementById('ws-submit-btn').textContent = 'Add model';
