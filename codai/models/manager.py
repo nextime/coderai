@@ -3743,7 +3743,18 @@ class MultiModelManager:
                 # Require headroom beyond raw weight size for activation buffers
                 # and generation scratch (30% of model size + 1 GB base).
                 headroom_gb = max(1.0, needed_gb * 0.30)
-                if needed_gb > 0 and free_gb >= needed_gb + headroom_gb:
+                # ds4 (DeepSeek-V4) is served by an external ds4-server that streams
+                # MoE experts and wants the WHOLE GPU for its expert cache — coderai's
+                # modest VRAM estimate for it is not its real footprint. Co-residing
+                # another model starves that cache (layer-0 "ffn batch encode failed").
+                # So a ds4 model claims VRAM exclusively: evict everything else.
+                _new_is_ds4 = (ds4_should_handle(model_key)
+                               or (resolved_name and ds4_should_handle(resolved_name)))
+                if _new_is_ds4:
+                    print(f"Ondemand mode - ds4 model '{model_key}' needs exclusive VRAM "
+                          f"— unloading all other models so ds4-server gets the full GPU")
+                    self.unload_all_models()
+                elif needed_gb > 0 and free_gb >= needed_gb + headroom_gb:
                     print(f"Ondemand mode - keeping '{loaded_canonical}' in VRAM alongside new model "
                           f"(need {needed_gb:.1f} GB + {headroom_gb:.1f} GB headroom, have {free_gb:.1f} GB free)")
                 else:
