@@ -361,3 +361,44 @@ Incremental update (FAST, ~30 s — code-only changes, NO bundle recopy):
   - CAUTION: COPY adds/overwrites but does NOT delete files removed from the
     repo; the cleanup RUN prunes only known-stale paths (.git/venv*/dist/...). A
     source file deleted from codai/ lingers in the overlay until a full rebuild.
+
+================================================================================
+## DeepSeek-V4: llama.cpp support is pending — ds4 for now
+================================================================================
+
+DeepSeek-V4 GGUFs use the `deepseek4` architecture (keys like
+`deepseek4.hash_layer_count`, `deepseek4.nextn_predict_layers`). The bundled
+llama.cpp (0.3.30, ggml 0.15.1) supports up to `deepseek32` (V3.2) — NOT
+`deepseek4`, so it fails fast with "Failed to load model from file" (this is an
+ARCHITECTURE gap, not VRAM/offload, and no quantization changes it).
+
+Mainline llama.cpp V4 support is IN PROGRESS but NOT yet merged — it needs new
+ggml ops (a "hyperconnection" op and `GGML_OP_LIGHTNING_INDEXER`) tracked in OPEN
+PRs ggml-org/llama.cpp#23122, #24162, #24231 (#22319 = the model request; #23706
+"can't launch deepseek-v4-flash" = the exact Flash variant). So:
+  - Rebuilding llama.cpp from `master` today will NOT run V4 (ops unmerged).
+  - TODO (revisit soon): once those PRs land, rebuild llama-cpp-python from a
+    tag/commit that includes them (CUDA build), and run V4 GGUFs converted with
+    MAINLINE's convert_hf_to_gguf (so the arch/tensors match) — any quant.
+  - The user's `…-ds4-…Q2_K.gguf` is ds4 (antirez/ds4 / DwarfStar) format; it
+    will only ever load under ds4, not llama.cpp.
+
+ds4 (codai/backends/ds4.py, config.ds4, codai/api/ds4_worker.py) is the native
+DeepSeek-V4 engine: coderai owns ds4-server (clone+build) and proxies to it.
+Routing & model selection (manager.ds4_should_handle):
+  - When ds4.enabled, a model routes to ds4 IFF its GGUF ARCHITECTURE is
+    `deepseek4` (read from the file header via manager._gguf_architecture, cached)
+    — NOT by filename. Mainline deepseek/2/3/32 GGUFs stay on llama.cpp. The
+    config.ds4.model_id alias also routes (for the downloaded-variant case).
+  - ds4-server serves the REQUESTED GGUF: Ds4Backend resolves the model to a local
+    .gguf and launches `ds4-server -m <that file>`. So any deepseek4 GGUF you have
+    is served directly — no per-model setup.
+  - `--ctx` honours the model's per-entry n_ctx (forwarded via kwargs), not just
+    config.ds4.ctx.
+  - config.ds4.ssd_streaming → `--ssd-streaming` (stream MoE experts from SSD/disk;
+    run a 100GB+ model on a small GPU). config.ds4.model_path = explicit -m override.
+  - config.ds4.auto_download is OFF by default: ds4 only serves GGUFs you already
+    have; with no local file it errors (clear message) instead of pulling tens of
+    GB. Enable auto_download to fetch config.ds4.model_variant as a fallback.
+  - ds4-server exposes only TEXT APIs (chat/completions/responses/anthropic) — no
+    image generation; that needs a separate diffusion model.

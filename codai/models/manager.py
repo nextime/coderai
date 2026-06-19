@@ -47,11 +47,85 @@ def get_active_ds4_config():
     return None
 
 
-def ds4_should_handle(model_name: str) -> bool:
-    """True when ds4 is enabled and ``model_name`` should be served by ds4-server.
+_GGUF_ARCH_CACHE: Dict[tuple, str] = {}
 
-    Matches the configured ``model_id`` (case-insensitive, short-name aware) or any
-    name containing ``deepseek-v4``, so the stock alias works without extra config.
+
+def _resolve_local_gguf(model_name: str):
+    """Map a model name/alias/path to a local .gguf file path, or None."""
+    if not model_name:
+        return None
+    cand = os.path.expanduser(model_name)
+    if cand.lower().endswith(".gguf") and os.path.isfile(cand):
+        return cand
+    try:
+        p = get_cached_model_path(model_name)
+        if p and str(p).lower().endswith(".gguf") and os.path.isfile(str(p)):
+            return str(p)
+    except Exception:
+        pass
+    return None
+
+
+def _gguf_architecture(path: str):
+    """Read ``general.architecture`` from a GGUF header. Cached by (path,mtime,size)."""
+    import struct
+    try:
+        st = os.stat(path)
+        key = (path, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+    if key in _GGUF_ARCH_CACHE:
+        return _GGUF_ARCH_CACHE[key] or None
+    arch = ""
+    _sz = {0: 1, 1: 1, 7: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 10: 8, 11: 8, 12: 8}
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                _GGUF_ARCH_CACHE[key] = ""
+                return None
+            f.read(4); f.read(8)  # version, tensor_count
+            kv_count = struct.unpack("<Q", f.read(8))[0]
+
+            def _rs(fh):
+                n = struct.unpack("<Q", fh.read(8))[0]
+                return fh.read(n)
+
+            for _ in range(kv_count):
+                k = _rs(f)
+                vtype = struct.unpack("<I", f.read(4))[0]
+                if vtype == 8:  # string
+                    v = _rs(f)
+                    if k == b"general.architecture":
+                        arch = v.decode("utf-8", "ignore")
+                        break
+                elif vtype in _sz:
+                    f.read(_sz[vtype])
+                elif vtype == 9:  # array — skip its elements
+                    atype = struct.unpack("<I", f.read(4))[0]
+                    alen = struct.unpack("<Q", f.read(8))[0]
+                    if atype == 8:
+                        for _ in range(alen):
+                            _rs(f)
+                    elif atype in _sz:
+                        f.read(_sz[atype] * alen)
+                    else:
+                        break  # unknown element type — stop
+                else:
+                    break  # unknown value type — stop
+    except Exception:
+        arch = ""
+    _GGUF_ARCH_CACHE[key] = arch
+    return arch or None
+
+
+def ds4_should_handle(model_name: str) -> bool:
+    """True when ds4 is enabled and ``model_name`` is a DeepSeek-V4 (ds4) model.
+
+    Routing is by the GGUF ARCHITECTURE, not the filename: ds4 serves only genuine
+    ``deepseek4`` GGUFs (its own format). Mainline DeepSeek GGUFs (deepseek/
+    deepseek2/deepseek3/deepseek32) are left to llama.cpp. The configured
+    ``model_id`` alias still routes (covers the variant ds4 downloads itself, which
+    has no local file yet).
     """
     if not model_name:
         return False
@@ -63,7 +137,13 @@ def ds4_should_handle(model_name: str) -> bool:
     mid = (getattr(cfg, "model_id", "") or "").lower()
     if mid and (name == mid or short == mid):
         return True
-    return "deepseek-v4" in name
+    # Definitive: read the GGUF architecture for a local file — only deepseek4.
+    path = _resolve_local_gguf(model_name)
+    if path:
+        return (_gguf_architecture(path) or "").lower() == "deepseek4"
+    # No local file (HF id / not downloaded yet): conservative name check that
+    # matches ONLY the V4 marker, so mainline deepseek GGUFs aren't grabbed.
+    return "deepseek-v4" in name or "deepseek4" in name
 
 
 def _trim_cpu_ram() -> None:

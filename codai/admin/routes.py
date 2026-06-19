@@ -3163,11 +3163,14 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "repo_url": c.ds4.repo_url,
             "install_dir": c.ds4.install_dir,
             "build_target": c.ds4.build_target,
+            "model_path": c.ds4.model_path,
+            "auto_download": c.ds4.auto_download,
             "model_variant": c.ds4.model_variant,
             "model_id": c.ds4.model_id,
             "host": c.ds4.host,
             "port": c.ds4.port,
             "ctx": c.ds4.ctx,
+            "ssd_streaming": c.ds4.ssd_streaming,
             "extra_args": c.ds4.extra_args,
             "auto_build": c.ds4.auto_build,
         },
@@ -3431,6 +3434,12 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             c.ds4.install_dir = (d.get("install_dir") or "").strip() or None
         if "build_target" in d:
             c.ds4.build_target = (d.get("build_target") or "auto").strip()
+        if "model_path" in d:
+            c.ds4.model_path = (d.get("model_path") or "").strip()
+        if "auto_download" in d:
+            c.ds4.auto_download = bool(d["auto_download"])
+        if "ssd_streaming" in d:
+            c.ds4.ssd_streaming = bool(d["ssd_streaming"])
         if "model_variant" in d:
             c.ds4.model_variant = (d.get("model_variant") or c.ds4.model_variant).strip()
         if "model_id" in d:

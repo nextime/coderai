@@ -35,6 +35,7 @@ import time
 import collections
 from pathlib import Path
 from typing import Optional
+from typing import Optional
 
 _lock = threading.RLock()
 # Single managed server (ds4 serves one DeepSeek V4 model). Keyed by model_id so a
@@ -195,22 +196,56 @@ def _health_ok(url: str) -> bool:
         return False
 
 
-def ensure_service(cfg, ready_timeout: float = 3600.0) -> str:
-    """Build + download (as needed), then start (or reuse) ds4-server.
+def resolve_service_key(cfg, model_file: Optional[str] = None):
+    """Decide which GGUF ds4-server should serve and the key to cache it under.
 
-    Returns the base URL. First call clones, builds, and downloads several GB, so the
-    timeout is generous. Raises RuntimeError if the service never becomes ready.
+    Preference: the requested model's own ``.gguf`` path → an explicit
+    ``cfg.model_path`` override → '' (download the variant as a last resort).
+    Returns ``(resolved_gguf_or_'', svc_key)``; the key is the file when we have
+    one (so different deepseek4 models get their own server), else ``model_id``.
     """
-    model_id = getattr(cfg, "model_id", "deepseek-v4") or "deepseek-v4"
+    resolved = ""
+    for cand in (model_file, getattr(cfg, "model_path", "") or ""):
+        cand = os.path.expanduser((cand or "").strip())
+        if cand and cand.lower().endswith(".gguf") and os.path.isfile(cand):
+            resolved = cand
+            break
+    svc_key = resolved or (getattr(cfg, "model_id", "deepseek-v4") or "deepseek-v4")
+    return resolved, svc_key
+
+
+def ensure_service(cfg, model_file: Optional[str] = None,
+                   ctx: Optional[int] = None,
+                   ready_timeout: float = 3600.0) -> str:
+    """Build (as needed), then start (or reuse) ds4-server serving the right GGUF.
+
+    ``model_file`` is the requested model's path; when it resolves to a local
+    ``.gguf`` (or ``cfg.model_path`` is set) ds4-server loads THAT via ``-m`` and
+    no weights are downloaded. Only when neither resolves does it fall back to
+    downloading ``cfg.model_variant``. ``ctx`` overrides the ds4 global context
+    (so the per-model n_ctx configuration wins). Returns the base URL.
+    """
+    resolved, svc_key = resolve_service_key(cfg, model_file)
     with _lock:
-        svc = _services.get(model_id)
+        svc = _services.get(svc_key)
         if svc and svc["proc"].poll() is None and _health_ok(svc["url"]):
             return svc["url"]
         if svc and svc["proc"].poll() is not None:
-            _services.pop(model_id, None)   # died — restart below
+            _services.pop(svc_key, None)   # died — restart below
 
         binary = ensure_built(cfg)
-        ensure_model(cfg)
+        if not resolved:
+            # No local deepseek4 GGUF resolved. Downloading ds4's own variant is
+            # OPT-IN (auto_download, off by default) — otherwise fail with a clear
+            # message instead of silently pulling tens of GB.
+            if bool(getattr(cfg, "auto_download", False)):
+                ensure_model(cfg)
+            else:
+                raise RuntimeError(
+                    "ds4: no local deepseek4 GGUF resolved for this request and "
+                    "auto-download is disabled. Point the model at a deepseek4 "
+                    ".gguf (or set ds4.model_path), or enable ds4.auto_download to "
+                    "fetch the configured weight variant.")
 
         install_dir = _install_dir(cfg)
         host = getattr(cfg, "host", "127.0.0.1") or "127.0.0.1"
@@ -220,21 +255,36 @@ def ensure_service(cfg, ready_timeout: float = 3600.0) -> str:
         connect_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
         url = f"http://{connect_host}:{port}"
 
+        # Per-model n_ctx (passed in) wins over the ds4 global ctx setting.
+        try:
+            ctx_val = int(ctx) if ctx else 0
+        except (TypeError, ValueError):
+            ctx_val = 0
+        if ctx_val <= 0:
+            ctx_val = int(getattr(cfg, "ctx", 100000) or 100000)
+
         cmd = [str(binary), "--host", host, "--port", str(port),
-               "--ctx", str(int(getattr(cfg, "ctx", 100000) or 100000)),
+               "--ctx", str(ctx_val),
                "--chdir", str(install_dir)]
+        if resolved:
+            cmd += ["-m", resolved]
+        if bool(getattr(cfg, "ssd_streaming", False)):
+            # Stream MoE experts from SSD/disk instead of full residency — lets a
+            # 100GB+ model run on a small GPU + modest RAM (slow but works).
+            cmd += ["--ssd-streaming"]
         extra = (getattr(cfg, "extra_args", "") or "").strip()
         if extra:
             import shlex
             cmd += shlex.split(extra)
 
+        print(f"[ds4] launching ds4-server: {' '.join(cmd)}", flush=True)
         proc = subprocess.Popen(
             cmd, cwd=str(install_dir), stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
         tail = collections.deque(maxlen=15)
         threading.Thread(target=_pump_logs, args=(proc, tail), daemon=True).start()
-        _services[model_id] = {"proc": proc, "port": port, "url": url}
+        _services[svc_key] = {"proc": proc, "port": port, "url": url}
 
     def _tail_msg():
         joined = " | ".join(list(tail)[-5:]).strip()
@@ -247,11 +297,11 @@ def ensure_service(cfg, ready_timeout: float = 3600.0) -> str:
                 f"ds4-server exited (code {proc.returncode}) before becoming ready"
                 + _tail_msg())
         if _health_ok(url):
-            print(f"[ds4] service ready for {model_id} at {url}", flush=True)
+            print(f"[ds4] service ready for {svc_key} at {url}", flush=True)
             return url
         time.sleep(2)
-    stop_service(model_id)
-    raise RuntimeError(f"ds4-server for {model_id} did not become ready in time"
+    stop_service(svc_key)
+    raise RuntimeError(f"ds4-server for {svc_key} did not become ready in time"
                        + _tail_msg())
 
 

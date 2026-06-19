@@ -394,17 +394,35 @@
       <div class="form-row" style="margin:0">
         <label class="form-label">Model id / alias</label>
         <input type="text" id="s-ds4-model-id" class="form-input" placeholder="deepseek-v4">
-        <span class="form-hint">Requests for this id (or any name containing "deepseek-v4") route to ds4.</span>
+        <span class="form-hint">When enabled, ds4 automatically serves any <b>deepseek4</b>-architecture GGUF you have (detected by reading the file); mainline DeepSeek GGUFs stay on llama.cpp. This alias also routes (for ds4's own downloaded variant).</span>
       </div>
       <div class="form-row" style="margin:0">
-        <label class="form-label">Weight variant</label>
+        <label class="form-label">Weight variant <span class="muted">(download fallback)</span></label>
         <select id="s-ds4-variant" class="form-input">
           <option value="q2-imatrix">q2-imatrix (96/128 GB)</option>
           <option value="q2-q4-imatrix">q2-q4-imatrix (96/128 GB)</option>
           <option value="q4-imatrix">q4-imatrix (256 GB+)</option>
           <option value="pro-q2-imatrix">pro-q2-imatrix (512 GB)</option>
         </select>
+        <span class="form-hint">Only used when auto-download is enabled below.</span>
       </div>
+    </div>
+    <div class="form-row">
+      <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+        <input type="checkbox" id="s-ds4-auto-download">
+        <span>Auto-download the weight variant <span class="muted">— OFF by default; when off, ds4 only serves deepseek4 GGUFs you already have and errors if none resolves (never pulls tens of GB silently)</span></span>
+      </label>
+    </div>
+    <div class="form-row">
+      <label class="form-label">Model GGUF path <span class="muted">(optional override)</span></label>
+      <input type="text" id="s-ds4-model-path" class="form-input" placeholder="/AI/guffcache/…-ds4-Q2_K.gguf">
+      <span class="form-hint">Force ds4-server to load this exact GGUF (skips the variant download). Leave blank to auto-serve the requested deepseek4 model.</span>
+    </div>
+    <div class="form-row">
+      <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+        <input type="checkbox" id="s-ds4-ssd-streaming">
+        <span>SSD streaming <span class="muted">— stream MoE experts from disk/SSD (run a 100GB+ model on a small GPU + modest RAM; slower)</span></span>
+      </label>
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;align-items:start">
       <div class="form-row" style="margin:0">
@@ -656,6 +674,9 @@ async function loadSettings(){
     document.getElementById('s-ds4-enabled').checked = !!ds4.enabled;
     document.getElementById('s-ds4-model-id').value = ds4.model_id ?? 'deepseek-v4';
     document.getElementById('s-ds4-variant').value = ds4.model_variant ?? 'q4-imatrix';
+    document.getElementById('s-ds4-model-path').value = ds4.model_path ?? '';
+    document.getElementById('s-ds4-auto-download').checked = !!ds4.auto_download;
+    document.getElementById('s-ds4-ssd-streaming').checked = !!ds4.ssd_streaming;
     document.getElementById('s-ds4-build-target').value = ds4.build_target ?? 'auto';
     document.getElementById('s-ds4-install-dir').value = ds4.install_dir ?? '';
     document.getElementById('s-ds4-auto-build').checked = ds4.auto_build !== false;
@@ -728,6 +749,9 @@ async function saveSettings(){
       enabled: document.getElementById('s-ds4-enabled').checked,
       model_id: document.getElementById('s-ds4-model-id').value.trim() || 'deepseek-v4',
       model_variant: document.getElementById('s-ds4-variant').value,
+      model_path: document.getElementById('s-ds4-model-path').value.trim(),
+      auto_download: document.getElementById('s-ds4-auto-download').checked,
+      ssd_streaming: document.getElementById('s-ds4-ssd-streaming').checked,
       build_target: document.getElementById('s-ds4-build-target').value,
       install_dir: document.getElementById('s-ds4-install-dir').value.trim(),
       auto_build: document.getElementById('s-ds4-auto-build').checked,

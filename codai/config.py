@@ -229,11 +229,18 @@ class Ds4Config:
     repo_url: str = "https://github.com/antirez/ds4"
     install_dir: Optional[str] = None      # None = ~/.coderai/ds4
     build_target: str = "auto"             # auto|cuda-generic|cuda-spark|metal|cpu
-    model_variant: str = "q4-imatrix"      # download_model.sh variant
+    # The model ds4-server loads. Preferred: serve a deepseek4 GGUF the user
+    # already has — the requested model's own path is used when it resolves to a
+    # local .gguf, else `model_path` (an explicit override), else the variant is
+    # downloaded as a last resort. So you normally DON'T set model_variant at all.
+    model_path: str = ""                   # explicit GGUF for ds4-server -m (overrides the download)
+    auto_download: bool = False            # OFF by default: only download a variant when explicitly opted in
+    model_variant: str = "q4-imatrix"      # download_model.sh variant (used only when auto_download is on)
     model_id: str = "deepseek-v4"          # model id/alias that routes to ds4
     host: str = "127.0.0.1"
     port: int = 0                          # 0 = auto-pick a free port
     ctx: int = 100000                      # ds4-server --ctx context window
+    ssd_streaming: bool = False            # ds4-server --ssd-streaming: stream experts from SSD/disk
     extra_args: str = ""                   # extra flags passed to ds4-server
     auto_build: bool = True                # clone+build the binary if it's missing
 
@@ -579,11 +586,14 @@ class ConfigManager:
                 "repo_url": self.config.ds4.repo_url,
                 "install_dir": self.config.ds4.install_dir,
                 "build_target": self.config.ds4.build_target,
+                "model_path": self.config.ds4.model_path,
+                "auto_download": self.config.ds4.auto_download,
                 "model_variant": self.config.ds4.model_variant,
                 "model_id": self.config.ds4.model_id,
                 "host": self.config.ds4.host,
                 "port": self.config.ds4.port,
                 "ctx": self.config.ds4.ctx,
+                "ssd_streaming": self.config.ds4.ssd_streaming,
                 "extra_args": self.config.ds4.extra_args,
                 "auto_build": self.config.ds4.auto_build,
             },

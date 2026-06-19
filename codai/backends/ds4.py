@@ -35,6 +35,7 @@ class Ds4Backend(ModelBackend):
             cfg = Ds4Config()
         self._cfg = cfg
         self._model_id = getattr(cfg, "model_id", "deepseek-v4") or "deepseek-v4"
+        self._svc_key: Optional[str] = None   # ds4_worker service key (file or model_id)
         self._url: Optional[str] = None
         self._ctx = int(getattr(cfg, "ctx", 100000) or 100000)
         self._last_usage: Dict = {}
@@ -46,7 +47,42 @@ class Ds4Backend(ModelBackend):
         from codai.api import ds4_worker
         if model_name:
             self._model_id = model_name
-        self._url = ds4_worker.ensure_service(self._cfg)
+        # Honour the model's configured context window (n_ctx / ctx from its
+        # models.json entry, forwarded by the manager) over the ds4 global ctx.
+        _ctx = kwargs.get("n_ctx", kwargs.get("ctx"))
+        if isinstance(_ctx, (list, tuple)):
+            _ctx = _ctx[0] if _ctx else None
+        try:
+            _ctx = int(_ctx) if _ctx else 0
+        except (TypeError, ValueError):
+            _ctx = 0
+        if _ctx > 0:
+            self._ctx = _ctx
+        # Resolve the requested model to a concrete .gguf so ds4-server serves THE
+        # deepseek4 model that was asked for (not a fixed downloaded variant).
+        model_file = self._resolve_gguf(model_name)
+        _resolved, self._svc_key = ds4_worker.resolve_service_key(self._cfg, model_file)
+        self._url = ds4_worker.ensure_service(
+            self._cfg, model_file=model_file, ctx=(self._ctx or None))
+
+    @staticmethod
+    def _resolve_gguf(model_name: str):
+        """Map a requested model name/path to a local .gguf path, if one exists."""
+        import os
+        if not model_name:
+            return None
+        cand = os.path.expanduser(model_name)
+        if cand.lower().endswith(".gguf") and os.path.isfile(cand):
+            return cand
+        # Bare filename / alias → look it up in the GGUF cache.
+        try:
+            from codai.models.cache import get_cached_model_path
+            p = get_cached_model_path(model_name)
+            if p and str(p).lower().endswith(".gguf") and os.path.isfile(p):
+                return str(p)
+        except Exception:
+            pass
+        return None
 
     def get_model_name(self) -> str:
         return self._model_id
@@ -59,7 +95,8 @@ class Ds4Backend(ModelBackend):
 
     def cleanup(self) -> None:
         from codai.api import ds4_worker
-        ds4_worker.stop_service(getattr(self._cfg, "model_id", self._model_id))
+        key = getattr(self, "_svc_key", None) or getattr(self._cfg, "model_id", self._model_id)
+        ds4_worker.stop_service(key)
         self._url = None
 
     # ------------------------------------------------------------------ #
