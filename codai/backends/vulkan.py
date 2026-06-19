@@ -734,7 +734,22 @@ class VulkanBackend(ModelBackend):
         """
         if not LLAMA_CPP_AVAILABLE:
             raise ImportError("llama-cpp-python is required for GGUF models. Install with: pip install llama-cpp-python")
-        
+
+        # A bare alias / basename (e.g. 'coe-…-q4_k_m', no '.gguf', not an on-disk
+        # path) may still name a *local* gguf — a configured model addressed by its
+        # automatic alias. Resolve it before assuming it's a HuggingFace repo to
+        # download (which 404s and fails the load).
+        if not model_path.endswith('.gguf') and not os.path.exists(model_path) \
+                and not model_path.startswith('http'):
+            try:
+                from codai.models.manager import _resolve_local_gguf
+                _local = _resolve_local_gguf(model_path)
+                if _local:
+                    print(f"  Resolved '{model_path}' to local GGUF: {_local}")
+                    model_path = _local
+            except Exception as _rg_e:
+                print(f"  (local GGUF resolve skipped: {_rg_e})")
+
         # Check if this looks like a GGUF model repo (e.g., "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF")
         is_gguf_repo = not model_path.endswith('.gguf') and not os.path.exists(model_path) and not model_path.startswith('http')
         
