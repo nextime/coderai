@@ -384,14 +384,35 @@ def _compact_messages(messages, n_ctx, pct, strategy, summary_text=None):
                       "content": f"[Note: {len(dropped)} earlier message(s) omitted to fit the context window.]"})
 
     new = sys_msgs + head + notes + tail
+    # Guarantee the CURRENT request (the last message) survives intact and is the
+    # very last message after compaction — the compacted history/summary precedes
+    # it, then the actual query is repeated at the end.
+    last_msg = messages[-1] if messages else None
+    if last_msg is not None and (not new or id(new[-1]) != id(last_msg)):
+        new = [m for m in new if id(m) != id(last_msg)] + [last_msg]
     return new, {"dropped": len(dropped), "strategy": strategy,
                  "before_tokens": est, "after_tokens": _estimate_tokens(new),
                  "n_ctx": n_ctx}
 
 
-async def _summarize_for_compact(manager, messages, keep_recent: int = 4):
-    """Best-effort: summarize the older turns with the loaded model itself. Returns
-    a summary string or None (caller falls back to a count note)."""
+async def _summarize_one(manager, text: str, max_tokens: int = 400):
+    prompt = [
+        {"role": "system", "content": "Summarize the following conversation "
+         "concisely, preserving key facts, decisions, code, file paths and open "
+         "tasks. Output only the summary."},
+        {"role": "user", "content": text},
+    ]
+    out = await asyncio.to_thread(
+        manager.generate_chat, messages=prompt, max_tokens=max_tokens, temperature=0.2)
+    return (out or "").strip()
+
+
+async def _summarize_for_compact(manager, messages, keep_recent: int = 2,
+                                 chunk_chars: int = 8000):
+    """Best-effort map-reduce summary of the older turns using the loaded model:
+    CHUNK the history, summarize each chunk, then summarize the combined chunk
+    summaries. Returns a summary string or None (caller falls back to a count
+    note). Chunking keeps the summarization prompt itself from overflowing."""
     try:
         body = [m for m in messages if m.get("role") != "system"]
         older = body[:-keep_recent] if len(body) > keep_recent else body
@@ -402,17 +423,23 @@ async def _summarize_for_compact(manager, messages, keep_recent: int = 4):
             c = m.get("content")
             if isinstance(c, list):
                 c = " ".join(it.get("text", "") for it in c if isinstance(it, dict))
-            lines.append(f"{m.get('role', '?')}: {str(c)[:2000]}")
-        convo = "\n".join(lines)[:12000]
-        prompt = [
-            {"role": "system", "content": "Summarize the following conversation "
-             "concisely, preserving key facts, decisions, code, file paths and open "
-             "tasks. Output only the summary."},
-            {"role": "user", "content": convo},
-        ]
-        out = await asyncio.to_thread(
-            manager.generate_chat, messages=prompt, max_tokens=400, temperature=0.2)
-        return (out or "").strip() or None
+            lines.append(f"{m.get('role', '?')}: {str(c)}")
+        text = "\n".join(lines)
+        chunks = [text[i:i + chunk_chars] for i in range(0, len(text), chunk_chars)] or [text]
+        # Map: summarize each chunk (cap the number of chunks so this stays bounded).
+        summaries = []
+        for ch in chunks[:12]:
+            s = await _summarize_one(manager, ch)
+            if s:
+                summaries.append(s)
+        if not summaries:
+            return None
+        if len(summaries) == 1:
+            return summaries[0]
+        # Reduce: summarize the combined chunk summaries.
+        combined = "\n".join(summaries)
+        final = await _summarize_one(manager, combined[:chunk_chars * 2], max_tokens=500)
+        return final or combined
     except Exception as e:
         print(f"[auto-compact] summary generation failed: {e}", flush=True)
         return None
@@ -992,6 +1019,15 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                       f"~{_info['before_tokens']}→{_info['after_tokens']} tokens "
                       f"(n_ctx={_nctx}, dropped {_info['dropped']} msgs via "
                       f"{_info['strategy']})", flush=True)
+            # If compaction couldn't get it under the window (e.g. a single huge
+            # final message), signal a clear "request too big for context" error
+            # instead of letting generation fail mid-stream.
+            if _estimate_tokens(messages_dict) > _nctx:
+                raise HTTPException(status_code=400, detail=(
+                    "The request is too large for this model's context window "
+                    f"(~{_estimate_tokens(messages_dict)} tokens vs n_ctx={_nctx}) "
+                    "even after auto-compaction. Shorten the latest message or "
+                    "increase the model's context size (n_ctx)."))
 
 
     # Convert tools to dict format if present
