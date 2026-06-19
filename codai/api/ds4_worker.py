@@ -196,6 +196,18 @@ def _health_ok(url: str) -> bool:
         return False
 
 
+def _coderai_offload_dir() -> str:
+    """coderai's configured disk-offload directory (config.offload.directory), or ''."""
+    try:
+        from codai.admin.routes import config_manager
+        if config_manager is not None and config_manager.config is not None:
+            d = (getattr(config_manager.config.offload, "directory", "") or "").strip()
+            return os.path.expanduser(d) if d else ""
+    except Exception:
+        pass
+    return ""
+
+
 def resolve_service_key(cfg, model_file: Optional[str] = None):
     """Decide which GGUF ds4-server should serve and the key to cache it under.
 
@@ -273,6 +285,17 @@ def ensure_service(cfg, model_file: Optional[str] = None,
             # 100GB+ model run on a small GPU + modest RAM (slow but works).
             cmd += ["--ssd-streaming"]
         extra = (getattr(cfg, "extra_args", "") or "").strip()
+        # Route ds4's on-disk KV checkpoints into coderai's offload directory by
+        # default (unless the user set --kv-disk-dir themselves in extra_args).
+        if "--kv-disk-dir" not in extra:
+            off = _coderai_offload_dir()
+            if off:
+                kvdir = os.path.join(off, "ds4-kv")
+                try:
+                    os.makedirs(kvdir, exist_ok=True)
+                    cmd += ["--kv-disk-dir", kvdir]
+                except OSError:
+                    pass
         if extra:
             import shlex
             cmd += shlex.split(extra)

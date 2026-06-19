@@ -51,16 +51,52 @@ _GGUF_ARCH_CACHE: Dict[tuple, str] = {}
 
 
 def _resolve_local_gguf(model_name: str):
-    """Map a model name/alias/path to a local .gguf file path, or None."""
+    """Map a model name/alias/path/basename to a local .gguf file path, or None.
+
+    Handles the bare ids clients use (e.g. "Foo-ds4-Q2_K" with no path/extension)
+    by matching configured model entries and scanning the GGUF cache by basename.
+    """
     if not model_name:
         return None
     cand = os.path.expanduser(model_name)
     if cand.lower().endswith(".gguf") and os.path.isfile(cand):
         return cand
+    # The cache resolver (handles aliases / repo ids), with/without the extension.
+    for nm in (model_name, model_name + ".gguf"):
+        try:
+            p = get_cached_model_path(nm)
+            if p and str(p).lower().endswith(".gguf") and os.path.isfile(str(p)):
+                return str(p)
+        except Exception:
+            pass
+    base = os.path.basename(model_name)
+    base_noext = base[:-5] if base.lower().endswith(".gguf") else base
+    # Match a configured models.json entry by path / basename (with or without .gguf).
     try:
-        p = get_cached_model_path(model_name)
-        if p and str(p).lower().endswith(".gguf") and os.path.isfile(str(p)):
-            return str(p)
+        from codai.admin.routes import config_manager as cfg_mgr
+        md = getattr(cfg_mgr, "models_data", None) if cfg_mgr else None
+        if isinstance(md, dict):
+            for cat, lst in md.items():
+                if not isinstance(lst, list):
+                    continue
+                for m in lst:
+                    key = m if isinstance(m, str) else (m.get("path") or m.get("id") or "") if isinstance(m, dict) else ""
+                    if not key or not str(key).lower().endswith(".gguf"):
+                        continue
+                    kb = os.path.basename(key)
+                    if (key == model_name or kb == base or kb[:-5] == base_noext) and os.path.isfile(os.path.expanduser(key)):
+                        return os.path.expanduser(key)
+    except Exception:
+        pass
+    # Scan the GGUF cache dir for a basename match.
+    try:
+        cache_dir = get_model_cache_dir()
+        if cache_dir and os.path.isdir(cache_dir):
+            for f in os.listdir(cache_dir):
+                if f.lower().endswith(".gguf") and (f == base or f[:-5] == base_noext):
+                    fp = os.path.join(cache_dir, f)
+                    if os.path.isfile(fp):
+                        return fp
     except Exception:
         pass
     return None
@@ -2748,6 +2784,19 @@ class MultiModelManager:
         4. HuggingFace hub cache size (dense shards or largest GGUF), adjusted.
         Returns 0 when the requirement cannot be determined.
         """
+        # ds4 (DeepSeek-V4) models are served by an external ds4-server that manages
+        # its own memory (SSD-streamed MoE experts), so the GGUF file size (100GB+)
+        # is NOT its VRAM footprint. Reporting that would make coderai try to evict
+        # ~128 GB on every request (needless churn) and mis-message CPU/disk offload.
+        # Use the measured value if we have one, else a modest fixed reserve.
+        try:
+            if ds4_should_handle(model_key) or (resolved_name and ds4_should_handle(resolved_name)):
+                measured = self._measured_vram_gb.get(model_key)
+                if not measured and resolved_name:
+                    measured = self._measured_vram_gb.get(resolved_name)
+                return float(measured) if measured else 12.0
+        except Exception:
+            pass
         # Resolve by basename/alias too — a model requested by basename would
         # otherwise miss self.config (keyed by full path), return 0, and skip the
         # eviction that makes room for it (→ OOM loading on top of a resident model).

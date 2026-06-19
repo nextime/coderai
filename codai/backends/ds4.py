@@ -67,22 +67,18 @@ class Ds4Backend(ModelBackend):
 
     @staticmethod
     def _resolve_gguf(model_name: str):
-        """Map a requested model name/path to a local .gguf path, if one exists."""
-        import os
-        if not model_name:
-            return None
-        cand = os.path.expanduser(model_name)
-        if cand.lower().endswith(".gguf") and os.path.isfile(cand):
-            return cand
-        # Bare filename / alias → look it up in the GGUF cache.
+        """Map a requested model name/alias/path/basename to a local .gguf path.
+
+        Delegates to the manager's config/cache-aware resolver so a bare client id
+        (e.g. "Foo-ds4-Q2_K", no path/extension) resolves to the configured file.
+        """
         try:
-            from codai.models.cache import get_cached_model_path
-            p = get_cached_model_path(model_name)
-            if p and str(p).lower().endswith(".gguf") and os.path.isfile(p):
-                return str(p)
+            from codai.models.manager import _resolve_local_gguf
+            return _resolve_local_gguf(model_name)
         except Exception:
-            pass
-        return None
+            import os
+            cand = os.path.expanduser(model_name or "")
+            return cand if cand.lower().endswith(".gguf") and os.path.isfile(cand) else None
 
     def get_model_name(self) -> str:
         return self._model_id

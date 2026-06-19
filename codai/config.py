@@ -416,22 +416,36 @@ class ConfigManager:
             with open(self.config_path, 'r') as f:
                 config_data = json.load(f)
             
-            # Parse into Config dataclass
+            # Parse into Config dataclass. Use a tolerant constructor (_dc) that
+            # drops unknown keys: a stale or newer-version config.json must NEVER
+            # crash the whole load, which would silently reset ALL settings to
+            # defaults (the "had to reconfigure everything" bug).
+            import dataclasses as _dataclasses
+
+            def _dc(cls, data):
+                if not isinstance(data, dict):
+                    return cls()
+                known = {f.name for f in _dataclasses.fields(cls)}
+                extra = [k for k in data if k not in known]
+                if extra:
+                    print(f"[config] ignoring unknown {cls.__name__} keys: {extra}")
+                return cls(**{k: v for k, v in data.items() if k in known})
+
             self.config = Config(
                 version=config_data.get("version", "1.0"),
-                server=ServerConfig(**config_data.get("server", {})),
-                backend=BackendConfig(**config_data.get("backend", {})),
-                models=ModelsConfig(**config_data.get("models", {})),
-                offload=OffloadConfig(**config_data.get("offload", {})),
-                vulkan=VulkanConfig(**config_data.get("vulkan", {})),
-                image=ImageConfig(**config_data.get("image", {})),
-                whisper=WhisperConfig(**config_data.get("whisper", {})),
-                archive=ArchiveConfig(**config_data.get("archive", {})),
-                thermal=ThermalConfig(**config_data.get("thermal", {})),
-                jobs=JobsConfig(**config_data.get("jobs", {})),
-                enhance=EnhanceConfig(**config_data.get("enhance", {})),
-                ds4=Ds4Config(**config_data.get("ds4", {})),
-                broker=BrokerConfig(**config_data.get("broker", {})),
+                server=_dc(ServerConfig, config_data.get("server", {})),
+                backend=_dc(BackendConfig, config_data.get("backend", {})),
+                models=_dc(ModelsConfig, config_data.get("models", {})),
+                offload=_dc(OffloadConfig, config_data.get("offload", {})),
+                vulkan=_dc(VulkanConfig, config_data.get("vulkan", {})),
+                image=_dc(ImageConfig, config_data.get("image", {})),
+                whisper=_dc(WhisperConfig, config_data.get("whisper", {})),
+                archive=_dc(ArchiveConfig, config_data.get("archive", {})),
+                thermal=_dc(ThermalConfig, config_data.get("thermal", {})),
+                jobs=_dc(JobsConfig, config_data.get("jobs", {})),
+                enhance=_dc(EnhanceConfig, config_data.get("enhance", {})),
+                ds4=_dc(Ds4Config, config_data.get("ds4", {})),
+                broker=_dc(BrokerConfig, config_data.get("broker", {})),
                 system_prompt=config_data.get("system_prompt"),
                 tools_closer_prompt=config_data.get("tools_closer_prompt", False),
                 grammar_guided=config_data.get("grammar_guided", False),
