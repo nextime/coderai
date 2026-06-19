@@ -354,6 +354,82 @@ class FrontProxy:
             data["loaded"] = sorted(loaded)
         return JSONResponse(data)
 
+    async def _forward_to_engine(self, request: Request, engine, body: bytes):
+        """Re-issue an admin POST verbatim to a specific engine and relay its reply."""
+        send_headers = self._filter_headers(request.headers, _DROP_REQ)
+        try:
+            r = await self._long.request(
+                request.method, engine.url + request.url.path,
+                headers=send_headers, params=request.query_params, content=body or b"")
+        except Exception as exc:
+            return JSONResponse(
+                {"detail": f"engine {engine.name} unreachable: {exc}"}, status_code=502)
+        return Response(content=r.content, status_code=r.status_code,
+                        headers=dict(self._filter_headers(r.headers, _DROP_RESP)),
+                        media_type=r.headers.get("content-type"))
+
+    @staticmethod
+    def _key_matches_path(key: str, path: str) -> bool:
+        return key == path or key.endswith(f":{path}") or key.endswith(path.split("/")[-1])
+
+    def _engine_by_name(self, name: Optional[str]):
+        if not name:
+            return None
+        for e in self.registry.all():
+            if e.name == name:
+                return e
+        return None
+
+    async def model_unload(self, request: Request):
+        """Route an admin model-unload to the engine that actually has the model
+        loaded. Unload is otherwise proxied to the primary, which doesn't hold a
+        model loaded on a secondary engine and reports it as never-loaded."""
+        if not await self.is_admin(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        body = await request.body()
+        try:
+            path = (json.loads(body or b"{}") or {}).get("path", "")
+        except Exception:
+            path = ""
+        target = None
+        if path:
+            for e in self.registry.all():
+                if any(self._key_matches_path(k, path) for k in e.loaded_models):
+                    target = e
+                    break
+        if target is None:
+            target = self.registry.primary()
+        if target is None:
+            return JSONResponse({"detail": "No engine available"}, status_code=503)
+        return await self._forward_to_engine(request, target, body)
+
+    async def model_load(self, request: Request):
+        """Route an admin model-load to the model's pinned engine (or one that's
+        already serving it), so loading a secondary-engine model from the UI lands
+        on the right engine instead of always the primary."""
+        if not await self.is_admin(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        body = await request.body()
+        try:
+            path = (json.loads(body or b"{}") or {}).get("path", "")
+        except Exception:
+            path = ""
+        target = None
+        if path:
+            # Already loaded somewhere? Reuse that engine.
+            for e in self.registry.all():
+                if any(self._key_matches_path(k, path) for k in e.loaded_models):
+                    target = e
+                    break
+            # Otherwise honour the model's engine pin from models.json.
+            if target is None:
+                target = self._engine_by_name(self._pin_for(path))
+        if target is None or not target.healthy:
+            target = self.registry.primary()
+        if target is None:
+            return JSONResponse({"detail": "No engine available"}, status_code=503)
+        return await self._forward_to_engine(request, target, body)
+
     def _cooling_engines(self) -> list:
         """Which engines are in thermal cooldown right now (for the Tasks banner)."""
         out = []
@@ -616,6 +692,16 @@ def build_app(config, config_dir=None) -> FastAPI:
     @app.get("/admin/api/model-loaded-status", include_in_schema=False)
     async def _model_loaded_status(request: Request):
         return await front.model_loaded_status(request)
+
+    # Load/unload must target the engine that owns (or is pinned to) the model, not
+    # always the primary. Registered before the catch-all so they aren't proxied.
+    @app.post("/admin/api/model-load", include_in_schema=False)
+    async def _model_load(request: Request):
+        return await front.model_load(request)
+
+    @app.post("/admin/api/model-unload", include_in_schema=False)
+    async def _model_unload(request: Request):
+        return await front.model_unload(request)
 
     @app.get("/admin/api/tasks", include_in_schema=False)
     async def _tasks(request: Request):
