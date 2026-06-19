@@ -692,7 +692,10 @@ async def api_list_models(username: str = Depends(require_admin)):
     models_data = session_manager._load_auth_data()  # TODO: move to ModelManager
     from codai.models.manager import multi_model_manager
     try:
-        return multi_model_manager.list_models()
+        # all_engines=True: the admin config view must show every configured model,
+        # including ones pinned to a secondary engine (e.g. whisper-servers on the
+        # radeon engine) which the per-engine assignment filter would otherwise hide.
+        return multi_model_manager.list_models(all_engines=True)
     except Exception:
         return []
 

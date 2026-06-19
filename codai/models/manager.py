@@ -3969,8 +3969,13 @@ class MultiModelManager:
                     return info.id
         return None
 
-    def list_models(self) -> List[ModelInfo]:
-        """List all available models (configured + runtime aliases) with type/capability metadata."""
+    def list_models(self, all_engines: bool = False) -> List[ModelInfo]:
+        """List all available models (configured + runtime aliases) with type/capability metadata.
+
+        all_engines=True bypasses the per-engine assignment filter so the admin
+        config UI sees every configured model — otherwise, on a multi-engine node,
+        models pinned to a secondary engine (e.g. whisper-servers on `radeon`) are
+        hidden from the primary's list, which serves /admin/api/models."""
         from codai.models.capabilities import detect_model_capabilities, ModelCapabilities
 
         models = []
@@ -4048,7 +4053,8 @@ class MultiModelManager:
                     for m in md.get(cat, []):
                         # Only list models the front assigned to THIS engine (so a
                         # per-engine /v1/models reflects what it actually serves).
-                        if not self._entry_assigned(m):
+                        # The admin config view passes all_engines=True to see them all.
+                        if not all_engines and not self._entry_assigned(m):
                             continue
                         if isinstance(m, str):
                             mid = m
