@@ -1312,14 +1312,16 @@ def _scan_caches() -> dict:
                 if isinstance(m, str):
                     p, s = m, {}
                 else:
-                    # Whisper-server entries have no "path"; their file is at
-                    # "model_path", so they surface as configs of the backing GGUF
-                    # file. The UI routes editing such a config to the whisper editor
-                    # (which updates in place), so they no longer spawn duplicates.
-                    if m.get("backend") == "whisper-server" and m.get("model_path"):
-                        p = m["model_path"]
-                    else:
-                        p = m.get("path") or m.get("id") or ""
+                    # A whisper-server is the RUNNER config (port, gpu, which model)
+                    # and is managed in its own card — it is a different thing from
+                    # the GGUF MODEL config (which configures/enables the model and
+                    # holds the load strategy). So whisper-server entries must NOT
+                    # appear as configs of the backing GGUF file, or the GGUF row's
+                    # config form would become the whisper form. The file still shows
+                    # "loaded" via its model_path key in the loaded-status sets.
+                    if m.get("backend") == "whisper-server":
+                        continue
+                    p = m.get("path") or m.get("id") or ""
                     s = m if isinstance(m, dict) else {}
                 if not p:
                     continue
