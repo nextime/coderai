@@ -1514,6 +1514,57 @@ class VulkanBackend(ModelBackend):
     # Chat-level generation (uses llama.cpp native chat template)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _fold_system_into_user(messages):
+        """Merge system message(s) into the first user turn.
+
+        Some chat templates (notably Gemma) reject a 'system' role and llama.cpp
+        raises "System role not supported". Folding the system text into the first
+        user message is Gemma's own convention and is harmless for other models.
+        Preserves order and multimodal (list) content."""
+        def _role(m):
+            return m.get('role') if isinstance(m, dict) else getattr(m, 'role', None)
+        def _content(m):
+            return m.get('content') if isinstance(m, dict) else getattr(m, 'content', None)
+
+        sys_texts, rest = [], []
+        for m in messages:
+            if _role(m) == 'system':
+                c = _content(m)
+                if isinstance(c, str):
+                    sys_texts.append(c)
+                elif isinstance(c, list):
+                    sys_texts += [p.get('text', '') for p in c
+                                  if isinstance(p, dict) and p.get('type') == 'text']
+                continue
+            rest.append(m)
+        preamble = "\n\n".join(t for t in sys_texts if t)
+        if not preamble:
+            return messages
+
+        out, injected = [], False
+        for m in rest:
+            if not injected and _role(m) == 'user':
+                c = _content(m)
+                nm = dict(m) if isinstance(m, dict) else {'role': 'user', 'content': c}
+                if isinstance(c, str):
+                    nm['content'] = preamble + "\n\n" + c
+                elif isinstance(c, list):
+                    nm['content'] = [{'type': 'text', 'text': preamble}] + c
+                else:
+                    nm['content'] = preamble
+                out.append(nm)
+                injected = True
+            else:
+                out.append(m)
+        if not injected:
+            out.insert(0, {'role': 'user', 'content': preamble})
+        return out
+
+    @staticmethod
+    def _is_system_role_error(exc) -> bool:
+        return 'system role' in str(exc).lower()
+
     def generate_chat(self, messages, max_tokens=None, temperature=0.7, top_p=1.0,
                       stop=None, tools=None, response_format=None):
         """Non-streaming chat completion using llama.cpp's native chat handler."""
@@ -1535,7 +1586,13 @@ class VulkanBackend(ModelBackend):
             kwargs['stopping_criteria'] = _tc
 
         with self._gen_lock:
-            result = self.model.create_chat_completion(**kwargs)
+            try:
+                result = self.model.create_chat_completion(**kwargs)
+            except Exception as e:
+                if not self._is_system_role_error(e):
+                    raise
+                kwargs['messages'] = self._fold_system_into_user(messages)
+                result = self.model.create_chat_completion(**kwargs)
         usage = result.get('usage', {})
         self._store_usage(
             prompt_tokens=usage.get('prompt_tokens', 0),
@@ -1563,10 +1620,21 @@ class VulkanBackend(ModelBackend):
         if _tc is not None and _chat_supports_stopping_criteria():
             kwargs['stopping_criteria'] = _tc
 
+        # Build the completion up front so a template error (e.g. Gemma's "System
+        # role not supported") is caught here and retried with the system message
+        # folded into the first user turn — before any chunk is streamed.
+        try:
+            _completion = self.model.create_chat_completion(**kwargs)
+        except Exception as e:
+            if not self._is_system_role_error(e):
+                raise
+            kwargs['messages'] = self._fold_system_into_user(messages)
+            _completion = self.model.create_chat_completion(**kwargs)
+
         prompt_tokens = 0
         completion_tokens = 0
         try:
-            async for chunk in _aiter_blocking(self.model.create_chat_completion(**kwargs), lock=self._gen_lock):
+            async for chunk in _aiter_blocking(_completion, lock=self._gen_lock):
                 delta = chunk['choices'][0].get('delta', {})
                 text = delta.get('content') or ''
                 if text:
