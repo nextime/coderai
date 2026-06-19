@@ -1102,6 +1102,52 @@ def parse_xml_wrapped_tool_calls(text: str, tool_names):
     return out
 
 
+def parse_tool_tag_json_calls(text: str, tool_names=None):
+    """Parse tool calls emitted as ``<tool>{"name":..,"arguments":..}`` markers.
+
+    Some Gemma finetunes use ``<tool>`` (or ``<tool_call>``) as BOTH the opening
+    and closing delimiter — i.e. no closing ``</tool>`` slash — and sometimes
+    append a stray ``"`` before the closer, so the strict ``<tool>{…}</tool>``
+    patterns never match. Extract the first brace-balanced object after each
+    marker (tolerant of trailing junk via the loose parser) and read
+    name + arguments/parameters. ``tool_names`` (when given) restricts matches to
+    declared tools so prose isn't misread; exact-duplicate calls are collapsed
+    (these models often repeat the same call several times)."""
+    if not text or '<tool' not in text.lower():
+        return []
+    out, seen = [], set()
+    for m in re.finditer(r'<tool(?:_call)?\s*>', text, re.IGNORECASE):
+        brace = text.find('{', m.end())
+        if brace == -1:
+            continue
+        # The object must follow the marker directly — only whitespace/quotes may
+        # sit between them — so a '{' belonging to later prose isn't grabbed.
+        if text[m.end():brace].strip(' \t\r\n"\'`'):
+            continue
+        try:
+            data, _ = _parse_gemma_loose_object(text, brace)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        name = data.get('name')
+        args = data.get('arguments')
+        if args is None:
+            args = data.get('parameters', {})
+        if not name or not isinstance(name, str):
+            continue
+        if tool_names and name not in tool_names:
+            continue
+        if not isinstance(args, dict):
+            args = {}
+        key = (name, json.dumps(args, sort_keys=True, default=str))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((name, args))
+    return out
+
+
 # 7. GEMMA PARSER
 class GemmaParser(BaseParser):
     @validate_tool_output
@@ -1130,6 +1176,15 @@ class GemmaParser(BaseParser):
         # Cline-style) prompts for XML tools rather than the model's native format.
         if not results and self.tools:
             for name, args in parse_xml_wrapped_tool_calls(text, set(self.tools.keys())):
+                results.append(self._to_oa(name, args))
+            if results:
+                return results
+
+        # <tool>{"name":..,"arguments":..}<tool> — some finetunes wrap a JSON call
+        # in <tool> markers with no closing slash (and stray quotes); recover it.
+        if not results:
+            names = set(self.tools.keys()) if self.tools else None
+            for name, args in parse_tool_tag_json_calls(text, names):
                 results.append(self._to_oa(name, args))
             if results:
                 return results
