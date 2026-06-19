@@ -256,6 +256,11 @@ async def internal_engine_state():
             if _wsm.is_running():
                 loaded.append(_wid)
                 loaded.append(f"audio:{_wid}")
+                # Also surface the backing gguf path so the GGUF-file row in the
+                # models page reflects that the file is in use by a running server.
+                _mp = getattr(_wsm, "_model_path", None)
+                if _mp:
+                    loaded.append(_mp)
     except Exception:
         pass
     vram = None

@@ -378,8 +378,9 @@ def api_status(username: str = Depends(require_auth)):
     try:
         for _wid, _wsm in multi_model_manager.whisper_servers.items():
             if _wsm.is_running():
-                for _wk in (_wid, f"audio:{_wid}"):
-                    if _wk not in loaded_keys:
+                _mp = getattr(_wsm, "_model_path", None)
+                for _wk in (_wid, f"audio:{_wid}", _mp):
+                    if _wk and _wk not in loaded_keys:
                         loaded_keys.append(_wk)
     except Exception:
         pass
@@ -2084,6 +2085,9 @@ async def api_model_loaded_status(username: str = Depends(require_admin)):
         if running:
             loaded.append(mid)
             loaded.append(f"audio:{mid}")
+            mp = getattr(wsm, "_model_path", None)
+            if mp:
+                loaded.append(mp)
 
     instance_pools = {}
     for key, pool in multi_model_manager.model_pools.items():
@@ -2287,19 +2291,30 @@ async def api_model_unload(request: Request, username: str = Depends(require_adm
         raise HTTPException(status_code=400, detail="path required")
 
     def _matches(k: str) -> bool:
-        return k == path or k.endswith(f":{path}") or k.endswith(path.split("/")[-1])
+        return bool(k) and (k == path or k.endswith(f":{path}")
+                            or k.endswith(path.split("/")[-1]))
 
-    # A whisper-server model runs as its own subprocess (tracked in whisper_servers,
-    # not in .models / .model_pools); stop the matching server(s) directly.
+    # A whisper-server model runs as its own subprocess (tracked in whisper_servers),
+    # but it's ALSO registered in the generic .models/.model_pools registry under
+    # `audio:<id>`. Stopping only the subprocess leaves that registry entry behind,
+    # so the UI keeps showing it as loaded. Match by id, `audio:<id>` or the gguf
+    # model_path (so unloading the file stops every server using it), stop the
+    # server, and drop the registry entries so the loaded-state flips to "Load".
     stopped_whisper = False
-    for mid in [m for m in list(multi_model_manager.whisper_servers.keys())
-                if _matches(m) or _matches(f"audio:{m}")]:
+    for mid in list(multi_model_manager.whisper_servers.keys()):
         wsm = multi_model_manager.whisper_servers.get(mid)
-        if wsm is not None:
+        if wsm is None:
+            continue
+        mp = getattr(wsm, "_model_path", None) or ""
+        if _matches(mid) or _matches(f"audio:{mid}") or _matches(mp):
             try:
                 wsm.stop()
             except Exception:
                 pass
+            for k in (f"audio:{mid}", mid):
+                multi_model_manager.models.pop(k, None)
+                multi_model_manager.model_pools.pop(k, None)
+                multi_model_manager.models_in_vram.discard(k)
             stopped_whisper = True
     if stopped_whisper:
         return {"success": True, "was_loaded": True}
