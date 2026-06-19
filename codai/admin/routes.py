@@ -1312,11 +1312,15 @@ def _scan_caches() -> dict:
                 if isinstance(m, str):
                     p, s = m, {}
                 else:
-                    # Whisper-server entries have no "path"; their file is at "model_path"
-                    if m.get("backend") == "whisper-server" and m.get("model_path"):
-                        p = m["model_path"]
-                    else:
-                        p = m.get("path") or m.get("id") or ""
+                    # Whisper-server models are managed in their own card, not as
+                    # editable configs of the backing GGUF file. Including them here
+                    # (keyed by model_path) made them appear as the file's configs —
+                    # and since they carry no config_id, "Configure" on the GGUF row
+                    # treated every save as a brand-new config, spawning duplicates.
+                    # Skip them; the file still shows "loaded" via its model_path key.
+                    if m.get("backend") == "whisper-server":
+                        continue
+                    p = m.get("path") or m.get("id") or ""
                     s = m if isinstance(m, dict) else {}
                 if not p:
                     continue
@@ -2004,8 +2008,10 @@ async def api_model_disable(request: Request, username: str = Depends(require_ad
         if config_id:
             # Targeted removal: only remove the entry with this config_id
             return m_entry.get("config_id", "") == config_id
-        key = m_entry.get("path", m_entry.get("id", ""))
-        return key == path or (fname and _os.path.basename(key) == fname)
+        # A whisper-server entry has path=None (its file is under model_path); guard
+        # against None so basename() doesn't blow up the whole disable request.
+        key = m_entry.get("path") or m_entry.get("id") or ""
+        return key == path or (fname and bool(key) and _os.path.basename(key) == fname)
 
     changed = False
     for cat in ("text_models", "image_models", "audio_models",
@@ -2435,16 +2441,10 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         gpu_device = int(data.get("gpu_device", 0))
         if gpu_device < 0:
             raise HTTPException(status_code=400, detail="gpu_device must be >= 0")
-        audio_list = config_manager.models_data.get("audio_models", [])
-        if any(
-            isinstance(m, dict)
-            and m.get("backend") == "whisper-server"
-            and m.get("id") == model_id
-            for m in audio_list
-        ):
-            raise HTTPException(status_code=409, detail=f"whisper-server model '{model_id}' already exists")
         alias = (data.get("alias") or "").strip() or None
-        entry = {
+        # Fields the whisper form manages. Anything NOT here (e.g. `engine`,
+        # `config_id`) is preserved when editing an existing entry.
+        fields = {
             "id": model_id,
             "backend": "whisper-server",
             "server_path": server_path,
@@ -2456,10 +2456,25 @@ async def api_model_configure(request: Request, username: str = Depends(require_
             "model_types": ["audio_models"],
         }
         if alias:
-            entry["alias"] = alias
+            fields["alias"] = alias
         if data.get("used_vram_gb") is not None:
-            entry["used_vram_gb"] = data["used_vram_gb"]
-        config_manager.models_data.setdefault("audio_models", []).append(entry)
+            fields["used_vram_gb"] = data["used_vram_gb"]
+        audio_list = config_manager.models_data.setdefault("audio_models", [])
+        # Update in place when the id already exists (this is an edit); only append
+        # for a genuinely new id. Otherwise editing an existing whisper-server model
+        # would either 409 or silently create a duplicate config.
+        existing = next(
+            (m for m in audio_list
+             if isinstance(m, dict) and m.get("backend") == "whisper-server"
+             and m.get("id") == model_id),
+            None,
+        )
+        if existing is not None:
+            if not alias:
+                existing.pop("alias", None)
+            existing.update(fields)
+        else:
+            audio_list.append(fields)
         config_manager.save_models()
         result = {"success": True, "model_id": model_id, "model_path": model_path, "server_path": server_path}
         if alias:
