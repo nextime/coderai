@@ -173,15 +173,10 @@ async def _run_transcription(
         await asyncio.to_thread(
             multi_model_manager.request_model, requested_model=model, model_type="audio")
         if not whisper_server.is_running():
-            whisper_server.start(
-                getattr(whisper_server, "_model_path", None),
-                gpu_device=getattr(whisper_server, "_gpu_device", 0),
-            )
-            if whisper_server.is_running():
-                ws_key = f"audio:{whisper_model_id or model}"
-                multi_model_manager.models[ws_key] = whisper_server
-                multi_model_manager.active_in_vram = ws_key
-                multi_model_manager.models_in_vram.add(ws_key)
+            # Treat starting the runner as a model load: evict other models for its
+            # VRAM and register it in the loaded-model maps (so it's evictable too).
+            await asyncio.to_thread(
+                multi_model_manager.start_whisper_server, whisper_model_id or model)
         if not whisper_server.is_running():
             raise HTTPException(status_code=500, detail="whisper-server failed to start")
         result = whisper_server.transcribe(

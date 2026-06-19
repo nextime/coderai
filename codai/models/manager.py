@@ -573,7 +573,13 @@ class WhisperServerManager:
                     print(f"Error stopping whisper-server: {e}")
                 self.process = None
                 self.current_model = None
-    
+
+    def cleanup(self):
+        """Free VRAM by stopping the subprocess. Lets the generic VRAM-eviction
+        path (_evict_one / unload_model) treat a running whisper-server like any
+        other loaded model and actually release its GPU memory."""
+        self.stop()
+
     def transcribe(self, audio_data: bytes, language: str = None, prompt: str = None):
         """Send transcription request to whisper-server."""
         if not self.is_running():
@@ -1283,6 +1289,68 @@ class MultiModelManager:
         print(f"Registered whisper-server audio model: {model_id} (server: {server_path})"
               + (f" alias={alias}" if alias else ""))
         return wsm
+
+    def _estimate_gguf_vram_gb(self, path: Optional[str]) -> float:
+        """Rough VRAM footprint of a gguf from its on-disk size (weights ~= file)."""
+        try:
+            if path and os.path.isfile(path):
+                return round(os.path.getsize(path) / 1e9 * 1.1, 2)
+        except Exception:
+            pass
+        return 0.0
+
+    def start_whisper_server(self, model_id: str, model_path: str = None,
+                             gpu_device: int = None) -> bool:
+        """Start a whisper-server RUNNER, treating it as a model load for VRAM
+        accounting: estimate its footprint, evict other loaded models to make room,
+        then register it in the loaded-model maps so a later load can evict IT in
+        turn (and so the dashboard/eviction see its VRAM). 1:1 with its gguf."""
+        wsm = self.whisper_servers.get(model_id)
+        if wsm is None:
+            return False
+        ws_key = f"audio:{model_id}"
+        if wsm.is_running():
+            self.models[ws_key] = wsm
+            self.models_in_vram.add(ws_key)
+            return True
+        mp = model_path or getattr(wsm, "_model_path", None)
+        gd = gpu_device if gpu_device is not None else getattr(wsm, "_gpu_device", 0)
+        needed = self._estimate_gguf_vram_gb(mp)
+        if needed > 0 and self._get_free_vram_gb() < needed:
+            print(f"Whisper start: need ~{needed:.1f} GB VRAM for '{model_id}' — evicting")
+            self._evict_models_for_vram(needed)
+        wsm.start(mp, gpu_device=int(gd or 0))
+        if not wsm.is_running():
+            return False
+        # Register it like a loaded model so eviction/accounting can see + evict it.
+        self.models[ws_key] = wsm
+        self.model_pools.pop(ws_key, None)
+        self.active_in_vram = ws_key
+        self.current_model_key = ws_key
+        self.models_in_vram.add(ws_key)
+        if needed > 0:
+            self._measured_vram_gb.setdefault(ws_key, needed)
+        return True
+
+    def stop_whisper_server(self, model_id: str) -> bool:
+        """Stop a whisper-server runner and clear its VRAM accounting (frees VRAM)."""
+        wsm = self.whisper_servers.get(model_id)
+        ws_key = f"audio:{model_id}"
+        was = bool(wsm and wsm.is_running())
+        if wsm is not None:
+            try:
+                wsm.stop()
+            except Exception:
+                pass
+        self.models.pop(ws_key, None)
+        self.model_pools.pop(ws_key, None)
+        self.models_in_vram.discard(ws_key)
+        self._measured_vram_gb.pop(ws_key, None)
+        if self.active_in_vram == ws_key:
+            self.active_in_vram = None
+        if self.current_model_key == ws_key:
+            self.current_model_key = None
+        return was
 
     def resolve_whisper_alias(self, name: str) -> Optional[WhisperServerManager]:
         """Return the next round-robin WhisperServerManager for an alias, or None."""

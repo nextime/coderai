@@ -2094,17 +2094,12 @@ async def api_model_disable(request: Request, username: str = Depends(require_ad
         for m in removed:
             if isinstance(m, dict) and m.get("backend") == "whisper-server":
                 mid = m.get("id")
-                wsm = _mmm.whisper_servers.pop(mid, None) if mid else None
-                if wsm is not None:
-                    try:
-                        wsm.stop()
-                    except Exception:
-                        pass
-                for k in (f"audio:{mid}", mid):
-                    if k:
-                        _mmm.models.pop(k, None)
-                        _mmm.model_pools.pop(k, None)
-                        _mmm.models_in_vram.discard(k)
+                if not mid:
+                    continue
+                # Stop the subprocess + clear VRAM accounting, then forget the runner
+                # entirely (its config is gone, unlike a plain unload).
+                _mmm.stop_whisper_server(mid)
+                _mmm.whisper_servers.pop(mid, None)
     except Exception as e:
         print(f"  [admin] whisper runner teardown failed: {e}")
 
@@ -2206,6 +2201,16 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
     path = data.get("path", "")
     if not path:
         raise HTTPException(status_code=400, detail="path required")
+
+    # A whisper-server runner: starting it IS the model load (subprocess onto the
+    # GPU). Route through the accounted start so it evicts for VRAM and registers
+    # as a loaded model (and "Unload" later frees it).
+    for _mid in (path, path.split("audio:")[-1]):
+        if _mid in multi_model_manager.whisper_servers:
+            ok = await asyncio.to_thread(multi_model_manager.start_whisper_server, _mid)
+            if not ok:
+                raise HTTPException(status_code=500, detail="whisper-server failed to start")
+            return {"success": True, "model_key": f"audio:{_mid}"}
 
     # Find the model config entry to determine its type. A model may be
     # registered in several categories (e.g. a vision LLM advertises image_to_text
@@ -2397,14 +2402,8 @@ async def api_model_unload(request: Request, username: str = Depends(require_adm
             continue
         mp = getattr(wsm, "_model_path", None) or ""
         if _matches(mid) or _matches(f"audio:{mid}") or _matches(mp):
-            try:
-                wsm.stop()
-            except Exception:
-                pass
-            for k in (f"audio:{mid}", mid):
-                multi_model_manager.models.pop(k, None)
-                multi_model_manager.model_pools.pop(k, None)
-                multi_model_manager.models_in_vram.discard(k)
+            # Stops the subprocess AND clears its VRAM accounting (frees VRAM).
+            multi_model_manager.stop_whisper_server(mid)
             stopped_whisper = True
     if stopped_whisper:
         return {"success": True, "was_loaded": True}

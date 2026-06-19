@@ -917,13 +917,8 @@ def main():
                 else:
                     print(f"  Warning: {mid} failed to load")
             elif mtype == "audio" and mid in multi_model_manager.whisper_servers:
-                wsm = multi_model_manager.whisper_servers[mid]
-                result = wsm.start(wsm._model_path, gpu_device=wsm._gpu_device)
-                if wsm.is_running():
-                    ws_key = f"audio:{mid}"
-                    multi_model_manager.models[ws_key] = wsm
-                    multi_model_manager.active_in_vram = ws_key
-                    multi_model_manager.models_in_vram.add(ws_key)
+                # Accounted start: evicts for VRAM + registers it as a loaded model.
+                if multi_model_manager.start_whisper_server(mid):
                     print(f"  whisper-server started: {mid}")
                 else:
                     print(f"  Warning: whisper-server '{mid}' failed to start")
