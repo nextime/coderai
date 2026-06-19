@@ -326,6 +326,34 @@ class FrontProxy:
                         "loaded_models": sorted(e.loaded_models), "pid": pid})
         return out
 
+    async def model_loaded_status(self, request: Request):
+        """Proxy /admin/api/model-loaded-status to the primary, then union in the
+        models loaded on every *other* engine. Otherwise the models page only sees
+        the primary engine's pool and shows models loaded on a secondary (e.g. the
+        radeon engine) as idle."""
+        prim = self.registry.primary()
+        if prim is None:
+            return JSONResponse({"loaded": [], "instances": {}, "configured_max": {}})
+        try:
+            headers = self._filter_headers(request.headers, _DROP_REQ)
+            r = await self._short.get(prim.url + request.url.path, headers=headers,
+                                      params=request.query_params)
+            if r.status_code != 200:
+                return Response(content=r.content, status_code=r.status_code,
+                                headers=dict(self._filter_headers(r.headers, _DROP_RESP)),
+                                media_type=r.headers.get("content-type"))
+            data = r.json()
+        except Exception:
+            return JSONResponse({"loaded": [], "instances": {}, "configured_max": {}})
+        if isinstance(data, dict):
+            loaded = set(data.get("loaded") or [])
+            for e in self.registry.all():
+                if prim is not None and e.id == prim.id:
+                    continue
+                loaded |= e.loaded_models
+            data["loaded"] = sorted(loaded)
+        return JSONResponse(data)
+
     def _cooling_engines(self) -> list:
         """Which engines are in thermal cooldown right now (for the Tasks banner)."""
         out = []
@@ -584,6 +612,10 @@ def build_app(config, config_dir=None) -> FastAPI:
     @app.get("/admin/api/status", include_in_schema=False)
     async def _status(request: Request):
         return await front.status(request)
+
+    @app.get("/admin/api/model-loaded-status", include_in_schema=False)
+    async def _model_loaded_status(request: Request):
+        return await front.model_loaded_status(request)
 
     @app.get("/admin/api/tasks", include_in_schema=False)
     async def _tasks(request: Request):

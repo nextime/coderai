@@ -312,13 +312,15 @@ async function loadEngines(){
     const vram = e.vram ? `${(e.vram.used ?? 0).toFixed ? e.vram.used.toFixed(1) : e.vram.used}/${e.vram.total} GB` : '';
     const cool = e.cooling ? ` <span class="badge badge-warn" style="font-size:9px">❄ cooling</span>` : '';
     const prim = e.primary ? ` <span class="badge badge-user" style="font-size:9px">primary</span>` : '';
-    const models = (e.loaded_models||[]).length;
+    const loaded = e.loaded_models||[];
+    const models = loaded.length;
+    const mtip = models ? esc(loaded.join('\n')) : 'no models loaded';
     return `<div class="sys-tile">
       <div class="sys-head">
         <span class="sys-name">${esc(e.name)} <span class="dim" style="text-transform:none">(${esc(e.backend)})</span>${prim}${cool}</span>
         <span style="width:9px;height:9px;border-radius:50%;background:${dot};display:inline-block" title="${state}"></span>
       </div>
-      <div class="sys-sub"><span>${esc(state)}${vram?' · '+esc(vram):''}</span><span>${models} model${models!==1?'s':''}</span></div>
+      <div class="sys-sub"><span>${esc(state)}${vram?' · '+esc(vram):''}</span><span title="${mtip}" style="cursor:${models?'help':'default'};${models?'text-decoration:underline dotted':''}">${models} model${models!==1?'s':''}</span></div>
       <div style="margin-top:.5rem;text-align:right">
         <button class="btn btn-ghost" style="font-size:11px;padding:.15rem .5rem;color:var(--error,#e55)"
                 onclick="restartEngine(${e.id}, '${esc(e.name)}')" title="Kill and respawn this engine">↻ Restart</button>
