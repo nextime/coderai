@@ -247,6 +247,17 @@ async def internal_engine_state():
         loaded = list(multi_model_manager.models.keys())
     except Exception:
         loaded = []
+    # Whisper-server models run as their own subprocess (tracked in whisper_servers,
+    # not in .models). Surface each running server under both its id and `audio:`
+    # alias so the front's cross-engine aggregation shows it as loaded — including
+    # when it runs on a secondary engine.
+    try:
+        for _wid, _wsm in multi_model_manager.whisper_servers.items():
+            if _wsm.is_running():
+                loaded.append(_wid)
+                loaded.append(f"audio:{_wid}")
+    except Exception:
+        pass
     vram = None
     try:
         import torch
