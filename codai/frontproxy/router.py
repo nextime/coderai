@@ -123,10 +123,17 @@ def pick_engine(registry: EngineRegistry, path: str, method: str,
         # 1. Per-model pin (models.json "engine") — only honoured if compatible.
         if pinned:
             e = registry.by_name(pinned)
-            if e and e.healthy and e.can_serve(cap):
-                return e
-            # Pin can't be honoured — say why (once per model+engine) instead of
-            # silently falling back, so a misconfiguration is visible in the logs.
+            if e and e.can_serve(cap):
+                if e.healthy:
+                    return e
+                # Pinned engine is busy (mid-generation → failing health polls) but
+                # its process is alive: route here anyway so the request queues on
+                # its gen-lock, instead of duplicating a pinned model on another
+                # engine (which also ignores its configured n_ctx etc.).
+                if e.is_alive():
+                    return e
+            # Pin can't be honoured (engine down or incompatible) — say why (once
+            # per model+engine) instead of silently falling back.
             _warn_bad_pin(model, pinned, cap, e)
 
         # 2. Engine that already has the model resident.
@@ -135,13 +142,20 @@ def pick_engine(registry: EngineRegistry, path: str, method: str,
             if e:
                 return e
 
-        # 3. Configured default engine, when it can serve this request.
+        # 3. The assigned owner, busy-but-alive: prefer queueing on the engine that
+        # owns this model over loading a second copy on a different one.
+        if model:
+            owner = registry.engine_owning(model)
+            if owner is not None and owner.can_serve(cap) and owner.is_alive():
+                return owner
+
+        # 4. Configured default engine, when it can serve this request.
         if default_engine:
             e = registry.by_name(default_engine)
             if e and e.healthy and e.can_serve(cap):
                 return e
 
-        # 4. Least-loaded compatible engine; then any engine rather than 503.
+        # 5. Least-loaded compatible engine; then any engine rather than 503.
         return (registry.least_loaded(cap)
                 or registry.least_loaded(None)
                 or registry.primary())

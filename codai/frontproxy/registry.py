@@ -83,6 +83,19 @@ class Engine:
     def can_serve(self, required_cap: Optional[str]) -> bool:
         return (not required_cap) or (required_cap in self.capabilities)
 
+    def is_alive(self) -> bool:
+        """Process is up (so 'unhealthy' means busy/GIL-blocked, not dead).
+
+        An engine mid-generation can't answer the health poll and reads as
+        unhealthy, but it's the right place to send a request pinned/assigned to
+        it — the request queues on its gen-lock instead of duplicating the model
+        elsewhere. A None proc means externally managed; assume alive."""
+        p = self.proc
+        try:
+            return p is None or p.poll() is None
+        except Exception:
+            return True
+
 
 class EngineRegistry:
     def __init__(self):
@@ -186,6 +199,24 @@ class EngineRegistry:
             for e in self._engines.values():
                 if not e.healthy:
                     continue
+                for k in e.assigned_models:
+                    if (k == model_key or _short_stem(k) == short
+                            or k.endswith(model_key) or model_key.endswith(k.split("/")[-1])):
+                        return e
+        return None
+
+    def engine_owning(self, model_key: str) -> Optional[Engine]:
+        """The engine ASSIGNED this model, regardless of current health.
+
+        Like engine_for_assigned but without the healthy filter — so a request can
+        be routed to its owner while the owner is transiently busy (mid-generation,
+        failing health polls) and queue there, rather than spawning a duplicate on
+        another engine. Callers should gate on ``is_alive()``."""
+        if not model_key:
+            return None
+        short = _short_stem(model_key)
+        with self._lock:
+            for e in self._engines.values():
                 for k in e.assigned_models:
                     if (k == model_key or _short_stem(k) == short
                             or k.endswith(model_key) or model_key.endswith(k.split("/")[-1])):
