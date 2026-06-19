@@ -245,20 +245,41 @@ class FrontProxy:
                 if not isinstance(m, dict):
                     continue
                 rec = {"engine": (m.get("engine") or "").strip() or None,
-                       "backend": (m.get("backend") or "").strip() or None}
+                       "backend": (m.get("backend") or "").strip() or None,
+                       "path": (m.get("path") or m.get("id") or "").strip() or None}
                 for field_ in (m.get("path"), m.get("id"), m.get("alias")):
-                    if field_:
-                        info[str(field_).lower()] = rec
-                        info[str(field_).split("/")[-1].lower()] = rec
+                    if not field_:
+                        continue
+                    f = str(field_).lower()
+                    base = f.split("/")[-1]
+                    info[f] = rec
+                    info[base] = rec
+                    # A gguf's automatic alias is its filename without '.gguf' — index
+                    # the stem too so a bare-alias request resolves to this record
+                    # (and thus its pin / gguf capability), not just the '.gguf' form.
+                    if base.endswith(".gguf"):
+                        info[base[:-5]] = rec
+                        info[f[:-5]] = rec
         return info
 
     def _required_cap(self, path: str, model: Optional[str]) -> Optional[str]:
         ds4 = getattr(self.config, "ds4", None)
-        return _router.required_capability(
+        info = self._model_info(model)
+        cap = _router.required_capability(
             model, path=path,
-            backend=self._model_info(model).get("backend"),
+            backend=info.get("backend"),
             ds4_model_id=getattr(ds4, "model_id", None) if ds4 else None,
             ds4_enabled=bool(getattr(ds4, "enabled", False)) if ds4 else False)
+        # The name heuristic can't see that a bare alias (e.g. '…-q4_k_m', no
+        # literal 'gguf') backs a .gguf file, so it falls through to
+        # 'transformers' (CUDA-only) and the request never reaches a Vulkan/AMD
+        # engine. Correct it from the model's configured path. (whisper/ds4 take
+        # precedence above and are left untouched.)
+        if cap == "transformers":
+            mpath = (info.get("path") or "").lower()
+            if mpath.endswith(".gguf"):
+                cap = "gguf"
+        return cap
 
     @staticmethod
     def _peek_model(body: bytes, content_type: str) -> Optional[str]:
