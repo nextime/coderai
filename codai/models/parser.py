@@ -974,8 +974,13 @@ def _parse_gemma_loose_value(s: str, i: int):
             if j < n and s[j] == ']':
                 j += 1
                 break
+            prev = j
             val, j = _parse_gemma_loose_value(s, j)
             arr.append(val)
+            # Malformed input (e.g. a stray '}' where ']' was expected) can leave
+            # j unmoved — bail instead of spinning forever appending empties.
+            if j <= prev:
+                break
         return arr, j
     # Bareword / number / bool / null: read until a delimiter.
     j = i
@@ -1008,6 +1013,7 @@ def _parse_gemma_loose_object(s: str, i: int):
     assert s[i] == '{'
     j = i + 1
     while j < n:
+        loop_start = j
         while j < n and s[j] in ' \t\r\n,':
             j += 1
         if j < n and s[j] == '}':
@@ -1028,6 +1034,9 @@ def _parse_gemma_loose_object(s: str, i: int):
         val, j = _parse_gemma_loose_value(s, j)
         if key:
             obj[key] = val
+        # Forward-progress guard: malformed input must never wedge the loop.
+        if j <= loop_start:
+            break
     return obj, j
 
 
