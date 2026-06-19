@@ -2465,7 +2465,7 @@ async function loadCachedModels(){
             <button class="btn btn-secondary btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openCfgModal(${idx},0)">${f.in_config?'Configure':'Add'}</button>
             ${f.in_config?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="disableModel(${idx})">Remove</button>`:''}
             ${toDlGg?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="unmarkDownload(${idx})" title="Remove this model from the download list">✕ Remove from list</button>`:''}
-            ${!f.missing&&!toDlGg&&(f.in_config||redownloadTarget)?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="freeDiskConfirm(${idx})" title="Delete this file from disk to save space, but keep it in the list so you can re-download it later">🗑 Free disk</button>`:''}
+            ${!f.missing&&!toDlGg?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="freeDiskConfirm(${idx})" title="Delete this file from disk to save space, but keep it in the list (as “to download”) so you can fetch it again later">🗑 Free disk</button>`:''}
             ${!f.missing&&!toDlGg?`<button class="btn btn-danger btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="deleteModelConfirm(${idx})">Delete</button>`:''}
           </td>
         </tr>`;

@@ -270,6 +270,35 @@ def _normalize_vision_content(content: list) -> list:
     return norm
 
 
+def _normalize_tool_call_arguments(tool_calls):
+    """Return tool_calls with each ``function.arguments`` as a dict (mapping)
+    rather than a JSON string. OpenAI/Kilo send arguments as a JSON STRING, but
+    several GGUF chat templates (e.g. Qwen) render them with ``arguments|items``,
+    which requires a mapping — otherwise llama.cpp raises "Can only get item pairs
+    from a mapping" while applying the template. A dict also serializes correctly
+    for templates that use ``arguments|tojson``, so this is safe either way."""
+    out = []
+    for tc in (tool_calls or []):
+        if hasattr(tc, "model_dump"):
+            tc = tc.model_dump()
+        if not isinstance(tc, dict):
+            out.append(tc)
+            continue
+        tc = dict(tc)
+        fn = tc.get("function")
+        if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+            try:
+                parsed = json.loads(fn["arguments"] or "{}")
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                fn = dict(fn)
+                fn["arguments"] = parsed
+                tc["function"] = fn
+        out.append(tc)
+    return out
+
+
 @router.post("/v1/chat/completions", summary="Chat completions")
 async def chat_completions(request: ChatCompletionRequest, http_request: Request = None):
     """Chat completions endpoint with streaming and tool support."""
@@ -793,8 +822,10 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             msg_dict["content"] = str(content) if content is not None else ""
         # Handle tool_calls - convert to proper format if present
         if msg.tool_calls:
-            # tool_calls should be a list of dicts with 'id', 'type', 'function' keys
-            msg_dict["tool_calls"] = msg.tool_calls
+            # tool_calls should be a list of dicts with 'id', 'type', 'function'
+            # keys; normalise function.arguments from a JSON string to a dict so
+            # templates that do `arguments|items` (Qwen, …) don't raise.
+            msg_dict["tool_calls"] = _normalize_tool_call_arguments(msg.tool_calls)
         if msg.name:
             msg_dict["name"] = msg.name
         if msg.tool_call_id:
@@ -1446,7 +1477,12 @@ import re as _re
 
 _TOOL_SPAN_RE = _re.compile(r'<(tool|tool_call)\b[\s\S]*?</\1\s*>', _re.IGNORECASE)
 _TOOL_OPEN_RE = _re.compile(r'<(?:tool|tool_call)\b', _re.IGNORECASE)
-_TOOL_OPEN_TAGS = ('<tool>', '<tool_call>')
+_TOOL_OPEN_TAGS = ('<tool>', '<tool_call>', '<|tool_call>', '<|tool_call|>')
+# gemma/qwen native special-token tool marker `<|tool_call>` — usually a special
+# token stripped on decode, but some GGUFs emit it as plain text. Treat it like a
+# tool-open: withhold everything from it to the end so the raw marker (and the
+# `call:NAME{…}` that follows) never leaks to the client as visible content.
+_NATIVE_TOOL_OPEN_RE = _re.compile(r'<\|tool_call', _re.IGNORECASE)
 # gemma-4 native tool call: `call:NAME{…}` (the <|tool_call> markers are stripped
 # by skip_special_tokens). Once it starts we withhold everything to the end of the
 # stream — the call is surfaced as structured tool_calls after generation.
@@ -1478,6 +1514,12 @@ def _gate_tool_content(buffer: str, final: bool = False):
         emit.append(buffer[:m.start()])
         held = '' if final else buffer[m.start():]
         return ''.join(emit), held
+    # gemma/qwen native `<|tool_call>` marker — withhold from it to the end.
+    nm = _NATIVE_TOOL_OPEN_RE.search(buffer)
+    if nm:
+        emit.append(buffer[:nm.start()])
+        held = '' if final else buffer[nm.start():]
+        return ''.join(emit), held
     # gemma-4 `call:NAME{…}` — withhold from the call onward (extracted at the end).
     gm = _GEMMA_CALL_OPEN_RE.search(buffer)
     if gm:
@@ -1499,6 +1541,21 @@ def _gate_tool_content(buffer: str, final: bool = False):
             return ''.join(emit), buffer[cm.start():]
     emit.append(buffer)
     return ''.join(emit), ''
+
+
+def _context_overflow_detail(e) -> Optional[str]:
+    """If the exception is a context-window overflow (prompt + generation exceed
+    the model's n_ctx), return a clear client-facing message; else None."""
+    s = str(e)
+    low = s.lower()
+    markers = ("exceed context window", "context window of", "requested tokens",
+               "exceeds n_ctx", "exceed the context", "context length",
+               "n_ctx", "kv cache is full", "context shift is disabled")
+    if any(m in low for m in markers) or ("token" in low and "exceed" in low):
+        return ("The conversation is too long for this model's context window "
+                f"({s}). Shorten the prompt or lower max_tokens, or increase the "
+                "model's context size (n_ctx) in its configuration.")
+    return None
 
 
 async def stream_chat_response(
@@ -1918,18 +1975,16 @@ async def stream_chat_response(
         yield "data: [DONE]\n\n"
     except Exception as e:
         print(f"Error during streaming generation: {e}")
-        data = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model_name,
-            "choices": [{
-                "index": 0,
-                "delta": {"content": f"\n[Generation error: {str(e)}]"},
-                "finish_reason": "stop",
-            }],
-        }
-        yield f"data: {json.dumps(data)}\n\n"
+        # Surface errors as a STRUCTURED error event (not as assistant content) so
+        # the client treats it as an error and it doesn't pollute the chat history.
+        _ctx = _context_overflow_detail(e)
+        if _ctx:
+            err = {"error": {"message": _ctx, "type": "invalid_request_error",
+                             "code": "context_length_exceeded", "param": "messages"}}
+        else:
+            err = {"error": {"message": str(e), "type": "internal_error",
+                             "code": "generation_error"}}
+        yield f"data: {json.dumps(err)}\n\n"
         yield "data: [DONE]\n\n"
     finally:
         # Always clean up queue state
@@ -2139,6 +2194,9 @@ async def generate_chat_response(
         return formatted_response
     except Exception as e:
         print(f"Error during generation: {e}")
+        _ctx = _context_overflow_detail(e)
+        if _ctx:
+            raise HTTPException(status_code=400, detail=_ctx)
         raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
 
 # =============================================================================
@@ -2361,4 +2419,7 @@ async def generate_completion_response(
         }
     except Exception as e:
         print(f"Error during completion: {e}")
+        _ctx = _context_overflow_detail(e)
+        if _ctx:
+            raise HTTPException(status_code=400, detail=_ctx)
         raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
