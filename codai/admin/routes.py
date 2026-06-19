@@ -372,6 +372,18 @@ def api_status(username: str = Depends(require_auth)):
     except Exception:
         pass
 
+    # Whisper-server models run as their own subprocess (not in .models); fold each
+    # running server in (id + `audio:` alias) so the dashboard/engine count and the
+    # models page reflect them — including on a secondary engine.
+    try:
+        for _wid, _wsm in multi_model_manager.whisper_servers.items():
+            if _wsm.is_running():
+                for _wk in (_wid, f"audio:{_wid}"):
+                    if _wk not in loaded_keys:
+                        loaded_keys.append(_wk)
+    except Exception:
+        pass
+
     # VRAM info
     vram = None
     is_cuda = False
@@ -2058,6 +2070,18 @@ async def api_model_loaded_status(username: str = Depends(require_admin)):
     from codai.models.manager import multi_model_manager
     loaded = list(multi_model_manager.models.keys())
 
+    # Whisper-server models run as their own subprocess (not in .models). Surface
+    # each running server under both its id and its `audio:` alias so the models
+    # page (which checks `audio:<id>` and `<id>`) shows it as loaded.
+    for mid, wsm in multi_model_manager.whisper_servers.items():
+        try:
+            running = wsm.is_running()
+        except Exception:
+            running = False
+        if running:
+            loaded.append(mid)
+            loaded.append(f"audio:{mid}")
+
     instance_pools = {}
     for key, pool in multi_model_manager.model_pools.items():
         instance_pools[key] = {"loaded": pool.count, "max": pool.max_instances}
@@ -2253,45 +2277,47 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
 @router.post("/admin/api/model-unload", summary="Unload a model")
 async def api_model_unload(request: Request, username: str = Depends(require_admin)):
     """Unload a model from VRAM (keeps it available for on-request reload)."""
-    import gc
     from codai.models.manager import multi_model_manager
     data = await request.json()
     path = data.get("path", "")
     if not path:
         raise HTTPException(status_code=400, detail="path required")
 
-    # Find the key in loaded models (exact or prefixed)
+    def _matches(k: str) -> bool:
+        return k == path or k.endswith(f":{path}") or k.endswith(path.split("/")[-1])
+
+    # A whisper-server model runs as its own subprocess (tracked in whisper_servers,
+    # not in .models / .model_pools); stop the matching server(s) directly.
+    stopped_whisper = False
+    for mid in [m for m in list(multi_model_manager.whisper_servers.keys())
+                if _matches(m) or _matches(f"audio:{m}")]:
+        wsm = multi_model_manager.whisper_servers.get(mid)
+        if wsm is not None:
+            try:
+                wsm.stop()
+            except Exception:
+                pass
+            stopped_whisper = True
+    if stopped_whisper:
+        return {"success": True, "was_loaded": True}
+
+    # Find the key across BOTH the single-model cache and the instance pools — a
+    # model served with max_instances>1 lives only in model_pools, so searching
+    # .models alone would miss it and leave the pooled instances in VRAM.
     key = None
-    for k in list(multi_model_manager.models.keys()):
-        if k == path or k.endswith(f":{path}") or k.endswith(path.split("/")[-1]):
+    for k in list(multi_model_manager.models.keys()) + list(multi_model_manager.model_pools.keys()):
+        if _matches(k):
             key = k
             break
     if key is None:
         return {"success": True, "was_loaded": False}
 
-    model_obj = multi_model_manager.models.pop(key, None)
-    if model_obj is not None:
-        try:
-            if hasattr(model_obj, "cleanup"):
-                model_obj.cleanup()
-            elif hasattr(model_obj, "to"):
-                model_obj.to("cpu")
-        except Exception:
-            pass
-    if multi_model_manager.active_in_vram == key:
-        multi_model_manager.active_in_vram = None
-    if multi_model_manager.current_model_key == key:
-        multi_model_manager.current_model_key = None
-
-    gc.collect()
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
-
-    return {"success": True, "was_loaded": True}
+    # unload_model() drops the cache entry AND cleans up the whole instance pool,
+    # then runs gc + torch.cuda.empty_cache() — the manual pop above froze pooled
+    # instances' VRAM. Offload to a thread: it may briefly wait for an in-flight
+    # request to finish and would otherwise block the admin event loop.
+    was = await asyncio.to_thread(multi_model_manager.unload_model, key)
+    return {"success": True, "was_loaded": bool(was)}
 
 
 def _sanitize_engine_int_overrides(raw) -> dict:
