@@ -1,0 +1,48 @@
+#!/usr/bin/env sh
+# Top-level entrypoint for the CoderAI distributable image.
+# Prepares shared state directories and hands off to supervisord, which runs
+# nginx + the main server + the bundled tool web UIs on the single published port.
+set -eu
+
+: "${CODERAI_CONFIG_DIR:=/config}"
+: "${CODERAI_MODELS_DIR:=/models}"
+: "${CODERAI_CACHE_DIR:=/cache}"
+# Default parler model id; referenced by supervisord even when the parler program
+# is disabled, so it must always be defined.
+: "${CODERAI_PARLER_MODEL:=parler-tts/parler-tts-mini-multilingual}"
+# Dedicated temp dir on the cache volume, shared by the server and the tool
+# processes (so scratch from upscaling/lip-sync/ffmpeg lands in one place). The
+# server's built-in janitor age-prunes it; see CODERAI_TMP below.
+: "${CODERAI_TMP:=$CODERAI_CACHE_DIR/coderai-tmp}"
+export TMPDIR="$CODERAI_TMP" TMP="$CODERAI_TMP" TEMP="$CODERAI_TMP"
+# Don't write .pyc into the read-only /opt/coderai tree (esp. when run as --user).
+export PYTHONDONTWRITEBYTECODE=1
+export CODERAI_CONFIG_DIR CODERAI_MODELS_DIR CODERAI_CACHE_DIR CODERAI_PARLER_MODEL CODERAI_TMP
+
+mkdir -p \
+  "$CODERAI_CONFIG_DIR/coderai" \
+  "$CODERAI_MODELS_DIR/coderai" \
+  "$CODERAI_CACHE_DIR/coderai" \
+  "$CODERAI_CACHE_DIR/township_output" \
+  "$CODERAI_CACHE_DIR/videogen_output" \
+  "$CODERAI_TMP" \
+  /tmp/nginx-client-body /tmp/nginx-proxy /tmp/nginx-fastcgi \
+  /tmp/nginx-uwsgi /tmp/nginx-scgi
+
+# Seed the ds4 working dir on the cache volume from the bundled binary + scripts
+# (DeepSeek-V4 weights download here at runtime, so it must be writable/persistent).
+if [ -d /opt/coderai/ds4 ] && [ ! -e "$CODERAI_CACHE_DIR/ds4/ds4-server" ]; then
+  mkdir -p "$CODERAI_CACHE_DIR/ds4"
+  cp -an /opt/coderai/ds4/. "$CODERAI_CACHE_DIR/ds4/" 2>/dev/null || true
+fi
+
+# If invoked with arguments, run them directly (debugging / one-off commands)
+# instead of the supervised stack.
+if [ "$#" -gt 0 ]; then
+  exec "$@"
+fi
+
+# supervisord runs on the system python3; a leaked PYTHONHOME (pointing at the
+# standalone 3.13) would break it. The per-service launchers set their own.
+unset PYTHONHOME
+exec /usr/bin/supervisord -c /etc/supervisor/supervisord.conf

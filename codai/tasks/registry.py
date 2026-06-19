@@ -54,6 +54,7 @@ class Task:
     status: str = "queued"         # queued | running | done | error | cancelled
     step: int = 0
     total: int = 0
+    rate: float = 0.0              # throughput (tokens/s) for text generation
     message: str = ""
     job_id: Optional[str] = None   # link to a durable loras training job, if any
     created_at: float = field(default_factory=time.time)

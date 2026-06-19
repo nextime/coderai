@@ -88,6 +88,15 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
     </div>
   </div>
 
+  <!-- name filter (applies to HF models, GGUF files and components) -->
+  <div class="card" style="padding-top:.75rem;padding-bottom:.75rem">
+    <div style="display:flex;align-items:center;gap:.5rem">
+      <span class="fl">Filter</span>
+      <input type="text" id="local-filter" class="form-input" placeholder="Filter models by name…" style="flex:1" oninput="applyLocalFilter()">
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('local-filter').value='';applyLocalFilter()">Clear</button>
+    </div>
+  </div>
+
   <!-- HF models -->
   <div class="card">
     <div class="card-title">HuggingFace models <span id="hf-model-badge" class="muted small"></span></div>
@@ -290,22 +299,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
 </div>
 
 
-<!-- Generic confirm modal -->
-<div id="confirm-modal" class="modal" onclick="if(event.target===this)document.getElementById('confirm-modal-cancel').click()">
-  <div class="modal-box" style="max-width:420px">
-    <div class="modal-head">
-      <span class="modal-title" id="confirm-modal-title">Confirm</span>
-      <button class="modal-close" id="confirm-modal-x">&times;</button>
-    </div>
-    <div class="modal-body">
-      <p id="confirm-modal-msg" style="margin:0 0 1.25rem"></p>
-      <div style="display:flex;gap:.5rem;justify-content:flex-end">
-        <button class="btn btn-ghost" id="confirm-modal-cancel">Cancel</button>
-        <button class="btn btn-danger" id="confirm-modal-ok">Confirm</button>
-      </div>
-    </div>
-  </div>
-</div>
+<!-- Confirm / notice modal is provided globally by base.html -->
 
 <!-- Download modal -->
 <div id="dl-modal" class="modal">
@@ -348,6 +342,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         </div>
         <div class="form-actions">
           <button class="btn btn-primary" id="dl-start-btn" onclick="startDownloadFromForm()">Download</button>
+          <button class="btn btn-secondary" id="dl-later-btn" onclick="markDownloadFromForm()" title="Add this model to your list as “to download” without fetching it now">Add to list (download later)</button>
           <button class="btn btn-ghost" onclick="closeModal('dl-modal')">Close</button>
         </div>
       </div>
@@ -577,6 +572,13 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           </select>
         </div>
       </div>
+      <div class="form-row" id="cfg-engine-row" style="margin-top:.75rem;display:none">
+        <label class="form-label">Engine / card</label>
+        <select id="cfg-engine" class="form-input">
+          <option value="">Default (auto — by capability)</option>
+        </select>
+        <span class="form-hint" style="font-size:11px">Pin this model to a specific engine/card. Overrides the default engine. Only shown when multiple engines are running.</span>
+      </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem;margin-top:.75rem">
         <div class="form-row" style="margin:0">
           <label class="form-label">Used VRAM <span class="muted">(GB)</span></label>
@@ -608,9 +610,10 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       <!-- inference -->
       <div class="card-title" style="margin-top:1.25rem">Inference</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
-        <div class="form-row" style="margin:0">
-          <label class="form-label">GPU layers <span class="muted">(-1 = all)</span></label>
+        <div class="form-row" style="margin:0" id="cfg-gpu-layers-row">
+          <label class="form-label">GPU layers <span class="muted">(llama.cpp offload)</span></label>
           <input type="number" id="cfg-gpu-layers" class="form-input" min="-1" value="-1">
+          <span class="form-hint" style="font-size:11px"><b>-1</b> = all on GPU (auto-offloads the overflow to CPU if it won't fit). <b>N</b> = N layers on GPU, the rest on CPU (slower, frees VRAM).</span>
         </div>
         <div class="form-row" style="margin:0">
           <label class="form-label">Context size</label>
@@ -638,6 +641,22 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             <option value="q4_0">q4_0 (smallest)</option>
           </select>
         </div>
+        <div class="form-row" style="margin:0" id="cfg-mmproj-row">
+          <label class="form-label">Multimodal projector <span class="muted">(mmproj → vision)</span></label>
+          <select id="cfg-mmproj" class="form-input" onchange="_onMmprojChange()">
+            <option value="">None</option>
+          </select>
+          <span class="form-hint" style="font-size:11px">Pairs an <b>mmproj</b> GGUF with this model to add image/vision input (passed to llama.cpp as <code>--mmproj</code>). Auto-selected when a matching projector is detected.</span>
+        </div>
+        <div class="form-row" style="margin:0">
+          <p class="muted" style="margin:0;font-size:0.85em;line-height:1.4">
+            <strong>Note:</strong> KV-cache quantization only applies to GGUF models on
+            the llama.cpp backend. HF-transformers models (incl. <strong>gemma</strong> and
+            other sliding-window / hybrid linear-attention architectures) ignore this and
+            keep an fp16 KV cache — their quantized-cache path crashes during generation.
+            For those, lower <strong>n_ctx</strong> to shrink the KV VRAM reserve instead.
+          </p>
+        </div>
         <div class="form-row" style="margin:0">
           <label class="form-label">Max GPU % <span class="muted">(optional)</span></label>
           <input type="number" id="cfg-max-gpu" class="form-input" min="1" max="100" placeholder="e.g. 90">
@@ -654,6 +673,30 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-noram"> No RAM fallback</label>
       </div>
 
+      <!-- Fast-kernel 4-bit (GPTQ/AWQ via Marlin) — HF transformers models only -->
+      <div id="cfg-fastquant-wrap" style="margin-top:1rem;padding:.75rem;border:1px solid var(--border);border-radius:6px;background:var(--raised)">
+        <div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
+          <div style="flex:1;min-width:220px">
+            <label class="form-label">Quant backend <span class="muted">(HF transformers)</span></label>
+            <select id="cfg-quant-backend" class="form-input">
+              <option value="auto">Auto — fast checkpoint if present, else bitsandbytes</option>
+              <option value="bnb">bitsandbytes only (NF4)</option>
+              <option value="gptq">GPTQ (Marlin/ExLlama) — needs quantized checkpoint</option>
+              <option value="awq">AWQ (Marlin) — needs quantized checkpoint</option>
+            </select>
+          </div>
+          <div style="display:flex;align-items:flex-end;gap:.5rem">
+            <button type="button" class="btn btn-secondary btn-sm" id="cfg-quantize-btn" onclick="startQuantize()">Quantize to 4-bit</button>
+          </div>
+        </div>
+        <div class="form-hint" id="cfg-quant-status" style="margin-top:.5rem">
+          bitsandbytes NF4 is the slowest 4-bit option. Quantizing to GPTQ/AWQ uses
+          Marlin kernels (2–4× faster) but is a heavy one-time background job; the
+          produced checkpoint is used automatically on the next load. Falls back to
+          bitsandbytes if unavailable or the architecture is unsupported.
+        </div>
+      </div>
+
       <!-- Per-component quantization (diffusers image/video pipelines) -->
       <div id="cfg-compquant-wrap">
         <div class="card-title" style="margin-top:1.25rem">Component Quantization <span class="muted" style="font-weight:normal">(image / video pipelines)</span></div>
@@ -666,8 +709,8 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       </div>
 
       <!-- offload -->
-      <div class="card-title" style="margin-top:1.25rem">Offload</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
+      <div class="card-title" style="margin-top:1.25rem" id="cfg-offload-title">Offload</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem" id="cfg-offload-grid">
         <div class="form-row" style="margin:0">
           <label class="form-label">Strategy</label>
           <select id="cfg-offload-strategy" class="form-input">
@@ -977,30 +1020,7 @@ function switchTab(name,btn){
 function openModal(id){document.getElementById(id).classList.add('show')}
 function closeModal(id){document.getElementById(id).classList.remove('show')}
 
-// Custom confirm to avoid browser native-dialog blocking
-function showConfirm(title, msg, okLabel){
-  return new Promise(resolve => {
-    document.getElementById('confirm-modal-title').textContent = title;
-    document.getElementById('confirm-modal-msg').textContent = msg;
-    const okBtn    = document.getElementById('confirm-modal-ok');
-    const cancelBtn= document.getElementById('confirm-modal-cancel');
-    const xBtn     = document.getElementById('confirm-modal-x');
-    okBtn.textContent = okLabel || 'Confirm';
-    openModal('confirm-modal');
-    function cleanup(result){
-      closeModal('confirm-modal');
-      okBtn.removeEventListener('click', onOk);
-      cancelBtn.removeEventListener('click', onCancel);
-      xBtn.removeEventListener('click', onCancel);
-      resolve(result);
-    }
-    function onOk(){ cleanup(true); }
-    function onCancel(){ cleanup(false); }
-    okBtn.addEventListener('click', onOk);
-    cancelBtn.addEventListener('click', onCancel);
-    xBtn.addEventListener('click', onCancel);
-  });
-}
+// showConfirm() and showAlert() are provided globally by base.html.
 
 /* ── Global settings ─────────────────────────────────── */
 let _defaultOffloadDir = './offload';
@@ -1162,6 +1182,7 @@ async function doSearch(){
           <div style="display:flex;gap:.3rem;flex-shrink:0">
             <button class="btn btn-ghost btn-sm" onclick="openInfo(${i})">Info</button>
             <button class="btn btn-ghost btn-sm" onclick="toggleFiles(${i})">▾ Files</button>
+            <button class="btn btn-ghost btn-sm" onclick="addKnownFromResult(${i},this)" title="Add to your model list without downloading now — fetch it later with Re-download">+ Add known</button>
             <button class="btn btn-secondary btn-sm" onclick="dlFromResult(${i})">Download</button>
           </div>
         </div>
@@ -1184,6 +1205,36 @@ function dlFromResult(i){
   } else {
     openDownloadFor(m.id, '');  // triggers snapshot download
   }
+}
+
+// Best-effort model_type for a search result, from its detected capabilities.
+function _resultModelType(m){
+  if(looksLikeGguf(m.id, '')) return 'gguf_models';
+  const {categories} = _capabilitiesToTypes(m.capabilities||[]);
+  if(categories.size) return [...categories][0];
+  return 'text_models';
+}
+
+// Register a searched model in config without downloading it now (same end state
+// as "Free disk": appears as missing, with a working Re-download button).
+async function addKnownFromResult(i, btn){
+  const m = _results[i];
+  if(!m) return;
+  const isGguf = looksLikeGguf(m.id, '');
+  if(!await showConfirm('Add without downloading',
+      `Add "${m.id}" to your model list without downloading it now? You can fetch it later with the Re-download button.`,
+      'Add known')) return;
+  try{
+    const r = await fetch(ROOT_PATH + '/admin/api/model-add-known', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({model_id:m.id, source_repo:m.id, model_type:_resultModelType(m), is_gguf:isGguf})
+    });
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok || !d.success){ showAlert('Error: '+(d.detail||d.error||('HTTP '+r.status))); return; }
+    _cachedSearchIds.add(m.id);
+    if(btn){ btn.textContent = d.already ? '✓ Known' : '✓ Added'; btn.disabled = true; btn.style.color = 'var(--ok,#16a34a)'; }
+    loadCachedModels();  // refresh the Local tab in the background
+  }catch(e){ showAlert('Error: '+e.message); }
 }
 
 /* ── files panel ─────────────────────────────────────── */
@@ -1401,7 +1452,7 @@ function showDownloadError(msg){
   if(_dlEs){_dlEs.close();_dlEs=null}
   document.getElementById('dl-form').style.display='block';
   document.getElementById('dl-progress').style.display='none';
-  alert('Download error: '+msg);
+  showAlert('Download error: '+msg);
 }
 
 function handleProgressEvent(evt){
@@ -1441,8 +1492,7 @@ function handleProgressEvent(evt){
     showDownloadError(evt.message);
   }else if(evt.type==='cancelled'){
     _dlDone=true;
-    if(_dlEs){_dlEs.close();_dlEs=null;}
-    showDownloadError('Download cancelled');
+    showDownloadCancelled();
   }
   // keepalive: ignore
 }
@@ -1483,7 +1533,7 @@ async function reopenDownload(session_id){
         if(s.rate) document.getElementById('dl-speed').textContent=fmtRate(s.rate);
         if(s.eta!=null) document.getElementById('dl-eta').textContent=fmtEta(s.eta);
         if(s.status==='done'){handleProgressEvent({type:'done'});return;}
-        if(s.status==='cancelled'){showDownloadError('Download cancelled');return;}
+        if(s.status==='cancelled'){_dlDone=true;showDownloadCancelled();return;}
         if(s.status==='error'){showDownloadError(s.error||'Download failed');return;}
       }
     }
@@ -1501,17 +1551,29 @@ async function reopenDownload(session_id){
   };
 }
 
+function showDownloadCancelled(){
+  if(_dlEs){_dlEs.close();_dlEs=null}
+  document.getElementById('dl-form').style.display='block';
+  document.getElementById('dl-progress').style.display='none';
+}
+
 async function stopDownload(session_id){
   if(!confirm('Cancel this download?')) return;
   try{
-    await fetch(ROOT_PATH + '/admin/api/download-cancel/'+session_id, {method:'POST'});
-    if(_dlSessionId===session_id){
-      if(_dlEs){_dlEs.close();_dlEs=null;}
-      _dlDone=true;
-      showDownloadError('Download cancelled');
+    const r = await fetch(ROOT_PATH + '/admin/api/download-cancel/'+session_id, {method:'POST'});
+    if(!r.ok){
+      let detail = r.status+' '+r.statusText;
+      try{ const j = await r.json(); if(j&&j.detail) detail = j.detail; }catch{}
+      showAlert('Could not cancel download: '+detail);
+      return;
     }
+    if(_dlSessionId===session_id){
+      _dlDone=true;
+      showDownloadCancelled();
+    }
+    pollDownloads(); // refresh the active-downloads strip immediately
   }catch(e){
-    alert('Could not cancel download: '+e.message);
+    showAlert('Could not cancel download: '+e.message);
   }
 }
 
@@ -1649,6 +1711,26 @@ function _attachEventSource(session_id){
   };
 }
 
+// Add the model in the download form to the "to download" wishlist without
+// fetching it now. It then appears in the model list as non-configured / to be
+// downloaded, with a Download button to fetch it later.
+async function markDownloadFromForm(){
+  const id = document.getElementById('dl-id').value.trim();
+  if(!id){ document.getElementById('dl-id').focus(); return; }
+  const patEl = document.getElementById('dl-pattern');
+  const pattern = patEl ? patEl.value.trim() : '';
+  const isGguf = looksLikeGguf(id, pattern);
+  try{
+    const r = await fetch(ROOT_PATH + '/admin/api/model-mark-download', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({model_id:id, source_repo:id, is_gguf:isGguf})
+    });
+    const d = await r.json().catch(()=>({}));
+    if(d.success){ closeModal('dl-modal'); refreshLocal(); }
+    else showAlert('Error: '+(d.detail||d.error||'could not add to list'));
+  }catch(e){ showAlert('Error: '+e.message); }
+}
+
 async function startDownloadFromForm(){
   const id = document.getElementById('dl-id').value.trim();
   if(!id){ document.getElementById('dl-id').focus(); return; }
@@ -1670,7 +1752,7 @@ async function startDownloadFromForm(){
   if(pickerVisible){
     // Multi-file download from quant picker
     const checked = [...document.querySelectorAll('#dl-quant-list input[type=checkbox]:checked')];
-    if(!checked.length){ alert('Select at least one quantization to download.'); return; }
+    if(!checked.length){ showAlert('Select at least one quantization to download.'); return; }
     _dlDone=false; _dlSessionId=null; _dlReset();
 
     if(checked.length===1){
@@ -1798,12 +1880,53 @@ let _localModels = [];
 let _ggufFiles = [];
 let _hfModels = [];
 
+// Engine/card hardware info (fetched once); used to tag models with the card they
+// run on when more than one engine is configured.
+let _engineNames = [];
+let _defaultEngine = '';
+async function _loadEngineInfo(){
+  // Live engine names from the front (covers auto-detected engines, not just those
+  // declared in engine_specs); default_engine still comes from settings.
+  try {
+    const er = await fetch(ROOT_PATH + '/admin/api/engines');
+    if (er.ok) _engineNames = ((await er.json()).engines || []).map(e => e.name);
+  } catch(e) {}
+  try {
+    const d = await (await fetch(ROOT_PATH + '/admin/api/settings')).json();
+    if (!_engineNames.length) _engineNames = (d.server && d.server.engine_names) || [];
+    _defaultEngine = (d.server && d.server.default_engine) || '';
+  } catch(e) {}
+}
+// Compact card tag for a model config. Pinned engines show as-is (with 📌);
+// otherwise the engine is inferred from the model's format (transformers/ds4 →
+// nvidia; gguf/whisper → the default engine, or "any"). Hidden when ≤1 engine, so
+// it never widens single-card setups.
+function _engineTagHtml(m, s){
+  if(!_engineNames || _engineNames.length < 2) return '';
+  let eng = ((s && s.engine) || '').trim();
+  let pinned = !!eng;
+  if(!eng){
+    const path = (((m && (m.path || m.id || m.filename)) || '') + '').toLowerCase();
+    const isGguf = path.endsWith('.gguf') || path.includes('gguf');
+    const isWhisper = ((s && s.backend) || '') === 'whisper-server';
+    const isDs4 = path.includes('deepseek-v4');
+    if(isDs4 || (!isGguf && !isWhisper)) eng = 'nvidia';   // ds4/transformers → nvidia
+    else eng = _defaultEngine || 'any';                     // gguf/whisper → default
+  }
+  const lc = eng.toLowerCase();
+  const color = (lc.includes('nv')) ? '#76b900'
+              : (lc.includes('rad') || lc.includes('amd')) ? '#ed1c24'
+              : 'var(--text-3)';
+  const title = pinned ? ('Pinned to engine: ' + eng) : ('Runs on: ' + eng + ' (auto)');
+  return `<span class="badge" title="${esc(title)}" style="font-size:9px;padding:.05rem .3rem;margin:.1rem .1rem 0 0;vertical-align:middle;border:1px solid ${color};color:${color};background:transparent">${esc(eng)}${pinned?' 📌':''}</span>`;
+}
+
 function _renderConfigPills(idx, m) {
   const configs = m.configs || [];
   if (!configs.length) return '';
   const pills = configs.map((c, cfgIdx) => {
     const label = (c.settings && (c.settings.config_name || c.settings.alias)) || `Config ${cfgIdx + 1}`;
-    return `<span class="badge badge-user" style="font-size:10px;cursor:pointer;vertical-align:middle;margin:.1rem .1rem 0 0" onclick="openCfgModal(${idx},${cfgIdx})" title="Edit this configuration">${esc(label)}</span>`;
+    return `<span class="badge badge-user" style="font-size:10px;cursor:pointer;vertical-align:middle;margin:.1rem .1rem 0 0" onclick="openCfgModal(${idx},${cfgIdx})" title="Edit this configuration">${esc(label)}</span>${_engineTagHtml(m, c.settings)}`;
   }).join('');
   const addPill = `<span class="badge" style="font-size:10px;cursor:pointer;vertical-align:middle;margin:.1rem 0 0 0;background:var(--raised);border:1px dashed var(--border);color:var(--text-2)" onclick="openCfgModalNew(${idx})" title="Add another configuration for this model">+ Config</span>`;
   return `<br style="line-height:.5rem">${pills}${addPill}`;
@@ -1811,6 +1934,7 @@ function _renderConfigPills(idx, m) {
 
 // ── Component file helpers ────────────────────────────────────────────────────
 const _COMP_ROLES = [
+  {key:'mmproj',      label:'mmproj (vision)', pat:/mm[._\-]?proj/i},
   {key:'vae',         label:'VAE',         pat:/vae|(^|[^a-z])ae\.(gguf|safetensors)/i},
   {key:'t5xxl',       label:'T5-XXL',      pat:/t5.?xxl|t5.?v1_1/i},
   {key:'clip_l',      label:'CLIP-L',      pat:/clip[_\-]l(?![_\-g])/i},
@@ -2025,6 +2149,91 @@ function _collectComponentQuant(){
   return Object.keys(out).length ? out : null;
 }
 
+// ---- Fast-kernel (GPTQ/AWQ) quantization ----
+let _quantPollTimer = null;
+let _quantCaps = null;
+
+async function _quantGetCaps(){
+  if(_quantCaps) return _quantCaps;
+  try{
+    const r = await fetch('/admin/api/quantize-capabilities');
+    const j = await r.json();
+    _quantCaps = j;
+  }catch(e){ _quantCaps = {available:false, capabilities:{error:String(e)}}; }
+  return _quantCaps;
+}
+
+function _renderQuantStatus(job, caps){
+  const el = document.getElementById('cfg-quant-status');
+  const btn = document.getElementById('cfg-quantize-btn');
+  if(!el) return;
+  if(caps && !caps.available){
+    btn.disabled = true;
+    const err = (caps.capabilities && caps.capabilities.error) || 'GPTQModel not installed';
+    el.innerHTML = `<span style="color:var(--warn,#d97706)">Fast-kernel quantization unavailable — using bitsandbytes. (${esc(err)})</span>`;
+    return;
+  }
+  const kernels = (caps && caps.capabilities && caps.capabilities.backends || []).join(', ');
+  if(job && job.status === 'running'){
+    btn.disabled = true;
+    const pct = Math.round((job.progress||0)*100);
+    el.innerHTML = `<span style="color:var(--accent,#6366f1)">Quantizing… ${pct}% — ${esc(job.message||'')}</span>`;
+  } else if(job && job.status === 'done'){
+    btn.disabled = false;
+    el.innerHTML = `<span style="color:var(--ok,#16a34a)">✓ Quantized checkpoint ready — used automatically on next load.</span> <span class="muted">Kernels: ${esc(kernels)}</span>`;
+  } else if(job && job.status === 'failed'){
+    btn.disabled = false;
+    el.innerHTML = `<span style="color:var(--danger,#dc2626)">Quantization failed: ${esc(job.error||'')}</span> <span class="muted">Falls back to bitsandbytes. Click to retry.</span>`;
+  } else if(job && job.status === 'interrupted'){
+    btn.disabled = false;
+    el.innerHTML = `<span style="color:var(--warn,#d97706)">Quantization was interrupted by a server restart.</span> <span class="muted">Click to restart.</span>`;
+  } else {
+    btn.disabled = false;
+    el.innerHTML = `Marlin/ExLlama 4-bit (2–4× faster than bitsandbytes). One-time background job; checkpoint auto-used on next load. <span class="muted">Kernels: ${esc(kernels||'detecting…')}</span>`;
+  }
+}
+
+async function _refreshQuantStatus(modelPath){
+  if(_quantPollTimer){ clearInterval(_quantPollTimer); _quantPollTimer = null; }
+  const caps = await _quantGetCaps();
+  const path = modelPath || (document.getElementById('cfg-path')||{}).value || '';
+  let job = (caps.jobs && caps.jobs[path]) || null;
+  _renderQuantStatus(job, caps);
+  // Poll while a job is running.
+  if(caps.available){
+    _quantPollTimer = setInterval(async ()=>{
+      try{
+        const r = await fetch('/admin/api/quantize-status?model_id='+encodeURIComponent(path));
+        const j = await r.json();
+        _renderQuantStatus(j.job, caps);
+        if(!j.job || (j.job.status !== 'running')){ clearInterval(_quantPollTimer); _quantPollTimer = null; }
+      }catch(e){ clearInterval(_quantPollTimer); _quantPollTimer = null; }
+    }, 2000);
+  }
+}
+
+async function startQuantize(){
+  const path = (document.getElementById('cfg-path')||{}).value || '';
+  if(!path){ showAlert('No model selected.'); return; }
+  const method = (document.getElementById('cfg-quant-backend').value === 'awq') ? 'awq' : 'gptq';
+  const el = document.getElementById('cfg-quant-status');
+  if(el) el.innerHTML = '<span class="muted">Starting quantization…</span>';
+  try{
+    const r = await fetch('/admin/api/model-quantize', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path, method})
+    });
+    const j = await r.json();
+    if(!j.success && j.job && j.job.status === 'unavailable'){
+      _renderQuantStatus(null, {available:false, capabilities:j.job.caps||{}});
+      return;
+    }
+    _refreshQuantStatus(path);
+  }catch(e){
+    if(el) el.innerHTML = '<span style="color:var(--danger,#dc2626)">Failed to start: '+esc(String(e))+'</span>';
+  }
+}
+
 function _renderWhisperServerRows(models){
   if(!models.length) return '';
   const rows = models.map(m=>{
@@ -2148,7 +2357,8 @@ async function loadCachedModels(){
         const idx = _localModels.length;
         _localModels.push({label:m.id, path:m.id, cacheType:'hf', size_gb:m.size_gb||0,
           defaultType:m.model_type||'text_models', settings:m.settings||{}, in_config:m.in_config,
-          capabilities:m.capabilities||[], incomplete:!!m.incomplete, configs:m.configs||[]});
+          capabilities:m.capabilities||[], incomplete:!!m.incomplete, configs:m.configs||[],
+          missing:!!m.missing, to_download:!!m.to_download, source_repo:m.source_repo||m.id});
         const loaded = _loadedKeys.has(m.id) || [..._loadedKeys].some(k=>k.endsWith(':'+m.id)||k===m.id);
         const capBadges = fmtCapabilities(m.capabilities||[]);
         const _hfLm = _localModels[idx];
@@ -2158,21 +2368,28 @@ async function loadCachedModels(){
         const instBadgeHf = m.in_config ? _instanceBadge([m.id], _hfCfgMax) : '';
         const hlHf = _highlightCap && (m.capabilities||[]).includes(_highlightCap);
         const incompleteBadgeHf = m.incomplete ? '<span class="badge" style="background:rgba(255,160,0,.18);color:#b87200;font-size:10px;margin-left:.3rem" title="Download may be incomplete — some files are missing or truncated">⚠ incomplete</span>' : '';
+        const toDlHf = !!m.to_download;
+        const missingBadgeHf = toDlHf
+          ? ' <span class="badge" style="background:rgba(80,140,220,.18);color:#4a86c7;font-size:10px" title="Listed for download — not yet downloaded or configured">⬇ to download</span>'
+          : (m.missing ? ' <span class="badge" style="background:rgba(220,50,50,.18);color:#e05555;font-size:10px" title="Files removed from disk to free space — re-download to restore">✕ on disk: freed</span>' : '');
         const _hfConfigCount = _hfConfigs.length;
-        return `<tr${hlHf?' class="local-cap-highlight"':''} style="border-top:1px solid var(--border)${hlHf?';background:rgba(110,207,126,.07);outline:2px solid rgba(110,207,126,.25);outline-offset:-1px':''}${m.incomplete?';background:rgba(255,160,0,.04)':''}">
-          <td style="padding:.4rem .25rem;font-family:monospace;font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis" title="${esc(m.id)}">${esc(m.id)}${incompleteBadgeHf}${_hfConfigPills}</td>
-          <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${fmtGB(m.size_gb)}</td>
-          <td style="text-align:right;padding:.4rem .25rem;color:var(--text-2)">${m.file_count}</td>
+        const rowBgHf = m.missing ? ';background:rgba(220,50,50,.04);outline:1px solid rgba(220,50,50,.2);outline-offset:-1px' : (m.incomplete?';background:rgba(255,160,0,.04)':'');
+        return `<tr${hlHf?' class="local-cap-highlight"':''} style="border-top:1px solid var(--border)${hlHf?';background:rgba(110,207,126,.07);outline:2px solid rgba(110,207,126,.25);outline-offset:-1px':''}${rowBgHf}">
+          <td style="padding:.4rem .25rem;font-family:monospace;font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis" title="${esc(m.id)}">${esc(m.id)}${missingBadgeHf}${incompleteBadgeHf}${_quantBadge(m.id)}${_hfConfigPills}</td>
+          <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${m.missing?'<span class="muted small">—</span>':fmtGB(m.size_gb)}</td>
+          <td style="text-align:right;padding:.4rem .25rem;color:var(--text-2)">${m.missing?'<span class="muted small">—</span>':m.file_count}</td>
           <td style="padding:.4rem .25rem;font-size:11px">${capBadges||'<span class="muted small">—</span>'}</td>
-          <td style="text-align:center;padding:.4rem .25rem">${m.in_config?`<span class="badge badge-ok">enabled${_hfConfigCount>1?` ×${_hfConfigCount}`:''}</span>${instBadgeHf?'<br>'+instBadgeHf:''}`:' <span class="muted small">—</span>'}</td>
+          <td style="text-align:center;padding:.4rem .25rem">${toDlHf?'<span class="badge" style="background:rgba(80,140,220,.18);color:#4a86c7">to download</span>':(m.in_config?`<span class="badge ${m.missing?'badge-err':'badge-ok'}">enabled${_hfConfigCount>1?` ×${_hfConfigCount}`:''}</span>${instBadgeHf?'<br>'+instBadgeHf:''}`:' <span class="muted small">—</span>')}</td>
           <td style="padding:.4rem .25rem;text-align:right;white-space:nowrap">
-            ${m.in_config?(loaded
+            ${m.in_config&&!m.missing?(loaded
               ?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="unloadModel(${idx})">Unload</button>`
               :`<button class="btn btn-primary btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="loadModel(${idx})">Load now</button>`):''}
+            <button class="btn ${toDlHf?'btn-warn':'btn-ghost'} btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openDownloadFor('${esc(m.id)}')" title="${m.missing?'Re-download to restore this model':'Download from HuggingFace'}">⬇ ${toDlHf?'Download':'Re-download'}</button>
             <button class="btn btn-secondary btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openCfgModal(${idx},0)">${m.in_config?'Configure':'Add'}</button>
             ${m.in_config?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="disableModel(${idx})">Remove</button>`:''}
-            <button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openDownloadFor('${esc(m.id)}')" title="Re-download from HuggingFace">⬇ Re-download</button>
-            <button class="btn btn-danger btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="deleteModelConfirm(${idx})">Delete</button>
+            ${toDlHf?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="unmarkDownload(${idx})" title="Remove this model from the download list">✕ Remove from list</button>`:''}
+            ${!m.missing&&!toDlHf?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="freeDiskConfirm(${idx})" title="Delete files from disk to save space, but keep this model in the list so you can re-download it later">🗑 Free disk</button>`:''}
+            ${!m.missing&&!toDlHf?`<button class="btn btn-danger btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="deleteModelConfirm(${idx})">Delete</button>`:''}
           </td>
         </tr>`;
       });
@@ -2208,7 +2425,7 @@ async function loadCachedModels(){
           capabilities:f.capabilities||[], ggufGroup:[f],
           source_repo:f.source_repo||'',
           incomplete:!!f.incomplete,
-          missing:!!f.missing,
+          missing:!!f.missing, to_download:!!f.to_download,
           configured_path:f.configured_path||'',
           configs:f.configs||[]});
         const loaded = _loadedKeys.has(f.path) || _loadedKeys.has(f.filename) ||
@@ -2219,10 +2436,16 @@ async function loadCachedModels(){
         const instBadge   = f.in_config ? _instanceBadge([f.path, f.filename], _cfgMax) : '';
         const quantBadge  = quant ? `<span class="badge badge-user" style="font-size:10px;padding:.1rem .3rem;margin-left:.3rem">${esc(quant)}</span>` : '';
         const hl          = _highlightCap && (f.capabilities||[]).includes(_highlightCap);
-        const missingBadge = f.missing ? ' <span class="badge" style="background:rgba(220,50,50,.18);color:#e05555;font-size:10px" title="File not found at configured path — re-download or remove this configuration">✕ file missing</span>' : '';
+        const toDlGg = !!f.to_download;
+        const missingBadge = toDlGg
+          ? ' <span class="badge" style="background:rgba(80,140,220,.18);color:#4a86c7;font-size:10px" title="Listed for download — not yet downloaded or configured">⬇ to download</span>'
+          : (f.missing ? ' <span class="badge" style="background:rgba(220,50,50,.18);color:#e05555;font-size:10px" title="File not found at configured path — re-download or remove this configuration">✕ file missing</span>' : '');
         const incompleteBadge = f.incomplete ? ' <span class="badge" style="background:rgba(255,160,0,.18);color:#b87200;font-size:10px" title="Download may be incomplete">⚠ incomplete</span>' : '';
         const redownloadTarget  = f.source_repo || '';
-        const redownloadPattern = f.source_repo ? f.filename : '';
+        // Only pass a file pattern when it's a concrete .gguf filename; for
+        // known-but-never-downloaded entries (repo id only) leave it blank so
+        // Re-download opens the browse modal to pick a quant.
+        const redownloadPattern = (f.source_repo && /\.gguf$/i.test(f.filename||'')) ? f.filename : '';
         const configPills = _renderConfigPills(idx, lm);
         const configCount = (lm.configs||[]).length;
         const rowBg = f.missing ? ';background:rgba(220,50,50,.04);outline:1px solid rgba(220,50,50,.2);outline-offset:-1px'
@@ -2231,17 +2454,19 @@ async function loadCachedModels(){
           <td style="padding:.4rem .25rem;font-family:monospace;font-size:11px;max-width:280px;overflow:hidden;text-overflow:ellipsis" title="${esc(f.path)}">${esc(base)}${quantBadge}${missingBadge}${incompleteBadge}${configPills}</td>
           <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${f.missing?'<span class="muted small">—</span>':fmtGB(f.size_gb)}</td>
           <td style="padding:.4rem .25rem;font-size:11px">${capBadges||'<span class="muted small">—</span>'}</td>
-          <td style="text-align:center;padding:.4rem .25rem">${f.in_config?`<span class="badge ${f.missing?'badge-err':'badge-ok'}">enabled${configCount>1?` ×${configCount}`:''}</span>${instBadge?'<br>'+instBadge:''}`:' <span class="muted small">—</span>'}</td>
+          <td style="text-align:center;padding:.4rem .25rem">${toDlGg?'<span class="badge" style="background:rgba(80,140,220,.18);color:#4a86c7">to download</span>':(f.in_config?`<span class="badge ${f.missing?'badge-err':'badge-ok'}">enabled${configCount>1?` ×${configCount}`:''}</span>${instBadge?'<br>'+instBadge:''}`:' <span class="muted small">—</span>')}</td>
           <td style="padding:.4rem .25rem;text-align:right;white-space:nowrap">
             ${f.in_config&&!f.missing?(loaded
               ?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="unloadModel(${idx})">Unload</button>`
               :`<button class="btn btn-primary btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="loadModel(${idx})">Load now</button>`):''}
             ${f.missing
-              ?`<button class="btn btn-warn btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openDownloadFor('${esc(redownloadTarget)}','${esc(redownloadPattern)}')" title="Re-download to restore this model">⬇ Re-download</button>`
+              ?`<button class="btn btn-warn btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openDownloadFor('${esc(redownloadTarget)}','${esc(redownloadPattern)}')" title="${toDlGg?'Download this model':'Re-download to restore this model'}">⬇ ${toDlGg?'Download':'Re-download'}</button>`
               :`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openDownloadFor('${esc(redownloadTarget)}','${esc(redownloadPattern)}')" title="${redownloadTarget?'Re-download from HuggingFace':'Download a replacement'}">⬇ Re-download</button>`}
             <button class="btn btn-secondary btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openCfgModal(${idx},0)">${f.in_config?'Configure':'Add'}</button>
             ${f.in_config?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="disableModel(${idx})">Remove</button>`:''}
-            ${!f.missing?`<button class="btn btn-danger btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="deleteModelConfirm(${idx})">Delete</button>`:''}
+            ${toDlGg?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="unmarkDownload(${idx})" title="Remove this model from the download list">✕ Remove from list</button>`:''}
+            ${!f.missing&&!toDlGg&&(f.in_config||redownloadTarget)?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="freeDiskConfirm(${idx})" title="Delete this file from disk to save space, but keep it in the list so you can re-download it later">🗑 Free disk</button>`:''}
+            ${!f.missing&&!toDlGg?`<button class="btn btn-danger btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="deleteModelConfirm(${idx})">Delete</button>`:''}
           </td>
         </tr>`;
       });
@@ -2269,9 +2494,33 @@ async function loadCachedModels(){
     const wsHtml = _renderWhisperServerRows(whisperModels);
     if(wsHtml) ggufEl.insertAdjacentHTML('afterend', wsHtml);
     resetWhisperServerBuilderDefaults();
+    applyLocalFilter();
   }catch(e){
     hfEl.innerHTML = ggufEl.innerHTML = `<span class="muted small">Error: ${esc(e.message)}</span>`;
   }
+}
+
+// Filter HF models, GGUF files and component rows by name match (first cell).
+function applyLocalFilter(){
+  const inp = document.getElementById('local-filter');
+  const q = (inp ? inp.value : '').trim().toLowerCase();
+  [['hf-models-list','hf-model-badge'],
+   ['gguf-models-list','gguf-file-badge'],
+   ['comp-list','comp-badge']].forEach(([listId,badgeId])=>{
+    const el = document.getElementById(listId);
+    if(!el) return;
+    const rows = el.querySelectorAll('tbody > tr');
+    let shown = 0;
+    rows.forEach(tr=>{
+      const cell = tr.querySelector('td');
+      const name = (cell ? cell.textContent : tr.textContent).toLowerCase();
+      const match = !q || name.includes(q);
+      tr.style.display = match ? '' : 'none';
+      if(match) shown++;
+    });
+    const badge = document.getElementById(badgeId);
+    if(badge && rows.length){ badge.textContent = q ? `(${shown}/${rows.length})` : `(${rows.length})`; }
+  });
 }
 
 function toggleWhisperModelSource(){
@@ -2331,13 +2580,49 @@ function _instanceBadge(lookupPaths, cfgMax){
   return '';
 }
 
+// ---- Quant-job badges on the model list (polled; re-renders only on change) ----
+let _quantJobs = {};
+let _quantSig = '';
+async function refreshQuantJobs(){
+  try{
+    const r = await fetch('/admin/api/quantize-status');
+    _quantJobs = (await r.json()).jobs || {};
+  }catch(e){ /* keep last-known on transient error */ }
+  // Signature buckets progress to 5% so we only re-render on meaningful change.
+  return Object.entries(_quantJobs)
+    .map(([k,v])=>`${k}:${v.status}:${Math.round((v.progress||0)*20)}`).sort().join('|');
+}
+function _quantBadge(modelId){
+  const j = _quantJobs[modelId];
+  if(!j) return '';
+  const m = esc((j.method||'gptq').toUpperCase());
+  if(j.status==='running'){
+    const pct = Math.round((j.progress||0)*100);
+    return `<span class="badge" style="background:rgba(99,102,241,.18);color:#A5B4FC;font-size:10px;margin-left:.3rem" title="Quantizing to ${m}: ${esc(j.message||'')}">⏳ quantizing ${pct}%</span>`;
+  }
+  if(j.status==='failed') return `<span class="badge badge-err" style="font-size:10px;margin-left:.3rem" title="${esc(j.error||'')} — falls back to bitsandbytes">quant failed</span>`;
+  if(j.status==='interrupted') return `<span class="badge" style="background:rgba(255,160,0,.18);color:#b87200;font-size:10px;margin-left:.3rem" title="Interrupted by a server restart — re-run from the model config">quant interrupted</span>`;
+  if(j.status==='done') return `<span class="badge badge-ok" style="font-size:10px;margin-left:.3rem" title="Fast-kernel ${m} checkpoint ready — used automatically on next load">4-bit ready</span>`;
+  return '';
+}
+
 async function refreshLocal(){
   await refreshLoadedStatus();
+  _quantSig = await refreshQuantJobs();
   loadCacheStats();
   loadCachedModels();
 }
 
+// Poll quant jobs; re-render the list only when a job's state/progress changes.
+setInterval(async () => {
+  const sig = await refreshQuantJobs();
+  if (sig !== _quantSig) { _quantSig = sig; loadCachedModels(); }
+}, 5000);
+
 loadGlobalSettings();
+// Load engine/card info first so the per-model card tags render on the first paint,
+// then re-render once it's available (covers the fetch resolving after the list).
+_loadEngineInfo().then(() => loadCachedModels());
 refreshLocal();
 
 // Toggle the acceleration / TurboQuant sections as model types are checked/unchecked.
@@ -2401,7 +2686,7 @@ async function clearCacheConfirm(type){
 
 async function deleteModelConfirm(idx){
   const m = _localModels[idx];
-  if(!m){ alert('Error: model not found — please refresh the page.'); return; }
+  if(!m){ showAlert('Error: model not found — please refresh the page.'); return; }
   const extra = m.in_config ? ' It will also be removed from your configuration.' : '';
   if(!await showConfirm('Delete model', `Delete "${m.label}" from local cache? This cannot be undone.${extra}`, 'Delete')) return;
   try{
@@ -2422,8 +2707,44 @@ async function deleteModelConfirm(idx){
     const r = await fetch(ROOT_PATH + '/admin/api/cached-models/'+encodeURIComponent(idForUrl)+'?cache_type='+m.cacheType, {method:'DELETE'});
     const d = await r.json();
     if(d.success) refreshLocal();
-    else alert('Error: '+(d.detail||d.error||'Unknown'));
-  }catch(e){alert('Error: '+e.message)}
+    else showAlert('Error: '+(d.detail||d.error||'Unknown'));
+  }catch(e){showAlert('Error: '+e.message)}
+}
+
+// Delete a model's files from disk to reclaim space while keeping its config
+// entry, so it can be re-downloaded later. The model then shows as "freed" with
+// a Re-download button.
+async function freeDiskConfirm(idx){
+  const m = _localModels[idx];
+  if(!m){ showAlert('Error: model not found — please refresh the page.'); return; }
+  // Re-download target: stored source repo, or the model id itself for HF repos.
+  const repo = m.source_repo || (m.cacheType==='hf' ? m.path : '');
+  const warn = repo ? '' : ' Note: no source repository is known for this file, so you may need to locate it manually to re-download.';
+  const extra = m.in_config ? '' : ' It will stay in your model list as “to download” so you can fetch it again later.';
+  if(!await showConfirm('Free disk space',
+      `Delete "${m.label}" from disk to save space, but keep it in your model list so you can re-download it when needed?${extra}${warn}`,
+      'Free disk')) return;
+  try{
+    // Unconfigured models only appear in the list because they are on disk; record
+    // them in the "to download" wishlist first so the entry survives the file
+    // deletion and stays listed (as non-configured / to be downloaded).
+    if(!m.in_config){
+      const er = await fetch(ROOT_PATH + '/admin/api/model-mark-download', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({model_id: repo || m.path, source_repo: repo || m.path,
+          model_type:m.defaultType||'text_models', is_gguf: m.cacheType==='gguf'})
+      });
+      const ed = await er.json().catch(()=>({}));
+      if(!ed.success){ showAlert('Error: '+(ed.detail||ed.error||'could not record model for re-download')); return; }
+    }
+    const r = await fetch(ROOT_PATH + '/admin/api/model-free-disk', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({path:m.path, cache_type:m.cacheType, source_repo:repo})
+    });
+    const d = await r.json();
+    if(d.success) refreshLocal();
+    else showAlert('Error: '+(d.detail||d.error||'Unknown'));
+  }catch(e){showAlert('Error: '+e.message)}
 }
 
 /* ── type checkbox helpers ─────────────────────────────── */
@@ -2542,7 +2863,7 @@ async function saveWhisperServerEdit() {
   const model_id = document.getElementById('wse-model-id').value;
   const model_source = document.getElementById('wse-model-source').value;
   const model_path = _getWseModelPath();
-  if (!model_path) { alert('Model path is required'); return; }
+  if (!model_path) { showAlert('Model path is required'); return; }
   const payload = {
     model_id,
     backend: 'whisper-server',
@@ -2563,12 +2884,81 @@ async function saveWhisperServerEdit() {
     if (!r.ok) throw new Error(d.detail || 'Failed to save');
     closeModal('ws-edit-modal');
     refreshLocal();
-  } catch(e) { alert('Error: ' + e.message); }
+  } catch(e) { showAlert('Error: ' + e.message); }
 }
 
 function openCfgModalNew(idx) {
   // Open modal for a brand-new config (no config_id) on an existing model
   openCfgModal(idx, -1);
+}
+
+// GGUF (llama.cpp) vs transformers models use different memory controls. GGUF
+// offloads via "GPU layers" (n_gpu_layers); the transformers "Offload" strategy
+// (device_map / disk offload) and GPTQ/AWQ fast-quant don't apply to it. Show
+// only the relevant controls so the config can't be set in a way the backend
+// ignores.
+function _applyBackendCfgVisibility(m){
+  const isGguf = (m && (m.cacheType === 'gguf'
+      || /\.gguf(\?|$)/i.test(m.path || m.id || '')
+      || (typeof looksLikeGguf === 'function' && looksLikeGguf(m.path || m.id || '', ''))));
+  const show = (id, on) => { const el = document.getElementById(id); if (el) el.style.display = on ? '' : 'none'; };
+  // transformers-only sections — hidden for GGUF/llama.cpp models
+  show('cfg-offload-title', !isGguf);
+  show('cfg-offload-grid', !isGguf);
+  show('cfg-fastquant-wrap', !isGguf);
+  // GGUF/llama.cpp-only controls — hidden for transformers models
+  show('cfg-gpu-layers-row', isGguf);
+  show('cfg-kv-k-row', isGguf);
+  show('cfg-kv-v-row', isGguf);
+  // mmproj pairing only applies to GGUF text models on llama.cpp.
+  show('cfg-mmproj-row', isGguf);
+}
+
+// Populate the mmproj (multimodal projector) select from the available component
+// GGUF files. Auto-selects the projector that best matches this model's name when
+// the config hasn't explicitly chosen one (mmproj is enabled by default when a
+// matching projector exists — e.g. gemma vision).
+function _populateMmprojSelect(m, s){
+  const sel = document.getElementById('cfg-mmproj');
+  if(!sel) return;
+  // All cached GGUF component files classified as mmproj projectors.
+  const projFiles = (_ggufFiles || []).filter(f => {
+    const role = _detectCompRole(f.filename);
+    return role && role.key === 'mmproj';
+  });
+  const cur = (s && s.mmproj) || '';
+  // Score each projector by shared name tokens with the model, so the gemma
+  // projector pairs with the gemma model rather than an unrelated one.
+  const modelName = (_ggufBaseName(m.label || m.path || '') || '').toLowerCase();
+  const tokens = modelName.split(/[^a-z0-9]+/).filter(t => t.length >= 3);
+  const score = (fname) => {
+    const n = fname.toLowerCase();
+    return tokens.reduce((acc, t) => acc + (n.includes(t) ? 1 : 0), 0);
+  };
+  let best = '', bestScore = 0;
+  const opts = ['<option value="">None</option>'];
+  for(const f of projFiles){
+    const sc = score(f.filename);
+    if(sc > bestScore){ bestScore = sc; best = f.path; }
+    opts.push(`<option value="${esc(f.path)}">${esc(f.filename)} (${fmtGB(f.size_gb)})</option>`);
+  }
+  sel.innerHTML = opts.join('');
+  // Selection priority: explicit config value → best name match (enabled by
+  // default) → None.
+  sel.value = cur || (bestScore > 0 ? best : '');
+  // If the stored value isn't among the current options (file removed), fall back.
+  if(cur && sel.value !== cur) sel.value = (bestScore > 0 ? best : '');
+  _onMmprojChange();
+}
+
+// Selecting an mmproj projector adds image/vision input, so reflect that in the
+// model's capabilities (so vision requests route to it). Only auto-checks; never
+// auto-unchecks a capability the user set for other reasons.
+function _onMmprojChange(){
+  const sel = document.getElementById('cfg-mmproj');
+  if(!sel || !sel.value) return;
+  const cap = document.querySelector('.cfg-cap-cb[value="image_to_text"]');
+  if(cap && !cap.checked){ cap.checked = true; }
 }
 
 function openCfgModal(idx, cfgIdx){
@@ -2707,6 +3097,7 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-n-ctx').value = nCtxForEst;
   document.getElementById('cfg-cache-type-k').value = s.cache_type_k || '';
   document.getElementById('cfg-cache-type-v').value = s.cache_type_v || '';
+  _populateMmprojSelect(m, s);
   document.getElementById('cfg-max-instances').value = s.max_instances != null ? s.max_instances : 1;
   document.getElementById('cfg-preload-all-instances').checked = !!s.preload_all_instances;
   _updatePreloadAllVisibility();
@@ -2726,11 +3117,15 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-ram-gb').value = s.manual_ram_gb != null ? s.manual_ram_gb : '';
   document.getElementById('cfg-4bit').checked = !!s.load_in_4bit;
   document.getElementById('cfg-8bit').checked = !!s.load_in_8bit;
+  document.getElementById('cfg-quant-backend').value = s.quant_backend || 'auto';
+  _refreshQuantStatus(m.path);
   _renderComponentQuant(s.component_quantization || {});
   document.getElementById('cfg-flash').checked = !!s.flash_attention;
   document.getElementById('cfg-noram').checked = !!s.no_ram;
   document.getElementById('cfg-offload-strategy').value = s.offload_strategy || 'auto';
   document.getElementById('cfg-offload-dir').value = s.offload_dir || _defaultOffloadDir;
+  _applyBackendCfgVisibility(m);
+  _populateEnginePin(s.engine || '');
   document.getElementById('cfg-sysprompt').value = s.system_prompt || '';
   document.getElementById('cfg-parser').value = s.parser || (!m.in_config ? _autoDetectParser(m.path) : 'auto');
   document.getElementById('cfg-tools').checked = !!s.tools_closer_prompt;
@@ -3024,7 +3419,22 @@ async function removeThisConfig(){
     }
     closeModal('cfg-modal');
     loadCachedModels();
-  } catch(e) { alert('Error: ' + e.message); }
+  } catch(e) { showAlert('Error: ' + e.message); }
+}
+
+// Engine-pin field: populate the datalist from declared engines and only show the
+// row when more than one engine is configured (single-engine setups don't need it).
+async function _populateEnginePin(desired){
+  const row = document.getElementById('cfg-engine-row');
+  const sel = document.getElementById('cfg-engine');
+  try {
+    if (!_engineNames || !_engineNames.length) await _loadEngineInfo();
+    const want = (desired !== undefined) ? desired : sel.value;
+    sel.querySelectorAll('option:not([value=""])').forEach(o => o.remove());
+    _engineNames.forEach(n => { const o=document.createElement('option'); o.value=n; o.textContent=n; sel.appendChild(o); });
+    sel.value = want || '';   // set AFTER options exist so the selection sticks
+    row.style.display = _engineNames.length > 1 ? '' : 'none';
+  } catch(e) { row.style.display = 'none'; }
 }
 
 async function saveModelConfig(){
@@ -3054,15 +3464,18 @@ async function saveModelConfig(){
     n_ctx:             parseInt(document.getElementById('cfg-n-ctx').value) || 2048,
     cache_type_k:      document.getElementById('cfg-cache-type-k').value || null,
     cache_type_v:      document.getElementById('cfg-cache-type-v').value || null,
+    mmproj:            document.getElementById('cfg-mmproj').value || null,
     max_gpu_percent:   isNaN(maxGpu) ? null : maxGpu,
     manual_ram_gb:     isNaN(ramGb) ? null : ramGb,
     load_in_4bit:      document.getElementById('cfg-4bit').checked,
     load_in_8bit:      document.getElementById('cfg-8bit').checked,
+    quant_backend:     document.getElementById('cfg-quant-backend').value || 'auto',
     component_quantization: _collectComponentQuant(),
     flash_attention:   document.getElementById('cfg-flash').checked,
     no_ram:            document.getElementById('cfg-noram').checked,
     offload_strategy:  document.getElementById('cfg-offload-strategy').value,
     offload_dir:       document.getElementById('cfg-offload-dir').value.trim() || './offload',
+    engine:            document.getElementById('cfg-engine').value.trim() || null,
     system_prompt:     document.getElementById('cfg-sysprompt').value.trim() || null,
     parser:            document.getElementById('cfg-parser').value,
     tools_closer_prompt: document.getElementById('cfg-tools').checked,
@@ -3094,9 +3507,14 @@ async function saveModelConfig(){
       body: JSON.stringify(data)
     });
     const d = await r.json();
-    if(d.success){ closeModal('cfg-modal'); loadCachedModels(); }
-    else alert('Error: '+(d.detail||'Unknown'));
-  }catch(e){ alert('Error: '+e.message); }
+    if(d.success){
+      if (d.warnings && d.warnings.length) {
+        showAlert('Saved, but check this:\n\n• ' + d.warnings.join('\n• '));
+      }
+      closeModal('cfg-modal'); loadCachedModels();
+    }
+    else showAlert('Error: '+(d.detail||'Unknown'));
+  }catch(e){ showAlert('Error: '+e.message); }
 }
 
 async function addWhisperServerModel(){
@@ -3136,7 +3554,7 @@ async function addWhisperServerModel(){
     document.getElementById('ws-submit-btn').textContent = 'Add model';
     toggleWhisperModelSource();
     refreshLocal();
-  }catch(e){ alert('Error: '+e.message); }
+  }catch(e){ showAlert('Error: '+e.message); }
 }
 
 toggleWhisperModelSource();
@@ -3153,8 +3571,8 @@ async function loadModel(idx){
     });
     const d = await r.json();
     if(d.success) refreshLocal();
-    else{ if(btn){ btn.disabled=false; btn.textContent='Load now'; } alert('Error: '+(d.detail||'Unknown')); }
-  }catch(e){ if(btn){ btn.disabled=false; btn.textContent='Load now'; } alert('Error: '+e.message); }
+    else{ if(btn){ btn.disabled=false; btn.textContent='Load now'; } showAlert('Error: '+(d.detail||'Unknown')); }
+  }catch(e){ if(btn){ btn.disabled=false; btn.textContent='Load now'; } showAlert('Error: '+e.message); }
 }
 
 async function unloadModel(idx){
@@ -3166,14 +3584,21 @@ async function unloadModel(idx){
     });
     const d = await r.json();
     if(d.success) refreshLocal();
-    else alert('Error: '+(d.detail||'Unknown'));
-  }catch(e){ alert('Error: '+e.message); }
+    else showAlert('Error: '+(d.detail||'Unknown'));
+  }catch(e){ showAlert('Error: '+e.message); }
 }
 
-async function disableModel(idx){
+async function disableModel(idx, keepReference){
   const m = _localModels[idx];
-  if(!m){ alert('Error: model not found — please refresh the page.'); return; }
-  if(!await showConfirm('Remove model', 'Remove this model from CoderAI config? It will stay in the local cache.', 'Remove')) return;
+  if(!m){ showAlert('Error: model not found — please refresh the page.'); return; }
+  // A freed (missing) model has no files left, so removing its config would make
+  // it vanish entirely. keepReference strips the serving config but re-adds a bare
+  // known reference so it stays in the list and remains re-downloadable.
+  const keep = keepReference || !!m.missing;
+  const msg = keep
+    ? 'Remove this model\'s configuration? It will stay in your list as a known model you can re-download later.'
+    : 'Remove this model from CoderAI config? It will stay in the local cache.';
+  if(!await showConfirm('Remove model', msg, 'Remove')) return;
   try{
     // Collect all paths that are marked in_config for this model (covers quant groups)
     const paths = m.ggufGroup
@@ -3192,15 +3617,43 @@ async function disableModel(idx){
         throw new Error(msg);
       }
     }
+    if(keep){
+      // No files left on disk — record the model in the "to download" wishlist so
+      // it survives config removal and stays listed as non-configured / to-download.
+      const repo = m.source_repo || (m.cacheType==='hf' ? m.path : '');
+      await fetch(ROOT_PATH + '/admin/api/model-mark-download', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({model_id: repo || m.path, source_repo: repo || m.path,
+          model_type: m.defaultType || 'text_models', is_gguf: m.cacheType==='gguf'})
+      });
+    }
     loadCachedModels();
-  }catch(e){ alert('Error: '+e.message); }
+  }catch(e){ showAlert('Error: '+e.message); }
+}
+
+// Drop a model from the "to download" wishlist (it should no longer be listed).
+async function unmarkDownload(idx){
+  const m = _localModels[idx];
+  if(!m){ showAlert('Error: model not found — please refresh the page.'); return; }
+  if(!await showConfirm('Remove from list',
+      `Remove "${m.label}" from your download list? It will no longer appear here until you add or download it again.`,
+      'Remove')) return;
+  try{
+    const r = await fetch(ROOT_PATH + '/admin/api/model-unmark-download', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({model_id: m.source_repo || m.path})
+    });
+    const d = await r.json().catch(()=>({}));
+    if(d.success) refreshLocal();
+    else showAlert('Error: '+(d.detail||d.error||'Unknown'));
+  }catch(e){ showAlert('Error: '+e.message); }
 }
 
 async function startUpload(){
   const fileInput = document.getElementById('upload-file');
   const file = fileInput.files[0];
-  if(!file){ alert('Please select a file'); return; }
-  if(!file.name.endsWith('.gguf')){ alert('Only .gguf files are supported'); return; }
+  if(!file){ showAlert('Please select a file'); return; }
+  if(!file.name.endsWith('.gguf')){ showAlert('Only .gguf files are supported'); return; }
 
   document.getElementById('upload-form').style.display='none';
   document.getElementById('upload-progress').style.display='block';
@@ -3225,7 +3678,7 @@ async function startUpload(){
     try{
       const r = await fetch(ROOT_PATH + '/admin/api/model-upload',{method:'POST', body:formData});
       const d = await r.json();
-      if(!d.success){ alert('Upload failed: '+(d.detail||'Unknown')); return; }
+      if(!d.success){ showAlert('Upload failed: '+(d.detail||'Unknown')); return; }
 
       const pct = Math.round((i+1)/totalChunks*100);
       document.getElementById('upload-bar').style.width = pct+'%';
@@ -3243,7 +3696,7 @@ async function startUpload(){
         }, 1500);
         return;
       }
-    }catch(e){ alert('Upload error: '+e.message); return; }
+    }catch(e){ showAlert('Upload error: '+e.message); return; }
   }
 }
 </script>

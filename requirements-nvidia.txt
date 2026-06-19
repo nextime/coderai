@@ -58,6 +58,23 @@ tiktoken>=0.5.0
 tokenizers>=0.15.0
 protobuf>=3.20.0
 
+# Optional: fast-kernel 4-bit quantization (GPTQ/AWQ via Marlin/ExLlama).
+# Much faster than bitsandbytes NF4, especially for MoE models. coderai uses this
+# for the per-model `quant_backend` (auto|bnb|gptq|awq) and the on-demand
+# "Quantize to 4-bit" button on the model admin page. The feature auto-detects
+# GPTQModel and falls back to bitsandbytes when it (or its kernels) are absent.
+#
+# On bleeding-edge stacks (e.g. CUDA 13 + torch 2.11) install the LATEST from
+# source for new-arch support (e.g. gemma-4 MoE). GPTQModel 7.x is a pure-Python
+# wheel (no CUDA compile) but pins numpy==2.2.6 in its metadata; do NOT let that
+# downgrade a newer numpy your stack needs — install with the deps below and a
+# numpy constraint, e.g.:
+#   pip install --no-deps "git+https://github.com/ModelCloud/GPTQModel.git"
+#   pip install -c <(echo "numpy==<your-version>") \
+#       torchao device-smi tokenicer logbar pypcre defuser maturin
+# gptqmodel>=7.1.0
+# torchao>=0.16.0
+
 # llama-cpp-python with CUDA support (for GGUF files on CUDA backend)
 llama-cpp-python>=0.2.0
 

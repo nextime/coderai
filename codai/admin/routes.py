@@ -16,6 +16,7 @@
 
 """Admin dashboard routes."""
 from pathlib import Path
+import asyncio
 import re
 import shutil
 from typing import Optional
@@ -48,13 +49,42 @@ _download_cancelled: set = set()  # session_ids the user has requested to cancel
 _download_procs: dict = {}    # session_id → multiprocessing.Process running the download
 
 
+def _worker_preexec():
+    """Child preexec: die with the parent (PR_SET_PDEATHSIG=SIGKILL).
+
+    Download workers are spawned as plain subprocesses; without this they survive a
+    server/engine restart as orphans, keep holding huggingface_hub's per-blob file
+    lock, and make the next re-download deadlock at 0%. Tying their lifetime to the
+    parent means a restart cleans them up, and the re-download resumes from the
+    ``.incomplete`` blob cleanly."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").prctl(1, 9, 0, 0, 0)  # PR_SET_PDEATHSIG, SIGKILL
+    except Exception:
+        pass
+
+
 def get_active_download_model_ids() -> set:
     """Return the set of model IDs whose download is currently in progress."""
     return {
         s["model_id"]
         for s in _download_status.values()
-        if s.get("status") == "downloading"
+        if s.get("status") in ("starting", "downloading")
     }
+
+
+def _active_download_session(model_id: str, file_pattern: str):
+    """Return the session_id of a live download for this exact (model_id, pattern),
+    or None. Used to dedup re-download clicks: a second worker for a model already
+    downloading would only block on huggingface_hub's per-blob file lock and sit at
+    0% forever, so we attach the new client to the running download instead."""
+    for sid, s in _download_status.items():
+        if (s.get("model_id") == model_id
+                and (s.get("file_pattern") or "") == (file_pattern or "")
+                and s.get("status") in ("starting", "downloading")
+                and sid in _download_sessions):
+            return sid
+    return None
 
 
 def _url(request: Request, path: str) -> str:
@@ -796,7 +826,8 @@ def _run_download_thread(session_id: str, model_id: str, file_pattern: str, pq):
     import time
     import os
 
-    status = {"session_id": session_id, "model_id": model_id, "status": "starting",
+    status = {"session_id": session_id, "model_id": model_id, "file_pattern": file_pattern,
+              "status": "starting", "started_at": time.time(),
               "percent": 0, "filename": "", "rate": 0, "eta": None}
     _download_status[session_id] = status
 
@@ -830,54 +861,94 @@ def _run_download_thread(session_id: str, model_id: str, file_pattern: str, pq):
     # JSON lines on stdout, which we relay onto this session's SSE queue.
     import subprocess as _sp
     import sys as _sys
+    import collections as _collections
+    import pathlib as _pathlib
 
-    proc = _sp.Popen(
-        [_sys.executable, "-m", "codai.admin.download_worker", model_id, file_pattern or ""],
-        stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True, bufsize=1,
-    )
-    _download_procs[session_id] = proc
+    # The worker runs as `python -m codai.admin.download_worker`; when coderai is
+    # run from source (not pip-installed) the child won't find the `codai`
+    # package unless the repo root is on its path. routes.py lives at
+    # <repo>/codai/admin/routes.py, so parents[2] is the repo root.
+    _repo_root = str(_pathlib.Path(__file__).resolve().parents[2])
 
-    terminal = None  # set to "done"/"error" once the child reports a final event
+    def _attempt(disable_xet: bool):
+        """Spawn the worker once; relay its events. Returns (terminal, rc, tail)."""
+        env = dict(os.environ)
+        env["PYTHONPATH"] = _repo_root + (os.pathsep + env["PYTHONPATH"]
+                                          if env.get("PYTHONPATH") else "")
+        # hf_xet (the accelerated transfer) bypasses our tqdm progress hook — so
+        # the bar freezes near 100% while a big file silently downloads — and can
+        # hard-crash the worker (segfault / signal kill) with no traceback. The
+        # plain HTTPS path reports byte-accurate progress and is reliable, so we
+        # default to it unless the operator explicitly opted in (set
+        # HF_HUB_DISABLE_XET=0). A crash retry always disables it.
+        if disable_xet or os.environ.get("HF_HUB_DISABLE_XET") is None:
+            env["HF_HUB_DISABLE_XET"] = "1"
+        proc = _sp.Popen(
+            [_sys.executable, "-m", "codai.admin.download_worker", model_id, file_pattern or ""],
+            stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True, bufsize=1, env=env, cwd=_repo_root,
+            preexec_fn=_worker_preexec if os.name == "posix" else None,
+        )
+        _download_procs[session_id] = proc
+        terminal = None
+        recent = _collections.deque(maxlen=12)
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    evt = _j.loads(line)
+                except Exception:
+                    # Non-JSON output (warnings / tracebacks) → surface as info
+                    # and keep a tail so a hard crash can report what it printed.
+                    recent.append(line)
+                    push({"type": "info", "message": line})
+                    continue
+                etype = evt.get("type")
+                push(evt)
+                if etype in ("done", "error"):
+                    terminal = etype
+        except Exception as exc:
+            push({"type": "error", "message": str(exc)})
+            terminal = "error"
+        finally:
+            if proc.poll() is None:
+                try:
+                    proc.terminate(); proc.wait(timeout=10)
+                except Exception:
+                    pass
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            _download_procs.pop(session_id, None)
+        return terminal, proc.poll(), " | ".join(list(recent)[-4:]).strip()
+
     try:
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                evt = _j.loads(line)
-            except Exception:
-                # Non-JSON output (warnings / tracebacks) → surface as info.
-                push({"type": "info", "message": line})
-                continue
-            etype = evt.get("type")
-            push(evt)
-            if etype in ("done", "error"):
-                terminal = etype
-    except Exception as exc:
-        push({"type": "error", "message": str(exc)})
-    finally:
-        # Ensure the child is gone (cancel, crash, or normal exit).
-        if proc.poll() is None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=10)
-            except Exception:
-                pass
-        if proc.poll() is None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        _download_procs.pop(session_id, None)
+        terminal, rc, tail = _attempt(disable_xet=False)
+        # A hard crash (no done/error event, not a user cancel) is the classic
+        # hf_xet failure — retry once with Xet disabled before giving up.
+        crashed = (terminal is None and session_id not in _download_cancelled)
+        if crashed and "HF_HUB_DISABLE_XET" not in os.environ:
+            push({"type": "info",
+                  "message": "Transfer crashed; retrying without the Xet accelerator…"})
+            _download_status.get(session_id, {}).update({"status": "downloading", "percent": 0})
+            terminal, rc, tail = _attempt(disable_xet=True)
 
         if terminal is None:
-            # Child ended without a done/error event → cancelled or died.
+            # Still no final event → cancelled or died for good.
             if session_id in _download_cancelled:
                 pq.put({"type": "cancelled", "message": "Download cancelled by user"})
                 _download_status.get(session_id, {}).update({"status": "cancelled"})
             else:
-                push({"type": "error", "message": "Download process exited unexpectedly"})
-
+                detail = f"Download process exited unexpectedly (exit code {rc})"
+                if rc is not None and rc < 0:
+                    detail += f" — killed by signal {-rc} (often out-of-memory)"
+                if tail:
+                    detail += f". Last output: {tail}"
+                push({"type": "error", "message": detail})
+    finally:
         _download_cancelled.discard(session_id)
 
         def _gc():
@@ -899,6 +970,23 @@ async def api_download_model(
 
     if not model_id:
         raise HTTPException(status_code=400, detail="Model ID required")
+
+    # Dedup: if this exact model is already downloading (e.g. the previous attempt
+    # survived a page reload, or the user clicked "download" again), attach to the
+    # live session instead of spawning a second worker. A duplicate worker would
+    # only deadlock on huggingface_hub's per-blob file lock and show 0% forever
+    # while the first worker quietly finishes.
+    existing = _active_download_session(model_id, file_pattern)
+    if existing:
+        return {"session_id": existing, "attached": True}
+
+    # A download supersedes any "to download" wishlist entry for this model.
+    if config_manager is not None:
+        changed = _prune_to_download(model_id)
+        if file_pattern:
+            changed = _prune_to_download(file_pattern) or changed
+        if changed:
+            config_manager.save_models()
 
     session_id = str(_uuid.uuid4())
     pq = _q.Queue()
@@ -995,15 +1083,16 @@ async def api_list_downloads(username: str = Depends(require_admin)):
     return list(_download_status.values())
 
 
-@router.post("/admin/api/download-cancel/{session_id}", summary="Cancel a download")
-async def api_cancel_download(session_id: str, username: str = Depends(require_admin)):
-    """Cancel an active download by terminating its worker process immediately.
+def _cancel_download_session(session_id: str) -> bool:
+    """Cancel an active download by flagging the session and terminating its worker
+    process. Returns False if there is no such download session.
 
     Flagging the session (so the supervisor classifies it as cancelled, not
     failed) and killing the child process tears down every HF chunk connection at
-    once — the supervisor's relay loop then exits cleanly."""
+    once — the supervisor's relay loop then exits cleanly. Shared by the dedicated
+    download-cancel endpoint and the unified Tasks-page cancel path."""
     if session_id not in _download_sessions and session_id not in _download_status:
-        raise HTTPException(status_code=404, detail="Download session not found")
+        return False
     _download_cancelled.add(session_id)
     proc = _download_procs.get(session_id)
     if proc is not None and proc.poll() is None:
@@ -1011,6 +1100,14 @@ async def api_cancel_download(session_id: str, username: str = Depends(require_a
             proc.terminate()
         except Exception:
             pass
+    return True
+
+
+@router.post("/admin/api/download-cancel/{session_id}", summary="Cancel a download")
+async def api_cancel_download(session_id: str, username: str = Depends(require_admin)):
+    """Cancel an active download by terminating its worker process immediately."""
+    if not _cancel_download_session(session_id):
+        raise HTTPException(status_code=404, detail="Download session not found")
     return {"success": True}
 
 
@@ -1081,6 +1178,58 @@ def _hf_repo_id_from_path(path: str) -> str:
     return ''
 
 
+# Categories that hold real (configured) models in models.json.
+_VALID_MODEL_CATS = {
+    "text_models", "image_models", "audio_models", "gguf_models", "tts_models",
+    "vision_models", "video_models", "audio_gen_models", "embedding_models",
+    "spatial_models",
+}
+
+
+def _entry_key(entry) -> str:
+    """The identifying path/id of a models.json entry (str or dict)."""
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        return entry.get("path") or entry.get("id") or ""
+    return ""
+
+
+def _basename_key(key: str) -> str:
+    import os as _os
+    return _os.path.basename(key) if ("/" in key or _os.sep in key) else key
+
+
+def _is_model_configured(model_id: str) -> bool:
+    """True if model_id is already a configured model (matched by id or basename)."""
+    if config_manager is None:
+        return False
+    fname = _basename_key(model_id)
+    for cat in _VALID_MODEL_CATS:
+        for m in config_manager.models_data.get(cat, []):
+            key = _entry_key(m)
+            if key == model_id or (fname and _basename_key(key) == fname):
+                return True
+    return False
+
+
+def _prune_to_download(model_id: str) -> bool:
+    """Drop any 'to download' wishlist entry matching model_id. Returns True if changed."""
+    if config_manager is None:
+        return False
+    lst = config_manager.models_data.get("to_download")
+    if not lst:
+        return False
+    fname = _basename_key(model_id)
+    kept = [e for e in lst
+            if not (_entry_key(e) == model_id
+                    or (fname and _basename_key(_entry_key(e)) == fname))]
+    if len(kept) != len(lst):
+        config_manager.models_data["to_download"] = kept
+        return True
+    return False
+
+
 def _scan_caches() -> dict:
     import os
     result: dict = {"hf": [], "gguf": []}
@@ -1115,7 +1264,28 @@ def _scan_caches() -> dict:
                     continue
                 if p not in configured_settings:
                     configured_settings[p] = (s, cat)
-                all_configs.setdefault(p, []).append({"settings": s, "cat": cat})
+                # A single logical config can be registered under multiple
+                # categories via model_types (for example text+vision). It is
+                # stored once per category in models.json with the same
+                # config_id, but the UI should show it as one editable config,
+                # not duplicate pills that appear to delete each other.
+                _cfg_list = all_configs.setdefault(p, [])
+                _cid = s.get("config_id") if isinstance(s, dict) else None
+                _existing = None
+                if _cid:
+                    for _cfg in _cfg_list:
+                        _settings = _cfg.get("settings") or {}
+                        if isinstance(_settings, dict) and _settings.get("config_id") == _cid:
+                            _existing = _cfg
+                            break
+                if _existing is not None:
+                    _cats = _existing.setdefault("cats", [])
+                    if cat not in _cats:
+                        _cats.append(cat)
+                    if not _existing.get("cat"):
+                        _existing["cat"] = cat
+                else:
+                    _cfg_list.append({"settings": s, "cat": cat, "cats": [cat]})
 
     # Secondary index: basename → (settings_tuple, original_path)
     # Used to reconnect a config to a re-downloaded file that landed at a different path.
@@ -1310,6 +1480,80 @@ def _scan_caches() -> dict:
                 "configs": all_configs.get(path, []),
             })
 
+    # Add configured non-GGUF HF models whose files have been evicted from disk
+    # (e.g. via "Free disk"). They are absent from the HF cache scan above, so
+    # surface them here as missing so they keep a Re-download button.
+    from codai.models.cache import is_huggingface_model_id
+    existing_hf_ids = {m["id"] for m in result["hf"]}
+    for path, (settings, mtype) in configured_settings.items():
+        if path in existing_hf_ids:
+            continue
+        s = settings if isinstance(settings, dict) else {}
+        if s.get("backend") == "whisper-server":
+            continue
+        # Only HF-style repo IDs (owner/repo) — skip local paths and GGUF files
+        if os.path.isabs(path) or path.endswith('.gguf') or not is_huggingface_model_id(path):
+            continue
+        # A real local relative path that still exists isn't an evicted model
+        if os.path.exists(path):
+            continue
+        caps = s.get("capabilities") or detect_model_capabilities(path).to_list()
+        result["hf"].append({
+            "id": path,
+            "size_gb": 0, "size_bytes": 0, "revision_count": 0,
+            "files": [], "file_count": 0,
+            "in_config": True, "missing": True,
+            "source_repo": path,
+            "model_type": mtype if mtype and mtype != "gguf_models" else "text_models",
+            "settings": s,
+            "capabilities": caps,
+            "incomplete": False,
+            "configs": all_configs.get(path, []),
+        })
+
+    # Surface "to download" wishlist entries: models the user wants listed for
+    # later download but has NOT configured and are NOT on disk. They appear as
+    # non-configured rows with a download button (in_config=False, missing=True).
+    seen_gguf = {m["path"] for m in result["gguf"]} | {m["filename"] for m in result["gguf"]}
+    seen_hf = {m["id"] for m in result["hf"]}
+    if config_manager:
+        for entry in config_manager.models_data.get("to_download", []):
+            e = entry if isinstance(entry, dict) else {"path": entry}
+            mid = (e.get("path") or e.get("id") or "").strip()
+            if not mid or _is_model_configured(mid):
+                continue
+            repo = e.get("source_repo") or mid
+            mtype = e.get("model_type") or "text_models"
+            is_gguf = (bool(e.get("is_gguf")) or mid.lower().endswith(".gguf")
+                       or "gguf" in mid.lower() or mtype == "gguf_models")
+            fname = os.path.basename(mid) if ("/" in mid or os.sep in mid) else mid
+            caps = e.get("capabilities") or detect_model_capabilities(mid).to_list()
+            if is_gguf:
+                if mid in seen_gguf or fname in seen_gguf:
+                    continue
+                result["gguf"].append({
+                    "filename": fname, "path": mid,
+                    "size_gb": 0, "size_bytes": 0,
+                    "in_config": False, "missing": True, "to_download": True,
+                    "source_repo": repo,
+                    "model_type": mtype if mtype != "gguf_models" else "text_models",
+                    "settings": {}, "capabilities": caps,
+                    "incomplete": False, "configs": [],
+                })
+                seen_gguf.add(mid); seen_gguf.add(fname)
+            else:
+                if mid in seen_hf:
+                    continue
+                result["hf"].append({
+                    "id": mid, "size_gb": 0, "size_bytes": 0, "revision_count": 0,
+                    "files": [], "file_count": 0,
+                    "in_config": False, "missing": True, "to_download": True,
+                    "source_repo": repo, "model_type": mtype,
+                    "settings": {}, "capabilities": caps,
+                    "incomplete": False, "configs": [],
+                })
+                seen_hf.add(mid)
+
     return result
 
 
@@ -1503,6 +1747,150 @@ async def api_delete_cached_model(
     return await asyncio.to_thread(_do_delete_model, model_id, cache_type)
 
 
+@router.post("/admin/api/model-free-disk", summary="Delete a model's files but keep its config")
+async def api_model_free_disk(request: Request, username: str = Depends(require_admin)):
+    """Reclaim disk space by deleting a model's files while keeping its
+    models.json entry, so it can be re-downloaded on demand. The source repo is
+    persisted onto the config entry first so the Re-download button has a target
+    once the file is gone."""
+    if config_manager is None:
+        raise HTTPException(status_code=503, detail="Config manager not initialized")
+    import os as _os, asyncio
+    data = await request.json()
+    path = (data.get("path") or data.get("model_id") or "").strip()
+    cache_type = data.get("cache_type", "gguf")
+    source_repo = (data.get("source_repo") or "").strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+
+    # Persist source_repo onto the matching config entries so re-download works
+    # after the file is deleted (flat GGUF files retain no HF repo info on disk).
+    # Skip when the entry key already IS the repo id (HF models re-download by id).
+    if source_repo and source_repo != path:
+        fname = _os.path.basename(path) if ("/" in path or _os.sep in path) else ""
+        changed = False
+        for cat in ("text_models", "image_models", "audio_models",
+                    "gguf_models", "tts_models", "vision_models", "video_models",
+                    "audio_gen_models", "embedding_models", "spatial_models"):
+            lst = config_manager.models_data.get(cat, [])
+            for i, m in enumerate(lst):
+                key = m if isinstance(m, str) else (m.get("path") or m.get("id") or "")
+                if key == path or (fname and _os.path.basename(key) == fname):
+                    if isinstance(m, str):
+                        lst[i] = {"path": m, "source_repo": source_repo}
+                        changed = True
+                    elif not m.get("source_repo"):
+                        m["source_repo"] = source_repo
+                        changed = True
+        if changed:
+            config_manager.save_models()
+
+    result = await asyncio.to_thread(_do_delete_model, path, cache_type)
+    _broker_notify_models_updated(request)
+    return result
+
+
+@router.post("/admin/api/model-add-known", summary="Register a model in config without downloading")
+async def api_model_add_known(request: Request, username: str = Depends(require_admin)):
+    """Add a model to models.json as a known-but-not-downloaded reference.
+
+    The model then appears in the model list as "missing" with a working
+    Re-download button, without fetching any files now — the same end state as
+    "Free disk", but reached without ever having the files locally."""
+    if config_manager is None:
+        raise HTTPException(status_code=503, detail="Config manager not initialized")
+    import os as _os
+    data = await request.json()
+    model_id = (data.get("model_id") or data.get("path") or "").strip()
+    if not model_id:
+        raise HTTPException(status_code=400, detail="model_id is required")
+    source_repo = (data.get("source_repo") or model_id).strip()
+    model_type = (data.get("model_type") or "").strip()
+    is_gguf = (bool(data.get("is_gguf")) or model_type == "gguf_models"
+               or "gguf" in model_id.lower())
+    valid = {"text_models", "image_models", "audio_models", "gguf_models", "tts_models",
+             "vision_models", "video_models", "audio_gen_models", "embedding_models", "spatial_models"}
+    if is_gguf:
+        model_type = "gguf_models"
+    if model_type not in valid:
+        model_type = "text_models"
+
+    # GGUF entries must persist source_repo so Re-download has a target (flat GGUF
+    # files keep no repo info on disk). Plain HF repos re-download by id, so a bare
+    # path string is enough and surfaces as a missing HF model.
+    if is_gguf:
+        entry = {"path": model_id, "source_repo": source_repo}
+    else:
+        entry = model_id
+
+    # Dedupe across all categories by path / basename so we don't double-add.
+    fname = _os.path.basename(model_id) if ("/" in model_id or _os.sep in model_id) else model_id
+    for cat in valid:
+        for m in config_manager.models_data.get(cat, []):
+            key = m if isinstance(m, str) else (m.get("path") or m.get("id") or "")
+            if key == model_id or (fname and _os.path.basename(key) == fname):
+                return {"success": True, "already": True}
+
+    config_manager.models_data.setdefault(model_type, []).append(entry)
+    _prune_to_download(model_id)
+    config_manager.save_models()
+    _broker_notify_models_updated(request)
+    return {"success": True}
+
+
+@router.post("/admin/api/model-mark-download", summary="List a model for later download")
+async def api_model_mark_download(request: Request, username: str = Depends(require_admin)):
+    """Record a model in the 'to download' wishlist: it appears in the model list
+    as a non-configured, to-be-downloaded entry (no files fetched, no serving
+    config created). Used by 'Free disk' on unconfigured models, 'Remove' on a
+    model with no files left, and 'Add to list' in the download window."""
+    if config_manager is None:
+        raise HTTPException(status_code=503, detail="Config manager not initialized")
+    data = await request.json()
+    model_id = (data.get("model_id") or data.get("path") or "").strip()
+    if not model_id:
+        raise HTTPException(status_code=400, detail="model_id is required")
+    source_repo = (data.get("source_repo") or model_id).strip()
+    model_type = (data.get("model_type") or "").strip()
+    is_gguf = (bool(data.get("is_gguf")) or model_type == "gguf_models"
+               or model_id.lower().endswith(".gguf") or "gguf" in model_id.lower())
+    if is_gguf:
+        model_type = "gguf_models"
+    if model_type not in _VALID_MODEL_CATS:
+        model_type = "text_models"
+    # Already a real (configured) model — nothing to add.
+    if _is_model_configured(model_id):
+        return {"success": True, "already_configured": True}
+    import os as _os
+    lst = config_manager.models_data.setdefault("to_download", [])
+    fname = _basename_key(model_id)
+    for e in lst:
+        k = _entry_key(e)
+        if k == model_id or (fname and _basename_key(k) == fname):
+            return {"success": True, "already": True}
+    lst.append({"path": model_id, "source_repo": source_repo,
+                "model_type": model_type, "is_gguf": is_gguf})
+    config_manager.save_models()
+    _broker_notify_models_updated(request)
+    return {"success": True}
+
+
+@router.post("/admin/api/model-unmark-download", summary="Remove a model from the download list")
+async def api_model_unmark_download(request: Request, username: str = Depends(require_admin)):
+    """Drop a model from the 'to download' wishlist (the user no longer wants it
+    listed). Has no effect on configured models or files on disk."""
+    if config_manager is None:
+        raise HTTPException(status_code=503, detail="Config manager not initialized")
+    data = await request.json()
+    model_id = (data.get("model_id") or data.get("path") or "").strip()
+    if not model_id:
+        raise HTTPException(status_code=400, detail="model_id is required")
+    if _prune_to_download(model_id):
+        config_manager.save_models()
+        _broker_notify_models_updated(request)
+    return {"success": True}
+
+
 @router.post("/admin/api/model-enable", summary="Enable a model")
 async def api_model_enable(request: Request, username: str = Depends(require_admin)):
     """Register a cached model in models.json so CoderAI can use it."""
@@ -1516,8 +1904,13 @@ async def api_model_enable(request: Request, username: str = Depends(require_adm
     if model_type not in valid:
         raise HTTPException(status_code=400, detail=f"model_type must be one of {valid}")
     lst = config_manager.models_data.setdefault(model_type, [])
+    changed = False
     if path not in lst:
         lst.append(path)
+        changed = True
+    if _prune_to_download(path):
+        changed = True
+    if changed:
         config_manager.save_models()
     _broker_notify_models_updated(request)
     return {"success": True}
@@ -1557,6 +1950,52 @@ async def api_model_disable(request: Request, username: str = Depends(require_ad
         config_manager.save_models()
     _broker_notify_models_updated(request)
     return {"success": True}
+
+
+@router.get("/admin/api/quantize-capabilities", summary="GPTQ/AWQ quantization availability")
+async def api_quantize_capabilities(username: str = Depends(require_admin)):
+    """Report whether fast-kernel (GPTQ/AWQ) quantization is available + any jobs."""
+    from codai.models import quant
+    return {
+        "capabilities": quant.capabilities(),
+        "available": quant.is_available(),
+        "jobs": quant.all_jobs(),
+    }
+
+
+@router.post("/admin/api/model-quantize", summary="Quantize a model to fast-kernel 4-bit")
+async def api_model_quantize(request: Request, username: str = Depends(require_admin)):
+    """Start (or report) an on-demand background GPTQ/AWQ quantization.
+
+    Body: {path|model_id, method?(gptq|awq), bits?(4), group_size?(128)}.
+    Quantization is heavy and slow; it runs in the background and the produced
+    checkpoint is picked up automatically on the model's next load. Falls back to
+    bitsandbytes if the fast kernels are unavailable or the arch is unsupported.
+    """
+    from codai.models import quant
+    data = await request.json()
+    model_id = (data.get("path") or data.get("model_id") or "").strip()
+    if not model_id:
+        raise HTTPException(status_code=400, detail="path/model_id is required")
+    method = (data.get("method") or "gptq").lower()
+    if method not in ("gptq", "awq"):
+        raise HTTPException(status_code=400, detail="method must be 'gptq' or 'awq'")
+    try:
+        bits = int(data.get("bits", 4))
+        group_size = int(data.get("group_size", 128))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="bits/group_size must be integers")
+    job = quant.start_quantization(model_id, method=method, bits=bits, group_size=group_size)
+    return {"success": job.get("status") != "unavailable", "job": job}
+
+
+@router.get("/admin/api/quantize-status", summary="Quantization job status")
+async def api_quantize_status(model_id: str = "", username: str = Depends(require_admin)):
+    """Status for one model's quant job (?model_id=...), or all jobs."""
+    from codai.models import quant
+    if model_id:
+        return {"job": quant.get_job(model_id.strip())}
+    return {"jobs": quant.all_jobs()}
 
 
 @router.get("/admin/api/model-loaded-status", summary="Model load status")
@@ -1678,7 +2117,6 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
                     multi_model_manager.add_model(model_key, pipeline)
                     multi_model_manager.record_vram_delta(model_key, _snap)
         elif model_type == "video":
-            import asyncio
             from codai.api.video import _load_video_pipeline, _derive_device
             model_key = f"video:{path}"
             device = _derive_device()
@@ -1693,7 +2131,6 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
             multi_model_manager.models_in_vram.add(model_key)
             multi_model_manager.record_vram_delta(model_key, _snap)
         elif model_type == "audio_gen":
-            import asyncio
             from codai.api.audio_gen import _load_musicgen, _load_audioldm, _detect_audio_gen_type, _derive_device
             model_key = f"audio_gen:{path}"
             device = _derive_device()
@@ -1711,32 +2148,26 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
             multi_model_manager.models_in_vram.add(model_key)
             multi_model_manager.record_vram_delta(model_key, _snap)
         elif model_type == "tts":
-            import asyncio
             model_key = f"tts:{path}"
             _snap = multi_model_manager.vram_before_load()
+            # Use the same backend factory as a real request so every engine is
+            # handled identically — in particular a Parler model boots its managed
+            # worker here, so "loading" it from the interface starts the service.
+            cfg = (multi_model_manager.config.get(model_key)
+                   or multi_model_manager.config.get(f"tts:{path}")
+                   or model_cfg or {})
             def _load_tts():
-                try:
-                    from kokoro import Kokoro
-                    return Kokoro(path)
-                except ImportError:
-                    pass
-                try:
-                    from bark import preload_models
-                    preload_models()
-                    return {"bark": True}
-                except ImportError:
-                    pass
-                return None
+                from codai.api import tts_backends
+                return tts_backends.load_backend(path, path, cfg)
             tts_obj = await asyncio.to_thread(_load_tts)
             if tts_obj is None:
-                raise RuntimeError("No supported TTS backend found (kokoro / bark)")
+                raise RuntimeError("TTS model failed to load")
             multi_model_manager.models[model_key] = tts_obj
             multi_model_manager.current_model_key = model_key
             multi_model_manager.active_in_vram = model_key
             multi_model_manager.models_in_vram.add(model_key)
             multi_model_manager.record_vram_delta(model_key, _snap)
         elif model_type in ("embedding", "spatial", "vision"):
-            import asyncio
             from codai.api.images import _load_diffusers_pipeline
             from codai.api.state import get_global_args
             model_key = f"{model_type}:{path}"
@@ -1795,6 +2226,78 @@ async def api_model_unload(request: Request, username: str = Depends(require_adm
         pass
 
     return {"success": True, "was_loaded": True}
+
+
+def _sanitize_engine_int_overrides(raw) -> dict:
+    """Clean a {engine_name: int} override map: keep positive ints, drop the rest."""
+    out = {}
+    if isinstance(raw, dict):
+        for name, val in raw.items():
+            if val in (None, ""):
+                continue
+            try:
+                iv = int(val)
+            except (TypeError, ValueError):
+                continue
+            if iv >= 1:
+                out[str(name)] = iv
+    return out
+
+
+def _resolve_engine_spec(engine_name: str, engine_specs):
+    """Find the declared engine matching ``engine_name`` (by name or backend)."""
+    for s in (engine_specs or []):
+        if not isinstance(s, dict):
+            continue
+        if (s.get("name") or "").lower() == engine_name.lower() \
+                or (s.get("backend") or "").lower() == engine_name.lower():
+            return s
+    return None
+
+
+def validate_engine_pin(engine_name: str, model_path: str, engine_specs,
+                        model_backend: str = None, ds4_cfg=None) -> list:
+    """Return human-readable warnings if pinning ``model_path`` to ``engine_name``
+    is wrong (unknown engine, or an engine that can't run this model's format).
+
+    Empty list = the pin is fine. Used to *notify* the admin instead of silently
+    ignoring a bad pin (the router would otherwise just fall back)."""
+    engine_name = (engine_name or "").strip()
+    if not engine_name:
+        return []
+    from codai.frontproxy.registry import _DEFAULT_CAPS
+    from codai.frontproxy.router import required_capability
+    specs = engine_specs or []
+    if specs:
+        spec = _resolve_engine_spec(engine_name, specs)
+        if spec is None:
+            names = [s.get("name") for s in specs if isinstance(s, dict) and s.get("name")]
+            return [f"Engine '{engine_name}' is not declared. Known engines: "
+                    f"{', '.join(names) or '(none)'}."]
+        backend = (spec.get("backend") or "auto").lower()
+        caps = set(spec.get("capabilities")
+                   or _DEFAULT_CAPS.get(backend, {"transformers", "gguf"}))
+    else:
+        # Auto-detection: no engine_specs to resolve against — infer the engine's
+        # capabilities from its vendor/backend name so we can still catch an
+        # impossible pin (e.g. a transformers model pinned to the Radeon engine).
+        key = engine_name.lower()
+        backend = {"radeon": "vulkan", "amd": "vulkan", "intel": "vulkan",
+                   "cuda": "nvidia"}.get(key, key)
+        caps = _DEFAULT_CAPS.get(backend)
+        if caps is None:
+            return []   # unknown name, nothing to validate against — accept silently
+        caps = set(caps)
+    req = required_capability(
+        model_path, backend=model_backend,
+        ds4_model_id=getattr(ds4_cfg, "model_id", None) if ds4_cfg else None,
+        ds4_enabled=bool(getattr(ds4_cfg, "enabled", False)) if ds4_cfg else False)
+    if req and req not in caps:
+        return [f"Engine '{engine_name}' (backend '{backend}') can't run this model: "
+                f"it needs '{req}' capability but the engine only provides "
+                f"{sorted(caps)}. The request would fall back to a compatible engine — "
+                f"pick a different engine or adjust the engine's capabilities."]
+    return []
 
 
 @router.post("/admin/api/model-configure", summary="Update a model's configuration")
@@ -1897,6 +2400,11 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         if existing_cid and not is_new_config:
             # Targeted removal: only the entry that shares this config_id
             return existing_cid == config_id
+        if existing_cid and is_new_config:
+            # Adding a new configuration for the same model must preserve modern
+            # sibling configs. Only legacy entries without config_id fall through
+            # to path-based replacement because they cannot be targeted safely.
+            return False
         # Path-based removal (no config_id on either side, or new entry replacing old)
         key = m_entry.get("path", m_entry.get("id", ""))
         return key in paths_to_remove or (fnames_to_remove and _os.path.basename(key) in fnames_to_remove)
@@ -1938,7 +2446,8 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "max_vram", "sdcpp_flash_attn", "sdcpp_diffusion_flash_attn", "vae_tiling",
                 "component_quantization", "output_crf", "force_vram_update",
                 "balanced_gpu_percent", "acceleration",
-                "cache_type_k", "cache_type_v", "turboquant"):
+                "cache_type_k", "cache_type_v", "turboquant", "engine",
+                "quant_backend", "kv_cache_budget_mb", "kv_cache_slots", "mmproj"):
         if key in data:
             entry[key] = data[key]
 
@@ -1966,7 +2475,15 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         applied = apply_model_entry_live(entry, model_types)
     except Exception as e:
         print(f"  [admin] live config apply failed (restart to apply): {e}")
-    return {"success": True, "applied_live": applied}
+    warnings = []
+    if entry.get("engine"):
+        warnings = validate_engine_pin(
+            entry["engine"], path, config_manager.config.server.engine_specs,
+            model_backend=entry.get("backend"),
+            ds4_cfg=getattr(config_manager.config, "ds4", None))
+        for w in warnings:
+            print(f"  [admin] engine-pin warning: {w}")
+    return {"success": True, "applied_live": applied, "warnings": warnings}
 
 
 @router.get("/admin/api/accel-presets", summary="List acceleration / distillation presets")
@@ -2075,6 +2592,32 @@ async def api_turboquant_info(username: str = Depends(require_admin)):
 
 # --- Task / queue management ---
 
+def _human_bytes(n: float) -> str:
+    """Compact human-readable byte size (e.g. 45.2 MB) for download readouts."""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def _human_duration(seconds: float) -> str:
+    """Compact h/m/s duration (e.g. 3m 12s) for download ETAs."""
+    try:
+        s = int(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    return f"{s // 3600}h {(s % 3600) // 60}m"
+
+
 @router.get("/admin/api/tasks", summary="List active and recent tasks")
 def api_tasks(username: str = Depends(require_admin)):
     """Unified live view of long-running work: in-flight / recent generations
@@ -2148,6 +2691,77 @@ def api_tasks(username: str = Depends(require_admin)):
             "cancellable": False,
             "restartable": False,
         })
+
+    # Model downloads run in out-of-process workers tracked in `_download_status`,
+    # not the task registry. Surface them here so the Tasks page shows downloads
+    # in progress alongside generations, training and queued requests.
+    for sid, d in list(_download_status.items()):
+        if sid in seen:
+            continue
+        seen.add(sid)
+        dstatus = d.get("status") or "starting"
+        active = dstatus in ("starting", "downloading")
+        pct = int(round(d.get("percent") or 0))
+        bits = []
+        fn = d.get("filename") or ""
+        if fn:
+            bits.append(fn)
+        rate = d.get("rate") or 0
+        if active and rate:
+            bits.append(f"{_human_bytes(rate)}/s")
+        eta = d.get("eta")
+        if active and eta:
+            bits.append(f"ETA {_human_duration(eta)}")
+        if d.get("error"):
+            bits.append(str(d["error"]))
+        elif not fn and d.get("last_info"):
+            bits.append(str(d["last_info"]))
+        tasks.append({
+            "id": sid,
+            "kind": "download",
+            "title": d.get("model_id") or "",
+            "model": d.get("file_pattern") or "",
+            "status": "running" if active else dstatus,
+            "step": pct, "total": 100,
+            "percent": pct,
+            "message": " · ".join(bits),
+            "started_at": d.get("started_at"),
+            "active": active,
+            "cancellable": active,
+            "pausable": False,
+            "restartable": False,
+        })
+
+    # GPTQ/AWQ quantization jobs run in in-process daemon threads (status persisted
+    # to disk so it survives a restart). Surface them alongside downloads/training.
+    try:
+        from codai.models import quant as _quant
+        for _name, _qj in _quant.all_jobs().items():
+            if _name in seen:
+                continue
+            seen.add(_name)
+            _qs = _qj.get("status") or "running"
+            _active = _qs == "running"
+            _pct = int(round((_qj.get("progress") or 0) * 100))
+            _msg = _qj.get("message") or ""
+            if _qj.get("error"):
+                _msg = str(_qj["error"])
+            tasks.append({
+                "id": f"quantize:{_name}",
+                "kind": "quantize",
+                "title": _name,
+                "model": (_qj.get("method") or "gptq").upper(),
+                "status": _qs,
+                "step": _pct, "total": 100, "percent": _pct,
+                "message": _msg,
+                "started_at": _qj.get("started"),
+                "active": _active,
+                "cancellable": False,
+                "pausable": False,
+                "restartable": _qs in ("failed", "interrupted"),
+            })
+    except Exception:
+        pass
 
     # Successfully-finished work is dropped from the live list — a "done" job is
     # no longer actionable, so it shouldn't clutter the view. Terminal-but-notable
@@ -2244,6 +2858,21 @@ def _read_vram_info() -> Optional[dict]:
     return None
 
 
+@router.get("/admin/api/gpu-stats", summary="Per-card GPU utilization, VRAM and temperature")
+def api_gpu_stats(username: str = Depends(require_auth)):
+    """Live stats for EVERY physical GPU installed (NVIDIA via nvidia-smi, AMD via
+    sysfs), independent of which engine owns it. Used by the Tasks page to show
+    per-card VRAM + utilization across all cards. Best-effort; empty if unreadable.
+
+    SYNC handler: it shells out to nvidia-smi / reads sysfs, so it runs in the
+    threadpool rather than on the event loop."""
+    try:
+        from codai.frontproxy.gpu_detect import gpu_stats
+        return {"cards": gpu_stats()}
+    except Exception as e:
+        return {"cards": [], "error": str(e)}
+
+
 @router.get("/admin/api/system-stats", summary="Live CPU / GPU / RAM / VRAM usage and temperatures")
 def api_system_stats(username: str = Depends(require_admin)):
     """Lightweight hardware telemetry for the Tasks page header: CPU & GPU
@@ -2285,6 +2914,9 @@ def _do_task_cancel(task_id: str) -> bool:
     in-memory task registry."""
     from codai.tasks import task_registry
     from codai.api.loras import cancel_job
+    # Download workers live in their own session registry, not the task registry.
+    if _cancel_download_session(task_id):
+        return True
     if cancel_job(task_id):
         return True
     return task_registry.cancel(task_id)
@@ -2313,6 +2945,14 @@ async def api_task_remove(task_id: str, username: str = Depends(require_admin)):
     remove a task that is still active — cancel it first."""
     from codai.tasks import task_registry
     from codai.api.loras import remove_job
+    # Finished/failed download session — drop it from the live status map.
+    d = _download_status.get(task_id)
+    if d is not None:
+        if d.get("status") in ("starting", "downloading"):
+            raise HTTPException(status_code=409, detail="Download is still active — cancel it first")
+        _download_status.pop(task_id, None)
+        _download_sessions.pop(task_id, None)
+        return {"ok": True, "task_id": task_id, "removed": True}
     # Training job (durable record) first.
     if remove_job(task_id):
         return {"ok": True, "task_id": task_id, "removed": True}
@@ -2406,6 +3046,12 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "https_cert_path": c.server.https_cert_path,
             "queue_max_size": c.server.queue_max_size,
             "max_parallel_requests": c.server.max_parallel_requests,
+            "max_parallel_requests_overrides": c.server.max_parallel_requests_overrides,
+            "internal_port_base": c.server.internal_port_base,
+            "default_engine": c.server.default_engine,
+            # Engine names available to pick as the default (for the settings UI).
+            "engine_names": [s.get("name") for s in (c.server.engine_specs or [])
+                             if isinstance(s, dict) and s.get("name")],
         },
         "backend": {
             "type": c.backend.type,
@@ -2417,6 +3063,8 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "default_load_mode": c.models.default_load_mode,
             "hf_cache_dir": c.models.hf_cache_dir,
             "gguf_cache_dir": c.models.gguf_cache_dir,
+            "max_model_instances": c.models.max_model_instances,
+            "max_model_instances_overrides": c.models.max_model_instances_overrides,
         },
         "offload": {
             "directory": c.offload.directory,
@@ -2430,6 +3078,9 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "max_ram_gb": c.offload.max_ram_gb,
             "evict_idle_on_ram": c.offload.evict_idle_on_ram,
             "ram_leak_watch": c.offload.ram_leak_watch,
+            "ram_watch_poll_seconds": c.offload.ram_watch_poll_seconds,
+            "ram_watch_soft_fraction": c.offload.ram_watch_soft_fraction,
+            "ram_watch_cuda": c.offload.ram_watch_cuda,
         },
         "vulkan": {
             "n_gpu_layers": c.vulkan.n_gpu_layers,
@@ -2449,6 +3100,7 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "cpu_resume": c.thermal.cpu_resume,
             "gpu_high": c.thermal.gpu_high,
             "gpu_resume": c.thermal.gpu_resume,
+            "gpu_overrides": c.thermal.gpu_overrides,
             "poll_seconds": c.thermal.poll_seconds,
             "soft_throttle_enabled": c.thermal.soft_throttle_enabled,
             "soft_throttle_temp": c.thermal.soft_throttle_temp,
@@ -2460,6 +3112,19 @@ async def api_get_settings(username: str = Depends(require_admin)):
         "enhance": {
             "allow_ffmpeg": c.enhance.allow_ffmpeg,
             "allow_rife_ncnn": c.enhance.allow_rife_ncnn,
+        },
+        "ds4": {
+            "enabled": c.ds4.enabled,
+            "repo_url": c.ds4.repo_url,
+            "install_dir": c.ds4.install_dir,
+            "build_target": c.ds4.build_target,
+            "model_variant": c.ds4.model_variant,
+            "model_id": c.ds4.model_id,
+            "host": c.ds4.host,
+            "port": c.ds4.port,
+            "ctx": c.ds4.ctx,
+            "extra_args": c.ds4.extra_args,
+            "auto_build": c.ds4.auto_build,
         },
         "broker": {
             "enabled": c.broker.enabled,
@@ -2495,6 +3160,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
 
     data = await request.json()
     c = config_manager.config
+    _settings_warnings: list = []
 
     if "server" in data:
         srv = data["server"]
@@ -2511,6 +3177,28 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             c.server.max_parallel_requests = int(srv["max_parallel_requests"])
             from codai.queue.manager import queue_manager
             queue_manager.max_parallel_requests = c.server.max_parallel_requests
+        if "max_parallel_requests_overrides" in srv:
+            c.server.max_parallel_requests_overrides = _sanitize_engine_int_overrides(
+                srv["max_parallel_requests_overrides"])
+        if "internal_port_base" in srv:
+            try:
+                c.server.internal_port_base = max(1, min(65535, int(srv["internal_port_base"])))
+            except (TypeError, ValueError):
+                pass
+        if "default_engine" in srv:
+            c.server.default_engine = (srv.get("default_engine") or "").strip() or None
+            # Only validate against engine_specs when they're explicitly declared.
+            # With auto-detection engine_specs is empty and the engines (nvidia/
+            # radeon/…) are only known to the front, so don't false-warn there — the
+            # front validates the name at routing time and logs if it can't honour it.
+            if (c.server.default_engine and c.server.engine_specs
+                    and _resolve_engine_spec(c.server.default_engine,
+                                             c.server.engine_specs) is None):
+                names = [s.get("name") for s in (c.server.engine_specs or [])
+                         if isinstance(s, dict) and s.get("name")]
+                _settings_warnings.append(
+                    f"Default engine '{c.server.default_engine}' is not declared. "
+                    f"Known engines: {', '.join(names) or '(none)'}.")
 
     if "backend" in data:
         bk = data["backend"]
@@ -2526,6 +3214,14 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             c.models.hf_cache_dir = mdl["hf_cache_dir"] or None
         if "gguf_cache_dir" in mdl:
             c.models.gguf_cache_dir = mdl["gguf_cache_dir"] or None
+        if "max_model_instances" in mdl:
+            try:
+                c.models.max_model_instances = max(1, int(mdl["max_model_instances"]))
+            except (TypeError, ValueError):
+                pass
+        if "max_model_instances_overrides" in mdl:
+            c.models.max_model_instances_overrides = _sanitize_engine_int_overrides(
+                mdl["max_model_instances_overrides"])
 
     if "offload" in data:
         off = data["offload"]
@@ -2543,6 +3239,11 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             c.offload.max_ram_gb = off["max_ram_gb"] or None
         c.offload.evict_idle_on_ram = bool(off.get("evict_idle_on_ram", c.offload.evict_idle_on_ram))
         c.offload.ram_leak_watch = bool(off.get("ram_leak_watch", c.offload.ram_leak_watch))
+        if "ram_watch_poll_seconds" in off:
+            c.offload.ram_watch_poll_seconds = float(off["ram_watch_poll_seconds"] or c.offload.ram_watch_poll_seconds)
+        if "ram_watch_soft_fraction" in off:
+            c.offload.ram_watch_soft_fraction = float(off["ram_watch_soft_fraction"] or c.offload.ram_watch_soft_fraction)
+        c.offload.ram_watch_cuda = bool(off.get("ram_watch_cuda", c.offload.ram_watch_cuda))
         # Push the RAM-cap settings to live global_args so the watcher, per-load
         # budget clamp and eviction honour them without a restart.
         try:
@@ -2552,6 +3253,9 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
                 ga.max_ram_gb = c.offload.max_ram_gb
                 ga.evict_idle_on_ram = c.offload.evict_idle_on_ram
                 ga.ram_leak_watch = c.offload.ram_leak_watch
+                ga.ram_watch_poll_seconds = c.offload.ram_watch_poll_seconds
+                ga.ram_watch_soft_fraction = c.offload.ram_watch_soft_fraction
+                ga.ram_watch_cuda = c.offload.ram_watch_cuda
         except Exception:
             pass
 
@@ -2607,6 +3311,22 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         c.thermal.cpu_resume = float(th.get("cpu_resume", c.thermal.cpu_resume))
         c.thermal.gpu_high = float(th.get("gpu_high", c.thermal.gpu_high))
         c.thermal.gpu_resume = float(th.get("gpu_resume", c.thermal.gpu_resume))
+        if "gpu_overrides" in th and isinstance(th["gpu_overrides"], dict):
+            # Sanitize: {vendor: {high, resume}} with numeric values only.
+            clean = {}
+            for vendor, ov in th["gpu_overrides"].items():
+                if not isinstance(ov, dict):
+                    continue
+                entry = {}
+                for k in ("high", "resume"):
+                    if ov.get(k) not in (None, ""):
+                        try:
+                            entry[k] = float(ov[k])
+                        except (TypeError, ValueError):
+                            pass
+                if entry:
+                    clean[str(vendor).lower()] = entry
+            c.thermal.gpu_overrides = clean
         c.thermal.poll_seconds = max(1.0, float(th.get("poll_seconds", c.thermal.poll_seconds)))
         c.thermal.soft_throttle_enabled = bool(th.get("soft_throttle_enabled", c.thermal.soft_throttle_enabled))
         c.thermal.soft_throttle_temp = float(th.get("soft_throttle_temp", c.thermal.soft_throttle_temp))
@@ -2622,6 +3342,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
                 ga.thermal_cpu_resume = c.thermal.cpu_resume
                 ga.thermal_gpu_high = c.thermal.gpu_high
                 ga.thermal_gpu_resume = c.thermal.gpu_resume
+                ga.thermal_gpu_overrides = c.thermal.gpu_overrides
                 ga.thermal_poll_seconds = c.thermal.poll_seconds
                 ga.thermal_soft_throttle_enabled = c.thermal.soft_throttle_enabled
                 ga.thermal_soft_throttle_temp = c.thermal.soft_throttle_temp
@@ -2656,6 +3377,30 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         except Exception:
             pass
 
+    if "ds4" in data:
+        d = data["ds4"]
+        c.ds4.enabled = bool(d.get("enabled", c.ds4.enabled))
+        if "repo_url" in d:
+            c.ds4.repo_url = (d.get("repo_url") or c.ds4.repo_url or "").strip()
+        if "install_dir" in d:
+            c.ds4.install_dir = (d.get("install_dir") or "").strip() or None
+        if "build_target" in d:
+            c.ds4.build_target = (d.get("build_target") or "auto").strip()
+        if "model_variant" in d:
+            c.ds4.model_variant = (d.get("model_variant") or c.ds4.model_variant).strip()
+        if "model_id" in d:
+            c.ds4.model_id = (d.get("model_id") or c.ds4.model_id or "deepseek-v4").strip()
+        if "host" in d:
+            c.ds4.host = (d.get("host") or "127.0.0.1").strip()
+        if "port" in d:
+            c.ds4.port = int(d.get("port") or 0)
+        if "ctx" in d:
+            c.ds4.ctx = max(1024, int(d.get("ctx") or c.ds4.ctx))
+        if "extra_args" in d:
+            c.ds4.extra_args = (d.get("extra_args") or "").strip()
+        if "auto_build" in d:
+            c.ds4.auto_build = bool(d["auto_build"])
+
     if "broker" in data:
         bro = data["broker"]
         c.broker.enabled = bool(bro.get("enabled", c.broker.enabled))
@@ -2688,7 +3433,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     config_manager.save_config()
-    return {"success": True}
+    return {"success": True, "warnings": _settings_warnings}
 
 
 # =============================================================================

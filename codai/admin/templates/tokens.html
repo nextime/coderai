@@ -126,15 +126,15 @@ async function createToken() {
       openModal('show-modal');
       loadTokens();
     } else {
-      const e = await r.json(); alert(e.detail || 'Failed');
+      const e = await r.json(); showAlert(e.detail || 'Failed');
     }
-  } catch (e) { alert(e.message); }
+  } catch (e) { showAlert(e.message); }
 }
 
 async function delToken(id) {
   if (!confirm('Delete this token? Clients using it will lose access immediately.')) return;
   const r = await fetch(ROOT_PATH + '/admin/api/tokens/'+id, {method:'DELETE'});
-  if (r.ok) loadTokens(); else alert('Failed to delete');
+  if (r.ok) loadTokens(); else showAlert('Failed to delete');
 }
 
 loadTokens();

@@ -60,8 +60,13 @@ def _is_text_response(content_type: str | None) -> bool:
     )
 
 
-async def execute_broker_request(app, envelope):
-    """Validate and execute a broker request envelope."""
+async def execute_broker_request(app, envelope, executor=None):
+    """Validate and execute a broker request envelope.
+
+    ``executor`` is an ``async (method, path, headers, query, body) -> {status_code,
+    headers, body}`` callable. When omitted the request is run in-process against
+    ``app`` via the ASGI bridge (engine / single-process mode). The front passes its
+    own executor that proxies to the right engine over HTTP."""
 
     logger.debug(
         "broker dispatch → op=%s request_id=%s path=%r method=%r stream=%s",
@@ -136,14 +141,20 @@ async def execute_broker_request(app, envelope):
         headers["content-type"] = envelope.content_type
 
     started_at = perf_counter()
-    response = await execute_internal_request(
-        app,
-        method=envelope.method,
-        path=envelope.path,
-        headers=headers,
-        query=envelope.query,
-        body=body,
-    )
+    if executor is not None:
+        response = await executor(
+            method=envelope.method, path=envelope.path, headers=headers,
+            query=envelope.query, body=body,
+        )
+    else:
+        response = await execute_internal_request(
+            app,
+            method=envelope.method,
+            path=envelope.path,
+            headers=headers,
+            query=envelope.query,
+            body=body,
+        )
     elapsed_ms = round((perf_counter() - started_at) * 1000, 3)
 
     response_headers = response["headers"]

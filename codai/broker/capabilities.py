@@ -49,7 +49,13 @@ def build_hardware_summary() -> Dict[str, Any]:
     total_vram_mb = 0
     available_vram_mb = 0
 
+    # Only use torch if it's ALREADY loaded (i.e. we're in an engine). Never import
+    # it here — the front is torch-free and must stay that way (importing torch in
+    # the front is heavy and would initialise CUDA in the wrong process).
+    import sys as _sys
     try:
+        if "torch" not in _sys.modules:
+            raise ImportError("torch not loaded (front) — using torch-free path")
         import torch
 
         if torch.cuda.is_available():
@@ -75,6 +81,23 @@ def build_hardware_summary() -> Dict[str, Any]:
                     available_vram_mb = total_vram_mb
     except Exception:
         pass
+
+    # Torch-free path (e.g. the front, which imports no torch): enumerate every
+    # physical card via nvidia-smi + sysfs so VRAM is reported for the whole node.
+    if not gpus:
+        try:
+            from codai.frontproxy.gpu_detect import gpu_stats
+            for c in gpu_stats():
+                total_mb = int(round((c.get("mem_total") or 0) * 1024))
+                used_mb = int(round((c.get("mem_used") or 0) * 1024))
+                if total_mb <= 0:
+                    continue
+                gpus.append({"name": c.get("name") or c.get("vendor"),
+                             "total_vram_mb": total_mb})
+                total_vram_mb += total_mb
+                available_vram_mb += max(0, total_mb - used_mb)
+        except Exception:
+            pass
 
     if not gpus:
         for total_path in sorted(glob.glob("/sys/class/drm/card*/device/mem_info_vram_total")):

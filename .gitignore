@@ -17,6 +17,15 @@ __pycache__/
 
 # Debug logs
 debug.log
+/logs/
+
+# Runtime model cache (downloads, self-quantized checkpoints, job state).
+# Root-anchored so it never shadows the tracked codai/models/ source package.
+/models/
+
+# Third-party source clone of the GPTQ quantizer — installed into the venv from
+# source; the working tree is not part of this repo (it has its own .git).
+/GPTQModel/
 
 # Test files
 test_*.py
@@ -33,3 +42,11 @@ township_output/
 # Packaging build cache + runtime temp (large artifacts)
 .packaging-cache/
 tmp/
+
+# Exported image tarballs + local OCI run-state (large artifacts)
+dist/
+coderai-runtime/
+
+# Video editor sessions + generated media (runtime artifacts)
+video_editor/sessions/
+tools/coderai_media/

@@ -72,4 +72,47 @@ if changed:
 PY
 fi
 
-exec /opt/coderai/python/bin/python3 /opt/coderai/app/coderai --config "$CONFIG_DIR" "$@"
+# Optional debug logging. CODERAI_DEBUG selects coderai's --debug* flags:
+#   all              -> every debug flag
+#   1|true|yes|on    -> just --debug
+#   "engine,ws,..."  -> --debug-engine --debug-ws ...  (bare names get --debug- prefixed;
+#                       full "--debug-foo" tokens are passed through; comma OR space separated)
+DEBUG_ARGS=""
+case "${CODERAI_DEBUG:-}" in
+  "") : ;;
+  all|ALL|All)
+    DEBUG_ARGS="--debug --debug-ws --debug-web --debug-thermal --debug-lora --debug-requests --debug-engine --debug-engine-web" ;;
+  1|true|TRUE|yes|YES|on|ON)
+    DEBUG_ARGS="--debug" ;;
+  *)
+    for _f in $(echo "$CODERAI_DEBUG" | tr ',' ' '); do
+      case "$_f" in
+        --*)  DEBUG_ARGS="$DEBUG_ARGS $_f" ;;
+        debug) DEBUG_ARGS="$DEBUG_ARGS --debug" ;;
+        *)    DEBUG_ARGS="$DEBUG_ARGS --debug-$_f" ;;
+      esac
+    done ;;
+esac
+# --debug-* flags need --debug present to take effect; add it if the user picked
+# only sub-flags.
+case " $DEBUG_ARGS " in *" --debug "*) : ;; *[!\ ]*) DEBUG_ARGS="--debug$DEBUG_ARGS" ;; esac
+
+# Assemble the server argv: --config, optional --tmp, debug flags, then passthrough.
+set -- --config "$CONFIG_DIR" "$@"
+[ -n "${CODERAI_TMP:-}" ] && set -- "$@" --tmp "$CODERAI_TMP"
+
+CODERAI_BIN="/opt/coderai/python/bin/python3 /opt/coderai/app/coderai"
+
+# Optional host-tailable file log. CODERAI_LOG_FILE should point under a mounted
+# volume (e.g. /cache/logs/coderai.log) so it's visible + tailable on the host.
+# We tee so output still reaches `docker logs` too. (supervisord runs this script
+# with killasgroup, so the coderai front + its engine subprocesses + tee are all
+# torn down together on stop.)
+if [ -n "${CODERAI_LOG_FILE:-}" ]; then
+  mkdir -p "$(dirname "$CODERAI_LOG_FILE")" 2>/dev/null || true
+  echo "[coderai-oci] debug='${CODERAI_DEBUG:-off}' → logging to $CODERAI_LOG_FILE" >&2
+  # shellcheck disable=SC2086
+  exec $CODERAI_BIN "$@" $DEBUG_ARGS 2>&1 | tee -a "$CODERAI_LOG_FILE"
+fi
+# shellcheck disable=SC2086
+exec $CODERAI_BIN "$@" $DEBUG_ARGS

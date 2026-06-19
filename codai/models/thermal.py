@@ -144,7 +144,20 @@ def _run(cmd, timeout=4.0) -> Optional[str]:
 
 
 def _read_gpu_temp_uncached() -> Optional[float]:
-    """Hottest GPU temperature in °C, or None if unreadable."""
+    """Hottest GPU temperature in °C across ALL installed cards, or None.
+
+    Spans every vendor (NVIDIA via nvidia-smi, AMD via sysfs) and is scoped to the
+    cards THIS engine owns (``CODERAI_ENGINE_GPUS``) — so a hot GPU pauses only the
+    engine using it, while a hot CPU (read globally) pauses everything. In
+    single-process mode it covers all cards. Falls back to the per-vendor probes
+    below if the unified reader fails."""
+    try:
+        from codai.frontproxy.gpu_detect import engine_gpu_stats
+        temps = [c["temp"] for c in engine_gpu_stats() if c.get("temp") is not None]
+        if temps:
+            return max(temps)
+    except Exception:
+        pass
     # NVIDIA — the inference GPU on CUDA backends.
     if _NVIDIA_SMI:
         out = _run([
@@ -282,7 +295,14 @@ _gpu_util_cache: Tuple[float, Optional[float]] = (0.0, None)
 
 
 def _read_gpu_util_uncached() -> Optional[float]:
-    """Hottest GPU utilization in %, or None if unreadable."""
+    """Busiest GPU utilization in % across ALL installed cards, or None."""
+    try:
+        from codai.frontproxy.gpu_detect import engine_gpu_stats
+        utils = [c["util"] for c in engine_gpu_stats() if c.get("util") is not None]
+        if utils:
+            return max(utils)
+    except Exception:
+        pass
     if _NVIDIA_SMI:
         out = _run([
             _NVIDIA_SMI,
@@ -441,6 +461,7 @@ class ThermalSettings:
     __slots__ = (
         "cpu_enabled", "gpu_enabled",
         "cpu_high", "cpu_resume", "gpu_high", "gpu_resume",
+        "gpu_overrides",
         "poll_seconds",
         "soft_enabled", "soft_temp", "soft_max_sleep",
     )
@@ -449,17 +470,27 @@ class ThermalSettings:
                  cpu_high=90.0, cpu_resume=87.0,
                  gpu_high=90.0, gpu_resume=87.0,
                  poll_seconds=5.0,
-                 soft_enabled=False, soft_temp=80.0, soft_max_sleep=3.0):
+                 soft_enabled=False, soft_temp=80.0, soft_max_sleep=3.0,
+                 gpu_overrides=None):
         self.cpu_enabled = bool(cpu_enabled)
         self.gpu_enabled = bool(gpu_enabled)
         self.cpu_high = float(cpu_high)
         self.cpu_resume = float(cpu_resume)
         self.gpu_high = float(gpu_high)
         self.gpu_resume = float(gpu_resume)
+        self.gpu_overrides = dict(gpu_overrides or {})
         self.poll_seconds = max(1.0, float(poll_seconds))
         self.soft_enabled = bool(soft_enabled)
         self.soft_temp = float(soft_temp)
         self.soft_max_sleep = max(0.0, float(soft_max_sleep))
+
+    def gpu_thresholds(self, vendor):
+        """(high, resume) for a card of ``vendor``, honouring per-vendor overrides."""
+        ov = (self.gpu_overrides or {}).get((vendor or "").lower())
+        if isinstance(ov, dict):
+            return (float(ov.get("high", self.gpu_high)),
+                    float(ov.get("resume", self.gpu_resume)))
+        return self.gpu_high, self.gpu_resume
 
 
 def _settings_from_global_args() -> ThermalSettings:
@@ -479,6 +510,7 @@ def _settings_from_global_args() -> ThermalSettings:
         cpu_resume=g("thermal_cpu_resume", 87.0),
         gpu_high=g("thermal_gpu_high", 90.0),
         gpu_resume=g("thermal_gpu_resume", 87.0),
+        gpu_overrides=g("thermal_gpu_overrides", None),
         poll_seconds=g("thermal_poll_seconds", 5.0),
         soft_enabled=g("thermal_soft_throttle_enabled", False),
         soft_temp=g("thermal_soft_throttle_temp", 80.0),
@@ -524,6 +556,39 @@ def checkpoint(context: str = "", throttle_seconds: float = 0.0) -> None:
     wait_until_safe(context=context)
 
 
+def gpu_eval(settings: ThermalSettings):
+    """Per-card GPU thermal check, scoped to THIS engine's cards.
+
+    Returns ``(over_high, over_resume, worst)`` where ``worst`` is
+    ``{name,temp,high,resume,vendor}`` for the card most over its OWN high threshold
+    (or hottest vs its resume when none are over high), or ``None`` if no card temp
+    is readable. Honours per-vendor overrides, so e.g. a Radeon limit can differ
+    from an NVIDIA one and each card is judged against its own threshold."""
+    try:
+        from codai.frontproxy.gpu_detect import engine_gpu_stats
+        cards = engine_gpu_stats()
+    except Exception:
+        cards = []
+    over_high = over_resume = False
+    worst = None
+    worst_margin = None
+    for c in cards:
+        t = c.get("temp")
+        if t is None:
+            continue
+        high, resume = settings.gpu_thresholds(c.get("vendor"))
+        if t >= high:
+            over_high = True
+        if t > resume:
+            over_resume = True
+        margin = t - high
+        if worst is None or margin > worst_margin:
+            worst_margin = margin
+            worst = {"name": c.get("name"), "temp": t, "high": high,
+                     "resume": resume, "vendor": c.get("vendor")}
+    return over_high, over_resume, worst
+
+
 def wait_until_safe(settings: Optional[ThermalSettings] = None,
                     debug: bool = False,
                     context: str = "") -> None:
@@ -543,19 +608,23 @@ def wait_until_safe(settings: Optional[ThermalSettings] = None,
     desc0 = f" [{context}]" if context else ""
 
     # Read current temps once (cached) and log the full picture in debug mode.
-    gpu_t = read_gpu_temp() if settings.gpu_enabled else None
+    # GPU is evaluated per-card (each card vs its own vendor threshold); gpu_t is
+    # the worst offender's temperature, used for messaging/soft-throttle/debug.
+    gpu_over, gpu_over_resume, gpu_worst = (
+        gpu_eval(settings) if settings.gpu_enabled else (False, False, None))
+    gpu_t = gpu_worst["temp"] if gpu_worst else None
     cpu_t = read_cpu_temp() if settings.cpu_enabled else None
     _dbg(
         f"check{desc0}: "
         f"GPU {_fmt(gpu_t)} (enabled={settings.gpu_enabled}, "
-        f"pause>={settings.gpu_high:.0f} resume<={settings.gpu_resume:.0f}) | "
+        f"over_high={gpu_over} over_resume={gpu_over_resume}) | "
         f"CPU {_fmt(cpu_t)} (enabled={settings.cpu_enabled}, "
         f"pause>={settings.cpu_high:.0f} resume<={settings.cpu_resume:.0f})"
     )
 
     hot = []
-    if settings.gpu_enabled and gpu_t is not None and gpu_t >= settings.gpu_high:
-        hot.append(("GPU", gpu_t, settings.gpu_resume))
+    if settings.gpu_enabled and gpu_over:
+        hot.append(("GPU", gpu_worst["temp"], gpu_worst["resume"]))
     if settings.cpu_enabled and cpu_t is not None and cpu_t >= settings.cpu_high:
         hot.append(("CPU", cpu_t, settings.cpu_resume))
 
@@ -567,7 +636,7 @@ def wait_until_safe(settings: Optional[ThermalSettings] = None,
     # the resume line and a cooldown is already in progress.
     joined = False
     if not hot and _cooldown_active():
-        if (settings.gpu_enabled and gpu_t is not None and gpu_t > settings.gpu_resume) or \
+        if (settings.gpu_enabled and gpu_over_resume) or \
            (settings.cpu_enabled and cpu_t is not None and cpu_t > settings.cpu_resume):
             joined = True
     if not hot and not joined:
@@ -588,11 +657,12 @@ def wait_until_safe(settings: Optional[ThermalSettings] = None,
     # Enter cooldown: wait until *every* triggered sensor is at/below resume.
     desc = f" ({context})" if context else ""
     if hot:
-        trig = ", ".join(f"{lbl} {t:.0f}°C>={settings.gpu_high if lbl=='GPU' else settings.cpu_high:.0f}°C"
-                         for lbl, t, _ in hot)
-        print(f"[thermal] Hardware too hot{desc}: {trig} — pausing requests "
-              f"until cooldown (GPU<={settings.gpu_resume:.0f}°C / "
-              f"CPU<={settings.cpu_resume:.0f}°C)")
+        # Each triggered sensor carries its own resume threshold (per-card for GPU).
+        trig = ", ".join(f"{lbl} {t:.0f}°C (resume<={r:.0f}°C)" for lbl, t, r in hot)
+        gpu_note = (f" [{gpu_worst['name']}]" if gpu_worst and any(h[0] == 'GPU' for h in hot)
+                    else "")
+        print(f"[thermal] Hardware too hot{desc}: {trig}{gpu_note} — pausing requests "
+              f"until cooldown")
     else:
         # Joined an already-active cooldown started by another parallel worker.
         print(f"[thermal] Joining active cooldown{desc} — another generation is "
@@ -605,13 +675,15 @@ def wait_until_safe(settings: Optional[ThermalSettings] = None,
             # Re-evaluate against resume thresholds (lower than trigger → hysteresis).
             # CPU temps are noisy, so average a few samples for the resume decision
             # (the pause check above stays single-read to react fast to spikes).
-            gt = read_gpu_temp() if settings.gpu_enabled else None
+            _, gpu_still, gpu_w2 = (gpu_eval(settings) if settings.gpu_enabled
+                                    else (False, False, None))
             ct = read_cpu_temp_avg() if settings.cpu_enabled else None
             still = []
-            if gt is not None and gt > settings.gpu_resume:
-                still.append(("GPU", gt, settings.gpu_resume))
+            if settings.gpu_enabled and gpu_still:
+                still.append(("GPU", gpu_w2["temp"], gpu_w2["resume"]))
             if ct is not None and ct > settings.cpu_resume:
                 still.append(("CPU", ct, settings.cpu_resume))
+            gt = gpu_w2["temp"] if gpu_w2 else None
             _dbg(f"cooldown{desc} {int(waited)}s: GPU {_fmt(gt)} CPU {_fmt(ct)} (avg-3) "
                  f"(still hot: {[s[0] for s in still] or 'none'})")
             if not still:

@@ -135,6 +135,32 @@ async def create_transcription(
     if len(file_content) > _MAX_AUDIO_BYTES:
         raise HTTPException(status_code=413, detail="Audio file too large (max 100 MB)")
 
+    # Register a task so transcription appears in the unified task list, like
+    # every other model type. Finished on success or error below.
+    from codai.tasks import task_registry
+    _tid = task_registry.register(
+        "transcription",
+        title=(file.filename or "audio")[:80],
+        model=model or "",
+    )
+    task_registry.start(_tid)
+    try:
+        _resp = await _run_transcription(
+            file_content, model, language, prompt, response_format, temperature, file)
+        task_registry.finish(_tid, "done")
+        return _resp
+    except HTTPException:
+        task_registry.finish(_tid, "error")
+        raise
+    except Exception as e:
+        task_registry.finish(_tid, "error", str(e)[:200])
+        raise
+
+
+async def _run_transcription(
+    file_content: bytes, model: str, language, prompt, response_format, temperature, file
+):
+    """Core transcription logic; registered as a task by create_transcription()."""
     # Check if the requested model maps to a configured whisper-server instance first.
     # Try alias round-robin resolution before direct ID lookup.
     whisper_model_id = multi_model_manager.resolve_whisper_alias_model_id(model)

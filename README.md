@@ -4,7 +4,7 @@
 
 ![CoderAI](CoderAI.gif)
 
-An OpenAI-compatible API server to run models on your local GPU with web administration dashboard, supporting multiple GPU backends: NVIDIA (CUDA), AMD (Vulkan), and Intel (Vulkan). Configuration-driven architecture with per-model settings and full multi-modal support.
+A multimodal and multi-backend local model orchestrator with an OpenAI-compatible API server to run models on local GPUs, supporting multiple GPU backends: NVIDIA (CUDA), AMD (Vulkan), and Intel (Vulkan). Configuration-driven architecture with per-model settings and full multi-modal support.
 
 ## Features
 

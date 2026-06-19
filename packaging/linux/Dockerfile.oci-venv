@@ -4,39 +4,22 @@ ARG UBUNTU_VERSION=22.04
 FROM scratch AS build_meta
 COPY .packaging-cache/build-manifest.json /build-manifest.json
 
-FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
+# ─────────────────────────────────────────────────────────────────────────────
+# assembler: stage the local bundle into /opt/coderai. The 27GB COPY of the
+# bundle lives ONLY in this stage; the final image copies the assembled
+# /opt/coderai once, so the bundle is never stored twice.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS assembler
 
 ARG PYTHON_VERSION=3.13.5
 ARG PBS_RELEASE=20250612
 ARG VENV_PYTHON_MINOR=3.13
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    PYTHONUNBUFFERED=1 \
-    HF_HOME=/cache/huggingface \
-    HUGGINGFACE_HUB_CACHE=/cache/huggingface/hub \
-    TRANSFORMERS_CACHE=/cache/huggingface/transformers \
-    DIFFUSERS_CACHE=/cache/diffusers \
-    CODERAI_CONFIG_DIR=/config \
-    CODERAI_MODELS_DIR=/models \
-    CODERAI_CACHE_DIR=/cache \
-    CODERAI_HOST=0.0.0.0 \
-    CODERAI_PORT=8776
+ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates \
-      curl \
-      ffmpeg \
-      git \
-      libgomp1 \
-      libgl1 \
-      libglib2.0-0 \
-      libsndfile1 \
-      libvulkan1 \
-      mesa-vulkan-drivers \
-      openssl \
-      rsync \
-    && rm -rf /var/lib/apt/lists/*
+      ca-certificates curl rsync \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb
 
 RUN set -eux; \
     curl -fsSL -o /tmp/python.tar.gz \
@@ -46,14 +29,12 @@ RUN set -eux; \
     rm /tmp/python.tar.gz; \
     /opt/coderai/python/bin/python3 --version
 
-ENV PYTHONHOME=/opt/coderai/python \
-    PATH=/opt/coderai/python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
 # BuildKit named context supplied by packaging/linux/build_oci_image.sh:
 #   --build-context local_bundle=/path/to/.packaging-cache/oci-venv-context
-# The bundle contains the selected venv plus ldd-discovered native libraries from
-# the local machine. GPU drivers are intentionally not bundled; NVIDIA Container
-# Toolkit / host Vulkan ICDs remain the runtime contract.
+# The bundle contains the selected venv plus ldd-discovered native libraries, the
+# parler overlay, the isolated lip-sync venvs (+repos/weights), a standalone
+# Python 3.10 for them, and the ds4 binary. GPU drivers are intentionally not
+# bundled; the NVIDIA Container Toolkit / host Vulkan ICDs remain the contract.
 COPY --from=local_bundle / /tmp/local-bundle/
 
 RUN set -eux; \
@@ -69,20 +50,109 @@ RUN set -eux; \
       mkdir -p /opt/coderai/local-libs; \
       rsync -a /tmp/local-bundle/local-libs/ /opt/coderai/local-libs/; \
     fi; \
+    if [ -d /tmp/local-bundle/parler-venv/site-packages ]; then \
+      mkdir -p /opt/coderai/parler-venv/site-packages; \
+      rsync -a /tmp/local-bundle/parler-venv/site-packages/ /opt/coderai/parler-venv/site-packages/; \
+    fi; \
+    if [ -d /tmp/local-bundle/py310 ]; then \
+      mkdir -p /opt/coderai/py310; \
+      rsync -a /tmp/local-bundle/py310/ /opt/coderai/py310/; \
+    fi; \
+    for d in lipsync_venv Wav2Lip SadTalker ds4; do \
+      if [ -d "/tmp/local-bundle/$d" ]; then \
+        mkdir -p "/opt/coderai/$d"; \
+        rsync -a "/tmp/local-bundle/$d/" "/opt/coderai/$d/"; \
+      fi; \
+    done; \
+    cfg="/opt/coderai/lipsync_venv/pyvenv.cfg"; \
+    if [ -f "$cfg" ]; then \
+      sed -i 's|^home *=.*|home = /opt/coderai/py310/bin|; s|^command *=.*|command = /opt/coderai/py310/bin/python3.10|' "$cfg"; \
+      for p in python python3 python3.10; do ln -sf /opt/coderai/py310/bin/python3.10 "/opt/coderai/lipsync_venv/bin/$p"; done; \
+    fi; \
     if [ -d /tmp/local-bundle/local-bin ]; then \
-      rsync -a /tmp/local-bundle/local-bin/ /usr/local/bin/; \
-      find /usr/local/bin -maxdepth 1 -type f -exec chmod +x '{}' \;; \
+      mkdir -p /opt/coderai/staged-local-bin; \
+      rsync -a /tmp/local-bundle/local-bin/ /opt/coderai/staged-local-bin/; \
     fi; \
     rm -rf /tmp/local-bundle; \
-    find /opt/coderai/python -type d \( -name __pycache__ -o -name tests -o -name test \) -prune -exec rm -rf '{}' +
+    find /opt/coderai -type d \( -name __pycache__ -o -name tests -o -name test \) -prune -exec rm -rf '{}' + || true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# runtime: the shipped image. Copies the assembled tree once (no bundle dup).
+# ─────────────────────────────────────────────────────────────────────────────
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
+
+ARG PYTHON_VERSION=3.13.5
+
+# Note: PYTHONHOME / the python-prefixed PATH are deliberately NOT set here — that
+# would hijack the system python3 during apt's python3-minimal post-install (the
+# standalone interpreter is only COPYed in below). They're set after apt.
+ENV DEBIAN_FRONTEND=noninteractive \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/cache/huggingface \
+    HUGGINGFACE_HUB_CACHE=/cache/huggingface/hub \
+    TRANSFORMERS_CACHE=/cache/huggingface/transformers \
+    DIFFUSERS_CACHE=/cache/diffusers \
+    CODERAI_CONFIG_DIR=/config \
+    CODERAI_MODELS_DIR=/models \
+    CODERAI_CACHE_DIR=/cache \
+    CODERAI_HOST=0.0.0.0 \
+    CODERAI_PORT=8776 \
+    CODERAI_LIPSYNC_VENV=/opt/coderai/lipsync_venv \
+    CODERAI_WAV2LIP_SRC=/opt/coderai/Wav2Lip \
+    CODERAI_WAV2LIP_DIR=/cache/lipsync/Wav2Lip \
+    CODERAI_SADTALKER_SRC=/opt/coderai/SadTalker \
+    CODERAI_SADTALKER_DIR=/cache/lipsync/SadTalker \
+    CODERAI_DS4_DIR=/cache/ds4
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      ffmpeg \
+      git \
+      libgomp1 \
+      libgl1 \
+      libglib2.0-0 \
+      libsndfile1 \
+      libvulkan1 \
+      mesa-vulkan-drivers \
+      vulkan-tools \
+      pciutils \
+      nginx \
+      supervisor \
+      openssl \
+      rsync \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb
+
+# The fully assembled CoderAI tree (Python + venvs + tools), copied once.
+COPY --from=assembler /opt/coderai /opt/coderai
+
+# Put the standalone interpreter first on PATH. Do NOT set PYTHONHOME globally:
+# supervisord runs on the system python3 (3.12) and a PYTHONHOME pointing at the
+# standalone 3.13 stdlib breaks it ("No module named 'encodings'"). The standalone
+# python is relocatable, and the per-service launchers set PYTHONHOME themselves.
+ENV PATH=/opt/coderai/python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 WORKDIR /opt/coderai/app
 COPY . /opt/coderai/app
 COPY --from=build_meta /build-manifest.json /opt/coderai/BUILD-MANIFEST.json
 COPY packaging/linux/launcher/coderai-oci /usr/local/bin/coderai
+COPY packaging/linux/launcher/with-env /usr/local/bin/with-env
+COPY packaging/linux/launcher/coderai-entrypoint /usr/local/bin/coderai-entrypoint
+COPY packaging/linux/launcher/wav2lip /usr/local/bin/wav2lip
+COPY packaging/linux/launcher/sadtalker /usr/local/bin/sadtalker
+COPY packaging/linux/nginx.conf /etc/nginx/nginx.conf
+COPY packaging/linux/supervisord.conf /etc/supervisor/supervisord.conf
+COPY packaging/linux/README-RUN.txt /opt/coderai/README-RUN.txt
 
 RUN set -eux; \
-    chmod +x /usr/local/bin/coderai /opt/coderai/app/coderai; \
+    if [ -d /opt/coderai/staged-local-bin ]; then \
+      rsync -a /opt/coderai/staged-local-bin/ /usr/local/bin/; \
+      find /usr/local/bin -maxdepth 1 -type f -exec chmod +x '{}' \;; \
+      rm -rf /opt/coderai/staged-local-bin; \
+    fi; \
+    chmod +x /usr/local/bin/coderai /usr/local/bin/with-env /usr/local/bin/coderai-entrypoint \
+             /usr/local/bin/wav2lip /usr/local/bin/sadtalker /opt/coderai/app/coderai; \
     mkdir -p /config /models /cache /opt/coderai/app/models; \
     rm -rf \
       /opt/coderai/app/.git \
@@ -101,5 +171,7 @@ if missing:
 PY
 
 VOLUME ["/config", "/models", "/cache"]
+# Single published port: nginx fronts the main server (/) and the tool web UIs
+# (/editor/, /videogen/, /township/).
 EXPOSE 8776
-ENTRYPOINT ["/usr/local/bin/coderai"]
+ENTRYPOINT ["/usr/local/bin/coderai-entrypoint"]

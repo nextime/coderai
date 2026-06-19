@@ -19,6 +19,8 @@
 
 import os
 import json
+import threading
+import time
 from typing import AsyncIterator, Optional, Union, List, Dict, Any
 from pathlib import Path
 
@@ -66,6 +68,30 @@ def _make_llama_thermal_criteria():
     except Exception:
         return None
 
+
+_CHAT_SUPPORTS_STOPPING_CRITERIA = None
+
+
+def _chat_supports_stopping_criteria() -> bool:
+    """Whether this llama-cpp-python's create_chat_completion accepts
+    ``stopping_criteria``. Older/newer versions differ: create_completion always
+    takes it, but several create_chat_completion builds do not, raising
+    'unexpected keyword argument'. Checked once via signature inspection."""
+    global _CHAT_SUPPORTS_STOPPING_CRITERIA
+    if _CHAT_SUPPORTS_STOPPING_CRITERIA is None:
+        supported = False
+        try:
+            import inspect
+            from llama_cpp import Llama as _L
+            sig = inspect.signature(_L.create_chat_completion)
+            supported = ("stopping_criteria" in sig.parameters
+                         or any(p.kind == inspect.Parameter.VAR_KEYWORD
+                                for p in sig.parameters.values()))
+        except Exception:
+            supported = False
+        _CHAT_SUPPORTS_STOPPING_CRITERIA = supported
+    return _CHAT_SUPPORTS_STOPPING_CRITERIA
+
 try:
     from llama_cpp import Llama
     from llama_cpp.llama_chat_format import ChatFormatterResponse
@@ -90,6 +116,74 @@ _KV_TYPE_ALIASES = {
 
 # Sub-8-bit KV types that llama.cpp can only use with flash attention enabled.
 _KV_NEEDS_FLASH = {'q5_0', 'q5_1', 'q5', 'q4_0', 'q4_1', 'q4', 'iq4_nl'}
+
+_GGUF_META_CACHE: dict = {}
+
+
+def _gguf_block_count(path) -> int:
+    """Layer (block) count from a GGUF header (``*.block_count``), 0 if unknown.
+    Reads only the metadata KV section (no tensors). Cached per path."""
+    if not path:
+        return 0
+    if path in _GGUF_META_CACHE:
+        return _GGUF_META_CACHE[path]
+    import struct
+    result = 0
+    try:
+        with open(path, 'rb') as f:
+            if f.read(4) != b'GGUF':
+                _GGUF_META_CACHE[path] = 0
+                return 0
+            struct.unpack('<I', f.read(4))                  # version
+            struct.unpack('<Q', f.read(8))                  # tensor count
+            n_kv = struct.unpack('<Q', f.read(8))[0]
+
+            def rd_str():
+                ln = struct.unpack('<Q', f.read(8))[0]
+                return f.read(ln).decode('utf-8', 'replace')
+
+            def rd_val(vt):
+                if vt == 0:  return struct.unpack('<B', f.read(1))[0]
+                if vt == 1:  return struct.unpack('<b', f.read(1))[0]
+                if vt == 2:  return struct.unpack('<H', f.read(2))[0]
+                if vt == 3:  return struct.unpack('<h', f.read(2))[0]
+                if vt == 4:  return struct.unpack('<I', f.read(4))[0]
+                if vt == 5:  return struct.unpack('<i', f.read(4))[0]
+                if vt == 6:  return struct.unpack('<f', f.read(4))[0]
+                if vt == 7:  return struct.unpack('<?', f.read(1))[0]
+                if vt == 8:  return rd_str()
+                if vt == 10: return struct.unpack('<Q', f.read(8))[0]
+                if vt == 11: return struct.unpack('<q', f.read(8))[0]
+                if vt == 12: return struct.unpack('<d', f.read(8))[0]
+                if vt == 9:
+                    et = struct.unpack('<I', f.read(4))[0]
+                    cnt = struct.unpack('<Q', f.read(8))[0]
+                    return [rd_val(et) for _ in range(cnt)]
+                raise ValueError(f"unknown gguf value type {vt}")
+
+            for _ in range(n_kv):
+                key = rd_str()
+                val = rd_val(struct.unpack('<I', f.read(4))[0])
+                if key.endswith('.block_count'):
+                    try:
+                        result = int(val)
+                    except (TypeError, ValueError):
+                        result = 0
+                    break
+    except Exception:
+        result = 0
+    _GGUF_META_CACHE[path] = result
+    return result
+
+
+def _free_vram_gb(device: int = 0) -> float:
+    """Free VRAM (GB) on the given CUDA device, 0.0 if unavailable."""
+    try:
+        import torch
+        free, _total = torch.cuda.mem_get_info(device)
+        return free / (1024 ** 3)
+    except Exception:
+        return 0.0
 
 
 def _ggml_kv_type(name):
@@ -143,7 +237,7 @@ def _install_layer_log_callback():
     return _cb  # caller must hold this reference
 
 
-async def _aiter_blocking(sync_iter):
+async def _aiter_blocking(sync_iter, lock=None):
     """Bridge a blocking (sync) generator onto the asyncio event loop.
 
     llama.cpp's create_(chat_)completion returns a *synchronous* generator whose
@@ -167,6 +261,13 @@ async def _aiter_blocking(sync_iter):
         except StopIteration:
             return _SENT
 
+    # When a per-instance generation lock is supplied, hold it for the whole
+    # iteration so a concurrent request on the same backend can't interleave its
+    # forward passes into this one's KV cache. Acquired in a worker thread so a
+    # contended lock doesn't block the event loop; released from here (a plain
+    # threading.Lock permits cross-thread release).
+    if lock is not None:
+        await asyncio.to_thread(lock.acquire)
     try:
         while True:
             item = await asyncio.to_thread(_next)
@@ -179,6 +280,11 @@ async def _aiter_blocking(sync_iter):
             try:
                 close()
             except Exception:
+                pass
+        if lock is not None:
+            try:
+                lock.release()
+            except RuntimeError:
                 pass
 
 
@@ -194,10 +300,19 @@ class VulkanBackend(ModelBackend):
         self.main_gpu = 0  # Default to first GPU
         self.chat_template = None  # Detected chat template name
         self.hf_tokenizer = None  # HuggingFace tokenizer for apply_chat_template
+        self.supports_vision = False  # set True when an mmproj projector is loaded
         self.force_cuda = original_backend in ("nvidia", "cuda")  # Force CUDA if original was nvidia
         if self.force_cuda:
             print("DEBUG: GGUF model will use CUDA backend (forced by --backend nvidia)")
         self._last_usage: dict = {}  # usage from the most recent completion call
+        # Serializes the synchronous forward pass within this one instance. The
+        # instance pool may hand the same backend to two concurrent requests when
+        # all instances are busy; overlapping create_completion calls share one KV
+        # cache and would corrupt each other. Distinct pool instances each have
+        # their own lock, so they still run in parallel. A plain Lock (not RLock)
+        # is used so the streaming path can acquire it in a worker thread and
+        # release it from the event-loop thread.
+        self._gen_lock = threading.Lock()
         self._detect_chat_template()
     
     def _detect_chat_template(self):
@@ -621,6 +736,27 @@ class VulkanBackend(ModelBackend):
             else:
                 raise ValueError(f"Could not cache model from URL: {model_path}")
         
+        # Fallback: a configured .gguf path that no longer exists (e.g. the file was
+        # downloaded into the GGUF cache rather than the HF-hub snapshot the entry
+        # points at, or a stale snapshot hash). Look for the same filename in the
+        # GGUF cache dir before giving up — the model loads without re-editing the
+        # config entry.
+        if model_path.endswith('.gguf') and not os.path.exists(model_path):
+            try:
+                from codai.models.cache import get_model_cache_dir
+                _base = os.path.basename(model_path)
+                _cache = get_model_cache_dir()
+                _cand = os.path.join(_cache, _base)
+                if not os.path.exists(_cand):
+                    import glob as _glob
+                    _hits = _glob.glob(os.path.join(_cache, "**", _base), recursive=True)
+                    _cand = _hits[0] if _hits else _cand
+                if os.path.exists(_cand):
+                    print(f"  Model path missing; resolved from GGUF cache: {_cand}")
+                    model_path = _cand
+            except Exception:
+                pass
+
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model file not found: {model_path}")
         
@@ -647,14 +783,45 @@ class VulkanBackend(ModelBackend):
             self.n_gpu_layers = -1
         elif n_gpu_layers != -1:
             self.n_gpu_layers = n_gpu_layers
-        
+        else:
+            # Auto (n_gpu_layers == -1): if the whole model won't fit in free VRAM,
+            # place as many layers on GPU as fit and leave the rest on CPU instead
+            # of trying to load everything and OOMing ("failed to create
+            # llama_context"). llama.cpp has no auto-fit, so we size it ourselves.
+            try:
+                _exp = kwargs.get('expected_vram_gb')
+                _nlayers = _gguf_block_count(model_path)
+                _free = _free_vram_gb(self.main_gpu if isinstance(self.main_gpu, int) else 0)
+                if _exp and _exp > 0 and _nlayers and _free > 0 and _exp > _free * 0.95:
+                    # Scale layers on GPU by the VRAM ratio (weights + KV roughly
+                    # scale per-layer). The estimate tends to undercount the KV
+                    # cache at large n_ctx, and a few GB of compute/output buffers
+                    # stay on GPU regardless — so reserve a context-scaled headroom
+                    # and inflate the need, to err toward fitting (CPU layers are
+                    # slow but a failed load is worse).
+                    _headroom = 2.0 + (self.n_ctx or 0) / 12000.0   # ~2 GB + ~1 GB per 12k ctx
+                    _usable = max(0.0, _free - _headroom)
+                    _fit = int(_nlayers * _usable / (_exp * 1.20))
+                    _fit = max(0, min(_nlayers - 1, _fit))
+                    self.n_gpu_layers = _fit
+                    print(f"  Auto-offload: model needs ~{_exp:.1f} GB but only "
+                          f"{_free:.1f} GB free — placing {_fit}/{_nlayers} layers on "
+                          f"GPU, {_nlayers - _fit} on CPU (slower). Lower n_ctx or use a "
+                          f"smaller model to keep it fully on GPU.", flush=True)
+            except Exception as _off_e:
+                print(f"  (auto-offload sizing skipped: {_off_e})", flush=True)
+
         # Configure context size
         if no_ram:
             # --no-ram: ignore --n-ctx, let the model use its own default
             self.n_ctx = 0  # 0 means use model's built-in default in llama.cpp
             print("DEBUG: --no-ram mode: ignoring --n-ctx, using model default context size")
         else:
-            n_ctx = kwargs.get('n_ctx', 2048)
+            # Accept either 'n_ctx' (models.json / GGUF) or 'ctx' (CLI / older
+            # configs); the manager passes both, but be robust to either alone.
+            n_ctx = kwargs.get('n_ctx')
+            if n_ctx is None:
+                n_ctx = kwargs.get('ctx', 2048)
             self.n_ctx = n_ctx
         
         # Set verbose
@@ -713,6 +880,35 @@ class VulkanBackend(ModelBackend):
             print(f"  KV cache: type_k={_ck or 'f16'}  type_v={_cv or 'f16'}"
                   f"{'  (flash_attn on)' if _flash else ''}")
 
+        # Multimodal projector (mmproj): pairs a CLIP/vision projector GGUF with
+        # this text model so it can accept images — the llama.cpp `--mmproj`
+        # equivalent, which adds vision capability (e.g. gemma). Uses llama.cpp's
+        # unified mtmd handler, which auto-detects the projector type from the file.
+        self.supports_vision = False
+        _mmproj = kwargs.get('mmproj', _raw_cfg.get('mmproj'))
+        if _mmproj:
+            _mmproj_path = os.path.expanduser(str(_mmproj))
+            if not os.path.isfile(_mmproj_path):
+                # Bare filename / moved cache → look beside the model file.
+                _cand = os.path.join(os.path.dirname(model_path),
+                                     os.path.basename(_mmproj_path))
+                if os.path.isfile(_cand):
+                    _mmproj_path = _cand
+            if os.path.isfile(_mmproj_path):
+                try:
+                    from llama_cpp.llama_chat_format import MTMDChatHandler
+                    llama_kwargs['chat_handler'] = MTMDChatHandler(
+                        clip_model_path=_mmproj_path,
+                        verbose=False,
+                        use_gpu=(self.n_gpu_layers != 0),
+                    )
+                    self.supports_vision = True
+                    print(f"  mmproj       : {os.path.basename(_mmproj_path)} (vision enabled)")
+                except Exception as _e:
+                    print(f"  mmproj       : failed to load projector ({_e}); continuing text-only")
+            else:
+                print(f"  mmproj       : configured path not found ({_mmproj}); skipping")
+
         # Force CUDA if requested
         if self.force_cuda:
             # Set environment variable to force CUDA
@@ -727,19 +923,60 @@ class VulkanBackend(ModelBackend):
             print(f"  GPU offload  : {'supported' if gpu_supported else 'NOT supported by this build'}")
 
         _log_cb = _install_layer_log_callback()
+        # Progress feedback during the (otherwise silent) tensor load. llama.cpp's
+        # progress_callback isn't exposed by the Llama wrapper, so inject it by
+        # patching the default model-params factory for the duration of construction.
+        # Kept alive in a local for the whole load (avoids a ctypes use-after-free).
+        _prog = {'last': -5, 't0': time.time()}
+
+        @_llama_cpp.llama_progress_callback
+        def _progress_cb(progress, user_data):
+            try:
+                pct = int(progress * 100)
+                if pct >= _prog['last'] + 5 or pct >= 100:
+                    _prog['last'] = pct
+                    print(f"  Loading model into VRAM/RAM: {pct}%"
+                          f" ({time.time() - _prog['t0']:.0f}s)", flush=True)
+            except Exception:
+                pass
+            return True
+
+        # Patch the SUBMODULE attribute — llama.py does `import llama_cpp.llama_cpp
+        # as llama_cpp` and builds model_params from it, so the top-level package
+        # attribute is not what it looks up.
+        _params_mod = getattr(_llama_cpp, 'llama_cpp', _llama_cpp)
+        _orig_params = _params_mod.llama_model_default_params
+        def _params_with_progress():
+            p = _orig_params()
+            try:
+                p.progress_callback = _progress_cb
+            except Exception:
+                pass
+            return p
+        _params_mod.llama_model_default_params = _params_with_progress
         try:
             self.model = Llama(**llama_kwargs)
         except Exception as e:
             print(f"Error loading GGUF model: {e}")
             raise
         finally:
-            # Restore llama.cpp's default (quiet) logging after load
+            _params_mod.llama_model_default_params = _orig_params
+            # Quiet logging after load — but DO NOT drop to NULL + GC the callback.
+            # ggml keeps the log-callback pointer and may still invoke it during
+            # generation (e.g. gemma's iSWA hybrid cache logs every step), so a
+            # garbage-collected ctypes callback becomes a use-after-free → SIGSEGV
+            # in libffi. Install a persistent no-op callback and keep a strong
+            # reference on self for the model's lifetime.
             if _llama_cpp:
                 try:
-                    _llama_cpp.llama_log_set(None, None)
+                    @_llama_cpp.llama_log_callback
+                    def _quiet_log_cb(level, text, user_data):
+                        pass
+                    _llama_cpp.llama_log_set(_quiet_log_cb, None)
+                    self._log_cb = _quiet_log_cb   # keep alive (prevents GC/UAF)
                 except Exception:
-                    pass
-            _log_cb = None  # release callback
+                    self._log_cb = None
+            _log_cb = None  # the verbose load-phase callback is no longer referenced
 
         # Post-load layer/buffer summary
         try:
@@ -751,10 +988,57 @@ class VulkanBackend(ModelBackend):
         except Exception:
             pass
 
+        # Multi-slot prefix cache. llama-cpp-python's LlamaRAMCache keeps several
+        # past sequences' KV states in host RAM and, on each completion, reloads
+        # the one sharing the longest token prefix with the new prompt (see
+        # Llama._create_completion). This lets two interleaved conversations both
+        # stay "warm" instead of evicting each other — only the changed suffix is
+        # re-evaluated. Bounded by a per-model byte budget so it can't grow without
+        # limit (the states live in CPU RAM, copied back on a slot switch).
+        # kv_cache_budget_mb honours kwargs first, then the raw models.json entry,
+        # mirroring how cache_type_k / flash_attn are resolved above. <=0 disables
+        # it; unset falls back to a sensible default.
+        _DEFAULT_CACHE_MB = 512
+        _budget_mb = kwargs.get('kv_cache_budget_mb', _raw_cfg.get('kv_cache_budget_mb'))
+        self._setup_prefix_cache(_budget_mb if _budget_mb is not None else _DEFAULT_CACHE_MB)
+
         # Try to detect and set up chat template
         self._finalize_chat_template_detection()
         print(f"  chat_template: {self.chat_template}")
-    
+
+    def _setup_prefix_cache(self, budget_mb) -> None:
+        """Attach a multi-slot LlamaRAMCache sized to ``budget_mb`` megabytes."""
+        try:
+            budget = max(0, int(budget_mb)) * 1024 * 1024
+        except (TypeError, ValueError):
+            budget = 512 * 1024 * 1024
+        self._prefix_cache_budget = budget
+        if budget <= 0:
+            print("  Prefix cache : disabled (kv_cache_budget_mb=0)")
+            return
+        try:
+            from llama_cpp import LlamaRAMCache
+            self.model.set_cache(LlamaRAMCache(capacity_bytes=budget))
+            print(f"  Prefix cache : multi-slot RAM cache, budget {budget // (1024*1024)} MB")
+        except Exception as e:
+            print(f"  Prefix cache : could not enable ({e}); relying on single-slot prefix match")
+
+    def clear_prefix_cache(self) -> None:
+        """Release the host-RAM prefix cache (called by the RAM-pressure ladder).
+
+        Re-attaches a fresh, empty LlamaRAMCache at the same budget so caching
+        keeps working after the reclaim — only the stored sequences are dropped.
+        """
+        budget = getattr(self, '_prefix_cache_budget', 0)
+        if not budget or self.model is None:
+            return
+        try:
+            from llama_cpp import LlamaRAMCache
+            with self._gen_lock:
+                self.model.set_cache(LlamaRAMCache(capacity_bytes=budget))
+        except Exception:
+            pass
+
     def generate(
         self,
         prompt: str,
@@ -825,17 +1109,18 @@ class VulkanBackend(ModelBackend):
                 pass
         
         try:
-            result = self.model.create_completion(
-                stopping_criteria=_make_llama_thermal_criteria(),
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                repeat_penalty=repeat_penalty,
-                stop=stop,
-                grammar=use_grammar,
-            )
+            with self._gen_lock:
+                result = self.model.create_completion(
+                    stopping_criteria=_make_llama_thermal_criteria(),
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repeat_penalty=repeat_penalty,
+                    stop=stop,
+                    grammar=use_grammar,
+                )
             usage = result.get('usage', {})
             self._store_usage(usage.get('prompt_tokens', 0), usage.get('completion_tokens', 0))
             return result['choices'][0]['text']
@@ -844,16 +1129,17 @@ class VulkanBackend(ModelBackend):
             if use_grammar:
                 print(f"Warning: Grammar-guided generation failed: {e}, falling back to normal generation")
                 try:
-                    result = self.model.create_completion(
-                        stopping_criteria=_make_llama_thermal_criteria(),
-                        prompt=prompt,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        top_p=top_p,
-                        top_k=top_k,
-                        repeat_penalty=repeat_penalty,
-                        stop=stop,
-                    )
+                    with self._gen_lock:
+                        result = self.model.create_completion(
+                            stopping_criteria=_make_llama_thermal_criteria(),
+                            prompt=prompt,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            top_p=top_p,
+                            top_k=top_k,
+                            repeat_penalty=repeat_penalty,
+                            stop=stop,
+                        )
                     usage = result.get('usage', {})
                     self._store_usage(usage.get('prompt_tokens', 0), usage.get('completion_tokens', 0))
                     return result['choices'][0]['text']
@@ -942,7 +1228,7 @@ class VulkanBackend(ModelBackend):
                 stop=stop,
                 stream=True,
                 grammar=use_grammar,
-            )):
+            ), lock=self._gen_lock):
                 text = chunk['choices'][0].get('text', '')
 
                 if first_chunk:
@@ -981,9 +1267,9 @@ class VulkanBackend(ModelBackend):
                         repeat_penalty=repeat_penalty,
                         stop=stop,
                         stream=True,
-                    )):
+                    ), lock=self._gen_lock):
                         text = chunk['choices'][0].get('text', '')
-                        
+
                         if first_chunk:
                             if text and len(text) > prompt_len:
                                 new_text = text[prompt_len:]
@@ -1050,7 +1336,7 @@ class VulkanBackend(ModelBackend):
                     repeat_penalty=repeat_penalty,
                     stop=stop,
                     stream=True,
-                )):
+                ), lock=self._gen_lock):
                     text = chunk['choices'][0].get('text', '')
                     
                     if first_chunk:
@@ -1068,16 +1354,17 @@ class VulkanBackend(ModelBackend):
             
             return {"stream": generate_stream(), "content": ""}
         else:
-            result = self.model.create_completion(
-                stopping_criteria=_make_llama_thermal_criteria(),
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                repeat_penalty=repeat_penalty,
-                stop=stop,
-            )
-            
+            with self._gen_lock:
+                result = self.model.create_completion(
+                    stopping_criteria=_make_llama_thermal_criteria(),
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    repeat_penalty=repeat_penalty,
+                    stop=stop,
+                )
+
             content = result['choices'][0]['text']
             
             return {
@@ -1186,10 +1473,11 @@ class VulkanBackend(ModelBackend):
         if response_format and response_format.get('type') == 'json_object':
             kwargs['response_format'] = {'type': 'json_object'}
         _tc = _make_llama_thermal_criteria()
-        if _tc is not None:
+        if _tc is not None and _chat_supports_stopping_criteria():
             kwargs['stopping_criteria'] = _tc
 
-        result = self.model.create_chat_completion(**kwargs)
+        with self._gen_lock:
+            result = self.model.create_chat_completion(**kwargs)
         usage = result.get('usage', {})
         self._store_usage(
             prompt_tokens=usage.get('prompt_tokens', 0),
@@ -1214,13 +1502,13 @@ class VulkanBackend(ModelBackend):
         if stop:
             kwargs['stop'] = stop
         _tc = _make_llama_thermal_criteria()
-        if _tc is not None:
+        if _tc is not None and _chat_supports_stopping_criteria():
             kwargs['stopping_criteria'] = _tc
 
         prompt_tokens = 0
         completion_tokens = 0
         try:
-            async for chunk in _aiter_blocking(self.model.create_chat_completion(**kwargs)):
+            async for chunk in _aiter_blocking(self.model.create_chat_completion(**kwargs), lock=self._gen_lock):
                 delta = chunk['choices'][0].get('delta', {})
                 text = delta.get('content') or ''
                 if text:

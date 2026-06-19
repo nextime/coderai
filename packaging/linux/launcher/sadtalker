@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# CLI shim for SadTalker talking-head generation, run in the shared lip-sync venv.
+# codai/api/video.py invokes:
+#   sadtalker --driven_audio AUDIO --source_video VIDEO --result_dir DIR
+# SadTalker animates a still image, so a source video is reduced to its first frame.
+#
+# Checkpoints are NOT baked into the image: on first use they download into the
+# writable working dir (a /cache volume in the container) and persist there.
+set -euo pipefail
+
+VENV="${CODERAI_LIPSYNC_VENV:-$HOME/.coderai/lipsync_venv}"
+SRC="${CODERAI_SADTALKER_SRC:-$HOME/.coderai/SadTalker}"   # baked read-only repo code
+DIR="${CODERAI_SADTALKER_DIR:-$SRC}"                       # writable working copy
+
+if [ ! -x "$VENV/bin/python" ]; then
+  echo "sadtalker: lip-sync venv not found at $VENV" >&2
+  exit 127
+fi
+
+if [ ! -f "$DIR/inference.py" ]; then
+  mkdir -p "$DIR"
+  rsync -a --exclude 'checkpoints/*' --exclude 'gfpgan/weights/*' "$SRC/" "$DIR/"
+fi
+
+# Download checkpoints on first use (idempotent).
+mkdir -p "$DIR/checkpoints" "$DIR/gfpgan/weights"
+_dl(){ if [ ! -s "$2" ]; then echo "sadtalker: downloading $(basename "$2") …" >&2;
+  curl -fSL --retry 3 -o "$2" "$1" || { echo "sadtalker: download failed: $1" >&2; exit 1; }; fi; }
+_b="https://github.com/OpenTalker/SadTalker/releases/download/v0.0.2-rc"
+_dl "$_b/mapping_00109-model.pth.tar"          "$DIR/checkpoints/mapping_00109-model.pth.tar"
+_dl "$_b/mapping_00229-model.pth.tar"          "$DIR/checkpoints/mapping_00229-model.pth.tar"
+_dl "$_b/SadTalker_V0.0.2_256.safetensors"     "$DIR/checkpoints/SadTalker_V0.0.2_256.safetensors"
+_dl "$_b/SadTalker_V0.0.2_512.safetensors"     "$DIR/checkpoints/SadTalker_V0.0.2_512.safetensors"
+_dl "https://github.com/xinntao/facexlib/releases/download/v0.1.0/alignment_WFLW_4HG.pth"      "$DIR/gfpgan/weights/alignment_WFLW_4HG.pth"
+_dl "https://github.com/xinntao/facexlib/releases/download/v0.1.0/detection_Resnet50_Final.pth" "$DIR/gfpgan/weights/detection_Resnet50_Final.pth"
+_dl "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth"              "$DIR/gfpgan/weights/GFPGANv1.4.pth"
+_dl "https://github.com/xinntao/facexlib/releases/download/v0.2.2/parsing_parsenet.pth"        "$DIR/gfpgan/weights/parsing_parsenet.pth"
+
+driven=""; result=""; source_img=""; source_video=""
+extra=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --driven_audio) driven="$2"; shift 2;;
+    --source_video) source_video="$2"; shift 2;;
+    --source_image) source_img="$2"; shift 2;;
+    --result_dir)   result="$2"; shift 2;;
+    *) extra+=("$1"); shift;;
+  esac
+done
+
+result="${result:-./results}"
+mkdir -p "$result"
+
+cleanup_img=""
+if [ -z "$source_img" ] && [ -n "$source_video" ]; then
+  source_img="$(mktemp --suffix=.png)"
+  cleanup_img="$source_img"
+  ffmpeg -y -i "$source_video" -frames:v 1 "$source_img" -loglevel error
+fi
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+cd "$work"
+export PYTHONPATH="$DIR${PYTHONPATH:+:$PYTHONPATH}"
+set +e
+"$VENV/bin/python" "$DIR/inference.py" \
+  --driven_audio "$driven" \
+  --source_image "$source_img" \
+  --result_dir "$result" \
+  --checkpoint_dir "$DIR/checkpoints" \
+  ${extra[@]+"${extra[@]}"}
+rc=$?
+set -e
+
+[ -n "$cleanup_img" ] && rm -f "$cleanup_img" || true
+
+newest="$(find "$result" -type f -name '*.mp4' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+if [ -n "$newest" ] && [ "$(dirname "$newest")" != "$result" ]; then
+  cp -f "$newest" "$result/"
+fi
+exit $rc

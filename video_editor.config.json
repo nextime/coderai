@@ -1,0 +1,12 @@
+{
+  "media_dir": "/storage/coderai/tools/coderai_media",
+  "output_dir": "/storage/coderai/video_editor_output",
+  "base_url": "http://127.0.0.1:8000",
+  "api_key": "sk-coderai-1b8b559808f9fb9927cabef33e0c1bf7ca7943f3281cbf7b7b661fc37aa9fbe0",
+  "voice": "feminine",
+  "voice_name": "af_sarah",
+  "tts_model": "suno/bark",
+  "stt_model": null,
+  "audio_model": null,
+  "video": null
+}

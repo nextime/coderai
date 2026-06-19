@@ -30,9 +30,21 @@
 <div id="sys-stats" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
      gap:.75rem;margin:0 0 1.25rem">
   <div class="sys-tile" id="tile-cpu"></div>
-  <div class="sys-tile" id="tile-gpu"></div>
   <div class="sys-tile" id="tile-ram"></div>
+  <!-- Per-card GPU tiles (util + VRAM) injected here when cards are detected. -->
+  <div id="tile-cards" style="display:contents"></div>
+  <!-- Fallback single tiles when per-card stats are unavailable. -->
+  <div class="sys-tile" id="tile-gpu"></div>
   <div class="sys-tile" id="tile-vram"></div>
+</div>
+
+<!-- Engines (only shown in front/multi-engine mode) -->
+<div id="engines-card" style="display:none;margin:0 0 1.25rem">
+  <div style="display:flex;align-items:baseline;gap:.5rem;margin-bottom:.5rem">
+    <h2 style="font-size:14px;margin:0">Engines</h2>
+    <span class="dim small">restart a stuck engine — the supervisor respawns it</span>
+  </div>
+  <div id="engines-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:.6rem"></div>
 </div>
 
 <style>
@@ -76,20 +88,34 @@ function fmtTime(s) {
   } catch { return ''; }
 }
 
-const KIND_LABEL = {training:'Training', image:'Image', video:'Video', upscale:'Upscale', interpolate:'Interpolate', audio:'Audio', text:'Text', pipeline:'Pipeline', request:'Request', loading:'Loading'};
+const KIND_LABEL = {training:'Training', image:'Image', video:'Video', upscale:'Upscale', interpolate:'Interpolate', audio:'Audio', text:'Text', tts:'Speech (TTS)', transcription:'Transcription', embedding:'Embedding', spatial:'3D / Spatial', pipeline:'Pipeline', request:'Request', loading:'Loading', download:'Download'};
 const STATUS_BADGE = {
   running:'badge-admin', queued:'badge-user', done:'badge-ok', error:'badge-err',
   cancelled:'badge-user', interrupted:'badge-warn'
 };
 
 function progressBar(t) {
+  // Downloads report a 0-100 percent; render a percentage bar (the filename /
+  // rate / ETA detail is shown in the status cell, so it isn't repeated here).
+  if (t.kind === 'download') {
+    const pct = Math.max(0, Math.min(100, Math.round(t.percent || t.step || 0)));
+    return `<div class="progress"><div class="progress-fill" style="width:${pct}%"></div></div>
+            <span class="dim small">${pct}%</span>`;
+  }
   const total = t.total || 0, step = t.step || 0;
+  // Live throughput for text generation (tokens/s), shown while running.
+  const rate = (t.rate && t.status === 'running')
+    ? ` <span class="dim small">· ${t.rate} tok/s</span>` : '';
   if (!total) {
-    return t.status === 'running' ? '<span class="dim small">working…</span>' : '<span class="dim small">—</span>';
+    if (t.status === 'running') {
+      const tok = step ? `${step} tok` : 'working…';
+      return `<span class="dim small">${tok}</span>${rate}`;
+    }
+    return '<span class="dim small">—</span>';
   }
   const pct = Math.max(0, Math.min(100, Math.round(step / total * 100)));
   return `<div class="progress"><div class="progress-fill" style="width:${pct}%"></div></div>
-          <span class="dim small">${step}/${total} (${pct}%)</span>`;
+          <span class="dim small">${step}/${total} (${pct}%)</span>${rate}`;
 }
 
 function actions(t) {
@@ -140,16 +166,87 @@ function _memTile(name, used, total, pct){
   return `<div class="sys-head"><span class="sys-name">${name}</span><span class="sys-val">${valTxt}</span></div>`
     + _bar(p) + `<div class="sys-sub"><span>${p == null ? '' : Math.round(p)+'% used'}</span><span></span></div>`;
 }
+// One tile per physical card showing both GPU utilization and VRAM (+ temp).
+function _cardTile(c){
+  const vColor = c.vendor==='nvidia' ? '#76b900'
+               : c.vendor==='amd' ? '#ed1c24' : 'var(--text-3)';
+  const memP = (c.mem_total ? (c.mem_used / c.mem_total * 100) : null);
+  const temp = (c.temp!=null) ? ' · '+Math.round(c.temp)+'°C' : '';
+  const util = (c.util!=null) ? Math.round(c.util)+'%' : '—';
+  return `<div class="sys-tile">
+    <div class="sys-head"><span class="sys-name" style="color:${vColor}">${esc(c.name)}</span>
+      <span class="sys-val">${util}${temp}</span></div>
+    ${_bar(c.util)}
+    <div class="sys-sub"><span>VRAM ${c.mem_used!=null?c.mem_used.toFixed(1):'—'}/${c.mem_total!=null?c.mem_total.toFixed(0):'—'} GB</span>
+      <span>${memP!=null?Math.round(memP)+'% used':''}</span></div>
+    ${_bar(memP)}
+  </div>`;
+}
+
 async function loadSystemStats(){
   try {
     const s = await fetch(ROOT_PATH + '/admin/api/system-stats').then(r => r.json());
     const cpu = s.cpu || {}, gpu = s.gpu || {}, ram = s.ram || {}, vram = s.vram || {};
     document.getElementById('tile-cpu').innerHTML = _utilTile('CPU', cpu.util, cpu.temp, (cpu.cores || 1) * 100);
-    document.getElementById('tile-gpu').innerHTML = _utilTile('GPU', gpu.util, gpu.temp);
     document.getElementById('tile-ram').innerHTML = _memTile('RAM', ram.used, ram.total, ram.percent);
-    document.getElementById('tile-vram').innerHTML =
-      _memTile('VRAM', vram.used, vram.total, vram.percent);
+
+    // Per-card GPU+VRAM tiles for every physical card; fall back to single tiles.
+    let cards = [];
+    try { cards = ((await fetch(ROOT_PATH + '/admin/api/gpu-stats').then(r => r.json())).cards) || []; } catch(e){}
+    const cardsEl = document.getElementById('tile-cards');
+    const gpuEl = document.getElementById('tile-gpu');
+    const vramEl = document.getElementById('tile-vram');
+    if (cards.length) {
+      cardsEl.innerHTML = cards.map(_cardTile).join('');
+      gpuEl.style.display = 'none'; vramEl.style.display = 'none';
+    } else {
+      cardsEl.innerHTML = '';
+      gpuEl.style.display = ''; vramEl.style.display = '';
+      gpuEl.innerHTML = _utilTile('GPU', gpu.util, gpu.temp);
+      vramEl.innerHTML = _memTile('VRAM', vram.used, vram.total, vram.percent);
+    }
   } catch(e){ /* keep last render on transient errors */ }
+}
+
+// Engines panel — only present in front/multi-engine mode (404 in single-process).
+async function loadEngines(){
+  let engines = null;
+  try {
+    const r = await fetch(ROOT_PATH + '/admin/api/engines');
+    if (!r.ok) { document.getElementById('engines-card').style.display = 'none'; return; }
+    engines = (await r.json()).engines || [];
+  } catch(e) { document.getElementById('engines-card').style.display = 'none'; return; }
+  const card = document.getElementById('engines-card');
+  if (!engines.length) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  document.getElementById('engines-body').innerHTML = engines.map(e => {
+    const dot = e.healthy ? '#3fb950' : '#e5534b';
+    const state = e.healthy ? 'healthy' : 'down / starting';
+    const vram = e.vram ? `${(e.vram.used ?? 0).toFixed ? e.vram.used.toFixed(1) : e.vram.used}/${e.vram.total} GB` : '';
+    const cool = e.cooling ? ` <span class="badge badge-warn" style="font-size:9px">❄ cooling</span>` : '';
+    const prim = e.primary ? ` <span class="badge badge-user" style="font-size:9px">primary</span>` : '';
+    const models = (e.loaded_models||[]).length;
+    return `<div class="sys-tile">
+      <div class="sys-head">
+        <span class="sys-name">${esc(e.name)} <span class="dim" style="text-transform:none">(${esc(e.backend)})</span>${prim}${cool}</span>
+        <span style="width:9px;height:9px;border-radius:50%;background:${dot};display:inline-block" title="${state}"></span>
+      </div>
+      <div class="sys-sub"><span>${esc(state)}${vram?' · '+esc(vram):''}</span><span>${models} model${models!==1?'s':''}</span></div>
+      <div style="margin-top:.5rem;text-align:right">
+        <button class="btn btn-ghost" style="font-size:11px;padding:.15rem .5rem;color:var(--error,#e55)"
+                onclick="restartEngine(${e.id}, '${esc(e.name)}')" title="Kill and respawn this engine">↻ Restart</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function restartEngine(id, name){
+  if (!confirm(`Restart engine "${name}"? In-flight requests on it will fail; the supervisor respawns it immediately.`)) return;
+  try {
+    const r = await fetch(ROOT_PATH + '/admin/api/engines/' + id + '/restart', {method:'POST'});
+    if (!r.ok) { const e = await r.json().catch(()=>({})); showAlert(e.detail || 'Restart failed'); }
+    setTimeout(loadEngines, 800);
+  } catch(e) { showAlert(e.message); }
 }
 
 let _refreshing = false;
@@ -165,7 +262,19 @@ async function loadTasks() {
 
     const therm = data.thermal || {};
     const banner = document.getElementById('thermal-banner');
-    if (therm.active) {
+    // Multi-engine: name which engine(s) are cooling and on what (GPU vs CPU).
+    const cooling = data.cooling_engines || [];
+    if (cooling.length) {
+      const parts = cooling.map(c => {
+        const what = (c.gpu != null && c.cpu == null) ? `GPU ${Math.round(c.gpu)}°C`
+                   : (c.cpu != null && c.gpu == null) ? `CPU ${Math.round(c.cpu)}°C`
+                   : (c.message || 'cooling');
+        return `${esc(c.engine)} (${esc(what)})`;
+      });
+      document.getElementById('thermal-banner-msg').textContent =
+        ' Cooling down: ' + parts.join(', ');
+      banner.style.display = '';
+    } else if (therm.active) {
       document.getElementById('thermal-banner-msg').textContent = ' ' + (therm.message || '');
       banner.style.display = '';
     } else {
@@ -207,7 +316,7 @@ async function loadTasks() {
       }
       return `<tr>
         <td><span class="badge badge-user">${esc(KIND_LABEL[t.kind] || t.kind)}</span></td>
-        <td><div class="td-name">${esc(title)}</div><div class="dim small mono">${esc(t.model || '')}</div></td>
+        <td><div class="td-name">${esc(title)}${t.engine?` <span class="badge badge-user" style="font-size:9px;padding:.05rem .3rem;vertical-align:middle" title="Running on engine">${esc(t.engine)}</span>`:''}</div><div class="dim small mono">${esc(t.model || '')}</div></td>
         <td>${statusCell}</td>
         <td>${progressBar(t)}</td>
         <td class="dim small">${fmtTime(t.started_at)}</td>
@@ -229,9 +338,9 @@ async function taskAction(id, action) {
     const r = await fetch(ROOT_PATH + '/admin/api/tasks/' + encodeURIComponent(id) + '/' + action, {method:'POST'});
     if (!r.ok) {
       const e = await r.json().catch(() => ({}));
-      alert(e.detail || (verb + ' failed'));
+      showAlert(e.detail || (verb + ' failed'));
     }
-  } catch (e) { alert(e.message); }
+  } catch (e) { showAlert(e.message); }
   loadTasks();
 }
 
@@ -240,15 +349,17 @@ async function removeTask(id) {
     const r = await fetch(ROOT_PATH + '/admin/api/tasks/' + encodeURIComponent(id), {method:'DELETE'});
     if (!r.ok) {
       const e = await r.json().catch(() => ({}));
-      alert(e.detail || 'Remove failed');
+      showAlert(e.detail || 'Remove failed');
     }
-  } catch (e) { alert(e.message); }
+  } catch (e) { showAlert(e.message); }
   loadTasks();
 }
 
 loadTasks();
 loadSystemStats();
+loadEngines();
 setInterval(loadTasks, 2000);
 setInterval(loadSystemStats, 2000);
+setInterval(loadEngines, 5000);
 </script>
 {% endblock %}

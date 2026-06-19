@@ -106,6 +106,27 @@ async def create_embeddings(request: EmbeddingsRequest, http_request: Request = 
     """
     OpenAI-compatible embeddings endpoint.
     """
+    # Register a task so embeddings appear in the unified task list, like every
+    # other model type. Finished on success or error below.
+    from codai.tasks import task_registry
+    _title = request.input if isinstance(request.input, str) else "embeddings"
+    _tid = task_registry.register(
+        "embedding", title=str(_title)[:80], model=(request.model or "embedding"))
+    task_registry.start(_tid)
+    try:
+        _resp = await _run_embeddings(request, http_request)
+        task_registry.finish(_tid, "done")
+        return _resp
+    except HTTPException:
+        task_registry.finish(_tid, "error")
+        raise
+    except Exception as e:
+        task_registry.finish(_tid, "error", str(e)[:200])
+        raise
+
+
+async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = None):
+    """Core embeddings logic; registered as a task by create_embeddings()."""
     model_info = await asyncio.to_thread(
         multi_model_manager.request_model, request.model, model_type="embedding")
     model_name = model_info.get('model_name')

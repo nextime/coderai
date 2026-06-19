@@ -105,7 +105,7 @@ async function delUser(id, name) {
   if (!confirm('Delete user "' + name + '"?')) return;
   const r = await fetch(ROOT_PATH + '/admin/api/users/'+id, {method:'DELETE'});
   if (r.ok) location.reload();
-  else { const e = await r.json(); alert(e.detail || 'Failed'); }
+  else { const e = await r.json(); showAlert(e.detail || 'Failed'); }
 }
 </script>
 {% endblock %}

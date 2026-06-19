@@ -335,7 +335,7 @@ async function deleteEntry() {
     closeDetail();
     loadArchive();
   } catch(e) {
-    alert('Delete failed: ' + e.message);
+    showAlert('Delete failed: ' + e.message);
   }
 }
 

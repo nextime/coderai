@@ -45,6 +45,31 @@ global_args = None
 global_file_path = None
 
 
+def _spatial_task(title: str):
+    """Decorator: register a spatial/3D endpoint in the unified task list so
+    every model type is visible there. Finishes done/error around the call."""
+    import functools
+
+    def deco(fn):
+        @functools.wraps(fn)
+        async def wrap(*args, **kwargs):
+            from codai.tasks import task_registry
+            tid = task_registry.register("spatial", title=title, model="spatial")
+            task_registry.start(tid)
+            try:
+                result = await fn(*args, **kwargs)
+                task_registry.finish(tid, "done")
+                return result
+            except HTTPException:
+                task_registry.finish(tid, "error")
+                raise
+            except Exception as e:
+                task_registry.finish(tid, "error", str(e)[:200])
+                raise
+        return wrap
+    return deco
+
+
 def set_global_args(args):
     global global_args
     global_args = args
@@ -500,6 +525,7 @@ class ImageTo3DRequest(BaseModel):
 
 
 @router.post("/v1/images/to3d", summary="Image to 3D model")
+@_spatial_task("Image → 3D")
 async def image_to_3d(request: ImageTo3DRequest, http_request: Request = None):
     """Convert a 2D image to a 3D representation.
 
@@ -568,6 +594,7 @@ class ImageFrom3DRequest(BaseModel):
 
 
 @router.post("/v1/images/from3d", summary="Render a 3D model to an image")
+@_spatial_task("3D → image")
 async def image_from_3d(request: ImageFrom3DRequest, http_request: Request = None):
     """Render a 3D model (GLB/OBJ) to a 2D PNG image from a specified camera angle."""
     raw = _decode_b64(request.model_data)
@@ -601,6 +628,7 @@ class VideoTo3DRequest(BaseModel):
 
 
 @router.post("/v1/video/to3d", summary="Video to 3D model")
+@_spatial_task("Video → 3D")
 async def video_to_3d(request: VideoTo3DRequest, http_request: Request = None):
     """Convert a 2D video to a 3D video frame-by-frame.
 
@@ -642,6 +670,7 @@ class VideoFrom3DRequest(BaseModel):
 
 
 @router.post("/v1/video/from3d", summary="Render a 3D model to a video")
+@_spatial_task("3D → video")
 async def video_from_3d(request: VideoFrom3DRequest, http_request: Request = None):
     """Render a 3D model as a 360° turntable video."""
     raw = _decode_b64(request.model_data)
@@ -675,6 +704,7 @@ class Generate3DRequest(BaseModel):
 
 
 @router.post("/v1/3d/generate", summary="Generate a 3D model from a prompt")
+@_spatial_task("Generate 3D")
 async def generate_3d(request: Generate3DRequest, http_request: Request = None):
     """Generate a 3D model (GLB) from a text prompt and/or an image.
 

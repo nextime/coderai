@@ -225,6 +225,13 @@ configuration directory (--config DIR, default: OS-specific CoderAI directory). 
         help="Dump model output: raw output, parsed output, and litellm debug info",
     )
     parser.add_argument(
+        "--debug-requests",
+        action="store_true",
+        help="Log the full request/response payloads exchanged with API clients "
+             "(opencode, etc.): incoming messages + tools and the outgoing "
+             "content/tool_calls. Use to diagnose agentic tool-call loops.",
+    )
+    parser.add_argument(
         "--list-cached-models",
         action="store_true",
         help="List all cached models in the model cache directory",
@@ -277,5 +284,40 @@ configuration directory (--config DIR, default: OS-specific CoderAI directory). 
         action="store_true",
         help="Ignore any existing pipeline cache and rebuild it from scratch this "
              "run (use after changing a model's quantization/precision config).",
+    )
+    # ─── Frontend/engine split ───────────────────────────────────────────────
+    parser.add_argument(
+        "--single-process",
+        action="store_true",
+        help="Run the legacy single-process server (UI/API and all model work in "
+             "one process). Default boots a front proxy + supervised engine "
+             "subprocess(es) so the web UI stays responsive during model work.",
+    )
+    parser.add_argument(
+        "--engine-only",
+        action="store_true",
+        help="Run this process as an engine (binds an internal localhost port, no "
+             "front proxy). Normally launched automatically by the front; not "
+             "intended to be run by hand.",
+    )
+    parser.add_argument(
+        "--internal-port",
+        type=int,
+        default=None,
+        help="Internal port for --engine-only mode (the front assigns one per engine).",
+    )
+    parser.add_argument(
+        "--debug-engine",
+        action="store_true",
+        help="General engine debugging in the front/engine split (engine lifecycle, "
+             "spawn details, health transitions). Does NOT include the internal "
+             "HTTP access log — use --debug-engine-web for that.",
+    )
+    parser.add_argument(
+        "--debug-engine-web",
+        action="store_true",
+        help="Show the internal front↔engine HTTP requests in an engine's access log "
+             "(proxied calls, /internal/engine-state, /healthz, …). Suppressed by "
+             "default since every engine only ever serves internal front traffic.",
     )
     return parser.parse_args()

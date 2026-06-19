@@ -1,0 +1,3 @@
+python tools/video_editor.py --no-browser --host 0.0.0.0 --media-dir tools/coderai_media --session
+tools/gen_township_fighters.py -c township_output/township_config.json
+

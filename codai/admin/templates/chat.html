@@ -2372,7 +2372,7 @@ const STUDIO_CAPABILITIES = {
     optional:[],
     notes:[
       'Requires <code>insightface</code> and <code>onnxruntime</code>: <code>pip install insightface onnxruntime</code>.',
-      'The <b>inswapper_128.onnx</b> model is <b>auto-downloaded</b> from HuggingFace on first use (<a href="/admin/models?tab=search&q=inswapper&pipeline=&gguf=no-gguf" class="cap-find-link">deepinsight/inswapper<span class="cap-find-icon">↗</span></a>).',
+      'The <b>inswapper_128.onnx</b> model is <b>auto-downloaded</b> from HuggingFace on first use (<a href="' + (window.ROOT_PATH||'') + '/admin/models?tab=search&q=inswapper&pipeline=&gguf=no-gguf" class="cap-find-link">deepinsight/inswapper<span class="cap-find-icon">↗</span></a>).',
       'No AI model selection needed — this feature uses its own dedicated backend.',
     ],
     backendPath: ROOT_PATH + '/v1/images/faceswap',
@@ -2386,7 +2386,7 @@ const STUDIO_CAPABILITIES = {
     optional:[],
     notes:[
       'Requires <code>insightface</code> and <code>onnxruntime</code>: <code>pip install insightface onnxruntime</code>.',
-      'The <b>inswapper_128.onnx</b> model is <b>auto-downloaded</b> from HuggingFace on first use (<a href="/admin/models?tab=search&q=inswapper&pipeline=&gguf=no-gguf" class="cap-find-link">deepinsight/inswapper<span class="cap-find-icon">↗</span></a>).',
+      'The <b>inswapper_128.onnx</b> model is <b>auto-downloaded</b> from HuggingFace on first use (<a href="' + (window.ROOT_PATH||'') + '/admin/models?tab=search&q=inswapper&pipeline=&gguf=no-gguf" class="cap-find-link">deepinsight/inswapper<span class="cap-find-icon">↗</span></a>).',
       'No AI model selection needed — this feature uses its own dedicated backend.',
     ],
     backendPath: ROOT_PATH + '/v1/images/faceswap',
@@ -2461,14 +2461,14 @@ function capSearchUrl(cap) {
   const s = CAP_TO_HF_SEARCH[cap];
   if (!s) return null;
   const p = new URLSearchParams({ tab:'search', q: s.q, pipeline: s.pipeline, gguf: s.gguf });
-  return '/admin/models?' + p.toString();
+  return (window.ROOT_PATH || '') + '/admin/models?' + p.toString();
 }
 function capMissingHtml(caps, label) {
   if (!caps.length) return '';
   const links = caps.map(cap => {
     const chip = `<span class="cap-chip dim">${cap.replace(/_/g,' ')}</span>`;
     if (_localCapSet.has(cap)) {
-      const url = `/admin/models?local_cap=${encodeURIComponent(cap)}`;
+      const url = `${window.ROOT_PATH || ''}/admin/models?local_cap=${encodeURIComponent(cap)}`;
       return `<a href="${url}" class="cap-find-link" title="You have a local model with ${cap.replace(/_/g,' ')} — click to configure it">${chip}<span class="cap-find-icon" style="color:#6ecf7e">↑ configure</span></a>`;
     }
     const url = capSearchUrl(cap);
@@ -4229,12 +4229,12 @@ async function loadCharProfileIntoSlot(prefix, idx, name) {
     charSlots[prefix][idx].name = charSlots[prefix][idx].name || d.name;
     charSlots[prefix][idx].images = (d.images||[]).map(img => img.data);
     renderCharSlots(prefix);
-  } catch(e) { alert('Failed to load profile: '+e.message); }
+  } catch(e) { showAlert('Failed to load profile: '+e.message); }
 }
 
 async function saveCharSlotAsProfile(prefix, idx) {
   const slot = charSlots[prefix]?.[idx];
-  if (!slot || !slot.images.length) { alert('Add at least one image first.'); return; }
+  if (!slot || !slot.images.length) { showAlert('Add at least one image first.'); return; }
   const name = slot.name || prompt('Profile name:');
   if (!name) return;
   try {
@@ -4246,8 +4246,8 @@ async function saveCharSlotAsProfile(prefix, idx) {
     charSlots[prefix][idx].name = name;
     await loadCharProfileList();
     renderCharSlots(prefix);
-    alert(`Saved profile "${name}"`);
-  } catch(e) { alert('Save failed: '+e.message); }
+    showAlert(`Saved profile "${name}"`);
+  } catch(e) { showAlert('Save failed: '+e.message); }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -6051,14 +6051,14 @@ async function profCharView(name) {
   try {
     const d = await fetch(ROOT_PATH + '/admin/api/characters/'+encodeURIComponent(name)).then(r=>r.json());
     _openProfModal(`Character: ${d.name}`, d.description||'', d.images||[]);
-  } catch(e) { alert('Failed to load character: ' + e.message); }
+  } catch(e) { showAlert('Failed to load character: ' + e.message); }
 }
 
 async function profCharDelete(name) {
   if (!confirm(`Delete character profile "${name}"?`)) return;
   const r = await fetch(ROOT_PATH + '/admin/api/characters/'+encodeURIComponent(name), {method:'DELETE'});
   if (r.ok) await profCharLoad();
-  else alert('Delete failed: ' + await r.text());
+  else showAlert('Delete failed: ' + await r.text());
 }
 
 
@@ -6139,7 +6139,7 @@ async function profVoiceDelete(name) {
   if (!confirm(`Delete voice profile "${name}"?`)) return;
   const r = await fetch(ROOT_PATH + '/admin/api/voices/'+encodeURIComponent(name), {method:'DELETE'});
   if (r.ok) await profVoiceLoad();
-  else alert('Delete failed: ' + await r.text());
+  else showAlert('Delete failed: ' + await r.text());
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -6296,14 +6296,14 @@ async function profEnvView(name) {
   try {
     const d = await fetch(ROOT_PATH + '/admin/api/environments/'+encodeURIComponent(name)).then(r=>r.json());
     _openProfModal(`Environment: ${d.name}`, d.description||'', d.images||[]);
-  } catch(e) { alert('Failed to load environment: ' + e.message); }
+  } catch(e) { showAlert('Failed to load environment: ' + e.message); }
 }
 
 async function profEnvDelete(name) {
   if (!confirm(`Delete environment profile "${name}"?`)) return;
   const r = await fetch(ROOT_PATH + '/admin/api/environments/'+encodeURIComponent(name), {method:'DELETE'});
   if (r.ok) await profEnvLoad();
-  else alert('Delete failed: ' + await r.text());
+  else showAlert('Delete failed: ' + await r.text());
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -6528,7 +6528,7 @@ async function deleteCustomPipeline(id) {
     _customPipelines = _customPipelines.filter(p => p.id !== id);
     if (_editingPipelineId === id) { _editingPipelineId = null; _pbSteps = []; renderBuilderSteps(); }
     renderCustomPipelineCards();
-  } catch(e) { alert('Delete failed: '+e.message); }
+  } catch(e) { showAlert('Delete failed: '+e.message); }
 }
 
 function _renderPipelineResult(outId, progId, d) {
@@ -6683,7 +6683,7 @@ async function archiveDelete(filename) {
     _archiveFiles = _archiveFiles.filter(f => f.filename !== filename);
     renderArchive();
   } catch(e) {
-    alert('Delete failed: ' + e.message);
+    showAlert('Delete failed: ' + e.message);
   }
 }
 

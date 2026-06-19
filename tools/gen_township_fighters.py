@@ -2200,6 +2200,8 @@ CONFIG_FIELDS = [
     "short_min", "short_max", "long_min", "long_max",
     "upscale_factor", "fps_multiplier",
     "web_port",
+    "upload_endpoint", "upload_token", "upload_fixture_id", "upload_after_render",
+    "odds_ranges",
 ]
 
 
@@ -2228,6 +2230,608 @@ def load_config(path: str) -> dict:
     if not isinstance(data, dict):
         raise ValueError("config file must contain a JSON object")
     return {k: v for k, v in data.items() if k in CONFIG_FIELDS}
+
+
+# ===========================================================================
+# Township Combat League upload — odds generation, anti-arbitrage, ZIP packing
+# and chunked upload to the league server (mbetterd 3-step fixture-source API).
+#
+# Payout matrix (mirrored from the server's SureBetAnalyzer):
+#   First extraction:  under / over (exactly one wins).
+#   Second extraction: win1, win2, ko1, ko2, ret1, ret2, draw where
+#     ko1 → fighter 2 wins by KO        (pays ko1 and win2)
+#     ko2 → fighter 1 wins by KO        (pays ko2 and win1)
+#     ret1 → fighter 2 wins by retire   (pays ret1 and win2)
+#     ret2 → fighter 1 wins by retire   (pays ret2 and win1)
+#     win1 → fighter 1 wins on points;  win2 → fighter 2;  draw → draw.
+# ===========================================================================
+
+# Odds ranges (inclusive); values are always rounded to two decimals.
+ODDS_RANGES = {
+    "under": (1.00, 2.00),
+    "over": (1.00, 2.00),
+    "win1": (1.00, 3.50),
+    "win2": (1.00, 3.50),
+    "ko1": (2.50, 7.00),
+    "ko2": (2.50, 7.00),
+    "ret1": (2.50, 7.00),
+    "ret2": (2.50, 7.00),
+    "draw": (1.50, 5.50),
+}
+
+OUTCOME_COLUMNS = list(ODDS_RANGES.keys())
+
+# Anti-arbitrage ("sure bet") thresholds — mirror of app/utils/sure_bet_analyzer.py
+MIN_SURE_BET_ODDS_FIRST = 2.0    # under/over: sure bet if BOTH > this
+MIN_SURE_BET_ODDS_SECOND = 3.0   # win1/win2/draw: sure bet if ALL > this
+MIN_SURE_BET_PRODUCT = 4.0       # 2-outcome scenarios: sure bet if product > this
+
+
+def default_ranges() -> dict:
+    """A fresh copy of the built-in odds ranges."""
+    return {k: (lo, hi) for k, (lo, hi) in ODDS_RANGES.items()}
+
+
+def _range_dict_to_json(ranges: dict) -> dict:
+    """Convert a range map of tuples to a JSON-friendly map of ``[min, max]``
+    lists (so it round-trips cleanly through config files)."""
+    return {col: [round(float(lo), 2), round(float(hi), 2)]
+            for col, (lo, hi) in ranges.items()}
+
+
+def merge_ranges(overrides: Optional[dict]) -> dict:
+    """Merge user-supplied range overrides onto the defaults.
+
+    ``overrides`` may be a mapping of ``column -> [min, max]`` (or ``(min, max)``);
+    unknown columns and malformed pairs are ignored so a partial/old config stays
+    usable. Returns a complete, validated range map (min <= max, all columns).
+    """
+    ranges = default_ranges()
+    if isinstance(overrides, dict):
+        for col, pair in overrides.items():
+            if col not in ranges:
+                continue
+            try:
+                lo, hi = float(pair[0]), float(pair[1])
+            except (TypeError, ValueError, IndexError, KeyError):
+                continue
+            if lo > hi:
+                lo, hi = hi, lo
+            ranges[col] = (round(lo, 2), round(hi, 2))
+    return ranges
+
+
+def check_arbitrage(odds: dict) -> tuple:
+    """Return ``(ok, reason)``. ``ok`` is True when the odds are SAFE (no sure
+    bet). Replicates every check the server's ``SureBetAnalyzer.analyze_match``
+    performs, with the same strict ``>`` comparisons, so anything we accept the
+    server will too."""
+    under = odds.get("under")
+    over = odds.get("over")
+    win1 = odds.get("win1")
+    win2 = odds.get("win2")
+    ko1 = odds.get("ko1")
+    ko2 = odds.get("ko2")
+    ret1 = odds.get("ret1")
+    ret2 = odds.get("ret2")
+    draw = odds.get("draw")
+
+    # First extraction: under/over.
+    if under and over and under > MIN_SURE_BET_ODDS_FIRST and over > MIN_SURE_BET_ODDS_FIRST:
+        return False, f"under ({under}) and over ({over}) both > {MIN_SURE_BET_ODDS_FIRST}"
+
+    # Second extraction: win1/win2/draw all above threshold (one always wins).
+    if (win1 and win2 and draw and win1 > MIN_SURE_BET_ODDS_SECOND
+            and win2 > MIN_SURE_BET_ODDS_SECOND and draw > MIN_SURE_BET_ODDS_SECOND):
+        return False, (f"win1 ({win1}), win2 ({win2}) and draw ({draw}) all "
+                       f"> {MIN_SURE_BET_ODDS_SECOND}")
+
+    # Two-outcome scenarios: product must not exceed the threshold.
+    pairs = [
+        ("ko1", ko1, "win2", win2),
+        ("ko2", ko2, "win1", win1),
+        ("ret1", ret1, "win2", win2),
+        ("ret2", ret2, "win1", win1),
+    ]
+    for an, a, bn, b in pairs:
+        if a and b and a * b > MIN_SURE_BET_PRODUCT:
+            return False, f"{an} ({a}) * {bn} ({b}) = {a * b:.2f} > {MIN_SURE_BET_PRODUCT}"
+
+    # Matrix safety margin: must be > 1.0.
+    if all(v for v in (win1, win2, ko1, ko2, ret1, ret2, draw)):
+        margin = (1.0 / draw
+                  + 1.0 / win1 + 1.0 / ko2 + 1.0 / ret2
+                  + 1.0 / win2 + 1.0 / ko1 + 1.0 / ret1)
+        if margin <= 1.0:
+            return False, f"matrix safety margin {margin:.4f} <= 1.0"
+
+    return True, "ok"
+
+
+def _r2(lo: float, hi: float, rng) -> float:
+    """Uniform sample in [lo, hi] rounded to two decimals (clamped into range)."""
+    if hi < lo:
+        hi = lo
+    v = round(rng.uniform(lo, hi), 2)
+    return min(max(v, round(lo, 2)), round(hi, 2))
+
+
+def generate_odds(seed: int = None, max_tries: int = 10, ranges: dict = None) -> dict:
+    """Generate a full, arbitrage-safe set of odds.
+
+    Sampling is constraint-aware so a valid set is usually found on the first try:
+    the win odds are drawn first (low enough that a KO/RET at its floor still
+    fits), then each KO/RET is bounded by the product cap. Because the win minimum
+    is ~1.0, a coupled KO/RET at the range maximum (e.g. 7.0) can NEVER avoid a
+    sure bet, so the usable KO/RET ceiling is driven by the chosen win odd. The
+    rounded result is verified with :func:`check_arbitrage` exactly as the server
+    would, re-rolling up to ``max_tries`` times. Raises ``RuntimeError`` if no
+    safe set is found."""
+    rng = random.Random(seed)
+    last_reason = "no attempts made"
+    rg = merge_ranges(ranges)
+
+    safe_product = MIN_SURE_BET_PRODUCT - 0.05
+    ko_ret_lo = min(rg["ko1"][0], rg["ko2"][0], rg["ret1"][0], rg["ret2"][0])
+    win_cap1 = min(rg["win1"][1], safe_product / ko_ret_lo)
+    win_cap2 = min(rg["win2"][1], safe_product / ko_ret_lo)
+
+    for _ in range(max_tries):
+        win1 = _r2(rg["win1"][0], win_cap1, rng)
+        win2 = _r2(rg["win2"][0], win_cap2, rng)
+
+        ko1 = _r2(rg["ko1"][0], min(rg["ko1"][1], safe_product / win2), rng)
+        ret1 = _r2(rg["ret1"][0], min(rg["ret1"][1], safe_product / win2), rng)
+        ko2 = _r2(rg["ko2"][0], min(rg["ko2"][1], safe_product / win1), rng)
+        ret2 = _r2(rg["ret2"][0], min(rg["ret2"][1], safe_product / win1), rng)
+
+        draw = _r2(*rg["draw"], rng)
+        under = _r2(*rg["under"], rng)
+        over = _r2(*rg["over"], rng)
+
+        odds = {
+            "under": under, "over": over,
+            "win1": win1, "win2": win2,
+            "ko1": ko1, "ko2": ko2,
+            "ret1": ret1, "ret2": ret2,
+            "draw": draw,
+        }
+        ok, reason = check_arbitrage(odds)
+        if ok:
+            return odds
+        last_reason = reason
+
+    raise RuntimeError(
+        f"could not generate arbitrage-safe odds in {max_tries} tries "
+        f"(last failure: {last_reason})")
+
+
+def _best_variant(base: Path):
+    """Highest-quality existing variant for a base video path, or None if the
+    base file does not exist. Reuses ``_video_variants`` (weakest→strongest)."""
+    if not base.exists():
+        return None
+    variants = _video_variants(base)
+    return variants[-1][1] if variants else base
+
+
+def resolve_match_videos(out_dir, match_name: str, f1: str, f2: str) -> tuple:
+    """Map each server ZIP filename to the best local video for the match.
+
+    Returns ``(found, missing)`` where ``found`` maps ``"OVER.mp4" -> Path`` and
+    ``missing`` lists the ZIP names with no source video. KO1/RET1 mean fighter 2
+    wins; KO2/RET2 mean fighter 1 wins (server payout matrix)."""
+    vdir = Path(out_dir) / "videos"
+
+    # The draw is stored once per match under one fighter's name; find whichever.
+    draw_src = None
+    for cand in sorted(vdir.glob(f"{match_name}_*_draw.mp4")):
+        suf = cand.stem[len(match_name) + 1:]
+        if suf.endswith("_draw"):
+            draw_src = cand
+            break
+
+    spec = {
+        "OVER.mp4": vdir / f"{match_name}_long.mp4",
+        "UNDER.mp4": vdir / f"{match_name}_short.mp4",
+        "WIN1.mp4": vdir / f"{match_name}_{f1}_win.mp4",
+        "WIN2.mp4": vdir / f"{match_name}_{f2}_win.mp4",
+        "KO1.mp4": vdir / f"{match_name}_{f2}_ko_win.mp4",
+        "KO2.mp4": vdir / f"{match_name}_{f1}_ko_win.mp4",
+        "RET1.mp4": vdir / f"{match_name}_{f2}_retire.mp4",
+        "RET2.mp4": vdir / f"{match_name}_{f1}_retire.mp4",
+        "DRAW.mp4": draw_src,
+    }
+
+    found, missing = {}, []
+    for name, base in spec.items():
+        best = _best_variant(base) if base else None
+        if best is not None and best.exists():
+            found[name] = best
+        else:
+            missing.append(name)
+    return found, missing
+
+
+def match_video_signature(out_dir, match_name: str, f1: str, f2: str) -> str:
+    """A stable signature over the match's source videos (size + mtime of the
+    best variant for each ZIP slot). Changes whenever any video is re-rendered or
+    re-enhanced, so a stored 'uploaded' state can be invalidated."""
+    import hashlib
+    found, missing = resolve_match_videos(out_dir, match_name, f1, f2)
+    h = hashlib.sha1()
+    for name in sorted(set(list(found.keys()) + missing)):
+        p = found.get(name)
+        if p is not None:
+            st = p.stat()
+            h.update(f"{name}:{p.name}:{st.st_size}:{int(st.st_mtime)}".encode())
+        else:
+            h.update(f"{name}:MISSING".encode())
+    return h.hexdigest()
+
+
+def build_match_zip(out_dir, match_name: str, f1: str, f2: str, dest_zip) -> tuple:
+    """Pack the match's nine renamed videos into ``dest_zip``.
+
+    Returns ``(ok, missing)``. ``ok`` is True only when all nine outcome videos
+    were found and written. When some are missing the ZIP is still written with
+    whatever exists so partial review is possible, but ``ok`` is False."""
+    import zipfile
+    found, missing = resolve_match_videos(out_dir, match_name, f1, f2)
+    dest_zip = Path(dest_zip)
+    dest_zip.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest_zip.with_suffix(dest_zip.suffix + ".tmp")
+    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_STORED) as zf:
+        for name, path in found.items():
+            zf.write(path, arcname=name)
+    tmp.replace(dest_zip)
+    return (len(missing) == 0), missing
+
+
+def _json_or_raise(resp, what: str) -> dict:
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {}
+    if resp.status_code >= 400 or (isinstance(data, dict) and data.get("success") is False):
+        msg = ((data.get("error") or data.get("details") or f"HTTP {resp.status_code}")
+               if isinstance(data, dict) else f"HTTP {resp.status_code}")
+        raise RuntimeError(f"{what} failed: {msg}")
+    return data if isinstance(data, dict) else {}
+
+
+def upload_match(endpoint: str, token: str, fixture_id: str,
+                 meta: dict, odds: dict, zip_path,
+                 progress_cb=None, chunk_size: int = 4 * 1024 * 1024,
+                 timeout: int = 600) -> dict:
+    """Upload one prepared match to the Township Combat League server.
+
+    ``meta`` must contain ``fighter1_township``, ``fighter2_township`` and
+    ``venue_kampala_township`` (optionally ``start_time``/``end_time`` ISO
+    strings). The ZIP is uploaded in chunks so it survives request-size limits on
+    reverse proxies. Returns the server's finalize JSON (includes ``match_id`` /
+    ``match_number``); raises ``RuntimeError`` on any failure."""
+    import uuid as _uuid
+
+    def _emit(frac, label):
+        if progress_cb:
+            try:
+                progress_cb(frac, label)
+            except Exception:
+                pass
+
+    base = endpoint.rstrip("/")
+    headers = {"Authorization": f"Bearer {token}"}
+    zip_path = Path(zip_path)
+    if not zip_path.exists():
+        raise RuntimeError(f"ZIP not found: {zip_path}")
+
+    # 1) Create the match (carries the odds).
+    _emit(0.0, "creating match…")
+    body = {
+        "fighter1_township": meta["fighter1_township"],
+        "fighter2_township": meta["fighter2_township"],
+        "venue_kampala_township": meta["venue_kampala_township"],
+        "outcomes": {k: float(v) for k, v in odds.items()},
+    }
+    for opt in ("start_time", "end_time", "result"):
+        if meta.get(opt):
+            body[opt] = meta[opt]
+
+    r = requests.post(f"{base}/api/fixture/{fixture_id}/match",
+                      json=body, headers=headers, timeout=timeout)
+    data = _json_or_raise(r, "create match")
+    match_id = data.get("match_id")
+    if not match_id:
+        raise RuntimeError(f"create match: no match_id in response ({data})")
+
+    # 2) Upload the ZIP in chunks.
+    upload_id = _uuid.uuid4().hex
+    file_name = zip_path.name
+    total = zip_path.stat().st_size
+    total_chunks = max(1, (total + chunk_size - 1) // chunk_size)
+    sent = 0
+    with open(zip_path, "rb") as fh:
+        for idx in range(total_chunks):
+            blob = fh.read(chunk_size)
+            files = {"chunk": (f"chunk_{idx}", blob, "application/octet-stream")}
+            form = {
+                "chunkIndex": str(idx),
+                "totalChunks": str(total_chunks),
+                "uploadId": upload_id,
+                "fileName": file_name,
+            }
+            cr = requests.post(
+                f"{base}/api/fixture/match/{match_id}/zip/chunk",
+                data=form, files=files, headers=headers, timeout=timeout)
+            _json_or_raise(cr, f"chunk {idx + 1}/{total_chunks}")
+            sent += len(blob)
+            _emit(0.05 + 0.85 * (sent / total if total else 1.0),
+                  f"uploading {sent // (1024 * 1024)}/{total // (1024 * 1024)} MB")
+
+    # 3) Finalize → assemble + go live.
+    _emit(0.95, "finalizing…")
+    fr = requests.post(
+        f"{base}/api/fixture/match/{match_id}/zip/finalize",
+        json={"uploadId": upload_id, "fileName": file_name},
+        headers=headers, timeout=timeout)
+    result = _json_or_raise(fr, "finalize")
+    _emit(1.0, "done")
+    result.setdefault("match_id", match_id)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Township upload — config resolution + per-match upload state
+# ---------------------------------------------------------------------------
+def _resolve_odds_ranges(args) -> dict:
+    """Return the configured odds-range overrides as a plain dict (or {}).
+
+    ``args.odds_ranges`` may be a dict (loaded from config), a JSON string
+    (rare CLI use), or None. Always returns something safe for
+    ``generate_odds(ranges=...)``.
+    """
+    raw = getattr(args, "odds_ranges", None)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = None
+    return raw if isinstance(raw, dict) else {}
+
+
+def _collect_odds_ranges(fv) -> dict:
+    """Assemble an odds-range dict from a form-value getter ``fv(key)``.
+
+    Reads ``odds_<col>_min`` / ``odds_<col>_max`` for each outcome column. Falls
+    back to the built-in default for any field left blank or unparseable, so the
+    stored map is always complete and valid.
+    """
+    defaults = default_ranges()
+    out = {}
+    for col, (dlo, dhi) in defaults.items():
+        def _num(suffix, fallback):
+            try:
+                return float(fv(f"odds_{col}_{suffix}", "") or fallback)
+            except (TypeError, ValueError):
+                return fallback
+        out[col] = [_num("min", dlo), _num("max", dhi)]
+    return _range_dict_to_json(merge_ranges(out))
+
+
+def _upload_state_path(out_dir) -> Path:
+    return Path(out_dir) / "videos" / "upload_state.json"
+
+
+def _load_upload_state(out_dir) -> dict:
+    p = _upload_state_path(out_dir)
+    if p.exists():
+        try:
+            data = json.loads(p.read_text())
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {}
+
+
+def _save_upload_state(out_dir, state: dict) -> None:
+    p = _upload_state_path(out_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+    tmp.replace(p)
+
+
+def _get_match_upload(out_dir, mn: str) -> dict:
+    return _load_upload_state(out_dir).get(mn, {}) or {}
+
+
+def _set_match_upload(out_dir, mn: str, entry: dict) -> None:
+    state = _load_upload_state(out_dir)
+    if entry:
+        state[mn] = entry
+    else:
+        state.pop(mn, None)
+    _save_upload_state(out_dir, state)
+
+
+def _clear_match_upload(out_dir, mn: str) -> None:
+    _set_match_upload(out_dir, mn, {})
+
+
+def _match_meta(out_dir, mn: str):
+    """Return (f1, f2, env) for a match from its saved plan, or ("","","")."""
+    pf = Path(out_dir) / "videos" / "prompts.json"
+    if pf.exists():
+        try:
+            plan = json.loads(pf.read_text())
+        except Exception:
+            plan = {}
+        for m in plan.get("fight_plan", []):
+            if m.get("match_name") == mn:
+                return m.get("f1", ""), m.get("f2", ""), m.get("env", "")
+    return "", "", ""
+
+
+def _upload_config_ready(args):
+    """Return (ok, missing_list) for the server upload settings on ``args``."""
+    missing = [k for k in ("upload_endpoint", "upload_token", "upload_fixture_id")
+               if not (getattr(args, k, "") or "").strip()]
+    return (not missing), missing
+
+
+def prepare_match_odds_zip(out_dir, mn: str, args, log=None,
+                           odds: dict = None, max_tries: int = 10) -> dict:
+    """Generate arbitrage-safe odds (unless ``odds`` is supplied) and pack the
+    match's renamed ZIP, persisting both into the upload state.
+
+    Returns a dict: ``{ok, odds, missing, zip, arbitrage_ok, error}``. ``ok`` is
+    True only when odds passed the anti-arbitrage check AND all nine videos were
+    packed. When odds fail after ``max_tries`` the ZIP is still built so the
+    operator can see what's missing, but ``ok`` is False.
+    """
+    log = log or _log
+    f1, f2, _env = _match_meta(out_dir, mn)
+    result = {"ok": False, "odds": None, "missing": [], "zip": None,
+              "arbitrage_ok": False, "error": None}
+
+    # 1) Odds (generate or validate the supplied set).
+    ranges = _resolve_odds_ranges(args)
+    if odds is None:
+        try:
+            odds = generate_odds(max_tries=max_tries, ranges=ranges)
+        except RuntimeError as e:
+            result["error"] = str(e)
+            log(f"  ✗ odds: {e}")
+            return result
+    arb_ok, arb_reason = check_arbitrage(odds)
+    result["odds"] = odds
+    result["arbitrage_ok"] = arb_ok
+    if not arb_ok:
+        result["error"] = f"arbitrage check failed: {arb_reason}"
+        log(f"  ✗ odds rejected: {arb_reason}")
+
+    # 2) ZIP (best-quality variant of each of the nine videos).
+    zip_path = Path(out_dir) / "videos" / "uploads" / f"{mn}.zip"
+    zip_ok, missing = build_match_zip(out_dir, mn, f1, f2, zip_path)
+    result["missing"] = missing
+    result["zip"] = str(zip_path)
+    if missing:
+        log(f"  ⚠ ZIP missing {len(missing)} video(s): {', '.join(missing)}")
+
+    # 3) Persist state (preserve any prior uploaded_at only if nothing changed —
+    #    a fresh prepare invalidates a previous upload because content/odds moved).
+    entry = {
+        "odds": odds,
+        "zip": str(zip_path),
+        "missing": missing,
+        "prepared_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "sig": match_video_signature(out_dir, mn, f1, f2),
+        "arbitrage_ok": arb_ok,
+    }
+    _set_match_upload(out_dir, mn, entry)
+
+    result["ok"] = arb_ok and zip_ok
+    if result["ok"]:
+        log(f"  ✓ odds + ZIP ready for {mn}")
+    return result
+
+
+def upload_prepared_match(out_dir, mn: str, args, log=None, progress_cb=None) -> dict:
+    """Upload a previously prepared match. Refuses (without contacting the server)
+    when the upload config is incomplete, no ZIP/odds were prepared, the prepared
+    videos changed since preparation, or the odds fail the anti-arbitrage re-check.
+
+    Returns ``{ok, error, match_id, match_number}``.
+    """
+    log = log or _log
+    out = {"ok": False, "error": None, "match_id": None, "match_number": None}
+
+    cfg_ok, missing_cfg = _upload_config_ready(args)
+    if not cfg_ok:
+        out["error"] = f"upload not configured (missing: {', '.join(missing_cfg)})"
+        return out
+
+    entry = _get_match_upload(out_dir, mn)
+    odds = entry.get("odds")
+    zip_path = entry.get("zip")
+    if not odds or not zip_path or not Path(zip_path).exists():
+        out["error"] = "no prepared ZIP/odds — generate odds & ZIP first"
+        return out
+    if entry.get("missing"):
+        out["error"] = f"ZIP incomplete — missing {', '.join(entry['missing'])}"
+        return out
+
+    f1, f2, env = _match_meta(out_dir, mn)
+    # Re-validate the content signature: a re-render/enhance since prep invalidates.
+    if entry.get("sig") and entry["sig"] != match_video_signature(out_dir, mn, f1, f2):
+        out["error"] = "videos changed since the ZIP was prepared — regenerate the ZIP"
+        return out
+    # Re-run the anti-arbitrage check (never upload a sure bet).
+    arb_ok, arb_reason = check_arbitrage(odds)
+    if not arb_ok:
+        out["error"] = f"arbitrage check failed: {arb_reason} — regenerate odds"
+        return out
+
+    meta = {
+        "fighter1_township": f1 or mn,
+        "fighter2_township": f2 or mn,
+        "venue_kampala_township": env or "Township Arena",
+    }
+    try:
+        res = upload_match(
+            args.upload_endpoint, args.upload_token, args.upload_fixture_id,
+            meta, odds, zip_path, progress_cb=progress_cb)
+    except Exception as e:
+        out["error"] = str(e)
+        log(f"  ✗ upload failed: {e}")
+        return out
+
+    entry.update({
+        "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "match_id": res.get("match_id"),
+        "match_number": res.get("match_number"),
+        "fixture_id": args.upload_fixture_id,
+        "sig": match_video_signature(out_dir, mn, f1, f2),
+    })
+    _set_match_upload(out_dir, mn, entry)
+    out.update({"ok": True, "match_id": res.get("match_id"),
+                "match_number": res.get("match_number")})
+    log(f"  ✓ uploaded {mn} → match #{res.get('match_number')}")
+    return out
+
+
+def _auto_upload_all_matches(out_dir, args, log=None) -> None:
+    """After a full render, prepare odds+ZIP and upload every match that has its
+    short/long finals on disk. Failures are logged and skipped (the match stays
+    rendered locally for a later manual retry)."""
+    log = log or _log
+    cfg_ok, missing_cfg = _upload_config_ready(args)
+    if not cfg_ok:
+        log(f"  ⚠ skipping auto-upload — upload not configured (missing: {', '.join(missing_cfg)})")
+        return
+    pf = Path(out_dir) / "videos" / "prompts.json"
+    if not pf.exists():
+        return
+    try:
+        plan = json.loads(pf.read_text())
+    except Exception:
+        return
+    vdir = Path(out_dir) / "videos"
+    log("\n  ── Township upload: preparing odds + ZIPs and uploading ──")
+    for m in plan.get("fight_plan", []):
+        mn = m.get("match_name")
+        if not mn:
+            continue
+        if not (vdir / f"{mn}_long.mp4").exists() and not (vdir / f"{mn}_short.mp4").exists():
+            continue  # nothing rendered for this match
+        log(f"\n  • {mn}")
+        prep = prepare_match_odds_zip(out_dir, mn, args, log=log)
+        if not prep["ok"]:
+            log(f"    ⏭ skipping upload for {mn} ({prep.get('error') or 'incomplete'})")
+            continue
+        upload_prepared_match(out_dir, mn, args, log=log)
 
 
 def _fighter_desc_hint(name: str, char_descriptions: dict) -> str:
@@ -4104,6 +4708,48 @@ def pick_model(client: CoderAIClient, kind: str, override: str = None) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # Web UI
 # ─────────────────────────────────────────────────────────────────────────────
+
+# App route roots that appear as server-rendered URLs and JS fetch targets. Used
+# to make the UI work behind a reverse-proxy sub-path mount (e.g. /township/).
+_MOUNT_ROUTES = ("media", "api", "matches", "match", "characters",
+                 "environments", "wardrobe", "prompts", "stream", "stop",
+                 "job", "favicon.ico")
+
+
+def _mount_html(html: str, prefix: str) -> str:
+    """Rewrite a server-rendered page so it works under reverse-proxy sub-path
+    ``prefix`` (e.g. '/township'). Prepends the prefix to app-route URLs in HTML
+    attributes and injects a fetch/EventSource shim so JS calls are prefixed too.
+    Idempotent: already-prefixed URLs are not matched again."""
+    import re as _re
+    if not prefix:
+        return html
+    routes = "|".join(_MOUNT_ROUTES)
+    # 1) Attribute URLs: href/src/action/poster/value/data-* pointing at a route.
+    attr_re = _re.compile(
+        r'((?:href|src|action|poster|value|data-src|data-url)\s*=\s*["\'])'
+        r'(/(?:' + routes + r')\b)')
+    html = attr_re.sub(lambda m: m.group(1) + prefix + m.group(2), html)
+    # 2) Home/nav link to bare root: href="/" -> href="<prefix>/".
+    html = _re.sub(r'(href\s*=\s*(["\']))/\2',
+                   lambda m: m.group(1) + prefix + '/' + m.group(2), html)
+    # 3) JS shim: prefix root-absolute fetch()/EventSource() URLs at call time.
+    if "/*coderai-mount*/" in html:
+        return html
+    shim = (
+        "<script>/*coderai-mount*/(function(){var P=" + repr(prefix) + ";if(!P)return;"
+        "function fix(u){return (typeof u==='string'&&u.charAt(0)==='/'"
+        "&&u.charAt(1)!=='/'&&u.indexOf(P+'/')!==0&&u!==P)?P+u:u;}"
+        "var of=window.fetch.bind(window);window.fetch=function(u,o){return of(fix(u),o);};"
+        "var OE=window.EventSource;if(OE){var NE=function(u,o){return new OE(fix(u),o);};"
+        "NE.prototype=OE.prototype;window.EventSource=NE;}})();</script>"
+    )
+    if "</head>" in html:
+        html = html.replace("</head>", shim + "</head>", 1)
+    else:
+        html = shim + html
+    return html
+
 
 def launch_web_ui(default_args):
     """Launch a local web interface for Township Fighters content generation.
@@ -6162,6 +6808,24 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
             f'<option value="{_html.escape(p["name"], quote=True)}">'
             for p in _list_profiles("environment"))
 
+        # Township upload: odds-range inputs, prefilled from the configured (or
+        # default) ranges. Each column gets a min/max number input named
+        # odds_<col>_min / odds_<col>_max so /save-config can reassemble them.
+        _or = merge_ranges(_resolve_odds_ranges(args_ns))
+        _odds_labels = {
+            "under": "Under", "over": "Over", "win1": "Win 1", "win2": "Win 2",
+            "ko1": "KO 1 (f2 by KO)", "ko2": "KO 2 (f1 by KO)",
+            "ret1": "Ret. 1 (f2 by ret.)", "ret2": "Ret. 2 (f1 by ret.)",
+            "draw": "Draw",
+        }
+        _odds_rows = "".join(
+            f'<div><label>{_odds_labels[col]} <span class=hint>(min–max)</span></label>'
+            f'<div style="display:flex;gap:.4rem">'
+            f'<input name=odds_{col}_min type=number min=1 max=50 step=0.01 value="{_or[col][0]:.2f}">'
+            f'<input name=odds_{col}_max type=number min=1 max=50 step=0.01 value="{_or[col][1]:.2f}">'
+            f'</div></div>'
+            for col in OUTCOME_COLUMNS)
+
         return f"""
 <h1>Run settings</h1>
 <form id=run-form method=post action=/start>
@@ -6404,6 +7068,31 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
         </div></div>
     </div>
   </div>
+</div>
+
+<div class=card>
+  <h2>Township Combat League upload</h2>
+  <div class=row>
+    <div><label>Server endpoint <span class=hint>(base URL, e.g. https://townshipcombatleague.com)</span></label>
+         <input name=upload_endpoint type=url value="{_v('upload_endpoint') or ''}"></div>
+    <div><label>API token <span class=hint>(fixture-source token)</span></label>
+         <input name=upload_token type=text value="{_v('upload_token') or ''}"></div>
+  </div>
+  <div class=row style="margin-top:.4rem">
+    <div><label>Fixture ID <span class=hint>(must already exist on the server)</span></label>
+         <input name=upload_fixture_id type=text value="{_v('upload_fixture_id') or ''}"></div>
+    <div style="display:flex;align-items:flex-end">
+      <label style="display:flex;align-items:center;gap:.4rem;margin:0">
+        <input type=checkbox name=upload_after_render{_c('upload_after_render')}>
+        Also generate odds, pack ZIP &amp; upload after a full render</label></div>
+  </div>
+  <details style="margin-top:.6rem">
+    <summary style="cursor:pointer;font-weight:600">Odds ranges <span class=hint>(2-decimal odds; the anti-arbitrage check still applies)</span></summary>
+    <p class=hint style="margin:.4rem 0">KO/Ret. odds are capped in practice by the no-arbitrage rule (a high KO paired with a win ≥1.0 is always a sure bet), so very high maxima may never be reached.</p>
+    <div class=row3 style="margin-top:.4rem">
+      {_odds_rows}
+    </div>
+  </details>
 </div>
 
 <input type=hidden name=step id=step_field value="">
@@ -7467,6 +8156,55 @@ async function saveMatch(ev, name){
     setSt('#7ed87e','✓ Saved');
   }catch(e){ setSt('#e07070','✗ '+e); }
 }
+// ── Township upload: generate odds + ZIP, then chunked upload with a bar ──
+function _upStatusEl(){ return document.querySelector('#detail .up-status'); }
+async function prepOdds(ev, name){
+  const st=_upStatusEl();
+  const setSt=(c,t)=>{ if(st){ st.style.color=c; st.textContent=t; } };
+  setSt('#aaa','🎲 Generating odds & packing ZIP…');
+  const fd=new FormData(); fd.append('name',name);
+  let j;
+  try{ j=await (await fetch('/match/odds',{method:'POST',body:fd})).json(); }
+  catch(e){ setSt('#e07070','✗ '+e); return; }
+  if(j.error && !j.odds){ setSt('#e07070','✗ '+j.error); return; }
+  if(!j.ok){
+    const why=j.error||(j.missing&&j.missing.length?('missing '+j.missing.join(', ')):'incomplete');
+    setSt('#e0a800','⚠ '+why);
+  } else {
+    setSt('#7ed87e','✓ Odds + ZIP ready');
+  }
+  // Reload so the odds table, badge and Upload button enabled-state refresh.
+  setTimeout(()=>location.reload(), 700);
+}
+async function uploadMatch(ev, name){
+  const btn=document.getElementById('upload-btn');
+  const st=_upStatusEl();
+  const setSt=(c,t)=>{ if(st){ st.style.color=c; st.textContent=t; } };
+  const prog=document.querySelector('#detail .up-progress');
+  const bar=document.querySelector('#detail .up-bar');
+  const pct=document.querySelector('#detail .up-pct');
+  if(btn) btn.disabled=true;
+  if(prog) prog.style.display='block';
+  const setBar=(p,msg)=>{ if(bar) bar.style.width=p+'%'; if(pct) pct.textContent=p+'% '+(msg||''); };
+  setBar(0,'starting…'); setSt('#aaa','Uploading…');
+  let j;
+  try{ const fd=new FormData(); fd.append('name',name);
+       j=await (await fetch('/match/upload',{method:'POST',body:fd})).json(); }
+  catch(e){ setSt('#e07070','✗ '+e); if(btn) btn.disabled=false; return; }
+  if(j.error){ setSt('#e07070','✗ '+j.error); if(btn) btn.disabled=false; return; }
+  // Poll the job for progress until done/error.
+  const jid=j.job_id;
+  while(true){
+    await new Promise(r=>setTimeout(r,500));
+    let d;
+    try{ d=await (await fetch('/job/'+jid)).json(); }catch(e){ continue; }
+    setBar(d.progress||0, d._msg||'');
+    if(d.status==='done'){ setSt('#7ed87e','✓ '+(d._msg||'uploaded')); setBar(100,'done');
+      setTimeout(()=>location.reload(), 900); return; }
+    if(d.status==='error'){ setSt('#e07070','✗ '+(d.error||d._msg||'upload failed'));
+      if(btn) btn.disabled=false; return; }
+  }
+}
 async function saveOutputs(ev, fighter){
   const root=document.getElementById('detail');
   const st=document.getElementById('detail-status');
@@ -7870,6 +8608,83 @@ function pollNewMatch(jobId, st){
             )
         outcomes_html = "".join(outcome_groups) or '<span class=hint>No outcomes planned for this match.</span>'
 
+        # ── Township upload state + card ────────────────────────────────────────
+        _up = _get_match_upload(out_dir, name)
+        _cur_sig = match_video_signature(out_dir, name, f1, f2)
+        _zip_ok = bool(_up.get("zip")) and Path(_up.get("zip", "")).exists()
+        _sig_match = _up.get("sig") == _cur_sig
+        _prepared = _zip_ok and _sig_match and not _up.get("missing")
+        _uploaded = bool(_up.get("uploaded_at")) and _sig_match
+        _cfg_ok, _cfg_missing = _upload_config_ready(default_args)
+
+        # Badge shown in the header (clears automatically when the videos change,
+        # because _sig_match goes false).
+        if _uploaded:
+            _upload_badge = (f'<span id=upload-badge style="font-size:.74rem;color:#2ecc71;'
+                             f'border:1px solid #2ecc71;border-radius:10px;padding:.1rem .55rem">'
+                             f'✓ Uploaded · match #{_esc(_up.get("match_number") or "?")}</span>')
+        elif _up.get("uploaded_at"):
+            _upload_badge = (f'<span id=upload-badge style="font-size:.74rem;color:#e0a800;'
+                             f'border:1px solid #e0a800;border-radius:10px;padding:.1rem .55rem" '
+                             f'title="Videos changed since the last upload — regenerate the ZIP and re-upload">'
+                             f'⚠ Upload outdated</span>')
+        else:
+            _upload_badge = '<span id=upload-badge></span>'
+
+        # Odds table (if any odds have been generated).
+        _odds = _up.get("odds") or {}
+        if _odds:
+            _ord = ["under", "over", "win1", "win2", "ko1", "ko2", "ret1", "ret2", "draw"]
+            _odds_cells = "".join(
+                f'<div style="display:flex;justify-content:space-between;gap:.6rem;'
+                f'padding:.1rem .4rem;background:#1a1a1a;border-radius:4px">'
+                f'<span class=hint>{_esc(c)}</span><b>{_odds.get(c, "—")}</b></div>'
+                for c in _ord)
+            _arb = _up.get("arbitrage_ok")
+            _arb_html = ('<span style="color:#2ecc71">✓ no arbitrage</span>' if _arb
+                         else '<span style="color:#e07070">✗ arbitrage check failed</span>')
+            _odds_html = (
+                f'<div style="margin-top:.5rem"><div class=hint style="margin-bottom:.25rem">'
+                f'Odds {_arb_html}</div>'
+                f'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:.3rem">{_odds_cells}</div>'
+                + (f'<div class=hint style="margin-top:.3rem;color:#e0a800">ZIP missing: '
+                   f'{_esc(", ".join(_up.get("missing", [])))}</div>' if _up.get("missing") else "")
+                + '</div>')
+        else:
+            _odds_html = '<div class=hint style="margin-top:.4rem">No odds generated yet.</div>'
+
+        if not _cfg_ok:
+            _upload_cfg_hint = (f'<div class=hint style="margin-top:.4rem;color:#e0a800">'
+                                f'Upload not configured (missing: {_esc(", ".join(_cfg_missing))}). '
+                                f'Set the server endpoint, token and fixture ID on the Run page.</div>')
+        else:
+            _upload_cfg_hint = ""
+
+        _upload_html = (
+            f'<div class=card>'
+            f'  <div style="display:flex;justify-content:space-between;align-items:center">'
+            f'    <h2 style="margin:0">Township upload</h2>{_upload_badge}</div>'
+            f'  {_odds_html}'
+            f'  <div class=pf-actions style="margin-top:.6rem">'
+            f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'onclick="prepOdds(event,\'{_esc(name)}\')">🎲 {"Regenerate" if _odds else "Generate"} odds &amp; ZIP</button>'
+            f'    <button class="btn btn-primary" style="font-size:.82rem;padding:.35rem .9rem" '
+            f'id=upload-btn onclick="uploadMatch(event,\'{_esc(name)}\')"'
+            f'{"" if (_prepared and _cfg_ok) else " disabled"}>⬆ Upload to Township</button>'
+            f'    <span class="up-status" style="font-size:.78rem;color:#7ea8f7"></span>'
+            f'  </div>'
+            f'  <div class=up-progress style="display:none;margin-top:.5rem">'
+            f'    <div style="height:8px;background:#222;border-radius:5px;overflow:hidden">'
+            f'      <div class=up-bar style="height:100%;width:0%;background:#7a3da8;transition:width .2s"></div></div>'
+            f'    <div class=up-pct class=hint style="margin-top:.2rem">0%</div>'
+            f'  </div>'
+            f'  {_upload_cfg_hint}'
+            f'  <p class=hint style="margin:.5rem 0 0">Packs OVER/UNDER + the six win '
+            f'outcomes + DRAW (highest-quality variant of each) into a ZIP, generates '
+            f'arbitrage-safe odds, and uploads to the configured fixture. The ZIP upload '
+            f'is chunked so it works behind a reverse proxy.</p>'
+            f'</div>')
+
         # Render fps (clips) + the auto final playtime fps after FPS-boost.
         _detail_eff_fps = int(getattr(default_args, "playback_fps", 0)
                               or getattr(default_args, "fps", 0) or 8)
@@ -7980,6 +8795,7 @@ function pollNewMatch(jobId, st){
             f'<code>*_2x</code>/<code>*_NxfpS</code> files alongside the originals (non-destructive).</span>'
             f'</div>'
             f'<div id=match-progress class=hidden></div>'
+            f'{_upload_html}'
             f'<div class=section-title style="margin:.7rem 0 .3rem">Final videos</div>'
             f'<div style="display:flex;gap:.6rem;flex-wrap:wrap">{finals_html}</div>'
             f'<div class=section-title style="margin:.9rem 0 .3rem">Single clips '
@@ -8378,8 +9194,27 @@ async function resetPrompts(ev){
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
 
+        def _public_prefix(self):
+            """Reverse-proxy sub-path mount prefix (e.g. '/township'), or ''."""
+            p = (self.headers.get("X-Forwarded-Prefix")
+                 or self.headers.get("X-Script-Name") or "")
+            p = p.strip().rstrip("/")
+            return p if p.startswith("/") else (("/" + p) if p else "")
+
+        def _route(self, path):
+            """Strip the forwarded prefix so internal routing is mount-agnostic
+            whether or not nginx already stripped it."""
+            pref = self._public_prefix()
+            if pref and (path == pref or path.startswith(pref + "/")):
+                path = path[len(pref):] or "/"
+            return path
+
         def _send(self, code, ctype, body):
             if isinstance(body, str): body = body.encode()
+            if "text/html" in ctype:
+                pref = self._public_prefix()
+                if pref:
+                    body = _mount_html(body.decode("utf-8", "replace"), pref).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
@@ -8389,7 +9224,7 @@ async function resetPrompts(ev){
 
         def do_GET(self):
             parsed = urllib.parse.urlparse(self.path)
-            path = parsed.path.rstrip("/") or "/"
+            path = self._route(parsed.path).rstrip("/") or "/"
 
             if path == "/favicon.ico":
                 # Bundled icon next to this script (tools/assets/favicon.ico).
@@ -8569,7 +9404,7 @@ async function resetPrompts(ev){
 
         def do_POST(self):
             parsed = urllib.parse.urlparse(self.path)
-            path = parsed.path
+            path = self._route(parsed.path)
 
             if path == "/stop":
                 _state["abort"].set()
@@ -8881,6 +9716,79 @@ async function resetPrompts(ev){
                 self._send(200, "application/json", _j.dumps({"job_id": job_id}))
                 return
 
+            if path in ("/match/odds", "/match/upload"):
+                import json as _j, uuid as _u
+                clen = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(clen)
+                ctype = self.headers.get("Content-Type", "")
+                if "multipart/form-data" in ctype:
+                    boundary = ctype.split("boundary=")[-1].strip().encode()
+                    form = _parse_multipart(raw, boundary)
+                else:
+                    form = dict(urllib.parse.parse_qsl(raw.decode(errors="replace")))
+
+                def _fv(k, default=""):
+                    v = form.get(k)
+                    if v is None: return default
+                    return v if isinstance(v, str) else v.decode(errors="replace")
+
+                name = _fv("name")
+                if not name or "/" in name or "\\" in name or ".." in name:
+                    self._send(400, "application/json", _j.dumps({"error": "invalid match name"}))
+                    return
+
+                if path == "/match/odds":
+                    # Generate arbitrage-safe odds + pack the ZIP (fast, synchronous).
+                    try:
+                        res = prepare_match_odds_zip(out_dir, name, default_args, log=_web_log)
+                    except Exception as e:
+                        self._send(500, "application/json", _j.dumps({"error": str(e)}))
+                        return
+                    self._send(200, "application/json", _j.dumps({
+                        "ok": res["ok"], "odds": res["odds"], "missing": res["missing"],
+                        "arbitrage_ok": res["arbitrage_ok"], "error": res["error"],
+                    }))
+                    return
+
+                # /match/upload — run in a background thread with a progress job so
+                # the page can render a progress bar (uploads can be large/slow).
+                job_id = _u.uuid4().hex[:12]
+                with _jobs_lock:
+                    _state["jobs"][job_id] = {
+                        "status": "running", "progress": 0, "error": None,
+                        "jtype": "upload", "match": name, "_msg": "starting…"}
+
+                def _upload_worker(_jid=job_id, _name=name):
+                    def _pcb(frac, label):
+                        with _jobs_lock:
+                            j = _state["jobs"].get(_jid)
+                            if j:
+                                j["progress"] = max(0, min(100, int(frac * 100)))
+                                j["_msg"] = label
+                    try:
+                        res = upload_prepared_match(out_dir, _name, default_args,
+                                                    log=_web_log, progress_cb=_pcb)
+                        with _jobs_lock:
+                            j = _state["jobs"].get(_jid)
+                            if j:
+                                if res["ok"]:
+                                    j.update({"status": "done", "progress": 100,
+                                              "_msg": f"uploaded — match #{res.get('match_number')}",
+                                              "match_number": res.get("match_number")})
+                                else:
+                                    j.update({"status": "error", "error": res["error"],
+                                              "_msg": f"✗ {res['error']}"})
+                    except Exception as e:
+                        with _jobs_lock:
+                            j = _state["jobs"].get(_jid)
+                            if j:
+                                j.update({"status": "error", "error": str(e), "_msg": f"✗ {e}"})
+
+                threading.Thread(target=_upload_worker, daemon=True,
+                                 name=f"upload-{name}").start()
+                self._send(200, "application/json", _j.dumps({"job_id": job_id}))
+                return
+
             if path == "/wardrobe/save":
                 import json as _j
                 clen = int(self.headers.get("Content-Length", 0))
@@ -9138,6 +10046,13 @@ async function resetPrompts(ev){
                         prompts_file.write_text(json.dumps(data, indent=2))
                     except Exception as e:
                         self._send(500, "application/json", _j.dumps({"error": f"cannot save: {e}"})); return
+                    # Editing a match invalidates any prepared/uploaded ZIP for it:
+                    # drop the upload state so the "Uploaded" badge disappears and a
+                    # fresh odds/ZIP must be generated before re-uploading.
+                    if mode in ("match", "outputs", "kfprompts"):
+                        _nm = _fv("name")
+                        if _nm and _safe(_nm):
+                            _clear_match_upload(out_dir, _nm)
                     self._send(200, "application/json", _j.dumps({"ok": True}))
                     return
 
@@ -9334,6 +10249,12 @@ async function resetPrompts(ev){
                                                       f"prompts.json: {e}"})); return
                 else:
                     self._send(400, "application/json", _j.dumps({"error": "invalid scope"})); return
+                # Removing any of a match's videos invalidates its prepared/uploaded
+                # ZIP — drop the upload state so the badge clears and the ZIP must be
+                # regenerated before re-uploading.
+                _dmn = _fv("match")
+                if _dmn and _safe(_dmn):
+                    _clear_match_upload(out_dir, _dmn)
                 self._send(200, "application/json", _j.dumps({"ok": True, "removed": removed}))
                 return
 
@@ -9592,6 +10513,11 @@ async function resetPrompts(ev){
                     "only_environments": sc == "environments",
                     "only_assets": sc == "assets",
                     "web_port": port,
+                    "upload_endpoint": _fv("upload_endpoint", "") or "",
+                    "upload_token": _fv("upload_token", "") or "",
+                    "upload_fixture_id": _fv("upload_fixture_id", "") or "",
+                    "upload_after_render": "upload_after_render" in form,
+                    "odds_ranges": _collect_odds_ranges(_fv),
                 }
                 # Apply ALL saved settings to the live session immediately, so
                 # subsequent per-profile jobs (regenerate, train LoRA), runs, AND a
@@ -9753,13 +10679,21 @@ async function resetPrompts(ev){
             ns.only_assets      = (os_mode == "assets")
             ns.cli_mode = True
             ns.web_port = port
+            # Township upload settings
+            ns.upload_endpoint    = _fv("upload_endpoint", "") or ""
+            ns.upload_token       = _fv("upload_token", "") or ""
+            ns.upload_fixture_id  = _fv("upload_fixture_id", "") or ""
+            ns.upload_after_render = "upload_after_render" in form
+            ns.odds_ranges        = _collect_odds_ranges(_fv)
 
             # Apply the submitted connection/model settings to the live session
             # so later per-profile jobs (regenerate, train LoRA) use them too.
             for _k in ("base_url", "api_key", "image_model",
                        "video_model", "text_model", "upscale_model",
                        "upscale_model_2x", "upscale_model_4x", "interpolation_model",
-                       "lora_train_base_model"):
+                       "lora_train_base_model",
+                       "upload_endpoint", "upload_token", "upload_fixture_id",
+                       "upload_after_render", "odds_ranges"):
                 setattr(default_args, _k, getattr(ns, _k, None))
 
             # Apply the same shortcut logic as CLI
@@ -10136,6 +11070,15 @@ async function resetPrompts(ev){
                 interpolation_model=getattr(args, "interpolation_model", None),
             )
 
+        # Optional: generate odds, pack ZIPs and upload every rendered match.
+        if (getattr(args, "upload_after_render", False) and not args.skip_videos
+                and not args.only_prompts and not getattr(args, "only_loras", False)
+                and not getattr(args, "only_keyframes", False)):
+            try:
+                _auto_upload_all_matches(out_dir_r, args, log=_web_log)
+            except Exception as e:
+                _web_log(f"  ✗ auto-upload error: {e}")
+
         _web_log("\n✓ Done.")
 
     # ── Start the server ────────────────────────────────────────────────────
@@ -10510,6 +11453,20 @@ OUTPUT LAYOUT
                         help="Auto-open a web browser at the UI URL on startup. Off by default "
                              "(avoids spawning a terminal text browser on headless servers).")
 
+    # ── Township Combat League upload ─────────────────────────────────────────
+    parser.add_argument("--upload-endpoint", default="", metavar="URL",
+                        help="Base URL of the Township Combat League server to upload matches to "
+                             "(e.g. https://townshipcombatleague.com).")
+    parser.add_argument("--upload-token", default="", metavar="TOKEN",
+                        help="Fixture-source API token for the upload endpoint.")
+    parser.add_argument("--upload-fixture-id", default="", metavar="ID",
+                        help="ID of an EXISTING fixture on the server to add uploaded matches to.")
+    parser.add_argument("--upload-after-render", action="store_true",
+                        help="After a full match render, also generate odds, pack the ZIP and "
+                             "upload it to the Township server.")
+    parser.add_argument("--odds-ranges", default=None,
+                        help=argparse.SUPPRESS)  # JSON map col->[min,max]; usually set via the web UI.
+
     # Two-phase parse: pre-scan for -c/--config so the saved values become
     # parser defaults that explicit command-line arguments can still override.
     pre, _ = parser.parse_known_args()
@@ -10709,6 +11666,14 @@ OUTPUT LAYOUT
             upscale_model=getattr(args, "upscale_model", None),
             interpolation_model=getattr(args, "interpolation_model", None),
         )
+
+        if (getattr(args, "upload_after_render", False) and not args.only_prompts
+                and not getattr(args, "only_loras", False)
+                and not getattr(args, "only_keyframes", False)):
+            try:
+                _auto_upload_all_matches(out_dir, args, log=_log)
+            except Exception as e:
+                _log(f"  ✗ auto-upload error: {e}")
 
     _log("\n✓ Done.")
 
