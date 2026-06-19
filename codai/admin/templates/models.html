@@ -567,6 +567,11 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           <option value="">Default (auto — by capability)</option>
         </select>
         <span class="form-hint" style="font-size:11px">Pin this model to a specific engine/card. Overrides the default engine. Only shown when multiple engines are running.</span>
+        <label style="display:flex;align-items:center;gap:.4rem;margin-top:.4rem;font-size:12px">
+          <input type="checkbox" id="cfg-engine-fallback" style="width:auto;margin:0">
+          Fall back to another engine if the pinned one is unavailable
+        </label>
+        <span class="form-hint" style="font-size:11px">When off (default), a request fails if the pinned engine is down/busy-unreachable instead of running on a different card.</span>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem;margin-top:.75rem">
         <div class="form-row" style="margin:0">
@@ -3154,6 +3159,7 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-offload-dir').value = s.offload_dir || _defaultOffloadDir;
   _applyBackendCfgVisibility(m);
   _populateEnginePin(s.engine || '');
+  document.getElementById('cfg-engine-fallback').checked = !!s.engine_fallback;
   document.getElementById('cfg-sysprompt').value = s.system_prompt || '';
   document.getElementById('cfg-parser').value = s.parser || (!m.in_config ? _autoDetectParser(m.path) : 'auto');
   document.getElementById('cfg-tools').checked = !!s.tools_closer_prompt;
@@ -3507,6 +3513,7 @@ async function saveModelConfig(){
     offload_strategy:  document.getElementById('cfg-offload-strategy').value,
     offload_dir:       document.getElementById('cfg-offload-dir').value.trim() || './offload',
     engine:            document.getElementById('cfg-engine').value.trim() || null,
+    engine_fallback:   document.getElementById('cfg-engine-fallback').checked,
     system_prompt:     document.getElementById('cfg-sysprompt').value.trim() || null,
     parser:            document.getElementById('cfg-parser').value,
     tools_closer_prompt: document.getElementById('cfg-tools').checked,

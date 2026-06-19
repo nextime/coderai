@@ -200,7 +200,8 @@ class FrontProxy:
         engine = _router.pick_engine(
             self.registry, path, method, model,
             required_cap=self._required_cap(path, model),
-            default_engine=self.default_engine, pinned=self._pin_for(model))
+            default_engine=self.default_engine, pinned=self._pin_for(model),
+            pin_fallback=bool(self._model_info(model).get("engine_fallback")))
         if engine is None:
             return {"status_code": 503, "headers": {"content-type": "application/json"},
                     "body": b'{"error":"No engine is ready yet."}'}
@@ -260,7 +261,8 @@ class FrontProxy:
                     continue
                 rec = {"engine": (m.get("engine") or "").strip() or None,
                        "backend": (m.get("backend") or "").strip() or None,
-                       "path": (m.get("path") or m.get("id") or "").strip() or None}
+                       "path": (m.get("path") or m.get("id") or "").strip() or None,
+                       "engine_fallback": bool(m.get("engine_fallback"))}
                 for field_ in (m.get("path"), m.get("id"), m.get("alias")):
                     if not field_:
                         continue
@@ -544,7 +546,8 @@ class FrontProxy:
         engine = _router.pick_engine(
             self.registry, path, method, model,
             required_cap=self._required_cap(path, model),
-            default_engine=self.default_engine, pinned=self._pin_for(model))
+            default_engine=self.default_engine, pinned=self._pin_for(model),
+            pin_fallback=bool(self._model_info(model).get("engine_fallback")))
         if engine is None:
             return JSONResponse(
                 {"error": "No engine is ready yet (still starting/loading)."},

@@ -51,20 +51,24 @@ def is_admin_path(path: str) -> bool:
 _warned_pins: set = set()
 
 
-def _warn_bad_pin(model, pinned, cap, engine) -> None:
-    key = (model, pinned)
+def _warn_bad_pin(model, pinned, cap, engine, fallback: bool = False) -> None:
+    key = (model, pinned, fallback)
     if key in _warned_pins:
         return
     _warned_pins.add(key)
     if engine is None:
         reason = f"no engine named/backed '{pinned}' is declared"
-    elif not engine.healthy:
-        reason = f"engine '{pinned}' is not healthy"
-    else:
+    elif not engine.is_alive():
+        reason = f"engine '{pinned}' is down"
+    elif not engine.can_serve(cap):
         reason = (f"engine '{pinned}' (backend '{engine.backend}') can't serve a "
                   f"'{cap}' model (capabilities: {sorted(engine.capabilities)})")
+    else:
+        reason = f"engine '{pinned}' is unavailable"
+    tail = ("falling back to another compatible engine (engine_fallback)."
+            if fallback else "failing the request (the pin is a hard constraint).")
     print(f"[front] WARNING: model '{model}' is pinned to '{pinned}' but {reason}; "
-          f"falling back to a compatible engine.", flush=True)
+          f"{tail}", flush=True)
 
 
 def required_capability(model: Optional[str], path: Optional[str] = None,
@@ -100,7 +104,8 @@ def required_capability(model: Optional[str], path: Optional[str] = None,
 def pick_engine(registry: EngineRegistry, path: str, method: str,
                 model: Optional[str], required_cap: Optional[str] = None,
                 default_engine: Optional[str] = None,
-                pinned: Optional[str] = None) -> Optional[Engine]:
+                pinned: Optional[str] = None,
+                pin_fallback: bool = False) -> Optional[Engine]:
     """Return the engine to proxy this request to, or None if none are ready.
 
     Precedence for inference: per-model pin → engine already holding the model →
@@ -112,29 +117,30 @@ def pick_engine(registry: EngineRegistry, path: str, method: str,
     if method.upper() == "POST" and is_inference_path(path):
         cap = required_cap
 
-        # 0. The front's precomputed assignment is authoritative — it already folds
-        # in the pin, the default engine, and balanced auto-selection, and is what
-        # keeps a model on exactly one engine. Honour it first when it's compatible.
+        # 0. Per-model pin (models.json "engine") is a HARD constraint: the model
+        # runs on that engine or not at all. Route there if it can serve and its
+        # process is alive — even when it's busy (mid-generation → failing health
+        # polls), so the request queues on its gen-lock rather than spawning a
+        # duplicate elsewhere with the wrong settings. If the pinned engine is down
+        # or incompatible, fail (return None → 503) instead of falling back to a
+        # different engine.
+        if pinned:
+            e = registry.by_name(pinned)
+            if e is not None and e.can_serve(cap) and e.is_alive():
+                return e
+            _warn_bad_pin(model, pinned, cap, e, fallback=pin_fallback)
+            # Default: a hard pin fails rather than running elsewhere. When the
+            # model opts in (engine_fallback), fall through to pick another engine.
+            if not pin_fallback:
+                return None
+
+        # 1. The front's precomputed assignment is authoritative — it already folds
+        # in the default engine and balanced auto-selection, and keeps a model on
+        # exactly one engine. Honour it first when it's compatible.
         if model:
             owner = registry.engine_for_assigned(model)
             if owner is not None and owner.can_serve(cap):
                 return owner
-
-        # 1. Per-model pin (models.json "engine") — only honoured if compatible.
-        if pinned:
-            e = registry.by_name(pinned)
-            if e and e.can_serve(cap):
-                if e.healthy:
-                    return e
-                # Pinned engine is busy (mid-generation → failing health polls) but
-                # its process is alive: route here anyway so the request queues on
-                # its gen-lock, instead of duplicating a pinned model on another
-                # engine (which also ignores its configured n_ctx etc.).
-                if e.is_alive():
-                    return e
-            # Pin can't be honoured (engine down or incompatible) — say why (once
-            # per model+engine) instead of silently falling back.
-            _warn_bad_pin(model, pinned, cap, e)
 
         # 2. Engine that already has the model resident.
         if model:
