@@ -870,8 +870,26 @@ def _run_download_thread(session_id: str, model_id: str, file_pattern: str, pq):
     # <repo>/codai/admin/routes.py, so parents[2] is the repo root.
     _repo_root = str(_pathlib.Path(__file__).resolve().parents[2])
 
-    def _attempt(disable_xet: bool):
-        """Spawn the worker once; relay its events. Returns (terminal, rc, tail)."""
+    # huggingface_hub raises this when a Xet-only blob is too large for the plain
+    # HTTPS path and Xet is disabled — we re-enable Xet and retry in that case.
+    _XET_REQUIRED_RE = re.compile(
+        r"too large to be downloaded using the regular download|"
+        r"install\s+`?hf_xet`?|xet-powered", re.IGNORECASE)
+
+    def _hf_xet_available() -> bool:
+        try:
+            import hf_xet  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    def _attempt(disable_xet: bool, force_xet: bool = False, hold_error: bool = False):
+        """Spawn the worker once; relay its events.
+
+        Returns ``(terminal, rc, tail, error_msg)``. When ``hold_error`` is set, an
+        ``error`` event is captured into ``error_msg`` instead of being pushed to
+        the client (so the caller can decide to retry — e.g. enable Xet — without
+        the user seeing a spurious error first)."""
         env = dict(os.environ)
         env["PYTHONPATH"] = _repo_root + (os.pathsep + env["PYTHONPATH"]
                                           if env.get("PYTHONPATH") else "")
@@ -880,8 +898,12 @@ def _run_download_thread(session_id: str, model_id: str, file_pattern: str, pq):
         # hard-crash the worker (segfault / signal kill) with no traceback. The
         # plain HTTPS path reports byte-accurate progress and is reliable, so we
         # default to it unless the operator explicitly opted in (set
-        # HF_HUB_DISABLE_XET=0). A crash retry always disables it.
-        if disable_xet or os.environ.get("HF_HUB_DISABLE_XET") is None:
+        # HF_HUB_DISABLE_XET=0). A crash retry always disables it. BUT some blobs
+        # are Xet-only and the plain path refuses them ("file too large … install
+        # hf_xet") — for those we re-enable Xet (force_xet) since it IS installed.
+        if force_xet:
+            env["HF_HUB_DISABLE_XET"] = "0"
+        elif disable_xet or os.environ.get("HF_HUB_DISABLE_XET") is None:
             env["HF_HUB_DISABLE_XET"] = "1"
         proc = _sp.Popen(
             [_sys.executable, "-m", "codai.admin.download_worker", model_id, file_pattern or ""],
@@ -890,6 +912,7 @@ def _run_download_thread(session_id: str, model_id: str, file_pattern: str, pq):
         )
         _download_procs[session_id] = proc
         terminal = None
+        held_error_msg = ""
         recent = _collections.deque(maxlen=12)
         try:
             for line in proc.stdout:
@@ -905,6 +928,10 @@ def _run_download_thread(session_id: str, model_id: str, file_pattern: str, pq):
                     push({"type": "info", "message": line})
                     continue
                 etype = evt.get("type")
+                if etype == "error" and hold_error:
+                    held_error_msg = evt.get("message", "") or ""
+                    terminal = "error"
+                    continue
                 push(evt)
                 if etype in ("done", "error"):
                     terminal = etype
@@ -923,10 +950,25 @@ def _run_download_thread(session_id: str, model_id: str, file_pattern: str, pq):
                 except Exception:
                     pass
             _download_procs.pop(session_id, None)
-        return terminal, proc.poll(), " | ".join(list(recent)[-4:]).strip()
+        return terminal, proc.poll(), " | ".join(list(recent)[-4:]).strip(), held_error_msg
 
     try:
-        terminal, rc, tail = _attempt(disable_xet=False)
+        # First pass with our reliable Xet-disabled default, but hold any error so
+        # we can transparently retry Xet-only blobs instead of failing the user.
+        terminal, rc, tail, errmsg = _attempt(disable_xet=False, hold_error=True)
+        # Xet-only large file refused by the plain HTTPS path → re-enable Xet
+        # (hf_xet is bundled) and try again.
+        xet_required = bool(terminal == "error" and errmsg
+                            and _XET_REQUIRED_RE.search(errmsg))
+        if xet_required and _hf_xet_available():
+            push({"type": "info",
+                  "message": "Large Xet-backed file detected; retrying with the Xet "
+                             "accelerator (progress may not update during transfer)…"})
+            _download_status.get(session_id, {}).update({"status": "downloading", "percent": 0})
+            terminal, rc, tail, errmsg = _attempt(disable_xet=False, force_xet=True)
+        elif terminal == "error" and errmsg:
+            # Held a non-Xet error on the first pass → surface it now.
+            push({"type": "error", "message": errmsg})
         # A hard crash (no done/error event, not a user cancel) is the classic
         # hf_xet failure — retry once with Xet disabled before giving up.
         crashed = (terminal is None and session_id not in _download_cancelled)
@@ -934,7 +976,7 @@ def _run_download_thread(session_id: str, model_id: str, file_pattern: str, pq):
             push({"type": "info",
                   "message": "Transfer crashed; retrying without the Xet accelerator…"})
             _download_status.get(session_id, {}).update({"status": "downloading", "percent": 0})
-            terminal, rc, tail = _attempt(disable_xet=True)
+            terminal, rc, tail, errmsg = _attempt(disable_xet=True)
 
         if terminal is None:
             # Still no final event → cancelled or died for good.
