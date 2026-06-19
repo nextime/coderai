@@ -344,6 +344,7 @@ class VulkanBackend(ModelBackend):
         self.chat_template = None  # Detected chat template name
         self.hf_tokenizer = None  # HuggingFace tokenizer for apply_chat_template
         self.supports_vision = False  # set True when an mmproj projector is loaded
+        self._no_system_cached = None  # lazy: template has no 'system' role (Gemma)
         self.force_cuda = original_backend in ("nvidia", "cuda")  # Force CUDA if original was nvidia
         if self.force_cuda:
             print("DEBUG: GGUF model will use CUDA backend (forced by --backend nvidia)")
@@ -1565,11 +1566,52 @@ class VulkanBackend(ModelBackend):
     def _is_system_role_error(exc) -> bool:
         return 'system role' in str(exc).lower()
 
+    def _template_rejects_system(self) -> bool:
+        """True when this model's chat template has no 'system' role.
+
+        The authoritative signal is the embedded template itself: the official
+        Gemma template (and other strict ones) carry
+        ``raise_exception("System role not supported")``, while some finetune/
+        quant conversions ship a permissive template that accepts system. So we
+        fold proactively only when the template actually rejects it — not for
+        every Gemma (e.g. 'heretic' gemma4 quants handle system fine). Falls back
+        to GGUF architecture when the template can't be read."""
+        if self._no_system_cached is not None:
+            return self._no_system_cached
+        val = None
+        # 1) Embedded chat template (authoritative).
+        tmpl = None
+        try:
+            md = getattr(self.model, 'metadata', None)
+            if isinstance(md, dict):
+                tmpl = md.get('tokenizer.chat_template')
+        except Exception:
+            tmpl = None
+        if not tmpl:
+            tmpl = getattr(self.model, 'chat_template', None) if self.model else None
+        if isinstance(tmpl, str) and tmpl:
+            low = tmpl.lower()
+            if 'system role' in low or ('raise_exception' in low and 'system' in low):
+                val = True
+            else:
+                val = False   # template renders without rejecting system
+        # 2) No readable template → fall back to architecture (Gemma rejects system).
+        if val is None:
+            try:
+                from codai.models.manager import _gguf_architecture
+                val = (_gguf_architecture(self.model_name) or "").lower().startswith("gemma")
+            except Exception:
+                val = False
+        self._no_system_cached = val
+        return val
+
     def generate_chat(self, messages, max_tokens=None, temperature=0.7, top_p=1.0,
                       stop=None, tools=None, response_format=None):
         """Non-streaming chat completion using llama.cpp's native chat handler."""
         if self.model is None:
             raise RuntimeError("Model not loaded")
+        if self._template_rejects_system():
+            messages = self._fold_system_into_user(messages)
 
         kwargs = dict(
             messages=messages,
@@ -1606,6 +1648,8 @@ class VulkanBackend(ModelBackend):
         """Streaming chat completion using llama.cpp's native chat handler."""
         if self.model is None:
             raise RuntimeError("Model not loaded")
+        if self._template_rejects_system():
+            messages = self._fold_system_into_user(messages)
 
         kwargs = dict(
             messages=messages,
