@@ -1600,6 +1600,12 @@ class MultiModelManager:
                                 allowed.add(val)
                                 short = val.split("/")[-1] if "/" in val else val
                                 allowed.add(short)
+                                # list_models advertises a gguf's filename WITHOUT
+                                # the .gguf extension as an id (its auto-alias), so
+                                # accept that name too — otherwise a request using
+                                # the id from /v1/models is rejected as not allowed.
+                                if short.lower().endswith(".gguf"):
+                                    allowed.add(short[:-5])
         except Exception:
             pass
 

@@ -309,6 +309,40 @@ async def internal_engine_state():
             "vram": vram, "tasks": tasks, "cooling": cooling}
 
 
+@app.post("/internal/reload-config", include_in_schema=False)
+async def internal_reload_config(request: Request):
+    """Live config refresh pushed by the front when models.json changes: re-read
+    models.json and update this engine's assigned-model set, so /v1/models and
+    request validation reflect added/removed models without a restart. Weights are
+    untouched — (re)loading still happens lazily on the next request."""
+    import json as _json
+    try:
+        body = await request.body()
+        data = _json.loads(body or b"{}") or {}
+    except Exception:
+        data = {}
+    n = 0
+    try:
+        from codai.admin.routes import config_manager
+        if config_manager is not None and getattr(config_manager, "models_path", None):
+            with open(config_manager.models_path) as _f:
+                config_manager.models_data = _json.load(_f)
+            _cats = ("text_models", "gguf_models", "vision_models", "image_models",
+                     "audio_models", "tts_models", "video_models", "audio_gen_models",
+                     "embedding_models", "spatial_models")
+            n = sum(len(config_manager.models_data.get(c, []) or []) for c in _cats)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    try:
+        from codai.models.manager import multi_model_manager
+        assigned = data.get("assigned")
+        if assigned is not None:
+            multi_model_manager.set_assigned_models(set(assigned))
+    except Exception:
+        pass
+    return {"ok": True, "models": n}
+
+
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
     if _favicon_path.exists():

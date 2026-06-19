@@ -129,6 +129,7 @@ class EngineSupervisor:
         self.internal_token = internal_token  # shared secret stamped on engine calls
         self.debug = debug               # --debug-engine: verbose engine lifecycle
         self._health = {}                # engine_id -> last healthy bool (for debug)
+        self._assign_mtime = 0.0         # models.json mtime → live re-assignment
         self._stopped = threading.Event()
         self._poll_thread = None
         self._logs = {}   # engine_id -> deque tail
@@ -431,12 +432,52 @@ class EngineSupervisor:
         self._poll_thread.start()
         atexit.register(self.stop_all)
 
+    def _push_assignment_if_changed(self, client) -> None:
+        """When models.json changes (admin add/remove model), re-compute the
+        per-engine assignment and push it live to every engine + the front's
+        router, so /v1/models and routing reflect the change without a restart."""
+        if not self.models_path or len(self.registry.all()) < 2:
+            return
+        try:
+            mtime = os.path.getmtime(self.models_path)
+        except OSError:
+            return
+        if mtime == self._assign_mtime:
+            return
+        self._assign_mtime = mtime
+        try:
+            from codai.frontproxy.assignment import compute_assignment
+            default_engine = getattr(self.config.server, "default_engine", None)
+            ds4 = getattr(self.config, "ds4", None)
+            assignment = compute_assignment(self.registry.all(), self.models_path,
+                                            default_engine, ds4)
+        except Exception as exc:
+            print(f"[front] live reassignment skipped: {exc}", flush=True)
+            return
+        for e in self.registry.all():
+            owned = assignment.get(e.name, [])
+            e.assigned_models = set(owned)   # update the front's router
+            try:
+                client.post(e.url + "/internal/reload-config", json={"assigned": owned})
+            except Exception as exc:
+                print(f"[front] reload-config push to '{e.name}' failed: {exc}",
+                      flush=True)
+        print(f"[front] models.json changed — re-pushed assignment "
+              f"({', '.join(f'{e.name}:{len(assignment.get(e.name, []))}' for e in self.registry.all())})",
+              flush=True)
+
     def _poll_loop(self) -> None:
         _auth = ({"x-coderai-internal": self.internal_token}
                  if self.internal_token else {})
         client = httpx.Client(timeout=self.config.server.proxy_status_timeout,
                               headers=_auth)
+        try:
+            self._assign_mtime = (os.path.getmtime(self.models_path)
+                                  if self.models_path else 0.0)
+        except OSError:
+            self._assign_mtime = 0.0
         while not self._stopped.is_set():
+            self._push_assignment_if_changed(client)
             for engine in self.registry.all():
                 # Respawn engines whose process has exited.
                 if engine.proc is not None and engine.proc.poll() is not None:
