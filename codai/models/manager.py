@@ -323,9 +323,18 @@ class ModelManager:
 
         available = detect_available_backends()
 
-        # Check if model is a GGUF file
+        # Check if model is a GGUF file. The name alone isn't reliable: a gguf's
+        # alias may carry only the quant suffix (e.g. '…-q4_k_m') with no literal
+        # 'gguf', which would mis-route it to the HF/transformers path. Fall back
+        # to resolving the alias to an actual local .gguf file.
         is_gguf = model_name.endswith('.gguf') or 'gguf' in model_name.lower()
-        
+        if not is_gguf:
+            try:
+                if _resolve_local_gguf(model_name):
+                    is_gguf = True
+            except Exception:
+                pass
+
         # Determine backend
         if backend_type == "auto":
             if available.get('nvidia'):
