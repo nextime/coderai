@@ -299,6 +299,125 @@ def _normalize_tool_call_arguments(tool_calls):
     return out
 
 
+def _estimate_tokens(messages) -> int:
+    """Cheap prompt-size estimate (≈ chars/4 + per-message overhead). Good enough
+    to decide whether to auto-compact; not an exact tokenizer count."""
+    total = 0
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            total += len(c)
+        elif isinstance(c, list):
+            for it in c:
+                if isinstance(it, dict) and isinstance(it.get("text"), str):
+                    total += len(it["text"])
+        if m.get("tool_calls"):
+            try:
+                total += len(json.dumps(m["tool_calls"]))
+            except Exception:
+                pass
+        total += 16
+    return int(total / 4) + 8
+
+
+def _compact_messages(messages, n_ctx, pct, strategy, summary_text=None):
+    """Shrink an over-long message list to ~65% of n_ctx, keeping system messages
+    and the most recent turns. Returns (new_messages, info|None). Strategies:
+      - drop_oldest : keep only system + the recent tail that fits.
+      - keep_head_tail: also keep the first user turn (context anchor) + a note.
+      - summarize   : keep_head_tail, but replace the dropped middle with an LLM
+                      summary (``summary_text``) when available, else a count note.
+    Returns info=None (no change) when not over threshold or nothing can be dropped.
+    """
+    if not messages or not n_ctx or n_ctx <= 0:
+        return messages, None
+    try:
+        pct = float(pct)
+    except (TypeError, ValueError):
+        pct = 85.0
+    pct = min(99.0, max(50.0, pct))
+    est = _estimate_tokens(messages)
+    if est < n_ctx * pct / 100.0:
+        return messages, None
+    target = int(n_ctx * 0.65)
+
+    sys_msgs = [m for m in messages if m.get("role") == "system"]
+    body = [m for m in messages if m.get("role") != "system"]
+    running = _estimate_tokens(sys_msgs)
+
+    # Track membership by object identity — message dicts can be value-equal
+    # (e.g. duplicate "try again" turns or identical tool results).
+    tail = []
+    tail_ids = set()
+    for m in reversed(body):
+        t = _estimate_tokens([m])
+        if tail and running + t > target:
+            break
+        tail.insert(0, m)
+        tail_ids.add(id(m))
+        running += t
+    # Don't start the kept tail on an orphaned tool result (its assistant
+    # tool_calls turn would have been dropped) — that breaks chat templates.
+    while tail and tail[0].get("role") == "tool":
+        running -= _estimate_tokens([tail[0]])
+        tail_ids.discard(id(tail[0]))
+        tail.pop(0)
+
+    head = []
+    head_ids = set()
+    if strategy in ("keep_head_tail", "summarize"):
+        first_user = next((m for m in body if m.get("role") == "user"), None)
+        if first_user is not None and id(first_user) not in tail_ids:
+            head = [first_user]
+            head_ids.add(id(first_user))
+
+    dropped = [m for m in body if id(m) not in head_ids and id(m) not in tail_ids]
+    if not dropped:
+        return messages, None
+
+    notes = []
+    if strategy == "summarize" and summary_text:
+        notes.append({"role": "system",
+                      "content": "[Summary of earlier conversation]\n" + summary_text})
+    elif strategy in ("keep_head_tail", "summarize"):
+        notes.append({"role": "system",
+                      "content": f"[Note: {len(dropped)} earlier message(s) omitted to fit the context window.]"})
+
+    new = sys_msgs + head + notes + tail
+    return new, {"dropped": len(dropped), "strategy": strategy,
+                 "before_tokens": est, "after_tokens": _estimate_tokens(new),
+                 "n_ctx": n_ctx}
+
+
+async def _summarize_for_compact(manager, messages, keep_recent: int = 4):
+    """Best-effort: summarize the older turns with the loaded model itself. Returns
+    a summary string or None (caller falls back to a count note)."""
+    try:
+        body = [m for m in messages if m.get("role") != "system"]
+        older = body[:-keep_recent] if len(body) > keep_recent else body
+        if not older:
+            return None
+        lines = []
+        for m in older:
+            c = m.get("content")
+            if isinstance(c, list):
+                c = " ".join(it.get("text", "") for it in c if isinstance(it, dict))
+            lines.append(f"{m.get('role', '?')}: {str(c)[:2000]}")
+        convo = "\n".join(lines)[:12000]
+        prompt = [
+            {"role": "system", "content": "Summarize the following conversation "
+             "concisely, preserving key facts, decisions, code, file paths and open "
+             "tasks. Output only the summary."},
+            {"role": "user", "content": convo},
+        ]
+        out = await asyncio.to_thread(
+            manager.generate_chat, messages=prompt, max_tokens=400, temperature=0.2)
+        return (out or "").strip() or None
+    except Exception as e:
+        print(f"[auto-compact] summary generation failed: {e}", flush=True)
+        return None
+
+
 @router.post("/v1/chat/completions", summary="Chat completions")
 async def chat_completions(request: ChatCompletionRequest, http_request: Request = None):
     """Chat completions endpoint with streaming and tool support."""
@@ -845,8 +964,36 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         # A list is legitimate multipart vision content — leave it intact.
         elif not isinstance(m["content"], str) and not isinstance(m["content"], list):
             messages_dict[i]["content"] = str(m["content"])
-    
-    
+
+    # Auto-compact (per-model, OFF by default): when the prompt would exceed
+    # `auto_compact_pct`% of the model's context window, shrink it to ~65% using
+    # the configured strategy (drop_oldest | keep_head_tail | summarize) instead of
+    # erroring out on overflow.
+    try:
+        from codai.models.manager import multi_model_manager as _mmm
+        _cc = _mmm._config_for_model(getattr(request, "model", None) or "") or {}
+    except Exception:
+        _cc = {}
+    if _cc.get("auto_compact"):
+        try:
+            _nctx = current_manager.get_context_size() if current_manager else 0
+        except Exception:
+            _nctx = 0
+        _pct = _cc.get("auto_compact_pct", 85)
+        _strategy = (_cc.get("auto_compact_strategy") or "drop_oldest").strip()
+        if _nctx and _estimate_tokens(messages_dict) >= _nctx * float(_pct or 85) / 100.0:
+            _summary = None
+            if _strategy == "summarize":
+                _summary = await _summarize_for_compact(current_manager, messages_dict)
+            messages_dict, _info = _compact_messages(
+                messages_dict, _nctx, _pct, _strategy, _summary)
+            if _info:
+                print(f"[auto-compact] {getattr(request, 'model', '?')}: "
+                      f"~{_info['before_tokens']}→{_info['after_tokens']} tokens "
+                      f"(n_ctx={_nctx}, dropped {_info['dropped']} msgs via "
+                      f"{_info['strategy']})", flush=True)
+
+
     # Convert tools to dict format if present
     tools_dict = None
     if request.tools:

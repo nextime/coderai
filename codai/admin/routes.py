@@ -2471,7 +2471,8 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "component_quantization", "output_crf", "force_vram_update",
                 "balanced_gpu_percent", "acceleration",
                 "cache_type_k", "cache_type_v", "turboquant", "engine",
-                "quant_backend", "kv_cache_budget_mb", "kv_cache_slots", "mmproj"):
+                "quant_backend", "kv_cache_budget_mb", "kv_cache_slots", "mmproj",
+                "auto_compact", "auto_compact_pct", "auto_compact_strategy"):
         if key in data:
             entry[key] = data[key]
 

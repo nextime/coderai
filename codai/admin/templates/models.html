@@ -666,6 +666,26 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           <input type="number" id="cfg-ram-gb" class="form-input" min="0" step="0.5" placeholder="auto">
         </div>
       </div>
+
+      <!-- Auto-compact: shrink an over-long conversation before generation -->
+      <div class="card-title" style="margin-top:1.25rem">Auto-compact context</div>
+      <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-autocompact" onchange="_toggleAutoCompact()"> Auto-compact when the prompt nears the context limit <span class="muted">(off by default)</span></label>
+      <div id="cfg-autocompact-opts" style="display:none;grid-template-columns:1fr 1fr;gap:.75rem;margin-top:.5rem">
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Trigger at <span class="muted">(% of context)</span></label>
+          <input type="number" id="cfg-autocompact-pct" class="form-input" min="50" max="99" step="1" value="85">
+          <span class="form-hint" style="font-size:11px">Compacts to ~65% of the context window when the prompt reaches this %.</span>
+        </div>
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Strategy</label>
+          <select id="cfg-autocompact-strategy" class="form-input">
+            <option value="drop_oldest">Drop oldest — keep system + most recent turns</option>
+            <option value="keep_head_tail">Keep head + tail — also keep the first turn, drop the middle</option>
+            <option value="summarize">Summarize — replace the dropped middle with an LLM summary</option>
+          </select>
+        </div>
+      </div>
+
       <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-top:.75rem">
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-4bit"> 4-bit quantization</label>
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-8bit"> 8-bit quantization</label>
@@ -2747,6 +2767,11 @@ async function freeDiskConfirm(idx){
   }catch(e){showAlert('Error: '+e.message)}
 }
 
+function _toggleAutoCompact(){
+  const on = document.getElementById('cfg-autocompact').checked;
+  document.getElementById('cfg-autocompact-opts').style.display = on ? 'grid' : 'none';
+}
+
 /* ── type checkbox helpers ─────────────────────────────── */
 function _autoDetectParser(path) {
   const n = (path || '').toLowerCase();
@@ -3115,6 +3140,10 @@ function openCfgModal(idx, cfgIdx){
   }
   document.getElementById('cfg-max-gpu').value = s.max_gpu_percent != null ? s.max_gpu_percent : '';
   document.getElementById('cfg-ram-gb').value = s.manual_ram_gb != null ? s.manual_ram_gb : '';
+  document.getElementById('cfg-autocompact').checked = !!s.auto_compact;
+  document.getElementById('cfg-autocompact-pct').value = s.auto_compact_pct != null ? s.auto_compact_pct : 85;
+  document.getElementById('cfg-autocompact-strategy').value = s.auto_compact_strategy || 'drop_oldest';
+  _toggleAutoCompact();
   document.getElementById('cfg-4bit').checked = !!s.load_in_4bit;
   document.getElementById('cfg-8bit').checked = !!s.load_in_8bit;
   document.getElementById('cfg-quant-backend').value = s.quant_backend || 'auto';
@@ -3465,6 +3494,9 @@ async function saveModelConfig(){
     cache_type_k:      document.getElementById('cfg-cache-type-k').value || null,
     cache_type_v:      document.getElementById('cfg-cache-type-v').value || null,
     mmproj:            document.getElementById('cfg-mmproj').value || null,
+    auto_compact:      document.getElementById('cfg-autocompact').checked,
+    auto_compact_pct:  parseInt(document.getElementById('cfg-autocompact-pct').value) || 85,
+    auto_compact_strategy: document.getElementById('cfg-autocompact-strategy').value || 'drop_oldest',
     max_gpu_percent:   isNaN(maxGpu) ? null : maxGpu,
     manual_ram_gb:     isNaN(ramGb) ? null : ramGb,
     load_in_4bit:      document.getElementById('cfg-4bit').checked,
