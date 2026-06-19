@@ -1934,7 +1934,12 @@ function _renderConfigPills(idx, m) {
   const configs = m.configs || [];
   if (!configs.length) return '';
   const pills = configs.map((c, cfgIdx) => {
-    const label = (c.settings && (c.settings.config_name || c.settings.alias)) || `Config ${cfgIdx + 1}`;
+    const cs = c.settings || {};
+    // Whisper-server configs share the same alias ("whisper"); label them by id
+    // so the two instances are distinguishable.
+    const label = cs.config_name
+      || (cs.backend === 'whisper-server' ? cs.id : cs.alias)
+      || `Config ${cfgIdx + 1}`;
     return `<span class="badge badge-user" style="font-size:10px;cursor:pointer;vertical-align:middle;margin:.1rem .1rem 0 0" onclick="openCfgModal(${idx},${cfgIdx})" title="Edit this configuration">${esc(label)}</span>${_engineTagHtml(m, c.settings)}`;
   }).join('');
   const addPill = `<span class="badge" style="font-size:10px;cursor:pointer;vertical-align:middle;margin:.1rem 0 0 0;background:var(--raised);border:1px dashed var(--border);color:var(--text-2)" onclick="openCfgModalNew(${idx})" title="Add another configuration for this model">+ Config</span>`;
@@ -2990,6 +2995,15 @@ function openCfgModal(idx, cfgIdx){
   }
   // Determine which config's settings to load
   const configs = m.configs || [];
+  // A whisper-server can appear as a config of its backing GGUF file. Editing it
+  // must go through the whisper editor (updates in place by id) — not the general
+  // modal, which would treat it as a config_id-less entry and create duplicates.
+  const _sel = (cfgIdx != null && cfgIdx >= 0) ? configs[cfgIdx] : (configs[0] || null);
+  if (_sel && (_sel.settings || {}).backend === 'whisper-server') {
+    const s = _sel.settings;
+    _openWhisperServerEdit({ path: s.id, settings: s });
+    return;
+  }
   // Normalize cfgIdx: undefined/null → 0, -1 → "new"
   const _cfgIdx = (cfgIdx == null) ? 0 : cfgIdx;
   let s, configId, isNewConfig;
