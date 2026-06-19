@@ -127,9 +127,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # The fully assembled CoderAI tree (Python + venvs + tools), copied once.
 COPY --from=assembler /opt/coderai /opt/coderai
 
-# Now the standalone interpreter exists, activate it for the app + launchers.
-ENV PYTHONHOME=/opt/coderai/python \
-    PATH=/opt/coderai/python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Put the standalone interpreter first on PATH. Do NOT set PYTHONHOME globally:
+# supervisord runs on the system python3 (3.12) and a PYTHONHOME pointing at the
+# standalone 3.13 stdlib breaks it ("No module named 'encodings'"). The standalone
+# python is relocatable, and the per-service launchers set PYTHONHOME themselves.
+ENV PATH=/opt/coderai/python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 WORKDIR /opt/coderai/app
 COPY . /opt/coderai/app

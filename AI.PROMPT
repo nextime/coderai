@@ -286,3 +286,67 @@ safe.
 14. Thermal protection is config-driven and model-agnostic (config.json
     `thermal`). Don't special-case it per model/backend; it only reads temps and
     sleeps. Honour the enable flags and high/resume hysteresis.
+
+================================================================================
+## Distributable Docker image (packaging/linux)
+================================================================================
+
+All-in-one image: coderai + tools (editor/videogen/township) behind nginx on a
+single port (8776), built from the LOCAL install's venv + binaries.
+
+Multi-stage `Dockerfile.oci-venv`:
+  - assembler stage stages the local bundle into /opt/coderai (python-build-
+    standalone interpreter + venv site-packages + ldd'd native libs + parler
+    overlay + lip-sync venv/repos + py310 + ds4). The ~20 GB bundle COPY lives
+    ONLY here; the runtime stage COPYs the assembled tree ONCE (no double-store).
+  - runtime stage: apt (nginx/supervisor/vulkan-tools/ffmpeg/...), COPY the
+    assembled /opt/coderai, then COPY app code → /opt/coderai/app, launchers →
+    /usr/local/bin, nginx/supervisor confs. Entry = coderai-entrypoint →
+    supervisord (nginx + main server + tool UIs).
+  - Do NOT set PYTHONHOME globally (breaks the system-python supervisord); set
+    PATH only. Bundle dereferences host symlinks (cp -aL) so binaries like
+    whisper-server are real files in the image, not dangling links.
+
+Full build (slow, ~15 min — rebuilds the bundle):
+  packaging/linux/build_oci_image.sh                      # tags coderai:dist
+Smoke test (no weights, checks services + every bundled binary):
+  DOCKER="sudo docker" GPU="--gpus all" PORT=18082 \
+    packaging/linux/smoke_test_services.sh coderai:dist
+
+Run against your LIVE local config + data (no rebuild — pure bind-mounts):
+  packaging/linux/run_oci.sh --nvidia --local \
+    --map /AI/guffcache --map /AI/huggingface --map /AI/offloads
+  - The image launcher reads config from /config/coderai and runs
+    `coderai --config /config/coderai`, rewriting server.host/port in config.json.
+  - `--local` (= --config-dir ~/.coderai) copies ONLY the *.json config files to
+    a temp dir and mounts it at /config/coderai, so your real config is untouched
+    (use --inplace-config to edit it directly).
+  - `--map HOST[:CONT]` bind-mounts a host dir at the SAME path inside the
+    container so the ABSOLUTE paths in models.json/config.json (gguf/hf caches,
+    offloads) resolve unchanged. Without these maps the models won't be found.
+  - `--debug[=SPEC]` runs coderai with --debug* flags (SPEC default 'all';
+    e.g. `--debug=engine,requests,ws` → --debug-engine/--debug-requests/--debug-ws,
+    `--debug` always auto-added) and writes a host-tailable file log. `--log-file
+    PATH` sets the in-container log path (default /cache/logs/coderai.log → host
+    under the cache mount). Driven by env CODERAI_DEBUG + CODERAI_LOG_FILE, read
+    by the coderai-oci launcher, which tees output so `docker logs` still works.
+    supervisord [program:coderai] uses stopasgroup/killasgroup so the front's
+    engine subprocesses + the tee are torn down together. NOTE: the launcher +
+    supervisord.conf are baked in, so changes need a (fast) update_oci_image.sh.
+
+Incremental update (FAST, ~30 s — code-only changes, NO bundle recopy):
+  DOCKER="sudo docker" packaging/linux/update_oci_image.sh
+  - `Dockerfile.update` is `FROM coderai:base` and re-layers ONLY the app code +
+    launchers + service confs. The heavy bundle layers are inherited unchanged.
+  - Keeps an immutable `coderai:base` (the bundle) and rebuilds `coderai:dist`
+    as base + a thin app layer. Every update starts from the SAME base, so app
+    layers never stack across updates. dist and base SHARE the bundle layers —
+    keeping both costs only the app layer (a few MB), not a second 23 GB.
+  - First run seeds coderai:base from the current coderai:dist (docker tag).
+  - Re-baseline the bundle (new venv/libs/tools): run build_oci_image.sh, then
+    `docker rmi coderai:base` so the next update re-seeds it from the new dist.
+  - Use this whenever ONLY codai/ app code (or launchers/confs) changed — a full
+    build_oci_image.sh is wasteful for that.
+  - CAUTION: COPY adds/overwrites but does NOT delete files removed from the
+    repo; the cleanup RUN prunes only known-stale paths (.git/venv*/dist/...). A
+    source file deleted from codai/ lingers in the overlay until a full rebuild.

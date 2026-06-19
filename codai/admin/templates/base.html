@@ -104,6 +104,81 @@ function donateCopy(id, btn) {
 </main>
 {% endif %}
 
+<!-- Shared confirm / notice modal (replaces window.confirm / window.alert) -->
+<div id="confirm-modal" class="modal" onclick="if(event.target===this)document.getElementById('confirm-modal-cancel').click()">
+  <div class="modal-box" style="max-width:420px">
+    <div class="modal-head">
+      <span class="modal-title" id="confirm-modal-title">Confirm</span>
+      <button class="modal-close" id="confirm-modal-x">&times;</button>
+    </div>
+    <div class="modal-body">
+      <p id="confirm-modal-msg" style="margin:0 0 1.25rem;white-space:pre-wrap"></p>
+      <div style="display:flex;gap:.5rem;justify-content:flex-end">
+        <button class="btn btn-ghost" id="confirm-modal-cancel">Cancel</button>
+        <button class="btn btn-danger" id="confirm-modal-ok">Confirm</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+// Global modal helpers, shared by every admin page. Defined here so templates
+// can call showAlert()/showConfirm() instead of window.alert()/window.confirm().
+if(typeof window.openModal!=='function') window.openModal=function(id){document.getElementById(id).classList.add('show')};
+if(typeof window.closeModal!=='function') window.closeModal=function(id){document.getElementById(id).classList.remove('show')};
+
+window.showConfirm=function(title, msg, okLabel){
+  return new Promise(resolve => {
+    document.getElementById('confirm-modal-title').textContent = title;
+    document.getElementById('confirm-modal-msg').textContent = msg;
+    const okBtn    = document.getElementById('confirm-modal-ok');
+    const cancelBtn= document.getElementById('confirm-modal-cancel');
+    const xBtn     = document.getElementById('confirm-modal-x');
+    okBtn.className = 'btn btn-danger';
+    okBtn.textContent = okLabel || 'Confirm';
+    cancelBtn.style.display = '';
+    openModal('confirm-modal');
+    function cleanup(result){
+      closeModal('confirm-modal');
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      xBtn.removeEventListener('click', onCancel);
+      resolve(result);
+    }
+    function onOk(){ cleanup(true); }
+    function onCancel(){ cleanup(false); }
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+    xBtn.addEventListener('click', onCancel);
+  });
+};
+
+// Styled replacement for window.alert(): a single-button notice modal.
+window.showAlert=function(msg, title, kind){
+  return new Promise(resolve => {
+    if(!title && !kind && /^\s*(error|failed|cannot|could not)\b/i.test(String(msg||''))) kind = 'error';
+    document.getElementById('confirm-modal-title').textContent =
+      title || (kind === 'error' ? 'Error' : 'Notice');
+    document.getElementById('confirm-modal-msg').textContent = msg;
+    const okBtn     = document.getElementById('confirm-modal-ok');
+    const cancelBtn = document.getElementById('confirm-modal-cancel');
+    const xBtn      = document.getElementById('confirm-modal-x');
+    okBtn.className = 'btn btn-primary';
+    okBtn.textContent = 'OK';
+    cancelBtn.style.display = 'none';
+    openModal('confirm-modal');
+    function cleanup(){
+      closeModal('confirm-modal');
+      cancelBtn.style.display = '';
+      okBtn.removeEventListener('click', onOk);
+      xBtn.removeEventListener('click', onOk);
+      resolve();
+    }
+    function onOk(){ cleanup(); }
+    okBtn.addEventListener('click', onOk);
+    xBtn.addEventListener('click', onOk);
+  });
+};
+</script>
 {% block scripts %}{% endblock %}
 </body>
 </html>

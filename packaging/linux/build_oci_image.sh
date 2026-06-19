@@ -263,7 +263,10 @@ prepare_venv_bundle() {
     if [[ -e "$dest_path" && "$bin_path" -ef "$dest_path" ]]; then
       continue
     fi
-    cp -a --remove-destination "$bin_path" "$dest_path"
+    # -L: dereference symlinks so the REAL binary is bundled. /usr/local/bin
+    # entries are often symlinks to a build dir (e.g. ~/whisper.cpp/build/bin);
+    # copying the link verbatim leaves a dangling symlink in the image.
+    cp -aL --remove-destination "$bin_path" "$dest_path"
   done
 
   if [[ ${#LOCAL_BINARIES[@]} -gt 0 ]]; then

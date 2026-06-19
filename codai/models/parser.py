@@ -1046,6 +1046,14 @@ def parse_gemma_native_tool_calls(text: str, tool_names=None):
         if tool_names and name not in tool_names:
             continue
         brace = m.end() - 1   # index of '{'
+        # Some models double-wrap the args: call:NAME{{"k":"v"}}. Skip the
+        # redundant outer brace so the real object is parsed instead of being
+        # mangled into a single key like '{"k"'.
+        j = brace + 1
+        while j < len(text) and text[j] in ' \t\r\n':
+            j += 1
+        if j < len(text) and text[j] == '{':
+            brace = j
         try:
             args, _ = _parse_gemma_loose_object(text, brace)
         except Exception:

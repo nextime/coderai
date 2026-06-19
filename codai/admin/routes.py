@@ -980,6 +980,14 @@ async def api_download_model(
     if existing:
         return {"session_id": existing, "attached": True}
 
+    # A download supersedes any "to download" wishlist entry for this model.
+    if config_manager is not None:
+        changed = _prune_to_download(model_id)
+        if file_pattern:
+            changed = _prune_to_download(file_pattern) or changed
+        if changed:
+            config_manager.save_models()
+
     session_id = str(_uuid.uuid4())
     pq = _q.Queue()
     _download_sessions[session_id] = pq
@@ -1168,6 +1176,58 @@ def _hf_repo_id_from_path(path: str) -> str:
             if sep != -1:
                 return repo_part[:sep] + '/' + repo_part[sep + 2:]
     return ''
+
+
+# Categories that hold real (configured) models in models.json.
+_VALID_MODEL_CATS = {
+    "text_models", "image_models", "audio_models", "gguf_models", "tts_models",
+    "vision_models", "video_models", "audio_gen_models", "embedding_models",
+    "spatial_models",
+}
+
+
+def _entry_key(entry) -> str:
+    """The identifying path/id of a models.json entry (str or dict)."""
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        return entry.get("path") or entry.get("id") or ""
+    return ""
+
+
+def _basename_key(key: str) -> str:
+    import os as _os
+    return _os.path.basename(key) if ("/" in key or _os.sep in key) else key
+
+
+def _is_model_configured(model_id: str) -> bool:
+    """True if model_id is already a configured model (matched by id or basename)."""
+    if config_manager is None:
+        return False
+    fname = _basename_key(model_id)
+    for cat in _VALID_MODEL_CATS:
+        for m in config_manager.models_data.get(cat, []):
+            key = _entry_key(m)
+            if key == model_id or (fname and _basename_key(key) == fname):
+                return True
+    return False
+
+
+def _prune_to_download(model_id: str) -> bool:
+    """Drop any 'to download' wishlist entry matching model_id. Returns True if changed."""
+    if config_manager is None:
+        return False
+    lst = config_manager.models_data.get("to_download")
+    if not lst:
+        return False
+    fname = _basename_key(model_id)
+    kept = [e for e in lst
+            if not (_entry_key(e) == model_id
+                    or (fname and _basename_key(_entry_key(e)) == fname))]
+    if len(kept) != len(lst):
+        config_manager.models_data["to_download"] = kept
+        return True
+    return False
 
 
 def _scan_caches() -> dict:
@@ -1451,6 +1511,49 @@ def _scan_caches() -> dict:
             "configs": all_configs.get(path, []),
         })
 
+    # Surface "to download" wishlist entries: models the user wants listed for
+    # later download but has NOT configured and are NOT on disk. They appear as
+    # non-configured rows with a download button (in_config=False, missing=True).
+    seen_gguf = {m["path"] for m in result["gguf"]} | {m["filename"] for m in result["gguf"]}
+    seen_hf = {m["id"] for m in result["hf"]}
+    if config_manager:
+        for entry in config_manager.models_data.get("to_download", []):
+            e = entry if isinstance(entry, dict) else {"path": entry}
+            mid = (e.get("path") or e.get("id") or "").strip()
+            if not mid or _is_model_configured(mid):
+                continue
+            repo = e.get("source_repo") or mid
+            mtype = e.get("model_type") or "text_models"
+            is_gguf = (bool(e.get("is_gguf")) or mid.lower().endswith(".gguf")
+                       or "gguf" in mid.lower() or mtype == "gguf_models")
+            fname = os.path.basename(mid) if ("/" in mid or os.sep in mid) else mid
+            caps = e.get("capabilities") or detect_model_capabilities(mid).to_list()
+            if is_gguf:
+                if mid in seen_gguf or fname in seen_gguf:
+                    continue
+                result["gguf"].append({
+                    "filename": fname, "path": mid,
+                    "size_gb": 0, "size_bytes": 0,
+                    "in_config": False, "missing": True, "to_download": True,
+                    "source_repo": repo,
+                    "model_type": mtype if mtype != "gguf_models" else "text_models",
+                    "settings": {}, "capabilities": caps,
+                    "incomplete": False, "configs": [],
+                })
+                seen_gguf.add(mid); seen_gguf.add(fname)
+            else:
+                if mid in seen_hf:
+                    continue
+                result["hf"].append({
+                    "id": mid, "size_gb": 0, "size_bytes": 0, "revision_count": 0,
+                    "files": [], "file_count": 0,
+                    "in_config": False, "missing": True, "to_download": True,
+                    "source_repo": repo, "model_type": mtype,
+                    "settings": {}, "capabilities": caps,
+                    "incomplete": False, "configs": [],
+                })
+                seen_hf.add(mid)
+
     return result
 
 
@@ -1729,8 +1832,62 @@ async def api_model_add_known(request: Request, username: str = Depends(require_
                 return {"success": True, "already": True}
 
     config_manager.models_data.setdefault(model_type, []).append(entry)
+    _prune_to_download(model_id)
     config_manager.save_models()
     _broker_notify_models_updated(request)
+    return {"success": True}
+
+
+@router.post("/admin/api/model-mark-download", summary="List a model for later download")
+async def api_model_mark_download(request: Request, username: str = Depends(require_admin)):
+    """Record a model in the 'to download' wishlist: it appears in the model list
+    as a non-configured, to-be-downloaded entry (no files fetched, no serving
+    config created). Used by 'Free disk' on unconfigured models, 'Remove' on a
+    model with no files left, and 'Add to list' in the download window."""
+    if config_manager is None:
+        raise HTTPException(status_code=503, detail="Config manager not initialized")
+    data = await request.json()
+    model_id = (data.get("model_id") or data.get("path") or "").strip()
+    if not model_id:
+        raise HTTPException(status_code=400, detail="model_id is required")
+    source_repo = (data.get("source_repo") or model_id).strip()
+    model_type = (data.get("model_type") or "").strip()
+    is_gguf = (bool(data.get("is_gguf")) or model_type == "gguf_models"
+               or model_id.lower().endswith(".gguf") or "gguf" in model_id.lower())
+    if is_gguf:
+        model_type = "gguf_models"
+    if model_type not in _VALID_MODEL_CATS:
+        model_type = "text_models"
+    # Already a real (configured) model — nothing to add.
+    if _is_model_configured(model_id):
+        return {"success": True, "already_configured": True}
+    import os as _os
+    lst = config_manager.models_data.setdefault("to_download", [])
+    fname = _basename_key(model_id)
+    for e in lst:
+        k = _entry_key(e)
+        if k == model_id or (fname and _basename_key(k) == fname):
+            return {"success": True, "already": True}
+    lst.append({"path": model_id, "source_repo": source_repo,
+                "model_type": model_type, "is_gguf": is_gguf})
+    config_manager.save_models()
+    _broker_notify_models_updated(request)
+    return {"success": True}
+
+
+@router.post("/admin/api/model-unmark-download", summary="Remove a model from the download list")
+async def api_model_unmark_download(request: Request, username: str = Depends(require_admin)):
+    """Drop a model from the 'to download' wishlist (the user no longer wants it
+    listed). Has no effect on configured models or files on disk."""
+    if config_manager is None:
+        raise HTTPException(status_code=503, detail="Config manager not initialized")
+    data = await request.json()
+    model_id = (data.get("model_id") or data.get("path") or "").strip()
+    if not model_id:
+        raise HTTPException(status_code=400, detail="model_id is required")
+    if _prune_to_download(model_id):
+        config_manager.save_models()
+        _broker_notify_models_updated(request)
     return {"success": True}
 
 
@@ -1747,8 +1904,13 @@ async def api_model_enable(request: Request, username: str = Depends(require_adm
     if model_type not in valid:
         raise HTTPException(status_code=400, detail=f"model_type must be one of {valid}")
     lst = config_manager.models_data.setdefault(model_type, [])
+    changed = False
     if path not in lst:
         lst.append(path)
+        changed = True
+    if _prune_to_download(path):
+        changed = True
+    if changed:
         config_manager.save_models()
     _broker_notify_models_updated(request)
     return {"success": True}
@@ -2285,7 +2447,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "component_quantization", "output_crf", "force_vram_update",
                 "balanced_gpu_percent", "acceleration",
                 "cache_type_k", "cache_type_v", "turboquant", "engine",
-                "quant_backend", "kv_cache_budget_mb", "kv_cache_slots"):
+                "quant_backend", "kv_cache_budget_mb", "kv_cache_slots", "mmproj"):
         if key in data:
             entry[key] = data[key]
 

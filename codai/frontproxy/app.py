@@ -81,6 +81,8 @@ class FrontProxy:
         requests are dispatched to the right engine through the same router/proxy."""
         cfg = getattr(self.config, "broker", None)
         if cfg is None or not getattr(cfg, "enabled", False):
+            print("[front] AISBF broker not started (broker.enabled is false in config)",
+                  flush=True)
             return
         try:
             from codai.broker import build_broker_runtime_config, BrokerConfigError
@@ -142,9 +144,23 @@ class FrontProxy:
         return ("ok", {"object": "list", "data": [seen[i] for i in order]})
 
     async def broker_execute(self, *, method, path, headers, query, body):
+        _clean_path = path.split("?", 1)[0].rstrip("/")
+        # Brokered capabilities must describe the WHOLE node. Routing this to a
+        # single engine would report only that engine's CUDA-visible card (its
+        # torch hardware summary), so a multi-GPU node looks like it has one card.
+        # Build it here in the (torch-free) front, which enumerates every physical
+        # GPU via nvidia-smi + sysfs.
+        if method.upper() == "GET" and _clean_path == "/coderai/capabilities":
+            from codai.broker.capabilities import (
+                build_capabilities_document, build_hardware_summary)
+            import json as _json
+            doc = build_capabilities_document(hardware=build_hardware_summary())
+            return {"status_code": 200,
+                    "headers": {"content-type": "application/json"},
+                    "body": _json.dumps(doc).encode()}
         # Brokered models.list must reflect the WHOLE node (union across engines),
         # not a single engine's assigned subset.
-        if method.upper() == "GET" and path.split("?", 1)[0].rstrip("/") == "/v1/models":
+        if method.upper() == "GET" and _clean_path == "/v1/models":
             hdrs = {k: v for k, v in (headers or {}).items() if k.lower() not in _DROP_REQ}
             kind, val = await self.collect_models(hdrs)
             if kind == "ok":

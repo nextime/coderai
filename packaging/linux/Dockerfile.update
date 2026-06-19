@@ -1,0 +1,43 @@
+# Incremental update of an already-built coderai image.
+#
+# Re-layers ONLY the application code, launcher scripts and service configs on
+# top of an existing base image (the heavy bundle: python, venvs, native libs,
+# lip-sync, ds4, parler). Those base layers are inherited unchanged — there is no
+# 20 GB bundle recopy — so this builds in seconds even with an empty build cache.
+#
+# Driven by packaging/linux/update_oci_image.sh, which keeps an immutable
+# `coderai:base` tag so repeated updates always start from the same bundle and
+# never stack app layers on top of each other.
+ARG BASE_IMAGE=coderai:base
+FROM ${BASE_IMAGE}
+
+# Refresh the app tree plus the scripts/configs that live outside it. The big
+# /opt/coderai/{python,*-venv,local-libs,Wav2Lip,SadTalker,ds4,py310} trees are
+# left as inherited layers. (COPY overwrites/adds; a file deleted from the repo
+# is pruned by the cleanup RUN below for the known-stale paths.)
+COPY . /opt/coderai/app
+COPY packaging/linux/launcher/coderai-oci /usr/local/bin/coderai
+COPY packaging/linux/launcher/with-env /usr/local/bin/with-env
+COPY packaging/linux/launcher/coderai-entrypoint /usr/local/bin/coderai-entrypoint
+COPY packaging/linux/launcher/wav2lip /usr/local/bin/wav2lip
+COPY packaging/linux/launcher/sadtalker /usr/local/bin/sadtalker
+COPY packaging/linux/nginx.conf /etc/nginx/nginx.conf
+COPY packaging/linux/supervisord.conf /etc/supervisor/supervisord.conf
+COPY packaging/linux/README-RUN.txt /opt/coderai/README-RUN.txt
+
+RUN set -eux; \
+    chmod +x /usr/local/bin/coderai /usr/local/bin/with-env /usr/local/bin/coderai-entrypoint \
+             /usr/local/bin/wav2lip /usr/local/bin/sadtalker /opt/coderai/app/coderai; \
+    mkdir -p /config /models /cache /opt/coderai/app/models; \
+    rm -rf \
+      /opt/coderai/app/.git \
+      /opt/coderai/app/venv* \
+      /opt/coderai/app/.venv \
+      /opt/coderai/app/township_output \
+      /opt/coderai/app/offload \
+      /opt/coderai/app/dist \
+      /opt/coderai/app/.packaging-cache; \
+    find /opt/coderai/app -type d -name __pycache__ -prune -exec rm -rf '{}' +; \
+    /opt/coderai/python/bin/python3 -c "import importlib.util, sys; m=[n for n in ('fastapi','uvicorn','torch') if importlib.util.find_spec(n) is None]; sys.exit('base image missing: '+', '.join(m) if m else 0)"
+
+# ENTRYPOINT / EXPOSE / VOLUME / ENV / WORKDIR are inherited from the base image.

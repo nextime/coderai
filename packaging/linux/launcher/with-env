@@ -1,0 +1,19 @@
+#!/usr/bin/env sh
+# Set the CoderAI runtime environment (standalone Python, bundled native libs,
+# nvidia wheel libs) then exec the given command. Used by supervisord to launch
+# the bundled tool web UIs with the same library environment as the main server.
+set -eu
+
+export PYTHONHOME=/opt/coderai/python
+export PATH="/opt/coderai/python/bin:$PATH"
+
+NV="/opt/coderai/python/lib/python3.13/site-packages/nvidia"
+LIBS="/opt/coderai/python/lib:/opt/coderai/local-libs"
+if [ -d "$NV" ]; then
+  for d in "$NV"/*/lib; do
+    [ -d "$d" ] && LIBS="$LIBS:$d"
+  done
+fi
+export LD_LIBRARY_PATH="$LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+exec "$@"

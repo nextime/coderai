@@ -243,6 +243,33 @@ def log_response_payload(payload, streamed=False):
 router = APIRouter()
 
 
+def _normalize_vision_content(content: list) -> list:
+    """Normalize an OpenAI multipart message content list to the shape the
+    llama.cpp multimodal (mmproj) handler expects: text parts as
+    ``{"type":"text","text":...}`` and images as
+    ``{"type":"image_url","image_url":{"url": ...}}``. The url may be an http(s)
+    link or a ``data:image/...;base64,...`` URI — both are accepted. Unknown
+    parts are dropped to a text placeholder so nothing crashes the handler."""
+    norm = []
+    for item in content:
+        if not isinstance(item, dict):
+            norm.append({"type": "text", "text": str(item)})
+            continue
+        t = item.get("type")
+        if t == "text" and "text" in item:
+            norm.append({"type": "text", "text": item["text"]})
+        elif t in ("image_url", "input_image"):
+            iu = item.get("image_url") if t == "image_url" else item.get("image")
+            url = iu.get("url") if isinstance(iu, dict) else iu
+            if url:
+                norm.append({"type": "image_url", "image_url": {"url": url}})
+        elif "text" in item:
+            norm.append({"type": "text", "text": str(item["text"])})
+        else:
+            norm.append({"type": "text", "text": f"[{t or 'unknown'} content]"})
+    return norm
+
+
 @router.post("/v1/chat/completions", summary="Chat completions")
 async def chat_completions(request: ChatCompletionRequest, http_request: Request = None):
     """Chat completions endpoint with streaming and tool support."""
@@ -519,6 +546,12 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                                    "Another model may be using all available VRAM.")
     current_manager = mm
 
+    # Does the resolved (loaded) model accept images? True only when an mmproj
+    # projector was loaded into the llama.cpp backend (see VulkanBackend). When
+    # set, multipart image content is preserved end-to-end instead of being
+    # flattened to a text placeholder, so the multimodal handler can see it.
+    _vision_ok = bool(getattr(getattr(current_manager, 'backend', None), 'supports_vision', False))
+
     # Inject system prompt if --system-prompt flag was provided
     messages = request.messages
     global_system_prompt = get_global_system_prompt()
@@ -733,19 +766,31 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         if content is None:
             content = ""
         elif isinstance(content, list):
-            # Handle multipart content array format: [{"type": "text", "text": "..."}]
-            parts = []
-            for item in content:
-                if isinstance(item, dict):
-                    if item.get('type') == 'text' and 'text' in item:
-                        parts.append(item['text'])
+            _has_image = _vision_ok and any(
+                isinstance(it, dict) and it.get('type') in ('image_url', 'input_image')
+                for it in content)
+            if _has_image:
+                # Vision (mmproj) model: keep OpenAI multipart content so the
+                # llama.cpp multimodal handler receives the images themselves.
+                content = _normalize_vision_content(content)
+            else:
+                # Handle multipart content array format: [{"type": "text", "text": "..."}]
+                parts = []
+                for item in content:
+                    if isinstance(item, dict):
+                        if item.get('type') == 'text' and 'text' in item:
+                            parts.append(item['text'])
+                        else:
+                            parts.append(f"[{item.get('type', 'unknown')} content]")
                     else:
-                        parts.append(f"[{item.get('type', 'unknown')} content]")
-                else:
-                    parts.append(str(item))
-            content = '\n'.join(parts)
-        # Ensure content is never None - convert to string
-        msg_dict["content"] = str(content) if content is not None else ""
+                        parts.append(str(item))
+                content = '\n'.join(parts)
+        # Ensure content is never None - convert to string (but keep multipart
+        # vision content as a list so the multimodal handler can consume it).
+        if isinstance(content, list):
+            msg_dict["content"] = content
+        else:
+            msg_dict["content"] = str(content) if content is not None else ""
         # Handle tool_calls - convert to proper format if present
         if msg.tool_calls:
             # tool_calls should be a list of dicts with 'id', 'type', 'function' keys
@@ -765,8 +810,9 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         # Handle None content
         elif m.get("content") is None:
             messages_dict[i]["content"] = ""
-        # Handle content that's not a string (shouldn't happen but be safe)
-        elif not isinstance(m["content"], str):
+        # Handle content that's not a string (shouldn't happen but be safe).
+        # A list is legitimate multipart vision content — leave it intact.
+        elif not isinstance(m["content"], str) and not isinstance(m["content"], list):
             messages_dict[i]["content"] = str(m["content"])
     
     

@@ -244,9 +244,9 @@ async function restartEngine(id, name){
   if (!confirm(`Restart engine "${name}"? In-flight requests on it will fail; the supervisor respawns it immediately.`)) return;
   try {
     const r = await fetch(ROOT_PATH + '/admin/api/engines/' + id + '/restart', {method:'POST'});
-    if (!r.ok) { const e = await r.json().catch(()=>({})); alert(e.detail || 'Restart failed'); }
+    if (!r.ok) { const e = await r.json().catch(()=>({})); showAlert(e.detail || 'Restart failed'); }
     setTimeout(loadEngines, 800);
-  } catch(e) { alert(e.message); }
+  } catch(e) { showAlert(e.message); }
 }
 
 let _refreshing = false;
@@ -338,9 +338,9 @@ async function taskAction(id, action) {
     const r = await fetch(ROOT_PATH + '/admin/api/tasks/' + encodeURIComponent(id) + '/' + action, {method:'POST'});
     if (!r.ok) {
       const e = await r.json().catch(() => ({}));
-      alert(e.detail || (verb + ' failed'));
+      showAlert(e.detail || (verb + ' failed'));
     }
-  } catch (e) { alert(e.message); }
+  } catch (e) { showAlert(e.message); }
   loadTasks();
 }
 
@@ -349,9 +349,9 @@ async function removeTask(id) {
     const r = await fetch(ROOT_PATH + '/admin/api/tasks/' + encodeURIComponent(id), {method:'DELETE'});
     if (!r.ok) {
       const e = await r.json().catch(() => ({}));
-      alert(e.detail || 'Remove failed');
+      showAlert(e.detail || 'Remove failed');
     }
-  } catch (e) { alert(e.message); }
+  } catch (e) { showAlert(e.message); }
   loadTasks();
 }
 

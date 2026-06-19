@@ -943,7 +943,7 @@ class MultiModelManager:
                 # KV-cache quantization (llama.cpp type_k/type_v) — pass through
                 # to the backend, with the raw models.json entry as a fallback.
                 _raw = config.get('_raw_cfg') if isinstance(config.get('_raw_cfg'), dict) else {}
-                for _kvk in ('cache_type_k', 'cache_type_v'):
+                for _kvk in ('cache_type_k', 'cache_type_v', 'mmproj'):
                     _kvv = config.get(_kvk)
                     if _kvv is None:
                         _kvv = _raw.get(_kvk)
@@ -1062,7 +1062,7 @@ class MultiModelManager:
                 # KV-cache quantization (llama.cpp type_k/type_v) — pass through
                 # to the backend, with the raw models.json entry as a fallback.
                 _raw = config.get('_raw_cfg') if isinstance(config.get('_raw_cfg'), dict) else {}
-                for _kvk in ('cache_type_k', 'cache_type_v'):
+                for _kvk in ('cache_type_k', 'cache_type_v', 'mmproj'):
                     _kvv = config.get(_kvk)
                     if _kvv is None:
                         _kvv = _raw.get(_kvk)

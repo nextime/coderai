@@ -709,7 +709,7 @@ def main():
             # Also restrict /v1/models (list_models) to the assigned subset, so the
             # per-engine model list matches what it actually serves — config_mgr's
             # full models_data is untouched (the admin model list stays complete).
-            multi_model_manager.set_assigned_models(keep)
+            multi_model_manager.set_assigned_models(_keep)
         except Exception as _e:
             print(f"[engine] assignment filter failed ({_e}); registering all models")
 

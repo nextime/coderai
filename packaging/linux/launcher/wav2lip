@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# CLI shim for Wav2Lip lip-sync, run inside the shared lip-sync venv.
+# codai/api/video.py invokes:  wav2lip --face VIDEO --audio AUDIO --outfile OUT
+#
+# Checkpoints are NOT baked into the image: on first use they download into the
+# writable working dir (a /cache volume in the container) and persist there.
+set -euo pipefail
+
+VENV="${CODERAI_LIPSYNC_VENV:-$HOME/.coderai/lipsync_venv}"
+SRC="${CODERAI_WAV2LIP_SRC:-$HOME/.coderai/Wav2Lip}"   # baked read-only repo code
+DIR="${CODERAI_WAV2LIP_DIR:-$SRC}"                     # writable working copy
+
+if [ ! -x "$VENV/bin/python" ]; then
+  echo "wav2lip: lip-sync venv not found at $VENV" >&2
+  exit 127
+fi
+
+# Seed a writable copy of the repo code if the working dir isn't populated
+# (the image ships the code read-only under /opt; weights are excluded).
+if [ ! -f "$DIR/inference.py" ]; then
+  mkdir -p "$DIR"
+  rsync -a --exclude 'checkpoints/' --exclude 'face_detection/detection/sfd/*.pth' "$SRC/" "$DIR/"
+fi
+
+# Download checkpoints on first use (idempotent: skips non-empty files).
+mkdir -p "$DIR/checkpoints" "$DIR/face_detection/detection/sfd"
+_dl(){ if [ ! -s "$2" ]; then echo "wav2lip: downloading $(basename "$2") …" >&2;
+  curl -fSL --retry 3 -o "$2" "$1" || { echo "wav2lip: download failed: $1" >&2; exit 1; }; fi; }
+_dl "https://huggingface.co/camenduru/Wav2Lip/resolve/main/checkpoints/wav2lip_gan.pth" \
+    "$DIR/checkpoints/wav2lip_gan.pth"
+_dl "https://www.adrianbulat.com/downloads/python-fan/s3fd-619a316812.pth" \
+    "$DIR/face_detection/detection/sfd/s3fd.pth"
+
+CKPT="${CODERAI_WAV2LIP_CKPT:-$DIR/checkpoints/wav2lip_gan.pth}"
+
+# Run from a writable scratch dir (inference.py writes ./temp/*), repo on PYTHONPATH.
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+cd "$work"
+mkdir -p temp
+export PYTHONPATH="$DIR${PYTHONPATH:+:$PYTHONPATH}"
+"$VENV/bin/python" "$DIR/inference.py" --checkpoint_path "$CKPT" "$@"

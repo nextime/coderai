@@ -43,6 +43,10 @@ township_output/
 .packaging-cache/
 tmp/
 
+# Exported image tarballs + local OCI run-state (large artifacts)
+dist/
+coderai-runtime/
+
 # Video editor sessions + generated media (runtime artifacts)
 video_editor/sessions/
 tools/coderai_media/

@@ -299,22 +299,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
 </div>
 
 
-<!-- Generic confirm modal -->
-<div id="confirm-modal" class="modal" onclick="if(event.target===this)document.getElementById('confirm-modal-cancel').click()">
-  <div class="modal-box" style="max-width:420px">
-    <div class="modal-head">
-      <span class="modal-title" id="confirm-modal-title">Confirm</span>
-      <button class="modal-close" id="confirm-modal-x">&times;</button>
-    </div>
-    <div class="modal-body">
-      <p id="confirm-modal-msg" style="margin:0 0 1.25rem"></p>
-      <div style="display:flex;gap:.5rem;justify-content:flex-end">
-        <button class="btn btn-ghost" id="confirm-modal-cancel">Cancel</button>
-        <button class="btn btn-danger" id="confirm-modal-ok">Confirm</button>
-      </div>
-    </div>
-  </div>
-</div>
+<!-- Confirm / notice modal is provided globally by base.html -->
 
 <!-- Download modal -->
 <div id="dl-modal" class="modal">
@@ -357,6 +342,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         </div>
         <div class="form-actions">
           <button class="btn btn-primary" id="dl-start-btn" onclick="startDownloadFromForm()">Download</button>
+          <button class="btn btn-secondary" id="dl-later-btn" onclick="markDownloadFromForm()" title="Add this model to your list as “to download” without fetching it now">Add to list (download later)</button>
           <button class="btn btn-ghost" onclick="closeModal('dl-modal')">Close</button>
         </div>
       </div>
@@ -624,9 +610,10 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       <!-- inference -->
       <div class="card-title" style="margin-top:1.25rem">Inference</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
-        <div class="form-row" style="margin:0">
-          <label class="form-label">GPU layers <span class="muted">(-1 = all)</span></label>
+        <div class="form-row" style="margin:0" id="cfg-gpu-layers-row">
+          <label class="form-label">GPU layers <span class="muted">(llama.cpp offload)</span></label>
           <input type="number" id="cfg-gpu-layers" class="form-input" min="-1" value="-1">
+          <span class="form-hint" style="font-size:11px"><b>-1</b> = all on GPU (auto-offloads the overflow to CPU if it won't fit). <b>N</b> = N layers on GPU, the rest on CPU (slower, frees VRAM).</span>
         </div>
         <div class="form-row" style="margin:0">
           <label class="form-label">Context size</label>
@@ -653,6 +640,13 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             <option value="q4_1">q4_1 (smallest)</option>
             <option value="q4_0">q4_0 (smallest)</option>
           </select>
+        </div>
+        <div class="form-row" style="margin:0" id="cfg-mmproj-row">
+          <label class="form-label">Multimodal projector <span class="muted">(mmproj → vision)</span></label>
+          <select id="cfg-mmproj" class="form-input" onchange="_onMmprojChange()">
+            <option value="">None</option>
+          </select>
+          <span class="form-hint" style="font-size:11px">Pairs an <b>mmproj</b> GGUF with this model to add image/vision input (passed to llama.cpp as <code>--mmproj</code>). Auto-selected when a matching projector is detected.</span>
         </div>
         <div class="form-row" style="margin:0">
           <p class="muted" style="margin:0;font-size:0.85em;line-height:1.4">
@@ -715,8 +709,8 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       </div>
 
       <!-- offload -->
-      <div class="card-title" style="margin-top:1.25rem">Offload</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
+      <div class="card-title" style="margin-top:1.25rem" id="cfg-offload-title">Offload</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem" id="cfg-offload-grid">
         <div class="form-row" style="margin:0">
           <label class="form-label">Strategy</label>
           <select id="cfg-offload-strategy" class="form-input">
@@ -1026,30 +1020,7 @@ function switchTab(name,btn){
 function openModal(id){document.getElementById(id).classList.add('show')}
 function closeModal(id){document.getElementById(id).classList.remove('show')}
 
-// Custom confirm to avoid browser native-dialog blocking
-function showConfirm(title, msg, okLabel){
-  return new Promise(resolve => {
-    document.getElementById('confirm-modal-title').textContent = title;
-    document.getElementById('confirm-modal-msg').textContent = msg;
-    const okBtn    = document.getElementById('confirm-modal-ok');
-    const cancelBtn= document.getElementById('confirm-modal-cancel');
-    const xBtn     = document.getElementById('confirm-modal-x');
-    okBtn.textContent = okLabel || 'Confirm';
-    openModal('confirm-modal');
-    function cleanup(result){
-      closeModal('confirm-modal');
-      okBtn.removeEventListener('click', onOk);
-      cancelBtn.removeEventListener('click', onCancel);
-      xBtn.removeEventListener('click', onCancel);
-      resolve(result);
-    }
-    function onOk(){ cleanup(true); }
-    function onCancel(){ cleanup(false); }
-    okBtn.addEventListener('click', onOk);
-    cancelBtn.addEventListener('click', onCancel);
-    xBtn.addEventListener('click', onCancel);
-  });
-}
+// showConfirm() and showAlert() are provided globally by base.html.
 
 /* ── Global settings ─────────────────────────────────── */
 let _defaultOffloadDir = './offload';
@@ -1259,11 +1230,11 @@ async function addKnownFromResult(i, btn){
       body: JSON.stringify({model_id:m.id, source_repo:m.id, model_type:_resultModelType(m), is_gguf:isGguf})
     });
     const d = await r.json().catch(()=>({}));
-    if(!r.ok || !d.success){ alert('Error: '+(d.detail||d.error||('HTTP '+r.status))); return; }
+    if(!r.ok || !d.success){ showAlert('Error: '+(d.detail||d.error||('HTTP '+r.status))); return; }
     _cachedSearchIds.add(m.id);
     if(btn){ btn.textContent = d.already ? '✓ Known' : '✓ Added'; btn.disabled = true; btn.style.color = 'var(--ok,#16a34a)'; }
     loadCachedModels();  // refresh the Local tab in the background
-  }catch(e){ alert('Error: '+e.message); }
+  }catch(e){ showAlert('Error: '+e.message); }
 }
 
 /* ── files panel ─────────────────────────────────────── */
@@ -1481,7 +1452,7 @@ function showDownloadError(msg){
   if(_dlEs){_dlEs.close();_dlEs=null}
   document.getElementById('dl-form').style.display='block';
   document.getElementById('dl-progress').style.display='none';
-  alert('Download error: '+msg);
+  showAlert('Download error: '+msg);
 }
 
 function handleProgressEvent(evt){
@@ -1593,7 +1564,7 @@ async function stopDownload(session_id){
     if(!r.ok){
       let detail = r.status+' '+r.statusText;
       try{ const j = await r.json(); if(j&&j.detail) detail = j.detail; }catch{}
-      alert('Could not cancel download: '+detail);
+      showAlert('Could not cancel download: '+detail);
       return;
     }
     if(_dlSessionId===session_id){
@@ -1602,7 +1573,7 @@ async function stopDownload(session_id){
     }
     pollDownloads(); // refresh the active-downloads strip immediately
   }catch(e){
-    alert('Could not cancel download: '+e.message);
+    showAlert('Could not cancel download: '+e.message);
   }
 }
 
@@ -1740,6 +1711,26 @@ function _attachEventSource(session_id){
   };
 }
 
+// Add the model in the download form to the "to download" wishlist without
+// fetching it now. It then appears in the model list as non-configured / to be
+// downloaded, with a Download button to fetch it later.
+async function markDownloadFromForm(){
+  const id = document.getElementById('dl-id').value.trim();
+  if(!id){ document.getElementById('dl-id').focus(); return; }
+  const patEl = document.getElementById('dl-pattern');
+  const pattern = patEl ? patEl.value.trim() : '';
+  const isGguf = looksLikeGguf(id, pattern);
+  try{
+    const r = await fetch(ROOT_PATH + '/admin/api/model-mark-download', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({model_id:id, source_repo:id, is_gguf:isGguf})
+    });
+    const d = await r.json().catch(()=>({}));
+    if(d.success){ closeModal('dl-modal'); refreshLocal(); }
+    else showAlert('Error: '+(d.detail||d.error||'could not add to list'));
+  }catch(e){ showAlert('Error: '+e.message); }
+}
+
 async function startDownloadFromForm(){
   const id = document.getElementById('dl-id').value.trim();
   if(!id){ document.getElementById('dl-id').focus(); return; }
@@ -1761,7 +1752,7 @@ async function startDownloadFromForm(){
   if(pickerVisible){
     // Multi-file download from quant picker
     const checked = [...document.querySelectorAll('#dl-quant-list input[type=checkbox]:checked')];
-    if(!checked.length){ alert('Select at least one quantization to download.'); return; }
+    if(!checked.length){ showAlert('Select at least one quantization to download.'); return; }
     _dlDone=false; _dlSessionId=null; _dlReset();
 
     if(checked.length===1){
@@ -1943,6 +1934,7 @@ function _renderConfigPills(idx, m) {
 
 // ── Component file helpers ────────────────────────────────────────────────────
 const _COMP_ROLES = [
+  {key:'mmproj',      label:'mmproj (vision)', pat:/mm[._\-]?proj/i},
   {key:'vae',         label:'VAE',         pat:/vae|(^|[^a-z])ae\.(gguf|safetensors)/i},
   {key:'t5xxl',       label:'T5-XXL',      pat:/t5.?xxl|t5.?v1_1/i},
   {key:'clip_l',      label:'CLIP-L',      pat:/clip[_\-]l(?![_\-g])/i},
@@ -2222,7 +2214,7 @@ async function _refreshQuantStatus(modelPath){
 
 async function startQuantize(){
   const path = (document.getElementById('cfg-path')||{}).value || '';
-  if(!path){ alert('No model selected.'); return; }
+  if(!path){ showAlert('No model selected.'); return; }
   const method = (document.getElementById('cfg-quant-backend').value === 'awq') ? 'awq' : 'gptq';
   const el = document.getElementById('cfg-quant-status');
   if(el) el.innerHTML = '<span class="muted">Starting quantization…</span>';
@@ -2366,7 +2358,7 @@ async function loadCachedModels(){
         _localModels.push({label:m.id, path:m.id, cacheType:'hf', size_gb:m.size_gb||0,
           defaultType:m.model_type||'text_models', settings:m.settings||{}, in_config:m.in_config,
           capabilities:m.capabilities||[], incomplete:!!m.incomplete, configs:m.configs||[],
-          missing:!!m.missing, source_repo:m.source_repo||m.id});
+          missing:!!m.missing, to_download:!!m.to_download, source_repo:m.source_repo||m.id});
         const loaded = _loadedKeys.has(m.id) || [..._loadedKeys].some(k=>k.endsWith(':'+m.id)||k===m.id);
         const capBadges = fmtCapabilities(m.capabilities||[]);
         const _hfLm = _localModels[idx];
@@ -2376,7 +2368,10 @@ async function loadCachedModels(){
         const instBadgeHf = m.in_config ? _instanceBadge([m.id], _hfCfgMax) : '';
         const hlHf = _highlightCap && (m.capabilities||[]).includes(_highlightCap);
         const incompleteBadgeHf = m.incomplete ? '<span class="badge" style="background:rgba(255,160,0,.18);color:#b87200;font-size:10px;margin-left:.3rem" title="Download may be incomplete — some files are missing or truncated">⚠ incomplete</span>' : '';
-        const missingBadgeHf = m.missing ? ' <span class="badge" style="background:rgba(220,50,50,.18);color:#e05555;font-size:10px" title="Files removed from disk to free space — re-download to restore">✕ on disk: freed</span>' : '';
+        const toDlHf = !!m.to_download;
+        const missingBadgeHf = toDlHf
+          ? ' <span class="badge" style="background:rgba(80,140,220,.18);color:#4a86c7;font-size:10px" title="Listed for download — not yet downloaded or configured">⬇ to download</span>'
+          : (m.missing ? ' <span class="badge" style="background:rgba(220,50,50,.18);color:#e05555;font-size:10px" title="Files removed from disk to free space — re-download to restore">✕ on disk: freed</span>' : '');
         const _hfConfigCount = _hfConfigs.length;
         const rowBgHf = m.missing ? ';background:rgba(220,50,50,.04);outline:1px solid rgba(220,50,50,.2);outline-offset:-1px' : (m.incomplete?';background:rgba(255,160,0,.04)':'');
         return `<tr${hlHf?' class="local-cap-highlight"':''} style="border-top:1px solid var(--border)${hlHf?';background:rgba(110,207,126,.07);outline:2px solid rgba(110,207,126,.25);outline-offset:-1px':''}${rowBgHf}">
@@ -2384,16 +2379,17 @@ async function loadCachedModels(){
           <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${m.missing?'<span class="muted small">—</span>':fmtGB(m.size_gb)}</td>
           <td style="text-align:right;padding:.4rem .25rem;color:var(--text-2)">${m.missing?'<span class="muted small">—</span>':m.file_count}</td>
           <td style="padding:.4rem .25rem;font-size:11px">${capBadges||'<span class="muted small">—</span>'}</td>
-          <td style="text-align:center;padding:.4rem .25rem">${m.in_config?`<span class="badge ${m.missing?'badge-err':'badge-ok'}">enabled${_hfConfigCount>1?` ×${_hfConfigCount}`:''}</span>${instBadgeHf?'<br>'+instBadgeHf:''}`:' <span class="muted small">—</span>'}</td>
+          <td style="text-align:center;padding:.4rem .25rem">${toDlHf?'<span class="badge" style="background:rgba(80,140,220,.18);color:#4a86c7">to download</span>':(m.in_config?`<span class="badge ${m.missing?'badge-err':'badge-ok'}">enabled${_hfConfigCount>1?` ×${_hfConfigCount}`:''}</span>${instBadgeHf?'<br>'+instBadgeHf:''}`:' <span class="muted small">—</span>')}</td>
           <td style="padding:.4rem .25rem;text-align:right;white-space:nowrap">
             ${m.in_config&&!m.missing?(loaded
               ?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="unloadModel(${idx})">Unload</button>`
               :`<button class="btn btn-primary btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="loadModel(${idx})">Load now</button>`):''}
+            <button class="btn ${toDlHf?'btn-warn':'btn-ghost'} btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openDownloadFor('${esc(m.id)}')" title="${m.missing?'Re-download to restore this model':'Download from HuggingFace'}">⬇ ${toDlHf?'Download':'Re-download'}</button>
             <button class="btn btn-secondary btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openCfgModal(${idx},0)">${m.in_config?'Configure':'Add'}</button>
             ${m.in_config?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="disableModel(${idx})">Remove</button>`:''}
-            <button class="btn ${m.missing?'btn-warn':'btn-ghost'} btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openDownloadFor('${esc(m.id)}')" title="${m.missing?'Re-download to restore this model':'Re-download from HuggingFace'}">⬇ Re-download</button>
-            ${!m.missing?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="freeDiskConfirm(${idx})" title="Delete files from disk to save space, but keep this model in the list so you can re-download it later">🗑 Free disk</button>`:''}
-            ${!m.missing?`<button class="btn btn-danger btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="deleteModelConfirm(${idx})">Delete</button>`:''}
+            ${toDlHf?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="unmarkDownload(${idx})" title="Remove this model from the download list">✕ Remove from list</button>`:''}
+            ${!m.missing&&!toDlHf?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="freeDiskConfirm(${idx})" title="Delete files from disk to save space, but keep this model in the list so you can re-download it later">🗑 Free disk</button>`:''}
+            ${!m.missing&&!toDlHf?`<button class="btn btn-danger btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="deleteModelConfirm(${idx})">Delete</button>`:''}
           </td>
         </tr>`;
       });
@@ -2429,7 +2425,7 @@ async function loadCachedModels(){
           capabilities:f.capabilities||[], ggufGroup:[f],
           source_repo:f.source_repo||'',
           incomplete:!!f.incomplete,
-          missing:!!f.missing,
+          missing:!!f.missing, to_download:!!f.to_download,
           configured_path:f.configured_path||'',
           configs:f.configs||[]});
         const loaded = _loadedKeys.has(f.path) || _loadedKeys.has(f.filename) ||
@@ -2440,7 +2436,10 @@ async function loadCachedModels(){
         const instBadge   = f.in_config ? _instanceBadge([f.path, f.filename], _cfgMax) : '';
         const quantBadge  = quant ? `<span class="badge badge-user" style="font-size:10px;padding:.1rem .3rem;margin-left:.3rem">${esc(quant)}</span>` : '';
         const hl          = _highlightCap && (f.capabilities||[]).includes(_highlightCap);
-        const missingBadge = f.missing ? ' <span class="badge" style="background:rgba(220,50,50,.18);color:#e05555;font-size:10px" title="File not found at configured path — re-download or remove this configuration">✕ file missing</span>' : '';
+        const toDlGg = !!f.to_download;
+        const missingBadge = toDlGg
+          ? ' <span class="badge" style="background:rgba(80,140,220,.18);color:#4a86c7;font-size:10px" title="Listed for download — not yet downloaded or configured">⬇ to download</span>'
+          : (f.missing ? ' <span class="badge" style="background:rgba(220,50,50,.18);color:#e05555;font-size:10px" title="File not found at configured path — re-download or remove this configuration">✕ file missing</span>' : '');
         const incompleteBadge = f.incomplete ? ' <span class="badge" style="background:rgba(255,160,0,.18);color:#b87200;font-size:10px" title="Download may be incomplete">⚠ incomplete</span>' : '';
         const redownloadTarget  = f.source_repo || '';
         // Only pass a file pattern when it's a concrete .gguf filename; for
@@ -2455,18 +2454,19 @@ async function loadCachedModels(){
           <td style="padding:.4rem .25rem;font-family:monospace;font-size:11px;max-width:280px;overflow:hidden;text-overflow:ellipsis" title="${esc(f.path)}">${esc(base)}${quantBadge}${missingBadge}${incompleteBadge}${configPills}</td>
           <td style="text-align:right;padding:.4rem .25rem;white-space:nowrap;color:var(--text-2)">${f.missing?'<span class="muted small">—</span>':fmtGB(f.size_gb)}</td>
           <td style="padding:.4rem .25rem;font-size:11px">${capBadges||'<span class="muted small">—</span>'}</td>
-          <td style="text-align:center;padding:.4rem .25rem">${f.in_config?`<span class="badge ${f.missing?'badge-err':'badge-ok'}">enabled${configCount>1?` ×${configCount}`:''}</span>${instBadge?'<br>'+instBadge:''}`:' <span class="muted small">—</span>'}</td>
+          <td style="text-align:center;padding:.4rem .25rem">${toDlGg?'<span class="badge" style="background:rgba(80,140,220,.18);color:#4a86c7">to download</span>':(f.in_config?`<span class="badge ${f.missing?'badge-err':'badge-ok'}">enabled${configCount>1?` ×${configCount}`:''}</span>${instBadge?'<br>'+instBadge:''}`:' <span class="muted small">—</span>')}</td>
           <td style="padding:.4rem .25rem;text-align:right;white-space:nowrap">
             ${f.in_config&&!f.missing?(loaded
               ?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="unloadModel(${idx})">Unload</button>`
               :`<button class="btn btn-primary btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="loadModel(${idx})">Load now</button>`):''}
             ${f.missing
-              ?`<button class="btn btn-warn btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openDownloadFor('${esc(redownloadTarget)}','${esc(redownloadPattern)}')" title="Re-download to restore this model">⬇ Re-download</button>`
+              ?`<button class="btn btn-warn btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openDownloadFor('${esc(redownloadTarget)}','${esc(redownloadPattern)}')" title="${toDlGg?'Download this model':'Re-download to restore this model'}">⬇ ${toDlGg?'Download':'Re-download'}</button>`
               :`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openDownloadFor('${esc(redownloadTarget)}','${esc(redownloadPattern)}')" title="${redownloadTarget?'Re-download from HuggingFace':'Download a replacement'}">⬇ Re-download</button>`}
             <button class="btn btn-secondary btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="openCfgModal(${idx},0)">${f.in_config?'Configure':'Add'}</button>
             ${f.in_config?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="disableModel(${idx})">Remove</button>`:''}
-            ${!f.missing&&(f.in_config||redownloadTarget)?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="freeDiskConfirm(${idx})" title="Delete this file from disk to save space, but keep it in the list so you can re-download it later">🗑 Free disk</button>`:''}
-            ${!f.missing?`<button class="btn btn-danger btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="deleteModelConfirm(${idx})">Delete</button>`:''}
+            ${toDlGg?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="unmarkDownload(${idx})" title="Remove this model from the download list">✕ Remove from list</button>`:''}
+            ${!f.missing&&!toDlGg&&(f.in_config||redownloadTarget)?`<button class="btn btn-ghost btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="freeDiskConfirm(${idx})" title="Delete this file from disk to save space, but keep it in the list so you can re-download it later">🗑 Free disk</button>`:''}
+            ${!f.missing&&!toDlGg?`<button class="btn btn-danger btn-sm" style="font-size:10px;padding:.15rem .4rem" onclick="deleteModelConfirm(${idx})">Delete</button>`:''}
           </td>
         </tr>`;
       });
@@ -2686,7 +2686,7 @@ async function clearCacheConfirm(type){
 
 async function deleteModelConfirm(idx){
   const m = _localModels[idx];
-  if(!m){ alert('Error: model not found — please refresh the page.'); return; }
+  if(!m){ showAlert('Error: model not found — please refresh the page.'); return; }
   const extra = m.in_config ? ' It will also be removed from your configuration.' : '';
   if(!await showConfirm('Delete model', `Delete "${m.label}" from local cache? This cannot be undone.${extra}`, 'Delete')) return;
   try{
@@ -2707,8 +2707,8 @@ async function deleteModelConfirm(idx){
     const r = await fetch(ROOT_PATH + '/admin/api/cached-models/'+encodeURIComponent(idForUrl)+'?cache_type='+m.cacheType, {method:'DELETE'});
     const d = await r.json();
     if(d.success) refreshLocal();
-    else alert('Error: '+(d.detail||d.error||'Unknown'));
-  }catch(e){alert('Error: '+e.message)}
+    else showAlert('Error: '+(d.detail||d.error||'Unknown'));
+  }catch(e){showAlert('Error: '+e.message)}
 }
 
 // Delete a model's files from disk to reclaim space while keeping its config
@@ -2716,24 +2716,26 @@ async function deleteModelConfirm(idx){
 // a Re-download button.
 async function freeDiskConfirm(idx){
   const m = _localModels[idx];
-  if(!m){ alert('Error: model not found — please refresh the page.'); return; }
+  if(!m){ showAlert('Error: model not found — please refresh the page.'); return; }
   // Re-download target: stored source repo, or the model id itself for HF repos.
   const repo = m.source_repo || (m.cacheType==='hf' ? m.path : '');
   const warn = repo ? '' : ' Note: no source repository is known for this file, so you may need to locate it manually to re-download.';
-  const extra = m.in_config ? '' : ' It will be added to your model list (marked as freed) so you can re-download it later.';
+  const extra = m.in_config ? '' : ' It will stay in your model list as “to download” so you can fetch it again later.';
   if(!await showConfirm('Free disk space',
       `Delete "${m.label}" from disk to save space, but keep it in your model list so you can re-download it when needed?${extra}${warn}`,
       'Free disk')) return;
   try{
-    // Unconfigured models only appear in the list because they are on disk; register
-    // them first so the entry survives the file deletion and stays re-downloadable.
+    // Unconfigured models only appear in the list because they are on disk; record
+    // them in the "to download" wishlist first so the entry survives the file
+    // deletion and stays listed (as non-configured / to be downloaded).
     if(!m.in_config){
-      const er = await fetch(ROOT_PATH + '/admin/api/model-enable', {
+      const er = await fetch(ROOT_PATH + '/admin/api/model-mark-download', {
         method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({path:m.path, model_type:m.defaultType||'text_models'})
+        body: JSON.stringify({model_id: repo || m.path, source_repo: repo || m.path,
+          model_type:m.defaultType||'text_models', is_gguf: m.cacheType==='gguf'})
       });
       const ed = await er.json().catch(()=>({}));
-      if(!ed.success){ alert('Error: '+(ed.detail||ed.error||'could not register model for re-download')); return; }
+      if(!ed.success){ showAlert('Error: '+(ed.detail||ed.error||'could not record model for re-download')); return; }
     }
     const r = await fetch(ROOT_PATH + '/admin/api/model-free-disk', {
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -2741,8 +2743,8 @@ async function freeDiskConfirm(idx){
     });
     const d = await r.json();
     if(d.success) refreshLocal();
-    else alert('Error: '+(d.detail||d.error||'Unknown'));
-  }catch(e){alert('Error: '+e.message)}
+    else showAlert('Error: '+(d.detail||d.error||'Unknown'));
+  }catch(e){showAlert('Error: '+e.message)}
 }
 
 /* ── type checkbox helpers ─────────────────────────────── */
@@ -2861,7 +2863,7 @@ async function saveWhisperServerEdit() {
   const model_id = document.getElementById('wse-model-id').value;
   const model_source = document.getElementById('wse-model-source').value;
   const model_path = _getWseModelPath();
-  if (!model_path) { alert('Model path is required'); return; }
+  if (!model_path) { showAlert('Model path is required'); return; }
   const payload = {
     model_id,
     backend: 'whisper-server',
@@ -2882,12 +2884,81 @@ async function saveWhisperServerEdit() {
     if (!r.ok) throw new Error(d.detail || 'Failed to save');
     closeModal('ws-edit-modal');
     refreshLocal();
-  } catch(e) { alert('Error: ' + e.message); }
+  } catch(e) { showAlert('Error: ' + e.message); }
 }
 
 function openCfgModalNew(idx) {
   // Open modal for a brand-new config (no config_id) on an existing model
   openCfgModal(idx, -1);
+}
+
+// GGUF (llama.cpp) vs transformers models use different memory controls. GGUF
+// offloads via "GPU layers" (n_gpu_layers); the transformers "Offload" strategy
+// (device_map / disk offload) and GPTQ/AWQ fast-quant don't apply to it. Show
+// only the relevant controls so the config can't be set in a way the backend
+// ignores.
+function _applyBackendCfgVisibility(m){
+  const isGguf = (m && (m.cacheType === 'gguf'
+      || /\.gguf(\?|$)/i.test(m.path || m.id || '')
+      || (typeof looksLikeGguf === 'function' && looksLikeGguf(m.path || m.id || '', ''))));
+  const show = (id, on) => { const el = document.getElementById(id); if (el) el.style.display = on ? '' : 'none'; };
+  // transformers-only sections — hidden for GGUF/llama.cpp models
+  show('cfg-offload-title', !isGguf);
+  show('cfg-offload-grid', !isGguf);
+  show('cfg-fastquant-wrap', !isGguf);
+  // GGUF/llama.cpp-only controls — hidden for transformers models
+  show('cfg-gpu-layers-row', isGguf);
+  show('cfg-kv-k-row', isGguf);
+  show('cfg-kv-v-row', isGguf);
+  // mmproj pairing only applies to GGUF text models on llama.cpp.
+  show('cfg-mmproj-row', isGguf);
+}
+
+// Populate the mmproj (multimodal projector) select from the available component
+// GGUF files. Auto-selects the projector that best matches this model's name when
+// the config hasn't explicitly chosen one (mmproj is enabled by default when a
+// matching projector exists — e.g. gemma vision).
+function _populateMmprojSelect(m, s){
+  const sel = document.getElementById('cfg-mmproj');
+  if(!sel) return;
+  // All cached GGUF component files classified as mmproj projectors.
+  const projFiles = (_ggufFiles || []).filter(f => {
+    const role = _detectCompRole(f.filename);
+    return role && role.key === 'mmproj';
+  });
+  const cur = (s && s.mmproj) || '';
+  // Score each projector by shared name tokens with the model, so the gemma
+  // projector pairs with the gemma model rather than an unrelated one.
+  const modelName = (_ggufBaseName(m.label || m.path || '') || '').toLowerCase();
+  const tokens = modelName.split(/[^a-z0-9]+/).filter(t => t.length >= 3);
+  const score = (fname) => {
+    const n = fname.toLowerCase();
+    return tokens.reduce((acc, t) => acc + (n.includes(t) ? 1 : 0), 0);
+  };
+  let best = '', bestScore = 0;
+  const opts = ['<option value="">None</option>'];
+  for(const f of projFiles){
+    const sc = score(f.filename);
+    if(sc > bestScore){ bestScore = sc; best = f.path; }
+    opts.push(`<option value="${esc(f.path)}">${esc(f.filename)} (${fmtGB(f.size_gb)})</option>`);
+  }
+  sel.innerHTML = opts.join('');
+  // Selection priority: explicit config value → best name match (enabled by
+  // default) → None.
+  sel.value = cur || (bestScore > 0 ? best : '');
+  // If the stored value isn't among the current options (file removed), fall back.
+  if(cur && sel.value !== cur) sel.value = (bestScore > 0 ? best : '');
+  _onMmprojChange();
+}
+
+// Selecting an mmproj projector adds image/vision input, so reflect that in the
+// model's capabilities (so vision requests route to it). Only auto-checks; never
+// auto-unchecks a capability the user set for other reasons.
+function _onMmprojChange(){
+  const sel = document.getElementById('cfg-mmproj');
+  if(!sel || !sel.value) return;
+  const cap = document.querySelector('.cfg-cap-cb[value="image_to_text"]');
+  if(cap && !cap.checked){ cap.checked = true; }
 }
 
 function openCfgModal(idx, cfgIdx){
@@ -3026,6 +3097,7 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-n-ctx').value = nCtxForEst;
   document.getElementById('cfg-cache-type-k').value = s.cache_type_k || '';
   document.getElementById('cfg-cache-type-v').value = s.cache_type_v || '';
+  _populateMmprojSelect(m, s);
   document.getElementById('cfg-max-instances').value = s.max_instances != null ? s.max_instances : 1;
   document.getElementById('cfg-preload-all-instances').checked = !!s.preload_all_instances;
   _updatePreloadAllVisibility();
@@ -3052,6 +3124,7 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-noram').checked = !!s.no_ram;
   document.getElementById('cfg-offload-strategy').value = s.offload_strategy || 'auto';
   document.getElementById('cfg-offload-dir').value = s.offload_dir || _defaultOffloadDir;
+  _applyBackendCfgVisibility(m);
   _populateEnginePin(s.engine || '');
   document.getElementById('cfg-sysprompt').value = s.system_prompt || '';
   document.getElementById('cfg-parser').value = s.parser || (!m.in_config ? _autoDetectParser(m.path) : 'auto');
@@ -3346,7 +3419,7 @@ async function removeThisConfig(){
     }
     closeModal('cfg-modal');
     loadCachedModels();
-  } catch(e) { alert('Error: ' + e.message); }
+  } catch(e) { showAlert('Error: ' + e.message); }
 }
 
 // Engine-pin field: populate the datalist from declared engines and only show the
@@ -3391,6 +3464,7 @@ async function saveModelConfig(){
     n_ctx:             parseInt(document.getElementById('cfg-n-ctx').value) || 2048,
     cache_type_k:      document.getElementById('cfg-cache-type-k').value || null,
     cache_type_v:      document.getElementById('cfg-cache-type-v').value || null,
+    mmproj:            document.getElementById('cfg-mmproj').value || null,
     max_gpu_percent:   isNaN(maxGpu) ? null : maxGpu,
     manual_ram_gb:     isNaN(ramGb) ? null : ramGb,
     load_in_4bit:      document.getElementById('cfg-4bit').checked,
@@ -3435,12 +3509,12 @@ async function saveModelConfig(){
     const d = await r.json();
     if(d.success){
       if (d.warnings && d.warnings.length) {
-        alert('Saved, but check this:\n\n• ' + d.warnings.join('\n• '));
+        showAlert('Saved, but check this:\n\n• ' + d.warnings.join('\n• '));
       }
       closeModal('cfg-modal'); loadCachedModels();
     }
-    else alert('Error: '+(d.detail||'Unknown'));
-  }catch(e){ alert('Error: '+e.message); }
+    else showAlert('Error: '+(d.detail||'Unknown'));
+  }catch(e){ showAlert('Error: '+e.message); }
 }
 
 async function addWhisperServerModel(){
@@ -3480,7 +3554,7 @@ async function addWhisperServerModel(){
     document.getElementById('ws-submit-btn').textContent = 'Add model';
     toggleWhisperModelSource();
     refreshLocal();
-  }catch(e){ alert('Error: '+e.message); }
+  }catch(e){ showAlert('Error: '+e.message); }
 }
 
 toggleWhisperModelSource();
@@ -3497,8 +3571,8 @@ async function loadModel(idx){
     });
     const d = await r.json();
     if(d.success) refreshLocal();
-    else{ if(btn){ btn.disabled=false; btn.textContent='Load now'; } alert('Error: '+(d.detail||'Unknown')); }
-  }catch(e){ if(btn){ btn.disabled=false; btn.textContent='Load now'; } alert('Error: '+e.message); }
+    else{ if(btn){ btn.disabled=false; btn.textContent='Load now'; } showAlert('Error: '+(d.detail||'Unknown')); }
+  }catch(e){ if(btn){ btn.disabled=false; btn.textContent='Load now'; } showAlert('Error: '+e.message); }
 }
 
 async function unloadModel(idx){
@@ -3510,13 +3584,13 @@ async function unloadModel(idx){
     });
     const d = await r.json();
     if(d.success) refreshLocal();
-    else alert('Error: '+(d.detail||'Unknown'));
-  }catch(e){ alert('Error: '+e.message); }
+    else showAlert('Error: '+(d.detail||'Unknown'));
+  }catch(e){ showAlert('Error: '+e.message); }
 }
 
 async function disableModel(idx, keepReference){
   const m = _localModels[idx];
-  if(!m){ alert('Error: model not found — please refresh the page.'); return; }
+  if(!m){ showAlert('Error: model not found — please refresh the page.'); return; }
   // A freed (missing) model has no files left, so removing its config would make
   // it vanish entirely. keepReference strips the serving config but re-adds a bare
   // known reference so it stays in the list and remains re-downloadable.
@@ -3544,23 +3618,42 @@ async function disableModel(idx, keepReference){
       }
     }
     if(keep){
-      // Re-add a minimal known reference so the model survives the config removal.
+      // No files left on disk — record the model in the "to download" wishlist so
+      // it survives config removal and stays listed as non-configured / to-download.
       const repo = m.source_repo || (m.cacheType==='hf' ? m.path : '');
-      await fetch(ROOT_PATH + '/admin/api/model-add-known', {
+      await fetch(ROOT_PATH + '/admin/api/model-mark-download', {
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({model_id: repo || m.path, source_repo: repo || m.path,
           model_type: m.defaultType || 'text_models', is_gguf: m.cacheType==='gguf'})
       });
     }
     loadCachedModels();
-  }catch(e){ alert('Error: '+e.message); }
+  }catch(e){ showAlert('Error: '+e.message); }
+}
+
+// Drop a model from the "to download" wishlist (it should no longer be listed).
+async function unmarkDownload(idx){
+  const m = _localModels[idx];
+  if(!m){ showAlert('Error: model not found — please refresh the page.'); return; }
+  if(!await showConfirm('Remove from list',
+      `Remove "${m.label}" from your download list? It will no longer appear here until you add or download it again.`,
+      'Remove')) return;
+  try{
+    const r = await fetch(ROOT_PATH + '/admin/api/model-unmark-download', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({model_id: m.source_repo || m.path})
+    });
+    const d = await r.json().catch(()=>({}));
+    if(d.success) refreshLocal();
+    else showAlert('Error: '+(d.detail||d.error||'Unknown'));
+  }catch(e){ showAlert('Error: '+e.message); }
 }
 
 async function startUpload(){
   const fileInput = document.getElementById('upload-file');
   const file = fileInput.files[0];
-  if(!file){ alert('Please select a file'); return; }
-  if(!file.name.endsWith('.gguf')){ alert('Only .gguf files are supported'); return; }
+  if(!file){ showAlert('Please select a file'); return; }
+  if(!file.name.endsWith('.gguf')){ showAlert('Only .gguf files are supported'); return; }
 
   document.getElementById('upload-form').style.display='none';
   document.getElementById('upload-progress').style.display='block';
@@ -3585,7 +3678,7 @@ async function startUpload(){
     try{
       const r = await fetch(ROOT_PATH + '/admin/api/model-upload',{method:'POST', body:formData});
       const d = await r.json();
-      if(!d.success){ alert('Upload failed: '+(d.detail||'Unknown')); return; }
+      if(!d.success){ showAlert('Upload failed: '+(d.detail||'Unknown')); return; }
 
       const pct = Math.round((i+1)/totalChunks*100);
       document.getElementById('upload-bar').style.width = pct+'%';
@@ -3603,7 +3696,7 @@ async function startUpload(){
         }, 1500);
         return;
       }
-    }catch(e){ alert('Upload error: '+e.message); return; }
+    }catch(e){ showAlert('Upload error: '+e.message); return; }
   }
 }
 </script>
