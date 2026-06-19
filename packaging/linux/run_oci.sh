@@ -27,6 +27,21 @@ MAPS=()
 # volume so it's tailable on the host).
 DEBUG_SPEC=""
 LOG_FILE_CONT=""
+# Demo tool web UIs (video editor, videogen, township, parler). Empty = image
+# default (the three UIs on, parler off). Keyed by CODERAI_TOOL_* env var.
+declare -A TOOL_STATE=()
+DISABLE_ALL_TOOLS=0
+
+# Map a friendly tool name to its CODERAI_TOOL_* env var (or fail).
+tool_env_var() {
+  case "$1" in
+    video-editor|video_editor|editor) echo CODERAI_TOOL_VIDEO_EDITOR ;;
+    videogen|video-gen)               echo CODERAI_TOOL_VIDEOGEN ;;
+    township|fighters)                echo CODERAI_TOOL_TOWNSHIP ;;
+    parler|tts)                       echo CODERAI_TOOL_PARLER ;;
+    *) return 1 ;;
+  esac
+}
 
 usage() {
   cat <<'EOF'
@@ -57,6 +72,13 @@ Options:
   --log-file PATH     In-container log path (default /cache/logs/coderai.log,
                       visible on the host under the cache mount). Implies a file
                       log even without --debug. tee'd, so `docker logs` still works.
+  --no-tools          Disable ALL bundled demo tool web UIs (video editor,
+                      videogen, township). They're on by default.
+  --enable-tool NAME  Force-enable a demo tool. Repeatable. NAME is one of:
+                        video-editor | videogen | township | parler
+                      (parler TTS is off by default; this turns it on.)
+  --disable-tool NAME Disable a single demo tool. Repeatable. Same NAMEs as above.
+                      Explicit --enable/--disable-tool overrides --no-tools.
   -- ARGS             Extra args passed to the container engine before the image name.
   -h, --help          Show this help.
 
@@ -95,6 +117,15 @@ while [[ $# -gt 0 ]]; do
     --log-file)
       [[ $# -ge 2 ]] || { echo "Error: --log-file requires a path" >&2; exit 2; }
       LOG_FILE_CONT="$2"; shift 2 ;;
+    --no-tools) DISABLE_ALL_TOOLS=1; shift ;;
+    --enable-tool)
+      [[ $# -ge 2 ]] || { echo "Error: --enable-tool requires a tool name" >&2; exit 2; }
+      _v="$(tool_env_var "$2")" || { echo "Error: unknown tool '$2' (video-editor|videogen|township|parler)" >&2; exit 2; }
+      TOOL_STATE["$_v"]=true; shift 2 ;;
+    --disable-tool)
+      [[ $# -ge 2 ]] || { echo "Error: --disable-tool requires a tool name" >&2; exit 2; }
+      _v="$(tool_env_var "$2")" || { echo "Error: unknown tool '$2' (video-editor|videogen|township|parler)" >&2; exit 2; }
+      TOOL_STATE["$_v"]=false; shift 2 ;;
     -d|--detach) DETACH=1; shift ;;
     --)
       shift
@@ -187,6 +218,24 @@ if [[ -n "$DEBUG_SPEC" || -n "$LOG_FILE_CONT" ]]; then
   esac
 fi
 
+# Demo tool toggles → CODERAI_TOOL_* env. --no-tools turns the three UIs off
+# (unless a specific --enable-tool re-enabled one); explicit toggles always win.
+if [[ "$DISABLE_ALL_TOOLS" == "1" ]]; then
+  for _v in CODERAI_TOOL_VIDEO_EDITOR CODERAI_TOOL_VIDEOGEN CODERAI_TOOL_TOWNSHIP; do
+    [[ -n "${TOOL_STATE[$_v]:-}" ]] || TOOL_STATE["$_v"]=false
+  done
+fi
+TOOLS_NOTE="image defaults (video-editor, videogen, township on; parler off)"
+if [[ "${#TOOL_STATE[@]}" -gt 0 ]]; then
+  TOOLS_NOTE=""
+  for _v in "${!TOOL_STATE[@]}"; do
+    args+=(-e "$_v=${TOOL_STATE[$_v]}")
+    _label="${_v#CODERAI_TOOL_}"
+    TOOLS_NOTE+="$(echo "$_label" | tr 'A-Z_' 'a-z-')=${TOOL_STATE[$_v]} "
+  done
+  TOOLS_NOTE="${TOOLS_NOTE% }"
+fi
+
 args+=("${EXTRA_ARGS[@]}" "$IMAGE_TAG")
 
 cat <<EOF
@@ -199,6 +248,7 @@ Starting CoderAI OCI container
   config:  $CONFIG_NOTE
   debug:   ${DEBUG_SPEC:-off}
   log:     $LOG_HOST_NOTE
+  tools:   $TOOLS_NOTE
 EOF
 
 if [[ "$LOG_HOST_NOTE" != "(none)" ]]; then

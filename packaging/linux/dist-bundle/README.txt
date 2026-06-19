@@ -43,6 +43,12 @@ Useful options (see --help)
   --debug[=engine,ws,...] Run with coderai debug flags + a host-tailable file log.
   --log-file PATH         In-container log path (default /cache/logs/coderai.log,
                           visible on the host under the cache mount).
+  --no-tools              Disable the bundled demo tool web UIs (video editor,
+                          videogen, township). They're on by default.
+  --enable-tool NAME      Force-enable a demo tool (also turns on parler TTS,
+                          which is off by default). NAME: video-editor | videogen
+                          | township | parler. Repeatable.
+  --disable-tool NAME     Disable a single demo tool. Repeatable.
   -d, --detach            Run in the background.
 
 Manual image load (without install.sh)

@@ -17,6 +17,15 @@ set -eu
 export TMPDIR="$CODERAI_TMP" TMP="$CODERAI_TMP" TEMP="$CODERAI_TMP"
 # Don't write .pyc into the read-only /opt/coderai tree (esp. when run as --user).
 export PYTHONDONTWRITEBYTECODE=1
+# Demo tool web-UI autostart toggles, consumed by supervisord.conf's
+# autostart=%(ENV_CODERAI_TOOL_*)s. Default the three UIs ON and parler OFF; the
+# run script (or any `-e CODERAI_TOOL_*=true|false`) overrides these. supervisord
+# fails to start if a referenced ENV var is undefined, so always export them.
+: "${CODERAI_TOOL_VIDEO_EDITOR:=true}"
+: "${CODERAI_TOOL_VIDEOGEN:=true}"
+: "${CODERAI_TOOL_TOWNSHIP:=true}"
+: "${CODERAI_TOOL_PARLER:=false}"
+export CODERAI_TOOL_VIDEO_EDITOR CODERAI_TOOL_VIDEOGEN CODERAI_TOOL_TOWNSHIP CODERAI_TOOL_PARLER
 export CODERAI_CONFIG_DIR CODERAI_MODELS_DIR CODERAI_CACHE_DIR CODERAI_PARLER_MODEL CODERAI_TMP
 
 mkdir -p \
