@@ -50,6 +50,11 @@ class FrontProxy:
         self._models_path = os.path.join(config_dir, "models.json") if config_dir else None
         self._pins: dict = {}
         self._pins_mtime: float = -1.0
+        # Last-good /v1/models list per engine. An engine that's mid-load is
+        # GIL-blocked and misses health polls; without this its models (incl. a
+        # freshly-added one) would flicker out of the aggregated /v1/models while
+        # it loads. Keyed by engine name.
+        self._engine_models_cache: dict = {}
         self.registry = EngineRegistry()
         self.supervisor: Optional[EngineSupervisor] = None
         # Per-run secret shared only with the engines (passed via env at spawn). The
@@ -122,19 +127,28 @@ class FrontProxy:
         duplicates. Returns ("ok", {...}) or ("passthrough", httpx.Response) when an
         auth/error response should be relayed instead."""
         seen, order, relay = {}, [], None
-        for e in self.registry.healthy():
-            try:
-                r = await self._short.get(e.url + "/v1/models", headers=headers)
-            except Exception:
-                continue
-            if r.status_code != 200:
-                relay = relay or r
-                continue
-            try:
-                data = r.json()
-            except Exception:
-                continue
-            for m in (data.get("data") or []):
+        for e in self.registry.all():
+            models = None
+            if e.healthy:
+                try:
+                    r = await self._short.get(e.url + "/v1/models", headers=headers)
+                    if r.status_code == 200:
+                        try:
+                            models = r.json().get("data") or []
+                        except Exception:
+                            models = None
+                    else:
+                        relay = relay or r
+                except Exception:
+                    models = None
+            if models is not None:
+                self._engine_models_cache[e.name] = models   # refresh last-good
+            else:
+                # Unhealthy/unreachable (e.g. mid-load, GIL-blocked): fall back to
+                # this engine's last-known list so its models stay listed — they're
+                # still assigned to it and will serve once it's free again.
+                models = self._engine_models_cache.get(e.name) or []
+            for m in models:
                 mid = m.get("id")
                 if mid and mid not in seen:
                     seen[mid] = m
