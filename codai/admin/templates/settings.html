@@ -466,7 +466,8 @@
     </div>
     <div class="form-row">
       <label class="form-label">Extra ds4-server args</label>
-      <input type="text" id="s-ds4-extra-args" class="form-input" placeholder="--kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192">
+      <input type="text" id="s-ds4-extra-args" class="form-input" placeholder="--ssd-streaming-cache-experts 12GB --ssd-streaming-cold">
+      <span class="form-hint">Passed verbatim to <code>ds4-server</code>. <code>--kv-disk-dir</code> is auto-set to coderai's offload dir unless you override it here. With SSD streaming on CUDA, sizing the routed expert cache helps, e.g. <code>--ssd-streaming-cache-experts 12GB</code>. Note: extremely low quants (Q2_K) can fail ds4's CUDA prefill — prefer Q4_K+.</span>
     </div>
   </div>
 </div>

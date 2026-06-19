@@ -63,7 +63,8 @@ class Ds4Backend(ModelBackend):
         model_file = self._resolve_gguf(model_name)
         _resolved, self._svc_key = ds4_worker.resolve_service_key(self._cfg, model_file)
         self._url = ds4_worker.ensure_service(
-            self._cfg, model_file=model_file, ctx=(self._ctx or None))
+            self._cfg, model_file=model_file, ctx=(self._ctx or None),
+            model_name=model_name)
 
     @staticmethod
     def _resolve_gguf(model_name: str):

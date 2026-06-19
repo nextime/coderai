@@ -126,17 +126,124 @@ def ensure_built(cfg) -> Path:
     return binary
 
 
-def ensure_model(cfg) -> None:
+def _coderai_gguf_cache_dir() -> str:
+    """coderai's GGUF cache directory (where the models page looks), or ''."""
+    try:
+        from codai.models.cache import get_model_cache_dir
+        return get_model_cache_dir() or ""
+    except Exception:
+        return ""
+
+
+def _relocate_into_cache(src: str) -> str:
+    """Move (or, across filesystems, symlink) a downloaded GGUF into coderai's
+    GGUF cache so it shows up on the models page. Returns the in-cache path
+    (falls back to ``src`` if no cache dir is configured)."""
+    real = os.path.realpath(src)
+    cache = _coderai_gguf_cache_dir()
+    if not cache:
+        return real
+    try:
+        os.makedirs(cache, exist_ok=True)
+    except OSError:
+        return real
+    dst = os.path.join(cache, os.path.basename(real))
+    if os.path.abspath(real) == os.path.abspath(dst) or os.path.exists(dst):
+        return dst if os.path.exists(dst) else real
+    try:
+        os.rename(real, dst)            # same filesystem: instant
+        return dst
+    except OSError:
+        # Cross-device: a 100GB+ copy is wasteful — symlink it into the cache
+        # instead (still "in" the cache for resolution and the models page).
+        try:
+            os.symlink(real, dst)
+            return dst
+        except OSError:
+            return real
+
+
+def _find_model_entry(md: dict, model_name: Optional[str]):
+    """Find the models.json entry the request was for, to mimic its config."""
+    if not md or not model_name:
+        return None
+    want_abs = os.path.abspath(os.path.expanduser(model_name))
+    want_base = os.path.basename(model_name).lower()
+    want_stem = want_base[:-5] if want_base.endswith(".gguf") else want_base
+    for key in ("text_models", "gguf_models"):
+        for e in md.get(key, []) or []:
+            if not isinstance(e, dict):
+                continue
+            p = e.get("path", "") or ""
+            pb = os.path.basename(p).lower()
+            if (os.path.abspath(os.path.expanduser(p)) == want_abs
+                    or pb == want_base or e.get("alias") == model_name
+                    or (want_stem and want_stem in pb)):
+                return e
+    return None
+
+
+def _register_downloaded_model(cfg, gguf_path: str, model_name: Optional[str]) -> None:
+    """Register the downloaded GGUF on the models page, mimicking the requested
+    ("failed") model's config, enabled and visible. Best-effort/no-op on error."""
+    try:
+        from codai.admin.routes import config_manager as cm
+    except Exception:
+        return
+    if cm is None or getattr(cm, "models_data", None) is None:
+        return
+    md = cm.models_data
+    tm = md.setdefault("text_models", [])
+    gp = os.path.abspath(gguf_path)
+    for e in tm:
+        if isinstance(e, dict) and os.path.abspath(os.path.expanduser(e.get("path", ""))) == gp:
+            return  # already registered
+    import uuid
+    template = _find_model_entry(md, model_name)
+    entry = dict(template) if isinstance(template, dict) else {}
+    entry.update({
+        "path": gguf_path,
+        "model_type": "text_models",
+        "model_types": ["text_models"],
+        "config_id": str(uuid.uuid4()),
+        "backend": "auto",            # ds4 routes deepseek4 by architecture
+        "load_mode": entry.get("load_mode", "on-request"),
+        "capabilities": ["text_generation"],
+    })
+    # Drop stale per-file measurements copied from the template.
+    for k in ("measured_vram_gb", "used_vram_gb", "force_vram_update", "alias"):
+        entry.pop(k, None)
+    tm.append(entry)
+    # Enabled/visible = present in text_models and NOT parked in unloaded/to_download.
+    base = os.path.basename(gguf_path)
+    for key in ("unloaded", "to_download"):
+        lst = md.get(key)
+        if isinstance(lst, list):
+            md[key] = [x for x in lst if not (
+                (isinstance(x, str) and (x == gguf_path or os.path.basename(x) == base))
+                or (isinstance(x, dict) and os.path.basename(x.get("path", "")) == base))]
+    try:
+        cm.save_models()
+        print(f"[ds4] registered downloaded model on models page: {gguf_path}", flush=True)
+    except Exception as exc:
+        print(f"[ds4] could not save models.json after download: {exc}", flush=True)
+
+
+def ensure_model(cfg, model_name: Optional[str] = None) -> Optional[str]:
     """Download the configured GGUF weight variant if it isn't present.
 
     ds4's ``download_model.sh`` writes into ``<install_dir>/gguf/`` and updates the
-    ``ds4flash.gguf`` symlink that ``ds4-server`` loads by default.
-    """
+    ``ds4flash.gguf`` symlink that ``ds4-server`` loads by default. After download
+    the file is relocated into coderai's GGUF cache and registered on the models
+    page (mimicking the requested model's config, enabled). Returns the resolved
+    in-cache GGUF path (or ``None`` if it could not be located)."""
     install_dir = _install_dir(cfg)
-    # If the default-loaded model file already resolves, nothing to do.
+    # If the default-loaded model file already resolves, just relocate/register it.
     default_model = install_dir / "ds4flash.gguf"
     if default_model.exists():
-        return
+        final = _relocate_into_cache(str(default_model))
+        _register_downloaded_model(cfg, final, model_name)
+        return final
     script = install_dir / "download_model.sh"
     if not script.exists():
         # The binary may have been bundled (e.g. into a Docker image) without the
@@ -169,6 +276,13 @@ def ensure_model(cfg) -> None:
           f"resumable) …", flush=True)
     _run_logged(["bash", str(script), variant], cwd=install_dir,
                 label="download_model.sh", tail=tail)
+    if not default_model.exists():
+        raise RuntimeError(
+            f"ds4 download_model.sh finished but {default_model} is missing. "
+            "Last output: " + " | ".join(list(tail)[-5:]))
+    final = _relocate_into_cache(str(default_model))
+    _register_downloaded_model(cfg, final, model_name)
+    return final
 
 
 def _free_port() -> int:
@@ -228,6 +342,7 @@ def resolve_service_key(cfg, model_file: Optional[str] = None):
 
 def ensure_service(cfg, model_file: Optional[str] = None,
                    ctx: Optional[int] = None,
+                   model_name: Optional[str] = None,
                    ready_timeout: float = 3600.0) -> str:
     """Build (as needed), then start (or reuse) ds4-server serving the right GGUF.
 
@@ -251,7 +366,11 @@ def ensure_service(cfg, model_file: Optional[str] = None,
             # OPT-IN (auto_download, off by default) — otherwise fail with a clear
             # message instead of silently pulling tens of GB.
             if bool(getattr(cfg, "auto_download", False)):
-                ensure_model(cfg)
+                dl = ensure_model(cfg, model_name=model_name)
+                if dl and os.path.isfile(dl):
+                    resolved = dl
+                    svc_key = dl
+                    _services.pop(svc_key, None)
             else:
                 raise RuntimeError(
                     "ds4: no local deepseek4 GGUF resolved for this request and "
