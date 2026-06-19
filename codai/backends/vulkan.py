@@ -176,14 +176,57 @@ def _gguf_block_count(path) -> int:
     return result
 
 
+def _amd_free_vram_gb(device: int = 0) -> float:
+    """Free VRAM (GB) for an AMD GPU from amdgpu sysfs, 0.0 if unavailable.
+
+    The Vulkan path runs on AMD cards where ``torch.cuda`` can't see VRAM, so the
+    CUDA query returns 0 and the auto-offload sizing below is silently skipped —
+    leaving ``n_gpu_layers=all`` and OOMing a model that doesn't fit (e.g. a 13 GB
+    model on an 8 GB RX 580, while a 24 GB CUDA card masks the bug). Read free VRAM
+    (total - used) straight from sysfs instead, indexing AMD cards in sorted order
+    to match the Vulkan device index."""
+    import glob, os, re
+    try:
+        idx = 0
+        for card in sorted(glob.glob("/sys/class/drm/card*")):
+            if not re.match(r"^card\d+$", os.path.basename(card)):
+                continue
+            dev = os.path.join(card, "device")
+
+            def _read(rel):
+                try:
+                    with open(os.path.join(dev, rel)) as f:
+                        return f.read().strip()
+                except OSError:
+                    return None
+            if (_read("vendor") or "").lower() != "0x1002":   # AMD only
+                continue
+            if idx != device:
+                idx += 1
+                continue
+            total = _read("mem_info_vram_total")
+            used = _read("mem_info_vram_used")
+            if total is None or used is None:
+                return 0.0
+            return max(0.0, (int(total) - int(used)) / (1024 ** 3))
+    except Exception:
+        return 0.0
+    return 0.0
+
+
 def _free_vram_gb(device: int = 0) -> float:
-    """Free VRAM (GB) on the given CUDA device, 0.0 if unavailable."""
+    """Free VRAM (GB) on the given GPU, 0.0 if unavailable.
+
+    Tries CUDA first (NVIDIA); falls back to amdgpu sysfs so the Vulkan/AMD
+    engine can size GPU-layer offload instead of always loading everything."""
     try:
         import torch
         free, _total = torch.cuda.mem_get_info(device)
-        return free / (1024 ** 3)
+        if free:
+            return free / (1024 ** 3)
     except Exception:
-        return 0.0
+        pass
+    return _amd_free_vram_gb(device)
 
 
 def _ggml_kv_type(name):
