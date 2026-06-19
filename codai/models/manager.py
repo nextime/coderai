@@ -2611,6 +2611,19 @@ class MultiModelManager:
                 specs.append(v)
         return self._lora_vram_gb(specs)
 
+    @staticmethod
+    def _kv_cache_size_factor(cache_type) -> float:
+        """KV-cache bytes-per-element relative to f16 (=1.0), by llama.cpp cache
+        type. Quantized caches are much smaller, so the runtime KV reserve should
+        shrink accordingly (q4_0 ≈ 0.27× f16). Unset/unknown → f16 (1.0)."""
+        t = str(cache_type or "").strip().lower().replace("-", "_")
+        return {
+            "": 1.0, "f16": 1.0, "f32": 2.0, "bf16": 1.0,
+            "q8_0": 0.53,
+            "q5_1": 0.34, "q5_0": 0.33,
+            "q4_1": 0.28, "q4_0": 0.27,
+        }.get(t, 1.0)
+
     def _runtime_reserve_gb(self, cfg: dict, model_key: str, base_gb: float) -> float:
         """Extra VRAM the model needs at RUNTIME beyond its resident weights.
 
@@ -2631,7 +2644,14 @@ class MultiModelManager:
             except (TypeError, ValueError):
                 n_ctx = 2048
             ctx_factor = min(3.0, max(1.0, n_ctx / 4096.0))
-            return base_gb * (0.10 + 0.08 * ctx_factor)   # ~0.18–0.34×
+            # The KV-cache part of the reserve scales with the cache quantization:
+            # a q4_0 KV cache is ~4x smaller than f16, so reserving an f16-sized KV
+            # for a quantized cache wildly over-estimates and forces needless CPU
+            # offload at large n_ctx. Scale only the KV term (0.08*ctx_factor); the
+            # 0.10 base (activations/compute buffers) is unaffected by KV dtype.
+            kv_factor = (self._kv_cache_size_factor(cfg.get("cache_type_k"))
+                         + self._kv_cache_size_factor(cfg.get("cache_type_v"))) / 2.0
+            return base_gb * (0.10 + 0.08 * ctx_factor * kv_factor)   # ~0.13–0.34×
         if mtype == "video":
             return base_gb * 0.08   # temporal activations + VAE decode (tiling-capped)
         if mtype == "image":

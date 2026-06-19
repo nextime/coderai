@@ -81,6 +81,8 @@ class TaskRegistry:
         self._tasks: Dict[str, Task] = {}
         self._events: Dict[str, threading.Event] = {}
         self._pause_events: Dict[str, threading.Event] = {}
+        # Per-task (last_time, last_step) for throughput (it/s) estimation in step().
+        self._rate_state: Dict[str, tuple] = {}
         self._history = history
 
     def register(self, kind: str, *, title: str = "", model: str = "",
@@ -121,9 +123,25 @@ class TaskRegistry:
             t = self._tasks.get(tid)
             if not t:
                 return
-            t.step = int(step)
+            new_step = int(step)
             if total is not None:
                 t.total = int(total)
+            # Estimate throughput (iterations/s) for generation tasks from the
+            # rate of step increments, EMA-smoothed. Text generation reports its
+            # own tokens/s via update(rate=…), so it doesn't go through here.
+            now = time.time()
+            prev = self._rate_state.get(tid)
+            if prev is not None:
+                _pt, _ps = prev
+                _dt = now - _pt
+                _dn = new_step - _ps
+                if _dt >= 0.3 and _dn > 0:
+                    _inst = _dn / _dt
+                    t.rate = round(_inst if not t.rate else 0.5 * t.rate + 0.5 * _inst, 2)
+                    self._rate_state[tid] = (now, new_step)
+            else:
+                self._rate_state[tid] = (now, new_step)
+            t.step = new_step
 
     def current_loading_task(self) -> Optional[str]:
         """Id of the most-recently-started running ``loading`` task, if any.
@@ -152,6 +170,13 @@ class TaskRegistry:
             if message:
                 t.message = message
             t.ended_at = time.time()
+            # Replace the live instantaneous rate with the run AVERAGE (it/s) so
+            # the history shows a stable, representative throughput.
+            if t.step and t.started_at:
+                _dur = (t.ended_at or t.started_at) - t.started_at
+                if _dur > 0 and not (t.kind == "text" and t.rate):
+                    t.rate = round(t.step / _dur, 2)
+            self._rate_state.pop(tid, None)
             self._prune_locked()
 
     def cancel(self, tid: str) -> bool:
@@ -234,6 +259,7 @@ class TaskRegistry:
         with self._lock:
             self._events.pop(tid, None)
             self._pause_events.pop(tid, None)
+            self._rate_state.pop(tid, None)
             return self._tasks.pop(tid, None) is not None
 
     def get(self, tid: str) -> Optional[dict]:
@@ -256,6 +282,7 @@ class TaskRegistry:
             self._tasks.pop(t.id, None)
             self._events.pop(t.id, None)
             self._pause_events.pop(t.id, None)
+            self._rate_state.pop(t.id, None)
 
 
 # Process-wide singleton.

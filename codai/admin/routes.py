@@ -1682,6 +1682,14 @@ def _do_delete_model(model_id: str, cache_type: str) -> dict:
     if cache_type == "hf":
         hf_dir = caches.get("huggingface")
         if hf_dir:
+            # huggingface_hub logs a WARNING + full traceback when a repo dir has
+            # already vanished (e.g. a GGUF model whose HF repo was never really
+            # cached). Quiet it during the delete — "repo gone" is exactly the
+            # end state Free disk wants, so it's not an error.
+            import logging as _logging
+            _hf_log = _logging.getLogger("huggingface_hub.utils._cache_manager")
+            _prev_lvl = _hf_log.level
+            _hf_log.setLevel(_logging.ERROR)
             try:
                 from huggingface_hub import scan_cache_dir
                 info = scan_cache_dir(hf_dir)
@@ -1692,13 +1700,17 @@ def _do_delete_model(model_id: str, cache_type: str) -> dict:
                     return {"success": True}
             except Exception:
                 pass
-            # Fallback: remove directory directly
+            finally:
+                _hf_log.setLevel(_prev_lvl)
+            # Fallback: remove the repo dir directly if it's still there.
             safe = model_id.replace("/", "--")
             d = os.path.join(hf_dir, f"models--{safe}")
             if os.path.exists(d):
                 shutil.rmtree(d, ignore_errors=True)
-                return {"success": True}
-        return {"success": False, "detail": "Model not found in HF cache"}
+            # Whether or not anything was on disk, the files are gone now — Free
+            # disk is idempotent, so report success instead of a scary error.
+            return {"success": True}
+        return {"success": False, "detail": "HF cache directory not configured"}
 
     if cache_type == "gguf":
         gguf_dir = get_model_cache_dir()
@@ -2032,7 +2044,13 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
     if not path:
         raise HTTPException(status_code=400, detail="path required")
 
-    # Find the model config entry to determine its type
+    # Find the model config entry to determine its type. A model may be
+    # registered in several categories (e.g. a vision LLM advertises image_to_text
+    # → also listed under vision_models). The category-bucket loop below would pick
+    # whichever non-text bucket it hits first, sending the model to the diffusers /
+    # transformers loader — which calls from_pretrained() and fails on a GGUF file.
+    # So the entry's DECLARED primary model_type wins, and a GGUF/llama.cpp text
+    # model always loads via the text path regardless of its other buckets.
     model_type = "text"
     model_cfg: dict = {}
     if config_manager:
@@ -2049,6 +2067,12 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
                     model_type = mtype
                     model_cfg = m if isinstance(m, dict) else {}
                     break
+        # Respect the entry's declared primary type; a text/gguf model (or any
+        # .gguf path) is a llama.cpp model and must use the text loader even when
+        # it's also bucketed under image/vision for capability routing.
+        _primary = (model_cfg.get("model_type") if isinstance(model_cfg, dict) else "") or ""
+        if _primary in ("text_models", "gguf_models") or str(path).lower().endswith(".gguf"):
+            model_type = "text"
 
     # Offload to a thread: request_model may block (thermal wait / busy model /
     # actual load) and would otherwise freeze the whole admin web UI event loop.
@@ -2450,6 +2474,27 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "quant_backend", "kv_cache_budget_mb", "kv_cache_slots", "mmproj"):
         if key in data:
             entry[key] = data[key]
+
+    # A GGUF LLM is served by llama.cpp. Its multimodal projector (mmproj) gives
+    # it VISION INPUT, which is the `image_to_text` capability served through
+    # llama.cpp — NOT the diffusers `vision_models`/`image_models` categories
+    # (those route the .gguf to from_pretrained() and fail). So for a GGUF text
+    # model: auto-tag image_to_text when an mmproj is set, and keep it out of the
+    # diffusers buckets (it stays a llama.cpp model that advertises vision).
+    _path_l = str(path).lower()
+    _is_gguf_llm = ((_path_l.endswith(".gguf") or "gguf" in _path_l
+                     or entry.get("model_type") == "gguf_models")
+                    and entry.get("model_type") in ("text_models", "gguf_models"))
+    if _is_gguf_llm:
+        _caps = list(entry.get("capabilities") or [])
+        if entry.get("mmproj") and "image_to_text" not in _caps:
+            _caps.append("image_to_text")
+            entry["capabilities"] = _caps
+        _DIFFUSERS_CATS = {"image_models", "vision_models", "video_models", "spatial_models"}
+        _kept = [t for t in model_types if t not in _DIFFUSERS_CATS] or ["text_models"]
+        if _kept != model_types:
+            model_types = _kept
+            entry["model_types"] = model_types
 
     # Add entry to each selected category
     for mtype in model_types:

@@ -73,6 +73,19 @@
     </tbody>
   </table>
 </div>
+
+<div class="table-wrap" id="history-wrap" style="display:none;margin-top:1.25rem">
+  <h2 style="font-size:14px;margin:0 0 .5rem">Recent tasks <span class="dim small">(last 10)</span></h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Type</th><th>Name / Model</th><th>Result</th>
+        <th style="width:220px">Throughput</th><th>Finished</th><th style="text-align:right"></th>
+      </tr>
+    </thead>
+    <tbody id="history-body"></tbody>
+  </table>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -94,6 +107,15 @@ const STATUS_BADGE = {
   cancelled:'badge-user', interrupted:'badge-warn'
 };
 
+// Format a task's throughput with the right unit. Text → tok/s; generation →
+// it/s, or s/it when each iteration takes longer than a second (more readable).
+function fmtRate(t) {
+  const r = Number(t.rate) || 0;
+  if (r <= 0) return '';
+  if (t.kind === 'text') return `${r} tok/s`;
+  return r >= 1 ? `${r} it/s` : `${(1 / r).toFixed(1)} s/it`;
+}
+
 function progressBar(t) {
   // Downloads report a 0-100 percent; render a percentage bar (the filename /
   // rate / ETA detail is shown in the status cell, so it isn't repeated here).
@@ -103,9 +125,10 @@ function progressBar(t) {
             <span class="dim small">${pct}%</span>`;
   }
   const total = t.total || 0, step = t.step || 0;
-  // Live throughput for text generation (tokens/s), shown while running.
+  // Live throughput, shown while running: tokens/s for text, iterations/s (or
+  // seconds/iteration when slow) for generation tasks (image/video/audio/…).
   const rate = (t.rate && t.status === 'running')
-    ? ` <span class="dim small">· ${t.rate} tok/s</span>` : '';
+    ? ` <span class="dim small">· ${fmtRate(t)}</span>` : '';
   if (!total) {
     if (t.status === 'running') {
       const tok = step ? `${step} tok` : 'working…';
@@ -137,6 +160,70 @@ function actions(t) {
     btns.push(`<button class="btn btn-ghost btn-sm" onclick="removeTask('${esc(t.id)}')">Remove</button>`);
   }
   return btns.join(' ') || '<span class="dim small">—</span>';
+}
+
+function fmtDur(start, end) {
+  if (!start || !end || end < start) return '';
+  const s = Math.round(end - start);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60), ss = s % 60;
+  if (m < 60) return `${m}m ${ss}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+// One active-task row (main table).
+function taskRow(t) {
+  const badge = STATUS_BADGE[t.status] || 'badge-dim';
+  const title = t.title || '(untitled)';
+  let statusCell;
+  if (t.cooling) {
+    statusCell = `<span class="badge badge-warn">❄ Cooling down</span>`
+      + `<div class="dim small">${esc(t.cooling_message || 'paused for thermal cooldown')}</div>`;
+  } else if (t.throttling) {
+    statusCell = `<span class="badge ${badge}">${esc(t.status)}</span>`
+      + ` <span class="badge badge-user">🐢 throttling</span>`
+      + `<div class="dim small">${esc(t.throttle_message || 'CPU soft-throttle')}</div>`;
+  } else if (t.paused) {
+    statusCell = `<span class="badge badge-warn">⏸ Paused</span>`
+      + `<div class="dim small">suspended — click Resume to continue</div>`;
+  } else {
+    statusCell = `<span class="badge ${badge}">${esc(t.status)}</span>`
+      + (t.message ? `<div class="dim small">${esc(t.message)}</div>` : '');
+  }
+  return `<tr>
+    <td><span class="badge badge-user">${esc(KIND_LABEL[t.kind] || t.kind)}</span></td>
+    <td><div class="td-name">${esc(title)}${t.engine?` <span class="badge badge-user" style="font-size:9px;padding:.05rem .3rem;vertical-align:middle" title="Running on engine">${esc(t.engine)}</span>`:''}</div><div class="dim small mono">${esc(t.model || '')}</div></td>
+    <td>${statusCell}</td>
+    <td>${progressBar(t)}</td>
+    <td class="dim small">${fmtTime(t.started_at)}</td>
+    <td style="text-align:right">${actions(t)}</td>
+  </tr>`;
+}
+
+// One finished-task row (history table): result + average throughput + duration.
+function historyRow(t) {
+  const badge = STATUS_BADGE[t.status] || 'badge-dim';
+  const title = t.title || '(untitled)';
+  const dur = fmtDur(t.started_at, t.ended_at);
+  const rate = fmtRate(t);
+  const result = `<span class="badge ${badge}">${esc(t.status)}</span>`
+    + (dur ? ` <span class="dim small">in ${dur}</span>` : '')
+    + (t.message && t.status !== 'done' ? `<div class="dim small">${esc(t.message)}</div>` : '');
+  let thru = '<span class="dim small">—</span>';
+  if (rate) {
+    const cnt = t.total ? ` <span class="dim small">· ${t.total} ${t.kind === 'text' ? 'tok' : 'it'}</span>` : '';
+    thru = `<span class="dim small">${rate}</span>${cnt}`;
+  } else if (t.step) {
+    thru = `<span class="dim small">${t.step} ${t.kind === 'text' ? 'tok' : 'it'}</span>`;
+  }
+  return `<tr>
+    <td><span class="badge badge-user">${esc(KIND_LABEL[t.kind] || t.kind)}</span></td>
+    <td><div class="td-name">${esc(title)}</div><div class="dim small mono">${esc(t.model || '')}</div></td>
+    <td>${result}</td>
+    <td>${thru}</td>
+    <td class="dim small">${fmtTime(t.ended_at)}</td>
+    <td style="text-align:right"><button class="btn btn-ghost btn-sm" onclick="removeTask('${esc(t.id)}')">Remove</button></td>
+  </tr>`;
 }
 
 // ---- Live hardware telemetry ----
@@ -291,38 +378,26 @@ async function loadTasks() {
       sbanner.style.display = 'none';
     }
 
+    // Split: active tasks in the main table, the most recent finished ones in a
+    // history section (last 10) so completed generations stay visible briefly.
+    const active = tasks.filter(t => t.active);
+    const finished = tasks.filter(t => !t.active)
+      .sort((a, b) => (b.ended_at || b.started_at || 0) - (a.ended_at || a.started_at || 0))
+      .slice(0, 10);
+
     const tbody = document.getElementById('tasks-body');
-    if (!tasks.length) {
-      tbody.innerHTML = '<tr class="empty-row"><td colspan="6">No tasks yet</td></tr>';
-      return;
+    tbody.innerHTML = active.length
+      ? active.map(taskRow).join('')
+      : '<tr class="empty-row"><td colspan="6">No active tasks</td></tr>';
+
+    const hwrap = document.getElementById('history-wrap');
+    const hbody = document.getElementById('history-body');
+    if (finished.length) {
+      hwrap.style.display = '';
+      hbody.innerHTML = finished.map(historyRow).join('');
+    } else {
+      hwrap.style.display = 'none';
     }
-    tbody.innerHTML = tasks.map(t => {
-      const badge = STATUS_BADGE[t.status] || 'badge-dim';
-      const title = t.title || '(untitled)';
-      let statusCell;
-      if (t.cooling) {
-        statusCell = `<span class="badge badge-warn">❄ Cooling down</span>`
-          + `<div class="dim small">${esc(t.cooling_message || 'paused for thermal cooldown')}</div>`;
-      } else if (t.throttling) {
-        statusCell = `<span class="badge ${badge}">${esc(t.status)}</span>`
-          + ` <span class="badge badge-user">🐢 throttling</span>`
-          + `<div class="dim small">${esc(t.throttle_message || 'CPU soft-throttle')}</div>`;
-      } else if (t.paused) {
-        statusCell = `<span class="badge badge-warn">⏸ Paused</span>`
-          + `<div class="dim small">suspended — click Resume to continue</div>`;
-      } else {
-        statusCell = `<span class="badge ${badge}">${esc(t.status)}</span>`
-          + (t.message ? `<div class="dim small">${esc(t.message)}</div>` : '');
-      }
-      return `<tr>
-        <td><span class="badge badge-user">${esc(KIND_LABEL[t.kind] || t.kind)}</span></td>
-        <td><div class="td-name">${esc(title)}${t.engine?` <span class="badge badge-user" style="font-size:9px;padding:.05rem .3rem;vertical-align:middle" title="Running on engine">${esc(t.engine)}</span>`:''}</div><div class="dim small mono">${esc(t.model || '')}</div></td>
-        <td>${statusCell}</td>
-        <td>${progressBar(t)}</td>
-        <td class="dim small">${fmtTime(t.started_at)}</td>
-        <td style="text-align:right">${actions(t)}</td>
-      </tr>`;
-    }).join('');
   } catch (e) {
     // transient fetch errors during a model swap are fine; keep last render.
   } finally {
