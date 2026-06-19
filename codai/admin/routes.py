@@ -190,14 +190,22 @@ def _is_whisper_runner(m) -> bool:
 
 
 def _sync_whisper_runner(model_path: str, model_entry: dict) -> bool:
-    """Ensure exactly ONE whisper-server runner exists for a whisper gguf model
-    (1:1). Creates it if missing. Returns True if a runner was created."""
+    """Ensure exactly ONE whisper-server runner per whisper gguf MODEL config
+    (strict 1:1). The runner's id (the whisper-server model_id) is inherited from
+    the config's `alias`, which is the link between the model config and its
+    runner. Returns True if models.json changed."""
     audio_list = config_manager.models_data.setdefault("audio_models", [])
-    if any(_is_whisper_runner(m) and m.get("model_path") == model_path
-           for m in audio_list):
+    rid = (model_entry.get("alias") or "").strip()
+    if not rid:
+        # No alias given: mint the runner id and stamp it as the config's alias so
+        # the config↔runner link (config.alias == runner.id) always exists.
+        rid = _next_whisper_server_model_id(audio_list)
+        model_entry["alias"] = rid
+    # Runner for this config (id == config alias) already exists? Nothing to do.
+    if any(_is_whisper_runner(m) and m.get("id") == rid for m in audio_list):
         return False
     runner = {
-        "id": _next_whisper_server_model_id(audio_list),
+        "id": rid,
         "backend": "whisper-server",
         "server_path": _default_whisper_server_path(),
         "model_path": model_path,
@@ -206,7 +214,7 @@ def _sync_whisper_runner(model_path: str, model_entry: dict) -> bool:
         "load_mode": model_entry.get("load_mode", "on-request"),
         "model_type": "audio_models",
         "model_types": ["audio_models"],
-        "alias": (model_entry.get("alias") or "").strip() or "whisper",
+        "alias": rid,
     }
     if model_entry.get("engine"):
         runner["engine"] = model_entry["engine"]
@@ -2060,14 +2068,32 @@ async def api_model_disable(request: Request, username: str = Depends(require_ad
         key = m_entry.get("path") or m_entry.get("id") or ""
         return key == path or (fname and bool(key) and _os.path.basename(key) == fname)
 
+    # Strict 1:1: a whisper gguf MODEL config owns the runner whose id == the
+    # config's alias. Pre-collect the alias(es) of the model config(s) being
+    # removed so the matching runner(s) come down with them.
+    removed_runner_ids = set()
+    for _cat in ("audio_models",):
+        for _m in config_manager.models_data.get(_cat, []):
+            if not isinstance(_m, dict) or _is_whisper_runner(_m):
+                continue
+            if _m.get("backend") != "whisper-server":
+                continue
+            if _matches(_m):
+                _a = (_m.get("alias") or "").strip()
+                if _a:
+                    removed_runner_ids.add(_a)
+
     def _is_runner_of_removed_model(m_entry) -> bool:
-        # Cascade: disabling a whisper gguf MODEL also tears down its runner(s),
-        # which reference the same gguf via model_path. Skip cascade for a targeted
-        # single-config removal (config_id), which addresses one entry only.
-        if config_id or not _is_whisper_runner(m_entry):
+        # Single-config removal (config_id) or whole-model removal (by path):
+        # drop the runner(s) whose id matches a removed config's alias.
+        if not _is_whisper_runner(m_entry):
             return False
+        if m_entry.get("id") in removed_runner_ids:
+            return True
+        if config_id:
+            return False  # targeted: only the alias-linked runner
         mp = m_entry.get("model_path") or ""
-        return mp == path or (fname and _os.path.basename(mp) == fname)
+        return mp == path or (fname and bool(mp) and _os.path.basename(mp) == fname)
 
     removed = []
     changed = False
