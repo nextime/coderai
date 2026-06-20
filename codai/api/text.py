@@ -1660,7 +1660,8 @@ import re as _re
 
 _TOOL_SPAN_RE = _re.compile(r'<(tool|tool_call)\b[\s\S]*?</\1\s*>', _re.IGNORECASE)
 _TOOL_OPEN_RE = _re.compile(r'<(?:tool|tool_call)\b', _re.IGNORECASE)
-_TOOL_OPEN_TAGS = ('<tool>', '<tool_call>', '<|tool_call>', '<|tool_call|>')
+_TOOL_OPEN_TAGS = ('<tool>', '<tool_call>', '<|tool_call>', '<|tool_call|>',
+                   '<｜dsml｜tool_calls>')
 # gemma/qwen native special-token tool marker `<|tool_call>` — usually a special
 # token stripped on decode, but some GGUFs emit it as plain text. Treat it like a
 # tool-open: withhold everything from it to the end so the raw marker (and the
@@ -1670,6 +1671,10 @@ _NATIVE_TOOL_OPEN_RE = _re.compile(r'<\|tool_call', _re.IGNORECASE)
 # by skip_special_tokens). Once it starts we withhold everything to the end of the
 # stream — the call is surfaced as structured tool_calls after generation.
 _GEMMA_CALL_OPEN_RE = _re.compile(r'call:\s*[A-Za-z_]\w*\s*\{')
+# DeepSeek V4 (ds4) native tool calls: `<｜DSML｜tool_calls>…` (｜ is U+FF5C; ASCII
+# | tolerated). Withhold from the first DSML marker to the end so the raw block is
+# never streamed as visible content — it's surfaced as structured tool_calls.
+_DSML_OPEN_RE = _re.compile(r'<[｜|]DSML[｜|]')
 
 
 def _gate_tool_content(buffer: str, final: bool = False):
@@ -1708,6 +1713,12 @@ def _gate_tool_content(buffer: str, final: bool = False):
     if gm:
         emit.append(buffer[:gm.start()])
         held = '' if final else buffer[gm.start():]
+        return ''.join(emit), held
+    # DeepSeek V4 DSML tool call (<｜DSML｜…>) — withhold from the marker onward.
+    dm = _DSML_OPEN_RE.search(buffer)
+    if dm:
+        emit.append(buffer[:dm.start()])
+        held = '' if final else buffer[dm.start():]
         return ''.join(emit), held
     # Hold back a trailing '<…' that could still become a tool open tag.
     if not final:
