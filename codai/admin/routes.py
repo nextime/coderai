@@ -2686,6 +2686,31 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         if key in data:
             entry[key] = data[key]
 
+    # Per-model ds4 launch overrides (only meaningful for a deepseek4 model served
+    # via the ds4 engine). Normalize to a small dict and drop it when empty, so the
+    # entry stays clean and inherits the global ds4 config as the default.
+    if "ds4" in data:
+        src = data.get("ds4") if isinstance(data.get("ds4"), dict) else {}
+        ds4o = {}
+        sv = src.get("ssd_streaming")
+        if sv is not None and sv != "":
+            ds4o["ssd_streaming"] = (sv.lower() in ("1", "true", "on", "yes")
+                                     if isinstance(sv, str) else bool(sv))
+        rg = src.get("expert_cache_reserve_gb")
+        if rg not in (None, "", 0, "0"):
+            try:
+                ds4o["expert_cache_reserve_gb"] = max(0, int(rg))
+            except (TypeError, ValueError):
+                pass
+        for k in ("extra_args", "extra_env"):
+            v = src.get(k)
+            if isinstance(v, str) and v.strip():
+                ds4o[k] = v.strip()
+        if ds4o:
+            entry["ds4"] = ds4o
+        else:
+            entry.pop("ds4", None)
+
     # A GGUF LLM is served by llama.cpp. Its multimodal projector (mmproj) gives
     # it VISION INPUT, which is the `image_to_text` capability served through
     # llama.cpp — NOT the diffusers `vision_models`/`image_models` categories

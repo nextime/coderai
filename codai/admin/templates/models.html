@@ -573,6 +573,36 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         </label>
         <span class="form-hint" style="font-size:11px">When off (default), a request fails if the pinned engine is down/busy-unreachable instead of running on a different card.</span>
       </div>
+      <div class="form-row" id="cfg-ds4-row" style="margin-top:.75rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
+        <label class="form-label" style="font-weight:600">ds4 (DeepSeek V4) streaming <span class="muted" style="font-weight:400">— per-model overrides</span></label>
+        <span class="form-hint" style="font-size:11px;margin-bottom:.4rem">These tune ds4-server for THIS model (they vary by quant/size/context). Leave blank to inherit the global ds4 settings. Context window is set by <b>n_ctx</b> above.</span>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem">
+          <div class="form-row" style="margin:0">
+            <label class="form-label">SSD expert streaming</label>
+            <select id="cfg-ds4-ssd" class="form-input">
+              <option value="">Inherit global</option>
+              <option value="true">On — stream experts from disk</option>
+              <option value="false">Off — full residency</option>
+            </select>
+            <span class="form-hint" style="font-size:11px">On for big models that don't fit VRAM; off for small ones that do.</span>
+          </div>
+          <div class="form-row" style="margin:0">
+            <label class="form-label">Expert-cache VRAM reserve (GiB)</label>
+            <input type="number" id="cfg-ds4-reserve" class="form-input" min="0" placeholder="0 = inherit / ds4 default">
+            <span class="form-hint" style="font-size:11px">Set just above this model's resident weights (+~2 GiB). ds4 defaults to half the card, which starves the cache.</span>
+          </div>
+        </div>
+        <div class="form-row" style="margin:.5rem 0 0">
+          <label class="form-label">Extra ds4-server args</label>
+          <input type="text" id="cfg-ds4-extra-args" class="form-input" placeholder="--ssd-streaming-cache-experts 300">
+          <span class="form-hint" style="font-size:11px">Cap the expert cache (a count or NGB), prefill-chunk, kv-disk-space, etc. Blank = inherit global.</span>
+        </div>
+        <div class="form-row" style="margin:.5rem 0 0">
+          <label class="form-label">Extra ds4-server env</label>
+          <input type="text" id="cfg-ds4-extra-env" class="form-input" placeholder="DS4_CUDA_WEIGHT_ARENA_CHUNK_MB=512">
+          <span class="form-hint" style="font-size:11px"><code>KEY=VALUE</code> pairs. e.g. <code>DS4_CUDA_WEIGHT_ARENA_CHUNK_MB=512</code> fixes weight-arena OOM under heavy expert caching. Blank = inherit global.</span>
+        </div>
+      </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem;margin-top:.75rem">
         <div class="form-row" style="margin:0">
           <label class="form-label">Used VRAM <span class="muted">(GB)</span></label>
@@ -1039,6 +1069,7 @@ function closeModal(id){document.getElementById(id).classList.remove('show')}
 /* ── Global settings ─────────────────────────────────── */
 let _defaultOffloadDir = './offload';
 let _highlightCap = null;  // capability to highlight in local models list (from ?local_cap= param)
+let _ds4Enabled = false;   // whether the ds4 (DeepSeek V4) engine is enabled globally
 
 async function loadGlobalSettings(){
   try{
@@ -1046,6 +1077,7 @@ async function loadGlobalSettings(){
     if(r.ok){
       const d = await r.json();
       _defaultOffloadDir = d.offload?.directory || './offload';
+      _ds4Enabled = !!(d.ds4 && d.ds4.enabled);
     }
   }catch{}
 }
@@ -3173,6 +3205,7 @@ function openCfgModal(idx, cfgIdx){
   _applyBackendCfgVisibility(m);
   _populateEnginePin(s.engine || '');
   document.getElementById('cfg-engine-fallback').checked = !!s.engine_fallback;
+  _populateDs4(m, s);
   document.getElementById('cfg-sysprompt').value = s.system_prompt || '';
   document.getElementById('cfg-parser').value = s.parser || (!m.in_config ? _autoDetectParser(m.path) : 'auto');
   document.getElementById('cfg-tools').checked = !!s.tools_closer_prompt;
@@ -3484,6 +3517,39 @@ async function _populateEnginePin(desired){
   } catch(e) { row.style.display = 'none'; }
 }
 
+// Per-model ds4 overrides: shown only when the ds4 engine is enabled globally and
+// the model is a deepseek4 (the engine that ds4-server serves). Fields left blank
+// inherit the global ds4 config.
+function _populateDs4(m, s){
+  const row = document.getElementById('cfg-ds4-row');
+  if(!row) return;
+  const hay = (((m && (m.path||m.id)) || '') + ' ' + ((s && s.alias) || '')).toLowerCase();
+  const isDeepSeek4 = /deepseek[\s\-_]?v4|ds4/.test(hay);
+  row.style.display = (_ds4Enabled && isDeepSeek4) ? '' : 'none';
+  const d = (s && s.ds4) || {};
+  document.getElementById('cfg-ds4-ssd').value =
+    (d.ssd_streaming === true ? 'true' : (d.ssd_streaming === false ? 'false' : ''));
+  document.getElementById('cfg-ds4-reserve').value =
+    (d.expert_cache_reserve_gb != null ? d.expert_cache_reserve_gb : '');
+  document.getElementById('cfg-ds4-extra-args').value = d.extra_args || '';
+  document.getElementById('cfg-ds4-extra-env').value = d.extra_env || '';
+}
+
+// Collect the per-model ds4 overrides; only set fields are included (blank =
+// inherit). The backend normalizes and drops the block when empty.
+function _collectDs4(){
+  const ssd = document.getElementById('cfg-ds4-ssd').value;       // '' | 'true' | 'false'
+  const reserve = parseInt(document.getElementById('cfg-ds4-reserve').value);
+  const ea = document.getElementById('cfg-ds4-extra-args').value.trim();
+  const ev = document.getElementById('cfg-ds4-extra-env').value.trim();
+  const o = {};
+  if(ssd === 'true' || ssd === 'false') o.ssd_streaming = (ssd === 'true');
+  if(!isNaN(reserve) && reserve > 0) o.expert_cache_reserve_gb = reserve;
+  if(ea) o.extra_args = ea;
+  if(ev) o.extra_env = ev;
+  return o;
+}
+
 async function saveModelConfig(){
   const path = document.getElementById('cfg-path').value;
   const maxGpu = parseFloat(document.getElementById('cfg-max-gpu').value);
@@ -3527,6 +3593,7 @@ async function saveModelConfig(){
     offload_dir:       document.getElementById('cfg-offload-dir').value.trim() || './offload',
     engine:            document.getElementById('cfg-engine').value.trim() || null,
     engine_fallback:   document.getElementById('cfg-engine-fallback').checked,
+    ds4:               _collectDs4(),
     system_prompt:     document.getElementById('cfg-sysprompt').value.trim() || null,
     parser:            document.getElementById('cfg-parser').value,
     tools_closer_prompt: document.getElementById('cfg-tools').checked,

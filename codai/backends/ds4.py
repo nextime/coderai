@@ -61,10 +61,75 @@ class Ds4Backend(ModelBackend):
         # Resolve the requested model to a concrete .gguf so ds4-server serves THE
         # deepseek4 model that was asked for (not a fixed downloaded variant).
         model_file = self._resolve_gguf(model_name)
+        # Per-model ds4 launch overrides (streaming / expert-cache reserve / extra
+        # args+env) from THIS model's own config entry — these vary by quant and
+        # context, so they live per-model. Unset fields inherit the global ds4
+        # config, which acts as the default/template.
+        overrides = self._ds4_overrides(model_name, model_file)
+        if overrides:
+            import dataclasses
+            try:
+                self._cfg = dataclasses.replace(self._cfg, **overrides)
+                print(f"[ds4] per-model overrides for '{model_name}': "
+                      + ", ".join(f"{k}={v!r}" for k, v in overrides.items()), flush=True)
+            except Exception as exc:
+                print(f"[ds4] failed to apply per-model overrides: {exc}", flush=True)
         _resolved, self._svc_key = ds4_worker.resolve_service_key(self._cfg, model_file)
         self._url = ds4_worker.ensure_service(
             self._cfg, model_file=model_file, ctx=(self._ctx or None),
             model_name=model_name)
+
+    @staticmethod
+    def _ds4_overrides(model_name: str, model_file: Optional[str]) -> Dict:
+        """Per-model ds4 overrides from the model's own models.json entry.
+
+        Looks up THIS model's config entry (by resolved path or name) and returns
+        the subset of :class:`Ds4Config` fields its optional ``ds4`` block sets:
+        ``ssd_streaming``, ``expert_cache_reserve_gb``, ``extra_args``,
+        ``extra_env``. Unset/blank fields are omitted so the global ds4 config
+        stays the default. Best-effort: any failure yields no overrides."""
+        out: Dict = {}
+        try:
+            import os
+            from codai.admin.routes import config_manager
+            md = getattr(config_manager, "models_data", {}) or {}
+            target = os.path.basename(os.path.expanduser(model_file or "")) or None
+            name_l = (model_name or "").strip().lower()
+            entry = None
+            for lst in md.values():
+                if not isinstance(lst, list):
+                    continue
+                for m in lst:
+                    if not isinstance(m, dict):
+                        continue
+                    path = str(m.get("path") or m.get("id") or "")
+                    base = os.path.basename(path)
+                    stem = base[:-5] if base.lower().endswith(".gguf") else base
+                    cands = {path.lower(), base.lower(), stem.lower(),
+                             str(m.get("alias") or "").lower()}
+                    if (target and base == target) or (name_l and name_l in cands):
+                        entry = m
+                        break
+                if entry:
+                    break
+            ds4o = entry.get("ds4") if entry and isinstance(entry.get("ds4"), dict) else None
+            if not ds4o:
+                return out
+            if ds4o.get("ssd_streaming") is not None:
+                out["ssd_streaming"] = bool(ds4o["ssd_streaming"])
+            rg = ds4o.get("expert_cache_reserve_gb")
+            if rg not in (None, "", 0, "0"):
+                try:
+                    out["expert_cache_reserve_gb"] = max(0, int(rg))
+                except (TypeError, ValueError):
+                    pass
+            for k in ("extra_args", "extra_env"):
+                v = ds4o.get(k)
+                if v and str(v).strip():
+                    out[k] = str(v).strip()
+        except Exception:
+            pass
+        return out
 
     @staticmethod
     def _resolve_gguf(model_name: str):
@@ -187,29 +252,53 @@ class Ds4Backend(ModelBackend):
         queue: asyncio.Queue = asyncio.Queue()
         _SENTINEL = object()
 
+        def _handle_line(line: str) -> bool:
+            """Process one SSE line; return True when the stream should stop."""
+            if not line or not line.startswith("data:"):
+                return False
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":
+                return True
+            try:
+                obj = json.loads(data)
+            except ValueError:
+                return False
+            choice = (obj.get("choices") or [{}])[0]
+            text = (choice.get(delta_key) or {}).get("content") or ""
+            if text:
+                loop.call_soon_threadsafe(queue.put_nowait, text)
+            if obj.get("usage"):
+                self._store_usage(obj["usage"])
+            return bool(choice.get("finish_reason"))
+
         def _worker():
             import requests
             try:
                 with requests.post(url, json=payload, stream=True, timeout=3600) as r:
                     r.raise_for_status()
-                    for raw in r.iter_lines(decode_unicode=True):
-                        if not raw or not raw.startswith("data:"):
+                    # Parse the SSE byte stream ourselves and split on the b"\n"
+                    # byte. requests' iter_lines(decode_unicode=True) decodes each
+                    # network chunk independently, so a multibyte UTF-8 char split
+                    # across chunks gets corrupted — which breaks that event's JSON
+                    # and silently drops the token (mangled '—', truncated tails).
+                    # b"\n" (0x0A) can never fall inside a UTF-8 multibyte sequence,
+                    # so splitting bytes first and decoding whole lines is safe.
+                    buf = b""
+                    done = False
+                    for bchunk in r.iter_content(chunk_size=8192):
+                        if not bchunk:
                             continue
-                        data = raw[len("data:"):].strip()
-                        if data == "[DONE]":
+                        buf += bchunk
+                        while b"\n" in buf:
+                            raw, buf = buf.split(b"\n", 1)
+                            if _handle_line(raw.decode("utf-8", "replace").strip()):
+                                done = True
+                                break
+                        if done:
                             break
-                        try:
-                            obj = json.loads(data)
-                        except ValueError:
-                            continue
-                        choice = (obj.get("choices") or [{}])[0]
-                        text = (choice.get(delta_key) or {}).get("content") or ""
-                        if text:
-                            loop.call_soon_threadsafe(queue.put_nowait, text)
-                        if obj.get("usage"):
-                            self._store_usage(obj["usage"])
-                        if choice.get("finish_reason"):
-                            break
+                    # Flush any final line the stream left without a trailing newline.
+                    if not done and buf.strip():
+                        _handle_line(buf.decode("utf-8", "replace").strip())
             except Exception as exc:  # surface to the consumer
                 loop.call_soon_threadsafe(queue.put_nowait, exc)
             finally:

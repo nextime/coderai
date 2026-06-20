@@ -1789,7 +1789,7 @@ async def stream_chat_response(
             "model": model_name,
             "choices": [{
                 "index": 0,
-                "delta": {"content": "Waiting for model reply..."},
+                "delta": {"content": "Waiting for model reply...\n"},
                 "finish_reason": None,
             }],
             "x_queue_info": {
