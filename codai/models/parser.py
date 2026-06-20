@@ -1190,14 +1190,23 @@ def parse_tool_tag_plaintext_calls(text: str, tool_names=None):
     tokens — higher-quant models emit proper formats and never reach here.
 
     To avoid catching a ``<tool>`` *example* a model writes inside an explanatory
-    reply, the block(s) must be the message's trailing ACTION: after the first
-    ``<tool>`` everything to end-of-text must be only ``<tool>…</tool>`` blocks and
-    whitespace. A reply with prose after/between the tags is treated as text, not a
-    call. Returns ``[(name, args), …]``."""
+    reply, AND to avoid amplifying the degenerate ``<tool>name</tool><tool>name</tool>…``
+    spam a too-low quant emits when it falls apart, this is deliberately strict:
+      - the block(s) must be the message's trailing ACTION — after the first
+        ``<tool>`` everything to end-of-text must be only ``<tool>…</tool>`` blocks
+        and whitespace (prose after/between → treated as text, not calls);
+      - every block must carry at least one ``key: value`` argument — a BARE
+        ``<tool>name</tool>`` is the spam signature, never a real call here;
+      - the whole reply may yield at most a few distinct calls — a flood of blocks
+        is model degeneration, so the batch is rejected wholesale.
+    Returns ``[(name, args), …]``."""
     if not text or '<tool' not in text.lower() or not tool_names:
         return []
     blocks = list(re.finditer(r'<tool\s*>(.*?)</tool\s*>', text, re.DOTALL | re.IGNORECASE))
     if not blocks:
+        return []
+    # A flood of <tool> tags is a model falling apart, not many real calls.
+    if len(blocks) > 6:
         return []
     # Require the tag(s) to form the trailing run of the message: strip the matched
     # blocks out of the tail (from the first block on) and demand only whitespace is
@@ -1227,6 +1236,10 @@ def parse_tool_tag_plaintext_calls(text: str, tool_names=None):
                 k = k.strip()
                 if k:
                     args[k] = v.strip()
+        # A bare <tool>name</tool> with no arguments is the degenerate-spam shape,
+        # never a real call in this format — drop it.
+        if not args:
+            continue
         key = (name, json.dumps(args, sort_keys=True, default=str))
         if key in seen:
             continue
