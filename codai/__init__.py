@@ -14,6 +14,10 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+# Canonical product version for CoderAI — single source of truth. Both the API
+# metadata and the admin web UI read from here.
+__version__ = "0.1.0"
+
 # Configure the CUDA caching allocator BEFORE torch is imported anywhere.
 # expandable_segments lets the allocator return freed pages to the driver even
 # from partially-used segments.  Without it, a single small live tensor (e.g. a

@@ -54,6 +54,7 @@ body,.table-wrap,.modal-box,.chat-messages,.studio .model-list,.studio .chat-msg
   font-size:9px;font-weight:700;color:#fff;letter-spacing:-.01em;
 }
 .nav-logo-name{font-size:13px;font-weight:700;letter-spacing:-.01em}
+.nav-logo-version{margin-left:6px;padding:1px 6px;border-radius:999px;font-size:10px;font-weight:600;line-height:1.4;color:var(--muted,#8b8f98);background:rgba(127,127,127,.14);letter-spacing:.01em}
 
 /* nav links */
 .nav-links{display:flex;align-items:center;gap:1px}

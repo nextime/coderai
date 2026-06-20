@@ -100,8 +100,10 @@ def _tmpl(request: Request, name: str, ctx: dict = None):
     picked up on a normal reload instead of being masked by the browser cache.
     """
     from codai.api.urlutils import get_public_prefix
+    from codai import __version__ as _coderai_version
     c = ctx or {}
     c.setdefault("root_path", get_public_prefix(request))
+    c.setdefault("coderai_version", _coderai_version)
     resp = templates.TemplateResponse(request, name, c)
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"

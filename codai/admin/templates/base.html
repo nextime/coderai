@@ -21,6 +21,7 @@
       <a href="{{ root_path }}/admin" class="nav-logo">
         <div class="nav-logo-mark">AI</div>
         <span class="nav-logo-name">CoderAI</span>
+        {% if coderai_version %}<span class="nav-logo-version" title="CoderAI version">v{{ coderai_version }}</span>{% endif %}
       </a>
       <div class="nav-links">
         <a href="{{ root_path }}/admin" class="nav-link {% if request.url.path == '/admin' %}active{% endif %}">Overview</a>
