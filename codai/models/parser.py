@@ -76,7 +76,25 @@ def extract_reasoning_content(text: str, model_family: str = None) -> Tuple[str,
                 break
         except:
             continue
-    
+
+    # Bare closing tag, no opening tag. Qwen3 (and other models whose chat template
+    # PRE-FILLS the opening <think> in the prompt) generate only the reasoning body
+    # followed by a closing </think> — there is no opening tag in the output, so the
+    # paired patterns above never match and the whole thought would leak into the
+    # content. Treat everything up to the first bare close tag as reasoning, as long
+    # as no matching opening tag precedes it.
+    if not reasoning_content:
+        for close in ('</think>', '</thinking>', '</thought>'):
+            idx = protected_text.lower().find(close)
+            if idx == -1:
+                continue
+            open_tag = close.replace('</', '<', 1)
+            if open_tag.lower() in protected_text[:idx].lower():
+                continue  # a real opening tag exists — leave it to the paired logic
+            reasoning_content = protected_text[:idx].strip()
+            clean_text = protected_text[idx + len(close):].strip()
+            break
+
     # Cleanup with pre-compiled patterns
     for p in REASONING_CLEANUP_PATTERNS:
         clean_text = p.sub('', clean_text)

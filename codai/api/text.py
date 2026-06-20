@@ -937,7 +937,32 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     # Combine CLI args with API param
     # 'chat' from CLI enables API reasoning param
     reasoning_enabled = enable_thinking_api or (len(force_reasoning_args) > 0)
-    
+
+    # Whether to suppress the reasoning channel (drop the model's thinking from the
+    # response). A REQUEST override wins, via a standard field — OpenRouter's
+    # `reasoning: {"exclude": true}`, OpenAI-style `reasoning_effort: "none"`, or a
+    # plain `suppress_reasoning` bool — else the per-model `suppress_reasoning`
+    # config. Default: surface reasoning as a separate `reasoning`/`reasoning_content`.
+    _suppress_reasoning = None
+    _req_reasoning = getattr(request, "reasoning", None)
+    if isinstance(_req_reasoning, dict) and "exclude" in _req_reasoning:
+        _suppress_reasoning = bool(_req_reasoning.get("exclude"))
+    if _suppress_reasoning is None:
+        _eff = getattr(request, "reasoning_effort", None)
+        if isinstance(_eff, str) and _eff.strip().lower() in ("none", "off", "disable"):
+            _suppress_reasoning = True
+    if _suppress_reasoning is None:
+        _rs = getattr(request, "suppress_reasoning", None)
+        if _rs is not None:
+            _suppress_reasoning = bool(_rs)
+    if _suppress_reasoning is None:
+        try:
+            from codai.models.manager import multi_model_manager as _mmm_sr
+            _sr_cfg = _mmm_sr._config_for_model(getattr(request, "model", None) or "") or {}
+            _suppress_reasoning = bool(_sr_cfg.get("suppress_reasoning", False))
+        except Exception:
+            _suppress_reasoning = False
+
     # DEBUG: Print force_reasoning status when debug mode is enabled
     if get_global_debug():
         # Get ggg and tools_closer_prompt from global_args
@@ -962,7 +987,16 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     # Check if model is qwen3 and force_reasoning is enabled
     is_qwen3 = 'qwen3' in model_family.lower() if model_family else False
     use_qwen3_penalties = is_qwen3 and force_reasoning_args
-    
+
+    # The reasoning channel must be separated whenever the model actually thinks —
+    # which includes models that AUTO-think: their chat template pre-fills <think>
+    # at generation regardless of the API `enable_thinking` flag (e.g. Qwen3, QwQ,
+    # DeepSeek-R1). So activate on the explicit flag OR a thinking-model name.
+    _thinking_model = bool(_re.search(
+        r'qwen3|qwq|deepseek[-_]?r[12]|[-_]reasoner|[-_]thinking|glm[-_]?z1',
+        (getattr(request, 'model', '') or ''), _re.IGNORECASE))
+    _reasoning_active = bool(reasoning_enabled) or _thinking_model
+
     # System prompt addon for qwen3 with force_reasoning
     qwen3_system_addon = ""
     if use_qwen3_penalties:
@@ -1774,6 +1808,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     _prefix_key,
                     enable_thinking=reasoning_enabled,
                     compact_plan=_compact_plan,
+                    suppress_reasoning=_suppress_reasoning,
+                    reasoning_active=_reasoning_active,
                 ):
                     yield chunk
             finally:
@@ -1796,6 +1832,8 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 request.response_format,
                 force_reasoning_args,
                 enable_thinking=reasoning_enabled,
+                suppress_reasoning=_suppress_reasoning,
+                reasoning_active=_reasoning_active,
             )
         finally:
             _release_instance()
@@ -1819,6 +1857,41 @@ _GEMMA_CALL_OPEN_RE = _re.compile(r'call:\s*[A-Za-z_]\w*\s*\{')
 # | tolerated). Withhold from the first DSML marker to the end so the raw block is
 # never streamed as visible content — it's surfaced as structured tool_calls.
 _DSML_OPEN_RE = _re.compile(r'<[｜|]DSML[｜|]')
+
+# Reasoning channel: a closing think tag terminates the model's thought. Qwen-style
+# chat templates PRE-FILL the opening <think> in the prompt, so the stream begins
+# inside the thought and ends with a bare </think> (no opening tag in the output).
+_THINK_CLOSE_RE = _re.compile(r'</(?:think|thinking|thought)\s*>', _re.IGNORECASE)
+_THINK_OPEN_RE = _re.compile(r'^\s*<(?:think|thinking|thought)\s*>', _re.IGNORECASE)
+_THINK_CLOSE_TAGS = ('</think>', '</thinking>', '</thought>')
+
+
+def _gate_reasoning(buffer: str, final: bool = False):
+    """Split a streaming buffer at the reasoning close tag.
+
+    Returns ``(reasoning_out, content_out, new_buffer, closed)``:
+      - before any close tag → the text is reasoning, but a trailing fragment that
+        could be the start of a partial close tag (e.g. ``</thin``) is held back in
+        ``new_buffer`` so half a tag is never emitted as reasoning;
+      - when a close tag is found → text before it is reasoning, text after it is
+        content, and ``closed`` is True. A leading explicit ``<think>`` is dropped.
+    On ``final`` the whole remaining buffer is flushed as reasoning."""
+    # Drop an explicit opening tag if the model emitted one (most don't).
+    om = _THINK_OPEN_RE.match(buffer)
+    if om:
+        buffer = buffer[om.end():]
+    m = _THINK_CLOSE_RE.search(buffer)
+    if m:
+        return buffer[:m.start()], buffer[m.end():], "", True
+    if final:
+        return buffer, "", "", False
+    # Hold back a trailing fragment that may be the prefix of a close tag.
+    idx = buffer.rfind('<')
+    if idx != -1:
+        tail = buffer[idx:].lower()
+        if any(t.startswith(tail) for t in _THINK_CLOSE_TAGS):
+            return buffer[:idx], "", buffer[idx:], False
+    return buffer, "", "", False
 
 
 def _gate_tool_content(buffer: str, final: bool = False):
@@ -1910,6 +1983,8 @@ async def stream_chat_response(
     prefix_key: str = "",
     enable_thinking: bool = False,
     compact_plan: Optional[Dict] = None,
+    suppress_reasoning: bool = False,
+    reasoning_active: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Stream chat completion response with queue notifications."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -2054,6 +2129,16 @@ async def stream_chat_response(
         # post tool-gating) — logged once at the end under --debug-requests so we
         # see the real reply, not just what we extracted internally.
         client_sent_content = ""
+        # Reasoning channel state. When thinking is enabled the model starts INSIDE
+        # its thought (Qwen pre-fills the opening <think>), so route everything up to
+        # the closing </think> into the reasoning field instead of content. The gate
+        # runs whenever thinking is enabled — even with suppress_reasoning, where it
+        # still strips the thought from content but emits no reasoning deltas. The
+        # boundary may straddle chunks, so buffer until it's resolvable.
+        _reason_active = bool(reasoning_active)
+        _reason_closed = False
+        _reason_buf = ""
+        reasoning_text = ""
 
         # Debug: Print what is being passed to the model
         if get_global_debug():
@@ -2128,6 +2213,38 @@ async def stream_chat_response(
                     _tail = generated_text[-220:].replace("\n", "\\n")
                     print(f"# <<< [live @{chunk_count} tok] …{_tail}", flush=True)
 
+            # Reasoning gate: while the model is still inside its thought, route the
+            # text into the reasoning channel (delta.reasoning / reasoning_content)
+            # instead of content — or drop it when suppress_reasoning is set. On the
+            # closing </think> we flip to content and keep streaming normally.
+            if _reason_active and not _reason_closed:
+                _reason_buf += filtered_chunk
+                _r_out, _c_out, _reason_buf, _closed = _gate_reasoning(_reason_buf)
+                if _r_out:
+                    reasoning_text += _r_out
+                    if not suppress_reasoning:
+                        rdata = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"reasoning": _r_out, "reasoning_content": _r_out},
+                                "finish_reason": None,
+                            }],
+                        }
+                        yield f"data: {json.dumps(rdata)}\n\n"
+                        await asyncio.sleep(0)
+                if not _closed:
+                    await asyncio.sleep(0)
+                    continue
+                _reason_closed = True
+                filtered_chunk = _c_out          # post-</think> remainder is content
+                if not filtered_chunk:
+                    await asyncio.sleep(0)
+                    continue
+
             # When tools are enabled, gate the content so in-progress <tool>…</tool>
             # spans are never streamed as visible text (they're surfaced as
             # structured tool_calls after the stream). Without tools, stream as-is.
@@ -2153,6 +2270,34 @@ async def stream_chat_response(
             yield f"data: {json.dumps(data)}\n\n"
             # Explicitly flush to ensure data is sent immediately
             await asyncio.sleep(0)
+
+        # Stream ended while still inside the thought (no closing </think>). Flush
+        # whatever reasoning is held as reasoning, not content.
+        if _reason_active and not _reason_closed and _reason_buf:
+            _r_out, _c_out, _reason_buf, _closed = _gate_reasoning(_reason_buf, final=True)
+            _reason_closed = True
+            if _r_out:
+                reasoning_text += _r_out
+                if not suppress_reasoning:
+                    rdata = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"reasoning": _r_out, "reasoning_content": _r_out},
+                            "finish_reason": None,
+                        }],
+                    }
+                    yield f"data: {json.dumps(rdata)}\n\n"
+
+        # The post-</think> answer text — reasoning stripped — used for final tool
+        # extraction and logging so the thought never re-enters the content channel.
+        answer_text = generated_text
+        if _reason_active:
+            _cm = _THINK_CLOSE_RE.search(generated_text)
+            answer_text = generated_text[_cm.end():] if _cm else ""
 
         # Flush any safe trailing text held back by the tool-content gate
         # (dropping leftover/unclosed tool tags — they become tool_calls below).
@@ -2215,8 +2360,8 @@ async def stream_chat_response(
                     logger.debug("Error converting tool: %s (type: %s)", e, type(t))
                     continue
             try:
-                tool_calls = tool_parser.extract_tool_calls(generated_text, tool_objects)
-                
+                tool_calls = tool_parser.extract_tool_calls(answer_text, tool_objects)
+
                 # FIX: Validate extracted tool calls have valid JSON (stream_chat_response)
                 if tool_calls:
                     from codai.models.parser import validate_json_complete
@@ -2380,6 +2525,8 @@ async def generate_chat_response(
     response_format: Optional[Dict] = None,
     force_reasoning_args: Optional[List[str]] = None,
     enable_thinking: bool = False,
+    suppress_reasoning: bool = False,
+    reasoning_active: bool = False,
 ) -> Dict:
     """Generate non-streaming chat completion response."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -2435,13 +2582,25 @@ async def generate_chat_response(
             print(generated_text)
             print(f"{'='*80}\n")
         
+        # Separate the model's thinking from the answer. Surface it as a reasoning
+        # field (unless suppress_reasoning), keeping content clean — and so the
+        # thought never confuses tool extraction below. Handles the bare-</think>
+        # form Qwen-style pre-fill templates produce (see extract_reasoning_content).
+        reasoning_text = ""
+        if reasoning_active:
+            from codai.models.parser import extract_reasoning_content
+            reasoning_text, generated_text = extract_reasoning_content(generated_text, model_name)
+
         response_message = {
             "role": "assistant",
             "content": generated_text,
         }
-        
+        if reasoning_text and not suppress_reasoning:
+            response_message["reasoning"] = reasoning_text
+            response_message["reasoning_content"] = reasoning_text
+
         finish_reason = "stop"
-        
+
         # Check for tool calls
         if tools:
             # Convert tools back to Tool objects for parsing
@@ -2527,7 +2686,15 @@ async def generate_chat_response(
         if formatted_response and 'usage' in formatted_response:
             details = formatted_response['usage'].setdefault('prompt_tokens_details', {})
             details['cached_tokens'] = cached_tokens
-        
+
+        # Carry the extracted reasoning onto the formatted message (the formatter
+        # doesn't take a reasoning arg here). Emit both field names for client
+        # compatibility (`reasoning` and DeepSeek-style `reasoning_content`).
+        if reasoning_text and not suppress_reasoning and formatted_response.get("choices"):
+            _msg = formatted_response["choices"][0].setdefault("message", {})
+            _msg["reasoning"] = reasoning_text
+            _msg["reasoning_content"] = reasoning_text
+
         # Add mock reasoning stats if 'mock' is in force_reasoning_args
         # But only if we don't already have real reasoning in the response
         # Check if reasoning already exists in the message

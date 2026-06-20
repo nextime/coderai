@@ -86,6 +86,9 @@ class ChatCompletionRequest(BaseModel):
     response_format: Optional[Dict] = Field(None, description="Structured-output format, e.g. {'type': 'json_object'}.")
     user: Optional[str] = Field(None, description="Opaque end-user identifier (passthrough).")
     enable_thinking: Optional[bool] = Field(False, description="Enable thinking/reasoning mode for models that support it.")
+    reasoning: Optional[Dict] = Field(None, description="Reasoning controls. OpenRouter-style; set {'exclude': true} to drop the model's thinking from the response.")
+    reasoning_effort: Optional[str] = Field(None, description="OpenAI-style reasoning effort ('low'|'medium'|'high'); 'none'/'off' suppresses reasoning output.")
+    suppress_reasoning: Optional[bool] = Field(None, description="Drop the model's reasoning/thinking from the response instead of returning it as a separate field.")
 
     model_config = ConfigDict(extra="allow")  # Allow extra fields to prevent 422 errors
 

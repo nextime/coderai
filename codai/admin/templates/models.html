@@ -722,6 +722,13 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         </div>
       </div>
 
+      <!-- Reasoning channel: surface the model's <think> thought as a separate
+           reasoning field by default; this suppresses it from the response. -->
+      <div style="margin-top:1rem">
+        <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-suppress-reasoning"> Suppress reasoning output <span class="muted">(drop the model's &lt;think&gt; thinking instead of returning it)</span></label>
+        <span class="form-hint" style="font-size:11px">By default the model's thinking is returned as a separate <code>reasoning</code> / <code>reasoning_content</code> field (think/thinking/thought tags, including the bare <code>&lt;/think&gt;</code> Qwen pre-fill emits) and kept out of <code>content</code>. Enable this to discard it entirely. A request can override per-call with <code>reasoning:{exclude:true}</code>, <code>reasoning_effort:"none"</code>, or <code>suppress_reasoning</code>.</span>
+      </div>
+
       <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-top:.75rem">
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-4bit"> 4-bit quantization</label>
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-8bit"> 8-bit quantization</label>
@@ -3235,6 +3242,7 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-autocompact-pct').value = s.auto_compact_pct != null ? s.auto_compact_pct : 85;
   document.getElementById('cfg-autocompact-strategy').value = s.auto_compact_strategy || 'drop_oldest';
   _populateCompactModelSelect(s.auto_compact_model || '');
+  document.getElementById('cfg-suppress-reasoning').checked = !!s.suppress_reasoning;
   _toggleAutoCompact();
   document.getElementById('cfg-4bit').checked = !!s.load_in_4bit;
   document.getElementById('cfg-8bit').checked = !!s.load_in_8bit;
@@ -3625,6 +3633,7 @@ async function saveModelConfig(){
     auto_compact_pct:  parseInt(document.getElementById('cfg-autocompact-pct').value) || 85,
     auto_compact_strategy: document.getElementById('cfg-autocompact-strategy').value || 'drop_oldest',
     auto_compact_model: document.getElementById('cfg-autocompact-model').value || '',
+    suppress_reasoning: document.getElementById('cfg-suppress-reasoning').checked,
     max_gpu_percent:   isNaN(maxGpu) ? null : maxGpu,
     manual_ram_gb:     isNaN(ramGb) ? null : ramGb,
     load_in_4bit:      document.getElementById('cfg-4bit').checked,
