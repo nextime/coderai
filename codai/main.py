@@ -354,6 +354,36 @@ def main():
         except Exception as _e:
             print(f"WARNING: tmp janitor failed to start: {_e}")
 
+    # Age-prune the ds4 on-disk KV-checkpoint cache (<offload>/ds4-kv, or an
+    # explicit --kv-disk-dir in ds4 extra_args). Abandoned ds4 sessions leave large
+    # KV files that never self-prune. Only when ds4 + this cleanup are both enabled.
+    try:
+        _ds4 = getattr(config, "ds4", None)
+        if _ds4 and getattr(_ds4, "enabled", False) and getattr(_ds4, "kv_cache_cleanup_enabled", False):
+            _kv_dir = ""
+            _extra = (getattr(_ds4, "extra_args", "") or "")
+            if "--kv-disk-dir" in _extra:
+                import shlex as _shlex
+                _toks = _shlex.split(_extra)
+                for _i, _t in enumerate(_toks):
+                    if _t == "--kv-disk-dir" and _i + 1 < len(_toks):
+                        _kv_dir = _toks[_i + 1]
+                        break
+            if not _kv_dir:
+                _off = (getattr(config.offload, "directory", "") or "").strip()
+                if _off:
+                    _kv_dir = os.path.join(os.path.expanduser(_off), "ds4-kv")
+            if _kv_dir:
+                from codai.api.ds4_kv_janitor import start as _start_ds4_kv_janitor
+                _start_ds4_kv_janitor(
+                    _kv_dir,
+                    enabled=True,
+                    max_age_hours=getattr(_ds4, "kv_cache_max_age_hours", 168.0),
+                    interval_minutes=getattr(_ds4, "kv_cache_cleanup_interval_minutes", 360.0),
+                )
+    except Exception as _e:
+        print(f"WARNING: ds4 kv janitor failed to start: {_e}")
+
     # Apply cache directory overrides from config before any cache module is used.
     # We set env vars AND patch huggingface_hub.constants in case the library was
     # already imported (constants are computed once at import time from env vars).

@@ -153,7 +153,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
 
     <!-- query row -->
     <div class="search-bar" style="margin-bottom:.75rem">
-      <input type="text" id="search-q" class="form-input" placeholder="Search models (e.g. llama, mistral, qwen…)">
+      <input type="text" id="search-q" class="form-input" placeholder="Search models (e.g. llama, mistral, qwen…)" onkeydown="if(event.key==='Enter'){event.preventDefault();doSearch();}">
       <button class="btn btn-secondary" onclick="doSearch()">Search</button>
     </div>
 

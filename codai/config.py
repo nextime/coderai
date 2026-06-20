@@ -273,6 +273,15 @@ class Ds4Config:
     # the streaming expert cache, avoiding "model arena alloc failed … OOM".
     extra_env: str = ""
     auto_build: bool = True                # clone+build the binary if it's missing
+    # On-disk KV-checkpoint cache (ds4-server --kv-disk-dir, defaulted to
+    # <offload>/ds4-kv). ds4 writes prompt KV checkpoints here to reuse across
+    # requests; abandoned sessions accumulate and never self-prune. When enabled, a
+    # background janitor deletes cache entries whose newest file is older than
+    # kv_cache_max_age_hours every kv_cache_cleanup_interval_minutes. Active
+    # sessions (recently touched) are spared (age is by newest mtime).
+    kv_cache_cleanup_enabled: bool = False
+    kv_cache_max_age_hours: float = 168.0          # 7 days
+    kv_cache_cleanup_interval_minutes: float = 360.0  # 6 hours
 
 
 @dataclass
@@ -644,6 +653,9 @@ class ConfigManager:
                 "expert_cache_reserve_gb": self.config.ds4.expert_cache_reserve_gb,
                 "extra_env": self.config.ds4.extra_env,
                 "auto_build": self.config.ds4.auto_build,
+                "kv_cache_cleanup_enabled": self.config.ds4.kv_cache_cleanup_enabled,
+                "kv_cache_max_age_hours": self.config.ds4.kv_cache_max_age_hours,
+                "kv_cache_cleanup_interval_minutes": self.config.ds4.kv_cache_cleanup_interval_minutes,
             },
             "compaction": {
                 "enabled": self.config.compaction.enabled,

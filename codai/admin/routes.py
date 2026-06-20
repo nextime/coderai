@@ -3432,6 +3432,9 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "expert_cache_reserve_gb": c.ds4.expert_cache_reserve_gb,
             "extra_env": c.ds4.extra_env,
             "auto_build": c.ds4.auto_build,
+            "kv_cache_cleanup_enabled": c.ds4.kv_cache_cleanup_enabled,
+            "kv_cache_max_age_hours": c.ds4.kv_cache_max_age_hours,
+            "kv_cache_cleanup_interval_minutes": c.ds4.kv_cache_cleanup_interval_minutes,
         },
         "compaction": {
             "enabled": c.compaction.enabled,
@@ -3726,6 +3729,18 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             c.ds4.extra_env = (d.get("extra_env") or "").strip()
         if "auto_build" in d:
             c.ds4.auto_build = bool(d["auto_build"])
+        if "kv_cache_cleanup_enabled" in d:
+            c.ds4.kv_cache_cleanup_enabled = bool(d["kv_cache_cleanup_enabled"])
+        if "kv_cache_max_age_hours" in d:
+            try:
+                c.ds4.kv_cache_max_age_hours = max(0.0, float(d["kv_cache_max_age_hours"]))
+            except (TypeError, ValueError):
+                pass
+        if "kv_cache_cleanup_interval_minutes" in d:
+            try:
+                c.ds4.kv_cache_cleanup_interval_minutes = max(1.0, float(d["kv_cache_cleanup_interval_minutes"]))
+            except (TypeError, ValueError):
+                pass
 
     if "compaction" in data:
         cp = data["compaction"] or {}
