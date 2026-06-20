@@ -365,8 +365,8 @@ def main():
             if "--kv-disk-dir" in _extra:
                 import shlex as _shlex
                 _toks = _shlex.split(_extra)
-                for _i, _t in enumerate(_toks):
-                    if _t == "--kv-disk-dir" and _i + 1 < len(_toks):
+                for _i, _tok in enumerate(_toks):
+                    if _tok == "--kv-disk-dir" and _i + 1 < len(_toks):
                         _kv_dir = _toks[_i + 1]
                         break
             if not _kv_dir:
