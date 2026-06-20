@@ -222,17 +222,28 @@ class CompactionConfig:
     """Global defaults for auto-compaction of an over-long chat history.
 
     Per-model settings in a models.json entry (``auto_compact``,
-    ``auto_compact_pct``, ``auto_compact_strategy``, ``auto_compact_model``)
-    OVERRIDE the values here; when a model leaves one unset, the global default
-    below applies. ``model`` selects which model performs the summarization for
-    the ``summarize`` strategy — empty means use the same model that serves the
-    request. Pointing it at a smaller/faster model lets that model summarize the
-    old turns while the big model answers; the dropped history is chunked to fit
-    the chosen summarizer's own context window before it is summarized."""
+    ``auto_compact_pct``, ``auto_compact_strategy``, ``auto_compact_model``,
+    ``auto_compact_tolerance_pct``) OVERRIDE the values here; when a model leaves
+    one unset, the global default below applies. ``model`` selects which model
+    performs the summarization for the ``summarize`` strategy — empty means use
+    the same model that serves the request. Pointing it at a smaller/faster model
+    lets that model summarize the old turns while the big model answers; the
+    dropped history is chunked to fit the chosen summarizer's own context window
+    before it is summarized.
+
+    The over-context check counts the prompt PLUS the request's ``max_tokens``
+    (the reply is generated into the same window). When that total overflows
+    ``n_ctx`` by no more than ``tolerance_pct`` we leave history alone and just
+    trim ``max_tokens`` to fit (lossless); beyond that we compact, and as a last
+    resort slice any single message still larger than the target. ``min_output``
+    is the smallest reply (in tokens) we always try to leave room for."""
     enabled: bool = False
     pct: int = 85                        # compact when the prompt reaches this % of n_ctx
     strategy: str = "drop_oldest"        # drop_oldest | keep_head_tail | summarize
     model: str = ""                      # model id/alias that summarizes; "" = same as request
+    tolerance_pct: int = 20              # accept prompt+max_tokens up to this % over n_ctx (trim instead of compact)
+    min_output: int = 512                # always try to leave at least this many tokens for the reply
+    estimate_safety: float = 1.15        # inflate the chars/4 prompt estimate by this factor for fit/trim (it undercounts code/JSON)
 
 
 @dataclass
@@ -666,6 +677,9 @@ class ConfigManager:
                 "pct": self.config.compaction.pct,
                 "strategy": self.config.compaction.strategy,
                 "model": self.config.compaction.model,
+                "tolerance_pct": self.config.compaction.tolerance_pct,
+                "min_output": self.config.compaction.min_output,
+                "estimate_safety": self.config.compaction.estimate_safety,
             },
             "broker": {
                 "enabled": self.config.broker.enabled,
