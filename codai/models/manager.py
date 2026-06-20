@@ -390,25 +390,33 @@ class ModelManager:
     def generate_chat(self, messages: List[Dict], max_tokens: Optional[int] = None,
                       temperature: float = 0.7, top_p: float = 1.0,
                       stop: Optional[List[str]] = None, tools: Optional[List] = None,
-                      response_format: Optional[Dict] = None, enable_thinking: bool = False):
-        """Generate chat completion non-streaming."""
+                      response_format: Optional[Dict] = None, enable_thinking: bool = False,
+                      repeat_penalty: float = 1.0, presence_penalty: float = 0.0,
+                      frequency_penalty: float = 0.0):
+        """Generate chat completion non-streaming.
+
+        Forwards client repetition controls to the backend (defaults are no-ops)."""
         if self.backend is None:
             raise RuntimeError("No model loaded")
+        _pen = dict(repeat_penalty=repeat_penalty, presence_penalty=presence_penalty,
+                    frequency_penalty=frequency_penalty)
         # Use generate_chat if available (Vulkan backend), otherwise format and use generate
         if hasattr(self.backend, 'generate_chat'):
-            try:
-                return self.backend.generate_chat(messages, max_tokens, temperature, top_p,
-                                                  stop, tools, response_format,
-                                                  enable_thinking=enable_thinking)
-            except TypeError:
-                # Backend doesn't accept enable_thinking (e.g. Vulkan) — call plainly.
-                return self.backend.generate_chat(messages, max_tokens, temperature, top_p,
-                                                  stop, tools, response_format)
+            for _extra in (dict(enable_thinking=enable_thinking, **_pen),
+                           dict(enable_thinking=enable_thinking), {}):
+                try:
+                    return self.backend.generate_chat(messages, max_tokens, temperature, top_p,
+                                                      stop, tools, response_format, **_extra)
+                except TypeError:
+                    continue
         else:
             # Fallback for NVIDIA backend
             from codai.pydantic.textrequest import ChatMessage
             prompt = self.format_messages([ChatMessage(**m) for m in messages])
-            return self.backend.generate(prompt, max_tokens, temperature, top_p, stop)
+            try:
+                return self.backend.generate(prompt, max_tokens, temperature, top_p, stop, **_pen)
+            except TypeError:
+                return self.backend.generate(prompt, max_tokens, temperature, top_p, stop)
     
     async def generate_stream(self, prompt: str, max_tokens: Optional[int] = None,
                               temperature: float = 0.7, top_p: float = 1.0,
@@ -422,26 +430,42 @@ class ModelManager:
     async def generate_chat_stream(self, messages: List[Dict], max_tokens: Optional[int] = None,
                                     temperature: float = 0.7, top_p: float = 1.0,
                                     stop: Optional[List[str]] = None, tools: Optional[List] = None,
-                                    response_format: Optional[Dict] = None, enable_thinking: bool = False):
-        """Generate chat completion streaming."""
+                                    response_format: Optional[Dict] = None, enable_thinking: bool = False,
+                                    repeat_penalty: float = 1.0, presence_penalty: float = 0.0,
+                                    frequency_penalty: float = 0.0):
+        """Generate chat completion streaming.
+
+        Client-supplied repetition controls (repeat/presence/frequency penalty) are
+        forwarded to the backend so a caller like Kilo can damp runaway loops via its
+        own per-model settings. Defaults are no-ops, so unset clients are unaffected."""
         if self.backend is None:
             raise RuntimeError("No model loaded")
+        _pen = dict(repeat_penalty=repeat_penalty, presence_penalty=presence_penalty,
+                    frequency_penalty=frequency_penalty)
         # Use generate_chat_stream if available (Vulkan backend), otherwise format and use generate_stream
         if hasattr(self.backend, 'generate_chat_stream'):
-            try:
-                _gen = self.backend.generate_chat_stream(
-                    messages, max_tokens, temperature, top_p, stop, tools,
-                    response_format, enable_thinking=enable_thinking)
-            except TypeError:
-                _gen = self.backend.generate_chat_stream(
-                    messages, max_tokens, temperature, top_p, stop, tools, response_format)
+            # Try richest signature first, then progressively drop kwargs the backend
+            # doesn't accept (older signatures) so we never hard-fail on plumbing.
+            for _extra in (dict(enable_thinking=enable_thinking, **_pen),
+                           dict(enable_thinking=enable_thinking), {}):
+                try:
+                    _gen = self.backend.generate_chat_stream(
+                        messages, max_tokens, temperature, top_p, stop, tools,
+                        response_format, **_extra)
+                    break
+                except TypeError:
+                    continue
             async for chunk in _gen:
                 yield chunk
         else:
             # Fallback for NVIDIA backend
             from codai.pydantic.textrequest import ChatMessage
             prompt = self.format_messages([ChatMessage(**m) for m in messages])
-            async for chunk in self.backend.generate_stream(prompt, max_tokens, temperature, top_p, stop):
+            try:
+                _gen = self.backend.generate_stream(prompt, max_tokens, temperature, top_p, stop, **_pen)
+            except TypeError:
+                _gen = self.backend.generate_stream(prompt, max_tokens, temperature, top_p, stop)
+            async for chunk in _gen:
                 yield chunk
     
     @property

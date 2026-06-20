@@ -1972,6 +1972,9 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     compact_plan=_compact_plan,
                     suppress_reasoning=_suppress_reasoning,
                     reasoning_active=_reasoning_active,
+                    repeat_penalty=request.repeat_penalty,
+                    presence_penalty=request.presence_penalty,
+                    frequency_penalty=request.frequency_penalty,
                 ):
                     yield chunk
             finally:
@@ -1996,6 +1999,9 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 enable_thinking=reasoning_enabled,
                 suppress_reasoning=_suppress_reasoning,
                 reasoning_active=_reasoning_active,
+                repeat_penalty=request.repeat_penalty,
+                presence_penalty=request.presence_penalty,
+                frequency_penalty=request.frequency_penalty,
             )
         finally:
             _release_instance()
@@ -2131,6 +2137,37 @@ def _context_overflow_detail(e) -> Optional[str]:
     return None
 
 
+def _detect_runaway_repetition(text: str) -> bool:
+    """Heuristic guard against a model stuck emitting the same fragment forever
+    (e.g. Qwen collapsing into a malformed parallel tool-call loop). It normalises
+    away the *variable* parts — quoted strings, filesystem paths, whitespace — so a
+    loop whose only difference each cycle is the path/arg still reads as periodic,
+    then looks for a short structural unit repeated back-to-back many times.
+
+    Tuned to fire only on genuine degeneration (>=5 identical structural periods),
+    so ordinary prose or code — which doesn't repeat a structural unit 5x verbatim —
+    won't trip it."""
+    tail = text[-1600:]
+    skel = _re.sub(r'"[^"]*"', '""', tail)        # collapse quoted strings/args
+    skel = _re.sub(r'/[^\s"<>]+', '/', skel)        # collapse filesystem paths
+    skel = _re.sub(r'\s+', ' ', skel)
+    n = len(skel)
+    for period in range(6, 140):
+        if n < period * 5:
+            break
+        unit = skel[-period:]
+        if not unit.strip():
+            continue
+        reps = 1
+        i = n - 2 * period
+        while i >= 0 and skel[i:i + period] == unit:
+            reps += 1
+            i -= period
+        if reps >= 5:
+            return True
+    return False
+
+
 async def stream_chat_response(
     messages: List[Dict],
     model_name: str,
@@ -2147,6 +2184,9 @@ async def stream_chat_response(
     compact_plan: Optional[Dict] = None,
     suppress_reasoning: bool = False,
     reasoning_active: bool = False,
+    repeat_penalty: float = 1.0,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
 ) -> AsyncGenerator[str, None]:
     """Stream chat completion response with queue notifications."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -2338,6 +2378,9 @@ async def stream_chat_response(
             tools=tools,
             response_format=response_format,
             enable_thinking=enable_thinking,
+            repeat_penalty=repeat_penalty,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
         ):
             # Cooperative cancellation: stop streaming if the task was cancelled.
             if task_registry.is_cancelled(_tid):
@@ -2365,6 +2408,21 @@ async def stream_chat_response(
             
             # Pass through all content including whitespace - it's essential for message composition
             generated_text += filtered_chunk
+
+            # Anti-loop safety net: if the model has collapsed into a runaway
+            # repetition (e.g. a malformed parallel tool-call flood), stop pulling
+            # tokens instead of burning the whole context. Check periodically once
+            # there's enough text to judge; downstream finalisation still runs on
+            # what we have (the parser's repetition guard keeps the first real call).
+            if chunk_count % 32 == 0 and len(generated_text) > 600 \
+                    and _detect_runaway_repetition(generated_text):
+                if _debug_requests_enabled():
+                    print(f"# <<< [anti-loop] runaway repetition detected at "
+                          f"{chunk_count} tok — stopping generation", flush=True)
+                logger.warning("stream_chat_response: runaway repetition detected for "
+                               "model=%s at %d chunks; truncating generation",
+                               model_name, chunk_count)
+                break
 
             # Live progress under --debug-requests so a non-terminating / looping
             # generation is visible AS IT HAPPENS — the end-of-stream response logs
@@ -2694,6 +2752,9 @@ async def generate_chat_response(
     enable_thinking: bool = False,
     suppress_reasoning: bool = False,
     reasoning_active: bool = False,
+    repeat_penalty: float = 1.0,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
 ) -> Dict:
     """Generate non-streaming chat completion response."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -2732,6 +2793,9 @@ async def generate_chat_response(
             tools=tools,
             response_format=response_format,
             enable_thinking=enable_thinking,
+            repeat_penalty=repeat_penalty,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
         )
         
         # Always filter out malformed content

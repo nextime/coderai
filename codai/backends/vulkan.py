@@ -1606,7 +1606,8 @@ class VulkanBackend(ModelBackend):
         return val
 
     def generate_chat(self, messages, max_tokens=None, temperature=0.7, top_p=1.0,
-                      stop=None, tools=None, response_format=None):
+                      stop=None, tools=None, response_format=None, enable_thinking=False,
+                      repeat_penalty=1.0, presence_penalty=0.0, frequency_penalty=0.0):
         """Non-streaming chat completion using llama.cpp's native chat handler."""
         if self.model is None:
             raise RuntimeError("Model not loaded")
@@ -1619,6 +1620,13 @@ class VulkanBackend(ModelBackend):
             temperature=temperature,
             top_p=top_p,
         )
+        # Forward client-supplied repetition controls (no-op at defaults).
+        if repeat_penalty and repeat_penalty != 1.0:
+            kwargs['repeat_penalty'] = repeat_penalty
+        if presence_penalty:
+            kwargs['presence_penalty'] = presence_penalty
+        if frequency_penalty:
+            kwargs['frequency_penalty'] = frequency_penalty
         if stop:
             kwargs['stop'] = stop
         if response_format and response_format.get('type') == 'json_object':
@@ -1644,7 +1652,9 @@ class VulkanBackend(ModelBackend):
         return content
 
     async def generate_chat_stream(self, messages, max_tokens=None, temperature=0.7,
-                                   top_p=1.0, stop=None, tools=None, response_format=None):
+                                   top_p=1.0, stop=None, tools=None, response_format=None,
+                                   enable_thinking=False, repeat_penalty=1.0,
+                                   presence_penalty=0.0, frequency_penalty=0.0):
         """Streaming chat completion using llama.cpp's native chat handler."""
         if self.model is None:
             raise RuntimeError("Model not loaded")
@@ -1658,6 +1668,13 @@ class VulkanBackend(ModelBackend):
             top_p=top_p,
             stream=True,
         )
+        # Forward client-supplied repetition controls (no-op at defaults).
+        if repeat_penalty and repeat_penalty != 1.0:
+            kwargs['repeat_penalty'] = repeat_penalty
+        if presence_penalty:
+            kwargs['presence_penalty'] = presence_penalty
+        if frequency_penalty:
+            kwargs['frequency_penalty'] = frequency_penalty
         if stop:
             kwargs['stop'] = stop
         _tc = _make_llama_thermal_criteria()
