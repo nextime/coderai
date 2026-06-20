@@ -142,22 +142,47 @@ class SessionManager:
                 pass
         return {"users": [], "tokens": [], "sessions": {}}
     
-    def _save_auth_data(self, auth_data: Dict[str, Any]):
-        """Save auth.json data atomically."""
+    def _write_auth_data(self, auth_data: Dict[str, Any]):
+        """Write auth.json to disk atomically. Caller MUST hold ``self._lock``."""
         auth_path = self.config_dir / "auth.json"
-        with self._lock:
-            import os, tempfile
-            fd, tmp = tempfile.mkstemp(dir=str(self.config_dir), suffix='.tmp')
+        import os, tempfile
+        fd, tmp = tempfile.mkstemp(dir=str(self.config_dir), suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump(auth_data, f, indent=2)
+            os.replace(tmp, str(auth_path))
+        except Exception:
             try:
-                with os.fdopen(fd, 'w') as f:
-                    json.dump(auth_data, f, indent=2)
-                os.replace(tmp, str(auth_path))
-            except Exception:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _save_auth_data(self, auth_data: Dict[str, Any]):
+        """Atomically persist a full auth_data snapshot (acquires the lock).
+
+        Prefer :meth:`update_auth_data` for read-modify-write sequences: a bare
+        load + mutate + save is not atomic and concurrent writers can clobber
+        each other's changes.
+        """
+        with self._lock:
+            self._write_auth_data(auth_data)
+
+    def update_auth_data(self, mutator):
+        """Atomic read-modify-write of auth.json under the instance lock.
+
+        ``mutator(auth_data)`` receives the freshly loaded dict, mutates it in
+        place, and returns ``(should_save, result)``. The file is rewritten only
+        when ``should_save`` is truthy; ``result`` is returned to the caller.
+        Holding the lock across the whole load → mutate → write cycle serializes
+        concurrent writers so updates can't lose each other's changes.
+        """
+        with self._lock:
+            auth_data = self._load_auth_data()
+            should_save, result = mutator(auth_data)
+            if should_save:
+                self._write_auth_data(auth_data)
+            return result
     
     def create_session(self, username: str) -> str:
         """Create a new session for a user.
@@ -167,19 +192,17 @@ class SessionManager:
         """
         session_id = secrets.token_urlsafe(32)
         expires_at = utc_now() + self.session_timeout
-        
-        auth_data = self._load_auth_data()
-        
-        # Update sessions dict
-        sessions = auth_data.get("sessions", {})
-        sessions[session_id] = {
-            "username": username,
-            "created_at": utc_now().isoformat(),
-            "expires_at": expires_at.isoformat()
-        }
-        auth_data["sessions"] = sessions
-        self._save_auth_data(auth_data)
-        
+
+        def _mut(auth_data):
+            sessions = auth_data.setdefault("sessions", {})
+            sessions[session_id] = {
+                "username": username,
+                "created_at": utc_now().isoformat(),
+                "expires_at": expires_at.isoformat(),
+            }
+            return True, None
+        self.update_auth_data(_mut)
+
         # Create signed cookie value: session_id.signature
         message = session_id.encode()
         signature = hmac.new(self.secret, message, hashlib.sha256).hexdigest()
@@ -204,31 +227,22 @@ class SessionManager:
         expected_sig = hmac.new(self.secret, message, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(signature, expected_sig):
             return None
-        
-        # Check session in storage
-        auth_data = self._load_auth_data()
-        sessions = auth_data.get("sessions", {})
-        session = sessions.get(session_id)
-        
-        if not session:
-            return None
-        
-        # Check expiration
-        expires_at = parse_session_timestamp(session["expires_at"])
-        if utc_now() > expires_at:
-            # Clean up expired session
-            del sessions[session_id]
-            auth_data["sessions"] = sessions
-            self._save_auth_data(auth_data)
-            return None
-        
-        # Extend session (sliding expiration)
-        new_expires = utc_now() + self.session_timeout
-        session["expires_at"] = new_expires.isoformat()
-        auth_data["sessions"] = sessions
-        self._save_auth_data(auth_data)
-        
-        return session["username"]
+
+        # Look up, expire-check, and extend the session atomically so a
+        # concurrent login or token write can't clobber the sessions map.
+        def _mut(auth_data):
+            sessions = auth_data.get("sessions", {})
+            session = sessions.get(session_id)
+            if not session:
+                return False, None
+            expires_at = parse_session_timestamp(session["expires_at"])
+            if utc_now() > expires_at:
+                del sessions[session_id]          # clean up expired session
+                return True, None
+            # Extend session (sliding expiration)
+            session["expires_at"] = (utc_now() + self.session_timeout).isoformat()
+            return True, session["username"]
+        return self.update_auth_data(_mut)
     
     def destroy_session(self, cookie_value: Optional[str]):
         """Destroy a session."""
@@ -239,13 +253,14 @@ class SessionManager:
             session_id, _ = cookie_value.rsplit('.', 1)
         except ValueError:
             return
-        
-        auth_data = self._load_auth_data()
-        sessions = auth_data.get("sessions", {})
-        if session_id in sessions:
-            del sessions[session_id]
-            auth_data["sessions"] = sessions
-            self._save_auth_data(auth_data)
+
+        def _mut(auth_data):
+            sessions = auth_data.get("sessions", {})
+            if session_id in sessions:
+                del sessions[session_id]
+                return True, None
+            return False, None
+        self.update_auth_data(_mut)
     
     def authenticate(self, username: str, password: str) -> Optional[str]:
         """Authenticate a user and create a session.
@@ -273,37 +288,32 @@ class SessionManager:
         Returns:
             True if successful, False otherwise
         """
-        auth_data = self._load_auth_data()
-        
-        for user in auth_data.get("users", []):
-            if user["username"] == username:
-                if not verify_password(old_password, user["password_hash"]):
-                    return False
-                
-                user["password_hash"] = hash_password(new_password)
-                user["must_change_password"] = False
-                self._save_auth_data(auth_data)
-                return True
-        
-        return False
-    
+        def _mut(auth_data):
+            for user in auth_data.get("users", []):
+                if user["username"] == username:
+                    if not verify_password(old_password, user["password_hash"]):
+                        return False, False
+                    user["password_hash"] = hash_password(new_password)
+                    user["must_change_password"] = False
+                    return True, True
+            return False, False
+        return self.update_auth_data(_mut)
+
     def force_password_change(self, username: str, new_password: str) -> bool:
         """Force a user to change password (e.g., on first login).
-        
+
         Returns:
             True if successful, False otherwise
         """
-        auth_data = self._load_auth_data()
-        
-        for user in auth_data.get("users", []):
-            if user["username"] == username:
-                user["password_hash"] = hash_password(new_password)
-                user["must_change_password"] = False
-                user["last_changed_at"] = utc_now().isoformat()
-                self._save_auth_data(auth_data)
-                return True
-        
-        return False
+        def _mut(auth_data):
+            for user in auth_data.get("users", []):
+                if user["username"] == username:
+                    user["password_hash"] = hash_password(new_password)
+                    user["must_change_password"] = False
+                    user["last_changed_at"] = utc_now().isoformat()
+                    return True, True
+            return False, False
+        return self.update_auth_data(_mut)
     
     def get_user(self, username: str) -> Optional[Dict[str, Any]]:
         """Get user details."""
@@ -337,28 +347,24 @@ class SessionManager:
         Returns:
             True if successful, False if user already exists
         """
-        auth_data = self._load_auth_data()
-        
-        # Check if user already exists
-        for user in auth_data.get("users", []):
-            if user["username"] == username:
-                return False
-        
-        # Find next available ID
-        max_id = max([u["id"] for u in auth_data.get("users", [])], default=0)
-        
-        new_user = {
-            "id": max_id + 1,
-            "username": username,
-            "password_hash": hash_password(password),
-            "role": role,
-            "created_at": utc_now().isoformat(),
-            "must_change_password": False
-        }
-        
-        auth_data["users"].append(new_user)
-        self._save_auth_data(auth_data)
-        return True
+        def _mut(auth_data):
+            # Check if user already exists
+            for user in auth_data.get("users", []):
+                if user["username"] == username:
+                    return False, False
+            # Find next available ID
+            max_id = max([u["id"] for u in auth_data.get("users", [])], default=0)
+            new_user = {
+                "id": max_id + 1,
+                "username": username,
+                "password_hash": hash_password(password),
+                "role": role,
+                "created_at": utc_now().isoformat(),
+                "must_change_password": False
+            }
+            auth_data.setdefault("users", []).append(new_user)
+            return True, True
+        return self.update_auth_data(_mut)
     
     def verify_token(self, token: str) -> bool:
         """Verify an API bearer token."""
@@ -377,28 +383,22 @@ class SessionManager:
         Returns:
             True if successful, False if user doesn't exist or is last admin
         """
-        auth_data = self._load_auth_data()
-        users = auth_data.get("users", [])
-        
-        # Check if last admin
-        admin_count = sum(1 for u in users if u.get("role") == "admin")
-        user = next((u for u in users if u["username"] == username), None)
-        
-        if not user:
-            return False
-        
-        if user.get("role") == "admin" and admin_count <= 1:
-            return False  # Can't delete last admin
-        
-        # Remove user
-        auth_data["users"] = [u for u in users if u["username"] != username]
-        
-        # Remove user's sessions
-        sessions = auth_data.get("sessions", {})
-        auth_data["sessions"] = {
-            k: v for k, v in sessions.items()
-            if v["username"] != username
-        }
-        
-        self._save_auth_data(auth_data)
-        return True
+        def _mut(auth_data):
+            users = auth_data.get("users", [])
+            # Check if last admin
+            admin_count = sum(1 for u in users if u.get("role") == "admin")
+            user = next((u for u in users if u["username"] == username), None)
+            if not user:
+                return False, False
+            if user.get("role") == "admin" and admin_count <= 1:
+                return False, False  # Can't delete last admin
+            # Remove user
+            auth_data["users"] = [u for u in users if u["username"] != username]
+            # Remove user's sessions
+            sessions = auth_data.get("sessions", {})
+            auth_data["sessions"] = {
+                k: v for k, v in sessions.items()
+                if v["username"] != username
+            }
+            return True, True
+        return self.update_auth_data(_mut)

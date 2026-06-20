@@ -701,24 +701,27 @@ async def api_create_token(request: Request, username: str = Depends(require_adm
     
     if not name:
         raise HTTPException(status_code=400, detail="Token name is required")
-    
-    auth_data = session_manager._load_auth_data()
-    
-    # Generate token
-    token_id = len(auth_data.get("tokens", [])) + 1
+
     import secrets
-    new_token = {
-        "id": token_id,
-        "name": name,
-        "token": f"sk-coderai-{secrets.token_hex(32)}",
-        "provider": provider,
-        "created_at": datetime.utcnow().isoformat() + "Z",
-        "last_used": None
-    }
-    
-    auth_data.setdefault("tokens", []).append(new_token)
-    session_manager._save_auth_data(auth_data)
-    
+    from datetime import datetime, timezone
+
+    def _mut(auth_data):
+        tokens = auth_data.setdefault("tokens", [])
+        # max+1 (not len+1) so IDs aren't reused after a deletion.
+        token_id = max([t.get("id", 0) for t in tokens], default=0) + 1
+        new_token = {
+            "id": token_id,
+            "name": name,
+            "token": f"sk-coderai-{secrets.token_hex(32)}",
+            "provider": provider,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "last_used": None,
+        }
+        tokens.append(new_token)
+        return True, new_token
+
+    new_token = session_manager.update_auth_data(_mut)
+
     return {
         "token": new_token["token"],
         "id": new_token["id"],
@@ -730,16 +733,17 @@ async def api_create_token(request: Request, username: str = Depends(require_adm
 @router.delete("/admin/api/tokens/{token_id}", summary="Revoke an API token")
 async def api_delete_token(token_id: int, username: str = Depends(require_admin)):
     """Delete an API token."""
-    auth_data = session_manager._load_auth_data()
-    tokens = auth_data.get("tokens", [])
-    
-    new_tokens = [t for t in tokens if t["id"] != token_id]
-    if len(new_tokens) == len(tokens):
+    def _mut(auth_data):
+        tokens = auth_data.get("tokens", [])
+        new_tokens = [t for t in tokens if t["id"] != token_id]
+        if len(new_tokens) == len(tokens):
+            return False, False  # not found → don't write
+        auth_data["tokens"] = new_tokens
+        return True, True
+
+    if not session_manager.update_auth_data(_mut):
         raise HTTPException(status_code=404, detail="Token not found")
-    
-    auth_data["tokens"] = new_tokens
-    session_manager._save_auth_data(auth_data)
-    
+
     return {"success": True}
 
 
@@ -1296,13 +1300,22 @@ async def api_model_upload(request: Request, username: str = Depends(require_adm
     filename = form.get("filename", "model.gguf")
     chunk_index = int(form.get("chunk_index", 0))
     total_chunks = int(form.get("total_chunks", 1))
-    
+
     if not chunk or not hasattr(chunk, "read"):
         raise HTTPException(status_code=400, detail="No file chunk provided")
-    
+
+    # Reject path-traversal in the client-supplied filename: it must be a bare
+    # name that stays inside the model cache directory.
+    filename = os.path.basename(str(filename))
+    if not filename or filename in (".", "..") or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
     cache_dir = get_model_cache_dir()
     temp_dir = tempfile.gettempdir()
-    upload_id = form.get("upload_id", filename)
+    # upload_id only ever names a temp scratch file; derive a safe slug from it
+    # so it can't escape temp_dir or collide via traversal either.
+    upload_id = os.path.basename(str(form.get("upload_id", filename))) or filename
+    upload_id = re.sub(r"[^A-Za-z0-9._-]", "_", upload_id)
     temp_path = os.path.join(temp_dir, f"upload_{upload_id}.part")
     
     # Append chunk
@@ -1313,6 +1326,15 @@ async def api_model_upload(request: Request, username: str = Depends(require_adm
     # If last chunk, move to final location
     if chunk_index == total_chunks - 1:
         final_path = os.path.join(cache_dir, filename)
+        # Belt-and-suspenders: ensure the resolved destination is still inside
+        # the cache directory before committing the upload.
+        if os.path.commonpath([os.path.realpath(final_path),
+                                os.path.realpath(cache_dir)]) != os.path.realpath(cache_dir):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            raise HTTPException(status_code=400, detail="Invalid destination path")
         os.replace(temp_path, final_path)
         return {"success": True, "complete": True, "path": final_path}
     
