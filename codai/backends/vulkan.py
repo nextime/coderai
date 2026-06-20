@@ -939,6 +939,18 @@ class VulkanBackend(ModelBackend):
             print(f"  KV cache: type_k={_ck or 'f16'}  type_v={_cv or 'f16'}"
                   f"{'  (flash_attn on)' if _flash else ''}")
 
+        # KV-cache offload target. Default (True) keeps the KV cache in VRAM. Set
+        # kv_offload=false on a model to keep it in *host RAM* instead (llama.cpp
+        # --no-kv-offload) — frees a lot of VRAM for big contexts (a 256k KV can be
+        # several GB) at the cost of slower decode, since KV ops then cross PCIe.
+        # llama.cpp has no SSD/disk KV paging, so RAM is the only off-GPU option.
+        _kv_off = kwargs.get('kv_offload', _raw_cfg.get('kv_offload',
+                  _raw_cfg.get('offload_kqv')))
+        if _kv_off is not None and not bool(_kv_off):
+            llama_kwargs['offload_kqv'] = False
+            print("  KV cache: offload_kqv=False — KV held in host RAM (saves VRAM, "
+                  "slower decode)")
+
         # Multimodal projector (mmproj): pairs a CLIP/vision projector GGUF with
         # this text model so it can accept images — the llama.cpp `--mmproj`
         # equivalent, which adds vision capability (e.g. gemma). Uses llama.cpp's

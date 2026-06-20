@@ -2725,7 +2725,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "max_vram", "sdcpp_flash_attn", "sdcpp_diffusion_flash_attn", "vae_tiling",
                 "component_quantization", "output_crf", "force_vram_update",
                 "balanced_gpu_percent", "acceleration",
-                "cache_type_k", "cache_type_v", "turboquant", "engine", "engine_fallback",
+                "cache_type_k", "cache_type_v", "kv_offload", "turboquant", "engine", "engine_fallback",
                 "quant_backend", "kv_cache_budget_mb", "kv_cache_slots", "mmproj",
                 "auto_compact", "auto_compact_pct", "auto_compact_strategy",
                 "auto_compact_model", "suppress_reasoning"):
