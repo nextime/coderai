@@ -578,11 +578,21 @@ class FrontProxy:
         rp_req = self._long.build_request(
             method, url, headers=headers, params=request.query_params,
             content=content)
+        # Count this as in-flight on the chosen engine so a restart can drain it:
+        # decremented only once the response is fully streamed (or send failed).
+        engine.enter_request()
         try:
             rp_resp = await self._long.send(rp_req, stream=True)
         except Exception as exc:
+            engine.exit_request()
             return JSONResponse(
                 {"error": f"Engine#{engine.id} unreachable: {exc}"}, status_code=502)
+
+        async def _release():
+            try:
+                await rp_resp.aclose()
+            finally:
+                engine.exit_request()
 
         resp_headers = self._filter_headers(rp_resp.headers, _DROP_RESP)
         return StreamingResponse(
@@ -590,7 +600,7 @@ class FrontProxy:
             status_code=rp_resp.status_code,
             headers=dict(resp_headers),
             media_type=rp_resp.headers.get("content-type"),
-            background=BackgroundTask(rp_resp.aclose),
+            background=BackgroundTask(_release),
         )
 
     # ----------------------------------------------------------------- status

@@ -50,3 +50,6 @@ coderai-runtime/
 # Video editor sessions + generated media (runtime artifacts)
 video_editor/sessions/
 tools/coderai_media/
+.oci-build.log
+.oci-rebuild.sh
+.oci-*.log

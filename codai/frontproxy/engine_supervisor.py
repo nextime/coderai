@@ -31,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Optional
 
 import httpx
 
@@ -528,31 +529,62 @@ class EngineSupervisor:
             time.sleep(1.0)   # avoid a tight crash loop
             self._spawn(engine)
 
-    def restart_engine(self, engine_id: int) -> bool:
+    def restart_engine(self, engine_id: int, drain_grace: Optional[float] = None) -> bool:
         """Forcibly kill and respawn one engine (e.g. it's stuck in a loop).
+
+        Before killing, mark the engine ``draining`` so the router stops sending it
+        NEW requests, and wait up to ``drain_grace`` seconds for in-flight (streaming)
+        requests to finish — so a config-triggered bounce doesn't sever active SSE
+        streams mid-response. After the grace window any stragglers are dropped.
 
         Holds the restart lock so the poll loop's own respawn can't double-spawn."""
         engine = self.registry.get(engine_id)
         if engine is None:
             return False
+        if drain_grace is None:
+            drain_grace = float(getattr(self.config.server,
+                                        "engine_restart_drain_grace", 30.0) or 0.0)
         with self._restart_lock:
             proc = engine.proc
-            if proc is not None and proc.poll() is None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=8)
-                except Exception:
-                    pass
-                if proc.poll() is None:
+            if proc is not None and proc.poll() is None and drain_grace > 0:
+                engine.draining = True
+                self.registry.update_state(engine_id, healthy=False)
+                deadline = time.time() + drain_grace
+                waited = False
+                while engine.inflight > 0 and time.time() < deadline \
+                        and not self._stopped.is_set():
+                    if not waited:
+                        print(f"[front] draining engine#{engine_id} ({engine.name}): "
+                              f"waiting for {engine.inflight} in-flight request(s) "
+                              f"(up to {drain_grace:.0f}s)", flush=True)
+                        waited = True
+                    time.sleep(0.25)
+                if engine.inflight > 0:
+                    print(f"[front] drain grace elapsed; bouncing engine#{engine_id} "
+                          f"with {engine.inflight} request(s) still in flight",
+                          flush=True)
+                elif waited:
+                    print(f"[front] engine#{engine_id} drained cleanly", flush=True)
+            try:
+                proc = engine.proc
+                if proc is not None and proc.poll() is None:
                     try:
-                        proc.kill()
-                        proc.wait(timeout=3)
+                        proc.terminate()
+                        proc.wait(timeout=8)
                     except Exception:
                         pass
-            self.registry.update_state(engine_id, healthy=False)
-            print(f"[front] restarting engine#{engine_id} ({engine.name}) on request",
-                  flush=True)
-            self._spawn(engine)
+                    if proc.poll() is None:
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=3)
+                        except Exception:
+                            pass
+                self.registry.update_state(engine_id, healthy=False)
+                print(f"[front] restarting engine#{engine_id} ({engine.name}) on request",
+                      flush=True)
+                self._spawn(engine)
+            finally:
+                engine.draining = False
         return True
 
     def wait_ready(self, timeout: float = 1800.0) -> bool:

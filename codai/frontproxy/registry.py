@@ -71,6 +71,10 @@ class Engine:
                                     # event loop is GIL-blocked and can't be polled
     last_ok: float = 0.0           # monotonic time of last successful poll
     proc: object = None            # subprocess.Popen (set by the supervisor)
+    draining: bool = False         # restart pending: stop routing NEW requests here
+                                    # and let in-flight ones finish (drain grace period)
+    inflight: int = 0              # proxied requests currently streaming through
+    _inflight_lock: object = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def __post_init__(self):
         if not self.url:
@@ -89,12 +93,26 @@ class Engine:
         An engine mid-generation can't answer the health poll and reads as
         unhealthy, but it's the right place to send a request pinned/assigned to
         it — the request queues on its gen-lock instead of duplicating the model
-        elsewhere. A None proc means externally managed; assume alive."""
+        elsewhere. A None proc means externally managed; assume alive.
+
+        While draining (a restart is pending) it reports not-alive so the router
+        diverts new traffic elsewhere and the existing requests can finish."""
+        if self.draining:
+            return False
         p = self.proc
         try:
             return p is None or p.poll() is None
         except Exception:
             return True
+
+    def enter_request(self) -> None:
+        with self._inflight_lock:
+            self.inflight += 1
+
+    def exit_request(self) -> None:
+        with self._inflight_lock:
+            if self.inflight > 0:
+                self.inflight -= 1
 
 
 class EngineRegistry:
@@ -151,6 +169,8 @@ class EngineRegistry:
             e = self._engines.get(engine_id)
             if not e:
                 return
+            if e.draining:        # a restart is pending — stay out of rotation
+                healthy = False
             e.healthy = healthy
             if healthy:
                 e.last_ok = time.monotonic()

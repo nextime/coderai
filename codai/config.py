@@ -52,6 +52,9 @@ class ServerConfig:
     engine_gpus: Optional[list] = None  # explicit GPU indices, e.g. [0, 1]; None = auto
     proxy_status_timeout: float = 2.0   # short timeout for UI/status proxying (seconds)
     proxy_max_inflight: int = 64        # max concurrent proxied requests through the front
+    engine_restart_drain_grace: float = 30.0  # on engine restart, wait this many seconds
+                                              # for in-flight requests to finish before
+                                              # killing the process (0 = bounce immediately)
     # Explicit, heterogeneous engine declarations. Auto GPU detection only finds
     # NVIDIA cards and assumes one backend, and CUDA vs Vulkan device enumeration is
     # inconsistent — so for mixed setups (e.g. an NVIDIA + a Radeon card, where the
@@ -559,6 +562,7 @@ class ConfigManager:
                 "engine_gpus": self.config.server.engine_gpus,
                 "proxy_status_timeout": self.config.server.proxy_status_timeout,
                 "proxy_max_inflight": self.config.server.proxy_max_inflight,
+                "engine_restart_drain_grace": self.config.server.engine_restart_drain_grace,
                 "engine_specs": self.config.server.engine_specs,
                 "default_engine": self.config.server.default_engine,
             },
