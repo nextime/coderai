@@ -812,7 +812,14 @@ class DeepSeekParser(BaseParser):
     @validate_tool_output
     def parse(self, text: str) -> List[Dict]:
         results = []
-        
+
+        # DeepSeek V4 (ds4) native DSML tool calls: <｜DSML｜invoke name="…">…
+        for name, args in parse_deepseek_dsml_tool_calls(
+                text, set(self.tools.keys()) if self.tools else None):
+            results.append(self._to_oa(name, args))
+        if results:
+            return results
+
         # DeepSeek-V3 uses specialized JSON prompts
         calls = re.findall(r'\{"name":\s*"(.*?)",\s*"parameters":\s*(\{.*?\})}', text)
         for name, params in calls:
@@ -1158,6 +1165,62 @@ def parse_tool_tag_json_calls(text: str, tool_names=None):
 
 
 # 7. GEMMA PARSER
+# DeepSeek V4 (ds4) special-token bar ｜ (U+FF5C); tolerate an ASCII | fallback.
+_DSML_INVOKE = re.compile(
+    r'<[｜|]DSML[｜|]invoke\s+name="([^"]+)"\s*>(.*?)'
+    r'</[｜|]DSML[｜|]invoke\s*>', re.DOTALL)
+_DSML_PARAM = re.compile(
+    r'<[｜|]DSML[｜|]parameter\s+name="([^"]+)"([^>]*)>(.*?)'
+    r'</[｜|]DSML[｜|]parameter\s*>', re.DOTALL)
+
+
+def parse_deepseek_dsml_tool_calls(text: str, tool_names=None):
+    """Parse DeepSeek V4 DSML tool calls into ``(name, args_dict)``.
+
+    ds4-server emits its native tool calls as
+    ``<｜DSML｜invoke name="read"><｜DSML｜parameter name="filePath" string="true">
+    /path</｜DSML｜parameter></｜DSML｜invoke>`` (the ``｜`` is U+FF5C). Our parsers
+    didn't know this shape, so the whole block was streamed to the client as raw
+    content. Recover it here. A ``string="false"`` parameter is decoded as JSON
+    (number/bool/object); otherwise the value is kept as a string."""
+    if not text or 'DSML' not in text:
+        return []
+    names = set(tool_names or [])
+    out, seen = [], set()
+    for m in _DSML_INVOKE.finditer(text):
+        name = m.group(1).strip()
+        if names and name not in names:
+            continue
+        args = {}
+        for pm in _DSML_PARAM.finditer(m.group(2)):
+            pname = pm.group(1).strip()
+            attrs = pm.group(2) or ''
+            val = pm.group(3).strip()
+            if 'string="true"' not in attrs:
+                try:
+                    val = json.loads(val)
+                except Exception:
+                    pass
+            args[pname] = val
+        key = (name, json.dumps(args, sort_keys=True, default=str))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((name, args))
+    return out
+
+
+def strip_dsml_tool_calls(text: str) -> str:
+    """Remove DeepSeek V4 DSML tool-call markup from displayed content, so the
+    raw ``<｜DSML｜…>`` block doesn't leak once it's been parsed into tool_calls."""
+    if not text or 'DSML' not in text:
+        return text
+    text = re.sub(r'<[｜|]DSML[｜|]tool_calls>[\s\S]*?</[｜|]DSML[｜|]tool_calls\s*>', '', text)
+    text = re.sub(r'<[｜|]DSML[｜|]invoke[\s\S]*?</[｜|]DSML[｜|]invoke\s*>', '', text)
+    text = re.sub(r'</?[｜|]DSML[｜|][^>]*>', '', text)  # any residual stray tags
+    return text
+
+
 class GemmaParser(BaseParser):
     @validate_tool_output
     def parse(self, text: str) -> List[Dict]:
@@ -2208,7 +2271,23 @@ class ToolCallParser:
         # REPAIR: Fix broken tool call formats that the model hallucinates
         # This handles cases like <tool><tool_name><param>value</param></tool_name></tool>
         text = repair_broken_tool_calls(text)
-        
+
+        # DeepSeek V4 (ds4) native DSML tool calls: <｜DSML｜invoke name="…">… .
+        # ds4-server emits these with the ｜ (U+FF5C) special-token bar; without
+        # this they were streamed to the client as raw content.
+        if 'DSML' in text:
+            names = [getattr(getattr(t, 'function', None), 'name', None)
+                     for t in (available_tools or [])]
+            names = [n for n in names if n]
+            dsml = parse_deepseek_dsml_tool_calls(text, names or None)
+            if dsml:
+                print(f"DEBUG ToolCallParser: DSML parsing found {len(dsml)} tool calls")
+                return [{
+                    "id": f"call_{uuid.uuid4().hex[:16]}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(args)},
+                } for name, args in dsml]
+
         # For Qwen models, try Qwen-specific parsing first
         if self._is_qwen_model():
             qwen_tool_calls = self._parse_qwen_tool_calls(text)
@@ -2270,7 +2349,8 @@ class ToolCallParser:
         Uses pre-compiled STRIP_TOOL_PATTERNS for efficiency."""
         if not text:
             return text
-        
+
+        text = strip_dsml_tool_calls(text)
         for pattern in STRIP_TOOL_PATTERNS:
             text = pattern.sub('', text)
         
@@ -2349,7 +2429,9 @@ class ModelParserAdapter:
         """Remove tool call format from text after extracting tool calls."""
         if not text:
             return text
-        
+
+        text = strip_dsml_tool_calls(text)
+
         # gemma-4 native: drop every `call:NAME{…}` span (balanced braces) and the
         # `thought` channel residue left after skip_special_tokens strips the
         # <|tool_call>/<|channel> markers.

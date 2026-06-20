@@ -1789,12 +1789,12 @@ async def stream_chat_response(
             "model": model_name,
             "choices": [{
                 "index": 0,
-                "delta": {"content": "Waiting for model to load..."},
+                "delta": {"content": "Waiting for model reply..."},
                 "finish_reason": None,
             }],
             "x_queue_info": {
                 "status": "waiting",
-                "message": "Model is loading, please wait...",
+                "message": "Waiting for model reply...",
             },
         }
         yield f"data: {json.dumps(data)}\n\n"
@@ -1823,7 +1823,7 @@ async def stream_chat_response(
                 }],
                 "x_queue_info": {
                     "status": "waiting",
-                    "message": f"Waiting for model... ({int(wait_time)}s)",
+                    "message": f"Waiting for model reply... ({int(wait_time)}s)",
                     "queue_position": queue_pos,
                     "wait_time_seconds": int(wait_time),
                 },
