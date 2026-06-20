@@ -602,6 +602,11 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           <input type="text" id="cfg-ds4-extra-env" class="form-input" placeholder="DS4_CUDA_WEIGHT_ARENA_CHUNK_MB=512">
           <span class="form-hint" style="font-size:11px"><code>KEY=VALUE</code> pairs. e.g. <code>DS4_CUDA_WEIGHT_ARENA_CHUNK_MB=512</code> fixes weight-arena OOM under heavy expert caching. Blank = inherit global.</span>
         </div>
+        <span class="form-hint" style="font-size:11px;line-height:1.5;margin-top:.4rem;display:block">
+          <b>⚡ Performance:</b> put the GGUF on <b>NVMe/SSD</b> (≈10× prefill for a streamed MoE) ·
+          cap the expert cache with <code>--ssd-streaming-cache-experts N</code> (a count, e.g. <code>400</code>) — higher helps decode but too high OOMs the weight arena ·
+          set <b>reserve</b> ≈ weights + ~2 GiB · add <code>DS4_CUDA_WEIGHT_ARENA_CHUNK_MB=512</code> · <b>avoid</b> <code>DS4_CUDA_WEIGHT_CACHE</code> (slower). Decode of a model bigger than VRAM is streaming-bound (~0.5 tok/s) — the real fix is a smaller quant. Context = <b>n_ctx</b> above.
+        </span>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem;margin-top:.75rem">
         <div class="form-row" style="margin:0">

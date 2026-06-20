@@ -479,6 +479,18 @@
       <input type="text" id="s-ds4-extra-env" class="form-input" placeholder="DS4_CUDA_WEIGHT_ARENA_CHUNK_MB=512">
       <span class="form-hint">Whitespace-separated <code>KEY=VALUE</code> pairs added to ds4-server's environment — for the many CUDA tunables it exposes only via env. Notably <code>DS4_CUDA_WEIGHT_ARENA_CHUNK_MB</code> (default 1792): lower it (e.g. <code>512</code>) so the weight arena allocates in smaller chunks that fit a heap fragmented by the streaming expert cache, fixing <i>model arena alloc failed … out of memory</i>.</span>
     </div>
+    <div class="form-row" style="background:var(--bg-2,#1a1a1a);border:1px solid var(--border,#333);border-radius:8px;padding:.7rem .8rem">
+      <label class="form-label" style="margin-bottom:.3rem">⚡ Tuning ds4 for performance</label>
+      <span class="form-hint" style="font-size:11.5px;line-height:1.55">
+        These are global <b>defaults</b>; override them per-model on the <b>Models</b> page (a big-quant streamer and a small one that fits VRAM want different settings). Order of impact:
+        <br>• <b>Put the GGUF on a fast NVMe/SSD</b>, not a spinning disk — for a streamed MoE this is the single biggest win (≈10× prefill). A symlink from the old path works.
+        <br>• <b>Cap the expert cache</b> with <code>--ssd-streaming-cache-experts N</code> (a COUNT, e.g. <code>400</code> — not NGB). Bigger = better decode hit-rate, but too big fragments VRAM and the weight arena OOMs; find the ceiling for your card.
+        <br>• <b>Reserve</b> ≈ resident weights + ~2 GiB (field above). ds4 defaults to half the card, which starves the cache.
+        <br>• Add <code>DS4_CUDA_WEIGHT_ARENA_CHUNK_MB=512</code> (env) to stop the weight-arena OOM under heavy caching.
+        <br>• <b>Avoid</b> <code>DS4_CUDA_WEIGHT_CACHE</code> — it disables ds4's zero-copy path and was slower in testing.
+        <br>• Decode of a model far larger than VRAM is streaming-bound (~0.5 tok/s here); the only real fix is a <b>smaller quant</b> (IQ2/IQ3) that mostly fits VRAM+RAM. Context window is set per-model via <b>n_ctx</b>.
+      </span>
+    </div>
   </div>
 </div>
 {% endblock %}
