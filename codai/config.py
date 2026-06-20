@@ -242,6 +242,18 @@ class Ds4Config:
     ctx: int = 100000                      # ds4-server --ctx context window
     ssd_streaming: bool = False            # ds4-server --ssd-streaming: stream experts from SSD/disk
     extra_args: str = ""                   # extra flags passed to ds4-server
+    # VRAM (GiB) ds4-server keeps free for non-cache use on CUDA, exported as
+    # DS4_CUDA_STREAMING_EXPERT_CACHE_RESERVE_GB. ds4 defaults this to half the
+    # card, which over-reserves for small-weight MoE models and starves the
+    # streaming expert cache. 0 = leave ds4's default. Set just above the model's
+    # resident weights (+~2 GiB headroom) to hand the rest to the expert cache.
+    expert_cache_reserve_gb: int = 0
+    # Free-form environment for ds4-server, as whitespace/newline-separated
+    # KEY=VALUE pairs. ds4 exposes many CUDA tunables only via env, e.g.
+    # DS4_CUDA_WEIGHT_ARENA_CHUNK_MB (default 1792) — lower it (e.g. 512) so the
+    # model-weight arena allocates in smaller chunks that fit a heap fragmented by
+    # the streaming expert cache, avoiding "model arena alloc failed … OOM".
+    extra_env: str = ""
     auto_build: bool = True                # clone+build the binary if it's missing
 
 
@@ -609,6 +621,8 @@ class ConfigManager:
                 "ctx": self.config.ds4.ctx,
                 "ssd_streaming": self.config.ds4.ssd_streaming,
                 "extra_args": self.config.ds4.extra_args,
+                "expert_cache_reserve_gb": self.config.ds4.expert_cache_reserve_gb,
+                "extra_env": self.config.ds4.extra_env,
                 "auto_build": self.config.ds4.auto_build,
             },
             "broker": {

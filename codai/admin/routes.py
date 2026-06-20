@@ -3403,6 +3403,8 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "ctx": c.ds4.ctx,
             "ssd_streaming": c.ds4.ssd_streaming,
             "extra_args": c.ds4.extra_args,
+            "expert_cache_reserve_gb": c.ds4.expert_cache_reserve_gb,
+            "extra_env": c.ds4.extra_env,
             "auto_build": c.ds4.auto_build,
         },
         "broker": {
@@ -3683,6 +3685,13 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             c.ds4.ctx = max(1024, int(d.get("ctx") or c.ds4.ctx))
         if "extra_args" in d:
             c.ds4.extra_args = (d.get("extra_args") or "").strip()
+        if "expert_cache_reserve_gb" in d:
+            try:
+                c.ds4.expert_cache_reserve_gb = max(0, int(d.get("expert_cache_reserve_gb") or 0))
+            except (TypeError, ValueError):
+                c.ds4.expert_cache_reserve_gb = 0
+        if "extra_env" in d:
+            c.ds4.extra_env = (d.get("extra_env") or "").strip()
         if "auto_build" in d:
             c.ds4.auto_build = bool(d["auto_build"])
 

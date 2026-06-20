@@ -419,10 +419,41 @@ def ensure_service(cfg, model_file: Optional[str] = None,
             import shlex
             cmd += shlex.split(extra)
 
-        print(f"[ds4] launching ds4-server: {' '.join(cmd)}", flush=True)
+        # ds4-server inherits our environment. The CUDA streaming expert-cache
+        # reserve (VRAM kept free for non-cache use) is tunable ONLY via env, not a
+        # CLI flag; ds4 defaults it to half the card, which starves the cache for
+        # small-weight MoE models. Export the configured override when set (>0).
+        env = os.environ.copy()
+        try:
+            reserve_gb = int(getattr(cfg, "expert_cache_reserve_gb", 0) or 0)
+        except (TypeError, ValueError):
+            reserve_gb = 0
+        if reserve_gb > 0 and "DS4_CUDA_STREAMING_EXPERT_CACHE_RESERVE_GB" not in env:
+            env["DS4_CUDA_STREAMING_EXPERT_CACHE_RESERVE_GB"] = str(reserve_gb)
+
+        # Free-form env passthrough (KEY=VALUE pairs) for ds4's many CUDA tunables;
+        # an explicit pair here overrides the dedicated reserve knob above.
+        applied_env = {}
+        extra_env = (getattr(cfg, "extra_env", "") or "").strip()
+        if extra_env:
+            import shlex
+            for tok in shlex.split(extra_env):
+                if "=" in tok:
+                    k, v = tok.split("=", 1)
+                    k = k.strip()
+                    if k:
+                        env[k] = v
+                        applied_env[k] = v
+        if reserve_gb > 0:
+            applied_env.setdefault("DS4_CUDA_STREAMING_EXPERT_CACHE_RESERVE_GB",
+                                   env["DS4_CUDA_STREAMING_EXPERT_CACHE_RESERVE_GB"])
+
+        env_note = ("  (" + " ".join(f"{k}={v}" for k, v in applied_env.items()) + ")"
+                    if applied_env else "")
+        print(f"[ds4] launching ds4-server: {' '.join(cmd)}{env_note}", flush=True)
         proc = subprocess.Popen(
             cmd, cwd=str(install_dir), stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, bufsize=1,
+            stderr=subprocess.STDOUT, text=True, bufsize=1, env=env,
         )
         tail = collections.deque(maxlen=15)
         threading.Thread(target=_pump_logs, args=(proc, tail), daemon=True).start()

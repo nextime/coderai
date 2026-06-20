@@ -469,6 +469,16 @@
       <input type="text" id="s-ds4-extra-args" class="form-input" placeholder="--ssd-streaming-cache-experts 12GB --ssd-streaming-cold">
       <span class="form-hint">Passed verbatim to <code>ds4-server</code>. <code>--kv-disk-dir</code> is auto-set to coderai's offload dir unless you override it here. With SSD streaming on CUDA, sizing the routed expert cache helps, e.g. <code>--ssd-streaming-cache-experts 12GB</code>. Note: extremely low quants (Q2_K) can fail ds4's CUDA prefill — prefer Q4_K+.</span>
     </div>
+    <div class="form-row">
+      <label class="form-label">CUDA expert-cache VRAM reserve (GiB)</label>
+      <input type="number" id="s-ds4-expert-cache-reserve" class="form-input" min="0" placeholder="0 = ds4 default (½ the card)">
+      <span class="form-hint">Exports <code>DS4_CUDA_STREAMING_EXPERT_CACHE_RESERVE_GB</code> — VRAM ds4 keeps free for non-cache use under SSD streaming. ds4 defaults to <b>half the card</b>, which over-reserves for small-weight MoE models and caps the expert cache far below your <code>--ssd-streaming-cache-experts</code> request. Set just above the model's resident weights (+~2 GiB headroom) to hand the rest to the cache; <code>0</code> leaves ds4's default. There is no CLI flag for this — it's env-only.</span>
+    </div>
+    <div class="form-row">
+      <label class="form-label">Extra ds4-server env</label>
+      <input type="text" id="s-ds4-extra-env" class="form-input" placeholder="DS4_CUDA_WEIGHT_ARENA_CHUNK_MB=512">
+      <span class="form-hint">Whitespace-separated <code>KEY=VALUE</code> pairs added to ds4-server's environment — for the many CUDA tunables it exposes only via env. Notably <code>DS4_CUDA_WEIGHT_ARENA_CHUNK_MB</code> (default 1792): lower it (e.g. <code>512</code>) so the weight arena allocates in smaller chunks that fit a heap fragmented by the streaming expert cache, fixing <i>model arena alloc failed … out of memory</i>.</span>
+    </div>
   </div>
 </div>
 {% endblock %}
@@ -686,6 +696,8 @@ async function loadSettings(){
     document.getElementById('s-ds4-ctx').value = ds4.ctx ?? 100000;
     document.getElementById('s-ds4-repo-url').value = ds4.repo_url ?? 'https://github.com/antirez/ds4';
     document.getElementById('s-ds4-extra-args').value = ds4.extra_args ?? '';
+    document.getElementById('s-ds4-expert-cache-reserve').value = ds4.expert_cache_reserve_gb ?? 0;
+    document.getElementById('s-ds4-extra-env').value = ds4.extra_env ?? '';
     toggleDs4Fields();
   }catch(e){ showAlert('error','Failed to load settings: '+e.message); }
 }
@@ -761,6 +773,8 @@ async function saveSettings(){
       ctx: parseInt(document.getElementById('s-ds4-ctx').value) || 100000,
       repo_url: document.getElementById('s-ds4-repo-url').value.trim() || 'https://github.com/antirez/ds4',
       extra_args: document.getElementById('s-ds4-extra-args').value.trim(),
+      expert_cache_reserve_gb: parseInt(document.getElementById('s-ds4-expert-cache-reserve').value) || 0,
+      extra_env: document.getElementById('s-ds4-extra-env').value.trim(),
     },
     broker:{
       enabled: document.getElementById('s-broker-enabled').checked,
