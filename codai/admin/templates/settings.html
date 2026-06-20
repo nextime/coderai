@@ -390,6 +390,15 @@
     </label>
   </div>
   <div id="ds4-fields" style="display:none">
+    <div class="form-row" style="background:var(--bg-2,#1a1a1a);border:1px solid var(--border,#333);border-radius:8px;padding:.7rem .8rem">
+      <label class="form-label" style="margin-bottom:.3rem">⬇ Download a default DeepSeek V4 model</label>
+      <span class="form-hint" style="margin-bottom:.5rem">Fetches an official GGUF from <code>antirez/deepseek-v4-gguf</code> straight into the gguf cache, where it appears in the model list to configure. Large (tens to ~150 GB) — runs in the background.</span>
+      <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap">
+        <select id="s-ds4-dl-select" class="form-input" style="flex:1;min-width:280px"></select>
+        <button type="button" id="s-ds4-dl-btn" class="btn btn-secondary" onclick="ds4DownloadDefault()">Download</button>
+      </div>
+      <div id="s-ds4-dl-status" class="form-hint" style="margin-top:.45rem;display:none"></div>
+    </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;align-items:start">
       <div class="form-row" style="margin:0">
         <label class="form-label">Model id / alias</label>
@@ -496,7 +505,7 @@
         <input type="checkbox" id="s-ds4-kv-cleanup" onchange="toggleDs4KvCleanup()">
         <span style="font-size:13px;font-weight:500">Auto-clean the on-disk KV cache</span>
       </label>
-      <span class="form-hint">ds4 writes prompt KV checkpoints to its <code>--kv-disk-dir</code> (<code>&lt;offload&gt;/ds4-kv</code>) to reuse prefixes across requests; abandoned sessions accumulate large files that never self-prune. When on, a janitor deletes entries whose newest file is older than the age below. Active (recently-reused) checkpoints are spared.</span>
+      <span class="form-hint">ds4 writes prompt KV checkpoints to its <code>--kv-disk-dir</code> (<code>&lt;offload&gt;/ds4-kv</code>) to reuse prefixes across requests; abandoned sessions accumulate large files that never self-prune. When on, a janitor deletes a checkpoint only when BOTH: its newest file is older than the age below, AND no running <code>ds4-server</code> currently has it open (fd or mmap). Files ds4 is actively using are always kept, regardless of age.</span>
     </div>
     <div id="ds4-kv-cleanup-fields" style="display:none">
       <div class="form-row" style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
@@ -621,6 +630,60 @@ function toggleCompactFields(){
 function toggleDs4KvCleanup(){
   document.getElementById('ds4-kv-cleanup-fields').style.display =
     document.getElementById('s-ds4-kv-cleanup').checked ? 'block' : 'none';
+}
+
+let _ds4DefaultModels = [];
+async function loadDs4DefaultModels(){
+  const sel = document.getElementById('s-ds4-dl-select');
+  if(!sel) return;
+  try{
+    const d = await fetch(ROOT_PATH + '/admin/api/ds4/default-models').then(r=>r.json());
+    _ds4DefaultModels = d.models || [];
+    sel.innerHTML = _ds4DefaultModels.map(m =>
+      `<option value="${m.file}">${m.label}${m.present ? ' ✓ downloaded' : ''}</option>`).join('');
+  }catch(e){
+    sel.innerHTML = '<option value="">(failed to load catalog)</option>';
+  }
+}
+
+async function ds4DownloadDefault(){
+  const sel = document.getElementById('s-ds4-dl-select');
+  const btn = document.getElementById('s-ds4-dl-btn');
+  const statusEl = document.getElementById('s-ds4-dl-status');
+  const file = sel.value;
+  const meta = _ds4DefaultModels.find(m => m.file === file);
+  if(!file || !meta){ return; }
+  if(meta.present && !confirm('This model is already in the gguf cache. Download again?')) return;
+  btn.disabled = true;
+  statusEl.style.display = 'block';
+  statusEl.textContent = 'Starting download…';
+  try{
+    const r = await fetch(ROOT_PATH + '/admin/api/model-download', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({model_id: meta.repo, file_pattern: file}),
+    });
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const {session_id} = await r.json();
+    const es = new EventSource(ROOT_PATH + '/admin/api/download-stream/' + session_id);
+    es.onmessage = (ev) => {
+      let m; try{ m = JSON.parse(ev.data); }catch(_){ return; }
+      if(m.type === 'progress'){
+        const pct = (m.percent||0).toFixed(1);
+        const rate = m.rate ? ' · ' + (m.rate/1048576).toFixed(1) + ' MB/s' : '';
+        statusEl.textContent = `Downloading ${meta.label.split(' (')[0]}: ${pct}%${rate}`;
+      }else if(m.type === 'done'){
+        statusEl.textContent = '✅ Downloaded — now available in the model list to configure.';
+        es.close(); btn.disabled = false; loadDs4DefaultModels();
+      }else if(m.type === 'error'){
+        statusEl.textContent = '⚠ Download failed: ' + (m.message||'unknown error');
+        es.close(); btn.disabled = false;
+      }
+    };
+    es.onerror = () => { es.close(); btn.disabled = false; };
+  }catch(e){
+    statusEl.textContent = '⚠ Could not start download: ' + e.message;
+    btn.disabled = false;
+  }
 }
 function toggleHttps(){
   document.getElementById('https-fields').style.display =
@@ -783,6 +846,7 @@ async function loadSettings(){
     document.getElementById('s-ds4-kv-interval').value = ds4.kv_cache_cleanup_interval_minutes ?? 360;
     toggleDs4KvCleanup();
     toggleDs4Fields();
+    loadDs4DefaultModels();
   }catch(e){ showAlert('error','Failed to load settings: '+e.message); }
 }
 

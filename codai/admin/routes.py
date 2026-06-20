@@ -1197,6 +1197,49 @@ async def api_list_downloads(username: str = Depends(require_admin)):
     return list(_download_status.values())
 
 
+# Catalog of the official DeepSeek V4 GGUF weights ds4 ships (matches antirez's
+# download_model.sh). Picking one and downloading it reuses the normal model
+# downloader (/admin/api/model-download with file_pattern = the exact .gguf), which
+# flattens the file into the gguf cache and surfaces it in the model list.
+_DS4_DEFAULT_REPO = "antirez/deepseek-v4-gguf"
+_DS4_DEFAULT_MODELS = [
+    {"key": "q2-imatrix", "label": "Flash q2-imatrix (~81 GB) — recommended for 96/128 GB RAM",
+     "file": "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
+     "size_gb": 81},
+    {"key": "q2-q4-imatrix", "label": "Flash q2-q4-imatrix (~98 GB) — higher quality, last layers Q4",
+     "file": "DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed.gguf",
+     "size_gb": 98},
+    {"key": "q4-imatrix", "label": "Flash q4-imatrix (~153 GB) — best quality, 256 GB+ RAM",
+     "file": "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf",
+     "size_gb": 153},
+    {"key": "mtp", "label": "MTP speculative-decoding component (~3.5 GB) — optional, run ds4 with --mtp",
+     "file": "DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf",
+     "size_gb": 4},
+]
+
+
+@router.get("/admin/api/ds4/default-models", summary="List downloadable ds4 default models")
+async def api_ds4_default_models(username: str = Depends(require_admin)):
+    """Catalog of official DeepSeek V4 GGUF variants ds4 can serve. The UI offers
+    these in a select; downloading one goes through /admin/api/model-download."""
+    gguf_dir = ""
+    try:
+        if config_manager is not None and config_manager.config is not None:
+            gguf_dir = (config_manager.config.models.gguf_cache_dir or "").strip()
+    except Exception:
+        gguf_dir = ""
+    out = []
+    for m in _DS4_DEFAULT_MODELS:
+        present = False
+        if gguf_dir:
+            try:
+                present = os.path.exists(os.path.join(os.path.expanduser(gguf_dir), m["file"]))
+            except Exception:
+                present = False
+        out.append({**m, "repo": _DS4_DEFAULT_REPO, "present": present})
+    return {"repo": _DS4_DEFAULT_REPO, "gguf_cache_dir": gguf_dir, "models": out}
+
+
 def _cancel_download_session(session_id: str) -> bool:
     """Cancel an active download by flagging the session and terminating its worker
     process. Returns False if there is no such download session.

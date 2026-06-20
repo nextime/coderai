@@ -28,6 +28,28 @@ from codai.backends.base import ModelBackend
 class Ds4Backend(ModelBackend):
     """Proxy backend that routes generation to a managed ds4-server."""
 
+    # Process-wide count of in-flight ds4 requests (across all backend instances).
+    # The KV-cache janitor checks this so it never sweeps mid-request — see
+    # codai.api.ds4_kv_janitor. Incremented/decremented around every generate path.
+    _inflight = 0
+    _inflight_lock = threading.Lock()
+
+    @classmethod
+    def _enter_request(cls):
+        with cls._inflight_lock:
+            cls._inflight += 1
+
+    @classmethod
+    def _exit_request(cls):
+        with cls._inflight_lock:
+            cls._inflight = max(0, cls._inflight - 1)
+
+    @classmethod
+    def any_request_active(cls) -> bool:
+        """True while any ds4 request is being served (prefill/decode in flight)."""
+        with cls._inflight_lock:
+            return cls._inflight > 0
+
     def __init__(self, cfg=None):
         # cfg is a codai.config.Ds4Config. When omitted, resolve the active one.
         if cfg is None:
@@ -207,22 +229,30 @@ class Ds4Backend(ModelBackend):
     def generate_chat(self, messages: List[Dict], max_tokens=None, temperature=0.7,
                       top_p=1.0, stop=None, tools=None, response_format=None):
         import requests
-        payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, False)
-        if response_format and response_format.get("type") == "json_object":
-            payload["response_format"] = {"type": "json_object"}
-        r = requests.post(self._base() + "/v1/chat/completions", json=payload, timeout=3600)
-        r.raise_for_status()
-        data = r.json()
-        self._store_usage(data.get("usage", {}))
-        return data["choices"][0]["message"].get("content") or ""
+        self._enter_request()
+        try:
+            payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, False)
+            if response_format and response_format.get("type") == "json_object":
+                payload["response_format"] = {"type": "json_object"}
+            r = requests.post(self._base() + "/v1/chat/completions", json=payload, timeout=3600)
+            r.raise_for_status()
+            data = r.json()
+            self._store_usage(data.get("usage", {}))
+            return data["choices"][0]["message"].get("content") or ""
+        finally:
+            self._exit_request()
 
     async def generate_chat_stream(self, messages: List[Dict], max_tokens=None,
                                    temperature=0.7, top_p=1.0, stop=None, tools=None,
                                    response_format=None) -> AsyncGenerator[str, None]:
-        payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, True)
-        async for chunk in self._stream(self._base() + "/v1/chat/completions", payload,
-                                        delta_key="delta"):
-            yield chunk
+        self._enter_request()
+        try:
+            payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, True)
+            async for chunk in self._stream(self._base() + "/v1/chat/completions", payload,
+                                            delta_key="delta"):
+                yield chunk
+        finally:
+            self._exit_request()
 
     # ------------------------------------------------------------------ #
     # plain completion (fallback path)

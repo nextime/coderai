@@ -820,6 +820,14 @@ class DeepSeekParser(BaseParser):
         if results:
             return results
 
+        # Degraded plaintext <tool>name arg: value</tool> from heavy quants (e.g.
+        # the ds4 q2-imatrix), which can't reliably emit the exact DSML tokens.
+        if self.tools:
+            for name, args in parse_tool_tag_plaintext_calls(text, set(self.tools.keys())):
+                results.append(self._to_oa(name, args))
+            if results:
+                return results
+
         # DeepSeek-V3 uses specialized JSON prompts
         calls = re.findall(r'\{"name":\s*"(.*?)",\s*"parameters":\s*(\{.*?\})}', text)
         for name, params in calls:
@@ -1156,6 +1164,69 @@ def parse_tool_tag_json_calls(text: str, tool_names=None):
             continue
         if not isinstance(args, dict):
             args = {}
+        key = (name, json.dumps(args, sort_keys=True, default=str))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((name, args))
+    return out
+
+
+def parse_tool_tag_plaintext_calls(text: str, tool_names=None):
+    """Parse the degraded PLAINTEXT ``<tool>`` format some heavily-quantized models
+    emit instead of JSON/DSML, e.g.::
+
+        <tool>
+        read filePath: /path/to/file
+        </tool>
+
+    The block wraps a first token = tool name, then one or more ``key: value``
+    argument lines (the name and its first arg may share line 1; each value is split
+    on its FIRST colon, so paths/URLs in the value survive). Only blocks whose name
+    is a DECLARED tool are accepted (``tool_names`` is REQUIRED) and the inner text
+    must be plain (no ``<…>`` sub-tags, no leading ``{``) so JSON/XML ``<tool>``
+    forms are left to their own parsers and ordinary prose isn't misread. This is a
+    best-effort rescue for low-bit quants that can't reproduce the exact tool-call
+    tokens — higher-quant models emit proper formats and never reach here.
+
+    To avoid catching a ``<tool>`` *example* a model writes inside an explanatory
+    reply, the block(s) must be the message's trailing ACTION: after the first
+    ``<tool>`` everything to end-of-text must be only ``<tool>…</tool>`` blocks and
+    whitespace. A reply with prose after/between the tags is treated as text, not a
+    call. Returns ``[(name, args), …]``."""
+    if not text or '<tool' not in text.lower() or not tool_names:
+        return []
+    blocks = list(re.finditer(r'<tool\s*>(.*?)</tool\s*>', text, re.DOTALL | re.IGNORECASE))
+    if not blocks:
+        return []
+    # Require the tag(s) to form the trailing run of the message: strip the matched
+    # blocks out of the tail (from the first block on) and demand only whitespace is
+    # left. Otherwise this is prose that merely mentions the <tool> syntax.
+    tail = text[blocks[0].start():]
+    for b in blocks:
+        tail = tail.replace(b.group(0), '', 1)
+    if tail.strip():
+        return []
+    out, seen = [], set()
+    for m in blocks:
+        inner = m.group(1).strip()
+        if not inner or inner.startswith('{') or '<' in inner:
+            continue
+        lines = [ln.strip() for ln in inner.splitlines() if ln.strip()]
+        if not lines:
+            continue
+        head = lines[0].split(None, 1)
+        name = head[0].strip().strip(':')
+        if name not in tool_names:
+            continue
+        arg_lines = ([head[1]] if len(head) > 1 else []) + lines[1:]
+        args = {}
+        for al in arg_lines:
+            if ':' in al:
+                k, v = al.split(':', 1)
+                k = k.strip()
+                if k:
+                    args[k] = v.strip()
         key = (name, json.dumps(args, sort_keys=True, default=str))
         if key in seen:
             continue
@@ -2287,6 +2358,11 @@ class ToolCallParser:
                     "type": "function",
                     "function": {"name": name, "arguments": json.dumps(args)},
                 } for name, args in dsml]
+
+        # NOTE: the degraded plaintext <tool>name arg: value</tool> form (heavy
+        # quants that can't emit DSML, e.g. ds4 q2-imatrix) is handled ONLY in
+        # DeepSeekParser — scoped to the DeepSeek family where it occurs — so it can
+        # never misread a <tool> example in some other model's prose reply here.
 
         # For Qwen models, try Qwen-specific parsing first
         if self._is_qwen_model():
