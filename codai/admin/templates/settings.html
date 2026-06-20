@@ -493,6 +493,40 @@
     </div>
   </div>
 </div>
+
+<!-- Auto-compact context -->
+<div class="card">
+  <div class="card-title">Auto-compact context</div>
+  <p class="form-hint" style="margin-bottom:.6rem">Global <b>defaults</b> for shrinking an over-long chat history before generation so requests don't error out on context overflow. Per-model settings on the <b>Models</b> page override these. OFF by default.</p>
+  <div class="form-row">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-compact-enabled" onchange="toggleCompactFields()">
+      <span style="font-size:13px;font-weight:500">Enable auto-compaction by default</span>
+    </label>
+  </div>
+  <div id="compact-fields" style="display:none">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
+      <div class="form-row">
+        <label class="form-label">Trigger at <span class="muted">(% of context)</span></label>
+        <input type="number" id="s-compact-pct" class="form-input" min="50" max="99" step="1" placeholder="85">
+        <span class="form-hint">Compacts to ~65% of the context window when the prompt reaches this %.</span>
+      </div>
+      <div class="form-row">
+        <label class="form-label">Strategy</label>
+        <select id="s-compact-strategy" class="form-input">
+          <option value="drop_oldest">Drop oldest — keep system + most recent turns</option>
+          <option value="keep_head_tail">Keep head + tail — also keep the first turn, drop the middle</option>
+          <option value="summarize">Summarize — replace the dropped middle with an LLM summary</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-row">
+      <label class="form-label">Summarizer model <span class="muted">(summarize strategy)</span></label>
+      <input type="text" id="s-compact-model" class="form-input" placeholder="(empty = the model serving the request)">
+      <span class="form-hint">Model id/alias that writes the summary. Empty = the request's own model summarizes itself. Point it at a smaller/faster model to summarize old turns while the main model answers — the dropped history is chunked to fit the chosen model's own context window. The client receives a status message and live progress while compaction runs.</span>
+    </div>
+  </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -560,6 +594,10 @@ function _collectConcOverrides(cls){
 function toggleDs4Fields(){
   document.getElementById('ds4-fields').style.display =
     document.getElementById('s-ds4-enabled').checked ? 'block' : 'none';
+}
+function toggleCompactFields(){
+  document.getElementById('compact-fields').style.display =
+    document.getElementById('s-compact-enabled').checked ? 'block' : 'none';
 }
 function toggleHttps(){
   document.getElementById('https-fields').style.display =
@@ -675,6 +713,13 @@ async function loadSettings(){
     document.getElementById('s-broker-reconnect-max').value = broker.reconnect_max_delay_seconds ?? 60;
     document.getElementById('s-broker-ws-ping').value = broker.websocket_ping_interval ?? 20;
     toggleBrokerFields();
+    // Auto-compact context
+    const compact = d.compaction || {};
+    document.getElementById('s-compact-enabled').checked = !!compact.enabled;
+    document.getElementById('s-compact-pct').value = compact.pct ?? 85;
+    document.getElementById('s-compact-strategy').value = compact.strategy || 'drop_oldest';
+    document.getElementById('s-compact-model').value = compact.model ?? '';
+    toggleCompactFields();
     // Thermal protection
     const therm = d.thermal || {};
     document.getElementById('s-therm-gpu-enabled').checked = therm.gpu_enabled !== false;
@@ -787,6 +832,12 @@ async function saveSettings(){
       extra_args: document.getElementById('s-ds4-extra-args').value.trim(),
       expert_cache_reserve_gb: parseInt(document.getElementById('s-ds4-expert-cache-reserve').value) || 0,
       extra_env: document.getElementById('s-ds4-extra-env').value.trim(),
+    },
+    compaction:{
+      enabled: document.getElementById('s-compact-enabled').checked,
+      pct: parseInt(document.getElementById('s-compact-pct').value) || 85,
+      strategy: document.getElementById('s-compact-strategy').value || 'drop_oldest',
+      model: document.getElementById('s-compact-model').value.trim(),
     },
     broker:{
       enabled: document.getElementById('s-broker-enabled').checked,

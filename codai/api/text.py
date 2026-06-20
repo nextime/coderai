@@ -407,12 +407,29 @@ async def _summarize_one(manager, text: str, max_tokens: int = 400):
     return (out or "").strip()
 
 
+def _summary_chunk_chars(compact_n_ctx: int) -> int:
+    """Per-chunk char budget for the summarizer so each summarization prompt fits
+    the SUMMARIZING model's own context. Leaves headroom for the summary system
+    prompt (~120 tok) and the generated summary (~500 tok); ~4 chars/token with a
+    0.75 safety factor."""
+    usable = max(int(compact_n_ctx or 0) - 700, 512)
+    return max(2000, int(usable * 4 * 0.75))
+
+
 async def _summarize_for_compact(manager, messages, keep_recent: int = 2,
-                                 chunk_chars: int = 8000):
-    """Best-effort map-reduce summary of the older turns using the loaded model:
-    CHUNK the history, summarize each chunk, then summarize the combined chunk
-    summaries. Returns a summary string or None (caller falls back to a count
-    note). Chunking keeps the summarization prompt itself from overflowing."""
+                                 compact_n_ctx: int = 8192, progress=None):
+    """Best-effort map-reduce summary of the older turns using ``manager`` (which
+    may be a DIFFERENT model than the one serving the request): CHUNK the history
+    to fit ``compact_n_ctx``, summarize each chunk, then iteratively reduce the
+    combined chunk summaries until they fit one chunk. ``progress`` is an optional
+    async callable(str) used to stream status to the client. Returns a summary
+    string or None (caller falls back to a count note)."""
+    async def _emit(msg):
+        if progress:
+            try:
+                await progress(msg)
+            except Exception:
+                pass
     try:
         body = [m for m in messages if m.get("role") != "system"]
         older = body[:-keep_recent] if len(body) > keep_recent else body
@@ -425,24 +442,165 @@ async def _summarize_for_compact(manager, messages, keep_recent: int = 2,
                 c = " ".join(it.get("text", "") for it in c if isinstance(it, dict))
             lines.append(f"{m.get('role', '?')}: {str(c)}")
         text = "\n".join(lines)
+        chunk_chars = _summary_chunk_chars(compact_n_ctx)
         chunks = [text[i:i + chunk_chars] for i in range(0, len(text), chunk_chars)] or [text]
-        # Map: summarize each chunk (cap the number of chunks so this stays bounded).
-        summaries = []
-        for ch in chunks[:12]:
-            s = await _summarize_one(manager, ch)
-            if s:
-                summaries.append(s)
-        if not summaries:
-            return None
-        if len(summaries) == 1:
-            return summaries[0]
-        # Reduce: summarize the combined chunk summaries.
-        combined = "\n".join(summaries)
-        final = await _summarize_one(manager, combined[:chunk_chars * 2], max_tokens=500)
-        return final or combined
+        # Map → Reduce, looping the reduce until the combined summaries fit one chunk.
+        level = 0
+        while True:
+            total = len(chunks)
+            await _emit(f"summarizing {total} chunk(s) of earlier context…")
+            summaries = []
+            for i, ch in enumerate(chunks):
+                await _emit(f"summarizing chunk {i + 1}/{total}…")
+                s = await _summarize_one(manager, ch)
+                if s:
+                    summaries.append(s)
+            if not summaries:
+                return None
+            if len(summaries) == 1:
+                return summaries[0]
+            combined = "\n".join(summaries)
+            if len(combined) <= chunk_chars or level >= 3:
+                await _emit("combining chunk summaries…")
+                final = await _summarize_one(manager, combined[:chunk_chars], max_tokens=500)
+                return final or combined
+            # Still too big — reduce another level.
+            chunks = [combined[i:i + chunk_chars] for i in range(0, len(combined), chunk_chars)]
+            level += 1
     except Exception as e:
         print(f"[auto-compact] summary generation failed: {e}", flush=True)
         return None
+
+
+def _resolve_compaction(request, current_manager):
+    """Resolve effective auto-compaction settings for a request by merging the
+    per-model config over the global ``compaction`` defaults. Returns a plan dict
+    or None when compaction is disabled. The over-threshold decision is made later
+    against the live token estimate (see ``_auto_compact_events``)."""
+    try:
+        from codai.models.manager import multi_model_manager as _mmm
+        _cc = _mmm._config_for_model(getattr(request, "model", None) or "") or {}
+    except Exception:
+        _mmm = None
+        _cc = {}
+    _g = None
+    try:
+        from codai.admin.routes import config_manager as _cm
+        if _cm is not None and getattr(_cm, "config", None) is not None:
+            _g = _cm.config.compaction
+    except Exception:
+        _g = None
+
+    def _gv(attr, default):
+        return getattr(_g, attr, default) if _g is not None else default
+
+    enabled = _cc.get("auto_compact", _gv("enabled", False))
+    if not enabled:
+        return None
+    pct = _cc.get("auto_compact_pct", _gv("pct", 85)) or 85
+    strategy = (_cc.get("auto_compact_strategy") or _gv("strategy", "drop_oldest") or "drop_oldest").strip()
+    compact_model = (_cc.get("auto_compact_model") or _gv("model", "") or "").strip()
+
+    try:
+        n_ctx = current_manager.get_context_size() if current_manager else 0
+    except Exception:
+        n_ctx = 0
+
+    # NOTE: the summarizer model (``compact_model``) is resolved LAZILY in
+    # _auto_compact_events, only when the prompt is actually over threshold — so a
+    # configured separate model isn't loaded on every (under-threshold) request.
+    return {
+        "pct": float(pct), "strategy": strategy, "n_ctx": n_ctx,
+        "compact_model": compact_model, "current_manager": current_manager,
+    }
+
+
+def _resolve_compact_manager(plan):
+    """Lazily pick the manager that performs summarization for ``plan`` and its
+    context size. Returns (manager, name, compact_n_ctx). Falls back to the
+    request's own model when no separate model is configured or it can't load."""
+    current_manager = plan.get("current_manager")
+    compact_manager = current_manager
+    try:
+        compact_name = getattr(current_manager, "model_name", None) or "the model"
+    except Exception:
+        compact_name = "the model"
+    compact_model = plan.get("compact_model")
+    if compact_model:
+        try:
+            from codai.models.manager import multi_model_manager as _mmm
+            _cand = _mmm.get_model_for_request(compact_model)
+            if _cand is not None and getattr(_cand, "backend", None) is not None:
+                compact_manager = _cand
+                compact_name = compact_model
+        except Exception:
+            pass
+    try:
+        compact_n_ctx = compact_manager.get_context_size() if compact_manager else 0
+    except Exception:
+        compact_n_ctx = 0
+    return compact_manager, compact_name, (compact_n_ctx or plan.get("n_ctx") or 4096)
+
+
+async def _auto_compact_events(plan, messages):
+    """Drive auto-compaction for ``plan`` (from ``_resolve_compaction``), yielding
+    ('status', text) progress events and finally one ('done', messages, info,
+    error) event. ``error`` is a string when the request still overflows after
+    compaction (caller decides whether to raise or stream it), else None. When the
+    prompt is under threshold, yields only the terminal ('done', messages, None,
+    None)."""
+    n_ctx = plan["n_ctx"]
+    pct = plan["pct"]
+    strategy = plan["strategy"]
+    est = _estimate_tokens(messages)
+    if not n_ctx or est < n_ctx * pct / 100.0:
+        yield ("done", messages, None, None)
+        return
+    summary = None
+    if strategy == "summarize":
+        # Resolve the summarizer model now (may load a separate, smaller model).
+        compact_manager, compact_name, compact_n_ctx = _resolve_compact_manager(plan)
+        via = f" via {compact_name}" if compact_name and compact_name != "the model" else ""
+        yield ("status", f"🗜 Compacting context (~{est} tokens ≥ {int(pct)}% of {n_ctx})"
+                         f" using '{strategy}'{via}…\n")
+        # Bridge the summarizer's progress callback to this generator through a
+        # queue so status lines stream to the client LIVE while it summarizes
+        # (summarization can take minutes on a large model).
+        _q: asyncio.Queue = asyncio.Queue()
+        _DONE = object()
+
+        async def _cb(msg):
+            await _q.put(f"  • {msg}\n")
+
+        async def _run():
+            try:
+                return await _summarize_for_compact(
+                    compact_manager, messages,
+                    compact_n_ctx=compact_n_ctx, progress=_cb)
+            finally:
+                await _q.put(_DONE)
+
+        _task = asyncio.create_task(_run())
+        while True:
+            _ev = await _q.get()
+            if _ev is _DONE:
+                break
+            yield ("status", _ev)
+        summary = await _task
+    else:
+        yield ("status", f"🗜 Compacting context (~{est} tokens ≥ {int(pct)}% of {n_ctx})"
+                         f" using '{strategy}'…\n")
+    new_messages, info = _compact_messages(messages, n_ctx, pct, strategy, summary)
+    if info:
+        yield ("status", f"✅ Context compacted: dropped {info['dropped']} message(s), "
+                         f"~{info['before_tokens']}→{info['after_tokens']} tokens.\n")
+    err = None
+    if _estimate_tokens(new_messages) > n_ctx:
+        err = ("The request is too large for this model's context window "
+               f"(~{_estimate_tokens(new_messages)} tokens vs n_ctx={n_ctx}) "
+               "even after auto-compaction. Shorten the latest message or "
+               "increase the model's context size (n_ctx).")
+    yield ("done", new_messages, info, err)
 
 
 @router.post("/v1/chat/completions", summary="Chat completions")
@@ -992,42 +1150,27 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         elif not isinstance(m["content"], str) and not isinstance(m["content"], list):
             messages_dict[i]["content"] = str(m["content"])
 
-    # Auto-compact (per-model, OFF by default): when the prompt would exceed
-    # `auto_compact_pct`% of the model's context window, shrink it to ~65% using
-    # the configured strategy (drop_oldest | keep_head_tail | summarize) instead of
-    # erroring out on overflow.
-    try:
-        from codai.models.manager import multi_model_manager as _mmm
-        _cc = _mmm._config_for_model(getattr(request, "model", None) or "") or {}
-    except Exception:
-        _cc = {}
-    if _cc.get("auto_compact"):
-        try:
-            _nctx = current_manager.get_context_size() if current_manager else 0
-        except Exception:
-            _nctx = 0
-        _pct = _cc.get("auto_compact_pct", 85)
-        _strategy = (_cc.get("auto_compact_strategy") or "drop_oldest").strip()
-        if _nctx and _estimate_tokens(messages_dict) >= _nctx * float(_pct or 85) / 100.0:
-            _summary = None
-            if _strategy == "summarize":
-                _summary = await _summarize_for_compact(current_manager, messages_dict)
-            messages_dict, _info = _compact_messages(
-                messages_dict, _nctx, _pct, _strategy, _summary)
-            if _info:
-                print(f"[auto-compact] {getattr(request, 'model', '?')}: "
-                      f"~{_info['before_tokens']}→{_info['after_tokens']} tokens "
-                      f"(n_ctx={_nctx}, dropped {_info['dropped']} msgs via "
-                      f"{_info['strategy']})", flush=True)
-            # If compaction couldn't get it under the window (e.g. a single huge
-            # final message), signal a clear "request too big for context" error
-            # instead of letting generation fail mid-stream.
-            if _estimate_tokens(messages_dict) > _nctx:
-                raise HTTPException(status_code=400, detail=(
-                    "The request is too large for this model's context window "
-                    f"(~{_estimate_tokens(messages_dict)} tokens vs n_ctx={_nctx}) "
-                    "even after auto-compaction. Shorten the latest message or "
-                    "increase the model's context size (n_ctx)."))
+    # Auto-compact (per-model or global, OFF by default): when the prompt nears
+    # the model's context window, shrink it using the configured strategy
+    # (drop_oldest | keep_head_tail | summarize). Resolve the effective settings
+    # now; the streaming path applies it inside stream_chat_response so it can
+    # stream progress to the client, while the non-streaming path applies it
+    # inline just below. The raw two-pass path builds its prompt from only the
+    # system + last user turn, so compaction there is a no-op and is skipped.
+    _compact_plan = _resolve_compaction(request, current_manager)
+    if _compact_plan and not request.stream:
+        async for _ev in _auto_compact_events(_compact_plan, messages_dict):
+            if _ev[0] == "status":
+                print(f"[auto-compact] {_ev[1].strip()}", flush=True)
+            else:
+                _, messages_dict, _info, _cerr = _ev
+                if _info:
+                    print(f"[auto-compact] {getattr(request, 'model', '?')}: "
+                          f"~{_info['before_tokens']}→{_info['after_tokens']} tokens "
+                          f"(dropped {_info['dropped']} msgs via {_info['strategy']})",
+                          flush=True)
+                if _cerr:
+                    raise HTTPException(status_code=400, detail=_cerr)
 
 
     # Convert tools to dict format if present
@@ -1630,6 +1773,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     request.response_format,
                     _prefix_key,
                     enable_thinking=reasoning_enabled,
+                    compact_plan=_compact_plan,
                 ):
                     yield chunk
             finally:
@@ -1765,6 +1909,7 @@ async def stream_chat_response(
     response_format: Optional[Dict] = None,
     prefix_key: str = "",
     enable_thinking: bool = False,
+    compact_plan: Optional[Dict] = None,
 ) -> AsyncGenerator[str, None]:
     """Stream chat completion response with queue notifications."""
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -1773,7 +1918,42 @@ async def stream_chat_response(
     _tid = None
 
     generated_text = ""
-    
+
+    # Auto-compact an over-long history before generation, streaming progress to
+    # the client as status content deltas (the same mechanism as the "Waiting for
+    # model reply…" notices — visible text, not part of the saved completion).
+    if compact_plan:
+        try:
+            async for _ev in _auto_compact_events(compact_plan, messages):
+                if _ev[0] == "status":
+                    _sc = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model_name,
+                        "choices": [{"index": 0, "delta": {"content": _ev[1]},
+                                     "finish_reason": None}],
+                        "x_compaction": {"status": "compacting"},
+                    }
+                    yield f"data: {json.dumps(_sc)}\n\n"
+                else:
+                    _, messages, _cinfo, _cerr = _ev
+                    if _cinfo:
+                        print(f"[auto-compact] {model_name}: "
+                              f"~{_cinfo['before_tokens']}→{_cinfo['after_tokens']} tokens "
+                              f"(dropped {_cinfo['dropped']} msgs via {_cinfo['strategy']})",
+                              flush=True)
+                    if _cerr:
+                        _ec = {
+                            "id": completion_id, "object": "chat.completion.chunk",
+                            "created": created, "model": model_name,
+                            "choices": [{"index": 0, "delta": {"content": "\n⚠ " + _cerr},
+                                         "finish_reason": "stop"}],
+                        }
+                        yield f"data: {json.dumps(_ec)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+        except Exception as _ce:
+            print(f"[auto-compact] streaming compaction failed: {_ce}", flush=True)
+
     # Check if model is loaded - if not, notify waiting clients
     # The model manager exists but backend may not be loaded yet in on-demand mode
     model_loaded = False

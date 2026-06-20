@@ -2682,7 +2682,8 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "balanced_gpu_percent", "acceleration",
                 "cache_type_k", "cache_type_v", "turboquant", "engine", "engine_fallback",
                 "quant_backend", "kv_cache_budget_mb", "kv_cache_slots", "mmproj",
-                "auto_compact", "auto_compact_pct", "auto_compact_strategy"):
+                "auto_compact", "auto_compact_pct", "auto_compact_strategy",
+                "auto_compact_model"):
         if key in data:
             entry[key] = data[key]
 
@@ -3432,6 +3433,12 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "extra_env": c.ds4.extra_env,
             "auto_build": c.ds4.auto_build,
         },
+        "compaction": {
+            "enabled": c.compaction.enabled,
+            "pct": c.compaction.pct,
+            "strategy": c.compaction.strategy,
+            "model": c.compaction.model,
+        },
         "broker": {
             "enabled": c.broker.enabled,
             "base_url": c.broker.base_url,
@@ -3719,6 +3726,22 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             c.ds4.extra_env = (d.get("extra_env") or "").strip()
         if "auto_build" in d:
             c.ds4.auto_build = bool(d["auto_build"])
+
+    if "compaction" in data:
+        cp = data["compaction"] or {}
+        if "enabled" in cp:
+            c.compaction.enabled = bool(cp["enabled"])
+        if "pct" in cp:
+            try:
+                c.compaction.pct = max(50, min(99, int(cp["pct"])))
+            except (TypeError, ValueError):
+                pass
+        if "strategy" in cp:
+            _st = (cp.get("strategy") or "drop_oldest").strip()
+            if _st in ("drop_oldest", "keep_head_tail", "summarize"):
+                c.compaction.strategy = _st
+        if "model" in cp:
+            c.compaction.model = (cp.get("model") or "").strip()
 
     if "broker" in data:
         bro = data["broker"]

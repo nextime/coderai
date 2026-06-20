@@ -215,6 +215,24 @@ class EnhanceConfig:
 
 
 @dataclass
+class CompactionConfig:
+    """Global defaults for auto-compaction of an over-long chat history.
+
+    Per-model settings in a models.json entry (``auto_compact``,
+    ``auto_compact_pct``, ``auto_compact_strategy``, ``auto_compact_model``)
+    OVERRIDE the values here; when a model leaves one unset, the global default
+    below applies. ``model`` selects which model performs the summarization for
+    the ``summarize`` strategy — empty means use the same model that serves the
+    request. Pointing it at a smaller/faster model lets that model summarize the
+    old turns while the big model answers; the dropped history is chunked to fit
+    the chosen summarizer's own context window before it is summarized."""
+    enabled: bool = False
+    pct: int = 85                        # compact when the prompt reaches this % of n_ctx
+    strategy: str = "drop_oldest"        # drop_oldest | keep_head_tail | summarize
+    model: str = ""                      # model id/alias that summarizes; "" = same as request
+
+
+@dataclass
 class Ds4Config:
     """DeepSeek V4 via ds4 (antirez/DwarfStar) external-worker configuration.
 
@@ -273,6 +291,7 @@ class Config:
     jobs: JobsConfig = field(default_factory=JobsConfig)
     enhance: EnhanceConfig = field(default_factory=EnhanceConfig)
     ds4: Ds4Config = field(default_factory=Ds4Config)
+    compaction: CompactionConfig = field(default_factory=CompactionConfig)
     broker: BrokerConfig = field(default_factory=BrokerConfig)
     system_prompt: Optional[str] = None
     tools_closer_prompt: bool = False
@@ -457,6 +476,7 @@ class ConfigManager:
                 jobs=_dc(JobsConfig, config_data.get("jobs", {})),
                 enhance=_dc(EnhanceConfig, config_data.get("enhance", {})),
                 ds4=_dc(Ds4Config, config_data.get("ds4", {})),
+                compaction=_dc(CompactionConfig, config_data.get("compaction", {})),
                 broker=_dc(BrokerConfig, config_data.get("broker", {})),
                 system_prompt=config_data.get("system_prompt"),
                 tools_closer_prompt=config_data.get("tools_closer_prompt", False),
@@ -624,6 +644,12 @@ class ConfigManager:
                 "expert_cache_reserve_gb": self.config.ds4.expert_cache_reserve_gb,
                 "extra_env": self.config.ds4.extra_env,
                 "auto_build": self.config.ds4.auto_build,
+            },
+            "compaction": {
+                "enabled": self.config.compaction.enabled,
+                "pct": self.config.compaction.pct,
+                "strategy": self.config.compaction.strategy,
+                "model": self.config.compaction.model,
             },
             "broker": {
                 "enabled": self.config.broker.enabled,

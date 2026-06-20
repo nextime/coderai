@@ -707,11 +707,18 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         </div>
         <div class="form-row" style="margin:0">
           <label class="form-label">Strategy</label>
-          <select id="cfg-autocompact-strategy" class="form-input">
+          <select id="cfg-autocompact-strategy" class="form-input" onchange="_toggleAutoCompact()">
             <option value="drop_oldest">Drop oldest — keep system + most recent turns</option>
             <option value="keep_head_tail">Keep head + tail — also keep the first turn, drop the middle</option>
             <option value="summarize">Summarize — replace the dropped middle with an LLM summary</option>
           </select>
+        </div>
+        <div class="form-row" id="cfg-autocompact-model-row" style="margin:0;grid-column:1/-1;display:none">
+          <label class="form-label">Summarizer model <span class="muted">(summarize only)</span></label>
+          <select id="cfg-autocompact-model" class="form-input">
+            <option value="">Same as request model (default)</option>
+          </select>
+          <span class="form-hint" style="font-size:11px">A separate (e.g. smaller/faster) model can write the summary while the main model answers. The dropped history is chunked to fit the chosen model's own context. Empty = the request's own model summarizes. Leave empty to inherit the global default.</span>
         </div>
       </div>
 
@@ -2812,6 +2819,36 @@ async function freeDiskConfirm(idx){
 function _toggleAutoCompact(){
   const on = document.getElementById('cfg-autocompact').checked;
   document.getElementById('cfg-autocompact-opts').style.display = on ? 'grid' : 'none';
+  const strat = document.getElementById('cfg-autocompact-strategy').value;
+  const mrow = document.getElementById('cfg-autocompact-model-row');
+  if(mrow) mrow.style.display = (on && strat === 'summarize') ? 'block' : 'none';
+}
+
+// Populate the summarizer-model dropdown from the configured text/LLM models,
+// preserving the current selection.
+function _populateCompactModelSelect(selected){
+  const sel = document.getElementById('cfg-autocompact-model');
+  if(!sel) return;
+  const cur = selected != null ? selected : sel.value;
+  const seen = new Set();
+  let html = '<option value="">Same as request model (default)</option>';
+  (_localModels||[]).forEach(m=>{
+    const caps = m.capabilities||[];
+    const type = m.defaultType||'text_models';
+    const isText = type==='text_models' || type==='gguf_models' || type==='vision_models'
+      || caps.includes('chat') || caps.includes('text') || caps.includes('tools');
+    if(!isText) return;
+    const id = m.path || m.label;
+    if(!id || seen.has(id)) return;
+    seen.add(id);
+    html += `<option value="${esc(id)}">${esc(m.label||id)}</option>`;
+  });
+  // Keep a previously-saved value even if its model isn't in the local list.
+  if(cur && !seen.has(cur)){
+    html += `<option value="${esc(cur)}">${esc(cur)}</option>`;
+  }
+  sel.innerHTML = html;
+  sel.value = cur || '';
 }
 
 /* ── type checkbox helpers ─────────────────────────────── */
@@ -3197,6 +3234,7 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-autocompact').checked = !!s.auto_compact;
   document.getElementById('cfg-autocompact-pct').value = s.auto_compact_pct != null ? s.auto_compact_pct : 85;
   document.getElementById('cfg-autocompact-strategy').value = s.auto_compact_strategy || 'drop_oldest';
+  _populateCompactModelSelect(s.auto_compact_model || '');
   _toggleAutoCompact();
   document.getElementById('cfg-4bit').checked = !!s.load_in_4bit;
   document.getElementById('cfg-8bit').checked = !!s.load_in_8bit;
@@ -3586,6 +3624,7 @@ async function saveModelConfig(){
     auto_compact:      document.getElementById('cfg-autocompact').checked,
     auto_compact_pct:  parseInt(document.getElementById('cfg-autocompact-pct').value) || 85,
     auto_compact_strategy: document.getElementById('cfg-autocompact-strategy').value || 'drop_oldest',
+    auto_compact_model: document.getElementById('cfg-autocompact-model').value || '',
     max_gpu_percent:   isNaN(maxGpu) ? null : maxGpu,
     manual_ram_gb:     isNaN(ramGb) ? null : ramGb,
     load_in_4bit:      document.getElementById('cfg-4bit').checked,
