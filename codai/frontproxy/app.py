@@ -262,6 +262,10 @@ class FrontProxy:
                 rec = {"engine": (m.get("engine") or "").strip() or None,
                        "backend": (m.get("backend") or "").strip() or None,
                        "path": (m.get("path") or m.get("id") or "").strip() or None,
+                       # Canonical model id (NOT the alias) — what the loaded-model
+                       # list should display so each model shows once, by its id.
+                       "model_id": (m.get("id") or m.get("path")
+                                    or m.get("alias") or "").strip() or None,
                        "engine_fallback": bool(m.get("engine_fallback"))}
                 for field_ in (m.get("path"), m.get("id"), m.get("alias")):
                     if not field_:
@@ -350,6 +354,19 @@ class FrontProxy:
         except Exception:
             return False
 
+    def _canonical_loaded(self, keys) -> list:
+        """Map an engine's loaded-model keys to canonical model ids, deduped.
+
+        A model can be resident under several keys — its real id/path, the
+        auto-derived gguf stem, an explicit alias, a type-prefixed key (``audio:`` …).
+        Resolve each to the model's configured id so the loaded-model list shows each
+        model once, by its actual id rather than an alias."""
+        seen: dict = {}
+        for k in sorted(keys):
+            canon = (self._model_info(k).get("model_id") or k)
+            seen.setdefault(canon, None)
+        return list(seen.keys())
+
     def engines_list(self) -> list:
         out = []
         for e in self.registry.all():
@@ -360,7 +377,8 @@ class FrontProxy:
             out.append({"id": e.id, "name": e.name, "backend": e.backend,
                         "gpu": e.gpu, "healthy": e.healthy, "primary": e.primary,
                         "vram": e.vram, "cooling": bool(e.cooling),
-                        "loaded_models": sorted(e.loaded_models), "pid": pid})
+                        "loaded_models": self._canonical_loaded(e.loaded_models),
+                        "pid": pid})
         return out
 
     async def model_loaded_status(self, request: Request):

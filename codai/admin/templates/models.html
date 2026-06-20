@@ -2944,9 +2944,9 @@ function _applyBackendCfgVisibility(m){
 }
 
 // Populate the mmproj (multimodal projector) select from the available component
-// GGUF files. Auto-selects the projector that best matches this model's name when
-// the config hasn't explicitly chosen one (mmproj is enabled by default when a
-// matching projector exists — e.g. gemma vision).
+// GGUF files. Defaults to None and only auto-pairs a projector when its name is a
+// strong, unambiguous match for this model (e.g. gemma vision) — never on a lone
+// shared family token, which previously paired the wrong-size projector.
 function _populateMmprojSelect(m, s){
   const sel = document.getElementById('cfg-mmproj');
   if(!sel) return;
@@ -2956,27 +2956,40 @@ function _populateMmprojSelect(m, s){
     return role && role.key === 'mmproj';
   });
   const cur = (s && s.mmproj) || '';
-  // Score each projector by shared name tokens with the model, so the gemma
-  // projector pairs with the gemma model rather than an unrelated one.
+  // Score each projector by shared *distinctive* name tokens with the model, so
+  // the gemma projector pairs with the gemma model — not an unrelated one, and
+  // not the wrong-size sibling. Generic tokens (quant level, format, "mmproj"…)
+  // are dropped so they can't manufacture a false match.
+  const GENERIC = new Set(['gguf','mmproj','proj','model','instruct','chat','text',
+    'vision','base','tuned','finetune','merge','fp16','bf16','f16','f32']);
+  const isQuant = (t) => /^(iq|q)\d/.test(t) || /^\d+bpw$/.test(t)
+    || ['k','km','ks','kl','kxl','km','kss','xs','xss'].includes(t);
+  const distinctive = (name) => name.split(/[^a-z0-9]+/)
+    .filter(t => t.length >= 3 && !GENERIC.has(t) && !isQuant(t));
   const modelName = (_ggufBaseName(m.label || m.path || '') || '').toLowerCase();
-  const tokens = modelName.split(/[^a-z0-9]+/).filter(t => t.length >= 3);
+  const tokens = distinctive(modelName);
   const score = (fname) => {
     const n = fname.toLowerCase();
     return tokens.reduce((acc, t) => acc + (n.includes(t) ? 1 : 0), 0);
   };
-  let best = '', bestScore = 0;
+  // A real match must cover at least half the model's distinctive tokens (floor
+  // 1) — a lone shared family token among several isn't enough.
+  const need = Math.max(1, Math.ceil(tokens.length / 2));
+  let best = '', bestScore = 0, tie = false;
   const opts = ['<option value="">None</option>'];
   for(const f of projFiles){
     const sc = score(f.filename);
-    if(sc > bestScore){ bestScore = sc; best = f.path; }
+    if(sc > bestScore){ bestScore = sc; best = f.path; tie = false; }
+    else if(sc === bestScore && sc > 0){ tie = true; }
     opts.push(`<option value="${esc(f.path)}">${esc(f.filename)} (${fmtGB(f.size_gb)})</option>`);
   }
   sel.innerHTML = opts.join('');
-  // Selection priority: explicit config value → best name match (enabled by
-  // default) → None.
-  sel.value = cur || (bestScore > 0 ? best : '');
+  // Auto-pair only on a strong, unambiguous match; otherwise default to None.
+  const auto = (bestScore >= need && !tie) ? best : '';
+  // Selection priority: explicit config value → strong name match → None.
+  sel.value = cur || auto;
   // If the stored value isn't among the current options (file removed), fall back.
-  if(cur && sel.value !== cur) sel.value = (bestScore > 0 ? best : '');
+  if(cur && sel.value !== cur) sel.value = auto;
   _onMmprojChange();
 }
 
