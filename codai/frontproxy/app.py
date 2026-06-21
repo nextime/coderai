@@ -375,6 +375,28 @@ class FrontProxy:
         except Exception:
             return False
 
+    async def gpu_stats(self, request: Request) -> Response:
+        """Serve per-card GPU stats (util/VRAM/temperature) FROM THE FRONT, using the
+        torch-free gpu_detect enumeration (nvidia-smi + AMD sysfs). This keeps the
+        dashboard's temps/stats live even when an engine is saturated generating —
+        previously /admin/api/gpu-stats fell through to the generic proxy and blocked
+        on the busy engine, hanging the whole UI. Run in a thread so the subprocess
+        (nvidia-smi) never blocks the front's event loop. Auth is light on purpose:
+        GPU telemetry is low-sensitivity, and full session validation lives on the
+        (possibly busy) engine, which would defeat the point — so we only require a
+        session cookie or bearer token to be present."""
+        has_cred = bool(request.cookies.get("session")) or \
+            request.headers.get("authorization", "").lower().startswith("bearer ")
+        if not has_cred:
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        import asyncio
+        from codai.frontproxy.gpu_detect import gpu_stats as _gpu_stats
+        try:
+            cards = await asyncio.to_thread(_gpu_stats)
+        except Exception as exc:
+            return JSONResponse({"cards": [], "error": str(exc)})
+        return JSONResponse({"cards": cards})
+
     def _canonical_loaded(self, keys) -> list:
         """Map an engine's loaded-model keys to canonical model ids, deduped.
 
@@ -800,6 +822,13 @@ def build_app(config, config_dir=None) -> FastAPI:
     @app.get("/admin/api/system-stats", include_in_schema=False)
     async def _system_stats(request: Request):
         return await front.poll(request)
+
+    # GPU stats are served by the FRONT (torch-free gpu_detect) so temps/util stay
+    # live even when an engine is busy generating — registered before the catch-all
+    # so it isn't proxied to a (possibly blocked) engine.
+    @app.get("/admin/api/gpu-stats", include_in_schema=False)
+    async def _gpu_stats(request: Request):
+        return await front.gpu_stats(request)
 
     # /v1/models is the union across engines (each engine registers only the models
     # the front assigned to it). Registered before the catch-all so it's aggregated.
