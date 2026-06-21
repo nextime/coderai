@@ -2336,21 +2336,13 @@ class MultiModelManager:
             cfg = dict(cfg) if isinstance(cfg, dict) else {}
             cfg["measured_vram_gb"] = measured
             self.config[model_key] = cfg
-            # Persist to models.json via config_manager (separate field; the
-            # user's own keys are never touched).
+            # Persist to models.json via a SINGLE-field read-modify-write, so a
+            # secondary engine's stale in-memory models_data can't clobber a UI edit
+            # (e.g. n_ctx) made on the primary after this engine booted. Only
+            # measured_vram_gb on the matching entry is touched.
             from codai.admin.routes import config_manager
             if config_manager is not None:
-                bare = model_key.split(":", 1)[1] if ":" in model_key else model_key
-                for cat in ("text_models", "image_models", "audio_models", "tts_models",
-                            "vision_models", "video_models", "audio_gen_models",
-                            "embedding_models", "spatial_models"):
-                    for entry in config_manager.models_data.get(cat, []):
-                        if not isinstance(entry, dict):
-                            continue
-                        epath = entry.get("path") or entry.get("id") or ""
-                        if epath == bare or epath.split("/")[-1] == bare.split("/")[-1]:
-                            entry["measured_vram_gb"] = measured
-                config_manager.save_models()
+                config_manager.persist_model_field(model_key, "measured_vram_gb", measured)
         except Exception as e:
             print(f"  Warning: could not persist measured_vram_gb: {e}")
 

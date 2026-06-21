@@ -615,7 +615,9 @@ class ConfigManager:
                 "ram_leak_watch": self.config.offload.ram_leak_watch,
                 "ram_watch_poll_seconds": self.config.offload.ram_watch_poll_seconds,
                 "ram_watch_soft_fraction": self.config.offload.ram_watch_soft_fraction,
-                "ram_watch_cuda": self.config.offload.ram_watch_cuda
+                "ram_watch_cuda": self.config.offload.ram_watch_cuda,
+                "gpu_split": self.config.offload.gpu_split,
+                "tensor_split": self.config.offload.tensor_split
             },
             "vulkan": {
                 "n_gpu_layers": self.config.vulkan.n_gpu_layers,
@@ -701,12 +703,14 @@ class ConfigManager:
                 "client_id": self.config.broker.client_id,
                 "registration_token": self.config.broker.registration_token,
                 "advertised_endpoint": self.config.broker.advertised_endpoint,
+                "websocket_path": self.config.broker.websocket_path,
                 "transport": self.config.broker.transport,
                 "heartbeat_interval_seconds": self.config.broker.heartbeat_interval_seconds,
                 "connect_timeout_seconds": self.config.broker.connect_timeout_seconds,
                 "request_timeout_seconds": self.config.broker.request_timeout_seconds,
                 "reconnect_initial_delay_seconds": self.config.broker.reconnect_initial_delay_seconds,
                 "reconnect_max_delay_seconds": self.config.broker.reconnect_max_delay_seconds,
+                "websocket_ping_interval": self.config.broker.websocket_ping_interval,
             },
             "system_prompt": self.config.system_prompt,
             "tools_closer_prompt": self.config.tools_closer_prompt,
@@ -728,6 +732,47 @@ class ConfigManager:
         """Save models.json to disk."""
         with open(self.models_path, 'w') as f:
             json.dump(self.models_data, f, indent=2)
+
+    def persist_model_field(self, model_path: str, key: str, value) -> bool:
+        """Set a SINGLE field on the matching model entry by RE-READING models.json
+        from disk first, then writing back — never dumping this process's whole
+        in-memory models_data.
+
+        This avoids a multi-process clobber: each engine (front + every backend
+        engine) loads models.json at its own boot, so a secondary engine's
+        in-memory copy is stale w.r.t. a UI edit (e.g. n_ctx) made afterward. When
+        that engine later auto-persists a runtime field (e.g. measured_vram_gb), a
+        plain save_models() would write its stale full state and revert the edit.
+        Read-modify-write of only the intended field keeps every other key intact.
+        Also refreshes self.models_data so this process sees the merged result."""
+        try:
+            on_disk = {}
+            if self.models_path.exists():
+                with open(self.models_path, 'r') as f:
+                    on_disk = json.load(f)
+        except Exception:
+            on_disk = dict(self.models_data)
+        bare = model_path.split(":", 1)[1] if ":" in model_path else model_path
+        changed = False
+        for cat, lst in on_disk.items():
+            if not isinstance(lst, list):
+                continue
+            for entry in lst:
+                if not isinstance(entry, dict):
+                    continue
+                epath = entry.get("path") or entry.get("id") or ""
+                if epath == bare or epath.split("/")[-1] == bare.split("/")[-1]:
+                    if entry.get(key) != value:
+                        entry[key] = value
+                        changed = True
+        if changed:
+            tmp = str(self.models_path) + ".tmp"
+            with open(tmp, 'w') as f:
+                json.dump(on_disk, f, indent=2)
+            os.replace(tmp, self.models_path)
+        # Keep our in-memory copy consistent with the merged on-disk file.
+        self.models_data = on_disk
+        return changed
     
     def save_auth(self):
         """Save auth.json to disk."""
