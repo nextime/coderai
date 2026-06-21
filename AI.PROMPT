@@ -311,15 +311,25 @@ Full build (slow, ~15 min — rebuilds the bundle):
   packaging/linux/build_oci_image.sh                      # tags coderai:dist
   - By DEFAULT it then exports the image and assembles the final distribution
     bundle (dist/coderai-docker-dist.tar). Pass --no-dist to just build.
+  - --from-scratch (default) builds from pinned packages + native wheels;
+    --venv PATH / --from-venv build from a local venv (e.g. ./venv_all).
+  - --versioned derives a deterministic tag from codai.__version__ + build mode +
+    GPU: local-venv -> coderai:full_<gpu>_<version>, from-scratch ->
+    coderai:base_<gpu>_<version> (overrides -t/--tag). --gpu all|nvidia|vulkan
+    (default all) sets <gpu>; it is a LABEL only — the image always bundles both
+    CUDA and Vulkan. e.g. `--venv ./venv_all --versioned` -> coderai:full_all_0.1.0.
 
 Distribution bundle (packaging/linux/make_dist_bundle.sh → dist/coderai-docker-dist.tar):
-  Expands to coderai-docker-dist/{install.sh, coderai-docker, coderai-dist.tar.gz,
-  README.txt}. Staged UNDER dist/ (not /tmp — too small) and the 12 GB image
-  tarball is HARDLINKED into the stage, not copied. install.sh: `docker load`s the
-  image (sudo-fallback for daemon access), then installs the coderai-docker runner
-  to /usr/local/bin (root) or ~/.local/usr/bin (user, added to ~/.bashrc PATH if
-  missing). The runner is run_oci.sh with its default image tag pinned (sed) to
-  whatever was shipped, so it matches the loaded tag.
+  Expands to coderai-docker-dist/{install.sh, uninstall.sh, coderai-docker,
+  coderai-dist.tar.gz, README.txt/.md}. Staged UNDER dist/ (not /tmp — too small)
+  and the 12 GB image tarball is HARDLINKED into the stage, not copied. install.sh:
+  `docker load`s the image (sudo-fallback for daemon access), then installs the
+  coderai-docker runner to /usr/local/bin (root) or ~/.local/usr/bin (user, added
+  to ~/.bashrc PATH if missing). uninstall.sh reverses it (removes the runner from
+  both locations + optionally the image; --keep-image). Both print what they'll do
+  and confirm before proceeding, bypassable with --yes/-y. The runner is run_oci.sh
+  with its default image tag pinned (sed) to whatever was shipped, so it matches
+  the loaded tag.
 Smoke test (no weights, checks services + every bundled binary):
   DOCKER="sudo docker" GPU="--gpus all" PORT=18082 \
     packaging/linux/smoke_test_services.sh coderai:dist
@@ -327,6 +337,15 @@ Smoke test (no weights, checks services + every bundled binary):
 Run against your LIVE local config + data (no rebuild — pure bind-mounts):
   packaging/linux/run_oci.sh --nvidia --local \
     --map /AI/guffcache --map /AI/huggingface --map /AI/offloads
+  - GPU backends are ADDITIVE: --cpu/--nvidia/--vulkan combine (last-one no longer
+    wins). --nvidia --vulkan enables both (maps libcuda via --gpus all AND
+    /dev/dri); --all = nvidia+vulkan. The bundled llama-cpp is a CUDA build, so
+    --vulkan auto bind-mounts the host's libcuda.so.1 (override with
+    --with-libcuda[=PATH]); a missing libcuda now degrades gracefully (server
+    starts, Vulkan/GGUF backend just unavailable) instead of crash-looping.
+  - -p/--port PORT sets the host port; --host ADDR binds the published port to a
+    specific interface (e.g. 127.0.0.1 localhost-only; default = all interfaces).
+    CODERAI_HOST stays 0.0.0.0 so the server listens on all interfaces in-container.
   - The image launcher reads config from /config/coderai and runs
     `coderai --config /config/coderai`, rewriting server.host/port in config.json.
   - `--local` (= --config-dir ~/.coderai) copies ONLY the *.json config files to

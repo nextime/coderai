@@ -19,6 +19,9 @@ declare -A MODES=()
 # full --gpus all). "auto" = detect via ldconfig; or an explicit path.
 WITH_LIBCUDA=""
 PORT="${CODERAI_PORT:-8776}"
+# Host interface the published port binds to. Empty = Docker's default (all
+# interfaces, 0.0.0.0). Set e.g. 127.0.0.1 to expose only on localhost.
+HOST_BIND="${CODERAI_HOST_BIND:-}"
 DATA_ROOT="$PWD/coderai-runtime"
 DETACH=0
 NAME="coderai"
@@ -71,6 +74,9 @@ Options:
                       host. P is an explicit path; default auto-detects via
                       ldconfig. (Implied automatically when --nvidia is set.)
   -p, --port PORT     Host port to expose (default: 8776).
+  --host ADDR         Host interface to bind the published port to (e.g.
+                      127.0.0.1 for localhost-only, 0.0.0.0 for all interfaces).
+                      Default: Docker's default (all interfaces).
   --data-dir PATH     Directory for config/models/cache (default: ./coderai-runtime).
   --name NAME         Container name (default: coderai).
   -d, --detach        Run in background.
@@ -117,6 +123,9 @@ while [[ $# -gt 0 ]]; do
     -p|--port)
       [[ $# -ge 2 ]] || { echo "Error: $1 requires a port" >&2; exit 2; }
       PORT="$2"; shift 2 ;;
+    --host)
+      [[ $# -ge 2 ]] || { echo "Error: --host requires an address" >&2; exit 2; }
+      HOST_BIND="$2"; shift 2 ;;
     --data-dir)
       [[ $# -ge 2 ]] || { echo "Error: --data-dir requires a path" >&2; exit 2; }
       DATA_ROOT="$2"; shift 2 ;;
@@ -159,7 +168,15 @@ done
 mkdir -p "$DATA_ROOT/config" "$DATA_ROOT/models" "$DATA_ROOT/cache"
 DATA_ROOT="$(cd "$DATA_ROOT" && pwd)"
 
-args=(run --rm --name "$NAME" --ipc=host -p "$PORT:8776" -e CODERAI_HOST=0.0.0.0 -e CODERAI_PORT=8776)
+# Publish spec: bind to a specific host interface when --host is given, else let
+# Docker use its default (all interfaces). CODERAI_HOST stays 0.0.0.0 so the
+# server listens on all interfaces *inside* the container.
+if [[ -n "$HOST_BIND" ]]; then
+  PUBLISH="$HOST_BIND:$PORT:8776"
+else
+  PUBLISH="$PORT:8776"
+fi
+args=(run --rm --name "$NAME" --ipc=host -p "$PUBLISH" -e CODERAI_HOST=0.0.0.0 -e CODERAI_PORT=8776)
 if [[ "$DETACH" == "1" ]]; then
   args+=(-d)
 fi
@@ -297,7 +314,7 @@ Starting CoderAI OCI container
   image:   $IMAGE_TAG
   mode:    $(echo "${!MODES[@]}" | tr ' ' '+' | tr 'A-Z' 'a-z')
   libcuda: $LIBCUDA_NOTE
-  url:     http://127.0.0.1:$PORT/admin
+  url:     http://${HOST_BIND:-127.0.0.1}:$PORT/admin
   data:    $DATA_ROOT
   config:  $CONFIG_NOTE
   debug:   ${DEBUG_SPEC:-off}

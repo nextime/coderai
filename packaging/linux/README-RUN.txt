@@ -56,7 +56,12 @@ Basic run (NVIDIA):
     -v "$PWD/coderai-cache:/cache" \
     coderai:local
 
-AMD/Intel Vulkan: replace `--gpus all` with `--device /dev/dri`.
+AMD/Intel Vulkan: replace `--gpus all` with `--device /dev/dri`. NOTE: the bundled
+  llama-cpp is a CUDA build, so GGUF needs libcuda.so.1 even under Vulkan — on a
+  host with the NVIDIA driver add e.g.
+    -v /usr/lib/x86_64-linux-gnu/libcuda.so.1:/usr/lib/x86_64-linux-gnu/libcuda.so.1:ro
+  (the coderai-docker runner's --vulkan does this automatically). Without it the
+  server still starts; only the Vulkan/GGUF text backend is unavailable.
 CPU only: drop the GPU flag entirely.
 Run as container-root instead: just omit the `--user` line (see "Running as a
 non-root user" below for rootless / userns-remap alternatives).

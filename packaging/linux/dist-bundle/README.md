@@ -9,6 +9,7 @@ studio + township fighters, all behind one nginx port).
 | File | Purpose |
 |------|---------|
 | `install.sh` | Loads the image into Docker and installs the runner. |
+| `uninstall.sh` | Removes the runner and (optionally) the image. |
 | `coderai-docker` | The run wrapper (installed to your PATH by `install.sh`). |
 | `coderai-dist.tar.gz` | The Docker image (gzip-compressed `docker save`). |
 | `README.md` / `README.txt` | This file. |
@@ -21,7 +22,7 @@ studio + township fighters, all behind one nginx port).
 ## Install
 
 ```sh
-./install.sh
+./install.sh            # prompts to confirm; add --yes to skip
 ```
 
 Installs `coderai-docker` to:
@@ -30,11 +31,21 @@ Installs `coderai-docker` to:
 - `~/.local/usr/bin` — when run as a normal user (added to PATH via `~/.bashrc`
   if it isn't there already).
 
+## Uninstall
+
+```sh
+./uninstall.sh          # removes the runner + (after a prompt) the image
+```
+
+`--keep-image` keeps the image; `--yes` skips all prompts. Your runtime data is
+left untouched.
+
 ## Run
 
 ```sh
-coderai-docker --nvidia      # CUDA; or --vulkan (AMD/Intel) / --cpu
-coderai-docker --help        # all options
+coderai-docker --nvidia          # CUDA; or --vulkan (AMD/Intel) / --cpu
+coderai-docker --nvidia --vulkan # both backends (also: --all)
+coderai-docker --help            # all options
 ```
 
 Then open <http://127.0.0.1:8776/admin>.
@@ -43,7 +54,9 @@ Then open <http://127.0.0.1:8776/admin>.
 
 | Option | Description |
 |--------|-------------|
+| `--nvidia` / `--vulkan` | GPU backends; **additive** (pass both, or `--all`). `--vulkan` auto-maps the host `libcuda.so.1` (the bundled llama-cpp is a CUDA build); `--with-libcuda[=PATH]` overrides. |
 | `-p, --port PORT` | Host port (default `8776`). |
+| `--host ADDR` | Bind the published port to a specific interface (e.g. `127.0.0.1` localhost-only; default all interfaces). |
 | `--data-dir PATH` | Where config/models/cache live (default `./coderai-runtime`). |
 | `--local` | Run against your existing `~/.coderai` config. |
 | `--map HOST[:CONT]` | Bind-mount a host dir at the same path (for absolute model paths in `models.json`), e.g. `--map /AI/guffcache`. |

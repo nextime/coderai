@@ -37,6 +37,12 @@ DS4_DIR="${CODERAI_DS4_DIR:-$HOME/.coderai/ds4}"
 # bundle (image tarball + install.sh + coderai-docker runner). Disable with
 # --no-dist (just builds the image).
 MAKE_DIST=1
+# --versioned auto-derives a structured image tag from the app version + build
+# mode + target GPU: full_<gpu>_<version> for a local-venv build, base_<gpu>_<version>
+# for a from-scratch build (e.g. coderai:full_all_0.1.0). GPU_SEL is a label only —
+# the image bundles CUDA + Vulkan regardless — so pick what you intend to ship.
+VERSIONED=0
+GPU_SEL="all"   # all | nvidia | vulkan
 
 usage() {
   cat <<'EOF'
@@ -62,6 +68,13 @@ Options:
   --no-parler             Do not bundle the Parler-TTS venv overlay.
   --no-tools              Do not bundle the lip-sync (wav2lip/sadtalker) venvs or ds4.
   -t, --tag TAG           Image tag to create (default: coderai:local or OCI_IMAGE from versions.env).
+  --versioned             Auto-derive the tag from the app version + build mode + GPU:
+                            local-venv build -> coderai:full_<gpu>_<version>
+                            from-scratch     -> coderai:base_<gpu>_<version>
+                          (overrides -t/--tag and the default). <version> comes from
+                          codai.__version__; <gpu> from --gpu (default all).
+  --gpu all|nvidia|vulkan Target-GPU label used by --versioned (default: all). Label
+                          only — the image always bundles both CUDA and Vulkan.
   --no-dist               Just build the image; skip exporting + bundling for distribution.
   --dist                  Force building the distribution bundle (default ON).
   -h, --help              Show this help.
@@ -147,6 +160,21 @@ while [[ $# -gt 0 ]]; do
       IMAGE_TAG="$2"
       shift 2
       ;;
+    --versioned)
+      VERSIONED=1
+      shift
+      ;;
+    --gpu)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --gpu requires one of: all nvidia vulkan" >&2
+        exit 2
+      fi
+      case "$2" in
+        all|nvidia|vulkan) GPU_SEL="$2" ;;
+        *) echo "Error: --gpu must be one of: all nvidia vulkan (got '$2')" >&2; exit 2 ;;
+      esac
+      shift 2
+      ;;
     --no-dist)
       MAKE_DIST=0
       shift
@@ -174,6 +202,26 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# --versioned: derive coderai:<prefix>_<gpu>_<version>. prefix=full for a local
+# venv build (the running stack), base for a from-scratch build. Overrides any
+# -t/--tag or positional tag, since the whole point is a deterministic name.
+if [[ "$VERSIONED" == "1" ]]; then
+  APP_VERSION="$(cd "$ROOT_DIR" && python3 - <<'PY'
+import re, pathlib, sys
+txt = pathlib.Path("codai/__init__.py").read_text()
+m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', txt)
+print(m.group(1) if m else "")
+PY
+)"
+  if [[ -z "$APP_VERSION" ]]; then
+    echo "Error: --versioned could not read __version__ from codai/__init__.py" >&2
+    exit 2
+  fi
+  if [[ "$BUILD_MODE" == "venv" ]]; then PREFIX="full"; else PREFIX="base"; fi
+  IMAGE_TAG="coderai:${PREFIX}_${GPU_SEL}_${APP_VERSION}"
+  echo "[build] --versioned -> $IMAGE_TAG"
+fi
 
 PYTHON_VERSION="${PYTHON_VERSION:-3.13.5}"
 PBS_RELEASE="${PBS_RELEASE:-20250612}"
