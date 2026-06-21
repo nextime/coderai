@@ -57,6 +57,8 @@ Then open <http://127.0.0.1:8776/admin>.
 | `--nvidia` / `--vulkan` | GPU backends; **additive** (pass both, or `--all`). `--vulkan` auto-maps the host `libcuda.so.1` (the bundled llama-cpp is a CUDA build); `--with-libcuda[=PATH]` overrides. |
 | `-p, --port PORT` | Host port (default `8776`). |
 | `--host ADDR` | Bind the published port to a specific interface (e.g. `127.0.0.1` localhost-only; default all interfaces). |
+| `--coderai-arg ARG` | Pass one extra flag straight through to the coderai server (repeatable; one token each). |
+| `--coderai-args "STR"` | Pass a raw space-separated string of extra coderai flags. |
 | `--data-dir PATH` | Where config/models/cache live (default `./coderai-runtime`). |
 | `--local` | Run against your existing `~/.coderai` config. |
 | `--map HOST[:CONT]` | Bind-mount a host dir at the same path (for absolute model paths in `models.json`), e.g. `--map /AI/guffcache`. |

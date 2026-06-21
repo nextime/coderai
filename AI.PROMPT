@@ -346,6 +346,12 @@ Run against your LIVE local config + data (no rebuild — pure bind-mounts):
   - -p/--port PORT sets the host port; --host ADDR binds the published port to a
     specific interface (e.g. 127.0.0.1 localhost-only; default = all interfaces).
     CODERAI_HOST stays 0.0.0.0 so the server listens on all interfaces in-container.
+  - Pass-through coderai server flags: --coderai-arg ARG (repeatable, one token
+    each) and --coderai-args "STR" build CODERAI_EXTRA_ARGS, which the in-image
+    coderai launcher (coderai-oci) appends to the server argv. supervisord's
+    command is fixed, so extra flags ride in via this env var (NOT via `--`, which
+    goes to the container engine). The launcher change is baked in — needs an image
+    (re)build / update_oci_image.sh to take effect.
   - The image launcher reads config from /config/coderai and runs
     `coderai --config /config/coderai`, rewriting server.host/port in config.json.
   - `--local` (= --config-dir ~/.coderai) copies ONLY the *.json config files to

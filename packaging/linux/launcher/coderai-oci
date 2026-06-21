@@ -101,6 +101,11 @@ case " $DEBUG_ARGS " in *" --debug "*) : ;; *[!\ ]*) DEBUG_ARGS="--debug$DEBUG_A
 set -- --config "$CONFIG_DIR" "$@"
 [ -n "${CODERAI_TMP:-}" ] && set -- "$@" --tmp "$CODERAI_TMP"
 
+# Extra coderai CLI flags passed straight through from the host launcher
+# (coderai-docker --coderai-arg / --coderai-args -> CODERAI_EXTRA_ARGS). supervisord
+# runs this script with a fixed command, so arbitrary server flags arrive via this
+# env var rather than argv. Word-split intentionally (like DEBUG_ARGS below).
+
 CODERAI_BIN="/opt/coderai/python/bin/python3 /opt/coderai/app/coderai"
 
 # Optional host-tailable file log. CODERAI_LOG_FILE should point under a mounted
@@ -112,7 +117,7 @@ if [ -n "${CODERAI_LOG_FILE:-}" ]; then
   mkdir -p "$(dirname "$CODERAI_LOG_FILE")" 2>/dev/null || true
   echo "[coderai-oci] debug='${CODERAI_DEBUG:-off}' → logging to $CODERAI_LOG_FILE" >&2
   # shellcheck disable=SC2086
-  exec $CODERAI_BIN "$@" $DEBUG_ARGS 2>&1 | tee -a "$CODERAI_LOG_FILE"
+  exec $CODERAI_BIN "$@" $DEBUG_ARGS ${CODERAI_EXTRA_ARGS:-} 2>&1 | tee -a "$CODERAI_LOG_FILE"
 fi
 # shellcheck disable=SC2086
-exec $CODERAI_BIN "$@" $DEBUG_ARGS
+exec $CODERAI_BIN "$@" $DEBUG_ARGS ${CODERAI_EXTRA_ARGS:-}

@@ -22,6 +22,10 @@ PORT="${CODERAI_PORT:-8776}"
 # Host interface the published port binds to. Empty = Docker's default (all
 # interfaces, 0.0.0.0). Set e.g. 127.0.0.1 to expose only on localhost.
 HOST_BIND="${CODERAI_HOST_BIND:-}"
+# Extra CLI flags passed straight through to the coderai server inside the
+# container (via CODERAI_EXTRA_ARGS, appended by the in-image coderai launcher).
+# Built from --coderai-arg (repeatable, one token each) and --coderai-args "...".
+CODERAI_EXTRA_ARGS="${CODERAI_EXTRA_ARGS:-}"
 DATA_ROOT="$PWD/coderai-runtime"
 DETACH=0
 NAME="coderai"
@@ -77,6 +81,12 @@ Options:
   --host ADDR         Host interface to bind the published port to (e.g.
                       127.0.0.1 for localhost-only, 0.0.0.0 for all interfaces).
                       Default: Docker's default (all interfaces).
+  --coderai-arg ARG   Pass one extra flag straight through to the coderai server
+                      (e.g. --coderai-arg --some-flag). Repeatable; each ARG is a
+                      single token (no embedded spaces).
+  --coderai-args STR  Pass a raw string of extra coderai flags (space-separated),
+                      e.g. --coderai-args "--foo bar --baz". Appended after any
+                      --coderai-arg values.
   --data-dir PATH     Directory for config/models/cache (default: ./coderai-runtime).
   --name NAME         Container name (default: coderai).
   -d, --detach        Run in background.
@@ -126,6 +136,12 @@ while [[ $# -gt 0 ]]; do
     --host)
       [[ $# -ge 2 ]] || { echo "Error: --host requires an address" >&2; exit 2; }
       HOST_BIND="$2"; shift 2 ;;
+    --coderai-arg)
+      [[ $# -ge 2 ]] || { echo "Error: --coderai-arg requires a value" >&2; exit 2; }
+      CODERAI_EXTRA_ARGS="${CODERAI_EXTRA_ARGS:+$CODERAI_EXTRA_ARGS }$2"; shift 2 ;;
+    --coderai-args)
+      [[ $# -ge 2 ]] || { echo "Error: --coderai-args requires a string" >&2; exit 2; }
+      CODERAI_EXTRA_ARGS="${CODERAI_EXTRA_ARGS:+$CODERAI_EXTRA_ARGS }$2"; shift 2 ;;
     --data-dir)
       [[ $# -ge 2 ]] || { echo "Error: --data-dir requires a path" >&2; exit 2; }
       DATA_ROOT="$2"; shift 2 ;;
@@ -177,6 +193,10 @@ else
   PUBLISH="$PORT:8776"
 fi
 args=(run --rm --name "$NAME" --ipc=host -p "$PUBLISH" -e CODERAI_HOST=0.0.0.0 -e CODERAI_PORT=8776)
+# Pass-through coderai server flags (appended by the in-image launcher's argv).
+if [[ -n "$CODERAI_EXTRA_ARGS" ]]; then
+  args+=(-e "CODERAI_EXTRA_ARGS=$CODERAI_EXTRA_ARGS")
+fi
 if [[ "$DETACH" == "1" ]]; then
   args+=(-d)
 fi
@@ -320,6 +340,7 @@ Starting CoderAI OCI container
   debug:   ${DEBUG_SPEC:-off}
   log:     $LOG_HOST_NOTE
   tools:   $TOOLS_NOTE
+  cdr-args:${CODERAI_EXTRA_ARGS:+ $CODERAI_EXTRA_ARGS}
 EOF
 
 if [[ "$LOG_HOST_NOTE" != "(none)" ]]; then
