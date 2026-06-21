@@ -1012,6 +1012,10 @@ def main():
     global_args.ram_watch_poll_seconds = config.offload.ram_watch_poll_seconds
     global_args.ram_watch_soft_fraction = config.offload.ram_watch_soft_fraction
     global_args.ram_watch_cuda = config.offload.ram_watch_cuda
+    # Cross-backend GPU pooling defaults (per-model config can override). Read by
+    # the GGUF loader to set llama.cpp split_mode/tensor_split.
+    global_args.gpu_split = getattr(config.offload, "gpu_split", False)
+    global_args.tensor_split = getattr(config.offload, "tensor_split", None)
     # Thermal protection settings (read live by codai.models.thermal).
     global_args.thermal_cpu_enabled = config.thermal.cpu_enabled
     global_args.thermal_gpu_enabled = config.thermal.gpu_enabled

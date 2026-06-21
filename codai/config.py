@@ -122,6 +122,17 @@ class OffloadConfig:
     ram_watch_poll_seconds: float = 15.0    # how often the watcher samples RSS
     ram_watch_soft_fraction: float = 0.90   # mitigate at/above this fraction of the cap
     ram_watch_cuda: bool = True             # allow mitigation to call CUDA empty_cache()
+    # Cross-backend GPU pooling. OFF by default: each engine uses only its own
+    # backend's GPUs (CUDA for an NVIDIA engine, Vulkan for a Radeon engine) and a
+    # model still splits across multiple SAME-backend cards (e.g. 2× 3090). When ON,
+    # an engine may ALSO pool a model across a different backend's card (e.g. NVIDIA
+    # 3090 via CUDA + Radeon RX 580 via Vulkan) for more total VRAM — slower, since
+    # the weakest card bottlenecks each token.
+    gpu_split: bool = False
+    # llama.cpp per-device layer ratio when a model is split, in llama.cpp device
+    # order (CUDA devices first, then Vulkan). e.g. "0.8,0.2" = 80% on the first GPU
+    # (3090), 20% on the second (RX 580). Blank = even split across the devices.
+    tensor_split: Optional[str] = None
 
 
 @dataclass

@@ -1106,6 +1106,11 @@ class MultiModelManager:
                         kwargs[_kvk] = _kvv
                 if _raw and '_raw_cfg' not in kwargs:
                     kwargs['_raw_cfg'] = _raw
+                # Cross-backend GPU pooling: per-model overrides global (global_args).
+                kwargs['gpu_split'] = _cfg_or_global('gpu_split', 'gpu_split', False)
+                _ts_val = _cfg_or_global('tensor_split', 'tensor_split', None)
+                if _ts_val:
+                    kwargs['tensor_split'] = _ts_val
                 no_ram = _cfg_or_global('no_ram', 'no_ram', False)
                 kwargs['no_ram'] = bool(no_ram)
                 offload_strategy = _cfg_or_global('offload_strategy', 'offload_strategy', 'auto')
@@ -1225,6 +1230,11 @@ class MultiModelManager:
                         kwargs[_kvk] = _kvv
                 if _raw and '_raw_cfg' not in kwargs:
                     kwargs['_raw_cfg'] = _raw
+                # Cross-backend GPU pooling: per-model overrides global (global_args).
+                kwargs['gpu_split'] = _cfg_or_global('gpu_split', 'gpu_split', False)
+                _ts_val = _cfg_or_global('tensor_split', 'tensor_split', None)
+                if _ts_val:
+                    kwargs['tensor_split'] = _ts_val
                 no_ram = _cfg_or_global('no_ram', 'no_ram', False)
                 kwargs['no_ram'] = bool(no_ram)
                 offload_strategy = _cfg_or_global('offload_strategy', 'offload_strategy', 'auto')

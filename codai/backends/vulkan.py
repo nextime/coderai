@@ -1013,6 +1013,41 @@ class VulkanBackend(ModelBackend):
                     print(f"  slots        : n_seq_max={_n_seq} requested but llama-cpp-python "
                           f"{getattr(_llama_cpp, '__version__', '?')} doesn't expose it — ignoring")
 
+        # Cross-GPU layer split (opt-in, per-model). gpu_split=True lets llama.cpp
+        # spread this model's layers across multiple visible GPU devices (e.g. an
+        # NVIDIA 3090 via CUDA + a Radeon via Vulkan) for more total VRAM. The
+        # engine's device visibility is set by the front (GGML_VK_VISIBLE_DEVICES /
+        # CUDA_VISIBLE_DEVICES); here we only choose HOW to distribute:
+        #   - gpu_split off → split_mode NONE: keep the whole model on main_gpu (one
+        #     card), so a foreign card the engine can see isn't used by accident.
+        #   - gpu_split on  → split_mode LAYER + optional tensor_split ratio
+        #     ("0.8,0.2" in llama.cpp device order: CUDA devices first, then Vulkan).
+        # By default (gpu_split off) we DON'T touch split_mode: llama.cpp's default
+        # LAYER split spreads the model across the engine's visible cards — which the
+        # front has already isolated to this engine's own backend (e.g. both 3090s),
+        # never the foreign Radeon. When gpu_split is on AND a tensor_split ratio is
+        # given, we set the per-device ratio (llama.cpp device order: CUDA first,
+        # then Vulkan), e.g. "0.8,0.2" = 80% on the 3090, 20% on the RX 580.
+        _gpu_split = kwargs.get('gpu_split', _raw_cfg.get('gpu_split'))
+        if _gpu_split is None:
+            _gpu_split = bool(kwargs.get('_global_gpu_split', False))
+        _ts = kwargs.get('tensor_split', _raw_cfg.get('tensor_split'))
+        if _ts is None:
+            _ts = kwargs.get('_global_tensor_split')
+        if _gpu_split and _ts:
+            _parsed = []
+            for _p in str(_ts).replace(' ', '').split(','):
+                if _p == '':
+                    continue
+                try:
+                    _parsed.append(float(_p))
+                except ValueError:
+                    _parsed = []
+                    break
+            if _parsed and _llama_accepts('tensor_split'):
+                llama_kwargs['tensor_split'] = _parsed
+                print(f"  gpu split    : tensor_split={_parsed} (multi-GPU pool, CUDA-first order)")
+
         # Multimodal projector (mmproj): pairs a CLIP/vision projector GGUF with
         # this text model so it can accept images — the llama.cpp `--mmproj`
         # equivalent, which adds vision capability (e.g. gemma). Uses llama.cpp's

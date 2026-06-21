@@ -158,12 +158,17 @@ def find_vulkan_icd(vendor: str) -> str:
     return ""
 
 
-def vendor_env(vendor: str) -> dict:
+def vendor_env(vendor: str, allow_cross: bool = False) -> dict:
     """Env that pins an engine to **all** of ``vendor``'s cards on this machine.
 
     NVIDIA: CUDA visible = all NVIDIA UUIDs (+ PCI_BUS_ID order), Vulkan ICD = nvidia.
     AMD/Intel: CUDA hidden (""), Vulkan ICD = that vendor's, so it sees only those
-    cards. Missing tools degrade gracefully (the key is simply omitted)."""
+    cards. Missing tools degrade gracefully (the key is simply omitted).
+
+    ``allow_cross`` (opt-in) lets this engine ALSO use other vendors' Vulkan cards
+    — e.g. an NVIDIA engine pooling a model across the 3090 (CUDA) and a Radeon
+    (Vulkan) for more total VRAM. Off by default: each engine stays on its own
+    backend's GPUs (and still splits across multiple same-backend cards)."""
     vendor = _norm_vendor(vendor)
     env = {}
     if vendor == "nvidia":
@@ -178,16 +183,41 @@ def vendor_env(vendor: str) -> dict:
     # non-AMD engine can't pick up a Radeon (mirrors CUDA hiding for non-NVIDIA).
     if vendor != "amd":
         env["RADEON_VISIBLE_DEVICES"] = ""
+    # Vulkan isolation. Detect each Vulkan device's vendor (vulkan_devices() reads
+    # vendorid and preserves Vulkan index order) and pin this engine to ONLY its
+    # vendor's cards — by their REAL indices, never an assumed 0..n-1 order.
     icd = find_vulkan_icd(vendor)
-    if icd:
+    vk_devs = vulkan_devices()
+    vendor_idx = [i for i, d in enumerate(vk_devs) if d.get("vendor") == vendor]
+    if allow_cross:
+        # Opt-in cross-backend pooling: expose EVERY enumerated Vulkan device (any
+        # vendor) so llama.cpp can split a model across backends. Don't pin the ICD.
+        if vk_devs:
+            env["GGML_VK_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(len(vk_devs)))
+    elif icd:
+        # The vendor ICD exists: point the loader at it so ONLY this vendor's cards
+        # are visible, then they are reindexed 0..n-1.
         env["VK_ICD_FILENAMES"] = icd
-    # After ICD isolation only THIS vendor's card(s) are visible to Vulkan, as
-    # indices 0..n-1. Pin GGML_VK_VISIBLE_DEVICES to those indices so an inherited
-    # value (e.g. a launcher exporting GGML_VK_VISIBLE_DEVICES=1 from the old
-    # multi-vendor enumeration) can't select an invalid index and silently fall back
-    # to CPU. Default to "0" when the count can't be determined (single card).
-    _n = sum(1 for d in vulkan_devices() if d.get("vendor") == vendor)
-    env["GGML_VK_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(max(1, _n)))
+        n = len(vendor_idx)
+        if n == 0 and vendor in gpu_vendors():
+            n = 1  # vulkaninfo couldn't enumerate (e.g. missing) but the card exists
+        env["GGML_VK_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(n)) if n else ""
+    elif vendor_idx:
+        # No vendor ICD to filter with, but this vendor DOES have Vulkan device(s):
+        # select their ACTUAL indices in the unfiltered enumeration (detected, not
+        # assumed), so we never grab a different vendor's card sitting at index 0.
+        env["GGML_VK_VISIBLE_DEVICES"] = ",".join(str(i) for i in vendor_idx)
+    else:
+        # No vendor ICD AND no Vulkan device for this vendor — e.g. an NVIDIA engine
+        # in a container that lacks nvidia_icd.json (the toolkit only injects it with
+        # the graphics capability). Previously VK_ICD_FILENAMES was left unset, so the
+        # loader fell back to ALL ICDs and the engine grabbed another vendor's card
+        # (the RX 580 via RADV) — splitting the model across the wrong GPU. Give this
+        # engine ZERO Vulkan devices instead (it runs on CUDA only); point the loader
+        # at a non-existent ICD so no Vulkan driver loads. Per-engine, so the AMD
+        # engine still keeps its Vulkan.
+        env["VK_ICD_FILENAMES"] = os.path.join(_ICD_DIRS[0], "_coderai_no_vulkan.json")
+        env["GGML_VK_VISIBLE_DEVICES"] = ""
     return env
 
 

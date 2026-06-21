@@ -193,6 +193,7 @@ class EngineSupervisor:
         specs = getattr(srv, "engine_specs", None)
         engines = []
 
+        _cross = bool(getattr(getattr(self.config, "offload", None), "gpu_split", False))
         if specs:
             from codai.frontproxy.gpu_detect import vendor_env
             for idx, spec in enumerate(specs):
@@ -203,7 +204,7 @@ class EngineSupervisor:
                 gpus_kw = (spec.get("gpus") or "").strip().lower()
                 if not gpus_kw and not spec.get("env") and backend == "nvidia":
                     gpus_kw = "nvidia"
-                detected = vendor_env(gpus_kw) if gpus_kw else {}
+                detected = vendor_env(gpus_kw, allow_cross=_cross) if gpus_kw else {}
                 explicit = {str(k): str(v) for k, v in (spec.get("env") or {}).items()}
                 env = {**detected, **explicit}     # explicit overrides detected
                 # Tell the engine which physical cards it owns, so thermal
@@ -241,7 +242,7 @@ class EngineSupervisor:
             return engines
 
         for idx, (name, vkw, backend) in enumerate(plan):
-            env = vendor_env(vkw)
+            env = vendor_env(vkw, allow_cross=_cross)
             sels = _gpu_selectors({"backend": backend, "gpus": vkw}, env)
             if sels:
                 env["CODERAI_ENGINE_GPUS"] = ",".join(sels)
