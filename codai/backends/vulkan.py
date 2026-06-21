@@ -296,6 +296,40 @@ def _pooled_free_vram_gb(cross: bool = False) -> float:
     return total if total > 0 else _free_vram_gb(0)
 
 
+def _per_device_free_vram_gb() -> list:
+    """Free VRAM (GB) per device in llama.cpp's device order — CUDA devices first
+    (by index), then Vulkan/AMD cards (amdgpu sysfs, sorted) — matching how
+    tensor_split is interpreted. Used to auto-derive a VRAM-proportional split when
+    the user enables cross-GPU pooling without specifying a ratio."""
+    out = []
+    try:
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                try:
+                    free, _ = torch.cuda.mem_get_info(i)
+                    out.append(free / (1024 ** 3))
+                except Exception:
+                    out.append(0.0)
+    except Exception:
+        pass
+    try:
+        import glob
+        for tp in sorted(glob.glob('/sys/class/drm/card*/device/mem_info_vram_total')):
+            up = tp.replace('vram_total', 'vram_used')
+            try:
+                with open(tp) as f:
+                    _t = int(f.read().strip())
+                with open(up) as f:
+                    _u = int(f.read().strip())
+                out.append((_t - _u) / (1024 ** 3))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
+
+
 def _ggml_kv_type(name):
     """Map a KV-cache quant name to the llama.cpp GGML type int, or None.
 
@@ -1082,19 +1116,31 @@ class VulkanBackend(ModelBackend):
         _ts = kwargs.get('tensor_split', _raw_cfg.get('tensor_split'))
         if _ts is None:
             _ts = kwargs.get('_global_tensor_split')
-        if _gpu_split and _ts:
+        if _gpu_split:
             _parsed = []
-            for _p in str(_ts).replace(' ', '').split(','):
-                if _p == '':
-                    continue
-                try:
-                    _parsed.append(float(_p))
-                except ValueError:
-                    _parsed = []
-                    break
+            if _ts:
+                # Explicit ratio.
+                for _p in str(_ts).replace(' ', '').split(','):
+                    if _p == '':
+                        continue
+                    try:
+                        _parsed.append(float(_p))
+                    except ValueError:
+                        _parsed = []
+                        break
+            if not _parsed:
+                # Auto: distribute proportionally to each device's free VRAM (a 24 GB
+                # 3090 + 8 GB RX 580 → ~0.75/0.25), so the bigger card carries more.
+                _free_dev = _per_device_free_vram_gb()
+                _sum = sum(_free_dev)
+                if len(_free_dev) > 1 and _sum > 0:
+                    _parsed = [round(f / _sum, 3) for f in _free_dev]
+                    print(f"  gpu split    : auto tensor_split={_parsed} (by free VRAM "
+                          f"{[round(f,1) for f in _free_dev]} GB)")
+            else:
+                print(f"  gpu split    : tensor_split={_parsed} (multi-GPU pool, CUDA-first order)")
             if _parsed and _llama_accepts('tensor_split'):
                 llama_kwargs['tensor_split'] = _parsed
-                print(f"  gpu split    : tensor_split={_parsed} (multi-GPU pool, CUDA-first order)")
 
         # Multimodal projector (mmproj): pairs a CLIP/vision projector GGUF with
         # this text model so it can accept images — the llama.cpp `--mmproj`

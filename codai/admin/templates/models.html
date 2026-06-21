@@ -563,15 +563,21 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       </div>
       <div class="form-row" id="cfg-engine-row" style="margin-top:.75rem;display:none">
         <label class="form-label">Engine / card</label>
-        <select id="cfg-engine" class="form-input">
+        <select id="cfg-engine" class="form-input" onchange="_updateGpuSplitVisibility()">
           <option value="">Default (auto — by capability)</option>
+          <option value="__all__">All GPUs (split across every backend)</option>
         </select>
-        <span class="form-hint" style="font-size:11px">Pin this model to a specific engine/card. Overrides the default engine. Only shown when multiple engines are running.</span>
+        <span class="form-hint" style="font-size:11px">Pin this model to a specific engine/card, or <b>All GPUs</b> to split one model across every card (e.g. NVIDIA 3090 + Radeon) for more total VRAM. Only shown when multiple engines are running.</span>
         <label style="display:flex;align-items:center;gap:.4rem;margin-top:.4rem;font-size:12px">
           <input type="checkbox" id="cfg-engine-fallback" style="width:auto;margin:0">
           Fall back to another engine if the pinned one is unavailable
         </label>
         <span class="form-hint" style="font-size:11px">When off (default), a request fails if the pinned engine is down/busy-unreachable instead of running on a different card.</span>
+      </div>
+      <div class="form-row" id="cfg-gpu-split-row" style="margin-top:.75rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
+        <label class="form-label" style="font-weight:600">Weight distribution <span class="muted" style="font-weight:400">— layers per GPU</span></label>
+        <input type="text" id="cfg-tensor-split" class="form-input" placeholder="auto (by free VRAM)">
+        <span class="form-hint" style="font-size:11px">Comma-separated ratio in llama.cpp device order (CUDA cards first, then Vulkan), e.g. <b>0.8,0.2</b> = 80% of layers on the first GPU (3090), 20% on the second (RX 580). <b>Blank = automatic</b>, split proportionally to each card's free VRAM. The slower card bottlenecks each token, so bias toward the faster GPU.</span>
       </div>
       <div class="form-row" id="cfg-ds4-row" style="margin-top:.75rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
         <label class="form-label" style="font-weight:600">ds4 (DeepSeek V4) streaming <span class="muted" style="font-weight:400">— per-model overrides</span></label>
@@ -3266,8 +3272,11 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-offload-strategy').value = s.offload_strategy || 'auto';
   document.getElementById('cfg-offload-dir').value = s.offload_dir || _defaultOffloadDir;
   _applyBackendCfgVisibility(m);
-  _populateEnginePin(s.engine || '');
+  // "All GPUs" cross-split (gpu_split) takes precedence over an engine pin in the
+  // selector; otherwise show the pinned engine. Weight ratio populates the field.
+  _populateEnginePin(s.gpu_split ? '__all__' : (s.engine || ''));
   document.getElementById('cfg-engine-fallback').checked = !!s.engine_fallback;
+  document.getElementById('cfg-tensor-split').value = s.tensor_split || '';
   _populateDs4(m, s);
   document.getElementById('cfg-sysprompt').value = s.system_prompt || '';
   document.getElementById('cfg-parser').value = s.parser || (!m.in_config ? _autoDetectParser(m.path) : 'auto');
@@ -3565,19 +3574,30 @@ async function removeThisConfig(){
   } catch(e) { showAlert('Error: ' + e.message); }
 }
 
+// Show the weight-distribution row only when "All GPUs" (cross-GPU split) is chosen.
+function _updateGpuSplitVisibility(){
+  const sel = document.getElementById('cfg-engine');
+  const row = document.getElementById('cfg-gpu-split-row');
+  if(!sel || !row) return;
+  row.style.display = (sel.value === '__all__') ? '' : 'none';
+}
+
 // Engine-pin field: populate the datalist from declared engines and only show the
 // row when more than one engine is configured (single-engine setups don't need it).
+// The special "__all__" option (added in the HTML) means split across all GPUs.
 async function _populateEnginePin(desired){
   const row = document.getElementById('cfg-engine-row');
   const sel = document.getElementById('cfg-engine');
   try {
     if (!_engineNames || !_engineNames.length) await _loadEngineInfo();
     const want = (desired !== undefined) ? desired : sel.value;
-    sel.querySelectorAll('option:not([value=""])').forEach(o => o.remove());
-    _engineNames.forEach(n => { const o=document.createElement('option'); o.value=n; o.textContent=n; sel.appendChild(o); });
+    sel.querySelectorAll('option[value]:not([value=""]):not([value="__all__"])').forEach(o => o.remove());
+    const allOpt = sel.querySelector('option[value="__all__"]');
+    _engineNames.forEach(n => { const o=document.createElement('option'); o.value=n; o.textContent=n; sel.insertBefore(o, allOpt); });
     sel.value = want || '';   // set AFTER options exist so the selection sticks
     row.style.display = _engineNames.length > 1 ? '' : 'none';
   } catch(e) { row.style.display = 'none'; }
+  _updateGpuSplitVisibility();
 }
 
 // Per-model ds4 overrides: shown only when the ds4 engine is enabled globally and
@@ -3658,8 +3678,13 @@ async function saveModelConfig(){
     no_ram:            document.getElementById('cfg-noram').checked,
     offload_strategy:  document.getElementById('cfg-offload-strategy').value,
     offload_dir:       document.getElementById('cfg-offload-dir').value.trim() || './offload',
-    engine:            document.getElementById('cfg-engine').value.trim() || null,
+    // "All GPUs" → gpu_split (no single-engine pin); any real engine name → pin.
+    engine:            (document.getElementById('cfg-engine').value.trim() === '__all__'
+                          ? null : document.getElementById('cfg-engine').value.trim() || null),
     engine_fallback:   document.getElementById('cfg-engine-fallback').checked,
+    gpu_split:         document.getElementById('cfg-engine').value.trim() === '__all__',
+    tensor_split:      (document.getElementById('cfg-engine').value.trim() === '__all__'
+                          ? (document.getElementById('cfg-tensor-split').value.trim() || null) : null),
     ds4:               _collectDs4(),
     system_prompt:     document.getElementById('cfg-sysprompt').value.trim() || null,
     parser:            document.getElementById('cfg-parser').value,

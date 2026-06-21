@@ -3452,6 +3452,8 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "ram_watch_poll_seconds": c.offload.ram_watch_poll_seconds,
             "ram_watch_soft_fraction": c.offload.ram_watch_soft_fraction,
             "ram_watch_cuda": c.offload.ram_watch_cuda,
+            "gpu_split": c.offload.gpu_split,
+            "tensor_split": c.offload.tensor_split,
         },
         "vulkan": {
             "n_gpu_layers": c.vulkan.n_gpu_layers,
@@ -3629,6 +3631,9 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "ram_watch_soft_fraction" in off:
             c.offload.ram_watch_soft_fraction = float(off["ram_watch_soft_fraction"] or c.offload.ram_watch_soft_fraction)
         c.offload.ram_watch_cuda = bool(off.get("ram_watch_cuda", c.offload.ram_watch_cuda))
+        c.offload.gpu_split = bool(off.get("gpu_split", c.offload.gpu_split))
+        if "tensor_split" in off:
+            c.offload.tensor_split = off["tensor_split"] or None
         # Push the RAM-cap settings to live global_args so the watcher, per-load
         # budget clamp and eviction honour them without a restart.
         try:
@@ -3641,6 +3646,8 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
                 ga.ram_watch_poll_seconds = c.offload.ram_watch_poll_seconds
                 ga.ram_watch_soft_fraction = c.offload.ram_watch_soft_fraction
                 ga.ram_watch_cuda = c.offload.ram_watch_cuda
+                ga.gpu_split = c.offload.gpu_split
+                ga.tensor_split = c.offload.tensor_split
         except Exception:
             pass
 

@@ -116,6 +116,18 @@
   </div>
   <div class="form-row" style="margin:0">
     <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-gpu-split">
+      <span>Split models across all GPUs (cross-backend pooling)</span>
+    </label>
+    <span class="form-hint">Default for every model: pool one model's layers across all GPUs of all backends (e.g. NVIDIA 3090 + Radeon) for more total VRAM. Off = each model stays on its own backend's card(s) (multiple same-backend cards still split). A per-model "Engine / card → All GPUs" setting overrides this. The slower card bottlenecks each token.</span>
+  </div>
+  <div class="form-row" style="margin:0">
+    <label class="form-label">Default weight distribution <span class="muted">(when splitting)</span></label>
+    <input type="text" id="s-tensor-split" class="form-input" placeholder="auto (by free VRAM)">
+    <span class="form-hint">Comma-separated ratio in llama.cpp device order (CUDA cards first, then Vulkan), e.g. <b>0.8,0.2</b>. Blank = automatic, proportional to each card's free VRAM.</span>
+  </div>
+  <div class="form-row" style="margin:0">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
       <input type="checkbox" id="s-ram-leak-watch">
       <span>Watch for RAM leaks (auto-mitigate)</span>
     </label>
@@ -762,6 +774,8 @@ async function loadSettings(){
     document.getElementById('s-offload-dir').value = d.offload?.directory ?? './offload';
     document.getElementById('s-max-ram').value = d.offload?.max_ram_gb ?? '';
     document.getElementById('s-evict-idle-ram').checked = d.offload?.evict_idle_on_ram !== false;
+    document.getElementById('s-gpu-split').checked = !!d.offload?.gpu_split;
+    document.getElementById('s-tensor-split').value = d.offload?.tensor_split ?? '';
     document.getElementById('s-ram-leak-watch').checked = d.offload?.ram_leak_watch !== false;
     document.getElementById('s-ram-watch-cuda').checked = d.offload?.ram_watch_cuda !== false;
     document.getElementById('s-ram-watch-poll').value = d.offload?.ram_watch_poll_seconds ?? '';
@@ -875,6 +889,8 @@ async function saveSettings(){
       directory: document.getElementById('s-offload-dir').value.trim() || './offload',
       max_ram_gb: (parseFloat(document.getElementById('s-max-ram').value) || null),
       evict_idle_on_ram: document.getElementById('s-evict-idle-ram').checked,
+      gpu_split: document.getElementById('s-gpu-split').checked,
+      tensor_split: (document.getElementById('s-tensor-split').value.trim() || null),
       ram_leak_watch: document.getElementById('s-ram-leak-watch').checked,
       ram_watch_cuda: document.getElementById('s-ram-watch-cuda').checked,
       ram_watch_poll_seconds: (parseFloat(document.getElementById('s-ram-watch-poll').value) || null),
