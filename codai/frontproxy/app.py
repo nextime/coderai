@@ -37,7 +37,11 @@ _HOP_BY_HOP = {
 # Also strip any client-supplied internal token so a caller can't spoof/override the
 # real one the front injects — only the front's httpx default header reaches engines.
 _DROP_REQ = _HOP_BY_HOP | {"host", "content-length", "x-coderai-internal"}
-_DROP_RESP = _HOP_BY_HOP | {"content-length"}
+# Also drop date/server from relayed engine responses: the front's own ASGI server
+# (uvicorn/starlette) adds its own Date and Server headers, so keeping the engine's
+# too produces DUPLICATE header lines — which nginx logs as a warning on every
+# request, flooding the terminal. Strip them here so each appears exactly once.
+_DROP_RESP = _HOP_BY_HOP | {"content-length", "date", "server"}
 
 
 class FrontProxy:
@@ -203,6 +207,10 @@ class FrontProxy:
             default_engine=self.default_engine, pinned=self._pin_for(model),
             pin_fallback=bool(self._model_info(model).get("engine_fallback")))
         if engine is None:
+            print("[front] broker route: NO ENGINE for path=%s model=%r "
+                  "(required_cap=%r pin=%r) — returning 503"
+                  % (path, model, self._required_cap(path, model), self._pin_for(model)),
+                  flush=True)
             return {"status_code": 503, "headers": {"content-type": "application/json"},
                     "body": b'{"error":"No engine is ready yet."}'}
         send_headers = {k: v for k, v in (headers or {}).items()
@@ -212,10 +220,17 @@ class FrontProxy:
                                          headers=send_headers, params=query or {},
                                          content=body or b"")
         except Exception as exc:
+            print("[front] broker route: engine#%s (%s) unreachable for %s: %s"
+                  % (engine.id, engine.name, path, exc), flush=True)
             return {"status_code": 502,
                     "headers": {"content-type": "application/json"},
                     "body": ('{"error":"engine#%s unreachable: %s"}'
                              % (engine.id, exc)).encode()}
+        # Surface the engine's actual reply so a brokered request that "doesn't get
+        # executed" (e.g. an instant small error body) is diagnosable from the log.
+        print("[front] broker route: %s %s -> engine#%s(%s) status=%s bytes=%d preview=%r"
+              % (method, path, engine.id, engine.name, r.status_code,
+                 len(r.content), r.content[:200]), flush=True)
         return {"status_code": r.status_code, "headers": dict(r.headers),
                 "body": r.content}
 

@@ -93,9 +93,20 @@ CODERAI_BIN="/opt/coderai/python/bin/python3 /opt/coderai/app/coderai"
 # torn down together on stop.)
 if [ -n "${CODERAI_LOG_FILE:-}" ]; then
   mkdir -p "$(dirname "$CODERAI_LOG_FILE")" 2>/dev/null || true
-  echo "[coderai-oci] debug='${CODERAI_DEBUG:-off}' → logging to $CODERAI_LOG_FILE" >&2
-  # shellcheck disable=SC2086
-  exec $CODERAI_BIN "$@" $DEBUG_ARGS ${CODERAI_EXTRA_ARGS:-} 2>&1 | tee -a "$CODERAI_LOG_FILE"
+  # Only use the file log if we can actually write it. When the container runs as
+  # --user but the log dir/file was created by an earlier ROOT run, it's root-owned
+  # and not writable — previously `tee` then spammed "Permission denied" and the
+  # file stayed empty. Detect that and fall back to plain stdout with a clear note,
+  # so output is never lost and the terminal isn't polluted by tee errors.
+  if ( : >> "$CODERAI_LOG_FILE" ) 2>/dev/null; then
+    echo "[coderai-oci] debug='${CODERAI_DEBUG:-off}' → logging to $CODERAI_LOG_FILE" >&2
+    # shellcheck disable=SC2086
+    exec $CODERAI_BIN "$@" $DEBUG_ARGS ${CODERAI_EXTRA_ARGS:-} 2>&1 | tee -a "$CODERAI_LOG_FILE"
+  else
+    echo "[coderai-oci] WARNING: cannot write $CODERAI_LOG_FILE (not writable by uid $(id -u)) —" >&2
+    echo "[coderai-oci]   logging to stdout only. Fix: remove the root-owned path on the host," >&2
+    echo "[coderai-oci]   e.g. 'sudo rm -rf <cache>/logs', or run without --user." >&2
+  fi
 fi
 # shellcheck disable=SC2086
 exec $CODERAI_BIN "$@" $DEBUG_ARGS ${CODERAI_EXTRA_ARGS:-}
