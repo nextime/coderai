@@ -2214,49 +2214,45 @@ class MultiModelManager:
             return False
 
     def _get_free_vram_gb(self) -> float:
-        """Return estimated free VRAM in GB, or a large number if unavailable.
+        """Return estimated free VRAM in GB across the cards this engine can use.
 
-        With cross-GPU pooling (gpu_split) on, a model can be split across every
-        visible card, so report the POOL: free CUDA VRAM (all devices) + free AMD
-        VRAM (sysfs). CUDA and amdgpu sysfs never name the same card, so there's no
-        double count. Off → just the primary CUDA device (legacy single-GPU math)."""
-        pooled = self._cross_gpu_pooling_enabled()
-        total_free = 0.0
-        got = False
+        ALWAYS multi-device: sums every visible CUDA device (torch honours
+        CUDA_VISIBLE_DEVICES, so it's scoped to this engine's NVIDIA cards — e.g.
+        both 3090s — making same-backend eviction math correct even without split).
+        AMD card(s) (amdgpu sysfs) are added when cross-backend pooling (gpu_split)
+        is on, OR when no CUDA device is visible (a Radeon/Vulkan engine). CUDA and
+        amdgpu sysfs never name the same card, so there's no double count."""
+        cross = self._cross_gpu_pooling_enabled()
+        cuda_free = 0.0
+        cuda_count = 0
         try:
             import torch
             if torch.cuda.is_available():
-                if pooled:
-                    for i in range(torch.cuda.device_count()):
-                        try:
-                            free, _ = torch.cuda.mem_get_info(i)
-                            total_free += free / 1e9
-                            got = True
-                        except Exception:
-                            pass
-                else:
-                    free, total = torch.cuda.mem_get_info()
-                    return free / 1e9
+                for i in range(torch.cuda.device_count()):
+                    try:
+                        free, _ = torch.cuda.mem_get_info(i)
+                        cuda_free += free / 1e9
+                        cuda_count += 1
+                    except Exception:
+                        pass
         except Exception:
             pass
-        # AMD GPU(s) via sysfs (covers Vulkan/ROCm on Linux).
-        try:
-            import glob
-            for total_path in sorted(glob.glob('/sys/class/drm/card*/device/mem_info_vram_total')):
-                used_path = total_path.replace('vram_total', 'vram_used')
-                with open(total_path) as f:
-                    total = int(f.read().strip())
-                with open(used_path) as f:
-                    used = int(f.read().strip())
-                free_amd = (total - used) / 1e9
-                if pooled:
-                    total_free += free_amd
+        total_free = cuda_free
+        got = cuda_count > 0
+        if cross or cuda_count == 0:
+            try:
+                import glob
+                for total_path in sorted(glob.glob('/sys/class/drm/card*/device/mem_info_vram_total')):
+                    used_path = total_path.replace('vram_total', 'vram_used')
+                    with open(total_path) as f:
+                        total = int(f.read().strip())
+                    with open(used_path) as f:
+                        used = int(f.read().strip())
+                    total_free += (total - used) / 1e9
                     got = True
-                else:
-                    return free_amd
-        except Exception:
-            pass
-        if pooled and got:
+            except Exception:
+                pass
+        if got:
             return total_free
         return 999.0  # Unknown — assume enough
 
