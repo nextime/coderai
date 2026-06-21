@@ -2203,16 +2203,43 @@ class MultiModelManager:
         except Exception as e:
             print(f"  Warning during VRAM load of '{model_key}': {e}")
 
+    @staticmethod
+    def _cross_gpu_pooling_enabled() -> bool:
+        """True when cross-backend GPU pooling (offload.gpu_split) is on, so a model
+        may span several cards and free-VRAM/eviction math must sum across them."""
+        try:
+            from codai.api.state import get_global_args
+            return bool(getattr(get_global_args(), "gpu_split", False))
+        except Exception:
+            return False
+
     def _get_free_vram_gb(self) -> float:
-        """Return estimated free VRAM in GB, or a large number if unavailable."""
+        """Return estimated free VRAM in GB, or a large number if unavailable.
+
+        With cross-GPU pooling (gpu_split) on, a model can be split across every
+        visible card, so report the POOL: free CUDA VRAM (all devices) + free AMD
+        VRAM (sysfs). CUDA and amdgpu sysfs never name the same card, so there's no
+        double count. Off → just the primary CUDA device (legacy single-GPU math)."""
+        pooled = self._cross_gpu_pooling_enabled()
+        total_free = 0.0
+        got = False
         try:
             import torch
             if torch.cuda.is_available():
-                free, total = torch.cuda.mem_get_info()
-                return free / 1e9
+                if pooled:
+                    for i in range(torch.cuda.device_count()):
+                        try:
+                            free, _ = torch.cuda.mem_get_info(i)
+                            total_free += free / 1e9
+                            got = True
+                        except Exception:
+                            pass
+                else:
+                    free, total = torch.cuda.mem_get_info()
+                    return free / 1e9
         except Exception:
             pass
-        # AMD GPU via sysfs (covers Vulkan/ROCm on Linux)
+        # AMD GPU(s) via sysfs (covers Vulkan/ROCm on Linux).
         try:
             import glob
             for total_path in sorted(glob.glob('/sys/class/drm/card*/device/mem_info_vram_total')):
@@ -2221,9 +2248,16 @@ class MultiModelManager:
                     total = int(f.read().strip())
                 with open(used_path) as f:
                     used = int(f.read().strip())
-                return (total - used) / 1e9
+                free_amd = (total - used) / 1e9
+                if pooled:
+                    total_free += free_amd
+                    got = True
+                else:
+                    return free_amd
         except Exception:
             pass
+        if pooled and got:
+            return total_free
         return 999.0  # Unknown — assume enough
 
     @staticmethod

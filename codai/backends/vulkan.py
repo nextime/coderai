@@ -253,6 +253,41 @@ def _free_vram_gb(device: int = 0) -> float:
     return _amd_free_vram_gb(device)
 
 
+def _pooled_free_vram_gb() -> float:
+    """Sum of free VRAM (GB) across EVERY GPU this process can see — all visible
+    CUDA devices plus all AMD cards (amdgpu sysfs). Used for cross-GPU split
+    (gpu_split), where the usable capacity is the POOL, not a single card. CUDA
+    and amdgpu sysfs never describe the same physical card, so there's no double
+    count (NVIDIA cards don't expose mem_info_vram_*)."""
+    total = 0.0
+    try:
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                try:
+                    free, _ = torch.cuda.mem_get_info(i)
+                    total += free / (1024 ** 3)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
+        import glob
+        for tp in sorted(glob.glob('/sys/class/drm/card*/device/mem_info_vram_total')):
+            up = tp.replace('vram_total', 'vram_used')
+            try:
+                with open(tp) as f:
+                    _t = int(f.read().strip())
+                with open(up) as f:
+                    _u = int(f.read().strip())
+                total += (_t - _u) / (1024 ** 3)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return total if total > 0 else _free_vram_gb(0)
+
+
 def _ggml_kv_type(name):
     """Map a KV-cache quant name to the llama.cpp GGML type int, or None.
 
@@ -874,7 +909,14 @@ class VulkanBackend(ModelBackend):
             try:
                 _exp = kwargs.get('expected_vram_gb')
                 _nlayers = _gguf_block_count(model_path)
-                _free = _free_vram_gb(self.main_gpu if isinstance(self.main_gpu, int) else 0)
+                # When this model is split across GPUs, the usable VRAM is the POOL
+                # across every visible card (e.g. 3090 + RX 580), not just main_gpu —
+                # otherwise we'd needlessly offload layers to CPU thinking only one
+                # card's free VRAM is available.
+                if kwargs.get('gpu_split'):
+                    _free = _pooled_free_vram_gb()
+                else:
+                    _free = _free_vram_gb(self.main_gpu if isinstance(self.main_gpu, int) else 0)
                 if _exp and _exp > 0 and _nlayers and _free > 0 and _exp > _free * 0.95:
                     # Scale layers on GPU by the VRAM ratio (weights + KV roughly
                     # scale per-layer). The estimate tends to undercount the KV
