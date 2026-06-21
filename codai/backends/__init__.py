@@ -33,12 +33,13 @@ def detect_available_backends():
     except ImportError:
         pass
     
-    # Check for llama-cpp-python (Vulkan)
-    try:
-        import llama_cpp
+    # Check for llama-cpp-python (Vulkan / GGUF). Use the flag computed at import
+    # time so a llama-cpp build that fails its shared-library load (e.g. a CUDA
+    # build missing libcuda.so.1) is reported unavailable instead of re-raising
+    # the RuntimeError/OSError here and aborting backend detection.
+    from codai.backends.vulkan import LLAMA_CPP_AVAILABLE
+    if LLAMA_CPP_AVAILABLE:
         backends['vulkan'] = True
-    except ImportError:
-        pass
     
     return backends
 

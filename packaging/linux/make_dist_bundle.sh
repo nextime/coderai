@@ -4,6 +4,7 @@
 #
 #   <NAME>/
 #     install.sh            loads the image + installs the runner (see dist-bundle/)
+#     uninstall.sh          removes the runner + (optionally) the image
 #     coderai-docker        the run wrapper (run_oci.sh, image tag pinned)
 #     coderai-dist.tar.gz   the image (gzip-compressed `docker save`)
 #     README.txt / README.md
@@ -47,7 +48,8 @@ mkdir -p "$STAGE"
 ln "$IMAGE_TAR" "$STAGE/coderai-dist.tar.gz" 2>/dev/null \
   || cp "$IMAGE_TAR" "$STAGE/coderai-dist.tar.gz"
 install -m 0755 "$HERE/run_oci.sh"            "$STAGE/coderai-docker"
-install -m 0755 "$HERE/dist-bundle/install.sh" "$STAGE/install.sh"
+install -m 0755 "$HERE/dist-bundle/install.sh"   "$STAGE/install.sh"
+install -m 0755 "$HERE/dist-bundle/uninstall.sh" "$STAGE/uninstall.sh"
 cp "$HERE/dist-bundle/README.txt"             "$STAGE/README.txt"
 cp "$HERE/dist-bundle/README.md"              "$STAGE/README.md"
 

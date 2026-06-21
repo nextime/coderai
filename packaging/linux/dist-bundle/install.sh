@@ -8,7 +8,7 @@
 #        - user  -> ~/.local/usr/bin/coderai-docker  (and ensures it's on PATH,
 #                   adding it to ~/.bashrc if missing).
 #
-# Usage:  ./install.sh
+# Usage:  ./install.sh [--yes]
 # Env:    CONTAINER_ENGINE=docker|podman   (default docker)
 set -euo pipefail
 
@@ -16,9 +16,28 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE_TAR="${IMAGE_TAR:-$HERE/coderai-dist.tar.gz}"
 RUNNER_SRC="${RUNNER_SRC:-$HERE/coderai-docker}"
 ENGINE="${CONTAINER_ENGINE:-docker}"
+ASSUME_YES=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -y|--yes) ASSUME_YES=1; shift ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    *) printf 'Error: unknown option: %s\n' "$1" >&2; exit 2 ;;
+  esac
+done
 
 say(){ printf '%s\n' "$*"; }
 die(){ printf 'Error: %s\n' "$*" >&2; exit 1; }
+
+# Tell the user what this will do, and confirm before proceeding.
+if [ "$(id -u)" -eq 0 ]; then _bin="/usr/local/bin"; else _bin="$HOME/.local/usr/bin"; fi
+say "This will load the CoderAI image into $ENGINE and install the 'coderai-docker'"
+say "runner to $_bin. Your runtime data and config are not touched."
+if [ "$ASSUME_YES" -ne 1 ]; then
+  printf 'Proceed? [y/N] '
+  read -r reply </dev/tty || reply=""
+  case "$reply" in y|Y|yes|YES) ;; *) die "aborted by user." ;; esac
+fi
 
 command -v "$ENGINE" >/dev/null 2>&1 || die "'$ENGINE' not found in PATH — install Docker (or set CONTAINER_ENGINE=podman) first."
 [ -f "$IMAGE_TAR" ]  || die "image tarball not found: $IMAGE_TAR"

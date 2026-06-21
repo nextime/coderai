@@ -10,7 +10,14 @@ fi
 
 ENGINE="${CONTAINER_ENGINE:-docker}"
 IMAGE_TAG="${OCI_IMAGE:-coderai:dist}"
-MODE="cpu"
+# Selected GPU backends. ADDITIVE: --nvidia --vulkan enables BOTH, so the
+# container gets the NVIDIA driver libs (libcuda.so.1 — needed even by a
+# CUDA-built llama-cpp running under Vulkan) AND /dev/dri. CPU always works.
+declare -A MODES=()
+# Bind-mount the host's libcuda.so.1 into the container (for Vulkan/CPU runs of a
+# CUDA-built llama-cpp on a host that has the driver but where you don't want the
+# full --gpus all). "auto" = detect via ldconfig; or an explicit path.
+WITH_LIBCUDA=""
 PORT="${CODERAI_PORT:-8776}"
 DATA_ROOT="$PWD/coderai-runtime"
 DETACH=0
@@ -51,9 +58,18 @@ Usage:
 Options:
   --docker            Use docker (default).
   --podman            Use podman.
-  --cpu               CPU-only run mode (default).
-  --nvidia            NVIDIA CUDA mode; adds --gpus all for Docker.
-  --vulkan            Vulkan mode; adds --device /dev/dri.
+  --cpu               Enable the CPU backend (always available; default if none).
+  --nvidia            Enable NVIDIA CUDA; adds --gpus all for Docker (maps the
+                      driver incl. libcuda.so.1).
+  --vulkan            Enable Vulkan; adds --device /dev/dri and auto bind-mounts
+                      the host's libcuda.so.1 (the bundled llama-cpp is a CUDA
+                      build). --nvidia and --vulkan are ADDITIVE — pass both to
+                      enable both backends in one container.
+  --all               Enable all GPU backends (nvidia + vulkan).
+  --with-libcuda[=P]  Bind-mount libcuda.so.1 into the container so a CUDA-built
+                      llama-cpp loads under --vulkan/--cpu on a driver-equipped
+                      host. P is an explicit path; default auto-detects via
+                      ldconfig. (Implied automatically when --nvidia is set.)
   -p, --port PORT     Host port to expose (default: 8776).
   --data-dir PATH     Directory for config/models/cache (default: ./coderai-runtime).
   --name NAME         Container name (default: coderai).
@@ -92,9 +108,12 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --docker) ENGINE=docker; shift ;;
     --podman) ENGINE=podman; shift ;;
-    --cpu) MODE=cpu; shift ;;
-    --nvidia|--cuda) MODE=nvidia; shift ;;
-    --vulkan) MODE=vulkan; shift ;;
+    --cpu) MODES[cpu]=1; shift ;;
+    --nvidia|--cuda) MODES[nvidia]=1; shift ;;
+    --vulkan) MODES[vulkan]=1; shift ;;
+    --all) MODES[nvidia]=1; MODES[vulkan]=1; shift ;;
+    --with-libcuda) WITH_LIBCUDA="auto"; shift ;;
+    --with-libcuda=*) WITH_LIBCUDA="${1#*=}"; shift ;;
     -p|--port)
       [[ $# -ge 2 ]] || { echo "Error: $1 requires a port" >&2; exit 2; }
       PORT="$2"; shift 2 ;;
@@ -145,19 +164,53 @@ if [[ "$DETACH" == "1" ]]; then
   args+=(-d)
 fi
 
-case "$MODE" in
-  nvidia)
-    if [[ "$ENGINE" == "docker" ]]; then
-      args+=(--gpus all)
-    else
-      args+=(--hooks-dir=/usr/share/containers/oci/hooks.d)
-    fi
-    ;;
-  vulkan)
-    args+=(--device /dev/dri)
-    ;;
-  cpu) ;;
-esac
+# Default to CPU-only when no GPU backend was requested.
+if [[ "${#MODES[@]}" -eq 0 ]]; then
+  MODES[cpu]=1
+fi
+
+if [[ -n "${MODES[nvidia]:-}" ]]; then
+  if [[ "$ENGINE" == "docker" ]]; then
+    args+=(--gpus all)
+  else
+    args+=(--hooks-dir=/usr/share/containers/oci/hooks.d)
+  fi
+fi
+if [[ -n "${MODES[vulkan]:-}" ]]; then
+  args+=(--device /dev/dri)
+  # The bundled llama-cpp is a CUDA build, so Vulkan GGUF still needs libcuda.so.1.
+  # Auto-map it from the host (unless --nvidia already maps the whole driver, or
+  # the user gave an explicit --with-libcuda path).
+  [[ -z "$WITH_LIBCUDA" ]] && WITH_LIBCUDA="auto"
+fi
+
+# libcuda.so.1: the bundled llama-cpp-python is a CUDA build, so it needs the
+# NVIDIA userspace driver lib even for Vulkan/CPU GGUF. --nvidia maps the whole
+# driver via --gpus all already; --vulkan auto-enables a libcuda bind-mount (set
+# just above); otherwise bind-mount just libcuda when asked via --with-libcuda,
+# so a CUDA llama-cpp at least loads. Misses degrade gracefully now: the server
+# starts and the Vulkan/GGUF backend is simply reported unavailable.
+LIBCUDA_NOTE="none"
+if [[ -n "${MODES[nvidia]:-}" ]]; then
+  LIBCUDA_NOTE="via --gpus all (driver mapped)"
+elif [[ -n "$WITH_LIBCUDA" ]]; then
+  libcuda_path=""
+  if [[ "$WITH_LIBCUDA" == "auto" ]]; then
+    libcuda_path="$(ldconfig -p 2>/dev/null | awk '/libcuda\.so\.1/ {print $NF; exit}')"
+    [[ -n "$libcuda_path" ]] || for c in /usr/lib/x86_64-linux-gnu/libcuda.so.1 /usr/lib/libcuda.so.1 /usr/lib64/libcuda.so.1; do
+      [[ -e "$c" ]] && { libcuda_path="$c"; break; }
+    done
+  else
+    libcuda_path="$WITH_LIBCUDA"
+  fi
+  if [[ -n "$libcuda_path" && -e "$libcuda_path" ]]; then
+    args+=(-v "$libcuda_path:/usr/lib/x86_64-linux-gnu/libcuda.so.1:ro")
+    LIBCUDA_NOTE="$libcuda_path → /usr/lib/x86_64-linux-gnu/libcuda.so.1"
+  else
+    echo "Warning: --with-libcuda requested but libcuda.so.1 not found${WITH_LIBCUDA:+ ($WITH_LIBCUDA)}; skipping" >&2
+    LIBCUDA_NOTE="requested but not found"
+  fi
+fi
 
 volume_suffix=""
 if [[ "$ENGINE" == "podman" ]]; then
@@ -242,7 +295,8 @@ cat <<EOF
 Starting CoderAI OCI container
   engine:  $ENGINE
   image:   $IMAGE_TAG
-  mode:    $MODE
+  mode:    $(echo "${!MODES[@]}" | tr ' ' '+' | tr 'A-Z' 'a-z')
+  libcuda: $LIBCUDA_NOTE
   url:     http://127.0.0.1:$PORT/admin
   data:    $DATA_ROOT
   config:  $CONFIG_NOTE

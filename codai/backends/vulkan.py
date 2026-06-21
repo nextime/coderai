@@ -97,11 +97,35 @@ try:
     from llama_cpp.llama_chat_format import ChatFormatterResponse
     import llama_cpp as _llama_cpp
     LLAMA_CPP_AVAILABLE = True
-except ImportError:
+except Exception as _llama_import_err:
+    # Catch more than ImportError: a llama-cpp-python built against CUDA raises
+    # RuntimeError/OSError (e.g. "libcuda.so.1: cannot open shared object file")
+    # when the NVIDIA driver libs aren't present — as in Vulkan/CPU-only runs.
+    # That must NOT crash the whole server import chain; the Vulkan backend just
+    # becomes unavailable and other backends (CUDA/CPU/ds4) keep working.
     LLAMA_CPP_AVAILABLE = False
     Llama = None
     ChatFormatterResponse = None
     _llama_cpp = None
+    if not isinstance(_llama_import_err, ImportError):
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "llama-cpp-python present but failed to load (%s); Vulkan/GGUF "
+            "backend disabled. If you expect GPU GGUF, ensure the matching GPU "
+            "runtime libs are mapped into this environment.", _llama_import_err)
+
+
+def _llama_accepts(param: str) -> bool:
+    """True when the installed llama-cpp-python ``Llama`` constructor accepts a
+    given keyword. Used to gate kwargs (e.g. ``n_seq_max``) that only some builds
+    expose, so passing them never raises ``TypeError`` on older bindings."""
+    if Llama is None:
+        return False
+    try:
+        import inspect
+        return param in inspect.signature(Llama.__init__).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 # Friendly KV-cache quant names → llama.cpp GGML type. q8_0 is near-lossless and
@@ -950,6 +974,44 @@ class VulkanBackend(ModelBackend):
             llama_kwargs['offload_kqv'] = False
             print("  KV cache: offload_kqv=False — KV held in host RAM (saves VRAM, "
                   "slower decode)")
+
+        # Batch size (llama.cpp -b / n_batch) and physical micro-batch (-ub /
+        # n_ubatch). The compute/graph buffer reserved for prompt ingestion scales
+        # with the micro-batch, so lowering it shrinks a large VRAM allocation (the
+        # buffer that ggml_gallocr fails to reserve when a big-context model is right
+        # at the VRAM ceiling) at the cost of slower prefill. llama.cpp clamps
+        # n_ubatch to <= n_batch, so setting n_batch alone also caps the micro-batch.
+        _n_batch = kwargs.get('n_batch', _raw_cfg.get('n_batch'))
+        if _n_batch:
+            try:
+                llama_kwargs['n_batch'] = int(_n_batch)
+                print(f"  batch        : n_batch={int(_n_batch)} (smaller prompt-ingest buffer)")
+            except (TypeError, ValueError):
+                pass
+        _n_ubatch = kwargs.get('n_ubatch', _raw_cfg.get('n_ubatch'))
+        if _n_ubatch:
+            try:
+                llama_kwargs['n_ubatch'] = int(_n_ubatch)
+            except (TypeError, ValueError):
+                pass
+
+        # Parallel sequence slots (llama.cpp -np / n_seq_max). Each slot reserves its
+        # own share of KV + compute VRAM; keeping it at 1 avoids reserving VRAM for
+        # concurrent sequences we don't serve. Only newer llama-cpp-python builds
+        # accept this kwarg, so pass it only when the constructor supports it.
+        _n_seq = kwargs.get('n_seq_max', _raw_cfg.get('n_seq_max'))
+        if _n_seq:
+            try:
+                _n_seq = int(_n_seq)
+            except (TypeError, ValueError):
+                _n_seq = None
+            if _n_seq:
+                if _llama_accepts('n_seq_max'):
+                    llama_kwargs['n_seq_max'] = _n_seq
+                    print(f"  slots        : n_seq_max={_n_seq} (fewer parallel-slot VRAM reserves)")
+                else:
+                    print(f"  slots        : n_seq_max={_n_seq} requested but llama-cpp-python "
+                          f"{getattr(_llama_cpp, '__version__', '?')} doesn't expose it — ignoring")
 
         # Multimodal projector (mmproj): pairs a CLIP/vision projector GGUF with
         # this text model so it can accept images — the llama.cpp `--mmproj`

@@ -648,6 +648,16 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           <label class="form-label">Context size</label>
           <input type="number" id="cfg-n-ctx" class="form-input" min="128" step="128" value="2048">
         </div>
+        <div class="form-row" style="margin:0" id="cfg-n-batch-row">
+          <label class="form-label">Batch size <span class="muted">(GGUF; llama.cpp -b)</span></label>
+          <input type="number" id="cfg-n-batch" class="form-input" min="1" step="1" placeholder="auto (512)">
+          <span class="form-hint" style="font-size:11px">Prompt-ingestion batch. Lowering it (e.g. <b>256</b>) shrinks the compute buffer so a big-context model fits at the VRAM ceiling — slower prefill. Blank = default (512).</span>
+        </div>
+        <div class="form-row" style="margin:0" id="cfg-n-seq-max-row">
+          <label class="form-label">Parallel slots <span class="muted">(GGUF; llama.cpp -np / n_seq_max)</span></label>
+          <input type="number" id="cfg-n-seq-max" class="form-input" min="1" step="1" placeholder="auto (1)">
+          <span class="form-hint" style="font-size:11px">Concurrent sequence slots. Each slot reserves its own KV/compute VRAM; keep at <b>1</b> to avoid reserving for unused parallelism. Blank = default (1). Ignored by older llama-cpp-python builds.</span>
+        </div>
         <div class="form-row" style="margin:0" id="cfg-kv-k-row">
           <label class="form-label">KV cache — Keys <span class="muted">(GGUF text; shrinks KV VRAM)</span></label>
           <select id="cfg-cache-type-k" class="form-input">
@@ -3218,6 +3228,8 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-force-vram-update').checked = !!s.force_vram_update;
   document.getElementById('cfg-gpu-layers').value = s.n_gpu_layers !== undefined ? s.n_gpu_layers : -1;
   document.getElementById('cfg-n-ctx').value = nCtxForEst;
+  document.getElementById('cfg-n-batch').value = s.n_batch != null ? s.n_batch : '';
+  document.getElementById('cfg-n-seq-max').value = s.n_seq_max != null ? s.n_seq_max : '';
   document.getElementById('cfg-cache-type-k').value = s.cache_type_k || '';
   document.getElementById('cfg-cache-type-v').value = s.cache_type_v || '';
   _populateMmprojSelect(m, s);
@@ -3626,6 +3638,8 @@ async function saveModelConfig(){
     preload_all_instances: document.getElementById('cfg-preload-all-instances').checked,
     n_gpu_layers:      parseInt(document.getElementById('cfg-gpu-layers').value) || -1,
     n_ctx:             parseInt(document.getElementById('cfg-n-ctx').value) || 2048,
+    n_batch:           parseInt(document.getElementById('cfg-n-batch').value) || null,
+    n_seq_max:         parseInt(document.getElementById('cfg-n-seq-max').value) || null,
     cache_type_k:      document.getElementById('cfg-cache-type-k').value || null,
     cache_type_v:      document.getElementById('cfg-cache-type-v').value || null,
     mmproj:            document.getElementById('cfg-mmproj').value || null,
