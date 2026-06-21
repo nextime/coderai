@@ -37,6 +37,11 @@ DS4_DIR="${CODERAI_DS4_DIR:-$HOME/.coderai/ds4}"
 # bundle (image tarball + install.sh + coderai-docker runner). Disable with
 # --no-dist (just builds the image).
 MAKE_DIST=1
+# After a successful build (and dist export), prune the dangling/intermediate
+# images this build left behind (untagged <none> layers from the multi-stage
+# build). Off with --no-prune. Only dangling images are removed — never tagged
+# images (the final image, the pulled CUDA base, or anything else you have).
+PRUNE_BUILD_IMAGES=1
 # --versioned auto-derives a structured image tag from the app version + build
 # mode + target GPU: full_<gpu>_<version> for a local-venv build, base_<gpu>_<version>
 # for a from-scratch build (e.g. coderai:full_all_0.1.0). GPU_SEL is a label only —
@@ -77,6 +82,8 @@ Options:
                           only — the image always bundles both CUDA and Vulkan.
   --no-dist               Just build the image; skip exporting + bundling for distribution.
   --dist                  Force building the distribution bundle (default ON).
+  --no-prune              Keep the dangling/intermediate images the build created.
+  --prune                 Prune dangling build images after building (default ON).
   -h, --help              Show this help.
 
 Examples:
@@ -177,6 +184,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-dist)
       MAKE_DIST=0
+      shift
+      ;;
+    --no-prune)
+      PRUNE_BUILD_IMAGES=0
+      shift
+      ;;
+    --prune)
+      PRUNE_BUILD_IMAGES=1
       shift
       ;;
     --dist)
@@ -597,4 +612,14 @@ if [[ "$MAKE_DIST" == "1" ]]; then
   echo "=== Building distribution bundle (use --no-dist to skip) ==="
   DOCKER="$DOCKER_BIN" IMAGE="$IMAGE_TAG" REFRESH=1 \
     "$ROOT_DIR/packaging/linux/make_dist_bundle.sh"
+fi
+
+# Clean up the dangling/intermediate images this build produced (untagged <none>
+# layers from the multi-stage build). `image prune -f` only removes dangling
+# images — the final image ($IMAGE_TAG), the CUDA base, and any other tagged
+# images are kept. Disable with --no-prune.
+if [[ "$PRUNE_BUILD_IMAGES" == "1" ]]; then
+  echo ""
+  echo "=== Pruning dangling build images (use --no-prune to skip) ==="
+  "${DOCKER_CMD[@]}" image prune -f 2>/dev/null || true
 fi
