@@ -9,7 +9,14 @@ if [[ -f "$VERSIONS_FILE" ]]; then
 fi
 
 ENGINE="${CONTAINER_ENGINE:-docker}"
+# Default image tag (this literal is pinned by make_dist_bundle to the shipped
+# tag). It's only a FALLBACK: when the user gives no explicit image (positional
+# arg) and OCI_IMAGE is unset, we resolve the actual loaded coderai image below —
+# auto-pick when there's exactly one, ask when there are several — so the runner
+# always targets a real installed image instead of a possibly-wrong fixed tag.
 IMAGE_TAG="${OCI_IMAGE:-coderai:dist}"
+IMAGE_EXPLICIT=0
+[[ -n "${OCI_IMAGE:-}" ]] && IMAGE_EXPLICIT=1
 # Selected GPU backends. ADDITIVE: --nvidia --vulkan enables BOTH, so the
 # container gets the NVIDIA driver libs (libcuda.so.1 — needed even by a
 # CUDA-built llama-cpp running under Vulkan) AND /dev/dri. CPU always works.
@@ -26,7 +33,19 @@ HOST_BIND="${CODERAI_HOST_BIND:-}"
 # container (via CODERAI_EXTRA_ARGS, appended by the in-image coderai launcher).
 # Built from --coderai-arg (repeatable, one token each) and --coderai-args "...".
 CODERAI_EXTRA_ARGS="${CODERAI_EXTRA_ARGS:-}"
+# Runtime dir (models/cache, and config when not using --local). Defaults to
+# $PWD/coderai-runtime, but for --local it moves to a stable per-user location
+# (~/.config/coderai-runtime) so it doesn't depend on the current directory —
+# unless the user pins it with --data-dir. DATA_ROOT_EXPLICIT tracks --data-dir.
 DATA_ROOT="$PWD/coderai-runtime"
+DATA_ROOT_EXPLICIT=0
+IS_LOCAL=0
+# Run the container as a specific user. Empty = container default (root). When set
+# (e.g. via --user with no value -> your uid:gid) AND a config dir is used, the
+# config is mounted IN PLACE so the app's edits persist to it (files stay owned by
+# you). Without --user, an in-place mount as root would create root-owned files,
+# so we fall back to the throwaway temp copy.
+USER_SPEC=""
 DETACH=0
 NAME="coderai"
 EXTRA_ARGS=()
@@ -87,18 +106,26 @@ Options:
   --coderai-args STR  Pass a raw string of extra coderai flags (space-separated),
                       e.g. --coderai-args "--foo bar --baz". Appended after any
                       --coderai-arg values.
-  --data-dir PATH     Directory for config/models/cache (default: ./coderai-runtime).
+  --data-dir PATH     Directory for config/models/cache. Default ./coderai-runtime,
+                      or ~/.config/coderai-runtime when --local is used.
   --name NAME         Container name (default: coderai).
   -d, --detach        Run in background.
   --config-dir PATH   Use an EXISTING config dir (with config.json/models.json),
                       mounted at /config/coderai. Copied to a temp dir by default
                       so the image's host/port rewrite leaves your dir untouched.
-  --local             Shortcut for --config-dir ~/.coderai.
-  --inplace-config    Mount --config-dir in place (the image WILL edit host/port).
+  --local             Shortcut for --config-dir ~/.coderai. Also puts the runtime
+                      dir under ~/.config/coderai-runtime (override with --data-dir).
+                      Add --user to persist the app's config edits back to it.
+  --user[=UID[:GID]]  Run the container as that user (no value = your uid:gid). With
+                      a config dir, switches to an IN-PLACE mount so config edits
+                      persist there, owned by you. Without it, --config-dir/--local
+                      use a throwaway copy (no persistence).
+  --inplace-config    Mount --config-dir in place (config edits persist there).
   --map HOST[:CONT]   Bind-mount a host dir at the SAME path (or HOST:CONT) inside
                       the container, so absolute paths in models.json resolve
                       (e.g. --map /AI/guffcache). Repeatable.
-  --debug[=SPEC]      Run coderai with debug flags. SPEC (default 'all'):
+  --debug[=SPEC]      Run coderai with debug flags. SPEC (default 'all'); may be
+                      given as --debug=SPEC or --debug SPEC:
                         all | engine,requests,ws,web,thermal,lora,engine-web
                       Also writes a host-tailable file log (see --log-file).
   --log-file PATH     In-container log path (default /cache/logs/coderai.log,
@@ -144,19 +171,34 @@ while [[ $# -gt 0 ]]; do
       CODERAI_EXTRA_ARGS="${CODERAI_EXTRA_ARGS:+$CODERAI_EXTRA_ARGS }$2"; shift 2 ;;
     --data-dir)
       [[ $# -ge 2 ]] || { echo "Error: --data-dir requires a path" >&2; exit 2; }
-      DATA_ROOT="$2"; shift 2 ;;
+      DATA_ROOT="$2"; DATA_ROOT_EXPLICIT=1; shift 2 ;;
     --name)
       [[ $# -ge 2 ]] || { echo "Error: --name requires a value" >&2; exit 2; }
       NAME="$2"; shift 2 ;;
     --config-dir)
       [[ $# -ge 2 ]] || { echo "Error: --config-dir requires a path" >&2; exit 2; }
       CONFIG_DIR_SRC="$2"; shift 2 ;;
-    --local) CONFIG_DIR_SRC="$HOME/.coderai"; shift ;;
+    --local) CONFIG_DIR_SRC="$HOME/.coderai"; IS_LOCAL=1; shift ;;
     --inplace-config) INPLACE_CONFIG=1; shift ;;
+    # --user [UID[:GID]] runs the container as that user (default: your uid:gid).
+    # With a config dir, this also switches the mount to IN PLACE so edits persist.
+    --user)
+      if [[ $# -ge 2 && "$2" =~ ^[0-9] ]]; then USER_SPEC="$2"; shift 2
+      else USER_SPEC="$(id -u):$(id -g)"; shift; fi ;;
+    --user=*) USER_SPEC="${1#*=}"; shift ;;
     --map)
       [[ $# -ge 2 ]] || { echo "Error: --map requires HOST[:CONT]" >&2; exit 2; }
       MAPS+=("$2"); shift 2 ;;
-    --debug) DEBUG_SPEC="all"; shift ;;
+    # --debug accepts an optional SPEC as the next token (e.g. --debug engine,ws)
+    # OR as --debug=SPEC. The next token is only taken as SPEC when it isn't
+    # another option and doesn't look like an image ref (no ':' or '/'), so e.g.
+    # `--debug coderai:tag` leaves the tag as the image, not the debug spec.
+    --debug)
+      if [[ $# -ge 2 && "$2" != -* && "$2" != *[:/]* ]]; then
+        DEBUG_SPEC="$2"; shift 2
+      else
+        DEBUG_SPEC="all"; shift
+      fi ;;
     --debug=*) DEBUG_SPEC="${1#*=}"; shift ;;
     --log-file)
       [[ $# -ge 2 ]] || { echo "Error: --log-file requires a path" >&2; exit 2; }
@@ -177,9 +219,53 @@ while [[ $# -gt 0 ]]; do
       break ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "Error: unknown option: $1" >&2; usage >&2; exit 2 ;;
-    *) IMAGE_TAG="$1"; shift ;;
+    *) IMAGE_TAG="$1"; IMAGE_EXPLICIT=1; shift ;;
   esac
 done
+
+# Resolve the image when the user didn't name one: prefer the single loaded
+# coderai image; if several exist, ask (default = the pinned fallback if present,
+# else the first). Keeps the runner pointed at a real installed image instead of
+# a fixed tag that may not exist after a rebuild/retag.
+if [[ "$IMAGE_EXPLICIT" -eq 0 ]]; then
+  _imgs=()
+  while IFS= read -r _l; do [[ -n "$_l" ]] && _imgs+=("$_l"); done < <(
+    "$ENGINE" images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+      | grep -E '^coderai:' | grep -v ':<none>$' | sort -u)
+  if [[ "${#_imgs[@]}" -eq 1 ]]; then
+    IMAGE_TAG="${_imgs[0]}"
+  elif [[ "${#_imgs[@]}" -gt 1 ]]; then
+    # Default selection: the pinned fallback if it's one of them, else the first.
+    _default="${_imgs[0]}"
+    for _i in "${_imgs[@]}"; do [[ "$_i" == "$IMAGE_TAG" ]] && _default="$IMAGE_TAG"; done
+    if [[ -t 0 ]]; then
+      echo "Multiple coderai images found — choose one to run:" >&2
+      _n=1; for _i in "${_imgs[@]}"; do
+        _mark=""; [[ "$_i" == "$_default" ]] && _mark="  (default)"
+        printf '  %d) %s%s\n' "$_n" "$_i" "$_mark" >&2; _n=$((_n+1))
+      done
+      printf 'Selection [1-%d, default %s]: ' "${#_imgs[@]}" "$_default" >&2
+      read -r _sel </dev/tty || _sel=""
+      if [[ -z "$_sel" ]]; then
+        IMAGE_TAG="$_default"
+      elif [[ "$_sel" =~ ^[0-9]+$ ]] && (( _sel >= 1 && _sel <= ${#_imgs[@]} )); then
+        IMAGE_TAG="${_imgs[$((_sel-1))]}"
+      else
+        echo "Error: invalid selection: $_sel" >&2; exit 2
+      fi
+    else
+      IMAGE_TAG="$_default"
+      echo "Note: multiple coderai images; no TTY to choose — using $IMAGE_TAG" >&2
+    fi
+  fi
+  # 0 images: keep the pinned fallback (docker run will report if it's missing).
+fi
+
+# For --local, default the runtime dir to a stable per-user location under
+# ~/.config instead of the current directory (unless --data-dir was given).
+if [[ "$IS_LOCAL" -eq 1 && "$DATA_ROOT_EXPLICIT" -eq 0 ]]; then
+  DATA_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/coderai-runtime"
+fi
 
 mkdir -p "$DATA_ROOT/config" "$DATA_ROOT/models" "$DATA_ROOT/cache"
 DATA_ROOT="$(cd "$DATA_ROOT" && pwd)"
@@ -197,6 +283,9 @@ args=(run --rm --name "$NAME" --ipc=host -p "$PUBLISH" -e CODERAI_HOST=0.0.0.0 -
 if [[ -n "$CODERAI_EXTRA_ARGS" ]]; then
   args+=(-e "CODERAI_EXTRA_ARGS=$CODERAI_EXTRA_ARGS")
 fi
+if [[ -n "$USER_SPEC" ]]; then
+  args+=(--user "$USER_SPEC")
+fi
 if [[ "$DETACH" == "1" ]]; then
   args+=(-d)
 fi
@@ -209,6 +298,15 @@ fi
 if [[ -n "${MODES[nvidia]:-}" ]]; then
   if [[ "$ENGINE" == "docker" ]]; then
     args+=(--gpus all)
+    # Some hosts set `no-cgroups = true` in /etc/nvidia-container-runtime/config.toml.
+    # Then --gpus all injects the device nodes + driver libs but does NOT add them to
+    # the container's device-cgroup allowlist, so the kernel blocks GPU access and
+    # NVML fails ("Failed to initialize NVML: Unknown Error") -> torch.cuda sees no
+    # GPU -> coderai falls back to vulkan/cpu. Passing the nodes via --device adds
+    # them to the cgroup allowlist. Harmless when cgroups are managed normally.
+    for _dev in /dev/nvidia*; do
+      [[ -c "$_dev" ]] && args+=(--device "$_dev")
+    done
   else
     args+=(--hooks-dir=/usr/share/containers/oci/hooks.d)
   fi
@@ -260,19 +358,25 @@ CONFIG_NOTE="$DATA_ROOT/config (fresh)"
 if [[ -n "$CONFIG_DIR_SRC" ]]; then
   [[ -d "$CONFIG_DIR_SRC" ]] || { echo "Error: --config-dir '$CONFIG_DIR_SRC' not found" >&2; exit 2; }
   CONFIG_DIR_SRC="$(cd "$CONFIG_DIR_SRC" && pwd)"
-  if [[ "$INPLACE_CONFIG" == "1" ]]; then
+  # Mount IN PLACE (so the app's config edits persist back to the real dir) when
+  # explicitly asked (--inplace-config) OR when running as a specific --user (so
+  # the files written stay owned by you, not root). The in-image launcher no
+  # longer rewrites host/port into config.json (it passes them on the CLI), so an
+  # in-place mount is non-destructive. Without --user, fall back to a throwaway
+  # copy so a root container can't leave root-owned files in your real config.
+  if [[ "$INPLACE_CONFIG" == "1" || -n "$USER_SPEC" ]]; then
     CFG_MOUNT="$CONFIG_DIR_SRC"
-    CONFIG_NOTE="$CONFIG_DIR_SRC (in place — image rewrites host/port!)"
+    CONFIG_NOTE="$CONFIG_DIR_SRC (in place — edits persist here)"
   else
-    # Copy ONLY the json config files to a throwaway dir so the image's host/port
-    # rewrite never touches your real config, and we don't copy big subdirs
+    # Copy ONLY the json config files to a throwaway dir so nothing in the
+    # container can touch your real config, and we don't copy big subdirs
     # (e.g. ~/.coderai/ds4 weights).
     CFG_PARENT="$(mktemp -d "${TMPDIR:-/tmp}/coderai-cfg.XXXXXX")"
     CFG_MOUNT="$CFG_PARENT/coderai"
     mkdir -p "$CFG_MOUNT"
     cp -a "$CONFIG_DIR_SRC"/*.json "$CFG_MOUNT/" 2>/dev/null || true
     [[ -f "$CFG_MOUNT/config.json" ]] || { echo "Error: no config.json in '$CONFIG_DIR_SRC'" >&2; exit 2; }
-    CONFIG_NOTE="$CONFIG_DIR_SRC → $CFG_MOUNT (copy; original untouched)"
+    CONFIG_NOTE="$CONFIG_DIR_SRC → $CFG_MOUNT (temporary copy; original untouched)"
   fi
   args+=(-v "$CFG_MOUNT:/config/coderai$volume_suffix" \
          -v "$DATA_ROOT/models:/models$volume_suffix" -v "$DATA_ROOT/cache:/cache$volume_suffix")
@@ -340,6 +444,7 @@ Starting CoderAI OCI container
   debug:   ${DEBUG_SPEC:-off}
   log:     $LOG_HOST_NOTE
   tools:   $TOOLS_NOTE
+  user:    ${USER_SPEC:-container default (root)}
   cdr-args:${CODERAI_EXTRA_ARGS:+ $CODERAI_EXTRA_ARGS}
 EOF
 

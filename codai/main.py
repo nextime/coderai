@@ -321,6 +321,16 @@ def main():
     config_mgr = ConfigManager(config_dir)
     config = config_mgr.load()
 
+    # CLI --host/--port override the server bind for THIS run only, in memory —
+    # they are never written back to config.json. The container launcher uses this
+    # so a config dir mounted in place (persistent) is not modified at startup.
+    _cli_host = getattr(args, "host", None)
+    _cli_port = getattr(args, "port", None)
+    if _cli_host:
+        config.server.host = _cli_host
+    if _cli_port:
+        config.server.port = int(_cli_port)
+
     # Configure the temporary-working-files directory as early as possible (before
     # any tempfile.* call). CLI --tmp overrides config.tmp_dir. Setting both
     # tempfile.tempdir and TMPDIR/TMP/TEMP makes every tempfile.* call AND child

@@ -32,8 +32,10 @@ mkdir -p "$CODERAI_CONFIG_DIR/coderai" "$CODERAI_MODELS_DIR/coderai" "$CODERAI_C
 CONFIG_DIR="$CODERAI_CONFIG_DIR/coderai"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 
-# Ensure the container binds to all interfaces even when config.json was created
-# by the app default, which uses 127.0.0.1 for local desktop installs.
+# Bind host/port are passed to coderai on the CLI (--host/--port below), which
+# override config.server in memory WITHOUT modifying config.json. This keeps an
+# in-place-mounted config dir untouched at startup. We only CREATE config.json on
+# first run (when it doesn't exist yet) — that's not modifying user config.
 if [ ! -f "$CONFIG_FILE" ]; then
   /opt/coderai/python/bin/python3 - "$CONFIG_FILE" "$CODERAI_HOST" "$CODERAI_PORT" <<'PY'
 import json
@@ -44,31 +46,6 @@ path = Path(sys.argv[1])
 host = sys.argv[2]
 port = int(sys.argv[3])
 path.write_text(json.dumps({"server": {"host": host, "port": port}}, indent=2) + "\n")
-PY
-else
-  /opt/coderai/python/bin/python3 - "$CONFIG_FILE" "$CODERAI_HOST" "$CODERAI_PORT" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-host = sys.argv[2]
-port = int(sys.argv[3])
-try:
-    data = json.loads(path.read_text())
-except Exception:
-    data = {}
-server = data.setdefault("server", {})
-changed = False
-if server.get("host") in (None, "", "127.0.0.1", "localhost") or host != "0.0.0.0":
-    if server.get("host") != host:
-        server["host"] = host
-        changed = True
-if server.get("port") != port:
-    server["port"] = port
-    changed = True
-if changed:
-    path.write_text(json.dumps(data, indent=2) + "\n")
 PY
 fi
 
@@ -97,8 +74,9 @@ esac
 # only sub-flags.
 case " $DEBUG_ARGS " in *" --debug "*) : ;; *[!\ ]*) DEBUG_ARGS="--debug$DEBUG_ARGS" ;; esac
 
-# Assemble the server argv: --config, optional --tmp, debug flags, then passthrough.
-set -- --config "$CONFIG_DIR" "$@"
+# Assemble the server argv: --config, --host/--port (override config.server in
+# memory, never written to config.json), optional --tmp, debug flags, passthrough.
+set -- --config "$CONFIG_DIR" --host "$CODERAI_HOST" --port "$CODERAI_PORT" "$@"
 [ -n "${CODERAI_TMP:-}" ] && set -- "$@" --tmp "$CODERAI_TMP"
 
 # Extra coderai CLI flags passed straight through from the host launcher

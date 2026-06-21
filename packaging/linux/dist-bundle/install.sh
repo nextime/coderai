@@ -55,7 +55,10 @@ if ! "$ENGINE" info >/dev/null 2>&1; then
 fi
 
 say "[install] loading image from $IMAGE_TAR — this is large, please wait…"
-"${DK[@]}" load -i "$IMAGE_TAR"
+LOAD_OUT="$("${DK[@]}" load -i "$IMAGE_TAR")"
+say "$LOAD_OUT"
+# e.g. "Loaded image: coderai:full_all_0.1.0" — the tag we just installed.
+LOADED_TAG="$(printf '%s\n' "$LOAD_OUT" | sed -n 's/^Loaded image: //p' | head -1)"
 
 # Pick the install dir by privilege.
 if [ "$(id -u)" -eq 0 ]; then
@@ -83,6 +86,35 @@ if [ "$(id -u)" -ne 0 ]; then
       fi
       ;;
   esac
+fi
+
+# Offer to remove OTHER coderai images (e.g. older versions) — default NO.
+OTHERS=()
+while IFS= read -r line; do
+  [ -n "$line" ] && [ "$line" != "$LOADED_TAG" ] && OTHERS+=("$line")
+done < <(
+  "${DK[@]}" images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+    | grep -E '^coderai:' | grep -v ':<none>$' | sort -u)
+
+if [ "${#OTHERS[@]}" -gt 0 ]; then
+  say ""
+  say "[install] other coderai image(s) already present:"
+  for img in "${OTHERS[@]}"; do say "    $img"; done
+  # Default NO — only remove on an explicit yes (and not under non-interactive --yes).
+  if [ "$ASSUME_YES" -ne 1 ]; then
+    printf '[install] remove the other image(s) above? [y/N] '
+    read -r reply </dev/tty || reply=""
+    case "$reply" in
+      y|Y|yes|YES)
+        for img in "${OTHERS[@]}"; do
+          "${DK[@]}" image rm "$img" >/dev/null 2>&1 && say "[install] removed $img" \
+            || say "[install] could not remove $img (in use?)"
+        done ;;
+      *) say "[install] keeping the other image(s)." ;;
+    esac
+  else
+    say "[install] --yes given; keeping the other image(s) (default)."
+  fi
 fi
 
 say ""

@@ -195,6 +195,23 @@ configuration directory (--config DIR, default: OS-specific CoderAI directory). 
              "('No space left on device').",
     )
     parser.add_argument(
+        "--host",
+        type=str,
+        default=None,
+        metavar="ADDR",
+        help="Override the server bind host (config.server.host) for this run only, "
+             "WITHOUT modifying config.json. Used by the container launcher so an "
+             "in-place-mounted config dir is never rewritten.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        metavar="PORT",
+        help="Override the server bind port (config.server.port) for this run only, "
+             "WITHOUT modifying config.json.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug mode - dumps full request/response to stdout for troubleshooting",
