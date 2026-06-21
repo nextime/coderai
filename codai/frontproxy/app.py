@@ -36,7 +36,8 @@ _HOP_BY_HOP = {
 }
 # Also strip any client-supplied internal token so a caller can't spoof/override the
 # real one the front injects — only the front's httpx default header reaches engines.
-_DROP_REQ = _HOP_BY_HOP | {"host", "content-length", "x-coderai-internal"}
+_DROP_REQ = _HOP_BY_HOP | {"host", "content-length", "x-coderai-internal",
+                          "x-coderai-broker-authed"}
 # Also drop date/server from relayed engine responses: the front's own ASGI server
 # (uvicorn/starlette) adds its own Date and Server headers, so keeping the engine's
 # too produces DUPLICATE header lines — which nginx logs as a warning on every
@@ -215,6 +216,11 @@ class FrontProxy:
                     "body": b'{"error":"No engine is ready yet."}'}
         send_headers = {k: v for k, v in (headers or {}).items()
                         if k.lower() not in _DROP_REQ}
+        # Mark this as a broker-relayed, already-authenticated request so the engine
+        # skips its end-user Bearer check (the AISBF broker authenticated upstream).
+        # Signed with the internal token; the engine accepts it only if it matches.
+        if self.internal_token:
+            send_headers["x-coderai-broker-authed"] = self.internal_token
         try:
             r = await self._long.request(method, engine.url + path,
                                          headers=send_headers, params=query or {},

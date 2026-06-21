@@ -21,6 +21,7 @@ Endpoints covered:
   /v1/completions           — legacy completions
 """
 
+import os
 import time
 import threading
 from collections import defaultdict
@@ -57,6 +58,18 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         # Requests from the ASGI broker bridge are in-process and have no real
         # Bearer token. Identify them by the sentinel server tuple set in asgi_bridge.py.
         if request.scope.get("server") == ("internal", 80):
+            return await call_next(request)
+
+        # Requests the front relays on behalf of an ALREADY-authenticated caller —
+        # the AISBF broker authenticates at the aisbf layer (registration token), so
+        # those requests carry no end-user Bearer. The front marks them with the
+        # internal shared token in x-coderai-broker-authed. It's unforgeable by
+        # external clients (only the front knows the token, and the front strips any
+        # client-supplied copy), so trust it and skip the end-user Bearer check.
+        # NOTE: this is NOT the plain internal token, which rides on EVERY front→engine
+        # request (direct included) — so direct requests still require a real Bearer.
+        _int = os.environ.get("CODERAI_INTERNAL_TOKEN")
+        if _int and request.headers.get("x-coderai-broker-authed", "") == _int:
             return await call_next(request)
 
         from codai.admin import routes as _admin_routes
