@@ -107,7 +107,7 @@ def extract_reasoning_content(text: str, model_family: str = None) -> Tuple[str,
     # FIX: If reasoning contains tool call tags, split at the first tool tag
     # The tool call part should NOT be in reasoning - it should be left in clean_text for tool extraction
     if reasoning_content:
-        tool_tag_patterns = ["<tool_call>", "<tool>", "<|tool_call|>", "<function="]
+        tool_tag_patterns = ["<tool_call>", "<tool>", "<|tool_call>", "<|tool_call|>", "<function="]
         earliest_tool_idx = len(reasoning_content)
         earliest_tool_tag = None
         for tag in tool_tag_patterns:

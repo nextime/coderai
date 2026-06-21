@@ -142,6 +142,62 @@ def _debug_requests_enabled() -> bool:
     return bool(getattr(global_args, 'debug_requests', False)) if global_args else False
 
 
+class _ToolCallStreamGate:
+    """Hold back streamed content once a tool-call marker appears, so a model's
+    tool call (e.g. gemma's ``<|tool_call>call:NAME{…}``) isn't leaked to the client
+    as assistant message content before it's parsed. The FULL text is still
+    accumulated by the caller for end-of-stream tool extraction; this only decides
+    what is safe to emit as a visible content delta.
+
+    Markers cover gemma's special tokens plus the common tag formats. ``feed()``
+    returns the text safe to emit for each chunk: everything up to the first marker,
+    minus a small tail that could be a marker split across chunk boundaries. After a
+    marker is seen, it emits nothing. ``flush()`` releases any held-back tail when no
+    marker ever appeared."""
+    MARKERS = ("<|tool_call>", "<|tool_response>", "<|tool_call|>", "<tool_call>",
+               "<tool>", "<function=", "<|tool|>", "<|function_call>")
+    _MAXLEN = max(len(m) for m in MARKERS)
+
+    def __init__(self):
+        self.buf = ""
+        self.emitted = 0
+        self.started = False
+
+    def feed(self, chunk: str) -> str:
+        self.buf += chunk
+        if self.started:
+            return ""
+        earliest = None
+        for m in self.MARKERS:
+            i = self.buf.find(m, self.emitted)
+            if i != -1 and (earliest is None or i < earliest):
+                earliest = i
+        if earliest is not None:
+            out = self.buf[self.emitted:earliest]
+            self.emitted = earliest
+            self.started = True
+            return out
+        # No full marker yet: hold back a trailing run that could be the start of a
+        # marker split across chunks (e.g. a chunk ending in "<|tool_c").
+        safe = len(self.buf)
+        maxtail = min(self._MAXLEN - 1, len(self.buf) - self.emitted)
+        for k in range(maxtail, 0, -1):
+            suffix = self.buf[-k:]
+            if any(m.startswith(suffix) for m in self.MARKERS):
+                safe = len(self.buf) - k
+                break
+        out = self.buf[self.emitted:safe]
+        self.emitted = safe
+        return out
+
+    def flush(self) -> str:
+        if self.started:
+            return ""
+        out = self.buf[self.emitted:]
+        self.emitted = len(self.buf)
+        return out
+
+
 def _summarize_tool_calls(tool_calls):
     """Compact one-line-per-call view of OpenAI tool_calls (dict or pydantic)."""
     out = []
@@ -1458,6 +1514,11 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 
                 # Use the backend's async generate if available
                 if hasattr(current_manager.backend, 'generate_stream'):
+                    # Gate visible content so a tool call (e.g. gemma's
+                    # <|tool_call>call:NAME{…}) isn't streamed as a message before it's
+                    # parsed; reasoning_text still accumulates the full text for the
+                    # end-of-stream tool extraction below.
+                    _gate = _ToolCallStreamGate()
                     async for chunk in current_manager.backend.generate_stream(
                         prompt=raw_prompt_for_generation,
                         max_tokens=request.max_tokens or 2048,
@@ -1467,18 +1528,24 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                         **extra_params,
                     ):
                         reasoning_text += chunk
-                        
+
                         # Debug: log first pass chunks
                         if get_global_debug():
                             print(f"DEBUG FIRST PASS: chunk length={len(chunk)}, total reasoning so far={len(reasoning_text)}")
-                        
-                        yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk}, 'finish_reason': None}]})}\n\n"
-                        
+
+                        _emit = _gate.feed(chunk)
+                        if _emit:
+                            yield f"data: {json.dumps({'choices': [{'delta': {'content': _emit}, 'finish_reason': None}]})}\n\n"
+
                         # Check if we hit the close tag
                         if close_tag and close_tag in reasoning_text:
                             if get_global_debug():
                                 print(f"DEBUG: Close tag detected in first pass, reasoning length={len(reasoning_text)}")
                             break
+                    # Release any held-back tail that turned out not to be a tool call.
+                    _tail = _gate.flush()
+                    if _tail:
+                        yield f"data: {json.dumps({'choices': [{'delta': {'content': _tail}, 'finish_reason': None}]})}\n\n"
                 else:
                     # Fallback: non-streaming
                     if get_global_debug():
@@ -1520,7 +1587,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                 
                 # FIX: If reasoning contains tool call tags, split at the first tool tag
                 # The tool call part should NOT be in reasoning - it should be left for tool extraction
-                tool_tag_patterns = ["<tool_call>", "<tool>", "<|tool_call|", "<function="]
+                tool_tag_patterns = ["<tool_call>", "<tool>", "<|tool_call>", "<|tool_call|", "<function="]
                 earliest_tool_idx = len(reasoning_text)
                 earliest_tool_tag = None
                 for tag in tool_tag_patterns:
@@ -1671,7 +1738,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         final_text = first_pass_result
         
         # Define tool tags that indicate end of reasoning
-        tool_tags = ["<tool_call>", "<tool>", "<|tool_call|>", "<|tool|>", "<function="]
+        tool_tags = ["<tool_call>", "<tool>", "<|tool_call>", "<|tool_call|>", "<|tool|>", "<function="]
         
         if close_tag and close_tag in first_pass_result:
             # Split at close tag
@@ -1721,7 +1788,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         
         # FIX: If reasoning contains tool call tags, split at the first tool tag
         # The tool call part should NOT be in reasoning - it should be left for tool extraction in final_text
-        tool_tag_patterns = ["<tool_call>", "<tool>", "<|tool_call|>", "<function="]
+        tool_tag_patterns = ["<tool_call>", "<tool>", "<|tool_call>", "<|tool_call|>", "<function="]
         earliest_tool_idx = len(reasoning_text)
         earliest_tool_tag = None
         for tag in tool_tag_patterns:
