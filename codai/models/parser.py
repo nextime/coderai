@@ -1787,6 +1787,38 @@ _CONTROL_TOKENS_START_SORTED = sorted(_CONTROL_TOKENS_START, key=len, reverse=Tr
 _CONTROL_TOKENS_END_SORTED = sorted(_CONTROL_TOKENS_END, key=len, reverse=True)
 
 
+# gemma-4 finetunes (esp. GGUF, where the markers aren't stripped as special tokens)
+# emit a CORRUPTED tool-call scheme that breaks both extraction and display:
+#   <|tool_call>call:bash{command:<|"|>wc -l README.md<|"|>}<tool_call|><|tool_response>…
+# Three distinct corruptions:
+#   * <|"|>            — the model's stand-in for a " quote; it leaks into string args
+#                        (a bash command becomes  <|"|>wc -l<|"|>  → "syntax error near |")
+#   * malformed open/close markers <|tool_call> / <tool_call|> (vs canonical <|tool_call|>)
+#   * a hallucinated <|tool_response>…/<turn|> tail (the model fakes the tool result)
+_RE_GEMMA_QUOTE = re.compile(r'<\|"\|>')
+# Only gemma's MALFORMED variants — deliberately NOT the canonical <|tool_call|> /
+# <|tool_call_end|>, which Phi (and others) emit and parse normally; stripping those
+# here would break their extraction.
+_RE_GEMMA_TOOL_MARKERS = re.compile(
+    r'<\|tool_call>|<tool_call\|>'
+    r'|<\|tool_response\|?>|<tool_response\|>|<\|turn\|?>|<turn\|>',
+    re.IGNORECASE)
+
+
+def normalize_gemma_tool_tokens(text: str) -> str:
+    """Repair gemma-4's corrupted tool-call tokens so calls parse with correct args
+    and the markers never leak into user-facing content. Restores ``<|"|>`` → ``"``
+    and strips the malformed/hallucinated tool-call markers. The native
+    ``call:NAME{…}`` body (and any ``response:NAME{…}`` residue) is left for the tool
+    parser / content stripper to handle. Safe on non-gemma text — these exact token
+    fragments don't occur in normal output."""
+    if not text or ('<|' not in text and '|>' not in text):
+        return text
+    text = _RE_GEMMA_QUOTE.sub('"', text)
+    text = _RE_GEMMA_TOOL_MARKERS.sub('', text)
+    return text
+
+
 def cleanup_control_tokens(text: str) -> str:
     """
     Clean up leading/trailing control tokens from model output.
@@ -1800,9 +1832,12 @@ def cleanup_control_tokens(text: str) -> str:
     """
     if not text:
         return text
-    
-    cleaned = text
-    
+
+    # Repair gemma-4's corrupted tool tokens (interior <|"|> quotes + stray markers)
+    # before the start/end stripping below — fixes both display and downstream tool
+    # extraction (which runs on this cleaned text).
+    cleaned = normalize_gemma_tool_tokens(text)
+
     # Strip from start - keep trying until no more tokens at start
     # Max iterations bounded by text length / min token length
     changed = True
@@ -2367,9 +2402,12 @@ class ToolCallParser:
         print(f"DEBUG ToolCallParser: Called with text (first 200 chars): {repr(text[:200] if len(text) > 200 else text)}")
         print(f"DEBUG ToolCallParser: available_tools count: {len(available_tools) if available_tools else 0}")
         
+        # Repair gemma-4's corrupted tool tokens (<|"|> quotes, malformed markers).
+        text = normalize_gemma_tool_tokens(text)
+
         # First filter out malformed content
         text = self._filter_malformed_content(text)
-        
+
         # REPAIR: Fix broken tool call formats that the model hallucinates
         # This handles cases like <tool><tool_name><param>value</param></tool_name></tool>
         text = repair_broken_tool_calls(text)
@@ -2457,16 +2495,28 @@ class ToolCallParser:
         if not text:
             return text
 
+        # Repair gemma-4's corrupted markers/quotes, then drop its native
+        # call:/response: spans so neither the call nor a hallucinated fake result
+        # leaks into the content.
+        text = normalize_gemma_tool_tokens(text)
+        while re.search(r'(?:call|response):\s*[A-Za-z_]\w*\s*\{', text):
+            m = re.search(r'(?:call|response):\s*[A-Za-z_]\w*\s*\{', text)
+            try:
+                _, end = _parse_gemma_loose_object(text, m.end() - 1)
+            except Exception:
+                end = m.end()
+            text = text[:m.start()] + text[end:]
+
         text = strip_dsml_tool_calls(text)
         for pattern in STRIP_TOOL_PATTERNS:
             text = pattern.sub('', text)
-        
+
         for tool_name in ['read', 'write', 'exec', 'browser', 'message', 'web_search', 'web_fetch',
                          'memory_search', 'memory_get', 'sessions_list', 'sessions_send', 'tts', 'canvas', 'nodes']:
             text = re.sub(rf'<{tool_name}>[\s\S]*?</{tool_name}>', '', text)
-        
+
         text = re.sub(r'\n{3,}', '\n\n', text)
-        
+
         return text
 
 
@@ -2495,7 +2545,12 @@ class ModelParserAdapter:
         """Extract tool calls from model output using model-specific parsing."""
         if not text:
             return None
-        
+
+        # Repair gemma-4's corrupted tool tokens (<|"|> quotes, malformed markers) so
+        # the native call:NAME{…} args parse cleanly instead of carrying <|"|> garbage
+        # into e.g. bash commands.
+        text = normalize_gemma_tool_tokens(text)
+
         # REPAIR: Fix broken tool call formats that the model hallucinates
         # This handles cases like <tool><tool_name><param>value</param></tool_name></tool>
         text = repair_broken_tool_calls(text)
@@ -2537,21 +2592,23 @@ class ModelParserAdapter:
         if not text:
             return text
 
+        # Repair gemma-4's corrupted markers/quotes first so the call:NAME{…} spans
+        # below match and the stray <|tool_call>/<|tool_response>/<|"|> fragments are
+        # gone from the content shown to the user.
+        text = normalize_gemma_tool_tokens(text)
+
         text = strip_dsml_tool_calls(text)
 
-        # gemma-4 native: drop every `call:NAME{…}` span (balanced braces) and the
-        # `thought` channel residue left after skip_special_tokens strips the
-        # <|tool_call>/<|channel> markers.
-        if 'call:' in text:
-            while True:
-                m = re.search(r'call:\s*[A-Za-z_]\w*\s*\{', text)
-                if not m:
-                    break
-                try:
-                    _, end = _parse_gemma_loose_object(text, m.end() - 1)
-                except Exception:
-                    end = m.end()
-                text = text[:m.start()] + text[end:]
+        # gemma-4 native: drop every `call:NAME{…}` (the real call) and any
+        # `response:NAME{…}` (a hallucinated fake tool result) span — balanced braces —
+        # plus the `thought` channel residue.
+        while re.search(r'(?:call|response):\s*[A-Za-z_]\w*\s*\{', text):
+            m = re.search(r'(?:call|response):\s*[A-Za-z_]\w*\s*\{', text)
+            try:
+                _, end = _parse_gemma_loose_object(text, m.end() - 1)
+            except Exception:
+                end = m.end()
+            text = text[:m.start()] + text[end:]
         text = re.sub(r'(?m)^\s*thought\s*$\n?', '', text)
 
         # Custom XML format: <tool><action>...</action><object>...</object><properties>...</properties></tool>
