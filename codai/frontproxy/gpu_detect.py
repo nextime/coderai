@@ -379,6 +379,51 @@ def engine_gpu_stats() -> list:
             if c.get("vendor") in sels or (c.get("uuid") and c["uuid"] in sels)]
 
 
+def card_key(vendor: str, uuid: str = "", pci: str = "") -> str:
+    """Stable identifier for one physical GPU, computable identically by the front
+    (which sees every card) and by an engine (which sees only its own, in llama.cpp
+    device order). NVIDIA → its UUID (stable across reboots); AMD/others → PCI bus
+    address. Used to key per-card VRAM caps so a cap follows the actual card."""
+    vendor = _norm_vendor(vendor)
+    if vendor == "nvidia" and uuid:
+        u = uuid.strip()
+        if u.upper().startswith("GPU-"):
+            u = u[4:]
+        return f"nvidia:{u}"
+    if pci:
+        return f"{vendor}:{pci.strip()}"
+    return f"{vendor}:?"
+
+
+def gpu_cards() -> list:
+    """Every physical GPU on the machine as ``[{key, vendor, name}]`` for a per-card
+    settings UI. Keys are stable (see :func:`card_key`) so a saved cap maps back to
+    the same card on the engine side. Software rasterizers are excluded."""
+    cards = []
+    for g in nvidia_gpus():
+        cards.append({"key": card_key("nvidia", uuid=g.get("uuid", "")),
+                      "vendor": "nvidia",
+                      "name": g.get("name") or "NVIDIA GPU"})
+    # AMD (and any non-NVIDIA) via sysfs DRM, keyed by PCI bus address.
+    for card in sorted(glob.glob("/sys/class/drm/card*")):
+        base = os.path.basename(card)
+        if not re.match(r"^card\d+$", base):
+            continue
+        dev = os.path.join(card, "device")
+        try:
+            with open(os.path.join(dev, "vendor")) as f:
+                vid = f.read().strip().lower()
+        except OSError:
+            continue
+        vendor = _PCI_VENDOR.get(vid)
+        if not vendor or vendor == "nvidia":   # nvidia handled above via nvidia-smi
+            continue
+        pci = os.path.basename(os.path.realpath(dev))
+        name = _amd_gpu_name(dev, base) if vendor == "amd" else f"{vendor} GPU ({base})"
+        cards.append({"key": card_key(vendor, pci=pci), "vendor": vendor, "name": name})
+    return cards
+
+
 def summary() -> dict:
     """Detected hardware, for a 'detect engines' UI / debugging."""
     return {"nvidia": nvidia_gpus(), "vulkan": vulkan_devices(),

@@ -140,10 +140,16 @@ class OffloadConfig:
     #   "performance" → fill the fast lead card first, spill only the overflow to the
     #                   slower card(s) so the weak GPU gates throughput the least.
     split_strategy: str = "vram"
-    # Cap (GB) on how much VRAM the auto-split may place on EACH secondary (non-main)
-    # card. Keeps a slow second GPU lightly loaded so it bottlenecks less; the
-    # remainder stays on the fast card or spills to CPU. None/0 = no cap.
+    # Per-MODEL cap (GB) on how much VRAM the auto-split may place on the secondary
+    # (non-main) card. For a 2-card split one cap is enough — which card is secondary
+    # is implicit. Lives in each model's config; None/0 = no cap.
     split_secondary_cap_gb: Optional[float] = None
+    # GLOBAL per-CARD VRAM caps: {card_key: gb}. Unlike the per-model scalar above,
+    # this caps a SPECIFIC physical card by a stable key (nvidia:<uuid> / amd:<pci>)
+    # regardless of which engine/model uses it — so you can independently limit, say,
+    # the Radeon to 4 GB and the NVIDIA to 20 GB. Effective cap on a device = lowest
+    # of its global per-card cap and the per-model secondary cap (when it applies).
+    split_card_caps_gb: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -630,7 +636,8 @@ class ConfigManager:
                 "gpu_split": self.config.offload.gpu_split,
                 "tensor_split": self.config.offload.tensor_split,
                 "split_strategy": self.config.offload.split_strategy,
-                "split_secondary_cap_gb": self.config.offload.split_secondary_cap_gb
+                "split_secondary_cap_gb": self.config.offload.split_secondary_cap_gb,
+                "split_card_caps_gb": self.config.offload.split_card_caps_gb
             },
             "vulkan": {
                 "n_gpu_layers": self.config.vulkan.n_gpu_layers,

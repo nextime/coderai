@@ -349,6 +349,70 @@ def _per_device_free_vram_gb() -> list:
     return out
 
 
+def _per_device_card_key() -> list:
+    """Stable card key per device in the SAME order as :func:`_per_device_free_vram_gb`
+    (CUDA devices first by index, then AMD/Vulkan via amdgpu sysfs sorted). Keys match
+    the front's ``gpu_detect.card_key`` (nvidia:<uuid> / amd:<pci>) so a global per-card
+    VRAM cap configured in the UI can be applied to the right physical device here."""
+    keys = []
+    try:
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                u = ""
+                try:
+                    u = str(getattr(torch.cuda.get_device_properties(i), "uuid", "") or "")
+                except Exception:
+                    u = ""
+                if u.upper().startswith("GPU-"):
+                    u = u[4:]
+                keys.append(f"nvidia:{u}" if u else f"nvidia:idx{i}")
+    except Exception:
+        pass
+    try:
+        import glob as _glob
+        for tp in sorted(_glob.glob('/sys/class/drm/card*/device/mem_info_vram_total')):
+            dev = os.path.dirname(tp)   # .../cardN/device
+            try:
+                pci = os.path.basename(os.path.realpath(dev))
+            except Exception:
+                pci = "?"
+            keys.append(f"amd:{pci}")
+    except Exception:
+        pass
+    return keys
+
+
+def _resolve_device_caps(n_devices: int, main_gpu: int,
+                         per_model_cap, global_caps) -> list:
+    """Return a per-device VRAM cap (GB) list (None = uncapped), length ``n_devices``.
+
+    Effective cap on a device = the LOWEST of:
+      * the per-MODEL secondary cap (``per_model_cap``), applied to NON-main devices;
+      * the GLOBAL per-card cap for that physical card (``global_caps[key]``).
+    """
+    try:
+        pmc = float(per_model_cap) if per_model_cap not in (None, '', 0, '0') else None
+    except (TypeError, ValueError):
+        pmc = None
+    gc = global_caps if isinstance(global_caps, dict) else {}
+    keys = _per_device_card_key() if gc else []
+    out = []
+    for i in range(n_devices):
+        vals = []
+        if pmc and pmc > 0 and i != main_gpu:
+            vals.append(pmc)
+        if gc and i < len(keys):
+            try:
+                _v = gc.get(keys[i])
+                if _v not in (None, '', 0, '0'):
+                    vals.append(float(_v))
+            except (TypeError, ValueError):
+                pass
+        out.append(min(vals) if vals else None)
+    return out
+
+
 def _ggml_kv_type(name):
     """Map a KV-cache quant name to the llama.cpp GGML type int, or None.
 
@@ -976,21 +1040,20 @@ class VulkanBackend(ModelBackend):
                 # Otherwise we'd needlessly offload layers to CPU thinking only one
                 # card's free VRAM is available.
                 _free = _pooled_free_vram_gb(cross=bool(kwargs.get('gpu_split')))
-                # Apply the secondary-card VRAM cap to the usable pool too, so that
-                # capping the slow card proactively offloads the remainder to CPU here
-                # (rather than only reacting to an OOM in the load-retry loop).
-                try:
-                    _sc = kwargs.get('split_secondary_cap_gb',
-                                     (kwargs.get('_raw_cfg') or {}).get('split_secondary_cap_gb'))
-                    _sc = float(_sc) if _sc not in (None, '', 0, '0') else None
-                except (TypeError, ValueError):
-                    _sc = None
-                if _sc and _sc > 0 and bool(kwargs.get('gpu_split')):
+                # Apply the VRAM caps to the usable pool too, so that capping a card
+                # proactively offloads the remainder to CPU here (rather than only
+                # reacting to an OOM in the load-retry loop). Per-model secondary cap
+                # plus the global per-card caps; effective per device = the lowest.
+                _pmc = kwargs.get('split_secondary_cap_gb',
+                                  (kwargs.get('_raw_cfg') or {}).get('split_secondary_cap_gb'))
+                _gcc = kwargs.get('_global_card_caps') or {}
+                if bool(kwargs.get('gpu_split')) and (_pmc or _gcc):
                     _mgi = self.main_gpu if isinstance(self.main_gpu, int) else 0
                     _pd = _per_device_free_vram_gb()
                     if len(_pd) > 1:
-                        _free = sum((d if i == _mgi else min(d, _sc))
-                                    for i, d in enumerate(_pd))
+                        _caps = _resolve_device_caps(len(_pd), _mgi, _pmc, _gcc)
+                        _free = sum((min(d, c) if c else d)
+                                    for d, c in zip(_pd, _caps))
                 # A vision projector (mmproj) loads ON TOP of the model on main_gpu;
                 # subtract it (weights + compute margin) from the usable pool so that
                 # when the model+KV+projector exceed BOTH cards combined, we reduce
@@ -1212,22 +1275,25 @@ class VulkanBackend(ModelBackend):
                 _adj = list(_free_dev)
                 if _reserve > 0 and 0 <= _mg < len(_adj):
                     _adj[_mg] = max(0.5, _adj[_mg] - _reserve)
-                # Secondary-card VRAM cap: limit how much of each NON-main device's
-                # free VRAM the auto-split may use. Keeps a slow second GPU (e.g. an
-                # RX 580) lightly loaded so it bottlenecks throughput less — the rest
-                # stays on the fast card or spills to CPU. Applies to both strategies.
-                try:
-                    _sec_cap = kwargs.get('split_secondary_cap_gb',
-                                          _raw_cfg.get('split_secondary_cap_gb'))
-                    _sec_cap = float(_sec_cap) if _sec_cap not in (None, '', 0, '0') else None
-                except (TypeError, ValueError):
-                    _sec_cap = None
-                if _sec_cap and _sec_cap > 0:
-                    for _i in range(len(_adj)):
-                        if _i != _mg:
-                            _adj[_i] = min(_adj[_i], _sec_cap)
-                    print(f"  gpu split    : secondary card VRAM capped at "
-                          f"{_sec_cap:.1f} GB/card")
+                # VRAM caps: limit how much of each device's free VRAM the auto-split
+                # may use. Two sources, combined as the LOWEST per device:
+                #   * per-MODEL secondary cap — caps every NON-main device (keeps a slow
+                #     second GPU, e.g. an RX 580, lightly loaded so it bottlenecks less);
+                #   * GLOBAL per-card caps — cap a SPECIFIC physical card by its key,
+                #     so you can independently limit each card on the machine.
+                # The remainder stays on the fast card or spills to CPU. Both strategies.
+                _pmc = kwargs.get('split_secondary_cap_gb',
+                                  _raw_cfg.get('split_secondary_cap_gb'))
+                _gcc = kwargs.get('_global_card_caps') or {}
+                if _pmc or _gcc:
+                    _devcaps = _resolve_device_caps(len(_adj), _mg, _pmc, _gcc)
+                    _keys = _per_device_card_key()
+                    for _i, _c in enumerate(_devcaps):
+                        if _c and _c > 0:
+                            _adj[_i] = min(_adj[_i], _c)
+                            _lbl = _keys[_i] if _i < len(_keys) else f"dev{_i}"
+                            print(f"  gpu split    : VRAM capped at {_c:.1f} GB on "
+                                  f"{_lbl}")
                 # Split strategy: "vram" (default) = proportional to free VRAM (max
                 # capacity); "performance" = fill the FAST lead card (main_gpu) first
                 # and spill only the overflow to the slower card(s), so the weak GPU

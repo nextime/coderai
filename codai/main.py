@@ -1062,6 +1062,7 @@ def main():
     global_args.tensor_split = getattr(config.offload, "tensor_split", None)
     global_args.split_strategy = getattr(config.offload, "split_strategy", "vram")
     global_args.split_secondary_cap_gb = getattr(config.offload, "split_secondary_cap_gb", None)
+    global_args.split_card_caps_gb = getattr(config.offload, "split_card_caps_gb", None) or {}
     # Thermal protection settings (read live by codai.models.thermal).
     global_args.thermal_cpu_enabled = config.thermal.cpu_enabled
     global_args.thermal_gpu_enabled = config.thermal.gpu_enabled

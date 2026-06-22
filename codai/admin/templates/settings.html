@@ -130,9 +130,9 @@
     <span class="form-hint">Default for split models when no explicit ratio is set. <b>VRAM</b> fits the largest model; <b>Speed</b> keeps most layers on the fast card so the slow one bottlenecks less. Per-model setting overrides this.</span>
   </div>
   <div class="form-row" style="margin:0">
-    <label class="form-label">Secondary card VRAM cap <span class="muted">(GB per non-lead card)</span></label>
-    <input type="number" step="0.5" min="0" id="s-split-secondary-cap" class="form-input" placeholder="no cap">
-    <span class="form-hint">Global cap on how much VRAM the auto-split may place on each secondary (slow) card — applies to every engine. e.g. <b>4</b> keeps at most 4 GB on an RX 580; the rest stays on the fast card or spills to CPU. Per-model setting overrides this. Blank/0 = no cap.</span>
+    <label class="form-label">Per-card VRAM cap <span class="muted">(GB per physical card)</span></label>
+    <div id="s-split-card-caps"><span class="form-hint">Detecting cards…</span></div>
+    <span class="form-hint">Cap how much VRAM the auto-split may place on each specific card on this machine — applies to every engine. e.g. set the <b>RX 580</b> to 4 GB and the <b>RTX 3090</b> to 20 GB independently; the rest stays on another card or spills to CPU. Blank/0 = no cap for that card.</span>
   </div>
   <div class="form-row" style="margin:0">
     <label class="form-label">Default weight distribution <span class="muted">(when splitting)</span></label>
@@ -747,6 +747,43 @@ function showAlert(type, msg){
   if(type !== 'error') setTimeout(()=>{ el.style.display='none'; }, 4000);
 }
 
+function renderCardCaps(cards, caps){
+  const box = document.getElementById('s-split-card-caps');
+  if(!box) return;
+  if(!cards || !cards.length){
+    box.innerHTML = '<span class="form-hint">No GPUs detected on this machine.</span>';
+    return;
+  }
+  box.innerHTML = '';
+  cards.forEach(c => {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;margin:4px 0';
+    const lbl = document.createElement('span');
+    lbl.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    lbl.textContent = c.name + ' (' + (c.vendor||'') + ')';
+    lbl.title = c.key;
+    const inp = document.createElement('input');
+    inp.type = 'number'; inp.step = '0.5'; inp.min = '0';
+    inp.className = 'form-input s-card-cap'; inp.placeholder = 'no cap';
+    inp.style.cssText = 'width:120px;flex:none';
+    inp.dataset.cardKey = c.key;
+    const v = (caps && caps[c.key] != null) ? caps[c.key] : '';
+    inp.value = v;
+    const unit = document.createElement('span'); unit.className='muted'; unit.textContent='GB';
+    row.appendChild(lbl); row.appendChild(inp); row.appendChild(unit);
+    box.appendChild(row);
+  });
+}
+
+function collectCardCaps(){
+  const out = {};
+  document.querySelectorAll('#s-split-card-caps .s-card-cap').forEach(inp => {
+    const v = (inp.value||'').trim();
+    if(v !== ''){ const n = parseFloat(v); if(!isNaN(n) && n > 0) out[inp.dataset.cardKey] = n; }
+  });
+  return out;
+}
+
 async function loadSettings(){
   try{
     const d = await fetch(ROOT_PATH + '/admin/api/settings').then(r=>r.json());
@@ -789,8 +826,7 @@ async function loadSettings(){
     document.getElementById('s-evict-idle-ram').checked = d.offload?.evict_idle_on_ram !== false;
     document.getElementById('s-gpu-split').checked = !!d.offload?.gpu_split;
     document.getElementById('s-split-strategy').value = d.offload?.split_strategy ?? 'vram';
-    document.getElementById('s-split-secondary-cap').value =
-      (d.offload?.split_secondary_cap_gb != null ? d.offload.split_secondary_cap_gb : '');
+    renderCardCaps(d.offload?.gpu_cards || [], d.offload?.split_card_caps_gb || {});
     document.getElementById('s-tensor-split').value = d.offload?.tensor_split ?? '';
     document.getElementById('s-ram-leak-watch').checked = d.offload?.ram_leak_watch !== false;
     document.getElementById('s-ram-watch-cuda').checked = d.offload?.ram_watch_cuda !== false;
@@ -907,7 +943,7 @@ async function saveSettings(){
       evict_idle_on_ram: document.getElementById('s-evict-idle-ram').checked,
       gpu_split: document.getElementById('s-gpu-split').checked,
       split_strategy: document.getElementById('s-split-strategy').value,
-      split_secondary_cap_gb: (function(){ const v=document.getElementById('s-split-secondary-cap').value.trim(); return v===''?null:parseFloat(v); })(),
+      split_card_caps_gb: collectCardCaps(),
       tensor_split: (document.getElementById('s-tensor-split').value.trim() || null),
       ram_leak_watch: document.getElementById('s-ram-leak-watch').checked,
       ram_watch_cuda: document.getElementById('s-ram-watch-cuda').checked,

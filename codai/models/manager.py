@@ -1112,9 +1112,11 @@ class MultiModelManager:
                 if _ts_val:
                     kwargs['tensor_split'] = _ts_val
                 kwargs['split_strategy'] = _cfg_or_global('split_strategy', 'split_strategy', 'vram')
-                # Secondary-card VRAM cap = the LOWEST of the global and per-model
-                # caps (whichever are set). A per-model cap can only tighten the
-                # global one — a per-model value higher than the global is ignored.
+                # Per-MODEL secondary cap (single value; the legacy global scalar still
+                # tightens it as a fallback) AND the GLOBAL per-card cap map. The engine
+                # combines them per device, taking the lowest. The per-card map keys
+                # physical cards (nvidia:<uuid> / amd:<pci>) so each card is capped
+                # independently regardless of which model/engine uses it.
                 _mcap = config.get('split_secondary_cap_gb') if isinstance(config, dict) else None
                 _gcap = getattr(_ga, 'split_secondary_cap_gb', None) if _ga else None
                 _caps = []
@@ -1125,6 +1127,7 @@ class MultiModelManager:
                     except (TypeError, ValueError):
                         pass
                 kwargs['split_secondary_cap_gb'] = min(_caps) if _caps else None
+                kwargs['_global_card_caps'] = getattr(_ga, 'split_card_caps_gb', None) or {}
                 no_ram = _cfg_or_global('no_ram', 'no_ram', False)
                 kwargs['no_ram'] = bool(no_ram)
                 offload_strategy = _cfg_or_global('offload_strategy', 'offload_strategy', 'auto')
@@ -1250,9 +1253,11 @@ class MultiModelManager:
                 if _ts_val:
                     kwargs['tensor_split'] = _ts_val
                 kwargs['split_strategy'] = _cfg_or_global('split_strategy', 'split_strategy', 'vram')
-                # Secondary-card VRAM cap = the LOWEST of the global and per-model
-                # caps (whichever are set). A per-model cap can only tighten the
-                # global one — a per-model value higher than the global is ignored.
+                # Per-MODEL secondary cap (single value; the legacy global scalar still
+                # tightens it as a fallback) AND the GLOBAL per-card cap map. The engine
+                # combines them per device, taking the lowest. The per-card map keys
+                # physical cards (nvidia:<uuid> / amd:<pci>) so each card is capped
+                # independently regardless of which model/engine uses it.
                 _mcap = config.get('split_secondary_cap_gb') if isinstance(config, dict) else None
                 _gcap = getattr(_ga, 'split_secondary_cap_gb', None) if _ga else None
                 _caps = []
@@ -1263,6 +1268,7 @@ class MultiModelManager:
                     except (TypeError, ValueError):
                         pass
                 kwargs['split_secondary_cap_gb'] = min(_caps) if _caps else None
+                kwargs['_global_card_caps'] = getattr(_ga, 'split_card_caps_gb', None) or {}
                 no_ram = _cfg_or_global('no_ram', 'no_ram', False)
                 kwargs['no_ram'] = bool(no_ram)
                 offload_strategy = _cfg_or_global('offload_strategy', 'offload_strategy', 'auto')

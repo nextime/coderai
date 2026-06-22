@@ -3397,6 +3397,16 @@ from datetime import datetime
 
 # --- Settings page ---
 
+def _detect_gpu_cards() -> list:
+    """Every physical GPU on the machine ([{key, vendor, name}]) for the per-card
+    VRAM-cap settings UI. Best-effort: returns [] if detection is unavailable."""
+    try:
+        from codai.frontproxy.gpu_detect import gpu_cards
+        return gpu_cards()
+    except Exception:
+        return []
+
+
 @router.get("/admin/settings", response_class=HTMLResponse, summary="Settings page")
 async def settings_page(request: Request, username: str = Depends(require_admin)):
     return _tmpl(request, "settings.html", {"username": username, "is_admin": True})
@@ -3456,6 +3466,10 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "tensor_split": c.offload.tensor_split,
             "split_strategy": c.offload.split_strategy,
             "split_secondary_cap_gb": c.offload.split_secondary_cap_gb,
+            "split_card_caps_gb": c.offload.split_card_caps_gb,
+            # Every physical card on the machine, so the UI can render a per-card cap
+            # row (key + name) and the user can cap each independently.
+            "gpu_cards": _detect_gpu_cards(),
         },
         "vulkan": {
             "n_gpu_layers": c.vulkan.n_gpu_layers,
@@ -3644,6 +3658,18 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
                 c.offload.split_secondary_cap_gb = float(_v) if _v not in (None, "", 0, "0") else None
             except (TypeError, ValueError):
                 c.offload.split_secondary_cap_gb = None
+        if "split_card_caps_gb" in off:
+            # {card_key: gb}. Drop blank/zero entries so an unset card means uncapped.
+            _raw = off["split_card_caps_gb"] or {}
+            _caps = {}
+            if isinstance(_raw, dict):
+                for _k, _v in _raw.items():
+                    try:
+                        if _v not in (None, "", 0, "0"):
+                            _caps[str(_k)] = float(_v)
+                    except (TypeError, ValueError):
+                        pass
+            c.offload.split_card_caps_gb = _caps
         # Push the RAM-cap settings to live global_args so the watcher, per-load
         # budget clamp and eviction honour them without a restart.
         try:
@@ -3660,6 +3686,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
                 ga.tensor_split = c.offload.tensor_split
                 ga.split_strategy = c.offload.split_strategy
                 ga.split_secondary_cap_gb = c.offload.split_secondary_cap_gb
+                ga.split_card_caps_gb = c.offload.split_card_caps_gb
         except Exception:
             pass
 
