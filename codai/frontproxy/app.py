@@ -77,6 +77,11 @@ class FrontProxy:
             headers=_auth)
         self._status_cache: Optional[dict] = None
         self._status_cache_at: float = 0.0
+        # Last-good primary task list. The primary engine can't answer the short
+        # tasks poll while it's GIL-busy generating, so without this its running
+        # generation would vanish from the Tasks page on every poll under load.
+        self._primary_tasks_cache: list = []
+        self._primary_tasks_at: float = 0.0
         self._broker = None
         self.debug_engine = False   # --debug-engine: verbose engine lifecycle
 
@@ -347,7 +352,13 @@ class FrontProxy:
             if is_tasks and r.status_code == 200:
                 try:
                     data = r.json()
-                    data["tasks"] = self._merge_engine_tasks(prim, data.get("tasks") or [])
+                    _ptasks = data.get("tasks") or []
+                    # Cache the primary's live task list as last-good, so when a later
+                    # poll times out (engine GIL-busy generating) we can still show its
+                    # running work instead of dropping it from the page.
+                    self._primary_tasks_cache = _ptasks
+                    self._primary_tasks_at = time.monotonic()
+                    data["tasks"] = self._merge_engine_tasks(prim, _ptasks)
                     data["cooling_engines"] = self._cooling_engines()
                     return JSONResponse(data)
                 except Exception:
@@ -357,8 +368,13 @@ class FrontProxy:
                             media_type=r.headers.get("content-type"))
         except Exception:
             # Engine busy (event loop blocked by GIL-heavy work) — don't hang the UI.
-            # Still surface known running tasks from other engines.
-            tasks = self._merge_engine_tasks(prim, []) if is_tasks else []
+            # Fall back to the last-good primary task list (recent) so a running
+            # generation stays visible while the engine can't answer the poll, plus
+            # the running tasks the supervisor saw on the other engines.
+            ptasks = []
+            if is_tasks and (time.monotonic() - self._primary_tasks_at) < 120:
+                ptasks = self._primary_tasks_cache or []
+            tasks = self._merge_engine_tasks(prim, ptasks) if is_tasks else []
             return JSONResponse({"engine": "loading", "stale": True,
                                  "tasks": tasks, "queue": []})
 
