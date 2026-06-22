@@ -574,9 +574,15 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <span class="form-hint" style="font-size:11px">When off (default), a request fails if the pinned engine is down/busy-unreachable instead of running on a different card.</span>
       </div>
       <div class="form-row" id="cfg-gpu-split-row" style="margin-top:.75rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
-        <label class="form-label" style="font-weight:600">Weight distribution <span class="muted" style="font-weight:400">— layers per GPU</span></label>
-        <input type="text" id="cfg-tensor-split" class="form-input" placeholder="auto (by free VRAM)">
-        <span class="form-hint" style="font-size:11px">Comma-separated ratio for the chosen "first" card then the rest, e.g. <b>0.8,0.2</b> = 80% of layers on the lead card, 20% on the other. <b>Blank = automatic</b>, split proportionally to each card's free VRAM. The slower card bottlenecks each token, so the lead/faster GPU usually gets the larger share.</span>
+        <label class="form-label" style="font-weight:600">Split strategy <span class="muted" style="font-weight:400">(when ratio is auto)</span></label>
+        <select id="cfg-split-strategy" class="form-input">
+          <option value="vram">Maximize VRAM — proportional to free memory (biggest model)</option>
+          <option value="performance">Maximize speed — fill the fast card first, least on the slow one</option>
+        </select>
+        <span class="form-hint" style="font-size:11px"><b>VRAM</b> packs the most onto every card (best for fitting a large model) but the slow card bottlenecks throughput. <b>Speed</b> keeps as much as possible on the lead/fast card and spills only the overflow to the slower one — faster, as long as it still fits.</span>
+        <label class="form-label" style="font-weight:600;margin-top:.5rem">Weight distribution <span class="muted" style="font-weight:400">— layers per GPU (manual override)</span></label>
+        <input type="text" id="cfg-tensor-split" class="form-input" placeholder="auto (uses the strategy above)">
+        <span class="form-hint" style="font-size:11px">Optional explicit ratio for the lead card then the rest, e.g. <b>0.8,0.2</b>. Overrides the strategy. Blank = automatic per the strategy above.</span>
       </div>
       <div class="form-row" id="cfg-ds4-row" style="margin-top:.75rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
         <label class="form-label" style="font-weight:600">ds4 (DeepSeek V4) streaming <span class="muted" style="font-weight:400">— per-model overrides</span></label>
@@ -3286,6 +3292,7 @@ function openCfgModal(idx, cfgIdx){
   _populateEnginePin(s.gpu_split ? ('__split__:' + ((s.engine || '').trim() || (_engineNames[0] || ''))) : (s.engine || ''));
   document.getElementById('cfg-engine-fallback').checked = !!s.engine_fallback;
   document.getElementById('cfg-tensor-split').value = s.tensor_split || '';
+  document.getElementById('cfg-split-strategy').value = s.split_strategy || 'vram';
   _populateDs4(m, s);
   document.getElementById('cfg-sysprompt').value = s.system_prompt || '';
   document.getElementById('cfg-parser').value = s.parser || (!m.in_config ? _autoDetectParser(m.path) : 'auto');
@@ -3705,6 +3712,8 @@ async function saveModelConfig(){
     gpu_split:         document.getElementById('cfg-engine').value.trim().startsWith('__split__:'),
     tensor_split:      (document.getElementById('cfg-engine').value.trim().startsWith('__split__:')
                           ? (document.getElementById('cfg-tensor-split').value.trim() || null) : null),
+    split_strategy:    (document.getElementById('cfg-engine').value.trim().startsWith('__split__:')
+                          ? document.getElementById('cfg-split-strategy').value : null),
     ds4:               _collectDs4(),
     system_prompt:     document.getElementById('cfg-sysprompt').value.trim() || null,
     parser:            document.getElementById('cfg-parser').value,

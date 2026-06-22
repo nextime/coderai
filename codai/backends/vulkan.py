@@ -1197,13 +1197,41 @@ class VulkanBackend(ModelBackend):
                 _adj = list(_free_dev)
                 if _reserve > 0 and 0 <= _mg < len(_adj):
                     _adj[_mg] = max(0.5, _adj[_mg] - _reserve)
-                _sum = sum(_adj)
-                if len(_adj) > 1 and _sum > 0:
-                    _parsed = [round(f / _sum, 3) for f in _adj]
-                    _note = (f" (reserved ~{_reserve:.1f} GB on GPU{_mg} for mmproj)"
-                             if _reserve > 0 else "")
-                    print(f"  gpu split    : auto tensor_split={_parsed} (by free VRAM "
-                          f"{[round(f,1) for f in _free_dev]} GB){_note}")
+                # Split strategy: "vram" (default) = proportional to free VRAM (max
+                # capacity); "performance" = fill the FAST lead card (main_gpu) first
+                # and spill only the overflow to the slower card(s), so the weak GPU
+                # holds the fewest layers and gates throughput the least.
+                _strategy = (kwargs.get('split_strategy', _raw_cfg.get('split_strategy'))
+                             or kwargs.get('_global_split_strategy') or 'vram')
+                _strategy = str(_strategy).lower()
+                _exp_total = kwargs.get('expected_vram_gb')
+                if (_strategy == 'performance' and len(_adj) > 1
+                        and _exp_total and _exp_total > 0):
+                    _w = [0.0] * len(_adj)
+                    _main_cap = _adj[_mg]
+                    if _exp_total <= _main_cap:
+                        _w[_mg] = 1.0   # fits on the fast card alone — no real spill
+                    else:
+                        _overflow = _exp_total - _main_cap
+                        _others = sum(_adj[i] for i in range(len(_adj)) if i != _mg)
+                        _w[_mg] = _main_cap
+                        for i in range(len(_adj)):
+                            if i != _mg and _others > 0:
+                                _w[i] = _overflow * (_adj[i] / _others)
+                    _sw = sum(_w)
+                    if _sw > 0:
+                        _parsed = [round(x / _sw, 3) for x in _w]
+                        print(f"  gpu split    : PERFORMANCE tensor_split={_parsed} "
+                              f"(fast card GPU{_mg} first; free {[round(f,1) for f in _free_dev]} GB, "
+                              f"model ~{_exp_total:.1f} GB)")
+                if not _parsed:
+                    _sum = sum(_adj)
+                    if len(_adj) > 1 and _sum > 0:
+                        _parsed = [round(f / _sum, 3) for f in _adj]
+                        _note = (f" (reserved ~{_reserve:.1f} GB on GPU{_mg} for mmproj)"
+                                 if _reserve > 0 else "")
+                        print(f"  gpu split    : VRAM tensor_split={_parsed} (by free VRAM "
+                              f"{[round(f,1) for f in _free_dev]} GB){_note}")
             else:
                 print(f"  gpu split    : tensor_split={_parsed} (multi-GPU pool)")
             if _parsed and _llama_accepts('tensor_split'):

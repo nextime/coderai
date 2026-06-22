@@ -1111,6 +1111,7 @@ class MultiModelManager:
                 _ts_val = _cfg_or_global('tensor_split', 'tensor_split', None)
                 if _ts_val:
                     kwargs['tensor_split'] = _ts_val
+                kwargs['split_strategy'] = _cfg_or_global('split_strategy', 'split_strategy', 'vram')
                 no_ram = _cfg_or_global('no_ram', 'no_ram', False)
                 kwargs['no_ram'] = bool(no_ram)
                 offload_strategy = _cfg_or_global('offload_strategy', 'offload_strategy', 'auto')
@@ -1235,6 +1236,7 @@ class MultiModelManager:
                 _ts_val = _cfg_or_global('tensor_split', 'tensor_split', None)
                 if _ts_val:
                     kwargs['tensor_split'] = _ts_val
+                kwargs['split_strategy'] = _cfg_or_global('split_strategy', 'split_strategy', 'vram')
                 no_ram = _cfg_or_global('no_ram', 'no_ram', False)
                 kwargs['no_ram'] = bool(no_ram)
                 offload_strategy = _cfg_or_global('offload_strategy', 'offload_strategy', 'auto')

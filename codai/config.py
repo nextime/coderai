@@ -133,6 +133,11 @@ class OffloadConfig:
     # order (CUDA devices first, then Vulkan). e.g. "0.8,0.2" = 80% on the first GPU
     # (3090), 20% on the second (RX 580). Blank = even split across the devices.
     tensor_split: Optional[str] = None
+    # Auto-split strategy when no explicit tensor_split is given:
+    #   "vram"        → proportional to each card's free VRAM (max capacity)
+    #   "performance" → fill the fast lead card first, spill only the overflow to the
+    #                   slower card(s) so the weak GPU gates throughput the least.
+    split_strategy: str = "vram"
 
 
 @dataclass
@@ -617,7 +622,8 @@ class ConfigManager:
                 "ram_watch_soft_fraction": self.config.offload.ram_watch_soft_fraction,
                 "ram_watch_cuda": self.config.offload.ram_watch_cuda,
                 "gpu_split": self.config.offload.gpu_split,
-                "tensor_split": self.config.offload.tensor_split
+                "tensor_split": self.config.offload.tensor_split,
+                "split_strategy": self.config.offload.split_strategy
             },
             "vulkan": {
                 "n_gpu_layers": self.config.vulkan.n_gpu_layers,
