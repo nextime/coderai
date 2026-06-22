@@ -342,18 +342,35 @@ class FrontProxy:
         import time as _t
         _started = _t.time()
         _status = 502
+        # Not-ready statuses (engine up but model still loading/reloading) and
+        # connection failures (engine just (re)starting) are retried rather than
+        # relayed as an error — mirrors the streaming path. A 4xx is a real client
+        # error and is returned as-is.
+        _RETRY_STATUS = {425, 429, 500, 502, 503, 504}
+        r = None
         try:
-            r = await self._long.request(method, engine.url + path,
-                                         headers=send_headers, params=query or {},
-                                         content=body or b"")
-            _status = r.status_code
-        except Exception as exc:
-            print("[front] broker route: engine#%s (%s) unreachable for %s: %s"
-                  % (engine.id, engine.name, path, exc), flush=True)
-            return {"status_code": 502,
-                    "headers": {"content-type": "application/json"},
-                    "body": ('{"error":"engine#%s unreachable: %s"}'
-                             % (engine.id, exc)).encode()}
+            for _attempt in range(6):
+                _last = (_attempt >= 5)
+                try:
+                    r = await self._long.request(method, engine.url + path,
+                                                 headers=send_headers,
+                                                 params=query or {},
+                                                 content=body or b"")
+                except Exception as exc:
+                    if _is_infer and not _last:
+                        await _asyncio.sleep(5.0)
+                        continue
+                    print("[front] broker route: engine#%s (%s) unreachable for %s: %s"
+                          % (engine.id, engine.name, path, exc), flush=True)
+                    return {"status_code": 502,
+                            "headers": {"content-type": "application/json"},
+                            "body": ('{"error":"engine#%s unreachable: %s"}'
+                                     % (engine.id, exc)).encode()}
+                _status = r.status_code
+                if _is_infer and _status in _RETRY_STATUS and not _last:
+                    await _asyncio.sleep(5.0)
+                    continue
+                break
         finally:
             engine.exit_request(_rid)
             if _qkey is not None:
@@ -436,18 +453,34 @@ class FrontProxy:
         import time as _t
         _started = _t.time()
         _status = 502
+        # Statuses that mean "not ready / try again" rather than a real client
+        # error: the engine is up but still loading/reloading the model. A 4xx is a
+        # genuine error and must be relayed as-is, not retried.
+        _RETRY_STATUS = {425, 429, 500, 502, 503, 504}
         try:
             for _attempt in range(_MAX_TRIES):
-                rp_req = self._long.build_request(method, engine.url + path,
-                                                  headers=send_headers,
-                                                  params=query or {},
-                                                  content=body or b"")
-                rp_resp = await self._long.send(rp_req, stream=True)
+                _last = (_attempt >= _MAX_TRIES - 1)
+                # Connection-level failure means the engine isn't accepting yet
+                # (just (re)starting). Don't relay an instant "unreachable" — that
+                # lands as a single empty SSE chunk over the broker. Wait + retry.
+                try:
+                    rp_req = self._long.build_request(method, engine.url + path,
+                                                      headers=send_headers,
+                                                      params=query or {},
+                                                      content=body or b"")
+                    rp_resp = await self._long.send(rp_req, stream=True)
+                except Exception as exc:
+                    if _is_infer and not _last:
+                        await _asyncio.sleep(_RETRY_WAIT)
+                        continue
+                    yield ('data: {"error":"engine#%s unreachable: %s"}\n\n'
+                           % (engine.id, exc))
+                    break
                 _status = rp_resp.status_code
                 # Not-ready (model still loading / mid OOM-reload): retry instead of
                 # relaying the empty/error reply. No tokens were generated on a
                 # non-200, so re-sending the body is safe (no duplicate output).
-                if _is_infer and _status != 200 and _attempt < _MAX_TRIES - 1:
+                if _is_infer and _status in _RETRY_STATUS and not _last:
                     await rp_resp.aclose()
                     await _asyncio.sleep(_RETRY_WAIT)
                     continue
@@ -465,9 +498,6 @@ class FrontProxy:
                     yield raw.decode("utf-8", "replace")
                 await rp_resp.aclose()
                 break
-        except Exception as exc:
-            yield ('data: {"error":"engine#%s unreachable: %s"}\n\n'
-                   % (engine.id, exc))
         finally:
             engine.exit_request(_rid)
             if _qkey is not None:
