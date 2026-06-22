@@ -1503,25 +1503,66 @@ def _do_delete_model(model_id: str, cache_type: str) -> dict:
     return {"success": False, "detail": "Unknown cache_type"}
 
 
+# Cache scans walk the whole HF/GGUF cache on disk (sizes + per-model capability
+# detection), which can take many seconds for a large cache. They change only when
+# a model is added/removed/downloaded, so serve them stale-while-revalidate: return
+# the last result instantly and refresh in the background once it's older than TTL.
+# First call computes synchronously; mutating ops force the next refresh.
+import threading as _cache_thr
+_SCAN_TTL = 25.0
+_scan_state = {"data": None, "at": 0.0, "busy": False}
+_stats_state = {"data": None, "at": 0.0, "busy": False}
+
+
+def _cached(state, fn):
+    import time as _t
+    now = _t.time()
+    if state["data"] is None:
+        state["data"] = fn()
+        state["at"] = _t.time()
+        return state["data"]
+    if now - state["at"] >= _SCAN_TTL and not state["busy"]:
+        state["busy"] = True
+
+        def _bg():
+            try:
+                d = fn()
+                state["data"] = d
+                state["at"] = _t.time()
+            finally:
+                state["busy"] = False
+        _cache_thr.Thread(target=_bg, daemon=True).start()
+    return state["data"]
+
+
+def _invalidate_cache_scan():
+    """Force the next cached-models/cache-stats read to refresh (after a model is
+    deleted/downloaded/freed)."""
+    _scan_state["at"] = 0.0
+    _stats_state["at"] = 0.0
+
+
 @router.get("/admin/api/cached-models", summary="List cached models")
 async def api_cached_models(username: str = Depends(require_admin)):
-    """Scan both caches and return all locally stored models."""
+    """Scan both caches and return all locally stored models (stale-while-revalidate)."""
     import asyncio
-    return await asyncio.to_thread(_scan_caches)
+    return await asyncio.to_thread(_cached, _scan_state, _scan_caches)
 
 
 @router.get("/admin/api/cache-stats", summary="Model cache statistics")
 async def api_cache_stats(username: str = Depends(require_admin)):
-    """Return disk-usage statistics for each cache."""
+    """Return disk-usage statistics for each cache (stale-while-revalidate)."""
     import asyncio
-    return await asyncio.to_thread(_get_cache_stats)
+    return await asyncio.to_thread(_cached, _stats_state, _get_cache_stats)
 
 
 @router.delete("/admin/api/cache", summary="Clear the model cache")
 async def api_clear_cache(cache_type: str = "all", username: str = Depends(require_admin)):
     """Bulk-delete cache. cache_type: all | hf | gguf"""
     import asyncio
-    return await asyncio.to_thread(_do_clear_cache, cache_type)
+    r = await asyncio.to_thread(_do_clear_cache, cache_type)
+    _invalidate_cache_scan()
+    return r
 
 
 @router.delete("/admin/api/cached-models/{model_id:path}", summary="Evict a cached model")
@@ -1532,7 +1573,9 @@ async def api_delete_cached_model(
 ):
     """Delete a specific cached model (HF repo ID or GGUF filename)."""
     import asyncio
-    return await asyncio.to_thread(_do_delete_model, model_id, cache_type)
+    r = await asyncio.to_thread(_do_delete_model, model_id, cache_type)
+    _invalidate_cache_scan()
+    return r
 
 
 @router.post("/admin/api/model-free-disk", summary="Delete a model's files but keep its config")
@@ -1574,6 +1617,7 @@ async def api_model_free_disk(request: Request, username: str = Depends(require_
             config_manager.save_models()
 
     result = await asyncio.to_thread(_do_delete_model, path, cache_type)
+    _invalidate_cache_scan()
     _broker_notify_models_updated(request)
     return result
 

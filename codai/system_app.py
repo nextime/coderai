@@ -100,5 +100,23 @@ def build_system_app(config, config_dir, internal_port: int = 0) -> FastAPI:
                     out.append({"id": str(getattr(m, "id", m))})
         return JSONResponse({"object": "list", "data": out})
 
+    @app.on_event("startup")
+    async def _prewarm():
+        # Warm the cache scans in the background so the first models-page load is
+        # already fast (the scans walk the whole HF/GGUF cache on disk).
+        import threading
+
+        def _warm():
+            try:
+                from codai.admin.routes import (
+                    _cached, _scan_state, _stats_state, _scan_caches,
+                    _get_cache_stats)
+                _cached(_scan_state, _scan_caches)
+                _cached(_stats_state, _get_cache_stats)
+                print("[system] cache scan pre-warmed", flush=True)
+            except Exception as exc:
+                print(f"[system] cache pre-warm skipped: {exc}", flush=True)
+        threading.Thread(target=_warm, daemon=True).start()
+
     app.include_router(admin_router, tags=["Admin"])
     return app

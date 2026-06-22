@@ -354,13 +354,28 @@ def _amd_stats() -> list:
     return cards
 
 
+_gpu_stats_cache = {"data": None, "at": 0.0}
+_GPU_STATS_TTL = 1.5
+
+
 def gpu_stats() -> list:
     """Live per-card stats for EVERY physical GPU installed (vendor-agnostic):
     ``[{vendor, index, name, util%, mem_used GB, mem_total GB, temp °C, uuid}]``.
 
     Independent of engine ownership — nvidia-smi and sysfs report all cards
-    regardless of CUDA_VISIBLE_DEVICES — so this shows the whole machine."""
-    return _nvidia_stats() + _amd_stats()
+    regardless of CUDA_VISIBLE_DEVICES — so this shows the whole machine.
+
+    Cached for a short TTL: the dashboard polls this ~every second and nvidia-smi
+    can be slow on a saturated GPU, so collapse rapid repeats onto one query."""
+    import time as _t
+    now = _t.time()
+    c = _gpu_stats_cache
+    if c["data"] is not None and now - c["at"] < _GPU_STATS_TTL:
+        return c["data"]
+    data = _nvidia_stats() + _amd_stats()
+    c["data"] = data
+    c["at"] = now
+    return data
 
 
 def engine_gpu_stats() -> list:
