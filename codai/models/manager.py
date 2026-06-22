@@ -3667,14 +3667,24 @@ class MultiModelManager:
         # Step 3: Check if already loaded in self.models
         existing_model = self.models.get(model_key)
 
-        # Fuzzy fallback: if not found by exact key, check for org-prefix
-        # variations (e.g. "image:Model" vs "image:org/Model").
+        # Fuzzy fallback: if not found by exact key, check for org-prefix and
+        # .gguf-extension variations, so all name forms of ONE model map to the
+        # SAME loaded instance (e.g. "image:Model" vs "image:org/Model", and a bare
+        # "gemma-…-Q4_0" request vs the loaded "/AI/…/gemma-…-Q4_0.gguf"). Without
+        # the .gguf normalization the bare name missed the loaded model and a SECOND
+        # instance was loaded despite max_model_instances=1.
         if existing_model is None:
             type_prefix = f"{model_type}:" if model_type and model_type != "text" else ""
-            short = resolved_name.split("/")[-1]
+
+            def _norm_id(s):
+                s = (s or "").split("/")[-1]
+                return s[:-5] if s.lower().endswith(".gguf") else s
+
+            short = _norm_id(resolved_name)
             for k, v in self.models.items():
                 k_name = k[len(type_prefix):] if type_prefix and k.startswith(type_prefix) else k
-                if k_name == resolved_name or k_name.split("/")[-1] == short:
+                if (k_name == resolved_name or k_name.split("/")[-1] == resolved_name.split("/")[-1]
+                        or _norm_id(k_name) == short):
                     model_key = k
                     resolved_name = k_name
                     existing_model = v
