@@ -537,6 +537,16 @@ class VulkanBackend(ModelBackend):
         if self.force_cuda:
             print("DEBUG: GGUF model will use CUDA backend (forced by --backend nvidia)")
         self._last_usage: dict = {}  # usage from the most recent completion call
+        # Fast chat-prompt rendering: a plain (non-sandboxed) Jinja template compiled
+        # once from the gguf's chat_template, + a small render cache. llama-cpp-python
+        # renders via ImmutableSandboxedEnvironment whose per-operation security
+        # checks make a heavy template (e.g. gemma-4's recursive/O(n^2) macros) take
+        # tens of seconds; a plain env renders the IDENTICAL prompt far faster.
+        self._chat_tmpl = None            # compiled jinja2.Template (lazy)
+        self._chat_tmpl_failed = False    # give up + fall back if it can't be built
+        self._chat_bos = ""
+        self._chat_eos = ""
+        self._chat_render_cache: dict = {}  # messages-hash -> (prompt, stop_list)
         # Serializes the synchronous forward pass within this one instance. The
         # instance pool may hand the same backend to two concurrent requests when
         # all instances are busy; overlapping create_completion calls share one KV
@@ -2138,6 +2148,68 @@ class VulkanBackend(ModelBackend):
         content = result['choices'][0]['message'].get('content') or ''
         return content
 
+    def _render_chat_prompt(self, messages):
+        """Render the chat prompt with a CACHED, non-sandboxed Jinja env, identical
+        to llama-cpp-python's output but without the sandbox's per-op overhead (the
+        cause of multi-second template renders for heavy templates). Returns
+        (prompt, stop_list), or (None, None) to fall back to create_chat_completion.
+        Applies to ANY gguf model that carries a chat_template."""
+        if self._chat_tmpl_failed:
+            return None, None
+        try:
+            if self._chat_tmpl is None:
+                md = getattr(self.model, "metadata", None) or {}
+                tmpl = md.get("tokenizer.chat_template")
+                if not tmpl:
+                    self._chat_tmpl_failed = True
+                    return None, None
+                import jinja2
+                import jinja2.ext
+                from llama_cpp.llama_chat_format import Jinja2ChatFormatter as _JF
+                env = jinja2.Environment(
+                    loader=jinja2.BaseLoader(), trim_blocks=True, lstrip_blocks=True,
+                    extensions=[_JF.IgnoreGenerationTags, jinja2.ext.loopcontrols])
+                env.filters["tojson"] = _JF.tojson
+                self._chat_tmpl = env.from_string(tmpl)
+                m = self.model
+                try:
+                    _eos = m.token_eos()
+                    _bos = m.token_bos()
+                    self._chat_eos = (m._model.token_get_text(_eos)
+                                      if _eos is not None and _eos >= 0 else "")
+                    self._chat_bos = (m._model.token_get_text(_bos)
+                                      if _bos is not None and _bos >= 0 else "")
+                except Exception:
+                    self._chat_eos = self._chat_bos = ""
+            import hashlib
+            key = hashlib.sha1(
+                json.dumps(messages, default=str).encode("utf-8", "replace")).hexdigest()
+            hit = self._chat_render_cache.get(key)
+            if hit is not None:
+                return hit
+            from llama_cpp.llama_chat_format import Jinja2ChatFormatter as _JF
+
+            def _raise(msg):
+                raise ValueError(msg)
+            _t0 = time.monotonic()
+            prompt = self._chat_tmpl.render(
+                messages=messages, eos_token=self._chat_eos, bos_token=self._chat_bos,
+                raise_exception=_raise, add_generation_prompt=True,
+                functions=None, function_call=None, tools=None, tool_choice=None,
+                strftime_now=_JF.strftime_now)
+            print(f"[timing] chat render (plain jinja): {time.monotonic() - _t0:.2f}s "
+                  f"({len(messages)} msgs, {len(prompt)} chars)", flush=True)
+            val = (prompt, [self._chat_eos] if self._chat_eos else [])
+            if len(self._chat_render_cache) >= 8:
+                self._chat_render_cache.clear()
+            self._chat_render_cache[key] = val
+            return val
+        except Exception as e:
+            print(f"[timing] chat render fell back to create_chat_completion: {e}",
+                  flush=True)
+            self._chat_tmpl_failed = True
+            return None, None
+
     async def generate_chat_stream(self, messages, max_tokens=None, temperature=0.7,
                                    top_p=1.0, stop=None, tools=None, response_format=None,
                                    enable_thinking=False, repeat_penalty=1.0,
@@ -2147,6 +2219,68 @@ class VulkanBackend(ModelBackend):
             raise RuntimeError("Model not loaded")
         if self._template_rejects_system():
             messages = self._fold_system_into_user(messages)
+
+        # Fast path: render the prompt ourselves (cached, plain Jinja) and generate
+        # via create_completion — avoids llama-cpp-python's slow per-call sandboxed
+        # chat-template render. Falls through to create_chat_completion if the model
+        # has no usable chat_template or rendering fails.
+        _prompt, _fmt_stops = self._render_chat_prompt(messages)
+        if _prompt is not None:
+            # Tokenize with add_bos=False (the chat template already emitted the BOS
+            # text — same as llama-cpp's handler, which tokenizes with
+            # add_bos=not added_special) and pass TOKENS so create_completion doesn't
+            # re-tokenize/double-BOS. Splits render vs tokenize timing.
+            _ttok = time.monotonic()
+            _ptokens = self.model.tokenize(_prompt.encode("utf-8"), add_bos=False,
+                                           special=True)
+            print(f"[timing] chat tokenize: {time.monotonic() - _ttok:.2f}s "
+                  f"({len(_ptokens)} tok)", flush=True)
+            ckwargs = dict(prompt=_ptokens, max_tokens=max_tokens or 512,
+                           temperature=temperature, top_p=top_p, stream=True)
+            _all = list(dict.fromkeys((self._augment_model_stops(stop) or [])
+                                      + (_fmt_stops or [])))
+            if _all:
+                ckwargs['stop'] = _all
+            if repeat_penalty and repeat_penalty != 1.0:
+                ckwargs['repeat_penalty'] = repeat_penalty
+            if presence_penalty:
+                ckwargs['presence_penalty'] = presence_penalty
+            if frequency_penalty:
+                ckwargs['frequency_penalty'] = frequency_penalty
+            _tc = _make_llama_thermal_criteria()
+            if _tc is not None:
+                ckwargs['stopping_criteria'] = _tc
+            _tb = time.monotonic()
+            _completion = self.model.create_completion(**ckwargs)
+            print(f"[timing] chat create_completion setup: "
+                  f"{time.monotonic() - _tb:.2f}s", flush=True)
+            prompt_tokens = 0
+            completion_tokens = 0
+            _tf = time.monotonic()
+            _first = True
+            try:
+                async for chunk in _aiter_blocking(_completion, lock=self._gen_lock):
+                    if _first:
+                        print(f"[timing] chat lock+prefill+first-token: "
+                              f"{time.monotonic() - _tf:.2f}s", flush=True)
+                        _first = False
+                    ch = chunk['choices'][0]
+                    text = ch.get('text') or ''
+                    if text:
+                        completion_tokens += 1
+                        yield text
+                    if chunk.get('usage'):
+                        u = chunk['usage']
+                        prompt_tokens = u.get('prompt_tokens', 0)
+                        completion_tokens = u.get('completion_tokens', completion_tokens)
+                    if ch.get('finish_reason'):
+                        break
+            finally:
+                if prompt_tokens == 0:
+                    prompt_tokens = sum(len(str(m.get('content', '')).split())
+                                        for m in messages)
+                self._store_usage(prompt_tokens, completion_tokens)
+            return
 
         kwargs = dict(
             messages=messages,
