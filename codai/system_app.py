@@ -79,5 +79,26 @@ def build_system_app(config, config_dir, internal_port: int = 0) -> FastAPI:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
         return JSONResponse({"ok": True})
 
+    @app.get("/v1/models", include_in_schema=False)
+    async def _v1_models():
+        """Full node model list (config-based), so the front can serve /v1/models
+        from here instead of fanning out to every engine."""
+        from codai.models.manager import multi_model_manager
+        out = []
+        for m in multi_model_manager.list_models(all_engines=True):
+            if hasattr(m, "model_dump"):
+                out.append(m.model_dump())
+            elif hasattr(m, "dict"):
+                out.append(m.dict())
+            elif isinstance(m, dict):
+                out.append(m)
+            else:
+                try:
+                    import dataclasses
+                    out.append(dataclasses.asdict(m))
+                except Exception:
+                    out.append({"id": str(getattr(m, "id", m))})
+        return JSONResponse({"object": "list", "data": out})
+
     app.include_router(admin_router, tags=["Admin"])
     return app

@@ -162,12 +162,30 @@ class FrontProxy:
             self._broker = None
 
     async def collect_models(self, headers):
-        """Union of every healthy engine's /v1/models. Each engine registers only
-        the models the front assigned to it, so the union is the full set with no
-        duplicates. Returns ("ok", {...}) or ("passthrough", httpx.Response) when an
-        auth/error response should be relayed instead."""
+        """Full node model list. Served from the coderai-system worker (config-based
+        list_models, off the GPU engines) in a single fast call, so /v1/models never
+        fans out to — or stalls on — a busy engine. Falls back to a per-engine union
+        only if the worker is unavailable. Returns ("ok", {...}) or ("passthrough",
+        httpx.Response)."""
+        sysw = self._system_engine()
+        if sysw is not None:
+            try:
+                r = await self._short.get(sysw.url + "/v1/models", headers=headers)
+                if r.status_code == 200:
+                    data = r.json().get("data") or []
+                    self._engine_models_cache["__system__"] = data  # last-good
+                    return ("ok", {"object": "list", "data": data})
+            except Exception:
+                pass
+            # Worker briefly unreachable: serve its last-good list if we have one.
+            cached = self._engine_models_cache.get("__system__")
+            if cached:
+                return ("ok", {"object": "list", "data": cached})
+
         seen, order, relay = {}, [], None
         for e in self.registry.all():
+            if getattr(e, "role", "engine") == "system":
+                continue
             models = None
             if e.healthy:
                 try:

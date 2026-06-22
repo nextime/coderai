@@ -2341,6 +2341,7 @@ async function startQuantize(){
       _renderQuantStatus(null, {available:false, capabilities:j.job.caps||{}});
       return;
     }
+    _quantActive = true;   // resume polling while this job runs
     _refreshQuantStatus(path);
   }catch(e){
     if(el) el.innerHTML = '<span style="color:var(--danger,#dc2626)">Failed to start: '+esc(String(e))+'</span>';
@@ -2747,11 +2748,13 @@ function _instanceBadge(lookupPaths, cfgMax){
 // ---- Quant-job badges on the model list (polled; re-renders only on change) ----
 let _quantJobs = {};
 let _quantSig = '';
+let _quantActive = false;   // any quant job currently running → keep polling the engine
 async function refreshQuantJobs(){
   try{
     const r = await pageFetch('/admin/api/quantize-status');
     _quantJobs = (await r.json()).jobs || {};
   }catch(e){ /* keep last-known on transient error */ }
+  _quantActive = Object.values(_quantJobs).some(j => j && j.status === 'running');
   // Signature buckets progress to 5% so we only re-render on meaningful change.
   return Object.entries(_quantJobs)
     .map(([k,v])=>`${k}:${v.status}:${Math.round((v.progress||0)*20)}`).sort().join('|');
@@ -2777,8 +2780,11 @@ async function refreshLocal(){
   loadCachedModels();
 }
 
-// Poll quant jobs; re-render the list only when a job's state/progress changes.
+// Poll quant jobs ONLY while one is running (and the tab is visible) — quant runs
+// on the engine, so don't poll it every 5s when there's nothing to watch.
 setInterval(async () => {
+  if (document.visibilityState === 'hidden') return;
+  if (!_quantActive) return;
   const sig = await refreshQuantJobs();
   if (sig !== _quantSig) { _quantSig = sig; loadCachedModels(); }
 }, 5000);
