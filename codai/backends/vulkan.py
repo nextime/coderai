@@ -1616,7 +1616,8 @@ class VulkanBackend(ModelBackend):
         if stop is None:
             # Get default stop tokens based on template
             stop = get_reasoning_stop_tokens(self.chat_template)
-        
+        stop = self._augment_model_stops(stop)
+
         # Check for grammar-guided generation
         use_grammar = grammar
         if use_grammar is None:
@@ -1717,7 +1718,8 @@ class VulkanBackend(ModelBackend):
         if stop is None:
             # Get default stop tokens based on template
             stop = get_reasoning_stop_tokens(self.chat_template)
-        
+        stop = self._augment_model_stops(stop)
+
         # Check for grammar-guided generation
         use_grammar = grammar
         if use_grammar is None:
@@ -1838,7 +1840,8 @@ class VulkanBackend(ModelBackend):
         stop = kwargs.get('stop', None)
         if stop is None:
             stop = get_reasoning_stop_tokens(self.chat_template)
-        
+        stop = self._augment_model_stops(stop)
+
         stream = kwargs.get('stream', False)
         
         if stream:
@@ -2066,6 +2069,24 @@ class VulkanBackend(ModelBackend):
         self._no_system_cached = val
         return val
 
+    def _augment_model_stops(self, stop):
+        """Merge model-specific stop sequences into the client-supplied ``stop`` list.
+
+        gemma-4 GGUF finetunes don't emit a clean EOS after a tool call — they keep
+        going and HALLUCINATE a fake tool result (``<tool_call|><|tool_response>
+        response:NAME{…}`` … ``<turn|>``). Adding those markers (and the real
+        ``<end_of_turn>``) as stop strings halts generation right after the call, so
+        the model doesn't waste tokens inventing a result llama.cpp would never run.
+        Stop strings are matched and trimmed by llama.cpp, so they never reach output.
+        Returns a list (or None when there's nothing to stop on)."""
+        out = list(stop) if isinstance(stop, (list, tuple)) else ([stop] if stop else [])
+        name = (self.model_name or "").lower()
+        if 'gemma' in name:
+            for s in ("<|tool_response>", "<tool_response|>", "<turn|>", "<end_of_turn>"):
+                if s not in out:
+                    out.append(s)
+        return out or None
+
     def generate_chat(self, messages, max_tokens=None, temperature=0.7, top_p=1.0,
                       stop=None, tools=None, response_format=None, enable_thinking=False,
                       repeat_penalty=1.0, presence_penalty=0.0, frequency_penalty=0.0):
@@ -2088,8 +2109,9 @@ class VulkanBackend(ModelBackend):
             kwargs['presence_penalty'] = presence_penalty
         if frequency_penalty:
             kwargs['frequency_penalty'] = frequency_penalty
-        if stop:
-            kwargs['stop'] = stop
+        _stop = self._augment_model_stops(stop)
+        if _stop:
+            kwargs['stop'] = _stop
         if response_format and response_format.get('type') == 'json_object':
             kwargs['response_format'] = {'type': 'json_object'}
         _tc = _make_llama_thermal_criteria()
@@ -2136,8 +2158,9 @@ class VulkanBackend(ModelBackend):
             kwargs['presence_penalty'] = presence_penalty
         if frequency_penalty:
             kwargs['frequency_penalty'] = frequency_penalty
-        if stop:
-            kwargs['stop'] = stop
+        _stop = self._augment_model_stops(stop)
+        if _stop:
+            kwargs['stop'] = _stop
         _tc = _make_llama_thermal_criteria()
         if _tc is not None and _chat_supports_stopping_criteria():
             kwargs['stopping_criteria'] = _tc
