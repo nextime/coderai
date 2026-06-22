@@ -234,6 +234,46 @@ async def healthz():
     return {"ok": True, "pid": _os.getpid()}
 
 
+_ENGINE_VRAM_CACHE = {"at": 0.0, "vram": None, "names": {}}
+_ENGINE_VRAM_TTL = 4.0   # seconds
+
+
+def _cached_engine_vram():
+    """This engine's CUDA VRAM, cached with a short TTL so the frequently-polled
+    health endpoint doesn't hit the CUDA context on every call (which can stall
+    behind a running forward pass and make the engine look 'not responding').
+    Device names are static, so cached for the process lifetime."""
+    import time as _t
+    now = _t.monotonic()
+    if _ENGINE_VRAM_CACHE["vram"] is not None and \
+            (now - _ENGINE_VRAM_CACHE["at"]) < _ENGINE_VRAM_TTL:
+        return _ENGINE_VRAM_CACHE["vram"]
+    vram = None
+    try:
+        import torch
+        if torch.cuda.is_available():
+            n = torch.cuda.device_count()
+            used = free = total = 0
+            devs = []
+            _names = _ENGINE_VRAM_CACHE["names"]
+            for i in range(n):
+                f, t = torch.cuda.mem_get_info(i)
+                used += (t - f); free += f; total += t
+                if i not in _names:
+                    _names[i] = torch.cuda.get_device_name(i)
+                devs.append({"index": i, "name": _names[i],
+                             "free": round(f / 1e9, 2), "total": round(t / 1e9, 2)})
+            label = (_names.get(0, "CUDA") if n == 1 else f"{n}× CUDA")
+            vram = {"used": round(used / 1e9, 2), "free": round(free / 1e9, 2),
+                    "total": round(total / 1e9, 2), "gpu": label,
+                    "devices": devs, "device_count": n}
+    except Exception:
+        vram = _ENGINE_VRAM_CACHE["vram"]   # keep last-good on transient error
+    _ENGINE_VRAM_CACHE["vram"] = vram
+    _ENGINE_VRAM_CACHE["at"] = now
+    return vram
+
+
 @app.get("/internal/engine-state", include_in_schema=False)
 async def internal_engine_state():
     """Auth-free engine introspection for the front proxy's router/aggregator.
@@ -263,28 +303,14 @@ async def internal_engine_state():
                     loaded.append(_mp)
     except Exception:
         pass
-    vram = None
-    try:
-        import torch
-        if torch.cuda.is_available():
-            # Sum across every CUDA device this engine can see — an engine may own
-            # more than one GPU (e.g. two NVIDIA cards sharding one large model), so
-            # reporting only device 0 would under-count its VRAM.
-            n = torch.cuda.device_count()
-            used = free = total = 0
-            devs = []
-            for i in range(n):
-                f, t = torch.cuda.mem_get_info(i)
-                used += (t - f); free += f; total += t
-                devs.append({"index": i, "name": torch.cuda.get_device_name(i),
-                             "free": round(f / 1e9, 2), "total": round(t / 1e9, 2)})
-            label = (torch.cuda.get_device_name(0) if n == 1
-                     else f"{n}× CUDA")
-            vram = {"used": round(used / 1e9, 2), "free": round(free / 1e9, 2),
-                    "total": round(total / 1e9, 2), "gpu": label,
-                    "devices": devs, "device_count": n}
-    except Exception:
-        vram = None
+    # VRAM is CACHED with a short TTL: this endpoint is polled every couple seconds
+    # by the front's health monitor, and calling torch.cuda.mem_get_info /
+    # get_device_name on EVERY poll can serialize behind the running generation on
+    # the CUDA context and stall the handler past the poll timeout — which is exactly
+    # what flips a busy engine to "not responding". Refresh at most every few seconds
+    # (device names cached permanently — they don't change), so mid-generation polls
+    # return the last snapshot instantly instead of blocking.
+    vram = _cached_engine_vram()
     # Running tasks so the front can show cross-engine activity without needing a
     # session on this engine (sessions live only on the primary).
     tasks = []
