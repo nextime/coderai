@@ -3658,6 +3658,21 @@ class MultiModelManager:
                     resolved_name = _m
                     break
 
+        # Step 1d: Canonicalize a GGUF text model to its absolute file path, so EVERY
+        # name form (bare id, basename.gguf, full path, alias) collapses to ONE
+        # model_key — and therefore one self.models entry and one instance pool.
+        # Without this, two CONCURRENT first-requests under different forms (e.g. a
+        # bare name and an alias) each compute a distinct key and each load an
+        # instance, exceeding max_model_instances=1. (The earlier fuzzy match only
+        # catches the case where one is ALREADY loaded.)
+        if not model_type or model_type == "text":
+            try:
+                _canon_path = _resolve_local_gguf(resolved_name)
+                if _canon_path:
+                    resolved_name = _canon_path
+            except Exception:
+                pass
+
         # Step 2: Build the model key (prefixed with type)
         if model_type and model_type != "text":
             model_key = f"{model_type}:{resolved_name}"
