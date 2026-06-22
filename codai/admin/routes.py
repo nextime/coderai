@@ -1503,31 +1503,66 @@ def _do_delete_model(model_id: str, cache_type: str) -> dict:
     return {"success": False, "detail": "Unknown cache_type"}
 
 
-# Cache scans walk the whole HF/GGUF cache on disk (sizes + per-model capability
-# detection), which can take many seconds for a large cache. They change only when
-# a model is added/removed/downloaded, so serve them stale-while-revalidate: return
-# the last result instantly and refresh in the background once it's older than TTL.
-# First call computes synchronously; mutating ops force the next refresh.
+# Cache scans walk the whole HF/GGUF cache on disk (huggingface_hub.scan_cache_dir
+# + per-file size sums), which takes many seconds on a large cache. They change only
+# when a model is added/removed/downloaded, so we gate the expensive scan on a CHEAP
+# change-signature: the names + mtimes of the top-level model dirs/files. When the
+# signature is unchanged we serve the cached result instantly and never re-walk;
+# when it changes we refresh in the background (returning the last result meanwhile).
+# A long backstop TTL re-scans occasionally even if mtimes somehow miss a change.
 import threading as _cache_thr
-_SCAN_TTL = 25.0
-_scan_state = {"data": None, "at": 0.0, "busy": False}
-_stats_state = {"data": None, "at": 0.0, "busy": False}
+_SCAN_TTL = 600.0
+_scan_state = {"data": None, "sig": None, "at": 0.0, "busy": False}
+_stats_state = {"data": None, "sig": None, "at": 0.0, "busy": False}
+
+
+def _scan_signature():
+    """Cheap fingerprint of the model caches: (path, mtime) of each top-level entry
+    in the HF and GGUF cache dirs. A handful of stat() calls — orders of magnitude
+    cheaper than the full scan it gates."""
+    import os
+    try:
+        from codai.models.cache import get_all_cache_dirs, get_model_cache_dir
+        caches = get_all_cache_dirs()
+        dirs = [caches.get("huggingface"),
+                caches.get("coderai") or get_model_cache_dir()]
+    except Exception:
+        return ()
+    sig = []
+    for d in dirs:
+        if not d:
+            continue
+        try:
+            for e in os.scandir(d):
+                try:
+                    sig.append((e.path, round(e.stat().st_mtime, 3)))
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    return tuple(sorted(sig))
 
 
 def _cached(state, fn):
     import time as _t
     now = _t.time()
+    sig = _scan_signature()
+    fresh = (state["sig"] == sig and (now - state["at"]) < _SCAN_TTL)
+    if state["data"] is not None and fresh:
+        return state["data"]                      # nothing changed → instant
     if state["data"] is None:
-        state["data"] = fn()
+        state["data"] = fn()                      # first call: compute synchronously
+        state["sig"] = sig
         state["at"] = _t.time()
         return state["data"]
-    if now - state["at"] >= _SCAN_TTL and not state["busy"]:
+    if not state["busy"]:                          # changed: refresh in background
         state["busy"] = True
 
         def _bg():
             try:
                 d = fn()
                 state["data"] = d
+                state["sig"] = _scan_signature()
                 state["at"] = _t.time()
             finally:
                 state["busy"] = False
@@ -1538,8 +1573,8 @@ def _cached(state, fn):
 def _invalidate_cache_scan():
     """Force the next cached-models/cache-stats read to refresh (after a model is
     deleted/downloaded/freed)."""
-    _scan_state["at"] = 0.0
-    _stats_state["at"] = 0.0
+    _scan_state["sig"] = None
+    _stats_state["sig"] = None
 
 
 @router.get("/admin/api/cached-models", summary="List cached models")
