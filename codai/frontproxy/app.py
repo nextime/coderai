@@ -1190,6 +1190,15 @@ def build_app(config, config_dir=None) -> FastAPI:
         print(f"[front] could not register local UI pages ({_exc}); "
               f"pages will be proxied to the engine", flush=True)
 
+    # Front-served admin DATA endpoints backed purely by auth.json (tokens, users)
+    # — answered from disk so they stay live while the engine is busy generating.
+    try:
+        from codai.frontproxy.admin_data import register_admin_data
+        register_admin_data(app, config_dir)
+    except Exception as _exc:
+        print(f"[front] could not register local admin-data endpoints ({_exc}); "
+              f"they will be proxied to the engine", flush=True)
+
     # Catch-all reverse proxy for everything else (admin UI, /v1 inference, files…).
     @app.api_route("/{path:path}", include_in_schema=False,
                    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
