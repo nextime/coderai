@@ -475,6 +475,57 @@ class FrontProxy:
             return JSONResponse({"cards": [], "error": str(exc)})
         return JSONResponse({"cards": cards})
 
+    async def batch(self, request: Request) -> Response:
+        """Fan out several engine GET reads CONCURRENTLY (server-side) and return
+        them in one response.
+
+        A page that needs ~10 ``/admin/api/*`` reads otherwise fires ~10 browser
+        requests; the browser caps ~6 connections per host, so during a generation
+        (engine event loop GIL-busy) the stuck requests saturate that limit and the
+        whole page freezes. Here the front issues all of them at once over its own
+        (un-capped) connection pool, each individually bounded, so the browser makes
+        ONE request and a slow/blocked sub-call returns an error marker without
+        holding up the rest. Body: {"paths": ["/admin/api/models", …]}. Returns
+        {"results": {path: {status, json|text|error, stale?}}}."""
+        if not self._has_cred(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        try:
+            payload = await request.json()
+            paths = payload.get("paths") or []
+        except Exception:
+            paths = []
+        prim = self.registry.primary()
+        if prim is None or not isinstance(paths, list) or not paths:
+            return JSONResponse({"results": {}})
+        headers = self._filter_headers(request.headers, _DROP_REQ)
+        _bound = httpx.Timeout(connect=10.0, read=12.0, write=12.0, pool=12.0)
+
+        async def _one(p):
+            if (not isinstance(p, str) or "/admin/api/" not in p
+                    or "stream" in p):
+                return p, {"status": 400, "error": "unsupported path"}
+            try:
+                r = await self._long.request("GET", prim.url + p, headers=headers,
+                                             timeout=_bound)
+                ctype = (r.headers.get("content-type") or "").lower()
+                out = {"status": r.status_code}
+                if "application/json" in ctype:
+                    try:
+                        out["json"] = r.json()
+                    except Exception:
+                        out["text"] = r.text
+                else:
+                    out["text"] = r.text
+                return p, out
+            except Exception:
+                return p, {"status": 503, "error": "engine busy (generating)",
+                           "stale": True}
+
+        import asyncio as _asyncio
+        # Cap fan-out width so a pathological request can't spawn unbounded calls.
+        pairs = await _asyncio.gather(*[_one(p) for p in paths[:24]])
+        return JSONResponse({"results": dict(pairs)})
+
     def _canonical_loaded(self, keys) -> list:
         """Map an engine's loaded-model keys to canonical model ids, deduped.
 
@@ -796,6 +847,32 @@ class FrontProxy:
                 {"error": "No engine is ready yet (still starting/loading)."},
                 status_code=503)
 
+        # Bound page-data reads with a finite timeout + graceful fallback, so a
+        # busy engine can never hang a page *forever*. The catch-all otherwise uses
+        # _long (no read timeout): a handful of stuck /admin/api GETs then saturate
+        # the browser's ~6-connections-per-host limit and freeze the whole page
+        # behind them. Excludes endpoints that are legitimately slow (HF hub
+        # lookups) or streaming (…-stream, SSE), which keep the unbounded path.
+        if (method == "GET" and "/admin/api/" in path and "stream" not in path
+                and "/hf-" not in path
+                and "text/event-stream"
+                not in (request.headers.get("accept", "").lower())):
+            try:
+                r = await self._long.request(
+                    "GET", engine.url + path,
+                    headers=self._filter_headers(request.headers, _DROP_REQ),
+                    params=request.query_params,
+                    timeout=httpx.Timeout(connect=10.0, read=12.0, write=12.0,
+                                          pool=12.0))
+            except Exception:
+                return JSONResponse(
+                    {"error": "engine busy (generating); data temporarily "
+                              "unavailable", "stale": True}, status_code=503)
+            return Response(
+                content=r.content, status_code=r.status_code,
+                headers=dict(self._filter_headers(r.headers, _DROP_RESP)),
+                media_type=r.headers.get("content-type"))
+
         # Front-managed generation queue (text only). Acquire a per-model slot
         # before dispatching: if all max_instances slots are busy this awaits
         # (showing as "queued" on the Tasks page) until one frees; if too many are
@@ -1061,6 +1138,13 @@ def build_app(config, config_dir=None) -> FastAPI:
     @app.get("/admin/api/gpu-stats", include_in_schema=False)
     async def _gpu_stats(request: Request):
         return await front.gpu_stats(request)
+
+    # Aggregate several engine reads into ONE response (concurrent, bounded) so a
+    # page makes one browser request instead of ~10 — avoids saturating the
+    # browser's per-host connection limit and freezing during a generation.
+    @app.post("/admin/api/batch", include_in_schema=False)
+    async def _batch(request: Request):
+        return await front.batch(request)
 
     # /v1/models is the union across engines (each engine registers only the models
     # the front assigned to it). Registered before the catch-all so it's aggregated.

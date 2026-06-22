@@ -1116,7 +1116,7 @@ let _ds4Enabled = false;   // whether the ds4 (DeepSeek V4) engine is enabled gl
 
 async function loadGlobalSettings(){
   try{
-    const r = await fetch(ROOT_PATH + '/admin/api/settings');
+    const r = await pageFetch('/admin/api/settings');
     if(r.ok){
       const d = await r.json();
       _defaultOffloadDir = d.offload?.directory || './offload';
@@ -1894,10 +1894,17 @@ async function startDownload(){
 
 /* ── active downloads strip ──────────────────────────── */
 let _pollTimer = null;
+let _dlInFlight = false;
 
 async function pollDownloads(){
+  // Skip this tick if the previous request is still pending (engine busy) or the
+  // tab is hidden — firing every 2s while each call takes seconds would stack up
+  // requests and saturate the browser's per-host connection limit, freezing the page.
+  if(_dlInFlight) return;
+  if(document.visibilityState === 'hidden') return;
+  _dlInFlight = true;
   try{
-    const r = await fetch(ROOT_PATH + '/admin/api/downloads');
+    const r = await pageFetch('/admin/api/downloads');
     if(!r.ok) return;
     const all = await r.json();
     const active = all.filter(d=>d.status!=='done'&&d.status!=='error'&&d.status!=='cancelled');
@@ -1934,6 +1941,7 @@ async function pollDownloads(){
       </div>`;
     }).join('<div style="border-top:1px solid var(--border);margin:.3rem 0"></div>');
   }catch{}
+  finally{ _dlInFlight = false; }
 }
 
 function startPolling(){
@@ -1946,13 +1954,13 @@ function stopPolling(){
   if(_pollTimer){ clearInterval(_pollTimer); _pollTimer=null; }
 }
 
-// Single one-shot check on page load; polling only runs while downloads are active.
-pollDownloads();
+// One-shot download check is driven from the batched bootstrap sequence below
+// (so it reuses the bundle instead of firing its own request before it lands).
 
 /* ── cache stats & local models ──────────────────────── */
 async function loadCacheStats(){
   try{
-    const r = await fetch(ROOT_PATH + '/admin/api/cache-stats');
+    const r = await pageFetch('/admin/api/cache-stats');
     if(!r.ok) return;
     const s = await r.json();
     document.getElementById('stat-hf-size').textContent  = fmtBytes(s.hf_bytes);
@@ -1981,7 +1989,7 @@ async function _loadEngineInfo(){
     if (er.ok) _engineNames = ((await er.json()).engines || []).map(e => e.name);
   } catch(e) {}
   try {
-    const d = await (await fetch(ROOT_PATH + '/admin/api/settings')).json();
+    const d = await (await pageFetch('/admin/api/settings')).json();
     if (!_engineNames.length) _engineNames = (d.server && d.server.engine_names) || [];
     _defaultEngine = (d.server && d.server.default_engine) || '';
   } catch(e) {}
@@ -2443,13 +2451,13 @@ async function loadCachedModels(){
   const _firstLoad = !hfEl.dataset.loaded;
   if(_firstLoad) hfEl.innerHTML = ggufEl.innerHTML = '<span class="muted small">Loading…</span>';
   try{
-    const r = await fetch(ROOT_PATH + '/admin/api/cached-models');
+    const r = await pageFetch('/admin/api/cached-models');
     if(!r.ok) throw new Error((await r.json()).detail||r.statusText);
     const d = await r.json();
     // Only whisper-server RUNNERS (they carry a model_path) belong in this card.
     // A whisper MODEL config (a .gguf entry with backend=whisper-server but no
     // model_path) is shown on the GGUF row instead, as that file's model config.
-    const whisperModels = (await fetch(ROOT_PATH + '/admin/api/models').then(r=>r.ok?r.json():[]))
+    const whisperModels = (await pageFetch('/admin/api/models').then(r=>r.ok?r.json():[]))
       .filter(m => m.backend === 'whisper-server' && m.model_path);
 
     // HF models
@@ -2695,7 +2703,7 @@ let _quantJobs = {};
 let _quantSig = '';
 async function refreshQuantJobs(){
   try{
-    const r = await fetch('/admin/api/quantize-status');
+    const r = await pageFetch('/admin/api/quantize-status');
     _quantJobs = (await r.json()).jobs || {};
   }catch(e){ /* keep last-known on transient error */ }
   // Signature buckets progress to 5% so we only re-render on meaningful change.
@@ -2729,11 +2737,22 @@ setInterval(async () => {
   if (sig !== _quantSig) { _quantSig = sig; loadCachedModels(); }
 }, 5000);
 
-loadGlobalSettings();
-// Load engine/card info first so the per-model card tags render on the first paint,
-// then re-render once it's available (covers the fetch resolving after the list).
-_loadEngineInfo().then(() => loadCachedModels());
-refreshLocal();
+// Collapse the first-paint engine reads into ONE batched request (fetched
+// concurrently server-side by the front) so the page load doesn't fire ~10 calls
+// that saturate the browser's per-host connection limit and freeze during a
+// generation. pageFetch() in these loaders transparently serves from the bundle.
+(async () => {
+  await bootstrapPage([
+    '/admin/api/settings', '/admin/api/cache-stats', '/admin/api/cached-models',
+    '/admin/api/models', '/admin/api/quantize-status', '/admin/api/downloads',
+  ]);
+  loadGlobalSettings();
+  // Engine/card info first so per-model card tags render on first paint, then
+  // re-render once it resolves (covers the fetch resolving after the list).
+  _loadEngineInfo().then(() => loadCachedModels());
+  refreshLocal();
+  pollDownloads();   // one-shot; reuses the batched bundle
+})();
 
 // Toggle the acceleration / TurboQuant sections as model types are checked/unchecked.
 document.querySelectorAll('.cfg-type-cb').forEach(cb =>

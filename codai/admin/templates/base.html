@@ -10,6 +10,44 @@
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="{{ root_path }}/static/admin/style.css">
   <script>const ROOT_PATH = "{{ root_path }}";</script>
+  <script>
+  // ── Batched page bootstrap ────────────────────────────────────────────────
+  // A page's first paint often needs ~10 /admin/api reads. Fired as separate
+  // fetches they hit the browser's ~6-connections-per-host cap and, during a
+  // generation (engine busy), pile up and freeze the page. bootstrapPage() asks
+  // the front to fetch them all CONCURRENTLY server-side and return one response;
+  // pageFetch() then transparently serves each from that bundle (once), falling
+  // back to a normal fetch on miss/expiry. Render code keeps using pageFetch like
+  // fetch — no other change needed.
+  const _bootCache = new Map();
+  async function bootstrapPage(paths){
+    try{
+      const r = await fetch(ROOT_PATH + '/admin/api/batch', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({paths})});
+      if(!r.ok) return;
+      const d = await r.json();
+      const now = Date.now();
+      for(const [p, res] of Object.entries(d.results||{})){
+        _bootCache.set(p, {res, at: now});
+      }
+    }catch{}
+  }
+  // Drop-in replacement for fetch(ROOT_PATH + path) on GET reads: returns the
+  // batched result if present (consumed once, valid ~8s), else a real fetch.
+  function pageFetch(path){
+    const hit = _bootCache.get(path);
+    if(hit && (Date.now() - hit.at) < 8000){
+      _bootCache.delete(path);
+      const res = hit.res || {};
+      const status = res.status || 200;
+      const body = ('json' in res) ? JSON.stringify(res.json) : (res.text || '');
+      return Promise.resolve(new Response(body, {status,
+        headers:{'Content-Type': ('json' in res) ? 'application/json' : 'text/plain'}}));
+    }
+    return fetch(ROOT_PATH + path);
+  }
+  </script>
   {% block head %}{% endblock %}
 </head>
 <body>
