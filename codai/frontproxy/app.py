@@ -385,6 +385,16 @@ class FrontProxy:
             return JSONResponse({"engine": "loading", "stale": True,
                                  "tasks": tasks, "queue": []})
 
+    @staticmethod
+    def _has_cred(request: Request) -> bool:
+        """Light auth: a session cookie or bearer token is merely PRESENT. Used for
+        low-sensitivity, front-served telemetry (GPU stats, engine status tiles) that
+        must stay live even while the primary engine is busy generating — full session
+        validation round-trips to that (possibly saturated) engine, which would make
+        the dashboard's own status panels vanish exactly when you want to watch them."""
+        return bool(request.cookies.get("session")) or \
+            request.headers.get("authorization", "").lower().startswith("bearer ")
+
     async def is_admin(self, request: Request) -> bool:
         """Authorize a front-handled admin action by validating the caller's session
         against the primary engine (which owns sessions). 200 → authorized."""
@@ -408,9 +418,7 @@ class FrontProxy:
         GPU telemetry is low-sensitivity, and full session validation lives on the
         (possibly busy) engine, which would defeat the point — so we only require a
         session cookie or bearer token to be present."""
-        has_cred = bool(request.cookies.get("session")) or \
-            request.headers.get("authorization", "").lower().startswith("bearer ")
-        if not has_cred:
+        if not self._has_cred(request):
             return JSONResponse({"detail": "Unauthorized"}, status_code=401)
         import asyncio
         from codai.frontproxy.gpu_detect import gpu_stats as _gpu_stats
@@ -945,7 +953,12 @@ def build_app(config, config_dir=None) -> FastAPI:
     # the catch-all so they aren't proxied to an engine.
     @app.get("/admin/api/engines", include_in_schema=False)
     async def _engines(request: Request):
-        if not await front.is_admin(request):
+        # Light auth (cookie/bearer present) like /admin/api/gpu-stats: the data is
+        # the front's OWN cached registry (engine name/health/VRAM/loaded models),
+        # not the engines themselves. Validating the session against the primary
+        # engine would 401 whenever it's busy generating — making the task page's
+        # engine tiles disappear exactly when the operator wants to see them.
+        if not front._has_cred(request):
             return JSONResponse({"detail": "Unauthorized"}, status_code=401)
         return JSONResponse({"engines": front.engines_list()})
 
