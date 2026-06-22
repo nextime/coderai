@@ -1317,22 +1317,29 @@ class VulkanBackend(ModelBackend):
                 _need_total = (_exp_total + _kv_head) if _exp_total else None
                 if (_strategy == 'performance' and len(_adj) > 1
                         and _need_total and _need_total > 0):
+                    # Each card holds AT MOST its (capped) free VRAM ``_adj[i]`` — a
+                    # per-card cap is an absolute ceiling, not just a ratio weight.
+                    # The total that can live on GPU is therefore bounded by sum(_adj);
+                    # anything beyond it spills to CPU (the n_gpu_layers auto-offload,
+                    # which uses the same capped pool, makes room for that). Fill the
+                    # fast lead card first up to its cap, then each other card up to
+                    # ITS cap — so a 5 GB-capped slow card never gets more than 5 GB
+                    # even when the model would otherwise overflow onto it.
                     _w = [0.0] * len(_adj)
-                    _main_cap = _adj[_mg]
-                    if _need_total <= _main_cap:
-                        _w[_mg] = 1.0   # genuinely fits on the fast card alone
-                    else:
-                        _overflow = _need_total - _main_cap
-                        _others = sum(_adj[i] for i in range(len(_adj)) if i != _mg)
-                        _w[_mg] = _main_cap
-                        for i in range(len(_adj)):
-                            if i != _mg and _others > 0:
-                                _w[i] = _overflow * (_adj[i] / _others)
+                    _gpu_budget = min(_need_total, sum(_adj))
+                    _rem = _gpu_budget
+                    _w[_mg] = max(0.0, min(_rem, _adj[_mg]))
+                    _rem -= _w[_mg]
+                    for i in range(len(_adj)):
+                        if i != _mg and _rem > 0:
+                            _w[i] = max(0.0, min(_rem, _adj[i]))
+                            _rem -= _w[i]
                     _sw = sum(_w)
                     if _sw > 0:
                         _parsed = [round(x / _sw, 3) for x in _w]
                         print(f"  gpu split    : PERFORMANCE tensor_split={_parsed} "
-                              f"(fast card GPU{_mg} first; free {[round(f,1) for f in _free_dev]} GB, "
+                              f"(fast card GPU{_mg} first; capped free "
+                              f"{[round(f,1) for f in _adj]} GB of {[round(f,1) for f in _free_dev]} GB, "
                               f"model ~{_exp_total:.1f} GB + ~{_kv_head:.1f} GB KV/ctx)")
                 if not _parsed:
                     _sum = sum(_adj)

@@ -329,6 +329,32 @@ def _repair_stale_model_paths(config_mgr) -> int:
     return fixed
 
 
+def _set_proc_title():
+    """Set this process's name by role (idempotent — safe to call more than once).
+
+    Engine  → coderai-<name>  (CODERAI_ENGINE_NAME, else CODERAI_ENGINE_BACKEND).
+    Front   → coderai-front.   Single-process → coderai.
+    Re-called right before the server binds so nothing that ran in between can leave
+    a stale title."""
+    try:
+        import setproctitle
+    except ImportError:
+        return
+    _argv = sys.argv[1:]
+    if "--engine-only" in _argv:
+        _ename = (os.environ.get("CODERAI_ENGINE_NAME")
+                  or os.environ.get("CODERAI_ENGINE_BACKEND") or "engine")
+        name = f"coderai-{_ename}"
+    elif "--single-process" in _argv:
+        name = "coderai"
+    else:
+        name = "coderai-front"
+    try:
+        setproctitle.setproctitle(name)
+    except Exception:
+        pass
+
+
 def main():
     """Main entry point for the codai server."""
     # Suppress unraisable exceptions from LlamaModel.__del__
@@ -339,24 +365,10 @@ def main():
         original_unraisablehook(unraisable)
     sys.unraisablehook = suppress_llama_del_errors
     
-    # Optional: set process name if setproctitle is available. Name by role so
-    # the front and each engine are distinguishable in ps/top/htop:
-    #   front process      → coderai-front
-    #   per-backend engine → coderai-<enginename>  (name passed via env at spawn)
-    #   legacy single proc → coderai
-    try:
-        import setproctitle
-        _argv = sys.argv[1:]
-        if "--engine-only" in _argv:
-            _ename = os.environ.get("CODERAI_ENGINE_NAME") or "engine"
-            _proc_name = f"coderai-{_ename}"
-        elif "--single-process" in _argv:
-            _proc_name = "coderai"
-        else:
-            _proc_name = "coderai-front"
-        setproctitle.setproctitle(_proc_name)
-    except ImportError:
-        pass
+    # Name the process by role so the front and each engine are distinguishable in
+    # ps/top/htop: front → coderai-front, per-backend engine → coderai-<enginename>
+    # (name from env set at spawn; backend as fallback), legacy single → coderai.
+    _set_proc_title()
     
     args = parse_args()
     
@@ -1342,6 +1354,10 @@ def main():
         # UI live on the front, so don't advertise them here (it's just confusing).
         print(f"[engine] serving on http://{bind_host}:{bind_port} "
               f"(internal — reach it via the front)")
+        # Re-assert the process name right before binding (defensive: nothing between
+        # startup and here should have changed it, but this guarantees the engine
+        # shows as coderai-<name> in ps/htop regardless).
+        _set_proc_title()
     else:
         bind_host = config.server.host
         bind_port = config.server.port
