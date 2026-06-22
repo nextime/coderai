@@ -2783,22 +2783,17 @@ setInterval(async () => {
   if (sig !== _quantSig) { _quantSig = sig; loadCachedModels(); }
 }, 5000);
 
-// Collapse the first-paint engine reads into ONE batched request (fetched
-// concurrently server-side by the front) so the page load doesn't fire ~10 calls
-// that saturate the browser's per-host connection limit and freeze during a
-// generation. pageFetch() in these loaders transparently serves from the bundle.
-(async () => {
-  await bootstrapPage([
-    '/admin/api/settings', '/admin/api/cache-stats', '/admin/api/cached-models',
-    '/admin/api/models', '/admin/api/quantize-status', '/admin/api/downloads',
-  ]);
-  loadGlobalSettings();
-  // Engine/card info first so per-model card tags render on first paint, then
-  // re-render once it resolves (covers the fetch resolving after the list).
-  _loadEngineInfo().then(() => loadCachedModels());
-  refreshLocal();
-  pollDownloads();   // one-shot; reuses the batched bundle
-})();
+// First-paint loads. These now hit fast targets directly: settings → the front,
+// cache-stats/cached-models/downloads → the coderai-system worker, and only
+// models/quantize-status → the engine. Since most are fast there's no need to
+// batch them through the engine (which was actually dragging the page back onto
+// the busy engine), so each call goes straight to its correct target.
+loadGlobalSettings();
+// Engine/card info first so per-model card tags render on first paint, then
+// re-render once it resolves (covers the fetch resolving after the list).
+_loadEngineInfo().then(() => loadCachedModels());
+refreshLocal();
+pollDownloads();
 
 // Toggle the acceleration / TurboQuant sections as model types are checked/unchecked.
 document.querySelectorAll('.cfg-type-cb').forEach(cb =>
