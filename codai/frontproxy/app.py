@@ -64,6 +64,11 @@ class FrontProxy:
         # Front-managed generation queue: admission control + ordering + queue
         # position, sized per-model to max_instances so the engine never queues.
         self.reqqueue = FrontQueue()
+        # Recent inference activity (front-tracked, since the front relays every
+        # request) so the Overview dashboard's activity table is served natively
+        # without asking the engine. Newest first; bounded.
+        import collections as _collections
+        self._recent_activity = _collections.deque(maxlen=25)
         self.registry = EngineRegistry()
         self.supervisor: Optional[EngineSupervisor] = None
         # Per-run secret shared only with the engines (passed via env at spawn). The
@@ -79,8 +84,6 @@ class FrontProxy:
         self._long = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=None),
             headers=_auth)
-        self._status_cache: Optional[dict] = None
-        self._status_cache_at: float = 0.0
         # Last-good primary task list. The primary engine can't answer the short
         # tasks poll while it's GIL-busy generating, so without this its running
         # generation would vanish from the Tasks page on every poll under load.
@@ -251,10 +254,14 @@ class FrontProxy:
         _rid = engine.enter_request(
             {"model": model or "", "kind": self._task_kind(path), "path": path}
             if _router.is_inference_path(path) else None)
+        import time as _t
+        _started = _t.time()
+        _status = 502
         try:
             r = await self._long.request(method, engine.url + path,
                                          headers=send_headers, params=query or {},
                                          content=body or b"")
+            _status = r.status_code
         except Exception as exc:
             print("[front] broker route: engine#%s (%s) unreachable for %s: %s"
                   % (engine.id, engine.name, path, exc), flush=True)
@@ -266,6 +273,8 @@ class FrontProxy:
             engine.exit_request(_rid)
             if _qkey is not None:
                 await self.reqqueue.release(_qkey)
+            if _router.is_inference_path(path):
+                self._record_activity(model, self._task_kind(path), _status, _started)
         # Surface the engine's actual reply so a brokered request that "doesn't get
         # executed" (e.g. an instant small error body) is diagnosable from the log.
         print("[front] broker route: %s %s -> engine#%s(%s) status=%s bytes=%d preview=%r"
@@ -339,6 +348,20 @@ class FrontProxy:
                         info[base[:-5]] = rec
                         info[f[:-5]] = rec
         return info
+
+    def _record_activity(self, model, kind, status, started_at):
+        """Append one completed inference to the recent-activity ring (newest first),
+        for the front-native Overview dashboard."""
+        try:
+            import time as _t
+            self._recent_activity.appendleft({
+                "time": started_at or _t.time(),
+                "model": model or "", "type": kind or "text",
+                "status": int(status or 0),
+                "duration": round(_t.time() - (started_at or _t.time()), 1),
+            })
+        except Exception:
+            pass
 
     def _queue_key(self, model: Optional[str]) -> str:
         """Stable gate key for a model: its canonical id (so every alias/path of
@@ -907,6 +930,8 @@ class FrontProxy:
         _meta = ({"model": model or "", "kind": self._task_kind(path), "path": path}
                  if _router.is_inference_path(path) else None)
         _rid = engine.enter_request(_meta)
+        import time as _t
+        _started = _t.time()
         try:
             rp_resp = await self._long.send(rp_req, stream=True)
         except Exception as exc:
@@ -923,6 +948,9 @@ class FrontProxy:
                 engine.exit_request(_rid)
                 if _qkey is not None:
                     await self.reqqueue.release(_qkey)
+                if _meta is not None:
+                    self._record_activity(model, self._task_kind(path),
+                                          rp_resp.status_code, _started)
 
         # Measure throughput from the SSE stream the front relays, and publish it on
         # the in-flight metadata. This gives the Tasks page a live it/s for the
@@ -964,32 +992,13 @@ class FrontProxy:
         registry so the dashboard reflects every GPU. On engine timeout, serve the
         cache plus an ``engine: loading|down`` marker — the UI never hangs.
         """
-        prim = self.registry.primary()
-        if prim is None:
-            return JSONResponse(self._native_status())
-        # If the primary is mid-generation its API is GIL-starved and the call
-        # below would just burn the full timeout before failing — skip straight to
-        # the front-native status so Overview stays instant.
-        if int(getattr(prim, "inflight", 0) or 0) > 0:
-            return JSONResponse(self._native_status())
-        try:
-            headers = self._filter_headers(request.headers, _DROP_REQ)
-            r = await self._short.get(prim.url + request.url.path, headers=headers,
-                                      params=request.query_params)
-            if r.status_code != 200:
-                # Pass through auth redirects/errors unchanged (e.g. login needed).
-                return Response(content=r.content, status_code=r.status_code,
-                                headers=dict(self._filter_headers(r.headers, _DROP_RESP)),
-                                media_type=r.headers.get("content-type"))
-            data = r.json()
-            data = self._overlay_engine_totals(data)
-            self._status_cache = data
-            self._status_cache_at = time.monotonic()
-            return JSONResponse(data)
-        except Exception:
-            # Engine GIL-busy generating (or down): build status from the front's
-            # OWN state so the Overview dashboard stays live instead of empty.
-            return JSONResponse(self._native_status())
+        # Status is served ENTIRELY from the front's own state (registry, config,
+        # models.json, live torch-free GPU/RAM stats, front-tracked activity). The
+        # engine is never asked — it only generates; the front owns stats. This
+        # keeps Overview instant and correct regardless of engine load.
+        if not self._has_cred(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        return JSONResponse(self._native_status())
 
     def _enabled_models_and_aliases(self):
         """(enabled_model_ids, {alias: [ids]}) parsed from models.json. Best-effort."""
@@ -1042,11 +1051,19 @@ class FrontProxy:
         except Exception:
             pass
         active = sum(int(getattr(e, "inflight", 0) or 0) for e in self.registry.all())
-        cache = self._status_cache or {}
+        # System RAM, read on the front (torch-free) via psutil when available.
+        ram = None
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            ram = {"used": round((vm.total - vm.available) / 1e9, 2),
+                   "free": round(vm.available / 1e9, 2),
+                   "total": round(vm.total / 1e9, 2)}
+        except Exception:
+            pass
         body = {
             "status": "ok",
-            "engine": "busy",       # served from the front while the engine is busy
-            "stale": True,
+            "engine": "ok",
             "backend": getattr(getattr(cfg, "backend", None), "type", None),
             "load_mode": getattr(getattr(cfg, "models", None),
                                  "default_load_mode", None),
@@ -1055,50 +1072,11 @@ class FrontProxy:
             "enabled_models": enabled,
             "enabled_aliases": aliases,
             "vram": vram,
-            "requests": {"active": active,
-                         "total": (cache.get("requests") or {}).get("total", 0)},
+            "ram": ram,
+            "requests": {"active": active, "total": len(self._recent_activity)},
+            "recent_activity": list(self._recent_activity),
         }
-        for k in ("ram", "recent_activity"):
-            if k in cache:
-                body[k] = cache[k]
         return body
-
-    def _overlay_engine_totals(self, data: dict) -> dict:
-        engines = self.registry.all()
-        per = []
-        used = free = total = 0.0
-        loaded = set()
-        have_vram = False
-        for e in engines:
-            per.append({"id": e.id, "name": e.name, "backend": e.backend,
-                        "gpu": e.gpu, "healthy": e.healthy, "vram": e.vram,
-                        "capabilities": sorted(e.capabilities),
-                        "loaded_models": sorted(e.loaded_models)})
-            loaded |= e.loaded_models
-            if e.vram:
-                have_vram = True
-                used += e.vram.get("used", 0.0)
-                free += e.vram.get("free", 0.0)
-                total += e.vram.get("total", 0.0)
-        data["x_engines"] = per
-        if len([e for e in engines if e.healthy]) > 1:
-            if have_vram:
-                data["vram"] = {"used": round(used, 2), "free": round(free, 2),
-                                "total": round(total, 2),
-                                "gpu": f"{len(engines)} engines"}
-            if loaded:
-                data["loaded_models"] = sorted(loaded)
-                data["models_loaded"] = len(loaded)
-        return data
-
-    def _cached_status(self, engine_state: str) -> Response:
-        body = dict(self._status_cache or {"models_loaded": 0, "loaded_models": [],
-                                           "vram": None})
-        body["engine"] = engine_state
-        body["stale"] = True
-        if self._status_cache_at:
-            body["stale_age_seconds"] = round(time.monotonic() - self._status_cache_at, 1)
-        return JSONResponse(body)
 
 
 class _PollNoiseFilter:
