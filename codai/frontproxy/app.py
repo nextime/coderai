@@ -226,6 +226,11 @@ class FrontProxy:
         # Signed with the internal token; the engine accepts it only if it matches.
         if self.internal_token:
             send_headers["x-coderai-broker-authed"] = self.internal_token
+        # Count brokered inference as in-flight too (with metadata) so it shows on
+        # the Tasks page even when the engine is too busy to report it itself.
+        _rid = engine.enter_request(
+            {"model": model or "", "kind": self._task_kind(path), "path": path}
+            if _router.is_inference_path(path) else None)
         try:
             r = await self._long.request(method, engine.url + path,
                                          headers=send_headers, params=query or {},
@@ -237,6 +242,8 @@ class FrontProxy:
                     "headers": {"content-type": "application/json"},
                     "body": ('{"error":"engine#%s unreachable: %s"}'
                              % (engine.id, exc)).encode()}
+        finally:
+            engine.exit_request(_rid)
         # Surface the engine's actual reply so a brokered request that "doesn't get
         # executed" (e.g. an instant small error body) is diagnosable from the log.
         print("[front] broker route: %s %s -> engine#%s(%s) status=%s bytes=%d preview=%r"
@@ -557,8 +564,31 @@ class FrontProxy:
                             "message": e.cooling.get("message")})
         return out
 
+    @staticmethod
+    def _task_kind(path: str) -> str:
+        """Coarse task kind from the inference path, for synthesized in-flight tasks."""
+        p = (path or "").lower()
+        if "/chat/completions" in p or "/completions" in p:
+            return "text"
+        if "/images" in p:
+            return "image"
+        if "/video" in p:
+            return "video"
+        if "/audio/speech" in p or "/tts" in p:
+            return "tts"
+        if "/audio" in p or "/transcri" in p:
+            return "audio"
+        if "/embeddings" in p:
+            return "embedding"
+        return "text"
+
     def _merge_engine_tasks(self, primary, primary_tasks: list) -> list:
-        """Tasks from all engines, each tagged with the engine *name* it runs on."""
+        """Tasks from all engines, each tagged with the engine *name* it runs on.
+
+        Also injects SYNTHETIC entries for requests the front itself has in flight
+        (engine.active) that aren't already represented by a real task — so work
+        shows on the Tasks page even when the target engine is too GIL-busy
+        generating to report it. Deduped by (engine, model)."""
         merged = []
         seen = set()
         # Primary's tasks (from its authed response) — tag with the primary name.
@@ -605,6 +635,32 @@ class FrontProxy:
                 "pausable": False,
                 "restartable": False,
             })
+        # Synthetic in-flight tasks for requests the front dispatched but that have
+        # no real task yet (engine too busy to report). Dedup by (engine, model) so
+        # we don't double-show a generation the engine already reported.
+        import time as _t
+        have = {(t.get("engine"), t.get("model")) for t in merged if isinstance(t, dict)}
+        for e in self.registry.all():
+            for rid, m in list((e.active or {}).items()):
+                key = (e.name, m.get("model") or "")
+                if key in have:
+                    continue
+                have.add(key)
+                merged.append({
+                    "id": f"inflight-{rid}",
+                    "kind": m.get("kind") or "text",
+                    "title": (m.get("model") or "generation"),
+                    "model": m.get("model") or "",
+                    "status": "running",
+                    "step": 0, "total": 0, "rate": 0.0,
+                    "message": "generating",
+                    "started_at": m.get("started_at"),
+                    "engine": e.name,
+                    "active": True,
+                    "cancellable": False,
+                    "pausable": False,
+                    "restartable": False,
+                })
         return merged
 
     # -------------------------------------------------------------------- proxy
@@ -639,11 +695,15 @@ class FrontProxy:
             content=content)
         # Count this as in-flight on the chosen engine so a restart can drain it:
         # decremented only once the response is fully streamed (or send failed).
-        engine.enter_request()
+        # Attach metadata (model/kind) for inference so the front can show a task
+        # for it even when the engine is too busy to answer its own Tasks poll.
+        _meta = ({"model": model or "", "kind": self._task_kind(path), "path": path}
+                 if _router.is_inference_path(path) else None)
+        _rid = engine.enter_request(_meta)
         try:
             rp_resp = await self._long.send(rp_req, stream=True)
         except Exception as exc:
-            engine.exit_request()
+            engine.exit_request(_rid)
             return JSONResponse(
                 {"error": f"Engine#{engine.id} unreachable: {exc}"}, status_code=502)
 
@@ -651,7 +711,7 @@ class FrontProxy:
             try:
                 await rp_resp.aclose()
             finally:
-                engine.exit_request()
+                engine.exit_request(_rid)
 
         resp_headers = self._filter_headers(rp_resp.headers, _DROP_RESP)
         return StreamingResponse(

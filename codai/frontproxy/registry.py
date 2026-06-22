@@ -75,6 +75,10 @@ class Engine:
                                     # and let in-flight ones finish (drain grace period)
     inflight: int = 0              # proxied requests currently streaming through
     _inflight_lock: object = field(default_factory=threading.Lock, repr=False, compare=False)
+    # In-flight request metadata {rid: {"model","kind","path","started_at"}} so the
+    # front can synthesize Tasks-page entries for work it dispatched — visible even
+    # when the engine is too GIL-busy generating to answer its own /admin/api/tasks.
+    active: dict = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self):
         if not self.url:
@@ -105,14 +109,26 @@ class Engine:
         except Exception:
             return True
 
-    def enter_request(self) -> None:
+    def enter_request(self, meta: Optional[dict] = None) -> Optional[str]:
+        """Mark a request in-flight. Returns a request id to pass to exit_request.
+        ``meta`` (model/kind/path) is stored so the front can show a synthetic task
+        for it while the engine itself can't answer the Tasks poll."""
+        import time as _t, uuid as _u
+        rid = _u.uuid4().hex[:12]
         with self._inflight_lock:
             self.inflight += 1
+            if meta is not None:
+                m = dict(meta)
+                m["started_at"] = _t.time()
+                self.active[rid] = m
+        return rid
 
-    def exit_request(self) -> None:
+    def exit_request(self, rid: Optional[str] = None) -> None:
         with self._inflight_lock:
             if self.inflight > 0:
                 self.inflight -= 1
+            if rid:
+                self.active.pop(rid, None)
 
 
 class EngineRegistry:

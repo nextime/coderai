@@ -47,15 +47,34 @@ def _make_llama_thermal_criteria():
     llama-cpp-python evaluates stopping criteria synchronously per token inside
     create_(chat_)completion, so blocking here pauses the GPU forward pass —
     mid-generation thermal protection for the GGUF/Vulkan/llama.cpp backend.
-    The criterion never stops generation (returns False) and is throttled so it
-    doesn't read sensors on every token. Returns None if unavailable.
+    The criterion never stops generation (returns False).
+
+    The callback fires PER TOKEN and holds the GIL, which starves the engine's
+    admin handlers (Tasks/status polls) under load. So we only do real work every
+    N tokens: N=50 by default, and N=100 when generation is fast (>50 tok/s), where
+    a per-token GIL grab hurts responsiveness most and thermal drift between checks
+    is negligible. The sensor read itself is still time-throttled in checkpoint().
     """
     try:
         from llama_cpp import StoppingCriteriaList
     except Exception:
         return None
 
+    import time as _time
+    _state = {"n": 0, "interval": 50, "t": _time.monotonic(), "last_n": 0}
+
     def _pause(input_ids, logits):
+        _state["n"] += 1
+        if _state["n"] % _state["interval"] != 0:
+            return False
+        # Re-estimate cadence from the measured token rate over the last window.
+        now = _time.monotonic()
+        dt = now - _state["t"]
+        if dt > 0:
+            rate = (_state["n"] - _state["last_n"]) / dt
+            _state["interval"] = 100 if rate > 50 else 50
+        _state["t"] = now
+        _state["last_n"] = _state["n"]
         try:
             from codai.models.thermal import checkpoint
             checkpoint(context="text-gen", throttle_seconds=2.0)
