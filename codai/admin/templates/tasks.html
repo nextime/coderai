@@ -435,8 +435,8 @@ async function removeTask(id) {
 loadTasks();
 loadSystemStats();
 loadEngines();
-setInterval(loadTasks, 2000);
-setInterval(loadSystemStats, 2000);
+setInterval(loadTasks, 1000);
+setInterval(loadSystemStats, 1000);
 setInterval(loadEngines, 5000);
 </script>
 {% endblock %}
