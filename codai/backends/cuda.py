@@ -23,6 +23,10 @@ from typing import Optional, List, Dict
 from threading import Thread
 from abc import ABC
 
+# Low-overhead stdout for the generation hot path: a single os.write(1) per line
+# instead of buffered, lock-guarded print(). Shadows print() for this module.
+from codai.api.fastlog import fast_print as print  # noqa: A004
+
 # Import from codai modules
 from codai.backends.base import ModelBackend
 from codai.models.capabilities import detect_model_capabilities

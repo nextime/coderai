@@ -25,6 +25,11 @@ import time
 import uuid
 from typing import AsyncGenerator, Dict, List, Optional
 
+# Engine debug/log lines go out via a single os.write(1) syscall instead of the
+# buffered, lock-guarded builtin print() — lower overhead on the generation hot
+# path. Shadows print() for this whole module.
+from codai.api.fastlog import fast_print as print  # noqa: A004
+
 from fastapi import APIRouter, HTTPException, Request
 
 logger = logging.getLogger(__name__)

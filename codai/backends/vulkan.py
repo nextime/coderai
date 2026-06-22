@@ -24,6 +24,10 @@ import time
 from typing import AsyncIterator, Optional, Union, List, Dict, Any
 from pathlib import Path
 
+# Low-overhead stdout for the generation hot path: a single os.write(1) per line
+# instead of buffered, lock-guarded print(). Shadows print() for this module.
+from codai.api.fastlog import fast_print as print  # noqa: A004
+
 from codai.backends.base import ModelBackend
 from codai.models.utils import (
     check_hf_chat_template,
