@@ -724,19 +724,17 @@ class FrontProxy:
         async def _counting_iter():
             import time as _t
             t0 = _t.monotonic(); ntok = 0; last = 0.0
-            try:
-                async for raw in rp_resp.aiter_raw():
-                    if _meas:
-                        ntok += raw.count(b"data:")
-                        now = _t.monotonic()
-                        if now - last >= 0.5:          # refresh ~2×/s, keep it cheap
-                            last = now
-                            dt = now - t0
-                            m = (engine.active or {}).get(_rid)
-                            if m is not None:
-                                m["step"] = ntok
-                                m["rate"] = round(ntok / dt, 1) if dt > 0 else 0.0
-                    yield raw
+            async for raw in rp_resp.aiter_raw():
+                ntok += raw.count(b"data:")
+                now = _t.monotonic()
+                if now - last >= 0.5:              # refresh ~2×/s, keep it cheap
+                    last = now
+                    dt = now - t0
+                    m = (engine.active or {}).get(_rid)
+                    if m is not None:
+                        m["step"] = ntok
+                        m["rate"] = round(ntok / dt, 1) if dt > 0 else 0.0
+                yield raw
 
         resp_headers = self._filter_headers(rp_resp.headers, _DROP_RESP)
         return StreamingResponse(
