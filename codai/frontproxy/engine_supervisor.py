@@ -193,7 +193,26 @@ class EngineSupervisor:
         specs = getattr(srv, "engine_specs", None)
         engines = []
 
+        # Expose every GPU to the engines (allow_cross) when cross-backend pooling is
+        # wanted: either the global default (offload.gpu_split) OR any individual model
+        # opts into a split ("Split — <engine> first" → per-model gpu_split). Without
+        # this the lead engine wouldn't even see the foreign card, so a per-model split
+        # couldn't use it. Non-split models are kept on their own backend by the GGUF
+        # loader (it zeroes the foreign devices) so this doesn't resurrect the
+        # "everything spreads onto the Radeon" bug.
         _cross = bool(getattr(getattr(self.config, "offload", None), "gpu_split", False))
+        if not _cross and self.models_path:
+            try:
+                import json as _json
+                with open(self.models_path) as _mf:
+                    _md = _json.load(_mf)
+                for _lst in _md.values():
+                    if isinstance(_lst, list) and any(
+                            isinstance(_e, dict) and _e.get("gpu_split") for _e in _lst):
+                        _cross = True
+                        break
+            except Exception:
+                pass
         if specs:
             from codai.frontproxy.gpu_detect import vendor_env
             for idx, spec in enumerate(specs):

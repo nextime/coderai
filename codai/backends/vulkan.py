@@ -1116,10 +1116,22 @@ class VulkanBackend(ModelBackend):
         _ts = kwargs.get('tensor_split', _raw_cfg.get('tensor_split'))
         if _ts is None:
             _ts = kwargs.get('_global_tensor_split')
+        # llama.cpp device order: all visible CUDA devices first, then Vulkan. Count
+        # each so we can tell own-backend from foreign when both are exposed (the
+        # engine was spawned with cross-GPU visibility for some split model).
+        _n_cuda = 0
+        try:
+            import torch as _t
+            if _t.cuda.is_available():
+                _n_cuda = _t.cuda.device_count()
+        except Exception:
+            _n_cuda = 0
+        _vk_env = os.environ.get('GGML_VK_VISIBLE_DEVICES', '')
+        _n_vk = len([x for x in _vk_env.split(',') if x.strip() != '']) if _vk_env else 0
+        _own = (os.environ.get('CODERAI_ENGINE_BACKEND') or '').lower()
         if _gpu_split:
             _parsed = []
             if _ts:
-                # Explicit ratio.
                 for _p in str(_ts).replace(' ', '').split(','):
                     if _p == '':
                         continue
@@ -1138,9 +1150,22 @@ class VulkanBackend(ModelBackend):
                     print(f"  gpu split    : auto tensor_split={_parsed} (by free VRAM "
                           f"{[round(f,1) for f in _free_dev]} GB)")
             else:
-                print(f"  gpu split    : tensor_split={_parsed} (multi-GPU pool, CUDA-first order)")
+                print(f"  gpu split    : tensor_split={_parsed} (multi-GPU pool)")
             if _parsed and _llama_accepts('tensor_split'):
                 llama_kwargs['tensor_split'] = _parsed
+        elif _n_cuda > 0 and _n_vk > 0 and _llama_accepts('tensor_split'):
+            # NOT a split model, but the engine can see BOTH backends' cards (cross
+            # visibility was enabled for some other split model). Confine THIS model
+            # to its own backend so it doesn't accidentally spread onto the foreign
+            # card — while still letting multiple SAME-backend cards share. Zero the
+            # foreign-backend devices in the per-device ratio.
+            if _own.startswith('nvidia') or _own in ('cuda',):
+                _conf = [1.0] * _n_cuda + [0.0] * _n_vk          # CUDA only
+            else:
+                _conf = [0.0] * _n_cuda + [1.0] * _n_vk          # Vulkan only
+            llama_kwargs['tensor_split'] = _conf
+            print(f"  gpu split    : confined to own backend ({_own or 'vulkan'}); "
+                  f"tensor_split={_conf} (foreign card excluded)")
 
         # Multimodal projector (mmproj): pairs a CLIP/vision projector GGUF with
         # this text model so it can accept images — the llama.cpp `--mmproj`
