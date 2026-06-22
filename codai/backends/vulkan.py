@@ -2172,6 +2172,9 @@ class VulkanBackend(ModelBackend):
         # Build the completion up front so a template error (e.g. Gemma's "System
         # role not supported") is caught here and retried with the system message
         # folded into the first user turn — before any chunk is streamed.
+        # [timing] split build (chat-template render + tokenize, done eagerly by
+        # create_chat_completion) from lock+prefill+first-token, to locate latency.
+        _t_build0 = time.monotonic()
         try:
             _completion = self.model.create_chat_completion(**kwargs)
         except Exception as e:
@@ -2179,11 +2182,19 @@ class VulkanBackend(ModelBackend):
                 raise
             kwargs['messages'] = self._fold_system_into_user(messages)
             _completion = self.model.create_chat_completion(**kwargs)
+        print(f"[timing] chat build (template+tokenize): "
+              f"{time.monotonic() - _t_build0:.2f}s", flush=True)
 
         prompt_tokens = 0
         completion_tokens = 0
+        _t_first = time.monotonic()
+        _first_token = True
         try:
             async for chunk in _aiter_blocking(_completion, lock=self._gen_lock):
+                if _first_token:
+                    print(f"[timing] chat lock+prefill+first-token: "
+                          f"{time.monotonic() - _t_first:.2f}s", flush=True)
+                    _first_token = False
                 delta = chunk['choices'][0].get('delta', {})
                 text = delta.get('content') or ''
                 if text:
