@@ -277,17 +277,33 @@ class FrontProxy:
         """Executor for brokered requests: route to an engine over HTTP and return
         the buffered response (the broker dispatcher base64s/relays it)."""
         import json as _json
+        import asyncio as _asyncio
         model = None
         if method.upper() == "POST" and _router.is_inference_path(path):
             try:
                 model = (_json.loads(body or b"{}") or {}).get("model")
             except Exception:
                 model = None
-        engine = _router.pick_engine(
-            self.registry, path, method, model,
-            required_cap=self._required_cap(path, model),
-            default_engine=self.default_engine, pinned=self._pin_for(model),
-            pin_fallback=bool(self._model_info(model).get("engine_fallback")))
+        _is_infer = _router.is_inference_path(path)
+
+        def _pick():
+            return _router.pick_engine(
+                self.registry, path, method, model,
+                required_cap=self._required_cap(path, model),
+                default_engine=self.default_engine, pinned=self._pin_for(model),
+                pin_fallback=bool(self._model_info(model).get("engine_fallback")))
+
+        # Brokered requests must not hard-fail in the startup/reload window where no
+        # engine is ready yet (e.g. an OOM-triggered evict+reload in progress). Wait
+        # + retry for readiness, attempt-bound, mirroring the streaming path; only
+        # return the 503 once exhausted.
+        engine = _pick()
+        if engine is None and _is_infer:
+            for _ in range(6):
+                await _asyncio.sleep(5.0)
+                engine = _pick()
+                if engine is not None:
+                    break
         if engine is None:
             print("[front] broker route: NO ENGINE for path=%s model=%r "
                   "(required_cap=%r pin=%r) — returning 503"
@@ -360,17 +376,40 @@ class FrontProxy:
         of buffering the whole reply. Shares the per-model queue + in-flight tracking
         with the buffered path."""
         import json as _json
+        import asyncio as _asyncio
         model = None
         if method.upper() == "POST" and _router.is_inference_path(path):
             try:
                 model = (_json.loads(body or b"{}") or {}).get("model")
             except Exception:
                 model = None
-        engine = _router.pick_engine(
-            self.registry, path, method, model,
-            required_cap=self._required_cap(path, model),
-            default_engine=self.default_engine, pinned=self._pin_for(model),
-            pin_fallback=bool(self._model_info(model).get("engine_fallback")))
+        _is_infer = _router.is_inference_path(path)
+        # Brokered streaming must behave like the direct/buffered path: when the
+        # target model isn't ready yet (an engine still warming up, or an
+        # OOM-triggered evict+reload in progress) DO NOT relay the instant
+        # not-ready reply to the client — over the broker that lands as a single
+        # empty SSE chunk (the "empty reply" symptom). Instead wait + retry for
+        # readiness, attempt-bound, and only surface an error once exhausted. The
+        # engine's own /v1/chat/completions handler already waits ~5min for a load;
+        # this guards the window before it even accepts the request (no engine
+        # ready, or a non-200 not-ready status).
+        _MAX_TRIES = 6
+        _RETRY_WAIT = 5.0
+
+        def _pick():
+            return _router.pick_engine(
+                self.registry, path, method, model,
+                required_cap=self._required_cap(path, model),
+                default_engine=self.default_engine, pinned=self._pin_for(model),
+                pin_fallback=bool(self._model_info(model).get("engine_fallback")))
+
+        engine = _pick()
+        if engine is None and _is_infer:
+            for _ in range(_MAX_TRIES):
+                await _asyncio.sleep(_RETRY_WAIT)
+                engine = _pick()
+                if engine is not None:
+                    break
         if engine is None:
             yield 'data: {"error":"No engine is ready yet."}\n\n'
             return
@@ -379,7 +418,7 @@ class FrontProxy:
         if self.internal_token:
             send_headers["x-coderai-broker-authed"] = self.internal_token
         _qkey = None
-        if (method.upper() == "POST" and _router.is_inference_path(path)
+        if (method.upper() == "POST" and _is_infer
                 and self._task_kind(path) == "text"):
             _qkey = self._queue_key(model)
             try:
@@ -393,29 +432,39 @@ class FrontProxy:
                 return
         _rid = engine.enter_request(
             {"model": model or "", "kind": self._task_kind(path), "path": path}
-            if _router.is_inference_path(path) else None)
+            if _is_infer else None)
         import time as _t
         _started = _t.time()
         _status = 502
-        rp_req = self._long.build_request(method, engine.url + path,
-                                          headers=send_headers, params=query or {},
-                                          content=body or b"")
         try:
-            rp_resp = await self._long.send(rp_req, stream=True)
-            _status = rp_resp.status_code
-            _meas = (rp_resp.status_code == 200 and "text/event-stream"
-                     in (rp_resp.headers.get("content-type") or ""))
-            ntok = 0
-            async for raw in rp_resp.aiter_raw():
-                if not raw:
+            for _attempt in range(_MAX_TRIES):
+                rp_req = self._long.build_request(method, engine.url + path,
+                                                  headers=send_headers,
+                                                  params=query or {},
+                                                  content=body or b"")
+                rp_resp = await self._long.send(rp_req, stream=True)
+                _status = rp_resp.status_code
+                # Not-ready (model still loading / mid OOM-reload): retry instead of
+                # relaying the empty/error reply. No tokens were generated on a
+                # non-200, so re-sending the body is safe (no duplicate output).
+                if _is_infer and _status != 200 and _attempt < _MAX_TRIES - 1:
+                    await rp_resp.aclose()
+                    await _asyncio.sleep(_RETRY_WAIT)
                     continue
-                if _meas:
-                    ntok += raw.count(b"data:")
-                    m = (engine.active or {}).get(_rid)
-                    if m is not None:
-                        m["step"] = ntok
-                yield raw.decode("utf-8", "replace")
-            await rp_resp.aclose()
+                _meas = (_status == 200 and "text/event-stream"
+                         in (rp_resp.headers.get("content-type") or ""))
+                ntok = 0
+                async for raw in rp_resp.aiter_raw():
+                    if not raw:
+                        continue
+                    if _meas:
+                        ntok += raw.count(b"data:")
+                        m = (engine.active or {}).get(_rid)
+                        if m is not None:
+                            m["step"] = ntok
+                    yield raw.decode("utf-8", "replace")
+                await rp_resp.aclose()
+                break
         except Exception as exc:
             yield ('data: {"error":"engine#%s unreachable: %s"}\n\n'
                    % (engine.id, exc))
@@ -423,7 +472,7 @@ class FrontProxy:
             engine.exit_request(_rid)
             if _qkey is not None:
                 await self.reqqueue.release(_qkey)
-            if _router.is_inference_path(path):
+            if _is_infer:
                 self._record_activity(model, self._task_kind(path), _status, _started)
 
     # ------------------------------------------------------------------ helpers
