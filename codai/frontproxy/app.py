@@ -652,7 +652,8 @@ class FrontProxy:
                     "title": (m.get("model") or "generation"),
                     "model": m.get("model") or "",
                     "status": "running",
-                    "step": 0, "total": 0, "rate": 0.0,
+                    "step": m.get("step") or 0, "total": 0,
+                    "rate": m.get("rate") or 0.0,
                     "message": "generating",
                     "started_at": m.get("started_at"),
                     "engine": e.name,
@@ -713,9 +714,33 @@ class FrontProxy:
             finally:
                 engine.exit_request(_rid)
 
+        # Measure throughput from the SSE stream the front relays, and publish it on
+        # the in-flight metadata. This gives the Tasks page a live it/s for the
+        # synthesized task even while the engine is too busy to report its own — each
+        # SSE "data:" event is ~one token for chat/text completions.
+        _meas = (_rid is not None and rp_resp.status_code == 200
+                 and "text/event-stream" in (rp_resp.headers.get("content-type") or ""))
+
+        async def _counting_iter():
+            import time as _t
+            t0 = _t.monotonic(); ntok = 0; last = 0.0
+            try:
+                async for raw in rp_resp.aiter_raw():
+                    if _meas:
+                        ntok += raw.count(b"data:")
+                        now = _t.monotonic()
+                        if now - last >= 0.5:          # refresh ~2×/s, keep it cheap
+                            last = now
+                            dt = now - t0
+                            m = (engine.active or {}).get(_rid)
+                            if m is not None:
+                                m["step"] = ntok
+                                m["rate"] = round(ntok / dt, 1) if dt > 0 else 0.0
+                    yield raw
+
         resp_headers = self._filter_headers(rp_resp.headers, _DROP_RESP)
         return StreamingResponse(
-            rp_resp.aiter_raw(),
+            _counting_iter() if _meas else rp_resp.aiter_raw(),
             status_code=rp_resp.status_code,
             headers=dict(resp_headers),
             media_type=rp_resp.headers.get("content-type"),
