@@ -75,6 +75,15 @@ class FrontProxy:
         self._models_path = os.path.join(config_dir, "models.json") if config_dir else None
         self._pins: dict = {}
         self._pins_mtime: float = -1.0
+        # The front owns config as the authority for reads (settings GET, status,
+        # capacity). A settings SAVE still runs on the engine (it applies live
+        # runtime changes — thermal, RAM monitor — that only exist there) and
+        # persists config.json; the front re-reads it on mtime change so everything
+        # it serves stays current. self.config is mutated in place so components
+        # holding a reference (admin_data, supervisor) see the refresh.
+        self._config_dir = config_dir
+        self._config_path = os.path.join(config_dir, "config.json") if config_dir else None
+        self._config_mtime: float = -1.0
         # Last-good /v1/models list per engine. An engine that's mid-load is
         # GIL-blocked and misses health polls; without this its models (incl. a
         # freshly-added one) would flicker out of the aggregated /v1/models while
@@ -424,7 +433,37 @@ class FrontProxy:
         return max(1, int(getattr(_models, "max_model_instances", 1) or 1))
 
     def _queue_max_waiting(self) -> int:
+        self._refresh_config_if_changed()
         return max(0, int(getattr(self.config.server, "queue_max_size", 6) or 0))
+
+    def _refresh_config_if_changed(self) -> None:
+        """Re-read config.json into self.config (in place) when it changes, so the
+        front's config-derived endpoints reflect a settings save (which the engine
+        persists) without a restart. Cheap: only acts on an mtime change."""
+        if not self._config_path:
+            return
+        import os
+        try:
+            mtime = os.path.getmtime(self._config_path)
+        except OSError:
+            return
+        if mtime == self._config_mtime:
+            return
+        self._config_mtime = mtime
+        try:
+            from codai.config import ConfigManager
+            cm = ConfigManager(self._config_dir)
+            cm.load()
+            new = cm.config
+            for f in ("server", "backend", "models", "offload", "vulkan", "image",
+                      "whisper", "archive", "thermal", "jobs", "enhance", "ds4",
+                      "compaction", "broker", "system_prompt", "tools_closer_prompt",
+                      "grammar_guided", "parser", "tmp_dir"):
+                if hasattr(new, f):
+                    setattr(self.config, f, getattr(new, f))
+            self.default_engine = getattr(self.config.server, "default_engine", None)
+        except Exception:
+            pass
 
     def _required_cap(self, path: str, model: Optional[str]) -> Optional[str]:
         ds4 = getattr(self.config, "ds4", None)
@@ -1192,6 +1231,7 @@ class FrontProxy:
         # keeps Overview instant and correct regardless of engine load.
         if not self._has_cred(request):
             return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        self._refresh_config_if_changed()
         return JSONResponse(self._native_status())
 
     def _enabled_models_and_aliases(self):
@@ -1445,7 +1485,8 @@ def build_app(config, config_dir=None) -> FastAPI:
     # — answered from disk so they stay live while the engine is busy generating.
     try:
         from codai.frontproxy.admin_data import register_admin_data
-        register_admin_data(app, config_dir, config=config)
+        register_admin_data(app, config_dir, config=config,
+                            on_config_read=front._refresh_config_if_changed)
     except Exception as _exc:
         print(f"[front] could not register local admin-data endpoints ({_exc}); "
               f"they will be proxied to the engine", flush=True)

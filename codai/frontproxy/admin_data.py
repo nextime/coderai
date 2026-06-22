@@ -22,7 +22,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 
-def register_admin_data(app: FastAPI, config_dir, config=None) -> bool:
+def register_admin_data(app: FastAPI, config_dir, config=None,
+                        on_config_read=None) -> bool:
     if not config_dir:
         return False
     try:
@@ -169,6 +170,11 @@ def register_admin_data(app: FastAPI, config_dir, config=None) -> bool:
             _u, err = _admin(request)
             if err:
                 return err
+            if on_config_read is not None:
+                try:
+                    on_config_read()   # re-read config.json if a save changed it
+                except Exception:
+                    pass
             try:
                 from codai.admin.routes import build_settings_dict
                 from codai.frontproxy.gpu_detect import gpu_cards as _gpu_cards
