@@ -19,7 +19,7 @@
 import time
 from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field, field_validator, ConfigDict
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 
 
 class ToolFunction(BaseModel):
@@ -73,6 +73,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = Field(1.0, description="Nucleus sampling probability mass.")
     n: int = Field(1, description="Number of completions to generate.")
     max_tokens: Optional[int] = Field(None, description="Max tokens to generate (model default if omitted).")
+    max_completion_tokens: Optional[int] = Field(None, description="Newer OpenAI alias for max_tokens; used when max_tokens is omitted.")
     stream: bool = Field(False, description="Stream the response as Server-Sent Events.")
     stop: Optional[Union[str, List[str]]] = Field(None, description="Stop sequence(s) that end generation.")
     presence_penalty: float = Field(0.0, description="Penalize tokens already present (encourages new topics).")
@@ -91,6 +92,14 @@ class ChatCompletionRequest(BaseModel):
     suppress_reasoning: Optional[bool] = Field(None, description="Drop the model's reasoning/thinking from the response instead of returning it as a separate field.")
 
     model_config = ConfigDict(extra="allow")  # Allow extra fields to prevent 422 errors
+
+    @model_validator(mode="after")
+    def _alias_max_completion_tokens(self):
+        """Accept the newer OpenAI ``max_completion_tokens`` as an alias for
+        ``max_tokens``. ``max_tokens`` wins when both are sent."""
+        if self.max_tokens is None and self.max_completion_tokens is not None:
+            self.max_tokens = self.max_completion_tokens
+        return self
 
 
 class CompletionRequest(BaseModel):
