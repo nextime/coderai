@@ -50,7 +50,9 @@ class ServerConfig:
     internal_port_base: int = 8780      # first engine binds here; +1 per extra engine
     engines: int = 0                    # 0 = auto (one per detected GPU, min 1)
     engine_gpus: Optional[list] = None  # explicit GPU indices, e.g. [0, 1]; None = auto
-    proxy_status_timeout: float = 2.0   # short timeout for UI/status proxying (seconds)
+    proxy_status_timeout: float = 4.0   # short timeout for UI/status proxying (seconds);
+                                        # generous enough that a GIL-busy engine's
+                                        # health poll doesn't time out mid-generation
     proxy_max_inflight: int = 64        # max concurrent proxied requests through the front
     engine_restart_drain_grace: float = 30.0  # on engine restart, wait this many seconds
                                               # for in-flight requests to finish before

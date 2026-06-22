@@ -526,9 +526,17 @@ class EngineSupervisor:
                     else:
                         self.registry.update_state(engine.id, healthy=False)
                 except Exception:
-                    # Connection refused / timeout: still-loading or dead. Mark
-                    # unhealthy; the process-exit check above handles true death.
-                    self.registry.update_state(engine.id, healthy=False)
+                    # Connection refused / timeout. If the process is ALIVE it's
+                    # almost certainly just GIL-busy generating (the engine-state
+                    # handler couldn't answer in time), NOT dead — keep its
+                    # last-known state so a busy engine doesn't flap to "not
+                    # responding" and drop out of the UI/routing mid-generation.
+                    # True death is caught by the process-exit check above
+                    # (_maybe_restart); only downgrade when the process is gone.
+                    if not engine.is_alive():
+                        self.registry.update_state(engine.id, healthy=False)
+                    else:
+                        healthy = self._health.get(engine.id, True)
                 # --debug-engine: report health transitions (ready / lost).
                 if self.debug and self._health.get(engine.id) != healthy:
                     self._health[engine.id] = healthy
