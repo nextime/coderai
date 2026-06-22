@@ -57,6 +57,11 @@ _SYSTEM_PATHS = (
     "/admin/api/hf-model-files", "/admin/api/ds4/default-models",
     "/admin/api/model-add-known", "/admin/api/model-mark-download",
     "/admin/api/model-unmark-download",
+    # Config-based reads/edits (no GPU): the system worker has config_manager +
+    # models.json, so these stay fast and never touch the busy engine.
+    "/admin/api/models", "/admin/api/accel-presets", "/admin/api/accel-loras",
+    "/admin/api/turboquant-info", "/admin/api/model-enable",
+    "/admin/api/model-disable",
 )
 
 
@@ -83,6 +88,10 @@ class FrontProxy:
         # without asking the engine. Newest first; bounded.
         import collections as _collections
         self._recent_activity = _collections.deque(maxlen=25)
+        # Last-good per-model instance detail from an engine (synced only when the
+        # engine is idle), so model-loaded-status can serve loaded/running from the
+        # front's own state without ever hitting a busy engine.
+        self._mls_cache: dict = {}
         self.registry = EngineRegistry()
         self.supervisor: Optional[EngineSupervisor] = None
         # Per-run secret shared only with the engines (passed via env at spawn). The
@@ -436,6 +445,16 @@ class FrontProxy:
         if prim is None:
             return JSONResponse({"engine": "down", "tasks": [], "queue": []})
         is_tasks = request.url.path.rstrip("/").endswith("/tasks")
+        # If the primary is mid-generation, don't poke it (the call would just burn
+        # the timeout). Serve the merged/synthesized task list from the front's
+        # last-good cache + live in-flight tracking — no engine hit during work.
+        if is_tasks and int(getattr(prim, "inflight", 0) or 0) > 0:
+            ptasks = (self._primary_tasks_cache or []) \
+                if (time.monotonic() - self._primary_tasks_at) < 120 else []
+            return JSONResponse({"engine": "busy", "stale": True,
+                                 "tasks": self._merge_engine_tasks(prim, ptasks),
+                                 "cooling_engines": self._cooling_engines(),
+                                 "queue": []})
         try:
             headers = self._filter_headers(request.headers, _DROP_REQ)
             r = await self._short.get(prim.url + request.url.path, headers=headers,
@@ -667,36 +686,45 @@ class FrontProxy:
         return sorted(running)
 
     async def model_loaded_status(self, request: Request):
-        """Proxy /admin/api/model-loaded-status to the primary, then union in the
-        models loaded on every *other* engine. Otherwise the models page only sees
-        the primary engine's pool and shows models loaded on a secondary (e.g. the
-        radeon engine) as idle. Also adds ``running`` — models actively serving a
-        request — from the front's own in-flight tracking."""
-        prim = self.registry.primary()
+        """Loaded-model status, served from the FRONT's own state.
+
+        The front issues every load/unload and the supervisor keeps each engine's
+        resident set in the registry (refreshed by the cheap engine-state poll that
+        answers even mid-generation), so ``loaded`` + ``running`` come from the front
+        with no engine round-trip. Richer per-model instance detail (instances /
+        configured_max) is synced from the engine ONLY when it's idle — never adding
+        load during generation — and cached for use while it's busy."""
         running = self._running_models()
-        if prim is None:
-            return JSONResponse({"loaded": [], "instances": {}, "configured_max": {},
-                                 "running": running})
-        try:
-            headers = self._filter_headers(request.headers, _DROP_REQ)
-            r = await self._short.get(prim.url + request.url.path, headers=headers,
-                                      params=request.query_params)
-            if r.status_code != 200:
-                return Response(content=r.content, status_code=r.status_code,
-                                headers=dict(self._filter_headers(r.headers, _DROP_RESP)),
-                                media_type=r.headers.get("content-type"))
-            data = r.json()
-        except Exception:
-            return JSONResponse({"loaded": [], "instances": {}, "configured_max": {},
-                                 "running": running})
-        if isinstance(data, dict):
-            loaded = set(data.get("loaded") or [])
-            for e in self.registry.all():
-                if prim is not None and e.id == prim.id:
-                    continue
-                loaded |= e.loaded_models
-            data["loaded"] = sorted(loaded)
-            data["running"] = running
+        loaded = set()
+        for e in self.registry.all():
+            if getattr(e, "role", "engine") == "system":
+                continue
+            loaded |= set(e.loaded_models or [])
+        data = {
+            "loaded": sorted(self._canonical_loaded(loaded)),
+            "running": running,
+            "instances": self._mls_cache.get("instances", {}),
+            "configured_max": self._mls_cache.get("configured_max", {}),
+        }
+        prim = self.registry.primary()
+        # Sync instance detail only when the primary is idle (inflight == 0).
+        if prim is not None and int(getattr(prim, "inflight", 0) or 0) == 0:
+            try:
+                headers = self._filter_headers(request.headers, _DROP_REQ)
+                r = await self._short.get(prim.url + request.url.path, headers=headers,
+                                          params=request.query_params)
+                if r.status_code == 200:
+                    ed = r.json()
+                    if isinstance(ed, dict):
+                        self._mls_cache = {
+                            "instances": ed.get("instances", {}) or {},
+                            "configured_max": ed.get("configured_max", {}) or {}}
+                        data["instances"] = self._mls_cache["instances"]
+                        data["configured_max"] = self._mls_cache["configured_max"]
+                        merged = loaded | set(ed.get("loaded") or [])
+                        data["loaded"] = sorted(self._canonical_loaded(merged))
+            except Exception:
+                pass
         return JSONResponse(data)
 
     async def _forward_to_engine(self, request: Request, engine, body: bytes):
