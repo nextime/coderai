@@ -336,8 +336,11 @@ def _amd_stats() -> list:
             "vendor": "amd", "index": int(base[4:]),
             "name": _amd_gpu_name(dev, base),
             "util": float(busy) if busy and busy.isdigit() else None,
-            "mem_used": round(int(used) / 1e9, 2) if used and used.isdigit() else None,
-            "mem_total": round(int(total) / 1e9, 2) if total and total.isdigit() else None,
+            # GiB (binary) to MATCH _nvidia_stats (which divides nvidia-smi MiB by
+            # 1024). Mixing GiB and decimal-GB made the two cards' VRAM ~7% out of
+            # step in the dashboard and any cross-card total.
+            "mem_used": round(int(used) / (1024 ** 3), 2) if used and used.isdigit() else None,
+            "mem_total": round(int(total) / (1024 ** 3), 2) if total and total.isdigit() else None,
             "temp": temp})
     return cards
 

@@ -1997,6 +1997,16 @@ function _engineTagHtml(m, s){
   const color = (lc.includes('nv')) ? '#76b900'
               : (lc.includes('rad') || lc.includes('amd')) ? '#ed1c24'
               : 'var(--text-3)';
+  // Cross-GPU split: the model runs on `eng` (its lead card) but spills onto the
+  // other GPU(s) for extra VRAM. Show it in the tag so the list makes the split
+  // visible, e.g. "nvidia ⇄split 📌".
+  const split = !!(s && s.gpu_split);
+  if(split){
+    const ratio = ((s && s.tensor_split) || '').trim();
+    const title = 'Loads on ' + eng + ', split across all GPUs ('
+                + (ratio ? ('ratio ' + ratio) : 'auto by free VRAM') + ')';
+    return `<span class="badge" title="${esc(title)}" style="font-size:9px;padding:.05rem .3rem;margin:.1rem .1rem 0 0;vertical-align:middle;border:1px solid ${color};color:${color};background:transparent">${esc(eng)} ⇄split${pinned?' 📌':''}</span>`;
+  }
   const title = pinned ? ('Pinned to engine: ' + eng) : ('Runs on: ' + eng + ' (auto)');
   return `<span class="badge" title="${esc(title)}" style="font-size:9px;padding:.05rem .3rem;margin:.1rem .1rem 0 0;vertical-align:middle;border:1px solid ${color};color:${color};background:transparent">${esc(eng)}${pinned?' 📌':''}</span>`;
 }
