@@ -642,19 +642,27 @@ def _model_max_tokens(request):
 
 
 def _clamp_max_tokens(request):
-    """Enforce the model-level max_tokens authority: honor the client's value only
-    when it is smaller than the model-level cap; otherwise use the model-level cap.
-    No-op when no model-level cap is configured (keeps the client's value / 2048
-    fallback)."""
-    cap = _model_max_tokens(request)
-    if not cap:
-        return
+    """Resolve the reply's max_tokens to a concrete value (never None).
+
+    The model-level cap (per-model models.json "max_tokens", else global
+    models.max_tokens) is the authority: a client's value is honored only when it
+    is SMALLER; a larger or absent request uses the model-level value. When no
+    model-level cap is configured, the client's value is kept as-is, and an absent
+    value falls back to 2048. Crucially we never leave it None — the GGUF backend
+    treats a missing max_tokens as its tiny 512-token default and truncates the
+    reply mid-sentence."""
     cur = getattr(request, "max_tokens", None)
     try:
         cur = int(cur) if cur is not None else None
     except (TypeError, ValueError):
         cur = None
-    request.max_tokens = min(cur, cap) if (cur and cur > 0) else cap
+    if cur is not None and cur <= 0:
+        cur = None
+    cap = _model_max_tokens(request)
+    if cap:
+        request.max_tokens = min(cur, cap) if cur else cap
+    else:
+        request.max_tokens = cur if cur else 2048
 
 
 def _resolve_compaction(request, current_manager):

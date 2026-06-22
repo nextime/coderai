@@ -451,73 +451,34 @@ class FrontProxy:
             {"model": model or "", "kind": self._task_kind(path), "path": path}
             if _is_infer else None)
         import time as _t
-        import re as _re
         _started = _t.time()
         _status = 502
         # Statuses that mean "not ready / try again" rather than a real client
         # error: the engine is up but still loading/reloading the model. A 4xx is a
-        # genuine error and must be relayed as-is, not retried.
+        # genuine error and must be relayed as-is, not retried. We do NOT inject any
+        # placeholder ("thinking…") chunk — we just wait for the real response. The
+        # model-load wait is held open engine-side (/v1/chat/completions waits
+        # ~5min) and at the broker protocol level (periodic `pending` keepalives
+        # keep the relay deadline extended).
         _RETRY_STATUS = {425, 429, 500, 502, 503, 504}
-        # Keepalive while the model loads / prefills (a CPU-offload fallback after an
-        # OOM can be slow): the client must NEVER be left with a silent, empty
-        # stream. On each gap emit a visible "the model is thinking…" chunk once —
-        # as a reasoning delta when thinking is enabled, else as a plain content
-        # message — then cheap SSE-comment pings to hold the connection open without
-        # polluting the reply further.
-        _think = False
         try:
-            _bj = _json.loads(body or b"{}") or {}
-            _think = (_bj.get("reasoning_effort") != "none") and (
-                bool(_bj.get("enable_thinking")) or bool(_bj.get("thinking"))
-                or bool(_re.search(r'qwen3|qwq|deepseek[-_]?r[12]|[-_]reasoner|'
-                                   r'[-_]thinking|glm[-_]?z1', str(model or ""),
-                                   _re.IGNORECASE)))
-        except Exception:
-            _think = False
-        _ka_delta = ({"reasoning_content": "the model is thinking…"} if _think
-                     else {"content": "the model is thinking…"})
-        _ka_first = 'data: %s\n\n' % _json.dumps(
-            {"choices": [{"index": 0, "delta": _ka_delta, "finish_reason": None}]})
-        _ka_ping = ': keepalive\n\n'
-        _KA_INTERVAL = 10.0
-        _ka_state = {"sent": False}
-
-        def _keepalive():
-            if _ka_state["sent"]:
-                return _ka_ping
-            _ka_state["sent"] = True
-            return _ka_first
-
-        try:
-            rp_resp = None
             for _attempt in range(_MAX_TRIES):
                 _last = (_attempt >= _MAX_TRIES - 1)
-                # Await the engine response while emitting keepalives, so the long
-                # model-load wait never starves the client. A connection-level
-                # failure means the engine isn't accepting yet (just (re)starting):
-                # wait + retry instead of relaying an instant "unreachable".
-                rp_req = self._long.build_request(method, engine.url + path,
-                                                  headers=send_headers,
-                                                  params=query or {},
-                                                  content=body or b"")
-                _send = _asyncio.ensure_future(self._long.send(rp_req, stream=True))
+                # Connection-level failure means the engine isn't accepting yet
+                # (just (re)starting): wait + retry instead of relaying an instant
+                # "unreachable" (which lands as a single empty SSE chunk).
                 try:
-                    while True:
-                        _d, _ = await _asyncio.wait({_send}, timeout=_KA_INTERVAL)
-                        if _send in _d:
-                            break
-                        if _is_infer:
-                            yield _keepalive()
-                    rp_resp = _send.result()
+                    rp_req = self._long.build_request(method, engine.url + path,
+                                                      headers=send_headers,
+                                                      params=query or {},
+                                                      content=body or b"")
+                    rp_resp = await self._long.send(rp_req, stream=True)
                 except Exception as exc:
-                    if not _send.done():
-                        _send.cancel()
                     if _is_infer and not _last:
                         await _asyncio.sleep(_RETRY_WAIT)
                         continue
                     yield ('data: {"error":"engine#%s unreachable: %s"}\n\n'
                            % (engine.id, exc))
-                    rp_resp = None
                     break
                 _status = rp_resp.status_code
                 # Not-ready (model still loading / mid OOM-reload): retry instead of
@@ -527,49 +488,20 @@ class FrontProxy:
                     await rp_resp.aclose()
                     await _asyncio.sleep(_RETRY_WAIT)
                     continue
-                break
-            if rp_resp is not None:
                 _meas = (_status == 200 and "text/event-stream"
                          in (rp_resp.headers.get("content-type") or ""))
                 ntok = 0
-                # Read the engine stream in the background and pull with a timeout so
-                # a slow first token (CPU-offload prefill) still emits keepalives
-                # rather than a silent gap.
-                _q: "_asyncio.Queue" = _asyncio.Queue()
-
-                async def _reader():
-                    try:
-                        async for raw in rp_resp.aiter_raw():
-                            await _q.put(raw)
-                    except Exception:
-                        pass
-                    finally:
-                        await _q.put(None)
-
-                _rt = _asyncio.ensure_future(_reader())
-                try:
-                    while True:
-                        try:
-                            raw = await _asyncio.wait_for(_q.get(),
-                                                          timeout=_KA_INTERVAL)
-                        except _asyncio.TimeoutError:
-                            if _is_infer:
-                                yield _keepalive()
-                            continue
-                        if raw is None:
-                            break
-                        if not raw:
-                            continue
-                        if _meas:
-                            ntok += raw.count(b"data:")
-                            m = (engine.active or {}).get(_rid)
-                            if m is not None:
-                                m["step"] = ntok
-                        yield raw.decode("utf-8", "replace")
-                finally:
-                    if not _rt.done():
-                        _rt.cancel()
-                    await rp_resp.aclose()
+                async for raw in rp_resp.aiter_raw():
+                    if not raw:
+                        continue
+                    if _meas:
+                        ntok += raw.count(b"data:")
+                        m = (engine.active or {}).get(_rid)
+                        if m is not None:
+                            m["step"] = ntok
+                    yield raw.decode("utf-8", "replace")
+                await rp_resp.aclose()
+                break
         finally:
             engine.exit_request(_rid)
             if _qkey is not None:
