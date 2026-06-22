@@ -643,6 +643,40 @@ class FrontProxy:
                 "pausable": False,
                 "restartable": False,
             })
+        # Overlay the front's LIVE in-flight counts onto the matching real task.
+        # The primary's task list is often served from the last-good cache while the
+        # engine is briefly busy, which FROZE the token count (step) even though the
+        # speed — a cumulative average over growing elapsed time — kept drifting, so
+        # it looked like "only the speed updates". The front is itself relaying the
+        # SSE stream and counting tokens (engine.active, refreshed ~2×/s by the
+        # streaming proxy), so use that as the live source of step/rate.
+        live = {}            # (engine, model) → {step, rate}
+        live_by_engine = {}  # engine → list of live in-flight metas
+        for e in self.registry.all():
+            for _rid, m in list((e.active or {}).items()):
+                meta = {"step": m.get("step") or 0, "rate": m.get("rate") or 0.0}
+                k = (e.name, m.get("model") or "")
+                if k not in live or meta["step"] > live[k]["step"]:
+                    live[k] = meta
+                live_by_engine.setdefault(e.name, []).append(meta)
+        for t in merged:
+            if not isinstance(t, dict) or t.get("status") != "running":
+                continue
+            lm = live.get((t.get("engine"), t.get("model") or ""))
+            # Exact (engine, model) match failed — the client's model string (alias /
+            # path) can differ from the task's resolved name. Fall back to the engine's
+            # sole live generation when there's exactly one (the common case).
+            if lm is None and t.get("kind") in ("text", "generation"):
+                eng_live = live_by_engine.get(t.get("engine")) or []
+                if len(eng_live) == 1:
+                    lm = eng_live[0]
+            if not lm:
+                continue
+            if (lm["step"] or 0) > (t.get("step") or 0):
+                t["step"] = lm["step"]
+            if lm["rate"]:
+                t["rate"] = lm["rate"]
+
         # Synthetic in-flight tasks for requests the front dispatched but that have
         # no real task yet (engine too busy to report). Dedup by (engine, model) so
         # we don't double-show a generation the engine already reported.
