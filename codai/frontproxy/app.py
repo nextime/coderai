@@ -1003,6 +1003,18 @@ def build_app(config, config_dir=None) -> FastAPI:
         ok = bool(front.supervisor and front.supervisor.restart_engine(eid))
         return JSONResponse({"success": ok}, status_code=200 if ok else 404)
 
+    # Serve the admin / Studio UI pages from the FRONT (rendered here, sessions
+    # validated locally) so navigating the dashboard never waits on a GIL-busy
+    # engine mid-generation. The engine handles only generation; pages live here.
+    # Registered before the catch-all so page GETs aren't proxied. Login/logout/
+    # change-password POST and all /admin/api/* data calls still fall through.
+    try:
+        from codai.frontproxy.ui_pages import register_ui_pages
+        register_ui_pages(app, config_dir)
+    except Exception as _exc:
+        print(f"[front] could not register local UI pages ({_exc}); "
+              f"pages will be proxied to the engine", flush=True)
+
     # Catch-all reverse proxy for everything else (admin UI, /v1 inference, files…).
     @app.api_route("/{path:path}", include_in_schema=False,
                    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
