@@ -957,6 +957,20 @@ class VulkanBackend(ModelBackend):
                 # Otherwise we'd needlessly offload layers to CPU thinking only one
                 # card's free VRAM is available.
                 _free = _pooled_free_vram_gb(cross=bool(kwargs.get('gpu_split')))
+                # A vision projector (mmproj) loads ON TOP of the model on main_gpu;
+                # subtract it (weights + compute margin) from the usable pool so that
+                # when the model+KV+projector exceed BOTH cards combined, we reduce
+                # GPU layers (spill to CPU) gracefully instead of filling both cards
+                # and aborting (GGML_ASSERT(buffer) failed) when the projector can't
+                # allocate.
+                _mmp = kwargs.get('mmproj') or (kwargs.get('_raw_cfg') or {}).get('mmproj')
+                if _mmp:
+                    try:
+                        _mp = os.path.expanduser(str(_mmp))
+                        _msz = os.path.getsize(_mp) / (1024 ** 3) if os.path.isfile(_mp) else 1.5
+                    except Exception:
+                        _msz = 1.5
+                    _free = max(0.0, _free - (_msz + 1.5))
                 if _exp and _exp > 0 and _nlayers and _free > 0 and _exp > _free * 0.95:
                     # Scale layers on GPU by the VRAM ratio (weights + KV roughly
                     # scale per-layer). The estimate tends to undercount the KV
@@ -1144,11 +1158,33 @@ class VulkanBackend(ModelBackend):
                 # Auto: distribute proportionally to each device's free VRAM (a 24 GB
                 # 3090 + 8 GB RX 580 → ~0.75/0.25), so the bigger card carries more.
                 _free_dev = _per_device_free_vram_gb()
-                _sum = sum(_free_dev)
-                if len(_free_dev) > 1 and _sum > 0:
-                    _parsed = [round(f / _sum, 3) for f in _free_dev]
+                # mmproj-aware headroom: a vision projector (CLIP/mmproj) ALWAYS loads
+                # on main_gpu (its own buffer + compute), and the model's output/KV
+                # anchor is there too. If the proportional split fills main_gpu to the
+                # brim, the projector can't allocate and llama.cpp aborts
+                # (GGML_ASSERT(buffer) failed). So reserve the projector's size + a
+                # compute margin on main_gpu by subtracting it from that device's free
+                # VRAM before computing the ratio — main_gpu then gets a smaller share.
+                _mg = self.main_gpu if isinstance(self.main_gpu, int) else 0
+                _reserve = 0.0
+                _mmp = kwargs.get('mmproj', _raw_cfg.get('mmproj'))
+                if _mmp:
+                    try:
+                        _mp = os.path.expanduser(str(_mmp))
+                        _sz = os.path.getsize(_mp) / (1024 ** 3) if os.path.isfile(_mp) else 1.5
+                    except Exception:
+                        _sz = 1.5
+                    _reserve = _sz + 1.5   # projector weights + its compute/KV margin
+                _adj = list(_free_dev)
+                if _reserve > 0 and 0 <= _mg < len(_adj):
+                    _adj[_mg] = max(0.5, _adj[_mg] - _reserve)
+                _sum = sum(_adj)
+                if len(_adj) > 1 and _sum > 0:
+                    _parsed = [round(f / _sum, 3) for f in _adj]
+                    _note = (f" (reserved ~{_reserve:.1f} GB on GPU{_mg} for mmproj)"
+                             if _reserve > 0 else "")
                     print(f"  gpu split    : auto tensor_split={_parsed} (by free VRAM "
-                          f"{[round(f,1) for f in _free_dev]} GB)")
+                          f"{[round(f,1) for f in _free_dev]} GB){_note}")
             else:
                 print(f"  gpu split    : tensor_split={_parsed} (multi-GPU pool)")
             if _parsed and _llama_accepts('tensor_split'):

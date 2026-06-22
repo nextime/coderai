@@ -190,9 +190,18 @@ def vendor_env(vendor: str, allow_cross: bool = False) -> dict:
     vk_devs = vulkan_devices()
     vendor_idx = [i for i, d in enumerate(vk_devs) if d.get("vendor") == vendor]
     if allow_cross:
-        # Opt-in cross-backend pooling: expose EVERY enumerated Vulkan device (any
-        # vendor) so llama.cpp can split a model across backends. Don't pin the ICD.
-        if vk_devs:
+        # Opt-in cross-backend pooling: expose every REAL GPU Vulkan device (any
+        # hardware vendor) so llama.cpp can split a model across backends. EXCLUDE
+        # software rasterizers (llvmpipe/lavapipe/virtio → vendor "other"): they are
+        # CPU-backed, have no real VRAM, and are far slower than llama.cpp's native
+        # CPU offload — and including them both skews the device list (so the
+        # tensor_split ratio no longer lines up with the real cards) and lets layers
+        # land on a fake "GPU". Don't pin the ICD (we want all hardware vendors).
+        real_idx = [i for i, d in enumerate(vk_devs)
+                    if d.get("vendor") in ("nvidia", "amd", "intel")]
+        if real_idx:
+            env["GGML_VK_VISIBLE_DEVICES"] = ",".join(str(i) for i in real_idx)
+        elif vk_devs:
             env["GGML_VK_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(len(vk_devs)))
     elif icd:
         # The vendor ICD exists: point the loader at it so ONLY this vendor's cards
