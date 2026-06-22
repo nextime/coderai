@@ -131,6 +131,7 @@ class EngineSupervisor:
         self.debug = debug               # --debug-engine: verbose engine lifecycle
         self._health = {}                # engine_id -> last healthy bool (for debug)
         self._assign_mtime = 0.0         # models.json mtime → live re-assignment
+        self._pending_reload = {}        # engine.name -> owned list awaiting an idle engine
         self._stopped = threading.Event()
         self._poll_thread = None
         self._logs = {}   # engine_id -> deque tail
@@ -491,15 +492,37 @@ class EngineSupervisor:
             return
         for e in self.registry.all():
             owned = assignment.get(e.name, [])
-            e.assigned_models = set(owned)   # update the front's router
+            e.assigned_models = set(owned)   # update the front's router (local, instant)
+            # Pushing /internal/reload-config to an engine that's mid-generation would
+            # block on its GIL and time out, freezing this poll thread. Queue the push
+            # instead and let _flush_pending_reloads() deliver it once the engine idles.
+            self._pending_reload[e.name] = owned
+        print(f"[front] models.json changed — assignment recomputed "
+              f"({', '.join(f'{e.name}:{len(assignment.get(e.name, []))}' for e in self.registry.all())}); "
+              f"reload queued until each engine is idle",
+              flush=True)
+        self._flush_pending_reloads(client)
+
+    def _flush_pending_reloads(self, client) -> None:
+        """Deliver any queued reload-config pushes to engines that are now idle.
+        Busy engines (inflight > 0) are left queued for a later poll iteration."""
+        if not self._pending_reload:
+            return
+        for e in self.registry.all():
+            if e.name not in self._pending_reload:
+                continue
+            if getattr(e, "inflight", 0) > 0:
+                continue   # still generating — keep it queued
+            owned = self._pending_reload.pop(e.name)
             try:
                 client.post(e.url + "/internal/reload-config", json={"assigned": owned})
+                print(f"[front] reload-config pushed to idle engine '{e.name}' "
+                      f"({len(owned)} models)", flush=True)
             except Exception as exc:
-                print(f"[front] reload-config push to '{e.name}' failed: {exc}",
+                # Push failed (engine may have gone busy/unhealthy mid-call); requeue.
+                self._pending_reload[e.name] = owned
+                print(f"[front] reload-config push to '{e.name}' failed: {exc}; requeued",
                       flush=True)
-        print(f"[front] models.json changed — re-pushed assignment "
-              f"({', '.join(f'{e.name}:{len(assignment.get(e.name, []))}' for e in self.registry.all())})",
-              flush=True)
 
     def _poll_loop(self) -> None:
         _auth = ({"x-coderai-internal": self.internal_token}
@@ -513,6 +536,7 @@ class EngineSupervisor:
             self._assign_mtime = 0.0
         while not self._stopped.is_set():
             self._push_assignment_if_changed(client)
+            self._flush_pending_reloads(client)   # deliver queued reloads to idle engines
             for engine in self.registry.all():
                 # Respawn engines whose process has exited.
                 if engine.proc is not None and engine.proc.poll() is not None:
