@@ -332,6 +332,8 @@ class EngineSupervisor:
         # auto-pick CUDA, and vice-versa.
         if engine.backend and engine.backend != "auto":
             env["CODERAI_ENGINE_BACKEND"] = engine.backend
+        # The engine names its own process (coderai-<name>) from this.
+        env["CODERAI_ENGINE_NAME"] = str(engine.name)
         cmd = self._engine_cmd(engine.port)
         tag = engine.name + (f"(gpu{engine.gpu})" if engine.gpu is not None else "")
         print(f"[front] launching {tag} on port {engine.port}: {' '.join(cmd)}", flush=True)
@@ -341,6 +343,18 @@ class EngineSupervisor:
             preexec_fn=_engine_preexec if os.name == "posix" else None,
         )
         engine.proc = proc
+        # Enlarge the kernel pipe buffer for this engine's stdout. The engine
+        # prints (incl. large --debug dumps) synchronously from its event-loop
+        # thread; if this pipe fills before the pump thread drains it, that
+        # print() BLOCKS and freezes the engine's event loop — the front then
+        # sees the health poll stall and flips the engine to 'not responding'.
+        # A bigger buffer absorbs bursts so a momentary drain lag can't stall it.
+        try:
+            import fcntl
+            F_SETPIPE_SZ = 1031  # not exposed as fcntl.F_SETPIPE_SZ on all builds
+            fcntl.fcntl(proc.stdout.fileno(), F_SETPIPE_SZ, 1 << 20)  # 1 MiB
+        except Exception:
+            pass
         tail = self._logs.setdefault(engine.id, collections.deque(maxlen=30))
         threading.Thread(target=self._pump_logs, args=(tag, proc, tail, engine),
                          daemon=True).start()

@@ -142,6 +142,27 @@ def _debug_requests_enabled() -> bool:
     return bool(getattr(global_args, 'debug_requests', False)) if global_args else False
 
 
+def _clip_for_log(s, limit: int = 4000) -> str:
+    """Bound a string for debug printing so a huge (e.g. runaway/prompt-echoing)
+    generation can't be dumped in full.
+
+    The engine writes stdout to a PIPE drained by the front; a multi-megabyte
+    synchronous print fills the pipe and BLOCKS the print() call. These debug
+    dumps run on the event-loop thread (inside the streaming generator), so a
+    blocked print freezes the whole engine and the front's health poll flips it
+    to 'not responding'. Keeping the head and tail bounds the write while still
+    showing both ends of the output."""
+    try:
+        s = s if isinstance(s, str) else str(s)
+    except Exception:
+        return "<unprintable>"
+    if len(s) <= limit:
+        return s
+    head = limit * 3 // 4
+    tail = limit - head
+    return f"{s[:head]}\n… [clipped {len(s) - limit} chars] …\n{s[-tail:]}"
+
+
 class _ToolCallStreamGate:
     """Hold back streamed content once a tool-call marker appears, so a model's
     tool call (e.g. gemma's ``<|tool_call>call:NAME{…}``) isn't leaked to the client
@@ -1611,15 +1632,15 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     print(f"=== RAW STREAM: FULL GENERATED TEXT (DEBUG) ===")
                     print(f"{'='*80}")
                     print(f"--- SECOND PASS RESULT ---")
-                    print(second_pass_result)
+                    print(_clip_for_log(second_pass_result))
                     print(f"--- END SECOND PASS RESULT ---")
                     print(f"{'='*80}\n")
-                    
+
                     # Also dump the reasoning text from first pass
                     print(f"\n{'='*80}")
                     print(f"=== RAW STREAM: REASONING TEXT (DEBUG) ===")
                     print(f"{'='*80}")
-                    print(reasoning_text)
+                    print(_clip_for_log(reasoning_text))
                     print(f"{'='*80}\n")
                 
                 # Try to extract tool calls from the second pass result ONLY
@@ -1685,7 +1706,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                             print(f"\n{'='*80}")
                             print(f"=== RAW STREAM: EXTRACTED TOOL CALLS (DEBUG) ===")
                             print(f"{'='*80}")
-                            print(json.dumps(extracted_tool_calls, indent=2))
+                            print(_clip_for_log(json.dumps(extracted_tool_calls, indent=2)))
                             print(f"{'='*80}\n")
                         elif get_global_debug():
                             print(f"DEBUG: No tool calls found in raw stream")
@@ -1774,9 +1795,9 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             print(f"{'='*80}")
             print(f"Close tag used: {close_tag}")
             print(f"\n--- REASONING TEXT ---")
-            print(reasoning_text)
+            print(_clip_for_log(reasoning_text))
             print(f"\n--- FINAL TEXT (before cleanup) ---")
-            print(final_text)
+            print(_clip_for_log(final_text))
             print(f"{'='*80}\n")
         
         # Clean up control tokens from final text
@@ -1978,7 +1999,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
             print(f"\n{'='*80}")
             print(f"=== RAW MODE PARSED OUTPUT (DUMP) ===")
             print(f"{'='*80}")
-            print(json.dumps(formatted_response, indent=2))
+            print(_clip_for_log(json.dumps(formatted_response, indent=2)))
             print(f"{'='*80}\n")
         
         # Add rate limit headers
@@ -2618,10 +2639,10 @@ async def stream_chat_response(
             print(f"{'='*80}")
             # Show both raw (actual) content and escaped representation
             print(f"--- RAW CONTENT (actual newlines shown as lines) ---")
-            print(generated_text)
+            print(_clip_for_log(generated_text))
             print(f"--- END RAW CONTENT ---")
             print(f"--- ESCAPED CONTENT (repr() - shows \\n for newlines) ---")
-            print(repr(generated_text))
+            print(_clip_for_log(repr(generated_text)))
             print(f"--- END ESCAPED CONTENT ---")
             print(f"{'='*80}\n")
         
@@ -2877,7 +2898,7 @@ async def generate_chat_response(
             print(f"\n{'='*80}")
             print(f"=== RAW MODEL OUTPUT (DUMP) ===")
             print(f"{'='*80}")
-            print(generated_text)
+            print(_clip_for_log(generated_text))
             print(f"{'='*80}\n")
         
         # Separate the model's thinking from the answer. Surface it as a reasoning
@@ -3026,7 +3047,7 @@ async def generate_chat_response(
             print(f"\n{'='*80}")
             print(f"=== PARSED OUTPUT (DUMP) ===")
             print(f"{'='*80}")
-            print(json.dumps(formatted_response, indent=2))
+            print(_clip_for_log(json.dumps(formatted_response, indent=2)))
             print(f"{'='*80}\n")
 
         log_response_payload(formatted_response, streamed=False)

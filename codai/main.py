@@ -339,10 +339,22 @@ def main():
         original_unraisablehook(unraisable)
     sys.unraisablehook = suppress_llama_del_errors
     
-    # Optional: set process name if setproctitle is available
+    # Optional: set process name if setproctitle is available. Name by role so
+    # the front and each engine are distinguishable in ps/top/htop:
+    #   front process      → coderai-front
+    #   per-backend engine → coderai-<enginename>  (name passed via env at spawn)
+    #   legacy single proc → coderai
     try:
         import setproctitle
-        setproctitle.setproctitle("codai")
+        _argv = sys.argv[1:]
+        if "--engine-only" in _argv:
+            _ename = os.environ.get("CODERAI_ENGINE_NAME") or "engine"
+            _proc_name = f"coderai-{_ename}"
+        elif "--single-process" in _argv:
+            _proc_name = "coderai"
+        else:
+            _proc_name = "coderai-front"
+        setproctitle.setproctitle(_proc_name)
     except ImportError:
         pass
     
