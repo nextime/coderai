@@ -95,6 +95,11 @@ class ModelsConfig:
     # Per-engine overrides for max_model_instances, keyed by engine name
     # (e.g. {"nvidia": 2, "radeon": 1}). Applied per-engine process; blank = default.
     max_model_instances_overrides: dict = field(default_factory=dict)
+    # Node-wide cap on a reply's max_tokens. A client's requested max_tokens is
+    # honored only when it is SMALLER than this; a larger (or absent) request is
+    # clamped to this value. None = no cap (use the client's value, or the 2048
+    # fallback). Overridable per-model via the models.json entry's "max_tokens".
+    max_tokens: Optional[int] = None
 
 
 @dataclass

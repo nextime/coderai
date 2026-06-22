@@ -608,6 +608,55 @@ async def _slice_oversized(manager, messages, target, compact_n_ctx, progress=No
     return out
 
 
+def _model_max_tokens(request):
+    """Model-level max_tokens cap, or None when unset.
+
+    Per-model models.json ``max_tokens`` wins; otherwise the node-wide
+    ``models.max_tokens``. This is the authority for a reply's length: the
+    client's request is honored only when it is smaller (see _clamp_max_tokens)."""
+    try:
+        from codai.models.manager import multi_model_manager as _mmm
+        _cc = _mmm._config_for_model(getattr(request, "model", None) or "") or {}
+    except Exception:
+        _cc = {}
+    _raw = _cc.get("_raw_cfg") if isinstance(_cc, dict) else None
+    if not isinstance(_raw, dict):
+        _raw = {}
+    _v = None
+    if isinstance(_cc, dict) and _cc.get("max_tokens") is not None:
+        _v = _cc.get("max_tokens")
+    elif _raw.get("max_tokens") is not None:
+        _v = _raw.get("max_tokens")
+    else:
+        try:
+            from codai.admin.routes import config_manager as _cm
+            if _cm is not None and getattr(_cm, "config", None) is not None:
+                _v = getattr(_cm.config.models, "max_tokens", None)
+        except Exception:
+            _v = None
+    try:
+        _v = int(_v) if _v is not None else None
+    except (TypeError, ValueError):
+        _v = None
+    return _v if (_v and _v > 0) else None
+
+
+def _clamp_max_tokens(request):
+    """Enforce the model-level max_tokens authority: honor the client's value only
+    when it is smaller than the model-level cap; otherwise use the model-level cap.
+    No-op when no model-level cap is configured (keeps the client's value / 2048
+    fallback)."""
+    cap = _model_max_tokens(request)
+    if not cap:
+        return
+    cur = getattr(request, "max_tokens", None)
+    try:
+        cur = int(cur) if cur is not None else None
+    except (TypeError, ValueError):
+        cur = None
+    request.max_tokens = min(cur, cap) if (cur and cur > 0) else cap
+
+
 def _resolve_compaction(request, current_manager):
     """Resolve effective auto-compaction settings for a request by merging the
     per-model config over the global ``compaction`` defaults. Returns a plan dict
@@ -1422,6 +1471,11 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         # A list is legitimate multipart vision content — leave it intact.
         elif not isinstance(m["content"], str) and not isinstance(m["content"], list):
             messages_dict[i]["content"] = str(m["content"])
+
+    # Model-level max_tokens authority: clamp the client's requested reply length
+    # to the model-level cap (client honored only when smaller). Done before
+    # compaction so the window-fit trim works off the clamped value.
+    _clamp_max_tokens(request)
 
     # Auto-compact (per-model or global, OFF by default): when the prompt nears
     # the model's context window, shrink it using the configured strategy
