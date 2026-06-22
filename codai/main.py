@@ -149,6 +149,12 @@ def build_runtime_kwargs(model_cfg, model_type):
         'no_ram':          model_cfg.get('no_ram', False),
         'n_gpu_layers':    model_cfg.get('n_gpu_layers', -1),
         'force_vram_update': model_cfg.get('force_vram_update', False),
+        # Cross-GPU split (per-model). Must be promoted to TOP-LEVEL kwargs: the
+        # manager's _cfg_or_global('gpu_split',…) reads config['gpu_split'] (not
+        # _raw_cfg), so without this a model set to "Split — <card> first" loaded
+        # confined to one card and spilled to CPU instead of using the 2nd GPU.
+        'gpu_split':       bool(model_cfg.get('gpu_split', False)),
+        'tensor_split':    model_cfg.get('tensor_split'),
         '_raw_cfg':        dict(model_cfg) if isinstance(model_cfg, dict) else {},
     }
     if model_type == "text":
@@ -221,6 +227,28 @@ def apply_model_entry_live(entry, model_types) -> int:
         except Exception:
             return "off"
 
+    # Settings that only take effect when the model is (re)loaded — they're baked
+    # into the llama.cpp/pipeline at construction time and can't be changed on an
+    # already-resident model. If a save changes any of these AND the model is loaded,
+    # we evict it so the next request reloads with the new config — i.e. the change
+    # applies immediately, no server restart.
+    _LOAD_AFFECTING = (
+        "n_ctx", "context_size", "n_gpu_layers", "gpu_split", "tensor_split",
+        "cache_type_k", "cache_type_v", "kv_offload", "n_batch", "n_ubatch",
+        "n_seq_max", "flash_attention", "flash_attn", "load_in_4bit", "load_in_8bit",
+        "offload_strategy", "no_ram", "max_gpu_percent", "mmproj", "quant_backend",
+        "engine", "precision", "vae_path", "vae_tiling", "component_quantization",
+    )
+
+    def _load_sig(c):
+        """Signature of the load-affecting fields of a config (raw entry preferred)."""
+        if not isinstance(c, dict):
+            return ""
+        src = c.get("_raw_cfg") if isinstance(c.get("_raw_cfg"), dict) else c
+        import json as _json
+        return _json.dumps({k: src.get(k) for k in _LOAD_AFFECTING},
+                           sort_keys=True, default=str)
+
     updated = 0
     for cat in (model_types or []):
         tp = _CATEGORY_TYPE_PREFIX.get(cat)
@@ -242,13 +270,14 @@ def apply_model_entry_live(entry, model_types) -> int:
         # so the NEXT request for this model reloads with the new acceleration —
         # applied immediately, no server restart.
         try:
-            if (key in multi_model_manager.models
-                    and _accel_sig(old_cfg) != _accel_sig(cfg)):
-                if multi_model_manager.unload_model(key):
-                    print(f"  [admin] acceleration changed for {key} — model "
-                          f"evicted; next request reloads with the new setting")
+            if key in multi_model_manager.models:
+                _changed = (_accel_sig(old_cfg) != _accel_sig(cfg)
+                            or _load_sig(old_cfg) != _load_sig(cfg))
+                if _changed and multi_model_manager.unload_model(key):
+                    print(f"  [admin] load-affecting config changed for {key} — model "
+                          f"evicted; next request reloads with the new settings")
         except Exception as _e:
-            print(f"  [admin] accel-evict skipped for {key}: {_e}")
+            print(f"  [admin] live-reload evict skipped for {key}: {_e}")
         alias = entry.get("alias")
         if alias:
             try:
