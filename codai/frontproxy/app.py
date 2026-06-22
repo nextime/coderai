@@ -27,6 +27,7 @@ from starlette.background import BackgroundTask
 from codai.frontproxy.registry import EngineRegistry
 from codai.frontproxy.engine_supervisor import EngineSupervisor
 from codai.frontproxy import router as _router
+from codai.frontproxy.reqqueue import FrontQueue, QueueFull
 
 # Hop-by-hop headers that must not be forwarded verbatim (RFC 7230 §6.1) plus
 # length/host headers that the client/StreamingResponse recompute.
@@ -60,6 +61,9 @@ class FrontProxy:
         # freshly-added one) would flicker out of the aggregated /v1/models while
         # it loads. Keyed by engine name.
         self._engine_models_cache: dict = {}
+        # Front-managed generation queue: admission control + ordering + queue
+        # position, sized per-model to max_instances so the engine never queues.
+        self.reqqueue = FrontQueue()
         self.registry = EngineRegistry()
         self.supervisor: Optional[EngineSupervisor] = None
         # Per-run secret shared only with the engines (passed via env at spawn). The
@@ -226,6 +230,22 @@ class FrontProxy:
         # Signed with the internal token; the engine accepts it only if it matches.
         if self.internal_token:
             send_headers["x-coderai-broker-authed"] = self.internal_token
+        # Front-managed generation queue (text only) — same per-model gate as the
+        # direct proxy path, so brokered and direct requests share one queue.
+        _qkey = None
+        if (method.upper() == "POST" and _router.is_inference_path(path)
+                and self._task_kind(path) == "text"):
+            _qkey = self._queue_key(model)
+            try:
+                await self.reqqueue.acquire(
+                    _qkey, self._model_capacity(model), self._queue_max_waiting(),
+                    rid=engine.name + ":" + (model or ""), model=model or "",
+                    engine=engine.name)
+            except QueueFull:
+                return {"status_code": 503,
+                        "headers": {"content-type": "application/json"},
+                        "body": b'{"error":"Server busy: the generation queue is '
+                                b'full, please retry shortly."}'}
         # Count brokered inference as in-flight too (with metadata) so it shows on
         # the Tasks page even when the engine is too busy to report it itself.
         _rid = engine.enter_request(
@@ -244,6 +264,8 @@ class FrontProxy:
                              % (engine.id, exc)).encode()}
         finally:
             engine.exit_request(_rid)
+            if _qkey is not None:
+                await self.reqqueue.release(_qkey)
         # Surface the engine's actual reply so a brokered request that "doesn't get
         # executed" (e.g. an instant small error body) is diagnosable from the log.
         print("[front] broker route: %s %s -> engine#%s(%s) status=%s bytes=%d preview=%r"
@@ -299,7 +321,10 @@ class FrontProxy:
                        # list should display so each model shows once, by its id.
                        "model_id": (m.get("id") or m.get("path")
                                     or m.get("alias") or "").strip() or None,
-                       "engine_fallback": bool(m.get("engine_fallback"))}
+                       "engine_fallback": bool(m.get("engine_fallback")),
+                       # Per-model concurrency ceiling — the front queue sizes its
+                       # gate to this so it never over-subscribes the engine.
+                       "max_instances": m.get("max_instances")}
                 for field_ in (m.get("path"), m.get("id"), m.get("alias")):
                     if not field_:
                         continue
@@ -314,6 +339,28 @@ class FrontProxy:
                         info[base[:-5]] = rec
                         info[f[:-5]] = rec
         return info
+
+    def _queue_key(self, model: Optional[str]) -> str:
+        """Stable gate key for a model: its canonical id (so every alias/path of
+        the same model shares one gate), else the raw model string."""
+        info = self._model_info(model)
+        return (info.get("model_id") or model or "").lower()
+
+    def _model_capacity(self, model: Optional[str]) -> int:
+        """Per-model concurrency = its max_instances, falling back to the global
+        server default. This is the number of front queue slots for the model."""
+        info = self._model_info(model)
+        mi = info.get("max_instances")
+        if mi:
+            try:
+                return max(1, int(mi))
+            except (TypeError, ValueError):
+                pass
+        _models = getattr(self.config, "models", None)
+        return max(1, int(getattr(_models, "max_model_instances", 1) or 1))
+
+    def _queue_max_waiting(self) -> int:
+        return max(0, int(getattr(self.config.server, "queue_max_size", 6) or 0))
 
     def _required_cap(self, path: str, model: Optional[str]) -> Optional[str]:
         ds4 = getattr(self.config, "ds4", None)
@@ -704,6 +751,26 @@ class FrontProxy:
                     "pausable": False,
                     "restartable": False,
                 })
+        # Front-queued (not yet running) generations: requests waiting on the
+        # front's per-model gate. The engine hasn't seen them yet, so only the
+        # front can report them — show each with its queue position.
+        for q in self.reqqueue.snapshot():
+            merged.append({
+                "id": f"queued-{q.get('rid')}-{q.get('position')}",
+                "kind": "text",
+                "title": (q.get("model") or "generation"),
+                "model": q.get("model") or "",
+                "status": "queued",
+                "position": q.get("position"),
+                "step": 0, "total": 0, "rate": 0.0,
+                "message": f"queued (#{q.get('position')})",
+                "started_at": q.get("enqueued_at"),
+                "engine": q.get("engine"),
+                "active": True,
+                "cancellable": True,
+                "pausable": False,
+                "restartable": False,
+            })
         return merged
 
     # -------------------------------------------------------------------- proxy
@@ -729,6 +796,26 @@ class FrontProxy:
                 {"error": "No engine is ready yet (still starting/loading)."},
                 status_code=503)
 
+        # Front-managed generation queue (text only). Acquire a per-model slot
+        # before dispatching: if all max_instances slots are busy this awaits
+        # (showing as "queued" on the Tasks page) until one frees; if too many are
+        # already waiting it returns 503. A client disconnect while queued cancels
+        # this await and drops it from the queue. Other inference kinds (images,
+        # audio, embeddings…) pass through unqueued.
+        _qkey = None
+        if (method == "POST" and _router.is_inference_path(path)
+                and self._task_kind(path) == "text"):
+            _qkey = self._queue_key(model)
+            try:
+                await self.reqqueue.acquire(
+                    _qkey, self._model_capacity(model), self._queue_max_waiting(),
+                    rid=engine.name + ":" + (model or ""), model=model or "",
+                    engine=engine.name)
+            except QueueFull:
+                return JSONResponse(
+                    {"error": "Server busy: the generation queue is full, "
+                              "please retry shortly."}, status_code=503)
+
         url = engine.url + path
         headers = self._filter_headers(request.headers, _DROP_REQ)
         content = body_bytes if body_bytes is not None else request.stream()
@@ -747,6 +834,8 @@ class FrontProxy:
             rp_resp = await self._long.send(rp_req, stream=True)
         except Exception as exc:
             engine.exit_request(_rid)
+            if _qkey is not None:
+                await self.reqqueue.release(_qkey)
             return JSONResponse(
                 {"error": f"Engine#{engine.id} unreachable: {exc}"}, status_code=502)
 
@@ -755,6 +844,8 @@ class FrontProxy:
                 await rp_resp.aclose()
             finally:
                 engine.exit_request(_rid)
+                if _qkey is not None:
+                    await self.reqqueue.release(_qkey)
 
         # Measure throughput from the SSE stream the front relays, and publish it on
         # the in-flight metadata. This gives the Tasks page a live it/s for the
