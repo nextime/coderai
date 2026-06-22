@@ -10,6 +10,12 @@
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="{{ root_path }}/static/admin/style.css">
   <script>const ROOT_PATH = "{{ root_path }}";</script>
+  <style>
+    /* Pulsing dot shown on a model's engine tag while it is serving a request. */
+    @keyframes craiPulse { 0%,100% { opacity: 1 } 50% { opacity: .2 } }
+    .crai-run-dot { color: #3fb950; animation: craiPulse 1s ease-in-out infinite;
+                    margin-right: .25rem; font-size: 1.1em; line-height: 0 }
+  </style>
   <script>
   // ── Batched page bootstrap ────────────────────────────────────────────────
   // A page's first paint often needs ~10 /admin/api reads. Fired as separate

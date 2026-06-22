@@ -638,14 +638,29 @@ class FrontProxy:
                         "pid": pid})
         return out
 
+    def _running_models(self) -> list:
+        """Canonical ids of models currently SERVING a request, from the front's
+        own in-flight tracking (engine.active). Front-native, so it's accurate even
+        while the engine is too busy to answer its own status."""
+        running = set()
+        for e in self.registry.all():
+            for _rid, m in list((e.active or {}).items()):
+                mid = m.get("model")
+                if mid:
+                    running.add(self._model_info(mid).get("model_id") or mid)
+        return sorted(running)
+
     async def model_loaded_status(self, request: Request):
         """Proxy /admin/api/model-loaded-status to the primary, then union in the
         models loaded on every *other* engine. Otherwise the models page only sees
         the primary engine's pool and shows models loaded on a secondary (e.g. the
-        radeon engine) as idle."""
+        radeon engine) as idle. Also adds ``running`` — models actively serving a
+        request — from the front's own in-flight tracking."""
         prim = self.registry.primary()
+        running = self._running_models()
         if prim is None:
-            return JSONResponse({"loaded": [], "instances": {}, "configured_max": {}})
+            return JSONResponse({"loaded": [], "instances": {}, "configured_max": {},
+                                 "running": running})
         try:
             headers = self._filter_headers(request.headers, _DROP_REQ)
             r = await self._short.get(prim.url + request.url.path, headers=headers,
@@ -656,7 +671,8 @@ class FrontProxy:
                                 media_type=r.headers.get("content-type"))
             data = r.json()
         except Exception:
-            return JSONResponse({"loaded": [], "instances": {}, "configured_max": {}})
+            return JSONResponse({"loaded": [], "instances": {}, "configured_max": {},
+                                 "running": running})
         if isinstance(data, dict):
             loaded = set(data.get("loaded") or [])
             for e in self.registry.all():
@@ -664,6 +680,7 @@ class FrontProxy:
                     continue
                 loaded |= e.loaded_models
             data["loaded"] = sorted(loaded)
+            data["running"] = running
         return JSONResponse(data)
 
     async def _forward_to_engine(self, request: Request, engine, body: bytes):

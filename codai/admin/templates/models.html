@@ -2017,15 +2017,21 @@ function _engineTagHtml(m, s){
   // Cross-GPU split: the model runs on `eng` (its lead card) but spills onto the
   // other GPU(s) for extra VRAM. Show it in the tag so the list makes the split
   // visible, e.g. "nvidia ⇄split 📌".
+  // Live "serving a request now" indicator inside the engine tag. The dot is also
+  // toggled in-place by updateRunningDots() on a fast poll (no list re-render).
+  const mkey = esc(((m && (m.id || m.path || m.filename)) || '') + '');
+  const running = _isModelRunning(m);
+  const dot = running ? '<span class="crai-run-dot" title="Serving a request now">●</span>' : '';
+  const runTitle = running ? ' — serving a request now' : '';
   const split = !!(s && s.gpu_split);
   if(split){
     const ratio = ((s && s.tensor_split) || '').trim();
     const title = 'Loads on ' + eng + ', split across all GPUs ('
-                + (ratio ? ('ratio ' + ratio) : 'auto by free VRAM') + ')';
-    return `<span class="badge" title="${esc(title)}" style="font-size:9px;padding:.05rem .3rem;margin:.1rem .1rem 0 0;vertical-align:middle;border:1px solid ${color};color:${color};background:transparent">${esc(eng)} ⇄split${pinned?' 📌':''}</span>`;
+                + (ratio ? ('ratio ' + ratio) : 'auto by free VRAM') + ')' + runTitle;
+    return `<span class="badge eng-tag" data-model="${mkey}" title="${esc(title)}" style="font-size:9px;padding:.05rem .3rem;margin:.1rem .1rem 0 0;vertical-align:middle;border:1px solid ${color};color:${color};background:transparent">${dot}${esc(eng)} ⇄split${pinned?' 📌':''}</span>`;
   }
-  const title = pinned ? ('Pinned to engine: ' + eng) : ('Runs on: ' + eng + ' (auto)');
-  return `<span class="badge" title="${esc(title)}" style="font-size:9px;padding:.05rem .3rem;margin:.1rem .1rem 0 0;vertical-align:middle;border:1px solid ${color};color:${color};background:transparent">${esc(eng)}${pinned?' 📌':''}</span>`;
+  const title = (pinned ? ('Pinned to engine: ' + eng) : ('Runs on: ' + eng + ' (auto)')) + runTitle;
+  return `<span class="badge eng-tag" data-model="${mkey}" title="${esc(title)}" style="font-size:9px;padding:.05rem .3rem;margin:.1rem .1rem 0 0;vertical-align:middle;border:1px solid ${color};color:${color};background:transparent">${dot}${esc(eng)}${pinned?' 📌':''}</span>`;
 }
 
 function _renderConfigPills(idx, m) {
@@ -2661,6 +2667,7 @@ function getWhisperServerModelPath(){
 
 let _loadedKeys = new Set();
 let _instanceInfo = {};   // loaded_key -> {loaded: N, max: N}
+let _runningKeys = new Set();   // model ids currently SERVING a request (front-tracked)
 
 async function refreshLoadedStatus(){
   try{
@@ -2669,9 +2676,48 @@ async function refreshLoadedStatus(){
       const d = await r.json();
       _loadedKeys = new Set(d.loaded||[]);
       _instanceInfo = d.instances || {};
+      _runningKeys = new Set(d.running||[]);
     }
   }catch{}
 }
+
+// True when a model is actively serving a request right now (any engine).
+function _runKeyMatch(key){
+  if(!key) return false;
+  key = '' + key;
+  return _runningKeys.has(key) || _runningKeys.has(key.split('/').pop());
+}
+function _isModelRunning(m){
+  if(!m) return false;
+  for(const c of [m.id, m.path, m.filename, m.alias].filter(Boolean).map(x=>''+x)){
+    if(_runKeyMatch(c)) return true;
+  }
+  return false;
+}
+
+// Toggle the pulsing "serving now" dot on every engine tag in place — no list
+// re-render (which would re-hit the slow cache scan), so it stays cheap to poll.
+function updateRunningDots(){
+  document.querySelectorAll('.eng-tag[data-model]').forEach(el => {
+    const on = _runKeyMatch(el.getAttribute('data-model'));
+    let dot = el.querySelector('.crai-run-dot');
+    if(on && !dot){
+      dot = document.createElement('span');
+      dot.className = 'crai-run-dot'; dot.title = 'Serving a request now';
+      dot.textContent = '●';
+      el.insertBefore(dot, el.firstChild);
+    } else if(!on && dot){
+      dot.remove();
+    }
+  });
+}
+// Poll the front's (fast, native) loaded-status for the live running set and
+// reflect it on the tags. model-loaded-status carries `running`.
+setInterval(async () => {
+  if(document.visibilityState === 'hidden') return;
+  await refreshLoadedStatus();
+  updateRunningDots();
+}, 2000);
 
 function _findLoadedKey(paths){
   for(const p of paths){
