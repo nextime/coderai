@@ -225,19 +225,23 @@ def _sync_whisper_runner(model_path: str, model_entry: dict) -> bool:
 
 
 def get_current_user(request: Request) -> Optional[str]:
-    """Get the current logged-in user from session cookie."""
+    """Get the current logged-in user from the session cookie.
+
+    Validates whichever ``session`` / ``session_<port>`` cookie is present by HMAC
+    signature, so the exact (port-derived) cookie name doesn't matter — the front,
+    an engine and the coderai-system worker bind different ports yet must all accept
+    the same browser cookie."""
     if session_manager is None:
         return None
-    
-    cookie = request.cookies.get(SESSION_COOKIE_NAME)
-    if not cookie:
-        return None
-    
-    # Handle MUST_CHANGE flag
-    if cookie.endswith(".MUST_CHANGE"):
-        cookie = cookie[:-12]  # Remove .MUST_CHANGE suffix
-    
-    return session_manager.validate_session(cookie)
+    for k, v in request.cookies.items():
+        if k != "session" and not k.startswith("session_"):
+            continue
+        if v.endswith(".MUST_CHANGE"):
+            v = v[:-12]
+        user = session_manager.validate_session(v)
+        if user:
+            return user
+    return None
 
 
 def require_auth(request: Request) -> str:

@@ -272,10 +272,11 @@ class EngineSupervisor:
         return engines
 
     # ------------------------------------------------------------------ spawning
-    def _engine_cmd(self, port: int) -> list:
-        """Build the command to relaunch this codebase as an engine."""
+    def _engine_cmd(self, port: int, mode: str = "--engine-only") -> list:
+        """Build the command to relaunch this codebase as an engine (or, with
+        mode='--system-only', the coderai-system worker)."""
         # sys.argv[0] is the launcher script (``coderai``); preserve all original
-        # args (config dir, model selection, …) and append the engine flags. Strip
+        # args (config dir, model selection, …) and append the worker flags. Strip
         # any flag that would re-trigger front mode or fix a different port.
         passthrough = []
         skip_next = False
@@ -283,14 +284,14 @@ class EngineSupervisor:
             if skip_next:
                 skip_next = False
                 continue
-            if a == "--engine-only":
+            if a in ("--engine-only", "--system-only"):
                 continue
             if a == "--internal-port":
                 skip_next = True
                 continue
             passthrough.append(a)
         return [sys.executable, sys.argv[0], *passthrough,
-                "--engine-only", "--internal-port", str(port)]
+                mode, "--internal-port", str(port)]
 
     def _spawn(self, engine: Engine) -> None:
         env = dict(os.environ)
@@ -335,7 +336,10 @@ class EngineSupervisor:
             env["CODERAI_ENGINE_BACKEND"] = engine.backend
         # The engine names its own process (coderai-<name>) from this.
         env["CODERAI_ENGINE_NAME"] = str(engine.name)
-        cmd = self._engine_cmd(engine.port)
+        cmd = self._engine_cmd(
+            engine.port,
+            mode="--system-only" if getattr(engine, "role", "engine") == "system"
+                 else "--engine-only")
         tag = engine.name + (f"(gpu{engine.gpu})" if engine.gpu is not None else "")
         print(f"[front] launching {tag} on port {engine.port}: {' '.join(cmd)}", flush=True)
         proc = subprocess.Popen(
@@ -464,6 +468,13 @@ class EngineSupervisor:
         for engine in engines:
             self.registry.add(engine)
             self._spawn(engine)
+        # The coderai-system worker: cache scan + HF downloads + cache management,
+        # off the GPU engines so they never block generation. One instance.
+        sysw = Engine(id=900, gpu=None, port=self._alloc_port(), role="system",
+                      name="system", backend="none")
+        self._system_worker = sysw
+        self.registry.add(sysw)
+        self._spawn(sysw)
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._poll_thread.start()
         atexit.register(self.stop_all)
@@ -472,8 +483,13 @@ class EngineSupervisor:
         """When models.json changes (admin add/remove model), re-compute the
         per-engine assignment and push it live to every engine + the front's
         router, so /v1/models and routing reflect the change without a restart."""
-        if not self.models_path or len(self.registry.all()) < 2:
+        if not self.models_path:
             return
+        # The coderai-system worker isn't an inference engine — exclude it from
+        # assignment (it owns no models), but still queue it a reload so it re-reads
+        # models.json (its cache view reflects admin add/remove).
+        real = [e for e in self.registry.all()
+                if getattr(e, "role", "engine") != "system"]
         try:
             mtime = os.path.getmtime(self.models_path)
         except OSError:
@@ -481,26 +497,26 @@ class EngineSupervisor:
         if mtime == self._assign_mtime:
             return
         self._assign_mtime = mtime
-        try:
-            from codai.frontproxy.assignment import compute_assignment
-            default_engine = getattr(self.config.server, "default_engine", None)
-            ds4 = getattr(self.config, "ds4", None)
-            assignment = compute_assignment(self.registry.all(), self.models_path,
-                                            default_engine, ds4)
-        except Exception as exc:
-            print(f"[front] live reassignment skipped: {exc}", flush=True)
-            return
+        assignment = {}
+        if len(real) >= 2:
+            try:
+                from codai.frontproxy.assignment import compute_assignment
+                default_engine = getattr(self.config.server, "default_engine", None)
+                ds4 = getattr(self.config, "ds4", None)
+                assignment = compute_assignment(real, self.models_path,
+                                                default_engine, ds4)
+            except Exception as exc:
+                print(f"[front] live reassignment skipped: {exc}", flush=True)
+                assignment = {}
+            for e in real:
+                e.assigned_models = set(assignment.get(e.name, []))
+        # Queue a reload to EVERY worker (engines + system) so they re-read
+        # models.json. Pushing to a mid-generation engine would block on its GIL, so
+        # _flush_pending_reloads() delivers each once that worker is idle.
         for e in self.registry.all():
-            owned = assignment.get(e.name, [])
-            e.assigned_models = set(owned)   # update the front's router (local, instant)
-            # Pushing /internal/reload-config to an engine that's mid-generation would
-            # block on its GIL and time out, freezing this poll thread. Queue the push
-            # instead and let _flush_pending_reloads() deliver it once the engine idles.
-            self._pending_reload[e.name] = owned
-        print(f"[front] models.json changed — assignment recomputed "
-              f"({', '.join(f'{e.name}:{len(assignment.get(e.name, []))}' for e in self.registry.all())}); "
-              f"reload queued until each engine is idle",
-              flush=True)
+            self._pending_reload[e.name] = assignment.get(e.name, [])
+        print(f"[front] models.json changed — reload queued for "
+              f"{', '.join(e.name for e in self.registry.all())}", flush=True)
         self._flush_pending_reloads(client)
 
     def _flush_pending_reloads(self, client) -> None:

@@ -45,6 +45,20 @@ _DROP_REQ = _HOP_BY_HOP | {"host", "content-length", "x-coderai-internal",
 # request, flooding the terminal. Strip them here so each appears exactly once.
 _DROP_RESP = _HOP_BY_HOP | {"content-length", "date", "server"}
 
+# Admin paths handled by the coderai-system worker (cache scan, HF downloads, cache
+# management) rather than a GPU engine — so they stay responsive during generation
+# and survive engine restarts. Matched as substrings of the request path.
+_SYSTEM_PATHS = (
+    "/admin/api/cached-models", "/admin/api/cache-stats", "/admin/api/cache",
+    "/admin/api/model-download", "/admin/api/download-stream",
+    "/admin/api/downloads", "/admin/api/download-cancel",
+    "/admin/api/model-upload", "/admin/api/model-free-disk",
+    "/admin/api/hf-search", "/admin/api/hf-files", "/admin/api/hf-model-info",
+    "/admin/api/hf-model-files", "/admin/api/ds4/default-models",
+    "/admin/api/model-add-known", "/admin/api/model-mark-download",
+    "/admin/api/model-unmark-download",
+)
+
 
 class FrontProxy:
     def __init__(self, config, config_dir=None):
@@ -627,6 +641,8 @@ class FrontProxy:
     def engines_list(self) -> list:
         out = []
         for e in self.registry.all():
+            if getattr(e, "role", "engine") == "system":
+                continue   # the cache/downloads worker isn't a GPU engine tile
             try:
                 pid = e.proc.pid if e.proc else None
             except Exception:
@@ -926,10 +942,51 @@ class FrontProxy:
             })
         return merged
 
+    def _system_engine(self):
+        """The coderai-system worker, if it's up."""
+        for e in self.registry.all():
+            if getattr(e, "role", "engine") == "system" and e.is_alive():
+                return e
+        return None
+
+    async def _proxy_passthrough(self, request: Request, engine) -> Response:
+        """Stream a request through to a specific worker (used for the coderai-system
+        worker). The worker is always responsive, so the long (no-read-timeout)
+        client is safe and handles both buffered JSON and SSE (download-stream)."""
+        method = request.method
+        url = engine.url + request.url.path
+        headers = self._filter_headers(request.headers, _DROP_REQ)
+        content = (request.stream()
+                   if method in ("POST", "PUT", "PATCH") else None)
+        rp_req = self._long.build_request(method, url, headers=headers,
+                                          params=request.query_params, content=content)
+        try:
+            rp_resp = await self._long.send(rp_req, stream=True)
+        except Exception as exc:
+            return JSONResponse(
+                {"error": f"coderai-system worker unreachable: {exc}"}, status_code=502)
+
+        async def _release():
+            await rp_resp.aclose()
+
+        return StreamingResponse(
+            rp_resp.aiter_raw(), status_code=rp_resp.status_code,
+            headers=dict(self._filter_headers(rp_resp.headers, _DROP_RESP)),
+            media_type=rp_resp.headers.get("content-type"),
+            background=BackgroundTask(_release))
+
     # -------------------------------------------------------------------- proxy
     async def proxy(self, request: Request) -> Response:
         path = request.url.path
         method = request.method
+
+        # Cache scan / HF downloads / cache management → the coderai-system worker
+        # (off the GPU engines, always responsive). Falls through to normal routing
+        # if the worker isn't up yet.
+        if any(s in path for s in _SYSTEM_PATHS):
+            sysw = self._system_engine()
+            if sysw is not None:
+                return await self._proxy_passthrough(request, sysw)
 
         # Inference JSON bodies are small: buffer so we can route by `model`, then
         # forward the buffered bytes. Everything else streams through unbuffered.

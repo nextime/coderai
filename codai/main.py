@@ -345,6 +345,8 @@ def _set_proc_title():
         _ename = (os.environ.get("CODERAI_ENGINE_NAME")
                   or os.environ.get("CODERAI_ENGINE_BACKEND") or "engine")
         name = f"coderai-{_ename}"
+    elif "--system-only" in _argv:
+        name = "coderai-system"
     else:
         name = "coderai-front"
     try:
@@ -603,9 +605,22 @@ def main():
     #   --engine-only     → this process IS an engine: bind an internal localhost
     #                       port and run the full app below (the front spawns these).
     _engine_only = getattr(args, "engine_only", False)
-    if not _engine_only:
+    _system_only = getattr(args, "system_only", False)
+    if not _engine_only and not _system_only:
         from codai.frontproxy import run_front
         run_front(config, args)
+        return
+    if _system_only:
+        # The coderai-system worker: cache scan + HF downloads + cache mgmt only.
+        import uvicorn
+        from codai.system_app import build_system_app
+        _sport = int(getattr(args, "internal_port", None)
+                     or config.server.internal_port_base)
+        _set_proc_title()
+        _sapp = build_system_app(config, config_dir, internal_port=_sport)
+        print(f"[system] coderai-system serving on http://127.0.0.1:{_sport} "
+              f"(internal — reach it via the front)", flush=True)
+        uvicorn.run(_sapp, host="127.0.0.1", port=_sport, log_config=None)
         return
     if _engine_only:
         # Engines bind plain localhost HTTP; the front owns the public host + TLS.

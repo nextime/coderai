@@ -311,10 +311,17 @@ configuration directory (--config DIR, default: OS-specific CoderAI directory). 
              "intended to be run by hand.",
     )
     parser.add_argument(
+        "--system-only",
+        action="store_true",
+        help="Run this process as the coderai-system worker (cache scan, HF "
+             "downloads, cache management) on an internal localhost port. Launched "
+             "automatically by the front; not intended to be run by hand.",
+    )
+    parser.add_argument(
         "--internal-port",
         type=int,
         default=None,
-        help="Internal port for --engine-only mode (the front assigns one per engine).",
+        help="Internal port for --engine-only / --system-only mode (assigned by the front).",
     )
     parser.add_argument(
         "--debug-engine",

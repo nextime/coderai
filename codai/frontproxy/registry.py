@@ -55,6 +55,7 @@ class Engine:
     gpu: Optional[int]             # device hint for logs (CUDA/Vulkan index; None = n/a)
     port: int
     primary: bool = False          # the engine that owns admin/auth/config traffic
+    role: str = "engine"           # "engine" (GPU/inference) or "system" (cache/downloads worker)
     name: str = ""                 # human label for logs
     backend: str = "auto"          # nvidia | vulkan | … (forced for this engine)
     env: dict = field(default_factory=dict)        # extra env applied at spawn
@@ -89,6 +90,10 @@ class Engine:
             self.capabilities = set(_DEFAULT_CAPS.get(self.backend, {"transformers", "gguf"}))
 
     def can_serve(self, required_cap: Optional[str]) -> bool:
+        # The system worker (cache/downloads) never serves inference, so it must
+        # never be picked as an inference target — even for cap-less requests.
+        if self.role == "system":
+            return False
         return (not required_cap) or (required_cap in self.capabilities)
 
     def is_alive(self) -> bool:
