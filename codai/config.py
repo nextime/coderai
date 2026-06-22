@@ -41,12 +41,10 @@ class ServerConfig:
     # use the default above.
     max_parallel_requests_overrides: dict = field(default_factory=dict)
     # ─── Frontend/engine split ───────────────────────────────────────────────
-    # By default coderai boots a thin, always-responsive *front* reverse proxy on
-    # the public host/port and supervises one or more *engine* subprocesses (which
-    # do all GPU/model work) on internal localhost ports. This keeps the web UI
-    # responsive while a model loads or generates. Set single_process=True (or pass
-    # --single-process) to keep the legacy one-process behavior.
-    single_process: bool = False
+    # coderai boots a thin, always-responsive *front* reverse proxy on the public
+    # host/port and supervises one or more *engine* subprocesses (which do all
+    # GPU/model work) on internal localhost ports. This keeps the web UI responsive
+    # while a model loads or generates.
     internal_port_base: int = 8780      # first engine binds here; +1 per extra engine
     engines: int = 0                    # 0 = auto (one per detected GPU, min 1)
     engine_gpus: Optional[list] = None  # explicit GPU indices, e.g. [0, 1]; None = auto
@@ -595,7 +593,6 @@ class ConfigManager:
                 "queue_max_size": self.config.server.queue_max_size,
                 "max_parallel_requests": self.config.server.max_parallel_requests,
                 "max_parallel_requests_overrides": self.config.server.max_parallel_requests_overrides,
-                "single_process": self.config.server.single_process,
                 "internal_port_base": self.config.server.internal_port_base,
                 "engines": self.config.server.engines,
                 "engine_gpus": self.config.server.engine_gpus,

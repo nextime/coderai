@@ -304,13 +304,6 @@ configuration directory (--config DIR, default: OS-specific CoderAI directory). 
     )
     # ─── Frontend/engine split ───────────────────────────────────────────────
     parser.add_argument(
-        "--single-process",
-        action="store_true",
-        help="Run the legacy single-process server (UI/API and all model work in "
-             "one process). Default boots a front proxy + supervised engine "
-             "subprocess(es) so the web UI stays responsive during model work.",
-    )
-    parser.add_argument(
         "--engine-only",
         action="store_true",
         help="Run this process as an engine (binds an internal localhost port, no "

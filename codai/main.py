@@ -345,8 +345,6 @@ def _set_proc_title():
         _ename = (os.environ.get("CODERAI_ENGINE_NAME")
                   or os.environ.get("CODERAI_ENGINE_BACKEND") or "engine")
         name = f"coderai-{_ename}"
-    elif "--single-process" in _argv:
-        name = "coderai"
     else:
         name = "coderai-front"
     try:
@@ -604,10 +602,8 @@ def main():
     # below runs in it (so its event loop is never blocked by model work).
     #   --engine-only     → this process IS an engine: bind an internal localhost
     #                       port and run the full app below (the front spawns these).
-    #   --single-process  → legacy: one process, full app on the public port.
     _engine_only = getattr(args, "engine_only", False)
-    _single_process = getattr(args, "single_process", False) or config.server.single_process
-    if not _engine_only and not _single_process:
+    if not _engine_only:
         from codai.frontproxy import run_front
         run_front(config, args)
         return
@@ -1342,9 +1338,8 @@ def main():
     # Start the server
     import uvicorn
     # The bind target: an engine binds 127.0.0.1:<internal-port> with plain HTTP
-    # (the front owns the public host + TLS); single-process uses the configured
-    # public host/port/https. config.server keeps the CONFIGURED values either way
-    # so the settings API reports them correctly.
+    # (the front owns the public host + TLS). config.server keeps the CONFIGURED
+    # values so the settings API reports them correctly.
     if getattr(args, 'engine_only', False):
         bind_host = "127.0.0.1"
         bind_port = int(getattr(args, "internal_port", None)

@@ -283,7 +283,7 @@ class EngineSupervisor:
             if skip_next:
                 skip_next = False
                 continue
-            if a in ("--single-process", "--engine-only"):
+            if a == "--engine-only":
                 continue
             if a == "--internal-port":
                 skip_next = True
