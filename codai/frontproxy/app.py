@@ -1194,7 +1194,7 @@ def build_app(config, config_dir=None) -> FastAPI:
     # — answered from disk so they stay live while the engine is busy generating.
     try:
         from codai.frontproxy.admin_data import register_admin_data
-        register_admin_data(app, config_dir)
+        register_admin_data(app, config_dir, config=config)
     except Exception as _exc:
         print(f"[front] could not register local admin-data endpoints ({_exc}); "
               f"they will be proxied to the engine", flush=True)

@@ -3417,7 +3417,13 @@ async def api_get_settings(username: str = Depends(require_admin)):
     """Return current config.json as JSON."""
     if config_manager is None or config_manager.config is None:
         raise HTTPException(status_code=503, detail="Config manager not initialized")
-    c = config_manager.config
+    return build_settings_dict(config_manager.config, _detect_gpu_cards())
+
+
+def build_settings_dict(c, gpu_cards):
+    """Pure ``Config`` → settings dict. Shared by the engine handler and the front
+    proxy (which holds the same Config) so both serve an identical
+    /admin/api/settings without the front having to round-trip to the engine."""
     return {
         "server": {
             "host": c.server.host,
@@ -3469,7 +3475,7 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "split_card_caps_gb": c.offload.split_card_caps_gb,
             # Every physical card on the machine, so the UI can render a per-card cap
             # row (key + name) and the user can cap each independently.
-            "gpu_cards": _detect_gpu_cards(),
+            "gpu_cards": gpu_cards,
         },
         "vulkan": {
             "n_gpu_layers": c.vulkan.n_gpu_layers,

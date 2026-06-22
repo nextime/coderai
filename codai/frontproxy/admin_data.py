@@ -22,7 +22,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 
-def register_admin_data(app: FastAPI, config_dir) -> bool:
+def register_admin_data(app: FastAPI, config_dir, config=None) -> bool:
     if not config_dir:
         return False
     try:
@@ -159,6 +159,28 @@ def register_admin_data(app: FastAPI, config_dir) -> bool:
             return JSONResponse({"detail": "Cannot delete user"}, status_code=400)
         return JSONResponse({"success": True})
 
-    print("[front] serving tokens/users data locally (no engine round-trip)",
+    # ---------------------------------------------------------------- settings
+    # GET is a pure function of the Config the front already holds, so serve it
+    # locally (identical to the engine via the shared build_settings_dict). The
+    # POST (save) still falls through to the engine, which persists + applies it.
+    if config is not None:
+        @app.get("/admin/api/settings", include_in_schema=False)
+        async def _get_settings(request: Request):
+            _u, err = _admin(request)
+            if err:
+                return err
+            try:
+                from codai.admin.routes import build_settings_dict
+                from codai.frontproxy.gpu_detect import gpu_cards as _gpu_cards
+                try:
+                    cards = _gpu_cards()
+                except Exception:
+                    cards = []
+                return JSONResponse(build_settings_dict(config, cards))
+            except Exception as exc:
+                return JSONResponse({"detail": f"settings unavailable: {exc}"},
+                                    status_code=500)
+
+    print("[front] serving tokens/users/settings data locally (no engine round-trip)",
           flush=True)
     return True
