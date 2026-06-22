@@ -966,7 +966,12 @@ class FrontProxy:
         """
         prim = self.registry.primary()
         if prim is None:
-            return self._cached_status("down")
+            return JSONResponse(self._native_status())
+        # If the primary is mid-generation its API is GIL-starved and the call
+        # below would just burn the full timeout before failing — skip straight to
+        # the front-native status so Overview stays instant.
+        if int(getattr(prim, "inflight", 0) or 0) > 0:
+            return JSONResponse(self._native_status())
         try:
             headers = self._filter_headers(request.headers, _DROP_REQ)
             r = await self._short.get(prim.url + request.url.path, headers=headers,
@@ -982,7 +987,81 @@ class FrontProxy:
             self._status_cache_at = time.monotonic()
             return JSONResponse(data)
         except Exception:
-            return self._cached_status("loading")
+            # Engine GIL-busy generating (or down): build status from the front's
+            # OWN state so the Overview dashboard stays live instead of empty.
+            return JSONResponse(self._native_status())
+
+    def _enabled_models_and_aliases(self):
+        """(enabled_model_ids, {alias: [ids]}) parsed from models.json. Best-effort."""
+        import json as _json
+        enabled, aliases, seen = [], {}, set()
+        if not self._models_path:
+            return enabled, aliases
+        try:
+            data = _json.load(open(self._models_path))
+        except Exception:
+            return enabled, aliases
+        for _key, lst in (data.items() if isinstance(data, dict) else []):
+            if not isinstance(lst, list):
+                continue
+            for m in lst:
+                if not isinstance(m, dict) or m.get("enabled") is False:
+                    continue
+                mid = (m.get("id") or m.get("path") or m.get("alias") or "").strip()
+                if mid and mid not in seen:
+                    seen.add(mid)
+                    enabled.append(mid)
+                alias = (m.get("alias") or "").strip()
+                if alias and mid:
+                    aliases.setdefault(alias, []).append(mid)
+        return enabled, aliases
+
+    def _native_status(self) -> dict:
+        """Status built entirely from the front's own state (registry, config,
+        models.json, live torch-free GPU stats) — no engine round-trip — so the
+        Overview dashboard stays live while the engine is GIL-busy generating.
+        Fields only the engine knows (recent_activity, the RAM watcher) are carried
+        over from the last good engine status when available."""
+        cfg = self.config
+        loaded = set()
+        for e in self.registry.all():
+            loaded |= set(e.loaded_models or [])
+        loaded_ids = self._canonical_loaded(loaded)
+        enabled, aliases = self._enabled_models_and_aliases()
+        vram = None
+        try:
+            from codai.frontproxy.gpu_detect import gpu_stats as _gs
+            cards = _gs()
+            used = sum((c.get("mem_used") or 0) for c in cards)
+            total = sum((c.get("mem_total") or 0) for c in cards)
+            if total:
+                vram = {"used": round(used, 2), "free": round(total - used, 2),
+                        "total": round(total, 2),
+                        "gpu": cards[0]["name"] if len(cards) == 1
+                               else f"{len(cards)} GPUs"}
+        except Exception:
+            pass
+        active = sum(int(getattr(e, "inflight", 0) or 0) for e in self.registry.all())
+        cache = self._status_cache or {}
+        body = {
+            "status": "ok",
+            "engine": "busy",       # served from the front while the engine is busy
+            "stale": True,
+            "backend": getattr(getattr(cfg, "backend", None), "type", None),
+            "load_mode": getattr(getattr(cfg, "models", None),
+                                 "default_load_mode", None),
+            "loaded_models": loaded_ids,
+            "models_loaded": len(loaded_ids),
+            "enabled_models": enabled,
+            "enabled_aliases": aliases,
+            "vram": vram,
+            "requests": {"active": active,
+                         "total": (cache.get("requests") or {}).get("total", 0)},
+        }
+        for k in ("ram", "recent_activity"):
+            if k in cache:
+                body[k] = cache[k]
+        return body
 
     def _overlay_engine_totals(self, data: dict) -> dict:
         engines = self.registry.all()
