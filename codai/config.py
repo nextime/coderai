@@ -140,6 +140,10 @@ class OffloadConfig:
     #   "performance" → fill the fast lead card first, spill only the overflow to the
     #                   slower card(s) so the weak GPU gates throughput the least.
     split_strategy: str = "vram"
+    # Cap (GB) on how much VRAM the auto-split may place on EACH secondary (non-main)
+    # card. Keeps a slow second GPU lightly loaded so it bottlenecks less; the
+    # remainder stays on the fast card or spills to CPU. None/0 = no cap.
+    split_secondary_cap_gb: Optional[float] = None
 
 
 @dataclass
@@ -625,7 +629,8 @@ class ConfigManager:
                 "ram_watch_cuda": self.config.offload.ram_watch_cuda,
                 "gpu_split": self.config.offload.gpu_split,
                 "tensor_split": self.config.offload.tensor_split,
-                "split_strategy": self.config.offload.split_strategy
+                "split_strategy": self.config.offload.split_strategy,
+                "split_secondary_cap_gb": self.config.offload.split_secondary_cap_gb
             },
             "vulkan": {
                 "n_gpu_layers": self.config.vulkan.n_gpu_layers,

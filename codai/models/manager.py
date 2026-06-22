@@ -1112,6 +1112,19 @@ class MultiModelManager:
                 if _ts_val:
                     kwargs['tensor_split'] = _ts_val
                 kwargs['split_strategy'] = _cfg_or_global('split_strategy', 'split_strategy', 'vram')
+                # Secondary-card VRAM cap = the LOWEST of the global and per-model
+                # caps (whichever are set). A per-model cap can only tighten the
+                # global one — a per-model value higher than the global is ignored.
+                _mcap = config.get('split_secondary_cap_gb') if isinstance(config, dict) else None
+                _gcap = getattr(_ga, 'split_secondary_cap_gb', None) if _ga else None
+                _caps = []
+                for _c in (_mcap, _gcap):
+                    try:
+                        if _c not in (None, '', 0, '0'):
+                            _caps.append(float(_c))
+                    except (TypeError, ValueError):
+                        pass
+                kwargs['split_secondary_cap_gb'] = min(_caps) if _caps else None
                 no_ram = _cfg_or_global('no_ram', 'no_ram', False)
                 kwargs['no_ram'] = bool(no_ram)
                 offload_strategy = _cfg_or_global('offload_strategy', 'offload_strategy', 'auto')
@@ -1237,6 +1250,19 @@ class MultiModelManager:
                 if _ts_val:
                     kwargs['tensor_split'] = _ts_val
                 kwargs['split_strategy'] = _cfg_or_global('split_strategy', 'split_strategy', 'vram')
+                # Secondary-card VRAM cap = the LOWEST of the global and per-model
+                # caps (whichever are set). A per-model cap can only tighten the
+                # global one — a per-model value higher than the global is ignored.
+                _mcap = config.get('split_secondary_cap_gb') if isinstance(config, dict) else None
+                _gcap = getattr(_ga, 'split_secondary_cap_gb', None) if _ga else None
+                _caps = []
+                for _c in (_mcap, _gcap):
+                    try:
+                        if _c not in (None, '', 0, '0'):
+                            _caps.append(float(_c))
+                    except (TypeError, ValueError):
+                        pass
+                kwargs['split_secondary_cap_gb'] = min(_caps) if _caps else None
                 no_ram = _cfg_or_global('no_ram', 'no_ram', False)
                 kwargs['no_ram'] = bool(no_ram)
                 offload_strategy = _cfg_or_global('offload_strategy', 'offload_strategy', 'auto')

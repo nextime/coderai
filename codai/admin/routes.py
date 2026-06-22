@@ -2748,7 +2748,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "component_quantization", "output_crf", "force_vram_update",
                 "balanced_gpu_percent", "acceleration",
                 "cache_type_k", "cache_type_v", "kv_offload", "n_batch", "n_ubatch", "n_seq_max",
-                "gpu_split", "tensor_split", "split_strategy",
+                "gpu_split", "tensor_split", "split_strategy", "split_secondary_cap_gb",
                 "turboquant", "engine", "engine_fallback",
                 "quant_backend", "kv_cache_budget_mb", "kv_cache_slots", "mmproj",
                 "auto_compact", "auto_compact_pct", "auto_compact_strategy",
@@ -3455,6 +3455,7 @@ async def api_get_settings(username: str = Depends(require_admin)):
             "gpu_split": c.offload.gpu_split,
             "tensor_split": c.offload.tensor_split,
             "split_strategy": c.offload.split_strategy,
+            "split_secondary_cap_gb": c.offload.split_secondary_cap_gb,
         },
         "vulkan": {
             "n_gpu_layers": c.vulkan.n_gpu_layers,
@@ -3637,6 +3638,12 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             c.offload.tensor_split = off["tensor_split"] or None
         if "split_strategy" in off:
             c.offload.split_strategy = off["split_strategy"] or "vram"
+        if "split_secondary_cap_gb" in off:
+            _v = off["split_secondary_cap_gb"]
+            try:
+                c.offload.split_secondary_cap_gb = float(_v) if _v not in (None, "", 0, "0") else None
+            except (TypeError, ValueError):
+                c.offload.split_secondary_cap_gb = None
         # Push the RAM-cap settings to live global_args so the watcher, per-load
         # budget clamp and eviction honour them without a restart.
         try:
@@ -3652,6 +3659,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
                 ga.gpu_split = c.offload.gpu_split
                 ga.tensor_split = c.offload.tensor_split
                 ga.split_strategy = c.offload.split_strategy
+                ga.split_secondary_cap_gb = c.offload.split_secondary_cap_gb
         except Exception:
             pass
 

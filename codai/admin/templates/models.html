@@ -580,6 +580,9 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           <option value="performance">Maximize speed — fill the fast card first, least on the slow one</option>
         </select>
         <span class="form-hint" style="font-size:11px"><b>VRAM</b> packs the most onto every card (best for fitting a large model) but the slow card bottlenecks throughput. <b>Speed</b> keeps as much as possible on the lead/fast card and spills only the overflow to the slower one — faster, as long as it still fits.</span>
+        <label class="form-label" style="font-weight:600;margin-top:.5rem">Secondary card VRAM cap <span class="muted" style="font-weight:400">— GB per non-lead card</span></label>
+        <input type="number" step="0.5" min="0" id="cfg-split-secondary-cap" class="form-input" placeholder="no cap (uses global default)">
+        <span class="form-hint" style="font-size:11px">Max VRAM the auto-split may put on each secondary (slow) card, e.g. <b>4</b> = at most 4 GB on the RX 580; the remainder stays on the lead card or spills to CPU. Lower = the slow card bottlenecks less. Blank = use the global default; 0 = no cap.</span>
         <label class="form-label" style="font-weight:600;margin-top:.5rem">Weight distribution <span class="muted" style="font-weight:400">— layers per GPU (manual override)</span></label>
         <input type="text" id="cfg-tensor-split" class="form-input" placeholder="auto (uses the strategy above)">
         <span class="form-hint" style="font-size:11px">Optional explicit ratio for the lead card then the rest, e.g. <b>0.8,0.2</b>. Overrides the strategy. Blank = automatic per the strategy above.</span>
@@ -3293,6 +3296,8 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-engine-fallback').checked = !!s.engine_fallback;
   document.getElementById('cfg-tensor-split').value = s.tensor_split || '';
   document.getElementById('cfg-split-strategy').value = s.split_strategy || 'vram';
+  document.getElementById('cfg-split-secondary-cap').value =
+    (s.split_secondary_cap_gb != null ? s.split_secondary_cap_gb : '');
   _populateDs4(m, s);
   document.getElementById('cfg-sysprompt').value = s.system_prompt || '';
   document.getElementById('cfg-parser').value = s.parser || (!m.in_config ? _autoDetectParser(m.path) : 'auto');
@@ -3714,6 +3719,10 @@ async function saveModelConfig(){
                           ? (document.getElementById('cfg-tensor-split').value.trim() || null) : null),
     split_strategy:    (document.getElementById('cfg-engine').value.trim().startsWith('__split__:')
                           ? document.getElementById('cfg-split-strategy').value : null),
+    split_secondary_cap_gb: (function(){
+                          if (!document.getElementById('cfg-engine').value.trim().startsWith('__split__:')) return null;
+                          const v = document.getElementById('cfg-split-secondary-cap').value.trim();
+                          return v === '' ? null : parseFloat(v); })(),
     ds4:               _collectDs4(),
     system_prompt:     document.getElementById('cfg-sysprompt').value.trim() || null,
     parser:            document.getElementById('cfg-parser').value,

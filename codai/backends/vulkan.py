@@ -976,6 +976,21 @@ class VulkanBackend(ModelBackend):
                 # Otherwise we'd needlessly offload layers to CPU thinking only one
                 # card's free VRAM is available.
                 _free = _pooled_free_vram_gb(cross=bool(kwargs.get('gpu_split')))
+                # Apply the secondary-card VRAM cap to the usable pool too, so that
+                # capping the slow card proactively offloads the remainder to CPU here
+                # (rather than only reacting to an OOM in the load-retry loop).
+                try:
+                    _sc = kwargs.get('split_secondary_cap_gb',
+                                     (kwargs.get('_raw_cfg') or {}).get('split_secondary_cap_gb'))
+                    _sc = float(_sc) if _sc not in (None, '', 0, '0') else None
+                except (TypeError, ValueError):
+                    _sc = None
+                if _sc and _sc > 0 and bool(kwargs.get('gpu_split')):
+                    _mgi = self.main_gpu if isinstance(self.main_gpu, int) else 0
+                    _pd = _per_device_free_vram_gb()
+                    if len(_pd) > 1:
+                        _free = sum((d if i == _mgi else min(d, _sc))
+                                    for i, d in enumerate(_pd))
                 # A vision projector (mmproj) loads ON TOP of the model on main_gpu;
                 # subtract it (weights + compute margin) from the usable pool so that
                 # when the model+KV+projector exceed BOTH cards combined, we reduce
@@ -1197,6 +1212,22 @@ class VulkanBackend(ModelBackend):
                 _adj = list(_free_dev)
                 if _reserve > 0 and 0 <= _mg < len(_adj):
                     _adj[_mg] = max(0.5, _adj[_mg] - _reserve)
+                # Secondary-card VRAM cap: limit how much of each NON-main device's
+                # free VRAM the auto-split may use. Keeps a slow second GPU (e.g. an
+                # RX 580) lightly loaded so it bottlenecks throughput less — the rest
+                # stays on the fast card or spills to CPU. Applies to both strategies.
+                try:
+                    _sec_cap = kwargs.get('split_secondary_cap_gb',
+                                          _raw_cfg.get('split_secondary_cap_gb'))
+                    _sec_cap = float(_sec_cap) if _sec_cap not in (None, '', 0, '0') else None
+                except (TypeError, ValueError):
+                    _sec_cap = None
+                if _sec_cap and _sec_cap > 0:
+                    for _i in range(len(_adj)):
+                        if _i != _mg:
+                            _adj[_i] = min(_adj[_i], _sec_cap)
+                    print(f"  gpu split    : secondary card VRAM capped at "
+                          f"{_sec_cap:.1f} GB/card")
                 # Split strategy: "vram" (default) = proportional to free VRAM (max
                 # capacity); "performance" = fill the FAST lead card (main_gpu) first
                 # and spill only the overflow to the slower card(s), so the weak GPU

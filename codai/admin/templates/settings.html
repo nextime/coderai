@@ -130,6 +130,11 @@
     <span class="form-hint">Default for split models when no explicit ratio is set. <b>VRAM</b> fits the largest model; <b>Speed</b> keeps most layers on the fast card so the slow one bottlenecks less. Per-model setting overrides this.</span>
   </div>
   <div class="form-row" style="margin:0">
+    <label class="form-label">Secondary card VRAM cap <span class="muted">(GB per non-lead card)</span></label>
+    <input type="number" step="0.5" min="0" id="s-split-secondary-cap" class="form-input" placeholder="no cap">
+    <span class="form-hint">Global cap on how much VRAM the auto-split may place on each secondary (slow) card — applies to every engine. e.g. <b>4</b> keeps at most 4 GB on an RX 580; the rest stays on the fast card or spills to CPU. Per-model setting overrides this. Blank/0 = no cap.</span>
+  </div>
+  <div class="form-row" style="margin:0">
     <label class="form-label">Default weight distribution <span class="muted">(when splitting)</span></label>
     <input type="text" id="s-tensor-split" class="form-input" placeholder="auto (by strategy)">
     <span class="form-hint">Comma-separated ratio in llama.cpp device order (CUDA cards first, then Vulkan), e.g. <b>0.8,0.2</b>. Blank = automatic per the strategy above.</span>
@@ -784,6 +789,8 @@ async function loadSettings(){
     document.getElementById('s-evict-idle-ram').checked = d.offload?.evict_idle_on_ram !== false;
     document.getElementById('s-gpu-split').checked = !!d.offload?.gpu_split;
     document.getElementById('s-split-strategy').value = d.offload?.split_strategy ?? 'vram';
+    document.getElementById('s-split-secondary-cap').value =
+      (d.offload?.split_secondary_cap_gb != null ? d.offload.split_secondary_cap_gb : '');
     document.getElementById('s-tensor-split').value = d.offload?.tensor_split ?? '';
     document.getElementById('s-ram-leak-watch').checked = d.offload?.ram_leak_watch !== false;
     document.getElementById('s-ram-watch-cuda').checked = d.offload?.ram_watch_cuda !== false;
@@ -900,6 +907,7 @@ async function saveSettings(){
       evict_idle_on_ram: document.getElementById('s-evict-idle-ram').checked,
       gpu_split: document.getElementById('s-gpu-split').checked,
       split_strategy: document.getElementById('s-split-strategy').value,
+      split_secondary_cap_gb: (function(){ const v=document.getElementById('s-split-secondary-cap').value.trim(); return v===''?null:parseFloat(v); })(),
       tensor_split: (document.getElementById('s-tensor-split').value.trim() || null),
       ram_leak_watch: document.getElementById('s-ram-leak-watch').checked,
       ram_watch_cuda: document.getElementById('s-ram-watch-cuda').checked,

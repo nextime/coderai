@@ -156,6 +156,7 @@ def build_runtime_kwargs(model_cfg, model_type):
         'gpu_split':       bool(model_cfg.get('gpu_split', False)),
         'tensor_split':    model_cfg.get('tensor_split'),
         'split_strategy':  model_cfg.get('split_strategy'),
+        'split_secondary_cap_gb': model_cfg.get('split_secondary_cap_gb'),
         '_raw_cfg':        dict(model_cfg) if isinstance(model_cfg, dict) else {},
     }
     if model_type == "text":
@@ -239,7 +240,7 @@ def apply_model_entry_live(entry, model_types) -> int:
         "n_seq_max", "flash_attention", "flash_attn", "load_in_4bit", "load_in_8bit",
         "offload_strategy", "no_ram", "max_gpu_percent", "mmproj", "quant_backend",
         "engine", "precision", "vae_path", "vae_tiling", "component_quantization",
-        "gpu_split", "tensor_split", "split_strategy",
+        "gpu_split", "tensor_split", "split_strategy", "split_secondary_cap_gb",
     )
 
     def _load_sig(c):
@@ -1048,6 +1049,7 @@ def main():
     global_args.gpu_split = getattr(config.offload, "gpu_split", False)
     global_args.tensor_split = getattr(config.offload, "tensor_split", None)
     global_args.split_strategy = getattr(config.offload, "split_strategy", "vram")
+    global_args.split_secondary_cap_gb = getattr(config.offload, "split_secondary_cap_gb", None)
     # Thermal protection settings (read live by codai.models.thermal).
     global_args.thermal_cpu_enabled = config.thermal.cpu_enabled
     global_args.thermal_gpu_enabled = config.thermal.gpu_enabled
