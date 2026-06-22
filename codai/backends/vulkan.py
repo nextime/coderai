@@ -1205,14 +1205,27 @@ class VulkanBackend(ModelBackend):
                              or kwargs.get('_global_split_strategy') or 'vram')
                 _strategy = str(_strategy).lower()
                 _exp_total = kwargs.get('expected_vram_gb')
+                # expected_vram_gb is the WEIGHTS estimate — it does NOT include the
+                # KV cache (which scales with n_ctx) or compute/output buffers. At
+                # large n_ctx those are many GB, so add a context-scaled headroom to
+                # the footprint before deciding what fits on the fast card. Without
+                # this, a 20 GB model at 178k ctx looked like it fit on a 24 GB card
+                # → tensor_split=[1.0,0.0] → llama_context creation OOM'd (the KV
+                # cache didn't fit) in a retry loop.
+                # KV+compute estimate, calibrated to observed usage (~10 GB KV for
+                # this class of model at 178k ctx → ~n_ctx/16000) plus ~1.5 GB compute.
+                # Tight enough that performance mode doesn't over-load the slow card,
+                # conservative enough to avoid the fast-card-only OOM.
+                _kv_head = 1.5 + (self.n_ctx or 0) / 16000.0
+                _need_total = (_exp_total + _kv_head) if _exp_total else None
                 if (_strategy == 'performance' and len(_adj) > 1
-                        and _exp_total and _exp_total > 0):
+                        and _need_total and _need_total > 0):
                     _w = [0.0] * len(_adj)
                     _main_cap = _adj[_mg]
-                    if _exp_total <= _main_cap:
-                        _w[_mg] = 1.0   # fits on the fast card alone — no real spill
+                    if _need_total <= _main_cap:
+                        _w[_mg] = 1.0   # genuinely fits on the fast card alone
                     else:
-                        _overflow = _exp_total - _main_cap
+                        _overflow = _need_total - _main_cap
                         _others = sum(_adj[i] for i in range(len(_adj)) if i != _mg)
                         _w[_mg] = _main_cap
                         for i in range(len(_adj)):
@@ -1223,7 +1236,7 @@ class VulkanBackend(ModelBackend):
                         _parsed = [round(x / _sw, 3) for x in _w]
                         print(f"  gpu split    : PERFORMANCE tensor_split={_parsed} "
                               f"(fast card GPU{_mg} first; free {[round(f,1) for f in _free_dev]} GB, "
-                              f"model ~{_exp_total:.1f} GB)")
+                              f"model ~{_exp_total:.1f} GB + ~{_kv_head:.1f} GB KV/ctx)")
                 if not _parsed:
                     _sum = sum(_adj)
                     if len(_adj) > 1 and _sum > 0:
@@ -1324,11 +1337,44 @@ class VulkanBackend(ModelBackend):
                 pass
             return p
         _params_mod.llama_model_default_params = _params_with_progress
+        self.model = None
         try:
-            self.model = Llama(**llama_kwargs)
-        except Exception as e:
-            print(f"Error loading GGUF model: {e}")
-            raise
+            _block_count = _gguf_block_count(model_path)
+        except Exception:
+            _block_count = None
+        try:
+            # Progressive CPU-offload retry: if llama_context creation OOMs (e.g. the
+            # KV cache / compute buffers don't fit even after the split), don't fail
+            # outright — move ~20% more layers to CPU and retry, up to 5 times, then
+            # give up. A slow CPU-spilled load beats a hard failure.
+            _last_err = None
+            _max_attempts = 6   # initial try + 5 progressive CPU-offload retries
+            for _attempt in range(_max_attempts):
+                try:
+                    self.model = Llama(**llama_kwargs)
+                    if _attempt > 0:
+                        print(f"  Loaded after CPU offload "
+                              f"(n_gpu_layers={llama_kwargs.get('n_gpu_layers')})")
+                    break
+                except Exception as e:
+                    _last_err = e
+                    print(f"Error loading GGUF model "
+                          f"(attempt {_attempt + 1}/{_max_attempts}): {e}")
+                    if _attempt + 1 >= _max_attempts:
+                        break
+                    _cur = llama_kwargs.get('n_gpu_layers', self.n_gpu_layers)
+                    _tot = _block_count or (_cur if (_cur and _cur > 0) else 40)
+                    if _cur is None or _cur < 0:
+                        _cur = _tot            # -1 (all) → start from total
+                    _step = max(1, int(_tot * 0.2))
+                    _new = max(0, _cur - _step)
+                    llama_kwargs['n_gpu_layers'] = _new
+                    self.n_gpu_layers = _new
+                    print(f"  Retrying with n_gpu_layers={_new} "
+                          f"({max(0, _tot - _new)}/{_tot} layers on CPU)…")
+            if self.model is None:
+                print(f"Error loading model after {_max_attempts} attempts: {_last_err}")
+                raise _last_err
         finally:
             _params_mod.llama_model_default_params = _orig_params
             # Quiet logging after load — but DO NOT drop to NULL + GC the callback.
