@@ -795,7 +795,14 @@ class FrontProxy:
             target = self.registry.primary()
         if target is None:
             return JSONResponse({"detail": "No engine available"}, status_code=503)
-        return await self._forward_to_engine(request, target, body)
+        resp = await self._forward_to_engine(request, target, body)
+        # The front issues the unload, so it updates its OWN resident-model list
+        # immediately (the supervisor's engine-state poll later reconciles) — the
+        # models page reflects it at once instead of waiting a poll cycle.
+        if path and 200 <= getattr(resp, "status_code", 500) < 300:
+            target.loaded_models = {k for k in target.loaded_models
+                                    if not self._key_matches_path(k, path)}
+        return resp
 
     async def model_load(self, request: Request):
         """Route an admin model-load to the model's pinned engine (or one that's
@@ -822,7 +829,12 @@ class FrontProxy:
             target = self.registry.primary()
         if target is None:
             return JSONResponse({"detail": "No engine available"}, status_code=503)
-        return await self._forward_to_engine(request, target, body)
+        resp = await self._forward_to_engine(request, target, body)
+        # Front-maintained resident list: mark the model loaded on its engine as
+        # soon as the load succeeds (supervisor poll reconciles the exact keys).
+        if path and 200 <= getattr(resp, "status_code", 500) < 300:
+            target.loaded_models = set(target.loaded_models) | {path}
+        return resp
 
     def _cooling_engines(self) -> list:
         """Which engines are in thermal cooldown right now (for the Tasks banner)."""
