@@ -256,17 +256,6 @@ def require_admin(request: Request) -> str:
     return username
 
 
-@router.get("/login", response_class=HTMLResponse, summary="Admin login page")
-async def login_page(request: Request):
-    """Display login page."""
-    # If already logged in, redirect to dashboard
-    username = get_current_user(request)
-    if username:
-        return RedirectResponse(url=_url(request, "/admin"), status_code=302)
-
-    return _tmpl(request, "login.html", {"error": None})
-
-
 @router.post("/login", summary="Authenticate admin login")
 async def login(
     request: Request,
@@ -312,18 +301,6 @@ async def logout(request: Request):
     return response
 
 
-@router.get("/admin/change-password", response_class=HTMLResponse, summary="Change-password page")
-async def change_password_page(request: Request, username: str = Depends(require_auth)):
-    user = session_manager.get_user(username)
-    must_change = user.get("must_change_password", False) if user else False
-    return _tmpl(request, "change_password.html", {
-        "username": username,
-        "must_change": must_change,
-        "is_admin": session_manager.is_admin(username),
-        "error": None,
-    })
-
-
 @router.post("/admin/change-password", summary="Change admin password")
 async def change_password(
     request: Request,
@@ -359,57 +336,6 @@ async def change_password(
 
     return RedirectResponse(url=_url(request, "/admin"), status_code=302)
 
-
-@router.get("/admin", response_class=HTMLResponse, summary="Admin dashboard")
-async def admin_dashboard(request: Request, username: str = Depends(require_auth)):
-    is_admin = session_manager.is_admin(username)
-    return _tmpl(request, "dashboard.html", {
-        "username": username, "is_admin": is_admin,
-    })
-
-
-@router.get("/admin/models", response_class=HTMLResponse, summary="Models admin page")
-async def models_page(request: Request, username: str = Depends(require_admin)):
-    return _tmpl(request, "models.html", {
-        "username": username,
-        "is_admin": True,
-        "default_whisper_server_path": _default_whisper_server_path(),
-    })
-
-
-@router.get("/admin/tokens", response_class=HTMLResponse, summary="API tokens admin page")
-async def tokens_page(request: Request, username: str = Depends(require_admin)):
-    return _tmpl(request, "tokens.html", {"username": username, "is_admin": True})
-
-
-@router.get("/admin/users", response_class=HTMLResponse, summary="Users admin page")
-async def users_page(request: Request, username: str = Depends(require_admin)):
-    users = session_manager.list_users()
-    return _tmpl(request, "users.html", {
-        "username": username, "is_admin": True, "users": users,
-    })
-
-
-@router.get("/admin/tasks", response_class=HTMLResponse, summary="Tasks admin page")
-async def tasks_page(request: Request, username: str = Depends(require_admin)):
-    return _tmpl(request, "tasks.html", {"username": username, "is_admin": True})
-
-
-@router.get("/chat", response_class=HTMLResponse, summary="Studio (chat) page")
-async def chat_page(request: Request, username: str = Depends(require_auth)):
-    return _tmpl(request, "chat.html", {
-        "username": username, "is_admin": session_manager.is_admin(username),
-    })
-
-
-# API endpoints for admin operations
-# NOTE: /admin/api/status, /admin/api/tokens (GET/POST/DELETE) and
-# /admin/api/users (POST/DELETE) are served by the FRONT now
-# (codai/frontproxy/admin_data.py + FrontProxy.status); the engine only
-# generates and never serves these. Removed from here.
-
-
-# --- Models management endpoints ---
 
 @router.get("/admin/api/models", summary="List configured models")
 async def api_list_models(username: str = Depends(require_admin)):
@@ -2891,56 +2817,6 @@ def _read_vram_info() -> Optional[dict]:
     return None
 
 
-@router.get("/admin/api/gpu-stats", summary="Per-card GPU utilization, VRAM and temperature")
-def api_gpu_stats(username: str = Depends(require_auth)):
-    """Live stats for EVERY physical GPU installed (NVIDIA via nvidia-smi, AMD via
-    sysfs), independent of which engine owns it. Used by the Tasks page to show
-    per-card VRAM + utilization across all cards. Best-effort; empty if unreadable.
-
-    SYNC handler: it shells out to nvidia-smi / reads sysfs, so it runs in the
-    threadpool rather than on the event loop."""
-    try:
-        from codai.frontproxy.gpu_detect import gpu_stats
-        return {"cards": gpu_stats()}
-    except Exception as e:
-        return {"cards": [], "error": str(e)}
-
-
-@router.get("/admin/api/system-stats", summary="Live CPU / GPU / RAM / VRAM usage and temperatures")
-def api_system_stats(username: str = Depends(require_admin)):
-    """Lightweight hardware telemetry for the Tasks page header: CPU & GPU
-    utilization and temperature, plus RAM and VRAM usage. All fields are
-    best-effort and may be null when a sensor/metric is unavailable.
-
-    SYNC handler on purpose: the temperature/util/VRAM reads hit sysfs and
-    blocking sensor calls, so it runs in FastAPI's threadpool to avoid freezing
-    the event loop (and the Tasks page) while a model is loading."""
-    from codai.models import thermal
-
-    # CPU tile = coderai process-tree usage, scaled 100% PER CORE (0..100*cores),
-    # not the all-core average (which reads misleadingly low when work is on a few
-    # cores). `cores` lets the UI scale the bar to full capacity = cores*100%.
-    cpu = {"util": thermal.read_process_tree_cpu(), "temp": thermal.read_cpu_temp(),
-           "cores": None}
-    ram = None
-    try:
-        import psutil
-        cpu["cores"] = psutil.cpu_count()
-        vm = psutil.virtual_memory()
-        ram = {"used": vm.used / 1e9, "total": vm.total / 1e9, "percent": vm.percent}
-    except Exception:
-        pass
-
-    gpu = {"util": thermal.read_gpu_util(), "temp": thermal.read_gpu_temp()}
-    vram = _read_vram_info()
-    if vram and vram.get("total"):
-        vram["percent"] = round(vram["used"] / vram["total"] * 100, 1)
-        if gpu.get("gpu") is None:
-            gpu["name"] = vram.get("gpu") or ""
-
-    return {"cpu": cpu, "gpu": gpu, "ram": ram, "vram": vram}
-
-
 def _do_task_cancel(task_id: str) -> bool:
     """Cancel a task by id. Training ids route through loras.cancel_job (handles
     queued vs running + the durable job record); everything else goes through the
@@ -3068,15 +2944,6 @@ def _detect_gpu_cards() -> list:
     except Exception:
         return []
 
-
-@router.get("/admin/settings", response_class=HTMLResponse, summary="Settings page")
-async def settings_page(request: Request, username: str = Depends(require_admin)):
-    return _tmpl(request, "settings.html", {"username": username, "is_admin": True})
-
-
-# /admin/api/settings GET is served by the front from the same
-# build_settings_dict() below (FrontProxy holds the same Config). The POST
-# (save) still lives here so the engine persists + applies config changes.
 
 def build_settings_dict(c, gpu_cards):
     """Pure ``Config`` → settings dict. Shared by the engine handler and the front
@@ -3575,11 +3442,6 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
 # =============================================================================
 # Archive management
 # =============================================================================
-
-@router.get("/admin/archive", response_class=HTMLResponse, summary="Archive page")
-async def archive_page(request: Request, username: str = Depends(require_admin)):
-    return _tmpl(request, "archive.html", {"username": username, "is_admin": True})
-
 
 @router.get("/admin/api/archive", summary="List archived generations")
 async def api_archive_list(

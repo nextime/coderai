@@ -498,6 +498,68 @@ class FrontProxy:
             return JSONResponse({"cards": [], "error": str(exc)})
         return JSONResponse({"cards": cards})
 
+    async def system_stats(self, request: Request) -> Response:
+        """CPU/GPU/RAM/VRAM telemetry for the Tasks header, built on the FRONT
+        (psutil + torch-free gpu_detect) so it stays live while an engine is busy
+        generating. Run in a thread so the brief CPU sample never blocks the loop."""
+        if not self._has_cred(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        import asyncio
+        try:
+            return JSONResponse(await asyncio.to_thread(self._build_system_stats))
+        except Exception as exc:
+            return JSONResponse({"cpu": {}, "gpu": {}, "ram": None, "vram": None,
+                                 "error": str(exc)})
+
+    @staticmethod
+    def _build_system_stats() -> dict:
+        cpu = {"util": None, "temp": None, "cores": None}
+        ram = None
+        try:
+            import psutil
+            cores = psutil.cpu_count() or 1
+            cpu["cores"] = cores
+            # System-wide load sampled briefly, scaled to the per-core sum the tile
+            # expects (0..cores*100).
+            avg = psutil.cpu_percent(interval=0.15)
+            cpu["util"] = round((avg or 0.0) * cores / 100.0 * 100.0, 1)
+            try:
+                temps = psutil.sensors_temperatures() or {}
+                for key in ("k10temp", "coretemp", "zenpower", "cpu_thermal"):
+                    if temps.get(key):
+                        cpu["temp"] = max(t.current for t in temps[key]
+                                          if t.current is not None)
+                        break
+            except Exception:
+                pass
+            vm = psutil.virtual_memory()
+            ram = {"used": round(vm.used / 1e9, 2), "total": round(vm.total / 1e9, 2),
+                   "percent": vm.percent}
+        except Exception:
+            pass
+        gpu = {"util": None, "temp": None, "name": None}
+        vram = None
+        try:
+            from codai.frontproxy.gpu_detect import gpu_stats as _gs
+            cards = _gs()
+            if cards:
+                utils = [c.get("util") for c in cards if c.get("util") is not None]
+                temps = [c.get("temp") for c in cards if c.get("temp") is not None]
+                gpu["util"] = round(sum(utils) / len(utils), 1) if utils else None
+                gpu["temp"] = max(temps) if temps else None
+                gpu["name"] = (cards[0]["name"] if len(cards) == 1
+                               else f"{len(cards)} GPUs")
+                used = sum((c.get("mem_used") or 0) for c in cards)
+                total = sum((c.get("mem_total") or 0) for c in cards)
+                if total:
+                    vram = {"used": round(used, 2), "total": round(total, 2),
+                            "free": round(total - used, 2),
+                            "percent": round(used / total * 100, 1),
+                            "gpu": gpu["name"]}
+        except Exception:
+            pass
+        return {"cpu": cpu, "gpu": gpu, "ram": ram, "vram": vram}
+
     async def batch(self, request: Request) -> Response:
         """Fan out several engine GET reads CONCURRENTLY (server-side) and return
         them in one response.
@@ -1187,7 +1249,7 @@ def build_app(config, config_dir=None) -> FastAPI:
 
     @app.get("/admin/api/system-stats", include_in_schema=False)
     async def _system_stats(request: Request):
-        return await front.poll(request)
+        return await front.system_stats(request)
 
     # GPU stats are served by the FRONT (torch-free gpu_detect) so temps/util stay
     # live even when an engine is busy generating — registered before the catch-all
