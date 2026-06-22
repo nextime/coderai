@@ -378,6 +378,35 @@ class BrokerClient:
                 message.get("client_id") or self.session_metadata.get("client_id"),
                 endpoint_path, method, stream,
             )
+            # Diagnostic: surface the inbound max_tokens so we can tell whether a
+            # remote client's value (e.g. Hermes) survives the aisbf relay into our
+            # payload, or is dropped before it reaches us. Handles the chat body
+            # being the payload directly or nested under body / body_base64.
+            try:
+                _b = payload
+                if isinstance(payload, dict):
+                    if isinstance(payload.get("body"), dict):
+                        _b = payload["body"]
+                    elif isinstance(payload.get("body"), str):
+                        try:
+                            _b = json.loads(payload["body"])
+                        except Exception:
+                            _b = {}
+                    elif payload.get("body_base64"):
+                        import base64 as _b64
+                        _b = json.loads(_b64.b64decode(
+                            payload["body_base64"]).decode("utf-8", "replace") or "{}")
+                _mt = _b.get("max_tokens") if isinstance(_b, dict) else None
+                _mct = _b.get("max_completion_tokens") if isinstance(_b, dict) else None
+                logger.info(
+                    "CoderAI broker inbound request_id=%s max_tokens=%s "
+                    "max_completion_tokens=%s body_keys=%s",
+                    request_id, _mt, _mct,
+                    sorted(_b.keys()) if isinstance(_b, dict) else type(_b).__name__,
+                )
+            except Exception as _probe_exc:
+                logger.info("CoderAI broker inbound max_tokens probe failed: %s",
+                            _probe_exc)
             # Send an immediate "pending" acknowledgment so the broker side extends
             # its deadline, then keep sending periodic keepalives while the request
             # runs (e.g. during model download).  The keepalive task is cancelled
