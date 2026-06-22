@@ -160,6 +160,25 @@ class FrontProxy:
             return await execute_broker_request(None, envelope,
                                                 executor=self.broker_execute)
         client.dispatcher = _dispatch
+
+        # Streaming dispatcher: for stream=true inference, yield engine SSE chunks so
+        # the broker client relays them token-by-token (chunk envelopes) instead of
+        # buffering the whole reply.
+        from codai.broker.dispatcher import (resolve_broker_request,
+                                             BrokerDispatchError)
+
+        async def _stream_dispatch(message):
+            envelope = client.message_to_envelope(message)
+            try:
+                headers, body = resolve_broker_request(envelope)
+            except BrokerDispatchError:
+                yield 'data: {"error":"unsupported broker request"}\n\n'
+                return
+            async for chunk in self.broker_execute_stream(
+                    method=envelope.method, path=envelope.path, headers=headers,
+                    query=envelope.query, body=body):
+                yield chunk
+        client.stream_dispatcher = _stream_dispatch
         self._broker = BrokerService(client)   # app=None → keep our dispatcher
         self._broker.start()
         print("[front] AISBF broker started (front-managed, routes to engines)",
@@ -332,6 +351,80 @@ class FrontProxy:
                  len(r.content), r.content[:200]), flush=True)
         return {"status_code": r.status_code, "headers": dict(r.headers),
                 "body": r.content}
+
+    async def broker_execute_stream(self, *, method, path, headers, query, body):
+        """Streaming executor for brokered inference: route to the engine, open a
+        streamed SSE response, and YIELD each chunk as it arrives (as text). The
+        broker client wraps each yielded chunk in a ``chunk`` envelope and sends a
+        terminal ``done`` — so the AISBF relay streams tokens to the client instead
+        of buffering the whole reply. Shares the per-model queue + in-flight tracking
+        with the buffered path."""
+        import json as _json
+        model = None
+        if method.upper() == "POST" and _router.is_inference_path(path):
+            try:
+                model = (_json.loads(body or b"{}") or {}).get("model")
+            except Exception:
+                model = None
+        engine = _router.pick_engine(
+            self.registry, path, method, model,
+            required_cap=self._required_cap(path, model),
+            default_engine=self.default_engine, pinned=self._pin_for(model),
+            pin_fallback=bool(self._model_info(model).get("engine_fallback")))
+        if engine is None:
+            yield 'data: {"error":"No engine is ready yet."}\n\n'
+            return
+        send_headers = {k: v for k, v in (headers or {}).items()
+                        if k.lower() not in _DROP_REQ}
+        if self.internal_token:
+            send_headers["x-coderai-broker-authed"] = self.internal_token
+        _qkey = None
+        if (method.upper() == "POST" and _router.is_inference_path(path)
+                and self._task_kind(path) == "text"):
+            _qkey = self._queue_key(model)
+            try:
+                await self.reqqueue.acquire(
+                    _qkey, self._model_capacity(model), self._queue_max_waiting(),
+                    rid=engine.name + ":" + (model or ""), model=model or "",
+                    engine=engine.name)
+            except QueueFull:
+                yield ('data: {"error":"Server busy: the generation queue is full, '
+                       'please retry shortly."}\n\n')
+                return
+        _rid = engine.enter_request(
+            {"model": model or "", "kind": self._task_kind(path), "path": path}
+            if _router.is_inference_path(path) else None)
+        import time as _t
+        _started = _t.time()
+        _status = 502
+        rp_req = self._long.build_request(method, engine.url + path,
+                                          headers=send_headers, params=query or {},
+                                          content=body or b"")
+        try:
+            rp_resp = await self._long.send(rp_req, stream=True)
+            _status = rp_resp.status_code
+            _meas = (rp_resp.status_code == 200 and "text/event-stream"
+                     in (rp_resp.headers.get("content-type") or ""))
+            ntok = 0
+            async for raw in rp_resp.aiter_raw():
+                if not raw:
+                    continue
+                if _meas:
+                    ntok += raw.count(b"data:")
+                    m = (engine.active or {}).get(_rid)
+                    if m is not None:
+                        m["step"] = ntok
+                yield raw.decode("utf-8", "replace")
+            await rp_resp.aclose()
+        except Exception as exc:
+            yield ('data: {"error":"engine#%s unreachable: %s"}\n\n'
+                   % (engine.id, exc))
+        finally:
+            engine.exit_request(_rid)
+            if _qkey is not None:
+                await self.reqqueue.release(_qkey)
+            if _router.is_inference_path(path):
+                self._record_activity(model, self._task_kind(path), _status, _started)
 
     # ------------------------------------------------------------------ helpers
     @staticmethod

@@ -18,7 +18,8 @@ from codai.broker.capabilities import (
     build_register_message,
 )
 from codai.broker.dispatcher import OP_ROUTE_MAP
-from codai.broker.models import BrokerRequestEnvelope, success_envelope
+from codai.broker.models import BrokerRequestEnvelope, success_envelope, error_envelope
+from codai.broker.streaming import stream_chunk_envelope, finalize_stream
 
 Dispatcher = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
@@ -29,6 +30,9 @@ class BrokerClient:
     def __init__(self, runtime, dispatcher: Dispatcher | None = None):
         self.runtime = runtime
         self.dispatcher = dispatcher
+        # Optional async-generator dispatcher for streaming requests: yields SSE
+        # chunks which we relay as ``chunk`` envelopes + a terminal ``done``.
+        self.stream_dispatcher = None
         self.websocket = None
         self.session_id = None
         self.session_metadata: dict[str, Any] = {}
@@ -393,6 +397,41 @@ class BrokerClient:
                 keepalive_task = asyncio.create_task(
                     self._send_keepalives(request_id, interval=30.0, estimated_timeout=300.0)
                 )
+
+            # Streaming path: relay engine SSE chunks as `chunk` envelopes + a
+            # terminal `done`, so the broker side streams tokens to the client
+            # instead of buffering the whole reply.
+            if stream and self.stream_dispatcher is not None and request_id:
+                seq = 0
+                _t_start = time.monotonic()
+                try:
+                    async for chunk in self.stream_dispatcher(message):
+                        if not chunk:
+                            continue
+                        seq += 1
+                        await self.websocket.send(json.dumps(
+                            stream_chunk_envelope(request_id, seq, chunk)))
+                    await self.websocket.send(json.dumps(finalize_stream(
+                        request_id, seq,
+                        round((time.monotonic() - _t_start) * 1000, 3))))
+                    logger.info(
+                        "CoderAI broker streamed request_id=%s chunks=%d", request_id, seq)
+                except Exception as exc:
+                    logger.error("CoderAI broker stream error request_id=%s: %s",
+                                 request_id, exc, exc_info=True)
+                    try:
+                        await self.websocket.send(json.dumps(error_envelope(
+                            request_id, code="stream_error", message=str(exc))))
+                    except Exception:
+                        pass
+                finally:
+                    if keepalive_task is not None:
+                        keepalive_task.cancel()
+                        try:
+                            await keepalive_task
+                        except asyncio.CancelledError:
+                            pass
+                return None
 
             try:
                 response = await self.dispatcher(message)

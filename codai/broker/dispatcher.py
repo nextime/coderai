@@ -60,19 +60,20 @@ def _is_text_response(content_type: str | None) -> bool:
     )
 
 
-async def execute_broker_request(app, envelope, executor=None):
-    """Validate and execute a broker request envelope.
+class BrokerDispatchError(Exception):
+    """Carries a ready error envelope for an unsupported op/path."""
 
-    ``executor`` is an ``async (method, path, headers, query, body) -> {status_code,
-    headers, body}`` callable. When omitted the request is run in-process against
-    ``app`` via the ASGI bridge (engine / single-process mode). The front passes its
-    own executor that proxies to the right engine over HTTP."""
+    def __init__(self, envelope: dict):
+        super().__init__(envelope.get("error") or "broker dispatch error")
+        self.envelope = envelope
 
-    logger.debug(
-        "broker dispatch → op=%s request_id=%s path=%r method=%r stream=%s",
-        envelope.op, envelope.request_id, envelope.path, envelope.method, envelope.stream,
-    )
 
+def resolve_broker_request(envelope):
+    """Resolve an envelope to (headers, body), applying op routing, body decoding
+    and validation (mutating envelope.method/path/query in place). Shared by the
+    buffered dispatch and the streaming path so they never diverge. Raises
+    :class:`BrokerDispatchError` (with a ready error envelope) on unsupported
+    op/path."""
     if envelope.op == "proxy":
         proxy_payload = envelope.payload or {}
         endpoint_path = str(proxy_payload.get("endpoint_path") or envelope.path or "").strip()
@@ -89,36 +90,24 @@ async def execute_broker_request(app, envelope, executor=None):
             envelope.payload = b64decode(proxy_payload.get("body_base64") or "")
         elif proxy_payload.get("multipart") is not None:
             envelope.payload = {"_broker_multipart": proxy_payload.get("multipart")}
-        logger.debug("broker dispatch proxy resolved → %s %s", envelope.method, envelope.path)
     elif envelope.op in OP_ROUTE_MAP:
         envelope.method, envelope.path = OP_ROUTE_MAP[envelope.op]
-        logger.debug("broker dispatch op mapped → %s %s", envelope.method, envelope.path)
     elif not envelope.path:
-        logger.warning("broker dispatch unsupported op=%s request_id=%s", envelope.op, envelope.request_id)
-        return error_envelope(
-            envelope.request_id,
-            code="unsupported_operation",
-            message=f"Unsupported broker op: {envelope.op}",
-        )
+        raise BrokerDispatchError(error_envelope(
+            envelope.request_id, code="unsupported_operation",
+            message=f"Unsupported broker op: {envelope.op}"))
 
     envelope.validate()
 
     if not is_supported_path(envelope.path):
-        logger.warning(
-            "broker dispatch unsupported path=%r op=%s request_id=%s",
-            envelope.path, envelope.op, envelope.request_id,
-        )
-        return error_envelope(
-            envelope.request_id,
-            code="unsupported_endpoint",
-            message=f"Unsupported endpoint: {envelope.path}",
-        )
+        raise BrokerDispatchError(error_envelope(
+            envelope.request_id, code="unsupported_endpoint",
+            message=f"Unsupported endpoint: {envelope.path}"))
 
-    body: bytes
     if isinstance(envelope.payload, dict) and "_broker_multipart" in envelope.payload:
         from codai.broker.asgi_bridge import _build_multipart_body
-
-        body, multipart_content_type = _build_multipart_body(envelope.payload["_broker_multipart"] or {})
+        body, multipart_content_type = _build_multipart_body(
+            envelope.payload["_broker_multipart"] or {})
         headers = dict(envelope.headers)
         headers["content-type"] = multipart_content_type
     elif isinstance(envelope.payload, (dict, list)):
@@ -139,6 +128,28 @@ async def execute_broker_request(app, envelope, executor=None):
 
     if body and "content-type" not in {key.lower() for key in headers}:
         headers["content-type"] = envelope.content_type
+    return headers, body
+
+
+async def execute_broker_request(app, envelope, executor=None):
+    """Validate and execute a broker request envelope.
+
+    ``executor`` is an ``async (method, path, headers, query, body) -> {status_code,
+    headers, body}`` callable. When omitted the request is run in-process against
+    ``app`` via the ASGI bridge (engine / single-process mode). The front passes its
+    own executor that proxies to the right engine over HTTP."""
+
+    logger.debug(
+        "broker dispatch → op=%s request_id=%s path=%r method=%r stream=%s",
+        envelope.op, envelope.request_id, envelope.path, envelope.method, envelope.stream,
+    )
+
+    try:
+        headers, body = resolve_broker_request(envelope)
+    except BrokerDispatchError as _bde:
+        logger.warning("broker dispatch unsupported op=%s path=%r request_id=%s",
+                       envelope.op, envelope.path, envelope.request_id)
+        return _bde.envelope
 
     started_at = perf_counter()
     if executor is not None:
