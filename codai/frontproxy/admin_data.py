@@ -181,6 +181,81 @@ def register_admin_data(app: FastAPI, config_dir, config=None) -> bool:
                 return JSONResponse({"detail": f"settings unavailable: {exc}"},
                                     status_code=500)
 
-    print("[front] serving tokens/users/settings data locally (no engine round-trip)",
-          flush=True)
+    # ---------------------------------------------------------------- archive
+    # The archive is plain on-disk metadata + files (codai/api/archive.py is
+    # torch-free), so the front serves it directly — no engine round-trip, stays
+    # live during generation.
+    try:
+        from codai.api.archive import archive_manager as _arch, RETENTION_OPTIONS
+        _arch_ok = True
+    except Exception:
+        _arch_ok = False
+    if _arch_ok:
+        _arch_dir = None
+        try:
+            _ac = getattr(config, "archive", None) if config is not None else None
+            _arch_dir = getattr(_ac, "directory", None) or \
+                str(Path(config_dir) / "archive")
+            _arch.configure(bool(getattr(_ac, "enabled", True)), _arch_dir,
+                            getattr(_ac, "retention", "forever"))
+        except Exception:
+            pass
+
+        @app.get("/admin/api/archive", include_in_schema=False)
+        async def _archive_list(request: Request, limit: int = 50, offset: int = 0):
+            _u, err = _admin(request)
+            if err:
+                return err
+            import asyncio
+            entries = await asyncio.to_thread(_arch.list_entries, limit, offset)
+            total = await asyncio.to_thread(_arch.count_entries)
+            return JSONResponse({"entries": entries, "total": total})
+
+        @app.get("/admin/api/archive-settings", include_in_schema=False)
+        async def _archive_settings(request: Request):
+            _u, err = _admin(request)
+            if err:
+                return err
+            _ac = getattr(config, "archive", None) if config is not None else None
+            return JSONResponse({
+                "enabled": bool(getattr(_ac, "enabled", True)),
+                "directory": getattr(_ac, "directory", _arch_dir),
+                "default_directory": str(Path(config_dir) / "archive"),
+                "retention": getattr(_ac, "retention", "forever"),
+                "retention_options": RETENTION_OPTIONS,
+            })
+
+        @app.get("/admin/api/archive/{gen_id}", include_in_schema=False)
+        async def _archive_get(gen_id: str, request: Request):
+            _u, err = _admin(request)
+            if err:
+                return err
+            entry = _arch.get_entry(gen_id)
+            if entry is None:
+                return JSONResponse({"detail": "Entry not found"}, status_code=404)
+            return JSONResponse(entry)
+
+        @app.delete("/admin/api/archive/{gen_id}", include_in_schema=False)
+        async def _archive_delete(gen_id: str, request: Request):
+            _u, err = _admin(request)
+            if err:
+                return err
+            if not _arch.delete_entry(gen_id):
+                return JSONResponse({"detail": "Entry not found"}, status_code=404)
+            return JSONResponse({"success": True})
+
+        @app.get("/admin/api/archive/{gen_id}/files/{filename}", include_in_schema=False)
+        async def _archive_file(gen_id: str, filename: str, request: Request):
+            if not _user(request):
+                return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+            from fastapi.responses import FileResponse
+            import mimetypes
+            path = _arch.get_file_path(gen_id, filename)
+            if path is None:
+                return JSONResponse({"detail": "File not found"}, status_code=404)
+            mt = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            return FileResponse(path, media_type=mt)
+
+    print("[front] serving tokens/users/settings/archive data locally "
+          "(no engine round-trip)", flush=True)
     return True
