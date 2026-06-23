@@ -115,6 +115,15 @@ class ModelsConfig:
     # "tool_loop_guard" / "tool_loop_repeats".
     tool_loop_guard: bool = True
     tool_loop_repeats: int = 3
+    # gemma-4 native tool-call heuristic (`call:NAME{…}` / `<|tool_call>` markup):
+    #   "full"       — parse & strip every call:/response: span (max recall, may
+    #                  eat legit `call:foo{…}` text in coding/prose replies);
+    #   "restricted" — only treat a span as a call when NAME is a declared tool
+    #                  (real calls work; prose/code is left intact) [default];
+    #   "off"        — disable the gemma heuristic entirely (for bigger models
+    #                  that emit standard structured tool calls).
+    # Overridable per-model via the models.json entry's "gemma_tool_parser".
+    gemma_tool_parser: str = "restricted"
 
 
 @dataclass

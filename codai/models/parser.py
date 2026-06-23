@@ -1073,19 +1073,92 @@ def _parse_gemma_loose_object(s: str, i: int):
     return obj, j
 
 
-def parse_gemma_native_tool_calls(text: str, tool_names=None):
+GEMMA_TOOL_MODES = ("full", "restricted", "off")
+
+
+def resolve_gemma_tool_mode(model_name):
+    """Resolve the gemma native tool-call mode for a model: 'full' | 'restricted'
+    | 'off'. Per-model models.json ``gemma_tool_parser`` wins, else the global
+    ``models.gemma_tool_parser``, else 'restricted'."""
+    mode = None
+    try:
+        from codai.models.manager import multi_model_manager as _mmm
+        cc = _mmm._config_for_model(model_name or "") or {}
+        raw = cc.get("_raw_cfg") if isinstance(cc, dict) else None
+        for src in (cc, raw if isinstance(raw, dict) else {}):
+            if isinstance(src, dict) and src.get("gemma_tool_parser"):
+                mode = str(src["gemma_tool_parser"]).strip().lower()
+    except Exception:
+        pass
+    if not mode:
+        try:
+            from codai.admin.routes import config_manager as _cm
+            if _cm is not None and getattr(_cm, "config", None) is not None:
+                mode = str(getattr(_cm.config.models, "gemma_tool_parser", "")
+                           or "").strip().lower()
+        except Exception:
+            pass
+    return mode if mode in GEMMA_TOOL_MODES else "restricted"
+
+
+_GEMMA_CALL_SPAN_RE = re.compile(r'(?:call|response):\s*([A-Za-z_]\w*)\s*\{')
+
+
+def strip_gemma_native(text, tool_names=None, mode="full"):
+    """Remove gemma-4 native ``call:NAME{…}`` / ``response:NAME{…}`` spans from
+    user-facing content, gated by mode:
+      * 'off'        — leave content untouched (no normalize, no strip);
+      * 'restricted' — only remove a span when NAME is a declared tool, so legit
+                       ``call:foo{…}`` prose/code in a coding reply is preserved;
+      * 'full'       — remove every span (and normalize the corrupted markers).
+    Returns the cleaned text. Other tool formats (DSML, XML) are handled by the
+    caller — this only governs the gemma heuristic."""
+    if not text or mode == "off":
+        return text
+    text = normalize_gemma_tool_tokens(text)
+    names = set(tool_names) if tool_names else set()
+    out, i = [], 0
+    while True:
+        m = _GEMMA_CALL_SPAN_RE.search(text, i)
+        if not m:
+            out.append(text[i:])
+            break
+        if mode == "restricted" and m.group(1) not in names:
+            # Unknown name — not a real tool; keep the text so we never delete
+            # legitimate content (the false-positive case).
+            out.append(text[i:m.end()])
+            i = m.end()
+            continue
+        try:
+            _, end = _parse_gemma_loose_object(text, m.end() - 1)
+        except Exception:
+            end = m.end()
+        out.append(text[i:m.start()])
+        i = end
+    return ''.join(out)
+
+
+def parse_gemma_native_tool_calls(text: str, tool_names=None, mode="full"):
     """Parse gemma-4's native tool-call format — ``call:NAME{args}`` (optionally
     wrapped in the ``<|tool_call>…<tool_call|>`` special tokens) — into a list of
-    ``(name, args_dict)``. ``tool_names`` (when given) restricts matches to real
-    tool names so prose containing ``call:`` isn't misread. Exact-duplicate calls
-    are collapsed (a degenerate model loop emits the same call repeatedly)."""
-    if not text or 'call:' not in text:
+    ``(name, args_dict)``. ``mode`` gates recall: 'off' parses nothing,
+    'restricted' parses only declared tool names, 'full' parses any call:NAME{.
+    ``tool_names`` (when given) restricts matches so prose containing ``call:``
+    isn't misread. Exact-duplicate calls are collapsed (a degenerate model loop
+    emits the same call repeatedly)."""
+    if not text or 'call:' not in text or mode == "off":
         return []
     out = []
     seen = set()
     for m in re.finditer(r'call:\s*([A-Za-z_]\w*)\s*\{', text):
         name = m.group(1)
-        if tool_names and name not in tool_names:
+        # restricted: a span is a call only when NAME is a declared tool (so prose
+        # / code like `call:foo{…}` is never misread). full: parse any call:NAME{,
+        # but still honor tool_names when we have them.
+        if mode == "restricted":
+            if not tool_names or name not in tool_names:
+                continue
+        elif tool_names and name not in tool_names:
             continue
         brace = m.end() - 1   # index of '{'
         # Some models double-wrap the args: call:NAME{{"k":"v"}}. Skip the
@@ -1332,7 +1405,8 @@ class GemmaParser(BaseParser):
         # markers are stripped by skip_special_tokens during decode). Restrict to
         # declared tool names when we know them, to avoid matching prose.
         native = parse_gemma_native_tool_calls(
-            text, set(self.tools.keys()) if self.tools else None)
+            text, set(self.tools.keys()) if self.tools else None,
+            mode=getattr(self, "_gemma_mode", "full"))
         for name, args in native:
             results.append(self._to_oa(name, args))
         if results:
@@ -1588,6 +1662,12 @@ class ModelParserDispatcher:
     
     def parse(self, text: str) -> List[Dict]:
         """Parse tool calls from model output."""
+        # Propagate the resolved gemma tool-call mode to the selected parser
+        # (only GemmaParser consults it) so per-model full/restricted/off applies.
+        try:
+            self.parser._gemma_mode = resolve_gemma_tool_mode(self.model_name)
+        except Exception:
+            pass
         return self.parser.parse(text)
     
     def set_tools(self, tools: Dict[str, Any]) -> None:
@@ -2401,7 +2481,17 @@ class ToolCallParser:
         # Debug logging for ToolCallParser
         print(f"DEBUG ToolCallParser: Called with text (first 200 chars): {repr(text[:200] if len(text) > 200 else text)}")
         print(f"DEBUG ToolCallParser: available_tools count: {len(available_tools) if available_tools else 0}")
-        
+
+        # Remember the declared tool names so a later strip_tool_calls_from_content
+        # (same parser instance, e.g. the streaming finalizer) can run the gemma
+        # 'restricted' mode — only stripping spans whose NAME is a real tool.
+        try:
+            self._last_tool_names = {
+                n for n in (getattr(getattr(t, 'function', None), 'name', None)
+                            for t in (available_tools or [])) if n}
+        except Exception:
+            self._last_tool_names = set()
+
         # Repair gemma-4's corrupted tool tokens (<|"|> quotes, malformed markers).
         text = normalize_gemma_tool_tokens(text)
 
@@ -2495,17 +2585,12 @@ class ToolCallParser:
         if not text:
             return text
 
-        # Repair gemma-4's corrupted markers/quotes, then drop its native
-        # call:/response: spans so neither the call nor a hallucinated fake result
-        # leaks into the content.
-        text = normalize_gemma_tool_tokens(text)
-        while re.search(r'(?:call|response):\s*[A-Za-z_]\w*\s*\{', text):
-            m = re.search(r'(?:call|response):\s*[A-Za-z_]\w*\s*\{', text)
-            try:
-                _, end = _parse_gemma_loose_object(text, m.end() - 1)
-            except Exception:
-                end = m.end()
-            text = text[:m.start()] + text[end:]
+        # Drop gemma-4 native call:/response: spans (gated by the per-model mode so
+        # 'restricted' never deletes legit call:foo{…} prose and 'off' is a no-op).
+        # Uses the tool names stashed by the matching extract_tool_calls call.
+        text = strip_gemma_native(
+            text, getattr(self, "_last_tool_names", None),
+            resolve_gemma_tool_mode(self.model_name))
 
         text = strip_dsml_tool_calls(text)
         for pattern in STRIP_TOOL_PATTERNS:
@@ -2592,23 +2677,15 @@ class ModelParserAdapter:
         if not text:
             return text
 
-        # Repair gemma-4's corrupted markers/quotes first so the call:NAME{…} spans
-        # below match and the stray <|tool_call>/<|tool_response>/<|"|> fragments are
-        # gone from the content shown to the user.
-        text = normalize_gemma_tool_tokens(text)
+        # gemma-4 native: drop `call:NAME{…}` (the real call) and `response:NAME{…}`
+        # (a hallucinated fake result) spans, gated by the per-model mode so a
+        # 'restricted' model never deletes legit `call:foo{…}` prose/code and an
+        # 'off' model is left entirely untouched.
+        text = strip_gemma_native(
+            text, (self._tools_schema or {}).keys(),
+            resolve_gemma_tool_mode(self._model_name))
 
         text = strip_dsml_tool_calls(text)
-
-        # gemma-4 native: drop every `call:NAME{…}` (the real call) and any
-        # `response:NAME{…}` (a hallucinated fake tool result) span — balanced braces —
-        # plus the `thought` channel residue.
-        while re.search(r'(?:call|response):\s*[A-Za-z_]\w*\s*\{', text):
-            m = re.search(r'(?:call|response):\s*[A-Za-z_]\w*\s*\{', text)
-            try:
-                _, end = _parse_gemma_loose_object(text, m.end() - 1)
-            except Exception:
-                end = m.end()
-            text = text[:m.start()] + text[end:]
         text = re.sub(r'(?m)^\s*thought\s*$\n?', '', text)
 
         # Custom XML format: <tool><action>...</action><object>...</object><properties>...</properties></tool>
