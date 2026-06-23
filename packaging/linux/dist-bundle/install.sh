@@ -54,8 +54,27 @@ if ! "$ENGINE" info >/dev/null 2>&1; then
   fi
 fi
 
-say "[install] loading image from $IMAGE_TAR — this is large, please wait…"
-LOAD_OUT="$("${DK[@]}" load -i "$IMAGE_TAR")"
+# Pre-authenticate sudo (if used) so its password prompt doesn't collide with the
+# progress bar drawn below.
+if [ "${DK[0]}" = "sudo" ]; then sudo -v || true; fi
+
+# Load the image WITH a progress bar. `docker load -i` shows nothing useful and we
+# used to capture its output (hiding even that), so a 12G load looked like a hang.
+# Stream the tarball through a meter into `docker load` instead: the read of the
+# file tracks load progress closely. `pv` gives a real bar+ETA; GNU `dd` is the
+# fallback (bytes + throughput); otherwise plain load. The progress is drawn on
+# stderr, so command substitution still captures the "Loaded image:" line.
+IMG_SIZE="$(stat -c %s "$IMAGE_TAR" 2>/dev/null || wc -c < "$IMAGE_TAR" 2>/dev/null || echo 0)"
+say "[install] loading image from $IMAGE_TAR — this is large (~$(( IMG_SIZE / 1024 / 1024 / 1024 ))G), please wait…"
+if command -v pv >/dev/null 2>&1 && [ "${IMG_SIZE:-0}" -gt 0 ]; then
+  LOAD_OUT="$(pv -s "$IMG_SIZE" "$IMAGE_TAR" | "${DK[@]}" load)"
+elif dd --version >/dev/null 2>&1; then
+  LOAD_OUT="$(dd if="$IMAGE_TAR" bs=4M status=progress | "${DK[@]}" load)"
+else
+  say "[install] (tip: install 'pv' for a progress bar) loading…"
+  LOAD_OUT="$("${DK[@]}" load -i "$IMAGE_TAR")"
+fi
+say ""
 say "$LOAD_OUT"
 # e.g. "Loaded image: coderai:full_all_0.1.0" — the tag we just installed.
 LOADED_TAG="$(printf '%s\n' "$LOAD_OUT" | sed -n 's/^Loaded image: //p' | head -1)"
