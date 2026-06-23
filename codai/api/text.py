@@ -21,6 +21,7 @@ Text generation endpoints for the codai API.
 import asyncio
 import json
 import logging
+import re as _re
 import time
 import uuid
 from typing import AsyncGenerator, Dict, List, Optional
@@ -2263,7 +2264,6 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         finally:
             _release_instance()
 
-import re as _re
 
 _TOOL_SPAN_RE = _re.compile(r'<(tool|tool_call)\b[\s\S]*?</\1\s*>', _re.IGNORECASE)
 _TOOL_OPEN_RE = _re.compile(r'<(?:tool|tool_call)\b', _re.IGNORECASE)
