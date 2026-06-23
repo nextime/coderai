@@ -44,21 +44,32 @@ class ChatMessage(BaseModel):
     @field_validator('content', mode='before')
     @classmethod
     def convert_content_array_to_string(cls, v):
-        """Convert multipart content array to string for compatibility."""
+        """Flatten a TEXT-ONLY multipart content array to a string for clients that
+        send text as parts (e.g. KiloCode). Multimodal arrays — anything with an
+        ``image_url`` (or other non-text part) — are PRESERVED as a list so the
+        vision backend (mmproj/CLIP) actually receives the image. Flattening those
+        replaced the image with a "[image_url content]" placeholder, so a vision
+        model saw only text and answered "no image attached"."""
         if v is None:
             return None
         if isinstance(v, str):
             return v
         if isinstance(v, list):
-            # Handle multipart content array format (e.g., from KiloCode)
-            # Format: [{"type": "text", "text": "..."}, {"type": "text", "text": "..."}]
+            # Preserve the array untouched when it carries any non-text part — the
+            # downstream chat path (vulkan _fold_system + MTMDChatHandler) handles
+            # list content and feeds image_url parts to the vision projector.
+            has_non_text = any(
+                isinstance(item, dict) and item.get('type') not in (None, 'text')
+                for item in v)
+            if has_non_text:
+                return v
+            # Pure text parts → join to a single string (the KiloCode case).
             parts = []
             for item in v:
                 if isinstance(item, dict):
                     if item.get('type') == 'text' and 'text' in item:
                         parts.append(item['text'])
                     else:
-                        # Handle other content types (image_url, etc.) by converting to placeholder
                         parts.append(f"[{item.get('type', 'unknown')} content]")
                 else:
                     parts.append(str(item))
