@@ -521,6 +521,7 @@ class FrontProxy:
                 _meas = (_status == 200 and "text/event-stream"
                          in (rp_resp.headers.get("content-type") or ""))
                 ntok = 0
+                _gen_t0 = None      # wall-clock of the first streamed token (for tok/s)
                 async for raw in rp_resp.aiter_raw():
                     if not raw:
                         continue
@@ -529,6 +530,16 @@ class FrontProxy:
                         m = (engine.active or {}).get(_rid)
                         if m is not None:
                             m["step"] = ntok
+                            # Publish tokens/s too, measured from the first token so the
+                            # model-load/queue wait doesn't drag the average down. The
+                            # Tasks page reads m["rate"] (see _merge_engine_tasks); without
+                            # this it showed token progress but a frozen 0 speed.
+                            if _gen_t0 is None:
+                                _gen_t0 = _t.time()
+                            else:
+                                _el = _t.time() - _gen_t0
+                                if _el > 0:
+                                    m["rate"] = round(ntok / _el, 1)
                     yield raw.decode("utf-8", "replace")
                 await rp_resp.aclose()
                 break
