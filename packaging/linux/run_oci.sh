@@ -40,12 +40,18 @@ CODERAI_EXTRA_ARGS="${CODERAI_EXTRA_ARGS:-}"
 DATA_ROOT="$PWD/coderai-runtime"
 DATA_ROOT_EXPLICIT=0
 IS_LOCAL=0
-# Run the container as a specific user. Empty = container default (root). When set
-# (e.g. via --user with no value -> your uid:gid) AND a config dir is used, the
-# config is mounted IN PLACE so the app's edits persist to it (files stay owned by
-# you). Without --user, an in-place mount as root would create root-owned files,
-# so we fall back to the throwaway temp copy.
-USER_SPEC=""
+# Run the container as a specific user. DEFAULT: the invoking user (uid:gid) so
+# nothing the container creates in the mounted /config|/models|/cache (logs,
+# coderai-tmp, hf cache, …) is left root-owned — a single root run would
+# otherwise poison those dirs so later --user runs can't write them (the
+# "cannot write /cache/logs … logging to stdout only" symptom). Pass --root to
+# opt back into the image's root default; pass --user UID[:GID] to pick another.
+# When non-empty AND a config dir is used, the config is mounted IN PLACE so the
+# app's edits persist to it (files stay owned by you); under --root we fall back
+# to a throwaway temp copy so a root container can't leave root-owned config.
+# Prefer the pre-sudo identity (SUDO_UID/GID) so `sudo coderai-docker` still runs
+# the container as the real user, not root — same anti-footgun goal.
+USER_SPEC="${SUDO_UID:-$(id -u)}:${SUDO_GID:-$(id -g)}"
 DETACH=0
 NAME="coderai"
 EXTRA_ARGS=()
@@ -116,10 +122,15 @@ Options:
   --local             Shortcut for --config-dir ~/.coderai. Also puts the runtime
                       dir under ~/.config/coderai-runtime (override with --data-dir).
                       Add --user to persist the app's config edits back to it.
-  --user[=UID[:GID]]  Run the container as that user (no value = your uid:gid). With
-                      a config dir, switches to an IN-PLACE mount so config edits
-                      persist there, owned by you. Without it, --config-dir/--local
-                      use a throwaway copy (no persistence).
+  --user[=UID[:GID]]  Run the container as that user (no value = your uid:gid).
+                      This is the DEFAULT (the invoking user) so the container
+                      never leaves root-owned files in the mounts. With a config
+                      dir, uses an IN-PLACE mount so config edits persist there,
+                      owned by you.
+  --root              Run the container as root (the image default). Opts out of
+                      the default --user; anything written to the mounts will be
+                      root-owned, and --config-dir/--local use a throwaway copy
+                      (no persistence) to avoid root-owned config.
   --inplace-config    Mount --config-dir in place (config edits persist there).
   --map HOST[:CONT]   Bind-mount a host dir at the SAME path (or HOST:CONT) inside
                       the container, so absolute paths in models.json resolve
@@ -186,6 +197,10 @@ while [[ $# -gt 0 ]]; do
       if [[ $# -ge 2 && "$2" =~ ^[0-9] ]]; then USER_SPEC="$2"; shift 2
       else USER_SPEC="$(id -u):$(id -g)"; shift; fi ;;
     --user=*) USER_SPEC="${1#*=}"; shift ;;
+    # Opt back into the image's root default (the container runs as root). Anything
+    # it writes into the mounts will be root-owned — only use when you really want
+    # that (e.g. a shared root-managed data dir).
+    --root) USER_SPEC=""; shift ;;
     --map)
       [[ $# -ge 2 ]] || { echo "Error: --map requires HOST[:CONT]" >&2; exit 2; }
       MAPS+=("$2"); shift 2 ;;
