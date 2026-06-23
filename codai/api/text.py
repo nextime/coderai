@@ -2269,6 +2269,10 @@ _TOOL_SPAN_RE = _re.compile(r'<(tool|tool_call)\b[\s\S]*?</\1\s*>', _re.IGNORECA
 _TOOL_OPEN_RE = _re.compile(r'<(?:tool|tool_call)\b', _re.IGNORECASE)
 _TOOL_OPEN_TAGS = ('<tool>', '<tool_call>', '<|tool_call>', '<|tool_call|>',
                    '<｜dsml｜tool_calls>')
+# Native/special-token tool markers used for trailing-partial holding even when no
+# tools were declared (so a relay-stripped tools array can't let <|tool_call> leak).
+_NATIVE_PARTIAL_TAGS = ('<|tool_call>', '<|tool_call|>', '<|tool_response>',
+                        '<｜dsml｜', '<|dsml|')
 # gemma/qwen native special-token tool marker `<|tool_call>` — usually a special
 # token stripped on decode, but some GGUFs emit it as plain text. Treat it like a
 # tool-open: withhold everything from it to the end so the raw marker (and the
@@ -2319,62 +2323,81 @@ def _gate_reasoning(buffer: str, final: bool = False):
     return buffer, "", "", False
 
 
-def _gate_tool_content(buffer: str, final: bool = False):
+def _gate_tool_content(buffer: str, final: bool = False,
+                       gemma_mode: str = "full", tool_names=None,
+                       gate_xml: bool = True):
     """Split accumulated stream text into (content_to_emit, held_buffer).
 
-    During tool-enabled streaming the model emits ``<tool>{json}</tool>`` spans
-    inline. Those must NOT reach the client as visible ``content`` (they're
+    Tool-call markup must NOT reach the client as visible ``content`` (it's
     surfaced separately as structured ``tool_calls``); otherwise the raw tags leak
-    into the chat. This withholds any complete or in-progress tool span, plus a
-    trailing partial ``<`` that could still grow into a tool tag, and streams only
-    the safe text around them. With ``final=True`` any leftover (possibly unclosed)
-    tool span is dropped and the rest emitted.
+    into the chat — the "spill". The UNAMBIGUOUS native special-token markers
+    (``<|tool_call>``, ``<|tool_response>``, DeepSeek DSML) are ALWAYS withheld,
+    even when no tools were declared on the request — the AISBF relay can drop the
+    ``tools`` array, but a gemma/qwen model still emits those markers from its
+    system prompt, and they are never legitimate content.
+
+    ``gate_xml`` (set from "tools present") controls the ambiguous ``<tool>…</tool>``
+    XML form. The gemma-4 ``call:NAME{…}`` form is gated by ``gemma_mode``: 'off'
+    never withholds it; 'full' always; 'restricted' only when NAME is a declared
+    tool (so legit ``call:foo{…}`` prose/code is streamed, not eaten). With
+    ``final=True`` any leftover (possibly unclosed) withheld span is dropped.
     """
     emit = []
-    # Strip complete tool spans, emitting the text around each.
-    while True:
-        m = _TOOL_SPAN_RE.search(buffer)
-        if not m:
-            break
-        emit.append(buffer[:m.start()])
-        buffer = buffer[m.end():]
-    # An open tag with no close yet → hold from there (a call is in progress).
-    m = _TOOL_OPEN_RE.search(buffer)
-    if m:
-        emit.append(buffer[:m.start()])
-        held = '' if final else buffer[m.start():]
-        return ''.join(emit), held
-    # gemma/qwen native `<|tool_call>` marker — withhold from it to the end.
+    names = set(tool_names) if tool_names else set()
+    # Complete <tool>…</tool> spans (ambiguous XML form — only when tools present).
+    if gate_xml:
+        while True:
+            m = _TOOL_SPAN_RE.search(buffer)
+            if not m:
+                break
+            emit.append(buffer[:m.start()])
+            buffer = buffer[m.end():]
+    # Native <|tool_call …> / <|tool_response …> — ALWAYS withhold to the end.
     nm = _NATIVE_TOOL_OPEN_RE.search(buffer)
     if nm:
         emit.append(buffer[:nm.start()])
-        held = '' if final else buffer[nm.start():]
-        return ''.join(emit), held
-    # gemma-4 `call:NAME{…}` — withhold from the call onward (extracted at the end).
-    gm = _GEMMA_CALL_OPEN_RE.search(buffer)
-    if gm:
-        emit.append(buffer[:gm.start()])
-        held = '' if final else buffer[gm.start():]
-        return ''.join(emit), held
-    # DeepSeek V4 DSML tool call (<｜DSML｜…>) — withhold from the marker onward.
+        return ''.join(emit), ('' if final else buffer[nm.start():])
+    # DeepSeek V4 DSML tool call (<｜DSML｜…>) — ALWAYS withhold to the end.
     dm = _DSML_OPEN_RE.search(buffer)
     if dm:
         emit.append(buffer[:dm.start()])
-        held = '' if final else buffer[dm.start():]
-        return ''.join(emit), held
-    # Hold back a trailing '<…' that could still become a tool open tag.
+        return ''.join(emit), ('' if final else buffer[dm.start():])
+    # Ambiguous XML open tag with no close yet (only when tools present).
+    if gate_xml:
+        m = _TOOL_OPEN_RE.search(buffer)
+        if m:
+            emit.append(buffer[:m.start()])
+            return ''.join(emit), ('' if final else buffer[m.start():])
+    # gemma-4 `call:NAME{…}` — withhold per mode. Under 'restricted', a name that
+    # isn't a declared tool is left in place (legit content) and scanning continues.
+    if gemma_mode != "off":
+        pos = 0
+        while True:
+            gm = _GEMMA_CALL_OPEN_RE.search(buffer, pos)
+            if not gm:
+                break
+            _nm = _re.match(r'call:\s*([A-Za-z_]\w*)', buffer[gm.start():])
+            cname = _nm.group(1) if _nm else ''
+            if gemma_mode == "restricted" and cname not in names:
+                pos = gm.end()
+                continue
+            emit.append(buffer[:gm.start()])
+            return ''.join(emit), ('' if final else buffer[gm.start():])
+    # Hold back trailing partials that could still grow into a marker next chunk.
     if not final:
         lt = buffer.rfind('<')
         if lt != -1:
             tail = buffer[lt:].lower()
-            if any(t.startswith(tail) for t in _TOOL_OPEN_TAGS):
+            # Native/DSML partials always; XML partials only when gating XML.
+            cand = _TOOL_OPEN_TAGS if gate_xml else _NATIVE_PARTIAL_TAGS
+            if any(t.startswith(tail) for t in cand):
                 emit.append(buffer[:lt])
                 return ''.join(emit), buffer[lt:]
-        # Hold a trailing 'call:NAME' (no '{' yet) that may grow into a gemma call.
-        cm = _re.search(r'call:\s*[A-Za-z_]?\w*$', buffer)
-        if cm:
-            emit.append(buffer[:cm.start()])
-            return ''.join(emit), buffer[cm.start():]
+        if gemma_mode != "off":
+            cm = _re.search(r'call:\s*[A-Za-z_]?\w*$', buffer)
+            if cm:
+                emit.append(buffer[:cm.start()])
+                return ''.join(emit), buffer[cm.start():]
     emit.append(buffer)
     return ''.join(emit), ''
 
@@ -2522,6 +2545,23 @@ async def stream_chat_response(
                                   model=model_name or "", task_id=request_id)
     task_registry.start(_tid)
 
+    # Tool-content gating context (resolved once). Native markers are always gated;
+    # XML <tool> gating follows "tools present"; the gemma call:NAME{ form follows
+    # the per-model gemma_tool_parser mode. Resolving here lets the gate withhold
+    # native markup even when the relay dropped the tools array (the spill).
+    from codai.models.parser import resolve_gemma_tool_mode as _resolve_gemma_mode
+    _gemma_mode = _resolve_gemma_mode(model_name)
+    _gate_xml = bool(tools)
+    _tool_names = set()
+    try:
+        for _t in (tools or []):
+            _fn = _t.get("function") if isinstance(_t, dict) else getattr(_t, "function", None)
+            _n = (_fn.get("name") if isinstance(_fn, dict) else getattr(_fn, "name", None)) if _fn else None
+            if _n:
+                _tool_names.add(_n)
+    except Exception:
+        _tool_names = set()
+
     try:
         chunk_count = 0
         _gen_t0 = None          # wall-clock of the first generated token (for it/s)
@@ -2665,15 +2705,19 @@ async def stream_chat_response(
                     await asyncio.sleep(0)
                     continue
 
-            # When tools are enabled, gate the content so in-progress <tool>…</tool>
-            # spans are never streamed as visible text (they're surfaced as
-            # structured tool_calls after the stream). Without tools, stream as-is.
-            if tools:
-                content_buffer += filtered_chunk
-                filtered_chunk, content_buffer = _gate_tool_content(content_buffer)
-                if not filtered_chunk:
-                    await asyncio.sleep(0)
-                    continue
+            # Gate the content so tool-call markup is never streamed as visible text
+            # (it's surfaced as structured tool_calls after the stream). Native
+            # markers (<|tool_call>, DSML) are withheld ALWAYS — even when no tools
+            # were declared, since the relay can drop the tools array yet the model
+            # still emits them (the spill). XML <tool> and gemma call:NAME{ gating
+            # follow tools-present / the gemma mode.
+            content_buffer += filtered_chunk
+            filtered_chunk, content_buffer = _gate_tool_content(
+                content_buffer, gemma_mode=_gemma_mode,
+                tool_names=_tool_names, gate_xml=_gate_xml)
+            if not filtered_chunk:
+                await asyncio.sleep(0)
+                continue
 
             data = {
                 "id": completion_id,
@@ -2721,8 +2765,11 @@ async def stream_chat_response(
 
         # Flush any safe trailing text held back by the tool-content gate
         # (dropping leftover/unclosed tool tags — they become tool_calls below).
-        if tools and content_buffer:
-            tail_content, content_buffer = _gate_tool_content(content_buffer, final=True)
+        # Runs even without a tools array, since native markup is gated regardless.
+        if content_buffer:
+            tail_content, content_buffer = _gate_tool_content(
+                content_buffer, final=True, gemma_mode=_gemma_mode,
+                tool_names=_tool_names, gate_xml=_gate_xml)
             if tail_content:
                 data = {
                     "id": completion_id,
