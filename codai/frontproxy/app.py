@@ -179,6 +179,10 @@ class FrontProxy:
                     query=envelope.query, body=body):
                 yield chunk
         client.stream_dispatcher = _stream_dispatch
+        # Gate the out-of-band `pending` keepalives by the per-model / global
+        # load_status_updates flag (default on). Returns True when the model is
+        # unknown so the relay deadline is still protected by default.
+        client.status_gate = self._load_status_enabled
         self._broker = BrokerService(client)   # app=None → keep our dispatcher
         self._broker.start()
         print("[front] AISBF broker started (front-managed, routes to engines)",
@@ -412,6 +416,26 @@ class FrontProxy:
         # ready, or a non-200 not-ready status).
         _MAX_TRIES = 6
         _RETRY_WAIT = 5.0
+        # Load-status SSE: while we wait for an engine/model to become ready, emit
+        # a NON-content chunk (empty delta.content + x_queue_info) so a watching
+        # client sees "still loading" without polluting the assembled reply. Gated
+        # by the per-model / global load_status_updates flag (default on); the
+        # out-of-band broker `pending` keepalive is gated by the same flag in the
+        # broker client. This runs in the front-proxy event loop, which stays
+        # responsive even while the engine is GIL-blocked loading the model.
+        _status_on = self._load_status_enabled(model)
+        import time as _t0
+
+        def _status_sse(msg):
+            return "data: " + _json.dumps({
+                "id": "chatcmpl-load",
+                "object": "chat.completion.chunk",
+                "created": int(_t0.time()),
+                "model": model or "",
+                "choices": [{"index": 0, "delta": {"content": ""},
+                             "finish_reason": None}],
+                "x_queue_info": {"status": "loading", "message": msg},
+            }) + "\n\n"
 
         def _pick():
             return _router.pick_engine(
@@ -423,6 +447,8 @@ class FrontProxy:
         engine = _pick()
         if engine is None and _is_infer:
             for _ in range(_MAX_TRIES):
+                if _status_on:
+                    yield _status_sse("waiting for an engine to come up")
                 await _asyncio.sleep(_RETRY_WAIT)
                 engine = _pick()
                 if engine is not None:
@@ -475,6 +501,8 @@ class FrontProxy:
                     rp_resp = await self._long.send(rp_req, stream=True)
                 except Exception as exc:
                     if _is_infer and not _last:
+                        if _status_on:
+                            yield _status_sse("engine starting up")
                         await _asyncio.sleep(_RETRY_WAIT)
                         continue
                     yield ('data: {"error":"engine#%s unreachable: %s"}\n\n'
@@ -486,6 +514,8 @@ class FrontProxy:
                 # non-200, so re-sending the body is safe (no duplicate output).
                 if _is_infer and _status in _RETRY_STATUS and not _last:
                     await rp_resp.aclose()
+                    if _status_on:
+                        yield _status_sse("model loading")
                     await _asyncio.sleep(_RETRY_WAIT)
                     continue
                 _meas = (_status == 200 and "text/event-stream"
@@ -559,7 +589,10 @@ class FrontProxy:
                        "engine_fallback": bool(m.get("engine_fallback")),
                        # Per-model concurrency ceiling — the front queue sizes its
                        # gate to this so it never over-subscribes the engine.
-                       "max_instances": m.get("max_instances")}
+                       "max_instances": m.get("max_instances"),
+                       # Per-model override for load-status signalling (None =
+                       # inherit the global models.load_status_updates).
+                       "load_status_updates": m.get("load_status_updates")}
                 for field_ in (m.get("path"), m.get("id"), m.get("alias")):
                     if not field_:
                         continue
@@ -607,6 +640,17 @@ class FrontProxy:
                 pass
         _models = getattr(self.config, "models", None)
         return max(1, int(getattr(_models, "max_model_instances", 1) or 1))
+
+    def _load_status_enabled(self, model: Optional[str]) -> bool:
+        """Whether to emit load-status signals (out-of-band broker `pending`
+        keepalives + a non-content SSE status chunk) while a model is loading /
+        not ready. Per-model ``load_status_updates`` in models.json wins; else the
+        global ``models.load_status_updates`` (default True)."""
+        ov = self._model_info(model).get("load_status_updates")
+        if ov is not None:
+            return bool(ov)
+        _models = getattr(self.config, "models", None)
+        return bool(getattr(_models, "load_status_updates", True))
 
     def _queue_max_waiting(self) -> int:
         self._refresh_config_if_changed()

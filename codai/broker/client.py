@@ -33,6 +33,10 @@ class BrokerClient:
         # Optional async-generator dispatcher for streaming requests: yields SSE
         # chunks which we relay as ``chunk`` envelopes + a terminal ``done``.
         self.stream_dispatcher = None
+        # Optional callback(model) -> bool gating the out-of-band `pending`
+        # keepalives by the per-model / global load_status_updates flag. None or a
+        # True return keeps keepalives on (default), protecting the relay deadline.
+        self.status_gate = None
         self.websocket = None
         self.session_id = None
         self.session_metadata: dict[str, Any] = {}
@@ -407,12 +411,25 @@ class BrokerClient:
             except Exception as _probe_exc:
                 logger.info("CoderAI broker inbound max_tokens probe failed: %s",
                             _probe_exc)
+            # Resolve whether load-status signalling is enabled for this model
+            # (per-model / global load_status_updates, default on). When off, we
+            # suppress the out-of-band `pending` keepalives below — matching the
+            # SSE side in the front proxy. Defaults to on when the gate or model
+            # is unavailable so the relay deadline stays protected.
+            _status_on = True
+            try:
+                _gate = self.status_gate
+                if _gate is not None:
+                    _model_id = _b.get("model") if isinstance(_b, dict) else None
+                    _status_on = bool(_gate(_model_id))
+            except Exception:
+                _status_on = True
             # Send an immediate "pending" acknowledgment so the broker side extends
             # its deadline, then keep sending periodic keepalives while the request
             # runs (e.g. during model download).  The keepalive task is cancelled
             # as soon as we have a final response to send.
             keepalive_task: asyncio.Task | None = None
-            if request_id:
+            if request_id and _status_on:
                 try:
                     await self.websocket.send(json.dumps({
                         "v": 1,

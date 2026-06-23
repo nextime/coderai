@@ -2403,85 +2403,23 @@ async def stream_chat_response(
             # Alternative check for some model managers
             model_loaded = True
     
-    # If model not loaded, add to queue and send waiting notifications
+    # If the model isn't loaded yet, register the request for queue bookkeeping
+    # and just wait. We deliberately do NOT inject any "waiting"/"model starting"
+    # placeholder chunks here: this handler runs inside the engine, whose event
+    # loop is GIL-blocked while the model loads, so anything yielded now never
+    # streams live — it only gets concatenated into the final reply and pollutes
+    # the output. Load-status signalling lives in the front proxy / broker layer
+    # (broker_execute_stream SSE + `pending` keepalives), which stays responsive
+    # during the load and is gated by the load_status_updates flag.
     if not model_loaded:
         await queue_manager.add_waiting(request_id, prefix_key=prefix_key)
-        wait_interval = 2.0  # Send waiting update every 2 seconds
-        last_wait_update = time.time()
-        
-        # Send initial waiting message
-        data = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model_name,
-            "choices": [{
-                "index": 0,
-                "delta": {"content": "Waiting for model reply...\n"},
-                "finish_reason": None,
-            }],
-            "x_queue_info": {
-                "status": "waiting",
-                "message": "Waiting for model reply...",
-            },
-        }
-        yield f"data: {json.dumps(data)}\n\n"
-        
-        # Keep sending wait updates until model is loaded
-        # In a real implementation, this would check a loading status
-        # For now, we'll send a few updates then proceed
-        max_wait_updates = 5
-        wait_count = 0
-        while wait_count < max_wait_updates:
-            await asyncio.sleep(wait_interval)
-            wait_time = await queue_manager.get_wait_time(request_id)
-            wait_count += 1
-            
-            queue_pos = await queue_manager.get_queue_position(request_id)
-            
-            data = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model_name,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": f""},
-                    "finish_reason": None,
-                }],
-                "x_queue_info": {
-                    "status": "waiting",
-                    "message": f"Waiting for model reply... ({int(wait_time)}s)",
-                    "queue_position": queue_pos,
-                    "wait_time_seconds": int(wait_time),
-                },
-            }
-            yield f"data: {json.dumps(data)}\n\n"
-    
+
     # Mark as starting processing
     await queue_manager.start_processing(request_id, model_name)
     _tid = task_registry.register("text", title=(model_name or "chat"),
                                   model=model_name or "", task_id=request_id)
     task_registry.start(_tid)
-    
-    # Send "Model starting" message
-    data = {
-        "id": completion_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model_name,
-        "choices": [{
-            "index": 0,
-            "delta": {"content": ""},
-            "finish_reason": None,
-        }],
-        "x_queue_info": {
-            "status": "starting",
-            "message": "Model starting",
-        },
-    }
-    yield f"data: {json.dumps(data)}\n\n"
-    
+
     try:
         chunk_count = 0
         _gen_t0 = None          # wall-clock of the first generated token (for it/s)

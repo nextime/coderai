@@ -100,6 +100,12 @@ class ModelsConfig:
     # clamped to this value. None = no cap (use the client's value, or the 2048
     # fallback). Overridable per-model via the models.json entry's "max_tokens".
     max_tokens: Optional[int] = None
+    # While a model is loading / not ready, signal "still working" so the channel
+    # stays alive and a watching client can show progress: out-of-band broker
+    # `pending` keepalives + a non-content SSE status chunk (no message pollution).
+    # Global default on; override per-model via the models.json entry's
+    # "load_status_updates" (set false to deactivate for that model).
+    load_status_updates: bool = True
 
 
 @dataclass
