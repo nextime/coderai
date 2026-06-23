@@ -106,6 +106,15 @@ class ModelsConfig:
     # Global default on; override per-model via the models.json entry's
     # "load_status_updates" (set false to deactivate for that model).
     load_status_updates: bool = True
+    # Degenerate tool-call loop guard: when the incoming history shows the same
+    # tool invoked with the same arguments repeatedly (and each attempt failed or
+    # the call spilled as un-parsed markup), inject a one-shot system reminder
+    # before generation telling the model to stop repeating it. coderai sees the
+    # whole history each request, so it can break a loop the agent's own runner
+    # didn't. Set repeats<=0 to disable. Overridable per-model via models.json
+    # "tool_loop_guard" / "tool_loop_repeats".
+    tool_loop_guard: bool = True
+    tool_loop_repeats: int = 3
 
 
 @dataclass

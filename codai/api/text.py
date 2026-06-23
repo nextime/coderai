@@ -665,6 +665,93 @@ def _clamp_max_tokens(request):
         request.max_tokens = cur if cur else 2048
 
 
+_GEMMA_CALL_RE = _re.compile(r'call:\s*([A-Za-z_]\w*)\s*\{')
+
+
+def _tool_loop_settings(request):
+    """Resolve (enabled, repeats) for the tool-loop guard: per-model models.json
+    ``tool_loop_guard``/``tool_loop_repeats`` win, else the global
+    ``models.tool_loop_*``. Disabled when repeats<=0."""
+    guard, repeats = True, 3
+    try:
+        from codai.admin.routes import config_manager as _cm
+        if _cm is not None and getattr(_cm, "config", None) is not None:
+            guard = bool(getattr(_cm.config.models, "tool_loop_guard", True))
+            repeats = int(getattr(_cm.config.models, "tool_loop_repeats", 3) or 0)
+    except Exception:
+        pass
+    try:
+        from codai.models.manager import multi_model_manager as _mmm
+        _cc = _mmm._config_for_model(getattr(request, "model", None) or "") or {}
+        _raw = _cc.get("_raw_cfg") if isinstance(_cc, dict) else None
+        _raw = _raw if isinstance(_raw, dict) else {}
+        for src in (_cc, _raw):
+            if isinstance(src, dict):
+                if src.get("tool_loop_guard") is not None:
+                    guard = bool(src.get("tool_loop_guard"))
+                if src.get("tool_loop_repeats") is not None:
+                    repeats = int(src.get("tool_loop_repeats") or 0)
+    except Exception:
+        pass
+    return (guard and repeats > 0), repeats
+
+
+def _detect_tool_loop(messages_dict, threshold=3, window=12):
+    """Detect a degenerate tool-call loop in the incoming history and return a
+    one-shot guard string (or None). A loop = the same (tool, arguments) signature
+    repeated >= threshold times within the recent window, where those attempts
+    either failed (the tool result said so) or spilled as un-parsed ``call:NAME{…}``
+    markup in assistant content. Each brokered request carries the full history, so
+    this catches cross-turn loops the per-turn parser can't see."""
+    # tool_call_id -> did its result indicate failure?
+    failed = {}
+    for m in messages_dict:
+        if not isinstance(m, dict) or m.get("role") != "tool":
+            continue
+        c = m.get("content")
+        bad = False
+        if isinstance(c, str):
+            cl = c.lower()
+            bad = ('"success": false' in cl or '"success":false' in cl
+                   or ('"error"' in cl and '"success": true' not in cl
+                       and '"success":true' not in cl))
+        if m.get("tool_call_id"):
+            failed[m["tool_call_id"]] = bad
+    recent = []   # (signature, failed_or_spilled)
+    for m in messages_dict:
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        for tc in (m.get("tool_calls") or []):
+            fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+            args = fn.get("arguments")
+            if not isinstance(args, str):
+                try:
+                    args = json.dumps(args, sort_keys=True, default=str)
+                except Exception:
+                    args = str(args)
+            recent.append(((fn.get("name"), args),
+                           failed.get(tc.get("id"), False) if isinstance(tc, dict) else False))
+        c = m.get("content")
+        if isinstance(c, str) and "call:" in c:
+            for mm in _GEMMA_CALL_RE.finditer(c):
+                recent.append(((mm.group(1), c[mm.end() - 1: mm.end() + 399]), True))
+    recent = recent[-window:]
+    if not recent:
+        return None
+    from collections import Counter
+    counts = Counter(sig for sig, _ in recent)
+    sig, n = counts.most_common(1)[0]
+    fails = sum(1 for s, f in recent if s == sig and f)
+    if n < threshold or fails < threshold:
+        return None
+    name = sig[0] or "the tool"
+    return (f"[automatic loop guard] The tool `{name}` has already been called "
+            f"{n} times with identical arguments and every attempt failed. Do NOT "
+            f"call `{name}` again with the same arguments — change the arguments or "
+            f"approach, try a different tool, or stop and explain the problem to the "
+            f"user instead of repeating the call.")
+
+
 def _resolve_compaction(request, current_manager):
     """Resolve effective auto-compaction settings for a request by merging the
     per-model config over the global ``compaction`` defaults. Returns a plan dict
@@ -1479,6 +1566,21 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
         # A list is legitimate multipart vision content — leave it intact.
         elif not isinstance(m["content"], str) and not isinstance(m["content"], list):
             messages_dict[i]["content"] = str(m["content"])
+
+    # Tool-call loop guard: if the history shows the same tool called with the same
+    # args repeatedly (each failing / spilled), inject one system reminder so the
+    # model breaks the cycle instead of re-emitting the doomed call. coderai sees
+    # the full history per request, so it can stop a loop the agent's runner didn't.
+    try:
+        _guard_on, _guard_n = _tool_loop_settings(request)
+        if _guard_on:
+            _guard = _detect_tool_loop(messages_dict, threshold=_guard_n)
+            if _guard:
+                messages_dict.append({"role": "system", "content": _guard})
+                print(f"[tool-loop-guard] {getattr(request, 'model', '')}: injected "
+                      f"(threshold={_guard_n})", flush=True)
+    except Exception as _gle:
+        print(f"[tool-loop-guard] skipped: {_gle}", flush=True)
 
     # Model-level max_tokens authority: clamp the client's requested reply length
     # to the model-level cap (client honored only when smaller). Done before
