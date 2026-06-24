@@ -1143,13 +1143,22 @@ class MultiModelManager:
 
                 print(f"Loading default model on demand: {self.default_model}")
                 _snap = self.vram_before_load()
+                _ram_snap = self._get_own_ram_gb()
                 kwargs['expected_vram_gb'] = self._get_model_used_vram_gb(self.default_model)
+                # Reuse a learned stable GPU-layer split so the load jumps straight
+                # to the config that fit (skips the OOM→move-to-RAM→retry dance).
+                _ngl = self._learned_n_gpu_layers(self.default_model, kwargs.get('n_gpu_layers'))
+                if _ngl is not None:
+                    kwargs['n_gpu_layers'] = _ngl
                 from codai.tasks import loading_task
                 with loading_task(self.default_model, model_type="text"):
                     model_manager.load_model(self.default_model, backend_type=backend_type, **kwargs)
                 self._last_load_errors.pop(self.default_model, None)
                 self.add_model(self.default_model, model_manager)
-                self.record_vram_delta(self.default_model, _snap)
+                self.record_vram_delta(
+                    self.default_model, _snap, ram_before=_ram_snap,
+                    n_gpu_layers=getattr(getattr(model_manager, 'backend', None),
+                                         'n_gpu_layers', None))
                 self.current_model_key = self.default_model
                 print(f"Model loaded successfully: {self.default_model}")
                 self._model_ready_event.set()
@@ -1296,16 +1305,25 @@ class MultiModelManager:
                     except Exception as _ev_e:
                         print(f"  (ensure_vram_for warning: {_ev_e})")
                 _snap = self.vram_before_load()
+                _ram_snap = self._get_own_ram_gb()
                 # Tell the backend how much VRAM this model is expected to need so
                 # it can decide whether Flash-Attention-2 is safe (FA2 requires the
                 # whole model on GPU; it device-side-asserts when layers offload).
                 kwargs['expected_vram_gb'] = self._get_model_used_vram_gb(model_name)
+                # Reuse a learned stable GPU-layer split so the load jumps straight
+                # to the config that fit (skips the OOM→move-to-RAM→retry dance).
+                _ngl = self._learned_n_gpu_layers(model_name, kwargs.get('n_gpu_layers'))
+                if _ngl is not None:
+                    kwargs['n_gpu_layers'] = _ngl
                 from codai.tasks import loading_task
                 with loading_task(model_name, model_type="text"):
                     model_manager.load_model(model_name, backend_type=backend_type, **kwargs)
                 self._last_load_errors.pop(model_name, None)
                 self.add_model(model_name, model_manager)
-                self.record_vram_delta(model_name, _snap)
+                self.record_vram_delta(
+                    model_name, _snap, ram_before=_ram_snap,
+                    n_gpu_layers=getattr(getattr(model_manager, 'backend', None),
+                                         'n_gpu_layers', None))
                 self.current_model_key = model_name
                 print(f"Model loaded successfully: {model_name}"
                       + (f" (instance {inst_num})" if inst_num > 1 else ""))
@@ -2340,78 +2358,125 @@ class MultiModelManager:
         return self._free_vram_snapshot()
 
     def record_vram_delta(self, model_key: str, free_before: float,
-                          offloaded: bool = False) -> None:
-        """Call immediately after a model finishes loading to record actual VRAM consumed.
+                          offloaded: bool = False, ram_before: float = -1.0,
+                          n_gpu_layers=None) -> None:
+        """Call immediately after a model finishes loading to record its REAL memory
+        footprint on this hardware, so the next load reuses it instead of repeating
+        the OOM→move-layers-to-RAM retry dance.
 
-        If the measured value exceeds the stored estimate by more than 10%, the real
-        value is written back into the model config and persisted to models.json so
-        future eviction decisions use the accurate figure.
+        Records up to three SYSTEM-OWNED fields (never the user's ``used_vram_gb``):
+          * ``measured_vram_gb``      — GPU VRAM delta + runtime reserve (the GPU
+                                        portion; eviction frees against this).
+          * ``measured_ram_gb``       — host-RAM delta (the CPU-offloaded layers).
+          * ``measured_n_gpu_layers`` — the layer split llama.cpp actually settled
+                                        on (after any progressive CPU-offload retry).
+        The TOTAL memory the model needs is ``measured_vram_gb + measured_ram_gb``.
 
-        ``offloaded`` MUST be True when the model was loaded with any CPU/disk
-        offload strategy (model/sequential/group/balanced/disk). In that case the
-        weights are not resident on the GPU, so the measured delta is a tiny,
-        meaningless lower bound — recording it would clobber a real full-GPU
-        measurement and make the next start under-estimate the footprint, pick a
-        full-GPU load, and OOM. So we skip recording entirely and keep the prior
-        estimate/measurement intact.
+        An OFFLOADED load is recorded too (NOT skipped): paired with
+        ``measured_n_gpu_layers`` the figures are self-consistent — the next load
+        goes straight to the same split and uses the same VRAM — so there's no
+        under-estimate→full-GPU→OOM hazard the old skip was guarding against.
+
+        Per-field persist rule: with ``force_vram_update`` set, refresh every run;
+        otherwise only when ``used_vram_gb`` isn't configured (a configured value is
+        authoritative). ``offloaded`` is accepted for back-compat but no longer skips.
         """
         if free_before < 0:
-            return
-        if offloaded:
             return
         free_after = self._free_vram_snapshot()
         if free_after < 0:
             return
-        delta_gb = (free_before - free_after) / 1e9
-        if delta_gb <= 0:
-            return
-
-        # The delta is the resident WEIGHT footprint measured at load time. Add
-        # the runtime reserve (KV cache / activations / VAE-decode spike) so the
-        # value we cache and persist reflects the model's PEAK runtime need — not
-        # just its loaded weights — and future eviction frees enough headroom.
         cfg = self._config_for_model_key(model_key)
-        reserve_gb = self._runtime_reserve_gb(
-            cfg if isinstance(cfg, dict) else {}, model_key, delta_gb)
-        measured = round(delta_gb + reserve_gb, 3)
-        # In-memory truth for the rest of this run (used by eviction estimates).
-        self._measured_vram_gb[model_key] = measured
-        print(f"Measured VRAM for '{model_key}': {delta_gb:.2f} GB weights "
-              f"+ {reserve_gb:.2f} GB runtime reserve = {measured:.2f} GB")
+        cfgd = cfg if isinstance(cfg, dict) else {}
+        force_update = bool(cfgd.get("force_vram_update"))
+        user_pinned = cfgd.get("used_vram_gb") is not None
 
-        # Persist the real value into the SEPARATE, system-owned
-        # `measured_vram_gb` field (never the user's `used_vram_gb`). Rules:
-        #   * force_vram_update set → refresh it EVERY run, even when
-        #     used_vram_gb is configured.
-        #   * otherwise → only when used_vram_gb is NOT configured (a configured
-        #     value is authoritative and must remain unchanged).
-        force_update = bool(cfg.get("force_vram_update")) if isinstance(cfg, dict) else False
-        if not force_update:
-            if isinstance(cfg, dict) and cfg.get("used_vram_gb") is not None:
-                return  # configured & not forced → leave it exactly as-is
-            # Avoid churning models.json when the measurement hasn't meaningfully
-            # changed from what's already persisted.
-            prev = cfg.get("measured_vram_gb") if isinstance(cfg, dict) else None
+        # --- GPU VRAM footprint (weights resident on GPU + runtime reserve) ------
+        delta_gb = (free_before - free_after) / 1e9
+        measured_vram = None
+        if delta_gb > 0:
+            reserve_gb = self._runtime_reserve_gb(cfgd, model_key, delta_gb)
+            measured_vram = round(delta_gb + reserve_gb, 3)
+            self._measured_vram_gb[model_key] = measured_vram  # in-memory truth
+
+        # --- Host-RAM footprint (the CPU-offloaded layers) ----------------------
+        measured_ram = None
+        if ram_before is not None and ram_before >= 0:
             try:
-                if prev is not None and abs(measured - float(prev)) <= max(0.5, float(prev) * 0.10):
-                    return
-            except (TypeError, ValueError):
-                pass
+                rd = round(self._get_own_ram_gb() - ram_before, 3)
+                if rd > 0:
+                    measured_ram = rd
+            except Exception:
+                measured_ram = None
+
+        # --- Settled GPU-layer split (the value the retry loop landed on) -------
+        measured_layers = None
         try:
-            _why = "force_vram_update" if force_update else "no used_vram_gb configured"
-            print(f"  Saving measured_vram_gb for '{model_key}': {measured:.2f} GB ({_why})")
-            cfg = dict(cfg) if isinstance(cfg, dict) else {}
-            cfg["measured_vram_gb"] = measured
-            self.config[model_key] = cfg
-            # Persist to models.json via a SINGLE-field read-modify-write, so a
-            # secondary engine's stale in-memory models_data can't clobber a UI edit
-            # (e.g. n_ctx) made on the primary after this engine booted. Only
-            # measured_vram_gb on the matching entry is touched.
-            from codai.admin.routes import config_manager
-            if config_manager is not None:
-                config_manager.persist_model_field(model_key, "measured_vram_gb", measured)
-        except Exception as e:
-            print(f"  Warning: could not persist measured_vram_gb: {e}")
+            if n_gpu_layers is not None:
+                measured_layers = int(n_gpu_layers)
+        except (TypeError, ValueError):
+            measured_layers = None
+
+        _total = (measured_vram or 0.0) + (measured_ram or 0.0)
+        print(f"Measured footprint for '{model_key}': "
+              f"VRAM={'%.2f' % measured_vram if measured_vram is not None else 'n/a'} GB + "
+              f"RAM={'%.2f' % measured_ram if measured_ram is not None else 'n/a'} GB = "
+              f"{_total:.2f} GB total  "
+              f"(n_gpu_layers={measured_layers if measured_layers is not None else 'n/a'})")
+
+        # Persist each system-owned field, accumulating into the in-memory config so
+        # successive fields don't clobber each other. Each is written to models.json
+        # via a single-field read-modify-write (safe vs. a sibling engine's stale view).
+        working = dict(cfgd)
+
+        def _persist(field, value, *, vram_guard=False):
+            if value is None:
+                return
+            if not force_update and user_pinned:
+                return  # configured & not forced → authoritative, leave as-is
+            if vram_guard and not force_update:
+                # Avoid churning models.json on a <=10% no-op VRAM change.
+                prev = cfgd.get(field)
+                try:
+                    if prev is not None and abs(value - float(prev)) <= max(0.5, float(prev) * 0.10):
+                        return
+                except (TypeError, ValueError):
+                    pass
+            try:
+                working[field] = value
+                self.config[model_key] = dict(working)
+                from codai.admin.routes import config_manager
+                if config_manager is not None:
+                    config_manager.persist_model_field(model_key, field, value)
+                print(f"  Saved {field}={value} for '{model_key}' "
+                      f"({'force_vram_update' if force_update else 'no used_vram_gb'})")
+            except Exception as e:
+                print(f"  Warning: could not persist {field}: {e}")
+
+        _persist("measured_vram_gb", measured_vram, vram_guard=True)
+        _persist("measured_ram_gb", measured_ram)
+        _persist("measured_n_gpu_layers", measured_layers)
+
+    def _learned_n_gpu_layers(self, model_key: str, configured):
+        """Prefer a previously-learned stable GPU-layer split over an auto guess.
+
+        When ``n_gpu_layers`` is auto (-1 / None), reuse ``measured_n_gpu_layers``
+        (recorded by record_vram_delta after the offload-retry settled) so a reload
+        jumps straight to the split that fit — no OOM→move-to-RAM→retry on every
+        load. An explicit positive pin in the config always wins."""
+        if configured is not None and configured != -1:
+            return configured
+        cfg = self._config_for_model_key(model_key)
+        if isinstance(cfg, dict):
+            learned = cfg.get("measured_n_gpu_layers")
+            if learned is not None:
+                try:
+                    iv = int(learned)
+                    if iv >= 0:
+                        return iv
+                except (TypeError, ValueError):
+                    pass
+        return configured
 
     # In-process cache: model_id -> size_bytes (never stale within a run)
     _hf_size_cache: Dict[str, int] = {}

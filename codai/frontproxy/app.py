@@ -1109,6 +1109,48 @@ class FrontProxy:
             target.loaded_models = set(target.loaded_models) | {path}
         return resp
 
+    async def task_action(self, request: Request) -> Response:
+        """Per-task actions (cancel / interrupt / pause / resume / restart, and
+        DELETE remove) must reach the engine that OWNS the task. A task can run on
+        ANY engine (or the system worker, for downloads), so the catch-all's
+        always-the-primary routing makes a task on another engine read 'Task not
+        found'. Front-only synthetic Tasks-page entries have no engine task at all.
+
+        Resolve it here: handle the front-synthetic ids, else fan the request out to
+        every engine — each validates the same session cookie (HMAC), so the engine
+        that owns the task acts on it and the rest 404; the first success wins."""
+        if not await self.is_admin(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        # The task id is the last or second-to-last path segment (…/{id} for DELETE,
+        # …/{id}/{action} for POST).
+        parts = [p for p in request.url.path.split("/") if p]
+        task_id = parts[-1] if request.method == "DELETE" else (
+            parts[-2] if len(parts) >= 2 else "")
+        # Front-only synthetic entries (see _merge_engine_tasks): no engine task.
+        if task_id.startswith("queued-"):
+            # A front-queued (not-yet-running) request is owned by the waiting client
+            # coroutine; it drops out when that client disconnects. There's nothing
+            # to cancel on an engine.
+            return JSONResponse(
+                {"detail": "Queued request — it cancels when the client disconnects."},
+                status_code=409)
+        if task_id.startswith(("inflight-", "loading-")):
+            return JSONResponse({"detail": "Task not found"}, status_code=404)
+        # Real task id: fan out to every live engine (incl. the system worker, which
+        # owns download/cache tasks). First 2xx wins; otherwise relay the last reply.
+        body = await request.body()
+        last = None
+        for e in self.registry.all():
+            if not e.is_alive():
+                continue
+            resp = await self._forward_to_engine(request, e, body)
+            code = getattr(resp, "status_code", 502)
+            if 200 <= code < 300:
+                return resp
+            last = resp
+        return last if last is not None else JSONResponse(
+            {"detail": "Task not found"}, status_code=404)
+
     def _cooling_engines(self) -> list:
         """Which engines are in thermal cooldown right now (for the Tasks banner).
 
@@ -1437,24 +1479,37 @@ class FrontProxy:
         _meas = (_rid is not None and rp_resp.status_code == 200
                  and "text/event-stream" in (rp_resp.headers.get("content-type") or ""))
 
-        async def _counting_iter():
+        async def _relay_iter():
             import time as _t
             t0 = _t.monotonic(); ntok = 0; last = 0.0
-            async for raw in rp_resp.aiter_raw():
-                ntok += raw.count(b"data:")
-                now = _t.monotonic()
-                if now - last >= 0.5:              # refresh ~2×/s, keep it cheap
-                    last = now
-                    dt = now - t0
-                    m = (engine.active or {}).get(_rid)
-                    if m is not None:
-                        m["step"] = ntok
-                        m["rate"] = round(ntok / dt, 1) if dt > 0 else 0.0
-                yield raw
+            try:
+                async for raw in rp_resp.aiter_raw():
+                    if _meas:
+                        ntok += raw.count(b"data:")
+                        now = _t.monotonic()
+                        if now - last >= 0.5:          # refresh ~2×/s, keep it cheap
+                            last = now
+                            dt = now - t0
+                            m = (engine.active or {}).get(_rid)
+                            if m is not None:
+                                m["step"] = ntok
+                                m["rate"] = round(ntok / dt, 1) if dt > 0 else 0.0
+                    yield raw
+            except httpx.HTTPError as exc:
+                # The upstream engine dropped the connection mid-stream — almost
+                # always because it CRASHED (e.g. a CUDA ggml_abort → SIGABRT on a
+                # VRAM-OOM during a large-context decode) or was restarted. The body
+                # is already partly sent, so we can't swap in a clean JSON error; just
+                # stop relaying. The supervisor respawns the engine. Without this the
+                # truncated read escapes as an unhandled ASGI exception (a noisy
+                # traceback) on every such crash.
+                print(f"[front] upstream engine#{engine.id} ({engine.name}) closed the "
+                      f"stream early on {path}: {exc!r}", flush=True)
+                return
 
         resp_headers = self._filter_headers(rp_resp.headers, _DROP_RESP)
         return StreamingResponse(
-            _counting_iter() if _meas else rp_resp.aiter_raw(),
+            _relay_iter(),
             status_code=rp_resp.status_code,
             headers=dict(resp_headers),
             media_type=rp_resp.headers.get("content-type"),
@@ -1663,6 +1718,18 @@ def build_app(config, config_dir=None) -> FastAPI:
     @app.get("/admin/api/tasks", include_in_schema=False)
     async def _tasks(request: Request):
         return await front.poll(request)
+
+    # Per-task actions must reach the engine that OWNS the task (any engine, not
+    # just the primary), else the UI reads "Task not found". Registered before the
+    # catch-all so they're routed here instead of proxied to the primary.
+    @app.api_route("/admin/api/tasks/{task_id}/{action}", methods=["POST"],
+                   include_in_schema=False)
+    async def _task_action(task_id: str, action: str, request: Request):
+        return await front.task_action(request)
+
+    @app.delete("/admin/api/tasks/{task_id}", include_in_schema=False)
+    async def _task_remove(task_id: str, request: Request):
+        return await front.task_action(request)
 
     @app.get("/admin/api/system-stats", include_in_schema=False)
     async def _system_stats(request: Request):
