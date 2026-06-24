@@ -603,7 +603,10 @@ class FrontProxy:
                        "max_instances": m.get("max_instances"),
                        # Per-model override for load-status signalling (None =
                        # inherit the global models.load_status_updates).
-                       "load_status_updates": m.get("load_status_updates")}
+                       "load_status_updates": m.get("load_status_updates"),
+                       # Per-model wait-keepalive mode (None = inherit global
+                       # models.wait_status_mode): silent | invisible | visible.
+                       "wait_status_mode": m.get("wait_status_mode")}
                 for field_ in (m.get("path"), m.get("id"), m.get("alias")):
                     if not field_:
                         continue
@@ -662,6 +665,45 @@ class FrontProxy:
             return bool(ov)
         _models = getattr(self.config, "models", None)
         return bool(getattr(_models, "load_status_updates", True))
+
+    def _wait_status_mode(self, model: Optional[str]) -> str:
+        """Resolve the wait-keepalive mode (silent|invisible|visible) for the DIRECT
+        streaming path: per-model ``wait_status_mode`` in models.json wins, else the
+        global ``models.wait_status_mode`` (default invisible). For back-compat,
+        derive from load_status_updates when no mode is set anywhere."""
+        ov = self._model_info(model).get("wait_status_mode")
+        if not ov:
+            ov = getattr(getattr(self.config, "models", None), "wait_status_mode", None)
+        if not ov:
+            ov = "invisible" if self._load_status_enabled(model) else "silent"
+        ov = str(ov).strip().lower()
+        return ov if ov in ("silent", "invisible", "visible") else "invisible"
+
+    @staticmethod
+    def _peek_stream(body_bytes) -> bool:
+        try:
+            import json as _j
+            return bool((_j.loads(body_bytes or b"{}") or {}).get("stream"))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _peek_thinking(body_bytes) -> bool:
+        """Best-effort detection of whether reasoning/thinking is requested, so the
+        wait keepalive can use the reasoning channel (no content pollution)."""
+        try:
+            import json as _j
+            d = _j.loads(body_bytes or b"{}") or {}
+        except Exception:
+            return False
+        if d.get("enable_thinking") is True or d.get("thinking") is True:
+            return True
+        if d.get("reasoning_effort") or d.get("reasoning"):
+            return True
+        ctk = d.get("chat_template_kwargs")
+        if isinstance(ctk, dict) and ctk.get("enable_thinking"):
+            return True
+        return False
 
     def _queue_max_waiting(self) -> int:
         self._refresh_config_if_changed()
@@ -1151,6 +1193,142 @@ class FrontProxy:
         return last if last is not None else JSONResponse(
             {"detail": "Task not found"}, status_code=404)
 
+    async def _stream_with_keepalive(self, request: Request, engine, path: str,
+                                     body_bytes: bytes, model, mode: str,
+                                     thinking: bool):
+        """Direct streaming inference with a wait-keepalive so the client doesn't
+        time out while a front queue slot is acquired and the engine loads the model.
+
+        Mirrors broker_execute_stream but returns a StreamingResponse: commit to a
+        200 text/event-stream up front, emit keepalive chunks (per ``mode`` /
+        ``thinking``) while waiting, then relay the engine's real SSE; end the stream
+        cleanly if the engine dies mid-flight."""
+        import json as _json
+        import asyncio as _asyncio
+        import time as _t
+
+        def _ka(msg: str) -> bytes:
+            if thinking:
+                delta = {"reasoning_content": msg}
+            elif mode == "visible":
+                delta = {"content": msg}
+            else:                       # invisible
+                delta = {"content": ""}
+            return ("data: " + _json.dumps({
+                "id": "chatcmpl-wait", "object": "chat.completion.chunk",
+                "created": int(_t.time()), "model": model or "",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                "x_queue_info": {"status": "loading", "message": msg},
+            }) + "\n\n").encode()
+
+        send_headers = self._filter_headers(request.headers, _DROP_REQ)
+        _KA = 3.0            # keepalive cadence while waiting
+        _MAX_TRIES = 6
+        _RETRY = 5.0
+        _RETRY_STATUS = {425, 429, 500, 502, 503, 504}
+        is_text = self._task_kind(path) == "text"
+
+        async def _gen():
+            _qkey = None
+            _acq = None
+            _rid = None
+            _status = 502
+            _started = _t.time()
+            rp_resp = None
+            try:
+                # 1. Front per-model queue slot (text only) — keepalive while waiting.
+                if is_text:
+                    _qkey = self._queue_key(model)
+                    _acq = _asyncio.ensure_future(self.reqqueue.acquire(
+                        _qkey, self._model_capacity(model), self._queue_max_waiting(),
+                        rid=engine.name + ":" + (model or ""), model=model or "",
+                        engine=engine.name))
+                    while True:
+                        try:
+                            await _asyncio.wait_for(_asyncio.shield(_acq), timeout=_KA)
+                            break
+                        except _asyncio.TimeoutError:
+                            if mode != "silent":
+                                yield _ka("queued — waiting for a free slot")
+                        except QueueFull:
+                            yield (b'data: {"error":"Server busy: the generation '
+                                   b'queue is full, please retry shortly."}\n\n')
+                            return
+                    _qkey = _qkey   # slot held now
+
+                _rid = engine.enter_request(
+                    {"model": model or "", "kind": self._task_kind(path), "path": path})
+
+                # 2. Send to the engine; retry on not-ready (model still loading),
+                #    keepalive between attempts.
+                for _attempt in range(_MAX_TRIES):
+                    _last = (_attempt >= _MAX_TRIES - 1)
+                    try:
+                        rp_req = self._long.build_request(
+                            "POST", engine.url + path, headers=send_headers,
+                            params=request.query_params, content=body_bytes)
+                        rp_resp = await self._long.send(rp_req, stream=True)
+                    except Exception as exc:
+                        if not _last:
+                            if mode != "silent":
+                                yield _ka("engine starting up")
+                            await _asyncio.sleep(_RETRY)
+                            continue
+                        yield ('data: {"error":"engine#%s unreachable: %s"}\n\n'
+                               % (engine.id, exc)).encode()
+                        return
+                    _status = rp_resp.status_code
+                    if _status in _RETRY_STATUS and not _last:
+                        try:
+                            await rp_resp.aclose()
+                        except Exception:
+                            pass
+                        if mode != "silent":
+                            yield _ka("model loading")
+                        await _asyncio.sleep(_RETRY)
+                        continue
+                    break
+
+                # 3. Relay the real stream, counting tokens for the Tasks page.
+                if rp_resp is not None:
+                    _m = (engine.active or {}).get(_rid)
+                    t0 = _t.monotonic(); ntok = 0; last = 0.0
+                    try:
+                        async for raw in rp_resp.aiter_raw():
+                            ntok += raw.count(b"data:")
+                            now = _t.monotonic()
+                            if now - last >= 0.5:
+                                last = now; dt = now - t0
+                                if _m is not None:
+                                    _m["step"] = ntok
+                                    _m["rate"] = round(ntok / dt, 1) if dt > 0 else 0.0
+                            yield raw
+                    except httpx.HTTPError as exc:
+                        print(f"[front] upstream engine#{engine.id} ({engine.name}) "
+                              f"closed the stream early on {path}: {exc!r}", flush=True)
+            finally:
+                if rp_resp is not None:
+                    try:
+                        await rp_resp.aclose()
+                    except Exception:
+                        pass
+                # Cancel a still-pending queue acquire (client gave up mid-wait); the
+                # queue drops the waiter on cancellation.
+                if _acq is not None and not _acq.done():
+                    _acq.cancel()
+                if _rid is not None:
+                    engine.exit_request(_rid)
+                if _qkey is not None and (_acq is None or _acq.done()):
+                    try:
+                        await self.reqqueue.release(_qkey)
+                    except Exception:
+                        pass
+                if _router.is_inference_path(path):
+                    self._record_activity(model, self._task_kind(path), _status, _started)
+
+        return StreamingResponse(_gen(), status_code=200,
+                                 media_type="text/event-stream")
+
     def _cooling_engines(self) -> list:
         """Which engines are in thermal cooldown right now (for the Tasks banner).
 
@@ -1415,6 +1593,18 @@ class FrontProxy:
                 content=r.content, status_code=r.status_code,
                 headers=dict(self._filter_headers(r.headers, _DROP_RESP)),
                 media_type=r.headers.get("content-type"))
+
+        # Streaming inference: emit a wait-keepalive (status / reasoning) while the
+        # front acquires a queue slot and the engine loads the model, so the client
+        # doesn't time out and disconnect. Mode is per-model / global
+        # (silent|invisible|visible); "silent" keeps the legacy silent path below.
+        if (method == "POST" and _router.is_inference_path(path)
+                and body_bytes is not None and self._peek_stream(body_bytes)):
+            _mode = self._wait_status_mode(model)
+            if _mode != "silent":
+                return await self._stream_with_keepalive(
+                    request, engine, path, body_bytes, model, _mode,
+                    self._peek_thinking(body_bytes))
 
         # Front-managed generation queue (text only). Acquire a per-model slot
         # before dispatching: if all max_instances slots are busy this awaits

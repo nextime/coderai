@@ -106,6 +106,16 @@ class ModelsConfig:
     # Global default on; override per-model via the models.json entry's
     # "load_status_updates" (set false to deactivate for that model).
     load_status_updates: bool = True
+    # Keepalive sent on the DIRECT streaming API path while a request waits for a
+    # front queue slot or the engine's model load, so the client doesn't time out:
+    #   "invisible" (default) — empty-content SSE chunk + x_queue_info metadata
+    #                           (holds the connection; no message-content pollution)
+    #   "visible"             — short visible status text (appears in the content)
+    #   "silent"              — send nothing (legacy behaviour)
+    # When the request has thinking enabled the keepalive is sent on the reasoning
+    # channel instead (no pollution), unless the mode is "silent". Global default;
+    # override per-model via the models.json entry's "wait_status_mode".
+    wait_status_mode: str = "invisible"
     # Degenerate tool-call loop guard: when the incoming history shows the same
     # tool invoked with the same arguments repeatedly (and each attempt failed or
     # the call spilled as un-parsed markup), inject a one-shot system reminder
@@ -651,6 +661,8 @@ class ConfigManager:
                 "gguf_cache_dir": self.config.models.gguf_cache_dir,
                 "max_model_instances": self.config.models.max_model_instances,
                 "max_model_instances_overrides": self.config.models.max_model_instances_overrides,
+                "load_status_updates": self.config.models.load_status_updates,
+                "wait_status_mode": self.config.models.wait_status_mode,
             },
             "offload": {
                 "directory": self.config.offload.directory,
