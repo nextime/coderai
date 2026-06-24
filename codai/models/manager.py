@@ -1099,7 +1099,16 @@ class MultiModelManager:
                 # flash_attn comes from the per-model config (source of truth).
                 # build_kwargs_from_config populates it from the model's
                 # 'flash_attention' setting; CLI/global is NOT consulted here.
-                kwargs['flash_attn'] = bool(config.get('flash_attn', False))
+                # Honour either per-model key (flash_attn / flash_attention) and the
+                # global default (global_args.flash_attn ← offload.flash_attention),
+                # matching hf_loading — so the standard config key isn't silently
+                # ignored on the nvidia text path.
+                kwargs['flash_attn'] = bool(
+                    config.get('flash_attn') or config.get('flash_attention')
+                    or getattr(_ga, 'flash_attn', False))
+                # Configured precision → torch dtype (parity with hf_loading); the
+                # nvidia backend defaults fp16/fp32 when unset.
+                kwargs['precision'] = config.get('precision')
                 # KV-cache quantization (llama.cpp type_k/type_v) — pass through
                 # to the backend, with the raw models.json entry as a fallback.
                 _raw = config.get('_raw_cfg') if isinstance(config.get('_raw_cfg'), dict) else {}
@@ -1254,7 +1263,16 @@ class MultiModelManager:
                 # flash_attn comes from the per-model config (source of truth).
                 # build_kwargs_from_config populates it from the model's
                 # 'flash_attention' setting; CLI/global is NOT consulted here.
-                kwargs['flash_attn'] = bool(config.get('flash_attn', False))
+                # Honour either per-model key (flash_attn / flash_attention) and the
+                # global default (global_args.flash_attn ← offload.flash_attention),
+                # matching hf_loading — so the standard config key isn't silently
+                # ignored on the nvidia text path.
+                kwargs['flash_attn'] = bool(
+                    config.get('flash_attn') or config.get('flash_attention')
+                    or getattr(_ga, 'flash_attn', False))
+                # Configured precision → torch dtype (parity with hf_loading); the
+                # nvidia backend defaults fp16/fp32 when unset.
+                kwargs['precision'] = config.get('precision')
                 # KV-cache quantization (llama.cpp type_k/type_v) — pass through
                 # to the backend, with the raw models.json entry as a fallback.
                 _raw = config.get('_raw_cfg') if isinstance(config.get('_raw_cfg'), dict) else {}

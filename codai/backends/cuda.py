@@ -592,7 +592,8 @@ class NvidiaBackend(ModelBackend):
         except Exception:
             return load_kwargs
 
-    def _make_bnb_config(self, model_name: str, load_in_4bit: bool, load_in_8bit: bool):
+    def _make_bnb_config(self, model_name: str, load_in_4bit: bool, load_in_8bit: bool,
+                         compute_dtype=None):
         """Build a transformers BitsAndBytesConfig (the modern quant API).
 
         Passing load_in_4bit/load_in_8bit as direct from_pretrained kwargs is
@@ -625,7 +626,9 @@ class NvidiaBackend(ModelBackend):
             return BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type='nf4',
-                bnb_4bit_compute_dtype=torch.float16,
+                # Honour the model's configured precision for the compute dtype
+                # (parity with hf_loading); default float16 when unset.
+                bnb_4bit_compute_dtype=(compute_dtype or torch.float16),
                 bnb_4bit_use_double_quant=True,
                 # Required when device_map spills modules to CPU/disk: without it
                 # bitsandbytes refuses any offloaded quantized model and aborts
@@ -759,6 +762,16 @@ class NvidiaBackend(ModelBackend):
             offload_dir = _resolve_off(offload_dir) if offload_dir else offload_dir
         except Exception:
             pass
+        # Resolve the model's configured `precision` → torch dtype (parity with
+        # hf_loading, which non-text loaders use). Default fp16 on CUDA / fp32 on CPU
+        # when unset, preserving this loader's historical behaviour.
+        try:
+            from codai.models.hf_loading import resolve_dtype as _resolve_dtype
+            _cfg_dtype = _resolve_dtype(
+                {'precision': kwargs.get('precision')},
+                default=('fp16' if self.device == 'cuda' else 'fp32'))
+        except Exception:
+            _cfg_dtype = torch.float16 if self.device == 'cuda' else torch.float32
         load_in_4bit = kwargs.get('load_in_4bit', False)
         load_in_8bit = kwargs.get('load_in_8bit', False)
         manual_ram_gb = kwargs.get('manual_ram_gb')
@@ -920,7 +933,7 @@ class NvidiaBackend(ModelBackend):
             
             # Still allow quantization in no-ram mode (reduces VRAM usage)
             if load_in_4bit or load_in_8bit:
-                _qc = self._make_bnb_config(model_name, load_in_4bit, load_in_8bit)
+                _qc = self._make_bnb_config(model_name, load_in_4bit, load_in_8bit, compute_dtype=_cfg_dtype)
                 if _qc is not None:
                     load_kwargs['quantization_config'] = _qc
             
@@ -950,14 +963,12 @@ class NvidiaBackend(ModelBackend):
         load_kwargs = {'trust_remote_code': True}
         
         if load_in_4bit or load_in_8bit:
-            _qc = self._make_bnb_config(model_name, load_in_4bit, load_in_8bit)
+            _qc = self._make_bnb_config(model_name, load_in_4bit, load_in_8bit, compute_dtype=_cfg_dtype)
             if _qc is not None:
                 load_kwargs['quantization_config'] = _qc
 
-        if self.device == "cuda":
-            load_kwargs['dtype'] = torch.float16
-        else:
-            load_kwargs['dtype'] = torch.float32
+        # Configured precision (default fp16 on CUDA / fp32 on CPU when unset).
+        load_kwargs['dtype'] = _cfg_dtype
         
         if offload_dir:
             os.makedirs(offload_dir, exist_ok=True)
@@ -1066,6 +1077,12 @@ class NvidiaBackend(ModelBackend):
                     max_memory = self._get_gpu_memory_map_with_limit(vram_pct)
                     load_kwargs['max_memory'] = max_memory
                     load_kwargs['device_map'] = 'auto'
+                    # Parity with hf_loading: when weights spill to CPU, offload the
+                    # activation buffers too (else they pin GPU memory and can OOM the
+                    # forward pass) and give accelerate a disk spill dir.
+                    load_kwargs['offload_buffers'] = True
+                    if offload_dir:
+                        load_kwargs['offload_folder'] = offload_dir
                     _gpu_gb = max_memory.get(0, 0) / 1e9
                     _cpu_gb = max_memory.get('cpu', 0) / 1e9
                     print(f"\nTrying GPU {_gpu_gb:.1f} GB + CPU {_cpu_gb:.1f} GB"
@@ -1098,6 +1115,13 @@ class NvidiaBackend(ModelBackend):
                     _gpu_budget = max(0, _free_vram - _headroom)
                     _free_ram = _psutil.virtual_memory().available
                     _cpu_budget = max(int(2e9), int(_free_ram * 0.80))
+                    try:
+                        from codai.api.state import get_global_args as _gga
+                        _cap = getattr(_gga(), 'max_ram_gb', None)
+                        if _cap:
+                            _cpu_budget = min(_cpu_budget, int(float(_cap) * 1e9))
+                    except Exception:
+                        pass
                     _disk_dir = offload_dir or os.path.join(
                         os.path.expanduser('~'), '.cache', 'coderai', 'offload')
                     os.makedirs(_disk_dir, exist_ok=True)
@@ -1205,6 +1229,17 @@ class NvidiaBackend(ModelBackend):
             available_ram = psutil.virtual_memory().available
             usable_ram = max(0, available_ram - int(4e9))
             max_memory['cpu'] = usable_ram
+
+        # Clamp the CPU offload budget to the server-wide host-RAM ceiling
+        # (offload.max_ram_gb), matching hf_loading, so the whole fleet stays under
+        # the cap instead of letting a text model alone exceed it.
+        try:
+            from codai.api.state import get_global_args
+            _cap = getattr(get_global_args(), 'max_ram_gb', None)
+            if _cap and max_memory.get('cpu', 0) > int(float(_cap) * 1e9):
+                max_memory['cpu'] = int(float(_cap) * 1e9)
+        except Exception:
+            pass
 
         return max_memory
     
