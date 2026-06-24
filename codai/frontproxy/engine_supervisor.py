@@ -348,6 +348,11 @@ class EngineSupervisor:
             preexec_fn=_engine_preexec if os.name == "posix" else None,
         )
         engine.proc = proc
+        # A freshly (re)spawned engine is never paused/frozen — clear any thermal
+        # supervision state left over from the previous process.
+        engine.therm_paused = False
+        engine.therm_sigstopped = False
+        engine.therm_stop_checks = 0
         # Enlarge the kernel pipe buffer for this engine's stdout. The engine
         # prints (incl. large --debug dumps) synchronously from its event-loop
         # thread; if this pipe fills before the pump thread drains it, that
@@ -477,6 +482,14 @@ class EngineSupervisor:
         self._spawn(sysw)
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._poll_thread.start()
+        # Central thermal supervisor: monitor temps from the front (responsive even
+        # when an engine is GIL-blocked) and drive cooperative pause/resume, with a
+        # SIGSTOP escalation for an engine that can't honour the pause in time.
+        self._thermal_thread = None
+        if getattr(self.config.thermal, "supervisor_enabled", True):
+            self._thermal_thread = threading.Thread(target=self._thermal_loop,
+                                                    daemon=True)
+            self._thermal_thread.start()
         atexit.register(self.stop_all)
 
     def _push_assignment_if_changed(self, client) -> None:
@@ -539,6 +552,189 @@ class EngineSupervisor:
                 self._pending_reload[e.name] = owned
                 print(f"[front] reload-config push to '{e.name}' failed: {exc}; requeued",
                       flush=True)
+
+    # ------------------------------------------------------------- thermal monitor
+    def _thermal_settings(self):
+        """Build ThermalSettings from the live config.thermal (same thresholds the
+        engines would use), so the front and engines agree on what 'hot' means."""
+        from codai.models.thermal import ThermalSettings
+        tc = self.config.thermal
+        return ThermalSettings(
+            cpu_enabled=tc.cpu_enabled, gpu_enabled=tc.gpu_enabled,
+            cpu_high=tc.cpu_high, cpu_resume=tc.cpu_resume,
+            gpu_high=tc.gpu_high, gpu_resume=tc.gpu_resume,
+            gpu_overrides=getattr(tc, "gpu_overrides", None),
+            poll_seconds=tc.poll_seconds)
+
+    @staticmethod
+    def _engine_cards(engine, all_cards) -> list:
+        """The physical cards this engine owns, by its CODERAI_ENGINE_GPUS selectors
+        — the same matching rule the engine's own thermal check uses. No scope
+        (single-engine / legacy) → it owns every card."""
+        raw = (engine.env or {}).get("CODERAI_ENGINE_GPUS", "") or ""
+        sels = {s.strip() for s in raw.split(",") if s.strip()}
+        if not sels:
+            return list(all_cards)
+        return [c for c in all_cards
+                if c.get("vendor") in sels or (c.get("uuid") and c["uuid"] in sels)]
+
+    def _thermal_signal(self, engine, sig) -> None:
+        """Send a signal to the engine's whole process group (it runs in its own
+        session via setsid), so a SIGSTOP/SIGCONT freezes/resumes the engine and any
+        children (whisper-server, ds4) in one shot."""
+        proc = engine.proc
+        if proc is None:
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except Exception:
+            try:
+                proc.send_signal(sig)
+            except Exception:
+                pass
+
+    def _thermal_post(self, client, engine, action: str, reason: str) -> bool:
+        try:
+            client.post(engine.url + f"/internal/thermal-{action}",
+                        json={"reason": reason})
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _thermal_reason(gtemp, cpu_t, settings) -> str:
+        bits = []
+        if gtemp is not None and gtemp >= settings.gpu_high:
+            bits.append(f"GPU {gtemp:.0f}°C")
+        if cpu_t is not None and cpu_t >= settings.cpu_high:
+            bits.append(f"CPU {cpu_t:.0f}°C")
+        return ", ".join(bits) or "hot"
+
+    def _thermal_resume_if_frozen(self, engine) -> None:
+        """Wake an engine we SIGSTOPped — used before a shutdown/restart so the
+        normal SIGTERM path works (a stopped process ignores SIGTERM until SIGCONT)."""
+        if getattr(engine, "therm_sigstopped", False):
+            self._thermal_signal(engine, signal.SIGCONT)
+            engine.therm_sigstopped = False
+
+    def _thermal_apply(self, client, engine, settings, want_pause: bool,
+                       want_resume_ok: bool, gtemp, cpu_t, escalate_n: int) -> None:
+        """Drive one engine's pause/resume state with hysteresis (pause at *_high,
+        resume only once back at/below *_resume), escalating to SIGSTOP if a paused
+        engine keeps generating (stuck in a native call it can't interrupt)."""
+        if not engine.therm_paused:
+            if not want_pause:
+                return
+            # idle -> paused: ask the engine to stop cooperatively.
+            engine.therm_paused = True
+            engine.therm_stop_checks = 0
+            engine.therm_sigstopped = False
+            reason = self._thermal_reason(gtemp, cpu_t, settings)
+            engine.cooling = {"gpu": gtemp, "cpu": cpu_t,
+                              "message": f"thermal pause: {reason}"}
+            ok = self._thermal_post(client, engine, "pause", reason)
+            print(f"[front] thermal: pausing engine '{engine.name}' ({reason})"
+                  f"{'' if ok else ' [pause msg failed — will escalate if busy]'}",
+                  flush=True)
+            return
+
+        # Already paused.
+        if want_resume_ok:
+            if engine.therm_sigstopped:
+                self._thermal_signal(engine, signal.SIGCONT)
+                engine.therm_sigstopped = False
+                print(f"[front] thermal: SIGCONT engine '{engine.name}' (cooled)",
+                      flush=True)
+            ok = self._thermal_post(client, engine, "resume", "")
+            if ok:
+                engine.therm_paused = False
+                engine.therm_stop_checks = 0
+                engine.cooling = None
+                print(f"[front] thermal: resuming engine '{engine.name}' "
+                      f"(GPU {self._fmt_t(gtemp)} CPU {self._fmt_t(cpu_t)})", flush=True)
+            else:
+                print(f"[front] thermal: resume msg to '{engine.name}' failed — "
+                      f"will retry next check", flush=True)
+            return
+
+        # Still hot and still paused.
+        if engine.therm_sigstopped:
+            return   # already frozen; just wait for cooldown
+        if int(getattr(engine, "inflight", 0) or 0) <= 0:
+            engine.therm_stop_checks = 0   # cooperatively idle — the pause worked
+            return
+        # Engine is still running work after we asked it to pause: it's stuck in a
+        # native call. Count consecutive busy checks, then freeze it at the OS level.
+        engine.therm_stop_checks += 1
+        if engine.therm_stop_checks >= max(1, escalate_n):
+            self._thermal_signal(engine, signal.SIGSTOP)
+            engine.therm_sigstopped = True
+            engine.cooling = {"gpu": gtemp, "cpu": cpu_t,
+                              "message": "thermal pause (SIGSTOP — engine was busy)"}
+            print(f"[front] thermal: engine '{engine.name}' ignored pause for "
+                  f"{engine.therm_stop_checks} checks (inflight={engine.inflight}) "
+                  f"— SIGSTOP", flush=True)
+
+    @staticmethod
+    def _fmt_t(t) -> str:
+        return f"{t:.0f}°C" if isinstance(t, (int, float)) else "n/a"
+
+    def _thermal_loop(self) -> None:
+        from codai.frontproxy.gpu_detect import gpu_stats
+        from codai.models import thermal as _thermal
+        _auth = ({"x-coderai-internal": self.internal_token}
+                 if self.internal_token else {})
+        client = httpx.Client(timeout=self.config.server.proxy_status_timeout,
+                              headers=_auth)
+        try:
+            while not self._stopped.is_set():
+                settings = self._thermal_settings()
+                period = max(2.0, settings.poll_seconds)
+                if not (settings.cpu_enabled or settings.gpu_enabled):
+                    self._stopped.wait(period)
+                    continue
+                try:
+                    try:
+                        cards = gpu_stats()
+                    except Exception:
+                        cards = []
+                    cpu_t = _thermal.read_cpu_temp() if settings.cpu_enabled else None
+                    cpu_hot = (cpu_t is not None and cpu_t >= settings.cpu_high)
+                    cpu_warm = (cpu_t is not None and cpu_t > settings.cpu_resume)
+                    escalate_n = int(getattr(self.config.thermal,
+                                             "stop_escalate_checks", 3) or 3)
+                    for engine in self.registry.all():
+                        if getattr(engine, "role", "engine") == "system":
+                            continue   # the cache/downloads worker isn't on the GPU
+                        ecards = (self._engine_cards(engine, cards)
+                                  if settings.gpu_enabled else [])
+                        gpu_hot = gpu_warm = False
+                        temps = []
+                        for c in ecards:
+                            t = c.get("temp")
+                            if t is None:
+                                continue
+                            temps.append(t)
+                            high, resume = settings.gpu_thresholds(c.get("vendor"))
+                            if t >= high:
+                                gpu_hot = True
+                            if t > resume:
+                                gpu_warm = True
+                        engine.therm_temp = max(temps) if temps else None
+                        # Pause when this engine's GPU is over high OR the (global)
+                        # CPU is over high. Resume only when BOTH are back to resume.
+                        want_pause = (settings.gpu_enabled and gpu_hot) or cpu_hot
+                        want_resume_ok = (not (settings.gpu_enabled and gpu_warm)
+                                          and not cpu_warm)
+                        self._thermal_apply(client, engine, settings, want_pause,
+                                            want_resume_ok, engine.therm_temp, cpu_t,
+                                            escalate_n)
+                except Exception as exc:
+                    if self.debug:
+                        print(f"[front] thermal monitor error: {exc}", flush=True)
+                self._stopped.wait(period)
+        finally:
+            client.close()
 
     def _poll_loop(self) -> None:
         _auth = ({"x-coderai-internal": self.internal_token}
@@ -627,6 +823,10 @@ class EngineSupervisor:
             drain_grace = float(getattr(self.config.server,
                                         "engine_restart_drain_grace", 30.0) or 0.0)
         with self._restart_lock:
+            # If we'd thermally frozen it, wake it so it can drain in-flight work and
+            # honour SIGTERM (a stopped process ignores both until continued).
+            self._thermal_resume_if_frozen(engine)
+            engine.therm_paused = False
             proc = engine.proc
             if proc is not None and proc.poll() is None and drain_grace > 0:
                 engine.draining = True
@@ -697,6 +897,11 @@ class EngineSupervisor:
                 except Exception:
                     pass
 
+        # Wake any thermally-frozen engine first: a SIGSTOPped process ignores
+        # SIGTERM until it's continued, so without this the polite phase below would
+        # do nothing and we'd wait out the full grace before SIGKILL.
+        for e in self.registry.all():
+            self._thermal_resume_if_frozen(e)
         procs = [(e, e.proc) for e in self.registry.all()
                  if e.proc is not None and e.proc.poll() is None]
         # Phase 1: polite SIGTERM to each group.

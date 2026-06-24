@@ -248,6 +248,14 @@ class ThermalConfig:
     soft_throttle_enabled: bool = False
     soft_throttle_temp: float = 80.0       # engage at/above this temperature (°C)
     soft_throttle_max_sleep: float = 3.0   # max seconds to sleep/checkpoint at the limit
+    # Front-driven thermal supervision. The front proxy monitors temperatures
+    # centrally (it stays responsive even while an engine is GIL-blocked in a long
+    # native call) and tells engines to pause/resume cooperatively. When an engine
+    # ignores a pause — stuck in a native call it can't interrupt — for
+    # `stop_escalate_checks` consecutive monitor checks, the front escalates to an
+    # OS-level SIGSTOP (and SIGCONT to resume after cooldown).
+    supervisor_enabled: bool = True
+    stop_escalate_checks: int = 3
 
 
 @dataclass
@@ -702,6 +710,8 @@ class ConfigManager:
                 "soft_throttle_enabled": self.config.thermal.soft_throttle_enabled,
                 "soft_throttle_temp": self.config.thermal.soft_throttle_temp,
                 "soft_throttle_max_sleep": self.config.thermal.soft_throttle_max_sleep,
+                "supervisor_enabled": self.config.thermal.supervisor_enabled,
+                "stop_escalate_checks": self.config.thermal.stop_escalate_checks,
             },
             "jobs": {
                 "resume_on_restart": self.config.jobs.resume_on_restart,

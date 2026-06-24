@@ -331,8 +331,45 @@ async def internal_engine_state():
                        "message": cs.get("message")}
     except Exception:
         cooling = None
+    # Whether the front's thermal supervisor currently holds this engine in a
+    # cooperative pause (so the front can confirm the engine acknowledged it).
+    paused = False
+    try:
+        from codai.models import thermal as _therm
+        paused = _therm.external_pause_active()
+    except Exception:
+        paused = False
     return {"ok": True, "pid": _os.getpid(), "loaded_models": loaded,
-            "vram": vram, "tasks": tasks, "cooling": cooling}
+            "vram": vram, "tasks": tasks, "cooling": cooling, "paused": paused}
+
+
+@app.post("/internal/thermal-pause", include_in_schema=False)
+async def internal_thermal_pause(request: Request):
+    """Front-driven thermal pause: the supervisor (which monitors temps centrally)
+    asks this engine to stop generating. Honoured cooperatively at the next safe
+    point — request entry / between tokens — via codai.models.thermal."""
+    import json as _json
+    try:
+        data = _json.loads((await request.body()) or b"{}") or {}
+    except Exception:
+        data = {}
+    try:
+        from codai.models import thermal as _therm
+        _therm.set_external_pause(True, reason=str(data.get("reason") or "thermal"))
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "paused": True}
+
+
+@app.post("/internal/thermal-resume", include_in_schema=False)
+async def internal_thermal_resume(request: Request):
+    """Lift the front-driven thermal pause once the hardware has cooled."""
+    try:
+        from codai.models import thermal as _therm
+        _therm.set_external_pause(False)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "paused": False}
 
 
 @app.post("/internal/reload-config", include_in_schema=False)

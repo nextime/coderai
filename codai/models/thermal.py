@@ -119,6 +119,67 @@ def _cooldown_exit() -> None:
 
 
 # ---------------------------------------------------------------------------
+# External (front-driven) pause
+# ---------------------------------------------------------------------------
+# The front proxy runs the AUTHORITATIVE thermal monitor: it reads temperatures
+# centrally and stays responsive even while an engine is GIL-blocked inside a
+# long native call (a single llama.cpp prefill/image-encode that the engine's own
+# between-token checkpoint can't interrupt). When the front decides an engine must
+# stop, it POSTs /internal/thermal-pause, which sets this flag; the engine honours
+# it COOPERATIVELY at the next safe point (request entry / between tokens) — the
+# same mechanism as a local temperature cooldown, just triggered remotely. The
+# front clears it (/internal/thermal-resume) once the hardware has cooled. If an
+# engine ignores the pause (stuck in a native call) the front escalates to an
+# OS-level SIGSTOP, which doesn't need the engine to cooperate.
+_external_lock = threading.Lock()
+_external_pause = {"active": False, "reason": "", "since": 0.0}
+
+
+def set_external_pause(active: bool, reason: str = "") -> None:
+    """Set/clear the front-driven pause. Called from the /internal/thermal-* routes."""
+    with _external_lock:
+        active = bool(active)
+        if active and not _external_pause["active"]:
+            _external_pause["since"] = time.time()
+        if not active:
+            _external_pause["since"] = 0.0
+        _external_pause["active"] = active
+        _external_pause["reason"] = reason if active else ""
+
+
+def external_pause_active() -> bool:
+    with _external_lock:
+        return _external_pause["active"]
+
+
+def external_pause_state() -> dict:
+    with _external_lock:
+        return dict(_external_pause)
+
+
+def _wait_external_pause(settings: "ThermalSettings", context: str = "") -> None:
+    """Block while the front holds an external thermal pause, publishing cooldown
+    state so the Tasks page shows the engine is paused for cooldown."""
+    desc = f" ({context})" if context else ""
+    st = external_pause_state()
+    print(f"[thermal] Paused by supervisor{desc}: {st.get('reason') or 'cooldown'} "
+          f"— holding until resume")
+    waited = 0.0
+    poll = min(2.0, max(0.5, settings.poll_seconds))
+    _cooldown_enter()
+    try:
+        while external_pause_active():
+            _cooldown_update(read_gpu_temp(), read_cpu_temp(), waited,
+                             external_pause_state().get("reason")
+                             or "paused by thermal supervisor")
+            time.sleep(poll)
+            waited += poll
+    finally:
+        _cooldown_exit()
+    print(f"[thermal] Supervisor lifted pause{desc} after {int(waited)}s — resuming")
+
+
+# ---------------------------------------------------------------------------
 # Temperature readers
 # ---------------------------------------------------------------------------
 
@@ -601,6 +662,14 @@ def wait_until_safe(settings: Optional[ThermalSettings] = None,
     """
     if settings is None:
         settings = _settings_from_global_args()
+
+    # Front-driven pause takes precedence: the central supervisor decided this
+    # engine must stop. Block here — a safe point — until it lifts the pause after
+    # cooldown. Honoured even when local CPU/GPU protection is disabled, since the
+    # front owns this decision (it sees temps the GIL-blocked engine can't).
+    if external_pause_active():
+        _wait_external_pause(settings, context)
+
     if not settings.cpu_enabled and not settings.gpu_enabled:
         _dbg(f"protection disabled (cpu/gpu both off) — proceeding [{context}]")
         return

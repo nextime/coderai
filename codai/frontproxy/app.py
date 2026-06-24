@@ -957,6 +957,9 @@ class FrontProxy:
             out.append({"id": e.id, "name": e.name, "backend": e.backend,
                         "gpu": e.gpu, "healthy": e.healthy, "primary": e.primary,
                         "vram": e.vram, "cooling": bool(e.cooling),
+                        "temp": getattr(e, "therm_temp", None),
+                        "thermal_paused": bool(getattr(e, "therm_paused", False)),
+                        "thermal_frozen": bool(getattr(e, "therm_sigstopped", False)),
                         "loaded_models": self._canonical_loaded(e.loaded_models),
                         "pid": pid})
         return out
@@ -1107,13 +1110,24 @@ class FrontProxy:
         return resp
 
     def _cooling_engines(self) -> list:
-        """Which engines are in thermal cooldown right now (for the Tasks banner)."""
+        """Which engines are in thermal cooldown right now (for the Tasks banner).
+
+        Covers both a locally-reported cooldown (engine.cooling, from the engine's
+        own checkpoint loop) and a front-driven supervisor pause (engine.therm_paused)
+        — the latter matters when the engine is SIGSTOPped and can't report at all."""
         out = []
         for e in self.registry.all():
             if e.cooling:
                 out.append({"engine": e.name, "gpu": e.cooling.get("gpu"),
                             "cpu": e.cooling.get("cpu"),
                             "message": e.cooling.get("message")})
+            elif getattr(e, "therm_paused", False):
+                out.append({
+                    "engine": e.name, "gpu": getattr(e, "therm_temp", None),
+                    "cpu": None,
+                    "message": ("thermal pause (frozen)"
+                                if getattr(e, "therm_sigstopped", False)
+                                else "thermal pause")})
         return out
 
     @staticmethod

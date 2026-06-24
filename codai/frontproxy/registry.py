@@ -75,6 +75,13 @@ class Engine:
     draining: bool = False         # restart pending: stop routing NEW requests here
                                     # and let in-flight ones finish (drain grace period)
     inflight: int = 0              # proxied requests currently streaming through
+    # Front-side thermal supervision bookkeeping (written by the EngineSupervisor's
+    # thermal monitor; NOT reported by the engine). therm_temp is this engine's
+    # hottest owned card.
+    therm_temp: Optional[float] = None
+    therm_paused: bool = False     # front asked this engine to pause (cooperatively)
+    therm_sigstopped: bool = False  # front escalated to an OS-level SIGSTOP
+    therm_stop_checks: int = 0     # consecutive checks the engine stayed busy after a pause
     _inflight_lock: object = field(default_factory=threading.Lock, repr=False, compare=False)
     # In-flight request metadata {rid: {"model","kind","path","started_at"}} so the
     # front can synthesize Tasks-page entries for work it dispatched — visible even
