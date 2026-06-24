@@ -26,6 +26,14 @@ export PYTHONDONTWRITEBYTECODE=1
 : "${CODERAI_TOOL_TOWNSHIP:=true}"
 : "${CODERAI_TOOL_PARLER:=false}"
 export CODERAI_TOOL_VIDEO_EDITOR CODERAI_TOOL_VIDEOGEN CODERAI_TOOL_TOWNSHIP CODERAI_TOOL_PARLER
+# Per-tool extra CLI args appended by supervisord (%(ENV_CODERAI_*_ARGS)s). The run
+# script sets these via --tool-arg/--tool-args; default empty. supervisord fails to
+# start if a referenced ENV var is undefined, so always export them.
+: "${CODERAI_VIDEO_EDITOR_ARGS:=}"
+: "${CODERAI_VIDEOGEN_ARGS:=}"
+: "${CODERAI_TOWNSHIP_ARGS:=}"
+: "${CODERAI_PARLER_ARGS:=}"
+export CODERAI_VIDEO_EDITOR_ARGS CODERAI_VIDEOGEN_ARGS CODERAI_TOWNSHIP_ARGS CODERAI_PARLER_ARGS
 export CODERAI_CONFIG_DIR CODERAI_MODELS_DIR CODERAI_CACHE_DIR CODERAI_PARLER_MODEL CODERAI_TMP
 
 mkdir -p \
@@ -35,6 +43,7 @@ mkdir -p \
   "$CODERAI_CACHE_DIR/township_output" \
   "$CODERAI_CACHE_DIR/videogen_output" \
   "$CODERAI_CACHE_DIR/video_editor" \
+  "$CODERAI_CACHE_DIR/video_editor/sessions" \
   "$CODERAI_TMP" \
   /tmp/nginx-client-body /tmp/nginx-proxy /tmp/nginx-fastcgi \
   /tmp/nginx-uwsgi /tmp/nginx-scgi

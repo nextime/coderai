@@ -70,6 +70,8 @@ LOG_FILE_CONT=""
 # default (the three UIs on, parler off). Keyed by CODERAI_TOOL_* env var.
 declare -A TOOL_STATE=()
 DISABLE_ALL_TOOLS=0
+# Extra CLI args appended to a tool's command line, keyed by CODERAI_*_ARGS env var.
+declare -A TOOL_ARGS=()
 
 # Map a friendly tool name to its CODERAI_TOOL_* env var (or fail).
 tool_env_var() {
@@ -78,6 +80,18 @@ tool_env_var() {
     videogen|video-gen)               echo CODERAI_TOOL_VIDEOGEN ;;
     township|fighters)                echo CODERAI_TOOL_TOWNSHIP ;;
     parler|tts)                       echo CODERAI_TOOL_PARLER ;;
+    *) return 1 ;;
+  esac
+}
+
+# Map a friendly tool name to the env var holding EXTRA args for that tool's
+# command (supervisord appends %(ENV_CODERAI_*_ARGS)s to each tool launcher).
+tool_args_var() {
+  case "$1" in
+    video-editor|video_editor|editor) echo CODERAI_VIDEO_EDITOR_ARGS ;;
+    videogen|video-gen)               echo CODERAI_VIDEOGEN_ARGS ;;
+    township|fighters)                echo CODERAI_TOWNSHIP_ARGS ;;
+    parler|tts)                       echo CODERAI_PARLER_ARGS ;;
     *) return 1 ;;
   esac
 }
@@ -151,12 +165,27 @@ Options:
                       (parler TTS is off by default; this turns it on.)
   --disable-tool NAME Disable a single demo tool. Repeatable. Same NAMEs as above.
                       Explicit --enable/--disable-tool overrides --no-tools.
+  --tool-arg TOOL VAL Append ONE extra CLI arg to a bundled tool's command line.
+                      Repeatable. TOOL is one of video-editor|videogen|township|
+                      parler. e.g. --tool-arg township --web-port --tool-arg township 9000
+  --tool-args TOOL STR
+                      Like --tool-arg but appends a whole whitespace-separated
+                      string at once, e.g. --tool-args video-editor "--voice masculine".
+                      Repeatable; combine with --tool-arg. (The video editor already
+                      runs with --session on by default, persisting to
+                      /cache/video_editor/sessions.)
   -- ARGS             Extra args passed to the container engine before the image name.
   -h, --help          Show this help.
 
-Test against your live config + data (no rebuild):
+Bring your bare-metal config + data into the container with --map (dir OR file):
+  # Server config/models/caches (paths in models.json resolve 1:1):
   packaging/linux/run_oci.sh --nvidia --local \
     --map /AI/guffcache --map /AI/huggingface --map /AI/offloads
+  # Township tool (one tree holds its config + all artifacts):
+  ...  --map /storage/coderai/township_output:/cache/township_output
+  # Video editor (config file + the media_dir/output_dir it points at):
+  ...  --map /host/video_editor.config.json:/cache/video_editor/video_editor.config.json \
+       --map /host/coderai_media --map /host/video_editor_output
 EOF
 }
 
@@ -229,6 +258,18 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { echo "Error: --disable-tool requires a tool name" >&2; exit 2; }
       _v="$(tool_env_var "$2")" || { echo "Error: unknown tool '$2' (video-editor|videogen|township|parler)" >&2; exit 2; }
       TOOL_STATE["$_v"]=false; shift 2 ;;
+    # Append extra CLI args to a bundled tool's command. --tool-arg adds ONE token;
+    # --tool-args adds a whitespace-separated string. Repeatable. e.g.
+    #   --tool-arg township --web-port  --tool-arg township 9000
+    #   --tool-args video-editor "--voice masculine"
+    --tool-arg)
+      [[ $# -ge 3 ]] || { echo "Error: --tool-arg requires TOOL and a value" >&2; exit 2; }
+      _v="$(tool_args_var "$2")" || { echo "Error: unknown tool '$2' (video-editor|videogen|township|parler)" >&2; exit 2; }
+      TOOL_ARGS["$_v"]="${TOOL_ARGS[$_v]:+${TOOL_ARGS[$_v]} }$3"; shift 3 ;;
+    --tool-args)
+      [[ $# -ge 3 ]] || { echo "Error: --tool-args requires TOOL and a string" >&2; exit 2; }
+      _v="$(tool_args_var "$2")" || { echo "Error: unknown tool '$2' (video-editor|videogen|township|parler)" >&2; exit 2; }
+      TOOL_ARGS["$_v"]="${TOOL_ARGS[$_v]:+${TOOL_ARGS[$_v]} }$3"; shift 3 ;;
     -d|--detach) DETACH=1; shift ;;
     --)
       shift
@@ -448,6 +489,16 @@ if [[ "${#TOOL_STATE[@]}" -gt 0 ]]; then
   done
   TOOLS_NOTE="${TOOLS_NOTE% }"
 fi
+# Per-tool extra CLI args (CODERAI_*_ARGS) → supervisord appends them to the tool.
+TOOLARGS_NOTE="(none)"
+if [[ "${#TOOL_ARGS[@]}" -gt 0 ]]; then
+  TOOLARGS_NOTE=""
+  for _v in "${!TOOL_ARGS[@]}"; do
+    args+=(-e "$_v=${TOOL_ARGS[$_v]}")
+    TOOLARGS_NOTE+="${_v}='${TOOL_ARGS[$_v]}' "
+  done
+  TOOLARGS_NOTE="${TOOLARGS_NOTE% }"
+fi
 
 args+=("${EXTRA_ARGS[@]}" "$IMAGE_TAG")
 
@@ -463,6 +514,7 @@ Starting CoderAI OCI container
   debug:   ${DEBUG_SPEC:-off}
   log:     $LOG_HOST_NOTE
   tools:   $TOOLS_NOTE
+  tool-args:$([[ "$TOOLARGS_NOTE" == "(none)" ]] && echo " (none)" || echo " $TOOLARGS_NOTE")
   user:    ${USER_SPEC:-container default (root)}
   cdr-args:${CODERAI_EXTRA_ARGS:+ $CODERAI_EXTRA_ARGS}
 EOF

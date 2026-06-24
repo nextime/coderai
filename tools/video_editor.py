@@ -1034,13 +1034,17 @@ class Config:
     back to a config file."""
 
     def __init__(self, settings: dict, config_path: str | None = None,
-                 session_name: str | None = None):
+                 session_name: str | None = None, session_dir: str | None = None):
         self.tts_dir = Path(tempfile.mkdtemp(prefix="vedit_tts_"))
         self.upload_dir = Path(tempfile.mkdtemp(prefix="vedit_up_"))
         self.config_path = Path(config_path).expanduser().resolve() if config_path else None
         self.session_name = safe_session_name(session_name) if session_name else None
-        self.session_path = (Path.home() / ".cache" / "coderai" / "video_editor" /
-                             "sessions" / f"{self.session_name}.json") if self.session_name else None
+        # Sessions live under --session-dir when given (e.g. a persistent/mapped path
+        # in a container), else the per-user cache dir.
+        _sessions_base = (Path(session_dir).expanduser() if session_dir
+                          else Path.home() / ".cache" / "coderai" / "video_editor" / "sessions")
+        self.session_path = (_sessions_base / f"{self.session_name}.json"
+                             if self.session_name else None)
         self.session_asset_dir = (self.session_path.with_suffix("") if self.session_path else None)
         self.media_dir = Path(settings["media_dir"]).expanduser().resolve()
         self.output_dir = Path(settings["output_dir"]).expanduser().resolve()
@@ -4012,6 +4016,10 @@ def main():
                         help="Do not auto-open a browser tab")
     parser.add_argument("--session", nargs="?", const="default", default=None,
                         help="Enable realtime editor-state recovery, optionally named")
+    parser.add_argument("--session-dir", default=None,
+                        help="Directory for session state/assets (default: "
+                             "~/.cache/coderai/video_editor/sessions). Point this at "
+                             "a persistent/mapped path when running in a container.")
     args = parser.parse_args()
 
     # When -c is omitted, auto-load (and later save back to) a default config in
@@ -4094,7 +4102,8 @@ def main():
               "until you set one (--audio-model, config file, or Settings panel).",
               file=sys.stderr)
 
-    cfg = Config(settings, config_path=args.config, session_name=args.session)
+    cfg = Config(settings, config_path=args.config, session_name=args.session,
+                 session_dir=args.session_dir)
     tts_model, stt_model, audio_model = cfg.tts_model, cfg.stt_model, cfg.audio_model
     editor = Editor(cfg)
     handler = make_handler(editor)
