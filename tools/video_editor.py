@@ -4041,14 +4041,21 @@ def main():
     if args.config:
         cfg_path = Path(args.config).expanduser()
         if not cfg_path.is_file():
-            raise SystemExit(f"--config file not found: {cfg_path}")
-        try:
-            loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as e:
-            raise SystemExit(f"Could not read config {cfg_path}: {e}")
-        for k in SETTINGS_KEYS:
-            if loaded.get(k) is not None:
-                settings[k] = loaded[k]
+            # Not fatal: the bundled launcher always points --config at
+            # /cache/video_editor/video_editor.config.json so a bind-mounted config
+            # auto-loads, but on a fresh install (no mapped/saved config yet) the
+            # file isn't there — start with defaults; the web UI Save creates it.
+            print(f"ℹ  Config {cfg_path} not found — starting with defaults "
+                  "(it'll be created when you Save from the web UI).",
+                  file=sys.stderr)
+        else:
+            try:
+                loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as e:
+                raise SystemExit(f"Could not read config {cfg_path}: {e}")
+            for k in SETTINGS_KEYS:
+                if loaded.get(k) is not None:
+                    settings[k] = loaded[k]
     cli = {
         "media_dir": args.media_dir, "output_dir": args.output_dir,
         "base_url": args.base_url, "api_key": args.api_key,

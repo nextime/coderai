@@ -132,9 +132,11 @@ Options:
                       root-owned, and --config-dir/--local use a throwaway copy
                       (no persistence) to avoid root-owned config.
   --inplace-config    Mount --config-dir in place (config edits persist there).
-  --map HOST[:CONT]   Bind-mount a host dir at the SAME path (or HOST:CONT) inside
-                      the container, so absolute paths in models.json resolve
-                      (e.g. --map /AI/guffcache). Repeatable.
+  --map HOST[:CONT]   Bind-mount a host dir OR file at the SAME path (or HOST:CONT)
+                      inside the container, so absolute paths in models.json (or a
+                      tool's config) resolve (e.g. --map /AI/guffcache, or
+                      --map /host/video_editor.config.json:/cache/video_editor/video_editor.config.json).
+                      Repeatable.
   --debug[=SPEC]      Run coderai with debug flags. SPEC (default 'all'); may be
                       given as --debug=SPEC or --debug SPEC:
                         all | engine,requests,ws,web,thermal,lora,engine-web
@@ -403,7 +405,9 @@ fi
 for m in "${MAPS[@]:-}"; do
   [[ -n "$m" ]] || continue
   host="${m%%:*}"; cont="${m#*:}"; [[ "$m" == *:* ]] || cont="$host"
-  if [[ -d "$host" ]]; then
+  if [[ -e "$host" ]]; then
+    # Accept a directory OR a single file (e.g. a tool's config.json that lives
+    # loose on the host rather than in a dedicated dir). Docker bind-mounts both.
     args+=(-v "$host:$cont$volume_suffix")
   else
     echo "Warning: --map source '$host' not found; skipping" >&2

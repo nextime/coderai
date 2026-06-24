@@ -34,6 +34,7 @@ mkdir -p \
   "$CODERAI_CACHE_DIR/coderai" \
   "$CODERAI_CACHE_DIR/township_output" \
   "$CODERAI_CACHE_DIR/videogen_output" \
+  "$CODERAI_CACHE_DIR/video_editor" \
   "$CODERAI_TMP" \
   /tmp/nginx-client-body /tmp/nginx-proxy /tmp/nginx-fastcgi \
   /tmp/nginx-uwsgi /tmp/nginx-scgi
