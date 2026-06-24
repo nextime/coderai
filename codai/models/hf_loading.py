@@ -25,6 +25,40 @@ import os
 from typing import Any, Dict, Optional
 
 
+def resolve_offload_dir(offload_dir) -> str:
+    """Return an ABSOLUTE, writable disk-offload directory.
+
+    A RELATIVE value (e.g. the legacy './offload' — whether the built-in default or
+    a stale per-model override saved into models.json) resolves against the CWD,
+    which in the OCI image is the READ-ONLY /opt/coderai/app tree → makedirs raises
+    EACCES. So:
+      * an absolute configured path is respected as-is;
+      * a relative/empty one INHERITS the configured GLOBAL offload dir
+        (global_args.offload_dir / config.offload.directory) when that's absolute,
+        then CODERAI_OFFLOAD_DIR (the container's writable default), then the user
+        cache — never the CWD.
+    This keeps the configuration authoritative while making a relative value mean
+    'use the configured offload location', not 'write next to the (read-only) app'.
+    """
+    if offload_dir:
+        p = os.path.expanduser(str(offload_dir))
+        if os.path.isabs(p):
+            return p
+    try:
+        from codai.api.state import get_global_args
+        g = getattr(get_global_args(), "offload_dir", None)
+        if g:
+            gp = os.path.expanduser(str(g))
+            if os.path.isabs(gp):
+                return gp
+    except Exception:
+        pass
+    env = os.environ.get("CODERAI_OFFLOAD_DIR")
+    if env:
+        return os.path.expanduser(env)
+    return os.path.join(os.path.expanduser("~"), ".cache", "coderai", "offload")
+
+
 def _norm(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Return the per-model config dict, unwrapping a forwarded `_raw_cfg`."""
     if not cfg:
@@ -372,10 +406,9 @@ def build_from_pretrained_kwargs(
         kwargs['device_map'] = 'auto'
         kwargs['max_memory'] = {0: gpu_budget, 'cpu': cpu_budget}
 
-        # Disk overflow when offloading is allowed.
-        offload_dir = c.get('offload_dir') or os.path.join(
-            os.path.expanduser('~'), '.cache', 'coderai', 'offload')
-        offload_dir = os.path.expanduser(offload_dir)
+        # Disk overflow when offloading is allowed. Resolve to an absolute writable
+        # dir (a relative per-model './offload' inherits the configured global dir).
+        offload_dir = resolve_offload_dir(c.get('offload_dir'))
         os.makedirs(offload_dir, exist_ok=True)
         kwargs['offload_folder'] = offload_dir
         kwargs['offload_buffers'] = True

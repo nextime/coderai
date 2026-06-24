@@ -1085,9 +1085,14 @@ class MultiModelManager:
                 n_gpu_layers = _cfg_or_global('n_gpu_layers', 'n_gpu_layers')
                 if n_gpu_layers is not None:
                     kwargs['n_gpu_layers'] = n_gpu_layers
-                offload_dir = _cfg_or_global('offload_dir', 'offload_dir')
-                if offload_dir:
-                    kwargs['offload_dir'] = offload_dir
+                # Resolve to an absolute, writable offload dir: a relative per-model
+                # './offload' (or the bare default) inherits the configured GLOBAL
+                # offload directory instead of the read-only CWD (app tree in the OCI
+                # image). Always pass it so backends never fall back to accelerate's
+                # './offload' default.
+                from codai.models.hf_loading import resolve_offload_dir as _resolve_off
+                kwargs['offload_dir'] = _resolve_off(
+                    _cfg_or_global('offload_dir', 'offload_dir'))
                 manual_ram = _cfg_or_global('manual_ram_gb', 'ram')
                 if manual_ram is not None:
                     kwargs['manual_ram_gb'] = manual_ram
@@ -1235,9 +1240,14 @@ class MultiModelManager:
                 n_gpu_layers = _cfg_or_global('n_gpu_layers', 'n_gpu_layers')
                 if n_gpu_layers is not None:
                     kwargs['n_gpu_layers'] = n_gpu_layers
-                offload_dir = _cfg_or_global('offload_dir', 'offload_dir')
-                if offload_dir:
-                    kwargs['offload_dir'] = offload_dir
+                # Resolve to an absolute, writable offload dir: a relative per-model
+                # './offload' (or the bare default) inherits the configured GLOBAL
+                # offload directory instead of the read-only CWD (app tree in the OCI
+                # image). Always pass it so backends never fall back to accelerate's
+                # './offload' default.
+                from codai.models.hf_loading import resolve_offload_dir as _resolve_off
+                kwargs['offload_dir'] = _resolve_off(
+                    _cfg_or_global('offload_dir', 'offload_dir'))
                 manual_ram = _cfg_or_global('manual_ram_gb', 'ram')
                 if manual_ram is not None:
                     kwargs['manual_ram_gb'] = manual_ram

@@ -1058,7 +1058,17 @@ def main():
     global_args.https = config.server.https
     global_args.privkey = config.server.https_key_path
     global_args.pubkey = config.server.https_cert_path
-    global_args.offload_dir = config.offload.directory
+    # Disk-offload directory. Honour the configured value (per-model offload_dir and
+    # this global both respected downstream), but when it's still the built-in
+    # relative default './offload' — which resolves to the CWD, the READ-ONLY
+    # /opt/coderai/app tree in the OCI image (EACCES on makedirs) — fall back to a
+    # container-provided writable default (CODERAI_OFFLOAD_DIR, set by the entrypoint
+    # to /cache/offload). Explicit config still wins; bare-metal keeps './offload'.
+    _off_dir = config.offload.directory
+    if (not _off_dir or str(_off_dir).strip() in ("", "./offload")) \
+            and os.environ.get("CODERAI_OFFLOAD_DIR"):
+        _off_dir = os.environ["CODERAI_OFFLOAD_DIR"]
+    global_args.offload_dir = _off_dir
     global_args.ram = config.offload.manual_ram_gb
     global_args.offload_strategy = config.offload.strategy
     global_args.no_ram = config.offload.no_ram

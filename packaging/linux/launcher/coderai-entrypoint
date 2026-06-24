@@ -15,6 +15,11 @@ set -eu
 # server's built-in janitor age-prunes it; see CODERAI_TMP below.
 : "${CODERAI_TMP:=$CODERAI_CACHE_DIR/coderai-tmp}"
 export TMPDIR="$CODERAI_TMP" TMP="$CODERAI_TMP" TEMP="$CODERAI_TMP"
+# Writable disk-offload dir on the cache volume. Used as the default ONLY when the
+# config still has the relative './offload' (which would land in the read-only
+# /opt/coderai/app tree). An explicit offload.directory in config wins.
+: "${CODERAI_OFFLOAD_DIR:=$CODERAI_CACHE_DIR/offload}"
+export CODERAI_OFFLOAD_DIR
 # Don't write .pyc into the read-only /opt/coderai tree (esp. when run as --user).
 export PYTHONDONTWRITEBYTECODE=1
 # Demo tool web-UI autostart toggles, consumed by supervisord.conf's
@@ -44,6 +49,7 @@ mkdir -p \
   "$CODERAI_CACHE_DIR/videogen_output" \
   "$CODERAI_CACHE_DIR/video_editor" \
   "$CODERAI_CACHE_DIR/video_editor/sessions" \
+  "$CODERAI_OFFLOAD_DIR" \
   "$CODERAI_TMP" \
   /tmp/nginx-client-body /tmp/nginx-proxy /tmp/nginx-fastcgi \
   /tmp/nginx-uwsgi /tmp/nginx-scgi

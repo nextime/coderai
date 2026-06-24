@@ -337,6 +337,12 @@ else
   PUBLISH="$PORT:8776"
 fi
 args=(run --rm --name "$NAME" --ipc=host -p "$PUBLISH" -e CODERAI_HOST=0.0.0.0 -e CODERAI_PORT=8776)
+# Forward a HuggingFace token from the host env so the engines authenticate to the
+# HF Hub (higher rate limits + gated models) instead of sending unauthenticated
+# requests. huggingface_hub auto-reads these; no-op when unset.
+for _hv in HF_TOKEN HUGGING_FACE_HUB_TOKEN; do
+  if [[ -n "${!_hv:-}" ]]; then args+=(-e "$_hv=${!_hv}"); fi
+done
 # Pass-through coderai server flags (appended by the in-image launcher's argv).
 if [[ -n "$CODERAI_EXTRA_ARGS" ]]; then
   args+=(-e "CODERAI_EXTRA_ARGS=$CODERAI_EXTRA_ARGS")

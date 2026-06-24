@@ -751,6 +751,14 @@ class NvidiaBackend(ModelBackend):
         self._kv_prefix_ok = None
 
         offload_dir = kwargs.get('offload_dir')
+        # Defensive: ensure an absolute, writable offload dir even if a caller passed
+        # a relative './offload' (resolves to the read-only app tree in the image) —
+        # a relative value inherits the configured global offload dir.
+        try:
+            from codai.models.hf_loading import resolve_offload_dir as _resolve_off
+            offload_dir = _resolve_off(offload_dir) if offload_dir else offload_dir
+        except Exception:
+            pass
         load_in_4bit = kwargs.get('load_in_4bit', False)
         load_in_8bit = kwargs.get('load_in_8bit', False)
         manual_ram_gb = kwargs.get('manual_ram_gb')
