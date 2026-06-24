@@ -21,41 +21,35 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 
 async def _post_json(path: str, body: dict, http_request: Request):
-    """Call an internal endpoint by importing its handler directly."""
-    from codai.api import app as _app_module
-    from fastapi.testclient import TestClient  # only for internal calls
-    # We avoid HTTP round-trips by calling handlers directly via their routers.
-    # Import lazily to avoid circular imports.
-    if path.startswith('/v1/images/generations'):
-        from codai.api.images import create_image_generation
-        from codai.pydantic.imagerequest import ImageGenerationRequest
-        req = ImageGenerationRequest(**body)
-        return await create_image_generation(req, http_request)
+    """Issue a pipeline sub-request to another coderai API endpoint, returning the
+    parsed JSON result.
 
-    if path.startswith('/v1/video/generations'):
-        from codai.api.video import create_video_generation
-        from codai.pydantic.videorequest import VideoGenerationRequest
-        req = VideoGenerationRequest(**body)
-        return await create_video_generation(req, http_request)
-
-    if path.startswith('/v1/video/dub'):
-        from codai.api.video import create_video_dub
-        from codai.pydantic.videorequest import VideoDubRequest
-        req = VideoDubRequest(**body)
-        return await create_video_dub(req, http_request)
-
-    if path.startswith('/v1/audio/speech'):
-        from codai.api.tts import create_speech, TTSRequest
-        req = TTSRequest(**body)
-        return await create_speech(req)
-
-    if path.startswith('/v1/chat/completions'):
-        from codai.api.text import chat_completions
-        from codai.pydantic.textrequest import ChatCompletionRequest
-        req = ChatCompletionRequest(**body)
-        return await chat_completions(req, http_request)
-
-    raise ValueError(f"Unknown internal path: {path}")
+    A pipeline chains several modalities (image, video, text, TTS, transcription),
+    and each model may live on a DIFFERENT engine. So we must NOT call the handlers
+    in-process (that would force every step onto whichever engine received the
+    pipeline request). Route each sub-step through the front (the single API), which
+    dispatches it to the engine that owns that model; falls back to in-process in
+    single-process mode. Mirrors codai.api.characters / environments."""
+    import json as _json
+    from fastapi import HTTPException
+    from codai.broker.asgi_bridge import execute_api_request
+    resp = await execute_api_request(
+        http_request, method="POST", path=path,
+        headers={"Content-Type": "application/json"},
+        body=_json.dumps(body).encode())
+    status = resp.get("status_code", 500)
+    raw = resp.get("body") or b""
+    if status >= 400:
+        try:
+            detail = _json.loads(raw).get("detail", raw.decode("utf-8", "replace"))
+        except Exception:
+            detail = raw.decode("utf-8", "replace")
+        raise HTTPException(status_code=status, detail=f"{path} failed: {detail}")
+    try:
+        return _json.loads(raw) if raw else {}
+    except Exception as e:
+        raise HTTPException(status_code=502,
+                            detail=f"{path} returned a non-JSON response: {e}")
 
 
 def _img_url(result) -> str:
