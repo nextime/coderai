@@ -54,6 +54,25 @@ mkdir -p \
   /tmp/nginx-client-body /tmp/nginx-proxy /tmp/nginx-fastcgi \
   /tmp/nginx-uwsgi /tmp/nginx-scgi
 
+# Some server paths (trained LoRAs, characters, environments, voices) are resolved
+# from the legacy HOME-based dir ~/.coderai, NOT from --config. In the container the
+# user's home (e.g. /home/ubuntu) is not where config is mounted ($CONFIG_DIR/coderai),
+# so those lookups would miss the mounted data and report e.g. "LoRA not found on
+# server". Alias ~/.coderai -> the mounted config dir so HOME-based and --config
+# lookups agree. Only act when it's safe (a symlink, missing, or an empty dir) so a
+# user-mounted volume or real data is never clobbered.
+if [ -n "${HOME:-}" ]; then
+  _legacy="$HOME/.coderai"
+  _target="$CODERAI_CONFIG_DIR/coderai"
+  if [ "$_legacy" != "$_target" ]; then
+    if [ -L "$_legacy" ] || [ ! -e "$_legacy" ]; then
+      ln -sfn "$_target" "$_legacy" 2>/dev/null || true
+    elif [ -d "$_legacy" ] && [ -z "$(ls -A "$_legacy" 2>/dev/null)" ]; then
+      rmdir "$_legacy" 2>/dev/null && ln -sfn "$_target" "$_legacy" 2>/dev/null || true
+    fi
+  fi
+fi
+
 # Seed the ds4 working dir on the cache volume from the bundled binary + scripts
 # (DeepSeek-V4 weights download here at runtime, so it must be writable/persistent).
 if [ -d /opt/coderai/ds4 ] && [ ! -e "$CODERAI_CACHE_DIR/ds4/ds4-server" ]; then
