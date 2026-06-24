@@ -1540,6 +1540,18 @@ def _scan_signature():
                     pass
         except OSError:
             pass
+    # models.json is part of the scan's inputs: _scan_caches() merges each model's
+    # configured settings (precision/quant/ctx/...) into the result. A config edit
+    # rewrites models.json but touches no cache file, so without this the signature
+    # wouldn't change and a saved edit would stay invisible on the models page until
+    # the TTL lapsed or a full restart. Fold its mtime in so any process serving
+    # cached-models re-scans on the next read after a save.
+    try:
+        if config_manager is not None and getattr(config_manager, "models_path", None):
+            sig.append((str(config_manager.models_path),
+                        round(os.path.getmtime(config_manager.models_path), 3)))
+    except OSError:
+        pass
     return tuple(sorted(sig))
 
 

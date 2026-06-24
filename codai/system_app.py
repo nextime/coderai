@@ -75,6 +75,14 @@ def build_system_app(config, config_dir, internal_port: int = 0) -> FastAPI:
             cm2 = ConfigManager(str(config_dir))
             cm2.load()
             set_config_manager(cm2)
+            # The cached-models scan (served from this worker, what the models page
+            # renders) merges per-model config — invalidate it so a saved config edit
+            # shows up immediately instead of waiting out the scan TTL.
+            try:
+                from codai.admin.routes import _invalidate_cache_scan
+                _invalidate_cache_scan()
+            except Exception:
+                pass
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
         return JSONResponse({"ok": True})

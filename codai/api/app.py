@@ -403,6 +403,14 @@ async def internal_reload_config(request: Request):
             multi_model_manager.set_assigned_models(set(assigned))
     except Exception:
         pass
+    # Invalidate the cached-models scan (it merges per-model config) so a saved
+    # config edit is visible immediately when an engine serves the models page
+    # (single-process / system-worker-down fallback).
+    try:
+        from codai.admin.routes import _invalidate_cache_scan
+        _invalidate_cache_scan()
+    except Exception:
+        pass
     return {"ok": True, "models": n}
 
 

@@ -53,3 +53,5 @@ tools/coderai_media/
 .oci-build.log
 .oci-rebuild.sh
 .oci-*.log
+venv_build.log
+.build.pid
