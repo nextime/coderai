@@ -2,7 +2,6 @@
 
 import base64
 import logging
-import os
 import uuid
 from urllib.parse import urlencode
 
@@ -10,38 +9,36 @@ logger = logging.getLogger(__name__)
 
 
 async def execute_api_request(request, *, method, path, headers=None, body=b""):
-    """Issue a sub-request to another coderai API endpoint from inside a handler.
+    """Issue a sub-request to another coderai API endpoint from inside a handler,
+    routing it THROUGH THE FRONT (the single public API).
 
     A feature endpoint that builds on another (e.g. /v1/characters/generate and
-    /v1/environments/generate producing reference images via /v1/images/generations)
-    must NOT assume the target model lives on the same engine that's handling it: in
-    a multi-engine deployment the image model may be assigned to — or pinned on — a
-    different engine. So:
+    /v1/environments/generate producing reference images via /v1/images/generations,
+    or the /v1/pipelines/* chains) must NOT run the sub-request in-process: the
+    target model may be assigned to — or pinned on — a different engine than the one
+    handling this request. coderai always runs as a front + engines, so we always
+    hand the sub-request to the front, which picks the engine that owns the target
+    model and stamps the internal token itself. The caller's Authorization is
+    forwarded so that engine authorises it exactly as it would a direct client call;
+    the handler adds no internal headers of its own.
 
-    * Behind a front (this process is an engine — CODERAI_INTERNAL_TOKEN is set):
-      route the sub-request THROUGH THE FRONT (the single public API), which picks
-      the engine that owns the target model. The caller's Authorization is forwarded
-      so that engine authorises it exactly as it would a direct client call — the
-      handler adds no internal headers of its own.
-    * Single-process (no front): dispatch in-process via execute_internal_request
-      (the internal-auth middleware is a no-op when no token is configured).
-
-    Returns the same {"status_code", "headers", "body"} dict shape either way.
+    Returns a {"status_code", "headers", "body"} dict. If the front can't be reached
+    or located, this returns a 502 — it never silently falls back to in-process
+    dispatch (that would run the model on the wrong engine and mask the failure).
     """
-    tok = os.environ.get("CODERAI_INTERNAL_TOKEN")
-    front_port = 0
-    if tok:
-        try:
-            from codai.api.state import get_global_args
-            front_port = int(getattr(get_global_args(), "port", 0) or 0)
-        except Exception:
-            front_port = 0
-    if not tok or front_port <= 0:
-        # Single-process (or front port unknown): serve it in-process.
-        return await execute_internal_request(
-            request.app, method=method, path=path, headers=headers, body=body)
-
     import httpx
+    try:
+        from codai.api.state import get_global_args
+        front_port = int(getattr(get_global_args(), "port", 0) or 0)
+    except Exception:
+        front_port = 0
+    if front_port <= 0:
+        logger.error("execute_api_request: cannot resolve front port for %s %s",
+                     method.upper(), path)
+        return {"status_code": 502,
+                "headers": {"content-type": "application/json"},
+                "body": b'{"error":"internal routing unavailable (front port unknown)"}'}
+
     fwd = {k: v for k, v in (headers or {}).items()}
     # Carry the caller's credentials so the destination engine authorises the
     # sub-request the same way it would the original client request.
@@ -57,13 +54,15 @@ async def execute_api_request(request, *, method, path, headers=None, body=b""):
                                       pool=None)) as client:
             r = await client.request(method.upper(), url, headers=fwd,
                                      content=body or b"")
-        return {"status_code": r.status_code, "headers": dict(r.headers),
-                "body": r.content}
     except Exception as exc:
-        logger.warning("API sub-request to front failed (%s); falling back "
-                       "to in-process dispatch", exc)
-        return await execute_internal_request(
-            request.app, method=method, path=path, headers=headers, body=body)
+        logger.error("API sub-request to front failed: %s %s — %s",
+                     method.upper(), url, exc)
+        return {"status_code": 502,
+                "headers": {"content-type": "application/json"},
+                "body": (f'{{"error":"internal routing to front failed: {exc}"}}'
+                         ).encode()}
+    return {"status_code": r.status_code, "headers": dict(r.headers),
+            "body": r.content}
 
 
 def _build_multipart_body(multipart):
