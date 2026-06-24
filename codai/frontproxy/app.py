@@ -1208,6 +1208,11 @@ class FrontProxy:
         import time as _t
 
         def _ka(msg: str) -> bytes:
+            # "silent" still keeps the connection alive — but as an SSE COMMENT
+            # (a ':' line), which keeps the socket/stream open without emitting any
+            # chat.completion.chunk (no event for parsers, no content, no metadata).
+            if mode == "silent":
+                return (": " + msg + "\n\n").encode()
             if thinking:
                 delta = {"reasoning_content": msg}
             elif mode == "visible":
@@ -1248,8 +1253,7 @@ class FrontProxy:
                             await _asyncio.wait_for(_asyncio.shield(_acq), timeout=_KA)
                             break
                         except _asyncio.TimeoutError:
-                            if mode != "silent":
-                                yield _ka("queued — waiting for a free slot")
+                            yield _ka("queued — waiting for a free slot")
                         except QueueFull:
                             yield (b'data: {"error":"Server busy: the generation '
                                    b'queue is full, please retry shortly."}\n\n')
@@ -1270,8 +1274,7 @@ class FrontProxy:
                         rp_resp = await self._long.send(rp_req, stream=True)
                     except Exception as exc:
                         if not _last:
-                            if mode != "silent":
-                                yield _ka("engine starting up")
+                            yield _ka("engine starting up")
                             await _asyncio.sleep(_RETRY)
                             continue
                         yield ('data: {"error":"engine#%s unreachable: %s"}\n\n'
@@ -1283,8 +1286,7 @@ class FrontProxy:
                             await rp_resp.aclose()
                         except Exception:
                             pass
-                        if mode != "silent":
-                            yield _ka("model loading")
+                        yield _ka("model loading")
                         await _asyncio.sleep(_RETRY)
                         continue
                     break
@@ -1594,17 +1596,17 @@ class FrontProxy:
                 headers=dict(self._filter_headers(r.headers, _DROP_RESP)),
                 media_type=r.headers.get("content-type"))
 
-        # Streaming inference: emit a wait-keepalive (status / reasoning) while the
-        # front acquires a queue slot and the engine loads the model, so the client
-        # doesn't time out and disconnect. Mode is per-model / global
-        # (silent|invisible|visible); "silent" keeps the legacy silent path below.
+        # Streaming inference always goes through the keepalive path: the WHOLE point
+        # is to hold the connection open (from the front, which stays responsive even
+        # when the engine is stuck/GIL-blocked loading) while we acquire a queue slot
+        # and the engine loads the model. The mode only changes the payload —
+        # "silent" still keeps the socket alive (SSE comments), "invisible"/"visible"
+        # add status, thinking uses the reasoning channel.
         if (method == "POST" and _router.is_inference_path(path)
                 and body_bytes is not None and self._peek_stream(body_bytes)):
-            _mode = self._wait_status_mode(model)
-            if _mode != "silent":
-                return await self._stream_with_keepalive(
-                    request, engine, path, body_bytes, model, _mode,
-                    self._peek_thinking(body_bytes))
+            return await self._stream_with_keepalive(
+                request, engine, path, body_bytes, model,
+                self._wait_status_mode(model), self._peek_thinking(body_bytes))
 
         # Front-managed generation queue (text only). Acquire a per-model slot
         # before dispatching: if all max_instances slots are busy this awaits

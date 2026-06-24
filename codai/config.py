@@ -111,7 +111,10 @@ class ModelsConfig:
     #   "invisible" (default) — empty-content SSE chunk + x_queue_info metadata
     #                           (holds the connection; no message-content pollution)
     #   "visible"             — short visible status text (appears in the content)
-    #   "silent"              — send nothing (legacy behaviour)
+    #   "silent"              — keep the connection alive via SSE comments only
+    #                           (no chunk, no content, no status) — still prevents a
+    #                           client/proxy idle-timeout disconnect while the engine
+    #                           is stuck loading
     # When the request has thinking enabled the keepalive is sent on the reasoning
     # channel instead (no pollution), unless the mode is "silent". Global default;
     # override per-model via the models.json entry's "wait_status_mode".
