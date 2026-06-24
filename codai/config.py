@@ -55,6 +55,17 @@ class ServerConfig:
     engine_restart_drain_grace: float = 30.0  # on engine restart, wait this many seconds
                                               # for in-flight requests to finish before
                                               # killing the process (0 = bounce immediately)
+    # Process-isolate GGUF (llama.cpp) inference from torch/diffusers on NVIDIA.
+    # llama.cpp's CUDA backend and PyTorch sharing one process corrupts the CUDA
+    # context — after a GGUF model runs, the next torch kernel (e.g. a diffusers
+    # text-encoder) dies with "CUDA error: invalid argument". When True (default) and
+    # GPUs are auto-detected, each NVIDIA torch engine gets a co-located sibling
+    # *gguf* engine on the SAME card (own process → own CUDA context): the torch
+    # engine drops the `gguf` capability and serves transformers/diffusers, while the
+    # sibling serves GGUF via llama.cpp. Both are real engine subprocesses, so the
+    # front's routing, VRAM/eviction and thermal pause/SIGSTOP all apply unchanged.
+    # Ignored when `engine_specs` is set (declare the split yourself there).
+    isolate_gguf_engine: bool = True
     # Explicit, heterogeneous engine declarations. Auto GPU detection only finds
     # NVIDIA cards and assumes one backend, and CUDA vs Vulkan device enumeration is
     # inconsistent — so for mixed setups (e.g. an NVIDIA + a Radeon card, where the
@@ -649,6 +660,7 @@ class ConfigManager:
                 "proxy_status_timeout": self.config.server.proxy_status_timeout,
                 "proxy_max_inflight": self.config.server.proxy_max_inflight,
                 "engine_restart_drain_grace": self.config.server.engine_restart_drain_grace,
+                "isolate_gguf_engine": self.config.server.isolate_gguf_engine,
                 "engine_specs": self.config.server.engine_specs,
                 "default_engine": self.config.server.default_engine,
             },

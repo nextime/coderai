@@ -261,14 +261,35 @@ class EngineSupervisor:
                                   primary=True, name="cpu", backend="auto", env={}))
             return engines
 
+        isolate = bool(getattr(srv, "isolate_gguf_engine", True))
+        from codai.frontproxy.registry import _DEFAULT_CAPS
+        next_id = len(plan)
         for idx, (name, vkw, backend) in enumerate(plan):
             env = vendor_env(vkw, allow_cross=_cross)
             sels = _gpu_selectors({"backend": backend, "gpus": vkw}, env)
             if sels:
                 env["CODERAI_ENGINE_GPUS"] = ",".join(sels)
+            # Process-isolate GGUF from torch on NVIDIA: llama.cpp's CUDA backend and
+            # PyTorch in one process corrupt the CUDA context (the next torch kernel
+            # after a GGUF run dies with "CUDA error: invalid argument"). So the torch
+            # engine drops `gguf` and a sibling gguf engine on the SAME card (own
+            # process → own CUDA context) serves llama.cpp. Both are real engine
+            # subprocesses, so routing/VRAM/thermal apply unchanged.
+            split_gguf = isolate and backend == "nvidia"
+            caps = (set(_DEFAULT_CAPS.get("nvidia", set())) - {"gguf"}) if split_gguf else set()
             engines.append(Engine(id=idx, gpu=None, port=self._alloc_port(),
                                   primary=(idx == 0), name=name,
-                                  backend=backend, env=env))
+                                  backend=backend, env=env, capabilities=caps))
+            if split_gguf:
+                # backend="nvidia" so a GGUF load takes the proven CUDA-llama path
+                # (manager sets original_backend="nvidia" → VulkanBackend forces CUDA);
+                # caps forced to {gguf} so the router only ever sends it GGUF work, so
+                # torch never runs a CUDA kernel here and can't be poisoned by llama.cpp.
+                engines.append(Engine(
+                    id=next_id, gpu=None, port=self._alloc_port(), primary=False,
+                    name=f"{name}-gguf", backend="nvidia", env=dict(env),
+                    capabilities={"gguf"}))
+                next_id += 1
         return engines
 
     # ------------------------------------------------------------------ spawning
