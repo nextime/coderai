@@ -11473,10 +11473,19 @@ OUTPUT LAYOUT
     if pre.config:
         try:
             cfg = load_config(pre.config)
+        except FileNotFoundError:
+            # A missing config is not an error: the bundled launcher always passes
+            # --config <out-dir>/township_config.json so a mapped config auto-loads,
+            # but on a fresh install (no mapped dir) the file simply isn't there yet
+            # — fall back to defaults instead of failing to start.
+            cfg = {}
+            _log(f"  Config {pre.config} not found — starting with defaults "
+                 f"(it'll be created when you Save from the web UI)")
         except Exception as e:
             parser.error(f"cannot load config {pre.config}: {e}")
-        parser.set_defaults(**cfg)
-        _log(f"  Loaded {len(cfg)} option(s) from config: {pre.config}")
+        if cfg:
+            parser.set_defaults(**cfg)
+            _log(f"  Loaded {len(cfg)} option(s) from config: {pre.config}")
 
     args = parser.parse_args()
 
