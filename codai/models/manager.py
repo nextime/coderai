@@ -2292,15 +2292,48 @@ class MultiModelManager:
 
     @staticmethod
     def _free_vram_snapshot() -> float:
-        """Return current free VRAM in bytes (CUDA) or -1 if unavailable."""
+        """Return current free VRAM in BYTES summed across every device this engine
+        can use, or -1 if nothing is measurable.
+
+        MUST be multi-device: a model loaded with gpu_split spans several cards (and,
+        under cross-backend pooling, a Radeon too). Measuring only the default CUDA
+        device (device 0) means a split that lands most weights on the OTHER card
+        yields a ~0 delta in record_vram_delta(), which trips its `delta <= 0` guard
+        and never persists measured_vram_gb — so the estimate stays 0 and every load
+        OOM-retries from scratch. Sum all CUDA devices (torch honours
+        CUDA_VISIBLE_DEVICES, so this is scoped to this engine's cards) and add
+        amdgpu sysfs when cross-pooling is on or no CUDA device is visible. CUDA and
+        amdgpu sysfs never name the same card, so there's no double count."""
+        total_free = 0.0
+        cuda_count = 0
         try:
             import torch
             if torch.cuda.is_available():
-                free, _ = torch.cuda.mem_get_info()
-                return float(free)
+                for i in range(torch.cuda.device_count()):
+                    try:
+                        free, _ = torch.cuda.mem_get_info(i)
+                        total_free += float(free)
+                        cuda_count += 1
+                    except Exception:
+                        pass
         except Exception:
             pass
-        return -1.0
+        got = cuda_count > 0
+        cross = MultiModelManager._cross_gpu_pooling_enabled()
+        if cross or cuda_count == 0:
+            try:
+                import glob
+                for total_path in sorted(glob.glob('/sys/class/drm/card*/device/mem_info_vram_total')):
+                    used_path = total_path.replace('vram_total', 'vram_used')
+                    with open(total_path) as f:
+                        total = int(f.read().strip())
+                    with open(used_path) as f:
+                        used = int(f.read().strip())
+                    total_free += float(total - used)
+                    got = True
+            except Exception:
+                pass
+        return total_free if got else -1.0
 
     def vram_before_load(self) -> float:
         """Call immediately before loading a model; returns a snapshot for delta measurement."""
