@@ -425,9 +425,12 @@ async def generate_environment(req: EnvironmentGenerateRequest, request: Request
 
     try:
         import json as _json
-        from codai.broker.asgi_bridge import execute_internal_request
-        resp = await execute_internal_request(
-            request.app,
+        from codai.broker.asgi_bridge import execute_api_request
+        # Route image generation through the front (single API) so it lands on the
+        # engine that owns the image model — which may not be this one. Falls back to
+        # in-process dispatch in single-process mode.
+        resp = await execute_api_request(
+            request,
             method="POST",
             path="/v1/images/generations",
             headers={"Content-Type": "application/json"},

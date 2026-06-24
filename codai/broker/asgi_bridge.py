@@ -2,10 +2,68 @@
 
 import base64
 import logging
+import os
 import uuid
 from urllib.parse import urlencode
 
 logger = logging.getLogger(__name__)
+
+
+async def execute_api_request(request, *, method, path, headers=None, body=b""):
+    """Issue a sub-request to another coderai API endpoint from inside a handler.
+
+    A feature endpoint that builds on another (e.g. /v1/characters/generate and
+    /v1/environments/generate producing reference images via /v1/images/generations)
+    must NOT assume the target model lives on the same engine that's handling it: in
+    a multi-engine deployment the image model may be assigned to — or pinned on — a
+    different engine. So:
+
+    * Behind a front (this process is an engine — CODERAI_INTERNAL_TOKEN is set):
+      route the sub-request THROUGH THE FRONT (the single public API), which picks
+      the engine that owns the target model. The caller's Authorization is forwarded
+      so that engine authorises it exactly as it would a direct client call — the
+      handler adds no internal headers of its own.
+    * Single-process (no front): dispatch in-process via execute_internal_request
+      (the internal-auth middleware is a no-op when no token is configured).
+
+    Returns the same {"status_code", "headers", "body"} dict shape either way.
+    """
+    tok = os.environ.get("CODERAI_INTERNAL_TOKEN")
+    front_port = 0
+    if tok:
+        try:
+            from codai.api.state import get_global_args
+            front_port = int(getattr(get_global_args(), "port", 0) or 0)
+        except Exception:
+            front_port = 0
+    if not tok or front_port <= 0:
+        # Single-process (or front port unknown): serve it in-process.
+        return await execute_internal_request(
+            request.app, method=method, path=path, headers=headers, body=body)
+
+    import httpx
+    fwd = {k: v for k, v in (headers or {}).items()}
+    # Carry the caller's credentials so the destination engine authorises the
+    # sub-request the same way it would the original client request.
+    auth = request.headers.get("authorization")
+    if auth and not any(k.lower() == "authorization" for k in fwd):
+        fwd["Authorization"] = auth
+    url = f"http://127.0.0.1:{front_port}{path}"
+    logger.debug("API sub-request → front %s %s (body_bytes=%d)",
+                 method.upper(), url, len(body or b""))
+    try:
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10.0, read=None, write=None,
+                                      pool=None)) as client:
+            r = await client.request(method.upper(), url, headers=fwd,
+                                     content=body or b"")
+        return {"status_code": r.status_code, "headers": dict(r.headers),
+                "body": r.content}
+    except Exception as exc:
+        logger.warning("API sub-request to front failed (%s); falling back "
+                       "to in-process dispatch", exc)
+        return await execute_internal_request(
+            request.app, method=method, path=path, headers=headers, body=body)
 
 
 def _build_multipart_body(multipart):
