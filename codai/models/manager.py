@@ -3602,6 +3602,27 @@ class MultiModelManager:
                   f"Remaining models are busy or VRAM is held elsewhere — the new "
                   f"model will load with CPU/disk offload.")
 
+    def release_idle_vram(self) -> float:
+        """Evict every loaded model that isn't actively serving a request, to free
+        VRAM for a CO-LOCATED sibling engine sharing this GPU (the GGUF-isolation
+        split runs a torch engine and a gguf engine on one NVIDIA card; neither can
+        evict the other's models, so the one needing room asks the other to release
+        via /internal/evict-vram). Returns GB freed. Busy models are left alone."""
+        before = self._get_free_vram_gb()
+        for key in list(self._lru_order()):
+            if self._is_key_busy(key):
+                print(f"  [cosite-evict] '{key}' is busy — not releasing")
+                continue
+            try:
+                print(f"  [cosite-evict] releasing '{key}' for a co-located engine")
+                self._evict_one(key)
+                if key == self.active_in_vram:
+                    self.active_in_vram = None
+            except Exception as e:
+                print(f"  [cosite-evict] failed to release '{key}': {e}")
+        after = self._get_free_vram_gb()
+        return max(0.0, after - before)
+
     def ensure_vram_for(self, model_key: str, resolved_name: str = None,
                         extra_vram_gb: float = 0.0) -> None:
         """Make room in VRAM for a model about to load — ANY type, ANY load mode.

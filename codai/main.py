@@ -749,6 +749,35 @@ def main():
         except ValueError:
             pass
 
+    # Cross-engine VRAM release: on a shared GPU (the GGUF-isolation split puts a
+    # torch engine and a gguf engine on one NVIDIA card) neither can evict the
+    # other's models. When local eviction can't free enough, ask each co-located
+    # sibling (CODERAI_COSITED_URLS, set by the front) to release its idle models.
+    _cosited = [u for u in (os.environ.get("CODERAI_COSITED_URLS") or "").split(",") if u]
+    if _cosited:
+        _itok = os.environ.get("CODERAI_INTERNAL_TOKEN")
+
+        def _cosite_vram_releaser(needed_gb: float) -> float:
+            import httpx as _httpx
+            total = 0.0
+            for _u in _cosited:
+                try:
+                    _r = _httpx.post(f"{_u}/internal/evict-vram",
+                                     json={"needed_gb": needed_gb},
+                                     headers={"x-coderai-internal": _itok or ""},
+                                     timeout=180.0)
+                    if _r.status_code == 200:
+                        total += float((_r.json() or {}).get("freed_gb") or 0.0)
+                except Exception as _e:
+                    print(f"  [cosite-evict] sibling {_u} failed: {_e}", flush=True)
+            return total
+
+        try:
+            multi_model_manager.register_external_vram_releaser(_cosite_vram_releaser)
+            print(f"  Cross-engine VRAM release enabled (co-located: {', '.join(_cosited)})")
+        except Exception as _e:
+            print(f"  Cross-engine VRAM release setup failed: {_e}")
+
     print(f"\nLoad mode: {load_mode}")
     if load_mode == "ondemand":
         print("  (pre-load first model, unload/load on switch)")

@@ -343,6 +343,21 @@ async def internal_engine_state():
             "vram": vram, "tasks": tasks, "cooling": cooling, "paused": paused}
 
 
+@app.post("/internal/evict-vram", include_in_schema=False)
+async def internal_evict_vram(request: Request):
+    """A co-located sibling engine (same GPU) asks this engine to release VRAM it
+    can't evict itself — the GGUF-isolation split runs two engines on one NVIDIA
+    card. Evicts all idle (non-busy) models and reports GB freed. Runs in a thread
+    so eviction's blocking CUDA frees don't stall the event loop."""
+    import asyncio
+    try:
+        from codai.models.manager import multi_model_manager
+        freed = await asyncio.to_thread(multi_model_manager.release_idle_vram)
+        return {"ok": True, "freed_gb": float(freed)}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "freed_gb": 0.0}
+
+
 @app.post("/internal/thermal-pause", include_in_schema=False)
 async def internal_thermal_pause(request: Request):
     """Front-driven thermal pause: the supervisor (which monitors temps centrally)

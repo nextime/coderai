@@ -179,6 +179,26 @@ class EngineSupervisor:
         return p
 
     # ----------------------------------------------------------------- planning
+    def _set_cosited_urls(self, engines) -> None:
+        """Tell each engine the internal URLs of co-located engines (same GPU), via
+        CODERAI_COSITED_URLS, so it can ask them to release VRAM when its own
+        eviction can't free enough on a shared card (the GGUF-isolation split puts
+        two engines — torch + gguf — on one NVIDIA card). Co-location is matched by
+        identical CODERAI_ENGINE_GPUS selectors."""
+        def _sel(e):
+            return (e.env.get("CODERAI_ENGINE_GPUS") or "").strip()
+        for e in engines:
+            if getattr(e, "role", "engine") == "system":
+                continue
+            mine = _sel(e)
+            if not mine:
+                continue
+            sibs = [f"http://127.0.0.1:{o.port}" for o in engines
+                    if o is not e and getattr(o, "role", "engine") != "system"
+                    and _sel(o) == mine]
+            if sibs:
+                e.env["CODERAI_COSITED_URLS"] = ",".join(sibs)
+
     def _build_engines(self) -> list:
         """Return the list of Engine objects to launch.
 
@@ -238,6 +258,7 @@ class EngineSupervisor:
                     name=spec.get("name") or f"engine#{idx}",
                     backend=backend, env=env, capabilities=caps,
                 ))
+            self._set_cosited_urls(engines)
             return engines
 
         # Auto: one engine per GPU vendor actually present on this machine. Vendors
@@ -290,6 +311,7 @@ class EngineSupervisor:
                     name=f"{name}-gguf", backend="nvidia", env=dict(env),
                     capabilities={"gguf"}))
                 next_id += 1
+        self._set_cosited_urls(engines)
         return engines
 
     # ------------------------------------------------------------------ spawning

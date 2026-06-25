@@ -90,11 +90,14 @@ No new mechanism: the gguf engine is a first-class engine, so the front already:
 - **Two processes per NVIDIA card.** Extra host RAM (the gguf engine imports the full
   stack) and a second, idle torch CUDA context (~0.3–0.6 GB VRAM). Acceptable for
   correctness; could be trimmed later by lazy-importing torch in gguf-only engines.
-- **No cross-engine eviction.** Each engine evicts only its own models, so on a single
-  shared card the gguf engine can't evict a resident diffusers model to reclaim VRAM
-  (and vice versa). llama.cpp's auto CPU-offload (`n_gpu_layers`) and the global RAM
-  cap keep this from hard-OOMing; tighter cross-engine VRAM coordination is a
-  follow-up.
+- **Cross-engine eviction (implemented).** Each engine evicts only its own models, so
+  on a shared card the torch engine can't directly evict a resident GGUF model (and
+  vice versa). Resolved via co-located VRAM release: the front passes each engine its
+  same-GPU siblings' internal URLs (`CODERAI_COSITED_URLS`); when an engine's local
+  eviction can't free enough, an `external_vram_releaser` POSTs to each sibling's
+  `/internal/evict-vram`, which evicts that engine's idle models and reports GB freed
+  (`manager.release_idle_vram`). Co-location is matched by identical
+  `CODERAI_ENGINE_GPUS` selectors. Busy (actively-serving) models are never released.
 - **`engine_specs` users opt out.** When `engine_specs` is set the auto-split is
   skipped — declare the torch/gguf split yourself (two specs on the same card: one
   `backend: nvidia` with `capabilities` minus `gguf`, one `backend: nvidia` /
