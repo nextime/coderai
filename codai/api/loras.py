@@ -1052,11 +1052,16 @@ def _train_lora_sync(req: LoraTrainRequest) -> dict:
     import os as _os, json as _json2
     _has_unet = _os.path.isdir(_os.path.join(base_path, "unet"))
     _has_transformer = _os.path.isdir(_os.path.join(base_path, "transformer"))
-    if _has_transformer and not _has_unet:
-        # DiT architecture. Native training is implemented for Z-Image; route there
-        # so its LoRA loads on the Z-Image pipeline. Other DiTs (Flux/SD3) still need
-        # an SDXL `lora_train_base_model` override or an external trainer.
-        _is_zimage = False
+    # Z-Image is a DiT and must train via _train_dit (its LoRA then loads on the
+    # Z-Image pipeline). Detect it by NAME first: _resolve_base_model_path returns an
+    # HF id verbatim (e.g. 'unsloth/Z-Image-Turbo-...') for models with no local
+    # `path`, so the isdir(transformer/) check below is False and it would otherwise
+    # misroute to the SDXL/SD15 trainer (which crashes loading a CLIP tokenizer
+    # Z-Image doesn't have). Fall back to the diffusers-config class name for local
+    # dirs / other DiTs.
+    _bm_name = f"{base_path} {getattr(req, 'base_model', '') or ''}".lower()
+    _is_zimage = ("z-image" in _bm_name) or ("zimage" in _bm_name)
+    if not _is_zimage and _has_transformer and not _has_unet:
         try:
             for _p in (_os.path.join(base_path, "model_index.json"),
                        _os.path.join(base_path, "transformer", "config.json")):
@@ -1066,9 +1071,10 @@ def _train_lora_sync(req: LoraTrainRequest) -> dict:
                         break
         except Exception:
             pass
-        if _is_zimage:
-            return _train_dit(req, base_path, images, instance_prompt,
-                              steps, rank, resolution, lr, seed, device)
+    if _is_zimage:
+        return _train_dit(req, base_path, images, instance_prompt,
+                          steps, rank, resolution, lr, seed, device)
+    if _has_transformer and not _has_unet:
         raise ValueError(
             f"LoRA training base model '{base_path}' is a transformer/DiT "
             f"architecture (has 'transformer/', no 'unet/'). Native DiT training is "
@@ -1469,6 +1475,20 @@ def _train_dit(req, base_path, images, instance_prompt,
     name = req.name
     torch.manual_seed(seed)
     compute_dtype = torch.bfloat16
+
+    # A pre-quantized (bnb/nf4/4-bit) build — e.g. the unsloth Z-Image used for fast
+    # inference — can't serve as a clean full-precision LoRA training base. Train
+    # against the full Z-Image instead; the resulting LoRA still applies to the
+    # quantized model at inference (identical architecture/keys). Overridable by a
+    # per-model `lora_train_base_model` pointing at a specific full-precision base.
+    _bl = str(base_path).lower()
+    if any(t in _bl for t in ("bnb", "nf4", "4bit", "int4")) and \
+            not getattr(req, "train_base_model", None):
+        _full = "Tongyi-MAI/Z-Image-Turbo"
+        print(f"  [lora][zimage] base '{base_path}' is a quantized build; training "
+              f"against the full base '{_full}' (LoRA still applies to the quantized "
+              f"model at inference)", flush=True)
+        base_path = _full
 
     def _calc_shift(seq_len, base=256, mx=4096, bs=0.5, ms=1.15):
         m = (ms - bs) / (mx - base)
