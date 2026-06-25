@@ -1484,47 +1484,31 @@ def _train_dit(req, base_path, images, instance_prompt,
         m = (ms - bs) / (mx - base)
         return seq_len * m + (bs - m * base)
 
-    # ── Load components ────────────────────────────────────────────────────────
-    _set_progress(status="preparing", message=f"loading Z-Image VAE: {base_path}")
-    vae = AutoencoderKL.from_pretrained(base_path, subfolder="vae", torch_dtype=torch.float32)
-    vae.requires_grad_(False); vae.eval()
-    _set_progress(status="preparing", message="loading Z-Image text encoder (Qwen3)")
-    tokenizer = AutoTokenizer.from_pretrained(base_path, subfolder="tokenizer")
-    text_encoder = AutoModel.from_pretrained(base_path, subfolder="text_encoder",
-                                             torch_dtype=compute_dtype, trust_remote_code=True)
-    text_encoder.requires_grad_(False); text_encoder.eval()
-    # Load the transformer in 4-bit (QLoRA): the frozen base stays ~4 GB so it fits
-    # on the GPU with no CPU offload — far faster than the full bf16 model, and it
-    # lets us train directly on the cached 4-bit (e.g. unsloth) build instead of
-    # downloading the full one. An already-4-bit checkpoint (embedded quant config)
-    # is loaded as-is; a full checkpoint is quantized on load.
-    _set_progress(status="preparing", message="loading Z-Image transformer (4-bit QLoRA)")
-    _q4 = _DiffBnb(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                   bnb_4bit_compute_dtype=compute_dtype) if _DiffBnb else None
-    transformer = None
-    if _q4 is not None:
+    # ── Load via the ZImagePipeline (the proven inference loader) ──────────────
+    # The unsloth build quantizes the TEXT ENCODER too; loading components piecemeal
+    # (AutoModel/AutoencoderKL by subfolder) leaves bitsandbytes' 4-bit quant-state
+    # unreconstructed -> AssertionError in Linear4bit.forward. The pipeline loads
+    # every component exactly as inference does (which works), 4-bit where the
+    # checkpoint specifies, so the frozen base stays ~4 GB on-GPU (no offload, fast).
+    # We LoRA-train only the transformer.
+    _set_progress(status="preparing", message=f"loading Z-Image pipeline: {base_path}")
+    pipe = ZImagePipeline.from_pretrained(base_path, torch_dtype=compute_dtype)
+    vae = pipe.vae
+    tokenizer = pipe.tokenizer
+    text_encoder = pipe.text_encoder
+    transformer = pipe.transformer
+
+    def _to_dev(m):
+        """Move a component to the GPU unless it's bnb-4-bit (already device-mapped;
+        .to() on a 4-bit module raises)."""
         try:
-            transformer = ZImageTransformer2DModel.from_pretrained(
-                base_path, subfolder="transformer", torch_dtype=compute_dtype,
-                quantization_config=_q4)
-        except Exception as _qe:
-            # Already-quantized checkpoints reject an explicit config — load embedded.
-            print(f"  [lora][zimage] explicit 4-bit load failed ({_qe}); using the "
-                  f"checkpoint's embedded quantization", flush=True)
-            transformer = None
-    if transformer is None:
-        transformer = ZImageTransformer2DModel.from_pretrained(
-            base_path, subfolder="transformer", torch_dtype=compute_dtype)
-    _tr_quantized = bool(getattr(transformer, "is_loaded_in_4bit", False) or
-                         getattr(transformer, "is_quantized", False))
-    if not _tr_quantized:
-        # bf16 fallback (no bnb): place on GPU explicitly (4-bit models are already
-        # device-mapped by bitsandbytes).
-        transformer = transformer.to(device)
+            return m.to(device)
+        except Exception:
+            return m
 
     # ── VAE encode reference images → scaled latents ───────────────────────────
     _set_progress(status="preparing", message="encoding reference images (VAE)")
-    vae.to(device)
+    vae = _to_dev(vae); vae.requires_grad_(False); vae.eval()
     sf = float(getattr(vae.config, "scaling_factor", 1.0) or 1.0)
     shf = float(getattr(vae.config, "shift_factor", 0.0) or 0.0)
     spatial = (int(resolution) // 16) * 16
@@ -1541,11 +1525,15 @@ def _train_dit(req, base_path, images, instance_prompt,
             lat = vae.encode(px).latent_dist.sample()
             lat = (lat - shf) * sf
             latents_list.append(lat.to(compute_dtype).cpu())
-    vae.to("cpu"); _free_train_vram()
+    try:
+        vae.to("cpu")
+    except Exception:
+        pass
+    pipe.vae = None; vae = None; _free_train_vram()
 
     # ── Qwen3 text encode of the instance prompt (chat template, hidden[-2]) ────
     _set_progress(status="preparing", message="encoding prompt (Qwen3)")
-    text_encoder.to(device)
+    text_encoder = _to_dev(text_encoder); text_encoder.requires_grad_(False); text_encoder.eval()
     with torch.no_grad():
         templated = tokenizer.apply_chat_template(
             [{"role": "user", "content": instance_prompt}],
@@ -1556,7 +1544,11 @@ def _train_dit(req, base_path, images, instance_prompt,
         hs = text_encoder(input_ids=ids, attention_mask=msk,
                           output_hidden_states=True).hidden_states[-2]
         prompt_embed = hs[0][msk[0]].to(compute_dtype).cpu()   # [seq, dim]
-    text_encoder.to("cpu"); _free_train_vram()
+    try:
+        text_encoder.to("cpu")
+    except Exception:
+        pass
+    pipe.text_encoder = None; text_encoder = None; _free_train_vram()
 
     # ── LoRA on the transformer ────────────────────────────────────────────────
     lora_cfg = PeftLoraConfig(r=rank, lora_alpha=rank, init_lora_weights="gaussian",
@@ -1564,16 +1556,12 @@ def _train_dit(req, base_path, images, instance_prompt,
     transformer.requires_grad_(False)
     transformer.add_adapter(lora_cfg, adapter_name="default")
     _hooks = []
-    try:
-        transformer.enable_gradient_checkpointing()
-        # Make checkpointing track grads through the frozen/4-bit base: force the
-        # input-embedding output to require grad (Z-Image's input proj is the
-        # all_x_embedder ModuleDict). Without this, QLoRA grads never reach the
-        # attention LoRA layers. Handles removed at job end.
-        for _emb in transformer.all_x_embedder.values():
-            _hooks.append(_emb.register_forward_hook(lambda m, i, o: o.requires_grad_(True)))
-    except Exception as _ge:
-        print(f"  [lora][zimage] gradient-checkpointing setup skipped: {_ge}", flush=True)
+    # Gradient checkpointing is intentionally OFF: with a bnb-4-bit frozen base the
+    # checkpoint recompute can desync bitsandbytes' quant-state (the same failure
+    # class as the text-encoder load). LoRA grads still reach the adapters without it
+    # (each LoRA layer's own params keep its output in the autograd graph), and at
+    # 512 res / batch 1 the ~4 GB 4-bit base + activations fit. Re-enable it (plus an
+    # all_x_embedder requires-grad hook) only if higher-res training OOMs.
     transformer.train()
     lora_params = [p for p in transformer.parameters() if p.requires_grad]
     if not lora_params:
@@ -1671,7 +1659,15 @@ def _train_dit(req, base_path, images, instance_prompt,
         transformer.delete_adapters("default")
     except Exception:
         pass
+    try:
+        pipe.transformer = None
+    except Exception:
+        pass
     del transformer
+    try:
+        del pipe
+    except Exception:
+        pass
     _free_train_vram()
     path = _lora_weight_file(name) or save_dir
     _set_progress(active=False, status="done", message="done", path=path)
