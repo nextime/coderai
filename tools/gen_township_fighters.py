@@ -4738,6 +4738,7 @@ def _mount_html(html: str, prefix: str) -> str:
         return html
     shim = (
         "<script>/*coderai-mount*/(function(){var P=" + repr(prefix) + ";if(!P)return;"
+        "window.ROOT_PATH=P;"
         "function fix(u){return (typeof u==='string'&&u.charAt(0)==='/'"
         "&&u.charAt(1)!=='/'&&u.indexOf(P+'/')!==0&&u!==P)?P+u:u;}"
         "var of=window.fetch.bind(window);window.fetch=function(u,o){return of(fix(u),o);};"
