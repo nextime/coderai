@@ -1907,8 +1907,11 @@ async def api_model_disable(request: Request, username: str = Depends(require_ad
 async def api_quantize_capabilities(username: str = Depends(require_admin)):
     """Report whether fast-kernel (GPTQ/AWQ) quantization is available + any jobs."""
     from codai.models import quant
+    # refresh=True: the settings page must get a LIVE re-detect, never a stale
+    # degraded cache from an early in-process call.
+    caps = quant.capabilities(refresh=True)
     return {
-        "capabilities": quant.capabilities(),
+        "capabilities": caps,
         "available": quant.is_available(),
         "jobs": quant.all_jobs(),
     }

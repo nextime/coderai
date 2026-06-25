@@ -58,14 +58,27 @@ def capabilities(refresh: bool = False) -> Dict[str, Any]:
             caps["available"] = True
         except Exception as e:  # ImportError or a broken transitive dep
             caps["error"] = str(e)
+        # Don't cache a DEGRADED result — gptqmodel imported but no fast-kernel
+        # backend was detected. That inner BACKEND import can transiently come up
+        # empty (e.g. when the first call lands mid model-load), and caching it would
+        # wrongly report quantization "unavailable" for the whole process life (the
+        # settings page then says "GPTQModel not installed" until a restart). Leave
+        # the cache unset so the next call re-detects; a clean positive or a genuine
+        # ImportError is stable and gets cached.
+        if caps["available"] and not caps["backends"]:
+            return caps
         _caps_cache = caps
         return caps
 
 
 def is_available() -> bool:
-    """True when GPTQModel imports and at least one fast kernel is present."""
-    c = capabilities()
-    return bool(c["available"] and c["backends"])
+    """True when GPTQModel imports. The fast-kernel backends (Marlin/ExLlama/Triton)
+    are informational only — GPTQModel always has a Triton/torch fallback and picks
+    the runtime kernel at load — so availability is NOT gated on a specific kernel
+    being detected. That detection can transiently report empty and would otherwise
+    disable quantization (and mislabel it "GPTQModel not installed") for the whole
+    process."""
+    return bool(capabilities().get("available"))
 
 
 # --------------------------------------------------------------------------------
