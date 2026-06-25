@@ -128,6 +128,15 @@ def pick_engine(registry: EngineRegistry, path: str, method: str,
             e = registry.by_name(pinned)
             if e is not None and e.can_serve(cap) and e.is_alive():
                 return e
+            # Co-located GGUF-isolation sibling: the split runs a "<name>-gguf"
+            # engine on the SAME card. A model pinned to the torch engine but needing
+            # `gguf` (or pinned to the gguf engine but needing transformers) should
+            # transparently use whichever sibling can serve it — they share the GPU,
+            # so the pin's intent (that physical card) is still honoured. Not a 503.
+            sib_name = (pinned[:-5] if pinned.endswith("-gguf") else f"{pinned}-gguf")
+            sib = registry.by_name(sib_name)
+            if sib is not None and sib.can_serve(cap) and sib.is_alive():
+                return sib
             _warn_bad_pin(model, pinned, cap, e, fallback=pin_fallback)
             # Default: a hard pin fails rather than running elsewhere. When the
             # model opts in (engine_fallback), fall through to pick another engine.

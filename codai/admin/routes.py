@@ -1562,10 +1562,15 @@ def _cached(state, fn):
     fresh = (state["sig"] == sig and (now - state["at"]) < _SCAN_TTL)
     if state["data"] is not None and fresh:
         return state["data"]                      # nothing changed → instant
-    if state["data"] is None:
-        state["data"] = fn()                      # first call: compute synchronously
+    if state["data"] is None or state.get("force_sync"):
+        # First call, or an EXPLICIT invalidation (e.g. a model-config save pushed a
+        # reload here): recompute synchronously so the very next read is fresh, not
+        # stale-while-revalidate. Otherwise a save wouldn't show until a second
+        # refresh — the reported "saved config doesn't appear in the frontend" bug.
+        state["data"] = fn()
         state["sig"] = sig
         state["at"] = _t.time()
+        state["force_sync"] = False
         return state["data"]
     if not state["busy"]:                          # changed: refresh in background
         state["busy"] = True
@@ -1584,9 +1589,13 @@ def _cached(state, fn):
 
 def _invalidate_cache_scan():
     """Force the next cached-models/cache-stats read to refresh (after a model is
-    deleted/downloaded/freed)."""
+    deleted/downloaded/freed, or a config save). force_sync makes that next read
+    recompute synchronously so the change is visible immediately, not on the read
+    after."""
     _scan_state["sig"] = None
+    _scan_state["force_sync"] = True
     _stats_state["sig"] = None
+    _stats_state["force_sync"] = True
 
 
 @router.get("/admin/api/cached-models", summary="List cached models")
