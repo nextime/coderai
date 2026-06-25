@@ -341,6 +341,17 @@ async def change_password(
     return RedirectResponse(url=_url(request, "/admin"), status_code=302)
 
 
+@router.get("/admin/api/whoami", summary="Validate the current admin session")
+async def api_whoami(username: str = Depends(require_admin)):
+    """Tiny admin-gated probe: 200 + username when the caller's session is a valid
+    admin session; 401/403 otherwise. The front calls this on the primary engine
+    (which owns sessions) to authorize front-handled admin actions — model
+    load/unload, engine management, etc. NOT a dead UI handler: do not remove (the
+    front-owned /admin/api/status was removed in def78c1, which silently broke this
+    auth path). Cheap and process-local."""
+    return {"ok": True, "user": username}
+
+
 @router.get("/admin/api/models", summary="List configured models")
 async def api_list_models(username: str = Depends(require_admin)):
     """List all configured models with details."""

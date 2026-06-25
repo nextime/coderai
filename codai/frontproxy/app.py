@@ -830,13 +830,18 @@ class FrontProxy:
 
     async def is_admin(self, request: Request) -> bool:
         """Authorize a front-handled admin action by validating the caller's session
-        against the primary engine (which owns sessions). 200 → authorized."""
+        against the primary engine (which owns sessions). 200 → authorized.
+
+        Probes the engine's /admin/api/whoami (admin-gated). NOTE: do not point this
+        at /admin/api/status — that route is front-only (removed from the engine in
+        def78c1), so probing it on the engine 404s and silently fails every
+        front-handled admin action (model load/unload, engine mgmt)."""
         prim = self.registry.primary()
         if prim is None:
             return False
         try:
             headers = self._filter_headers(request.headers, _DROP_REQ)
-            r = await self._short.get(prim.url + "/admin/api/status", headers=headers)
+            r = await self._short.get(prim.url + "/admin/api/whoami", headers=headers)
             return r.status_code == 200
         except Exception:
             return False

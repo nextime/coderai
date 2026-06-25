@@ -813,20 +813,28 @@ class CoderAIClient:
             return []
 
     def generate_character(self, name: str, prompt: str, description: str,
-                           model: str, n: int = 4, size: str = "512x512") -> dict:
-        return self._post("/v1/characters/generate", {
+                           model: str, n: int = 4, size: str = "512x512",
+                           steps: int = None) -> dict:
+        body = {
             "name": name, "prompt": prompt, "description": description,
             "model": model, "n": n,
             "width": int(size.split("x")[0]), "height": int(size.split("x")[1]),
-        })
+        }
+        if steps:
+            body["steps"] = int(steps)
+        return self._post("/v1/characters/generate", body)
 
     def generate_environment(self, name: str, prompt: str, description: str,
-                             model: str, n: int = 3, size: str = "768x512") -> dict:
-        return self._post("/v1/environments/generate", {
+                             model: str, n: int = 3, size: str = "768x512",
+                             steps: int = None) -> dict:
+        body = {
             "name": name, "prompt": prompt, "description": description,
             "model": model, "n": n,
             "width": int(size.split("x")[0]), "height": int(size.split("x")[1]),
-        })
+        }
+        if steps:
+            body["steps"] = int(steps)
+        return self._post("/v1/environments/generate", body)
 
     def generate_image(self, prompt: str, model: str,
                        character_profiles: list = None,
@@ -2217,6 +2225,26 @@ def save_config(path: str, args) -> dict:
         json.dump(data, f, indent=2, sort_keys=True)
         f.write("\n")
     return data
+
+
+def _ref_gen_res_steps(args):
+    """(size, steps) for reference / keyframe image generation, honouring the
+    resolution + steps configured on the Run page (keyframe_size / keyframe_steps).
+    Re-reads the saved config file when available so Run-page edits apply without a
+    restart; falls back to the launch args, then sane defaults. This is what makes
+    the characters/environments/matches reference generators use the same resolution
+    and steps as keyframes instead of hardcoded 512/768 + 28 steps."""
+    size = getattr(args, "keyframe_size", None) or "832x480"
+    steps = getattr(args, "keyframe_steps", None) or 28
+    try:
+        cf = getattr(args, "config", None)
+        if cf and os.path.isfile(cf):
+            c = load_config(cf)
+            size = c.get("keyframe_size") or size
+            steps = c.get("keyframe_steps") or steps
+    except Exception:
+        pass
+    return str(size), int(steps)
 
 
 def load_config(path: str) -> dict:
@@ -5001,10 +5029,9 @@ def launch_web_ui(default_args):
                 pass
             # Build a generation prompt from the saved profile.
             prompt = (meta.get("prompt") or meta.get("description") or name).strip()
-            if kind == "environment":
-                size = "768x512"
-            else:
-                size = "512x512"
+            # Honour the Run-page resolution + steps (keyframe_size/keyframe_steps)
+            # instead of a hardcoded size/28 steps.
+            size, _ref_steps = _ref_gen_res_steps(default_args)
 
             client = CoderAIClient(default_args.base_url,
                                    getattr(default_args, "api_key", None))
@@ -5033,7 +5060,7 @@ def launch_web_ui(default_args):
                         prompt=prompt, model=model,
                         character_profiles=char_p, environment_profiles=env_p,
                         character_strength=0.7,
-                        size=size, steps=28, seed=random.randint(0, 2**31),
+                        size=size, steps=_ref_steps, seed=random.randint(0, 2**31),
                     )
                 except Exception as e:
                     _web_log(f"  ✗ regen image {k+1}/{count} for {name} failed: {e}")
@@ -5103,7 +5130,8 @@ def launch_web_ui(default_args):
                 prompt = f"{prompt}, {_ref_look}" if prompt and prompt != name else _ref_look
                 if not description:
                     description = "Fight referee / official."
-            size = "768x512" if kind == "environment" else "512x512"
+            # Honour the Run-page resolution + steps (keyframe_size/keyframe_steps).
+            size, _ref_steps = _ref_gen_res_steps(default_args)
             client = CoderAIClient(default_args.base_url,
                                    getattr(default_args, "api_key", None))
             _prog(8, "selecting image model…")
@@ -5119,11 +5147,11 @@ def launch_web_ui(default_args):
                 if kind == "character":
                     client.generate_character(name=name, prompt=prompt,
                                               description=description, model=model,
-                                              n=count, size=size)
+                                              n=count, size=size, steps=_ref_steps)
                 else:
                     client.generate_environment(name=name, prompt=prompt,
                                                 description=description, model=model,
-                                                n=count, size=size)
+                                                n=count, size=size, steps=_ref_steps)
             except Exception as e:
                 _fail(f"generation failed: {e}")
                 return
