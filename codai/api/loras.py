@@ -1049,15 +1049,31 @@ def _train_lora_sync(req: LoraTrainRequest) -> dict:
     # `transformer/` subfolder and no `unet/`; loading their non-CLIP tokenizer
     # as a CLIPTokenizer crashes deep inside transformers.  Detect that up front
     # and fail with an actionable message instead.
-    import os as _os
+    import os as _os, json as _json2
     _has_unet = _os.path.isdir(_os.path.join(base_path, "unet"))
     _has_transformer = _os.path.isdir(_os.path.join(base_path, "transformer"))
     if _has_transformer and not _has_unet:
+        # DiT architecture. Native training is implemented for Z-Image; route there
+        # so its LoRA loads on the Z-Image pipeline. Other DiTs (Flux/SD3) still need
+        # an SDXL `lora_train_base_model` override or an external trainer.
+        _is_zimage = False
+        try:
+            for _p in (_os.path.join(base_path, "model_index.json"),
+                       _os.path.join(base_path, "transformer", "config.json")):
+                if _os.path.isfile(_p):
+                    if "zimage" in (_json2.load(open(_p)).get("_class_name") or "").lower():
+                        _is_zimage = True
+                        break
+        except Exception:
+            pass
+        if _is_zimage:
+            return _train_dit(req, base_path, images, instance_prompt,
+                              steps, rank, resolution, lr, seed, device)
         raise ValueError(
             f"LoRA training base model '{base_path}' is a transformer/DiT "
-            f"architecture (has 'transformer/', no 'unet/'). This trainer only "
-            f"supports UNet-based SD1.x/SDXL models. Configure an SD1.x or SDXL "
-            f"image model as the LoRA training base."
+            f"architecture (has 'transformer/', no 'unet/'). Native DiT training is "
+            f"currently implemented for Z-Image only. For Flux/SD3, configure an SDXL "
+            f"`lora_train_base_model` override, or use an external DiT trainer."
         )
 
     # Detect SDXL by attempting to load a second tokenizer.
@@ -1404,6 +1420,207 @@ def _train_sdxl(req, base_path, images, instance_prompt,
         pass
     _free_train_vram()
 
+    path = _lora_weight_file(name) or save_dir
+    _set_progress(active=False, status="done", message="done", path=path)
+    return {"name": name, "path": path}
+
+
+def _train_dit(req, base_path, images, instance_prompt,
+               steps, rank, resolution, lr, seed, device):
+    """Train a LoRA for an image diffusion-TRANSFORMER (DiT) — currently Z-Image
+    (ZImageTransformer2DModel) — so it loads on the Z-Image pipeline. The SDXL-UNet
+    trainer produces `unet.`-prefixed keys that silently no-op on a DiT; this path
+    produces `transformer.`-prefixed keys diffusers' ZImagePipeline.load_lora_weights
+    applies correctly.
+
+    Reverse-engineered from diffusers ZImagePipeline so training matches inference:
+      * prompt: tokenizer.apply_chat_template → Qwen3 text_encoder → hidden_states[-2],
+        masked to a variable-length per-sample embedding (the transformer takes a LIST).
+      * latents: AutoencoderKL, scaled (lat - shift_factor) * scaling_factor.
+      * transformer I/O is list-based: a LIST of [C,1,H,W] latents, a normalized
+        timestep (1000 - t)/1000, and a prompt-embed LIST; output is a list, stacked.
+      * Z-Image NEGATES the model output before the flow-match step, so the
+        transformer's RAW target is (x0 - noise) = -velocity.
+      * timesteps are sampled from the TURBO discrete schedule (set_timesteps with the
+        resolution shift mu), not a uniform sigma — staying on the ~9 turbo nodes keeps
+        the distilled model sharp (uniform sampling blurs it).
+
+    v1: validate with one short train (rank 8, ~800 steps) + a generation. If the
+    LoRA inverts the subject, flip the velocity sign (target = noise - x0); if results
+    are soft/blurry, the turbo-node sampling is the knob.
+    """
+    import os as _os, json as _json, random as _random
+    import torch
+    import torch.nn.functional as F
+    from peft import LoraConfig as PeftLoraConfig
+    from peft.utils import get_peft_model_state_dict
+    from torchvision import transforms
+    try:
+        from diffusers import (AutoencoderKL, ZImageTransformer2DModel,
+                               ZImagePipeline, FlowMatchEulerDiscreteScheduler)
+        from diffusers.utils import convert_state_dict_to_diffusers
+        from transformers import AutoTokenizer, AutoModel
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=("Z-Image LoRA training needs a diffusers build with Z-Image "
+                    f"support (ZImageTransformer2DModel/ZImagePipeline): {e}"))
+
+    name = req.name
+    torch.manual_seed(seed)
+    compute_dtype = torch.bfloat16
+
+    def _calc_shift(seq_len, base=256, mx=4096, bs=0.5, ms=1.15):
+        m = (ms - bs) / (mx - base)
+        return seq_len * m + (bs - m * base)
+
+    # ── Load components ────────────────────────────────────────────────────────
+    _set_progress(status="preparing", message=f"loading Z-Image VAE: {base_path}")
+    vae = AutoencoderKL.from_pretrained(base_path, subfolder="vae", torch_dtype=torch.float32)
+    vae.requires_grad_(False); vae.eval()
+    _set_progress(status="preparing", message="loading Z-Image text encoder (Qwen3)")
+    tokenizer = AutoTokenizer.from_pretrained(base_path, subfolder="tokenizer")
+    text_encoder = AutoModel.from_pretrained(base_path, subfolder="text_encoder",
+                                             torch_dtype=compute_dtype, trust_remote_code=True)
+    text_encoder.requires_grad_(False); text_encoder.eval()
+    _set_progress(status="preparing", message="loading Z-Image transformer")
+    transformer = ZImageTransformer2DModel.from_pretrained(
+        base_path, subfolder="transformer", torch_dtype=compute_dtype).to(device)
+
+    # ── VAE encode reference images → scaled latents ───────────────────────────
+    _set_progress(status="preparing", message="encoding reference images (VAE)")
+    vae.to(device)
+    sf = float(getattr(vae.config, "scaling_factor", 1.0) or 1.0)
+    shf = float(getattr(vae.config, "shift_factor", 0.0) or 0.0)
+    spatial = (int(resolution) // 16) * 16
+    tfm = transforms.Compose([
+        transforms.Resize(spatial, interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.CenterCrop(spatial),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
+    latents_list = []
+    with torch.no_grad():
+        for img in images:
+            px = tfm(img.convert("RGB")).unsqueeze(0).to(device, dtype=torch.float32)
+            lat = vae.encode(px).latent_dist.sample()
+            lat = (lat - shf) * sf
+            latents_list.append(lat.to(compute_dtype).cpu())
+    vae.to("cpu"); _free_train_vram()
+
+    # ── Qwen3 text encode of the instance prompt (chat template, hidden[-2]) ────
+    _set_progress(status="preparing", message="encoding prompt (Qwen3)")
+    text_encoder.to(device)
+    with torch.no_grad():
+        templated = tokenizer.apply_chat_template(
+            [{"role": "user", "content": instance_prompt}],
+            tokenize=False, add_generation_prompt=True, enable_thinking=True)
+        ti = tokenizer([templated], padding="max_length", max_length=512,
+                       truncation=True, return_tensors="pt")
+        ids = ti.input_ids.to(device); msk = ti.attention_mask.to(device).bool()
+        hs = text_encoder(input_ids=ids, attention_mask=msk,
+                          output_hidden_states=True).hidden_states[-2]
+        prompt_embed = hs[0][msk[0]].to(compute_dtype).cpu()   # [seq, dim]
+    text_encoder.to("cpu"); _free_train_vram()
+
+    # ── LoRA on the transformer ────────────────────────────────────────────────
+    lora_cfg = PeftLoraConfig(r=rank, lora_alpha=rank, init_lora_weights="gaussian",
+                              target_modules=["to_k", "to_q", "to_v", "to_out.0"])
+    transformer.requires_grad_(False)
+    transformer.add_adapter(lora_cfg, adapter_name="default")
+    transformer.train()
+    lora_params = [p for p in transformer.parameters() if p.requires_grad]
+    if not lora_params:
+        raise HTTPException(status_code=500,
+                            detail="Z-Image LoRA: no trainable adapter params were created")
+    optimizer = torch.optim.AdamW(lora_params, lr=lr)
+
+    start_step = 0
+    _ck = _load_train_state(name, base_path=base_path, target="image", rank=rank,
+                            session=getattr(req, "session", None)) if _resume_allowed(req) else None
+    if _ck:
+        try:
+            _apply_peft_checkpoint(name, "default", transformer)
+            start_step = int(_ck["step"])
+            _set_progress(step=start_step, message=f"resuming from step {start_step}/{steps}")
+        except Exception as e:
+            print(f"  [lora] could not resume Z-Image '{name}': {e}; starting fresh")
+            start_step = 0
+
+    # ── Turbo discrete timestep schedule (match inference) ─────────────────────
+    sched = FlowMatchEulerDiscreteScheduler.from_pretrained(base_path, subfolder="scheduler")
+    num_train_t = float(getattr(sched.config, "num_train_timesteps", 1000) or 1000)
+    _lh, _lw = latents_list[0].shape[-2], latents_list[0].shape[-1]
+    image_seq_len = (_lh // 2) * (_lw // 2)
+    mu = _calc_shift(image_seq_len,
+                     getattr(sched.config, "base_image_seq_len", 256),
+                     getattr(sched.config, "max_image_seq_len", 4096),
+                     getattr(sched.config, "base_shift", 0.5),
+                     getattr(sched.config, "max_shift", 1.15))
+    try:
+        sched.sigma_min = 0.0
+    except Exception:
+        pass
+    try:
+        sched.set_timesteps(num_inference_steps=9, device=device, mu=mu)
+    except TypeError:
+        sched.set_timesteps(num_inference_steps=9, device=device)
+    node_t = sched.timesteps.to(device).float()
+    node_sigma = sched.sigmas.to(device).float()[:len(node_t)]
+
+    _set_progress(status="training", message="training (Z-Image LoRA)")
+    n = len(latents_list)
+    embed_dev = prompt_embed.to(device)
+    for step in range(start_step, steps):
+        _check_train_cancel()
+        x0 = latents_list[step % n].to(device, dtype=compute_dtype)   # [1,C,h,w]
+        noise = torch.randn_like(x0)
+        j = _random.randint(0, len(node_t) - 1)
+        t = node_t[j]; sigma = node_sigma[j]
+        s = sigma.view(1, 1, 1, 1)
+        x0f = x0.float(); nf = noise.float()
+        x_t = ((1.0 - s) * x0f + s * nf).to(compute_dtype)
+        target = (x0f - nf).to(compute_dtype)                          # -velocity (Z-Image negates output)
+        timestep_norm = ((num_train_t - t) / num_train_t).view(1).to(compute_dtype)  # (1000-t)/1000
+
+        in_list = list(x_t.unsqueeze(2).unbind(dim=0))                 # [ [C,1,h,w] ]
+        out = transformer(in_list, timestep_norm, [embed_dev], return_dict=False)[0]
+        pred = torch.stack([o.float() for o in out], dim=0).squeeze(2)  # [1,C,h,w]
+        loss = F.mse_loss(pred, target.float(), reduction="mean")
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
+        optimizer.step(); optimizer.zero_grad()
+
+        _set_progress(step=step + 1, message=f"step {step+1}/{steps} loss={loss.item():.4f}")
+        if step % 10 == 0 or step == steps - 1:
+            _dbg_lora(f"Z-Image step {step+1}/{steps} loss={loss.item():.4f}")
+        if (step + 1) % _CKPT_EVERY == 0 and step + 1 < steps:
+            _save_train_checkpoint(name,
+                {"name": name, "base_path": base_path, "target": "image",
+                 "rank": rank, "step": step + 1, "total": steps, "seed": seed,
+                 "session": getattr(req, "session", None)},
+                {"default": get_peft_model_state_dict(transformer)})
+        try:
+            from codai.models.thermal import checkpoint as _thermal_checkpoint
+            _thermal_checkpoint(context="lora-train", throttle_seconds=2.0)
+        except Exception:
+            pass
+
+    # ── Save (transformer LoRA layers, diffusers format) ───────────────────────
+    _set_progress(status="saving", message="saving Z-Image LoRA weights")
+    save_dir = _lora_dir(name)
+    os.makedirs(save_dir, exist_ok=True)
+    tlayers = convert_state_dict_to_diffusers(get_peft_model_state_dict(transformer))
+    ZImagePipeline.save_lora_weights(save_directory=save_dir,
+                                     transformer_lora_layers=tlayers,
+                                     safe_serialization=True)
+    _write_meta(name, req, base_path, len(images), "zimage", instance_prompt)
+    _clear_train_checkpoint(name)
+    try:
+        transformer.delete_adapters("default")
+    except Exception:
+        pass
+    _free_train_vram()
     path = _lora_weight_file(name) or save_dir
     _set_progress(active=False, status="done", message="done", path=path)
     return {"name": name, "path": path}
