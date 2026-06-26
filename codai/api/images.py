@@ -676,6 +676,11 @@ def _ensure_ip_adapter_loaded(pipeline) -> bool:
 def _apply_loras(pipeline, loras):
     """Load and activate LoRA weights on a diffusers pipeline."""
     try:
+        # peft dispatches AWQ for any non-bnb target when gptqmodel is installed;
+        # gptqmodel 7.1.0 renamed the class peft imports, which would crash
+        # load_lora_weights below. Alias it before applying any adapter.
+        from codai.models.peft_compat import ensure_peft_awq_compat
+        ensure_peft_awq_compat()
         names = []
         weights = []
         for i, lora in enumerate(loras):

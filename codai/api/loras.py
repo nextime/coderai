@@ -1443,13 +1443,11 @@ def _ensure_peft_awq_compat():
     import AwqGEMMQuantLinear`, but gptqmodel 7.1.0 renamed that class to
     AwqGEMMLinear. Since peft calls dispatch_awq for ANY non-bnb target whenever
     gptqmodel is installed, the failed import crashes EVERY add_adapter() (SDXL, Wan
-    and Z-Image LoRA training alike). Alias the renamed class so the import succeeds;
-    no-op when the name already exists or gptqmodel isn't present."""
+    and Z-Image LoRA training alike). Delegates to the shared shim (also used by
+    the inference LoRA-apply path)."""
     try:
-        import importlib
-        m = importlib.import_module("gptqmodel.nn_modules.qlinear.gemm_awq")
-        if not hasattr(m, "AwqGEMMQuantLinear") and hasattr(m, "AwqGEMMLinear"):
-            m.AwqGEMMQuantLinear = m.AwqGEMMLinear
+        from codai.models.peft_compat import ensure_peft_awq_compat
+        ensure_peft_awq_compat()
     except Exception:
         pass
 

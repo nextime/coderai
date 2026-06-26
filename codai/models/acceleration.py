@@ -293,6 +293,14 @@ def apply_accel_to_pipeline(pipe, accel: Optional[dict]) -> None:
                     "acceleration LoRA", type(pipe).__name__)
         return
 
+    # gptqmodel 7.1.0 renamed the AWQ class peft imports during dispatch; alias
+    # it before any load_lora_weights so the import doesn't crash the fuse.
+    try:
+        from codai.models.peft_compat import ensure_peft_awq_compat
+        ensure_peft_awq_compat()
+    except Exception:
+        pass
+
     weight = float(accel.get("lora_weight") or 1.0)
 
     def _load_one(ref, into_t2: bool, adapter: str) -> bool:
