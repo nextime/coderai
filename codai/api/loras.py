@@ -1154,6 +1154,7 @@ def _train_sd15(req, base_path, images, instance_prompt,
         r=rank, lora_alpha=rank, init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
+    _ensure_peft_awq_compat()
     unet.add_adapter(lora_cfg, adapter_name="default")
     lora_params = [p for p in unet.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(lora_params, lr=lr)
@@ -1298,6 +1299,7 @@ def _train_sdxl(req, base_path, images, instance_prompt,
         r=rank, lora_alpha=rank, init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
+    _ensure_peft_awq_compat()
     unet.add_adapter(lora_cfg, adapter_name="default")
     lora_params = [p for p in unet.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(lora_params, lr=lr)
@@ -1431,6 +1433,22 @@ def _train_sdxl(req, base_path, images, instance_prompt,
     return {"name": name, "path": path}
 
 
+def _ensure_peft_awq_compat():
+    """peft's LoRA AWQ dispatcher does `from gptqmodel.nn_modules.qlinear.gemm_awq
+    import AwqGEMMQuantLinear`, but gptqmodel 7.1.0 renamed that class to
+    AwqGEMMLinear. Since peft calls dispatch_awq for ANY non-bnb target whenever
+    gptqmodel is installed, the failed import crashes EVERY add_adapter() (SDXL, Wan
+    and Z-Image LoRA training alike). Alias the renamed class so the import succeeds;
+    no-op when the name already exists or gptqmodel isn't present."""
+    try:
+        import importlib
+        m = importlib.import_module("gptqmodel.nn_modules.qlinear.gemm_awq")
+        if not hasattr(m, "AwqGEMMQuantLinear") and hasattr(m, "AwqGEMMLinear"):
+            m.AwqGEMMQuantLinear = m.AwqGEMMLinear
+    except Exception:
+        pass
+
+
 def _train_dit(req, base_path, images, instance_prompt,
                steps, rank, resolution, lr, seed, device):
     """Train a LoRA for an image diffusion-TRANSFORMER (DiT) — currently Z-Image
@@ -1561,6 +1579,7 @@ def _train_dit(req, base_path, images, instance_prompt,
     lora_cfg = PeftLoraConfig(r=rank, lora_alpha=rank, init_lora_weights="gaussian",
                               target_modules=["to_k", "to_q", "to_v", "to_out.0"])
     transformer.requires_grad_(False)
+    _ensure_peft_awq_compat()
     transformer.add_adapter(lora_cfg, adapter_name="default")
     _hooks = []
     # Gradient checkpointing is intentionally OFF: with a bnb-4-bit frozen base the
@@ -1813,6 +1832,7 @@ def _train_wan(req, base_path, images, instance_prompt,
     hook_handles = []
     for _, tr in experts:
         tr.requires_grad_(False)
+        _ensure_peft_awq_compat()
         tr.add_adapter(lora_cfg, adapter_name="default")
         try:
             tr.enable_gradient_checkpointing()
