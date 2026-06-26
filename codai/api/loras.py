@@ -75,6 +75,11 @@ _train_lock = threading.Lock()
 _jobs_lock = threading.Lock()
 _jobs: dict = {}                  # job_id -> record
 _active_job_id: Optional[str] = None
+# Base model of the job currently executing on the GPU. The trainer loads its base
+# pipeline OUTSIDE the model manager (and unloads all manager models first), so the
+# engine's loaded_models would otherwise read 0 mid-training even though the GPU is
+# busy. Surfaced via active_training_model() so the engine status reflects reality.
+_active_train_model: Optional[str] = None
 _bg_tasks: set = set()            # strong refs to detached train tasks
 # Job ids with a pending cancel. Survives the window before a queued job's task
 # is registered (the worker checks this set right after acquiring the GPU lock).
@@ -2044,6 +2049,17 @@ def _write_meta(name, req, base_path, n_images, arch, instance_prompt):
 _TRAIN_MODEL_KEY = "lora-train"
 
 
+def active_training_model() -> Optional[str]:
+    """The base model of the training job currently running on the GPU, or None.
+
+    The trainer holds its base pipeline outside the model manager, so this is the
+    only way the engine status can report that the GPU is busy with training rather
+    than showing 0 loaded models."""
+    if _train_lock.locked():
+        return _active_train_model
+    return None
+
+
 def _train_lora_blocking(req: LoraTrainRequest, job_id: Optional[str] = None) -> dict:
     """Run one training job to completion (called inside a worker thread).
 
@@ -2053,9 +2069,10 @@ def _train_lora_blocking(req: LoraTrainRequest, job_id: Optional[str] = None) ->
     `_active_job_id` is set so live progress mirrors into this job's record (and
     only this job's) for its owner to poll.
     """
-    global _active_job_id
+    global _active_job_id, _active_train_model
     _train_lock.acquire()
     _active_job_id = job_id
+    _active_train_model = getattr(req, "base_model", "") or None
     # Live cancellable task (id == job id). Registered here, when the job actually
     # starts on the GPU, so its progress mirrors via _set_progress.
     if job_id:
@@ -2113,6 +2130,7 @@ def _train_lora_blocking(req: LoraTrainRequest, job_id: Optional[str] = None) ->
         raise
     finally:
         _active_job_id = None
+        _active_train_model = None
         if job_id:
             _cancel_requested.discard(job_id)
             _force_resume_jobs.discard(job_id)

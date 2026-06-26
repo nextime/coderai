@@ -303,6 +303,17 @@ async def internal_engine_state():
                     loaded.append(_mp)
     except Exception:
         pass
+    # A LoRA training job loads its base pipeline OUTSIDE the model manager (and
+    # unloads all manager models first), so without this the engine would report 0
+    # loaded models mid-training even though the GPU is fully busy. Surface the base
+    # model being trained so the engines card reflects what's actually resident.
+    try:
+        from codai.api.loras import active_training_model
+        _tm = active_training_model()
+        if _tm and _tm not in loaded:
+            loaded.append(_tm)
+    except Exception:
+        pass
     # VRAM is CACHED with a short TTL: this endpoint is polled every couple seconds
     # by the front's health monitor, and calling torch.cuda.mem_get_info /
     # get_device_name on EVERY poll can serialize behind the running generation on

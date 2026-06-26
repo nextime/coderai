@@ -141,3 +141,84 @@ server {
 
 Sub-path mounting for these three needs their client URLs made relative (the
 same change already applied to `video_editor.py`).
+
+> **Note:** inside the all-in-one Docker image the bundled nginx already mounts
+> `gen_township_fighters.py` at `/township/` (and the editor/videogen) and
+> rewrites its server-rendered asset URLs, so the township UI *does* work under
+> a sub-path **when reached through the container's own nginx**. The caveat above
+> applies only to running these tools standalone, directly behind your proxy.
+
+## Double proxy: the all-in-one container behind another reverse proxy
+
+This is the common production layout: the `coderai` Docker image already runs an
+**internal** nginx on `:8776` that fronts the API plus the bundled tool UIs
+(`/township/`, `/editor/`, `/videogen/`). You then put **your own** nginx in
+front of it (terminating TLS, on your real hostname) pointing at the container's
+LAN IP — two proxies in a chain.
+
+The internal nginx is **chain-aware**: it prefers the `X-Forwarded-Proto`,
+`X-Forwarded-Host`, and `X-Forwarded-Prefix` your outer proxy sends and only
+falls back to its own hop's values when they're absent. It also **nests** its
+sub-app prefixes under any outer prefix (outer `/ai` + bundled `/township` →
+`/ai/township`). So the *only* thing you have to get right is what your **outer**
+proxy advertises — if it doesn't tell the stack the public scheme/host/prefix,
+the container can only see the LAN IP + plain http on the inner leg, and
+absolute links (image/file URLs, redirects) and sub-path asset URLs break. That
+is exactly why the characters/environments thumbnails 404 in a misconfigured
+double proxy.
+
+**Outer proxy at the root** (`https://ai.example.com/` → container):
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name ai.example.com;
+    # ssl_certificate ... ; ssl_certificate_key ... ;
+    client_max_body_size 4096m;
+
+    location / {
+        proxy_pass http://CONTAINER_LAN_IP:8776;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;            # NOT the LAN IP
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;          # https, not http
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;                                  # SSE
+    }
+}
+```
+
+**Outer proxy under a sub-path** (`https://example.com/ai/` → container):
+
+```nginx
+location /ai/ {
+    proxy_pass http://CONTAINER_LAN_IP:8776/;   # trailing slash strips /ai
+    proxy_http_version 1.1;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host  $host;
+    proxy_set_header X-Forwarded-Prefix /ai;     # <-- the key line; gets nested
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_read_timeout 3600s;
+    proxy_buffering off;
+}
+```
+
+With the sub-path form, the township UI ends up correctly at
+`https://example.com/ai/township/` and its `/media/...` images resolve to
+`/ai/township/media/...`.
+
+The two most common double-proxy mistakes:
+
+1. **Omitting `proxy_set_header Host $host`** on the outer proxy. nginx then
+   sends `Host: CONTAINER_LAN_IP:8776` upstream, and CoderAI builds public file
+   URLs against the LAN IP — unreachable from the browser.
+2. **Omitting `X-Forwarded-Proto $scheme`** when the public side is HTTPS. The
+   inner leg is plain http, so links come back as `http://` and get blocked as
+   mixed content on an https page.
+
+If you'd rather not depend on headers at all, pin the API's public origin with
+`--url https://ai.example.com` (root mount only).
