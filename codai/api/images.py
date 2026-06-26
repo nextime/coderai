@@ -681,15 +681,35 @@ def _apply_loras(pipeline, loras):
         # load_lora_weights below. Alias it before applying any adapter.
         from codai.models.peft_compat import ensure_peft_awq_compat
         ensure_peft_awq_compat()
+        # The pipeline is cached and reused across requests, so the adapters we
+        # added last time linger. Re-loading the same fighter then fails with
+        # "Adapter name <x> already in use", and stale adapters from a different
+        # request would accumulate in VRAM. Drop the ones WE added previously
+        # (tracked by name) before re-applying — leaving any acceleration/turbo
+        # LoRA (a different adapter name, loaded elsewhere) untouched.
+        prev = list(getattr(pipeline, "_coderai_request_adapters", None) or [])
+        if prev:
+            try:
+                pipeline.delete_adapters(prev)
+            except Exception:
+                pass
+            pipeline._coderai_request_adapters = []
         names = []
         weights = []
         for i, lora in enumerate(loras):
             name = lora.name or f"lora_{i}"
+            # Defensive: if this exact name somehow survived, drop it first so the
+            # load can't collide.
+            try:
+                pipeline.delete_adapters(name)
+            except Exception:
+                pass
             pipeline.load_lora_weights(lora.model, adapter_name=name)
             names.append(name)
             weights.append(float(lora.weight if lora.weight is not None else 1.0))
         if names:
             pipeline.set_adapters(names, weights)
+            pipeline._coderai_request_adapters = list(names)
             _log.info("LoRA weights applied: %s", names)
     except Exception as e:
         _log.warning("Could not apply LoRA weights: %s", e)
