@@ -1509,6 +1509,13 @@ def _train_dit(req, base_path, images, instance_prompt,
     # ── VAE encode reference images → scaled latents ───────────────────────────
     _set_progress(status="preparing", message="encoding reference images (VAE)")
     vae = _to_dev(vae); vae.requires_grad_(False); vae.eval()
+    # The pipeline loads the VAE in the pipeline dtype (bf16); the input image tensor
+    # must match the VAE's weight dtype or conv2d raises "Input type (float) and bias
+    # type (BFloat16) should be the same".
+    try:
+        _vdt = next(vae.parameters()).dtype
+    except Exception:
+        _vdt = compute_dtype
     sf = float(getattr(vae.config, "scaling_factor", 1.0) or 1.0)
     shf = float(getattr(vae.config, "shift_factor", 0.0) or 0.0)
     spatial = (int(resolution) // 16) * 16
@@ -1521,7 +1528,7 @@ def _train_dit(req, base_path, images, instance_prompt,
     latents_list = []
     with torch.no_grad():
         for img in images:
-            px = tfm(img.convert("RGB")).unsqueeze(0).to(device, dtype=torch.float32)
+            px = tfm(img.convert("RGB")).unsqueeze(0).to(device, dtype=_vdt)
             lat = vae.encode(px).latent_dist.sample()
             lat = (lat - shf) * sf
             latents_list.append(lat.to(compute_dtype).cpu())
