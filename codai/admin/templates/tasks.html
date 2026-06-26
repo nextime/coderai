@@ -218,7 +218,7 @@ function historyRow(t) {
   }
   return `<tr>
     <td><span class="badge badge-user">${esc(KIND_LABEL[t.kind] || t.kind)}</span></td>
-    <td><div class="td-name">${esc(title)}</div><div class="dim small mono">${esc(t.model || '')}</div></td>
+    <td><div class="td-name">${esc(title)}${t.engine?` <span class="badge badge-user" style="font-size:9px;padding:.05rem .3rem;vertical-align:middle" title="Ran on engine">${esc(t.engine)}</span>`:''}</div><div class="dim small mono">${esc(t.model || '')}</div></td>
     <td>${result}</td>
     <td>${thru}</td>
     <td class="dim small">${fmtTime(t.ended_at)}</td>
@@ -312,12 +312,13 @@ async function loadEngines(){
     const vram = e.vram ? `${(e.vram.used ?? 0).toFixed ? e.vram.used.toFixed(1) : e.vram.used}/${e.vram.total} GB` : '';
     const cool = e.cooling ? ` <span class="badge badge-warn" style="font-size:9px">❄ cooling</span>` : '';
     const prim = e.primary ? ` <span class="badge badge-user" style="font-size:9px">primary</span>` : '';
+    const proc = e.processing ? ` <span class="badge badge-admin" style="font-size:9px" title="actively processing a request">● processing</span>` : '';
     const loaded = e.loaded_models||[];
     const models = loaded.length;
     const mtip = models ? esc(loaded.join('\n')) : 'no models loaded';
     return `<div class="sys-tile">
       <div class="sys-head">
-        <span class="sys-name">${esc(e.name)} <span class="dim" style="text-transform:none">(${esc(e.backend)})</span>${prim}${cool}</span>
+        <span class="sys-name">${esc(e.name)} <span class="dim" style="text-transform:none">(${esc(e.backend)})</span>${prim}${proc}${cool}</span>
         <span style="width:9px;height:9px;border-radius:50%;background:${dot};display:inline-block" title="${state}"></span>
       </div>
       <div class="sys-sub"><span>${esc(state)}${vram?' · '+esc(vram):''}</span><span title="${mtip}" style="cursor:${models?'help':'default'};${models?'text-decoration:underline dotted':''}">${models} model${models!==1?'s':''}</span></div>

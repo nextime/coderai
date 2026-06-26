@@ -779,6 +779,28 @@ class FrontProxy:
         # the timeout). Serve the merged/synthesized task list from the front's
         # last-good cache + live in-flight tracking — no engine hit during work.
         if is_tasks and int(getattr(prim, "inflight", 0) or 0) > 0:
+            # In-flight: try a SHORT poll FIRST. An image/diffusers generation
+            # releases the GIL, so the engine can still answer with the REAL
+            # step/total progress (otherwise the task page only shows "working…").
+            # Only fall back to the synthesized list when the engine is genuinely
+            # GIL-bound (text gen) and the quick poll times out — keeping the page
+            # responsive either way.
+            try:
+                headers = self._filter_headers(request.headers, _DROP_REQ)
+                r = await self._short.get(
+                    prim.url + request.url.path, headers=headers,
+                    params=request.query_params,
+                    timeout=httpx.Timeout(connect=2.0, read=1.5, write=2.0, pool=2.0))
+                if r.status_code == 200:
+                    data = r.json()
+                    _ptasks = data.get("tasks") or []
+                    self._primary_tasks_cache = _ptasks
+                    self._primary_tasks_at = time.monotonic()
+                    data["tasks"] = self._merge_engine_tasks(prim, _ptasks)
+                    data["cooling_engines"] = self._cooling_engines()
+                    return JSONResponse(data)
+            except Exception:
+                pass
             ptasks = (self._primary_tasks_cache or []) \
                 if (time.monotonic() - self._primary_tasks_at) < 120 else []
             return JSONResponse({"engine": "busy", "stale": True,
@@ -1008,6 +1030,9 @@ class FrontProxy:
                         "thermal_paused": bool(getattr(e, "therm_paused", False)),
                         "thermal_frozen": bool(getattr(e, "therm_sigstopped", False)),
                         "loaded_models": self._canonical_loaded(e.loaded_models),
+                        "inflight": int(getattr(e, "inflight", 0) or 0),
+                        "processing": (int(getattr(e, "inflight", 0) or 0) > 0
+                                       or bool(getattr(e, "loading", None))),
                         "pid": pid})
         return out
 
@@ -1385,10 +1410,18 @@ class FrontProxy:
         merged = []
         seen = set()
         # Primary's tasks (from its authed response) — tag with the primary name.
+        def _mark_cooling(t, e):
+            """Surface a thermal cooldown on the task entry itself (the row reads
+            t.cooling / t.cooling_message), so a paused-for-heat task shows why."""
+            if e is not None and getattr(e, "cooling", None) and t.get("status") == "running":
+                t["cooling"] = True
+                _cm = e.cooling.get("message") if isinstance(e.cooling, dict) else None
+                t.setdefault("cooling_message", _cm or "paused for thermal cooldown")
         for t in primary_tasks:
             if isinstance(t, dict):
                 t = dict(t)
                 t.setdefault("engine", primary.name if primary else None)
+                _mark_cooling(t, primary)
                 seen.add(t.get("id"))
             merged.append(t)
         # Tasks the supervisor saw on the other engines.
@@ -1400,6 +1433,7 @@ class FrontProxy:
                     continue
                 t = dict(t)
                 t["engine"] = e.name
+                _mark_cooling(t, e)
                 merged.append(t)
                 seen.add(t.get("id"))
         # Synthetic "loading" tasks parsed from the log stream, for any engine that
