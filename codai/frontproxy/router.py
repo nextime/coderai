@@ -33,7 +33,7 @@ _INFERENCE_PATHS = {
     "/v1/images/edits",
     "/v1/audio/speech",
     "/v1/audio/transcriptions",
-    "/v1/videos/generations",
+    "/v1/video/generations",
 }
 
 
@@ -170,10 +170,22 @@ def pick_engine(registry: EngineRegistry, path: str, method: str,
             if e and e.healthy and e.can_serve(cap):
                 return e
 
-        # 5. Least-loaded compatible engine; then any engine rather than 503.
-        return (registry.least_loaded(cap)
-                or registry.least_loaded(None)
-                or registry.primary())
+        # 5. Least-loaded compatible engine. A capability-BLIND fallback
+        # (least_loaded(None)) is permitted ONLY for a request that needs no
+        # specific capability — a TYPED request (`transformers` video/image,
+        # `gguf`, `whisper`, …) must never run on an engine that lacks that
+        # capability. Otherwise the torch/GGUF process isolation breaks: when the
+        # nvidia (transformers) engine is briefly down mid-restart, a video request
+        # would otherwise land on the gguf-only sibling and run a torch pipeline
+        # there. Instead prefer the primary when IT can serve the cap (the request
+        # queues there / the caller retries as it comes back), else 503.
+        best = registry.least_loaded(cap)
+        if best is not None:
+            return best
+        if cap is None:
+            return registry.least_loaded(None) or registry.primary()
+        prim = registry.primary()
+        return prim if (prim is not None and prim.can_serve(cap)) else None
 
     # Admin/auth/config/UI and everything else → primary (consistent sessions).
     return registry.primary() or registry.least_loaded()
