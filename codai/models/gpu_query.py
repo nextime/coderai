@@ -149,6 +149,36 @@ def gpu_memory() -> Optional[List[Dict[str, Any]]]:
     return _via_pynvml() or _via_nvidia_smi() or _via_torch_if_inited()
 
 
+def amd_gpu_memory() -> Optional[List[Dict[str, Any]]]:
+    """Per-device VRAM for amdgpu cards via sysfs — driver-free, no context.
+
+    Reads ``/sys/class/drm/card*/device/mem_info_vram_{total,used}`` (present only
+    for amdgpu). Returns ``{index, name, uuid, free, total}`` (bytes) keyed by the
+    sysfs card index, or ``None`` when no amdgpu card is present. Used by the
+    Vulkan/Radeon engine (which has ``CUDA_VISIBLE_DEVICES=""``, so the NVML/CUDA
+    queries report nothing for it)."""
+    import glob
+    import re
+    out: List[Dict[str, Any]] = []
+    for total_path in sorted(glob.glob('/sys/class/drm/card*/device/mem_info_vram_total')):
+        used_path = total_path.replace('mem_info_vram_total', 'mem_info_vram_used')
+        try:
+            with open(total_path) as f:
+                total = int(f.read().strip())
+        except Exception:
+            continue
+        try:
+            with open(used_path) as f:
+                used = int(f.read().strip())
+        except Exception:
+            used = 0
+        m = re.search(r'card(\d+)', total_path)
+        idx = int(m.group(1)) if m else len(out)
+        out.append({"index": idx, "name": "AMD GPU", "uuid": None,
+                    "free": max(0, total - used), "total": total})
+    return out or None
+
+
 def _visible_tokens() -> Optional[Set[str]]:
     """Parse ``CUDA_VISIBLE_DEVICES`` into a set of selector tokens (physical
     index strings and/or ``GPU-<uuid>`` strings).

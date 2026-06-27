@@ -49,24 +49,28 @@ def build_hardware_summary() -> Dict[str, Any]:
     total_vram_mb = 0
     available_vram_mb = 0
 
-    # Prefer a context-free query (pynvml → nvidia-smi → torch-if-inited). This
-    # never creates a CUDA primary context, so probing capabilities in an engine
-    # that hasn't loaded a torch model (the GGUF/llama.cpp engine) doesn't pin a
-    # ~256 MiB context. It also works in the torch-free front (NVML/nvidia-smi
-    # only — it imports torch solely if a context already exists in-process).
+    # In an ENGINE (torch already loaded), report THIS engine's cards via a
+    # context-free, CUDA_VISIBLE_DEVICES-scoped query — so the probe never pins a
+    # ~256 MiB CUDA context (the old torch.cuda.mem_get_info path did). The nvidia
+    # engine yields its NVIDIA card; the Vulkan/Radeon engine (CUDA_VISIBLE_DEVICES
+    # ="") yields nothing and falls through to the whole-node path below, as before.
+    # The torch-free FRONT also falls through to the whole-node path (it must stay
+    # torch-free and report every physical card).
+    import sys as _sys
     try:
-        from codai.models.gpu_query import gpu_memory
-        _gpus = gpu_memory()
-        if _gpus:
-            for d in _gpus:
-                device_total_mb = int(d["total"] / (1024 * 1024))
-                gpus.append({
-                    "index": d["index"],
-                    "name": d["name"],
-                    "total_vram_mb": device_total_mb,
-                })
-                total_vram_mb += device_total_mb
-                available_vram_mb += int(d["free"] / (1024 * 1024))
+        if "torch" in _sys.modules:
+            from codai.models.gpu_query import visible_gpu_memory
+            _gpus = visible_gpu_memory()
+            if _gpus:
+                for d in _gpus:
+                    device_total_mb = int(d["total"] / (1024 * 1024))
+                    gpus.append({
+                        "index": d["index"],
+                        "name": d["name"],
+                        "total_vram_mb": device_total_mb,
+                    })
+                    total_vram_mb += device_total_mb
+                    available_vram_mb += int(d["free"] / (1024 * 1024))
     except Exception:
         pass
 

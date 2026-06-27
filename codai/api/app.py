@@ -250,11 +250,14 @@ def _cached_engine_vram():
         return _ENGINE_VRAM_CACHE["vram"]
     vram = None
     try:
-        # Query VRAM context-free (pynvml → nvidia-smi → torch-if-inited) so an
-        # engine that never loads a torch model (the GGUF/llama.cpp engine) doesn't
-        # pin a ~256 MiB CUDA context just to answer this health poll.
-        from codai.models.gpu_query import gpu_memory
-        gpus = gpu_memory()
+        # Query VRAM context-free so an engine that never loads a torch model (the
+        # GGUF/llama.cpp engine) doesn't pin a ~256 MiB CUDA context just to answer
+        # this poll. Scope to THIS engine's cards: visible_gpu_memory() honours
+        # CUDA_VISIBLE_DEVICES, so the Vulkan/Radeon engine (CUDA_VISIBLE_DEVICES="")
+        # reports nothing here and falls back to its amdgpu card via sysfs — instead
+        # of leaking the NVIDIA card's VRAM.
+        from codai.models.gpu_query import visible_gpu_memory, amd_gpu_memory
+        gpus = visible_gpu_memory() or amd_gpu_memory()
         if gpus:
             used = free = total = 0
             devs = []
@@ -267,7 +270,7 @@ def _cached_engine_vram():
                 devs.append({"index": i, "name": _names[i],
                              "free": round(f / 1e9, 2), "total": round(t / 1e9, 2)})
             n = len(devs)
-            label = (_names.get(0, "CUDA") if n == 1 else f"{n}× CUDA")
+            label = (devs[0]["name"] if n == 1 else f"{n}× GPU")
             vram = {"used": round(used / 1e9, 2), "free": round(free / 1e9, 2),
                     "total": round(total / 1e9, 2), "gpu": label,
                     "devices": devs, "device_count": n}
