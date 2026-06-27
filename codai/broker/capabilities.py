@@ -49,36 +49,24 @@ def build_hardware_summary() -> Dict[str, Any]:
     total_vram_mb = 0
     available_vram_mb = 0
 
-    # Only use torch if it's ALREADY loaded (i.e. we're in an engine). Never import
-    # it here — the front is torch-free and must stay that way (importing torch in
-    # the front is heavy and would initialise CUDA in the wrong process).
-    import sys as _sys
+    # Prefer a context-free query (pynvml → nvidia-smi → torch-if-inited). This
+    # never creates a CUDA primary context, so probing capabilities in an engine
+    # that hasn't loaded a torch model (the GGUF/llama.cpp engine) doesn't pin a
+    # ~256 MiB context. It also works in the torch-free front (NVML/nvidia-smi
+    # only — it imports torch solely if a context already exists in-process).
     try:
-        if "torch" not in _sys.modules:
-            raise ImportError("torch not loaded (front) — using torch-free path")
-        import torch
-
-        if torch.cuda.is_available():
-            gpu_count = torch.cuda.device_count()
-            for index in range(gpu_count):
-                props = torch.cuda.get_device_properties(index)
-                device_total_mb = int(props.total_memory / (1024 * 1024))
-                if index == torch.cuda.current_device():
-                    free_bytes, total_bytes = torch.cuda.mem_get_info()
-                    total_vram_mb = int(total_bytes / (1024 * 1024))
-                    available_vram_mb = int(free_bytes / (1024 * 1024))
-                gpus.append(
-                    {
-                        "index": index,
-                        "name": torch.cuda.get_device_name(index),
-                        "total_vram_mb": device_total_mb,
-                    }
-                )
-            if gpus:
-                if total_vram_mb == 0:
-                    total_vram_mb = sum(gpu["total_vram_mb"] for gpu in gpus)
-                if available_vram_mb == 0 and total_vram_mb:
-                    available_vram_mb = total_vram_mb
+        from codai.models.gpu_query import gpu_memory
+        _gpus = gpu_memory()
+        if _gpus:
+            for d in _gpus:
+                device_total_mb = int(d["total"] / (1024 * 1024))
+                gpus.append({
+                    "index": d["index"],
+                    "name": d["name"],
+                    "total_vram_mb": device_total_mb,
+                })
+                total_vram_mb += device_total_mb
+                available_vram_mb += int(d["free"] / (1024 * 1024))
     except Exception:
         pass
 

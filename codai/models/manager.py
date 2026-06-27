@@ -2306,15 +2306,14 @@ class MultiModelManager:
         cuda_free = 0.0
         cuda_count = 0
         try:
-            import torch
-            if torch.cuda.is_available():
-                for i in range(torch.cuda.device_count()):
-                    try:
-                        free, _ = torch.cuda.mem_get_info(i)
-                        cuda_free += free / 1e9
-                        cuda_count += 1
-                    except Exception:
-                        pass
+            # Context-free (pynvml → nvidia-smi → torch-if-inited), scoped to this
+            # engine's cards via CUDA_VISIBLE_DEVICES — so the eviction/offload check
+            # doesn't pin a ~256 MiB CUDA context in an engine (e.g. GGUF/llama.cpp)
+            # that wouldn't otherwise create one.
+            from codai.models.gpu_query import visible_gpu_memory
+            for d in (visible_gpu_memory() or []):
+                cuda_free += d["free"] / 1e9
+                cuda_count += 1
         except Exception:
             pass
         total_free = cuda_free
@@ -2353,15 +2352,11 @@ class MultiModelManager:
         total_free = 0.0
         cuda_count = 0
         try:
-            import torch
-            if torch.cuda.is_available():
-                for i in range(torch.cuda.device_count()):
-                    try:
-                        free, _ = torch.cuda.mem_get_info(i)
-                        total_free += float(free)
-                        cuda_count += 1
-                    except Exception:
-                        pass
+            # Context-free + CUDA_VISIBLE_DEVICES-scoped (see _get_free_vram_gb).
+            from codai.models.gpu_query import visible_gpu_memory
+            for d in (visible_gpu_memory() or []):
+                total_free += float(d["free"])
+                cuda_count += 1
         except Exception:
             pass
         got = cuda_count > 0

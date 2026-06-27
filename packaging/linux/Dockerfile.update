@@ -40,4 +40,9 @@ RUN set -eux; \
     find /opt/coderai/app -type d -name __pycache__ -prune -exec rm -rf '{}' +; \
     /opt/coderai/python/bin/python3 -c "import importlib.util, sys; m=[n for n in ('fastapi','uvicorn','torch') if importlib.util.find_spec(n) is None]; sys.exit('base image missing: '+', '.join(m) if m else 0)"
 
+# Context-free GPU memory query dependency (provides `pynvml`). Pure-python and
+# tiny, so install it in the overlay too — the base may predate it. The code
+# falls back to nvidia-smi when absent, hence `|| true` keeps offline builds OK.
+RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir "nvidia-ml-py>=12.0.0" || true
+
 # ENTRYPOINT / EXPOSE / VOLUME / ENV / WORKDIR are inherited from the base image.
