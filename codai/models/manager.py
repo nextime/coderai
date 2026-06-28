@@ -3391,9 +3391,18 @@ class MultiModelManager:
             try:
                 if hasattr(model_obj, 'cleanup'):
                     model_obj.cleanup()
+                elif hasattr(model_obj, 'components'):
+                    # Diffusers pipeline. device_map/accelerate-offloaded pipelines
+                    # (balanced/disk/model/sequential) AND quantized (bitsandbytes)
+                    # pipelines REJECT `.to('cpu')` — a naive move silently leaves the
+                    # weights resident and strands VRAM (the OOM death spiral where the
+                    # next load OOMs on a near-full card). Use the thorough free
+                    # (remove accelerate hooks → drop component refs → empty_cache);
+                    # it also correctly frees a plain full-GPU pipeline.
+                    from codai.api.video import _free_pipeline_vram
+                    _free_pipeline_vram(model_obj)
                 elif hasattr(model_obj, 'to'):
-                    # Diffusers pipeline: move all components to CPU explicitly
-                    # before dropping the reference so VRAM is freed promptly.
+                    # Non-pipeline model with no device_map: a plain move frees it.
                     model_obj.to('cpu')
             except Exception as e:
                 print(f"  Warning during eviction of '{key}': {e}")
@@ -3497,8 +3506,17 @@ class MultiModelManager:
         if self._get_process_ram_gb() <= target_gb:
             return
         _before = self._get_process_ram_gb()
+        # Never RAM-evict the LIVE model — the one a request loop keeps reusing.
+        # The video/image path tracks it via current_model_key (it does NOT set
+        # active_in_vram), and an offloaded pipeline's host RAM IS the live model,
+        # so unloading it between same-model requests just forces an immediate
+        # reload — churning VRAM/RAM (and stranding device_map weights) while
+        # freeing nothing that doesn't come right back. Other idle models are still
+        # fair game. (Independent of offload mode: in full-GPU mode the live model
+        # uses little host RAM, so protecting it costs nothing.)
+        _live = {self.active_in_vram, self.current_model_key}
         for key in self._lru_order():
-            if key == self.active_in_vram:
+            if key in _live:
                 continue
             if self._get_process_ram_gb() <= target_gb:
                 break
@@ -3508,12 +3526,15 @@ class MultiModelManager:
             print(f"RAM eviction: unloading '{key}' to free host RAM "
                   f"(RSS {self._get_process_ram_gb():.1f} GB > cap target {target_gb:.1f} GB)")
             self._evict_one(key)
-        # Last resort: the active model, only if idle.
+        # Last resort: a STALE active model (one no longer the live/current model)
+        # if idle. The current/live model is never evicted here — that churn is
+        # exactly what we're avoiding.
         if (self._get_process_ram_gb() > target_gb and self.active_in_vram
-                and self.active_in_vram in self.models):
+                and self.active_in_vram in self.models
+                and self.active_in_vram != self.current_model_key):
             _active = self.active_in_vram
             if not self._is_key_busy(_active) and self._wait_until_idle(_active):
-                print(f"RAM eviction: unloading active model '{_active}' to free host RAM")
+                print(f"RAM eviction: unloading stale active model '{_active}' to free host RAM")
                 self._evict_one(_active)
                 self.active_in_vram = None
         _freed = _before - self._get_process_ram_gb()
