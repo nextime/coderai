@@ -843,7 +843,7 @@ def _video_runtime_reserve_gb(request) -> float:
         return 3.0
 
 
-def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str = None, model_cfg: dict = None):
+def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str = None, model_cfg: dict = None, use_incremental_cache: bool = True):
     # GGUF models go through stable-diffusion.cpp, not diffusers
     from codai.api.images import _is_gguf_model
     if _is_gguf_model(model_name):
@@ -906,6 +906,22 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
             model_name, model_cfg, torch_dtype)
         if _gguf_components:
             print(f"  Video GGUF components: {_gguf_desc}")
+        # Incremental per-component cache: load each bnb-quantizable heavy component
+        # from the per-component cache (or build+cache it one-at-a-time on the GPU),
+        # then inject like GGUF components so the offload ladder assembles them. This
+        # lets a model that only loads via offload still get cached (a wholesale
+        # save_pretrained of an offloaded pipe is impossible). Fully fallback-safe;
+        # the caller retries with use_incremental_cache=False if assembly fails.
+        if use_incremental_cache:
+            try:
+                from codai.models.hf_loading import build_cached_components
+                _cached_comps, _cc_desc = build_cached_components(
+                    model_name, model_cfg, torch_dtype)
+                if _cached_comps:
+                    print(f"  Video cached components: {_cc_desc}")
+                    _gguf_components = {**_gguf_components, **_cached_comps}
+            except Exception as _cce:
+                print(f"  [pipeline-cache] incremental components skipped ({_cce})")
 
     def _with_quant(kw: dict) -> dict:
         """Inject quantization_config + GGUF components into from_pretrained kwargs."""
@@ -3264,21 +3280,30 @@ async def video_generations(request: VideoGenerationRequest,
                     "CUDA context corrupted (device-side assert) while loading the "
                     "video model. Restart coderai to recover. "
                     f"Original error: {str(e).splitlines()[0]}"))
-            # Self-heal: a failed load from a (possibly stale/corrupt) pipeline
-            # cache should drop the cache and rebuild once rather than wedging.
+            # Self-heal: a failed load should retry once WITHOUT the incremental
+            # per-component cache + with any monolithic cache dropped — i.e. fall
+            # back to a plain from_pretrained build (today's behaviour) rather than
+            # wedging. This catches both a stale/corrupt cache and any breakage in
+            # the component-injection assembly path.
             _retried_fresh = False
             try:
                 from codai.models import pipeline_cache as _pcache
                 if _pcache.enabled() and _pcache.valid(_pcache.path(model_name, _model_cfg)):
                     print(f"  [pipeline-cache] load failed ({str(e).splitlines()[0]}) "
-                          f"— invalidating cache and rebuilding")
+                          f"— invalidating monolithic cache")
                     _pcache.invalidate(model_name, _model_cfg)
-                    with loading_task(model_name, model_type="video"):
-                        pipe = await asyncio.get_event_loop().run_in_executor(
-                            None, _load_video_pipeline, model_name, device,
-                            request.mode, _offload, _model_cfg)
-                    _retried_fresh = True
-            except Exception:
+                print(f"  [pipeline-cache] retrying load without incremental "
+                      f"component cache (plain build)")
+                with loading_task(model_name, model_type="video"):
+                    pipe = await asyncio.get_event_loop().run_in_executor(
+                        None, _load_video_pipeline, model_name, device,
+                        request.mode, _offload, _model_cfg, False)
+                _retried_fresh = True
+            except Exception as _e2:
+                import traceback as _tb2
+                print(f"  [video] fallback (no-incremental) load ALSO failed for "
+                      f"'{model_name}': {str(_e2).splitlines()[0] if str(_e2) else type(_e2).__name__}\n"
+                      + _tb2.format_exc())
                 _retried_fresh = False
             if not _retried_fresh:
                 raise HTTPException(status_code=500, detail=f"Failed to load video model: {e}")

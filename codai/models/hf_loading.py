@@ -316,6 +316,130 @@ def build_gguf_pipeline_components(model_name: str, cfg: Optional[Dict[str, Any]
     return components, ', '.join(descs)
 
 
+def build_cached_components(model_name: str, cfg: Optional[Dict[str, Any]], dtype):
+    """Incremental per-component cache for big bnb-quantized video pipelines.
+
+    A Wan2.2 A14B pipeline often won't fit on the GPU and can only load with
+    offload — and an offloaded pipeline can't be save_pretrained wholesale. But
+    each component IS small enough to pass through the GPU alone, where bnb
+    quantizes it to a uniform 4-bit. So for every bnb-quantizable heavy component
+    we: load it from the per-component cache if present, else build it fresh from
+    the model (quantizing on the GPU) and cache it — then move it to CPU to free
+    the GPU slot for the next one. Peak VRAM is ONE component even when the whole
+    model doesn't fit; the result is injected into the pipeline's from_pretrained
+    exactly like GGUF components, and the offload ladder places them at runtime.
+
+    Caching is incremental and resumable: a load evicted before all components are
+    cached leaves the finished ones valid, and the next load mixes cached with
+    freshly-built (now cached) ones until the set is complete.
+
+    Returns ``(components_dict, description)``. Empty when disabled (kill-switch
+    CODERAI_INCREMENTAL_CACHE=0, --pipeline-cache off, or no bnb quant). Fully
+    fallback-safe: any per-component failure skips that component (the normal
+    pipeline load handles it) and is logged."""
+    import os
+    if os.environ.get("CODERAI_INCREMENTAL_CACHE", "1") == "0":
+        return {}, ''
+    c = _norm(cfg)
+    comp_q = c.get('component_quantization') or {}
+    global_4 = bool(c.get('load_in_4bit', False))
+    global_8 = bool(c.get('load_in_8bit', False))
+    if not comp_q and not (global_4 or global_8):
+        return {}, ''
+    try:
+        from codai.models import pipeline_cache as _pcache
+        if not _pcache.enabled():
+            return {}, ''
+    except Exception:
+        return {}, ''
+    try:
+        import diffusers
+        import transformers
+        from diffusers import BitsAndBytesConfig as DiffBnb
+        from transformers import BitsAndBytesConfig as TfBnb
+    except Exception as e:
+        print(f"  [pipeline-cache] incremental build unavailable: {e}")
+        return {}, ''
+
+    specs = _discover_components(model_name)  # name -> [library, class_name]
+
+    def _is_heavy(name: str) -> bool:
+        return (name.startswith('transformer') or name == 'unet'
+                or name.startswith('text_encoder'))
+
+    def _bnb_incompatible(name: str) -> bool:
+        n = (name or '').lower()
+        return n == 'vae' or n.endswith('_vae') or n.startswith('vae')
+
+    # Which components to handle, and at what bnb width.
+    targets: Dict[str, str] = {}
+    if comp_q:
+        for name, raw in comp_q.items():
+            mode = _normalize_quant_mode(raw)  # gguf/none/2bit -> not bnb here
+            if mode in ('4bit', '8bit') and not _bnb_incompatible(name) and name in specs:
+                targets[name] = mode
+    else:
+        mode = '4bit' if global_4 else '8bit'
+        for name in specs:
+            if _is_heavy(name) and not _bnb_incompatible(name):
+                targets[name] = mode
+    if not targets:
+        return {}, ''
+
+    def _mk(lib: str, mode: str):
+        BnB = TfBnb if lib == 'transformers' else DiffBnb
+        if mode == '4bit':
+            return BnB(load_in_4bit=True, bnb_4bit_quant_type='nf4',
+                       bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True)
+        return BnB(load_in_8bit=True)
+
+    def _cls(name):
+        spec = specs.get(name) or []
+        lib = spec[0] if spec else 'diffusers'
+        cls_name = spec[1] if len(spec) > 1 else None
+        mod = transformers if lib == 'transformers' else diffusers
+        return (getattr(mod, cls_name, None) if cls_name else None), lib
+
+    components: Dict[str, Any] = {}
+    descs = []
+    for name, mode in targets.items():
+        try:
+            cls, lib = _cls(name)
+            if cls is None or not hasattr(cls, 'from_pretrained'):
+                continue
+            cached = _pcache.component_valid(model_name, cfg, name)
+            if cached:
+                cdir = _pcache.component_dir(model_name, cfg, name)
+                print(f"  [pipeline-cache] component '{name}' HIT — loading 4-bit from cache")
+                comp = cls.from_pretrained(
+                    cdir, quantization_config=_mk(lib, mode),
+                    torch_dtype=dtype, device_map={'': 0})
+            else:
+                print(f"  [pipeline-cache] component '{name}' MISS — building 4-bit "
+                      f"(one component on GPU, then cached)")
+                comp = cls.from_pretrained(
+                    model_name, subfolder=name, quantization_config=_mk(lib, mode),
+                    torch_dtype=dtype, device_map={'': 0})
+                _pcache.save_component(comp, model_name, cfg, name)
+            # Free the single GPU slot for the next component; the offload ladder
+            # re-places it at runtime. bnb 4-bit survives the move to CPU (verified).
+            try:
+                comp = comp.to('cpu')
+                import torch as _t
+                if _t.cuda.is_available():
+                    _t.cuda.synchronize()
+                    _t.cuda.empty_cache()
+            except Exception:
+                pass
+            components[name] = comp
+            descs.append(f"{name}:{mode}{'(cached)' if cached else '(built)'}")
+        except Exception as e:
+            print(f"  [pipeline-cache] component '{name}' incremental build failed "
+                  f"({str(e).splitlines()[0] if str(e) else type(e).__name__}) — "
+                  f"leaving it to the normal pipeline load")
+    return components, ', '.join(descs)
+
+
 def build_from_pretrained_kwargs(
     cfg: Optional[Dict[str, Any]],
     *,

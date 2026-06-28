@@ -120,6 +120,99 @@ def valid(p: str) -> bool:
         return False
 
 
+# ── Per-component (incremental) cache ────────────────────────────────────────
+# A big quantized video pipeline (Wan2.2 A14B) often won't fit on the GPU and can
+# only be loaded with offload — and an offloaded pipeline can't be save_pretrained
+# wholesale. But we CAN cache it one component at a time: each component is small
+# enough to pass through the GPU alone (where bitsandbytes quantizes it to a
+# uniform 4-bit), so we save each as it's built. The cache is then a set of
+# per-component subdirs under the same model+signature dir as the monolithic
+# cache, each with its OWN completion marker. A load that's evicted before every
+# component is cached still leaves the finished ones valid; the next load mixes
+# cached components with freshly-built (and now-cached) ones, converging to a full
+# cache over a couple of runs. Each component carries the same model+quant+
+# precision signature, so a config change invalidates it like the monolithic one.
+
+def _component_marker(cdir: str) -> str:
+    return os.path.join(cdir, ".coderai_component.json")
+
+
+def component_dir(model_name: str, model_cfg: Optional[dict], comp: str) -> str:
+    """Cache subdir for a single pipeline component (e.g. 'transformer')."""
+    return os.path.join(path(model_name, model_cfg), comp)
+
+
+def component_valid(model_name: str, model_cfg: Optional[dict], comp: str) -> bool:
+    """True if a complete, signature-matching cache for this component exists."""
+    if _force_rebuild():
+        return False
+    try:
+        cdir = component_dir(model_name, model_cfg, comp)
+        if not os.path.isfile(os.path.join(cdir, "config.json")):
+            return False
+        with open(_component_marker(cdir)) as f:
+            meta = json.load(f)
+        return (meta.get("version") == _CACHE_VERSION
+                and meta.get("complete") is True
+                and meta.get("signature") == _signature(model_name, model_cfg))
+    except Exception:
+        return False
+
+
+def save_component(comp_obj, model_name: str, model_cfg: Optional[dict], comp: str) -> bool:
+    """Atomically save one freshly-built (4-bit) component to its cache subdir.
+
+    Writes to ``<comp>.building`` then renames, with the completion marker written
+    last, so an interrupted save never leaves a half-written component that
+    component_valid() would accept. Best-effort: any failure returns False and the
+    caller keeps the in-memory component regardless."""
+    cdir = component_dir(model_name, model_cfg, comp)
+    if not cdir:
+        return False
+    tmp = cdir + ".building"
+    try:
+        os.makedirs(os.path.dirname(cdir), exist_ok=True)
+        sweep_stale()
+        if os.path.exists(tmp):
+            shutil.rmtree(tmp, ignore_errors=True)
+        print(f"  [pipeline-cache] caching component '{comp}' → {cdir}")
+        t0 = time.time()
+        comp_obj.save_pretrained(tmp)
+        with open(_component_marker(tmp), "w") as f:
+            json.dump({
+                "version": _CACHE_VERSION, "complete": True,
+                "model": model_name, "component": comp, "saved_at": time.time(),
+                "signature": _signature(model_name, model_cfg),
+                "bytes": _dir_size(tmp),
+            }, f)
+        if os.path.exists(cdir):
+            shutil.rmtree(cdir, ignore_errors=True)
+        os.replace(tmp, cdir)
+        print(f"  [pipeline-cache] cached '{comp}' in {time.time() - t0:.0f}s")
+        return True
+    except Exception as e:
+        print(f"  [pipeline-cache] component '{comp}' save failed ({e}) — skipping")
+        try:
+            shutil.rmtree(tmp, ignore_errors=True)
+        except Exception:
+            pass
+        return False
+
+
+def _dir_size(d: str) -> int:
+    total = 0
+    try:
+        for root, _, files in os.walk(d):
+            for fn in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, fn))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return total
+
+
 def invalidate(model_name: str, model_cfg: Optional[dict]) -> None:
     """Delete a model's cache dir (e.g. after a failed cache load) so the next
     build rewrites it. Best-effort."""
