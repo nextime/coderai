@@ -1186,11 +1186,13 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
             _pcts = sorted({_gpu_pct} | {p for p in (80.0, 60.0, 40.0)
                                          if p < _gpu_pct}, reverse=True)
             for _i, _pct in enumerate(_pcts):
+                _oom = False
                 try:
                     return _load_balanced(_pct)
                 except (RuntimeError, MemoryError) as _e:
                     if not _is_oom(_e):
                         raise
+                    _oom = True
                     _nxt = _pcts[_i + 1] if _i + 1 < len(_pcts) else None
                     if _nxt is not None:
                         print(f"  Video: balanced {_pct:.0f}% GPU OOM — "
@@ -1198,6 +1200,17 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
                     else:
                         print(f"  Video: balanced {_pct:.0f}% GPU OOM — "
                               f"falling back to sequential CPU offload…")
+                    # When from_pretrained OOMs MID-LOAD, `pipe` is never assigned —
+                    # the ~20 GB already placed on the GPU is pinned by this
+                    # exception's traceback frames (their locals hold the partial
+                    # model). Drop the traceback so those frames become collectable.
+                    _e.__traceback__ = None
+                # CRITICAL: reclaim OUTSIDE the except block. While we're still
+                # inside it, sys.exc_info() keeps the traceback (hence the stranded
+                # GPU tensors) alive, so _clear_mem()'s gc/empty_cache would free
+                # nothing — and the next step would recompute its GPU budget from a
+                # card still ~20 GB full (the 70%→60%→40% shrinking death-spiral).
+                if _oom:
                     _clear_mem()
             return None
 
@@ -1329,7 +1342,8 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
                 # then group offload + stream, then sequential, then disk. Balanced
                 # is reserved for an explicit offload_strategy=balanced.
                 print(f"  Video: full-GPU OOM ({e}) — trying model CPU offload…")
-                _clear_mem()
+                e.__traceback__ = None  # release frames pinning the partial model's GPU tensors
+            _clear_mem()
 
         # ── Attempt 1: model CPU offload ─────────────────────────────────────
         if offload not in ('group', 'sequential', 'disk'):
@@ -1349,7 +1363,8 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
                     raise
                 print(f"  Video: model CPU offload OOM ({e})"
                       f" — trying group offload + stream…")
-                _clear_mem()
+                e.__traceback__ = None  # release frames pinning the partial model's GPU tensors
+            _clear_mem()
 
         # ── Attempt 1.5: group offload + stream → sequential ─────────────────
         # Block-level offloading with CUDA-stream prefetch: lowest VRAM after
@@ -3235,6 +3250,14 @@ async def video_generations(request: VideoGenerationRequest,
                 pipe = await asyncio.get_event_loop().run_in_executor(
                     None, _load_video_pipeline, model_name, device, request.mode, _offload, _model_cfg)
         except Exception as e:
+            # Log the FULL traceback — otherwise the only trace of a post-load
+            # failure (e.g. enable_sequential_cpu_offload rejecting a bnb-4bit pipe,
+            # or an OOM on the first forward) is a bare "Response status: 500" with
+            # the cause swallowed into the HTTP detail. We need the stack to debug.
+            import traceback as _tb
+            print(f"  [video] model load FAILED for '{model_name}' "
+                  f"(strategy={_offload or 'auto'}): {str(e).splitlines()[0] if str(e) else type(e).__name__}\n"
+                  + _tb.format_exc())
             multi_model_manager._mark_cuda_poisoned_if_fatal(e)
             if getattr(multi_model_manager, 'cuda_context_poisoned', False):
                 raise HTTPException(status_code=503, detail=(
@@ -3342,6 +3365,10 @@ async def video_generations(request: VideoGenerationRequest,
                 frames, fps = await asyncio.get_event_loop().run_in_executor(
                     None, _generate_video, pipe, request)
             except Exception as e2:
+                import traceback as _tb
+                print(f"  [video] generation FAILED on OOM-retry for '{model_name}': "
+                      f"{str(e2).splitlines()[0] if str(e2) else type(e2).__name__}\n"
+                      + _tb.format_exc())
                 multi_model_manager.models.pop(model_key, None)
                 multi_model_manager.model_pools.pop(model_key, None)
                 # Release the failed retry pipeline too, so the NEXT request
@@ -3352,6 +3379,10 @@ async def video_generations(request: VideoGenerationRequest,
         else:
             # Non-OOM failure: evict the cached pipeline so the next request
             # attempts a clean reload rather than reusing a broken object.
+            import traceback as _tb
+            print(f"  [video] generation FAILED (non-OOM) for '{model_name}': "
+                  f"{str(e).splitlines()[0] if str(e) else type(e).__name__}\n"
+                  + _tb.format_exc())
             multi_model_manager.models.pop(model_key, None)
             multi_model_manager.model_pools.pop(model_key, None)
             _free_pipeline_vram(pipe)

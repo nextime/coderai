@@ -32,6 +32,7 @@ Everything here is best-effort: any failure (save or load) is swallowed and the
 caller falls back to a normal build, so the cache can never break generation.
 """
 
+import glob
 import hashlib
 import json
 import os
@@ -131,6 +132,50 @@ def invalidate(model_name: str, model_cfg: Optional[dict]) -> None:
         pass
 
 
+def sweep_stale(max_age_s: float = 1800.0) -> None:
+    """Delete orphaned ``*.building`` temp dirs left by a save that was killed
+    mid-write (the atomic ``os.replace`` never ran). They waste tens of GB and,
+    being incomplete, are never valid() anyway. Best-effort; only removes dirs
+    older than ``max_age_s`` so it never races a save in progress."""
+    try:
+        root = cache_root()
+        now = time.time()
+        for d in glob.glob(os.path.join(root, "*.building")):
+            try:
+                if now - os.path.getmtime(d) >= max_age_s:
+                    shutil.rmtree(d, ignore_errors=True)
+                    print(f"  [pipeline-cache] swept stale {os.path.basename(d)}")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _unsavable_reason(pipe) -> Optional[str]:
+    """Return why ``pipe`` cannot be serialized, or None if it's savable.
+
+    diffusers refuses save_pretrained on a pipeline with CPU-offload hooks
+    (enable_model_cpu_offload / enable_sequential_cpu_offload), and a device_map
+    pipeline that spilled to disk holds meta tensors that serialize to garbage.
+    Detect both so we skip cleanly (no half-written .building) instead of failing
+    deep inside save_pretrained — the cache must be built from a savable
+    (pre-offload, fully-materialised) pipeline."""
+    try:
+        if getattr(pipe, "_all_hooks", None) or getattr(pipe, "hf_device_map", None):
+            return "accelerate offload active (cpu/sequential/device_map)"
+        comps = getattr(pipe, "components", {}) or {}
+        for name, comp in comps.items():
+            if not hasattr(comp, "parameters"):
+                continue
+            for prm in comp.parameters():
+                if getattr(prm, "is_meta", False) or str(getattr(prm, "device", "")) == "meta":
+                    return f"component '{name}' has meta/offloaded tensors"
+                break  # one param per component is enough to classify
+    except Exception:
+        return None  # can't tell — let save_pretrained try
+    return None
+
+
 def save(pipe, p: str, *, model_name: str = "", model_cfg: Optional[dict] = None) -> bool:
     """Serialize ``pipe`` to the cache dir ``p`` (atomic via a temp dir).
 
@@ -138,9 +183,15 @@ def save(pipe, p: str, *, model_name: str = "", model_cfg: Optional[dict] = None
     keeps the freshly built in-memory pipeline regardless."""
     if not p:
         return False
+    _why = _unsavable_reason(pipe)
+    if _why:
+        print(f"  [pipeline-cache] not caching {os.path.basename(p)}: {_why} "
+              f"— cache must be built from a pre-offload pipeline")
+        return False
     tmp = p + ".building"
     try:
         os.makedirs(cache_root(), exist_ok=True)
+        sweep_stale()
         if os.path.exists(tmp):
             shutil.rmtree(tmp, ignore_errors=True)
         print(f"  [pipeline-cache] saving quantized pipeline → {p}")
