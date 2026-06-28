@@ -868,6 +868,7 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
     _orig_model_name = model_name
     _pc_save_path = None
     _loading_from_cache = False
+    _have_injected_components = False  # set when incremental cached components injected
     try:
         from codai.models import pipeline_cache as _pcache
         if _pcache.enabled():
@@ -920,6 +921,7 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
                 if _cached_comps:
                     print(f"  Video cached components: {_cc_desc}")
                     _gguf_components = {**_gguf_components, **_cached_comps}
+                    _have_injected_components = True
             except Exception as _cce:
                 print(f"  [pipeline-cache] incremental components skipped ({_cce})")
 
@@ -938,6 +940,19 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
         offload = 'model'
     elif offload in ('disk', 'offload'):
         offload = 'disk'
+
+    # Injected (pre-loaded) cached components can't be placed by a device_map
+    # strategy — accelerate's device_map only dispatches components it LOADS, so
+    # injected ones keep whatever device they're on with NO offload hook, and a
+    # forward pass then hits "index on cuda:0, weights on cpu". The HOOK-based
+    # strategies (model → group → sequential) add hooks to EVERY component in the
+    # pipeline, injected included, so force a hook-based path when we injected
+    # cached components. (model CPU offload keeps only the active 4-bit component
+    # resident — a single ~7 GB expert — so it fits easily and is fastest.)
+    if _have_injected_components and offload in (None, 'auto', 'balanced', 'disk'):
+        print(f"  [pipeline-cache] injected cached components → forcing hook-based "
+              f"'model' CPU offload (device_map can't place pre-loaded components)")
+        offload = 'model'
 
     # Resolve offload directory for disk-offload fallback.
     _offload_dir = (
@@ -3402,8 +3417,7 @@ async def video_generations(request: VideoGenerationRequest,
                 pipe = None
                 raise HTTPException(status_code=500, detail=f"Video generation failed (OOM retry): {e2}")
         else:
-            # Non-OOM failure: evict the cached pipeline so the next request
-            # attempts a clean reload rather than reusing a broken object.
+            # Non-OOM failure: evict the broken pipeline.
             import traceback as _tb
             print(f"  [video] generation FAILED (non-OOM) for '{model_name}': "
                   f"{str(e).splitlines()[0] if str(e) else type(e).__name__}\n"
@@ -3412,7 +3426,37 @@ async def video_generations(request: VideoGenerationRequest,
             multi_model_manager.model_pools.pop(model_key, None)
             _free_pipeline_vram(pipe)
             pipe = None
-            raise HTTPException(status_code=500, detail=f"Video generation failed: {e}")
+            # Safety net: a device-mismatch ("tensors on cuda:0 vs cpu") can come
+            # from injected incremental-cache components that an offload strategy
+            # didn't hook. Retry ONCE with the incremental cache disabled (plain
+            # build = pre-cache behaviour) so generation self-heals even if the
+            # component-injection path is imperfect, rather than wedging the queue.
+            _dev_mismatch = ("same device" in _err_str or "index_select" in _err_str
+                             or "cuda:0" in _err_str)
+            if _dev_mismatch:
+                try:
+                    print(f"  [video] retrying generation with incremental cache "
+                          f"DISABLED (plain build) after device-mismatch…")
+                    with loading_task(model_name, model_type="video"):
+                        pipe = await asyncio.get_event_loop().run_in_executor(
+                            None, _load_video_pipeline, model_name, device,
+                            request.mode, _offload, _model_cfg, False)
+                    multi_model_manager.models[model_key] = pipe
+                    multi_model_manager.current_model_key = model_key
+                    frames, fps = await asyncio.get_event_loop().run_in_executor(
+                        None, _generate_video, pipe, request)
+                    e = None  # recovered
+                except Exception as _e3:
+                    print(f"  [video] plain-build retry ALSO failed for '{model_name}': "
+                          f"{str(_e3).splitlines()[0] if str(_e3) else type(_e3).__name__}\n"
+                          + _tb.format_exc())
+                    multi_model_manager.models.pop(model_key, None)
+                    multi_model_manager.model_pools.pop(model_key, None)
+                    _free_pipeline_vram(pipe)
+                    pipe = None
+                    raise HTTPException(status_code=500, detail=f"Video generation failed: {_e3}")
+            if e is not None:
+                raise HTTPException(status_code=500, detail=f"Video generation failed: {e}")
 
     # Encode raw frames to MP4 (per-model output quality via CRF when configured).
     try:
