@@ -946,15 +946,16 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
     # injected ones keep whatever device they're on with NO offload hook, and a
     # forward pass then hits "index on cuda:0, weights on cpu". The HOOK-based
     # strategies add hooks to EVERY component (injected included), so force one.
-    # Use SEQUENTIAL, not model: model CPU offload keeps a whole expert resident
-    # and OOMs this dual-expert A14B forward (verified — loads at 11 GB then the
-    # forward spikes past 24 GB). Sequential has the minimal footprint that
-    # reliably fits; the cache still makes the LOAD fast even if generation is
-    # slower. (A user wanting speed can set offload_strategy=group explicitly.)
-    if _have_injected_components and offload in (None, 'auto', 'balanced', 'disk', 'model'):
+    # Use 'model' (keeps only the active ~7 GB 4-bit expert resident) — it fits the
+    # forward on a CLEAN card. An earlier "model offload OOMs generation" was a
+    # red herring: the card had ~11 GB LEAKED from the prior clip's failed forward
+    # (exception traceback pinning its activations — now fixed), so the forward had
+    # only ~13 GB to work in. With clean VRAM model offload fits; the leak-free
+    # retry still degrades to sequential if a genuinely clean forward ever OOMs.
+    if _have_injected_components and offload in (None, 'auto', 'balanced', 'disk'):
         print(f"  [pipeline-cache] injected cached components → forcing hook-based "
-              f"'sequential' CPU offload (device_map can't place pre-loaded components)")
-        offload = 'sequential'
+              f"'model' CPU offload (device_map can't place pre-loaded components)")
+        offload = 'model'
 
     # Resolve offload directory for disk-offload fallback.
     _offload_dir = (
