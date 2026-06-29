@@ -6201,28 +6201,87 @@ def launch_web_ui(default_args):
                     _cancel_done("⏹ cancelled during render — finals not assembled")
                     return
 
-                # ── Phase 4/4 — assemble the final short/long videos (last) ──────
-                _prog(90, "phase 4/4 — assembling final videos…")
+                # ── Optional finalize/package flags (driven by the Run/match UI) ──
+                # "package"  → enhance (2× upscale + 2× fps) + arbitrage-safe odds +
+                #              renamed upload ZIP (videos picked from their highest-
+                #              quality variant).  "upload" → also push to the
+                #              configured Township endpoint (implies package).
+                # When the caller doesn't pass "package" (e.g. CLI/legacy), default
+                # to True so the historical always-enhance behaviour is preserved.
+                def _truthy(v):
+                    return str(v).strip().lower() in ("1", "true", "on", "yes")
+                _want_upload = _truthy(params.get("upload", ""))
+                _pkg_raw = params.get("package", None)
+                _want_pkg = _want_upload or (
+                    _truthy(_pkg_raw) if _pkg_raw is not None else True)
+
+                # ── Phase 4 — assemble the final short/long videos (always) ──────
+                _prog(86, "phase 4 — assembling final videos…")
                 st = float(m.get("short_target", 45))
                 lt = float(m.get("long_target", 70))
                 n_assembled = _reassemble_finals(vdir, match_name, st, lt)
-                # A whole-match regen finishes with a quality pass: 2× AI upscale and
-                # 2× frame interpolation of the final short/long assemblies and the
-                # outcome videos (the per-clip fight videos are left at base res).
+
+                # ── Phase 5 — quality pass: 2× AI upscale + 2× frame interpolation
+                # of the final short/long assemblies and the outcome videos (the
+                # per-clip fight videos are left at base res).  Gated by "package".
                 _enh = 0
-                try:
-                    _prog(94, "phase 4/4 — upscaling ×2 + interpolating ×2 finals + outcomes…")
-                    _um = _upscale_model_for(default_args, 2) or None
-                    _im = (getattr(default_args, "interpolation_model", None) or None)
-                    _enh = _stage_enhance_videos(
-                        client, _um, vdir, [mm], match_outcomes,
-                        upscale=2, fps_mult=2, interpolation_model=_im)
-                except Exception as e:
-                    _log(f"  ⚠ enhance pass failed (finals left at base res): {e}")
+                if _want_pkg:
+                    try:
+                        _prog(90, "phase 5 — upscaling ×2 + interpolating ×2 finals + outcomes…")
+                        _um = _upscale_model_for(default_args, 2) or None
+                        _im = (getattr(default_args, "interpolation_model", None) or None)
+                        _enh = _stage_enhance_videos(
+                            client, _um, vdir, [mm], match_outcomes,
+                            upscale=2, fps_mult=2, interpolation_model=_im)
+                    except Exception as e:
+                        _log(f"  ⚠ enhance pass failed (finals left at base res): {e}")
+
+                # ── Phase 6 — odds + renamed upload ZIP (gated by "package") ──────
+                _pkg_msg = ""
+                if _want_pkg:
+                    try:
+                        _prog(96, "phase 6 — generating odds + packing upload ZIP…")
+                        _pz = prepare_match_odds_zip(out_dir, match_name, default_args,
+                                                     log=_log)
+                        if _pz.get("ok"):
+                            _pkg_msg = ", odds + ZIP ready"
+                        elif _pz.get("missing"):
+                            _pkg_msg = (", ZIP missing "
+                                        f"{len(_pz['missing'])} video(s)")
+                        elif _pz.get("error"):
+                            _pkg_msg = f", packaging issue: {_pz['error']}"
+                    except Exception as e:
+                        _log(f"  ⚠ odds/ZIP packaging failed: {e}")
+                        _pkg_msg = f", packaging failed: {e}"
+
+                # ── Phase 7 — upload to the configured endpoint (gated by "upload")
+                _up_msg = ""
+                if _want_upload:
+                    try:
+                        _prog(98, "phase 7 — uploading to Township endpoint…")
+
+                        def _ucb(frac, label, _p=_prog):
+                            try:
+                                _p(98 + int(2 * max(0.0, min(1.0, frac))), label)
+                            except Exception:
+                                pass
+
+                        _ur = upload_prepared_match(out_dir, match_name, default_args,
+                                                    log=_log, progress_cb=_ucb)
+                        if _ur.get("ok"):
+                            _up_msg = f", uploaded → match #{_ur.get('match_number')}"
+                        else:
+                            _up_msg = f", upload skipped: {_ur.get('error')}"
+                    except Exception as e:
+                        _log(f"  ⚠ upload failed: {e}")
+                        _up_msg = f", upload failed: {e}"
+
                 _done(f"regenerated match {match_name} end to end — "
                       f"{len(mm['clips'])} clip(s), {len(match_outcomes)} outcome(s), "
-                      f"finals assembled from {n_assembled} clip(s), "
-                      f"{_enh} video(s) upscaled ×2 + interpolated ×2")
+                      f"finals assembled from {n_assembled} clip(s)"
+                      + (f", {_enh} video(s) upscaled ×2 + interpolated ×2"
+                         if _want_pkg else "")
+                      + _pkg_msg + _up_msg)
                 return
 
             # ── Regenerate keyframes (image model) ─────────────────────────────
@@ -8075,6 +8134,14 @@ async function reMatch(ev, scope, params){
   const isReplan=(scope==='replan'||scope==='replan-outcomes'||scope==='clip-prompt'||scope==='outcome-prompt');
   const isPrompt=(scope==='clip-prompt'||scope==='outcome-prompt');
   const isFull=(scope==='full');
+  let fullPkg=true, fullUpl=false;
+  if(isFull){
+    fullPkg=!!(document.getElementById('full-package')||{checked:true}).checked;
+    fullUpl=!!(document.getElementById('full-upload')||{}).checked;
+    const extra=[]; if(fullPkg) extra.push('enhance ×2, generate odds + pack the upload ZIP');
+    if(fullUpl) extra.push('upload to the configured Township endpoint');
+    if(extra.length) labels.full += ' Afterwards it will '+extra.join(', then ')+'.';
+  }
   if(!(await uiConfirm(labels[scope]||'Proceed?',
        {title:(isFull?'Regenerate whole match':(isPrompt?'Rewrite prompt':(isReplan?'Re-plan match prompts':(kfMiss?'Generate missing keyframes':(kf?'Regenerate keyframes':'Regenerate'))))),
         okText:(isFull?'Regenerate match':(scope==='reassemble'?'Reassemble':(isPrompt?'Rewrite prompt':(isReplan?'Re-plan':(kfMiss?'Generate missing':(kf?'Regenerate':'Re-render')))))),
@@ -8083,6 +8150,7 @@ async function reMatch(ev, scope, params){
   const setSt=(c,t)=>{ if(stEl){ stEl.style.color=c; stEl.textContent=t; } };
   const fd=new FormData(); fd.append('scope',scope);
   for(const k in params) fd.append(k, params[k]);
+  if(isFull){ fd.append('package', fullPkg?'1':'0'); fd.append('upload', fullUpl?'1':'0'); }
   setSt('#aaa','Starting…');
   let j;
   try{ j=await (await fetch('/matches/render',{method:'POST',body:fd})).json(); }
@@ -8773,6 +8841,16 @@ function pollNewMatch(jobId, st){
             f'onclick="reMatch(event,\'reassemble\',{{match:\'{_esc(name)}\'}})">🎞 Reassemble finals</button>'
             f'    <button class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem" '
             f'onclick="reMatch(event,\'outcomes\',{{match:\'{_esc(name)}\'}})">♻ Re-render all outcomes</button>'
+            f'  </div>'
+            # ── Whole-match finalize/package options (applied by Regenerate) ──
+            f'  <div class=pf-actions style="margin-top:.3rem;align-items:center;gap:.9rem">'
+            f'    <label style="display:flex;align-items:center;gap:.35rem;font-size:.8rem;white-space:nowrap" '
+            f'title="After rendering, AI-upscale ×2 + interpolate ×2 the finals/outcomes, then generate arbitrage-safe odds and pack the upload ZIP (each video picked from its highest-quality variant and renamed to its slot).">'
+            f'<input type=checkbox id=full-package checked> Finalize &amp; package <span class=hint>(enhance + odds + ZIP)</span></label>'
+            f'    <label style="display:flex;align-items:center;gap:.35rem;font-size:.8rem;white-space:nowrap" '
+            f'title="After packaging, upload to the configured Township endpoint. Requires the upload endpoint/token/fixture to be set on the Run page; otherwise it is skipped.">'
+            f'<input type=checkbox id=full-upload {"checked" if getattr(default_args, "upload_after_render", False) else ""}> Upload after <span class=hint>(needs endpoint)</span></label>'
+            f'    <span class=hint>↳ applied by “♻ Regenerate whole match”.</span>'
             f'  </div>'
             f'  <div class=pf-actions style="margin-top:.4rem">'
             f'    <a class="btn btn-secondary" style="font-size:.82rem;padding:.35rem .9rem;text-decoration:none" '
@@ -9729,7 +9807,7 @@ async function resetPrompts(ev){
                                _j.dumps({"error": "invalid scope"}))
                     return
                 params = {}
-                for k in ("match", "idx", "fighter", "outcome", "seg", "target", "upscale", "fps", "force", "final_fps"):
+                for k in ("match", "idx", "fighter", "outcome", "seg", "target", "upscale", "fps", "force", "final_fps", "package", "upload"):
                     val = _fv(k)
                     if val:
                         # Guard path-like fields against traversal.
