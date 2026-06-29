@@ -843,6 +843,70 @@ def _video_runtime_reserve_gb(request) -> float:
         return 3.0
 
 
+def _video_cfg_bool(model_cfg: dict, key: str, default: bool) -> bool:
+    """Resolve a boolean video tuning flag: per-model config wins, then the global
+    args (config.json offload section), then the supplied default."""
+    v = (model_cfg or {}).get(key)
+    if v is None and global_args is not None:
+        v = getattr(global_args, key, None)
+    if v is None:
+        return default
+    return str(v).strip().lower() in ('1', 'true', 'on', 'yes')
+
+
+def _resolve_attn_backend(model_cfg: dict):
+    """Resolve the diffusers attention backend for the video transformer(s).
+
+    Returns a backend name to apply, or None to leave the model's default in place.
+    'auto' prefers SageAttention (fastest, INT8) when installed, then FlashAttention
+    (flash_attn), else leaves the default (SDPA). An explicit name is passed through
+    so the operator can force e.g. 'flash', 'sage', 'xformers' or 'native'.
+    """
+    val = ((model_cfg or {}).get('video_attention_backend')
+           or (getattr(global_args, 'video_attention_backend', None)
+               if global_args else None)
+           or 'auto')
+    val = str(val).strip().lower()
+    if val in ('', 'none', 'default'):
+        return None
+    if val == 'auto':
+        import importlib.util as _u
+        if _u.find_spec('sageattention') is not None:
+            return 'sage'
+        if _u.find_spec('flash_attn') is not None:
+            return 'flash'
+        return None
+    return val
+
+
+def _apply_attention_backend(pipe, model_cfg: dict) -> None:
+    """Switch the Wan transformer(s) to a faster attention backend (diffusers 0.38+
+    dispatcher). Best-effort and per-component: if a backend isn't available it
+    falls back to the model's default with a log line and never raises."""
+    name = _resolve_attn_backend(model_cfg)
+    if not name:
+        return
+    applied = []
+    for cn in ('transformer', 'transformer_2'):
+        comp = getattr(pipe, cn, None)
+        if comp is None or not hasattr(comp, 'set_attention_backend'):
+            continue
+        try:
+            comp.set_attention_backend(name)
+            applied.append(cn)
+        except Exception as e:
+            print(f"  [video][attn] {cn}: backend '{name}' unavailable "
+                  f"({str(e).splitlines()[0] if str(e) else type(e).__name__}) "
+                  f"— keeping default")
+    if applied:
+        try:
+            pipe._coderai_attn_backend = name
+        except Exception:
+            pass
+        print(f"  [video][attn] using '{name}' attention backend on "
+              f"{', '.join(applied)}")
+
+
 def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str = None, model_cfg: dict = None, use_incremental_cache: bool = True):
     # GGUF models go through stable-diffusion.cpp, not diffusers
     from codai.api.images import _is_gguf_model
@@ -962,9 +1026,21 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
     # only ~13 GB to work in. With clean VRAM model offload fits; the leak-free
     # retry still degrades to sequential if a genuinely clean forward ever OOMs.
     if _have_injected_components and offload in (None, 'auto', 'balanced', 'disk'):
-        print(f"  [pipeline-cache] injected cached components → forcing hook-based "
-              f"'model' CPU offload (device_map can't place pre-loaded components)")
-        offload = 'model'
+        # Default: keep the WHOLE pipeline resident on the GPU (both 4-bit experts +
+        # text encoder + VAE). This removes the per-clip module shuffling that hook
+        # based 'model' offload pays on every part (text-encode, VACE-encode and
+        # VAE-decode all run on already-resident weights), which is the dominant
+        # per-part overhead. Falls back to 'model' offload on OOM (a big clip's
+        # activation peak not fitting). Set video_resident_experts=false to force the
+        # previous hook-based 'model' offload behaviour.
+        if _video_cfg_bool(model_cfg, 'video_resident_experts', True):
+            print(f"  [pipeline-cache] injected cached components → RESIDENT all-GPU "
+                  f"load (video_resident_experts=on; falls back to model offload on OOM)")
+            offload = 'resident'
+        else:
+            print(f"  [pipeline-cache] injected cached components → forcing hook-based "
+                  f"'model' CPU offload (device_map can't place pre-loaded components)")
+            offload = 'model'
 
     # Resolve offload directory for disk-offload fallback.
     _offload_dir = (
@@ -1140,6 +1216,9 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
     def _report_loaded(pipe, strategy: str) -> None:
         """Print a post-load summary: strategy, device placement, memory state."""
         _enable_vae_memory_opts(pipe)
+        # Faster attention (Flash / Sage) on the diffusion transformer(s). Applied
+        # here so every load path + fallback reload gets it; no-op when unavailable.
+        _apply_attention_backend(pipe, model_cfg)
         # Record the actual strategy used (after any OOM fallbacks) so the caller
         # knows whether the post-load VRAM delta reflects the FULL model footprint
         # (full GPU) or just the slice that happens to be resident under offload
@@ -1354,6 +1433,45 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
             if pipe is not None:
                 return pipe
             # Even sequential OOM'd → continue to the disk-offload attempts.
+
+        # ── Attempt 0a: resident — all components on GPU (no offload hooks) ────
+        # Chosen for injected bnb-4bit components when video_resident_experts is on.
+        # Builds the pipeline (re-using the injected pre-quantized experts/encoder)
+        # then moves every component onto the card, so the denoise loop, text encode
+        # and VAE encode/decode all run on resident weights with no per-part GPU↔CPU
+        # shuffling. On an activation-peak OOM it degrades to 'model' CPU offload
+        # (the previous behaviour) by falling through to Attempt 1.
+        if offload == 'resident':
+            _mem_snapshot("before resident (all-GPU) load")
+            print("  Video load strategy: resident — all components on GPU "
+                  "(no offload hooks; falls back to model offload on OOM)")
+            try:
+                time.sleep(0)
+                pipe = PClass.from_pretrained(**_with_quant(dict(
+                    pretrained_model_name_or_path=model_name,
+                    torch_dtype=torch_dtype, low_cpu_mem_usage=True)))
+                _moved, _kept = [], []
+                for _cn, _comp in (getattr(pipe, 'components', {}) or {}).items():
+                    if (_comp is None or not hasattr(_comp, 'to')
+                            or not hasattr(_comp, 'parameters')):
+                        continue
+                    try:
+                        _comp.to('cuda')
+                        _moved.append(_cn)
+                    except Exception as _me:
+                        _kept.append(f"{_cn}({str(_me).splitlines()[0][:40]})")
+                if _kept:
+                    print(f"  [resident] components left off-GPU: {', '.join(_kept)}")
+                _report_loaded(pipe, "resident (all components on GPU)")
+                return pipe
+            except (RuntimeError, MemoryError) as e:
+                if not _is_oom(e):
+                    raise
+                print(f"  Video: resident all-GPU OOM ({e}) — "
+                      f"falling back to model CPU offload…")
+                e.__traceback__ = None  # release frames pinning the partial model
+            _clear_mem()
+            offload = 'model'  # fall through to Attempt 1 (model CPU offload)
 
         # ── Attempt 0: full GPU ──────────────────────────────────────────────
         if offload not in ('model', 'group', 'sequential', 'disk', 'balanced'):
@@ -3366,7 +3484,8 @@ async def video_generations(request: VideoGenerationRequest,
         # the forward OOMs).
         try:
             _strat = str(getattr(pipe, '_coderai_load_strategy', '') or '')
-            _was_offloaded = bool(_strat) and not _strat.startswith('full GPU')
+            _was_offloaded = bool(_strat) and not (
+                _strat.startswith('full GPU') or _strat.startswith('resident'))
             multi_model_manager.record_vram_delta(
                 model_key, _vram_before, offloaded=_was_offloaded,
                 ram_before=_ram_before)
@@ -3399,9 +3518,18 @@ async def video_generations(request: VideoGenerationRequest,
     import gc as _gc, traceback as _tb
     from codai.tasks import loading_task as _loading_task
     _loop = asyncio.get_event_loop()
-    _rungs = [None, ('balanced', False), ('disk', False)]  # None = already-loaded pipe
+    # When rung 0 loaded RESIDENT (all-GPU), the first fallback is the previous
+    # behaviour — hook-based 'model' CPU offload with the injected components (near
+    # full-GPU speed, fits a big clip's forward) — before the slower balanced/disk
+    # rungs. Otherwise keep the original ladder.
+    _strat0 = str(getattr(pipe, '_coderai_load_strategy', '') or '')
+    if _strat0.startswith('resident'):
+        _rungs = [None, ('model', True), ('balanced', False), ('disk', False)]
+    else:
+        _rungs = [None, ('balanced', False), ('disk', False)]  # None = already-loaded pipe
     frames = fps = None
     _last_err = None
+    _attn_reset_done = False  # one-time attention-backend self-heal guard
     for _ri, _rung in enumerate(_rungs):
         # (Re)load for fallback rungs; rung 0 reuses the already-loaded pipe.
         if _rung is not None:
@@ -3446,6 +3574,47 @@ async def video_generations(request: VideoGenerationRequest,
                   + _tb.format_exc())
             _last_err = e
             e.__traceback__ = None  # drop NOW so the free below can reclaim VRAM
+        # One-time self-heal: if a faster attention backend (flash/sage) is active and
+        # the failure is NOT an OOM, it's most likely a backend/shape incompatibility
+        # on this diffusers/torch build. Reset the transformer(s) to default attention
+        # and retry the SAME pipe once — far cheaper than (and avoids re-applying the
+        # same broken backend on) a slower reload rung.
+        _oom_like = ('out of memory' in _err_str or 'cannot allocate' in _err_str)
+        if (pipe is not None and not _attn_reset_done and not _oom_like
+                and getattr(pipe, '_coderai_attn_backend', None)):
+            _attn_reset_done = True
+            _reset_n = []
+            for _cn in ('transformer', 'transformer_2'):
+                _c = getattr(pipe, _cn, None)
+                if _c is not None and hasattr(_c, 'reset_attention_backend'):
+                    try:
+                        _c.reset_attention_backend()
+                        _reset_n.append(_cn)
+                    except Exception:
+                        pass
+            try:
+                pipe._coderai_attn_backend = None
+            except Exception:
+                pass
+            if _reset_n:
+                print(f"  [video][attn] reset {', '.join(_reset_n)} to default "
+                      f"attention after a non-OOM failure — retrying same pipe…")
+                try:
+                    if _is_sdcpp_video:
+                        frames, fps = await _loop.run_in_executor(
+                            None, _generate_sdcpp_video, pipe, request, _model_cfg)
+                    else:
+                        frames, fps = await _loop.run_in_executor(
+                            None, _generate_video, pipe, request)
+                    _last_err = None
+                    break  # success → return to client
+                except Exception as _e3:
+                    _vid_progress_done()
+                    _err_str = str(_e3).lower()
+                    print(f"  [video] retry after attn-reset still FAILED: "
+                          f"{str(_e3).splitlines()[0] if str(_e3) else type(_e3).__name__}")
+                    _last_err = _e3
+                    _e3.__traceback__ = None
         # Failure handling OUTSIDE the except: free the pipe + activations.
         multi_model_manager.models.pop(model_key, None)
         multi_model_manager.model_pools.pop(model_key, None)
