@@ -850,6 +850,15 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
         return _load_sdcpp_video_model(model_name, offload, model_cfg)
 
     import sys, time, torch, gc
+    # Start every load from a swept card: reclaim any UNREFERENCED orphaned VRAM a
+    # prior teardown dropped but didn't collect, and surface a diagnostic if the
+    # card holds VRAM no tracked model accounts for (a referenced teardown leak we
+    # can't free here). This runs right after request_model's eviction, so it's also
+    # the "make sure the swapped-out model actually freed its VRAM" check.
+    try:
+        multi_model_manager.sweep_orphan_vram(context="before video load")
+    except Exception:
+        pass
     PClass = _detect_pipeline_class(model_name, mode)
     if PClass is None:
         raise RuntimeError("diffusers not installed: pip install diffusers")

@@ -2293,6 +2293,57 @@ class MultiModelManager:
         except Exception:
             return False
 
+    def _estimate_tracked_vram_gb(self) -> float:
+        """Sum the estimated VRAM footprint of every currently-tracked model.
+
+        Used to detect UNTRACKED in-use VRAM (a teardown leak): if the card reports
+        far more VRAM in use than this accounts for, something dropped a model's
+        registry entry but left its GPU tensors resident (e.g. activations pinned by
+        an exception traceback). Offloaded models over-report here (their full
+        footprint vs the small GPU-resident slice), which only makes the check
+        CONSERVATIVE — it never false-positives on a legitimately offloaded model."""
+        total = 0.0
+        for key in list(self.models.keys()):
+            try:
+                total += self._get_model_used_vram_gb(key)
+            except Exception:
+                pass
+        return total
+
+    def sweep_orphan_vram(self, context: str = "") -> None:
+        """Reclaim any UNREFERENCED orphaned GPU memory and surface a diagnostic for
+        the referenced kind. gc.collect() makes a just-dropped-but-not-collected
+        pipeline collectable; empty_cache() returns it to the driver. A referenced
+        leak can't be freed here (it must be fixed at its source) but is announced so
+        a mystery OOM is traceable. Cheap; safe to call before every load."""
+        import gc as _gc
+        for _ in range(2):
+            _gc.collect()
+        try:
+            import torch as _t
+            if not _t.cuda.is_available():
+                return
+            _t.cuda.synchronize()
+            _t.cuda.empty_cache()
+        except Exception:
+            return
+        try:
+            from codai.models.gpu_query import visible_gpu_memory
+            gpus = visible_gpu_memory() or []
+            if not gpus:
+                return
+            used_gb = sum(d["total"] - d["free"] for d in gpus) / 1e9
+            tracked_gb = self._estimate_tracked_vram_gb()
+            # ~1 GB driver/context baseline + slack before we call it a leak.
+            orphan_gb = used_gb - tracked_gb - 1.0
+            if orphan_gb > 2.0:
+                print(f"  [vram]{(' ' + context) if context else ''} {used_gb:.1f} GB "
+                      f"in use but tracked models account for only {tracked_gb:.1f} GB "
+                      f"— ~{orphan_gb:.1f} GB untracked (teardown leak; not freeable "
+                      f"here — referenced elsewhere)")
+        except Exception:
+            pass
+
     def _get_free_vram_gb(self) -> float:
         """Return estimated free VRAM in GB across the cards this engine can use.
 
