@@ -871,12 +871,32 @@ def _resolve_attn_backend(model_cfg: dict):
         return None
     if val == 'auto':
         import importlib.util as _u
-        if _u.find_spec('sageattention') is not None:
+        # Prefer Sage ONLY when diffusers can actually use it: it requires a
+        # specific SageAttention version with compiled CUDA kernels (e.g. 0.38
+        # needs >=2.1.1). Merely having the package importable is NOT enough — an
+        # old v1 wheel would be rejected by diffusers and silently drop us to
+        # plain SDPA instead of Flash. So gate on diffusers' own capability flag.
+        if _sage_usable():
             return 'sage'
         if _u.find_spec('flash_attn') is not None:
             return 'flash'
         return None
     return val
+
+
+def _sage_usable() -> bool:
+    """True only when diffusers can actually dispatch to SageAttention (correct
+    version + compiled kernels importable)."""
+    try:
+        from diffusers.models.attention_dispatch import _CAN_USE_SAGE_ATTN
+        return bool(_CAN_USE_SAGE_ATTN)
+    except Exception:
+        try:
+            from diffusers.utils import import_utils as _iu
+            return bool(_iu.is_sageattention_available()
+                        and _iu.is_sageattention_version(">=", "2.1.1"))
+        except Exception:
+            return False
 
 
 def _apply_attention_backend(pipe, model_cfg: dict) -> None:
