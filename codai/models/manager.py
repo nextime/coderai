@@ -3130,6 +3130,65 @@ class MultiModelManager:
             return base_gb * 0.08
         return base_gb * 0.08
 
+    def _quantized_cache_gb(self, model_key: str, resolved_name: str, cfg: dict) -> float:
+        """Actual on-disk size (GB) of this model's quantized pipeline cache, or 0.
+
+        UNIVERSAL footprint rule: a model that loads ALREADY-QUANTIZED weights (our
+        per-component / monolithic pipeline cache, a GGUF, a pre-quantized repo)
+        needs exactly that many bytes — the stored size IS the real footprint, so NO
+        quant factor applies. Only an unquantized source we quantize AT LOAD gets the
+        quant reduction. The cache size is also authoritative over a stale
+        used_vram_gb (e.g. one left as the fp32 disk size). Returns 0 when there's no
+        cache, so the caller falls back to the factor-based estimate."""
+        try:
+            import glob
+            from codai.models import pipeline_cache as _pc
+            if not _pc.enabled():
+                return 0.0
+            name = resolved_name or model_key or ""
+            # Strip a leading type prefix ("video:"/"image:"/…) — the cache is keyed
+            # by the bare model name/path, as the loaders key it.
+            if ":" in name and name.split(":", 1)[0] in (
+                    "video", "image", "audio", "tts", "vision",
+                    "audio_gen", "embedding", "spatial"):
+                name = name.split(":", 1)[1]
+            # Find the cache by MODEL NAME, not the exact config signature: the
+            # signature suffix drifts with minor config edits, but ANY quantized
+            # build of this model gives a sound footprint for eviction. Match
+            # '<safe_name>__*', ignore in-progress '.building' dirs, take the largest.
+            pattern = os.path.join(_pc.cache_root(), _pc._safe_name(name) + "__*")
+            dirs = [d for d in glob.glob(pattern)
+                    if os.path.isdir(d) and not d.endswith(".building")]
+            if not dirs:
+                return 0.0
+            memo = getattr(self, "_cache_size_memo", None)
+            if memo is None:
+                memo = self._cache_size_memo = {}
+            best = 0.0
+            for cdir in dirs:
+                try:
+                    mtime = os.path.getmtime(cdir)
+                except OSError:
+                    mtime = 0.0
+                cached = memo.get(cdir)
+                if cached and cached[0] == mtime:
+                    gb = cached[1]
+                else:
+                    total = 0
+                    for root, _, files in os.walk(cdir):
+                        for fn in files:
+                            try:
+                                total += os.path.getsize(os.path.join(root, fn))
+                            except OSError:
+                                pass
+                    gb = total / 1e9
+                    memo[cdir] = (mtime, gb)
+                best = max(best, gb)
+            # Ignore a trivially-small dir (only markers / an aborted build).
+            return best if best >= 0.5 else 0.0
+        except Exception:
+            return 0.0
+
     def _get_model_used_vram_gb(self, model_key: str, resolved_name: str = None) -> float:
         """Return VRAM requirement in GB for a model.
 
@@ -3281,6 +3340,19 @@ class MultiModelManager:
         # configured used_vram_gb — and is refreshed from reality every run.
         if bool(cfg.get("force_vram_update")) and measured:
             return _dbg_est("measured(force)", float(measured))
+
+        # UNIVERSAL already-quantized rule: if a quantized pipeline cache for this
+        # model exists on disk, those bytes ARE its full footprint — use the cache's
+        # actual size with NO quant factor (it's already quantized). This beats a
+        # stale used_vram_gb (which may be the unquantized disk size, e.g. an fp32
+        # 151 GB) and needs no per-model tuning. Only models quantized AT LOAD fall
+        # through to the factor-based estimate below.
+        _cache_gb = self._quantized_cache_gb(model_key, resolved_name, cfg)
+        if _cache_gb > 0:
+            return _dbg_est(
+                "quantized-cache-size",
+                _cache_gb + self._runtime_reserve_gb(cfg, model_key, _cache_gb)
+                + self._config_lora_vram_gb(cfg))
 
         # used_vram_gb set in config is AUTHORITATIVE — use it as-is (with the
         # usual quant/offload factors) and never override it with a measurement.
