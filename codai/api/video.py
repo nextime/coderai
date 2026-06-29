@@ -3536,6 +3536,30 @@ async def video_generations(request: VideoGenerationRequest,
     except Exception:
         pass
 
+    # ── Per-clip RAM hygiene ─────────────────────────────────────────────────
+    # The pipeline is REUSED across clips (model CPU offload keeps the weights in
+    # host RAM), so the per-request teardown that normally trims the heap never
+    # runs between clips. Each generation allocates ~1 GB of decode/latent/offload
+    # buffers; Python frees them but glibc keeps the pages in its arena, so RSS
+    # creeps up every clip and eventually blows past the RAM cap (which can't help:
+    # the only resident model is the protected live one — nothing idle to evict).
+    # Drop the decode buffers and malloc_trim the freed heap back to the OS. The
+    # before/after RSS log also reveals any RESIDUAL leak: if RSS doesn't return to
+    # ~baseline after the trim, something is holding a real reference (chase that).
+    try:
+        import gc as _gc
+        _rss_before = multi_model_manager._get_own_ram_gb()
+        frames = None
+        frame_np = None
+        _gc.collect()
+        from codai.models.manager import _trim_cpu_ram
+        _trim_cpu_ram()
+        _rss_after = multi_model_manager._get_own_ram_gb()
+        print(f"  [video][ram] post-clip trim: {_rss_before:.1f} -> {_rss_after:.1f} GB "
+              f"RSS (reclaimed {max(0.0, _rss_before - _rss_after):.1f} GB)")
+    except Exception:
+        pass
+
     return VideoGenerationResponse(created=int(time.time()), data=[result])
 
 
