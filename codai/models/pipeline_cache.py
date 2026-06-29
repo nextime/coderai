@@ -133,6 +133,29 @@ def valid(p: str) -> bool:
 # cache over a couple of runs. Each component carries the same model+quant+
 # precision signature, so a config change invalidates it like the monolithic one.
 
+def mark_monolithic_complete(model_name: str, model_cfg: Optional[dict]) -> bool:
+    """Write the monolithic completion marker for a cache dir that was populated
+    component-by-component (heavy components via save_component, light components +
+    model_index.json by the finalizer). After this, valid() returns True and the
+    dir loads as a normal pipeline via from_pretrained(dir, device_map=…) — no
+    injection — so device_map can place every component and big-clip generation
+    fits. Only call once model_index.json and every component subdir are present."""
+    try:
+        p = path(model_name, model_cfg)
+        if not os.path.isfile(os.path.join(p, "model_index.json")):
+            return False
+        with open(_marker(p), "w") as f:
+            json.dump({
+                "version": _CACHE_VERSION, "complete": True,
+                "model": model_name, "saved_at": time.time(),
+                "signature": _signature(model_name, model_cfg),
+                "built": "incremental",
+            }, f)
+        return True
+    except Exception:
+        return False
+
+
 def _component_marker(cdir: str) -> str:
     return os.path.join(cdir, ".coderai_component.json")
 

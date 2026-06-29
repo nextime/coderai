@@ -437,7 +437,88 @@ def build_cached_components(model_name: str, cfg: Optional[Dict[str, Any]], dtyp
             print(f"  [pipeline-cache] component '{name}' incremental build failed "
                   f"({str(e).splitlines()[0] if str(e) else type(e).__name__}) — "
                   f"leaving it to the normal pipeline load")
+
+    # If every heavy component is now cached, complete the cache DIR into a
+    # normally-loadable pipeline (light components + model_index.json + marker), so
+    # subsequent loads use the monolithic HIT path — from_pretrained(dir,
+    # device_map=…) with NO injection. That lets big-clip generation fit via
+    # device_map (the injected-component path is stuck on hook-based offload, where
+    # 'model' OOMs big forwards and 'sequential' hits a bnb Params4bit bug).
+    if components and len(components) == len(targets):
+        try:
+            finalize_monolithic_cache(model_name, cfg, dtype, set(components.keys()))
+        except Exception as _fe:
+            print(f"  [pipeline-cache] monolithic finalize skipped ({_fe})")
+
     return components, ', '.join(descs)
+
+
+def finalize_monolithic_cache(model_name: str, cfg: Optional[Dict[str, Any]],
+                              dtype, built_names) -> bool:
+    """Complete a per-component cache DIR into a pipeline from_pretrained() can load
+    directly: save the LIGHT components the heavy build didn't cover (vae /
+    scheduler / tokenizer / …), copy model_index.json, then mark it complete.
+
+    Best-effort and conservative: it marks the cache complete ONLY if every
+    component named in model_index.json is present, so a partial dir is left
+    UNMARKED (valid() stays False) and the injection path keeps working. Returns
+    True only when the monolithic cache is fully written + marked."""
+    import os
+    import json
+    try:
+        from codai.models import pipeline_cache as _pcache
+        import diffusers
+        import transformers
+    except Exception as e:
+        print(f"  [pipeline-cache] finalize unavailable: {e}")
+        return False
+    cdir = _pcache.path(model_name, cfg)
+    try:
+        idx = diffusers.DiffusionPipeline.load_config(model_name)
+    except Exception as e:
+        print(f"  [pipeline-cache] finalize: can't read model_index ({e})")
+        return False
+    comps = {k: v for k, v in idx.items()
+             if not k.startswith('_') and isinstance(v, (list, tuple))
+             and len(v) >= 2 and v[1]}
+    for name, spec in comps.items():
+        sub = os.path.join(cdir, name)
+        # Already cached? (heavy component subdir, or a light one from a prior run)
+        if (os.path.isfile(os.path.join(sub, 'config.json'))
+                or os.path.isfile(os.path.join(sub, 'tokenizer_config.json'))
+                or os.path.isfile(os.path.join(sub, 'scheduler_config.json'))):
+            continue
+        lib, cls_name = spec[0], spec[1]
+        mod = transformers if lib == 'transformers' else diffusers
+        cls = getattr(mod, cls_name, None)
+        if cls is None or not hasattr(cls, 'from_pretrained'):
+            print(f"  [pipeline-cache] finalize: no loadable class for '{name}' "
+                  f"({spec}) — leaving monolithic cache incomplete")
+            return False
+        try:
+            print(f"  [pipeline-cache] finalize: caching light component '{name}'")
+            try:
+                obj = cls.from_pretrained(model_name, subfolder=name, torch_dtype=dtype)
+            except TypeError:
+                # tokenizer / scheduler don't accept torch_dtype
+                obj = cls.from_pretrained(model_name, subfolder=name)
+            obj.save_pretrained(sub)
+            del obj
+        except Exception as e:
+            print(f"  [pipeline-cache] finalize: couldn't cache '{name}' ({e}) — "
+                  f"leaving monolithic cache incomplete")
+            return False
+    try:
+        with open(os.path.join(cdir, 'model_index.json'), 'w') as f:
+            json.dump(idx, f)
+    except Exception as e:
+        print(f"  [pipeline-cache] finalize: couldn't write model_index.json ({e})")
+        return False
+    ok = _pcache.mark_monolithic_complete(model_name, cfg)
+    if ok:
+        print(f"  [pipeline-cache] monolithic cache complete → next load uses "
+              f"device_map from cache (no injection)")
+    return ok
 
 
 def build_from_pretrained_kwargs(
