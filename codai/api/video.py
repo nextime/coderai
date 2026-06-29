@@ -945,14 +945,16 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
     # strategy — accelerate's device_map only dispatches components it LOADS, so
     # injected ones keep whatever device they're on with NO offload hook, and a
     # forward pass then hits "index on cuda:0, weights on cpu". The HOOK-based
-    # strategies (model → group → sequential) add hooks to EVERY component in the
-    # pipeline, injected included, so force a hook-based path when we injected
-    # cached components. (model CPU offload keeps only the active 4-bit component
-    # resident — a single ~7 GB expert — so it fits easily and is fastest.)
-    if _have_injected_components and offload in (None, 'auto', 'balanced', 'disk'):
+    # strategies add hooks to EVERY component (injected included), so force one.
+    # Use SEQUENTIAL, not model: model CPU offload keeps a whole expert resident
+    # and OOMs this dual-expert A14B forward (verified — loads at 11 GB then the
+    # forward spikes past 24 GB). Sequential has the minimal footprint that
+    # reliably fits; the cache still makes the LOAD fast even if generation is
+    # slower. (A user wanting speed can set offload_strategy=group explicitly.)
+    if _have_injected_components and offload in (None, 'auto', 'balanced', 'disk', 'model'):
         print(f"  [pipeline-cache] injected cached components → forcing hook-based "
-              f"'model' CPU offload (device_map can't place pre-loaded components)")
-        offload = 'model'
+              f"'sequential' CPU offload (device_map can't place pre-loaded components)")
+        offload = 'sequential'
 
     # Resolve offload directory for disk-offload fallback.
     _offload_dir = (
@@ -3366,6 +3368,8 @@ async def video_generations(request: VideoGenerationRequest,
     except ImportError:
         pass
 
+    _gen_exc = None
+    _gen_err_str = ""
     try:
         if _is_sdcpp_video:
             frames, fps = await asyncio.get_event_loop().run_in_executor(
@@ -3375,88 +3379,76 @@ async def video_generations(request: VideoGenerationRequest,
                 None, _generate_video, pipe, request)
     except Exception as e:
         _vid_progress_done()
-        _err_str = str(e).lower()
-        _is_oom = "out of memory" in _err_str or ("cuda" in _err_str and "memory" in _err_str)
-        # On OOM: free the GPU pipeline, reload with CPU offload, and retry once.
-        if _is_oom and not _is_sdcpp_video:
-            import gc, torch as _torch, psutil as _ps
-            # Choose retry offload strategy based on current free RAM.
-            # enable_model_cpu_offload() loads ALL weights into RAM first — if RAM
-            # is already tight that triggers another OOM kill.  Use sequential+disk
-            # offload instead when free RAM < 2× the pipeline's last known RAM usage.
-            _free_ram_gb = _ps.virtual_memory().available / 1e9
-            _retry_strategy = 'model' if _free_ram_gb > 20 else 'sequential'
-            print(f"Video generation OOM — freeing pipeline, retrying with "
-                  f"'{_retry_strategy}' offload "
-                  f"({_free_ram_gb:.1f} GB RAM free)…")
-            multi_model_manager.models.pop(model_key, None)
-            multi_model_manager.model_pools.pop(model_key, None)
-            # Fully release the OOM'd pipeline's VRAM before reloading — a naive
-            # .to('cpu') silently fails on quantized/device_map pipelines, which
-            # is what leaks VRAM and snowballs into the OOM death spiral.
-            _free_pipeline_vram(pipe)
-            pipe = None
+        import traceback as _tb
+        _gen_exc = e
+        _gen_err_str = str(e).lower()
+        print(f"  [video] generation FAILED for '{model_name}': "
+              f"{str(e).splitlines()[0] if str(e) else type(e).__name__}\n"
+              + _tb.format_exc())
+        # CRITICAL: drop the traceback NOW. It pins the failed forward pass's GPU
+        # activations (and the resident expert) via this except's sys.exc_info(),
+        # so _free_pipeline_vram()/empty_cache() below would reclaim nothing and a
+        # retry reload would see the card still ~20 GB full and OOM again (the leak
+        # seen in the logs). We free + retry OUTSIDE this except block, below.
+        e.__traceback__ = None
+
+    if _gen_exc is not None:
+        # Outside the except block: sys.exc_info() no longer pins the failed
+        # forward's tensors, so the pipeline + activations are now collectable.
+        import gc as _gc, traceback as _tb
+        multi_model_manager.models.pop(model_key, None)
+        multi_model_manager.model_pools.pop(model_key, None)
+        _free_pipeline_vram(pipe)
+        pipe = None
+        for _ in range(2):
+            _gc.collect()
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _torch.cuda.synchronize()
+                _torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        _is_oom = ("out of memory" in _gen_err_str
+                   or ("cuda" in _gen_err_str and "memory" in _gen_err_str))
+        _dev_mismatch = ("same device" in _gen_err_str or "index_select" in _gen_err_str
+                         or "cuda:0" in _gen_err_str)
+        # Retry ONCE for OOM or device-mismatch (sd.cpp pipes don't offload-retry).
+        if (_is_oom or _dev_mismatch) and not _is_sdcpp_video:
+            # OOM  -> sequential offload (minimal VRAM, reliably fits the forward).
+            # mismatch -> drop incremental injection; the plain device_map build
+            # places every component itself, so there's nothing un-hooked.
+            _retry_strategy = 'sequential' if _is_oom else _offload
+            _retry_incremental = not _dev_mismatch
+            print(f"  [video] retrying generation once "
+                  f"(strategy={_retry_strategy or 'auto'}, "
+                  f"incremental={'on' if _retry_incremental else 'off'}) "
+                  f"after {'OOM' if _is_oom else 'device-mismatch'}…")
             try:
-                pipe = await asyncio.get_event_loop().run_in_executor(
-                    None, _load_video_pipeline, model_name, device, request.mode,
-                    _retry_strategy, _model_cfg)
+                with loading_task(model_name, model_type="video"):
+                    pipe = await asyncio.get_event_loop().run_in_executor(
+                        None, _load_video_pipeline, model_name, device, request.mode,
+                        _retry_strategy, _model_cfg, _retry_incremental)
                 multi_model_manager.models[model_key] = pipe
                 multi_model_manager.current_model_key = model_key
                 frames, fps = await asyncio.get_event_loop().run_in_executor(
                     None, _generate_video, pipe, request)
-            except Exception as e2:
-                import traceback as _tb
-                print(f"  [video] generation FAILED on OOM-retry for '{model_name}': "
-                      f"{str(e2).splitlines()[0] if str(e2) else type(e2).__name__}\n"
+                _gen_exc = None  # recovered
+            except Exception as _e2:
+                print(f"  [video] generation retry ALSO failed for '{model_name}': "
+                      f"{str(_e2).splitlines()[0] if str(_e2) else type(_e2).__name__}\n"
                       + _tb.format_exc())
                 multi_model_manager.models.pop(model_key, None)
                 multi_model_manager.model_pools.pop(model_key, None)
-                # Release the failed retry pipeline too, so the NEXT request
-                # starts from clean VRAM instead of inheriting the leak.
                 _free_pipeline_vram(pipe)
                 pipe = None
-                raise HTTPException(status_code=500, detail=f"Video generation failed (OOM retry): {e2}")
-        else:
-            # Non-OOM failure: evict the broken pipeline.
-            import traceback as _tb
-            print(f"  [video] generation FAILED (non-OOM) for '{model_name}': "
-                  f"{str(e).splitlines()[0] if str(e) else type(e).__name__}\n"
-                  + _tb.format_exc())
-            multi_model_manager.models.pop(model_key, None)
-            multi_model_manager.model_pools.pop(model_key, None)
-            _free_pipeline_vram(pipe)
-            pipe = None
-            # Safety net: a device-mismatch ("tensors on cuda:0 vs cpu") can come
-            # from injected incremental-cache components that an offload strategy
-            # didn't hook. Retry ONCE with the incremental cache disabled (plain
-            # build = pre-cache behaviour) so generation self-heals even if the
-            # component-injection path is imperfect, rather than wedging the queue.
-            _dev_mismatch = ("same device" in _err_str or "index_select" in _err_str
-                             or "cuda:0" in _err_str)
-            if _dev_mismatch:
-                try:
-                    print(f"  [video] retrying generation with incremental cache "
-                          f"DISABLED (plain build) after device-mismatch…")
-                    with loading_task(model_name, model_type="video"):
-                        pipe = await asyncio.get_event_loop().run_in_executor(
-                            None, _load_video_pipeline, model_name, device,
-                            request.mode, _offload, _model_cfg, False)
-                    multi_model_manager.models[model_key] = pipe
-                    multi_model_manager.current_model_key = model_key
-                    frames, fps = await asyncio.get_event_loop().run_in_executor(
-                        None, _generate_video, pipe, request)
-                    e = None  # recovered
-                except Exception as _e3:
-                    print(f"  [video] plain-build retry ALSO failed for '{model_name}': "
-                          f"{str(_e3).splitlines()[0] if str(_e3) else type(_e3).__name__}\n"
-                          + _tb.format_exc())
-                    multi_model_manager.models.pop(model_key, None)
-                    multi_model_manager.model_pools.pop(model_key, None)
-                    _free_pipeline_vram(pipe)
-                    pipe = None
-                    raise HTTPException(status_code=500, detail=f"Video generation failed: {_e3}")
-            if e is not None:
-                raise HTTPException(status_code=500, detail=f"Video generation failed: {e}")
+                _e2.__traceback__ = None
+                raise HTTPException(status_code=500,
+                                    detail=f"Video generation failed (retry): {_e2}")
+        if _gen_exc is not None:
+            raise HTTPException(status_code=500,
+                                detail=f"Video generation failed: {_gen_exc}")
 
     # Encode raw frames to MP4 (per-model output quality via CRF when configured).
     try:
