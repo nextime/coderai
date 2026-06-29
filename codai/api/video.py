@@ -3285,8 +3285,13 @@ async def video_generations(request: VideoGenerationRequest,
                               f"free) — using full GPU (it falls back to offload on OOM)")
             except Exception:
                 pass
-        # Snapshot free VRAM so we can record the real footprint after load.
+        # Snapshot free VRAM + own RAM so record_vram_delta can compute the FULL
+        # model footprint (GPU-resident weights + the portion offloaded to host RAM).
         _vram_before = multi_model_manager.vram_before_load()
+        try:
+            _ram_before = multi_model_manager._get_own_ram_gb()
+        except Exception:
+            _ram_before = -1.0
         from codai.tasks import loading_task
         try:
             with loading_task(model_name, model_type="video"):
@@ -3354,17 +3359,17 @@ async def video_generations(request: VideoGenerationRequest,
             print(f"  [video][accel] skipped: {_e}")
         multi_model_manager.models[model_key] = pipe
         multi_model_manager.current_model_key = model_key
-        # Record the real VRAM used. record_vram_delta only persists when no
-        # used_vram_gb is configured (it writes the separate measured_vram_gb).
-        # Under ANY offload strategy the weights live on CPU/disk, so the GPU
-        # delta is a meaningless ~0 — never let it overwrite a real full-GPU
-        # measurement (that bug saved measured_vram_gb=0.05 and made the next
-        # start mis-pick full-GPU and OOM-cascade).
+        # Record the model's FULL footprint (GPU-resident + offloaded-to-RAM). Pass
+        # ram_before so an offloaded load's host-RAM weights are counted — otherwise
+        # measured_vram_gb collapses to the tiny GPU slice (~0.3 GB) and eviction
+        # never frees room for the forward (an idle image model stays resident and
+        # the forward OOMs).
         try:
             _strat = str(getattr(pipe, '_coderai_load_strategy', '') or '')
             _was_offloaded = bool(_strat) and not _strat.startswith('full GPU')
             multi_model_manager.record_vram_delta(
-                model_key, _vram_before, offloaded=_was_offloaded)
+                model_key, _vram_before, offloaded=_was_offloaded,
+                ram_before=_ram_before)
         except Exception:
             pass
 

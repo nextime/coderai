@@ -2465,15 +2465,7 @@ class MultiModelManager:
         force_update = bool(cfgd.get("force_vram_update"))
         user_pinned = cfgd.get("used_vram_gb") is not None
 
-        # --- GPU VRAM footprint (weights resident on GPU + runtime reserve) ------
-        delta_gb = (free_before - free_after) / 1e9
-        measured_vram = None
-        if delta_gb > 0:
-            reserve_gb = self._runtime_reserve_gb(cfgd, model_key, delta_gb)
-            measured_vram = round(delta_gb + reserve_gb, 3)
-            self._measured_vram_gb[model_key] = measured_vram  # in-memory truth
-
-        # --- Host-RAM footprint (the CPU-offloaded layers) ----------------------
+        # --- Host-RAM footprint (the portion of weights offloaded to CPU) -------
         measured_ram = None
         if ram_before is not None and ram_before >= 0:
             try:
@@ -2483,6 +2475,23 @@ class MultiModelManager:
             except Exception:
                 measured_ram = None
 
+        # --- FULL model footprint (what measured_vram_gb represents) ------------
+        # measured_vram_gb is the TOTAL memory the model needs — the GPU-resident
+        # weights PLUS the portion offloaded to host RAM PLUS the runtime/activation
+        # reserve. It is PLACEMENT-INDEPENDENT: offload just moves weights GPU<->CPU,
+        # the model still needs this much in total. Recording only the GPU-resident
+        # slice of an OFFLOADED load (~0.3 GB) made eviction think the model needed
+        # ~nothing, so it never freed room (e.g. an idle image model) and the forward
+        # then OOM'd. force_vram_update persists this full footprint every run.
+        delta_gb = (free_before - free_after) / 1e9
+        gpu_gb = max(0.0, delta_gb)
+        measured_vram = None
+        if gpu_gb > 0 or (measured_ram and measured_ram > 0):
+            reserve_gb = self._runtime_reserve_gb(
+                cfgd, model_key, gpu_gb + (measured_ram or 0.0))
+            measured_vram = round(gpu_gb + (measured_ram or 0.0) + reserve_gb, 3)
+            self._measured_vram_gb[model_key] = measured_vram  # in-memory truth
+
         # --- Settled GPU-layer split (the value the retry loop landed on) -------
         measured_layers = None
         try:
@@ -2491,12 +2500,14 @@ class MultiModelManager:
         except (TypeError, ValueError):
             measured_layers = None
 
-        _total = (measured_vram or 0.0) + (measured_ram or 0.0)
+        # measured_vram already INCLUDES the offloaded RAM portion (full footprint),
+        # so don't add measured_ram again here — that would double-count.
         print(f"Measured footprint for '{model_key}': "
-              f"VRAM={'%.2f' % measured_vram if measured_vram is not None else 'n/a'} GB + "
-              f"RAM={'%.2f' % measured_ram if measured_ram is not None else 'n/a'} GB = "
-              f"{_total:.2f} GB total  "
-              f"(n_gpu_layers={measured_layers if measured_layers is not None else 'n/a'})")
+              f"{'%.2f' % measured_vram if measured_vram is not None else 'n/a'} GB total "
+              f"(full model footprint, placement-independent; of which "
+              f"{'%.2f' % measured_ram if measured_ram is not None else '0.00'} GB was "
+              f"offloaded to host RAM this load; "
+              f"n_gpu_layers={measured_layers if measured_layers is not None else 'n/a'})")
 
         # Persist each system-owned field, accumulating into the in-memory config so
         # successive fields don't clobber each other. Each is written to models.json
