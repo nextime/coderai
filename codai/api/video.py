@@ -740,6 +740,39 @@ def _free_pipeline_vram(pipe) -> None:
     try:
         if pipe is not None:
             _comps = getattr(pipe, 'components', {}) or {}
+            # Break references that outlive a plain component-null and would pin the
+            # weights past gc/empty_cache (the "untracked teardown leak"):
+            #  1) reset any non-default attention backend so diffusers' dispatcher
+            #     stops routing through (and holding) these transformer modules;
+            #  2) unload LoRA/PEFT adapters injected into the transformer(s);
+            #  3) run the pipe's own hook/device-map teardown (frees accelerate
+            #     offload hooks + the cpu<->gpu staging buffers they hold).
+            for _cn in ('transformer', 'transformer_2'):
+                _c = getattr(pipe, _cn, None)
+                if _c is not None and hasattr(_c, 'reset_attention_backend'):
+                    try:
+                        _c.reset_attention_backend()
+                    except Exception:
+                        pass
+            try:
+                _unload_video_loras(pipe)
+            except Exception:
+                pass
+            for _m in ('maybe_free_model_hooks', 'reset_device_map'):
+                _fn = getattr(pipe, _m, None)
+                if callable(_fn):
+                    try:
+                        _fn()
+                    except Exception:
+                        pass
+            # Drop coderai-stamped strong refs (accel config, active-lora tuple, etc.)
+            for _attr in ('_coderai_accel', '_coderai_active_loras',
+                          '_coderai_attn_backend', '_coderai_load_strategy'):
+                try:
+                    if hasattr(pipe, _attr):
+                        setattr(pipe, _attr, None)
+                except Exception:
+                    pass
             try:
                 from accelerate.hooks import remove_hook_from_submodules
                 for _c in _comps.values():
@@ -1046,14 +1079,17 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
     # only ~13 GB to work in. With clean VRAM model offload fits; the leak-free
     # retry still degrades to sequential if a genuinely clean forward ever OOMs.
     if _have_injected_components and offload in (None, 'auto', 'balanced', 'disk'):
-        # Default: keep the WHOLE pipeline resident on the GPU (both 4-bit experts +
+        # OPT-IN: keep the WHOLE pipeline resident on the GPU (both 4-bit experts +
         # text encoder + VAE). This removes the per-clip module shuffling that hook
         # based 'model' offload pays on every part (text-encode, VACE-encode and
-        # VAE-decode all run on already-resident weights), which is the dominant
-        # per-part overhead. Falls back to 'model' offload on OOM (a big clip's
-        # activation peak not fitting). Set video_resident_experts=false to force the
-        # previous hook-based 'model' offload behaviour.
-        if _video_cfg_bool(model_cfg, 'video_resident_experts', True):
+        # VAE-decode all run on already-resident weights). DEFAULT OFF: a dual-expert
+        # 14B model (Wan2.2-VACE-Fun: transformer + transformer_2, ~10 GB each at
+        # 4-bit) does NOT fit both experts + text encoder + VAE + the activation peak
+        # in 24 GB — resident then leaves transformer_2 on the CPU and the denoise
+        # loop (which needs BOTH experts) OOMs at step 0. 'model' CPU offload keeps
+        # only the active ~7 GB expert resident and swaps, so it fits. Turn this on
+        # (video_resident_experts=true) only on a card big enough to hold both.
+        if _video_cfg_bool(model_cfg, 'video_resident_experts', False):
             print(f"  [pipeline-cache] injected cached components → RESIDENT all-GPU "
                   f"load (video_resident_experts=on; falls back to model offload on OOM)")
             offload = 'resident'
@@ -1481,9 +1517,22 @@ def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str =
                     except Exception as _me:
                         _kept.append(f"{_cn}({str(_me).splitlines()[0][:40]})")
                 if _kept:
-                    print(f"  [resident] components left off-GPU: {', '.join(_kept)}")
-                _report_loaded(pipe, "resident (all components on GPU)")
-                return pipe
+                    # A component could not fit (e.g. transformer_2 on a dual-expert
+                    # model in 24 GB). A half-resident pipe is unusable — the denoise
+                    # loop needs every expert on-GPU and would OOM at step 0 — so this
+                    # is a FAILED load, not a success. Tear the partial pipe down
+                    # thoroughly (its on-GPU components would otherwise stay pinned and
+                    # leak ~10 GB) and fall through to 'model' CPU offload.
+                    print(f"  [resident] components left off-GPU: {', '.join(_kept)} "
+                          f"— resident can't fit this model; freeing partial pipe and "
+                          f"falling back to model CPU offload…")
+                    _free_pipeline_vram(pipe)
+                    pipe = None
+                    _clear_mem()
+                    offload = 'model'
+                else:
+                    _report_loaded(pipe, "resident (all components on GPU)")
+                    return pipe
             except (RuntimeError, MemoryError) as e:
                 if not _is_oom(e):
                     raise
