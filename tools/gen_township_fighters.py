@@ -6719,6 +6719,27 @@ textarea{background:#111;border:1px solid #333;color:#e0e0e0;padding:.35rem .5re
 .pf-thumb-del:hover{background:#c0392b}
 .pf-status{font-size:.76rem;color:#7ed87e;min-height:1.1rem;margin-left:.5rem}
 .pf-actions{display:flex;gap:.5rem;align-items:center;margin-top:.7rem}
+/* ── mobile / narrow screens ─────────────────────────────────────────────── */
+@media (max-width:640px){
+  .container{padding:.8rem}
+  h1{font-size:1.2rem}h2{font-size:1rem}
+  /* nav wraps instead of overflowing; gentler spacing */
+  .nav{padding:.55rem .8rem;gap:.5rem 1rem;flex-wrap:wrap}
+  /* multi-column form grids stack to a single column */
+  .row,.row3,.modal .row2{grid-template-columns:1fr}
+  /* modal must fit a 320px viewport */
+  .modal{min-width:0;width:94%;padding:1rem}
+  /* fixed-width tile cards become full-width so they don't leave dead space */
+  .card[style*="width:230px"],.card[style*="width:215px"]{width:100%!important}
+  /* 16px inputs stop iOS Safari from auto-zooming the page on focus */
+  input[type=text],input[type=number],input[type=url],select,textarea,
+  .modal select,.modal input{font-size:16px}
+  /* roomier, wrap-friendly tap targets */
+  .btn{padding:.55rem 1rem;font-size:.95rem}
+  .pf-actions{flex-wrap:wrap}
+  /* taller log box is awkward on small screens */
+  #log-box{height:240px}
+}
 """
 
     # Shared modal dialog + promise-based helpers (uiConfirm/uiAlert/uiPrompt),
