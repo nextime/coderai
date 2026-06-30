@@ -12,6 +12,14 @@ ARG UV_VERSION=0.7.13
 ARG WHISPERCPP_REF=master
 ARG LLAMA_CPP_PYTHON_VERSION=
 ARG SD_CPP_PYTHON_VERSION=
+# SageAttention (INT8 attention for the diffusers video transformer). Like
+# flash-attn it is CUDA-arch-sensitive, so it is built from source and gated by
+# an ARG; the build is non-fatal (video falls back to flash/SDPA automatically
+# via the attention-backend resolver). Default arch covers RTX 3090 (8.6);
+# override SAGEATTENTION_ARCH for other GPUs (e.g. "8.0;8.6;8.9;9.0").
+ARG BUILD_SAGEATTENTION=1
+ARG SAGEATTENTION_REF=main
+ARG SAGEATTENTION_ARCH=8.6
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -91,6 +99,21 @@ RUN uv pip install --python /opt/coderai/python/bin/python3 \
       --find-links /opt/wheels \
       -r /tmp/requirements-oci.txt \
     && rm -rf /root/.cache/uv /tmp/requirements*.txt
+
+# SageAttention (optional, non-fatal): built against the torch just installed.
+# Needs no-build-isolation so it sees the installed torch; arch list keeps the
+# build small. On any failure the image still works — the video path resolves to
+# flash/SDPA. Set --build-arg BUILD_SAGEATTENTION=0 to skip entirely.
+RUN set -eux; \
+    if [ "${BUILD_SAGEATTENTION}" = "1" ]; then \
+      TORCH_CUDA_ARCH_LIST="${SAGEATTENTION_ARCH}" MAX_JOBS="${MAX_JOBS:-4}" \
+        uv pip install --python /opt/coderai/python/bin/python3 --no-build-isolation \
+        "git+https://github.com/thu-ml/SageAttention.git@${SAGEATTENTION_REF}" \
+      || echo "WARN: SageAttention build failed — video falls back to flash/SDPA"; \
+    else \
+      echo "SageAttention build skipped (BUILD_SAGEATTENTION=${BUILD_SAGEATTENTION})"; \
+    fi; \
+    rm -rf /root/.cache/uv
 
 RUN set -eux; \
     chmod +x /opt/coderai/app/coderai; \

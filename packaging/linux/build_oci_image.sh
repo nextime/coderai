@@ -246,6 +246,12 @@ UBUNTU_VERSION="${UBUNTU_VERSION:-22.04}"
 WHISPERCPP_REF="${WHISPERCPP_REF:-master}"
 LLAMA_CPP_PYTHON_VERSION="${LLAMA_CPP_PYTHON_VERSION:-}"
 SD_CPP_PYTHON_VERSION="${SD_CPP_PYTHON_VERSION:-}"
+# SageAttention (INT8 video attention): built from source (CUDA-arch-sensitive).
+# Default ON for the RTX 3090 arch (8.6); non-fatal in the Dockerfile so a build
+# on another arch/CUDA just falls back to flash/SDPA at runtime.
+BUILD_SAGEATTENTION="${BUILD_SAGEATTENTION:-1}"
+SAGEATTENTION_REF="${SAGEATTENTION_REF:-main}"
+SAGEATTENTION_ARCH="${SAGEATTENTION_ARCH:-8.6}"
 
 write_build_manifest() {
   local mode="$1"
@@ -572,6 +578,9 @@ else
     --build-arg WHISPERCPP_REF="$WHISPERCPP_REF" \
     --build-arg LLAMA_CPP_PYTHON_VERSION="$LLAMA_CPP_PYTHON_VERSION" \
     --build-arg SD_CPP_PYTHON_VERSION="$SD_CPP_PYTHON_VERSION" \
+    --build-arg BUILD_SAGEATTENTION="$BUILD_SAGEATTENTION" \
+    --build-arg SAGEATTENTION_REF="$SAGEATTENTION_REF" \
+    --build-arg SAGEATTENTION_ARCH="$SAGEATTENTION_ARCH" \
     -t "$IMAGE_TAG" \
     "$ROOT_DIR"
 fi
