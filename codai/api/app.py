@@ -365,12 +365,29 @@ async def internal_engine_state():
 async def internal_evict_vram(request: Request):
     """A co-located sibling engine (same GPU) asks this engine to release VRAM it
     can't evict itself — the GGUF-isolation split runs two engines on one NVIDIA
-    card. Evicts all idle (non-busy) models and reports GB freed. Runs in a thread
-    so eviction's blocking CUDA frees don't stall the event loop."""
-    import asyncio
+    card. Evicts all idle (non-busy) models; when the caller passes needed_gb + wait
+    and idle eviction isn't enough, it WAITS for a busy model (e.g. an in-flight
+    video clip) to finish its current unit and evicts it too — a clean cross-engine
+    swap instead of the sibling loading into the render's VRAM and both OOMing. Runs
+    in a thread so eviction's blocking CUDA frees don't stall the event loop."""
+    import asyncio, json as _json
+    try:
+        data = _json.loads((await request.body()) or b"{}") or {}
+    except Exception:
+        data = {}
+    try:
+        needed_gb = float(data.get("needed_gb") or 0.0)
+    except (TypeError, ValueError):
+        needed_gb = 0.0
+    wait = bool(data.get("wait", True))
+    try:
+        wait_timeout = float(data.get("wait_timeout") or 180.0)
+    except (TypeError, ValueError):
+        wait_timeout = 180.0
     try:
         from codai.models.manager import multi_model_manager
-        freed = await asyncio.to_thread(multi_model_manager.release_idle_vram)
+        freed = await asyncio.to_thread(
+            multi_model_manager.release_idle_vram, needed_gb, wait, wait_timeout)
         return {"ok": True, "freed_gb": float(freed)}
     except Exception as e:
         return {"ok": False, "error": str(e), "freed_gb": 0.0}

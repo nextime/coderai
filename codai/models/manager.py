@@ -3752,16 +3752,34 @@ class MultiModelManager:
                   f"Remaining models are busy or VRAM is held elsewhere — the new "
                   f"model will load with CPU/disk offload.")
 
-    def release_idle_vram(self) -> float:
-        """Evict every loaded model that isn't actively serving a request, to free
-        VRAM for a CO-LOCATED sibling engine sharing this GPU (the GGUF-isolation
-        split runs a torch engine and a gguf engine on one NVIDIA card; neither can
-        evict the other's models, so the one needing room asks the other to release
-        via /internal/evict-vram). Returns GB freed. Busy models are left alone."""
+    def release_idle_vram(self, needed_gb: float = 0.0,
+                          wait_for_busy: bool = False,
+                          wait_timeout: float = 180.0) -> float:
+        """Evict loaded models to free VRAM for a CO-LOCATED sibling engine sharing
+        this GPU (the GGUF-isolation split runs a torch engine and a gguf engine on
+        one NVIDIA card; neither can evict the other's models, so the one needing
+        room asks the other to release via /internal/evict-vram). Returns GB freed.
+
+        Pass 1 evicts every IDLE model immediately. Pass 2 — only when the caller
+        passes `needed_gb` and `wait_for_busy` and Pass 1 didn't free enough — WAITS
+        for each still-busy model to reach a safe idle point (between requests, e.g.
+        between video clip parts) and then evicts it too. This is the cross-engine
+        analogue of the local `_wait_until_idle` eviction: it turns a would-be
+        CONTENTION (the sibling loading into VRAM an active render still needs → both
+        OOM) into a CLEAN SWAP (the render's current unit finishes, its model is
+        evicted, the sibling loads alone, and the render reloads + resumes on its
+        next unit). Bounded by `wait_timeout` so two mutually-waiting busy engines
+        can't deadlock — one gives up and falls back to its own offload."""
         before = self._get_free_vram_gb()
+
+        def _freed_enough() -> bool:
+            return needed_gb > 0 and (self._get_free_vram_gb() - before) >= needed_gb
+
+        # Pass 1: evict everything idle right now (cheap, non-blocking).
+        _busy = []
         for key in list(self._lru_order()):
             if self._is_key_busy(key):
-                print(f"  [cosite-evict] '{key}' is busy — not releasing")
+                _busy.append(key)
                 continue
             try:
                 print(f"  [cosite-evict] releasing '{key}' for a co-located engine")
@@ -3770,6 +3788,37 @@ class MultiModelManager:
                     self.active_in_vram = None
             except Exception as e:
                 print(f"  [cosite-evict] failed to release '{key}': {e}")
+
+        # Pass 2: for a sibling that will otherwise OOM, wait for busy models to go
+        # idle at their next request boundary, then evict — a clean cross-engine swap.
+        if wait_for_busy and _busy and not _freed_enough():
+            import time as _time
+            _deadline = _time.time() + max(0.0, wait_timeout)
+            for key in _busy:
+                if _freed_enough():
+                    break
+                if key not in self.models and key not in self.model_pools:
+                    continue  # already gone
+                _remaining = _deadline - _time.time()
+                if _remaining <= 0:
+                    print(f"  [cosite-evict] wait budget exhausted — leaving '{key}' "
+                          f"busy (sibling will fall back to its own offload)")
+                    break
+                print(f"  [cosite-evict] '{key}' busy — waiting up to {_remaining:.0f}s "
+                      f"for it to finish its current unit, then releasing (clean swap)…")
+                if self._wait_until_idle(key, timeout=_remaining):
+                    try:
+                        print(f"  [cosite-evict] releasing now-idle '{key}' for a "
+                              f"co-located engine")
+                        self._evict_one(key)
+                        if key == self.active_in_vram:
+                            self.active_in_vram = None
+                    except Exception as e:
+                        print(f"  [cosite-evict] failed to release '{key}': {e}")
+                else:
+                    print(f"  [cosite-evict] '{key}' still busy after wait — leaving it "
+                          f"loaded")
+
         after = self._get_free_vram_gb()
         return max(0.0, after - before)
 

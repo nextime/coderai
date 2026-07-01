@@ -758,14 +758,23 @@ def main():
         _itok = os.environ.get("CODERAI_INTERNAL_TOKEN")
 
         def _cosite_vram_releaser(needed_gb: float) -> float:
+            # Ask each co-located sibling to free `needed_gb`, WAITING for a busy
+            # model (e.g. an in-flight video clip) to finish its current unit and be
+            # evicted — a clean cross-engine swap rather than loading into the
+            # render's VRAM and both OOMing. The HTTP timeout must exceed the
+            # sibling's wait budget (a video clip part can run ~2.5 min) so the wait
+            # isn't cut short; on true timeout the sibling gives up and we fall back
+            # to our own offload.
             import httpx as _httpx
+            _wait_budget = 180.0
             total = 0.0
             for _u in _cosited:
                 try:
                     _r = _httpx.post(f"{_u}/internal/evict-vram",
-                                     json={"needed_gb": needed_gb},
+                                     json={"needed_gb": needed_gb, "wait": True,
+                                           "wait_timeout": _wait_budget},
                                      headers={"x-coderai-internal": _itok or ""},
-                                     timeout=180.0)
+                                     timeout=_wait_budget + 30.0)
                     if _r.status_code == 200:
                         total += float((_r.json() or {}).get("freed_gb") or 0.0)
                 except Exception as _e:
