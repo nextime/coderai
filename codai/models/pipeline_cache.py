@@ -106,6 +106,35 @@ def _marker(p: str) -> str:
     return os.path.join(p, ".coderai_pipeline_cache.json")
 
 
+def _first_bad_json(d: str) -> Optional[str]:
+    """Return the path of the first empty/unparseable ``.json`` under ``d``, or None
+    if every JSON is intact.
+
+    The completion markers only prove a save *finished*, not that every file landed
+    intact — a transient truncated write (e.g. a 0-byte ``tokenizer_config.json``)
+    slips into an otherwise "valid" cache and then throws JSONDecodeError on EVERY
+    subsequent load, knocking the video pipeline off its fast path into the offload
+    fallback ladder (and a VRAM leak). Checking the small JSONs is cheap (they're
+    KBs; the big weights are ``.safetensors``, not scanned) and turns a poisoned
+    cache into a clean rebuild instead of a death spiral."""
+    try:
+        for root, _, files in os.walk(d):
+            for fn in files:
+                if not fn.endswith(".json"):
+                    continue
+                fp = os.path.join(root, fn)
+                try:
+                    if os.path.getsize(fp) == 0:
+                        return fp
+                    with open(fp) as f:
+                        json.load(f)
+                except Exception:
+                    return fp
+    except Exception:
+        return None
+    return None
+
+
 def valid(p: str) -> bool:
     """True if a complete, current cache exists at ``p`` and rebuild wasn't forced."""
     if not p or _force_rebuild():
@@ -115,7 +144,15 @@ def valid(p: str) -> bool:
             return False
         with open(_marker(p)) as f:
             meta = json.load(f)
-        return meta.get("version") == _CACHE_VERSION and meta.get("complete") is True
+        if not (meta.get("version") == _CACHE_VERSION and meta.get("complete") is True):
+            return False
+        bad = _first_bad_json(p)
+        if bad:
+            print(f"  [pipeline-cache] cache {os.path.basename(p)} has a corrupt JSON "
+                  f"({os.path.relpath(bad, p)}) — invalidating so it rebuilds clean")
+            invalidate_path(p)
+            return False
+        return True
     except Exception:
         return False
 
@@ -143,6 +180,11 @@ def mark_monolithic_complete(model_name: str, model_cfg: Optional[dict]) -> bool
     try:
         p = path(model_name, model_cfg)
         if not os.path.isfile(os.path.join(p, "model_index.json")):
+            return False
+        _bad = _first_bad_json(p)
+        if _bad:
+            print(f"  [pipeline-cache] NOT finalizing {os.path.basename(p)}: corrupt "
+                  f"JSON ({os.path.relpath(_bad, p)}) — leaving incremental, will rebuild")
             return False
         with open(_marker(p), "w") as f:
             json.dump({
@@ -175,9 +217,17 @@ def component_valid(model_name: str, model_cfg: Optional[dict], comp: str) -> bo
             return False
         with open(_component_marker(cdir)) as f:
             meta = json.load(f)
-        return (meta.get("version") == _CACHE_VERSION
+        if not (meta.get("version") == _CACHE_VERSION
                 and meta.get("complete") is True
-                and meta.get("signature") == _signature(model_name, model_cfg))
+                and meta.get("signature") == _signature(model_name, model_cfg)):
+            return False
+        bad = _first_bad_json(cdir)
+        if bad:
+            print(f"  [pipeline-cache] component '{comp}' has a corrupt JSON "
+                  f"({os.path.basename(bad)}) — invalidating so it rebuilds clean")
+            invalidate_path(cdir)
+            return False
+        return True
     except Exception:
         return False
 
@@ -201,6 +251,9 @@ def save_component(comp_obj, model_name: str, model_cfg: Optional[dict], comp: s
         print(f"  [pipeline-cache] caching component '{comp}' → {cdir}")
         t0 = time.time()
         comp_obj.save_pretrained(tmp)
+        _bad = _first_bad_json(tmp)
+        if _bad:
+            raise ValueError(f"save produced a corrupt JSON ({os.path.basename(_bad)})")
         with open(_component_marker(tmp), "w") as f:
             json.dump({
                 "version": _CACHE_VERSION, "complete": True,
@@ -236,14 +289,22 @@ def _dir_size(d: str) -> int:
     return total
 
 
+def invalidate_path(p: str) -> None:
+    """Delete a cache dir by path (best-effort). Used when a poisoned/corrupt cache
+    is detected during validation."""
+    try:
+        if p and os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True)
+            print(f"  [pipeline-cache] invalidated {p}")
+    except Exception:
+        pass
+
+
 def invalidate(model_name: str, model_cfg: Optional[dict]) -> None:
     """Delete a model's cache dir (e.g. after a failed cache load) so the next
     build rewrites it. Best-effort."""
     try:
-        p = path(model_name, model_cfg)
-        if p and os.path.isdir(p):
-            shutil.rmtree(p, ignore_errors=True)
-            print(f"  [pipeline-cache] invalidated {p}")
+        invalidate_path(path(model_name, model_cfg))
     except Exception:
         pass
 
@@ -313,6 +374,9 @@ def save(pipe, p: str, *, model_name: str = "", model_cfg: Optional[dict] = None
         print(f"  [pipeline-cache] saving quantized pipeline → {p}")
         t0 = time.time()
         pipe.save_pretrained(tmp)
+        _bad = _first_bad_json(tmp)
+        if _bad:
+            raise ValueError(f"save produced a corrupt JSON ({os.path.relpath(_bad, tmp)})")
         with open(_marker(tmp), "w") as f:
             json.dump({
                 "version": _CACHE_VERSION, "complete": True,
