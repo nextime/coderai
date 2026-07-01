@@ -92,6 +92,11 @@ class FrontProxy:
         # Front-managed generation queue: admission control + ordering + queue
         # position, sized per-model to max_instances so the engine never queues.
         self.reqqueue = FrontQueue()
+        # Per-shared-GPU model-swap scheduler (GGUF-isolation split): serialize which
+        # model owns a shared card so two forwards never contend for VRAM, batching
+        # same-model requests before swapping. Keyed by the engines' shared-GPU
+        # selector; created lazily for engines that actually have a co-located sibling.
+        self._swap_gates = {}
         # Recent inference activity (front-tracked, since the front relays every
         # request) so the Overview dashboard's activity table is served natively
         # without asking the engine. Newest first; bounded.
@@ -322,6 +327,12 @@ class FrontProxy:
         # Signed with the internal token; the engine accepts it only if it matches.
         if self.internal_token:
             send_headers["x-coderai-broker-authed"] = self.internal_token
+        # Shared-GPU swap gate (all inference kinds): wait out any in-flight swap on
+        # a shared card so this request doesn't contend for VRAM.
+        try:
+            _swap_tok = await self._swap_acquire(engine, model, path, method)
+        except Exception:
+            _swap_tok = None
         # Front-managed generation queue (text only) — same per-model gate as the
         # direct proxy path, so brokered and direct requests share one queue.
         _qkey = None
@@ -334,6 +345,7 @@ class FrontProxy:
                     rid=engine.name + ":" + (model or ""), model=model or "",
                     engine=engine.name)
             except QueueFull:
+                await self._swap_release(_swap_tok)
                 return {"status_code": 503,
                         "headers": {"content-type": "application/json"},
                         "body": b'{"error":"Server busy: the generation queue is '
@@ -379,6 +391,7 @@ class FrontProxy:
             engine.exit_request(_rid)
             if _qkey is not None:
                 await self.reqqueue.release(_qkey)
+            await self._swap_release(_swap_tok)
             if _router.is_inference_path(path):
                 self._record_activity(model, self._task_kind(path), _status, _started)
         # Surface the engine's actual reply so a brokered request that "doesn't get
@@ -460,6 +473,10 @@ class FrontProxy:
                         if k.lower() not in _DROP_REQ}
         if self.internal_token:
             send_headers["x-coderai-broker-authed"] = self.internal_token
+        try:
+            _swap_tok = await self._swap_acquire(engine, model, path, method)
+        except Exception:
+            _swap_tok = None
         _qkey = None
         if (method.upper() == "POST" and _is_infer
                 and self._task_kind(path) == "text"):
@@ -470,6 +487,7 @@ class FrontProxy:
                     rid=engine.name + ":" + (model or ""), model=model or "",
                     engine=engine.name)
             except QueueFull:
+                await self._swap_release(_swap_tok)
                 yield ('data: {"error":"Server busy: the generation queue is full, '
                        'please retry shortly."}\n\n')
                 return
@@ -547,6 +565,7 @@ class FrontProxy:
             engine.exit_request(_rid)
             if _qkey is not None:
                 await self.reqqueue.release(_qkey)
+            await self._swap_release(_swap_tok)
             if _is_infer:
                 self._record_activity(model, self._task_kind(path), _status, _started)
 
@@ -641,6 +660,60 @@ class FrontProxy:
         the same model shares one gate), else the raw model string."""
         info = self._model_info(model)
         return (info.get("model_id") or model or "").lower()
+
+    def _swap_cap(self) -> int:
+        try:
+            return int(getattr(self.config.server, "gpu_swap_batch", 10) or 10)
+        except Exception:
+            return 10
+
+    def _swap_gate_for(self, engine):
+        """Return the shared-GPU model-swap gate for `engine`, or None when it isn't
+        on a shared card (nothing to serialize). Co-location is the same signal the
+        supervisor uses for cross-engine VRAM release: an engine with a co-located
+        sibling carries CODERAI_COSITED_URLS; engines sharing a card have the same
+        CODERAI_ENGINE_GPUS selector, which keys the gate so both share one."""
+        try:
+            if engine is None or getattr(engine, "role", "engine") == "system":
+                return None
+            env = getattr(engine, "env", None) or {}
+            if not env.get("CODERAI_COSITED_URLS"):
+                return None  # no sibling on this card → no cross-engine contention
+            gkey = env.get("CODERAI_ENGINE_GPUS") or getattr(engine, "url", "") or "shared"
+            gate = self._swap_gates.get(gkey)
+            if gate is None:
+                from codai.frontproxy.reqqueue import GpuSwapGate
+                gate = GpuSwapGate(cap=self._swap_cap())
+                self._swap_gates[gkey] = gate
+            return gate
+        except Exception:
+            return None
+
+    def _swap_owner_key(self, engine, model: Optional[str]) -> str:
+        """The model identity that determines GPU residency for the swap gate. Same
+        model → same owner (runs free); different model → a swap. Falls back to the
+        engine name for inference without an explicit model."""
+        return self._queue_key(model) or getattr(engine, "name", "") or "?"
+
+    async def _swap_acquire(self, engine, model, path, method):
+        """Acquire this engine's shared-GPU swap slot for a GPU-inference request.
+        Returns a (gate, key) token for _swap_release, or None when no gate applies
+        (single-card engine or non-inference request)."""
+        if str(method).upper() != "POST" or not _router.is_inference_path(path):
+            return None
+        gate = self._swap_gate_for(engine)
+        if gate is None:
+            return None
+        key = self._swap_owner_key(engine, model)
+        await gate.acquire(key)
+        return (gate, key)
+
+    async def _swap_release(self, token) -> None:
+        if token is not None:
+            try:
+                await token[0].release(token[1])
+            except Exception:
+                pass
 
     def _model_capacity(self, model: Optional[str]) -> int:
         """Per-model concurrency = its max_instances, falling back to the global
@@ -1270,7 +1343,23 @@ class FrontProxy:
             _status = 502
             _started = _t.time()
             rp_resp = None
+            _swap_tok = None
+            _swap_acq = None
             try:
+                # 0. Shared-GPU swap gate: if a different model owns the card, wait
+                #    for the swap (keepalive so the client doesn't time out).
+                _gate = self._swap_gate_for(engine)
+                if _gate is not None:
+                    _skey = self._swap_owner_key(engine, model)
+                    _swap_acq = _asyncio.ensure_future(_gate.acquire(_skey))
+                    while True:
+                        try:
+                            await _asyncio.wait_for(_asyncio.shield(_swap_acq),
+                                                    timeout=_KA)
+                            _swap_tok = (_gate, _skey)
+                            break
+                        except _asyncio.TimeoutError:
+                            yield _ka("waiting for GPU (another model is finishing)")
                 # 1. Front per-model queue slot (text only) — keepalive while waiting.
                 if is_text:
                     _qkey = self._queue_key(model)
@@ -1355,6 +1444,10 @@ class FrontProxy:
                         await self.reqqueue.release(_qkey)
                     except Exception:
                         pass
+                # Release / cancel the shared-GPU swap slot.
+                if _swap_acq is not None and not _swap_acq.done():
+                    _swap_acq.cancel()
+                await self._swap_release(_swap_tok)
                 if _router.is_inference_path(path):
                     self._record_activity(model, self._task_kind(path), _status, _started)
 
@@ -1671,6 +1764,13 @@ class FrontProxy:
         headers = self._filter_headers(request.headers, _DROP_REQ)
         content = body_bytes if body_bytes is not None else request.stream()
 
+        # Shared-GPU swap gate (all inference kinds, incl. image/video): wait for the
+        # card if a different model currently owns it, so this forward never contends.
+        try:
+            _swap_tok = await self._swap_acquire(engine, model, path, method)
+        except Exception:
+            _swap_tok = None
+
         rp_req = self._long.build_request(
             method, url, headers=headers, params=request.query_params,
             content=content)
@@ -1689,6 +1789,7 @@ class FrontProxy:
             engine.exit_request(_rid)
             if _qkey is not None:
                 await self.reqqueue.release(_qkey)
+            await self._swap_release(_swap_tok)
             return JSONResponse(
                 {"error": f"Engine#{engine.id} unreachable: {exc}"}, status_code=502)
 
@@ -1699,6 +1800,7 @@ class FrontProxy:
                 engine.exit_request(_rid)
                 if _qkey is not None:
                     await self.reqqueue.release(_qkey)
+                await self._swap_release(_swap_tok)
                 if _meta is not None:
                     self._record_activity(model, self._task_kind(path),
                                           rp_resp.status_code, _started)

@@ -52,6 +52,11 @@ class ServerConfig:
                                         # generous enough that a GIL-busy engine's
                                         # health poll doesn't time out mid-generation
     proxy_max_inflight: int = 64        # max concurrent proxied requests through the front
+    gpu_swap_batch: int = 10            # on a shared GPU (GGUF-isolation split), serve up to
+                                        # this many requests for the model that currently owns
+                                        # the card before swapping to a queued different model
+                                        # (then round-robin back). Prevents cross-engine VRAM
+                                        # contention while avoiding per-request model thrash.
     engine_restart_drain_grace: float = 30.0  # on engine restart, wait this many seconds
                                               # for in-flight requests to finish before
                                               # killing the process (0 = bounce immediately)
@@ -659,6 +664,7 @@ class ConfigManager:
                 "engine_gpus": self.config.server.engine_gpus,
                 "proxy_status_timeout": self.config.server.proxy_status_timeout,
                 "proxy_max_inflight": self.config.server.proxy_max_inflight,
+                "gpu_swap_batch": self.config.server.gpu_swap_batch,
                 "engine_restart_drain_grace": self.config.server.engine_restart_drain_grace,
                 "isolate_gguf_engine": self.config.server.isolate_gguf_engine,
                 "engine_specs": self.config.server.engine_specs,
