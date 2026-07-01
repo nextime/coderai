@@ -157,55 +157,69 @@ class GpuSwapGate:
     model identity that determines residency. Cancelling a pending acquire (client
     disconnect) drops the waiter with no slot leak."""
 
-    def __init__(self, cap: int = 10):
-        self._lock = asyncio.Lock()
+    def __init__(self, cap: int = 10, log=None):
+        # NO asyncio.Lock on purpose: every critical section below is straight-line
+        # (no `await` between reading and writing state), so under asyncio's single
+        # thread they are already atomic. Crucially this makes release()/_pump()
+        # SYNCHRONOUS and therefore uncancellable — a request cancelled mid-flight
+        # (client disconnect / interrupt) still frees its slot from a `finally`,
+        # instead of an `await release()` being cancelled before it decrements the
+        # counter and permanently stranding a slot (→ a queued swap never fires).
         self.cap = max(1, int(cap))
         self._owner = None      # model key currently allowed to run GPU work
         self._running = 0       # in-flight granted requests (all for _owner)
         self._served = 0        # grants since _owner took the GPU (batch-cap counter)
         self._waiters = []      # FIFO list[_SwapWaiter]
+        self._log = log
 
     def _other_waiting(self) -> bool:
         return any(w.key != self._owner for w in self._waiters)
 
     async def acquire(self, key) -> None:
-        async with self._lock:
-            if self._owner is None:
-                self._owner = key
-                self._served = 0
-            # Fast path: the resident model, unless its batch cap is spent AND a
-            # different model is waiting (then it must yield — fall through to queue).
-            if key == self._owner and (self._served < self.cap
-                                       or not self._other_waiting()):
-                self._running += 1
-                self._served += 1
-                return
-            w = _SwapWaiter(key)
-            self._waiters.append(w)
-            # If the GPU is idle right now nothing will pump this waiter later, so
-            # process it immediately (may swap the owner to `key`).
-            if self._running == 0:
-                self._pump()
+        if self._owner is None:
+            self._owner = key
+            self._served = 0
+        # Fast path: the resident model, unless its batch cap is spent AND a
+        # different model is waiting (then it must yield — fall through to queue).
+        if key == self._owner and (self._served < self.cap
+                                   or not self._other_waiting()):
+            self._running += 1
+            self._served += 1
+            return
+        w = _SwapWaiter(key)
+        self._waiters.append(w)
+        if self._log:
+            try:
+                self._log(f"[gpu-swap] queued {key!r} behind owner {self._owner!r} "
+                          f"(running={self._running}, served={self._served}/{self.cap}, "
+                          f"waiting={len(self._waiters)})")
+            except Exception:
+                pass
+        # If the GPU is idle right now nothing will pump this waiter later, so
+        # process it immediately (may swap the owner to `key`).
+        if self._running == 0:
+            self._pump()
         try:
             await w.event.wait()
         except BaseException:
-            # Cancelled/errored while queued OR just after being granted.
-            async with self._lock:
-                if w in self._waiters:
-                    self._waiters.remove(w)             # never held a slot
-                elif w.granted:
-                    self._running -= 1                  # granted as we cancelled
-                    if self._running <= 0:
-                        self._running = 0
-                        self._pump()
+            # Cancelled/errored while queued OR just after being granted. Synchronous
+            # cleanup (no await) so it always runs to completion even under cancel.
+            if w in self._waiters:
+                self._waiters.remove(w)                 # never held a slot
+            elif w.granted:
+                self._running -= 1                      # granted as we cancelled
+                if self._running <= 0:
+                    self._running = 0
+                    self._pump()
             raise
 
-    async def release(self, key) -> None:
-        async with self._lock:
-            self._running -= 1
-            if self._running <= 0:
-                self._running = 0
-                self._pump()
+    def release(self, key) -> None:
+        """SYNCHRONOUS — safe to call from a `finally` even while the surrounding
+        coroutine is being cancelled (no await to interrupt)."""
+        self._running -= 1
+        if self._running <= 0:
+            self._running = 0
+            self._pump()
 
     def _grant(self, w: "_SwapWaiter") -> None:
         self._waiters.remove(w)
@@ -215,6 +229,12 @@ class GpuSwapGate:
         w.event.set()
 
     def _swap_to(self, key) -> None:
+        if self._log and key != self._owner:
+            try:
+                self._log(f"[gpu-swap] swapping GPU owner {self._owner!r} -> {key!r} "
+                          f"(waiting={len(self._waiters)})")
+            except Exception:
+                pass
         self._owner = key
         self._served = 0
         for w in [x for x in self._waiters if x.key == key]:

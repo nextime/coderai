@@ -345,7 +345,7 @@ class FrontProxy:
                     rid=engine.name + ":" + (model or ""), model=model or "",
                     engine=engine.name)
             except QueueFull:
-                await self._swap_release(_swap_tok)
+                self._swap_release(_swap_tok)
                 return {"status_code": 503,
                         "headers": {"content-type": "application/json"},
                         "body": b'{"error":"Server busy: the generation queue is '
@@ -391,7 +391,7 @@ class FrontProxy:
             engine.exit_request(_rid)
             if _qkey is not None:
                 await self.reqqueue.release(_qkey)
-            await self._swap_release(_swap_tok)
+            self._swap_release(_swap_tok)
             if _router.is_inference_path(path):
                 self._record_activity(model, self._task_kind(path), _status, _started)
         # Surface the engine's actual reply so a brokered request that "doesn't get
@@ -487,7 +487,7 @@ class FrontProxy:
                     rid=engine.name + ":" + (model or ""), model=model or "",
                     engine=engine.name)
             except QueueFull:
-                await self._swap_release(_swap_tok)
+                self._swap_release(_swap_tok)
                 yield ('data: {"error":"Server busy: the generation queue is full, '
                        'please retry shortly."}\n\n')
                 return
@@ -565,7 +565,7 @@ class FrontProxy:
             engine.exit_request(_rid)
             if _qkey is not None:
                 await self.reqqueue.release(_qkey)
-            await self._swap_release(_swap_tok)
+            self._swap_release(_swap_tok)
             if _is_infer:
                 self._record_activity(model, self._task_kind(path), _status, _started)
 
@@ -683,7 +683,9 @@ class FrontProxy:
             gate = self._swap_gates.get(gkey)
             if gate is None:
                 from codai.frontproxy.reqqueue import GpuSwapGate
-                gate = GpuSwapGate(cap=self._swap_cap())
+                gate = GpuSwapGate(
+                    cap=self._swap_cap(),
+                    log=lambda m: print("[front] " + m, flush=True))
                 self._swap_gates[gkey] = gate
             return gate
         except Exception:
@@ -708,10 +710,14 @@ class FrontProxy:
         await gate.acquire(key)
         return (gate, key)
 
-    async def _swap_release(self, token) -> None:
+    def _swap_release(self, token) -> None:
+        """Synchronous on purpose: called from `finally` blocks that may run while
+        the request coroutine is being cancelled — a sync release always completes
+        and frees the slot, where an awaited one could be cancelled mid-way and
+        strand the slot (blocking every queued swap behind it)."""
         if token is not None:
             try:
-                await token[0].release(token[1])
+                token[0].release(token[1])
             except Exception:
                 pass
 
@@ -1447,7 +1453,7 @@ class FrontProxy:
                 # Release / cancel the shared-GPU swap slot.
                 if _swap_acq is not None and not _swap_acq.done():
                     _swap_acq.cancel()
-                await self._swap_release(_swap_tok)
+                self._swap_release(_swap_tok)
                 if _router.is_inference_path(path):
                     self._record_activity(model, self._task_kind(path), _status, _started)
 
@@ -1789,7 +1795,7 @@ class FrontProxy:
             engine.exit_request(_rid)
             if _qkey is not None:
                 await self.reqqueue.release(_qkey)
-            await self._swap_release(_swap_tok)
+            self._swap_release(_swap_tok)
             return JSONResponse(
                 {"error": f"Engine#{engine.id} unreachable: {exc}"}, status_code=502)
 
@@ -1800,7 +1806,7 @@ class FrontProxy:
                 engine.exit_request(_rid)
                 if _qkey is not None:
                     await self.reqqueue.release(_qkey)
-                await self._swap_release(_swap_tok)
+                self._swap_release(_swap_tok)
                 if _meta is not None:
                     self._record_activity(model, self._task_kind(path),
                                           rp_resp.status_code, _started)
