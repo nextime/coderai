@@ -999,6 +999,11 @@ def _train_lora_sync(req: LoraTrainRequest) -> dict:
         try:
             from codai.models.manager import multi_model_manager
             multi_model_manager.unload_all_models()
+            # Also release any co-located sibling engine's model (shared-GPU split):
+            # training needs the whole card and the swap-gate doesn't cover it.
+            _freed = multi_model_manager.evict_cosited_siblings()
+            if _freed:
+                print(f"  [lora] freed {_freed:.1f} GB from co-located engine(s) for training")
         except Exception as e:
             print(f"  [lora] could not unload models before training: {e}")
         device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
@@ -1041,6 +1046,13 @@ def _train_lora_sync(req: LoraTrainRequest) -> dict:
     try:
         from codai.models.manager import multi_model_manager
         multi_model_manager.unload_all_models()
+        # Also release any co-located sibling engine's model (shared-GPU split):
+        # unload_all_models() only frees THIS engine; a sibling's resident model
+        # (e.g. the gguf text engine) would otherwise share the card and OOM
+        # training. The swap-gate doesn't cover training, so evict explicitly.
+        _freed = multi_model_manager.evict_cosited_siblings()
+        if _freed:
+            print(f"  [lora] freed {_freed:.1f} GB from co-located engine(s) for training")
     except Exception as e:
         print(f"  [lora] could not unload models before training: {e}")
 

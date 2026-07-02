@@ -867,6 +867,27 @@ class MultiModelManager:
         if callable(fn) and fn not in self._external_vram_releasers:
             self._external_vram_releasers.append(fn)
 
+    def evict_cosited_siblings(self, needed_gb: float = 999.0) -> float:
+        """Ask co-located sibling engines (a shared GPU) to release their VRAM.
+
+        `unload_all_models()` only frees THIS engine's models; a sibling engine on
+        the same card (the GGUF-isolation split) keeps its own model resident and
+        can't be evicted locally. Before an EXCLUSIVE GPU operation that needs the
+        whole card — LoRA training especially, which the front swap-gate doesn't
+        cover — call this so the sibling's model is released too (otherwise training
+        + a resident text model exceed VRAM and OOM). `needed_gb` defaults high so
+        the sibling frees everything it can; it waits for a busy sibling to reach a
+        safe point (the cosite releaser posts wait=True). Returns GB siblings freed."""
+        total = 0.0
+        for _rel in list(self._external_vram_releasers):
+            try:
+                freed = _rel(needed_gb)
+                if freed:
+                    total += float(freed)
+            except Exception as e:
+                print(f"  Warning in external VRAM releaser: {e}")
+        return total
+
     @staticmethod
     def _is_cuda_context_fatal(err: Exception) -> bool:
         """True for CUDA errors that corrupt the whole process context."""
