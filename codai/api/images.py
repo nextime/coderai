@@ -385,6 +385,25 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
         dtype = torch.float16  # Use fp16 to maximize VRAM efficiency
         print(f"--no-ram mode: Using precision fp16 for maximum VRAM efficiency")
     else:
+        # A quantized checkpoint — pre-quantized (bnb 4/8-bit, fp8, nf4, gptq, awq;
+        # e.g. Z-Image-Turbo-unsloth-bnb-4bit) or runtime-quantized via config —
+        # dequantizes to a HALF compute dtype, and modern diffusion transformers use
+        # FlashAttention, which only supports fp16/bf16. Loading such a model at the
+        # f32 default both wastes VRAM and crashes generation with "FlashAttention
+        # only support fp16 and bf16 data type". When precision was left at f32 for a
+        # quantized model, use bf16 instead.
+        if dtype == torch.float32:
+            _name_l = (model_name or '').lower()
+            _prequant = any(t in _name_l for t in (
+                'bnb-4bit', 'bnb_4bit', '-4bit', '_4bit', '4bit', '8bit', 'fp8',
+                'int4', 'int8', 'nf4', 'gptq', 'awq'))
+            _cfg_quant = bool(_cfg('load_in_4bit') or _cfg('load_in_8bit')
+                              or _cfg('component_quantization'))
+            if _prequant or _cfg_quant:
+                print("  [image] quantized model with f32 precision → using bf16 "
+                      "(f32 breaks FlashAttention and defeats quantization)")
+                dtype = torch.bfloat16
+                precision = 'bf16'
         print(f"Using precision: {precision} ({dtype})")
     
     # CPU offload comes from the per-model configuration: an explicit
