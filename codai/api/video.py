@@ -754,6 +754,18 @@ def _free_pipeline_vram(pipe) -> None:
                         _c.reset_attention_backend()
                     except Exception:
                         pass
+            # reset_attention_backend() clears per-processor backends but NOT the
+            # process-wide active backend that set_attention_backend() flipped to
+            # flash — restore the env default so it can't leak to a later image
+            # model (Z-Image's masked attention rejects flash-attn 2).
+            try:
+                from diffusers.models.attention_dispatch import (
+                    _AttentionBackendRegistry, AttentionBackendName)
+                from diffusers.utils.constants import DIFFUSERS_ATTN_BACKEND
+                _AttentionBackendRegistry.set_active_backend(
+                    AttentionBackendName(DIFFUSERS_ATTN_BACKEND))
+            except Exception:
+                pass
             try:
                 _unload_video_loras(pipe)
             except Exception:

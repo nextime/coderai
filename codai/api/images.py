@@ -967,6 +967,23 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
         except Exception as _ip_err:
             print(f"Warning: IP-Adapter injection failed ({_ip_err}), continuing without character refs")
 
+    # Reset the diffusers GLOBAL attention backend to the environment default
+    # (native/SDPA) before generating. diffusers' Model.set_attention_backend()
+    # ALSO flips a process-wide active backend, and the video path sets it to
+    # flash-attn — which then leaks to image transformers that don't set their own
+    # (e.g. Z-Image passes backend=None → uses the global) and crashes with
+    # "`attn_mask` is not supported for flash-attn 2". Image + video share the
+    # engine process, so restore the default here so masked image attention (SDPA)
+    # always works. Cheap + idempotent; no-op if diffusers lacks the dispatcher.
+    try:
+        from diffusers.models.attention_dispatch import (
+            _AttentionBackendRegistry, AttentionBackendName)
+        from diffusers.utils.constants import DIFFUSERS_ATTN_BACKEND
+        _AttentionBackendRegistry.set_active_backend(
+            AttentionBackendName(DIFFUSERS_ATTN_BACKEND))
+    except Exception:
+        pass
+
     try:
         result = await asyncio.to_thread(pipeline, **call_kwargs)
     except TaskCancelled:
