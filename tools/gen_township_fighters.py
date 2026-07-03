@@ -1697,6 +1697,87 @@ def resolve_fighters(client: CoderAIClient, args, out_dir: Path) -> list:
     return None   # signal to stage_characters to generate
 
 
+def _invent_profiles(client: CoderAIClient, text_model: Optional[str], out_dir: Path,
+                     kind: str, count: int, *, role: str = "fighter",
+                     include_female: bool = False, existing=None, log=_log) -> list:
+    """PROMPT phase: invent `count` FRESH profiles from scratch via the text model
+    and save each one's metadata locally (no images yet). Returns the list of
+    profile dicts (name/region/gender?/description/prompt) for the image phase.
+
+    Generating from scratch requires a text model; only if none is configured does
+    it fall back to the built-in static pool (a clear warning is logged)."""
+    taken = set(existing or [])
+    profiles = []
+    use_llm = bool(client and text_model)
+    if not use_llm:
+        log(f"  ⚠ No text model configured — cannot invent {kind}s from scratch; "
+            f"using the built-in pool prompts as a fallback.")
+    _pool = ENVIRONMENT_POOL if kind == "environment" else FIGHTER_POOL
+    for i in range(1, max(1, int(count)) + 1):
+        if use_llm:
+            p = _autogen_profile_payload(client, text_model, kind, role, taken)
+        else:
+            _avail = [s for s in _pool if s["name"] not in taken
+                      and (kind == "environment" or include_female
+                           or s.get("gender", "male") == "male")]
+            base = random.choice(_avail or _pool)
+            p = {"name": _unique_name(base["name"], taken), "region": base["region"],
+                 "description": base["description"], "prompt": base["prompt"]}
+            if kind != "environment":
+                p["gender"] = base.get("gender", "male")
+        nm = p.get("name")
+        if not nm:
+            continue
+        taken.add(nm)
+        meta = {"name": nm, "region": p.get("region", ""),
+                "description": p.get("description", ""), "prompt": p.get("prompt", "")}
+        if kind != "environment":
+            meta["gender"] = p.get("gender", "male")
+        _save_profile_locally(out_dir, kind, nm, meta, [])  # metadata only, no images yet
+        profiles.append(p)
+        log(f"  [{i}/{count}] invented {kind} '{nm}'  ({p.get('region','')})")
+        log(f"    description: {p.get('description','')}")
+        log(f"    prompt: {p.get('prompt','')}")
+    return profiles
+
+
+def _render_profile_images(client: CoderAIClient, image_model: str, out_dir: Path,
+                           kind: str, profiles: list, n_refs: int, log=_log) -> list:
+    """IMAGE phase: render reference images for already-invented profiles (using
+    their saved prompt). Returns the list of names that succeeded."""
+    done, failed = [], []
+    _gen = client.generate_environment if kind == "environment" else client.generate_character
+    _default_refs = 3 if kind == "environment" else 4
+    for i, p in enumerate(profiles or [], 1):
+        name = p.get("name")
+        if not name:
+            continue
+        log(f"\n  [{i}/{len(profiles)}] {name}  ({p.get('region','')})")
+        try:
+            kw = dict(name=name, prompt=p.get("prompt", ""),
+                      description=p.get("description", ""), model=image_model,
+                      n=max(1, int(n_refs or _default_refs)), poll_fn=client.image_progress)
+            if kind == "environment":
+                kw["size"] = "768x512"
+            d = _run_with_spinner(f"generating {kind} '{name}'", _gen, **kw)
+            log(f"    ✓ {d.get('image_count', '?')} reference images saved in CoderAI")
+            images = client.fetch_profile_images(kind, name)
+            if images:
+                meta = {"name": name, "region": p.get("region", ""),
+                        "description": p.get("description", ""),
+                        "prompt": p.get("prompt", "")}
+                if kind != "environment":
+                    meta["gender"] = p.get("gender", "male")
+                _save_profile_locally(out_dir, kind, name, meta, images)
+            done.append(name)
+        except Exception as e:
+            log(f"    ✗ FAILED: {e}")
+            failed.append(name)
+    log(f"\n  {kind.capitalize()} images: {len(done)} ok, {len(failed)} failed"
+        + (f" ({', '.join(failed)})" if failed else ""))
+    return done
+
+
 def stage_characters(client: CoderAIClient, image_model: str, out_dir: Path,
                      region_filter: Optional[str] = None,
                      include_female: bool = False,
@@ -11033,7 +11114,11 @@ async function resetPrompts(ev){
         consistency = parse_consistency(getattr(args, "consistency", "keyframe"))
         _web_log(f"  Consistency strategy: {', '.join(sorted(consistency))}")
 
+        # Character + environment profiles. The reuse/skip branches resolve names
+        # directly; a fresh GENERATE run is deferred to the phased block below so
+        # ALL prompts are invented (from scratch) first, THEN all reference images.
         char_names = None
+        _gen_chars = False
         if args.fighters or args.reuse_fighters:
             char_names = resolve_fighters(client, args, out_dir_r)
         elif args.skip_characters:
@@ -11046,13 +11131,10 @@ async function resetPrompts(ev){
                 char_names = [f["name"] for f in FIGHTER_POOL if f.get("gender","male") == "male" or args.include_female]
                 _web_log(f"  Skipping generation, assuming pool names: {', '.join(char_names)}")
         else:
-            char_names = stage_characters(client, image_model, out_dir_r,
-                                          region_filter=args.region,
-                                          include_female=args.include_female,
-                                          max_count=int(getattr(args, "num_fighters", 0) or 0),
-                                          n_refs=int(getattr(args, "char_refs", 4) or 4))
+            _gen_chars = True
 
         env_names = None
+        _gen_envs = False
         if args.environments or args.reuse_environments:
             env_names = resolve_environments(client, args, out_dir_r)
         elif args.skip_environments:
@@ -11065,9 +11147,39 @@ async function resetPrompts(ev){
                 env_names = [e["name"] for e in ENVIRONMENT_POOL]
                 _web_log(f"  Skipping generation, assuming pool names: {', '.join(env_names)}")
         else:
-            env_names = stage_environments(client, image_model, out_dir_r, region_filter=args.region,
-                                           max_count=int(getattr(args, "num_environments", 0) or 0),
-                                           n_refs=int(getattr(args, "env_refs", 3) or 3))
+            _gen_envs = True
+
+        # Fresh generation, PHASED: (1) invent ALL prompts from scratch via the text
+        # model, then (2) render ALL reference images. Image LoRAs and then video
+        # LoRAs run below (prompts → images → image-LoRA → video-LoRA). Never falls
+        # back to the built-in pool prompts while a text model is available.
+        if _gen_chars or _gen_envs:
+            _num_chars = int(getattr(args, "num_fighters", 0) or 0) or len(
+                [f for f in FIGHTER_POOL
+                 if args.include_female or f.get("gender", "male") == "male"])
+            _num_envs = int(getattr(args, "num_environments", 0) or 0) or len(ENVIRONMENT_POOL)
+            _char_profiles = _env_profiles = None
+            _web_log("\n" + "═" * 60)
+            _web_log("  STAGE 1a — inventing prompts (from scratch via the text model)")
+            _web_log("═" * 60)
+            if _gen_chars:
+                _char_profiles = _invent_profiles(
+                    client, text_model, out_dir_r, "character", _num_chars,
+                    include_female=args.include_female, log=_web_log)
+            if _gen_envs:
+                _env_profiles = _invent_profiles(
+                    client, text_model, out_dir_r, "environment", _num_envs, log=_web_log)
+            _web_log("\n" + "═" * 60)
+            _web_log("  STAGE 1b — rendering reference images")
+            _web_log("═" * 60)
+            if _gen_chars:
+                char_names = _render_profile_images(
+                    client, image_model, out_dir_r, "character", _char_profiles,
+                    int(getattr(args, "char_refs", 4) or 4), log=_web_log)
+            if _gen_envs:
+                env_names = _render_profile_images(
+                    client, image_model, out_dir_r, "environment", _env_profiles,
+                    int(getattr(args, "env_refs", 3) or 3), log=_web_log)
 
         only_loras = getattr(args, "only_loras", False)
         only_keyframes = getattr(args, "only_keyframes", False)
