@@ -2101,6 +2101,14 @@ def _train_lora_blocking(req: LoraTrainRequest, job_id: Optional[str] = None) ->
             _active_job_id = None
             _train_lock.release()
             raise
+    # Reserve the GPU for the whole training: block ordinary model loads on this
+    # engine (image/video) AND on co-located siblings (gguf text), so nothing
+    # reloads mid-training and OOMs the trainer. Released in the finally below.
+    try:
+        from codai.models import gpu_lock
+        gpu_lock.reserve(f"lora-training:{getattr(req, 'name', '') or '?'}")
+    except Exception as _gle:
+        print(f"  [lora] could not reserve GPU lock: {_gle}")
     try:
         result = _train_lora_sync(req)
         if job_id:
@@ -2139,6 +2147,11 @@ def _train_lora_blocking(req: LoraTrainRequest, job_id: Optional[str] = None) ->
         _drop_wan_cache()
         raise
     finally:
+        try:
+            from codai.models import gpu_lock
+            gpu_lock.release()
+        except Exception:
+            pass
         _active_job_id = None
         _active_train_model = None
         if job_id:

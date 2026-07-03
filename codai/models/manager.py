@@ -3899,6 +3899,13 @@ class MultiModelManager:
                 - 'config': The stored configuration for this model
                 - 'already_loaded': True if the model is already loaded and ready in VRAM
         """
+        # Wait if the GPU is reserved for an exclusive op (LoRA training, here or on
+        # a co-located sibling): don't load a model that would contend with it.
+        try:
+            from codai.models import gpu_lock
+            gpu_lock.wait_until_free(context=f"request '{requested_model}'")
+        except Exception:
+            pass
         # Fail fast if the CUDA context is already corrupted — loading anything
         # onto a poisoned context just re-triggers the same async assert.
         if self.cuda_context_poisoned:

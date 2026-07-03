@@ -973,6 +973,13 @@ def _apply_attention_backend(pipe, model_cfg: dict) -> None:
 
 
 def _load_video_pipeline(model_name: str, device: str, mode: str, offload: str = None, model_cfg: dict = None, use_incremental_cache: bool = True):
+    # Wait if the GPU is reserved for an exclusive op (LoRA training here or on a
+    # co-located sibling) so this load doesn't contend with it.
+    try:
+        from codai.models import gpu_lock
+        gpu_lock.wait_until_free(context=f"video load '{model_name}'")
+    except Exception:
+        pass
     # GGUF models go through stable-diffusion.cpp, not diffusers
     from codai.api.images import _is_gguf_model
     if _is_gguf_model(model_name):

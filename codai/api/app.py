@@ -393,6 +393,41 @@ async def internal_evict_vram(request: Request):
         return {"ok": False, "error": str(e), "freed_gb": 0.0}
 
 
+@app.post("/internal/gpu-reserve", include_in_schema=False)
+async def internal_gpu_reserve(request: Request):
+    """A co-located sibling engine (same GPU) reserves the card for an exclusive op
+    (LoRA training). While reserved, this engine's model-load paths wait, so it
+    doesn't load a model and contend with the sibling's training VRAM."""
+    import json as _json
+    try:
+        data = _json.loads((await request.body()) or b"{}") or {}
+    except Exception:
+        data = {}
+    try:
+        from codai.models import gpu_lock
+        gpu_lock.set_sibling(str(data.get("from") or "sibling"),
+                             data.get("reason") or "sibling-reserved")
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/internal/gpu-release", include_in_schema=False)
+async def internal_gpu_release(request: Request):
+    """Lift a sibling engine's GPU reservation (its exclusive op finished)."""
+    import json as _json
+    try:
+        data = _json.loads((await request.body()) or b"{}") or {}
+    except Exception:
+        data = {}
+    try:
+        from codai.models import gpu_lock
+        gpu_lock.set_sibling(str(data.get("from") or "sibling"), None)
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.post("/internal/thermal-pause", include_in_schema=False)
 async def internal_thermal_pause(request: Request):
     """Front-driven thermal pause: the supervisor (which monitors temps centrally)

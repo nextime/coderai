@@ -361,6 +361,14 @@ def _load_diffusers_pipeline(model_name: str, global_args, model_config: dict = 
     from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline, DiffusionPipeline
     import torch
 
+    # Wait if the GPU is reserved for an exclusive op (LoRA training here or on a
+    # co-located sibling) so this load doesn't contend with it.
+    try:
+        from codai.models import gpu_lock
+        gpu_lock.wait_until_free(context=f"image load '{model_name}'")
+    except Exception:
+        pass
+
     _mc = model_config or {}
 
     def _cfg(key, default=None):
