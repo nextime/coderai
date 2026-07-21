@@ -925,9 +925,16 @@ class FrontProxy:
         low-sensitivity, front-served telemetry (GPU stats, engine status tiles) that
         must stay live even while the primary engine is busy generating — full session
         validation round-trips to that (possibly saturated) engine, which would make
-        the dashboard's own status panels vanish exactly when you want to watch them."""
-        return bool(request.cookies.get("session")) or \
-            request.headers.get("authorization", "").lower().startswith("bearer ")
+        the dashboard's own status panels vanish exactly when you want to watch them.
+
+        The session cookie is port-specific (``session_<port>``) so two instances on
+        the same host don't clobber each other's cookie, so accept any ``session`` /
+        ``session_*`` cookie — matching the engine's get_current_user. Checking only
+        the literal ``session`` name 401'd every front-served telemetry call."""
+        for k in request.cookies:
+            if k == "session" or k.startswith("session_"):
+                return True
+        return request.headers.get("authorization", "").lower().startswith("bearer ")
 
     async def is_admin(self, request: Request) -> bool:
         """Authorize a front-handled admin action by validating the caller's session
