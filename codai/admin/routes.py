@@ -671,6 +671,14 @@ def _run_download_thread(session_id: str, model_id: str, file_pattern: str, pq):
                 if tail:
                     detail += f". Last output: {tail}"
                 push({"type": "error", "message": detail})
+        # On a successful download, ensure any config entry for this model carries
+        # a used_vram_gb estimate — the save that registered it ran before the
+        # weights existed on disk, so its own auto-estimate came back empty.
+        if terminal == "done" and session_id not in _download_cancelled:
+            try:
+                _backfill_vram_estimate(model_id, file_pattern)
+            except Exception as _bf_err:
+                print(f"[download] used_vram_gb backfill failed for '{model_id}': {_bf_err}")
     finally:
         _download_cancelled.discard(session_id)
 
@@ -982,6 +990,60 @@ def _entry_key(entry) -> str:
 def _basename_key(key: str) -> str:
     import os as _os
     return _os.path.basename(key) if ("/" in key or _os.sep in key) else key
+
+
+def _estimate_used_vram_gb(path: str):
+    """Best-effort VRAM estimate (GB) for a model path/HF id, or None.
+
+    Local weight file → its size; HF repo id → the cached shard total. A small
+    multiplier covers runtime overhead (KV/activations/VAE spike). Deliberately
+    on the conservative (slightly high) side: over-estimating makes eviction free
+    a touch too much, whereas under-estimating risks an OOM on load.
+    """
+    import os
+    from codai.models.cache import is_huggingface_model_id
+    if os.path.isfile(path):
+        size_bytes = os.path.getsize(path)
+        multiplier = 1.1 if path.endswith(".gguf") else 1.2
+        return round(size_bytes / 1e9 * multiplier, 2)
+    if is_huggingface_model_id(path):
+        from codai.models.manager import MultiModelManager
+        size_bytes = MultiModelManager._hf_cached_model_size_bytes(path)
+        if size_bytes > 0:
+            return round(size_bytes / 1e9 * 1.2, 2)
+    return None
+
+
+def _backfill_vram_estimate(model_id: str, file_pattern: str = "") -> bool:
+    """After a download, fill in used_vram_gb on any matching config entry that
+    lacks one — the save that created the entry ran before the weights existed on
+    disk, so its estimate came back empty. Returns True if anything changed.
+
+    A CLIP/SigLIP (or any) entry thus always ends up with a reasonable estimate,
+    so the pre-load eviction can size how much VRAM to reclaim instead of freeing
+    only the 1 GB fallback headroom.
+    """
+    if config_manager is None:
+        return False
+    fname = _basename_key(model_id)
+    changed = False
+    for cat in _VALID_MODEL_CATS | {"gguf_models"}:
+        for m in config_manager.models_data.get(cat, []):
+            if not isinstance(m, dict):
+                continue
+            key = _entry_key(m)
+            if not (key == model_id or (fname and _basename_key(key) == fname)):
+                continue
+            if m.get("used_vram_gb") is not None:
+                continue
+            est = _estimate_used_vram_gb(key or model_id)
+            if est is not None:
+                m["used_vram_gb"] = est
+                changed = True
+                print(f"[download] backfilled used_vram_gb={est} GB for '{key or model_id}'")
+    if changed:
+        config_manager.save_models()
+    return changed
 
 
 def _is_model_configured(model_id: str) -> bool:
@@ -2158,7 +2220,23 @@ async def api_model_load(request: Request, username: str = Depends(require_admin
             multi_model_manager.active_in_vram = model_key
             multi_model_manager.models_in_vram.add(model_key)
             multi_model_manager.record_vram_delta(model_key, _snap)
-        elif model_type in ("embedding", "spatial", "vision"):
+        elif model_type == "embedding":
+            # Embedding models are sentence-transformers / CLIP encoders, not
+            # diffusers pipelines — use the same loader the /v1/embeddings path
+            # uses so a preload from the interface produces a reusable model.
+            from codai.api.embeddings import _load_embedding_model, _derive_device as _emb_device
+            model_key = f"embedding:{path}"
+            _snap = multi_model_manager.vram_before_load()
+            cfg = (multi_model_manager.config.get(model_key)
+                   or multi_model_manager.config.get(path) or model_cfg or {})
+            emb_obj = await asyncio.to_thread(_load_embedding_model, path, _emb_device(), cfg)
+            if emb_obj is None:
+                raise RuntimeError("Embedding model failed to load")
+            multi_model_manager.add_model(model_key, emb_obj)
+            multi_model_manager.active_in_vram = model_key
+            multi_model_manager.models_in_vram.add(model_key)
+            multi_model_manager.record_vram_delta(model_key, _snap)
+        elif model_type in ("spatial", "vision"):
             from codai.api.images import _load_diffusers_pipeline
             from codai.api.state import get_global_args
             model_key = f"{model_type}:{path}"
@@ -2420,20 +2498,12 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         lst = config_manager.models_data.get(cat, [])
         config_manager.models_data[cat] = [m for m in lst if not _should_remove(m)]
 
-    # Auto-estimate used_vram_gb from file size if not provided
+    # Auto-estimate used_vram_gb from file size if not provided. For a not-yet-
+    # downloaded HF model this returns None (nothing on disk to measure); the
+    # download-completion backfill fills it in once the weights land.
     used_vram_gb = data.get("used_vram_gb")
     if used_vram_gb is None:
-        import os
-        from codai.models.cache import is_huggingface_model_id
-        if os.path.isfile(path):
-            size_bytes = os.path.getsize(path)
-            multiplier = 1.1 if path.endswith(".gguf") else 1.2
-            used_vram_gb = round(size_bytes / 1e9 * multiplier, 2)
-        elif is_huggingface_model_id(path):
-            from codai.models.manager import MultiModelManager
-            size_bytes = MultiModelManager._hf_cached_model_size_bytes(path)
-            if size_bytes > 0:
-                used_vram_gb = round(size_bytes / 1e9 * 1.2, 2)
+        used_vram_gb = _estimate_used_vram_gb(path)
 
     # Build settings entry
     entry: dict = {"path": path, "model_type": model_types[0], "model_types": model_types, "config_id": config_id}

@@ -22,8 +22,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class EmbeddingsRequest(BaseModel):
     model: str = Field(..., description="Embedding model id to use.")
-    input: Union[str, List[str]] = Field(..., description="Text or list of texts to embed.")
-    image: Optional[Union[str, List[str]]] = Field(None, description="Base64/URL image(s) for multimodal embedding models.")
+    input: Optional[Union[str, List[str]]] = Field(None, description="Text or list of texts to embed. Optional only when 'image' is given.")
+    image: Optional[Union[str, List[str]]] = Field(None, description="Image(s) for multimodal embedding models: http(s) URL, data URI, local path or bare base64. Vectors are returned after the text ones.")
     encoding_format: Optional[str] = Field("float", description="Return embeddings as 'float' arrays or 'base64'.")
     dimensions: Optional[int] = Field(None, description="Truncate embeddings to N dimensions (if the model supports it).")
     quantization: Optional[str] = Field(None, description="Optional TurboQuant vector quantization: 'turbo' (8-bit), 'turbo8', 'turbo6', 'turbo4' or 'turbo2'. With encoding_format='float' the (lossy) reconstructed vectors are returned; with 'base64' the compact packed bytes are returned plus a 'quantization' metadata block describing how to decode them.")
