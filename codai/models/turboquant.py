@@ -242,8 +242,15 @@ def _unpack_bits(packed: np.ndarray, p: int, bits: int) -> np.ndarray:
 # Public API
 # ---------------------------------------------------------------------------
 
-def _reconstruct_library(arr2d: np.ndarray, bits: int, seed: int) -> Optional[np.ndarray]:
-    """Reconstruct via turboquant-py; None if the library is unavailable / errors."""
+def _reconstruct_library(arr2d: np.ndarray, bits: int, seed: int,
+                         strict: bool = False) -> Optional[np.ndarray]:
+    """Reconstruct via turboquant-py; None if the library is unavailable / errors.
+
+    With ``strict`` (an explicitly selected 'library' backend), a bit width the
+    upstream package rejects raises a PRECISE error instead of the generic
+    "unavailable" one: turboquant-py 0.1.x only accepts bit_width 1–4, so
+    turbo6/turbo8 need the built-in quantizer.
+    """
     tq = _lib()
     if tq is None:
         return None
@@ -255,7 +262,13 @@ def _reconstruct_library(arr2d: np.ndarray, bits: int, seed: int) -> Optional[np
         if rec.shape != arr2d.shape:
             return None
         return rec
-    except Exception:
+    except Exception as e:
+        if strict and type(e).__name__ == 'InvalidBitWidthError':
+            raise RuntimeError(
+                f"turboquant-py only supports 1-4 bit quantization (requested "
+                f"{bits}-bit): use 'turbo2'/'turbo4' with the library backend, "
+                "or switch this model's TurboQuant backend to 'builtin' for "
+                "turbo6/turbo8.") from e
         return None
 
 
@@ -281,7 +294,7 @@ def reconstruct(vectors, bits: int, seed: int = DEFAULT_SEED,
     b = (backend or "builtin").strip().lower()
     out = None
     if b in ("library", "external", "turboquant-py", "turboquantpy", "auto"):
-        out = _reconstruct_library(arr, bits, seed)
+        out = _reconstruct_library(arr, bits, seed, strict=(b != "auto"))
         if out is None and b != "auto":
             raise RuntimeError(
                 "TurboQuant 'library' backend selected but turboquant-py is "

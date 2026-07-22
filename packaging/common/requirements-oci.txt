@@ -13,6 +13,7 @@ tokenizers>=0.15.0
 protobuf>=3.20.0
 optimum-quanto>=0.2.0
 gguf>=0.9.0
+turboquant-py>=0.1.0  # optional TurboQuant embedding-vector quantization backend (1-4 bit)
 
 # Native wheels are built by packaging/linux/Dockerfile.oci with CUDA+Vulkan enabled.
 llama-cpp-python>=0.2.0
