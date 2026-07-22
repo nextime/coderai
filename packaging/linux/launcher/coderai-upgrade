@@ -79,15 +79,18 @@ vercmp() {
   echo 0
 }
 
-# Fingerprint the dependency-declaring files under a tree, so we can tell whether
-# the fetched code changed what must be installed. Mirrors the set the OCI image
-# actually installs: the base requirements.txt plus the container's extra list
-# (packaging/common/requirements-oci.txt). Missing files are simply skipped.
-hash_reqs() {
+# Emit the normalized, sorted set of requirement specs a tree declares: the base
+# requirements.txt plus the container extras (packaging/common/requirements-oci.txt,
+# minus its build-time `-r` self-include). Comments and surrounding whitespace are
+# stripped so the diff below reflects real dependency changes, not formatting.
+reqs_content() {
   local d="$1"
-  cat "$d/requirements.txt" \
-      "$d/packaging/common/requirements-oci.txt" 2>/dev/null \
-    | sha256sum 2>/dev/null | awk '{print $1}'
+  { [[ -f "$d/requirements.txt" ]] && cat "$d/requirements.txt"
+    [[ -f "$d/packaging/common/requirements-oci.txt" ]] \
+      && grep -vE '^[[:space:]]*-r[[:space:]]' "$d/packaging/common/requirements-oci.txt"
+  } 2>/dev/null \
+    | sed 's/#.*//' | sed 's/[[:space:]]*$//' \
+    | grep -vE '^[[:space:]]*$' | sort -u
 }
 
 # Refresh the launcher scripts and service configs that live OUTSIDE the app tree
@@ -116,26 +119,28 @@ sync_system_files() {
   _install_file "$src/packaging/linux/README-RUN.txt"              /opt/coderai/README-RUN.txt        0644
 }
 
-# Re-install the app's declared dependencies into /opt/coderai/python. Uses the
-# same effective set as the image build (requirements.txt + the OCI extras), but
-# drops requirements-oci.txt's build-time `-r /tmp/requirements.txt` self-include
-# (we prepend the real requirements.txt instead). Native CUDA builds pinned with
-# `>=` are already satisfied, so pip leaves them untouched — only genuinely new or
-# version-bumped packages are (re)installed.
+# Install ONLY the dependency specs that are new or version-changed relative to
+# what the image already declared ($WORK/old_reqs vs $WORK/new_reqs, both sorted).
+# This is deliberately a DELTA install, not a full `pip install -r requirements`:
+# the repo's requirements list can contain entries that don't cleanly reinstall in
+# this environment (e.g. a package with no py3.13 wheel that the image provisions
+# another way). Reprocessing the whole file would fail on those pre-existing lines;
+# installing only what actually changed adds new deps while leaving satisfied ones
+# untouched. Returns 0 (nothing to do) when there is no delta.
 pip_sync() {
   [[ -x "$PYBIN" ]] || { log "python not found at $PYBIN — skipping dependency sync"; return 1; }
-  local tmpreq; tmpreq="$(mktemp "$WORK/reqs.XXXXXX")"
-  [[ -f "$APP_DIR/requirements.txt" ]] && cat "$APP_DIR/requirements.txt" >> "$tmpreq"
-  if [[ -f "$APP_DIR/packaging/common/requirements-oci.txt" ]]; then
-    grep -vE '^[[:space:]]*-r[[:space:]]' "$APP_DIR/packaging/common/requirements-oci.txt" >> "$tmpreq"
+  local delta; delta="$(comm -13 "$WORK/old_reqs" "$WORK/new_reqs")"
+  if [[ -z "$delta" ]]; then
+    log "no new or changed dependencies — nothing to install"
+    return 0
   fi
-  [[ -s "$tmpreq" ]] || { log "no requirements files found — nothing to install"; return 0; }
+  log "installing new/changed dependencies:"
+  printf '%s\n' "$delta" | sed 's/^/  + /' >&2
   local pip_args=(-m pip install --no-input --disable-pip-version-check)
   # Prefer prebuilt CUDA wheels when the build left them behind (older images
   # don't have /opt/wheels; the flag is simply omitted then).
   [[ -d /opt/wheels ]] && pip_args+=(--find-links /opt/wheels)
-  log "syncing python dependencies (pip install)…"
-  "$PYBIN" "${pip_args[@]}" -r "$tmpreq"
+  printf '%s\n' "$delta" | "$PYBIN" "${pip_args[@]}" -r /dev/stdin
 }
 
 CUR_VER="$(read_version "$APP_DIR/codai/__init__.py" || true)"
@@ -189,10 +194,10 @@ fi
 [[ "$FORCE" == "1" && "$CMP" != "1" ]] && log "forcing upgrade to $NEW_VER (was $CUR_VER)…" \
                                        || log "upgrading $CUR_VER -> $NEW_VER…"
 
-# Fingerprint the CURRENT dependencies before we overwrite the tree, and the
-# fetched ones, so we only re-run pip when the declared deps actually changed.
-OLD_REQ_HASH="$(hash_reqs "$APP_DIR")"
-NEW_REQ_HASH="$(hash_reqs "$WORK/src")"
+# Snapshot the CURRENT vs fetched dependency specs before we overwrite the tree,
+# so pip_sync can install just the delta (new/changed lines) after the swap.
+reqs_content "$APP_DIR"   > "$WORK/old_reqs"
+reqs_content "$WORK/src"  > "$WORK/new_reqs"
 
 # Strip the parts that must never land in the read-only app tree — mirror the
 # exclusions the image build applies (Dockerfile.update) so the in-image layout
@@ -227,22 +232,14 @@ mkdir -p "$APP_DIR/models"
 # Non-fatal: a failed config copy must not abort an otherwise-successful upgrade.
 sync_system_files || log "warning: launcher/config refresh incomplete"
 
-# Dependency sync: run pip when the declared deps changed (or on --force). A pip
-# failure aborts with a non-zero exit so the host does NOT commit a half-upgraded
-# image (new code but missing packages) — the fetched code is simply discarded.
+# Dependency sync: install any new/changed deps (pip_sync no-ops when there are
+# none). A failure aborts with a non-zero exit so the host does NOT commit a
+# half-upgraded image (new code but a missing package) — the fetched code is
+# simply discarded and the running image is left untouched.
 if [[ "$SKIP_PIP" == "1" ]]; then
   log "dependency sync skipped (CODERAI_UPGRADE_SKIP_PIP=1)"
-elif [[ "$OLD_REQ_HASH" != "$NEW_REQ_HASH" || "$FORCE" == "1" ]]; then
-  if [[ "$OLD_REQ_HASH" != "$NEW_REQ_HASH" ]]; then
-    log "dependencies changed — updating the python environment"
-  else
-    log "forcing dependency sync"
-  fi
-  if ! pip_sync; then
-    die "dependency install failed — image left unchanged (fix connectivity/requirements and retry)"
-  fi
-else
-  log "dependencies unchanged — no pip install needed"
+elif ! pip_sync; then
+  die "dependency install failed — image left unchanged (fix connectivity/requirements and retry)"
 fi
 
 FINAL_VER="$(read_version "$APP_DIR/codai/__init__.py" || echo "$NEW_VER")"
