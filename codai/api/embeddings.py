@@ -58,11 +58,18 @@ class _EmbeddingModel:
     those branches and its VRAM is only reclaimed implicitly by gc.
     """
 
-    __slots__ = ("backend", "model")
+    __slots__ = ("backend", "model", "lock")
 
     def __init__(self, backend, model):
         self.backend = backend
         self.model = model
+        # llama.cpp contexts are NOT thread-safe: two executor threads calling
+        # embed() on one ctx segfault the engine. Serialize per model instance.
+        if backend == 'llama':
+            import threading
+            self.lock = threading.Lock()
+        else:
+            self.lock = None
 
     def __iter__(self):
         yield self.backend
@@ -442,10 +449,30 @@ def _embed_texts(model_obj, texts: List[str], dimensions=None) -> List[List[floa
         # those. Normalize either way (llama.cpp does not normalize).
         import math
         results = []
+        # Generous safety margin: embed() re-tokenizes the chunk text itself
+        # (with BOS/specials), and a detokenize→retokenize roundtrip is NOT
+        # token-count-stable — a window cut at exactly n_ctx can re-inflate
+        # past it and trip llama.cpp's GGML_ASSERT (SIGABRT).
         try:
-            _tok_limit = max(16, model.n_ctx() - 8)
+            _tok_limit = max(64, model.n_ctx() - 64)
         except Exception:
-            _tok_limit = 2040
+            _tok_limit = 1984
+
+        def _retok_len(txt):
+            return len(model.tokenize(txt.encode('utf-8', 'ignore'),
+                                      add_bos=True, special=True))
+
+        def _fit_chunk(toks):
+            """Detokenize a token window, shrinking until its RE-tokenized
+            length verifiably fits the context (roundtrip can inflate)."""
+            end = len(toks)
+            while end > 0:
+                txt = model.detokenize(toks[:end]).decode('utf-8', 'ignore')
+                n = _retok_len(txt)
+                if n <= _tok_limit:
+                    return txt, end
+                end -= max(8, n - _tok_limit)
+            return '', 0
 
         def _embed_one(chunk_text):
             emb = model.embed(chunk_text)
@@ -454,41 +481,52 @@ def _embed_texts(model_obj, texts: List[str], dimensions=None) -> List[List[floa
                 emb = [sum(col) / n for col in zip(*emb)]
             return emb
 
-        for t in texts:
-            # An input longer than the context window would abort llama.cpp
-            # (GGML_ASSERT) and take the whole engine down. Instead of cutting
-            # the text, CHUNK it into context-sized token windows, embed each,
-            # and combine with a token-count-weighted mean — no content is
-            # dropped, and single-chunk inputs take the direct path.
-            _chunks = [(t, 1)]
-            try:
-                _toks = model.tokenize(t.encode('utf-8', 'ignore'),
-                                       add_bos=True, special=False)
-                if len(_toks) > _tok_limit:
-                    _chunks = []
-                    for _i in range(0, len(_toks), _tok_limit):
-                        _w = _toks[_i:_i + _tok_limit]
-                        _chunks.append(
-                            (model.detokenize(_w).decode('utf-8', 'ignore'),
-                             len(_w)))
-            except Exception:
-                pass
-            if len(_chunks) == 1:
-                emb = _embed_one(_chunks[0][0])
-            else:
-                _acc = None
-                _tot = 0
-                for _ct, _cw in _chunks:
-                    _e = _embed_one(_ct)
-                    if _acc is None:
-                        _acc = [x * _cw for x in _e]
+        # Serialize on the model's lock: llama.cpp ctxs are not thread-safe and
+        # concurrent embed() calls from parallel requests segfault the engine.
+        import contextlib
+        _mlock = getattr(model_obj, 'lock', None)
+        with (_mlock if _mlock is not None else contextlib.nullcontext()):
+            for t in texts:
+                # An input longer than the context window would abort llama.cpp
+                # (GGML_ASSERT). Instead of cutting the text, CHUNK it into
+                # verified context-sized windows, embed each, and combine with a
+                # token-count-weighted mean — no content is dropped;
+                # single-chunk inputs take the direct path.
+                _chunks = None
+                try:
+                    if _retok_len(t) <= _tok_limit:
+                        _chunks = [(t, 1)]
                     else:
-                        for _j, _x in enumerate(_e):
-                            _acc[_j] += _x * _cw
-                    _tot += _cw
-                emb = [x / _tot for x in _acc]
-            norm = math.sqrt(sum(x * x for x in emb)) or 1.0
-            results.append([x / norm for x in emb])
+                        _toks = model.tokenize(t.encode('utf-8', 'ignore'),
+                                               add_bos=True, special=False)
+                        _chunks = []
+                        _i = 0
+                        while _i < len(_toks):
+                            _txt, _used = _fit_chunk(_toks[_i:_i + _tok_limit])
+                            if _used <= 0:
+                                break  # pathological token — skip it
+                            _chunks.append((_txt, _used))
+                            _i += _used
+                except Exception:
+                    _chunks = [(t, 1)]
+                if not _chunks:
+                    _chunks = [(t[:2000], 1)]
+                if len(_chunks) == 1:
+                    emb = _embed_one(_chunks[0][0])
+                else:
+                    _acc = None
+                    _tot = 0
+                    for _ct, _cw in _chunks:
+                        _e = _embed_one(_ct)
+                        if _acc is None:
+                            _acc = [x * _cw for x in _e]
+                        else:
+                            for _j, _x in enumerate(_e):
+                                _acc[_j] += _x * _cw
+                        _tot += _cw
+                    emb = [x / _tot for x in _acc]
+                norm = math.sqrt(sum(x * x for x in emb)) or 1.0
+                results.append([x / norm for x in emb])
     elif backend == 'vision':
         raise ValueError(
             "this embedding model is image-only (no text tower) — send 'image' "
