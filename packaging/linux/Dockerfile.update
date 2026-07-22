@@ -47,4 +47,11 @@ RUN set -eux; \
 # falls back to nvidia-smi when absent, hence `|| true` keeps offline builds OK.
 RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir "nvidia-ml-py>=12.0.0" || true
 
+# openssh-client so `coderai-docker --upgrade --ssh-key …` can fetch over SSH
+# (git is present but the CUDA runtime base ships no ssh). Tiny; keep the overlay
+# still fast. `|| true` keeps offline overlay builds working (HTTPS upgrade still
+# works without it).
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client \
+    && rm -rf /var/lib/apt/lists/* || true
+
 # ENTRYPOINT / EXPOSE / VOLUME / ENV / WORKDIR are inherited from the base image.

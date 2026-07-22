@@ -383,8 +383,8 @@ if [[ "$UPGRADE" -eq 1 ]]; then
   echo "== CoderAI in-image upgrade =="
   echo "  engine:  $ENGINE"
   echo "  image:   $IMAGE_TAG"
-  echo "  ref:     $UPGRADE_REF${UPGRADE_FORCE:+   (force)}"
-  echo "  auth:    ${UPGRADE_SSH_KEY:+ssh key $UPGRADE_SSH_KEY}${UPGRADE_SSH_KEY:-https/anonymous}"
+  echo "  ref:     $UPGRADE_REF$([[ "$UPGRADE_FORCE" == "1" ]] && echo '   (force)')"
+  echo "  auth:    $([[ -n "$UPGRADE_SSH_KEY" ]] && echo "ssh key $UPGRADE_SSH_KEY" || echo 'https/anonymous')"
   echo "  pip:     $([[ "$UPGRADE_SKIP_PIP" == "1" ]] && echo 'skipped (--no-pip)' || echo 'sync deps if changed')"
 
   # Make sure a stale upgrade container from an aborted run doesn't block us.
