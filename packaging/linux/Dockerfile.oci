@@ -165,9 +165,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /opt/coderai /opt/coderai
 COPY --from=build_meta /build-manifest.json /opt/coderai/BUILD-MANIFEST.json
 COPY packaging/linux/launcher/coderai-oci /usr/local/bin/coderai
+COPY packaging/linux/launcher/coderai-upgrade /usr/local/bin/coderai-upgrade
 
 RUN set -eux; \
-    chmod +x /usr/local/bin/coderai; \
+    chmod +x /usr/local/bin/coderai /usr/local/bin/coderai-upgrade; \
     mkdir -p /config /models /cache
 
 VOLUME ["/config", "/models", "/cache"]

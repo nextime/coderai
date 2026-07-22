@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# In-image code upgrader for the CoderAI distributable container.
+#
+# Runs INSIDE the container (driven by the host runner `coderai-docker --upgrade`,
+# i.e. run_oci.sh). It fetches the configured branch of the CoderAI git repo,
+# compares its product version (codai/__init__.py __version__) with the version
+# baked into this image, and — when the remote is newer (or --force) — replaces
+# the in-image application tree at /opt/coderai/app with the fetched code.
+#
+# The image ships WITHOUT a .git dir (it's stripped at build time), so this does
+# a fresh shallow clone of the target ref rather than a `git pull`. After it
+# returns, the host runner `docker commit`s the container back onto the SAME
+# image tag, so the updated code persists with no Dockerfile rebuild and no new
+# overlay image.
+#
+# Contract with the host runner (exit codes):
+#   0   -> code was updated; the host should commit the container.
+#   10  -> already up to date (nothing changed); host must NOT commit.
+#   !=0 -> error; host must NOT commit.
+#
+# Configuration (all optional; the host runner passes these as env):
+#   CODERAI_UPGRADE_REPO   git URL to fetch (https or ssh). Default: the nexlab
+#                          HTTPS repo, or its SSH form when a key is provided.
+#   CODERAI_UPGRADE_REF    branch/tag/commit to fetch. Default: production.
+#   CODERAI_UPGRADE_FORCE  "1" to upgrade even if not strictly newer.
+#   CODERAI_UPGRADE_SSH_KEY  path (inside the container) to an SSH private key;
+#                          when set, git uses it (StrictHostKeyChecking=accept-new).
+set -euo pipefail
+
+APP_DIR="/opt/coderai/app"
+DEFAULT_HTTPS_REPO="https://git.nexlab.net/nexlab/coderai.git"
+DEFAULT_SSH_REPO="git@git.nexlab.net:nexlab/coderai.git"
+
+REF="${CODERAI_UPGRADE_REF:-production}"
+FORCE="${CODERAI_UPGRADE_FORCE:-0}"
+SSH_KEY="${CODERAI_UPGRADE_SSH_KEY:-}"
+
+# Pick the default repo form to match the auth method: SSH URL when a key was
+# supplied, HTTPS otherwise. An explicit CODERAI_UPGRADE_REPO always wins.
+if [[ -n "${CODERAI_UPGRADE_REPO:-}" ]]; then
+  REPO="$CODERAI_UPGRADE_REPO"
+elif [[ -n "$SSH_KEY" ]]; then
+  REPO="$DEFAULT_SSH_REPO"
+else
+  REPO="$DEFAULT_HTTPS_REPO"
+fi
+
+log(){ printf '[upgrade] %s\n' "$*" >&2; }
+die(){ printf '[upgrade] error: %s\n' "$*" >&2; exit 1; }
+
+command -v git >/dev/null 2>&1 || die "git is not available in this image"
+
+# Read __version__ = "x.y.z" from a codai/__init__.py file.
+read_version() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  sed -n 's/^__version__ *= *["'"'"']\([^"'"'"']*\)["'"'"'].*/\1/p' "$f" | head -1
+}
+
+# Compare two dotted numeric versions. Prints: -1 if a<b, 0 if a==b, 1 if a>b.
+# Non-numeric components sort as 0. Missing components are treated as 0.
+vercmp() {
+  local a="$1" b="$2" IFS=.
+  local -a A=($a) B=($b)
+  local n=$(( ${#A[@]} > ${#B[@]} ? ${#A[@]} : ${#B[@]} ))
+  local i x y
+  for (( i=0; i<n; i++ )); do
+    x=${A[i]:-0}; y=${B[i]:-0}
+    x=$((10#${x//[^0-9]/0} + 0)) 2>/dev/null || x=0
+    y=$((10#${y//[^0-9]/0} + 0)) 2>/dev/null || y=0
+    if (( x < y )); then echo -1; return; fi
+    if (( x > y )); then echo 1; return; fi
+  done
+  echo 0
+}
+
+CUR_VER="$(read_version "$APP_DIR/codai/__init__.py" || true)"
+[[ -n "$CUR_VER" ]] || CUR_VER="0"
+log "installed version: $CUR_VER"
+log "source:  $REPO  (ref: $REF)"
+
+# Auth: when an SSH key path is given, drive git through it. accept-new adds the
+# host key on first contact without prompting, but still rejects a changed key.
+export GIT_TERMINAL_PROMPT=0
+if [[ -n "$SSH_KEY" ]]; then
+  [[ -f "$SSH_KEY" ]] || die "ssh key not found in container at: $SSH_KEY"
+  export GIT_SSH_COMMAND="ssh -i '$SSH_KEY' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+fi
+
+WORK="$(mktemp -d /tmp/coderai-upgrade.XXXXXX)"
+cleanup(){ rm -rf "$WORK"; }
+trap cleanup EXIT
+
+log "fetching '$REF'…"
+# Shallow single-branch clone: minimal transfer, no history. A ref that is a tag
+# or bare commit also works with --branch for tags; for a raw commit we fall back
+# to a full-ish fetch.
+if ! git clone --depth 1 --branch "$REF" --single-branch "$REPO" "$WORK/src" 2>"$WORK/clone.err"; then
+  if grep -qiE "Could not find remote branch|not found in upstream" "$WORK/clone.err"; then
+    log "ref '$REF' is not a branch/tag; trying to fetch it as a commit…"
+    git init -q "$WORK/src"
+    git -C "$WORK/src" remote add origin "$REPO"
+    git -C "$WORK/src" fetch -q --depth 1 origin "$REF" || { cat "$WORK/clone.err" >&2; die "fetch of ref '$REF' failed"; }
+    git -C "$WORK/src" checkout -q FETCH_HEAD
+  else
+    cat "$WORK/clone.err" >&2
+    die "clone failed (auth? network? wrong repo/ref?)"
+  fi
+fi
+
+NEW_VER="$(read_version "$WORK/src/codai/__init__.py" || true)"
+[[ -n "$NEW_VER" ]] || die "fetched tree has no codai/__init__.py __version__"
+log "fetched version:   $NEW_VER"
+
+CMP="$(vercmp "$NEW_VER" "$CUR_VER")"
+if [[ "$CMP" != "1" && "$FORCE" != "1" ]]; then
+  if [[ "$CMP" == "0" ]]; then
+    log "already up to date ($CUR_VER) — nothing to do (use --force to reinstall)."
+  else
+    log "installed version ($CUR_VER) is newer than '$REF' ($NEW_VER) — refusing to downgrade (use --force)."
+  fi
+  exit 10
+fi
+
+[[ "$FORCE" == "1" && "$CMP" != "1" ]] && log "forcing upgrade to $NEW_VER (was $CUR_VER)…" \
+                                       || log "upgrading $CUR_VER -> $NEW_VER…"
+
+# Strip the parts that must never land in the read-only app tree — mirror the
+# exclusions the image build applies (Dockerfile.update) so the in-image layout
+# stays identical to a freshly built image.
+rm -rf \
+  "$WORK/src/.git" \
+  "$WORK/src/venv"* \
+  "$WORK/src/.venv" \
+  "$WORK/src/township_output" \
+  "$WORK/src/offload" \
+  "$WORK/src/dist" \
+  "$WORK/src/.packaging-cache"
+find "$WORK/src" -type d -name __pycache__ -prune -exec rm -rf '{}' + 2>/dev/null || true
+
+# Replace the app tree in place. rsync --delete makes /opt/coderai/app exactly
+# mirror the fetched (pruned) source, so files removed upstream also disappear.
+# Fall back to a copy when rsync isn't present.
+if command -v rsync >/dev/null 2>&1; then
+  rsync -a --delete "$WORK/src/./" "$APP_DIR/./"
+else
+  log "rsync not found — using cp (stale removed-upstream files may linger)"
+  find "$APP_DIR" -mindepth 1 -maxdepth 1 \
+       ! -name models -exec rm -rf '{}' + 2>/dev/null || true
+  cp -a "$WORK/src/." "$APP_DIR/"
+fi
+
+# Keep the entrypoint expectations intact.
+mkdir -p "$APP_DIR/models"
+[[ -f "$APP_DIR/coderai" ]] && chmod +x "$APP_DIR/coderai" || true
+
+FINAL_VER="$(read_version "$APP_DIR/codai/__init__.py" || echo "$NEW_VER")"
+log "done — in-image code is now $FINAL_VER"
+exit 0

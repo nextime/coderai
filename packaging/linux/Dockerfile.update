@@ -19,6 +19,7 @@ COPY . /opt/coderai/app
 COPY packaging/linux/launcher/coderai-oci /usr/local/bin/coderai
 COPY packaging/linux/launcher/with-env /usr/local/bin/with-env
 COPY packaging/linux/launcher/coderai-entrypoint /usr/local/bin/coderai-entrypoint
+COPY packaging/linux/launcher/coderai-upgrade /usr/local/bin/coderai-upgrade
 COPY packaging/linux/launcher/wav2lip /usr/local/bin/wav2lip
 COPY packaging/linux/launcher/sadtalker /usr/local/bin/sadtalker
 COPY packaging/linux/nginx.conf /etc/nginx/nginx.conf
@@ -27,6 +28,7 @@ COPY packaging/linux/README-RUN.txt /opt/coderai/README-RUN.txt
 
 RUN set -eux; \
     chmod +x /usr/local/bin/coderai /usr/local/bin/with-env /usr/local/bin/coderai-entrypoint \
+             /usr/local/bin/coderai-upgrade \
              /usr/local/bin/wav2lip /usr/local/bin/sadtalker /opt/coderai/app/coderai; \
     mkdir -p /config /models /cache /opt/coderai/app/models; \
     rm -rf \

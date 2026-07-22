@@ -17,6 +17,15 @@ ENGINE="${CONTAINER_ENGINE:-docker}"
 IMAGE_TAG="${OCI_IMAGE:-coderai:dist}"
 IMAGE_EXPLICIT=0
 [[ -n "${OCI_IMAGE:-}" ]] && IMAGE_EXPLICIT=1
+# --upgrade: instead of running the server, refresh the in-image application code
+# from the git repo's production branch (see the upgrade block near the end).
+# UPGRADE_FORCE re-installs even when not strictly newer; UPGRADE_REF/REPO/SSH_KEY
+# override the source branch, URL and SSH identity used inside the container.
+UPGRADE=0
+UPGRADE_FORCE=0
+UPGRADE_REF="${CODERAI_UPGRADE_REF:-production}"
+UPGRADE_REPO="${CODERAI_UPGRADE_REPO:-}"
+UPGRADE_SSH_KEY="${CODERAI_UPGRADE_SSH_KEY:-}"
 # Selected GPU backends. ADDITIVE: --nvidia --vulkan enables BOTH, so the
 # container gets the NVIDIA driver libs (libcuda.so.1 — needed even by a
 # CUDA-built llama-cpp running under Vulkan) AND /dev/dri. CPU always works.
@@ -104,6 +113,19 @@ Usage:
 Options:
   --docker            Use docker (default).
   --podman            Use podman.
+
+Upgrade (refresh the in-image code instead of running the server):
+  --upgrade           Fetch the git production branch and, if it is newer than
+                      the version baked into the image, replace the in-image
+                      application code and commit it back onto the SAME image tag
+                      (no rebuild, no overlay image). The server is NOT started.
+  --force             With --upgrade, reinstall the fetched code even if it is
+                      not strictly newer than what's installed.
+  --upgrade-ref REF   Branch/tag/commit to upgrade to (default: production).
+  --upgrade-repo URL  Git URL to fetch from (default: the nexlab HTTPS repo, or
+                      its SSH form when --ssh-key is given).
+  --ssh-key PATH      Host path to an SSH private key; mounted into the upgrade
+                      container so git can authenticate over SSH.
   --cpu               Enable the CPU backend (always available; default if none).
   --nvidia            Enable NVIDIA CUDA; adds --gpus all for Docker (maps the
                       driver incl. libcuda.so.1).
@@ -193,6 +215,19 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --docker) ENGINE=docker; shift ;;
     --podman) ENGINE=podman; shift ;;
+    # In-image code upgrade (does not start the server). See the upgrade block
+    # after argument parsing.
+    --upgrade) UPGRADE=1; shift ;;
+    --force) UPGRADE_FORCE=1; shift ;;
+    --upgrade-ref)
+      [[ $# -ge 2 ]] || { echo "Error: --upgrade-ref requires a branch/tag/commit" >&2; exit 2; }
+      UPGRADE_REF="$2"; shift 2 ;;
+    --upgrade-repo)
+      [[ $# -ge 2 ]] || { echo "Error: --upgrade-repo requires a git URL" >&2; exit 2; }
+      UPGRADE_REPO="$2"; shift 2 ;;
+    --ssh-key)
+      [[ $# -ge 2 ]] || { echo "Error: --ssh-key requires a path" >&2; exit 2; }
+      UPGRADE_SSH_KEY="$2"; shift 2 ;;
     --cpu) MODES[cpu]=1; shift ;;
     --nvidia|--cuda) MODES[nvidia]=1; shift ;;
     --vulkan) MODES[vulkan]=1; shift ;;
@@ -317,6 +352,61 @@ if [[ "$IMAGE_EXPLICIT" -eq 0 ]]; then
     fi
   fi
   # 0 images: keep the pinned fallback (docker run will report if it's missing).
+fi
+
+# ---------------------------------------------------------------------------
+# --upgrade: refresh the in-image application code from git, then re-commit the
+# SAME image tag. This does NOT start the server. We run the in-image upgrader
+# (/usr/local/bin/coderai-upgrade) in a throwaway container as root (so it can
+# write /opt/coderai/app), and commit only when it reports an actual update
+# (exit 0). Exit 10 = already up to date (no commit); anything else = error.
+# ---------------------------------------------------------------------------
+if [[ "$UPGRADE" -eq 1 ]]; then
+  UP_NAME="${NAME}-upgrade-$$"
+  up_args=(run --name "$UP_NAME" --entrypoint /usr/local/bin/coderai-upgrade
+           -e "CODERAI_UPGRADE_REF=$UPGRADE_REF"
+           -e "CODERAI_UPGRADE_FORCE=$UPGRADE_FORCE")
+  [[ -n "$UPGRADE_REPO" ]] && up_args+=(-e "CODERAI_UPGRADE_REPO=$UPGRADE_REPO")
+  if [[ -n "$UPGRADE_SSH_KEY" ]]; then
+    [[ -f "$UPGRADE_SSH_KEY" ]] || { echo "Error: --ssh-key '$UPGRADE_SSH_KEY' not found" >&2; exit 2; }
+    _key_abs="$(cd "$(dirname "$UPGRADE_SSH_KEY")" && pwd)/$(basename "$UPGRADE_SSH_KEY")"
+    up_args+=(-v "$_key_abs:/tmp/coderai_upgrade_key:ro" -e "CODERAI_UPGRADE_SSH_KEY=/tmp/coderai_upgrade_key")
+  fi
+  up_args+=("$IMAGE_TAG")
+
+  echo "== CoderAI in-image upgrade =="
+  echo "  engine:  $ENGINE"
+  echo "  image:   $IMAGE_TAG"
+  echo "  ref:     $UPGRADE_REF${UPGRADE_FORCE:+   (force)}"
+  echo "  auth:    ${UPGRADE_SSH_KEY:+ssh key $UPGRADE_SSH_KEY}${UPGRADE_SSH_KEY:-https/anonymous}"
+
+  # Make sure a stale upgrade container from an aborted run doesn't block us.
+  "$ENGINE" rm -f "$UP_NAME" >/dev/null 2>&1 || true
+
+  set +e
+  "$ENGINE" "${up_args[@]}"
+  rc=$?
+  set -e
+
+  if [[ "$rc" -eq 0 ]]; then
+    echo "== committing updated code back onto '$IMAGE_TAG' =="
+    if "$ENGINE" commit "$UP_NAME" "$IMAGE_TAG" >/dev/null; then
+      echo "== upgrade complete: '$IMAGE_TAG' now carries the new code. =="
+      echo "   Restart the server to pick it up (e.g. stop the container and re-run coderai-docker)."
+    else
+      echo "Error: commit failed; image left unchanged." >&2
+      "$ENGINE" rm -f "$UP_NAME" >/dev/null 2>&1 || true
+      exit 1
+    fi
+  elif [[ "$rc" -eq 10 ]]; then
+    echo "== no upgrade applied (already up to date); image unchanged. =="
+  else
+    echo "Error: upgrade failed (exit $rc); image left unchanged." >&2
+    "$ENGINE" rm -f "$UP_NAME" >/dev/null 2>&1 || true
+    exit "$rc"
+  fi
+  "$ENGINE" rm -f "$UP_NAME" >/dev/null 2>&1 || true
+  exit 0
 fi
 
 # For --local, default the runtime dir to a stable per-user location under
