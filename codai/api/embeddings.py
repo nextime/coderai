@@ -83,6 +83,30 @@ class _EmbeddingModel:
         self.model = None
 
 
+def _is_cuda_error(e: Exception) -> bool:
+    s = str(e)
+    return 'CUDA' in s or 'cuda' in s or 'out of memory' in s.lower()
+
+
+def _move_to_cpu(model_obj: '_EmbeddingModel') -> '_EmbeddingModel':
+    """Move a loaded embedding model to CPU in place (VRAM-contention fallback).
+    Mutates model_obj so the manager's registry entry stays valid."""
+    backend, model = model_obj
+    if backend == 'sentence_transformers':
+        model.to('cpu')
+    else:
+        proc, hf_model, _dev = model
+        if hf_model is not None and hasattr(hf_model, 'to'):
+            hf_model.to('cpu')
+        model_obj.model = (proc, hf_model, 'cpu')
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    return model_obj
+
+
 def _trust_remote_code(model_config: dict = None) -> bool:
     cfg = model_config or {}
     raw = cfg.get('_raw_cfg') if isinstance(cfg.get('_raw_cfg'), dict) else {}
@@ -527,7 +551,20 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
                 model_obj = await asyncio.get_event_loop().run_in_executor(
                     None, _load_embedding_model, model_name, device, _emb_cfg)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to load embedding model: {e}")
+            # GPU full (e.g. a video job owns the card): serve degraded from CPU
+            # rather than 500 — embedding is small enough for host RAM.
+            if _is_cuda_error(e):
+                print(f"[embeddings] GPU load failed ({str(e)[:120]}) — "
+                      f"falling back to CPU for '{model_name}'")
+                try:
+                    with loading_task(model_name, model_type="embedding"):
+                        model_obj = await asyncio.get_event_loop().run_in_executor(
+                            None, _load_embedding_model, model_name, 'cpu', _emb_cfg)
+                except Exception as e2:
+                    raise HTTPException(status_code=500,
+                                        detail=f"Failed to load embedding model: {e2}")
+            else:
+                raise HTTPException(status_code=500, detail=f"Failed to load embedding model: {e}")
         # Register through add_model (pool + models_in_vram bookkeeping) rather than
         # a bare dict assignment, so eviction/unload treat it like every other model.
         multi_model_manager.add_model(model_key, model_obj)
@@ -563,7 +600,26 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
+        # Encode-time CUDA failure (VRAM grabbed by another engine mid-flight):
+        # move the model to CPU and retry once before giving up.
+        if not _is_cuda_error(e):
+            raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
+        print(f"[embeddings] CUDA encode failed ({str(e)[:120]}) — "
+              f"retrying '{model_name}' on CPU")
+        try:
+            model_obj = await asyncio.get_event_loop().run_in_executor(
+                None, _move_to_cpu, model_obj)
+            vectors = []
+            if texts:
+                vectors += await asyncio.get_event_loop().run_in_executor(
+                    None, _embed_texts, model_obj, texts, request.dimensions)
+            if images:
+                vectors += await asyncio.get_event_loop().run_in_executor(
+                    None, _embed_images, model_obj, images, request.dimensions)
+        except ValueError as e2:
+            raise HTTPException(status_code=400, detail=str(e2))
+        except Exception as e2:
+            raise HTTPException(status_code=500, detail=f"Embedding failed: {e2}")
 
     # Optional TurboQuant vector quantization (data-free, inner-product preserving).
     # The per-model config block (turboquant: {enabled, backend, bits}) is the
