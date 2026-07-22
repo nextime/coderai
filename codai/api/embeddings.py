@@ -500,6 +500,88 @@ async def create_embeddings(request: EmbeddingsRequest, http_request: Request = 
         raise
 
 
+# Per-model-key asyncio locks serializing embedding model loads (see the
+# comment at the acquire site in _run_embeddings).
+_load_locks: dict = {}
+
+
+async def _load_embedding_locked(request, model_key: str, model_name: str,
+                                 _emb_cfg: dict):
+    """Load an embedding model — called with the per-model load lock HELD.
+
+    Re-checks the registry first (another request may have finished the load
+    while we waited on the lock), then loads with the standard evict-and-retry
+    contract every other model type follows."""
+    # Re-check under the lock: the request that held the lock before us has
+    # usually just loaded the model.
+    model_obj = multi_model_manager.models.get(model_key)
+    if model_obj is not None:
+        return model_obj
+
+    device = _derive_device()
+    from codai.tasks import loading_task
+    # Snapshot VRAM around the load so the model's real footprint is measured
+    # and recorded — this is what lets a later request for another model size
+    # its eviction correctly (and lets this model be evicted to reclaim VRAM).
+    _snap = multi_model_manager.vram_before_load()
+
+    def _cuda_oom(exc: Exception) -> bool:
+        s = str(exc)
+        return ('CUDA' in s or 'cuda' in s or 'out of memory' in s.lower()
+                or 'CUBLAS' in s)
+
+    try:
+        with loading_task(model_name, model_type="embedding"):
+            try:
+                model_obj = await asyncio.get_event_loop().run_in_executor(
+                    None, _load_embedding_model, model_name, device, _emb_cfg)
+            except Exception as e:
+                # Same contract as every other model type: if the load hit
+                # OOM (e.g. a video/image model owns the card, or a
+                # concurrent load raced request_model's free-VRAM check),
+                # make room — evicting idle models and WAITING on busy ones
+                # (_evict_models_for_vram waits for the active model to go
+                # idle) — then retry the load once instead of failing.
+                if not _cuda_oom(e):
+                    raise
+                print(f"[embeddings] load OOM ({str(e)[:100]}) — "
+                      f"evicting to make room and retrying")
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                # If another model (e.g. a video pipeline) is mid-load, its
+                # VRAM reservation is active — wait for that load to finish
+                # (bounded) before evicting/retrying, exactly like queued
+                # requests for any other model wait out a load.
+                try:
+                    import time as _time
+                    _deadline = _time.time() + 300
+                    while (getattr(multi_model_manager,
+                                   '_loading_reservations', None)
+                           and _time.time() < _deadline):
+                        await asyncio.sleep(2)
+                except Exception:
+                    pass
+                # extra_vram_gb keeps the eviction meaningful even when the
+                # model has no VRAM estimate yet (first-ever load).
+                await asyncio.get_event_loop().run_in_executor(
+                    None, multi_model_manager.ensure_vram_for,
+                    model_key, model_name, 2.0)
+                model_obj = await asyncio.get_event_loop().run_in_executor(
+                    None, _load_embedding_model, model_name, device, _emb_cfg)
+    except Exception as e:
+        raise HTTPException(status_code=500,
+                            detail=f"Failed to load embedding model: {e}")
+    # Register through add_model (pool + models_in_vram bookkeeping) rather than
+    # a bare dict assignment, so eviction/unload treat it like every other model.
+    multi_model_manager.add_model(model_key, model_obj)
+    multi_model_manager.current_model_key = model_key
+    multi_model_manager.record_vram_delta(model_key, _snap)
+    return model_obj
+
+
 async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = None):
     """Core embeddings logic; registered as a task by create_embeddings()."""
     model_info = await asyncio.to_thread(
@@ -516,66 +598,15 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
                 or multi_model_manager.config.get(model_name) or {})
 
     if model_obj is None:
-        device = _derive_device()
-        from codai.tasks import loading_task
-        # Snapshot VRAM around the load so the model's real footprint is measured
-        # and recorded — this is what lets a later request for another model size
-        # its eviction correctly (and lets this model be evicted to reclaim VRAM).
-        _snap = multi_model_manager.vram_before_load()
-
-        def _cuda_oom(exc: Exception) -> bool:
-            s = str(exc)
-            return ('CUDA' in s or 'cuda' in s or 'out of memory' in s.lower()
-                    or 'CUBLAS' in s)
-
-        try:
-            with loading_task(model_name, model_type="embedding"):
-                try:
-                    model_obj = await asyncio.get_event_loop().run_in_executor(
-                        None, _load_embedding_model, model_name, device, _emb_cfg)
-                except Exception as e:
-                    # Same contract as every other model type: if the load hit
-                    # OOM (e.g. a video/image model owns the card, or a
-                    # concurrent load raced request_model's free-VRAM check),
-                    # make room — evicting idle models and WAITING on busy ones
-                    # (_evict_models_for_vram waits for the active model to go
-                    # idle) — then retry the load once instead of failing.
-                    if not _cuda_oom(e):
-                        raise
-                    print(f"[embeddings] load OOM ({str(e)[:100]}) — "
-                          f"evicting to make room and retrying")
-                    try:
-                        import torch
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
-                    # If another model (e.g. a video pipeline) is mid-load, its
-                    # VRAM reservation is active — wait for that load to finish
-                    # (bounded) before evicting/retrying, exactly like queued
-                    # requests for any other model wait out a load.
-                    try:
-                        import time as _time
-                        _deadline = _time.time() + 300
-                        while (getattr(multi_model_manager,
-                                       '_loading_reservations', None)
-                               and _time.time() < _deadline):
-                            await asyncio.sleep(2)
-                    except Exception:
-                        pass
-                    # extra_vram_gb keeps the eviction meaningful even when the
-                    # model has no VRAM estimate yet (first-ever load).
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, multi_model_manager.ensure_vram_for,
-                        model_key, model_name, 2.0)
-                    model_obj = await asyncio.get_event_loop().run_in_executor(
-                        None, _load_embedding_model, model_name, device, _emb_cfg)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to load embedding model: {e}")
-        # Register through add_model (pool + models_in_vram bookkeeping) rather than
-        # a bare dict assignment, so eviction/unload treat it like every other model.
-        multi_model_manager.add_model(model_key, model_obj)
-        multi_model_manager.current_model_key = model_key
-        multi_model_manager.record_vram_delta(model_key, _snap)
+        # Serialize loads per model: a burst of first-requests (a bulk indexer)
+        # otherwise ALL see model_obj None and EACH loads its own copy — several
+        # 8 GB instances of the same embedder stacked on the card (observed as
+        # pool_instances=3/6), which is what actually filled the GPU. One
+        # request loads; the rest wait on the lock and reuse the loaded model.
+        _lock = _load_locks.setdefault(model_key, asyncio.Lock())
+        async with _lock:
+            model_obj = await _load_embedding_locked(
+                request, model_key, model_name, _emb_cfg)
 
     texts: List[str] = []
     if request.input is not None:
