@@ -737,6 +737,40 @@ def _free_pipeline_vram(pipe) -> None:
         import torch as _t
     except Exception:
         _t = None
+    # Record the CUDA storage pointers of every tensor this pipeline owns
+    # BEFORE breaking it apart. After teardown+gc, any of these pointers still
+    # alive means an EXTERNAL structure (accelerate's tied_params_map, the
+    # attention dispatcher, a stray cache…) kept a strong reference — the
+    # "referenced elsewhere" teardown leak that empty_cache() can't reclaim.
+    # We then null exactly those tensors out of their list/dict referrers (the
+    # same targeted pass the CUDA text backend's cleanup uses), never touching
+    # tensors of other resident models.
+    _orig_cuda_ptrs = set()
+    _vram_used0 = -1.0
+    if _t is not None and pipe is not None:
+        try:
+            if _t.cuda.is_available():
+                _vram_used0 = sum(
+                    _t.cuda.memory_allocated(i)
+                    for i in range(_t.cuda.device_count())) / 1e9
+        except Exception:
+            pass
+        try:
+            for _cv in (getattr(pipe, 'components', {}) or {}).values():
+                if not hasattr(_cv, 'parameters'):
+                    continue
+                for _tens in list(_cv.parameters()) + list(getattr(_cv, 'buffers', lambda: [])()):
+                    try:
+                        if _tens.is_cuda:
+                            _orig_cuda_ptrs.add(_tens.untyped_storage().data_ptr())
+                        # bnb 4-bit params keep quantized data on .data
+                        _d = getattr(_tens, 'data', None)
+                        if _d is not None and getattr(_d, 'is_cuda', False):
+                            _orig_cuda_ptrs.add(_d.untyped_storage().data_ptr())
+                    except Exception:
+                        continue
+        except Exception:
+            pass
     try:
         if pipe is not None:
             _comps = getattr(pipe, 'components', {}) or {}
@@ -821,6 +855,65 @@ def _free_pipeline_vram(pipe) -> None:
                 _t.cuda.empty_cache()
         except Exception:
             pass
+    # Referenced-leak breaker: any of THIS pipeline's tensors still on the GPU
+    # after gc are pinned by an external list/dict (accelerate maps, dispatcher
+    # caches…). Null them out of their referrers so the next gc+empty_cache can
+    # actually return the VRAM — this is what turns the "~22 GB untracked
+    # (teardown leak)" card back into a usable one without a restart.
+    if _t is not None and _orig_cuda_ptrs:
+        try:
+            if _t.cuda.is_available():
+                _broken = 0
+                _still_gb = 0.0
+                _holders = []
+                for _obj in _gc.get_objects():
+                    if not (isinstance(_obj, _t.Tensor) and _obj.is_cuda):
+                        continue
+                    try:
+                        if _obj.untyped_storage().data_ptr() not in _orig_cuda_ptrs:
+                            continue
+                    except Exception:
+                        continue
+                    _gb = _obj.numel() * _obj.element_size() / 1e9
+                    _still_gb += _gb
+                    for _ref in _gc.get_referrers(_obj):
+                        try:
+                            if isinstance(_ref, list):
+                                for _i, _it in enumerate(_ref):
+                                    if _it is _obj:
+                                        _ref[_i] = None
+                                        _broken += 1
+                            elif isinstance(_ref, dict):
+                                for _k, _v in list(_ref.items()):
+                                    if _v is _obj:
+                                        _ref[_k] = None
+                                        _broken += 1
+                                if _gb > 0.05 and len(_holders) < 6:
+                                    try:
+                                        _holders.append(
+                                            f"{_gb:.2f} GB dict{list(_ref.keys())[:3]}")
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                if _broken or _still_gb > 0.5:
+                    print(f"  [video] teardown-leak breaker: {_still_gb:.1f} GB of this "
+                          f"pipeline's tensors survived teardown; nulled {_broken} "
+                          f"external reference(s)"
+                          + (f"; holders: {_holders}" if _holders else ""))
+                    for _ in range(2):
+                        _gc.collect()
+                    _t.cuda.synchronize()
+                    _t.cuda.empty_cache()
+                    _t.cuda.synchronize()
+                if _vram_used0 >= 0:
+                    _vram_used1 = sum(
+                        _t.cuda.memory_allocated(i)
+                        for i in range(_t.cuda.device_count())) / 1e9
+                    print(f"  [video] pipeline free: torch-allocated "
+                          f"{_vram_used0:.1f} → {_vram_used1:.1f} GB")
+        except Exception as _lbe:
+            print(f"  [video] teardown-leak breaker failed: {_lbe}")
     try:
         from codai.models.manager import _trim_cpu_ram
         _trim_cpu_ram()
@@ -3499,6 +3592,10 @@ async def video_generations(request: VideoGenerationRequest,
         except Exception:
             _ram_before = -1.0
         from codai.tasks import loading_task
+        # Reserve the model's VRAM estimate for the whole load window so
+        # concurrent loads (e.g. an embedding model) see the card as spoken-for
+        # instead of racing this multi-minute load into a mutual OOM.
+        multi_model_manager.note_loading(model_key)
         try:
             with loading_task(model_name, model_type="video"):
                 pipe = await asyncio.get_event_loop().run_in_executor(
@@ -3544,6 +3641,7 @@ async def video_generations(request: VideoGenerationRequest,
                       + _tb2.format_exc())
                 _retried_fresh = False
             if not _retried_fresh:
+                multi_model_manager.clear_loading(model_key)
                 raise HTTPException(status_code=500, detail=f"Failed to load video model: {e}")
         # Fuse any configured acceleration/distillation LoRA (Lightning / Lightx2v /
         # LCM) into the freshly loaded pipeline. Done once at load; cached pipes keep
@@ -3565,6 +3663,8 @@ async def video_generations(request: VideoGenerationRequest,
             print(f"  [video][accel] skipped: {_e}")
         multi_model_manager.models[model_key] = pipe
         multi_model_manager.current_model_key = model_key
+        # Registered — normal tracking takes over from the load reservation.
+        multi_model_manager.clear_loading(model_key)
         # Record the model's FULL footprint (GPU-resident + offloaded-to-RAM). Pass
         # ram_before so an offloaded load's host-RAM weights are counted — otherwise
         # measured_vram_gb collapses to the tiny GPU slice (~0.3 GB) and eviction
@@ -3625,6 +3725,7 @@ async def video_generations(request: VideoGenerationRequest,
             print(f"  [video] fallback {_ri}/{len(_rungs)-1}: reloading "
                   f"'{model_name}' with strategy='{_strat}' (incremental={_incr}) — "
                   f"NOT returning to client…")
+            multi_model_manager.note_loading(model_key)
             try:
                 with _loading_task(model_name, model_type="video"):
                     pipe = await _loop.run_in_executor(
@@ -3632,12 +3733,14 @@ async def video_generations(request: VideoGenerationRequest,
                         _strat, _model_cfg, _incr)
                 multi_model_manager.models[model_key] = pipe
                 multi_model_manager.current_model_key = model_key
+                multi_model_manager.clear_loading(model_key)
             except Exception as _le:
                 print(f"  [video] fallback {_ri} load FAILED: "
                       f"{str(_le).splitlines()[0] if str(_le) else type(_le).__name__}\n"
                       + _tb.format_exc())
                 _last_err = _le
                 _le.__traceback__ = None
+                multi_model_manager.clear_loading(model_key)
                 multi_model_manager.models.pop(model_key, None)
                 multi_model_manager.model_pools.pop(model_key, None)
                 _free_pipeline_vram(pipe)

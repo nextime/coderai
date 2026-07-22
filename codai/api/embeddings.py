@@ -549,6 +549,19 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
                         torch.cuda.empty_cache()
                     except Exception:
                         pass
+                    # If another model (e.g. a video pipeline) is mid-load, its
+                    # VRAM reservation is active — wait for that load to finish
+                    # (bounded) before evicting/retrying, exactly like queued
+                    # requests for any other model wait out a load.
+                    try:
+                        import time as _time
+                        _deadline = _time.time() + 300
+                        while (getattr(multi_model_manager,
+                                       '_loading_reservations', None)
+                               and _time.time() < _deadline):
+                            await asyncio.sleep(2)
+                    except Exception:
+                        pass
                     # extra_vram_gb keeps the eviction meaningful even when the
                     # model has no VRAM estimate yet (first-ever load).
                     await asyncio.get_event_loop().run_in_executor(

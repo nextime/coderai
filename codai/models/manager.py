@@ -829,6 +829,15 @@ class MultiModelManager:
         self._model_ready_event = threading.Event()
         self._model_ready_event.set()   # initially ready (nothing loading)
         self.model_pools: Dict[str, ModelInstancePool] = {}  # per-key instance pools
+        # In-flight load reservations: model_key -> estimated GB. A big pipeline
+        # (video) takes minutes to load and is only registered in self.models
+        # AFTER the load completes — during that window the card is filling up
+        # but nothing is tracked, so a concurrent load (e.g. an embedding model)
+        # passes the free-VRAM check and both race into OOM. Reserving the
+        # estimate up front makes _get_free_vram_gb conservative for the whole
+        # load window and keeps sweep_orphan_vram from mislabeling an
+        # in-progress load as a teardown leak.
+        self._loading_reservations: Dict[str, float] = {}
         # Set once a CUDA device-side assert / unrecoverable CUDA error is seen.
         # The CUDA context is corrupted process-wide after such an error, so all
         # further GPU work is futile until the server is restarted.  We surface
@@ -2329,7 +2338,29 @@ class MultiModelManager:
                 total += self._get_model_used_vram_gb(key)
             except Exception:
                 pass
+        # A load in progress isn't in self.models yet but its weights are already
+        # streaming onto the card — count the reservation so the orphan check
+        # doesn't call an in-flight load a teardown leak.
+        for key, gb in list(self._loading_reservations.items()):
+            if key not in self.models:
+                total += gb
         return total
+
+    def note_loading(self, model_key: str, gb: float = 0.0) -> None:
+        """Reserve VRAM for a load that is about to start (see
+        _loading_reservations). Pass the model's estimate, or 0 to look it up."""
+        try:
+            if not gb or gb <= 0:
+                gb = self._get_model_used_vram_gb(model_key)
+            if gb and gb > 0:
+                self._loading_reservations[model_key] = float(gb)
+        except Exception:
+            pass
+
+    def clear_loading(self, model_key: str) -> None:
+        """Drop a load reservation (call from finally once the model is
+        registered in self.models — or the load failed)."""
+        self._loading_reservations.pop(model_key, None)
 
     def sweep_orphan_vram(self, context: str = "") -> None:
         """Reclaim any UNREFERENCED orphaned GPU memory and surface a diagnostic for
@@ -2404,7 +2435,12 @@ class MultiModelManager:
             except Exception:
                 pass
         if got:
-            return total_free
+            # Subtract in-flight load reservations: that VRAM is spoken for even
+            # if the loading model hasn't materialized all its weights yet.
+            # max(0, …) — late in a load the reservation overlaps memory the
+            # card already reports as used; being conservative here is the point.
+            _reserved = sum(self._loading_reservations.values())
+            return max(0.0, total_free - _reserved)
         return 999.0  # Unknown — assume enough
 
     @staticmethod
