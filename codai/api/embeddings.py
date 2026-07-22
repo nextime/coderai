@@ -73,7 +73,7 @@ class _EmbeddingModel:
             if self.backend == 'sentence_transformers':
                 if hasattr(self.model, 'to'):
                     self.model.to('cpu')
-            elif self.backend in ('clip', 'transformers'):
+            elif self.backend in ('clip', 'transformers', 'vision', 'qwenvl'):
                 # model is (processor_or_tokenizer, hf_model, device)
                 hf_model = self.model[1]
                 if hf_model is not None and hasattr(hf_model, 'to'):
@@ -96,6 +96,36 @@ _DUAL_ENCODER_TYPES = {
     'clip', 'clip_vision_model', 'siglip', 'siglip2', 'chinese_clip',
     'altclip', 'blip', 'blip-2', 'blip_2', 'x_clip', 'metaclip_2',
 }
+
+# IMAGE-ONLY encoders (DINOv2, plain ViT, …). No text tower, no tokenizer: they
+# embed images into their own space (image↔image similarity / retrieval). Text
+# requests against these return a clear 400.
+_VISION_ONLY_TYPES = {
+    'dinov2', 'dinov2_with_registers', 'vit', 'vit_mae', 'vit_msn',
+    'swin', 'swinv2', 'beit', 'deit', 'convnext', 'convnextv2',
+    'ijepa', 'videomae',
+}
+
+
+def _hf_model_type(model_name: str, trust: bool) -> str:
+    """The HF config's model_type for a repo, or '' when unreadable."""
+    try:
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=trust)
+        return str(getattr(cfg, 'model_type', ''))
+    except Exception:
+        return ''
+
+
+def _is_vision_only(model_name: str, trust: bool) -> bool:
+    """True if the HF config describes an image-only encoder (no text tower)."""
+    try:
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=trust)
+    except Exception:
+        return False
+    return (str(getattr(cfg, 'model_type', '')) in _VISION_ONLY_TYPES
+            and not hasattr(cfg, 'vision_config'))
 
 
 def _is_dual_encoder(model_name: str, trust: bool) -> bool:
@@ -131,6 +161,60 @@ def _has_st_modules(model_name: str) -> bool:
 def _load_embedding_model(model_name: str, device: str, model_config: dict = None):
     from codai.models.hf_loading import build_from_pretrained_kwargs
     trust = _trust_remote_code(model_config)
+
+    # Image-only encoder (DINOv2/ViT…): no tokenizer, no text tower — neither ST
+    # nor the text paths below can load it. Dedicated processor+model backend.
+    if _is_vision_only(model_name, trust):
+        try:
+            from transformers import AutoImageProcessor, AutoModel
+            fp = build_from_pretrained_kwargs(model_config)
+            if trust:
+                fp['trust_remote_code'] = True
+            processor = AutoImageProcessor.from_pretrained(model_name, trust_remote_code=trust)
+            model = AutoModel.from_pretrained(model_name, **fp)
+            if 'quantization_config' not in fp and 'device_map' not in fp:
+                model = model.to(device)
+            return _EmbeddingModel('vision', (processor, model, device))
+        except Exception as e:
+            raise RuntimeError(f"Cannot load image embedding model '{model_name}': {e}")
+
+    # Qwen2-VL-family embedders (GME-Qwen2-VL…): loaded NATIVELY, not through the
+    # repo's sentence-transformers custom code — that code pins transformers<4.52
+    # (it reaches into Qwen2-VL internals that were since refactored) and would
+    # refuse to load on this stack. The model is plain Qwen2-VL weights; the GME
+    # embedding is the last-token hidden state under their documented chat prompt,
+    # which _qwenvl_embed reproduces. No trust_remote_code needed.
+    _qwen_mt = _hf_model_type(model_name, trust)
+    if _qwen_mt in ('qwen2_vl', 'qwen2_5_vl'):
+        try:
+            import torch
+            # CONCRETE native classes, not Auto*: GME's config.json auto_map routes
+            # the Auto entry points into its remote module, whose import-time guard
+            # rejects transformers>=4.52. The concrete classes never consult
+            # auto_map, so the pinned remote code is bypassed entirely.
+            if _qwen_mt == 'qwen2_vl':
+                from transformers import Qwen2VLForConditionalGeneration as _VLM
+                from transformers import Qwen2VLProcessor as _PROC
+            else:
+                from transformers import Qwen2_5_VLForConditionalGeneration as _VLM
+                try:
+                    from transformers import Qwen2_5_VLProcessor as _PROC
+                except ImportError:
+                    from transformers import AutoProcessor as _PROC
+            fp = build_from_pretrained_kwargs(model_config)
+            if 'quantization_config' not in fp:
+                fp.setdefault('dtype', torch.float16)   # GME reference runs fp16
+            # GME's image-token budget (min/max pixels) from its reference code.
+            processor = _PROC.from_pretrained(
+                model_name, min_pixels=256 * 28 * 28, max_pixels=1280 * 28 * 28)
+            processor.tokenizer.padding_side = 'right'
+            model = _VLM.from_pretrained(model_name, **fp)
+            if 'quantization_config' not in fp and 'device_map' not in fp:
+                model = model.to(device)
+            model.eval()
+            return _EmbeddingModel('qwenvl', (processor, model, device))
+        except Exception as e:
+            raise RuntimeError(f"Cannot load Qwen-VL embedding model '{model_name}': {e}")
 
     # A dual encoder without an ST recipe must go down the transformers path so
     # text and images share one space; everything else prefers ST.
@@ -171,9 +255,10 @@ def _load_embedding_model(model_name: str, device: str, model_config: dict = Non
 
 
 def _supports_images(model_obj) -> bool:
-    """True if this loaded model can embed images into the same space as text."""
+    """True if this loaded model can embed images (shared space for clip/ST
+    multimodal; image-only space for the 'vision' backend)."""
     backend, model = model_obj
-    if backend == 'clip':
+    if backend in ('clip', 'vision', 'qwenvl'):
         return True
     if backend != 'sentence_transformers':
         return False
@@ -181,11 +266,19 @@ def _supports_images(model_obj) -> bool:
         first = model._first_module()
     except Exception:
         return False
-    # ST's CLIPModel module, or a custom (trust_remote_code) module that carries
-    # an image processor — both accept PIL images in encode().
-    return (type(first).__name__.lower().startswith('clip')
-            or hasattr(first, 'processor')
-            or hasattr(first, 'image_processor'))
+    # ST's CLIPModel module accepts PIL images in encode() directly.
+    if type(first).__name__.lower().startswith('clip'):
+        return True
+    # A custom (trust_remote_code) multimodal module (e.g. GME) carries a
+    # PROCESSOR that can handle images. A bare hasattr check is not enough —
+    # ST's plain Transformer module also exposes a (text) processor attribute,
+    # which made text-only models look image-capable and turned image requests
+    # into a 500 instead of a clean 400.
+    proc = getattr(first, 'processor', None) or getattr(first, 'image_processor', None)
+    if proc is None:
+        return False
+    return (hasattr(proc, 'image_processor')
+            or 'image' in type(proc).__name__.lower())
 
 
 def _decode_image(src: str):
@@ -215,6 +308,49 @@ def _decode_image(src: str):
         raise ValueError(
             f"image is not a URL, data URI, file path or base64 blob: {e}")
     return Image.open(io.BytesIO(raw)).convert('RGB')
+
+
+def _qwenvl_embed(model_tuple, items, dimensions=None):
+    """GME-style embedding on a native Qwen2-VL: last-token hidden state under the
+    GME chat prompt (mirrors the repo's custom_st tokenize/forward, which we can't
+    run — it pins transformers<4.52). `items` are {'text': …} / {'image': PIL} dicts;
+    each batch is modality-homogeneous (all-text or all-image), matching GME's own
+    'consistent batch' requirement."""
+    import torch
+    import torch.nn.functional as F
+    processor, hf_model, device = model_tuple
+
+    instruction = 'You are a helpful assistant.'
+    prompts, images = [], []
+    for it in items:
+        body = ''
+        img = it.get('image')
+        if img is not None:
+            body += '<|vision_start|><|image_pad|><|vision_end|>'
+            images.append(img)
+        if it.get('text'):
+            body += it['text']
+        prompts.append(
+            f'<|im_start|>system\n{instruction}<|im_end|>\n'
+            f'<|im_start|>user\n{body}<|im_end|>\n'
+            f'<|im_start|>assistant\n<|endoftext|>')
+
+    inputs = processor(text=prompts, images=images or None, padding='longest',
+                       truncation=True, max_length=1800, return_tensors='pt')
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    if 'pixel_values' in inputs:
+        inputs['pixel_values'] = inputs['pixel_values'].to(hf_model.dtype)
+    with torch.no_grad():
+        out = hf_model(**inputs, output_hidden_states=True, return_dict=True)
+    hs = out.hidden_states[-1]
+    # Right padding → the last REAL token (the <|endoftext|>) is at mask.sum()-1.
+    idx = inputs['attention_mask'].sum(dim=1) - 1
+    emb = hs[torch.arange(hs.shape[0], device=hs.device), idx]
+    emb = F.normalize(emb.float(), dim=-1)
+    results = [row.cpu().tolist() for row in emb]
+    if dimensions:
+        results = [v[:dimensions] for v in results]
+    return results
 
 
 def _clip_feats(raw):
@@ -250,6 +386,12 @@ def _embed_texts(model_obj, texts: List[str], dimensions=None) -> List[List[floa
             feats = _clip_feats(hf_model.get_text_features(**inputs))
         feats = F.normalize(feats, dim=-1)
         results = [row.cpu().tolist() for row in feats]
+    elif backend == 'qwenvl':
+        return _qwenvl_embed(model, [{'text': t} for t in texts], dimensions)
+    elif backend == 'vision':
+        raise ValueError(
+            "this embedding model is image-only (no text tower) — send 'image' "
+            "instead of 'input', or use a text/multimodal embedding model")
     else:
         import torch
         tokenizer, hf_model, device = model
@@ -277,8 +419,15 @@ def _embed_images(model_obj, images: List[str], dimensions=None) -> List[List[fl
     pil_images = [_decode_image(src) for src in images]
 
     if backend == 'sentence_transformers':
-        vecs = model.encode(pil_images, convert_to_numpy=True,
-                            normalize_embeddings=True)
+        try:
+            # ST's native CLIP wrapper takes PIL images directly.
+            vecs = model.encode(pil_images, convert_to_numpy=True,
+                                normalize_embeddings=True)
+        except Exception:
+            # Custom multimodal ST modules (e.g. GME-Qwen2-VL's custom_st) take
+            # {"image": …} dicts instead of bare PIL objects.
+            vecs = model.encode([{'image': im} for im in pil_images],
+                                convert_to_numpy=True, normalize_embeddings=True)
         results = [v.tolist() for v in vecs]
     elif backend == 'clip':
         import torch
@@ -288,6 +437,23 @@ def _embed_images(model_obj, images: List[str], dimensions=None) -> List[List[fl
         inputs = {k: v.to(device) for k, v in inputs.items()}
         with torch.no_grad():
             feats = _clip_feats(hf_model.get_image_features(**inputs))
+        feats = F.normalize(feats, dim=-1)
+        results = [row.cpu().tolist() for row in feats]
+    elif backend == 'qwenvl':
+        return _qwenvl_embed(model, [{'image': im} for im in pil_images], dimensions)
+    elif backend == 'vision':
+        # Image-only encoder (DINOv2/ViT…): CLS/pooled token of the vision
+        # transformer is the image representation.
+        import torch
+        import torch.nn.functional as F
+        processor, hf_model, device = model
+        inputs = processor(images=pil_images, return_tensors='pt')
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            out = hf_model(**inputs)
+        feats = getattr(out, 'pooler_output', None)
+        if feats is None:
+            feats = out.last_hidden_state[:, 0]   # CLS token
         feats = F.normalize(feats, dim=-1)
         results = [row.cpu().tolist() for row in feats]
     else:
