@@ -1705,6 +1705,36 @@ class FrontProxy:
             body_bytes = await request.body()
             model = self._peek_model(body_bytes, request.headers.get("content-type", ""))
 
+        # Modality-aware embedding reroute: a GGUF embedder (llama.cpp) has no
+        # image tower, so an `image` request against it would 400. When the SAME
+        # model is also registered as a non-GGUF (HF) entry, serve the image
+        # request from that sibling instead — the client keeps one model name;
+        # text requests stay on the GGUF entry's (e.g. radeon) engine.
+        if body_bytes is not None and "/embeddings" in path and model:
+            _gpath = str(self._model_info(model).get("path") or "")
+            if _gpath.lower().endswith(".gguf"):
+                try:
+                    import json as _json
+                    import re as _re
+                    _b = _json.loads(body_bytes or b"{}")
+                except Exception:
+                    _b = None
+                if isinstance(_b, dict) and _b.get("image"):
+                    _stem = model.lower().split("/")[-1]
+                    if _stem.endswith(".gguf"):
+                        _stem = _stem[:-5]
+                    # strip a trailing quant tag (…-Q4_K_M, ….i1-IQ4_XS, …)
+                    _stem = _re.sub(r'[-.](i1-)?(iq|q)\d[\w-]*$', '', _stem)
+                    _sib = self._model_info(_stem)
+                    _spath = str(_sib.get("path") or "")
+                    if _spath and not _spath.lower().endswith(".gguf"):
+                        _b["model"] = _sib.get("model_id") or _spath
+                        body_bytes = _json.dumps(_b).encode()
+                        model = _b["model"]
+                        print(f"[front] embeddings: image request for a GGUF "
+                              f"(text-only) embedder rerouted to HF sibling "
+                              f"'{model}'", flush=True)
+
         engine = _router.pick_engine(
             self.registry, path, method, model,
             required_cap=self._required_cap(path, model),
