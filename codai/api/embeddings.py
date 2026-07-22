@@ -180,6 +180,13 @@ def _load_embedding_model(model_name: str, device: str, model_config: dict = Non
                 model_path=model_name,
                 embedding=True,
                 n_ctx=n_ctx,
+                # CRITICAL: embedding mode asserts (SIGABRT, killing the whole
+                # engine) when an input has more tokens than the batch —
+                # GGML_ASSERT(out_ids.size() == n_outputs). Size both batches
+                # to the full context so any input we accept can be processed;
+                # _embed_texts truncates inputs to n_ctx to close the loop.
+                n_batch=n_ctx,
+                n_ubatch=n_ctx,
                 n_gpu_layers=int(n_gpu_layers if n_gpu_layers is not None else -1),
                 verbose=False,
             )
@@ -435,7 +442,20 @@ def _embed_texts(model_obj, texts: List[str], dimensions=None) -> List[List[floa
         # those. Normalize either way (llama.cpp does not normalize).
         import math
         results = []
+        try:
+            _tok_limit = max(16, model.n_ctx() - 8)
+        except Exception:
+            _tok_limit = 2040
         for t in texts:
+            # Truncate to the context window — an over-long input would abort
+            # llama.cpp (GGML_ASSERT) and take the whole engine down with it.
+            try:
+                _toks = model.tokenize(t.encode('utf-8', 'ignore'),
+                                       add_bos=True, special=False)
+                if len(_toks) > _tok_limit:
+                    t = model.detokenize(_toks[:_tok_limit]).decode('utf-8', 'ignore')
+            except Exception:
+                pass
             emb = model.embed(t)
             if emb and isinstance(emb[0], (list, tuple)):
                 n = len(emb)
