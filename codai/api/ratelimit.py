@@ -110,7 +110,9 @@ _DEFAULT_LIMITS: Dict[str, Tuple[int, int]] = {
     "/v1/images/":          (30, 60),
     "/v1/audio/":           (60, 60),
     "/v1/video/":           (10, 60),
-    "/v1/embeddings":       (120, 60),
+    # Embeddings are cheap and legitimately arrive in bulk (indexers embedding
+    # whole corpora at several req/s) — keep this an abuse guard, not a throttle.
+    "/v1/embeddings":       (1200, 60),
 }
 
 # API prefixes that count against the request queue

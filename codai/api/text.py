@@ -353,6 +353,17 @@ def _normalize_vision_content(content: list) -> list:
     return norm
 
 
+def _content_to_text(content) -> str:
+    """Flatten a message content field to plain text for token estimates.
+    Vision requests carry content as a multipart LIST (text + image parts) —
+    joining messages with ``str.join`` would raise on those."""
+    if isinstance(content, list):
+        return "\n".join(
+            it.get("text", "") if isinstance(it, dict) else str(it)
+            for it in content)
+    return content if isinstance(content, str) else ("" if content is None else str(content))
+
+
 def _normalize_tool_call_arguments(tool_calls):
     """Return tool_calls with each ``function.arguments`` as a dict (mapping)
     rather than a JSON string. OpenAI/Kilo send arguments as a JSON STRING, but
@@ -2875,7 +2886,7 @@ async def stream_chat_response(
                 yield f"data: {json.dumps(data)}\n\n"
             else:
                 # Calculate token counts for usage in final chunk
-                prompt_text = "\n".join([m.get("content", "") for m in messages])
+                prompt_text = "\n".join(_content_to_text(m.get("content")) for m in messages)
                 prompt_tokens = len(prompt_text.split())
                 completion_tokens = len(generated_text.split()) if generated_text else 0
                 
@@ -2898,7 +2909,7 @@ async def stream_chat_response(
                 yield f"data: {json.dumps(final_chunk)}\n\n"
         else:
             # Calculate token counts for usage in final chunk
-            prompt_text = "\n".join([m.get("content", "") for m in messages])
+            prompt_text = "\n".join(_content_to_text(m.get("content")) for m in messages)
             prompt_tokens = len(prompt_text.split())
             completion_tokens = len(generated_text.split()) if generated_text else 0
 
@@ -3129,7 +3140,7 @@ async def generate_chat_response(
         _model_key_for_cache = getattr(current_manager, 'model_name', None) or model_name
         last_usage = (current_manager.get_last_usage()
                       if hasattr(current_manager, 'get_last_usage') else {})
-        prompt_text = "\n".join([m.get("content", "") for m in messages])
+        prompt_text = "\n".join(_content_to_text(m.get("content")) for m in messages)
         prompt_tokens = last_usage.get('prompt_tokens') or len(prompt_text.split())
         completion_tokens = last_usage.get('completion_tokens') or (
             len(generated_text.split()) if generated_text else 0)
