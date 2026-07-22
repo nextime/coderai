@@ -446,20 +446,47 @@ def _embed_texts(model_obj, texts: List[str], dimensions=None) -> List[List[floa
             _tok_limit = max(16, model.n_ctx() - 8)
         except Exception:
             _tok_limit = 2040
+
+        def _embed_one(chunk_text):
+            emb = model.embed(chunk_text)
+            if emb and isinstance(emb[0], (list, tuple)):
+                n = len(emb)
+                emb = [sum(col) / n for col in zip(*emb)]
+            return emb
+
         for t in texts:
-            # Truncate to the context window — an over-long input would abort
-            # llama.cpp (GGML_ASSERT) and take the whole engine down with it.
+            # An input longer than the context window would abort llama.cpp
+            # (GGML_ASSERT) and take the whole engine down. Instead of cutting
+            # the text, CHUNK it into context-sized token windows, embed each,
+            # and combine with a token-count-weighted mean — no content is
+            # dropped, and single-chunk inputs take the direct path.
+            _chunks = [(t, 1)]
             try:
                 _toks = model.tokenize(t.encode('utf-8', 'ignore'),
                                        add_bos=True, special=False)
                 if len(_toks) > _tok_limit:
-                    t = model.detokenize(_toks[:_tok_limit]).decode('utf-8', 'ignore')
+                    _chunks = []
+                    for _i in range(0, len(_toks), _tok_limit):
+                        _w = _toks[_i:_i + _tok_limit]
+                        _chunks.append(
+                            (model.detokenize(_w).decode('utf-8', 'ignore'),
+                             len(_w)))
             except Exception:
                 pass
-            emb = model.embed(t)
-            if emb and isinstance(emb[0], (list, tuple)):
-                n = len(emb)
-                emb = [sum(col) / n for col in zip(*emb)]
+            if len(_chunks) == 1:
+                emb = _embed_one(_chunks[0][0])
+            else:
+                _acc = None
+                _tot = 0
+                for _ct, _cw in _chunks:
+                    _e = _embed_one(_ct)
+                    if _acc is None:
+                        _acc = [x * _cw for x in _e]
+                    else:
+                        for _j, _x in enumerate(_e):
+                            _acc[_j] += _x * _cw
+                    _tot += _cw
+                emb = [x / _tot for x in _acc]
             norm = math.sqrt(sum(x * x for x in emb)) or 1.0
             results.append([x / norm for x in emb])
     elif backend == 'vision':
