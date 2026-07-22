@@ -397,7 +397,29 @@ if [[ "$UPGRADE" -eq 1 ]]; then
 
   if [[ "$rc" -eq 0 ]]; then
     echo "== committing updated code back onto '$IMAGE_TAG' =="
-    if "$ENGINE" commit "$UP_NAME" "$IMAGE_TAG" >/dev/null; then
+    # docker commit bakes the container's RUNTIME config into the image — i.e.
+    # our --entrypoint override and the -e CODERAI_UPGRADE_* vars. Without the
+    # --change corrections below, the committed image would run the upgrader as
+    # its default entrypoint instead of the server (a container from it "fails
+    # to start"). Restore the image's original ENTRYPOINT/CMD (captured before
+    # the upgrade container mutated anything) and blank the injected env.
+    _orig_entry="$("$ENGINE" inspect --format '{{json .Config.Entrypoint}}' "$IMAGE_TAG" 2>/dev/null || echo null)"
+    _orig_cmd="$("$ENGINE" inspect --format '{{json .Config.Cmd}}' "$IMAGE_TAG" 2>/dev/null || echo null)"
+    commit_args=(commit)
+    if [[ -n "$_orig_entry" && "$_orig_entry" != "null" ]]; then
+      commit_args+=(--change "ENTRYPOINT $_orig_entry")
+    fi
+    if [[ -n "$_orig_cmd" && "$_orig_cmd" != "null" ]]; then
+      commit_args+=(--change "CMD $_orig_cmd")
+    else
+      commit_args+=(--change "CMD []")
+    fi
+    commit_args+=(--change 'ENV CODERAI_UPGRADE_REF='
+                  --change 'ENV CODERAI_UPGRADE_FORCE='
+                  --change 'ENV CODERAI_UPGRADE_SKIP_PIP='
+                  --change 'ENV CODERAI_UPGRADE_REPO='
+                  --change 'ENV CODERAI_UPGRADE_SSH_KEY=')
+    if "$ENGINE" "${commit_args[@]}" "$UP_NAME" "$IMAGE_TAG" >/dev/null; then
       echo "== upgrade complete: '$IMAGE_TAG' now carries the new code. =="
       echo "   Restart the server to pick it up (e.g. stop the container and re-run coderai-docker)."
     else
