@@ -2224,7 +2224,17 @@ class VulkanBackend(ModelBackend):
         # via create_completion — avoids llama-cpp-python's slow per-call sandboxed
         # chat-template render. Falls through to create_chat_completion if the model
         # has no usable chat_template or rendering fails.
-        _prompt, _fmt_stops = self._render_chat_prompt(messages)
+        # NEVER take the fast path for vision requests: only create_chat_completion
+        # invokes the multimodal chat handler (mmproj) that actually embeds the
+        # images — a plain Jinja render would silently drop them and the model
+        # answers as if no image was sent.
+        _has_images = self.supports_vision and any(
+            isinstance(m.get('content'), list) and any(
+                isinstance(p, dict) and p.get('type') in ('image_url', 'input_image')
+                for p in m['content'])
+            for m in messages)
+        _prompt, _fmt_stops = ((None, None) if _has_images
+                               else self._render_chat_prompt(messages))
         if _prompt is not None:
             # Tokenize with add_bos=False (the chat template already emitted the BOS
             # text — same as llama-cpp's handler, which tokenizes with
