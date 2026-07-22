@@ -26,6 +26,8 @@ UPGRADE_FORCE=0
 UPGRADE_REF="${CODERAI_UPGRADE_REF:-production}"
 UPGRADE_REPO="${CODERAI_UPGRADE_REPO:-}"
 UPGRADE_SSH_KEY="${CODERAI_UPGRADE_SSH_KEY:-}"
+# --no-pip: refresh code only, don't re-run pip even if dependencies changed.
+UPGRADE_SKIP_PIP="${CODERAI_UPGRADE_SKIP_PIP:-0}"
 # Selected GPU backends. ADDITIVE: --nvidia --vulkan enables BOTH, so the
 # container gets the NVIDIA driver libs (libcuda.so.1 — needed even by a
 # CUDA-built llama-cpp running under Vulkan) AND /dev/dri. CPU always works.
@@ -126,6 +128,8 @@ Upgrade (refresh the in-image code instead of running the server):
                       its SSH form when --ssh-key is given).
   --ssh-key PATH      Host path to an SSH private key; mounted into the upgrade
                       container so git can authenticate over SSH.
+  --no-pip            With --upgrade, refresh the code only; do not re-run pip
+                      even when the fetched code changed its dependencies.
   --cpu               Enable the CPU backend (always available; default if none).
   --nvidia            Enable NVIDIA CUDA; adds --gpus all for Docker (maps the
                       driver incl. libcuda.so.1).
@@ -228,6 +232,7 @@ while [[ $# -gt 0 ]]; do
     --ssh-key)
       [[ $# -ge 2 ]] || { echo "Error: --ssh-key requires a path" >&2; exit 2; }
       UPGRADE_SSH_KEY="$2"; shift 2 ;;
+    --no-pip) UPGRADE_SKIP_PIP=1; shift ;;
     --cpu) MODES[cpu]=1; shift ;;
     --nvidia|--cuda) MODES[nvidia]=1; shift ;;
     --vulkan) MODES[vulkan]=1; shift ;;
@@ -365,7 +370,8 @@ if [[ "$UPGRADE" -eq 1 ]]; then
   UP_NAME="${NAME}-upgrade-$$"
   up_args=(run --name "$UP_NAME" --entrypoint /usr/local/bin/coderai-upgrade
            -e "CODERAI_UPGRADE_REF=$UPGRADE_REF"
-           -e "CODERAI_UPGRADE_FORCE=$UPGRADE_FORCE")
+           -e "CODERAI_UPGRADE_FORCE=$UPGRADE_FORCE"
+           -e "CODERAI_UPGRADE_SKIP_PIP=$UPGRADE_SKIP_PIP")
   [[ -n "$UPGRADE_REPO" ]] && up_args+=(-e "CODERAI_UPGRADE_REPO=$UPGRADE_REPO")
   if [[ -n "$UPGRADE_SSH_KEY" ]]; then
     [[ -f "$UPGRADE_SSH_KEY" ]] || { echo "Error: --ssh-key '$UPGRADE_SSH_KEY' not found" >&2; exit 2; }
@@ -379,6 +385,7 @@ if [[ "$UPGRADE" -eq 1 ]]; then
   echo "  image:   $IMAGE_TAG"
   echo "  ref:     $UPGRADE_REF${UPGRADE_FORCE:+   (force)}"
   echo "  auth:    ${UPGRADE_SSH_KEY:+ssh key $UPGRADE_SSH_KEY}${UPGRADE_SSH_KEY:-https/anonymous}"
+  echo "  pip:     $([[ "$UPGRADE_SKIP_PIP" == "1" ]] && echo 'skipped (--no-pip)' || echo 'sync deps if changed')"
 
   # Make sure a stale upgrade container from an aborted run doesn't block us.
   "$ENGINE" rm -f "$UP_NAME" >/dev/null 2>&1 || true

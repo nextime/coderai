@@ -34,6 +34,11 @@ DEFAULT_SSH_REPO="git@git.nexlab.net:nexlab/coderai.git"
 REF="${CODERAI_UPGRADE_REF:-production}"
 FORCE="${CODERAI_UPGRADE_FORCE:-0}"
 SSH_KEY="${CODERAI_UPGRADE_SSH_KEY:-}"
+# When the fetched code changes its declared dependencies, re-run pip so new
+# packages land in the image's python env. Set CODERAI_UPGRADE_SKIP_PIP=1 to skip
+# (e.g. an offline/air-gapped host that only wants the code refresh).
+SKIP_PIP="${CODERAI_UPGRADE_SKIP_PIP:-0}"
+PYBIN="/opt/coderai/python/bin/python3"
 
 # Pick the default repo form to match the auth method: SSH URL when a key was
 # supplied, HTTPS otherwise. An explicit CODERAI_UPGRADE_REPO always wins.
@@ -72,6 +77,65 @@ vercmp() {
     if (( x > y )); then echo 1; return; fi
   done
   echo 0
+}
+
+# Fingerprint the dependency-declaring files under a tree, so we can tell whether
+# the fetched code changed what must be installed. Mirrors the set the OCI image
+# actually installs: the base requirements.txt plus the container's extra list
+# (packaging/common/requirements-oci.txt). Missing files are simply skipped.
+hash_reqs() {
+  local d="$1"
+  cat "$d/requirements.txt" \
+      "$d/packaging/common/requirements-oci.txt" 2>/dev/null \
+    | sha256sum 2>/dev/null | awk '{print $1}'
+}
+
+# Refresh the launcher scripts and service configs that live OUTSIDE the app tree
+# (in /usr/local/bin, /etc/nginx, /etc/supervisor). The in-image code replace only
+# touches /opt/coderai/app, so without this a rebuild would be the only way to
+# pick up launcher/config changes — including changes to THIS upgrade script.
+# Mirrors the COPY set in packaging/linux/Dockerfile.update. Each file is written
+# via a temp + atomic rename so replacing the currently-running coderai-upgrade
+# doesn't corrupt this in-flight process (bash keeps executing the old inode).
+sync_system_files() {
+  local src="$WORK/src"
+  _install_file() {  # <src> <dest> <mode>
+    [[ -f "$1" ]] || return 0
+    local tmp; tmp="$(dirname "$2")/.$(basename "$2").upgrade.$$"
+    cp "$1" "$tmp" && chmod "$3" "$tmp" && mv -f "$tmp" "$2" \
+      || { rm -f "$tmp"; log "warning: could not update $2"; return 1; }
+  }
+  _install_file "$src/packaging/linux/launcher/coderai-oci"         /usr/local/bin/coderai             0755
+  _install_file "$src/packaging/linux/launcher/with-env"            /usr/local/bin/with-env            0755
+  _install_file "$src/packaging/linux/launcher/coderai-entrypoint"  /usr/local/bin/coderai-entrypoint  0755
+  _install_file "$src/packaging/linux/launcher/coderai-upgrade"     /usr/local/bin/coderai-upgrade     0755
+  _install_file "$src/packaging/linux/launcher/wav2lip"             /usr/local/bin/wav2lip             0755
+  _install_file "$src/packaging/linux/launcher/sadtalker"           /usr/local/bin/sadtalker           0755
+  _install_file "$src/packaging/linux/nginx.conf"                   /etc/nginx/nginx.conf              0644
+  _install_file "$src/packaging/linux/supervisord.conf"             /etc/supervisor/supervisord.conf   0644
+  _install_file "$src/packaging/linux/README-RUN.txt"              /opt/coderai/README-RUN.txt        0644
+}
+
+# Re-install the app's declared dependencies into /opt/coderai/python. Uses the
+# same effective set as the image build (requirements.txt + the OCI extras), but
+# drops requirements-oci.txt's build-time `-r /tmp/requirements.txt` self-include
+# (we prepend the real requirements.txt instead). Native CUDA builds pinned with
+# `>=` are already satisfied, so pip leaves them untouched — only genuinely new or
+# version-bumped packages are (re)installed.
+pip_sync() {
+  [[ -x "$PYBIN" ]] || { log "python not found at $PYBIN — skipping dependency sync"; return 1; }
+  local tmpreq; tmpreq="$(mktemp "$WORK/reqs.XXXXXX")"
+  [[ -f "$APP_DIR/requirements.txt" ]] && cat "$APP_DIR/requirements.txt" >> "$tmpreq"
+  if [[ -f "$APP_DIR/packaging/common/requirements-oci.txt" ]]; then
+    grep -vE '^[[:space:]]*-r[[:space:]]' "$APP_DIR/packaging/common/requirements-oci.txt" >> "$tmpreq"
+  fi
+  [[ -s "$tmpreq" ]] || { log "no requirements files found — nothing to install"; return 0; }
+  local pip_args=(-m pip install --no-input --disable-pip-version-check)
+  # Prefer prebuilt CUDA wheels when the build left them behind (older images
+  # don't have /opt/wheels; the flag is simply omitted then).
+  [[ -d /opt/wheels ]] && pip_args+=(--find-links /opt/wheels)
+  log "syncing python dependencies (pip install)…"
+  "$PYBIN" "${pip_args[@]}" -r "$tmpreq"
 }
 
 CUR_VER="$(read_version "$APP_DIR/codai/__init__.py" || true)"
@@ -125,6 +189,11 @@ fi
 [[ "$FORCE" == "1" && "$CMP" != "1" ]] && log "forcing upgrade to $NEW_VER (was $CUR_VER)…" \
                                        || log "upgrading $CUR_VER -> $NEW_VER…"
 
+# Fingerprint the CURRENT dependencies before we overwrite the tree, and the
+# fetched ones, so we only re-run pip when the declared deps actually changed.
+OLD_REQ_HASH="$(hash_reqs "$APP_DIR")"
+NEW_REQ_HASH="$(hash_reqs "$WORK/src")"
+
 # Strip the parts that must never land in the read-only app tree — mirror the
 # exclusions the image build applies (Dockerfile.update) so the in-image layout
 # stays identical to a freshly built image.
@@ -153,6 +222,28 @@ fi
 # Keep the entrypoint expectations intact.
 mkdir -p "$APP_DIR/models"
 [[ -f "$APP_DIR/coderai" ]] && chmod +x "$APP_DIR/coderai" || true
+
+# Refresh launchers + service configs from the fetched tree (incl. this script).
+# Non-fatal: a failed config copy must not abort an otherwise-successful upgrade.
+sync_system_files || log "warning: launcher/config refresh incomplete"
+
+# Dependency sync: run pip when the declared deps changed (or on --force). A pip
+# failure aborts with a non-zero exit so the host does NOT commit a half-upgraded
+# image (new code but missing packages) — the fetched code is simply discarded.
+if [[ "$SKIP_PIP" == "1" ]]; then
+  log "dependency sync skipped (CODERAI_UPGRADE_SKIP_PIP=1)"
+elif [[ "$OLD_REQ_HASH" != "$NEW_REQ_HASH" || "$FORCE" == "1" ]]; then
+  if [[ "$OLD_REQ_HASH" != "$NEW_REQ_HASH" ]]; then
+    log "dependencies changed — updating the python environment"
+  else
+    log "forcing dependency sync"
+  fi
+  if ! pip_sync; then
+    die "dependency install failed — image left unchanged (fix connectivity/requirements and retry)"
+  fi
+else
+  log "dependencies unchanged — no pip install needed"
+fi
 
 FINAL_VER="$(read_version "$APP_DIR/codai/__init__.py" || echo "$NEW_VER")"
 log "done — in-image code is now $FINAL_VER"
