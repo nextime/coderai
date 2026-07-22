@@ -70,7 +70,11 @@ class _EmbeddingModel:
 
     def cleanup(self):
         try:
-            if self.backend == 'sentence_transformers':
+            if self.backend == 'llama':
+                # llama.cpp model: close() frees the ctx + weights (VRAM incl.)
+                if hasattr(self.model, 'close'):
+                    self.model.close()
+            elif self.backend == 'sentence_transformers':
                 if hasattr(self.model, 'to'):
                     self.model.to('cpu')
             elif self.backend in ('clip', 'transformers', 'vision', 'qwenvl'):
@@ -161,6 +165,28 @@ def _has_st_modules(model_name: str) -> bool:
 def _load_embedding_model(model_name: str, device: str, model_config: dict = None):
     from codai.models.hf_loading import build_from_pretrained_kwargs
     trust = _trust_remote_code(model_config)
+
+    # GGUF file → llama.cpp in embedding mode (works on whatever backend this
+    # build targets: Vulkan on the radeon engine, CUDA on nvidia). Text-only —
+    # llama.cpp's embedding path has no image tower wired here.
+    if str(model_name).lower().endswith('.gguf'):
+        try:
+            from llama_cpp import Llama
+            cfg = model_config or {}
+            raw = cfg.get('_raw_cfg') if isinstance(cfg.get('_raw_cfg'), dict) else {}
+            n_ctx = int(cfg.get('n_ctx') or raw.get('n_ctx') or 2048)
+            n_gpu_layers = cfg.get('n_gpu_layers', raw.get('n_gpu_layers', -1))
+            model = Llama(
+                model_path=model_name,
+                embedding=True,
+                n_ctx=n_ctx,
+                n_gpu_layers=int(n_gpu_layers if n_gpu_layers is not None else -1),
+                verbose=False,
+            )
+            return _EmbeddingModel('llama', model)
+        except Exception as e:
+            raise RuntimeError(
+                f"Cannot load GGUF embedding model '{model_name}': {e}")
 
     # Image-only encoder (DINOv2/ViT…): no tokenizer, no text tower — neither ST
     # nor the text paths below can load it. Dedicated processor+model backend.
@@ -403,6 +429,19 @@ def _embed_texts(model_obj, texts: List[str], dimensions=None) -> List[List[floa
         results = [row.cpu().tolist() for row in feats]
     elif backend == 'qwenvl':
         return _qwenvl_embed(model, [{'text': t} for t in texts], dimensions)
+    elif backend == 'llama':
+        # llama.cpp embedding mode. With a pooling type baked into the GGUF the
+        # result is one vector per input; without, per-token vectors — mean-pool
+        # those. Normalize either way (llama.cpp does not normalize).
+        import math
+        results = []
+        for t in texts:
+            emb = model.embed(t)
+            if emb and isinstance(emb[0], (list, tuple)):
+                n = len(emb)
+                emb = [sum(col) / n for col in zip(*emb)]
+            norm = math.sqrt(sum(x * x for x in emb)) or 1.0
+            results.append([x / norm for x in emb])
     elif backend == 'vision':
         raise ValueError(
             "this embedding model is image-only (no text tower) — send 'image' "
