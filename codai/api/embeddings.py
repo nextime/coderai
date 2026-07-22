@@ -522,10 +522,40 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
         # and recorded — this is what lets a later request for another model size
         # its eviction correctly (and lets this model be evicted to reclaim VRAM).
         _snap = multi_model_manager.vram_before_load()
+
+        def _cuda_oom(exc: Exception) -> bool:
+            s = str(exc)
+            return ('CUDA' in s or 'cuda' in s or 'out of memory' in s.lower()
+                    or 'CUBLAS' in s)
+
         try:
             with loading_task(model_name, model_type="embedding"):
-                model_obj = await asyncio.get_event_loop().run_in_executor(
-                    None, _load_embedding_model, model_name, device, _emb_cfg)
+                try:
+                    model_obj = await asyncio.get_event_loop().run_in_executor(
+                        None, _load_embedding_model, model_name, device, _emb_cfg)
+                except Exception as e:
+                    # Same contract as every other model type: if the load hit
+                    # OOM (e.g. a video/image model owns the card, or a
+                    # concurrent load raced request_model's free-VRAM check),
+                    # make room — evicting idle models and WAITING on busy ones
+                    # (_evict_models_for_vram waits for the active model to go
+                    # idle) — then retry the load once instead of failing.
+                    if not _cuda_oom(e):
+                        raise
+                    print(f"[embeddings] load OOM ({str(e)[:100]}) — "
+                          f"evicting to make room and retrying")
+                    try:
+                        import torch
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    # extra_vram_gb keeps the eviction meaningful even when the
+                    # model has no VRAM estimate yet (first-ever load).
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, multi_model_manager.ensure_vram_for,
+                        model_key, model_name, 2.0)
+                    model_obj = await asyncio.get_event_loop().run_in_executor(
+                        None, _load_embedding_model, model_name, device, _emb_cfg)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load embedding model: {e}")
         # Register through add_model (pool + models_in_vram bookkeeping) rather than
@@ -563,7 +593,37 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
+        # Encode-time CUDA OOM: another workload grabbed the card's remaining
+        # VRAM mid-flight (no room left for the forward pass's scratch buffers).
+        # Behave like any other model — evict idle models / wait on busy ones —
+        # then retry the encode once.
+        s = str(e)
+        if not ('CUDA' in s or 'CUBLAS' in s or 'out of memory' in s.lower()):
+            raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
+        print(f"[embeddings] encode OOM ({s[:100]}) — evicting to make room and retrying")
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            # Only scratch room is needed (the model is already resident) — and
+            # marking it active first keeps the eviction pass off the embedding
+            # model itself while it frees other idle models.
+            multi_model_manager.active_in_vram = model_key
+            await asyncio.get_event_loop().run_in_executor(
+                None, multi_model_manager._evict_models_for_vram, 2.0)
+            vectors = []
+            if texts:
+                vectors += await asyncio.get_event_loop().run_in_executor(
+                    None, _embed_texts, model_obj, texts, request.dimensions)
+            if images:
+                vectors += await asyncio.get_event_loop().run_in_executor(
+                    None, _embed_images, model_obj, images, request.dimensions)
+        except ValueError as e2:
+            raise HTTPException(status_code=400, detail=str(e2))
+        except Exception as e2:
+            raise HTTPException(status_code=500, detail=f"Embedding failed: {e2}")
 
     # Optional TurboQuant vector quantization (data-free, inner-product preserving).
     # The per-model config block (turboquant: {enabled, backend, bits}) is the
