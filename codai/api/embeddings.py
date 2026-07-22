@@ -310,6 +310,23 @@ def _decode_image(src: str):
     return Image.open(io.BytesIO(raw)).convert('RGB')
 
 
+def _truncate_dims(results, dimensions):
+    """Matryoshka-style truncation: keep the first N dims, then RE-normalize —
+    a truncated slice of a unit vector is no longer unit-norm, and downstream
+    cosine/dot-product math assumes normalized embeddings (this matches how
+    OpenAI applies `dimensions`). Meaningful for MRL-trained models
+    (Qwen3-Embedding: 32-2560); others degrade gracefully but aren't trained
+    for truncation."""
+    if not dimensions:
+        return results
+    out = []
+    for v in results:
+        t = v[:dimensions]
+        n = sum(x * x for x in t) ** 0.5
+        out.append([x / n for x in t] if n > 0 else t)
+    return out
+
+
 def _qwenvl_embed(model_tuple, items, dimensions=None):
     """GME-style embedding on a native Qwen2-VL: last-token hidden state under the
     GME chat prompt (mirrors the repo's custom_st tokenize/forward, which we can't
@@ -348,9 +365,7 @@ def _qwenvl_embed(model_tuple, items, dimensions=None):
     emb = hs[torch.arange(hs.shape[0], device=hs.device), idx]
     emb = F.normalize(emb.float(), dim=-1)
     results = [row.cpu().tolist() for row in emb]
-    if dimensions:
-        results = [v[:dimensions] for v in results]
-    return results
+    return _truncate_dims(results, dimensions)
 
 
 def _clip_feats(raw):
@@ -408,9 +423,7 @@ def _embed_texts(model_obj, texts: List[str], dimensions=None) -> List[List[floa
         mean_emb = F.normalize(mean_emb, dim=-1)
         results = [row.cpu().tolist() for row in mean_emb]
 
-    if dimensions:
-        results = [v[:dimensions] for v in results]
-    return results
+    return _truncate_dims(results, dimensions)
 
 
 def _embed_images(model_obj, images: List[str], dimensions=None) -> List[List[float]]:
@@ -459,9 +472,7 @@ def _embed_images(model_obj, images: List[str], dimensions=None) -> List[List[fl
     else:
         raise ValueError("model is text-only")
 
-    if dimensions:
-        results = [v[:dimensions] for v in results]
-    return results
+    return _truncate_dims(results, dimensions)
 
 
 @router.post("/v1/embeddings", response_model=EmbeddingsResponse, summary="Create embeddings")
