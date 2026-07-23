@@ -236,10 +236,29 @@ def _load_embedding_model(model_name: str, device: str, model_config: dict = Non
         _ngl = cfg.get('n_gpu_layers', raw.get('n_gpu_layers', -1))
         if _ngl == 0:
             env['DINOV2_FORCE_CPU'] = '1'
+        # Reap any ORPHANED embed server for this model first: if the engine
+        # process crashed, its child survived re-parented (still holding VRAM)
+        # and the respawned engine would stack a second copy next to it.
+        try:
+            subprocess.run(['pkill', '-f', f'dinov2-embed -m {model_name}'],
+                           timeout=10)
+        except Exception:
+            pass
+
+        def _die_with_parent():
+            # PR_SET_PDEATHSIG: the kernel kills the child if the engine dies,
+            # so a crashed engine can never leak a VRAM-holding orphan again.
+            try:
+                import ctypes
+                ctypes.CDLL('libc.so.6').prctl(1, 9)  # (PR_SET_PDEATHSIG, SIGKILL)
+            except Exception:
+                pass
+
         proc = subprocess.Popen(
             [_bin, '-m', model_name, '-t', '8'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, env=env, text=True, bufsize=1)
+            stderr=subprocess.DEVNULL, env=env, text=True, bufsize=1,
+            preexec_fn=_die_with_parent)
         # wait for the ready line (model load), skipping loader chatter
         import json as _json
         import time as _time

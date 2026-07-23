@@ -369,8 +369,13 @@ async def internal_engine_state():
                 continue
             _seen_li.add(_k)
             try:
-                _vg = (multi_model_manager._measured_vram_gb.get(_k)
-                       or multi_model_manager._get_model_used_vram_gb(_k) or 0)
+                # A load that happened while the card was already full measures
+                # a ~0 VRAM delta (free_before ≈ free_after) — never report that
+                # as the model's footprint; take the max of measurement and the
+                # config estimate.
+                _meas = multi_model_manager._measured_vram_gb.get(_k) or 0
+                _est = multi_model_manager._get_model_used_vram_gb(_k) or 0
+                _vg = max(float(_meas), float(_est))
             except Exception:
                 _vg = 0
             _cfg = {}
