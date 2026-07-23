@@ -2969,6 +2969,24 @@ def api_tasks(username: str = Depends(require_admin)):
     except Exception:
         pass
 
+    # Tag every task with the compute device it runs on ("GPU RTX 3090",
+    # "GPU Vulkan/AMD · CPU offload 12.4 GB", "CPU"). Per-model state comes from
+    # record_vram_delta (device + offload measured at load); tasks whose model
+    # hasn't loaded yet (or non-model tasks like downloads, which are CPU/disk)
+    # fall back to the engine's device / a sensible per-kind default.
+    try:
+        _default_dev = multi_model_manager.engine_device_desc()
+        for t in tasks:
+            if t.get("device"):
+                continue
+            if t.get("kind") == "download":
+                t["device"] = "CPU"
+                continue
+            t["device"] = (multi_model_manager.device_for_model(t.get("model"))
+                           or _default_dev)
+    except Exception:
+        pass
+
     # The queue-summary header must reflect ALL model activity, not just requests
     # that flow through queue_manager (text/pipelines/training). Image/video/audio
     # generations run their own paths and live only in the task registry, so derive

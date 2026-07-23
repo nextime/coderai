@@ -65,7 +65,7 @@ class _EmbeddingModel:
         self.model = model
         # llama.cpp contexts are NOT thread-safe: two executor threads calling
         # embed() on one ctx segfault the engine. Serialize per model instance.
-        if backend in ('llama', 'llama-vl'):
+        if backend in ('llama', 'llama-vl', 'dinov2cpp'):
             import threading
             self.lock = threading.Lock()
         else:
@@ -77,7 +77,18 @@ class _EmbeddingModel:
 
     def cleanup(self):
         try:
-            if self.backend == 'llama-vl':
+            if self.backend == 'dinov2cpp':
+                # persistent embed server subprocess — terminating it frees
+                # its (V)RAM; eviction restarts it on the next request.
+                try:
+                    self.model.terminate()
+                    self.model.wait(timeout=10)
+                except Exception:
+                    try:
+                        self.model.kill()
+                    except Exception:
+                        pass
+            elif self.backend == 'llama-vl':
                 llm, mctx = self.model
                 try:
                     from llama_cpp import mtmd_cpp as _M
@@ -179,6 +190,11 @@ def _has_st_modules(model_name: str) -> bool:
         return False
 
 
+def _os_basename(p) -> str:
+    import os
+    return os.path.basename(str(p))
+
+
 def _load_embedding_model(model_name: str, device: str, model_config: dict = None):
     from codai.models.hf_loading import build_from_pretrained_kwargs
     trust = _trust_remote_code(model_config)
@@ -186,6 +202,49 @@ def _load_embedding_model(model_name: str, device: str, model_config: dict = Non
     # GGUF file → llama.cpp in embedding mode (works on whatever backend this
     # build targets: Vulkan on the radeon engine, CUDA on nvidia). Text-only —
     # llama.cpp's embedding path has no image tower wired here.
+    # DINOv2 GGUF → the dinov2.cpp `dinov2-embed` server (ggml Vulkan/CPU;
+    # llama.cpp cannot load a ViT-only arch). One persistent subprocess holds
+    # the model; requests stream image paths in and JSON embeddings out. Its
+    # CLS output matches the HF 'vision' backend at ~0.997 cosine.
+    if (str(model_name).lower().endswith('.gguf')
+            and 'dinov2' in _os_basename(model_name).lower()):
+        import os as _os
+        import subprocess
+        _bin = _os.environ.get('DINOV2_EMBED_BIN', '/opt/coderai/bin/dinov2-embed')
+        if not _os.path.isfile(_bin):
+            raise RuntimeError(
+                f"dinov2-embed binary not found at {_bin} — build it with "
+                "packaging/dinov2cpp/build.sh")
+        cfg = model_config or {}
+        raw = cfg.get('_raw_cfg') if isinstance(cfg.get('_raw_cfg'), dict) else {}
+        env = dict(_os.environ)
+        _ngl = cfg.get('n_gpu_layers', raw.get('n_gpu_layers', -1))
+        if _ngl == 0:
+            env['DINOV2_FORCE_CPU'] = '1'
+        proc = subprocess.Popen(
+            [_bin, '-m', model_name, '-t', '8'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, env=env, text=True, bufsize=1)
+        # wait for the ready line (model load), skipping loader chatter
+        import json as _json
+        import time as _time
+        _deadline = _time.time() + 300
+        while _time.time() < _deadline:
+            line = proc.stdout.readline()
+            if not line:
+                raise RuntimeError("dinov2-embed exited during load")
+            line = line.strip()
+            if line.startswith('{'):
+                try:
+                    if _json.loads(line).get('ready'):
+                        break
+                except Exception:
+                    pass
+        else:
+            proc.kill()
+            raise RuntimeError("dinov2-embed load timed out")
+        return _EmbeddingModel('dinov2cpp', proc)
+
     if str(model_name).lower().endswith('.gguf'):
         try:
             import os as _os
@@ -337,7 +396,7 @@ def _supports_images(model_obj) -> bool:
     """True if this loaded model can embed images (shared space for clip/ST
     multimodal; image-only space for the 'vision' backend)."""
     backend, model = model_obj
-    if backend in ('clip', 'vision', 'qwenvl', 'llama-vl'):
+    if backend in ('clip', 'vision', 'qwenvl', 'llama-vl', 'dinov2cpp'):
         return True
     if backend != 'sentence_transformers':
         return False
@@ -678,7 +737,7 @@ def _embed_texts(model_obj, texts: List[str], dimensions=None) -> List[List[floa
                     emb = [x / _tot for x in _acc]
                 norm = math.sqrt(sum(x * x for x in emb)) or 1.0
                 results.append([x / norm for x in emb])
-    elif backend == 'vision':
+    elif backend in ('vision', 'dinov2cpp'):
         raise ValueError(
             "this embedding model is image-only (no text tower) — send 'image' "
             "instead of 'input', or use a text/multimodal embedding model")
@@ -732,6 +791,47 @@ def _embed_images(model_obj, images: List[str], dimensions=None) -> List[List[fl
     elif backend == 'llama-vl':
         return _llama_vl_embed(model_obj, [{'image': im} for im in pil_images],
                                dimensions)
+    elif backend == 'dinov2cpp':
+        # dinov2-embed subprocess: temp-file the PIL images, send paths, read
+        # JSON lines back; normalize (the binary emits raw CLS values).
+        import contextlib
+        import json as _json
+        import math
+        import os
+        import tempfile
+        proc = model
+        results = []
+        _mlock = getattr(model_obj, 'lock', None)
+        with (_mlock if _mlock is not None else contextlib.nullcontext()):
+            if proc.poll() is not None:
+                raise RuntimeError("dinov2-embed process died — retry (it will reload)")
+            for im in pil_images:
+                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+                    tmp = f.name
+                try:
+                    im.convert('RGB').save(tmp, 'PNG')
+                    proc.stdin.write(tmp + "\n")
+                    proc.stdin.flush()
+                    while True:
+                        line = proc.stdout.readline()
+                        if not line:
+                            raise RuntimeError("dinov2-embed died mid-request")
+                        line = line.strip()
+                        if not line.startswith('{'):
+                            continue
+                        d = _json.loads(line)
+                        if 'error' in d:
+                            raise ValueError(f"dinov2-embed: {d['error']}")
+                        v = d['embedding']
+                        n = math.sqrt(sum(x * x for x in v)) or 1.0
+                        results.append([x / n for x in v])
+                        break
+                finally:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+        return _truncate_dims(results, dimensions)
     elif backend == 'vision':
         # Image-only encoder (DINOv2/ViT…): CLS/pooled token of the vision
         # transformer is the image representation.

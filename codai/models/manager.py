@@ -838,6 +838,11 @@ class MultiModelManager:
         # load window and keeps sweep_orphan_vram from mislabeling an
         # in-progress load as a teardown leak.
         self._loading_reservations: Dict[str, float] = {}
+        # model_key -> human compute-device description ("GPU RTX 3090",
+        # "GPU Vulkan/AMD · CPU offload 12.4 GB", "CPU"). Populated by
+        # record_vram_delta after each load; the Tasks page reads it so every
+        # task shows WHERE it runs and whether the model is CPU-offloading.
+        self.model_devices: Dict[str, str] = {}
         # Set once a CUDA device-side assert / unrecoverable CUDA error is seen.
         # The CUDA context is corrupted process-wide after such an error, so all
         # further GPU work is futile until the server is restarted.  We surface
@@ -2346,6 +2351,54 @@ class MultiModelManager:
                 total += gb
         return total
 
+    _engine_device_cache: Optional[str] = None
+
+    @classmethod
+    def engine_device_desc(cls) -> str:
+        """Human name of this engine's compute device ("GPU RTX 3090",
+        "GPU Vulkan/AMD", "CPU"). torch is only consulted when ALREADY imported
+        — the GGUF engines must not pull in a ~1 GB torch just for a label."""
+        if cls._engine_device_cache is not None:
+            return cls._engine_device_cache
+        import os
+        import sys
+        desc = None
+        if 'torch' in sys.modules:
+            try:
+                _t = sys.modules['torch']
+                if _t.cuda.is_available():
+                    desc = f"GPU {_t.cuda.get_device_name(0)}"
+            except Exception:
+                pass
+        if desc is None:
+            be = (os.environ.get("CODERAI_ENGINE_BACKEND") or "").lower()
+            if 'vulkan' in be or 'radeon' in be or 'amd' in be:
+                desc = "GPU Vulkan/AMD"
+            elif be in ('nvidia', 'cuda'):
+                desc = "GPU CUDA"
+            else:
+                desc = "CPU"
+        cls._engine_device_cache = desc
+        return desc
+
+    def device_for_model(self, name) -> Optional[str]:
+        """Device description for a model in any id form (key, path, basename)."""
+        if not name:
+            return None
+        n = str(name)
+        d = self.model_devices.get(n)
+        if d:
+            return d
+        import os
+        base = os.path.basename(n)
+        base_noext = base[:-5] if base.lower().endswith('.gguf') else base
+        for k, v in self.model_devices.items():
+            kb = os.path.basename(str(k).split(':', 1)[-1])
+            kb_noext = kb[:-5] if kb.lower().endswith('.gguf') else kb
+            if kb == base or kb_noext == base_noext:
+                return v
+        return None
+
     def note_loading(self, model_key: str, gb: float = 0.0) -> None:
         """Reserve VRAM for a load that is about to start (see
         _loading_reservations). Pass the model's estimate, or 0 to look it up."""
@@ -2556,6 +2609,13 @@ class MultiModelManager:
                 measured_layers = int(n_gpu_layers)
         except (TypeError, ValueError):
             measured_layers = None
+
+        # Record the compute device + offload state for the Tasks page.
+        _dev = self.engine_device_desc()
+        if offloaded or (measured_ram and measured_ram > 0.3):
+            _dev += (f" · CPU offload {measured_ram:.1f} GB"
+                     if measured_ram else " · CPU offload")
+        self.model_devices[model_key] = _dev
 
         # measured_vram already INCLUDES the offloaded RAM portion (full footprint),
         # so don't add measured_ram again here — that would double-count.

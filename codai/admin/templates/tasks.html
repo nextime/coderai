@@ -192,7 +192,7 @@ function taskRow(t) {
   }
   return `<tr>
     <td><span class="badge badge-user">${esc(KIND_LABEL[t.kind] || t.kind)}</span></td>
-    <td><div class="td-name">${esc(title)}${t.engine?` <span class="badge badge-user" style="font-size:9px;padding:.05rem .3rem;vertical-align:middle" title="Running on engine">${esc(t.engine)}</span>`:''}</div><div class="dim small mono">${esc(t.model || '')}</div></td>
+    <td><div class="td-name">${esc(title)}${t.engine?` <span class="badge badge-user" style="font-size:9px;padding:.05rem .3rem;vertical-align:middle" title="Running on engine">${esc(t.engine)}</span>`:''}${t.device?` <span class="badge" style="font-size:9px;padding:.05rem .3rem;vertical-align:middle;background:${/offload/i.test(t.device)?'#7a5a1e':(/^GPU/i.test(t.device)?'#1e5a3a':'#444')};color:#fff" title="Compute device${/offload/i.test(t.device)?' — model partially offloaded to CPU RAM':''}">${esc(t.device)}</span>`:''}</div><div class="dim small mono">${esc(t.model || '')}</div></td>
     <td>${statusCell}</td>
     <td>${progressBar(t)}</td>
     <td class="dim small">${fmtTime(t.started_at)}</td>
