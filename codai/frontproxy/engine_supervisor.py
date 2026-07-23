@@ -757,6 +757,22 @@ class EngineSupervisor:
                             t = c.get("temp")
                             if t is None:
                                 continue
+                            # Broken-sensor guard: no real GPU reports ≥150°C
+                            # (observed: amdgpu SMU stuck at a constant 511°C =
+                            # 0x1FF invalid-ADC after a GPU reset). Believing it
+                            # would SIGSTOP-freeze the engine forever on a
+                            # healthy card — ignore the reading instead.
+                            if t >= 150:
+                                if not getattr(self, "_warned_bad_sensor", False):
+                                    self._warned_bad_sensor = True
+                                    print(f"[front] thermal: IGNORING impossible "
+                                          f"GPU temp {t:.0f}°C from "
+                                          f"'{c.get('name') or c.get('vendor')}' — "
+                                          f"broken/stuck sensor; power-cycle to "
+                                          f"restore it. Thermal protection for "
+                                          f"that card is disabled until it reads "
+                                          f"sane values.", flush=True)
+                                continue
                             temps.append(t)
                             high, resume = settings.gpu_thresholds(c.get("vendor"))
                             if t >= high:

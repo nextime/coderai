@@ -204,6 +204,31 @@ def _run(cmd, timeout=4.0) -> Optional[str]:
     return None
 
 
+# Sensor sanity ceiling: no GPU reports a REAL temperature this high — silicon
+# dies long before. Readings at/above it are a broken/stuck sensor (observed:
+# amdgpu SMU returning a constant 511°C = 0x1FF invalid-ADC after a GPU reset),
+# and believing one would freeze the engine forever on a healthy card.
+_TEMP_SANE_MAX = 150.0
+
+
+def _sane_temps(temps):
+    good = [t for t in temps if t is not None and 0 < t < _TEMP_SANE_MAX]
+    bad = [t for t in temps if t is not None and t >= _TEMP_SANE_MAX]
+    if bad:
+        global _WARNED_BAD_SENSOR
+        if not _WARNED_BAD_SENSOR:
+            _WARNED_BAD_SENSOR = True
+            print(f"[thermal] IGNORING physically impossible GPU temperature "
+                  f"reading(s) {bad} °C — broken/stuck sensor (e.g. amdgpu SMU "
+                  f"after a GPU reset). Power-cycle the machine to restore the "
+                  f"sensor; thermal protection for that card is DISABLED until "
+                  f"it reads sane values again.")
+    return good
+
+
+_WARNED_BAD_SENSOR = False
+
+
 def _read_gpu_temp_uncached() -> Optional[float]:
     """Hottest GPU temperature in °C across ALL installed cards, or None.
 
@@ -214,7 +239,8 @@ def _read_gpu_temp_uncached() -> Optional[float]:
     below if the unified reader fails."""
     try:
         from codai.frontproxy.gpu_detect import engine_gpu_stats
-        temps = [c["temp"] for c in engine_gpu_stats() if c.get("temp") is not None]
+        temps = _sane_temps(
+            [c["temp"] for c in engine_gpu_stats() if c.get("temp") is not None])
         if temps:
             return max(temps)
     except Exception:
