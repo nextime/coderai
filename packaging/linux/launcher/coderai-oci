@@ -86,6 +86,18 @@ set -- --config "$CONFIG_DIR" --host "$CODERAI_HOST" --port "$CODERAI_PORT" "$@"
 
 CODERAI_BIN="/opt/coderai/python/bin/python3 /opt/coderai/app/coderai"
 
+# Stale-tree sweep: engines run in their OWN sessions (setsid), so supervisord's
+# killasgroup cannot reach them — teardown relies on the front's shutdown handler
+# and the engines' parent-death signal. That chain has been observed to leak a
+# whole front+engine tree across a restart (two trees then fight over one GPU:
+# phantom VRAM usage, evictions that free nothing, duplicated model workers).
+# At THIS point no coderai server process can legitimately exist yet, so reap
+# any survivor from a previous incarnation before starting.
+for _pat in 'coderai-front' 'coderai-nvidia' 'coderai-nvidia-gguf' \
+            'coderai-radeon' 'coderai-system' 'dinov2-embed'; do
+  pkill -9 -x "$_pat" 2>/dev/null || true
+done
+
 # Optional host-tailable file log. CODERAI_LOG_FILE should point under a mounted
 # volume (e.g. /cache/logs/coderai.log) so it's visible + tailable on the host.
 # We tee so output still reaches `docker logs` too. (supervisord runs this script
