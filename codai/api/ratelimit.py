@@ -160,10 +160,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if path in self._EXEMPT_PATHS:
             return await call_next(request)
 
-        # Queue-size enforcement for authenticated API requests (not for status polls)
+        # Queue-size enforcement for authenticated API requests (not for status
+        # polls). PER-MODEL: the request is rejected only when its own model's
+        # queue is full — other loaded models keep accepting and run in
+        # parallel. (request.body() caches, so downstream handlers still read it.)
         if path not in self._EXEMPT_PATHS and any(path.startswith(p) for p in _QUEUED_PREFIXES):
             from codai.queue.manager import queue_manager
-            if await queue_manager.is_full():
+            _model = None
+            if request.method == "POST" and "json" in (
+                    request.headers.get("content-type") or ""):
+                try:
+                    import json as _json
+                    _model = (_json.loads(await request.body() or b"{}")
+                              or {}).get("model")
+                except Exception:
+                    _model = None
+            if await queue_manager.is_full_for(_model or ""):
                 return JSONResponse(
                     status_code=429,
                     content={

@@ -91,6 +91,18 @@ class QueueManager:
         async with self.lock:
             return len(self.waiting) >= self.max_size
 
+    async def is_full_for(self, model_key: str) -> bool:
+        """PER-MODEL admission: the queue is full for a request only when THAT
+        model already has max_size waiters — one hot model's backlog must not
+        reject requests for other (loaded, idle) models. A generous global
+        backstop (4× max_size across all models) still bounds total memory."""
+        async with self.lock:
+            if len(self.waiting) >= self.max_size * 4:
+                return True
+            if not model_key:
+                return len(self.waiting) >= self.max_size
+            return self._waiting_counts_locked().get(model_key, 0) >= self.max_size
+
     async def acquire(self, request_id: str, model_key: str,
                       prefix_key: str = "") -> SchedulerLease:
         waiter = None

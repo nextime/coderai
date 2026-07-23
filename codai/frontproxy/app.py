@@ -697,6 +697,20 @@ class FrontProxy:
         engine name for inference without an explicit model."""
         return self._queue_key(model) or getattr(engine, "name", "") or "?"
 
+    def _resident_on(self, engine, key: str) -> bool:
+        """True when the model behind `key` is already loaded on `engine` (per
+        its last health poll), so serving it needs NO swap/eviction."""
+        try:
+            if not key:
+                return False
+            for m in (engine.loaded_models or ()):
+                canon = (self._model_info(str(m)).get("model_id") or str(m)).lower()
+                if canon == key or str(m).lower() == key:
+                    return True
+        except Exception:
+            pass
+        return False
+
     async def _swap_acquire(self, engine, model, path, method):
         """Acquire this engine's shared-GPU swap slot for a GPU-inference request.
         Returns a (gate, key) token for _swap_release, or None when no gate applies
@@ -707,6 +721,13 @@ class FrontProxy:
         if gate is None:
             return None
         key = self._swap_owner_key(engine, model)
+        # A model that is ALREADY resident on this engine needs no swap — its
+        # own per-model queue governs its concurrency, and serializing it
+        # behind the current GPU owner would block cross-model parallelism
+        # (e.g. three co-resident embedders serving one request each). The gate
+        # only serializes requests that would trigger an actual model swap.
+        if self._resident_on(engine, key):
+            return None
         await gate.acquire(key)
         return (gate, key)
 
