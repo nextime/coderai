@@ -1116,6 +1116,7 @@ class FrontProxy:
                         "thermal_paused": bool(getattr(e, "therm_paused", False)),
                         "thermal_frozen": bool(getattr(e, "therm_sigstopped", False)),
                         "loaded_models": self._canonical_loaded(e.loaded_models),
+                        "loaded_info": list(getattr(e, "loaded_info", []) or []),
                         "inflight": int(getattr(e, "inflight", 0) or 0),
                         "processing": (int(getattr(e, "inflight", 0) or 0) > 0
                                        or bool(getattr(e, "loading", None))),

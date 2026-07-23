@@ -807,6 +807,7 @@ class EngineSupervisor:
                         self.registry.update_state(
                             engine.id, healthy=True,
                             loaded_models=loaded,
+                            loaded_info=d.get("loaded_info") or [],
                             vram=d.get("vram"),
                             tasks=d.get("tasks") or [],
                             cooling=d.get("cooling"),

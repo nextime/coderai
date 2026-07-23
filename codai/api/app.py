@@ -357,7 +357,38 @@ async def internal_engine_state():
         paused = _therm.external_pause_active()
     except Exception:
         paused = False
+    # Per-model memory footprint for the engines card tooltip: measured VRAM
+    # (in-memory truth from record_vram_delta, falling back to the config
+    # estimate) plus the separately-measured host-RAM slice when the model is
+    # CPU-offloading.
+    loaded_info = []
+    try:
+        _seen_li = set()
+        for _k in loaded:
+            if _k in _seen_li:
+                continue
+            _seen_li.add(_k)
+            try:
+                _vg = (multi_model_manager._measured_vram_gb.get(_k)
+                       or multi_model_manager._get_model_used_vram_gb(_k) or 0)
+            except Exception:
+                _vg = 0
+            _cfg = {}
+            try:
+                _cfg = multi_model_manager._config_for_model_key(_k) or {}
+            except Exception:
+                pass
+            _rg = _cfg.get("measured_ram_gb") or 0
+            loaded_info.append({
+                "model": _k,
+                "vram_gb": round(float(_vg), 2) if _vg else 0,
+                "ram_gb": round(float(_rg), 2) if _rg else 0,
+                "device": multi_model_manager.model_devices.get(_k) or "",
+            })
+    except Exception:
+        loaded_info = []
     return {"ok": True, "pid": _os.getpid(), "loaded_models": loaded,
+            "loaded_info": loaded_info,
             "vram": vram, "tasks": tasks, "cooling": cooling, "paused": paused}
 
 

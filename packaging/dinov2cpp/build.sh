@@ -70,6 +70,6 @@ cp "$HERE/embed.cpp" .
 mkdir -p build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON \
       -DBUILD_SHARED_LIBS=OFF \
-      -DBUILD_REALTIME=OFF -DBUILD_QUANTIZE=OFF ..
-make -j"$(nproc)" embed
+      -DBUILD_REALTIME=OFF -DBUILD_QUANTIZE=ON ..
+make -j"$(nproc)" embed quantize
 echo "BUILT: $(pwd)/bin/embed"

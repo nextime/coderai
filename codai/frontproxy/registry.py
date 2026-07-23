@@ -64,6 +64,9 @@ class Engine:
     url: str = ""
     healthy: bool = False
     loaded_models: Set[str] = field(default_factory=set)
+    # Per-model memory info from /internal/engine-state:
+    # [{model, vram_gb, ram_gb, device}, …] for the engines-card tooltip.
+    loaded_info: list = field(default_factory=list)
     vram: Optional[dict] = None
     tasks: list = field(default_factory=list)   # running/queued tasks on this engine
     cooling: Optional[dict] = None  # thermal cooldown state, or None when not cooling
@@ -191,8 +194,8 @@ class EngineRegistry:
         return match
 
     def update_state(self, engine_id: int, *, healthy: bool,
-                     loaded_models=None, vram=None, tasks=None,
-                     cooling=False) -> None:
+                     loaded_models=None, loaded_info=None, vram=None,
+                     tasks=None, cooling=False) -> None:
         with self._lock:
             e = self._engines.get(engine_id)
             if not e:
@@ -204,6 +207,8 @@ class EngineRegistry:
                 e.last_ok = time.monotonic()
             if loaded_models is not None:
                 e.loaded_models = set(loaded_models)
+            if loaded_info is not None:
+                e.loaded_info = list(loaded_info)
             if vram is not None:
                 e.vram = vram
             if tasks is not None:

@@ -315,7 +315,22 @@ async function loadEngines(){
     const proc = e.processing ? ` <span class="badge badge-admin" style="font-size:9px" title="actively processing a request">● processing</span>` : '';
     const loaded = e.loaded_models||[];
     const models = loaded.length;
-    const mtip = models ? esc(loaded.join('\n')) : 'no models loaded';
+    // Tooltip: one line per model with its memory footprint — VRAM, plus the
+    // host-RAM slice separately when the model is CPU-offloading.
+    const info = e.loaded_info||[];
+    const infoByBase = {};
+    info.forEach(m => {
+      const b = (m.model||'').split('/').pop().replace(/\.gguf$/i,'');
+      infoByBase[b] = m; infoByBase[m.model] = m;
+    });
+    const mtip = models ? esc(loaded.map(name => {
+      const b = (name||'').split('/').pop().replace(/\.gguf$/i,'');
+      const m = infoByBase[name] || infoByBase[b];
+      if (!m || (!m.vram_gb && !m.ram_gb)) return name;
+      let s = `${name} — VRAM ${m.vram_gb} GB`;
+      if (m.ram_gb) s += ` · RAM ${m.ram_gb} GB (offload)`;
+      return s;
+    }).join('\n')) : 'no models loaded';
     return `<div class="sys-tile">
       <div class="sys-head">
         <span class="sys-name">${esc(e.name)} <span class="dim" style="text-transform:none">(${esc(e.backend)})</span>${prim}${proc}${cool}</span>

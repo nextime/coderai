@@ -76,6 +76,21 @@ class _EmbeddingModel:
         yield self.model
 
     def cleanup(self):
+        # Eviction can fire while a request is mid-encode (embeddings hold no
+        # pool ref, so _is_key_busy sees idle). Closing a llama ctx / killing
+        # the subprocess under a running embed segfaults the engine — take the
+        # same per-model lock the embed paths hold so cleanup WAITS for the
+        # in-flight call to finish.
+        _l = getattr(self, 'lock', None)
+        if _l is not None:
+            _l.acquire()
+        try:
+            self._cleanup_locked()
+        finally:
+            if _l is not None:
+                _l.release()
+
+    def _cleanup_locked(self):
         try:
             if self.backend == 'dinov2cpp':
                 # persistent embed server subprocess — terminating it frees
