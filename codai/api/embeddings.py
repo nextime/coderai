@@ -290,6 +290,16 @@ def _load_embedding_model(model_name: str, device: str, model_config: dict = Non
                 mp.use_gpu = (n_gpu_layers != 0)
                 mp.print_timings = False
                 mp.n_threads = 8
+                # Bound the vision token budget: qwen2-vl dynamic resolution
+                # turns a large photo into thousands of image tokens, and the
+                # vision tower's transient compute buffer then spikes VRAM —
+                # which evicts co-resident models mid-encode on a small card.
+                try:
+                    mp.image_max_tokens = int(
+                        cfg.get('image_max_tokens')
+                        or raw.get('image_max_tokens') or 1024)
+                except Exception:
+                    pass
                 mctx = _M.mtmd_init_from_file(
                     str(_mmproj).encode(), llm._model.model, mp)
                 if not mctx:

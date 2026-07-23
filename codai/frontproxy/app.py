@@ -1100,6 +1100,21 @@ class FrontProxy:
             seen.setdefault(canon, None)
         return list(seen.keys())
 
+    def _canonical_info(self, loaded_info) -> dict:
+        """loaded_info entries keyed by CANONICAL model id (same mapping as
+        _canonical_loaded), deduping the several key forms one resident model
+        reports under; keeps the largest footprint among duplicates."""
+        out: dict = {}
+        for m in (loaded_info or []):
+            if not isinstance(m, dict):
+                continue
+            k = str(m.get("model") or "")
+            canon = (self._model_info(k).get("model_id") or k)
+            prev = out.get(canon)
+            if prev is None or (m.get("vram_gb") or 0) > (prev.get("vram_gb") or 0):
+                out[canon] = {**m, "model": canon}
+        return out
+
     def engines_list(self) -> list:
         out = []
         for e in self.registry.all():
@@ -1116,7 +1131,8 @@ class FrontProxy:
                         "thermal_paused": bool(getattr(e, "therm_paused", False)),
                         "thermal_frozen": bool(getattr(e, "therm_sigstopped", False)),
                         "loaded_models": self._canonical_loaded(e.loaded_models),
-                        "loaded_info": list(getattr(e, "loaded_info", []) or []),
+                        "loaded_info": self._canonical_info(
+                            getattr(e, "loaded_info", None)),
                         "inflight": int(getattr(e, "inflight", 0) or 0),
                         "processing": (int(getattr(e, "inflight", 0) or 0) > 0
                                        or bool(getattr(e, "loading", None))),
