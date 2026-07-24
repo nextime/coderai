@@ -567,6 +567,44 @@ def _clip_feats(raw):
     raise RuntimeError("CLIP model returned no usable feature tensor")
 
 
+def _resize_image_to_token_budget(img, max_tokens, patch=28):
+    """Downscale a PIL image so the qwen2-vl vision tower can't emit more than
+    ``max_tokens`` image tokens. Token count ≈ (W//patch) * (H//patch) (28px
+    patches; observed 896×896 → 1024 tokens). mtmd's own ``image_max_tokens``
+    budget is NOT honoured by this llama.cpp build (2048-token batches slipped
+    through and overflowed the KV context → 'failed to find a memory slot' →
+    HTTP 500), so we clamp here BEFORE handing the bitmap to mtmd. Aspect ratio
+    is preserved; only oversize images are touched."""
+    try:
+        w, h = int(img.width), int(img.height)
+    except Exception:
+        return img
+    tw, th = max(1, w // patch), max(1, h // patch)
+    if tw * th <= max_tokens or max_tokens < 1:
+        return img
+    import math
+    scale = math.sqrt(max_tokens / float(tw * th))
+    nw = max(patch, (int(w * scale) // patch) * patch)
+    nh = max(patch, (int(h * scale) // patch) * patch)
+    # Rounding up to a whole patch can nudge back over budget — trim the longer
+    # side one patch at a time until it fits.
+    while (nw // patch) * (nh // patch) > max_tokens and (nw > patch or nh > patch):
+        if nw >= nh:
+            nw = max(patch, nw - patch)
+        else:
+            nh = max(patch, nh - patch)
+    try:
+        from PIL import Image as _PILImage
+        resample = getattr(_PILImage, "Resampling", _PILImage).LANCZOS
+        out = img.resize((nw, nh), resample)
+        print(f"[embeddings] resized oversize image {w}x{h} "
+              f"(~{tw*th} tok) -> {nw}x{nh} (~{(nw//patch)*(nh//patch)} tok) "
+              f"to fit vision token budget {max_tokens}", flush=True)
+        return out
+    except Exception:
+        return img
+
+
 def _llama_vl_embed(model_obj, items, dimensions=None):
     """GME-style embedding on a GGUF Qwen2-VL via llama.cpp mtmd: last-token
     hidden state (ctx pooling LAST) under the GME chat prompt — the same scheme
@@ -623,6 +661,12 @@ def _llama_vl_embed(model_obj, items, dimensions=None):
                 # PIL image → raw RGB bitmap straight into mtmd (its own stb
                 # decoder can't read AVIF/WebP variants PIL already handled).
                 rgb = img.convert('RGB')
+                # Guard the KV context: cap image tokens at n_ctx minus a reserve
+                # for the chat-prompt frame (system/user/vision markers ~30 tok).
+                # Without this a large photo emits >n_ctx image tokens and mtmd's
+                # decode fails ('no memory slot') → 500. n_ctx is sized to fit a
+                # full-budget image (see the model's n_ctx in models.json).
+                rgb = _resize_image_to_token_budget(rgb, max(256, n_ctx - 128))
                 raw = rgb.tobytes()
                 buf = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw)
                 bmp = _M.mtmd_bitmap_init(rgb.width, rgb.height, buf)
