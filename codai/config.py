@@ -40,6 +40,13 @@ class ServerConfig:
     # override lets a bigger card run more concurrently than a smaller one. Blank =
     # use the default above.
     max_parallel_requests_overrides: dict = field(default_factory=dict)
+    # Per-engine AMD GPU power/clock lock (engine name → level, e.g.
+    # {"radeon": "high"}). Applied at engine startup: writes the level to each
+    # amdgpu card's power_dpm_force_performance_level. Stabilises Polaris/GCN
+    # cards that hang under sustained Vulkan compute due to DPM clock switching.
+    # Levels: auto | low | high | manual | profile_standard | profile_peak.
+    # Best-effort — an unprivileged container logs the manual host command.
+    dpm_force_performance_level_overrides: dict = field(default_factory=dict)
     # ─── Frontend/engine split ───────────────────────────────────────────────
     # coderai boots a thin, always-responsive *front* reverse proxy on the public
     # host/port and supervises one or more *engine* subprocesses (which do all
@@ -659,6 +666,7 @@ class ConfigManager:
                 "queue_max_size": self.config.server.queue_max_size,
                 "max_parallel_requests": self.config.server.max_parallel_requests,
                 "max_parallel_requests_overrides": self.config.server.max_parallel_requests_overrides,
+                "dpm_force_performance_level_overrides": self.config.server.dpm_force_performance_level_overrides,
                 "internal_port_base": self.config.server.internal_port_base,
                 "engines": self.config.server.engines,
                 "engine_gpus": self.config.server.engine_gpus,

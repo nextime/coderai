@@ -401,6 +401,52 @@ def engine_gpu_stats() -> list:
             if c.get("vendor") in sels or (c.get("uuid") and c["uuid"] in sels)]
 
 
+_VALID_DPM_LEVELS = ("auto", "low", "high", "manual",
+                     "profile_standard", "profile_min_sclk", "profile_min_mclk",
+                     "profile_peak")
+
+
+def apply_amd_dpm_force_level(level: str) -> None:
+    """Write ``level`` to every amdgpu card's power_dpm_force_performance_level.
+
+    Locking a Polaris/GCN card to 'high' (fixed top clocks) avoids the DPM
+    power-state transitions that hang these cards under sustained Vulkan
+    compute. Best-effort: an unprivileged container can't write root-owned
+    sysfs, so on PermissionError we log the exact host command to run instead."""
+    import glob
+    level = (level or "").strip()
+    if level not in _VALID_DPM_LEVELS:
+        print(f"[dpm] ignoring invalid level '{level}' "
+              f"(valid: {', '.join(_VALID_DPM_LEVELS)})", flush=True)
+        return
+    wrote, denied = [], []
+    for card in sorted(glob.glob("/sys/class/drm/card*")):
+        dev = os.path.join(card, "device")
+        try:
+            with open(os.path.join(dev, "vendor")) as f:
+                if f.read().strip().lower() != "0x1002":   # AMD PCI vendor id
+                    continue
+        except OSError:
+            continue
+        node = os.path.join(dev, "power_dpm_force_performance_level")
+        if not os.path.exists(node):
+            continue
+        try:
+            with open(node, "w") as f:
+                f.write(level + "\n")
+            wrote.append(os.path.basename(card))
+        except PermissionError:
+            denied.append(node)
+        except OSError as e:
+            print(f"[dpm] failed to set {node}: {e}", flush=True)
+    if wrote:
+        print(f"[dpm] locked AMD power level '{level}' on {', '.join(wrote)}",
+              flush=True)
+    for node in denied:
+        print(f"[dpm] cannot set power level (unprivileged container). Run once "
+              f"on the HOST: echo {level} | sudo tee {node}", flush=True)
+
+
 def card_key(vendor: str, uuid: str = "", pci: str = "") -> str:
     """Stable identifier for one physical GPU, computable identically by the front
     (which sees every card) and by an engine (which sees only its own, in llama.cpp

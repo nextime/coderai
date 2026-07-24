@@ -372,6 +372,13 @@ class EngineSupervisor:
             env["CODERAI_MAX_PARALLEL"] = str(int(par))
         if inst is not None:
             env["CODERAI_MAX_MODEL_INSTANCES"] = str(int(inst))
+        # Per-engine AMD GPU power-state lock (e.g. {"radeon": "high"}) — the
+        # engine applies it to its amdgpu card(s) at startup to avoid Polaris
+        # DPM-transition hangs under sustained Vulkan compute.
+        _dpm = (getattr(srv, "dpm_force_performance_level_overrides", None)
+                or {}).get(engine.name)
+        if _dpm:
+            env["CODERAI_DPM_FORCE"] = str(_dpm)
         # Force this engine's backend (the engine reads this in --engine-only mode
         # and overrides config.backend.type) so a Vulkan/Radeon engine doesn't
         # auto-pick CUDA, and vice-versa.

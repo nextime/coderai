@@ -635,6 +635,18 @@ def main():
         if _forced_backend:
             config.backend.type = _forced_backend
             print(f"[engine] backend forced to '{_forced_backend}' by the front")
+        # Optional: pin this engine's AMD GPU(s) to a fixed power/clock state.
+        # Polaris (and other GCN) cards frequently HANG under sustained Vulkan
+        # compute when the driver switches DPM power states mid-kernel; locking
+        # to 'high' avoids those transitions. Configured per-engine via
+        # server.dpm_force_performance_level_overrides (env CODERAI_DPM_FORCE).
+        _dpm = os.environ.get("CODERAI_DPM_FORCE")
+        if _dpm:
+            try:
+                from codai.frontproxy.gpu_detect import apply_amd_dpm_force_level
+                apply_amd_dpm_force_level(_dpm.strip())
+            except Exception as _de:
+                print(f"[dpm] apply failed: {_de}", flush=True)
         # The front owns the AISBF broker (always-responsive, one registration for
         # the whole node, routes to engines). So no engine runs its own broker
         # client — that would double-register and stall when the engine loads.
