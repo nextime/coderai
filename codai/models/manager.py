@@ -1608,6 +1608,37 @@ class MultiModelManager:
         for model_type in self._registered_types_for(model_name):
             self._remember_registered_type(alias, model_type)
 
+    def _resolve_config_key(self, name) -> Optional[str]:
+        """Return the ACTUAL ``self.config`` key holding this model's config, tolerant
+        of the id form the caller used (exact id → alias map → basename /
+        basename-without-extension). Returns None when no entry matches.
+
+        Writers (e.g. ``record_vram_delta``) MUST persist under this canonical key,
+        not the raw request id: an on-demand load arrives as a *basename* while the
+        real entry is keyed by full path, so writing measured fields under the
+        basename creates a SECOND, stripped entry (only the measured_* keys, no
+        mmproj / n_ctx / parser). ``_config_for_model``'s exact-match then finds that
+        stripped basename entry FIRST on the next load and silently drops mmproj —
+        the vision projector never loads and the model answers from text alone."""
+        if not name:
+            return None
+        if self.config.get(name):
+            return name
+        target = self.model_aliases.get(name)
+        if target and target != name and self.config.get(target):
+            return target
+        import os
+        base = os.path.basename(str(name))
+        base_noext = base[:-5] if base.endswith(".gguf") else base
+        for key, kcfg in self.config.items():
+            if not kcfg:
+                continue
+            kbase = os.path.basename(str(key))
+            kbase_noext = kbase[:-5] if kbase.endswith(".gguf") else kbase
+            if kbase == base or kbase_noext == base_noext:
+                return key
+        return None
+
     def _config_for_model(self, name) -> dict:
         """Per-model config dict, tolerant of the id form the caller used.
 
@@ -1619,24 +1650,9 @@ class MultiModelManager:
         through: exact id → alias map → basename / basename-without-extension."""
         if not name:
             return {}
-        cfg = self.config.get(name)
-        if cfg:
-            return cfg
-        target = self.model_aliases.get(name)
-        if target and target != name:
-            cfg = self.config.get(target)
-            if cfg:
-                return cfg
-        import os
-        base = os.path.basename(str(name))
-        base_noext = base[:-5] if base.endswith(".gguf") else base
-        for key, kcfg in self.config.items():
-            if not kcfg:
-                continue
-            kbase = os.path.basename(str(key))
-            kbase_noext = kbase[:-5] if kbase.endswith(".gguf") else kbase
-            if kbase == base or kbase_noext == base_noext:
-                return kcfg
+        key = self._resolve_config_key(name)
+        if key is not None:
+            return self.config.get(key) or {}
         return {}
     
     def set_assigned_models(self, keys) -> None:
@@ -1922,6 +1938,13 @@ class MultiModelManager:
             cfg = self.config.get(f"{prefix}:{bare}", {})
             if cfg:
                 return cfg
+        # Basename/alias fallback (mirrors _config_for_model): an on-demand load
+        # arrives as a basename while the entry is keyed by full path. Without this
+        # the caller gets {} and any writeback creates a stripped duplicate entry
+        # that later shadows the real config (mmproj/n_ctx dropped).
+        key = self._resolve_config_key(model_key)
+        if key is not None:
+            return self.config.get(key) or {}
         return {}
 
     def is_allowed_model(self, requested_or_resolved: str, model_type: str = None) -> bool:
@@ -2570,7 +2593,15 @@ class MultiModelManager:
         free_after = self._free_vram_snapshot()
         if free_after < 0:
             return
-        cfg = self._config_for_model_key(model_key)
+        # Persist measured fields onto the model's REAL config entry, under the key
+        # it is actually stored (usually a full path), not the raw request id (often
+        # a basename). Writing under the basename would spawn a second, stripped
+        # entry {measured_* only} that _config_for_model's exact-match then returns
+        # FIRST on the next load — dropping mmproj so vision silently breaks.
+        canon_key = self._resolve_config_key(model_key) or model_key
+        cfg = self.config.get(canon_key)
+        if not cfg:
+            cfg = self._config_for_model_key(model_key)
         cfgd = cfg if isinstance(cfg, dict) else {}
         force_update = bool(cfgd.get("force_vram_update"))
         user_pinned = cfgd.get("used_vram_gb") is not None
@@ -2646,10 +2677,10 @@ class MultiModelManager:
                     pass
             try:
                 working[field] = value
-                self.config[model_key] = dict(working)
+                self.config[canon_key] = dict(working)
                 from codai.admin.routes import config_manager
                 if config_manager is not None:
-                    config_manager.persist_model_field(model_key, field, value)
+                    config_manager.persist_model_field(canon_key, field, value)
                 print(f"  Saved {field}={value} for '{model_key}' "
                       f"({'force_vram_update' if force_update else 'no used_vram_gb'})")
             except Exception as e:
