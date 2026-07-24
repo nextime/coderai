@@ -347,6 +347,19 @@ class EngineSupervisor:
         # values are honoured (e.g. CUDA_VISIBLE_DEVICES="" hides all CUDA cards).
         for k, v in (engine.env or {}).items():
             env[str(k)] = str(v)
+        # Config-driven per-engine env overrides (low-level driver tuning, e.g.
+        # RADV_DEBUG=syncshaders on the radeon). Applied AFTER the auto-detected
+        # block so the user's value wins.
+        try:
+            _eov = (getattr(self.config.server, "engine_env_overrides", None)
+                    or {}).get(engine.name) or {}
+            for k, v in _eov.items():
+                env[str(k)] = str(v)
+            if _eov:
+                print(f"[front] {engine.name}: env overrides "
+                      f"{ {k: v for k, v in _eov.items()} }", flush=True)
+        except Exception:
+            pass
         # The global host-RAM cap (offload.max_ram_gb) is SHARED across all engines,
         # not split: tell each engine the front's PID so it measures the whole
         # fleet's RAM (front + every engine + workers) against the one cap.

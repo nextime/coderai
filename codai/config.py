@@ -47,6 +47,11 @@ class ServerConfig:
     # Levels: auto | low | high | manual | profile_standard | profile_peak.
     # Best-effort — an unprivileged container logs the manual host command.
     dpm_force_performance_level_overrides: dict = field(default_factory=dict)
+    # Extra environment variables injected per engine (engine name → {VAR: val}),
+    # merged into that engine's process env at spawn. For low-level driver tuning
+    # without hardcoding — e.g. {"radeon": {"RADV_DEBUG": "syncshaders"}} to
+    # serialize RADV shader dispatch and avoid Polaris async compute-ring hangs.
+    engine_env_overrides: dict = field(default_factory=dict)
     # ─── Frontend/engine split ───────────────────────────────────────────────
     # coderai boots a thin, always-responsive *front* reverse proxy on the public
     # host/port and supervises one or more *engine* subprocesses (which do all
