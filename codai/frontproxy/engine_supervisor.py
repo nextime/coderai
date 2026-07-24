@@ -840,13 +840,26 @@ class EngineSupervisor:
                         d = r.json()
                         healthy = True
                         loaded = d.get("loaded_models") or []
+                        # Cooling indicator: the FRONT's thermal supervisor owns the
+                        # pause state (it's what pauses ALL engines on a global CPU
+                        # cooldown). The engine only self-reports cooling while it's
+                        # sitting in its OWN wait_until_safe loop (i.e. it has an
+                        # in-flight request). An engine the front paused while idle
+                        # reports cooling=None — so blindly taking the engine's report
+                        # here would ERASE the front's pause indicator and the Tasks
+                        # page would show that engine as running mid-cooldown. While
+                        # the front holds this engine paused, keep the front's
+                        # indicator (sentinel False = don't touch); only let the
+                        # engine's self-report through once the front isn't pausing it.
+                        _cooling = (False if getattr(engine, "therm_paused", False)
+                                    else d.get("cooling"))
                         self.registry.update_state(
                             engine.id, healthy=True,
                             loaded_models=loaded,
                             loaded_info=d.get("loaded_info") or [],
                             vram=d.get("vram"),
                             tasks=d.get("tasks") or [],
-                            cooling=d.get("cooling"),
+                            cooling=_cooling,
                         )
                         # Backstop: the engine answered, so it's no longer GIL-blocked
                         # loading. Clear the log-parsed loading state (the real task,
