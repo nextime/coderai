@@ -481,6 +481,13 @@ fi
 if [[ -n "${MODES[nvidia]:-}" ]]; then
   if [[ "$ENGINE" == "docker" ]]; then
     args+=(--gpus all)
+    # Expose the NVIDIA GPU to Vulkan, not just CUDA. The nvidia container runtime
+    # only injects the NVIDIA Vulkan ICD when the 'graphics' capability is requested;
+    # the default (compute,utility) leaves Vulkan blind to the NVIDIA card, so a
+    # Vulkan GGUF (e.g. the dinov2-embed embedder) can only reach the AMD card. 'all'
+    # adds graphics/display so Vulkan enumerates the NVIDIA GPU too. Honour any value
+    # the caller already exported.
+    args+=(-e "NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-all}")
     # Some hosts set `no-cgroups = true` in /etc/nvidia-container-runtime/config.toml.
     # Then --gpus all injects the device nodes + driver libs but does NOT add them to
     # the container's device-cgroup allowlist, so the kernel blocks GPU access and

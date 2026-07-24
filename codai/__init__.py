@@ -16,7 +16,7 @@
 
 # Canonical product version for CoderAI — single source of truth. Both the API
 # metadata and the admin web UI read from here.
-__version__ = "0.1.63"
+__version__ = "0.1.64"
 
 # Configure the CUDA caching allocator BEFORE torch is imported anywhere.
 # expandable_segments lets the allocator return freed pages to the driver even
