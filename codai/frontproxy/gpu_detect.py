@@ -71,17 +71,47 @@ def nvidia_gpus() -> list:
         return []
 
 
+def _call_with_timeout(fn, timeout, default):
+    """Run ``fn()`` in a daemon thread; return its result, or ``default`` if it
+    doesn't finish within ``timeout`` seconds.
+
+    Unlike subprocess timeouts, this survives a callee stuck UNINTERRUPTIBLY
+    (D-state on a wedged GPU) — we simply STOP WAITING and leave the daemon
+    thread orphaned, so a hung ``vulkaninfo`` can never block the front's
+    startup. The orphan clears when the GPU recovers / on reboot."""
+    import threading
+    box = {}
+    def _runner():
+        try:
+            box["v"] = fn()
+        except Exception:
+            box["v"] = default
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        print(f"[gpu-detect] probe exceeded {timeout}s (GPU may be wedged) — "
+              f"proceeding without it", flush=True)
+        return default
+    return box.get("v", default)
+
+
 def vulkan_devices() -> list:
     """Return [{'vendor','vendor_id','name'}] from ``vulkaninfo --summary``.
 
     Order matches Vulkan device indexing. Best-effort: empty if vulkaninfo is
-    missing or unparseable."""
+    missing/unparseable, or if it HANGS on a wedged GPU (bounded by a wall-clock
+    timeout that survives an un-killable D-state child)."""
+    return _call_with_timeout(_vulkan_devices_impl, 12, [])
+
+
+def _vulkan_devices_impl() -> list:
     vk = shutil.which("vulkaninfo")
     if not vk:
         return []
     try:
         out = subprocess.run([vk, "--summary"], capture_output=True, text=True,
-                             timeout=15)
+                             timeout=10)
         text = out.stdout
     except Exception:
         return []
@@ -379,7 +409,13 @@ def gpu_stats() -> list:
     c = _gpu_stats_cache
     if c["data"] is not None and now - c["at"] < _GPU_STATS_TTL:
         return c["data"]
-    data = _nvidia_stats() + _amd_stats()
+    # _amd_stats reads live GPU sysfs (mem_info/temp) which can BLOCK
+    # uninterruptibly on a wedged card — bound it so a hung Radeon can't freeze
+    # the health/thermal poll threads (which would stall the HEALTHY card's
+    # monitoring too). On timeout, reuse the last-good AMD rows from the cache.
+    _prev = c["data"] if (c := _gpu_stats_cache) and c.get("data") else []
+    _prev_amd = [r for r in _prev if isinstance(r, dict) and r.get("vendor") == "amd"]
+    data = _nvidia_stats() + _call_with_timeout(_amd_stats, 6, _prev_amd)
     c["data"] = data
     c["at"] = now
     return data
