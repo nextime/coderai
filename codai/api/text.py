@@ -326,13 +326,54 @@ def log_response_payload(payload, streamed=False):
 router = APIRouter()
 
 
+# Formats llama.cpp's image decoder (stb_image) can read natively. Anything
+# else (AVIF, WebP, HEIC, JXL…) must be transcoded to PNG first, or the mtmd
+# chat handler silently receives no image and the model replies as if blind.
+_STB_OK_FORMATS = ("jpeg", "jpg", "png", "gif", "bmp", "pnm", "ppm", "pgm",
+                   "tga", "psd", "hdr", "pic")
+
+
+def _transcode_data_uri_for_stb(url: str) -> str:
+    """If ``url`` is a data: URI in a format llama.cpp's stb_image can't decode
+    (AVIF/WebP/…), decode it with PIL (which supports those) and re-encode as a
+    PNG data URI. http(s) links and already-supported formats pass through."""
+    try:
+        if not isinstance(url, str) or not url.startswith("data:image/"):
+            return url
+        header, _, b64 = url.partition(",")
+        if not b64:
+            return url
+        # data:image/<fmt>;base64
+        fmt = header[len("data:image/"):].split(";", 1)[0].strip().lower()
+        if fmt in _STB_OK_FORMATS:
+            return url
+        import base64 as _b64
+        import io
+        from PIL import Image
+        raw = _b64.b64decode(b64, validate=False)
+        im = Image.open(io.BytesIO(raw)).convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, "PNG")
+        enc = _b64.b64encode(buf.getvalue()).decode("ascii")
+        print(f"[vision] transcoded {fmt.upper()} image → PNG for the mtmd "
+              f"chat handler ({len(raw)}→{buf.tell()} bytes)", flush=True)
+        return "data:image/png;base64," + enc
+    except Exception as e:
+        # Leave the original URL; worst case is the current no-image behaviour.
+        print(f"[vision] image transcode failed ({str(e)[:100]}) — passing "
+              f"original through", flush=True)
+        return url
+
+
 def _normalize_vision_content(content: list) -> list:
     """Normalize an OpenAI multipart message content list to the shape the
     llama.cpp multimodal (mmproj) handler expects: text parts as
     ``{"type":"text","text":...}`` and images as
     ``{"type":"image_url","image_url":{"url": ...}}``. The url may be an http(s)
-    link or a ``data:image/...;base64,...`` URI — both are accepted. Unknown
-    parts are dropped to a text placeholder so nothing crashes the handler."""
+    link or a ``data:image/...;base64,...`` URI — both are accepted. Images in
+    formats stb_image can't decode (AVIF/WebP/…) are transcoded to PNG first.
+    Unknown parts are dropped to a text placeholder so nothing crashes the
+    handler."""
     norm = []
     for item in content:
         if not isinstance(item, dict):
@@ -345,6 +386,7 @@ def _normalize_vision_content(content: list) -> list:
             iu = item.get("image_url") if t == "image_url" else item.get("image")
             url = iu.get("url") if isinstance(iu, dict) else iu
             if url:
+                url = _transcode_data_uri_for_stb(url)
                 norm.append({"type": "image_url", "image_url": {"url": url}})
         elif "text" in item:
             norm.append({"type": "text", "text": str(item["text"])})
