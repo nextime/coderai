@@ -975,14 +975,30 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
         except Exception as _ip_err:
             print(f"Warning: IP-Adapter injection failed ({_ip_err}), continuing without character refs")
 
-    # Reset the diffusers GLOBAL attention backend to the environment default
-    # (native/SDPA) before generating. diffusers' Model.set_attention_backend()
-    # ALSO flips a process-wide active backend, and the video path sets it to
-    # flash-attn — which then leaks to image transformers that don't set their own
-    # (e.g. Z-Image passes backend=None → uses the global) and crashes with
-    # "`attn_mask` is not supported for flash-attn 2". Image + video share the
-    # engine process, so restore the default here so masked image attention (SDPA)
-    # always works. Cheap + idempotent; no-op if diffusers lacks the dispatcher.
+    # Pin the denoising model's attention to a mask-supporting backend before
+    # generating. The diffusers "active attention backend" is PROCESS-WIDE global
+    # mutable state (a class attribute on _AttentionBackendRegistry) shared with the
+    # video path, which sets it to flash-attn-2. A transformer whose per-module
+    # backend is None reads that global at dispatch time — and flash-attn-2 REJECTS
+    # attn_mask ("`attn_mask` is not supported for flash-attn 2."), so a masked image
+    # transformer (e.g. Z-Image) crashes → HTTP 500. Simply resetting the global
+    # isn't enough: the reset isn't atomic with the pipeline() call (which runs in a
+    # to_thread worker), so a concurrent/subsequent video generation can flip the
+    # shared global back to flash before image attention dispatches — a race.
+    #
+    # Setting the per-module backend EXPLICITLY makes image dispatch immune to the
+    # shared global (the dispatcher passes processor._attention_backend, bypassing
+    # get_active_backend()). native (SDPA) supports masks. This doesn't disturb the
+    # video path — it sets its own explicit per-module 'flash', so it ignores the
+    # global too. Image pipelines were never intentionally on flash, so pinning
+    # native here is non-regressive. Cheap + idempotent; no-op if unsupported.
+    for _cn in ("transformer", "unet"):
+        _c = getattr(pipeline, _cn, None)
+        if _c is not None and hasattr(_c, "set_attention_backend"):
+            try:
+                _c.set_attention_backend("native")
+            except Exception:
+                pass
     try:
         from diffusers.models.attention_dispatch import (
             _AttentionBackendRegistry, AttentionBackendName)
