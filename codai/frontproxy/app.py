@@ -97,6 +97,10 @@ class FrontProxy:
         # same-model requests before swapping. Keyed by the engines' shared-GPU
         # selector; created lazily for engines that actually have a co-located sibling.
         self._swap_gates = {}
+        # Per-engine request-rate throttle state (engine name → asyncio.Lock /
+        # last-dispatch monotonic time). See _rate_gate.
+        self._rate_locks: dict = {}
+        self._rate_last: dict = {}
         # Recent inference activity (front-tracked, since the front relays every
         # request) so the Overview dashboard's activity table is served natively
         # without asking the engine. Newest first; bounded.
@@ -331,6 +335,7 @@ class FrontProxy:
         # a shared card so this request doesn't contend for VRAM.
         try:
             _swap_tok = await self._swap_acquire(engine, model, path, method)
+            await self._rate_gate(engine, path, method)
         except Exception:
             _swap_tok = None
         # Front-managed generation queue (text only) — same per-model gate as the
@@ -475,6 +480,7 @@ class FrontProxy:
             send_headers["x-coderai-broker-authed"] = self.internal_token
         try:
             _swap_tok = await self._swap_acquire(engine, model, path, method)
+            await self._rate_gate(engine, path, method)
         except Exception:
             _swap_tok = None
         _qkey = None
@@ -710,6 +716,38 @@ class FrontProxy:
         except Exception:
             pass
         return False
+
+    async def _rate_gate(self, engine, path, method) -> None:
+        """Throttle inference dispatches to `engine` to at most one per
+        configured min-interval (server.engine_request_min_interval_ms[name]).
+
+        Spaces request STARTS: holds a per-engine lock only long enough to wait
+        out the remaining gap since the last dispatch, then records the new start
+        and releases — so the actual request runs unthrottled, but back-to-back
+        submissions to a marginal GPU get idle time between them. No-op when the
+        interval is 0/unset or the request isn't inference."""
+        if engine is None or str(method).upper() != "POST" \
+                or not _router.is_inference_path(path):
+            return
+        try:
+            ms = int((getattr(self.config.server,
+                              "engine_request_min_interval_ms", None) or {}
+                      ).get(engine.name, 0) or 0)
+        except Exception:
+            ms = 0
+        if ms <= 0:
+            return
+        import asyncio as _a
+        import time as _t
+        lock = self._rate_locks.get(engine.name)
+        if lock is None:
+            lock = self._rate_locks[engine.name] = _a.Lock()
+        async with lock:
+            now = _t.monotonic()
+            wait = (self._rate_last.get(engine.name, 0.0) + ms / 1000.0) - now
+            if wait > 0:
+                await _a.sleep(wait)
+            self._rate_last[engine.name] = _t.monotonic()
 
     async def _swap_acquire(self, engine, model, path, method):
         """Acquire this engine's shared-GPU swap slot for a GPU-inference request.
@@ -1819,6 +1857,7 @@ class FrontProxy:
         # card if a different model currently owns it, so this forward never contends.
         try:
             _swap_tok = await self._swap_acquire(engine, model, path, method)
+            await self._rate_gate(engine, path, method)
         except Exception:
             _swap_tok = None
 

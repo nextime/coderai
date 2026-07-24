@@ -52,6 +52,12 @@ class ServerConfig:
     # without hardcoding — e.g. {"radeon": {"RADV_DEBUG": "syncshaders"}} to
     # serialize RADV shader dispatch and avoid Polaris async compute-ring hangs.
     engine_env_overrides: dict = field(default_factory=dict)
+    # Per-engine minimum interval between inference request DISPATCHES, in
+    # milliseconds (engine name → ms). 0 / unset = no throttle. Spaces request
+    # starts by at least this gap, capping the request rate and inserting idle
+    # time between GPU submissions — a stability lever for a marginal card that
+    # wedges under sustained back-to-back compute (e.g. {"radeon": 250}).
+    engine_request_min_interval_ms: dict = field(default_factory=dict)
     # ─── Frontend/engine split ───────────────────────────────────────────────
     # coderai boots a thin, always-responsive *front* reverse proxy on the public
     # host/port and supervises one or more *engine* subprocesses (which do all
