@@ -1,0 +1,16 @@
+# Lock AMD GPUs to their top power/clock state (power_dpm_force_performance_level
+# = high) at device bind. Polaris/GCN cards frequently HANG under sustained
+# Vulkan compute when the amdgpu driver switches DPM power states mid-kernel;
+# pinning to a fixed state avoids those transitions.
+#
+# Matched by DRIVER=="amdgpu" (not card number), so it survives DRM card
+# renumbering across GPU resets/reboots. Fires for every AMD GPU present.
+#
+# Install:
+#   sudo cp 30-amdgpu-dpm-high.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --subsystem-match=pci --attr-match=driver=amdgpu
+# Verify:
+#   cat /sys/class/drm/card*/device/power_dpm_force_performance_level   # -> high
+
+ACTION=="add|change", SUBSYSTEM=="pci", DRIVER=="amdgpu", ATTR{power_dpm_force_performance_level}="high"
