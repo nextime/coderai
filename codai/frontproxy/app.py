@@ -98,7 +98,7 @@ class FrontProxy:
         # selector; created lazily for engines that actually have a co-located sibling.
         self._swap_gates = {}
         # Per-engine request-rate throttle state (engine name → asyncio.Lock /
-        # last-dispatch monotonic time). See _rate_gate.
+        # per-engine throttle lock & token. See _rate_acquire/_rate_release.
         self._rate_locks: dict = {}
         self._rate_last: dict = {}
         # Recent inference activity (front-tracked, since the front relays every
@@ -333,11 +333,12 @@ class FrontProxy:
             send_headers["x-coderai-broker-authed"] = self.internal_token
         # Shared-GPU swap gate (all inference kinds): wait out any in-flight swap on
         # a shared card so this request doesn't contend for VRAM.
+        _swap_tok = _rate_tok = None
         try:
             _swap_tok = await self._swap_acquire(engine, model, path, method)
-            await self._rate_gate(engine, path, method)
+            _rate_tok = await self._rate_acquire(engine, path, method)
         except Exception:
-            _swap_tok = None
+            pass
         # Front-managed generation queue (text only) — same per-model gate as the
         # direct proxy path, so brokered and direct requests share one queue.
         _qkey = None
@@ -351,6 +352,7 @@ class FrontProxy:
                     engine=engine.name)
             except QueueFull:
                 self._swap_release(_swap_tok)
+                self._rate_release(_rate_tok)
                 return {"status_code": 503,
                         "headers": {"content-type": "application/json"},
                         "body": b'{"error":"Server busy: the generation queue is '
@@ -397,6 +399,7 @@ class FrontProxy:
             if _qkey is not None:
                 await self.reqqueue.release(_qkey)
             self._swap_release(_swap_tok)
+            self._rate_release(_rate_tok)
             if _router.is_inference_path(path):
                 self._record_activity(model, self._task_kind(path), _status, _started)
         # Surface the engine's actual reply so a brokered request that "doesn't get
@@ -478,11 +481,12 @@ class FrontProxy:
                         if k.lower() not in _DROP_REQ}
         if self.internal_token:
             send_headers["x-coderai-broker-authed"] = self.internal_token
+        _swap_tok = _rate_tok = None
         try:
             _swap_tok = await self._swap_acquire(engine, model, path, method)
-            await self._rate_gate(engine, path, method)
+            _rate_tok = await self._rate_acquire(engine, path, method)
         except Exception:
-            _swap_tok = None
+            pass
         _qkey = None
         if (method.upper() == "POST" and _is_infer
                 and self._task_kind(path) == "text"):
@@ -494,6 +498,7 @@ class FrontProxy:
                     engine=engine.name)
             except QueueFull:
                 self._swap_release(_swap_tok)
+                self._rate_release(_rate_tok)
                 yield ('data: {"error":"Server busy: the generation queue is full, '
                        'please retry shortly."}\n\n')
                 return
@@ -572,6 +577,7 @@ class FrontProxy:
             if _qkey is not None:
                 await self.reqqueue.release(_qkey)
             self._swap_release(_swap_tok)
+            self._rate_release(_rate_tok)
             if _is_infer:
                 self._record_activity(model, self._task_kind(path), _status, _started)
 
@@ -717,37 +723,70 @@ class FrontProxy:
             pass
         return False
 
-    async def _rate_gate(self, engine, path, method) -> None:
-        """Throttle inference dispatches to `engine` to at most one per
-        configured min-interval (server.engine_request_min_interval_ms[name]).
+    def _rate_interval_ms(self, engine) -> int:
+        try:
+            return int((getattr(self.config.server,
+                                "engine_request_min_interval_ms", None) or {}
+                        ).get(engine.name, 0) or 0)
+        except Exception:
+            return 0
 
-        Spaces request STARTS: holds a per-engine lock only long enough to wait
-        out the remaining gap since the last dispatch, then records the new start
-        and releases — so the actual request runs unthrottled, but back-to-back
-        submissions to a marginal GPU get idle time between them. No-op when the
-        interval is 0/unset or the request isn't inference."""
+    async def _rate_acquire(self, engine, path, method):
+        """Begin a throttled inference request to `engine`. Holds a per-engine
+        lock for the WHOLE request; _rate_release frees it only AFTER a full
+        `engine_request_min_interval_ms` idle gap has elapsed past completion —
+        so consecutive requests to the engine are always separated by at least
+        that much idle GPU time (a stability lever for a card that wedges under
+        continuous back-to-back compute). Returns a token for _rate_release, or
+        None when no throttle applies (non-inference or interval 0/unset)."""
         if engine is None or str(method).upper() != "POST" \
                 or not _router.is_inference_path(path):
-            return
+            return None
+        # Pick up a live settings save (the admin POST persists to config.json;
+        # this re-reads it on mtime change) so a changed rate limit applies to
+        # the very next request without a restart.
         try:
-            ms = int((getattr(self.config.server,
-                              "engine_request_min_interval_ms", None) or {}
-                      ).get(engine.name, 0) or 0)
+            self._refresh_config_if_changed()
         except Exception:
-            ms = 0
-        if ms <= 0:
-            return
+            pass
+        if self._rate_interval_ms(engine) <= 0:
+            return None
         import asyncio as _a
-        import time as _t
         lock = self._rate_locks.get(engine.name)
         if lock is None:
             lock = self._rate_locks[engine.name] = _a.Lock()
-        async with lock:
-            now = _t.monotonic()
-            wait = (self._rate_last.get(engine.name, 0.0) + ms / 1000.0) - now
-            if wait > 0:
-                await _a.sleep(wait)
-            self._rate_last[engine.name] = _t.monotonic()
+        await lock.acquire()
+        return (engine.name, lock)
+
+    def _rate_release(self, token) -> None:
+        """Release a throttle token `interval` ms from now (scheduled on the
+        loop, non-blocking) so the NEXT request can't start until a full idle
+        gap has passed. Synchronous + call-later so it always runs, even from a
+        finally during request cancellation."""
+        if not token:
+            return
+        name, lock = token
+        try:
+            import asyncio as _a
+            ms = 0
+            try:
+                ms = int((getattr(self.config.server,
+                                  "engine_request_min_interval_ms", None) or {}
+                          ).get(name, 0) or 0)
+            except Exception:
+                ms = 0
+            if ms > 0:
+                _a.get_event_loop().call_later(
+                    ms / 1000.0, lambda: lock.locked() and lock.release())
+            else:
+                if lock.locked():
+                    lock.release()
+        except Exception:
+            try:
+                if lock.locked():
+                    lock.release()
+            except Exception:
+                pass
 
     async def _swap_acquire(self, engine, model, path, method):
         """Acquire this engine's shared-GPU swap slot for a GPU-inference request.
@@ -1855,11 +1894,12 @@ class FrontProxy:
 
         # Shared-GPU swap gate (all inference kinds, incl. image/video): wait for the
         # card if a different model currently owns it, so this forward never contends.
+        _swap_tok = _rate_tok = None
         try:
             _swap_tok = await self._swap_acquire(engine, model, path, method)
-            await self._rate_gate(engine, path, method)
+            _rate_tok = await self._rate_acquire(engine, path, method)
         except Exception:
-            _swap_tok = None
+            pass
 
         rp_req = self._long.build_request(
             method, url, headers=headers, params=request.query_params,
@@ -1880,6 +1920,7 @@ class FrontProxy:
             if _qkey is not None:
                 await self.reqqueue.release(_qkey)
             self._swap_release(_swap_tok)
+            self._rate_release(_rate_tok)
             return JSONResponse(
                 {"error": f"Engine#{engine.id} unreachable: {exc}"}, status_code=502)
 
@@ -1891,6 +1932,7 @@ class FrontProxy:
                 if _qkey is not None:
                     await self.reqqueue.release(_qkey)
                 self._swap_release(_swap_tok)
+                self._rate_release(_rate_tok)
                 if _meta is not None:
                     self._record_activity(model, self._task_kind(path),
                                           rp_resp.status_code, _started)
