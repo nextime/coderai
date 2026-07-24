@@ -3183,6 +3183,8 @@ def build_settings_dict(c, gpu_cards):
             "max_parallel_requests_overrides": c.server.max_parallel_requests_overrides,
             "dpm_force_performance_level_overrides": getattr(
                 c.server, "dpm_force_performance_level_overrides", {}) or {},
+            "engine_request_min_interval_ms": getattr(
+                c.server, "engine_request_min_interval_ms", {}) or {},
             "internal_port_base": c.server.internal_port_base,
             "default_engine": c.server.default_engine,
             # Engine names available to pick as the default (for the settings UI).
@@ -3342,6 +3344,10 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             c.server.dpm_force_performance_level_overrides = (
                 _sanitize_engine_dpm_overrides(
                     srv["dpm_force_performance_level_overrides"]))
+        if "engine_request_min_interval_ms" in srv:
+            c.server.engine_request_min_interval_ms = (
+                _sanitize_engine_int_overrides(
+                    srv["engine_request_min_interval_ms"]))
         if "internal_port_base" in srv:
             try:
                 c.server.internal_port_base = max(1, min(65535, int(srv["internal_port_base"])))

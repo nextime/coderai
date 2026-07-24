@@ -82,8 +82,9 @@
   <div id="concurrency-overrides" style="margin-top:.7rem;display:none">
     <label class="form-label" style="margin-bottom:.3rem">Per-engine overrides <span class="muted">(blank = use the defaults above)</span></label>
     <span class="form-hint" style="margin-bottom:.4rem">Give a bigger card more concurrency than a smaller one — e.g. more parallel requests on a 24 GB NVIDIA than an 8 GB Radeon.</span>
-    <div id="concurrency-override-rows" style="display:grid;grid-template-columns:110px 1fr 1fr 1.3fr;gap:.5rem;align-items:center"></div>
+    <div id="concurrency-override-rows" style="display:grid;grid-template-columns:100px 1fr 1fr 1.2fr 1fr;gap:.5rem;align-items:center"></div>
     <span class="form-hint" style="margin-top:.4rem"><b>GPU power lock</b> pins an AMD card to a fixed power/clock state, avoiding the DPM transitions that hang Polaris/GCN cards under sustained Vulkan compute. <em>high</em> = max clocks (runs hotter). Applied at engine start; in an unprivileged container it logs the host command instead.</span>
+    <span class="form-hint"><b>Rate limit</b> spaces inference requests to the engine by at least this many milliseconds (0 = no limit) — throttles GPU duty cycle to stabilise a marginal card that wedges under sustained back-to-back compute.</span>
   </div>
 </div>
 
@@ -623,12 +624,12 @@ function _collectGpuOverrides(){
   return ov;
 }
 // Per-engine concurrency overrides — one row per running engine (by name).
-function _buildConcurrencyOverrides(engNames, parOv, instOv, dpmOv){
+function _buildConcurrencyOverrides(engNames, parOv, instOv, dpmOv, rateOv){
   const wrap = document.getElementById('concurrency-overrides');
   const rows = document.getElementById('concurrency-override-rows');
   if(!engNames || engNames.length < 2){ wrap.style.display='none'; rows.innerHTML=''; return; }
   wrap.style.display = '';
-  dpmOv = dpmOv || {};
+  dpmOv = dpmOv || {}; rateOv = rateOv || {};
   const DPM = ['','auto','low','high','profile_standard','profile_peak'];
   const dpmSel = (n) => `<select class="form-input conc-dpm" data-engine="${n}">` +
     DPM.map(l => `<option value="${l}"${(dpmOv[n]||'')===l?' selected':''}>${l||'default'}</option>`).join('') +
@@ -637,12 +638,14 @@ function _buildConcurrencyOverrides(engNames, parOv, instOv, dpmOv){
     `<span class="muted" style="font-size:11px">Engine</span>
      <span class="muted" style="font-size:11px">Max parallel</span>
      <span class="muted" style="font-size:11px">Max instances</span>
-     <span class="muted" style="font-size:11px">GPU power lock</span>` +
+     <span class="muted" style="font-size:11px">GPU power lock</span>
+     <span class="muted" style="font-size:11px">Rate limit (ms)</span>` +
     engNames.map(n => `
       <span style="font-size:12px">${n}</span>
       <input type="number" class="form-input conc-par" data-engine="${n}" min="1" max="64" placeholder="default" value="${parOv[n] ?? ''}">
       <input type="number" class="form-input conc-inst" data-engine="${n}" min="1" max="16" placeholder="default" value="${instOv[n] ?? ''}">
-      ${dpmSel(n)}`).join('');
+      ${dpmSel(n)}
+      <input type="number" class="form-input conc-rate" data-engine="${n}" min="0" max="60000" placeholder="0" value="${rateOv[n] ?? ''}">`).join('');
 }
 function _collectConcOverrides(cls){
   const o = {};
@@ -835,7 +838,8 @@ async function loadSettings(){
     _buildConcurrencyOverrides(engNames,
       d.server?.max_parallel_requests_overrides || {},
       d.models?.max_model_instances_overrides || {},
-      d.server?.dpm_force_performance_level_overrides || {});
+      d.server?.dpm_force_performance_level_overrides || {},
+      d.server?.engine_request_min_interval_ms || {});
     document.getElementById('s-hf-cache').value   = d.models?.hf_cache_dir ?? '';
     document.getElementById('s-gguf-cache').value = d.models?.gguf_cache_dir ?? '';
     document.getElementById('s-offload-dir').value = d.offload?.directory ?? './offload';
@@ -947,6 +951,7 @@ async function saveSettings(){
       max_parallel_requests: parseInt(document.getElementById('s-max-parallel').value) || 2,
       max_parallel_requests_overrides: _collectConcOverrides('conc-par'),
       dpm_force_performance_level_overrides: _collectDpmOverrides(),
+      engine_request_min_interval_ms: _collectConcOverrides('conc-rate'),
       default_engine: document.getElementById('s-default-engine').value || null,
     },
     models:{
