@@ -2320,6 +2320,22 @@ def _sanitize_engine_int_overrides(raw) -> dict:
     return out
 
 
+_DPM_LEVELS = ("auto", "low", "high", "manual", "profile_standard",
+               "profile_min_sclk", "profile_min_mclk", "profile_peak")
+
+
+def _sanitize_engine_dpm_overrides(raw) -> dict:
+    """Clean a {engine_name: dpm_level} map: keep valid AMD power levels, drop the
+    rest (and blank/'default' → not set, so the card keeps its OS default)."""
+    out = {}
+    if isinstance(raw, dict):
+        for name, val in raw.items():
+            lvl = str(val or "").strip().lower()
+            if lvl and lvl != "default" and lvl in _DPM_LEVELS:
+                out[str(name)] = lvl
+    return out
+
+
 def _resolve_engine_spec(engine_name: str, engine_specs):
     """Find the declared engine matching ``engine_name`` (by name or backend)."""
     for s in (engine_specs or []):
@@ -3165,6 +3181,8 @@ def build_settings_dict(c, gpu_cards):
             "queue_max_size": c.server.queue_max_size,
             "max_parallel_requests": c.server.max_parallel_requests,
             "max_parallel_requests_overrides": c.server.max_parallel_requests_overrides,
+            "dpm_force_performance_level_overrides": getattr(
+                c.server, "dpm_force_performance_level_overrides", {}) or {},
             "internal_port_base": c.server.internal_port_base,
             "default_engine": c.server.default_engine,
             # Engine names available to pick as the default (for the settings UI).
@@ -3320,6 +3338,10 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "max_parallel_requests_overrides" in srv:
             c.server.max_parallel_requests_overrides = _sanitize_engine_int_overrides(
                 srv["max_parallel_requests_overrides"])
+        if "dpm_force_performance_level_overrides" in srv:
+            c.server.dpm_force_performance_level_overrides = (
+                _sanitize_engine_dpm_overrides(
+                    srv["dpm_force_performance_level_overrides"]))
         if "internal_port_base" in srv:
             try:
                 c.server.internal_port_base = max(1, min(65535, int(srv["internal_port_base"])))
