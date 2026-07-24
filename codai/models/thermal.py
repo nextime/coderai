@@ -363,6 +363,21 @@ def read_gpu_temp() -> Optional[float]:
     if now - ts < _CACHE_TTL:
         return val
     val = _read_gpu_temp_uncached()
+    # FINAL broken-sensor chokepoint: _read_gpu_temp_uncached has several probe
+    # fallbacks (rocm-smi, psutil amdgpu) that _sane_temps does NOT cover — an
+    # invalid reading (e.g. amdgpu SMU stuck at 511°C = 0x1FF after a GPU reset)
+    # slips through the fallback path. Drop any physically impossible value HERE
+    # so no reader can act on it, then treat the card as temp-unknown (None).
+    if val is not None and val >= _TEMP_SANE_MAX:
+        global _WARNED_BAD_SENSOR
+        if not _WARNED_BAD_SENSOR:
+            _WARNED_BAD_SENSOR = True
+            print(f"[thermal] IGNORING physically impossible GPU temperature "
+                  f"{val:.0f}°C — broken/stuck sensor (e.g. amdgpu SMU after a "
+                  f"GPU reset; power-cycle to restore it). Thermal protection "
+                  f"for that card is DISABLED until it reads sane values.",
+                  flush=True)
+        val = None
     _gpu_cache = (now, val)
     return val
 

@@ -339,8 +339,15 @@ def _amd_stats() -> list:
             except OSError:
                 t = None
             if t is not None:
-                temp = t / 1000.0
-                break
+                _c = t / 1000.0
+                # Broken-sensor guard at the SOURCE: amdgpu's SMU can return a
+                # stuck invalid reading (observed 511°C = 0x1FF invalid-ADC
+                # after a GPU reset). No real GPU is ≥150°C; report the card as
+                # temp-unknown (None) rather than let a bogus value reach the
+                # thermal supervisor, which would pause/SIGSTOP a healthy card.
+                if _c < 150.0:
+                    temp = _c
+                    break
         cards.append({
             "vendor": "amd", "index": int(base[4:]),
             "name": _amd_gpu_name(dev, base),
