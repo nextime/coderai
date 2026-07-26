@@ -58,14 +58,19 @@ class _EmbeddingModel:
     those branches and its VRAM is only reclaimed implicitly by gc.
     """
 
-    __slots__ = ("backend", "model", "lock")
+    __slots__ = ("backend", "model", "lock", "respawn")
 
-    def __init__(self, backend, model):
+    def __init__(self, backend, model, respawn=None):
         self.backend = backend
         self.model = model
+        # Optional zero-arg callable that returns a fresh, ready backend handle for
+        # subprocess models — lets the embed path self-heal a dead server in place
+        # instead of failing forever with a stale handle (the manager may have
+        # killed the child under VRAM pressure without dropping the cached model).
+        self.respawn = respawn
         # llama.cpp contexts are NOT thread-safe: two executor threads calling
         # embed() on one ctx segfault the engine. Serialize per model instance.
-        if backend in ('llama', 'llama-vl', 'dinov2cpp'):
+        if backend in ('llama', 'llama-vl', 'dinov2cpp', 'vpr-server'):
             import threading
             self.lock = threading.Lock()
         else:
@@ -92,7 +97,7 @@ class _EmbeddingModel:
 
     def _cleanup_locked(self):
         try:
-            if self.backend == 'dinov2cpp':
+            if self.backend in ('dinov2cpp', 'vpr-server'):
                 # persistent embed server subprocess — terminating it frees
                 # its (V)RAM; eviction restarts it on the next request.
                 try:
@@ -396,6 +401,81 @@ def _vpr_embed_images(model, pil_images, dimensions=None):
     return _truncate_dims(results, dimensions)
 
 
+_SALAD_IDS = {'salad', 'dinov2-salad'}
+
+
+def _is_salad(model_name) -> bool:
+    return str(model_name).strip().lower().replace('_', '-') in _SALAD_IDS
+
+
+def _load_salad(model_name, device, model_config=None):
+    """Spawn DINOv2-SALAD (near-SOTA VPR, 8448-d) as an ISOLATED subprocess so its
+    pytorch_lightning / pytorch_metric_learning deps stay out of the main engine
+    venv. Same stdin/stdout JSON protocol as dinov2-embed, so the 'vpr-server'
+    embed path reuses that reader. GPU-preferred (the child picks cuda), CPU only
+    as fallback."""
+    import os as _os
+    import subprocess
+    cfg = model_config or {}
+    raw = cfg.get('_raw_cfg') if isinstance(cfg.get('_raw_cfg'), dict) else {}
+    venv_py = (cfg.get('salad_venv_python') or raw.get('salad_venv_python')
+               or _os.environ.get('SALAD_VENV_PY') or '/cache/salad-venv/bin/python')
+    if not _os.path.isfile(venv_py):
+        raise RuntimeError(
+            f"SALAD venv python not found at {venv_py} — create it with "
+            "`python -m venv --system-site-packages /cache/salad-venv` then "
+            "`/cache/salad-venv/bin/pip install pytorch_lightning pytorch_metric_learning`")
+    server = _os.path.join(_os.path.dirname(__file__), 'vpr_salad_server.py')
+    env = dict(_os.environ)
+    env.setdefault('TORCH_HOME',
+                   _os.environ.get('CODERAI_TORCH_HOME', '/cache/torchhub'))
+    # GPU preferred; force CPU only when the model is pinned off-GPU.
+    _ngl = cfg.get('n_gpu_layers', raw.get('n_gpu_layers'))
+    if str(device) == 'cpu' or _ngl == 0:
+        env['SALAD_FORCE_CPU'] = '1'
+    _sz = cfg.get('vpr_image_size') or raw.get('vpr_image_size')
+    if _sz:
+        env['SALAD_IMAGE_SIZE'] = str(_sz)
+
+    def _die_with_parent():
+        try:
+            import ctypes
+            ctypes.CDLL('libc.so.6').prctl(1, 9)  # PR_SET_PDEATHSIG, SIGKILL
+        except Exception:
+            pass
+
+    import json as _json
+    import time as _time
+
+    def _spawn():
+        # Reap an orphaned/dead server for this script first.
+        try:
+            subprocess.run(['pkill', '-f', 'vpr_salad_server.py'], timeout=10)
+        except Exception:
+            pass
+        p = subprocess.Popen(
+            [venv_py, server],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, env=env, text=True, bufsize=1,
+            preexec_fn=_die_with_parent)
+        _deadline = _time.time() + 600   # DINOv2 backbone load can be slow cold
+        while _time.time() < _deadline:
+            line = p.stdout.readline()
+            if not line:
+                raise RuntimeError("salad server exited during load")
+            line = line.strip()
+            if line.startswith('{'):
+                try:
+                    if _json.loads(line).get('ready'):
+                        return p
+                except Exception:
+                    pass
+        p.kill()
+        raise RuntimeError("salad server load timed out")
+
+    return _EmbeddingModel('vpr-server', _spawn(), respawn=_spawn)
+
+
 def _load_embedding_model(model_name: str, device: str, model_config: dict = None):
     from codai.models.hf_loading import build_from_pretrained_kwargs
     trust = _trust_remote_code(model_config)
@@ -405,9 +485,13 @@ def _load_embedding_model(model_name: str, device: str, model_config: dict = Non
     if _is_geoclip(model_name):
         return _load_geoclip(model_name, device)
 
-    # Visual place recognition (EigenPlaces). Logical id, not a repo/file.
+    # Visual place recognition (EigenPlaces, in-process). Logical id, not a repo.
     if _is_vpr(model_name):
         return _load_vpr(model_name, device, model_config)
+
+    # DINOv2-SALAD VPR — isolated subprocess (pytorch_lightning dep quarantine).
+    if _is_salad(model_name):
+        return _load_salad(model_name, device, model_config)
 
     # GGUF file → llama.cpp in embedding mode (works on whatever backend this
     # build targets: Vulkan on the radeon engine, CUDA on nvidia). Text-only —
@@ -953,6 +1037,9 @@ def _embed_texts(model_obj, texts: List[str], dimensions=None) -> List[List[floa
         # VPR is image-only; the contract sends the image data URI in 'input'.
         return _vpr_embed_images(
             model, [_decode_image(t) for t in texts], dimensions)
+    elif backend == 'vpr-server':
+        # SALAD subprocess is image-only; 'input' carries image data URIs.
+        return _embed_images(model_obj, texts, dimensions)
     elif backend == 'llama':
         # llama.cpp embedding mode. With a pooling type baked into the GGUF the
         # result is one vector per input; without, per-token vectors — mean-pool
@@ -1095,9 +1182,9 @@ def _embed_images(model_obj, images: List[str], dimensions=None) -> List[List[fl
         return _geoclip_embed_images(model, pil_images, dimensions)
     elif backend == 'vpr':
         return _vpr_embed_images(model, pil_images, dimensions)
-    elif backend == 'dinov2cpp':
-        # dinov2-embed subprocess: temp-file the PIL images, send paths, read
-        # JSON lines back; normalize (the binary emits raw CLS values).
+    elif backend in ('dinov2cpp', 'vpr-server'):
+        # persistent embed subprocess (dinov2-embed / salad server): temp-file the
+        # PIL images, send paths, read JSON lines back; normalize.
         import contextlib
         import json as _json
         import math
@@ -1108,7 +1195,16 @@ def _embed_images(model_obj, images: List[str], dimensions=None) -> List[List[fl
         _mlock = getattr(model_obj, 'lock', None)
         with (_mlock if _mlock is not None else contextlib.nullcontext()):
             if proc.poll() is not None:
-                raise RuntimeError("dinov2-embed process died — retry (it will reload)")
+                # The server died (e.g. the manager killed the child under VRAM
+                # pressure without dropping this cached model). Self-heal: respawn
+                # in place if we know how, so we don't fail forever on a stale
+                # handle; only give up if no respawn hook is available.
+                _rs = getattr(model_obj, 'respawn', None)
+                if _rs is None:
+                    raise RuntimeError(
+                        "embed server process died — retry (it will reload)")
+                proc = _rs()
+                model_obj.model = proc
             for im in pil_images:
                 with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
                     tmp = f.name
