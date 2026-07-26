@@ -130,6 +130,11 @@ class _EmbeddingModel:
                 obj = self.model[0] if self.model else None
                 if obj is not None and hasattr(obj, 'to'):
                     obj.to('cpu')
+            elif self.backend == 'vpr':
+                # model is (net, device, transform); move the net off GPU
+                net = self.model[0] if self.model else None
+                if net is not None and hasattr(net, 'to'):
+                    net.to('cpu')
         except Exception:
             pass
         self.model = None
@@ -334,6 +339,63 @@ def _geoclip_embed_images(model, pil_images, dimensions=None):
     return _truncate_dims(results, dimensions)
 
 
+# ---------------------------------------------------------------- VPR
+# Visual Place Recognition: turn a photo into ONE L2-normalised descriptor trained
+# so two images of the SAME place land close — discriminating building identity
+# under viewpoint/lighting/season change, which dinov2 / gme / geoclip do NOT
+# (REQUEST-vpr-embeddings.md: HomeHunter matches listing photos to Street View
+# panoramas). Served as 'vpr' / 'eigenplaces'. Backed by EigenPlaces (gmberton,
+# ResNet50, 2048-d) via torch.hub — clean deps (torch + torchvision, no
+# pytorch_lightning, unlike SALAD/MixVPR).
+_VPR_IDS = {'vpr', 'eigenplaces', 'eigenplaces-resnet50'}
+
+
+def _is_vpr(model_name) -> bool:
+    return str(model_name).strip().lower().replace('_', '-') in _VPR_IDS
+
+
+def _load_vpr(model_name, device, model_config=None):
+    import os
+    import torch
+    cfg = model_config or {}
+    raw = cfg.get('_raw_cfg') if isinstance(cfg.get('_raw_cfg'), dict) else {}
+    # Persistent torch.hub cache: the repo code, weights, and trusted_list live
+    # here so the engine loads OFFLINE and NON-INTERACTIVELY across restarts (a
+    # cold torch.hub.load would otherwise hit the network and an interactive trust
+    # prompt that EOF-crashes a server). Pre-seeded during setup.
+    os.environ.setdefault('TORCH_HOME',
+                          os.environ.get('CODERAI_TORCH_HOME', '/cache/torchhub'))
+    backbone = cfg.get('vpr_backbone') or raw.get('vpr_backbone') or 'ResNet50'
+    fc_dim = int(cfg.get('vpr_dim') or raw.get('vpr_dim') or 2048)
+    net = torch.hub.load('gmberton/eigenplaces', 'get_trained_model',
+                         backbone=backbone, fc_output_dim=fc_dim)
+    net = net.to(device).eval()
+    # EigenPlaces eval transform: resize to a square + ImageNet normalise (matches
+    # the 512x512 training crops). The network's final layer already L2-normalises;
+    # we normalise again downstream to guarantee the contract regardless.
+    import torchvision.transforms as T
+    size = int(cfg.get('vpr_image_size') or raw.get('vpr_image_size') or 512)
+    tfm = T.Compose([
+        T.Resize((size, size)),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    return _EmbeddingModel('vpr', (net, device, tfm))
+
+
+def _vpr_embed_images(model, pil_images, dimensions=None):
+    """Embed images -> one L2-normalised place descriptor each (pooled, not patch
+    tokens). Deterministic: same image -> same vector."""
+    import torch
+    import torch.nn.functional as F
+    net, device, tfm = model
+    batch = torch.stack([tfm(im.convert('RGB')) for im in pil_images]).to(device)
+    with torch.no_grad():
+        feats = F.normalize(net(batch), dim=-1)
+    results = [row.detach().cpu().tolist() for row in feats]
+    return _truncate_dims(results, dimensions)
+
+
 def _load_embedding_model(model_name: str, device: str, model_config: dict = None):
     from codai.models.hf_loading import build_from_pretrained_kwargs
     trust = _trust_remote_code(model_config)
@@ -342,6 +404,10 @@ def _load_embedding_model(model_name: str, device: str, model_config: dict = Non
     # GGUF/HF paths — 'geoclip'/'geoclip-location' are logical ids, not repos.
     if _is_geoclip(model_name):
         return _load_geoclip(model_name, device)
+
+    # Visual place recognition (EigenPlaces). Logical id, not a repo/file.
+    if _is_vpr(model_name):
+        return _load_vpr(model_name, device, model_config)
 
     # GGUF file → llama.cpp in embedding mode (works on whatever backend this
     # build targets: Vulkan on the radeon engine, CUDA on nvidia). Text-only —
@@ -575,7 +641,7 @@ def _supports_images(model_obj) -> bool:
             return model[1] == 'image'
         except Exception:
             return False
-    if backend in ('clip', 'vision', 'qwenvl', 'llama-vl', 'dinov2cpp'):
+    if backend in ('clip', 'vision', 'qwenvl', 'llama-vl', 'dinov2cpp', 'vpr', 'vpr-server'):
         return True
     if backend != 'sentence_transformers':
         return False
@@ -883,6 +949,10 @@ def _embed_texts(model_obj, texts: List[str], dimensions=None) -> List[List[floa
         # image model: the HomeHunter contract sends the image data URI in 'input'
         return _geoclip_embed_images(
             model, [_decode_image(t) for t in texts], dimensions)
+    elif backend == 'vpr':
+        # VPR is image-only; the contract sends the image data URI in 'input'.
+        return _vpr_embed_images(
+            model, [_decode_image(t) for t in texts], dimensions)
     elif backend == 'llama':
         # llama.cpp embedding mode. With a pooling type baked into the GGUF the
         # result is one vector per input; without, per-token vectors — mean-pool
@@ -1023,6 +1093,8 @@ def _embed_images(model_obj, images: List[str], dimensions=None) -> List[List[fl
                                dimensions)
     elif backend == 'geoclip':
         return _geoclip_embed_images(model, pil_images, dimensions)
+    elif backend == 'vpr':
+        return _vpr_embed_images(model, pil_images, dimensions)
     elif backend == 'dinov2cpp':
         # dinov2-embed subprocess: temp-file the PIL images, send paths, read
         # JSON lines back; normalize (the binary emits raw CLS values).
