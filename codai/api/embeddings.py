@@ -125,6 +125,11 @@ class _EmbeddingModel:
                 hf_model = self.model[1]
                 if hf_model is not None and hasattr(hf_model, 'to'):
                     hf_model.to('cpu')
+            elif self.backend == 'geoclip':
+                # model is (geoclip_obj_or_encoder, mode, device); move off GPU
+                obj = self.model[0] if self.model else None
+                if obj is not None and hasattr(obj, 'to'):
+                    obj.to('cpu')
         except Exception:
             pass
         self.model = None
@@ -210,9 +215,133 @@ def _os_basename(p) -> str:
     return os.path.basename(str(p))
 
 
+# ---------------------------------------------------------------- GeoCLIP
+# GeoCLIP puts images and GPS coordinates in ONE 512-d space, so a photo can be
+# scored directly against candidate coordinates (image·location dot product) —
+# the core of HomeHunter's visual geolocation (REQUEST-geoclip-embeddings.md).
+# Two model ids off the SAME checkpoint:
+#   'geoclip'          -> image encoder    (CLIP ViT-L/14 + projection MLP; GPU)
+#   'geoclip-location' -> location encoder (equal-earth + RFF MLP; tiny)
+# Both outputs are L2-normalised. Loaded separately so each is independently
+# evictable, but from the identical bundled weights, so the two spaces coincide
+# BY CONSTRUCTION — the mismatched-checkpoint failure the request warns about
+# (silently wrong scores, no error) cannot happen here.
+_GEOCLIP_IDS_IMAGE = {'geoclip', 'geoclip-image', 'geoclip-img'}
+_GEOCLIP_IDS_LOCATION = {'geoclip-location', 'geoclip-loc', 'geoclip-gps'}
+
+
+def _geoclip_norm_id(model_name) -> str:
+    return str(model_name).strip().lower().replace('_', '-')
+
+
+def _is_geoclip(model_name) -> bool:
+    n = _geoclip_norm_id(model_name)
+    return n in _GEOCLIP_IDS_IMAGE or n in _GEOCLIP_IDS_LOCATION
+
+
+def _load_geoclip(model_name, device):
+    """Load one side of GeoCLIP. The location side loads ONLY the tiny GPS encoder
+    (no CLIP backbone); the image side loads the full model (the CLIP ViT wants
+    the GPU). Both read the same bundled weights, so the two 512-d spaces match."""
+    import torch
+    mode = ('location' if _geoclip_norm_id(model_name) in _GEOCLIP_IDS_LOCATION
+            else 'image')
+    if mode == 'location':
+        import os
+        from geoclip.model.location_encoder import LocationEncoder
+        from geoclip.model.misc import file_dir
+        enc = LocationEncoder()
+        enc.load_state_dict(torch.load(
+            os.path.join(file_dir, 'weights', 'location_encoder_weights.pth'),
+            map_location='cpu'))
+        # Pin the GPS encoder to CPU: it is a tiny MLP (hundreds of coords in a
+        # few ms), so CPU is plenty fast, uses no VRAM, AND is bit-exact across
+        # batch sizes — GPU reduction order makes the same coordinate differ by
+        # ~1e-7 between a batch of 1 and a batch of 300, which would defeat the
+        # caller's per-coordinate cache. Determinism is a stated requirement.
+        enc.to('cpu').eval()
+        return _EmbeddingModel('geoclip', (enc, mode, 'cpu'))
+    from geoclip import GeoCLIP
+    model = GeoCLIP().to(device)
+    model.eval()
+    return _EmbeddingModel('geoclip', (model, mode, device))
+
+
+def _parse_latlon(s):
+    """Parse a 'lat,lon' WGS84 decimal-degree string (tolerant of whitespace and a
+    ';' separator); also accepts a [lat, lon] pair. Raises ValueError -> HTTP 400."""
+    if isinstance(s, (list, tuple)):
+        if len(s) != 2:
+            raise ValueError(f"geoclip-location expects [lat, lon], got {s!r}")
+        return float(s[0]), float(s[1])
+    parts = str(s).strip().replace(';', ',').split(',')
+    if len(parts) != 2:
+        raise ValueError(
+            f"geoclip-location expects 'lat,lon' in decimal degrees, got {s!r}")
+    try:
+        return float(parts[0].strip()), float(parts[1].strip())
+    except ValueError:
+        raise ValueError(f"geoclip-location could not parse coordinates from {s!r}")
+
+
+def _geoclip_embed_locations(model, coords, dimensions=None):
+    """Embed a batch of 'lat,lon' strings -> one L2-normalised 512-d vector each,
+    in input order. This is the batched path that matters for cost (hundreds of
+    candidate cells per listing in one request)."""
+    import torch
+    import torch.nn.functional as F
+    enc, mode, device = model
+    if mode != 'location':
+        raise ValueError(
+            "model 'geoclip' embeds images; POST coordinates to 'geoclip-location'")
+    pairs = [_parse_latlon(c) for c in coords]
+    gps = torch.tensor(pairs, dtype=torch.float32, device=device)
+    with torch.no_grad():
+        v = F.normalize(enc(gps), dim=-1)
+    results = [row.detach().cpu().tolist() for row in v]
+    return _truncate_dims(results, dimensions)
+
+
+def _geoclip_embed_images(model, pil_images, dimensions=None):
+    """Embed images -> L2-normalised 512-d vectors in the same space as the GPS
+    encoder (CLIP image features -> projection MLP)."""
+    import torch
+    import torch.nn.functional as F
+    obj, mode, device = model
+    if mode != 'image':
+        raise ValueError(
+            "model 'geoclip-location' embeds coordinates; POST images to 'geoclip'")
+    enc = obj.image_encoder
+    results = []
+    with torch.no_grad():
+        for im in pil_images:
+            px = enc.preprocess_image(im.convert('RGB')).to(device)
+            # GeoCLIP's ImageEncoder.forward() does CLIP.get_image_features(...) ->
+            # mlp(...). transformers >=5 changed get_image_features to return a
+            # BaseModelOutputWithPooling (768-d projected features in pooler_output)
+            # instead of a bare tensor, which breaks the package's internal mlp()
+            # call. Pull the 768-d tensor out ourselves (tolerant of both the old
+            # tensor return and the new object) before the projection MLP.
+            out = enc.CLIP.get_image_features(pixel_values=px)
+            if torch.is_tensor(out):
+                feat768 = out
+            elif getattr(out, 'image_embeds', None) is not None:
+                feat768 = out.image_embeds
+            else:
+                feat768 = out.pooler_output
+            feat = F.normalize(enc.mlp(feat768), dim=-1)[0]
+            results.append(feat.detach().cpu().tolist())
+    return _truncate_dims(results, dimensions)
+
+
 def _load_embedding_model(model_name: str, device: str, model_config: dict = None):
     from codai.models.hf_loading import build_from_pretrained_kwargs
     trust = _trust_remote_code(model_config)
+
+    # GeoCLIP image/location encoders (shared 512-d space). Caught before the
+    # GGUF/HF paths — 'geoclip'/'geoclip-location' are logical ids, not repos.
+    if _is_geoclip(model_name):
+        return _load_geoclip(model_name, device)
 
     # GGUF file → llama.cpp in embedding mode (works on whatever backend this
     # build targets: Vulkan on the radeon engine, CUDA on nvidia). Text-only —
@@ -440,6 +569,12 @@ def _supports_images(model_obj) -> bool:
     """True if this loaded model can embed images (shared space for clip/ST
     multimodal; image-only space for the 'vision' backend)."""
     backend, model = model_obj
+    if backend == 'geoclip':
+        # only the image encoder embeds images; the location encoder is coords-only
+        try:
+            return model[1] == 'image'
+        except Exception:
+            return False
     if backend in ('clip', 'vision', 'qwenvl', 'llama-vl', 'dinov2cpp'):
         return True
     if backend != 'sentence_transformers':
@@ -741,6 +876,13 @@ def _embed_texts(model_obj, texts: List[str], dimensions=None) -> List[List[floa
         return _qwenvl_embed(model, [{'text': t} for t in texts], dimensions)
     elif backend == 'llama-vl':
         return _llama_vl_embed(model_obj, [{'text': t} for t in texts], dimensions)
+    elif backend == 'geoclip':
+        _obj, _mode, _dev = model
+        if _mode == 'location':
+            return _geoclip_embed_locations(model, texts, dimensions)
+        # image model: the HomeHunter contract sends the image data URI in 'input'
+        return _geoclip_embed_images(
+            model, [_decode_image(t) for t in texts], dimensions)
     elif backend == 'llama':
         # llama.cpp embedding mode. With a pooling type baked into the GGUF the
         # result is one vector per input; without, per-token vectors — mean-pool
@@ -879,6 +1021,8 @@ def _embed_images(model_obj, images: List[str], dimensions=None) -> List[List[fl
     elif backend == 'llama-vl':
         return _llama_vl_embed(model_obj, [{'image': im} for im in pil_images],
                                dimensions)
+    elif backend == 'geoclip':
+        return _geoclip_embed_images(model, pil_images, dimensions)
     elif backend == 'dinov2cpp':
         # dinov2-embed subprocess: temp-file the PIL images, send paths, read
         # JSON lines back; normalize (the binary emits raw CLS values).

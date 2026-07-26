@@ -34,6 +34,13 @@ torchaudio
 # ML dependencies
 transformers>=4.35.0
 accelerate>=0.24.0
+# GeoCLIP visual geolocation embedder (image<->GPS shared space) — served as the
+# 'geoclip' / 'geoclip-location' embedding model ids. Its deps (torch, transformers,
+# Pillow, pandas, numpy) are already pinned above/below; geopy+geographiclib are the
+# only extras it pulls (both pure-python, no version churn on the ML stack).
+geoclip>=1.2.0
+geopy>=2.4
+geographiclib>=2.0
 diffusers>=0.25.0  # For Stable Diffusion image generation
 safetensors>=0.4.0  # Required by diffusers
 ftfy>=6.0  # Prompt text cleaning for diffusers Wan/T5 pipelines (prompt_clean)
