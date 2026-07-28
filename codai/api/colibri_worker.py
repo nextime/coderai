@@ -241,8 +241,15 @@ class MuxEngine:
     def __init__(self, binary: Path, model_dir: str, *, cap: int = 8,
                  max_tokens: int = 1024, kv_slots: int = 1, env: Optional[dict] = None):
         kv_slots = max(1, min(16, int(kv_slots or 1)))
+        # colibri's context window is the CTX env (default 4096) — DISTINCT from NGEN
+        # (max new tokens). Without CTX the engine rejects any prompt over ~4095 tokens
+        # ("prompt does not fit … CTX=4096"), which breaks coding clients that send
+        # large system prompts + tools. Size CTX to the model's configured n_ctx (the
+        # value passed here). A caller-set CTX in the env still wins.
+        ctx = max(512, int(max_tokens or 4096))
         child_env = dict(env or os.environ, SNAP=str(model_dir), SERVE="1",
                          SERVE_BATCH="1", NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
+        child_env.setdefault("CTX", str(ctx))
         self.model_dir = str(model_dir)
         self.kv_slots = kv_slots
         self.process = subprocess.Popen(
