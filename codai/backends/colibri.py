@@ -191,14 +191,41 @@ class ColibriBackend(ModelBackend):
             self._cfg, model_dir=model_dir, ctx=(self._ctx or None))
 
     @staticmethod
-    def _resolve_container(model_name: str) -> Optional[str]:
+    def _hf_snapshot_dir(repo_id: str) -> Optional[str]:
+        """Local snapshot DIRECTORY of a fully-cached HF repo, or None. colibri needs
+        the directory (SNAP=<dir>), not a file inside it, so we can't reuse the
+        file-returning cache resolver — ask huggingface_hub for the snapshot root."""
+        import os
+        try:
+            from huggingface_hub import snapshot_download
+            hf_dir = None
+            try:
+                from codai.models.cache import get_all_cache_dirs
+                hf_dir = (get_all_cache_dirs() or {}).get("huggingface") or None
+            except Exception:
+                hf_dir = None
+            d = snapshot_download(repo_id, local_files_only=True, cache_dir=hf_dir)
+            return os.path.abspath(d) if d and os.path.isdir(d) else None
+        except Exception:
+            return None
+
+    @classmethod
+    def _resolve_container(cls, model_name: str) -> Optional[str]:
         """Map a requested model name/alias/path to its GLM-5.2 container directory.
 
-        The colibri model is a directory (int4 container), not a file — so we look up
-        the model's models.json entry and use its ``path`` when it is a directory,
-        else the raw name if it is itself a directory.
+        The colibri model is a directory (int4 container), not a file. Resolution
+        order: a local directory given directly → the model's models.json entry
+        ``path`` when it is a local directory → that entry's ``path`` (or the name
+        itself) resolved as an HF repo id to its local snapshot directory. The last
+        case is what makes a model downloaded the normal way (an HF repo → snapshot
+        dir) Just Work.
         """
         import os
+        cand = os.path.expanduser(model_name or "")
+        if cand and os.path.isdir(cand):
+            return os.path.abspath(cand)
+
+        entry_path = None
         try:
             from codai.admin.routes import config_manager
             md = getattr(config_manager, "models_data", {}) or {}
@@ -213,12 +240,24 @@ class ColibriBackend(ModelBackend):
                     base = os.path.basename(path.rstrip("/"))
                     cands = {path.lower(), base.lower(), str(m.get("alias") or "").lower(),
                              str(m.get("id") or "").lower()}
-                    if name_l and name_l in cands and os.path.isdir(os.path.expanduser(path)):
-                        return os.path.abspath(os.path.expanduser(path))
+                    if name_l and name_l in cands:
+                        entry_path = path
+                        if path and os.path.isdir(os.path.expanduser(path)):
+                            return os.path.abspath(os.path.expanduser(path))
+                        break
+                if entry_path is not None:
+                    break
         except Exception:
             pass
-        cand = os.path.expanduser(model_name or "")
-        return os.path.abspath(cand) if cand and os.path.isdir(cand) else None
+
+        # HF repo id (from the entry's path, else the requested name) → snapshot dir.
+        for rid in (entry_path, model_name):
+            rid = (rid or "").strip()
+            if rid and "/" in rid and not os.path.isabs(rid):
+                snap = cls._hf_snapshot_dir(rid)
+                if snap:
+                    return snap
+        return None
 
     @staticmethod
     def _colibri_overrides(model_name: str, model_dir: Optional[str]) -> Dict:

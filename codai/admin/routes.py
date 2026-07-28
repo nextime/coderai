@@ -857,6 +857,40 @@ async def api_ds4_default_models(username: str = Depends(require_admin)):
     return {"repo": _DS4_DEFAULT_REPO, "gguf_cache_dir": gguf_dir, "models": out}
 
 
+# The official GLM-5.2 int4 container colibri serves — a full HF repo (a DIRECTORY of
+# .safetensors shards + config + tokenizer + MTP head), downloaded like any other HF
+# model (whole-repo snapshot). Requires the gs64 build with the int8 MTP head.
+_COLIBRI_DEFAULT_MODELS = [
+    {"key": "glm-5.2-int4-g64-mtp",
+     "repo": "mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp",
+     "label": "GLM-5.2 int4 g64 + int8-MTP (~372 GB) — the colibri container",
+     "size_gb": 372},
+]
+
+
+@router.get("/admin/api/colibri/default-models", summary="List downloadable colibri default models")
+async def api_colibri_default_models(username: str = Depends(require_admin)):
+    """Catalog of the official GLM-5.2 container(s) colibri serves. The UI offers
+    these in a select; downloading one goes through the normal /admin/api/model-download
+    (a full-repo snapshot into a directory) and registers it as a colibri-backed model."""
+    model_id = "glm-5.2-colibri"
+    try:
+        if config_manager is not None and config_manager.config is not None:
+            model_id = (config_manager.config.colibri.model_id or model_id).strip()
+    except Exception:
+        pass
+    out = []
+    for m in _COLIBRI_DEFAULT_MODELS:
+        present = False
+        try:
+            from codai.backends.colibri import ColibriBackend
+            present = bool(ColibriBackend._hf_snapshot_dir(m["repo"]))
+        except Exception:
+            present = False
+        out.append({**m, "present": present})
+    return {"models": out, "model_id": model_id}
+
+
 def _cancel_download_session(session_id: str) -> bool:
     """Cancel an active download by flagging the session and terminating its worker
     process. Returns False if there is no such download session.
@@ -1776,13 +1810,28 @@ async def api_model_add_known(request: Request, username: str = Depends(require_
     if model_type not in valid:
         model_type = "text_models"
 
+    # Optional: pin a serving backend (e.g. "colibri" for a GLM-5.2 container) and/or
+    # a client-facing alias on the new entry. When either is set the entry must be a
+    # dict rather than a bare path string.
+    backend = (data.get("backend") or "").strip()
+    alias = (data.get("alias") or "").strip()
+
     # GGUF entries must persist source_repo so Re-download has a target (flat GGUF
     # files keep no repo info on disk). Plain HF repos re-download by id, so a bare
     # path string is enough and surfaces as a missing HF model.
     if is_gguf:
         entry = {"path": model_id, "source_repo": source_repo}
+    elif backend or alias:
+        entry = {"path": model_id}
+        if source_repo and source_repo != model_id:
+            entry["source_repo"] = source_repo
     else:
         entry = model_id
+    if isinstance(entry, dict):
+        if backend:
+            entry["backend"] = backend
+        if alias:
+            entry["alias"] = alias
 
     # Dedupe across all categories by path / basename so we don't double-add.
     fname = _os.path.basename(model_id) if ("/" in model_id or _os.sep in model_id) else model_id

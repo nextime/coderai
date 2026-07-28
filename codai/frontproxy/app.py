@@ -55,6 +55,7 @@ _SYSTEM_PATHS = (
     "/admin/api/model-upload", "/admin/api/model-free-disk",
     "/admin/api/hf-search", "/admin/api/hf-files", "/admin/api/hf-model-info",
     "/admin/api/hf-model-files", "/admin/api/ds4/default-models",
+    "/admin/api/colibri/default-models",
     "/admin/api/model-add-known", "/admin/api/model-mark-download",
     "/admin/api/model-unmark-download",
     # Config-based reads/edits (no GPU): the system worker has config_manager +

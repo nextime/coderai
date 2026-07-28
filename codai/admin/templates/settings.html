@@ -561,6 +561,15 @@
   </div>
   <div id="colibri-fields" style="display:none">
     <div class="form-group">
+      <label class="form-label">Download the GLM-5.2 container</label>
+      <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
+        <select id="s-colibri-dl-select" class="form-input" style="flex:1;min-width:280px"></select>
+        <button type="button" id="s-colibri-dl-btn" class="btn btn-secondary" onclick="colibriDownloadDefault()">Download</button>
+      </div>
+      <span class="form-hint">Fetches the full HF repo (a directory of int4 shards, ~372&nbsp;GB) like any other model and registers it as a colibri-backed model pointing at the snapshot dir. Keep the HF cache on fast storage (NVMe/ext4). Resumable.</span>
+      <div id="s-colibri-dl-status" class="form-hint" style="margin-top:.45rem;display:none"></div>
+    </div>
+    <div class="form-group">
       <label class="form-label">Model id / alias</label>
       <input type="text" id="s-colibri-model-id" class="form-input" placeholder="glm-5.2-colibri">
       <span class="form-hint">When enabled, this id (and names containing <b>glm-5.2</b> / <b>colibri</b>, or any model whose config <code>backend</code> is <code>colibri</code>) routes to the colibri engine.</span>
@@ -809,6 +818,76 @@ async function ds4DownloadDefault(){
     btn.disabled = false;
   }
 }
+
+let _colibriDefaultModels = [];
+let _colibriModelId = 'glm-5.2-colibri';
+async function loadColibriDefaultModels(){
+  const sel = document.getElementById('s-colibri-dl-select');
+  if(!sel) return;
+  try{
+    const d = await fetch(ROOT_PATH + '/admin/api/colibri/default-models').then(r=>r.json());
+    _colibriDefaultModels = d.models || [];
+    _colibriModelId = d.model_id || _colibriModelId;
+    sel.innerHTML = _colibriDefaultModels.map(m =>
+      `<option value="${m.repo}">${m.label}${m.present ? ' ✓ downloaded' : ''}</option>`).join('');
+  }catch(e){
+    sel.innerHTML = '<option value="">(failed to load catalog)</option>';
+  }
+}
+
+async function colibriDownloadDefault(){
+  const sel = document.getElementById('s-colibri-dl-select');
+  const btn = document.getElementById('s-colibri-dl-btn');
+  const statusEl = document.getElementById('s-colibri-dl-status');
+  const repo = sel.value;
+  const meta = _colibriDefaultModels.find(m => m.repo === repo);
+  if(!repo || !meta){ return; }
+  if(meta.present && !confirm('This container is already downloaded. Download again?')) return;
+  const modelId = (document.getElementById('s-colibri-model-id').value.trim() || _colibriModelId);
+  btn.disabled = true;
+  statusEl.style.display = 'block';
+  statusEl.textContent = 'Starting download (full repo — this is large)…';
+  try{
+    // Full-repo snapshot (no file_pattern) → a directory, exactly what colibri loads.
+    const r = await fetch(ROOT_PATH + '/admin/api/model-download', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({model_id: repo}),
+    });
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const {session_id} = await r.json();
+    const es = new EventSource(ROOT_PATH + '/admin/api/download-stream/' + session_id);
+    es.onmessage = async (ev) => {
+      let m; try{ m = JSON.parse(ev.data); }catch(_){ return; }
+      if(m.type === 'progress'){
+        const pct = (m.percent||0).toFixed(1);
+        const rate = m.rate ? ' · ' + (m.rate/1048576).toFixed(1) + ' MB/s' : '';
+        statusEl.textContent = `Downloading GLM-5.2 container: ${pct}%${rate}`;
+      }else if(m.type === 'info'){
+        statusEl.textContent = m.message || statusEl.textContent;
+      }else if(m.type === 'done'){
+        // Register it as a colibri-backed model, addressable by the model id.
+        try{
+          await fetch(ROOT_PATH + '/admin/api/model-add', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({model_id: repo, model_type:'text_models',
+                                  backend:'colibri', alias: modelId}),
+          });
+          statusEl.textContent = '✅ Downloaded and registered as a colibri model — enable colibri above and it serves as "' + modelId + '".';
+        }catch(_){
+          statusEl.textContent = '✅ Downloaded. Add it as a model with backend "colibri" to serve it.';
+        }
+        es.close(); btn.disabled = false; loadColibriDefaultModels();
+      }else if(m.type === 'error'){
+        statusEl.textContent = '⚠ Download failed: ' + (m.message||'unknown error');
+        es.close(); btn.disabled = false;
+      }
+    };
+    es.onerror = () => { es.close(); btn.disabled = false; };
+  }catch(e){
+    statusEl.textContent = '⚠ Could not start download: ' + e.message;
+    btn.disabled = false;
+  }
+}
 function toggleHttps(){
   document.getElementById('https-fields').style.display =
     document.getElementById('s-https').checked ? 'block' : 'none';
@@ -1029,6 +1108,7 @@ async function loadSettings(){
     document.getElementById('s-colibri-repo-url').value = colibri.repo_url ?? 'https://github.com/JustVugg/colibri';
     document.getElementById('s-colibri-extra-env').value = colibri.extra_env ?? '';
     toggleColibriFields();
+    loadColibriDefaultModels();
   }catch(e){ showAlert('error','Failed to load settings: '+e.message); }
 }
 
