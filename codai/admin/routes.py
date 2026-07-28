@@ -863,8 +863,8 @@ async def api_ds4_default_models(username: str = Depends(require_admin)):
 _COLIBRI_DEFAULT_MODELS = [
     {"key": "glm-5.2-int4-g64-mtp",
      "repo": "mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp",
-     "label": "GLM-5.2 int4 g64 + int8-MTP (~372 GB) — the colibri container",
-     "size_gb": 372},
+     "label": "GLM-5.2 int4 g64 + int8-MTP (~429 GB / 400 GiB) — the colibri container",
+     "size_gb": 429},
 ]
 
 
@@ -881,14 +881,30 @@ async def api_colibri_default_models(username: str = Depends(require_admin)):
         pass
     out = []
     for m in _COLIBRI_DEFAULT_MODELS:
-        present = False
-        try:
-            from codai.backends.colibri import ColibriBackend
-            present = bool(ColibriBackend._hf_snapshot_dir(m["repo"]))
-        except Exception:
-            present = False
-        out.append({**m, "present": present})
+        out.append({**m, "present": _colibri_repo_complete(m["repo"])})
     return {"models": out, "model_id": model_id}
+
+
+def _colibri_repo_complete(repo: str) -> bool:
+    """True when the HF repo is fully downloaded — the snapshot resolves AND every
+    file symlink points to an existing blob (no dangling links). This is hf's own
+    notion of "cached". Stale ``.incomplete`` temp files whose final blob already
+    exists are IGNORED: hf leaves them behind after a resumed/retried chunk, so their
+    mere presence does NOT mean the model is unfinished (a missing final blob shows up
+    as a dangling snapshot symlink, which is what we actually check)."""
+    try:
+        from codai.backends.colibri import ColibriBackend
+        snap = ColibriBackend._hf_snapshot_dir(repo)
+        if not snap or not os.path.isdir(snap):
+            return False
+        for root, _dirs, files in os.walk(snap):
+            for n in files:
+                p = os.path.join(root, n)
+                if os.path.islink(p) and not os.path.exists(p):
+                    return False   # dangling symlink = a file not yet downloaded
+        return True
+    except Exception:
+        return False
 
 
 def _cancel_download_session(session_id: str) -> bool:
@@ -1197,16 +1213,31 @@ def _scan_caches() -> dict:
                 if rid:
                     incomplete_repos.add(str(rid))
             # Also scan each repo's blobs directory for .incomplete marker files
-            # (used by some huggingface_hub versions for in-progress downloads).
+            # (used by some huggingface_hub versions for in-progress downloads). A
+            # `.incomplete` file is only evidence of an UNFINISHED download when its
+            # final blob is absent — hf leaves a stale `.incomplete` orphan behind
+            # after a resumed/retried chunk even though the real file completed, so
+            # counting those would flag a fully-downloaded model as incomplete.
             try:
                 for _repo_entry in os.scandir(hf_dir):
                     if not _repo_entry.is_dir() or not _repo_entry.name.startswith('models--'):
                         continue
                     _blobs = os.path.join(_repo_entry.path, 'blobs')
-                    if os.path.isdir(_blobs) and any(
-                        n.endswith('.incomplete') or n.endswith('.lock')
-                        for n in os.listdir(_blobs)
-                    ):
+                    if not os.path.isdir(_blobs):
+                        continue
+                    _names = os.listdir(_blobs)
+                    _finals = set(_names)
+                    _genuine = False
+                    for n in _names:
+                        if n.endswith('.lock'):
+                            continue                      # transient/orphaned lock, not a partial
+                        if n.endswith('.incomplete'):
+                            # <sha>.<etag>.incomplete → final blob is <sha>; if that
+                            # blob exists this is a harmless orphan, else a real partial.
+                            if n.split('.', 1)[0] not in _finals:
+                                _genuine = True
+                                break
+                    if _genuine:
                         _rid = _repo_entry.name[len('models--'):].replace('--', '/', 1)
                         incomplete_repos.add(_rid)
             except Exception:
