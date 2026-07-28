@@ -494,6 +494,33 @@ def read_process_tree_cpu() -> Optional[float]:
     return round(total, 1)
 
 
+# --- per-engine CPU relevance ---------------------------------------------------
+# The CPU is shared, but only an engine that actually LOADS the CPU can be cooled by
+# pausing it. A GPU-bound engine (e.g. the Vulkan embedding engine — its compute is on
+# the GPU, ~0 CPU) contributes no CPU heat, so making it wait on a hot CPU can't cool
+# anything; it would just be stranded while a CPU-heavy engine (colibri, dense-on-CPU)
+# keeps the shared CPU above the resume line. So the CPU thermal term below applies
+# only when THIS engine's own process tree is a real CPU-heat source.
+_CPU_RELEVANT_PCT = 150.0          # this engine's tree using >= 1.5 cores = a CPU source
+_self_cpu_hist: list = []
+_self_cpu_lock = threading.Lock()
+
+
+def _self_cpu_relevant() -> bool:
+    """True when this engine's process tree (itself + children like colibri) is a
+    meaningful CPU-heat source. Rolling MAX so a briefly-idle CPU-heavy engine still
+    counts (keeps its normal hysteresis); a persistently GPU-bound engine is exempt.
+    Fails safe to True when CPU can't be measured (no psutil)."""
+    pct = read_process_tree_cpu()
+    with _self_cpu_lock:
+        if pct is not None:
+            _self_cpu_hist.append(pct)
+            del _self_cpu_hist[:-6]
+        if not _self_cpu_hist:
+            return True
+        return max(_self_cpu_hist) >= _CPU_RELEVANT_PCT
+
+
 def read_cpu_temp_avg(samples: int = 3, max_seconds: float = 3.0) -> Optional[float]:
     """Averaged CPU temperature for stable resume/cooldown decisions.
 
@@ -724,18 +751,22 @@ def wait_until_safe(settings: Optional[ThermalSettings] = None,
         gpu_eval(settings) if settings.gpu_enabled else (False, False, None))
     gpu_t = gpu_worst["temp"] if gpu_worst else None
     cpu_t = read_cpu_temp() if settings.cpu_enabled else None
+    # Only honour the CPU term if THIS engine is actually heating the CPU (see
+    # _self_cpu_relevant). A GPU-bound engine ignores CPU heat it didn't cause.
+    cpu_rel = _self_cpu_relevant() if settings.cpu_enabled else False
+    cpu_active = settings.cpu_enabled and cpu_rel
     _dbg(
         f"check{desc0}: "
         f"GPU {_fmt(gpu_t)} (enabled={settings.gpu_enabled}, "
         f"over_high={gpu_over} over_resume={gpu_over_resume}) | "
-        f"CPU {_fmt(cpu_t)} (enabled={settings.cpu_enabled}, "
+        f"CPU {_fmt(cpu_t)} (enabled={settings.cpu_enabled}, cpu_source={cpu_rel}, "
         f"pause>={settings.cpu_high:.0f} resume<={settings.cpu_resume:.0f})"
     )
 
     hot = []
     if settings.gpu_enabled and gpu_over:
         hot.append(("GPU", gpu_worst["temp"], gpu_worst["resume"]))
-    if settings.cpu_enabled and cpu_t is not None and cpu_t >= settings.cpu_high:
+    if cpu_active and cpu_t is not None and cpu_t >= settings.cpu_high:
         hot.append(("CPU", cpu_t, settings.cpu_resume))
 
     # Cross-worker hysteresis: a thermal pause is a GLOBAL hardware event. When a
@@ -747,7 +778,7 @@ def wait_until_safe(settings: Optional[ThermalSettings] = None,
     joined = False
     if not hot and _cooldown_active():
         if (settings.gpu_enabled and gpu_over_resume) or \
-           (settings.cpu_enabled and cpu_t is not None and cpu_t > settings.cpu_resume):
+           (cpu_active and cpu_t is not None and cpu_t > settings.cpu_resume):
             joined = True
     if not hot and not joined:
         # Proactive soft-throttle (CPU only): not hot enough to hard-pause, but if
@@ -755,7 +786,7 @@ def wait_until_safe(settings: Optional[ThermalSettings] = None,
         # by how close to the pause threshold) so its temperature climbs slower and
         # we rarely hit the full cooldown. Caps the heat-rate of a single pegged
         # core. GPU heat is handled solely by the hard cooldown.
-        _sleep = _soft_throttle_sleep(settings, cpu_t)
+        _sleep = _soft_throttle_sleep(settings, cpu_t if cpu_active else None)
         if _sleep > 0:
             _dbg(f"soft-throttle{desc0}: sleeping {_sleep:.2f}s "
                  f"(GPU {_fmt(gpu_t)} CPU {_fmt(cpu_t)}, engage>={settings.soft_temp:.0f})")
@@ -791,7 +822,7 @@ def wait_until_safe(settings: Optional[ThermalSettings] = None,
             still = []
             if settings.gpu_enabled and gpu_still:
                 still.append(("GPU", gpu_w2["temp"], gpu_w2["resume"]))
-            if ct is not None and ct > settings.cpu_resume:
+            if cpu_active and ct is not None and ct > settings.cpu_resume:
                 still.append(("CPU", ct, settings.cpu_resume))
             gt = gpu_w2["temp"] if gpu_w2 else None
             _dbg(f"cooldown{desc} {int(waited)}s: GPU {_fmt(gt)} CPU {_fmt(ct)} (avg-3) "
