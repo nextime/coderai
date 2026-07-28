@@ -58,7 +58,7 @@ RUN set -eux; \
       mkdir -p /opt/coderai/py310; \
       rsync -a /tmp/local-bundle/py310/ /opt/coderai/py310/; \
     fi; \
-    for d in lipsync_venv Wav2Lip SadTalker ds4; do \
+    for d in lipsync_venv Wav2Lip SadTalker ds4 colibri; do \
       if [ -d "/tmp/local-bundle/$d" ]; then \
         mkdir -p "/opt/coderai/$d"; \
         rsync -a "/tmp/local-bundle/$d/" "/opt/coderai/$d/"; \
@@ -103,7 +103,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CODERAI_WAV2LIP_DIR=/cache/lipsync/Wav2Lip \
     CODERAI_SADTALKER_SRC=/opt/coderai/SadTalker \
     CODERAI_SADTALKER_DIR=/cache/lipsync/SadTalker \
-    CODERAI_DS4_DIR=/cache/ds4
+    CODERAI_DS4_DIR=/cache/ds4 \
+    CODERAI_COLIBRI_DIR=/cache/colibri
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \

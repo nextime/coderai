@@ -38,14 +38,15 @@ def _short_stem(key: str) -> str:
 #   gguf         — llama.cpp models (CUDA or Vulkan)
 #   whisper      — whisper.cpp STT (CUDA or Vulkan)
 #   ds4          — DeepSeek V4 via the native ds4 engine (CUDA-only build)
+#   colibri      — GLM-5.2 via the native colibri C engine (CUDA build here)
 # An NVIDIA engine can do all of them; a Vulkan (e.g. Radeon) engine does GGUF and
-# whisper, but not transformers and not ds4.
+# whisper, but not transformers, ds4 or colibri.
 _DEFAULT_CAPS = {
-    "nvidia": {"transformers", "gguf", "whisper", "ds4"},
-    "cuda": {"transformers", "gguf", "whisper", "ds4"},
+    "nvidia": {"transformers", "gguf", "whisper", "ds4", "colibri"},
+    "cuda": {"transformers", "gguf", "whisper", "ds4", "colibri"},
     "vulkan": {"gguf", "whisper"},
     "opencl": {"gguf", "whisper"},
-    "auto": {"transformers", "gguf", "whisper", "ds4"},
+    "auto": {"transformers", "gguf", "whisper", "ds4", "colibri"},
 }
 
 

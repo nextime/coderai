@@ -12,7 +12,7 @@ ARG BASE_IMAGE=coderai:base
 FROM ${BASE_IMAGE}
 
 # Refresh the app tree plus the scripts/configs that live outside it. The big
-# /opt/coderai/{python,*-venv,local-libs,Wav2Lip,SadTalker,ds4,py310} trees are
+# /opt/coderai/{python,*-venv,local-libs,Wav2Lip,SadTalker,ds4,colibri,py310} trees are
 # left as inherited layers. (COPY overwrites/adds; a file deleted from the repo
 # is pruned by the cleanup RUN below for the known-stale paths.)
 COPY . /opt/coderai/app

@@ -54,17 +54,20 @@ def _route_key(entry):
     return None
 
 
-def _required_cap(entry, ds4_cfg):
+def _required_cap(entry, ds4_cfg, colibri_cfg=None):
     from codai.frontproxy.router import required_capability
     path = _entry_path(entry) or ""
     backend = entry.get("backend") if isinstance(entry, dict) else None
     return required_capability(
         path, backend=backend,
         ds4_model_id=getattr(ds4_cfg, "model_id", None) if ds4_cfg else None,
-        ds4_enabled=bool(getattr(ds4_cfg, "enabled", False)) if ds4_cfg else False)
+        ds4_enabled=bool(getattr(ds4_cfg, "enabled", False)) if ds4_cfg else False,
+        colibri_model_id=getattr(colibri_cfg, "model_id", None) if colibri_cfg else None,
+        colibri_enabled=bool(getattr(colibri_cfg, "enabled", False)) if colibri_cfg else False)
 
 
-def compute_assignment(engines, models_path, default_engine=None, ds4_cfg=None):
+def compute_assignment(engines, models_path, default_engine=None, ds4_cfg=None,
+                       colibri_cfg=None):
     """Return {engine_name: [model_identifiers]} — each model owned by one engine."""
     assignment = {e.name: [] for e in engines}
     if not engines or not models_path:
@@ -84,7 +87,7 @@ def compute_assignment(engines, models_path, default_engine=None, ds4_cfg=None):
             ident = _route_key(entry)
             if not ident or ident in seen:
                 continue
-            cap = _required_cap(entry, ds4_cfg)
+            cap = _required_cap(entry, ds4_cfg, colibri_cfg)
             candidates = [e for e in engines if e.can_serve(cap)]
             if not candidates:
                 continue   # nothing can run it — leave unassigned

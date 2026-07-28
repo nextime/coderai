@@ -36,6 +36,7 @@ FLASH=false
 CUSTOM_VENV=""
 PACKAGE=false
 DS4=false
+COLIBRI=false
 
 # Parse arguments
 i=1
@@ -53,6 +54,9 @@ for arg in "$@"; do
             ;;
         --ds4)
             DS4=true
+            ;;
+        --colibri)
+            COLIBRI=true
             ;;
     esac
     i=$((i + 1))
@@ -73,6 +77,7 @@ if [[ "$BACKEND" != "nvidia" && "$BACKEND" != "vulkan" && "$BACKEND" != "vulkan-
     echo "Options:"
     echo "  --flash     - Install Flash Attention 2 for faster inference (NVIDIA only)"
     echo "  --ds4       - Clone + build the ds4 (DeepSeek V4) native engine"
+    echo "  --colibri   - Clone + build the colibri (GLM-5.2) native engine"
     exit 1
 fi
 
@@ -787,6 +792,38 @@ build_ds4() {
 
 if [ "$DS4" = true ]; then
     build_ds4
+fi
+
+# Optionally clone + build colibri (GLM-5.2 native C engine). Opt-in via --colibri.
+# coderai drives the C engine binary directly (no colibri Python at runtime); it can
+# also auto-build at runtime on first use, but doing it here lets the OCI/Docker
+# packaging bundle the prebuilt `colibri` binary.
+build_colibri() {
+    local COLIBRI_DIR="${CODERAI_COLIBRI_DIR:-$HOME/.coderai/colibri}"
+    echo -e "${YELLOW}Building colibri (GLM-5.2 engine) → $COLIBRI_DIR ...${NC}"
+    if [ ! -e "$COLIBRI_DIR/c/Makefile" ]; then
+        mkdir -p "$(dirname "$COLIBRI_DIR")"
+        git clone --depth 1 https://github.com/JustVugg/colibri "$COLIBRI_DIR" || {
+            echo -e "${YELLOW}Warning: could not clone colibri; skipping.${NC}"; return 0; }
+    fi
+    local MAKE_ARGS="colibri"
+    if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
+        MAKE_ARGS="colibri CUDA=1 CUDA_ARCH=${COLI_CUDA_ARCH:-native}"
+    elif command -v hipcc &> /dev/null || [ -d "/opt/rocm" ]; then
+        MAKE_ARGS="colibri HIP=1 HIP_ARCH=${COLI_HIP_ARCH:-native}"
+    elif [ "$(uname -s)" = "Darwin" ]; then
+        MAKE_ARGS="colibri METAL=1"
+    fi
+    ( cd "$COLIBRI_DIR/c" && make -s $MAKE_ARGS ) || {
+        echo -e "${YELLOW}Warning: colibri build failed; it can still be built at runtime.${NC}"; return 0; }
+    if [ -x "$COLIBRI_DIR/c/colibri" ]; then
+        echo -e "${GREEN}✓ colibri built at $COLIBRI_DIR/c/colibri${NC}"
+        echo -e "${YELLOW}Note: the GLM-5.2 int4 container (~372 GB dir) is NOT downloaded; point colibri.model_path at it.${NC}"
+    fi
+}
+
+if [ "$COLIBRI" = true ]; then
+    build_colibri
 fi
 
 # Create .backend file to track which backend was used

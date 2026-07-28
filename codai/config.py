@@ -409,6 +409,47 @@ class Ds4Config:
 
 
 @dataclass
+class ColibriConfig:
+    """GLM-5.2 via colibri (JustVugg/colibri) embedded-engine configuration.
+
+    colibri is a pure-C MoE inference engine for GLM-5.2 that streams experts from
+    disk. Unlike ds4 it ships *no* server we keep running — its Python launcher is
+    only a thin gateway. So coderai drives the C engine binary (``colibri``) DIRECTLY
+    over its stdin/stdout "mux" wire protocol (SUBMIT/DATA/DONE, see
+    ``docs/serve_protocol.md``): we own the build, the process, the GLM-5.2 chat
+    template and the protocol client — no colibri Python at runtime.
+
+    The model is a *directory* container (int4 g64 + int8 MTP, ~372 GB), NOT a
+    single file — so routing matches by ``model_id``/alias/``model_path`` (the
+    container dir), not by GGUF architecture the way ds4 does. When ``enabled``, any
+    requested model whose name matches ``model_id`` (or contains ``glm-5.2`` /
+    ``colibri``) is routed to the colibri engine instead of the normal backends.
+    """
+    enabled: bool = False
+    repo_url: str = "https://github.com/JustVugg/colibri"
+    install_dir: Optional[str] = None      # None = ~/.coderai/colibri
+    build_target: str = "auto"             # auto|cuda|hip|cpu (auto: CUDA if nvcc present)
+    # The GLM-5.2 int4 container directory colibri loads (engine env SNAP=<dir>).
+    # Preferred: point the requested model's own path at the container; else this
+    # explicit override is used. There is no auto-download of the 372 GB container.
+    model_path: str = ""                   # explicit container dir (overrides per-model path)
+    model_id: str = "glm-5.2-colibri"      # model id/alias that routes to colibri
+    ctx: int = 100000                      # advisory context window (engine NGEN/KV sizing)
+    kv_slots: int = 1                       # engine KV_SLOTS (1–16): concurrent cached conversations
+    cap: int = 8                            # engine positional "cap" arg (worker thread cap)
+    # VRAM (GiB) of resident experts colibri pins on CUDA, exported as CUDA_EXPERT_GB.
+    # "" = leave colibri's default (auto). "all" pins every expert it can fit.
+    cuda_expert_gb: str = ""
+    extra_args: str = ""                   # reserved: extra positional/flag args to the engine
+    # Free-form environment for the colibri engine, whitespace/newline-separated
+    # KEY=VALUE pairs. colibri exposes its tuning ONLY via env (see docs/ENVIRONMENT.md):
+    # COLI_MODEL_MIRROR, COLI_DISK_WEIGHTS, COLI_NUMA, COLI_CUDA_PIPE, DIRECT, PIPE,
+    # PILOT, DRAFT, SPEC_PIN, GRAMMAR, etc.
+    extra_env: str = ""
+    auto_build: bool = True                # clone+build the binary if it's missing
+
+
+@dataclass
 class Config:
     """Main configuration class."""
     version: str = "1.0"
@@ -424,6 +465,7 @@ class Config:
     jobs: JobsConfig = field(default_factory=JobsConfig)
     enhance: EnhanceConfig = field(default_factory=EnhanceConfig)
     ds4: Ds4Config = field(default_factory=Ds4Config)
+    colibri: ColibriConfig = field(default_factory=ColibriConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
     broker: BrokerConfig = field(default_factory=BrokerConfig)
     system_prompt: Optional[str] = None
@@ -609,6 +651,7 @@ class ConfigManager:
                 jobs=_dc(JobsConfig, config_data.get("jobs", {})),
                 enhance=_dc(EnhanceConfig, config_data.get("enhance", {})),
                 ds4=_dc(Ds4Config, config_data.get("ds4", {})),
+                colibri=_dc(ColibriConfig, config_data.get("colibri", {})),
                 compaction=_dc(CompactionConfig, config_data.get("compaction", {})),
                 broker=_dc(BrokerConfig, config_data.get("broker", {})),
                 system_prompt=config_data.get("system_prompt"),
@@ -792,6 +835,21 @@ class ConfigManager:
                 "kv_cache_cleanup_enabled": self.config.ds4.kv_cache_cleanup_enabled,
                 "kv_cache_max_age_hours": self.config.ds4.kv_cache_max_age_hours,
                 "kv_cache_cleanup_interval_minutes": self.config.ds4.kv_cache_cleanup_interval_minutes,
+            },
+            "colibri": {
+                "enabled": self.config.colibri.enabled,
+                "repo_url": self.config.colibri.repo_url,
+                "install_dir": self.config.colibri.install_dir,
+                "build_target": self.config.colibri.build_target,
+                "model_path": self.config.colibri.model_path,
+                "model_id": self.config.colibri.model_id,
+                "ctx": self.config.colibri.ctx,
+                "kv_slots": self.config.colibri.kv_slots,
+                "cap": self.config.colibri.cap,
+                "cuda_expert_gb": self.config.colibri.cuda_expert_gb,
+                "extra_args": self.config.colibri.extra_args,
+                "extra_env": self.config.colibri.extra_env,
+                "auto_build": self.config.colibri.auto_build,
             },
             "compaction": {
                 "enabled": self.config.compaction.enabled,

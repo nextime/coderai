@@ -549,6 +549,82 @@
   </div>
 </div>
 
+<!-- GLM-5.2 (colibri) -->
+<div class="card">
+  <div class="card-title">GLM-5.2 (colibri)</div>
+  <p class="form-hint" style="margin-bottom:.6rem">Run GLM-5.2 through JustVugg's pure-C <a href="https://github.com/JustVugg/colibri" target="_blank" rel="noopener">colibri</a> MoE engine. Unlike ds4, colibri ships no server — coderai drives the C engine binary <b>directly</b> over its stdin/stdout mux protocol (no colibri Python at runtime). First use clones + builds the engine (CUDA when available). The GLM-5.2 int4 container (~372&nbsp;GB directory) is <b>not</b> downloaded automatically — point the model path at it (see <a href="https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp" target="_blank" rel="noopener">the int4 g64 + int8-MTP container</a>).</p>
+  <div class="form-group">
+    <label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-colibri-enabled" onchange="toggleColibriFields()">
+      <span style="font-size:13px;font-weight:500">Enable colibri (GLM-5.2)</span>
+    </label>
+  </div>
+  <div id="colibri-fields" style="display:none">
+    <div class="form-group">
+      <label class="form-label">Model id / alias</label>
+      <input type="text" id="s-colibri-model-id" class="form-input" placeholder="glm-5.2-colibri">
+      <span class="form-hint">When enabled, this id (and names containing <b>glm-5.2</b> / <b>colibri</b>, or any model whose config <code>backend</code> is <code>colibri</code>) routes to the colibri engine.</span>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Model container path</label>
+      <input type="text" id="s-colibri-model-path" class="form-input" placeholder="/nvme/glm52_i4">
+      <span class="form-hint">The GLM-5.2 int4 container <b>directory</b> (engine env <code>SNAP</code>). Keep it on fast local storage (NVMe/ext4), never on a network mount. Leave blank to serve the requested model's own configured directory.</span>
+    </div>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:160px">
+        <label class="form-label">Context (ctx)</label>
+        <input type="number" id="s-colibri-ctx" class="form-input" min="1024" placeholder="100000">
+      </div>
+      <div class="form-group" style="flex:1;min-width:120px">
+        <label class="form-label">KV slots</label>
+        <input type="number" id="s-colibri-kv-slots" class="form-input" min="1" max="16" placeholder="1">
+        <span class="form-hint">1–16 concurrent cached conversations (continuous batching).</span>
+      </div>
+      <div class="form-group" style="flex:1;min-width:120px">
+        <label class="form-label">Cap</label>
+        <input type="number" id="s-colibri-cap" class="form-input" min="1" placeholder="8">
+        <span class="form-hint">Engine worker cap (positional arg).</span>
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">CUDA expert VRAM (GB)</label>
+      <input type="text" id="s-colibri-cuda-expert-gb" class="form-input" placeholder="empty = auto; 'all' = pin all that fit">
+      <span class="form-hint">Exports <code>CUDA_EXPERT_GB</code> — size of the resident expert tier colibri pins on the GPU. Blank leaves colibri's auto sizing.</span>
+    </div>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:180px">
+        <label class="form-label">Build target</label>
+        <select id="s-colibri-build-target" class="form-input">
+          <option value="auto">auto (CUDA if nvcc present)</option>
+          <option value="cuda">cuda</option>
+          <option value="hip">hip (ROCm/AMD)</option>
+          <option value="metal">metal (macOS)</option>
+          <option value="cpu">cpu</option>
+        </select>
+      </div>
+      <div class="form-group" style="flex:2;min-width:220px">
+        <label class="form-label">Install dir</label>
+        <input type="text" id="s-colibri-install-dir" class="form-input" placeholder="~/.coderai/colibri">
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+        <input type="checkbox" id="s-colibri-auto-build">
+        <span>Auto clone + build the colibri engine binary if missing</span>
+      </label>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Repo URL</label>
+      <input type="text" id="s-colibri-repo-url" class="form-input" placeholder="https://github.com/JustVugg/colibri">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Extra engine env</label>
+      <input type="text" id="s-colibri-extra-env" class="form-input" placeholder="COLI_MODEL_MIRROR=/nvme2/glm52_i4 DIRECT=1 PIPE=2">
+      <span class="form-hint">Whitespace-separated <code>KEY=VALUE</code> pairs added to the engine's environment — colibri exposes its tuning only via env (<code>COLI_MODEL_MIRROR</code>, <code>COLI_DISK_WEIGHTS</code>, <code>COLI_NUMA</code>, <code>COLI_CUDA_PIPE</code>, <code>DIRECT</code>, <code>PIPE</code>, <code>PILOT</code>, <code>DRAFT</code>, …). Context window is set per-model via <b>n_ctx</b>.</span>
+    </div>
+  </div>
+</div>
+
 <!-- Auto-compact context -->
 <div class="card">
   <div class="card-title">Auto-compact context</div>
@@ -674,6 +750,10 @@ function toggleCompactFields(){
 function toggleDs4KvCleanup(){
   document.getElementById('ds4-kv-cleanup-fields').style.display =
     document.getElementById('s-ds4-kv-cleanup').checked ? 'block' : 'none';
+}
+function toggleColibriFields(){
+  document.getElementById('colibri-fields').style.display =
+    document.getElementById('s-colibri-enabled').checked ? 'block' : 'none';
 }
 
 let _ds4DefaultModels = [];
@@ -934,6 +1014,21 @@ async function loadSettings(){
     toggleDs4KvCleanup();
     toggleDs4Fields();
     loadDs4DefaultModels();
+    // GLM-5.2 (colibri)
+    const colibri = d.colibri || {};
+    document.getElementById('s-colibri-enabled').checked = !!colibri.enabled;
+    document.getElementById('s-colibri-model-id').value = colibri.model_id ?? 'glm-5.2-colibri';
+    document.getElementById('s-colibri-model-path').value = colibri.model_path ?? '';
+    document.getElementById('s-colibri-ctx').value = colibri.ctx ?? 100000;
+    document.getElementById('s-colibri-kv-slots').value = colibri.kv_slots ?? 1;
+    document.getElementById('s-colibri-cap').value = colibri.cap ?? 8;
+    document.getElementById('s-colibri-cuda-expert-gb').value = colibri.cuda_expert_gb ?? '';
+    document.getElementById('s-colibri-build-target').value = colibri.build_target ?? 'auto';
+    document.getElementById('s-colibri-install-dir').value = colibri.install_dir ?? '';
+    document.getElementById('s-colibri-auto-build').checked = colibri.auto_build !== false;
+    document.getElementById('s-colibri-repo-url').value = colibri.repo_url ?? 'https://github.com/JustVugg/colibri';
+    document.getElementById('s-colibri-extra-env').value = colibri.extra_env ?? '';
+    toggleColibriFields();
   }catch(e){ showAlert('error','Failed to load settings: '+e.message); }
 }
 
@@ -1019,6 +1114,20 @@ async function saveSettings(){
       kv_cache_cleanup_enabled: document.getElementById('s-ds4-kv-cleanup').checked,
       kv_cache_max_age_hours: parseFloat(document.getElementById('s-ds4-kv-max-age').value) || 168,
       kv_cache_cleanup_interval_minutes: parseFloat(document.getElementById('s-ds4-kv-interval').value) || 360,
+    },
+    colibri:{
+      enabled: document.getElementById('s-colibri-enabled').checked,
+      model_id: document.getElementById('s-colibri-model-id').value.trim() || 'glm-5.2-colibri',
+      model_path: document.getElementById('s-colibri-model-path').value.trim(),
+      ctx: parseInt(document.getElementById('s-colibri-ctx').value) || 100000,
+      kv_slots: parseInt(document.getElementById('s-colibri-kv-slots').value) || 1,
+      cap: parseInt(document.getElementById('s-colibri-cap').value) || 8,
+      cuda_expert_gb: document.getElementById('s-colibri-cuda-expert-gb').value.trim(),
+      build_target: document.getElementById('s-colibri-build-target').value,
+      install_dir: document.getElementById('s-colibri-install-dir').value.trim(),
+      auto_build: document.getElementById('s-colibri-auto-build').checked,
+      repo_url: document.getElementById('s-colibri-repo-url').value.trim() || 'https://github.com/JustVugg/colibri',
+      extra_env: document.getElementById('s-colibri-extra-env').value.trim(),
     },
     compaction:{
       enabled: document.getElementById('s-compact-enabled').checked,

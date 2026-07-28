@@ -622,6 +622,32 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           set <b>reserve</b> ≈ weights + ~2 GiB · add <code>DS4_CUDA_WEIGHT_ARENA_CHUNK_MB=512</code> · <b>avoid</b> <code>DS4_CUDA_WEIGHT_CACHE</code> (slower). Decode of a model bigger than VRAM is streaming-bound (~0.5 tok/s) — the real fix is a smaller quant. Context = <b>n_ctx</b> above.
         </span>
       </div>
+      <div class="form-row" id="cfg-colibri-row" style="margin-top:.75rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
+        <label class="form-label" style="font-weight:600">colibri (GLM-5.2) <span class="muted" style="font-weight:400">— per-model overrides</span></label>
+        <span class="form-hint" style="font-size:11px;margin-bottom:.4rem">These tune the colibri engine for THIS model. Leave blank to inherit the global colibri settings. Context window is set by <b>n_ctx</b> above.</span>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem">
+          <div class="form-row" style="margin:0">
+            <label class="form-label">KV slots</label>
+            <input type="number" id="cfg-colibri-kv-slots" class="form-input" min="1" max="16" placeholder="inherit global">
+            <span class="form-hint" style="font-size:11px">1–16 concurrent cached conversations.</span>
+          </div>
+          <div class="form-row" style="margin:0">
+            <label class="form-label">Cap</label>
+            <input type="number" id="cfg-colibri-cap" class="form-input" min="1" placeholder="inherit global">
+            <span class="form-hint" style="font-size:11px">Engine worker cap.</span>
+          </div>
+        </div>
+        <div class="form-row" style="margin:.5rem 0 0">
+          <label class="form-label">CUDA expert VRAM (GB)</label>
+          <input type="text" id="cfg-colibri-cuda-expert-gb" class="form-input" placeholder="inherit global — e.g. all">
+          <span class="form-hint" style="font-size:11px">Exports <code>CUDA_EXPERT_GB</code>. Blank = inherit global.</span>
+        </div>
+        <div class="form-row" style="margin:.5rem 0 0">
+          <label class="form-label">Extra engine env</label>
+          <input type="text" id="cfg-colibri-extra-env" class="form-input" placeholder="COLI_MODEL_MIRROR=/nvme2/glm52_i4 DIRECT=1">
+          <span class="form-hint" style="font-size:11px"><code>KEY=VALUE</code> pairs for colibri's env-only tuning. Blank = inherit global.</span>
+        </div>
+      </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem;margin-top:.75rem">
         <div class="form-row" style="margin:0">
           <label class="form-label">Used VRAM <span class="muted">(GB)</span></label>
@@ -1113,6 +1139,7 @@ function closeModal(id){document.getElementById(id).classList.remove('show')}
 let _defaultOffloadDir = './offload';
 let _highlightCap = null;  // capability to highlight in local models list (from ?local_cap= param)
 let _ds4Enabled = false;   // whether the ds4 (DeepSeek V4) engine is enabled globally
+let _colibriEnabled = false;   // whether the colibri (GLM-5.2) engine is enabled globally
 
 async function loadGlobalSettings(){
   try{
@@ -1121,6 +1148,7 @@ async function loadGlobalSettings(){
       const d = await r.json();
       _defaultOffloadDir = d.offload?.directory || './offload';
       _ds4Enabled = !!(d.ds4 && d.ds4.enabled);
+      _colibriEnabled = !!(d.colibri && d.colibri.enabled);
     }
   }catch{}
 }
@@ -2007,7 +2035,8 @@ function _engineTagHtml(m, s){
     const isGguf = path.endsWith('.gguf') || path.includes('gguf');
     const isWhisper = ((s && s.backend) || '') === 'whisper-server';
     const isDs4 = path.includes('deepseek-v4');
-    if(isDs4 || (!isGguf && !isWhisper)) eng = 'nvidia';   // ds4/transformers → nvidia
+    const isColibri = ((s && s.backend) || '') === 'colibri' || path.includes('glm-5.2') || path.includes('colibri');
+    if(isDs4 || isColibri || (!isGguf && !isWhisper)) eng = 'nvidia';   // ds4/colibri/transformers → nvidia
     else eng = _defaultEngine || 'any';                     // gguf/whisper → default
   }
   const lc = eng.toLowerCase();
@@ -3365,6 +3394,7 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-split-secondary-cap').value =
     (s.split_secondary_cap_gb != null ? s.split_secondary_cap_gb : '');
   _populateDs4(m, s);
+  _populateColibri(m, s);
   document.getElementById('cfg-sysprompt').value = s.system_prompt || '';
   document.getElementById('cfg-parser').value = s.parser || (!m.in_config ? _autoDetectParser(m.path) : 'auto');
   document.getElementById('cfg-tools').checked = !!s.tools_closer_prompt;
@@ -3730,6 +3760,34 @@ function _collectDs4(){
   return o;
 }
 
+// Per-model colibri overrides: shown only when the colibri engine is enabled
+// globally and the model looks like a GLM-5.2 / colibri model. Blank = inherit.
+function _populateColibri(m, s){
+  const row = document.getElementById('cfg-colibri-row');
+  if(!row) return;
+  const hay = (((m && (m.path||m.id)) || '') + ' ' + ((s && s.alias) || '')).toLowerCase();
+  const isColibri = /glm[\s\-_]?5\.?2|colibri/.test(hay) || ((s && s.backend) === 'colibri');
+  row.style.display = (_colibriEnabled && isColibri) ? '' : 'none';
+  const d = (s && s.colibri) || {};
+  document.getElementById('cfg-colibri-kv-slots').value = (d.kv_slots != null ? d.kv_slots : '');
+  document.getElementById('cfg-colibri-cap').value = (d.cap != null ? d.cap : '');
+  document.getElementById('cfg-colibri-cuda-expert-gb').value = d.cuda_expert_gb || '';
+  document.getElementById('cfg-colibri-extra-env').value = d.extra_env || '';
+}
+
+function _collectColibri(){
+  const kv = parseInt(document.getElementById('cfg-colibri-kv-slots').value);
+  const cap = parseInt(document.getElementById('cfg-colibri-cap').value);
+  const ceg = document.getElementById('cfg-colibri-cuda-expert-gb').value.trim();
+  const ev = document.getElementById('cfg-colibri-extra-env').value.trim();
+  const o = {};
+  if(!isNaN(kv) && kv > 0) o.kv_slots = kv;
+  if(!isNaN(cap) && cap > 0) o.cap = cap;
+  if(ceg) o.cuda_expert_gb = ceg;
+  if(ev) o.extra_env = ev;
+  return o;
+}
+
 async function saveModelConfig(){
   const path = document.getElementById('cfg-path').value;
   const maxGpu = parseFloat(document.getElementById('cfg-max-gpu').value);
@@ -3790,6 +3848,7 @@ async function saveModelConfig(){
                           const v = document.getElementById('cfg-split-secondary-cap').value.trim();
                           return v === '' ? null : parseFloat(v); })(),
     ds4:               _collectDs4(),
+    colibri:           _collectColibri(),
     system_prompt:     document.getElementById('cfg-sysprompt').value.trim() || null,
     parser:            document.getElementById('cfg-parser').value,
     tools_closer_prompt: document.getElementById('cfg-tools').checked,

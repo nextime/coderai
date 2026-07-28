@@ -80,6 +80,14 @@ if [ -d /opt/coderai/ds4 ] && [ ! -e "$CODERAI_CACHE_DIR/ds4/ds4-server" ]; then
   cp -an /opt/coderai/ds4/. "$CODERAI_CACHE_DIR/ds4/" 2>/dev/null || true
 fi
 
+# Seed the colibri working dir on the cache volume from the bundled repo + engine
+# binary (the GLM-5.2 int4 container lives outside the image; point colibri.model_path
+# at it). Persistent so a runtime rebuild survives restarts.
+if [ -d /opt/coderai/colibri ] && [ ! -e "$CODERAI_CACHE_DIR/colibri/c/colibri" ]; then
+  mkdir -p "$CODERAI_CACHE_DIR/colibri"
+  cp -an /opt/coderai/colibri/. "$CODERAI_CACHE_DIR/colibri/" 2>/dev/null || true
+fi
+
 # If invoked with arguments, run them directly (debugging / one-off commands)
 # instead of the supervised stack.
 if [ "$#" -gt 0 ]; then

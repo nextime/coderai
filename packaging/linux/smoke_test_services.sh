@@ -58,6 +58,9 @@ done
 echo "== ds4 seeded on the cache volume =="
 if "${DK[@]}" exec "$NAME" sh -lc "test -x /cache/ds4/ds4-server"; then ok "/cache/ds4/ds4-server"; else bad "/cache/ds4/ds4-server" "missing"; fi
 
+echo "== colibri seeded on the cache volume =="
+if "${DK[@]}" exec "$NAME" sh -lc "test -x /cache/colibri/c/colibri"; then ok "/cache/colibri/c/colibri"; else bad "/cache/colibri/c/colibri" "missing (optional — bundle with build.sh --colibri)"; fi
+
 echo "== shared lip-sync venv (py3.10 + torch) =="
 if "${DK[@]}" exec "$NAME" /opt/coderai/lipsync_venv/bin/python -c "import torch,sys; print(sys.version.split()[0], torch.__version__)" >/dev/null 2>&1; then
   ok "lipsync venv imports torch"

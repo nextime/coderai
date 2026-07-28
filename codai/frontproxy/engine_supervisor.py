@@ -153,8 +153,9 @@ class EngineSupervisor:
             from codai.frontproxy.assignment import compute_assignment
             default_engine = getattr(self.config.server, "default_engine", None)
             ds4 = getattr(self.config, "ds4", None)
+            colibri = getattr(self.config, "colibri", None)
             assignment = compute_assignment(engines, self.models_path,
-                                            default_engine, ds4)
+                                            default_engine, ds4, colibri)
             for e in engines:
                 owned = assignment.get(e.name, [])
                 e.assigned_models = set(owned)   # the front's router enforces this
@@ -579,8 +580,9 @@ class EngineSupervisor:
                 from codai.frontproxy.assignment import compute_assignment
                 default_engine = getattr(self.config.server, "default_engine", None)
                 ds4 = getattr(self.config, "ds4", None)
+                colibri = getattr(self.config, "colibri", None)
                 assignment = compute_assignment(real, self.models_path,
-                                                default_engine, ds4)
+                                                default_engine, ds4, colibri)
             except Exception as exc:
                 print(f"[front] live reassignment skipped: {exc}", flush=True)
                 assignment = {}

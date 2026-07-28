@@ -33,6 +33,7 @@ LIPSYNC_VENV="${CODERAI_LIPSYNC_VENV:-$HOME/.coderai/lipsync_venv}"
 WAV2LIP_DIR="${CODERAI_WAV2LIP_SRC:-$HOME/.coderai/Wav2Lip}"
 SADTALKER_DIR="${CODERAI_SADTALKER_SRC:-$HOME/.coderai/SadTalker}"
 DS4_DIR="${CODERAI_DS4_DIR:-$HOME/.coderai/ds4}"
+COLIBRI_DIR="${CODERAI_COLIBRI_DIR:-$HOME/.coderai/colibri}"
 # After a successful build, export the image and assemble the final distribution
 # bundle (image tarball + install.sh + coderai-docker runner). Disable with
 # --no-dist (just builds the image).
@@ -305,6 +306,7 @@ discover_local_binaries() {
     "$HOME/whisper.cpp/build/bin/server"
     "/usr/local/bin/ds4-server"
     "${CODERAI_DS4_DIR:-$HOME/.coderai/ds4}/ds4-server"
+    "${CODERAI_COLIBRI_DIR:-$HOME/.coderai/colibri}/c/colibri"
     "/usr/local/bin/rife-ncnn-vulkan"
     "$HOME/.local/bin/rife-ncnn-vulkan"
   )
@@ -398,6 +400,12 @@ prepare_venv_bundle() {
     if [[ -d "$DS4_DIR" ]]; then
       rsync -a --exclude 'gguf/' --exclude '*.gguf' --exclude '*.gguf.*' "$DS4_DIR/" "$bundle/ds4/"
       echo "Bundled ds4 (binary + scripts, no weights)"
+    fi
+    # colibri: repo + built C engine, minus the ~372 GB GLM-5.2 int4 container.
+    if [[ -d "$COLIBRI_DIR" ]]; then
+      rsync -a --exclude '*.safetensors' --exclude 'glm52_i4/' --exclude '*.bin' \
+        --exclude 'web/node_modules/' "$COLIBRI_DIR/" "$bundle/colibri/"
+      echo "Bundled colibri (repo + engine binary, no model container)"
     fi
   fi
 

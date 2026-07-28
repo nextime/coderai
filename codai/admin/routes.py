@@ -2348,7 +2348,7 @@ def _resolve_engine_spec(engine_name: str, engine_specs):
 
 
 def validate_engine_pin(engine_name: str, model_path: str, engine_specs,
-                        model_backend: str = None, ds4_cfg=None) -> list:
+                        model_backend: str = None, ds4_cfg=None, colibri_cfg=None) -> list:
     """Return human-readable warnings if pinning ``model_path`` to ``engine_name``
     is wrong (unknown engine, or an engine that can't run this model's format).
 
@@ -2383,7 +2383,9 @@ def validate_engine_pin(engine_name: str, model_path: str, engine_specs,
     req = required_capability(
         model_path, backend=model_backend,
         ds4_model_id=getattr(ds4_cfg, "model_id", None) if ds4_cfg else None,
-        ds4_enabled=bool(getattr(ds4_cfg, "enabled", False)) if ds4_cfg else False)
+        ds4_enabled=bool(getattr(ds4_cfg, "enabled", False)) if ds4_cfg else False,
+        colibri_model_id=getattr(colibri_cfg, "model_id", None) if colibri_cfg else None,
+        colibri_enabled=bool(getattr(colibri_cfg, "enabled", False)) if colibri_cfg else False)
     if req and req not in caps:
         return [f"Engine '{engine_name}' (backend '{backend}') can't run this model: "
                 f"it needs '{req}' capability but the engine only provides "
@@ -2573,6 +2575,28 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         else:
             entry.pop("ds4", None)
 
+    # Per-model colibri launch overrides (only meaningful for a GLM-5.2 model served
+    # via the colibri engine). Normalize to a small dict; drop when empty so the entry
+    # inherits the global colibri config as the default.
+    if "colibri" in data:
+        src = data.get("colibri") if isinstance(data.get("colibri"), dict) else {}
+        co = {}
+        for k in ("kv_slots", "cap"):
+            v = src.get(k)
+            if v not in (None, "", 0, "0"):
+                try:
+                    co[k] = max(1, int(v))
+                except (TypeError, ValueError):
+                    pass
+        for k in ("cuda_expert_gb", "extra_args", "extra_env"):
+            v = src.get(k)
+            if isinstance(v, str) and v.strip():
+                co[k] = v.strip()
+        if co:
+            entry["colibri"] = co
+        else:
+            entry.pop("colibri", None)
+
     # A GGUF LLM is served by llama.cpp. Its multimodal projector (mmproj) gives
     # it VISION INPUT, which is the `image_to_text` capability served through
     # llama.cpp — NOT the diffusers `vision_models`/`image_models` categories
@@ -2643,7 +2667,8 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         warnings = validate_engine_pin(
             entry["engine"], path, config_manager.config.server.engine_specs,
             model_backend=entry.get("backend"),
-            ds4_cfg=getattr(config_manager.config, "ds4", None))
+            ds4_cfg=getattr(config_manager.config, "ds4", None),
+            colibri_cfg=getattr(config_manager.config, "colibri", None))
         for w in warnings:
             print(f"  [admin] engine-pin warning: {w}")
     return {"success": True, "applied_live": applied, "warnings": warnings}
@@ -3280,6 +3305,21 @@ def build_settings_dict(c, gpu_cards):
             "kv_cache_max_age_hours": c.ds4.kv_cache_max_age_hours,
             "kv_cache_cleanup_interval_minutes": c.ds4.kv_cache_cleanup_interval_minutes,
         },
+        "colibri": {
+            "enabled": c.colibri.enabled,
+            "repo_url": c.colibri.repo_url,
+            "install_dir": c.colibri.install_dir,
+            "build_target": c.colibri.build_target,
+            "model_path": c.colibri.model_path,
+            "model_id": c.colibri.model_id,
+            "ctx": c.colibri.ctx,
+            "kv_slots": c.colibri.kv_slots,
+            "cap": c.colibri.cap,
+            "cuda_expert_gb": c.colibri.cuda_expert_gb,
+            "extra_args": c.colibri.extra_args,
+            "extra_env": c.colibri.extra_env,
+            "auto_build": c.colibri.auto_build,
+        },
         "compaction": {
             "enabled": c.compaction.enabled,
             "pct": c.compaction.pct,
@@ -3621,6 +3661,40 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
                 c.ds4.kv_cache_cleanup_interval_minutes = max(1.0, float(d["kv_cache_cleanup_interval_minutes"]))
             except (TypeError, ValueError):
                 pass
+
+    if "colibri" in data:
+        d = data["colibri"]
+        c.colibri.enabled = bool(d.get("enabled", c.colibri.enabled))
+        if "repo_url" in d:
+            c.colibri.repo_url = (d.get("repo_url") or c.colibri.repo_url or "").strip()
+        if "install_dir" in d:
+            c.colibri.install_dir = (d.get("install_dir") or "").strip() or None
+        if "build_target" in d:
+            c.colibri.build_target = (d.get("build_target") or "auto").strip()
+        if "model_path" in d:
+            c.colibri.model_path = (d.get("model_path") or "").strip()
+        if "model_id" in d:
+            c.colibri.model_id = (d.get("model_id") or c.colibri.model_id or "glm-5.2-colibri").strip()
+        if "ctx" in d:
+            c.colibri.ctx = max(1024, int(d.get("ctx") or c.colibri.ctx))
+        if "kv_slots" in d:
+            try:
+                c.colibri.kv_slots = max(1, min(16, int(d.get("kv_slots") or 1)))
+            except (TypeError, ValueError):
+                pass
+        if "cap" in d:
+            try:
+                c.colibri.cap = max(1, int(d.get("cap") or 8))
+            except (TypeError, ValueError):
+                pass
+        if "cuda_expert_gb" in d:
+            c.colibri.cuda_expert_gb = (d.get("cuda_expert_gb") or "").strip()
+        if "extra_args" in d:
+            c.colibri.extra_args = (d.get("extra_args") or "").strip()
+        if "extra_env" in d:
+            c.colibri.extra_env = (d.get("extra_env") or "").strip()
+        if "auto_build" in d:
+            c.colibri.auto_build = bool(d["auto_build"])
 
     if "compaction" in data:
         cp = data["compaction"] or {}

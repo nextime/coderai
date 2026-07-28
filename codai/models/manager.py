@@ -47,6 +47,17 @@ def get_active_ds4_config():
     return None
 
 
+def get_active_colibri_config():
+    """Return the active ColibriConfig from the server config, or None if unavailable."""
+    try:
+        from codai.admin.routes import config_manager
+        if config_manager is not None and config_manager.config is not None:
+            return config_manager.config.colibri
+    except Exception:
+        pass
+    return None
+
+
 _GGUF_ARCH_CACHE: Dict[tuple, str] = {}
 
 
@@ -180,6 +191,45 @@ def ds4_should_handle(model_name: str) -> bool:
     # No local file (HF id / not downloaded yet): conservative name check that
     # matches ONLY the V4 marker, so mainline deepseek GGUFs aren't grabbed.
     return "deepseek-v4" in name or "deepseek4" in name
+
+
+def colibri_should_handle(model_name: str) -> bool:
+    """True when colibri is enabled and ``model_name`` is a GLM-5.2 (colibri) model.
+
+    colibri's model is a *directory* container (int4), not a GGUF — so there is no
+    architecture to sniff. Routing is by the configured ``model_id`` alias, a GLM-5.2
+    name marker, or an explicit ``backend: "colibri"`` on the model's config entry.
+    """
+    if not model_name:
+        return False
+    cfg = get_active_colibri_config()
+    if cfg is None or not getattr(cfg, "enabled", False):
+        return False
+    name = model_name.lower()
+    short = name.split("/")[-1]
+    mid = (getattr(cfg, "model_id", "") or "").lower()
+    if mid and (name == mid or short == mid):
+        return True
+    # An explicit backend pin on the model's own config entry wins.
+    try:
+        from codai.admin.routes import config_manager as cfg_mgr
+        md = getattr(cfg_mgr, "models_data", None) if cfg_mgr else None
+        if isinstance(md, dict):
+            for lst in md.values():
+                if not isinstance(lst, list):
+                    continue
+                for m in lst:
+                    if not isinstance(m, dict):
+                        continue
+                    path = str(m.get("path") or m.get("id") or "")
+                    base = os.path.basename(path.rstrip("/")).lower()
+                    cands = {path.lower(), base, str(m.get("alias") or "").lower()}
+                    if name in cands and str(m.get("backend") or "").lower() == "colibri":
+                        return True
+    except Exception:
+        pass
+    # Name marker for GLM-5.2 (kept narrow so unrelated GLM GGUFs aren't grabbed).
+    return "glm-5.2" in name or "glm5.2" in name or "colibri" in short
 
 
 def _trim_cpu_ram() -> None:
@@ -317,6 +367,17 @@ class ModelManager:
             print(f"Routing '{model_name}' to ds4 (DeepSeek V4) backend")
             self.backend_type = "ds4"
             self.backend = Ds4Backend(get_active_ds4_config())
+            self.backend.load_model(model_name, **kwargs)
+            self.tool_parser = ModelParserAdapter(model_name=model_name)
+            return
+
+        # GLM-5.2 via colibri: when enabled, drive the managed colibri C engine
+        # (in-process mux protocol) instead of the normal nvidia/vulkan backends.
+        if colibri_should_handle(model_name):
+            from codai.backends.colibri import ColibriBackend
+            print(f"Routing '{model_name}' to colibri (GLM-5.2) backend")
+            self.backend_type = "colibri"
+            self.backend = ColibriBackend(get_active_colibri_config())
             self.backend.load_model(model_name, **kwargs)
             self.tool_parser = ModelParserAdapter(model_name=model_name)
             return
@@ -1970,6 +2031,11 @@ class MultiModelManager:
         if model_type in (None, "text") and ds4_should_handle(requested_or_resolved):
             return True
 
+        # colibri-served GLM-5.2 likewise has no models.json entry when addressed by
+        # its model_id alias; accept it for text when colibri is enabled and matches.
+        if model_type in (None, "text") and colibri_should_handle(requested_or_resolved):
+            return True
+
         # If a model_type is specified, reject models registered under a
         # different type (e.g. an image GGUF requested via /v1/chat/completions).
         if model_type:
@@ -3353,7 +3419,9 @@ class MultiModelManager:
         # ~128 GB on every request (needless churn) and mis-message CPU/disk offload.
         # Use the measured value if we have one, else a modest fixed reserve.
         try:
-            if ds4_should_handle(model_key) or (resolved_name and ds4_should_handle(resolved_name)):
+            if (ds4_should_handle(model_key) or (resolved_name and ds4_should_handle(resolved_name))
+                    or colibri_should_handle(model_key)
+                    or (resolved_name and colibri_should_handle(resolved_name))):
                 measured = self._measured_vram_gb.get(model_key)
                 if not measured and resolved_name:
                     measured = self._measured_vram_gb.get(resolved_name)
@@ -4449,9 +4517,15 @@ class MultiModelManager:
                 # So a ds4 model claims VRAM exclusively: evict everything else.
                 _new_is_ds4 = (ds4_should_handle(model_key)
                                or (resolved_name and ds4_should_handle(resolved_name)))
-                if _new_is_ds4:
-                    print(f"Ondemand mode - ds4 model '{model_key}' needs exclusive VRAM "
-                          f"— unloading all other models so ds4-server gets the full GPU")
+                # colibri (GLM-5.2) likewise streams MoE experts and wants the whole
+                # GPU for its expert tier — co-residence starves it. Claim VRAM
+                # exclusively, same as ds4.
+                _new_is_colibri = (colibri_should_handle(model_key)
+                                   or (resolved_name and colibri_should_handle(resolved_name)))
+                if _new_is_ds4 or _new_is_colibri:
+                    _eng = "ds4 (DeepSeek V4)" if _new_is_ds4 else "colibri (GLM-5.2)"
+                    print(f"Ondemand mode - {_eng} model '{model_key}' needs exclusive VRAM "
+                          f"— unloading all other models so the engine gets the full GPU")
                     self.unload_all_models()
                 elif needed_gb > 0 and free_gb >= needed_gb + headroom_gb:
                     print(f"Ondemand mode - keeping '{loaded_canonical}' in VRAM alongside new model "
@@ -4843,6 +4917,11 @@ class MultiModelManager:
         if ds4_cfg is not None and getattr(ds4_cfg, "enabled", False):
             mid = getattr(ds4_cfg, "model_id", "deepseek-v4") or "deepseek-v4"
             _add(mid, "text", {"backend": "ds4"})
+
+        colibri_cfg = get_active_colibri_config()
+        if colibri_cfg is not None and getattr(colibri_cfg, "enabled", False):
+            mid = getattr(colibri_cfg, "model_id", "glm-5.2-colibri") or "glm-5.2-colibri"
+            _add(mid, "text", {"backend": "colibri"})
 
         return models
 

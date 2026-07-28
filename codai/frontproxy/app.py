@@ -906,7 +906,7 @@ class FrontProxy:
             cm.load()
             new = cm.config
             for f in ("server", "backend", "models", "offload", "vulkan", "image",
-                      "whisper", "archive", "thermal", "jobs", "enhance", "ds4",
+                      "whisper", "archive", "thermal", "jobs", "enhance", "ds4", "colibri",
                       "compaction", "broker", "system_prompt", "tools_closer_prompt",
                       "grammar_guided", "parser", "tmp_dir"):
                 if hasattr(new, f):
@@ -917,12 +917,15 @@ class FrontProxy:
 
     def _required_cap(self, path: str, model: Optional[str]) -> Optional[str]:
         ds4 = getattr(self.config, "ds4", None)
+        colibri = getattr(self.config, "colibri", None)
         info = self._model_info(model)
         cap = _router.required_capability(
             model, path=path,
             backend=info.get("backend"),
             ds4_model_id=getattr(ds4, "model_id", None) if ds4 else None,
-            ds4_enabled=bool(getattr(ds4, "enabled", False)) if ds4 else False)
+            ds4_enabled=bool(getattr(ds4, "enabled", False)) if ds4 else False,
+            colibri_model_id=getattr(colibri, "model_id", None) if colibri else None,
+            colibri_enabled=bool(getattr(colibri, "enabled", False)) if colibri else False)
         # The name heuristic can't see that a bare alias (e.g. '…-q4_k_m', no
         # literal 'gguf') backs a .gguf file, so it falls through to
         # 'transformers' (CUDA-only) and the request never reaches a Vulkan/AMD

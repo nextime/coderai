@@ -74,12 +74,15 @@ def _warn_bad_pin(model, pinned, cap, engine, fallback: bool = False) -> None:
 def required_capability(model: Optional[str], path: Optional[str] = None,
                         backend: Optional[str] = None,
                         ds4_model_id: Optional[str] = None,
-                        ds4_enabled: bool = False) -> Optional[str]:
+                        ds4_enabled: bool = False,
+                        colibri_model_id: Optional[str] = None,
+                        colibri_enabled: bool = False) -> Optional[str]:
     """The capability an engine must have to serve this request.
 
     * ``whisper``      — whisper.cpp STT (transcription endpoint or a
                          ``whisper-server`` model). Runs on CUDA or Vulkan.
     * ``ds4``          — DeepSeek V4 via the native ds4 engine. CUDA-only.
+    * ``colibri``      — GLM-5.2 via the native colibri C engine. CUDA-only here.
     * ``gguf``         — llama.cpp model. Runs on CUDA or Vulkan.
     * ``transformers`` — safetensors/HF model. CUDA-only.
 
@@ -90,6 +93,12 @@ def required_capability(model: Optional[str], path: Optional[str] = None,
     if p == "/v1/audio/transcriptions" or (backend or "") == "whisper-server":
         return "whisper"
     m = (model or "").lower()
+    if (backend or "") == "colibri" or (colibri_enabled and m and (
+            ((colibri_model_id or "").lower()
+             and (m == (colibri_model_id or "").lower()
+                  or m.split("/")[-1] == (colibri_model_id or "").lower()))
+            or "glm-5.2" in m or "glm5.2" in m or "colibri" in m)):
+        return "colibri"
     if ds4_enabled and m:
         mid = (ds4_model_id or "").lower()
         if (mid and (m == mid or m.split("/")[-1] == mid)) or "deepseek-v4" in m:
