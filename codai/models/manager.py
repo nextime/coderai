@@ -3419,13 +3419,31 @@ class MultiModelManager:
         # ~128 GB on every request (needless churn) and mis-message CPU/disk offload.
         # Use the measured value if we have one, else a modest fixed reserve.
         try:
-            if (ds4_should_handle(model_key) or (resolved_name and ds4_should_handle(resolved_name))
-                    or colibri_should_handle(model_key)
-                    or (resolved_name and colibri_should_handle(resolved_name))):
+            if ds4_should_handle(model_key) or (resolved_name and ds4_should_handle(resolved_name)):
                 measured = self._measured_vram_gb.get(model_key)
                 if not measured and resolved_name:
                     measured = self._measured_vram_gb.get(resolved_name)
                 return float(measured) if measured else 12.0
+            # colibri (GLM-5.2) is a normal citizen of the VRAM eviction system: it
+            # streams MoE experts and pins only a CONFIGURABLE resident tier
+            # (CUDA_EXPERT_GB), so — unlike ds4 — it coexists and is evicted like any
+            # other model. Estimate its footprint from the configured tier (+ a small
+            # allowance for non-expert weights/KV) so the standard coexist/evict math
+            # works; the measured value wins once we have one.
+            if colibri_should_handle(model_key) or (resolved_name and colibri_should_handle(resolved_name)):
+                measured = self._measured_vram_gb.get(model_key)
+                if not measured and resolved_name:
+                    measured = self._measured_vram_gb.get(resolved_name)
+                if measured:
+                    return float(measured)
+                cfg = get_active_colibri_config()
+                ceg = (getattr(cfg, "cuda_expert_gb", "") or "").strip() if cfg else ""
+                try:
+                    if ceg and ceg.replace(".", "", 1).isdigit():
+                        return float(ceg) + 3.0    # expert tier + non-expert weights/KV
+                except (TypeError, ValueError):
+                    pass
+                return 14.0                          # modest default until measured
         except Exception:
             pass
         # Resolve by basename/alias too — a model requested by basename would
@@ -4517,15 +4535,9 @@ class MultiModelManager:
                 # So a ds4 model claims VRAM exclusively: evict everything else.
                 _new_is_ds4 = (ds4_should_handle(model_key)
                                or (resolved_name and ds4_should_handle(resolved_name)))
-                # colibri (GLM-5.2) likewise streams MoE experts and wants the whole
-                # GPU for its expert tier — co-residence starves it. Claim VRAM
-                # exclusively, same as ds4.
-                _new_is_colibri = (colibri_should_handle(model_key)
-                                   or (resolved_name and colibri_should_handle(resolved_name)))
-                if _new_is_ds4 or _new_is_colibri:
-                    _eng = "ds4 (DeepSeek V4)" if _new_is_ds4 else "colibri (GLM-5.2)"
-                    print(f"Ondemand mode - {_eng} model '{model_key}' needs exclusive VRAM "
-                          f"— unloading all other models so the engine gets the full GPU")
+                if _new_is_ds4:
+                    print(f"Ondemand mode - ds4 model '{model_key}' needs exclusive VRAM "
+                          f"— unloading all other models so ds4-server gets the full GPU")
                     self.unload_all_models()
                 elif needed_gb > 0 and free_gb >= needed_gb + headroom_gb:
                     print(f"Ondemand mode - keeping '{loaded_canonical}' in VRAM alongside new model "

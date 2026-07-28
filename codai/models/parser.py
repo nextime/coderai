@@ -865,6 +865,30 @@ class DeepSeekParser(BaseParser):
         return results
 
 
+# 2b. GLM PARSER (GLM-5.2 / colibri — <tool_call>name<arg_key>…<arg_value>…)
+class GLMParser(BaseParser):
+    @validate_tool_output
+    def parse(self, text: str) -> List[Dict]:
+        results = []
+
+        # GLM-5.2 native tool calls (gated on the <arg_key> marker so a generic
+        # <tool_call>{json} from some other prose can't be misread here).
+        for name, args in parse_glm_tool_calls(
+                text, set(self.tools.keys()) if self.tools else None, self.tools):
+            results.append(self._to_oa(name, args))
+        if results:
+            return results
+
+        # Fallback for anything non-GLM-shaped: the generic ToolCallParser.
+        if not results:
+            tool_call_parser = ToolCallParser()
+            fallback_calls = tool_call_parser.extract_tool_calls(text, [])
+            if fallback_calls:
+                print(f"DEBUG GLMParser: ToolCallParser fallback found {len(fallback_calls)} tool calls")
+                results.extend(fallback_calls)
+        return results
+
+
 # 3. LLAMA PARSER (Markdown JSON)
 class LlamaParser(BaseParser):
     @validate_tool_output
@@ -1396,6 +1420,115 @@ def strip_dsml_tool_calls(text: str) -> str:
     return text
 
 
+# GLM-5.2 (colibri) tool calls. The model expresses them as ordinary text from its
+# chat_template.jinja:
+#   <tool_call>{name}<arg_key>{k}</arg_key><arg_value>{v}</arg_value>...</tool_call>
+# This is DISTINCT from the generic <tool_call>{json} other families emit — the
+# <arg_key>/<arg_value> children are the GLM-specific marker, so we gate on them and
+# never hijack another model's <tool_call> shape.
+_GLM_BOX_RE = re.compile(re.escape('<tool_call>') + r'(.*?)' + re.escape('</tool_call>'),
+                         re.DOTALL)
+_GLM_ARG_RE = re.compile(r'<arg_key>([^<]*)</arg_key><arg_value>(.*?)</arg_value>', re.DOTALL)
+_GLM_NAME_RE = re.compile(r'\s*([A-Za-z0-9_.\-]+)')
+# A trailing <tool_call> the model opened but never closed (ran out of budget, or the
+# closing tag came out mangled). Recovered only when unambiguous (see below).
+_GLM_PARTIAL_END_RE = re.compile(r'<(?:/(?:t(?:o(?:o(?:l(?:_(?:c(?:a(?:l)?)?)?)?)?)?)?)?)?\Z')
+
+
+def has_glm_tool_markup(text: str) -> bool:
+    """True when the text carries GLM-5.2 tool-call markers (arg_key is the tell)."""
+    return bool(text) and '<arg_key>' in text and '<tool_call>' in text
+
+
+def _glm_coerce(value: str, declared):
+    """Decode a raw <arg_value> per the declared JSON-schema type (like colibri's
+    _coerce_arg): a string-typed param is kept verbatim; everything else parses if it
+    parses, else stays text. Without a schema we're permissive but conservative."""
+    if declared == 'string':
+        return value
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return value
+    if declared in ('integer', 'number') and isinstance(parsed, bool):
+        return value                                  # `true` is not a number
+    if declared and declared not in ('integer', 'number', 'boolean', 'object', 'array'):
+        return value
+    return parsed
+
+
+def _glm_unclosed_tail(text: str, names):
+    """Body of a trailing <tool_call> that was never closed, or None. Unambiguous
+    only: the last <tool_call> has no closing tag AND the tail either carries a
+    complete <arg_key>..</arg_value> pair or is exactly a declared tool name."""
+    start = text.rfind('<tool_call>')
+    if start < 0 or '</tool_call>' in text[start:]:
+        return None
+    inner = _GLM_PARTIAL_END_RE.sub('', text[start + len('<tool_call>'):])
+    if _GLM_ARG_RE.search(inner):
+        return inner
+    return inner if (names and inner.strip() in names) else None
+
+
+def parse_glm_tool_calls(text: str, tool_names=None, tools_schema=None):
+    """Parse GLM-5.2 ``<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>…``
+    into ``(name, args_dict)`` tuples. Byte-compatible with colibri's own parser;
+    uses the declared parameter types (from ``tools_schema``) so a string-typed value
+    that happens to look numeric isn't silently turned into an int."""
+    if not has_glm_tool_markup(text):
+        return []
+    names = set(tool_names or [])
+    # name -> {param: json-schema-type}, for correct value coercion.
+    types_by_tool = {}
+    for tname, spec in (tools_schema or {}).items():
+        fn = spec.get('function', spec) if isinstance(spec, dict) else {}
+        props = ((fn.get('parameters') or {}).get('properties') or {}) if isinstance(fn, dict) else {}
+        tt = {}
+        for k, s in props.items():
+            if isinstance(s, dict):
+                t = s.get('type')
+                if isinstance(t, list):
+                    t = next((x for x in t if x != 'null'), None)
+                tt[k] = t
+        types_by_tool[tname] = tt
+
+    boxes = [m.group(1) for m in _GLM_BOX_RE.finditer(text)]
+    tail = _glm_unclosed_tail(text, names)
+    if tail is not None:
+        boxes.append(tail)
+    out, seen = [], set()
+    for inner in boxes:
+        nm = _GLM_NAME_RE.match(inner)
+        name = nm.group(1) if nm else inner.strip()
+        if names and name not in names:
+            continue
+        types = types_by_tool.get(name, {})
+        args = {}
+        for arg in _GLM_ARG_RE.finditer(inner):
+            key, val = arg.group(1), arg.group(2)
+            args[key] = _glm_coerce(val, types.get(key))
+        sig = (name, json.dumps(args, sort_keys=True, default=str))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append((name, args))
+    return out
+
+
+def strip_glm_tool_calls(text: str) -> str:
+    """Remove GLM-5.2 tool-call markup (and any stray arg tags / trailing unclosed
+    box) from displayed content once it's been parsed into tool_calls."""
+    if not text or '<tool_call>' not in text:
+        return text
+    text = _GLM_BOX_RE.sub('', text)
+    # Drop a trailing unclosed <tool_call>… the recovery above consumed.
+    start = text.rfind('<tool_call>')
+    if start >= 0 and '</tool_call>' not in text[start:]:
+        text = text[:start]
+    text = re.sub(r'</?arg_key>|</?arg_value>|</?tool_call>', '', text)  # residual stray tags
+    return text
+
+
 class GemmaParser(BaseParser):
     @validate_tool_output
     def parse(self, text: str) -> List[Dict]:
@@ -1603,6 +1736,14 @@ class ModelParserDispatcher:
             parser = DeepSeekParser(self.tools)
             if self._log_selection:
                 print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: DeepSeekParser")
+            return parser
+
+        # GLM models (GLM-5.2 via colibri, and GLM-4.5/4.6 which share the template):
+        # <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>…</tool_call>.
+        if 'glm' in model_lower or 'colibri' in model_lower:
+            parser = GLMParser(self.tools)
+            if self._log_selection:
+                print(f"DEBUG model_parser: model_name={self.model_name}, selected parser: GLMParser")
             return parser
         
         # Llama models
@@ -2518,6 +2659,24 @@ class ToolCallParser:
                     "function": {"name": name, "arguments": json.dumps(args)},
                 } for name, args in dsml]
 
+        # GLM-5.2 (colibri) native tool calls, gated on the <arg_key> marker so this
+        # model-agnostic path never misreads a generic <tool_call>{json} shape.
+        if has_glm_tool_markup(text):
+            names = [getattr(getattr(t, 'function', None), 'name', None)
+                     for t in (available_tools or [])]
+            names = [n for n in names if n]
+            schema = {t.function.name: {'parameters': (t.function.parameters or {})}
+                      for t in (available_tools or [])
+                      if getattr(getattr(t, 'function', None), 'name', None)}
+            glm = parse_glm_tool_calls(text, names or None, schema or None)
+            if glm:
+                print(f"DEBUG ToolCallParser: GLM parsing found {len(glm)} tool calls")
+                return [{
+                    "id": f"call_{uuid.uuid4().hex[:16]}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(args)},
+                } for name, args in glm]
+
         # NOTE: the degraded plaintext <tool>name arg: value</tool> form (heavy
         # quants that can't emit DSML, e.g. ds4 q2-imatrix) is handled ONLY in
         # DeepSeekParser — scoped to the DeepSeek family where it occurs — so it can
@@ -2593,6 +2752,7 @@ class ToolCallParser:
             resolve_gemma_tool_mode(self.model_name))
 
         text = strip_dsml_tool_calls(text)
+        text = strip_glm_tool_calls(text)
         for pattern in STRIP_TOOL_PATTERNS:
             text = pattern.sub('', text)
 
@@ -2686,6 +2846,7 @@ class ModelParserAdapter:
             resolve_gemma_tool_mode(self._model_name))
 
         text = strip_dsml_tool_calls(text)
+        text = strip_glm_tool_calls(text)
         text = re.sub(r'(?m)^\s*thought\s*$\n?', '', text)
 
         # Custom XML format: <tool><action>...</action><object>...</object><properties>...</properties></tool>
