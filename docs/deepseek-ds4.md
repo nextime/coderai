@@ -72,3 +72,10 @@ coderai shallow-clones the repo at first use to obtain `download_model.sh`.
   `ModelBackend` interface.
 - `codai/models/manager.py` — `ds4_should_handle()` routes matching models to
   `Ds4Backend`; `is_allowed_model()` accepts the ds4 model id.
+
+## Credits
+
+DeepSeek-V4 support is made possible entirely by **[ds4 / DwarfStar](https://github.com/antirez/ds4)**,
+a from-scratch native inference engine by **Salvatore Sanfilippo ([antirez](https://github.com/antirez))**.
+CoderAI merely owns its lifecycle and proxies to it — all of the hard, brilliant
+inference work is theirs. Huge thanks.

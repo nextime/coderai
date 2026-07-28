@@ -479,6 +479,15 @@ async def internal_thermal_pause(request: Request):
         _therm.set_external_pause(True, reason=str(data.get("reason") or "thermal"))
     except Exception as e:
         return {"ok": False, "error": str(e)}
+    # Gracefully idle any in-flight colibri generation via the PAUSE mux frame — it
+    # decodes autonomously once submitted, so the between-tokens external-pause flag
+    # alone can't stop it; this lets the cooperative pause actually cool the box
+    # without the front escalating to SIGSTOP.
+    try:
+        from codai.api import colibri_worker
+        colibri_worker.pause_all()
+    except Exception:
+        pass
     return {"ok": True, "paused": True}
 
 
@@ -490,6 +499,11 @@ async def internal_thermal_resume(request: Request):
         _therm.set_external_pause(False)
     except Exception as e:
         return {"ok": False, "error": str(e)}
+    try:
+        from codai.api import colibri_worker
+        colibri_worker.resume_all()
+    except Exception:
+        pass
     return {"ok": True, "paused": False}
 
 

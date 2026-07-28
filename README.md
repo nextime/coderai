@@ -694,8 +694,23 @@ Merge requests welcome.
 
 ## Acknowledgments
 
+CoderAI stands on the shoulders of remarkable open-source work. Special, heartfelt
+thanks to the developers of the native inference engines that let it punch far above
+its hardware — running models that otherwise simply couldn't run on a single GPU:
+
+- **[colibri](https://github.com/JustVugg/colibri)** by **JustVugg** — a brilliant
+  pure-C MoE engine that streams **GLM-5.2 (744B params)** across VRAM/RAM/disk to run
+  it on a single consumer GPU.
+- **[ds4 / DwarfStar](https://github.com/antirez/ds4)** by **Salvatore Sanfilippo
+  (antirez)** — a superb from-scratch **DeepSeek-V4** inference engine.
+- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** &
+  **[whisper.cpp](https://github.com/ggml-org/whisper.cpp)** by **Georgi Gerganov**
+  and contributors — the foundational GGUF LLM inference and Whisper STT engines.
+
+And the libraries, models and research CoderAI builds on:
+
 - [FastAPI](https://fastapi.tiangolo.com/)
-- [HuggingFace Transformers](https://huggingface.co/docs/transformers/) — NVIDIA text backend
+- [HuggingFace Transformers](https://huggingface.co/docs/transformers/) & [Diffusers](https://github.com/huggingface/diffusers) — NVIDIA text/image backends
 - [llama-cpp-python](https://github.com/abetlen/llama-cpp-python) — Vulkan/CUDA GGUF text backend
 - [stable-diffusion-cpp-python](https://github.com/william-murray1204/stable-diffusion-cpp-python) — GGUF image backend
 - [InsightFace](https://github.com/deepinsight/insightface) — face swap
@@ -704,3 +719,4 @@ Merge requests welcome.
 - [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) — image/video upscaling
 - [Wav2Lip](https://github.com/Rudrabha/Wav2Lip) — audio-driven lip sync
 - [SadTalker](https://github.com/OpenTalker/SadTalker) — talking head / lip sync generation
+- Visual place recognition & geolocation research — [EigenPlaces](https://github.com/gmberton/EigenPlaces) (Gabriele Berton et al.), [DINOv2-SALAD](https://github.com/serizba/salad) (Sergio Izquierdo, Javier Civera), [GeoCLIP](https://github.com/VicenteVivan/geo-clip) (Vicente Vivanco et al.), [DINOv2](https://github.com/facebookresearch/dinov2) (Meta AI)

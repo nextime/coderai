@@ -435,6 +435,30 @@ class MuxEngine:
         finally:
             self._slots.put(slot)
 
+    def pause(self):
+        """Gracefully idle the decode loop (thermal throttle) via the PAUSE mux frame
+        — colibri stops issuing forward passes but keeps all KV/slot state, so no
+        tokens are lost and the process stays alive/responsive (unlike SIGSTOP).
+        Best-effort; needs the coderai PAUSE/RESUME colibri patch (packaging/
+        patch-colibri.py) — an unpatched engine simply ignores the unknown line."""
+        try:
+            if self.process.poll() is None:
+                with self.write_lock:
+                    self.process.stdin.write(b"PAUSE\n")
+                    self.process.stdin.flush()
+        except Exception:
+            pass
+
+    def resume(self):
+        """Resume decoding after :meth:`pause` (RESUME mux frame)."""
+        try:
+            if self.process.poll() is None:
+                with self.write_lock:
+                    self.process.stdin.write(b"RESUME\n")
+                    self.process.stdin.flush()
+        except Exception:
+            pass
+
     def close(self):
         with self.pending_lock:
             if self.closed:
@@ -604,6 +628,40 @@ def stop_service(model_id: str) -> None:
 def stop_all() -> None:
     for mid in list(_services.keys()):
         stop_service(mid)
+
+
+def pause_all() -> int:
+    """Gracefully idle every live colibri engine (thermal throttle). Returns the count
+    signalled. Used by the engine's cooperative /internal/thermal-pause handler so a
+    hot box can throttle in-flight colibri generation without SIGSTOP."""
+    with _lock:
+        engines = list(_services.values())
+    n = 0
+    for eng in engines:
+        try:
+            eng.pause()
+            n += 1
+        except Exception:
+            pass
+    if n:
+        print(f"[colibri] thermal pause → idled {n} engine(s)", flush=True)
+    return n
+
+
+def resume_all() -> int:
+    """Resume every live colibri engine after :func:`pause_all` (thermal cooled)."""
+    with _lock:
+        engines = list(_services.values())
+    n = 0
+    for eng in engines:
+        try:
+            eng.resume()
+            n += 1
+        except Exception:
+            pass
+    if n:
+        print(f"[colibri] thermal resume → woke {n} engine(s)", flush=True)
+    return n
 
 
 import atexit as _atexit

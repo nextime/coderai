@@ -643,10 +643,142 @@ class EngineSupervisor:
         return [c for c in all_cards
                 if c.get("vendor") in sels or (c.get("uuid") and c["uuid"] in sels)]
 
+    # An engine's process group using at least this many CPU cores is a real source
+    # of CPU heat; below it, pausing the engine can't meaningfully cool the CPU.
+    _CPU_RELEVANT_CORES = 1.5
+    _CPU_HIST_LEN = 6          # rolling window (~poll_seconds × 6) for CPU relevance
+
+    @staticmethod
+    def _scan_pgroup_cpu() -> dict:
+        """One pass over /proc → {pgid: total (utime+stime) ticks}. Used to attribute
+        CPU load to each engine's process group (its own PID + children like
+        colibri/ds4/whisper-server, which inherit the engine's setsid pgid)."""
+        out: dict = {}
+        try:
+            for name in os.listdir("/proc"):
+                if not name.isdigit():
+                    continue
+                try:
+                    with open("/proc/" + name + "/stat", "rb") as f:
+                        data = f.read()
+                    # comm (field 2) is parenthesised and may contain spaces/parens;
+                    # fields after the last ')' are stable and space-separated.
+                    fields = data[data.rindex(b")") + 2:].split()
+                    pgid = int(fields[2])                      # field 5: pgrp
+                    out[pgid] = out.get(pgid, 0) + int(fields[11]) + int(fields[12])
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return out
+
+    def _engine_cpu_cores(self, engine, pg_ticks: dict, now: float):
+        """CPU cores this engine's process group used since the last poll, or None
+        (first sample / unmeasurable)."""
+        proc = getattr(engine, "proc", None)
+        pid = getattr(proc, "pid", None) if proc is not None else None
+        if not pid:
+            return None
+        try:
+            pgid = os.getpgid(pid)
+        except Exception:
+            return None
+        ticks = pg_ticks.get(pgid)
+        if ticks is None:
+            return None
+        cache = getattr(self, "_cpu_sample", None)
+        if cache is None:
+            cache = self._cpu_sample = {}
+        prev = cache.get(engine.id)
+        cache[engine.id] = (ticks, now)
+        if not prev:
+            return None
+        dt = now - prev[1]
+        if dt <= 0:
+            return None
+        try:
+            clk = os.sysconf("SC_CLK_TCK")
+        except Exception:
+            clk = 100.0
+        return max(0.0, (ticks - prev[0]) / clk / dt)
+
+    def _engine_cpu_relevant(self, engine, pg_ticks: dict, now: float) -> bool:
+        """True when this engine is a meaningful CPU-heat source, so the shared-CPU
+        thermal term applies to it. Uses a rolling MAX so an engine that just got
+        SIGSTOP-ed/idled (e.g. colibri between throttle cycles) still counts as
+        CPU-heavy and keeps its normal hysteresis, while a persistently GPU-bound
+        engine (Vulkan embeddings, ~0 CPU) is exempt and can't be stranded by another
+        engine's CPU heat. Fails safe to True when it can't be measured."""
+        cores = self._engine_cpu_cores(engine, pg_ticks, now)
+        hist = getattr(self, "_cpu_hist", None)
+        if hist is None:
+            hist = self._cpu_hist = {}
+        lst = hist.setdefault(engine.id, [])
+        if cores is not None:
+            lst.append(cores)
+            del lst[:-self._CPU_HIST_LEN]
+        if not lst:
+            return True
+        return max(lst) >= self._CPU_RELEVANT_CORES
+
     def _thermal_signal(self, engine, sig) -> None:
-        """Send a signal to the engine's whole process group (it runs in its own
-        session via setsid), so a SIGSTOP/SIGCONT freezes/resumes the engine and any
-        children (whisper-server, ds4) in one shot."""
+        """Freeze/resume this engine's heavy native compute WITHOUT freezing its
+        Python HTTP server, so it can still ack pause/resume and report health.
+
+        The old behaviour SIGSTOP-ed the whole process group (``os.killpg``), which
+        froze the engine's own process too — for a subprocess backend (colibri/ds4/
+        whisper-server) that left the front unable to talk to it, causing the resume
+        message to fail and a SIGSTOP/SIGCONT thrash. Instead, signal the engine's
+        native compute CHILDREN (everything in the group except the engine's own PID);
+        that stops the CPU/GPU heat source while the parent stays responsive. When
+        there are no such children (an in-process torch engine), fall back to killpg
+        so those still stop."""
+        proc = getattr(engine, "proc", None)
+        if proc is None:
+            return
+        try:
+            pgid = os.getpgid(proc.pid)
+        except Exception:
+            try:
+                proc.send_signal(sig)
+            except Exception:
+                pass
+            return
+        # Children = group members other than the engine's own process.
+        children = []
+        try:
+            for name in os.listdir("/proc"):
+                if not name.isdigit():
+                    continue
+                cpid = int(name)
+                if cpid == proc.pid:
+                    continue
+                try:
+                    if os.getpgid(cpid) == pgid:
+                        children.append(cpid)
+                except Exception:
+                    continue
+        except Exception:
+            children = []
+        if children:
+            for cpid in children:
+                try:
+                    os.kill(cpid, sig)
+                except Exception:
+                    pass
+            return
+        # No child compute process (in-process engine): stop the whole group.
+        try:
+            os.killpg(pgid, sig)
+        except Exception:
+            try:
+                proc.send_signal(sig)
+            except Exception:
+                pass
+
+    def _thermal_signal_group(self, engine, sig) -> None:
+        """Signal the engine's WHOLE process group (legacy behaviour) — used by
+        shutdown/restart where we do want to reach every child in one shot."""
         proc = engine.proc
         if proc is None:
             return
@@ -768,6 +900,13 @@ class EngineSupervisor:
                     cpu_warm = (cpu_t is not None and cpu_t > settings.cpu_resume)
                     escalate_n = int(getattr(self.config.thermal,
                                              "stop_escalate_checks", 3) or 3)
+                    # CPU is a SHARED resource, but only the engines actually loading it
+                    # can be cooled by pausing them. Sample per-engine CPU once per poll
+                    # so the shared-CPU thermal term applies only to real CPU-heat
+                    # sources — a GPU-bound engine (embeddings) is never paused/stranded
+                    # by another engine's (e.g. colibri's) CPU heat.
+                    pg_ticks = self._scan_pgroup_cpu() if cpu_t is not None else {}
+                    _now = time.monotonic()
                     for engine in self.registry.all():
                         if getattr(engine, "role", "engine") == "system":
                             continue   # the cache/downloads worker isn't on the GPU
@@ -802,11 +941,19 @@ class EngineSupervisor:
                             if t > resume:
                                 gpu_warm = True
                         engine.therm_temp = max(temps) if temps else None
-                        # Pause when this engine's GPU is over high OR the (global)
-                        # CPU is over high. Resume only when BOTH are back to resume.
-                        want_pause = (settings.gpu_enabled and gpu_hot) or cpu_hot
+                        # Apply the (global) CPU term only to engines that actually heat
+                        # the CPU — pausing a GPU-bound engine can't cool it, and the
+                        # hysteresis would strand it in the resume<CPU<high dead-band a
+                        # CPU-heavy engine keeps the shared CPU parked in.
+                        cpu_rel = (self._engine_cpu_relevant(engine, pg_ticks, _now)
+                                   if cpu_t is not None else False)
+                        e_cpu_hot = cpu_hot and cpu_rel
+                        e_cpu_warm = cpu_warm and cpu_rel
+                        # Pause when this engine's GPU is over high OR (it's a CPU-heat
+                        # source AND) the CPU is over high. Resume only when BOTH clear.
+                        want_pause = (settings.gpu_enabled and gpu_hot) or e_cpu_hot
                         want_resume_ok = (not (settings.gpu_enabled and gpu_warm)
-                                          and not cpu_warm)
+                                          and not e_cpu_warm)
                         self._thermal_apply(client, engine, settings, want_pause,
                                             want_resume_ok, engine.therm_temp, cpu_t,
                                             escalate_n)

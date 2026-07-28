@@ -667,6 +667,32 @@
     </div>
   </div>
 </div>
+
+<!-- Credits & acknowledgements -->
+<div class="card">
+  <div class="card-title">Credits &amp; acknowledgements</div>
+  <p class="form-hint" style="margin-bottom:.7rem">CoderAI stands on the shoulders of remarkable open-source work. Heartfelt thanks to the developers whose engines and research make these capabilities possible.</p>
+
+  <div style="display:flex;flex-direction:column;gap:.6rem">
+    <div style="border-left:3px solid var(--accent,#5b8cff);padding:.15rem 0 .15rem .7rem">
+      <div style="font-weight:600">colibri <span class="muted" style="font-weight:400">— GLM-5.2 on consumer hardware</span></div>
+      <div class="form-hint">A brilliant pure-C MoE engine by <b>JustVugg</b> that streams a 744B-parameter model across VRAM/RAM/disk to run it on a single GPU. <a href="https://github.com/JustVugg/colibri" target="_blank" rel="noopener">github.com/JustVugg/colibri</a></div>
+    </div>
+    <div style="border-left:3px solid var(--accent,#5b8cff);padding:.15rem 0 .15rem .7rem">
+      <div style="font-weight:600">ds4 / DwarfStar <span class="muted" style="font-weight:400">— DeepSeek-V4 native engine</span></div>
+      <div class="form-hint">A superb from-scratch DeepSeek-V4 inference engine by <b>Salvatore Sanfilippo (antirez)</b>. <a href="https://github.com/antirez/ds4" target="_blank" rel="noopener">github.com/antirez/ds4</a></div>
+    </div>
+    <div style="border-left:3px solid var(--border,#444);padding:.15rem 0 .15rem .7rem">
+      <div style="font-weight:600">llama.cpp &amp; whisper.cpp <span class="muted" style="font-weight:400">— GGUF LLM inference &amp; Whisper STT</span></div>
+      <div class="form-hint">The foundational C/C++ inference engines by <b>Georgi Gerganov</b> and contributors. <a href="https://github.com/ggml-org/llama.cpp" target="_blank" rel="noopener">llama.cpp</a> · <a href="https://github.com/ggml-org/whisper.cpp" target="_blank" rel="noopener">whisper.cpp</a></div>
+    </div>
+    <div style="border-left:3px solid var(--border,#444);padding:.15rem 0 .15rem .7rem">
+      <div style="font-weight:600">Visual place recognition &amp; geolocation research</div>
+      <div class="form-hint"><b>EigenPlaces</b> (Gabriele Berton et&nbsp;al.) · <b>DINOv2-SALAD</b> (Sergio Izquierdo, Javier Civera) · <b>GeoCLIP</b> (Vicente Vivanco et&nbsp;al.) · <b>DINOv2</b> (Meta AI) — the models that power visual matching &amp; geolocation.</div>
+    </div>
+  </div>
+  <p class="form-hint" style="margin-top:.7rem;font-size:11px">…and the wider open-source ecosystem (PyTorch, Hugging Face Transformers/Diffusers, and many more) that CoderAI builds on.</p>
+</div>
 {% endblock %}
 
 {% block scripts %}

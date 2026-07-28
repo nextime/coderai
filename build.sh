@@ -806,6 +806,12 @@ build_colibri() {
         git clone --depth 1 https://github.com/JustVugg/colibri "$COLIBRI_DIR" || {
             echo -e "${YELLOW}Warning: could not clone colibri; skipping.${NC}"; return 0; }
     fi
+    # Apply coderai's serve-mux PAUSE/RESUME patch (idempotent) so thermal throttle can
+    # gracefully idle in-flight generation instead of SIGSTOP-freezing the engine.
+    if [ -f "$(dirname "$0")/packaging/patch-colibri.py" ]; then
+        python3 "$(dirname "$0")/packaging/patch-colibri.py" "$COLIBRI_DIR/c/colibri.c" || \
+            echo -e "${YELLOW}Warning: colibri PAUSE/RESUME patch failed (building unpatched).${NC}"
+    fi
     # Default to a PORTABLE CUDA arch (SASS for Ampere..Blackwell + PTX fallback), like
     # ds4's cuda-generic, so the bundled binary isn't locked to the build host's GPU.
     # Requires a real nvcc (a CUDA *runtime* has /usr/local/cuda but no compiler); the
