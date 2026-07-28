@@ -806,9 +806,13 @@ build_colibri() {
         git clone --depth 1 https://github.com/JustVugg/colibri "$COLIBRI_DIR" || {
             echo -e "${YELLOW}Warning: could not clone colibri; skipping.${NC}"; return 0; }
     fi
+    # Default to a PORTABLE CUDA arch (SASS for Ampere..Blackwell + PTX fallback), like
+    # ds4's cuda-generic, so the bundled binary isn't locked to the build host's GPU.
+    # Requires a real nvcc (a CUDA *runtime* has /usr/local/cuda but no compiler); the
+    # binary links libcudart.so.13, resolved in the container from /opt/coderai/local-libs.
     local MAKE_ARGS="colibri"
-    if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
-        MAKE_ARGS="colibri CUDA=1 CUDA_ARCH=${COLI_CUDA_ARCH:-native}"
+    if command -v nvcc &> /dev/null; then
+        MAKE_ARGS="colibri CUDA=1 CUDA_ARCH=${COLI_CUDA_ARCH:-portable}"
     elif command -v hipcc &> /dev/null || [ -d "/opt/rocm" ]; then
         MAKE_ARGS="colibri HIP=1 HIP_ARCH=${COLI_HIP_ARCH:-native}"
     elif [ "$(uname -s)" = "Darwin" ]; then

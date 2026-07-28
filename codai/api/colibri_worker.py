@@ -78,13 +78,30 @@ def _engine_bin(install_dir: Path) -> Path:
     return cdir / "colibri"
 
 
+def _find_nvcc() -> Optional[str]:
+    """Path to a real ``nvcc`` binary, or None. A CUDA *runtime* container has
+    ``/usr/local/cuda`` (the libraries) but NO compiler — checking the directory is
+    not enough, we must find the nvcc binary itself."""
+    import glob
+    n = shutil.which("nvcc")
+    if n:
+        return n
+    for c in sorted(glob.glob("/usr/local/cuda*/bin/nvcc"), reverse=True):
+        if os.path.isfile(c):
+            return c
+    return None
+
+
 def _detect_build_target() -> str:
-    """Pick a build flavour from the host: CUDA when the toolkit is present."""
+    """Pick the *intended* build flavour. A CUDA runtime/GPU means the intent is a
+    CUDA build even when the toolkit (nvcc) is missing — :func:`ensure_built` then
+    surfaces a clear 'pre-compile the binary' error rather than silently building a
+    CPU-only engine on a GPU box."""
     if platform.system() == "Darwin":
         return "metal"
-    if shutil.which("nvcc") or os.path.isdir("/usr/local/cuda"):
+    if _find_nvcc() or os.path.isdir("/usr/local/cuda") or shutil.which("nvidia-smi"):
         return "cuda"
-    if shutil.which("hipcc") or os.path.isdir("/opt/rocm"):
+    if shutil.which("hipcc") or os.path.isfile("/opt/rocm/bin/hipcc"):
         return "hip"
     return "cpu"
 
@@ -95,9 +112,15 @@ def _make_args(cfg) -> list:
     if target in ("", "auto"):
         target = _detect_build_target()
     if target == "cuda":
-        # native SASS is fine — coderai builds on the same GPU host it runs on. For a
-        # portable image build pass CUDA_ARCH=portable via extra make env if needed.
-        return ["colibri", "CUDA=1", f"CUDA_ARCH={os.environ.get('COLI_CUDA_ARCH', 'native')}"]
+        # Default to a PORTABLE arch (SASS for Ampere..Blackwell + a PTX fallback) so
+        # a pre-compiled/bundled binary runs on any modern card; override with
+        # COLI_CUDA_ARCH (e.g. sm_86 for a single 3090 build). Point the Makefile at
+        # a real nvcc/CUDA_HOME so a non-PATH toolkit still builds.
+        args = ["colibri", "CUDA=1", f"CUDA_ARCH={os.environ.get('COLI_CUDA_ARCH', 'portable')}"]
+        nvcc = _find_nvcc()
+        if nvcc:
+            args += [f"NVCC={nvcc}", f"CUDA_HOME={os.path.dirname(os.path.dirname(nvcc))}"]
+        return args
     if target == "hip":
         return ["colibri", "HIP=1", f"HIP_ARCH={os.environ.get('COLI_HIP_ARCH', 'native')}"]
     if target == "metal":
@@ -134,6 +157,23 @@ def ensure_built(cfg) -> Path:
             f"colibri engine not found at {binary} and auto_build is disabled. Build it "
             f"manually (git clone {cfg.repo_url}; cd c; make colibri [CUDA=1]) or enable "
             "auto_build.")
+
+    # A CUDA build needs the toolkit (nvcc), which a CUDA *runtime* container does
+    # NOT ship. Rather than clone + fail deep in `make` (the confusing
+    # "nvcc not found … backend_cuda.o Error" the user hit), fail early with the fix:
+    # pre-compile the binary. The engine is meant to be pre-built (bundled in the
+    # image or built once on a box with the toolkit), never compiled per-request.
+    _target = (getattr(cfg, "build_target", "auto") or "auto").strip().lower()
+    if _target in ("", "auto"):
+        _target = _detect_build_target()
+    if _target == "cuda" and _find_nvcc() is None:
+        raise RuntimeError(
+            f"colibri needs a CUDA build but no CUDA toolkit (nvcc) is available here "
+            f"— this looks like a CUDA *runtime* environment. Pre-compile the engine "
+            f"and place it at {binary}: build once on a box/image with the matching "
+            f"CUDA toolkit (e.g. `build.sh --colibri`, or a cuda:*-devel container) "
+            f"targeting the same CUDA runtime as this container. Runtime auto-build "
+            f"cannot compile CUDA without nvcc.")
 
     tail = collections.deque(maxlen=40)
     install_dir.parent.mkdir(parents=True, exist_ok=True)
