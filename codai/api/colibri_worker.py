@@ -479,13 +479,39 @@ def resolve_service_key(cfg, model_dir: Optional[str] = None):
 
 
 def _build_env(cfg) -> tuple:
-    """Engine environment: CUDA_EXPERT_GB + free-form extra_env KEY=VALUE pairs."""
+    """Engine environment: enable the GPU backend + CUDA_EXPERT_GB + free-form extra_env.
+
+    colibri's GPU tiering is OFF unless explicitly enabled — ``COLI_CUDA=1`` (CUDA/HIP)
+    or ``COLI_METAL=1`` (Apple). It is NOT implied by shipping a CUDA build, and
+    ``CUDA_EXPERT_GB`` without ``COLI_CUDA=1`` aborts startup ("CUDA_EXPERT_GB requires
+    COLI_CUDA=1"). Since coderai routes colibri to the CUDA engine and ships a CUDA
+    binary, default the backend on (overridable via extra_env, e.g. COLI_CUDA=0)."""
     env = os.environ.copy()
     applied = {}
+
+    target = (getattr(cfg, "build_target", "auto") or "auto").strip().lower()
+    if target in ("", "auto"):
+        target = "cuda"    # coderai ships a CUDA build and routes colibri to the CUDA engine
+    cuda_on = False
+    if target in ("cuda", "hip"):
+        if "COLI_CUDA" not in env:
+            env["COLI_CUDA"] = "1"
+            applied["COLI_CUDA"] = "1"
+        cuda_on = env.get("COLI_CUDA") not in ("0", "", None)
+    elif target == "metal":
+        if "COLI_METAL" not in env:
+            env["COLI_METAL"] = "1"
+            applied["COLI_METAL"] = "1"
+
+    # CUDA_EXPERT_GB is only valid with the CUDA backend enabled — setting it otherwise
+    # aborts the engine, so gate it on COLI_CUDA being on.
     ceg = (getattr(cfg, "cuda_expert_gb", "") or "").strip()
-    if ceg and "CUDA_EXPERT_GB" not in env:
+    if ceg and cuda_on and "CUDA_EXPERT_GB" not in env:
         env["CUDA_EXPERT_GB"] = ceg
         applied["CUDA_EXPERT_GB"] = ceg
+
+    # Free-form passthrough LAST so an explicit pair (e.g. COLI_CUDA=0 to force CPU)
+    # overrides the defaults above.
     extra_env = (getattr(cfg, "extra_env", "") or "").strip()
     if extra_env:
         for tok in shlex.split(extra_env):
