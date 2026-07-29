@@ -35,8 +35,10 @@ import collections
 import os
 import platform
 import queue
+import select
 import shlex
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -247,8 +249,18 @@ class MuxEngine:
         # large system prompts + tools. Size CTX to the model's configured n_ctx (the
         # value passed here). A caller-set CTX in the env still wins.
         ctx = max(512, int(max_tokens or 4096))
+        # KV_SLOTS==1 → SINGLE-CLIENT mode: run colibri's `run_serve` path (SERVE_BATCH
+        # off) instead of `run_serve_mux`. run_serve keeps the int8 **MTP** speculative-
+        # decode head ENABLED — the mux path force-disables it ("speculation is not
+        # ragged-safe across KV slots") and its batched decode loop has NO MTP path at
+        # all; MTP lives only in run_serve's single-sequence spec_decode. Enabling it is
+        # a real decode win (accepted drafts = fewer forward passes = fewer expert
+        # streams). Multi-slot (kv_slots>1) keeps the batched mux path (concurrent
+        # conversations, no MTP). See docs/serve_protocol.md + colibri.c run_serve.
+        self.single_client = (int(kv_slots) == 1)
         child_env = dict(env or os.environ, SNAP=str(model_dir), SERVE="1",
-                         SERVE_BATCH="1", NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
+                         NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
+        child_env["SERVE_BATCH"] = "0" if self.single_client else "1"
         child_env.setdefault("CTX", str(ctx))
         self.model_dir = str(model_dir)
         self.kv_slots = kv_slots
@@ -274,11 +286,20 @@ class MuxEngine:
         self._log_tail = collections.deque(maxlen=30)
         threading.Thread(target=self._pump_stderr, daemon=True,
                          name="colibri-stderr").start()
-        # READY handshake must complete before the dispatcher starts consuming lines.
+        # Single-client mode serializes turns (one run_serve conversation, no id mux).
+        self._run_lock = threading.Lock()
+        # READY handshake must complete before we consume protocol output.
         _read_engine_turn(self.process.stdout, READY)
-        self.dispatcher = threading.Thread(target=self._dispatch_stdout,
-                                           name="colibri-stdout", daemon=True)
-        self.dispatcher.start()
+        if self.single_client:
+            # run_serve emits one-shot tiers/telemetry to stdout right after READY, then
+            # blocks awaiting a PROMPT. Drain it so the first turn's response read starts
+            # clean. No persistent dispatcher — run() reads the byte stream synchronously.
+            self._drain_stdout(0.6)
+            self.dispatcher = None
+        else:
+            self.dispatcher = threading.Thread(target=self._dispatch_stdout,
+                                               name="colibri-stdout", daemon=True)
+            self.dispatcher.start()
 
     # ---- logs / health ---------------------------------------------------- #
     def _pump_stderr(self):
@@ -376,10 +397,136 @@ class MuxEngine:
                 self.dispatcher_error = error
                 self._fail_pending(error)
 
+    # ---- single-client (run_serve, MTP-enabled) protocol ------------------ #
+    # run_serve frames: in  = "\x02PROMPT <bytes> <max> <temp> <top_p> <slot>\n<payload>\n"
+    #                   out = <raw decoded text bytes> "\x01\x01END\x01\x01\n" "STAT …\n"
+    _SERVE_END = b"\x01\x01" b"END" b"\x01\x01\n"
+
+    def _drain_stdout(self, idle_timeout: float) -> None:
+        """Read and discard stdout until it stays quiet for ``idle_timeout`` s (the
+        engine has gone back to blocking on getline). Swallows run_serve's one-shot
+        startup telemetry / any trailing per-turn chatter so the next response read is
+        clean. bufsize=0 on the pipe means no bytes are stranded in a Python buffer."""
+        try:
+            fd = self.process.stdout.fileno()
+        except Exception:
+            return
+        while True:
+            try:
+                r, _, _ = select.select([fd], [], [], idle_timeout)
+            except Exception:
+                return
+            if not r:
+                return
+            try:
+                if os.read(fd, 65536) == b"":
+                    return
+            except OSError:
+                return
+
+    def _read_stat_line(self, prefix: bytes) -> list:
+        """Complete and parse the ``STAT …`` line that follows the END sentinel."""
+        buf = bytearray(prefix)
+        fd = self.process.stdout.fileno()
+        while b"\n" not in buf:
+            try:
+                r, _, _ = select.select([fd], [], [], 2.0)
+            except Exception:
+                break
+            if not r:
+                break
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if chunk == b"":
+                break
+            buf += chunk
+        nl = buf.find(b"\n")
+        line = bytes(buf[:nl]) if nl >= 0 else bytes(buf)
+        return line.decode("utf-8", "replace").strip().split()
+
+    def _run_single(self, prompt: str, max_tokens: int, temperature: float, top_p: float,
+                    on_text: Callable[[str], None],
+                    cancelled: Optional[Callable[[], bool]] = None) -> dict:
+        """run_serve single-client turn: write the PROMPT frame, stream the raw text
+        response until the END sentinel, then read STAT. Cancellation = SIGINT (colibri
+        treats Ctrl-C as end-of-turn, not end-of-process), after which it still emits a
+        normal END+STAT."""
+        if self.process.poll() is not None:
+            raise RuntimeError("colibri engine is not running. " + self.log_tail())
+        payload = prompt.encode("utf-8")
+        if b"\0" in payload:
+            raise ValueError("NUL bytes are not supported in prompts.")
+        # colibri validates: temp∈[0,2], top_p∈(0,1], ngen≥1, slot 0.
+        tt = min(2.0, max(0.0, float(temperature)))
+        tp = min(1.0, max(1e-6, float(top_p)))
+        ngen = max(1, int(max_tokens))
+        header = ("\x02PROMPT %d %d %.8g %.8g 0\n" % (len(payload), ngen, tt, tp)).encode("latin-1")
+        fd = self.process.stdout.fileno()
+        SENT = self._SERVE_END
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        with self._run_lock:
+            with self.write_lock:
+                if self.process.poll() is not None:
+                    raise RuntimeError("colibri engine is not running")
+                self.process.stdin.write(header + payload + b"\n")
+                self.process.stdin.flush()
+            buf = bytearray()
+            cancel_sent = False
+            while True:
+                if cancelled and not cancel_sent and cancelled():
+                    cancel_sent = True
+                    try:
+                        self.process.send_signal(signal.SIGINT)
+                    except Exception:
+                        pass
+                try:
+                    r, _, _ = select.select([fd], [], [], 0.25)
+                except Exception:
+                    r = [fd]
+                if not r:
+                    if self.process.poll() is not None:
+                        raise RuntimeError("colibri engine exited mid-turn. " + self.log_tail())
+                    continue
+                chunk = os.read(fd, 65536)
+                if chunk == b"":
+                    raise RuntimeError("colibri engine exited mid-turn. " + self.log_tail())
+                buf += chunk
+                idx = buf.find(SENT)
+                if idx >= 0:
+                    pre = bytes(buf[:idx])
+                    if pre and not cancel_sent:
+                        text = decoder.decode(pre, final=True)
+                        if text:
+                            on_text(text)
+                    fields = self._read_stat_line(bytes(buf[idx + len(SENT):]))
+                    if len(fields) >= 5 and fields[0] == "STAT":
+                        stats = _parse_stat(fields)
+                    else:
+                        stats = {"completion_tokens": 0, "tokens_per_second": 0.0,
+                                 "cache_hit_percent": 0.0, "rss_gb": 0.0,
+                                 "prompt_tokens": 0, "length_limited": False}
+                    stats["total_tokens"] = (stats.get("completion_tokens", 0)
+                                             + stats.get("prompt_tokens", 0))
+                    self._drain_stdout(0.05)   # swallow any trailing per-turn telemetry
+                    return stats
+                # emit all but a possible partial trailing sentinel
+                if len(buf) > len(SENT):
+                    keep = len(SENT) - 1
+                    safe = bytes(buf[:-keep])
+                    del buf[:len(safe)]
+                    if safe and not cancel_sent:
+                        text = decoder.decode(safe)
+                        if text:
+                            on_text(text)
+
     def run(self, prompt: str, max_tokens: int, temperature: float, top_p: float,
             on_text: Callable[[str], None], cancelled: Optional[Callable[[], bool]] = None
             ) -> dict:
         """Submit one rendered prompt; stream decoded text to ``on_text``; return stats."""
+        if self.single_client:
+            return self._run_single(prompt, max_tokens, temperature, top_p, on_text, cancelled)
         if self.dispatcher_error is not None:
             raise RuntimeError("colibri engine dispatcher stopped: "
                                + (self.log_tail() or str(self.dispatcher_error)))
@@ -450,7 +597,13 @@ class MuxEngine:
         — colibri stops issuing forward passes but keeps all KV/slot state, so no
         tokens are lost and the process stays alive/responsive (unlike SIGSTOP).
         Best-effort; needs the coderai PAUSE/RESUME colibri patch (packaging/
-        patch-colibri.py) — an unpatched engine simply ignores the unknown line."""
+        patch-colibri.py) — an unpatched engine simply ignores the unknown line.
+
+        No-op in single-client (run_serve) mode: run_serve reads stdin only between
+        turns and would treat a "PAUSE" line as a prompt. Thermal throttling there
+        falls back to the front's targeted SIGSTOP, which freezes the whole engine."""
+        if self.single_client:
+            return
         try:
             if self.process.poll() is None:
                 with self.write_lock:
@@ -461,6 +614,8 @@ class MuxEngine:
 
     def resume(self):
         """Resume decoding after :meth:`pause` (RESUME mux frame)."""
+        if self.single_client:
+            return
         try:
             if self.process.poll() is None:
                 with self.write_lock:
