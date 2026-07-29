@@ -414,12 +414,14 @@ class MuxEngine:
                 raise
 
             cancel_sent = False
+            emitted = 0
             while True:
                 kind, value = events.get()
                 if kind == "data":
                     text = decoder.decode(value)
                     if text and not cancel_sent:
                         on_text(text)
+                        emitted += 1
                     if cancelled and cancelled() and not cancel_sent:
                         cancel_sent = True
                         with self.write_lock:
@@ -431,6 +433,14 @@ class MuxEngine:
                         on_text(tail)
                     return value
                 else:  # error
+                    # Our own cancel (e.g. hit a stop boundary) → colibri acks with
+                    # ERROR <id> CANCELLED. That's a clean early stop, not a failure:
+                    # return partial stats instead of raising.
+                    if cancel_sent and "CANCELLED" in str(value):
+                        return {"completion_tokens": emitted, "prompt_tokens": 0,
+                                "total_tokens": emitted, "tokens_per_second": 0.0,
+                                "cache_hit_percent": 0.0, "rss_gb": 0.0,
+                                "length_limited": False}
                     raise value if isinstance(value, Exception) else RuntimeError(str(value))
         finally:
             self._slots.put(slot)

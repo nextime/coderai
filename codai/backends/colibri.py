@@ -33,6 +33,34 @@ from codai.backends.base import ModelBackend
 BOX_START, BOX_END = "<tool_call>", "</tool_call>"
 TR_OPEN, TR_CLOSE = "<tool_response>", "</tool_response>"
 
+# GLM-5.2 turn boundaries. colibri's serve-mux mode keeps ONLY the EOS token as a
+# hard stop (it filters the non-EOS special-token stops for tool-call safety, #401),
+# so the model can run past the end of its turn and emit these. We cut the reply at
+# the first one and strip any residual GLM control tokens from the visible content.
+_GLM_STOP_MARKERS = ("<|user|>", "<|observation|>", "<|assistant|>", "<|system|>",
+                     "<|endoftext|>")
+_GLM_STRIP_TOKENS = ("<think>", "</think>", "[gMASK]", "<sop>", "<eop>")
+
+
+def _glm_cut_index(text: str) -> int:
+    """Index of the first GLM turn boundary in ``text``, or len(text) if none."""
+    cut = len(text)
+    for m in _GLM_STOP_MARKERS:
+        i = text.find(m)
+        if i != -1 and i < cut:
+            cut = i
+    return cut
+
+
+def clean_glm_output(text: str) -> str:
+    """Trim a GLM-5.2 completion at its turn boundary and strip control tokens."""
+    if not text:
+        return text
+    text = text[:_glm_cut_index(text)]
+    for t in _GLM_STRIP_TOKENS:
+        text = text.replace(t, "")
+    return text
+
 
 def _content_text(content) -> str:
     """Flatten OpenAI message content (string or list of text parts) to a string."""
@@ -225,6 +253,24 @@ class ColibriBackend(ModelBackend):
         if cand and os.path.isdir(cand):
             return os.path.abspath(cand)
 
+        # The configured colibri model_id ALIAS (e.g. "glm-5.2-colibri") and an
+        # explicit colibri.model_path both address the container even though neither is
+        # a models.json path. Honour them so the friendly id loads, not just the repo.
+        colibri_mid = ""
+        try:
+            from codai.models.manager import get_active_colibri_config
+            _ccfg = get_active_colibri_config()
+            colibri_mid = (getattr(_ccfg, "model_id", "") or "").strip().lower()
+            _mp = (getattr(_ccfg, "model_path", "") or "").strip()
+            name_l0 = (model_name or "").strip().lower()
+            short0 = name_l0.split("/")[-1]
+            if _mp and (name_l0 == colibri_mid or short0 == colibri_mid):
+                _mp = os.path.expanduser(_mp)
+                if os.path.isdir(_mp):
+                    return os.path.abspath(_mp)
+        except Exception:
+            pass
+
         entry_path = None
         try:
             from codai.admin.routes import config_manager
@@ -240,7 +286,11 @@ class ColibriBackend(ModelBackend):
                     base = os.path.basename(path.rstrip("/"))
                     cands = {path.lower(), base.lower(), str(m.get("alias") or "").lower(),
                              str(m.get("id") or "").lower()}
-                    if name_l and name_l in cands:
+                    # Also match the colibri model_id against any colibri-backed entry,
+                    # so the alias resolves to that entry's container.
+                    is_colibri_entry = str(m.get("backend") or "").lower() == "colibri"
+                    if (name_l and name_l in cands) or (
+                            is_colibri_entry and colibri_mid and name_l == colibri_mid):
                         entry_path = path
                         if path and os.path.isdir(os.path.expanduser(path)):
                             return os.path.abspath(os.path.expanduser(path))
@@ -353,10 +403,19 @@ class ColibriBackend(ModelBackend):
             engine = self._need_engine()
             prompt = render_chat(messages, enable_thinking=self._enable_thinking, tools=tools)
             chunks: List[str] = []
+
+            def _hit_turn_boundary():
+                # colibri keeps only EOS as a hard stop in serve mode, so the model can
+                # ramble into a new turn. Stop it the moment a turn marker appears —
+                # a big saving at streaming-bound decode speeds.
+                joined = "".join(chunks)
+                return _glm_cut_index(joined) < len(joined)
+
             stats = engine.run(prompt, int(max_tokens or 1024), float(temperature),
-                               float(top_p), on_text=chunks.append)
+                               float(top_p), on_text=chunks.append,
+                               cancelled=_hit_turn_boundary)
             self._store_usage(stats)
-            return "".join(chunks)
+            return clean_glm_output("".join(chunks))
         finally:
             self._exit_request()
 
@@ -399,14 +458,21 @@ class ColibriBackend(ModelBackend):
         loop = asyncio.get_event_loop()
         out_queue: asyncio.Queue = asyncio.Queue()
         _SENTINEL = object()
+        raw: List[str] = []          # full raw text (worker thread appends)
+
+        def _hit_turn_boundary():
+            joined = "".join(raw)
+            return _glm_cut_index(joined) < len(joined)
 
         def _on_text(text: str):
             if text:
-                loop.call_soon_threadsafe(out_queue.put_nowait, text)
+                raw.append(text)
+                loop.call_soon_threadsafe(out_queue.put_nowait, True)   # wake consumer
 
         def _worker():
             try:
-                stats = engine.run(prompt, max_tokens, temperature, top_p, on_text=_on_text)
+                stats = engine.run(prompt, max_tokens, temperature, top_p,
+                                   on_text=_on_text, cancelled=_hit_turn_boundary)
                 self._store_usage(stats)
             except Exception as exc:  # surface to the consumer
                 loop.call_soon_threadsafe(out_queue.put_nowait, exc)
@@ -414,10 +480,22 @@ class ColibriBackend(ModelBackend):
                 loop.call_soon_threadsafe(out_queue.put_nowait, _SENTINEL)
 
         threading.Thread(target=_worker, daemon=True).start()
+        # Emit the CLEANED text incrementally. Hold back the last few chars so a GLM
+        # control token split across chunks (e.g. "<th"+"ink>") is never emitted raw;
+        # clean_glm_output also cuts at the turn boundary, so the stream ends there.
+        _HOLD = 16
+        yielded = 0
         while True:
             item = await out_queue.get()
             if item is _SENTINEL:
                 break
             if isinstance(item, Exception):
                 raise item
-            yield item
+            cleaned = clean_glm_output("".join(raw))
+            safe = max(yielded, len(cleaned) - _HOLD)
+            if safe > yielded:
+                yield cleaned[yielded:safe]
+                yielded = safe
+        cleaned = clean_glm_output("".join(raw))
+        if len(cleaned) > yielded:
+            yield cleaned[yielded:]
