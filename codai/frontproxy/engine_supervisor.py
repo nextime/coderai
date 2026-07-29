@@ -215,26 +215,47 @@ class EngineSupervisor:
         specs = getattr(srv, "engine_specs", None)
         engines = []
 
-        # Expose every GPU to the engines (allow_cross) when cross-backend pooling is
-        # wanted: either the global default (offload.gpu_split) OR any individual model
-        # opts into a split ("Split — <engine> first" → per-model gpu_split). Without
-        # this the lead engine wouldn't even see the foreign card, so a per-model split
-        # couldn't use it. Non-split models are kept on their own backend by the GGUF
-        # loader (it zeroes the foreign devices) so this doesn't resurrect the
-        # "everything spreads onto the Radeon" bug.
-        _cross = bool(getattr(getattr(self.config, "offload", None), "gpu_split", False))
-        if not _cross and self.models_path:
+        # Cross-backend GPU pooling ("use both cards for ONE model") is granted ONLY to
+        # the engine that LEADS a split — never blanket-applied to every engine. Default:
+        # each engine is isolated to its own backend's card(s). A per-model split names
+        # its lead engine (the model's `engine` field, stored by the "Split — <engine>
+        # first" UI); only that lead engine's card is un-isolated so it can pull in the
+        # foreign GPU. Every OTHER engine stays pinned to its own vendor's ICD — so a
+        # plain model on a non-lead engine (e.g. radeon embeddings) can never drift onto
+        # the wrong card just because some unrelated model enabled a split.
+        def _vendor_of(name):
+            n = (name or "").strip().lower()
+            if "nvidia" in n or n == "nv":
+                return "nvidia"
+            if "radeon" in n or "amd" in n:
+                return "amd"
+            if "intel" in n:
+                return "intel"
+            return n
+        # An explicit GLOBAL offload.gpu_split means "pool every model across all cards" —
+        # honour that by crossing all engines. Otherwise cross only the per-model lead(s).
+        _global_cross = bool(getattr(getattr(self.config, "offload", None), "gpu_split", False))
+        _split_lead_vendors = set()
+        if not _global_cross and self.models_path:
             try:
                 import json as _json
                 with open(self.models_path) as _mf:
                     _md = _json.load(_mf)
                 for _lst in _md.values():
-                    if isinstance(_lst, list) and any(
-                            isinstance(_e, dict) and _e.get("gpu_split") for _e in _lst):
-                        _cross = True
-                        break
+                    if not isinstance(_lst, list):
+                        continue
+                    for _e in _lst:
+                        if isinstance(_e, dict) and _e.get("gpu_split"):
+                            # Lead = the model's pinned engine (its card); default to the
+                            # primary (nvidia) when a split model leaves it unspecified.
+                            _split_lead_vendors.add(_vendor_of(_e.get("engine")) or "nvidia")
             except Exception:
                 pass
+
+        def _cross_for(vendor_kw):
+            """Cross-backend visibility for an engine of this vendor: only if it leads a
+            split (or a global pool is on)."""
+            return _global_cross or (_vendor_of(vendor_kw) in _split_lead_vendors)
         if specs:
             from codai.frontproxy.gpu_detect import vendor_env
             for idx, spec in enumerate(specs):
@@ -245,7 +266,7 @@ class EngineSupervisor:
                 gpus_kw = (spec.get("gpus") or "").strip().lower()
                 if not gpus_kw and not spec.get("env") and backend == "nvidia":
                     gpus_kw = "nvidia"
-                detected = vendor_env(gpus_kw, allow_cross=_cross) if gpus_kw else {}
+                detected = vendor_env(gpus_kw, allow_cross=_cross_for(gpus_kw)) if gpus_kw else {}
                 explicit = {str(k): str(v) for k, v in (spec.get("env") or {}).items()}
                 env = {**detected, **explicit}     # explicit overrides detected
                 # Tell the engine which physical cards it owns, so thermal
@@ -287,7 +308,7 @@ class EngineSupervisor:
         from codai.frontproxy.registry import _DEFAULT_CAPS
         next_id = len(plan)
         for idx, (name, vkw, backend) in enumerate(plan):
-            env = vendor_env(vkw, allow_cross=_cross)
+            env = vendor_env(vkw, allow_cross=_cross_for(vkw))
             sels = _gpu_selectors({"backend": backend, "gpus": vkw}, env)
             if sels:
                 env["CODERAI_ENGINE_GPUS"] = ",".join(sels)
