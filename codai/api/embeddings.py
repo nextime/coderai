@@ -22,6 +22,8 @@ Supports sentence-transformers, BGE, E5, nomic-embed, etc.
 
 import asyncio
 import base64
+import contextlib
+import os
 import time
 from typing import List
 
@@ -38,6 +40,81 @@ global_args = None
 def set_global_args(args):
     global global_args
     global_args = args
+
+
+# ---------------------------------------------------------------- admission gate
+# Embeddings bypass the front's request queue (relayed UNQUEUED) and the
+# per-model lease scheduler — the only guard is the per-IP fixed window in
+# ratelimit.py. A single authenticated client can therefore pipeline unlimited
+# embedding requests straight at the GPU. On the Polaris/RX580 Vulkan backend
+# that relentless back-to-back load wedged the SDMA ring (ring timeout -> GPU
+# reset -> device lost from bus). This gate is coderai-side backpressure so a
+# flooding client cannot pin/kill the card:
+#   * bounded CONCURRENCY  — at most N embedding executions run at once
+#   * backlog SHEDDING     — beyond N+backlog admitted, return 429 (don't queue
+#                            an unbounded pile that keeps the GPU saturated)
+#   * paced CONSUMPTION    — an optional minimum spacing between GPU starts so
+#                            the SDMA ring gets breathing room between transfers
+# Tunable via env (read once, at first use):
+#   CODERAI_EMBED_MAX_CONCURRENCY (default 2)
+#   CODERAI_EMBED_MAX_BACKLOG     (default 32; 0 = never shed, only bound conc)
+#   CODERAI_EMBED_MIN_INTERVAL_MS (default 0 = no pacing)
+_embed_gate_state = {"sem": None, "conc": 0, "inflight": 0, "last_start": 0.0}
+_embed_gate_lock = asyncio.Lock()
+
+
+def _embed_gate_cfg():
+    def _int(name, default):
+        try:
+            return int(os.environ.get(name, str(default)))
+        except (TypeError, ValueError):
+            return default
+    conc = max(1, _int("CODERAI_EMBED_MAX_CONCURRENCY", 2))
+    backlog = max(0, _int("CODERAI_EMBED_MAX_BACKLOG", 32))
+    interval = max(0.0, _int("CODERAI_EMBED_MIN_INTERVAL_MS", 0) / 1000.0)
+    return conc, backlog, interval
+
+
+@contextlib.asynccontextmanager
+async def _embed_admission():
+    """Admit one embedding request, or raise HTTP 429 when the GPU is already
+    saturated and the backlog is full. Bounds concurrency + paces consumption."""
+    conc, backlog, interval = _embed_gate_cfg()
+    loop = asyncio.get_event_loop()
+    # (Re)build the semaphore if the configured concurrency changed. Safe: a
+    # larger sem just frees more slots; a smaller one throttles as holders drain.
+    async with _embed_gate_lock:
+        if _embed_gate_state["sem"] is None or _embed_gate_state["conc"] != conc:
+            _embed_gate_state["sem"] = asyncio.Semaphore(conc)
+            _embed_gate_state["conc"] = conc
+        # Shed the flood: if everyone admitted (running + waiting) already fills
+        # concurrency + backlog, reject rather than growing the pile unbounded.
+        if backlog and _embed_gate_state["inflight"] >= conc + backlog:
+            raise HTTPException(
+                status_code=429,
+                detail="Embedding queue is full — too many concurrent embedding "
+                       "requests. Slow down and retry.",
+                headers={"Retry-After": "2"})
+        _embed_gate_state["inflight"] += 1
+        sem = _embed_gate_state["sem"]
+    try:
+        await sem.acquire()
+        # Pace GPU starts: keep at least `interval` between successive begins so
+        # the Polaris SDMA ring isn't hammered with zero-gap transfers.
+        if interval:
+            async with _embed_gate_lock:
+                gap = _embed_gate_state["last_start"] + interval - loop.time()
+            if gap > 0:
+                await asyncio.sleep(gap)
+            async with _embed_gate_lock:
+                _embed_gate_state["last_start"] = loop.time()
+        try:
+            yield
+        finally:
+            sem.release()
+    finally:
+        async with _embed_gate_lock:
+            _embed_gate_state["inflight"] -= 1
 
 
 def _derive_device() -> str:
@@ -1267,7 +1344,10 @@ async def create_embeddings(request: EmbeddingsRequest, http_request: Request = 
         "embedding", title=str(_title)[:80], model=(request.model or "embedding"))
     task_registry.start(_tid)
     try:
-        _resp = await _run_embeddings(request, http_request)
+        # Admission gate: bound concurrency + shed backlog + pace GPU starts so a
+        # flooding client can't wedge the card (see _embed_admission above).
+        async with _embed_admission():
+            _resp = await _run_embeddings(request, http_request)
         task_registry.finish(_tid, "done")
         return _resp
     except HTTPException:
