@@ -55,66 +55,104 @@ def set_global_args(args):
 #                            an unbounded pile that keeps the GPU saturated)
 #   * paced CONSUMPTION    — an optional minimum spacing between GPU starts so
 #                            the SDMA ring gets breathing room between transfers
-# Tunable via env (read once, at first use):
-#   CODERAI_EMBED_MAX_CONCURRENCY (default 2)
-#   CODERAI_EMBED_MAX_BACKLOG     (default 32; 0 = never shed, only bound conc)
-#   CODERAI_EMBED_MIN_INTERVAL_MS (default 0 = no pacing)
-_embed_gate_state = {"sem": None, "conc": 0, "inflight": 0, "last_start": 0.0}
+# Tunable PER-MODEL (models.json entry) → env var → default. Per-model lets a
+# fragile card (RX 580 Vulkan embeddings, which times out its GPU ring under
+# relentless back-to-back load) be throttled hard while a robust one (3090/CUDA)
+# runs wide open. Keys / envs / defaults:
+#   embed_max_concurrency  CODERAI_EMBED_MAX_CONCURRENCY  (default 2)
+#   embed_max_backlog      CODERAI_EMBED_MAX_BACKLOG      (default 32; 0 = no shed)
+#   embed_min_interval_ms  CODERAI_EMBED_MIN_INTERVAL_MS  (default 200 — paces GPU
+#       starts so the ring gets breathing room between ops)
+# Each distinct model id gets its OWN gate (semaphore + backlog counter + pacing).
+_EMBED_CONC_DEFAULT = 2
+_EMBED_BACKLOG_DEFAULT = 32
+_EMBED_INTERVAL_MS_DEFAULT = 200
+_embed_gates: dict = {}          # model key -> {sem, conc, inflight, last_start}
 _embed_gate_lock = asyncio.Lock()
 
 
-def _embed_gate_cfg():
-    def _int(name, default):
+def _embed_gate_cfg(model=None):
+    """Resolve (concurrency, backlog, interval_seconds) for a model: the per-model
+    config (models.json) overrides the env var, which overrides the default."""
+    mc = {}
+    if model:
         try:
-            return int(os.environ.get(name, str(default)))
+            c = multi_model_manager._config_for_model(model)
+            if isinstance(c, dict):
+                raw = c.get('_raw_cfg') if isinstance(c.get('_raw_cfg'), dict) else {}
+                mc = {**raw, **c}
+        except Exception:
+            mc = {}
+
+    def _resolve(cfg_keys, env, default):
+        for k in cfg_keys:
+            v = mc.get(k)
+            if v not in (None, ''):
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    pass
+        try:
+            return int(os.environ.get(env, str(default)))
         except (TypeError, ValueError):
             return default
-    conc = max(1, _int("CODERAI_EMBED_MAX_CONCURRENCY", 2))
-    backlog = max(0, _int("CODERAI_EMBED_MAX_BACKLOG", 32))
-    interval = max(0.0, _int("CODERAI_EMBED_MIN_INTERVAL_MS", 0) / 1000.0)
-    return conc, backlog, interval
+
+    conc = max(1, _resolve(('embed_max_concurrency', 'embed_concurrency'),
+                           'CODERAI_EMBED_MAX_CONCURRENCY', _EMBED_CONC_DEFAULT))
+    backlog = max(0, _resolve(('embed_max_backlog', 'embed_backlog'),
+                              'CODERAI_EMBED_MAX_BACKLOG', _EMBED_BACKLOG_DEFAULT))
+    interval_ms = max(0, _resolve(('embed_min_interval_ms', 'embed_interval_ms'),
+                                  'CODERAI_EMBED_MIN_INTERVAL_MS', _EMBED_INTERVAL_MS_DEFAULT))
+    return conc, backlog, interval_ms / 1000.0
 
 
 @contextlib.asynccontextmanager
-async def _embed_admission():
-    """Admit one embedding request, or raise HTTP 429 when the GPU is already
-    saturated and the backlog is full. Bounds concurrency + paces consumption."""
-    conc, backlog, interval = _embed_gate_cfg()
+async def _embed_admission(model=None):
+    """Admit one embedding request for ``model`` through THAT model's own gate, or
+    raise HTTP 429 when its concurrency+backlog is full. Bounds concurrency, sheds
+    overflow, and paces GPU starts by the model's min interval."""
+    conc, backlog, interval = _embed_gate_cfg(model)
+    key = model or ""
     loop = asyncio.get_event_loop()
-    # (Re)build the semaphore if the configured concurrency changed. Safe: a
-    # larger sem just frees more slots; a smaller one throttles as holders drain.
     async with _embed_gate_lock:
-        if _embed_gate_state["sem"] is None or _embed_gate_state["conc"] != conc:
-            _embed_gate_state["sem"] = asyncio.Semaphore(conc)
-            _embed_gate_state["conc"] = conc
-        # Shed the flood: if everyone admitted (running + waiting) already fills
-        # concurrency + backlog, reject rather than growing the pile unbounded.
-        if backlog and _embed_gate_state["inflight"] >= conc + backlog:
+        g = _embed_gates.get(key)
+        if g is None:
+            g = {"sem": asyncio.Semaphore(conc), "conc": conc,
+                 "inflight": 0, "last_start": 0.0}
+            _embed_gates[key] = g
+        elif g["conc"] != conc:
+            # Concurrency reconfigured: swap in a right-sized semaphore. In-flight
+            # holders release their captured (old) sem; new arrivals use the new one.
+            g["sem"] = asyncio.Semaphore(conc)
+            g["conc"] = conc
+        # Shed the flood: if this model's admitted set (running + waiting) already
+        # fills concurrency + backlog, reject rather than growing an unbounded pile.
+        if backlog and g["inflight"] >= conc + backlog:
             raise HTTPException(
                 status_code=429,
-                detail="Embedding queue is full — too many concurrent embedding "
-                       "requests. Slow down and retry.",
+                detail=f"Embedding queue is full for '{key or 'model'}' — too many "
+                       "concurrent embedding requests. Slow down and retry.",
                 headers={"Retry-After": "2"})
-        _embed_gate_state["inflight"] += 1
-        sem = _embed_gate_state["sem"]
+        g["inflight"] += 1
+        sem = g["sem"]
     try:
         await sem.acquire()
-        # Pace GPU starts: keep at least `interval` between successive begins so
-        # the Polaris SDMA ring isn't hammered with zero-gap transfers.
+        # Pace GPU starts: keep at least `interval` between successive begins so a
+        # fragile GPU ring isn't hammered with zero-gap ops.
         if interval:
             async with _embed_gate_lock:
-                gap = _embed_gate_state["last_start"] + interval - loop.time()
+                gap = g["last_start"] + interval - loop.time()
             if gap > 0:
                 await asyncio.sleep(gap)
             async with _embed_gate_lock:
-                _embed_gate_state["last_start"] = loop.time()
+                g["last_start"] = loop.time()
         try:
             yield
         finally:
             sem.release()
     finally:
         async with _embed_gate_lock:
-            _embed_gate_state["inflight"] -= 1
+            g["inflight"] -= 1
 
 
 def _derive_device() -> str:
@@ -1346,7 +1384,7 @@ async def create_embeddings(request: EmbeddingsRequest, http_request: Request = 
     try:
         # Admission gate: bound concurrency + shed backlog + pace GPU starts so a
         # flooding client can't wedge the card (see _embed_admission above).
-        async with _embed_admission():
+        async with _embed_admission(request.model):
             _resp = await _run_embeddings(request, http_request)
         task_registry.finish(_tid, "done")
         return _resp
