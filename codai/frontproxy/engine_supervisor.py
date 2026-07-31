@@ -136,6 +136,8 @@ class EngineSupervisor:
         self._poll_thread = None
         self._logs = {}   # engine_id -> deque tail
         self._restart_lock = threading.RLock()
+        self._restart_times = {}         # engine_id -> [exit epoch,...] (crash-loop window)
+        self._quarantined = set()        # engine_ids taken out of respawn (GPU lost, etc.)
         # Serialise terminal writes across engine pump threads + track whether the
         # last thing we printed was an in-place tqdm progress line (so the next
         # normal line finalises it with a newline).
@@ -910,6 +912,10 @@ class EngineSupervisor:
             self._push_assignment_if_changed(client)
             self._flush_pending_reloads(client)   # deliver queued reloads to idle engines
             for engine in self.registry.all():
+                # A quarantined engine (repeated crash-loop; e.g. GPU off-bus) stays
+                # down until a manual restart_engine() revives it — don't poll/respawn.
+                if engine.id in self._quarantined:
+                    continue
                 # Respawn engines whose process has exited.
                 if engine.proc is not None and engine.proc.poll() is not None:
                     self._maybe_restart(engine)
@@ -973,10 +979,32 @@ class EngineSupervisor:
         with self._restart_lock:
             if self._stopped.is_set():
                 return
+            if engine.id in self._quarantined:
+                return
             code = engine.proc.poll() if engine.proc else None
             tail = " | ".join(list(self._logs.get(engine.id, []))[-3:])
-            print(f"[front] engine#{engine.id} exited (code {code}); respawning. {tail}",
-                  flush=True)
+            # Circuit breaker: a GPU that has fallen off the bus (e.g. the Polaris
+            # secondary-bus-reset bug) makes its engine exit on every launch. Without
+            # a breaker the supervisor respawns it ~1/s forever — hammering a dead
+            # card and flooding the log. Quarantine after `crashloop_max` exits within
+            # `crashloop_window` seconds; a manual restart_engine() clears it.
+            now = time.time()
+            window = float(getattr(self.config.server, "engine_crashloop_window", 120.0) or 0.0)
+            maxn = int(getattr(self.config.server, "engine_crashloop_max", 5) or 0)
+            hist = self._restart_times.setdefault(engine.id, [])
+            if window > 0:
+                hist[:] = [t for t in hist if now - t < window]
+            hist.append(now)
+            if maxn > 0 and len(hist) >= maxn:
+                self._quarantined.add(engine.id)
+                self.registry.update_state(engine.id, healthy=False)
+                print(f"[front] engine#{engine.id} ({engine.name}) exited {len(hist)}x "
+                      f"in {window:.0f}s (code {code}) — QUARANTINED, not respawning. "
+                      f"GPU likely lost (reset/off-bus); reboot or manual restart "
+                      f"needed. {tail}", flush=True)
+                return
+            print(f"[front] engine#{engine.id} exited (code {code}); respawning "
+                  f"({len(hist)}/{maxn} in {window:.0f}s). {tail}", flush=True)
             self.registry.update_state(engine.id, healthy=False)
             time.sleep(1.0)   # avoid a tight crash loop
             self._spawn(engine)
@@ -997,6 +1025,11 @@ class EngineSupervisor:
             drain_grace = float(getattr(self.config.server,
                                         "engine_restart_drain_grace", 30.0) or 0.0)
         with self._restart_lock:
+            # A manual restart is an explicit "try again" — clear any crash-loop
+            # quarantine and history so the engine is respawned below (e.g. after the
+            # GPU has been power-cycled / recovered).
+            self._quarantined.discard(engine_id)
+            self._restart_times.pop(engine_id, None)
             # If we'd thermally frozen it, wake it so it can drain in-flight work and
             # honour SIGTERM (a stopped process ignores both until continued).
             self._thermal_resume_if_frozen(engine)

@@ -61,12 +61,12 @@ def set_global_args(args):
 # runs wide open. Keys / envs / defaults:
 #   embed_max_concurrency  CODERAI_EMBED_MAX_CONCURRENCY  (default 2)
 #   embed_max_backlog      CODERAI_EMBED_MAX_BACKLOG      (default 32; 0 = no shed)
-#   embed_min_interval_ms  CODERAI_EMBED_MIN_INTERVAL_MS  (default 200 — paces GPU
+#   embed_min_interval_ms  CODERAI_EMBED_MIN_INTERVAL_MS  (default 300 — paces GPU
 #       starts so the ring gets breathing room between ops)
 # Each distinct model id gets its OWN gate (semaphore + backlog counter + pacing).
 _EMBED_CONC_DEFAULT = 2
 _EMBED_BACKLOG_DEFAULT = 32
-_EMBED_INTERVAL_MS_DEFAULT = 200
+_EMBED_INTERVAL_MS_DEFAULT = 300
 _embed_gates: dict = {}          # model key -> {sem, conc, inflight, last_start}
 _embed_gate_lock = asyncio.Lock()
 

@@ -961,6 +961,28 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         </div>
       </div>
 
+      <!-- Embedding throttle (embedding models) — protect fragile GPUs from request floods -->
+      <div id="cfg-embed-throttle-section" style="display:none">
+        <div class="card-title" style="margin-top:1.25rem">Embedding throttle <span class="muted" style="font-weight:normal">(admission gate — bounds concurrency, sheds bursts, paces GPU starts)</span></div>
+        <div style="display:flex;gap:1rem;flex-wrap:wrap">
+          <div class="form-row" style="max-width:200px">
+            <label class="form-label">Max concurrency</label>
+            <input type="number" id="cfg-embed-max-concurrency" class="form-input" min="1" step="1" placeholder="auto (2)">
+            <span class="form-hint">simultaneous embeds on the GPU (1 = strict serialise; use for fragile cards like Polaris/RX580)</span>
+          </div>
+          <div class="form-row" style="max-width:200px">
+            <label class="form-label">Max backlog</label>
+            <input type="number" id="cfg-embed-max-backlog" class="form-input" min="0" step="1" placeholder="auto (32)">
+            <span class="form-hint">requests queued beyond concurrency before returning 429 (0 = never shed)</span>
+          </div>
+          <div class="form-row" style="max-width:200px">
+            <label class="form-label">Min interval (ms)</label>
+            <input type="number" id="cfg-embed-min-interval-ms" class="form-input" min="0" step="10" placeholder="auto (300)">
+            <span class="form-hint">minimum gap between GPU starts; paces a flooding client (0 = no pacing)</span>
+          </div>
+        </div>
+      </div>
+
       <!-- components -->
       <div class="card-title" style="margin-top:1.25rem">Components</div>
       <div class="form-row">
@@ -3350,6 +3372,9 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-n-ctx').value = nCtxForEst;
   document.getElementById('cfg-n-batch').value = s.n_batch != null ? s.n_batch : '';
   document.getElementById('cfg-n-seq-max').value = s.n_seq_max != null ? s.n_seq_max : '';
+  document.getElementById('cfg-embed-max-concurrency').value = s.embed_max_concurrency != null ? s.embed_max_concurrency : '';
+  document.getElementById('cfg-embed-max-backlog').value = s.embed_max_backlog != null ? s.embed_max_backlog : '';
+  document.getElementById('cfg-embed-min-interval-ms').value = s.embed_min_interval_ms != null ? s.embed_min_interval_ms : '';
   document.getElementById('cfg-cache-type-k').value = s.cache_type_k || '';
   document.getElementById('cfg-cache-type-v').value = s.cache_type_v || '';
   _populateMmprojSelect(m, s);
@@ -3616,8 +3641,11 @@ function _turboQuantApplies(){
     .some(cb => cb.value === 'embedding_models');
 }
 function _refreshTurboQuantVisibility(){
+  const applies = _turboQuantApplies();
   const section = document.getElementById('cfg-turboquant-section');
-  if (section) section.style.display = _turboQuantApplies() ? '' : 'none';
+  if (section) section.style.display = applies ? '' : 'none';
+  const thr = document.getElementById('cfg-embed-throttle-section');
+  if (thr) thr.style.display = applies ? '' : 'none';
 }
 function onTurboQuantToggle(){
   const on = document.getElementById('cfg-tq-enabled').checked;
@@ -3816,6 +3844,9 @@ async function saveModelConfig(){
     n_ctx:             parseInt(document.getElementById('cfg-n-ctx').value) || 2048,
     n_batch:           parseInt(document.getElementById('cfg-n-batch').value) || null,
     n_seq_max:         parseInt(document.getElementById('cfg-n-seq-max').value) || null,
+    embed_max_concurrency: document.getElementById('cfg-embed-max-concurrency').value === '' ? null : parseInt(document.getElementById('cfg-embed-max-concurrency').value),
+    embed_max_backlog:     document.getElementById('cfg-embed-max-backlog').value === '' ? null : parseInt(document.getElementById('cfg-embed-max-backlog').value),
+    embed_min_interval_ms: document.getElementById('cfg-embed-min-interval-ms').value === '' ? null : parseInt(document.getElementById('cfg-embed-min-interval-ms').value),
     cache_type_k:      document.getElementById('cfg-cache-type-k').value || null,
     cache_type_v:      document.getElementById('cfg-cache-type-v').value || null,
     mmproj:            document.getElementById('cfg-mmproj').value || null,
