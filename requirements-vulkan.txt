@@ -32,3 +32,6 @@ voicefixer>=0.1.3
 # Face swap (insightface INSwapper — downloads inswapper_128.onnx on first use)
 insightface>=0.7.3
 onnxruntime>=1.20.0            # CPU ONNX runtime (use onnxruntime-gpu for GPU acceleration)
+
+# PDF rasterisation for the OCR subsystem (/v1/ocr); self-contained, no system poppler
+pypdfium2>=4.20.0

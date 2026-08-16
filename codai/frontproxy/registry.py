@@ -41,12 +41,14 @@ def _short_stem(key: str) -> str:
 #   colibri      — GLM-5.2 via the native colibri C engine (CUDA build here)
 # An NVIDIA engine can do all of them; a Vulkan (e.g. Radeon) engine does GGUF and
 # whisper, but not transformers, ds4 or colibri.
+# k3 (kimi-k3-in-c) is a CPU engine → any node can host it; kt (ktransformers/SGLang)
+# is CPU+GPU → the GPU-capable nodes.
 _DEFAULT_CAPS = {
-    "nvidia": {"transformers", "gguf", "whisper", "ds4", "colibri"},
-    "cuda": {"transformers", "gguf", "whisper", "ds4", "colibri"},
-    "vulkan": {"gguf", "whisper"},
-    "opencl": {"gguf", "whisper"},
-    "auto": {"transformers", "gguf", "whisper", "ds4", "colibri"},
+    "nvidia": {"transformers", "gguf", "whisper", "ds4", "colibri", "k3", "kt"},
+    "cuda": {"transformers", "gguf", "whisper", "ds4", "colibri", "k3", "kt"},
+    "vulkan": {"gguf", "whisper", "k3"},
+    "opencl": {"gguf", "whisper", "k3"},
+    "auto": {"transformers", "gguf", "whisper", "ds4", "colibri", "k3", "kt"},
 }
 
 

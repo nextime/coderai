@@ -26,6 +26,7 @@ openai-whisper>=20231117       # Whisper for subtitle generation
 # Image/video/audio utilities
 Pillow>=10.0.0
 numpy>=1.24.0
+pypdfium2>=4.20.0             # PDF rasterisation for the OCR subsystem (/v1/ocr); self-contained, no system poppler
 imageio[ffmpeg]>=2.33.0       # frame I/O + ffmpeg bridge for video generation
 scipy>=1.11.0
 sentence-transformers>=2.7.0  # /v1/embeddings

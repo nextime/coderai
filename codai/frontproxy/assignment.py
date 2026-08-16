@@ -54,7 +54,7 @@ def _route_key(entry):
     return None
 
 
-def _required_cap(entry, ds4_cfg, colibri_cfg=None):
+def _required_cap(entry, ds4_cfg, colibri_cfg=None, k3_cfg=None, kt_cfg=None):
     from codai.frontproxy.router import required_capability
     path = _entry_path(entry) or ""
     backend = entry.get("backend") if isinstance(entry, dict) else None
@@ -63,11 +63,15 @@ def _required_cap(entry, ds4_cfg, colibri_cfg=None):
         ds4_model_id=getattr(ds4_cfg, "model_id", None) if ds4_cfg else None,
         ds4_enabled=bool(getattr(ds4_cfg, "enabled", False)) if ds4_cfg else False,
         colibri_model_id=getattr(colibri_cfg, "model_id", None) if colibri_cfg else None,
-        colibri_enabled=bool(getattr(colibri_cfg, "enabled", False)) if colibri_cfg else False)
+        colibri_enabled=bool(getattr(colibri_cfg, "enabled", False)) if colibri_cfg else False,
+        k3_model_id=getattr(k3_cfg, "model_id", None) if k3_cfg else None,
+        k3_enabled=bool(getattr(k3_cfg, "enabled", False)) if k3_cfg else False,
+        kt_model_id=getattr(kt_cfg, "model_id", None) if kt_cfg else None,
+        kt_enabled=bool(getattr(kt_cfg, "enabled", False)) if kt_cfg else False)
 
 
 def compute_assignment(engines, models_path, default_engine=None, ds4_cfg=None,
-                       colibri_cfg=None):
+                       colibri_cfg=None, k3_cfg=None, kt_cfg=None):
     """Return {engine_name: [model_identifiers]} — each model owned by one engine."""
     assignment = {e.name: [] for e in engines}
     if not engines or not models_path:
@@ -87,7 +91,7 @@ def compute_assignment(engines, models_path, default_engine=None, ds4_cfg=None,
             ident = _route_key(entry)
             if not ident or ident in seen:
                 continue
-            cap = _required_cap(entry, ds4_cfg, colibri_cfg)
+            cap = _required_cap(entry, ds4_cfg, colibri_cfg, k3_cfg, kt_cfg)
             candidates = [e for e in engines if e.can_serve(cap)]
             if not candidates:
                 continue   # nothing can run it — leave unassigned

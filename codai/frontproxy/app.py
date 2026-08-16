@@ -908,6 +908,7 @@ class FrontProxy:
             new = cm.config
             for f in ("server", "backend", "models", "offload", "vulkan", "image",
                       "whisper", "archive", "thermal", "jobs", "enhance", "ds4", "colibri",
+                      "k3", "ktransformers",
                       "compaction", "broker", "system_prompt", "tools_closer_prompt",
                       "grammar_guided", "parser", "tmp_dir"):
                 if hasattr(new, f):
@@ -919,6 +920,8 @@ class FrontProxy:
     def _required_cap(self, path: str, model: Optional[str]) -> Optional[str]:
         ds4 = getattr(self.config, "ds4", None)
         colibri = getattr(self.config, "colibri", None)
+        k3 = getattr(self.config, "k3", None)
+        kt = getattr(self.config, "ktransformers", None)
         info = self._model_info(model)
         cap = _router.required_capability(
             model, path=path,
@@ -926,7 +929,11 @@ class FrontProxy:
             ds4_model_id=getattr(ds4, "model_id", None) if ds4 else None,
             ds4_enabled=bool(getattr(ds4, "enabled", False)) if ds4 else False,
             colibri_model_id=getattr(colibri, "model_id", None) if colibri else None,
-            colibri_enabled=bool(getattr(colibri, "enabled", False)) if colibri else False)
+            colibri_enabled=bool(getattr(colibri, "enabled", False)) if colibri else False,
+            k3_model_id=getattr(k3, "model_id", None) if k3 else None,
+            k3_enabled=bool(getattr(k3, "enabled", False)) if k3 else False,
+            kt_model_id=getattr(kt, "model_id", None) if kt else None,
+            kt_enabled=bool(getattr(kt, "enabled", False)) if kt else False)
         # The name heuristic can't see that a bare alias (e.g. '…-q4_k_m', no
         # literal 'gguf') backs a .gguf file, so it falls through to
         # 'transformers' (CUDA-only) and the request never reaches a Vulkan/AMD

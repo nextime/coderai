@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------------------
+# CoderAI — OCR subsystem (dedicated OCR engines, NOT a vision LLM).
+#
+# These are HEAVY / environment-specific dependencies for the /v1/ocr backends.
+# They are kept OUT of the base requirements so the default install and OCI image
+# stay lean. Install with:
+#
+#     pip install -r requirements-ocr.txt
+#
+# or, via the build script (opt-in):
+#
+#     ./build.sh nvidia --ocr
+#
+# The subsystem degrades gracefully: an engine whose dependency is missing returns
+# HTTP 503 from /v1/ocr instead of crashing the server.
+# ---------------------------------------------------------------------------
+
+# --- PDF rasterisation (also pinned in the base requirements; harmless to repeat) ---
+pypdfium2>=4.20.0
+# Optional fallback rasteriser (needs system 'poppler-utils'); pypdfium2 is preferred.
+# pdf2image>=1.17.0
+
+# --- PaddleOCR (optional): Apache-2.0, layout + tables via PP-Structure ---
+# NOTE: paddlepaddle-gpu is CUDA-version-specific and has NO wheel for very new CUDA
+#   (e.g. CUDA 13) — pick the wheel matching your CUDA from
+#   https://www.paddlepaddle.org.cn/en/install/quick , or use CPU 'paddlepaddle'.
+#   Also pulls opencv-contrib-python, which can clash with opencv-python (cv2) — install
+#   deliberately. On CUDA-13 boxes prefer docTR (below), which uses the existing torch.
+# paddlepaddle-gpu>=2.6.0    # uncomment + pin to YOUR CUDA
+# paddleocr>=2.7.0
+
+# --- docTR (Mindee): Apache-2.0, pure-PyTorch (uses the torch already installed) ---
+# The 'torch' extra was dropped in docTR 1.x — plain python-doctr uses the resident torch.
+python-doctr>=0.8.0
+
+# --- Surya: BEST layout/reading-order. GPL (compatible with coderai's GPLv3). ---
+# NOT installed in the main venv — Surya caps pillow<11, which conflicts with the rest of
+# coderai (pillow>=12). It runs in an ISOLATED venv + subprocess worker (same pattern as
+# DINOv2-SALAD); see requirements-surya.txt and the surya worker. Enabled at runtime only
+# when ocr.surya_accept_license = true.
+
+# --- stamp / signature detection (O3): small YOLO detector ---
+ultralytics>=8.1.0
+
+# --- structured extraction (O4): optional JSON Schema validation of model output ---
+jsonschema>=4.0.0

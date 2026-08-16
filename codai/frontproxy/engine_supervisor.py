@@ -156,8 +156,10 @@ class EngineSupervisor:
             default_engine = getattr(self.config.server, "default_engine", None)
             ds4 = getattr(self.config, "ds4", None)
             colibri = getattr(self.config, "colibri", None)
+            k3 = getattr(self.config, "k3", None)
+            kt = getattr(self.config, "ktransformers", None)
             assignment = compute_assignment(engines, self.models_path,
-                                            default_engine, ds4, colibri)
+                                            default_engine, ds4, colibri, k3, kt)
             for e in engines:
                 owned = assignment.get(e.name, [])
                 e.assigned_models = set(owned)   # the front's router enforces this
@@ -604,8 +606,10 @@ class EngineSupervisor:
                 default_engine = getattr(self.config.server, "default_engine", None)
                 ds4 = getattr(self.config, "ds4", None)
                 colibri = getattr(self.config, "colibri", None)
+                k3 = getattr(self.config, "k3", None)
+                kt = getattr(self.config, "ktransformers", None)
                 assignment = compute_assignment(real, self.models_path,
-                                                default_engine, ds4, colibri)
+                                                default_engine, ds4, colibri, k3, kt)
             except Exception as exc:
                 print(f"[front] live reassignment skipped: {exc}", flush=True)
                 assignment = {}

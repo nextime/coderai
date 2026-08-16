@@ -35,18 +35,25 @@ if "g_paused" not in src:
 
 # 2) handle PAUSE / RESUME command lines in mux_submit (line is already NUL-terminated,
 #    trailing newline stripped) — right after the CANCEL handler's NOT_FOUND return.
+#    v1.5.0 added a STOP handler whose NOT_FOUND block is byte-identical to CANCEL's, so
+#    the bare NOT_FOUND+`}` anchor is no longer unique; pin it to the CANCEL→submit
+#    boundary by including the following `ColiSubmit sub;` line (only present after the
+#    CANCEL handler), which also keeps the insertion in the intended place.
 _anchor = ('        printf("ERROR %llu NOT_FOUND\\n",id); fflush(stdout); free(line); return 0;\n'
-           '    }\n')
+           '    }\n'
+           '    ColiSubmit sub; int valid=coli_submit_parse(line,&sub);\n')
 if 'strcmp(line,"PAUSE")' not in src:
     if _anchor not in src:
-        print("[patch-colibri] ERROR: CANCEL/NOT_FOUND anchor not found — upstream changed; "
-              "patch NOT applied", file=sys.stderr)
+        print("[patch-colibri] ERROR: CANCEL/NOT_FOUND→ColiSubmit anchor not found — "
+              "upstream changed; patch NOT applied", file=sys.stderr)
         sys.exit(2)
     src = src.replace(
         _anchor,
-        _anchor +
+        '        printf("ERROR %llu NOT_FOUND\\n",id); fflush(stdout); free(line); return 0;\n'
+        '    }\n'
         '    if(!strcmp(line,"PAUSE")){  g_paused=1; printf("PAUSED\\n");  fflush(stdout); free(line); return 0; }\n'
-        '    if(!strcmp(line,"RESUME")){ g_paused=0; printf("RESUMED\\n"); fflush(stdout); free(line); return 0; }\n',
+        '    if(!strcmp(line,"RESUME")){ g_paused=0; printf("RESUMED\\n"); fflush(stdout); free(line); return 0; }\n'
+        '    ColiSubmit sub; int valid=coli_submit_parse(line,&sub);\n',
         1)
     applied.append("PAUSE/RESUME handler")
 

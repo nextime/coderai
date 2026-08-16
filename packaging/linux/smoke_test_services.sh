@@ -61,6 +61,16 @@ if "${DK[@]}" exec "$NAME" sh -lc "test -x /cache/ds4/ds4-server"; then ok "/cac
 echo "== colibri seeded on the cache volume =="
 if "${DK[@]}" exec "$NAME" sh -lc "test -x /cache/colibri/c/colibri"; then ok "/cache/colibri/c/colibri"; else bad "/cache/colibri/c/colibri" "missing (optional — bundle with build.sh --colibri)"; fi
 
+echo "== kimi-k3-in-c seeded on the cache volume =="
+if "${DK[@]}" exec "$NAME" sh -lc "test -x /cache/kimi-k3-in-c/bin/k3"; then ok "/cache/kimi-k3-in-c/bin/k3"; else bad "/cache/kimi-k3-in-c/bin/k3" "missing (optional — bundle with build.sh --k3)"; fi
+
+echo "== OCR subsystem present (core imports; engine deps optional) =="
+if "${DK[@]}" exec "$NAME" sh -lc "cd /opt/coderai/app && python -c 'import codai.ocr; from codai.ocr.schemas import schema_store; assert any(s[\"name\"]==\"italian_sentenza\" for s in schema_store.list())'"; then
+  ok "codai.ocr imports + built-in schemas present"
+else
+  bad "codai.ocr" "import or built-in schema check failed"
+fi
+
 echo "== shared lip-sync venv (py3.10 + torch) =="
 if "${DK[@]}" exec "$NAME" /opt/coderai/lipsync_venv/bin/python -c "import torch,sys; print(sys.version.split()[0], torch.__version__)" >/dev/null 2>&1; then
   ok "lipsync venv imports torch"

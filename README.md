@@ -699,13 +699,23 @@ thanks to the developers of the native inference engines that let it punch far a
 its hardware — running models that otherwise simply couldn't run on a single GPU:
 
 - **[colibri](https://github.com/JustVugg/colibri)** by **JustVugg** — a brilliant
-  pure-C MoE engine that streams **GLM-5.2 (744B params)** across VRAM/RAM/disk to run
-  it on a single consumer GPU.
+  pure-C multi-family MoE engine that streams **GLM-5.2, DeepSeek-V4 and Kimi-K3**
+  across VRAM/RAM/disk to run them on a single consumer GPU (or CPU).
 - **[ds4 / DwarfStar](https://github.com/antirez/ds4)** by **Salvatore Sanfilippo
   (antirez)** — a superb from-scratch **DeepSeek-V4** inference engine.
+- **[kimi-k3-in-c](https://github.com/FareedKhan-dev/kimi-k3-in-c)** by
+  **Fareed Khan** — a portable-C engine that runs **Kimi-K3 (2.78T params)** on CPU by
+  streaming the dense trunk + routed experts from disk in as little as ~8 GB RAM.
+- **[ktransformers](https://github.com/kvcache-ai/ktransformers)** by **KVCache.AI** —
+  a CPU+GPU heterogeneous engine (served via SGLang) for large MoE models
+  (DeepSeek / Kimi / Qwen / GLM / MiniMax).
 - **[llama.cpp](https://github.com/ggml-org/llama.cpp)** &
   **[whisper.cpp](https://github.com/ggml-org/whisper.cpp)** by **Georgi Gerganov**
   and contributors — the foundational GGUF LLM inference and Whisper STT engines.
+- **[PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)** (Baidu),
+  **[docTR](https://github.com/mindee/doctr)** (Mindee) and
+  **[Surya](https://github.com/VikParuchuri/surya)** — the dedicated OCR engines behind
+  the `/v1/ocr` document-transcription subsystem (text + layout + structured extraction).
 
 And the libraries, models and research CoderAI builds on:
 
@@ -717,6 +727,7 @@ And the libraries, models and research CoderAI builds on:
 - [F5-TTS](https://github.com/SWivid/F5-TTS) — voice cloning
 - [Seed-VC](https://github.com/Plachta/Seed-VC) — singing voice conversion
 - [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) — image/video upscaling
+- [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) — PDF rasterisation for OCR; [Ultralytics YOLO](https://github.com/ultralytics/ultralytics) — stamp/signature detection
 - [Wav2Lip](https://github.com/Rudrabha/Wav2Lip) — audio-driven lip sync
 - [SadTalker](https://github.com/OpenTalker/SadTalker) — talking head / lip sync generation
 - Visual place recognition & geolocation research — [EigenPlaces](https://github.com/gmberton/EigenPlaces) (Gabriele Berton et al.), [DINOv2-SALAD](https://github.com/serizba/salad) (Sergio Izquierdo, Javier Civera), [GeoCLIP](https://github.com/VicenteVivan/geo-clip) (Vicente Vivanco et al.), [DINOv2](https://github.com/facebookresearch/dinov2) (Meta AI)

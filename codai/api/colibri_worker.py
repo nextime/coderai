@@ -69,15 +69,54 @@ def _install_dir(cfg) -> Path:
         else default_install_dir()
 
 
-def _engine_bin(install_dir: Path) -> Path:
-    """The C engine binary. colibri builds it as ``colibri`` inside the ``c/`` dir
-    (``glm`` is the pre-#391 name, kept as a fallback for old trees)."""
+# colibri v1.5.0 ships one C engine per model family. Each is a distinct binary in the
+# ``c/`` dir, built by its own make target, and speaks the shared serve framing (see
+# project memory ``project_colibri_v15_families``). ``glm`` is the default family.
+_FAMILIES = ("glm", "deepseek_v4", "kimi_k3")
+_FAMILY_BIN = {"glm": "colibri", "deepseek_v4": "deepseek_v4", "kimi_k3": "kimi_k3"}
+# The make target name (Makefile) differs from the binary name for DeepSeek (hyphen).
+_FAMILY_TARGET_NAME = {"glm": "colibri", "deepseek_v4": "deepseek-v4", "kimi_k3": "kimi_k3"}
+
+
+def _detect_family(container_dir: Optional[str]) -> str:
+    """Infer the colibri model family from a container's ``config.json`` (falling back
+    to the directory name). Returns one of :data:`_FAMILIES` (default ``"glm"``)."""
+    import json as _json
+    blob = ""
+    try:
+        if container_dir:
+            with open(os.path.join(container_dir, "config.json"),
+                      encoding="utf-8", errors="ignore") as f:
+                cfg = _json.load(f)
+            mt = str(cfg.get("model_type") or "")
+            archs = " ".join(str(a) for a in (cfg.get("architectures") or []))
+            blob = (mt + " " + archs).lower()
+    except Exception:
+        blob = ""
+    hint = (os.path.basename(os.path.expanduser(container_dir or "").rstrip("/"))).lower()
+    text = blob + " " + hint
+    if "kimi" in text or "k3" in text:
+        return "kimi_k3"
+    if "deepseek" in text:
+        return "deepseek_v4"
+    if "glm" in text:
+        return "glm"
+    return "glm"
+
+
+def _engine_bin(install_dir: Path, family: str = "glm") -> Path:
+    """The C engine binary for ``family`` inside the ``c/`` dir. colibri builds GLM as
+    ``colibri`` (``glm`` is the pre-#391 name, kept as a fallback); DeepSeek-V4 as
+    ``deepseek_v4`` and Kimi-K3 as ``kimi_k3``."""
     cdir = install_dir / "c"
-    for name in ("colibri", "colibri.exe", "glm", "glm.exe"):
+    base = _FAMILY_BIN.get(family, "colibri")
+    names = ((base, base + ".exe", "glm", "glm.exe") if family == "glm"
+             else (base, base + ".exe"))
+    for name in names:
         cand = cdir / name
         if cand.exists():
             return cand
-    return cdir / "colibri"
+    return cdir / base
 
 
 def _find_nvcc() -> Optional[str]:
@@ -108,26 +147,43 @@ def _detect_build_target() -> str:
     return "cpu"
 
 
-def _make_args(cfg) -> list:
-    """``make`` arguments for the resolved build target."""
+def _make_args(cfg, family: str = "glm") -> list:
+    """``make`` arguments for ``family``'s engine on the resolved build target."""
+    tgt = _FAMILY_TARGET_NAME.get(family, "colibri")
     target = (getattr(cfg, "build_target", "auto") or "auto").strip().lower()
     if target in ("", "auto"):
         target = _detect_build_target()
+    # Kimi-K3 has no CUDA path: it is CPU + an opt-in Vulkan compute tier (make VK=1,
+    # needs glslc/shaderc). Build CPU by default; enable VK via COLI_K3_VK or a
+    # ``vulkan`` build_target.
+    if family == "kimi_k3":
+        args = [tgt]
+        want_vk = (str(os.environ.get("COLI_K3_VK", "")).strip().lower() in ("1", "true", "on")
+                   or target == "vulkan"
+                   or (getattr(cfg, "build_target", "") or "").strip().lower() == "vulkan")
+        if want_vk:
+            args.append("VK=1")
+        return args
+    # DeepSeek-V4 (colibri's engine) is CPU/AVX2 — Makefile.deepseek-v4 has no CUDA path
+    # (distinct from the separate ds4 CUDA engine). Stream experts from disk; tune via
+    # RAM_GB. Just build the target on the host's default ARCH.
+    if family == "deepseek_v4":
+        return [tgt]
     if target == "cuda":
         # Default to a PORTABLE arch (SASS for Ampere..Blackwell + a PTX fallback) so
         # a pre-compiled/bundled binary runs on any modern card; override with
         # COLI_CUDA_ARCH (e.g. sm_86 for a single 3090 build). Point the Makefile at
         # a real nvcc/CUDA_HOME so a non-PATH toolkit still builds.
-        args = ["colibri", "CUDA=1", f"CUDA_ARCH={os.environ.get('COLI_CUDA_ARCH', 'portable')}"]
+        args = [tgt, "CUDA=1", f"CUDA_ARCH={os.environ.get('COLI_CUDA_ARCH', 'portable')}"]
         nvcc = _find_nvcc()
         if nvcc:
             args += [f"NVCC={nvcc}", f"CUDA_HOME={os.path.dirname(os.path.dirname(nvcc))}"]
         return args
     if target == "hip":
-        return ["colibri", "HIP=1", f"HIP_ARCH={os.environ.get('COLI_HIP_ARCH', 'native')}"]
+        return [tgt, "HIP=1", f"HIP_ARCH={os.environ.get('COLI_HIP_ARCH', 'native')}"]
     if target == "metal":
-        return ["colibri", "METAL=1"]
-    return ["colibri"]
+        return [tgt, "METAL=1"]
+    return [tgt]
 
 
 def _run_logged(cmd, cwd, label, tail, **kw):
@@ -146,36 +202,38 @@ def _run_logged(cmd, cwd, label, tail, **kw):
         raise RuntimeError(f"{label} failed (exit {proc.returncode}). {joined}")
 
 
-def ensure_built(cfg) -> Path:
-    """Clone + build colibri if the engine binary is missing. Returns its path."""
+def ensure_built(cfg, family: str = "glm") -> Path:
+    """Clone + build the ``family`` colibri engine if its binary is missing. Returns
+    its path. Each family (glm/deepseek_v4/kimi_k3) is a separate binary + make target."""
     global _built
     install_dir = _install_dir(cfg)
-    binary = _engine_bin(install_dir)
+    binary = _engine_bin(install_dir, family)
     if binary.exists():
         _built = True
         return binary
+    tgt = _FAMILY_TARGET_NAME.get(family, "colibri")
     if not getattr(cfg, "auto_build", True):
         raise RuntimeError(
-            f"colibri engine not found at {binary} and auto_build is disabled. Build it "
-            f"manually (git clone {cfg.repo_url}; cd c; make colibri [CUDA=1]) or enable "
-            "auto_build.")
+            f"colibri {family} engine not found at {binary} and auto_build is disabled. "
+            f"Build it manually (git clone {cfg.repo_url}; cd c; make {tgt} [CUDA=1|VK=1]) "
+            "or enable auto_build.")
 
-    # A CUDA build needs the toolkit (nvcc), which a CUDA *runtime* container does
-    # NOT ship. Rather than clone + fail deep in `make` (the confusing
-    # "nvcc not found … backend_cuda.o Error" the user hit), fail early with the fix:
-    # pre-compile the binary. The engine is meant to be pre-built (bundled in the
-    # image or built once on a box with the toolkit), never compiled per-request.
+    # The CUDA families (glm/deepseek_v4) need the toolkit (nvcc), which a CUDA *runtime*
+    # container does NOT ship. Rather than clone + fail deep in `make` (the confusing
+    # "nvcc not found … Error"), fail early with the fix: pre-compile the binary. The
+    # engine is meant to be pre-built (bundled in the image or built once on a box with
+    # the toolkit), never compiled per-request. Kimi-K3 is CPU/Vulkan, so it is exempt.
     _target = (getattr(cfg, "build_target", "auto") or "auto").strip().lower()
     if _target in ("", "auto"):
         _target = _detect_build_target()
-    if _target == "cuda" and _find_nvcc() is None:
+    if family != "kimi_k3" and _target == "cuda" and _find_nvcc() is None:
         raise RuntimeError(
-            f"colibri needs a CUDA build but no CUDA toolkit (nvcc) is available here "
-            f"— this looks like a CUDA *runtime* environment. Pre-compile the engine "
-            f"and place it at {binary}: build once on a box/image with the matching "
-            f"CUDA toolkit (e.g. `build.sh --colibri`, or a cuda:*-devel container) "
-            f"targeting the same CUDA runtime as this container. Runtime auto-build "
-            f"cannot compile CUDA without nvcc.")
+            f"colibri {family} needs a CUDA build but no CUDA toolkit (nvcc) is available "
+            f"here — this looks like a CUDA *runtime* environment. Pre-compile the engine "
+            f"and place it at {binary}: build once on a box/image with the matching CUDA "
+            f"toolkit (e.g. `build.sh --colibri`, or a cuda:*-devel container) targeting "
+            f"the same CUDA runtime as this container. Runtime auto-build cannot compile "
+            f"CUDA without nvcc.")
 
     tail = collections.deque(maxlen=40)
     install_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -185,15 +243,15 @@ def ensure_built(cfg) -> Path:
                     cwd=install_dir.parent, label="git clone", tail=tail)
 
     cdir = install_dir / "c"
-    make_args = _make_args(cfg)
-    print(f"[colibri] building engine (make {' '.join(make_args)}) — this can take a while …",
-          flush=True)
+    make_args = _make_args(cfg, family)
+    print(f"[colibri] building {family} engine (make {' '.join(make_args)}) — this can "
+          "take a while …", flush=True)
     _run_logged(["make", "-s"] + make_args, cwd=cdir, label="make", tail=tail)
 
-    binary = _engine_bin(install_dir)
+    binary = _engine_bin(install_dir, family)
     if not binary.exists():
         raise RuntimeError(
-            f"colibri build completed but {binary} is missing. Last output: "
+            f"colibri {family} build completed but {binary} is missing. Last output: "
             + " | ".join(list(tail)[-5:]))
     _built = True
     print(f"[colibri] built {binary}", flush=True)
@@ -219,6 +277,15 @@ def _read_engine_turn(stream, sentinel: bytes) -> dict:
     return _parse_stat(fields)
 
 
+def _to_payload(prompt) -> bytes:
+    """Serve payload bytes for a prompt. GLM/DeepSeek send a rendered UTF-8 string;
+    Kimi-K3 sends a pre-framed ``K3CHAT1`` blob (already ``bytes``) that must go on the
+    wire verbatim — so accept ``bytes``/``bytearray`` as-is and only encode ``str``."""
+    if isinstance(prompt, (bytes, bytearray)):
+        return bytes(prompt)
+    return prompt.encode("utf-8")
+
+
 def _parse_stat(fields) -> dict:
     return {
         "completion_tokens": int(fields[1]),
@@ -241,7 +308,9 @@ class MuxEngine:
     """
 
     def __init__(self, binary: Path, model_dir: str, *, cap: int = 8,
-                 max_tokens: int = 1024, kv_slots: int = 1, env: Optional[dict] = None):
+                 max_tokens: int = 1024, kv_slots: int = 1, env: Optional[dict] = None,
+                 force_mux: bool = False, family: str = "glm",
+                 argv: Optional[list] = None, inject_colibri_env: bool = True):
         kv_slots = max(1, min(16, int(kv_slots or 1)))
         # colibri's context window is the CTX env (default 4096) — DISTINCT from NGEN
         # (max new tokens). Without CTX the engine rejects any prompt over ~4095 tokens
@@ -257,15 +326,31 @@ class MuxEngine:
         # a real decode win (accepted drafts = fewer forward passes = fewer expert
         # streams). Multi-slot (kv_slots>1) keeps the batched mux path (concurrent
         # conversations, no MTP). See docs/serve_protocol.md + colibri.c run_serve.
-        self.single_client = (int(kv_slots) == 1)
-        child_env = dict(env or os.environ, SNAP=str(model_dir), SERVE="1",
-                         NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
-        child_env["SERVE_BATCH"] = "0" if self.single_client else "1"
-        child_env.setdefault("CTX", str(ctx))
+        #
+        # ``force_mux`` overrides this for the non-GLM families: colibri's ``deepseek_v4``
+        # and ``kimi_k3`` engines implement ONLY the mux ``SUBMIT`` serve loop — they have
+        # no ``\x02PROMPT`` (run_serve) path — so they must speak the mux protocol even at
+        # a single KV slot. (They are single-slot: slot 0 only / slot ignored.) See
+        # project memory ``project_colibri_v15_families``.
+        self.family = family or "glm"
+        self.single_client = (int(kv_slots) == 1) and not force_mux
+        # colibri's engines take the container via SNAP + serve knobs via env. Other
+        # engines driven over the SAME mux protocol (e.g. the patched kimi-k3-in-c) take
+        # the model dir + flags as ARGV and their own env — pass argv + a full env and
+        # set inject_colibri_env=False so we don't force colibri's SNAP/NGEN/KV_SLOTS.
+        if inject_colibri_env:
+            child_env = dict(env or os.environ, SNAP=str(model_dir), SERVE="1",
+                             NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
+            child_env["SERVE_BATCH"] = "0" if self.single_client else "1"
+            child_env.setdefault("CTX", str(ctx))
+        else:
+            child_env = dict(env or os.environ)
+            child_env.setdefault("SERVE", "1")
         self.model_dir = str(model_dir)
         self.kv_slots = kv_slots
+        cmd = [str(a) for a in argv] if argv else [str(binary), str(cap)]
         self.process = subprocess.Popen(
-            [str(binary), str(cap)], env=child_env, stdin=subprocess.PIPE,
+            cmd, env=child_env, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
         )
         self.write_lock = threading.Lock()
@@ -455,7 +540,7 @@ class MuxEngine:
         normal END+STAT."""
         if self.process.poll() is not None:
             raise RuntimeError("colibri engine is not running. " + self.log_tail())
-        payload = prompt.encode("utf-8")
+        payload = _to_payload(prompt)
         if b"\0" in payload:
             raise ValueError("NUL bytes are not supported in prompts.")
         # colibri validates: temp∈[0,2], top_p∈(0,1], ngen≥1, slot 0.
@@ -532,7 +617,7 @@ class MuxEngine:
                                + (self.log_tail() or str(self.dispatcher_error)))
         if self.process.poll() is not None:
             raise RuntimeError("colibri engine is not running. " + self.log_tail())
-        payload = prompt.encode("utf-8")
+        payload = _to_payload(prompt)
         if b"\0" in payload:
             raise ValueError("NUL bytes are not supported in prompts.")
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -674,14 +759,18 @@ def resolve_service_key(cfg, model_dir: Optional[str] = None):
     return resolved, svc_key
 
 
-def _build_env(cfg) -> tuple:
+def _build_env(cfg, family: str = "glm") -> tuple:
     """Engine environment: enable the GPU backend + CUDA_EXPERT_GB + free-form extra_env.
 
     colibri's GPU tiering is OFF unless explicitly enabled — ``COLI_CUDA=1`` (CUDA/HIP)
     or ``COLI_METAL=1`` (Apple). It is NOT implied by shipping a CUDA build, and
     ``CUDA_EXPERT_GB`` without ``COLI_CUDA=1`` aborts startup ("CUDA_EXPERT_GB requires
     COLI_CUDA=1"). Since coderai routes colibri to the CUDA engine and ships a CUDA
-    binary, default the backend on (overridable via extra_env, e.g. COLI_CUDA=0)."""
+    binary, default the backend on (overridable via extra_env, e.g. COLI_CUDA=0).
+
+    Only the GLM/DeepSeek families use the ``COLI_CUDA``/``CUDA_EXPERT_GB`` knobs; Kimi-K3
+    has its own ``K3_*`` env (K3_VK for the Vulkan tier, K3_EXPERT_GB, K3_BITS, …), so we
+    do NOT force the COLI_CUDA vars for it — Kimi tuning goes through ``extra_env``."""
     env = os.environ.copy()
     applied = {}
 
@@ -689,7 +778,12 @@ def _build_env(cfg) -> tuple:
     if target in ("", "auto"):
         target = "cuda"    # coderai ships a CUDA build and routes colibri to the CUDA engine
     cuda_on = False
-    if target in ("cuda", "hip"):
+    if family in ("kimi_k3", "deepseek_v4"):
+        # colibri's Kimi-K3 and DeepSeek-V4 engines are CPU (Kimi + opt-in Vulkan); the
+        # COLI_CUDA/CUDA_EXPERT_GB knobs don't apply. Leave them unset for a clean env —
+        # Kimi tuning goes via K3_* and DeepSeek via RAM_GB, both through extra_env.
+        pass
+    elif target in ("cuda", "hip"):
         if "COLI_CUDA" not in env:
             env["COLI_CUDA"] = "1"
             applied["COLI_CUDA"] = "1"
@@ -729,6 +823,9 @@ def ensure_engine(cfg, model_dir: Optional[str] = None, ctx: Optional[int] = Non
     per-turn generation budget (NGEN). Returns a live :class:`MuxEngine`.
     """
     resolved, svc_key = resolve_service_key(cfg, model_dir)
+    # Family is inferred from the resolved container (config.json / dir name) and
+    # decides the binary, the make target, and the serve protocol.
+    family = _detect_family(resolved)
     with _lock:
         eng = _services.get(svc_key)
         if eng and eng.is_alive():
@@ -737,12 +834,12 @@ def ensure_engine(cfg, model_dir: Optional[str] = None, ctx: Optional[int] = Non
             eng.close()
             _services.pop(svc_key, None)
 
-        binary = ensure_built(cfg)
+        binary = ensure_built(cfg, family)
         if not resolved:
             raise RuntimeError(
-                "colibri: no GLM-5.2 container resolved for this request. Point the "
-                "model at the int4 container directory (or set colibri.model_path). "
-                "There is no auto-download of the ~372 GB container.")
+                "colibri: no model container resolved for this request. Point the model "
+                "at the container directory (GLM-5.2 int4 / DeepSeek-V4 / Kimi-K3), or set "
+                "colibri.model_path. There is no auto-download of the multi-GB container.")
 
         try:
             ngen = int(ctx) if ctx else 0
@@ -751,15 +848,20 @@ def ensure_engine(cfg, model_dir: Optional[str] = None, ctx: Optional[int] = Non
         if ngen <= 0:
             ngen = int(getattr(cfg, "ctx", 100000) or 100000)
 
-        env, applied = _build_env(cfg)
+        env, applied = _build_env(cfg, family)
         env_note = ("  (" + " ".join(f"{k}={v}" for k, v in applied.items()) + ")"
                     if applied else "")
-        kv_slots = int(getattr(cfg, "kv_slots", 1) or 1)
+        # GLM keeps its configurable KV-slot pool (and MTP at 1 slot); DeepSeek-V4 and
+        # Kimi-K3 are single-slot mux engines (no run_serve/PROMPT path), so pin them to
+        # 1 slot and force the mux SUBMIT protocol.
+        force_mux = family != "glm"
+        kv_slots = 1 if force_mux else int(getattr(cfg, "kv_slots", 1) or 1)
         cap = int(getattr(cfg, "cap", 8) or 8)
-        print(f"[colibri] launching engine {binary} on {resolved} "
-              f"(cap={cap}, kv_slots={kv_slots}, ngen={ngen}){env_note}", flush=True)
+        print(f"[colibri] launching {family} engine {binary} on {resolved} "
+              f"(cap={cap}, kv_slots={kv_slots}, ngen={ngen}, mux={force_mux}){env_note}",
+              flush=True)
         eng = MuxEngine(binary, resolved, cap=cap, max_tokens=ngen,
-                        kv_slots=kv_slots, env=env)
+                        kv_slots=kv_slots, env=env, force_mux=force_mux, family=family)
         _services[svc_key] = eng
 
     # READY already completed inside MuxEngine.__init__; a quick liveness gate here

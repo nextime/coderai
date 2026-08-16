@@ -76,32 +76,59 @@ def required_capability(model: Optional[str], path: Optional[str] = None,
                         ds4_model_id: Optional[str] = None,
                         ds4_enabled: bool = False,
                         colibri_model_id: Optional[str] = None,
-                        colibri_enabled: bool = False) -> Optional[str]:
+                        colibri_enabled: bool = False,
+                        k3_model_id: Optional[str] = None,
+                        k3_enabled: bool = False,
+                        kt_model_id: Optional[str] = None,
+                        kt_enabled: bool = False) -> Optional[str]:
     """The capability an engine must have to serve this request.
 
     * ``whisper``      — whisper.cpp STT (transcription endpoint or a
                          ``whisper-server`` model). Runs on CUDA or Vulkan.
     * ``ds4``          — DeepSeek V4 via the native ds4 engine. CUDA-only.
-    * ``colibri``      — GLM-5.2 via the native colibri C engine. CUDA-only here.
+    * ``colibri``      — GLM-5.2 / DeepSeek-V4 / Kimi-K3 via the native colibri C engine.
+    * ``k3``           — Kimi-K3 via kimi-k3-in-c. CPU.
+    * ``kt``           — many families via ktransformers/SGLang. CPU+GPU.
     * ``gguf``         — llama.cpp model. Runs on CUDA or Vulkan.
     * ``transformers`` — safetensors/HF model. CUDA-only.
 
-    Signals are combined: the request path and the model's configured ``backend``
-    (from models.json) take precedence over the name heuristic, so whisper works
-    even when the model id isn't in the request body (multipart upload)."""
+    This mirrors the in-process resolver (:func:`codai.models.manager.resolve_engine_backend`):
+    an explicit ``backend`` pin is authoritative, then an enabled engine's ``model_id``
+    alias, then an unambiguous name marker (a Kimi name claimed by BOTH colibri and k3
+    falls through — the model must pin a backend)."""
     p = (path or "").split("?", 1)[0].rstrip("/")
     if p == "/v1/audio/transcriptions" or (backend or "") == "whisper-server":
         return "whisper"
+    # 1. Explicit engine-backend pin wins (authoritative), like the manager resolver.
+    b = (backend or "").lower()
+    if b in ("colibri", "ds4", "k3", "kt"):
+        return b
     m = (model or "").lower()
-    if (backend or "") == "colibri" or (colibri_enabled and m and (
-            ((colibri_model_id or "").lower()
-             and (m == (colibri_model_id or "").lower()
-                  or m.split("/")[-1] == (colibri_model_id or "").lower()))
-            or "glm-5.2" in m or "glm5.2" in m or "colibri" in m)):
+
+    def _alias(mid: Optional[str]) -> bool:
+        mid = (mid or "").lower()
+        return bool(mid) and (m == mid or m.split("/")[-1] == mid)
+
+    # 2. An enabled engine's model_id alias.
+    if kt_enabled and _alias(kt_model_id):
+        return "kt"
+    if k3_enabled and _alias(k3_model_id):
+        return "k3"
+    if colibri_enabled and _alias(colibri_model_id):
         return "colibri"
-    if ds4_enabled and m:
-        mid = (ds4_model_id or "").lower()
-        if (mid and (m == mid or m.split("/")[-1] == mid)) or "deepseek-v4" in m:
+    if ds4_enabled and _alias(ds4_model_id):
+        return "ds4"
+
+    # 3. Name markers (unambiguous only). GLM → colibri; DeepSeek → ds4 (default owner);
+    #    Kimi → colibri XOR k3 (ambiguous when both enabled → fall through to a pin).
+    if m:
+        if colibri_enabled and ("glm-5.2" in m or "glm5.2" in m or "colibri" in m):
+            return "colibri"
+        if "kimi-k3" in m or "kimi_k3" in m or "kimik3" in m:
+            claimers = [c for c, en in (("colibri", colibri_enabled), ("k3", k3_enabled)) if en]
+            if len(claimers) == 1:
+                return claimers[0]
+        if ds4_enabled and "deepseek-v4" in m:
             return "ds4"
     if m.endswith(".gguf") or "gguf" in m:
         return "gguf"

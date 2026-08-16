@@ -58,6 +58,28 @@ def get_active_colibri_config():
     return None
 
 
+def get_active_k3_config():
+    """Return the active K3Config (kimi-k3-in-c) from the server config, or None."""
+    try:
+        from codai.admin.routes import config_manager
+        if config_manager is not None and config_manager.config is not None:
+            return config_manager.config.k3
+    except Exception:
+        pass
+    return None
+
+
+def get_active_ktransformers_config():
+    """Return the active KtransformersConfig from the server config, or None."""
+    try:
+        from codai.admin.routes import config_manager
+        if config_manager is not None and config_manager.config is not None:
+            return config_manager.config.ktransformers
+    except Exception:
+        pass
+    return None
+
+
 _GGUF_ARCH_CACHE: Dict[tuple, str] = {}
 
 
@@ -165,52 +187,51 @@ def _gguf_architecture(path: str):
     return arch or None
 
 
-def ds4_should_handle(model_name: str) -> bool:
-    """True when ds4 is enabled and ``model_name`` is a DeepSeek-V4 (ds4) model.
+# --------------------------------------------------------------------------- #
+# External managed-engine routing (ds4 / colibri / k3 / kt)
+#
+# Several external engines can serve overlapping model families (DeepSeek-V4 by
+# ds4/colibri/kt; Kimi-K3 by colibri/k3/kt; GLM-5.2 by colibri/kt). To keep two
+# engines from both "claiming" the same model, a SINGLE resolver arbitrates by a
+# fixed precedence and every caller routes through it (via the thin
+# ``*_should_handle`` wrappers below). Precedence:
+#   1. an explicit ``backend:`` pin on the model's models.json entry — authoritative;
+#   2. else an *enabled* engine whose configured ``model_id`` alias equals the name;
+#   3. else name/architecture auto-detect, but ONLY when exactly one enabled engine
+#      claims the name (ambiguity routes to no engine and is logged).
+# --------------------------------------------------------------------------- #
 
-    Routing is by the GGUF ARCHITECTURE, not the filename: ds4 serves only genuine
-    ``deepseek4`` GGUFs (its own format). Mainline DeepSeek GGUFs (deepseek/
-    deepseek2/deepseek3/deepseek32) are left to llama.cpp. The configured
-    ``model_id`` alias still routes (covers the variant ds4 downloads itself, which
-    has no local file yet).
-    """
+# Ordered by arbitration preference for ambiguous names. New engines append here.
+_ENGINE_BACKENDS = ("ds4", "colibri", "k3", "kt")
+
+
+def _engine_config(engine: str):
+    """The active config object for an engine backend, or None."""
+    getter = {
+        "ds4": get_active_ds4_config,
+        "colibri": get_active_colibri_config,
+        "k3": get_active_k3_config,
+        "kt": get_active_ktransformers_config,
+    }.get(engine)
+    return getter() if getter else None
+
+
+def _engine_enabled(engine: str) -> bool:
+    cfg = _engine_config(engine)
+    return bool(cfg is not None and getattr(cfg, "enabled", False))
+
+
+def _engine_model_id(engine: str) -> str:
+    cfg = _engine_config(engine)
+    return (getattr(cfg, "model_id", "") or "").lower() if cfg else ""
+
+
+def _model_entry_for(model_name: str):
+    """The models.json entry (dict) matching ``model_name`` by path / basename /
+    alias / id, or None."""
     if not model_name:
-        return False
-    cfg = get_active_ds4_config()
-    if cfg is None or not getattr(cfg, "enabled", False):
-        return False
-    name = model_name.lower()
-    short = name.split("/")[-1]
-    mid = (getattr(cfg, "model_id", "") or "").lower()
-    if mid and (name == mid or short == mid):
-        return True
-    # Definitive: read the GGUF architecture for a local file — only deepseek4.
-    path = _resolve_local_gguf(model_name)
-    if path:
-        return (_gguf_architecture(path) or "").lower() == "deepseek4"
-    # No local file (HF id / not downloaded yet): conservative name check that
-    # matches ONLY the V4 marker, so mainline deepseek GGUFs aren't grabbed.
-    return "deepseek-v4" in name or "deepseek4" in name
-
-
-def colibri_should_handle(model_name: str) -> bool:
-    """True when colibri is enabled and ``model_name`` is a GLM-5.2 (colibri) model.
-
-    colibri's model is a *directory* container (int4), not a GGUF — so there is no
-    architecture to sniff. Routing is by the configured ``model_id`` alias, a GLM-5.2
-    name marker, or an explicit ``backend: "colibri"`` on the model's config entry.
-    """
-    if not model_name:
-        return False
-    cfg = get_active_colibri_config()
-    if cfg is None or not getattr(cfg, "enabled", False):
-        return False
-    name = model_name.lower()
-    short = name.split("/")[-1]
-    mid = (getattr(cfg, "model_id", "") or "").lower()
-    if mid and (name == mid or short == mid):
-        return True
-    # An explicit backend pin on the model's own config entry wins.
+        return None
+    name = model_name.strip().lower()
     try:
         from codai.admin.routes import config_manager as cfg_mgr
         md = getattr(cfg_mgr, "models_data", None) if cfg_mgr else None
@@ -223,13 +244,142 @@ def colibri_should_handle(model_name: str) -> bool:
                         continue
                     path = str(m.get("path") or m.get("id") or "")
                     base = os.path.basename(path.rstrip("/")).lower()
-                    cands = {path.lower(), base, str(m.get("alias") or "").lower()}
-                    if name in cands and str(m.get("backend") or "").lower() == "colibri":
-                        return True
+                    cands = {path.lower(), base, str(m.get("alias") or "").lower(),
+                             str(m.get("id") or "").lower()}
+                    if name in cands:
+                        return m
     except Exception:
         pass
-    # Name marker for GLM-5.2 (kept narrow so unrelated GLM GGUFs aren't grabbed).
-    return "glm-5.2" in name or "glm5.2" in name or "colibri" in short
+    return None
+
+
+def _pinned_backend(model_name: str) -> str:
+    """The explicit ``backend`` pin on the model's entry, lowercased, or ''."""
+    entry = _model_entry_for(model_name)
+    return str(entry.get("backend") or "").lower() if entry else ""
+
+
+def _engine_id_match(engine: str, model_name: str) -> bool:
+    mid = _engine_model_id(engine)
+    if not mid:
+        return False
+    name = model_name.lower()
+    return name == mid or name.split("/")[-1] == mid
+
+
+def _ds4_name_claims(model_name: str) -> bool:
+    """ds4's own name/architecture rule (no pin, no enabled check).
+
+    Routing is by GGUF ARCHITECTURE, not filename: ds4 serves only genuine
+    ``deepseek4`` GGUFs (its own format); mainline DeepSeek GGUFs are left to
+    llama.cpp. With no local file (HF id / not downloaded), fall back to a
+    conservative V4-only name marker.
+    """
+    path = _resolve_local_gguf(model_name)
+    if path:
+        return (_gguf_architecture(path) or "").lower() == "deepseek4"
+    name = model_name.lower()
+    return "deepseek-v4" in name or "deepseek4" in name
+
+
+def _colibri_name_claims(model_name: str) -> bool:
+    """colibri's own name rule (no pin, no enabled check).
+
+    colibri's model is a *directory* container (int4/native), not a GGUF, so there
+    is no architecture to sniff — match the served families by narrow name markers.
+
+    GLM-5.2 and Kimi-K3 auto-claim by name (colibri is their only current engine here).
+    DeepSeek-V4 is deliberately NOT auto-claimed: ds4 owns the ``deepseek-v4`` name by
+    default, so colibri-served DeepSeek is opt-in via an explicit ``backend: colibri``
+    pin (or the colibri ``model_id`` alias) — the resolver would otherwise mark a
+    ds4+colibri box ambiguous and route DeepSeek nowhere.
+    """
+    name = model_name.lower()
+    short = name.split("/")[-1]
+    return ("glm-5.2" in name or "glm5.2" in name or "colibri" in short
+            or "kimi-k3" in name or "kimi_k3" in name or "kimik3" in name)
+
+
+def _k3_name_claims(model_name: str) -> bool:
+    """kimi-k3-in-c's own name rule (no pin, no enabled check). Serves Kimi-K3, whose
+    checkpoint is a directory (not a GGUF), so match by narrow Kimi-K3 name markers.
+    When colibri is ALSO enabled both claim Kimi by name — the resolver then flags it
+    ambiguous and a ``backend`` pin chooses the engine, which is the intended UX."""
+    name = model_name.lower()
+    short = name.split("/")[-1]
+    return "kimi-k3" in name or "kimi_k3" in name or "kimik3" in name or "kimi-k3" in short
+
+
+def _kt_name_claims(model_name: str) -> bool:
+    """ktransformers serves MANY families (DeepSeek/Kimi/Qwen/GLM/MiniMax), so it must
+    NEVER auto-claim by a broad name marker — it would collide with every other engine.
+    It routes ONLY via an explicit ``backend: "kt"`` pin (step 1) or its configured
+    ``model_id`` alias (step 2)."""
+    return False
+
+
+_ENGINE_NAME_CLAIMS = {
+    "ds4": _ds4_name_claims,
+    "colibri": _colibri_name_claims,
+    "k3": _k3_name_claims,
+    "kt": _kt_name_claims,
+}
+
+
+def resolve_engine_backend(model_name: str):
+    """Decide which external managed engine (if any) serves ``model_name``.
+
+    Returns the engine key ("ds4"/"colibri"/…) or None. See the module comment
+    above for the precedence rules. This is the single arbiter — the
+    ``*_should_handle`` helpers are thin wrappers over it, so no two engines ever
+    claim the same model.
+    """
+    if not model_name:
+        return None
+
+    # 1. An explicit per-model backend pin is authoritative. A pin to an engine
+    #    backend routes there when enabled (else nowhere); a pin to a *non-engine*
+    #    backend (vulkan/nvidia/transformers/…) means "use the normal path", so it
+    #    also blocks name-marker auto-grab.
+    pin = _pinned_backend(model_name)
+    if pin:
+        return pin if (pin in _ENGINE_BACKENDS and _engine_enabled(pin)) else None
+
+    # 2. An enabled engine's configured model_id alias.
+    for eng in _ENGINE_BACKENDS:
+        if _engine_enabled(eng) and _engine_id_match(eng, model_name):
+            return eng
+
+    # 3. Name/architecture auto-detect — unambiguous only.
+    claimers = [eng for eng in _ENGINE_BACKENDS
+                if _engine_enabled(eng) and _ENGINE_NAME_CLAIMS[eng](model_name)]
+    if len(claimers) == 1:
+        return claimers[0]
+    if len(claimers) > 1:
+        print(f"[engine-route] {model_name!r} is claimed by multiple enabled engines "
+              f"{claimers}; pin a 'backend' on the model entry to disambiguate — "
+              "routing to none", flush=True)
+    return None
+
+
+def ds4_should_handle(model_name: str) -> bool:
+    """True when ds4 is the resolved engine backend for ``model_name``."""
+    return resolve_engine_backend(model_name) == "ds4"
+
+
+def colibri_should_handle(model_name: str) -> bool:
+    """True when colibri is the resolved engine backend for ``model_name``."""
+    return resolve_engine_backend(model_name) == "colibri"
+
+
+def k3_should_handle(model_name: str) -> bool:
+    """True when k3 (kimi-k3-in-c) is the resolved engine backend for ``model_name``."""
+    return resolve_engine_backend(model_name) == "k3"
+
+
+def kt_should_handle(model_name: str) -> bool:
+    """True when kt (ktransformers) is the resolved engine backend for ``model_name``."""
+    return resolve_engine_backend(model_name) == "kt"
 
 
 def _trim_cpu_ram() -> None:
@@ -375,9 +525,31 @@ class ModelManager:
         # (in-process mux protocol) instead of the normal nvidia/vulkan backends.
         if colibri_should_handle(model_name):
             from codai.backends.colibri import ColibriBackend
-            print(f"Routing '{model_name}' to colibri (GLM-5.2) backend")
+            print(f"Routing '{model_name}' to colibri (GLM-5.2 / DeepSeek-V4 / Kimi-K3) backend")
             self.backend_type = "colibri"
             self.backend = ColibriBackend(get_active_colibri_config())
+            self.backend.load_model(model_name, **kwargs)
+            self.tool_parser = ModelParserAdapter(model_name=model_name)
+            return
+
+        # Kimi-K3 via kimi-k3-in-c: when enabled, drive the managed k3 C engine
+        # (same in-process mux protocol as colibri) instead of the normal backends.
+        if k3_should_handle(model_name):
+            from codai.backends.k3 import K3Backend
+            print(f"Routing '{model_name}' to k3 (Kimi-K3 / kimi-k3-in-c) backend")
+            self.backend_type = "k3"
+            self.backend = K3Backend(get_active_k3_config())
+            self.backend.load_model(model_name, **kwargs)
+            self.tool_parser = ModelParserAdapter(model_name=model_name)
+            return
+
+        # ktransformers via SGLang: when enabled, proxy matching models to the managed
+        # SGLang subprocess (CPU+GPU heterogeneous) instead of the normal backends.
+        if kt_should_handle(model_name):
+            from codai.backends.ktransformers import KtransformersBackend
+            print(f"Routing '{model_name}' to ktransformers (SGLang) backend")
+            self.backend_type = "kt"
+            self.backend = KtransformersBackend(get_active_ktransformers_config())
             self.backend.load_model(model_name, **kwargs)
             self.tool_parser = ModelParserAdapter(model_name=model_name)
             return
@@ -2034,6 +2206,15 @@ class MultiModelManager:
         # colibri-served GLM-5.2 likewise has no models.json entry when addressed by
         # its model_id alias; accept it for text when colibri is enabled and matches.
         if model_type in (None, "text") and colibri_should_handle(requested_or_resolved):
+            return True
+
+        # k3 (kimi-k3-in-c) served Kimi-K3, same story: accept for text when it matches.
+        if model_type in (None, "text") and k3_should_handle(requested_or_resolved):
+            return True
+
+        # ktransformers (SGLang) served models: accept for text when kt is the resolver's
+        # pick (explicit backend:kt pin or the kt model_id alias).
+        if model_type in (None, "text") and kt_should_handle(requested_or_resolved):
             return True
 
         # If a model_type is specified, reject models registered under a
@@ -4934,6 +5115,16 @@ class MultiModelManager:
         if colibri_cfg is not None and getattr(colibri_cfg, "enabled", False):
             mid = getattr(colibri_cfg, "model_id", "glm-5.2-colibri") or "glm-5.2-colibri"
             _add(mid, "text", {"backend": "colibri"})
+
+        k3_cfg = get_active_k3_config()
+        if k3_cfg is not None and getattr(k3_cfg, "enabled", False):
+            mid = getattr(k3_cfg, "model_id", "kimi-k3") or "kimi-k3"
+            _add(mid, "text", {"backend": "k3"})
+
+        kt_cfg = get_active_ktransformers_config()
+        if kt_cfg is not None and getattr(kt_cfg, "enabled", False):
+            mid = getattr(kt_cfg, "model_id", "ktransformers") or "ktransformers"
+            _add(mid, "text", {"backend": "kt"})
 
         return models
 

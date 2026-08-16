@@ -1,0 +1,33 @@
+{
+  "name": "invoice",
+  "description": "Invoice / fattura — demonstrates a strict JSON Schema (validated when jsonschema is installed)",
+  "language": "",
+  "type": "jsonschema",
+  "prompt_hint": "Amounts as numbers without currency symbols; put the currency in 'currency'.",
+  "schema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+      "invoice_number": {"type": ["string", "null"]},
+      "issue_date": {"type": ["string", "null"], "description": "YYYY-MM-DD"},
+      "seller": {"type": ["string", "null"]},
+      "buyer": {"type": ["string", "null"]},
+      "currency": {"type": ["string", "null"]},
+      "subtotal": {"type": ["number", "null"]},
+      "tax": {"type": ["number", "null"]},
+      "total": {"type": ["number", "null"]},
+      "line_items": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "description": {"type": "string"},
+            "quantity": {"type": ["number", "null"]},
+            "unit_price": {"type": ["number", "null"]},
+            "amount": {"type": ["number", "null"]}
+          }
+        }
+      }
+    }
+  }
+}

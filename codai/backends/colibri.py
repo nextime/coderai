@@ -26,6 +26,7 @@ import threading
 from typing import AsyncGenerator, Dict, List, Optional
 
 from codai.backends.base import ModelBackend
+from codai.backends.colibri_families import render_deepseek_chat, build_kimi_wire
 
 # GLM-5.2 chat-template markers (from colibri openai_server.py — the model expresses
 # tool calls as ordinary text, so we render them into the prompt and let the parser
@@ -60,6 +61,70 @@ def clean_glm_output(text: str) -> str:
     for t in _GLM_STRIP_TOKENS:
         text = text.replace(t, "")
     return text
+
+
+# --- DeepSeek-V4 / Kimi-K3 output trimming (multi-family colibri, v1.5.0) -------- #
+# DeepSeek uses the official markers (｜=U+FF5C, ▁=U+2581); Kimi emits XTML specials
+# that its serve loop already suppresses, but we strip any residual defensively.
+_DS_STOP_MARKERS = ("<｜end▁of▁sentence｜>", "<｜User｜>", "<｜Assistant｜>",
+                    "<｜begin▁of▁sentence｜>")
+_KIMI_STRIP_TOKENS = ("<|open|>", "<|close|>", "<|sep|>", "<|end_of_msg|>")
+
+
+def _ds_cut_index(text: str) -> int:
+    cut = len(text)
+    for m in _DS_STOP_MARKERS:
+        i = text.find(m)
+        if i != -1 and i < cut:
+            cut = i
+    return cut
+
+
+def clean_deepseek_output(text: str) -> str:
+    """Trim a DeepSeek-V4 completion at its turn boundary."""
+    if not text:
+        return text
+    text = text[:_ds_cut_index(text)]
+    return text
+
+
+def clean_kimi_output(text: str) -> str:
+    """Strip any residual Kimi-K3 XTML control tokens from the visible content (the
+    engine's serve loop already suppresses structural runs, so this is defensive)."""
+    if not text:
+        return text
+    for t in _KIMI_STRIP_TOKENS:
+        text = text.replace(t, "")
+    return text
+
+
+# Family → (payload builder, output cleaner, turn-boundary cut). The payload builder
+# takes (messages, enable_thinking, tools) and returns str (GLM/DeepSeek rendered
+# prompt) or bytes (Kimi K3CHAT1 wire). See project_colibri_v15_families.
+def _payload_for(family: str, messages, enable_thinking: bool, tools):
+    if family == "deepseek_v4":
+        return render_deepseek_chat(messages, enable_thinking=enable_thinking)
+    if family == "kimi_k3":
+        return build_kimi_wire(messages, enable_thinking=enable_thinking)
+    return render_chat(messages, enable_thinking=enable_thinking, tools=tools)
+
+
+def _clean_for(family: str, text: str) -> str:
+    if family == "deepseek_v4":
+        return clean_deepseek_output(text)
+    if family == "kimi_k3":
+        return clean_kimi_output(text)
+    return clean_glm_output(text)
+
+
+def _cut_index_for(family: str, text: str) -> int:
+    if family == "deepseek_v4":
+        return _ds_cut_index(text)
+    if family == "kimi_k3":
+        # The Kimi engine emits already-trimmed visible text and stops on its own EOS;
+        # no extra server-side turn cut is needed.
+        return len(text)
+    return _glm_cut_index(text)
 
 
 def _content_text(content) -> str:
@@ -401,7 +466,8 @@ class ColibriBackend(ModelBackend):
         self._enter_request()
         try:
             engine = self._need_engine()
-            prompt = render_chat(messages, enable_thinking=self._enable_thinking, tools=tools)
+            family = getattr(engine, "family", "glm")
+            prompt = _payload_for(family, messages, self._enable_thinking, tools)
             chunks: List[str] = []
 
             def _hit_turn_boundary():
@@ -409,13 +475,13 @@ class ColibriBackend(ModelBackend):
                 # ramble into a new turn. Stop it the moment a turn marker appears —
                 # a big saving at streaming-bound decode speeds.
                 joined = "".join(chunks)
-                return _glm_cut_index(joined) < len(joined)
+                return _cut_index_for(family, joined) < len(joined)
 
             stats = engine.run(prompt, int(max_tokens or 1024), float(temperature),
                                float(top_p), on_text=chunks.append,
                                cancelled=_hit_turn_boundary)
             self._store_usage(stats)
-            return clean_glm_output("".join(chunks))
+            return _clean_for(family, "".join(chunks))
         finally:
             self._exit_request()
 
@@ -425,9 +491,10 @@ class ColibriBackend(ModelBackend):
         self._enter_request()
         try:
             engine = self._need_engine()
-            prompt = render_chat(messages, enable_thinking=self._enable_thinking, tools=tools)
+            family = getattr(engine, "family", "glm")
+            prompt = _payload_for(family, messages, self._enable_thinking, tools)
             async for chunk in self._stream(engine, prompt, int(max_tokens or 1024),
-                                            float(temperature), float(top_p)):
+                                            float(temperature), float(top_p), family=family):
                 yield chunk
         finally:
             self._exit_request()
@@ -453,8 +520,8 @@ class ColibriBackend(ModelBackend):
     # SSE streaming: the engine's blocking run() streams tokens to a callback on a
     # worker thread; bridge them to the event loop through an asyncio.Queue.
     # ------------------------------------------------------------------ #
-    async def _stream(self, engine, prompt: str, max_tokens: int, temperature: float,
-                      top_p: float) -> AsyncGenerator[str, None]:
+    async def _stream(self, engine, prompt, max_tokens: int, temperature: float,
+                      top_p: float, family: str = "glm") -> AsyncGenerator[str, None]:
         loop = asyncio.get_event_loop()
         out_queue: asyncio.Queue = asyncio.Queue()
         _SENTINEL = object()
@@ -462,7 +529,7 @@ class ColibriBackend(ModelBackend):
 
         def _hit_turn_boundary():
             joined = "".join(raw)
-            return _glm_cut_index(joined) < len(joined)
+            return _cut_index_for(family, joined) < len(joined)
 
         def _on_text(text: str):
             if text:
@@ -480,9 +547,9 @@ class ColibriBackend(ModelBackend):
                 loop.call_soon_threadsafe(out_queue.put_nowait, _SENTINEL)
 
         threading.Thread(target=_worker, daemon=True).start()
-        # Emit the CLEANED text incrementally. Hold back the last few chars so a GLM
-        # control token split across chunks (e.g. "<th"+"ink>") is never emitted raw;
-        # clean_glm_output also cuts at the turn boundary, so the stream ends there.
+        # Emit the CLEANED text incrementally. Hold back the last few chars so a control
+        # token split across chunks (e.g. "<th"+"ink>") is never emitted raw; the
+        # per-family cleaner also cuts at the turn boundary, so the stream ends there.
         _HOLD = 16
         yielded = 0
         while True:
@@ -491,11 +558,11 @@ class ColibriBackend(ModelBackend):
                 break
             if isinstance(item, Exception):
                 raise item
-            cleaned = clean_glm_output("".join(raw))
+            cleaned = _clean_for(family, "".join(raw))
             safe = max(yielded, len(cleaned) - _HOLD)
             if safe > yielded:
                 yield cleaned[yielded:safe]
                 yielded = safe
-        cleaned = clean_glm_output("".join(raw))
+        cleaned = _clean_for(family, "".join(raw))
         if len(cleaned) > yielded:
             yield cleaned[yielded:]

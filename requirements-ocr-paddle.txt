@@ -1,0 +1,19 @@
+# ---------------------------------------------------------------------------
+# CoderAI — PaddleOCR ISOLATED venv.
+#
+# PaddleOCR pulls opencv-contrib-python (clashes with the main venv's opencv-python/cv2),
+# and paddlepaddle-gpu wheels bundle their OWN CUDA runtime — so it lives in its own venv +
+# subprocess worker. The bundled CUDA means a cu12x wheel runs on GPU even when the HOST is
+# on newer CUDA (e.g. CUDA 13), as long as the NVIDIA driver is recent.
+#
+#   python3 -m venv ~/.coderai/paddle_venv
+#   ~/.coderai/paddle_venv/bin/pip install -r requirements-ocr-paddle.txt
+#
+# GPU wheels come from Paddle's own index (below). Pick the cuXY matching a wheel that
+# exists for your Python — adjust the index URL / version if needed. For CPU-only, drop the
+# --extra-index-url line and use `paddlepaddle` instead of `paddlepaddle-gpu`.
+# ---------------------------------------------------------------------------
+--extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu126/
+paddlepaddle-gpu>=3.0.0
+paddleocr>=2.7.0
+pypdfium2>=4.20.0

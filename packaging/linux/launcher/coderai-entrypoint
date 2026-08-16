@@ -73,19 +73,40 @@ if [ -n "${HOME:-}" ]; then
   fi
 fi
 
-# Seed the ds4 working dir on the cache volume from the bundled binary + scripts
-# (DeepSeek-V4 weights download here at runtime, so it must be writable/persistent).
-if [ -d /opt/coderai/ds4 ] && [ ! -e "$CODERAI_CACHE_DIR/ds4/ds4-server" ]; then
-  mkdir -p "$CODERAI_CACHE_DIR/ds4"
-  cp -an /opt/coderai/ds4/. "$CODERAI_CACHE_DIR/ds4/" 2>/dev/null || true
+# Seed — or UPGRADE — the ds4 working dir on the cache volume from the bundled binary
+# + scripts (DeepSeek-V4 weights download here at runtime, so it must be writable/
+# persistent). Refresh when the bundled binary differs from the seeded one so an image
+# upgrade actually reaches an existing /cache volume; cp (no -n) clobbers the tree, but
+# the bundle carries NO weights and cp never deletes, so downloaded GGUFs are preserved.
+if [ -d /opt/coderai/ds4 ]; then
+  if [ ! -e "$CODERAI_CACHE_DIR/ds4/ds4-server" ] || \
+     ! cmp -s /opt/coderai/ds4/ds4-server "$CODERAI_CACHE_DIR/ds4/ds4-server"; then
+    mkdir -p "$CODERAI_CACHE_DIR/ds4"
+    cp -a /opt/coderai/ds4/. "$CODERAI_CACHE_DIR/ds4/" 2>/dev/null || true
+  fi
 fi
 
-# Seed the colibri working dir on the cache volume from the bundled repo + engine
-# binary (the GLM-5.2 int4 container lives outside the image; point colibri.model_path
-# at it). Persistent so a runtime rebuild survives restarts.
-if [ -d /opt/coderai/colibri ] && [ ! -e "$CODERAI_CACHE_DIR/colibri/c/colibri" ]; then
-  mkdir -p "$CODERAI_CACHE_DIR/colibri"
-  cp -an /opt/coderai/colibri/. "$CODERAI_CACHE_DIR/colibri/" 2>/dev/null || true
+# Seed — or UPGRADE — the colibri working dir likewise (the GLM-5.2 / DeepSeek-V4 /
+# Kimi-K3 container lives outside the image; point the model_path at it). Refresh on
+# upgrade so a new engine binary reaches the volume; runtime rebuilds still survive
+# restarts because the bundled binary matches after an upgrade.
+if [ -d /opt/coderai/colibri ]; then
+  if [ ! -e "$CODERAI_CACHE_DIR/colibri/c/colibri" ] || \
+     ! cmp -s /opt/coderai/colibri/c/colibri "$CODERAI_CACHE_DIR/colibri/c/colibri"; then
+    mkdir -p "$CODERAI_CACHE_DIR/colibri"
+    cp -a /opt/coderai/colibri/. "$CODERAI_CACHE_DIR/colibri/" 2>/dev/null || true
+  fi
+fi
+
+# Seed — or UPGRADE — the kimi-k3-in-c working dir likewise (the ~1.56 TB Kimi-K3
+# checkpoint + packed trunk live outside the image; point k3.model_path/trunk_dir at
+# them). Refresh on upgrade so a new patched bin/k3 reaches the volume.
+if [ -d /opt/coderai/kimi-k3-in-c ]; then
+  if [ ! -e "$CODERAI_CACHE_DIR/kimi-k3-in-c/bin/k3" ] || \
+     ! cmp -s /opt/coderai/kimi-k3-in-c/bin/k3 "$CODERAI_CACHE_DIR/kimi-k3-in-c/bin/k3"; then
+    mkdir -p "$CODERAI_CACHE_DIR/kimi-k3-in-c"
+    cp -a /opt/coderai/kimi-k3-in-c/. "$CODERAI_CACHE_DIR/kimi-k3-in-c/" 2>/dev/null || true
+  fi
 fi
 
 # If invoked with arguments, run them directly (debugging / one-off commands)

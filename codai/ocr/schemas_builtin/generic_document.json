@@ -1,0 +1,16 @@
+{
+  "name": "generic_document",
+  "description": "Generic document metadata + free key/value fields (any language)",
+  "language": "",
+  "type": "template",
+  "prompt_hint": "Add any additional salient fields you find under 'fields' as key/value pairs.",
+  "schema": {
+    "document_type": "string|null",
+    "title": "string|null",
+    "date": "YYYY-MM-DD|null",
+    "authors_or_parties": ["string"],
+    "reference_numbers": ["string"],
+    "summary": "string|null",
+    "fields": {"<detected_field_name>": "<value>"}
+  }
+}

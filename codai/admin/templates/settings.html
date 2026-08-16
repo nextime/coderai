@@ -631,6 +631,275 @@
       <input type="text" id="s-colibri-extra-env" class="form-input" placeholder="COLI_MODEL_MIRROR=/nvme2/glm52_i4 DIRECT=1 PIPE=2">
       <span class="form-hint">Whitespace-separated <code>KEY=VALUE</code> pairs added to the engine's environment — colibri exposes its tuning only via env (<code>COLI_MODEL_MIRROR</code>, <code>COLI_DISK_WEIGHTS</code>, <code>COLI_NUMA</code>, <code>COLI_CUDA_PIPE</code>, <code>DIRECT</code>, <code>PIPE</code>, <code>PILOT</code>, <code>DRAFT</code>, …). Context window is set per-model via <b>n_ctx</b>.</span>
     </div>
+    <p class="form-hint" style="margin-top:.6rem">colibri v1.5.0 also serves <b>DeepSeek-V4</b> and <b>Kimi-K3</b> (CPU engines) from the same install — add a model whose <code>backend</code> is <code>colibri</code> pointing at that family's container; the engine auto-detects the family from the container's <code>config.json</code>.</p>
+  </div>
+</div>
+
+<!-- Kimi-K3 (kimi-k3-in-c) -->
+<div class="card">
+  <div class="card-title">Kimi-K3 (kimi-k3-in-c)</div>
+  <p class="form-hint" style="margin-bottom:.6rem">Run Kimi-K3 through FareedKhan-dev's portable-C <a href="https://github.com/FareedKhan-dev/kimi-k3-in-c" target="_blank" rel="noopener">kimi-k3-in-c</a> engine. coderai patches in a resident serve loop and drives it over the same mux protocol as colibri. <b>CPU-only</b> (AVX2+FMA) and needs ~1.7&nbsp;TB fast local storage (the ~1.56&nbsp;TB checkpoint + a ~109&nbsp;GB packed trunk from the repo's <code>scripts/pack-trunk.sh</code>). Nothing is downloaded automatically.</p>
+  <div class="form-group">
+    <label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-k3-enabled" onchange="toggleK3Fields()">
+      <span style="font-size:13px;font-weight:500">Enable k3 (Kimi-K3)</span>
+    </label>
+  </div>
+  <div id="k3-fields" style="display:none">
+    <div class="form-group">
+      <label class="form-label">Model id / alias</label>
+      <input type="text" id="s-k3-model-id" class="form-input" placeholder="kimi-k3">
+      <span class="form-hint">When enabled, this id (and names containing <b>kimi-k3</b>, or any model whose config <code>backend</code> is <code>k3</code>) routes to the k3 engine. If colibri is also enabled, a bare Kimi name is ambiguous — set the model's <code>backend</code> to choose.</span>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Checkpoint path</label>
+      <input type="text" id="s-k3-model-path" class="form-input" placeholder="/nvme/Kimi-K3">
+      <span class="form-hint">The Kimi-K3 checkpoint <b>directory</b> (config.json + tokenizer + safetensors shards).</span>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Packed trunk dir</label>
+      <input type="text" id="s-k3-trunk-dir" class="form-input" placeholder="/nvme/Kimi-K3-trunk">
+      <span class="form-hint">The packed dense trunk (<code>scripts/pack-trunk.sh</code>). Blank = fully resident (needs ~114&nbsp;GB RAM).</span>
+    </div>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:150px">
+        <label class="form-label">Preset</label>
+        <select id="s-k3-preset" class="form-input">
+          <option value="">(explicit budgets)</option>
+          <option value="laptop">laptop</option>
+          <option value="desktop">desktop</option>
+          <option value="workstation">workstation</option>
+          <option value="server">server</option>
+          <option value="max">max</option>
+        </select>
+      </div>
+      <div class="form-group" style="flex:1;min-width:120px">
+        <label class="form-label">Trunk GB</label>
+        <input type="number" id="s-k3-trunk-gb" class="form-input" min="0" step="1" placeholder="16">
+      </div>
+      <div class="form-group" style="flex:1;min-width:120px">
+        <label class="form-label">Cache GB</label>
+        <input type="number" id="s-k3-cache-gb" class="form-input" min="0" step="1" placeholder="64">
+      </div>
+      <div class="form-group" style="flex:1;min-width:120px">
+        <label class="form-label">Context (K3_MAXT)</label>
+        <input type="number" id="s-k3-ctx" class="form-input" min="32" placeholder="4096">
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+        <input type="checkbox" id="s-k3-auto-build">
+        <span>Auto clone + patch + build the k3 engine binary if missing</span>
+      </label>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Extra engine env</label>
+      <input type="text" id="s-k3-extra-env" class="form-input" placeholder="K3_EXPERT_GB=8 K3_BITS=4 K3_DIRECT=1">
+      <span class="form-hint">Whitespace-separated <code>KEY=VALUE</code> pairs (<code>K3_EXPERT_GB</code>, <code>K3_BITS</code>, <code>K3_DIRECT</code>, <code>K3_PIPE</code>, …).</span>
+    </div>
+  </div>
+</div>
+
+<!-- ktransformers (SGLang) -->
+<div class="card">
+  <div class="card-title">ktransformers (SGLang)</div>
+  <p class="form-hint" style="margin-bottom:.6rem">Run many large MoE families (DeepSeek, Kimi, Qwen, GLM, MiniMax) through <a href="https://github.com/kvcache-ai/ktransformers" target="_blank" rel="noopener">ktransformers</a>' CPU+GPU heterogeneous engine, served over SGLang's OpenAI API. coderai launches <code>python -m sglang.launch_server</code> as a managed subprocess and proxies to it. Requires <b>SGLang + kt-kernel</b> installed out of band (best on AMX/AVX-512 CPUs). Selected per model via an explicit <code>backend: kt</code> pin or the model id below — never by a broad name marker.</p>
+  <div class="form-group">
+    <label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-kt-enabled" onchange="toggleKtFields()">
+      <span style="font-size:13px;font-weight:500">Enable ktransformers</span>
+    </label>
+  </div>
+  <div id="kt-fields" style="display:none">
+    <div class="form-group">
+      <label class="form-label">Model id / alias</label>
+      <input type="text" id="s-kt-model-id" class="form-input" placeholder="ktransformers">
+      <span class="form-hint">This id routes to ktransformers and is passed to SGLang as <code>--served-model-name</code>. Also matched by any model whose config <code>backend</code> is <code>kt</code>.</span>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Model path (HF dir)</label>
+      <input type="text" id="s-kt-model-path" class="form-input" placeholder="/nvme/DeepSeek-V4-Flash">
+    </div>
+    <div class="form-group">
+      <label class="form-label">KT weight path</label>
+      <input type="text" id="s-kt-weight-path" class="form-input" placeholder="/nvme/DeepSeek-V4-Flash-kt">
+      <span class="form-hint">The KT quantized weights directory (<code>--kt-weight-path</code>).</span>
+    </div>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:2;min-width:160px">
+        <label class="form-label">Host</label>
+        <input type="text" id="s-kt-host" class="form-input" placeholder="127.0.0.1">
+      </div>
+      <div class="form-group" style="flex:1;min-width:110px">
+        <label class="form-label">Port</label>
+        <input type="number" id="s-kt-port" class="form-input" min="0" placeholder="0 = auto">
+      </div>
+      <div class="form-group" style="flex:1;min-width:140px">
+        <label class="form-label">Context length</label>
+        <input type="number" id="s-kt-ctx" class="form-input" min="512" placeholder="32768">
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Extra SGLang args</label>
+      <input type="text" id="s-kt-extra-args" class="form-input" placeholder="--tp-size 1 --mem-fraction-static 0.8">
+    </div>
+    <div class="form-group">
+      <label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+        <input type="checkbox" id="s-kt-auto-build">
+        <span>Attempt <code>pip install sglang</code> if missing (heavy; kt-kernel still installed manually)</span>
+      </label>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Extra subprocess env</label>
+      <input type="text" id="s-kt-extra-env" class="form-input" placeholder="CUDA_VISIBLE_DEVICES=0">
+    </div>
+  </div>
+</div>
+
+<!-- OCR (dedicated document OCR engines) -->
+<div class="card">
+  <div class="card-title">OCR (document → text)</div>
+  <p class="form-hint" style="margin-bottom:.6rem">Dedicated OCR engines (detection + recognition), <b>not</b> a vision LLM — faithful text with bounding boxes and layout, batched on GPU. Serve <a href="https://github.com/PaddlePaddle/PaddleOCR" target="_blank" rel="noopener">PaddleOCR</a>, <a href="https://github.com/mindee/doctr" target="_blank" rel="noopener">docTR</a> or <a href="https://github.com/VikParuchuri/surya" target="_blank" rel="noopener">Surya</a>, selectable per request. Endpoints: <code>POST /v1/ocr</code>, <code>POST /v1/ocr/batch</code>. Heavy deps install out of band (<code>pip install -r requirements-ocr.txt</code> or <code>./build.sh … --ocr</code>); a missing engine returns HTTP 503.</p>
+  <div class="form-row">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-ocr-enabled" onchange="toggleOcrFields()">
+      <span style="font-size:13px;font-weight:500">Enable OCR subsystem</span>
+    </label>
+  </div>
+  <div id="ocr-fields" style="display:none">
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:150px">
+        <label class="form-label">Default engine</label>
+        <select id="s-ocr-default-engine" class="form-input">
+          <option value="paddle">PaddleOCR</option>
+          <option value="doctr">docTR</option>
+          <option value="surya">Surya</option>
+        </select>
+      </div>
+      <div class="form-group" style="flex:1;min-width:110px">
+        <label class="form-label">PDF DPI</label>
+        <input type="number" id="s-ocr-dpi" class="form-input" min="72" placeholder="200">
+      </div>
+      <div class="form-group" style="flex:1;min-width:110px">
+        <label class="form-label">Max concurrency</label>
+        <input type="number" id="s-ocr-max-concurrency" class="form-input" min="1" placeholder="4">
+      </div>
+      <div class="form-group" style="flex:1;min-width:90px">
+        <label class="form-label">Language</label>
+        <input type="text" id="s-ocr-lang" class="form-input" placeholder="it">
+      </div>
+    </div>
+
+    <div class="card-title" style="font-size:13px;margin-top:.4rem">PaddleOCR</div>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center">
+      <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-paddle-enabled"><span>Enable</span></label>
+      <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-paddle-use-gpu"><span>Use GPU</span></label>
+      <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-paddle-structure"><span>PP-Structure (layout + tables)</span></label>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Instances</label><input type="number" id="s-ocr-paddle-instances" class="form-input" min="1" placeholder="2"></div>
+      <div class="form-group" style="flex:1;min-width:90px"><label class="form-label">Lang</label><input type="text" id="s-ocr-paddle-lang" class="form-input" placeholder="it"></div>
+    </div>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:180px"><label class="form-label">Det model dir <span class="muted">(opt)</span></label><input type="text" id="s-ocr-paddle-det-dir" class="form-input" placeholder="(default)"></div>
+      <div class="form-group" style="flex:1;min-width:180px"><label class="form-label">Rec model dir <span class="muted">(opt)</span></label><input type="text" id="s-ocr-paddle-rec-dir" class="form-input" placeholder="(default)"></div>
+    </div>
+    <p class="form-hint" style="margin:0 0 .3rem">Runs in an <b>isolated venv</b> (opencv-contrib clash + bundled CUDA — a cu12x wheel runs on GPU even on newer host CUDA).</p>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center">
+      <div class="form-group" style="flex:2;min-width:200px"><label class="form-label">Isolated venv dir</label><input type="text" id="s-ocr-paddle-venv" class="form-input" placeholder="/opt/coderai/paddle_venv"></div>
+      <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-paddle-auto-build"><span>Auto-build on first use</span></label>
+    </div>
+    <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap"><button type="button" class="btn btn-sm" onclick="ocrBuildVenv('paddle')">Build Paddle venv now</button><span id="s-ocr-paddle-build-status" class="form-hint"></span></div>
+
+    <div class="card-title" style="font-size:13px;margin-top:.4rem">docTR</div>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center">
+      <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-doctr-enabled"><span>Enable</span></label>
+      <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-doctr-use-gpu"><span>Use GPU</span></label>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Instances</label><input type="number" id="s-ocr-doctr-instances" class="form-input" min="1" placeholder="1"></div>
+      <div class="form-group" style="flex:1;min-width:150px"><label class="form-label">Det arch</label><input type="text" id="s-ocr-doctr-det" class="form-input" placeholder="db_resnet50"></div>
+      <div class="form-group" style="flex:1;min-width:150px"><label class="form-label">Reco arch</label><input type="text" id="s-ocr-doctr-reco" class="form-input" placeholder="crnn_vgg16_bn"></div>
+    </div>
+
+    <div class="card-title" style="font-size:13px;margin-top:.4rem">Surya</div>
+    <p class="form-hint" style="margin:0 0 .4rem">GPL-licensed (compatible with coderai's GPLv3). Enable + accept to load it. Some releases add a revenue-capped commercial clause — check the version you install.</p>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center">
+      <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-surya-enabled"><span>Enable</span></label>
+      <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-surya-license"><span>Accept license</span></label>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Instances</label><input type="number" id="s-ocr-surya-instances" class="form-input" min="1" placeholder="1"></div>
+      <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">Langs</label><input type="text" id="s-ocr-surya-langs" class="form-input" placeholder="it"></div>
+    </div>
+    <p class="form-hint" style="margin:0 0 .3rem">Runs in an <b>isolated venv</b> (Surya caps pillow&lt;11, incompatible with the main venv).</p>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center">
+      <div class="form-group" style="flex:2;min-width:200px"><label class="form-label">Isolated venv dir</label><input type="text" id="s-ocr-surya-venv" class="form-input" placeholder="/opt/coderai/surya_venv"></div>
+      <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-surya-auto-build"><span>Auto-build on first use</span></label>
+    </div>
+    <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap"><button type="button" class="btn btn-sm" onclick="ocrBuildVenv('surya')">Build Surya venv now</button><span id="s-ocr-surya-build-status" class="form-hint"></span></div>
+
+    <div class="card-title" style="font-size:13px;margin-top:.4rem">Stamp / signature detection</div>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:150px">
+        <label class="form-label">Mode</label>
+        <select id="s-ocr-detect-mode" class="form-input">
+          <option value="off">Off</option>
+          <option value="layout">Layout regions (coarse, no extra model)</option>
+          <option value="detector">YOLO detector (accurate)</option>
+          <option value="both">Both</option>
+        </select>
+      </div>
+      <div class="form-group" style="flex:2;min-width:200px"><label class="form-label">YOLO weights (.pt)</label><input type="text" id="s-ocr-detect-model" class="form-input" placeholder="/models/signature-stamp-yolo.pt"></div>
+      <div class="form-group" style="flex:1;min-width:100px"><label class="form-label">Confidence</label><input type="number" id="s-ocr-detect-conf" class="form-input" min="0" max="1" step="0.05" placeholder="0.35"></div>
+    </div>
+
+    <div class="card-title" style="font-size:13px;margin-top:.4rem">Structured field extraction</div>
+    <p class="form-hint" style="margin:0 0 .4rem">Extract JSON fields from the OCR text using an existing coderai text model. Choose the default schema below; override per request with the <code>schema</code> field.</p>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center">
+      <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-extract-enabled"><span>Enable extraction</span></label>
+      <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer"><input type="checkbox" id="s-ocr-extract-validate"><span>Validate (JSON Schema)</span></label>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">Max tokens</label><input type="number" id="s-ocr-extract-max-tokens" class="form-input" min="64" placeholder="2048"></div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Extraction model id</label>
+      <input type="text" id="s-ocr-extract-model" class="form-input" placeholder="a coderai text model id/alias">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Default schema</label>
+      <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
+        <select id="s-ocr-extract-schema" class="form-input" style="flex:1;min-width:180px" onchange="ocrSchemaPicked()"></select>
+        <button type="button" class="btn btn-sm" onclick="ocrLoadSchemas()">Refresh</button>
+      </div>
+      <span class="form-hint">The default schema for extraction. Pick a built-in or one of your saved schemas, or <b>auto</b> for generic key/value extraction.</span>
+    </div>
+
+    <!-- Schema editor: picker (above) + raw JSON + form builder, kept in sync -->
+    <div class="card mb-0" style="margin-top:.4rem;background:rgba(127,127,127,.06)">
+      <div class="card-title" style="font-size:13px">Schema editor</div>
+      <p class="form-hint" style="margin:0 0 .5rem">Create or edit a <b>user</b> schema (built-ins are read-only; saving a built-in's name creates an override). The field builder and raw JSON stay in sync.</p>
+      <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center">
+        <div class="form-group" style="flex:2;min-width:160px"><label class="form-label">Name</label><input type="text" id="s-ocr-sch-name" class="form-input" placeholder="my_schema"></div>
+        <div class="form-group" style="flex:1;min-width:130px"><label class="form-label">Type</label>
+          <select id="s-ocr-sch-type" class="form-input"><option value="template">template</option><option value="jsonschema">jsonschema</option></select>
+        </div>
+        <div class="form-group" style="flex:1;min-width:90px"><label class="form-label">Lang</label><input type="text" id="s-ocr-sch-lang" class="form-input" placeholder=""></div>
+      </div>
+      <div class="form-group"><label class="form-label">Description</label><input type="text" id="s-ocr-sch-desc" class="form-input" placeholder=""></div>
+      <div class="form-group"><label class="form-label">Prompt hint <span class="muted">(opt)</span></label><input type="text" id="s-ocr-sch-hint" class="form-input" placeholder=""></div>
+
+      <label class="form-label" style="margin-top:.3rem">Fields <span class="muted">(builder — template type)</span></label>
+      <div id="s-ocr-sch-builder"></div>
+      <div style="margin:.35rem 0 .6rem"><button type="button" class="btn btn-sm" onclick="ocrBuilderAddRow()">+ Add field</button>
+        <button type="button" class="btn btn-sm" onclick="ocrBuilderToJson()">Builder → JSON ↓</button>
+        <button type="button" class="btn btn-sm" onclick="ocrJsonToBuilder()">JSON → Builder ↑</button></div>
+
+      <div class="form-group">
+        <label class="form-label">Raw schema JSON</label>
+        <textarea id="s-ocr-sch-json" class="form-input" rows="8" spellcheck="false" style="font-family:monospace;font-size:12px" placeholder='{"numero": "string", "data": "YYYY-MM-DD"}'></textarea>
+        <span class="form-hint">The value of the schema's <code>schema</code> field (a fill-in template or a JSON Schema object).</span>
+      </div>
+      <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+        <button type="button" class="btn btn-sm" onclick="ocrSchemaLoadIntoEditor()">Load selected</button>
+        <button type="button" class="btn btn-sm btn-primary" onclick="ocrSchemaSave()">Save schema</button>
+        <button type="button" class="btn btn-sm btn-danger" onclick="ocrSchemaDelete()">Delete (user only)</button>
+        <span id="s-ocr-sch-status" class="form-hint" style="align-self:center"></span>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -789,6 +1058,157 @@ function toggleDs4KvCleanup(){
 function toggleColibriFields(){
   document.getElementById('colibri-fields').style.display =
     document.getElementById('s-colibri-enabled').checked ? 'block' : 'none';
+}
+
+function toggleK3Fields(){
+  document.getElementById('k3-fields').style.display =
+    document.getElementById('s-k3-enabled').checked ? 'block' : 'none';
+}
+
+function toggleKtFields(){
+  document.getElementById('kt-fields').style.display =
+    document.getElementById('s-kt-enabled').checked ? 'block' : 'none';
+}
+function toggleOcrFields(){
+  document.getElementById('ocr-fields').style.display =
+    document.getElementById('s-ocr-enabled').checked ? 'block' : 'none';
+}
+
+// ---- OCR isolated-venv build (paddle/surya) ----
+const _ocrBuildPollers = {};
+async function ocrBuildVenv(engine){
+  const statusEl = document.getElementById('s-ocr-'+engine+'-build-status');
+  statusEl.textContent = 'starting build…';
+  try{
+    const r = await fetch(ROOT_PATH + '/admin/api/ocr/build-venv', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({engine})});
+    if(!r.ok){ const e=await r.json(); throw new Error(e.detail||'failed'); }
+    ocrPollBuild(engine);
+  }catch(e){ statusEl.textContent = 'error: '+e.message; }
+}
+function ocrPollBuild(engine){
+  if(_ocrBuildPollers[engine]) clearInterval(_ocrBuildPollers[engine]);
+  const statusEl = document.getElementById('s-ocr-'+engine+'-build-status');
+  _ocrBuildPollers[engine] = setInterval(async () => {
+    try{
+      const r = await fetch(ROOT_PATH + '/admin/api/ocr/build-venv/status?engine='+engine);
+      const d = await r.json();
+      const tail = (d.log||[]).slice(-1)[0] || '';
+      statusEl.textContent = d.state + (tail ? ' — '+tail : '');
+      if(d.state === 'done' || d.state === 'error'){
+        clearInterval(_ocrBuildPollers[engine]); _ocrBuildPollers[engine] = null;
+      }
+    }catch(e){ /* keep polling */ }
+  }, 3000);
+}
+
+// ---- OCR extraction schema management (picker + raw JSON + field builder) ----
+let _ocrDefaultSchema = '';
+function _ocrSchStatus(msg, isErr){
+  const el = document.getElementById('s-ocr-sch-status');
+  el.textContent = msg || '';
+  el.style.color = isErr ? '#c0392b' : '';
+}
+async function ocrLoadSchemas(){
+  const sel = document.getElementById('s-ocr-extract-schema');
+  if(!sel) return;
+  try{
+    const r = await fetch(ROOT_PATH + '/admin/api/ocr/schemas');
+    const d = await r.json();
+    const list = (d.schemas || []);
+    sel.innerHTML = '<option value="">auto (generic key/value)</option>' +
+      list.map(s => `<option value="${s.name}">${s.name} — ${s.description||s.type} [${s.source}]</option>`).join('');
+    sel.value = _ocrDefaultSchema || '';
+  }catch(e){ _ocrSchStatus('failed to list schemas: '+e.message, true); }
+}
+function ocrSchemaPicked(){ /* selection is read on save; nothing else needed */ }
+
+function ocrBuilderRow(key, val){
+  const wrap = document.createElement('div');
+  wrap.className = 'ocr-sch-row';
+  wrap.style = 'display:flex;gap:.4rem;margin-bottom:.3rem';
+  wrap.innerHTML =
+    `<input type="text" class="form-input ocr-sch-key" placeholder="field name" style="flex:1" value="${(key||'').replace(/"/g,'&quot;')}">`+
+    `<input type="text" class="form-input ocr-sch-val" placeholder="type/hint e.g. string|null" style="flex:1" value="${(val||'').replace(/"/g,'&quot;')}">`+
+    `<button type="button" class="btn btn-sm btn-danger" onclick="this.parentNode.remove()">×</button>`;
+  document.getElementById('s-ocr-sch-builder').appendChild(wrap);
+}
+function ocrBuilderAddRow(){ ocrBuilderRow('', ''); }
+function ocrBuilderClear(){ document.getElementById('s-ocr-sch-builder').innerHTML = ''; }
+function ocrBuilderToJson(){
+  const rows = document.querySelectorAll('#s-ocr-sch-builder .ocr-sch-row');
+  const obj = {};
+  rows.forEach(r => {
+    const k = r.querySelector('.ocr-sch-key').value.trim();
+    const v = r.querySelector('.ocr-sch-val').value.trim();
+    if(k) obj[k] = v || 'string';
+  });
+  document.getElementById('s-ocr-sch-json').value = JSON.stringify(obj, null, 2);
+}
+function ocrJsonToBuilder(){
+  let obj;
+  try{ obj = JSON.parse(document.getElementById('s-ocr-sch-json').value || '{}'); }
+  catch(e){ _ocrSchStatus('raw JSON is invalid: '+e.message, true); return; }
+  ocrBuilderClear();
+  if(obj && typeof obj === 'object' && !Array.isArray(obj)){
+    Object.keys(obj).forEach(k => {
+      const v = obj[k];
+      ocrBuilderRow(k, (typeof v === 'string') ? v : JSON.stringify(v));
+    });
+  }
+  _ocrSchStatus('builder rebuilt from JSON (nested values shown as JSON text)');
+}
+async function ocrSchemaLoadIntoEditor(){
+  const name = document.getElementById('s-ocr-extract-schema').value;
+  if(!name){ _ocrSchStatus('pick a named schema first (auto has no body)', true); return; }
+  try{
+    const r = await fetch(ROOT_PATH + '/admin/api/ocr/schemas/' + encodeURIComponent(name));
+    if(!r.ok){ const e=await r.json(); throw new Error(e.detail||'not found'); }
+    const s = await r.json();
+    document.getElementById('s-ocr-sch-name').value = s.name || name;
+    document.getElementById('s-ocr-sch-type').value = s.type || 'template';
+    document.getElementById('s-ocr-sch-lang').value = s.language || '';
+    document.getElementById('s-ocr-sch-desc').value = s.description || '';
+    document.getElementById('s-ocr-sch-hint').value = s.prompt_hint || '';
+    document.getElementById('s-ocr-sch-json').value = JSON.stringify(s.schema || {}, null, 2);
+    ocrJsonToBuilder();
+    _ocrSchStatus('loaded "'+(s.name||name)+'" ('+(s.source||'')+')');
+  }catch(e){ _ocrSchStatus('load failed: '+e.message, true); }
+}
+async function ocrSchemaSave(){
+  const name = document.getElementById('s-ocr-sch-name').value.trim();
+  if(!name){ _ocrSchStatus('name is required', true); return; }
+  let schema;
+  try{ schema = JSON.parse(document.getElementById('s-ocr-sch-json').value || '{}'); }
+  catch(e){ _ocrSchStatus('raw JSON invalid: '+e.message, true); return; }
+  const payload = {
+    name,
+    type: document.getElementById('s-ocr-sch-type').value || 'template',
+    language: document.getElementById('s-ocr-sch-lang').value.trim(),
+    description: document.getElementById('s-ocr-sch-desc').value.trim(),
+    prompt_hint: document.getElementById('s-ocr-sch-hint').value.trim(),
+    schema,
+  };
+  try{
+    const r = await fetch(ROOT_PATH + '/admin/api/ocr/schemas', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    if(!r.ok){ const e=await r.json(); throw new Error(e.detail||'save failed'); }
+    _ocrSchStatus('saved "'+name+'"');
+    await ocrLoadSchemas();
+    document.getElementById('s-ocr-extract-schema').value = name;
+  }catch(e){ _ocrSchStatus('save failed: '+e.message, true); }
+}
+async function ocrSchemaDelete(){
+  const name = document.getElementById('s-ocr-sch-name').value.trim() ||
+               document.getElementById('s-ocr-extract-schema').value;
+  if(!name){ _ocrSchStatus('nothing to delete', true); return; }
+  if(!confirm('Delete user schema "'+name+'"? (built-ins cannot be deleted)')) return;
+  try{
+    const r = await fetch(ROOT_PATH + '/admin/api/ocr/schemas/' + encodeURIComponent(name), {method:'DELETE'});
+    if(!r.ok){ const e=await r.json(); throw new Error(e.detail||'delete failed'); }
+    _ocrSchStatus('deleted "'+name+'"');
+    await ocrLoadSchemas();
+  }catch(e){ _ocrSchStatus('delete failed: '+e.message, true); }
 }
 
 let _ds4DefaultModels = [];
@@ -1135,6 +1555,70 @@ async function loadSettings(){
     document.getElementById('s-colibri-extra-env').value = colibri.extra_env ?? '';
     toggleColibriFields();
     loadColibriDefaultModels();
+    // Kimi-K3 (kimi-k3-in-c)
+    const k3 = d.k3 || {};
+    document.getElementById('s-k3-enabled').checked = !!k3.enabled;
+    document.getElementById('s-k3-model-id').value = k3.model_id ?? 'kimi-k3';
+    document.getElementById('s-k3-model-path').value = k3.model_path ?? '';
+    document.getElementById('s-k3-trunk-dir').value = k3.trunk_dir ?? '';
+    document.getElementById('s-k3-preset').value = k3.preset ?? '';
+    document.getElementById('s-k3-trunk-gb').value = k3.trunk_gb ?? 16;
+    document.getElementById('s-k3-cache-gb').value = k3.cache_gb ?? 64;
+    document.getElementById('s-k3-ctx').value = k3.ctx ?? 4096;
+    document.getElementById('s-k3-auto-build').checked = k3.auto_build !== false;
+    document.getElementById('s-k3-extra-env').value = k3.extra_env ?? '';
+    toggleK3Fields();
+    // ktransformers (SGLang)
+    const kt = d.ktransformers || {};
+    document.getElementById('s-kt-enabled').checked = !!kt.enabled;
+    document.getElementById('s-kt-model-id').value = kt.model_id ?? 'ktransformers';
+    document.getElementById('s-kt-model-path').value = kt.model_path ?? '';
+    document.getElementById('s-kt-weight-path').value = kt.kt_weight_path ?? '';
+    document.getElementById('s-kt-host').value = kt.host ?? '127.0.0.1';
+    document.getElementById('s-kt-port').value = kt.port ?? 0;
+    document.getElementById('s-kt-ctx').value = kt.ctx ?? 32768;
+    document.getElementById('s-kt-extra-args').value = kt.extra_args ?? '';
+    document.getElementById('s-kt-auto-build').checked = !!kt.auto_build;
+    document.getElementById('s-kt-extra-env').value = kt.extra_env ?? '';
+    toggleKtFields();
+
+    // OCR subsystem
+    const ocr = d.ocr || {};
+    document.getElementById('s-ocr-enabled').checked = !!ocr.enabled;
+    document.getElementById('s-ocr-default-engine').value = ocr.default_engine ?? 'paddle';
+    document.getElementById('s-ocr-dpi').value = ocr.dpi ?? 200;
+    document.getElementById('s-ocr-max-concurrency').value = ocr.max_concurrency ?? 4;
+    document.getElementById('s-ocr-lang').value = ocr.lang ?? 'it';
+    document.getElementById('s-ocr-paddle-enabled').checked = ocr.paddle_enabled !== false;
+    document.getElementById('s-ocr-paddle-use-gpu').checked = ocr.paddle_use_gpu !== false;
+    document.getElementById('s-ocr-paddle-structure').checked = ocr.paddle_structure !== false;
+    document.getElementById('s-ocr-paddle-instances').value = ocr.paddle_instances ?? 2;
+    document.getElementById('s-ocr-paddle-lang').value = ocr.paddle_lang ?? 'it';
+    document.getElementById('s-ocr-paddle-det-dir').value = ocr.paddle_det_model_dir ?? '';
+    document.getElementById('s-ocr-paddle-rec-dir').value = ocr.paddle_rec_model_dir ?? '';
+    document.getElementById('s-ocr-paddle-venv').value = ocr.paddle_venv ?? '';
+    document.getElementById('s-ocr-paddle-auto-build').checked = !!ocr.paddle_auto_build;
+    document.getElementById('s-ocr-doctr-enabled').checked = !!ocr.doctr_enabled;
+    document.getElementById('s-ocr-doctr-use-gpu').checked = ocr.doctr_use_gpu !== false;
+    document.getElementById('s-ocr-doctr-instances').value = ocr.doctr_instances ?? 1;
+    document.getElementById('s-ocr-doctr-det').value = ocr.doctr_det_arch ?? 'db_resnet50';
+    document.getElementById('s-ocr-doctr-reco').value = ocr.doctr_reco_arch ?? 'crnn_vgg16_bn';
+    document.getElementById('s-ocr-surya-enabled').checked = !!ocr.surya_enabled;
+    document.getElementById('s-ocr-surya-license').checked = !!ocr.surya_accept_license;
+    document.getElementById('s-ocr-surya-instances').value = ocr.surya_instances ?? 1;
+    document.getElementById('s-ocr-surya-langs').value = ocr.surya_langs ?? 'it';
+    document.getElementById('s-ocr-surya-venv').value = ocr.surya_venv ?? '';
+    document.getElementById('s-ocr-surya-auto-build').checked = !!ocr.surya_auto_build;
+    document.getElementById('s-ocr-detect-mode').value = ocr.detect_mode ?? 'off';
+    document.getElementById('s-ocr-detect-model').value = ocr.detect_model_path ?? '';
+    document.getElementById('s-ocr-detect-conf').value = ocr.detect_conf ?? 0.35;
+    document.getElementById('s-ocr-extract-enabled').checked = !!ocr.extract_enabled;
+    document.getElementById('s-ocr-extract-validate').checked = ocr.extract_validate !== false;
+    document.getElementById('s-ocr-extract-max-tokens').value = ocr.extract_max_tokens ?? 2048;
+    document.getElementById('s-ocr-extract-model').value = ocr.extract_model_id ?? '';
+    _ocrDefaultSchema = ocr.extract_schema ?? '';
+    toggleOcrFields();
+    ocrLoadSchemas();
   }catch(e){ showAlert('error','Failed to load settings: '+e.message); }
 }
 
@@ -1234,6 +1718,65 @@ async function saveSettings(){
       auto_build: document.getElementById('s-colibri-auto-build').checked,
       repo_url: document.getElementById('s-colibri-repo-url').value.trim() || 'https://github.com/JustVugg/colibri',
       extra_env: document.getElementById('s-colibri-extra-env').value.trim(),
+    },
+    k3:{
+      enabled: document.getElementById('s-k3-enabled').checked,
+      model_id: document.getElementById('s-k3-model-id').value.trim() || 'kimi-k3',
+      model_path: document.getElementById('s-k3-model-path').value.trim(),
+      trunk_dir: document.getElementById('s-k3-trunk-dir').value.trim(),
+      preset: document.getElementById('s-k3-preset').value,
+      trunk_gb: parseFloat(document.getElementById('s-k3-trunk-gb').value) || 16,
+      cache_gb: parseFloat(document.getElementById('s-k3-cache-gb').value) || 64,
+      ctx: parseInt(document.getElementById('s-k3-ctx').value) || 4096,
+      auto_build: document.getElementById('s-k3-auto-build').checked,
+      extra_env: document.getElementById('s-k3-extra-env').value.trim(),
+    },
+    ktransformers:{
+      enabled: document.getElementById('s-kt-enabled').checked,
+      model_id: document.getElementById('s-kt-model-id').value.trim() || 'ktransformers',
+      model_path: document.getElementById('s-kt-model-path').value.trim(),
+      kt_weight_path: document.getElementById('s-kt-weight-path').value.trim(),
+      host: document.getElementById('s-kt-host').value.trim() || '127.0.0.1',
+      port: parseInt(document.getElementById('s-kt-port').value) || 0,
+      ctx: parseInt(document.getElementById('s-kt-ctx').value) || 32768,
+      extra_args: document.getElementById('s-kt-extra-args').value.trim(),
+      auto_build: document.getElementById('s-kt-auto-build').checked,
+      extra_env: document.getElementById('s-kt-extra-env').value.trim(),
+    },
+    ocr:{
+      enabled: document.getElementById('s-ocr-enabled').checked,
+      default_engine: document.getElementById('s-ocr-default-engine').value || 'paddle',
+      dpi: parseInt(document.getElementById('s-ocr-dpi').value) || 200,
+      max_concurrency: parseInt(document.getElementById('s-ocr-max-concurrency').value) || 4,
+      lang: document.getElementById('s-ocr-lang').value.trim() || 'it',
+      paddle_enabled: document.getElementById('s-ocr-paddle-enabled').checked,
+      paddle_use_gpu: document.getElementById('s-ocr-paddle-use-gpu').checked,
+      paddle_structure: document.getElementById('s-ocr-paddle-structure').checked,
+      paddle_instances: parseInt(document.getElementById('s-ocr-paddle-instances').value) || 2,
+      paddle_lang: document.getElementById('s-ocr-paddle-lang').value.trim() || 'it',
+      paddle_det_model_dir: document.getElementById('s-ocr-paddle-det-dir').value.trim(),
+      paddle_rec_model_dir: document.getElementById('s-ocr-paddle-rec-dir').value.trim(),
+      paddle_venv: document.getElementById('s-ocr-paddle-venv').value.trim(),
+      paddle_auto_build: document.getElementById('s-ocr-paddle-auto-build').checked,
+      doctr_enabled: document.getElementById('s-ocr-doctr-enabled').checked,
+      doctr_use_gpu: document.getElementById('s-ocr-doctr-use-gpu').checked,
+      doctr_instances: parseInt(document.getElementById('s-ocr-doctr-instances').value) || 1,
+      doctr_det_arch: document.getElementById('s-ocr-doctr-det').value.trim() || 'db_resnet50',
+      doctr_reco_arch: document.getElementById('s-ocr-doctr-reco').value.trim() || 'crnn_vgg16_bn',
+      surya_enabled: document.getElementById('s-ocr-surya-enabled').checked,
+      surya_accept_license: document.getElementById('s-ocr-surya-license').checked,
+      surya_instances: parseInt(document.getElementById('s-ocr-surya-instances').value) || 1,
+      surya_langs: document.getElementById('s-ocr-surya-langs').value.trim() || 'it',
+      surya_venv: document.getElementById('s-ocr-surya-venv').value.trim(),
+      surya_auto_build: document.getElementById('s-ocr-surya-auto-build').checked,
+      detect_mode: document.getElementById('s-ocr-detect-mode').value || 'off',
+      detect_model_path: document.getElementById('s-ocr-detect-model').value.trim(),
+      detect_conf: parseFloat(document.getElementById('s-ocr-detect-conf').value) || 0.35,
+      extract_enabled: document.getElementById('s-ocr-extract-enabled').checked,
+      extract_validate: document.getElementById('s-ocr-extract-validate').checked,
+      extract_max_tokens: parseInt(document.getElementById('s-ocr-extract-max-tokens').value) || 2048,
+      extract_model_id: document.getElementById('s-ocr-extract-model').value.trim(),
+      extract_schema: document.getElementById('s-ocr-extract-schema').value || '',
     },
     compaction:{
       enabled: document.getElementById('s-compact-enabled').checked,

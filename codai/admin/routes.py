@@ -835,6 +835,80 @@ _DS4_DEFAULT_MODELS = [
 ]
 
 
+@router.get("/admin/api/ocr/schemas", summary="List OCR extraction schemas")
+async def api_ocr_schemas(username: str = Depends(require_admin)):
+    from codai.ocr.schemas import schema_store
+    return {"schemas": schema_store.list()}
+
+
+@router.get("/admin/api/ocr/schemas/{name}", summary="Get one OCR extraction schema")
+async def api_ocr_schema_get(name: str, username: str = Depends(require_admin)):
+    from codai.ocr.schemas import schema_store
+    from codai.ocr.base import OcrError
+    try:
+        return schema_store.get(name)
+    except OcrError as e:
+        raise HTTPException(status_code=e.status, detail=str(e))
+
+
+@router.post("/admin/api/ocr/schemas", summary="Create/update a user OCR schema")
+async def api_ocr_schema_save(request: Request, username: str = Depends(require_admin)):
+    from codai.ocr.schemas import schema_store
+    from codai.ocr.base import OcrError
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="schema 'name' is required")
+    data = {
+        "name": name,
+        "description": body.get("description", "") or "",
+        "language": body.get("language", "") or "",
+        "type": body.get("type", "template") or "template",
+        "prompt_hint": body.get("prompt_hint", "") or "",
+        "schema": body.get("schema") or {},
+    }
+    try:
+        return schema_store.save(name, data)
+    except OcrError as e:
+        raise HTTPException(status_code=e.status, detail=str(e))
+
+
+@router.delete("/admin/api/ocr/schemas/{name}", summary="Delete a user OCR schema")
+async def api_ocr_schema_delete(name: str, username: str = Depends(require_admin)):
+    from codai.ocr.schemas import schema_store
+    from codai.ocr.base import OcrError
+    try:
+        schema_store.delete(name)
+        return {"deleted": name}
+    except OcrError as e:
+        raise HTTPException(status_code=e.status, detail=str(e))
+
+
+@router.post("/admin/api/ocr/build-venv", summary="Build a Paddle/Surya isolated venv")
+async def api_ocr_build_venv(request: Request, username: str = Depends(require_admin)):
+    """Kick off a background build of an OCR engine's isolated venv (paddle|surya)."""
+    body = await request.json()
+    engine = (body.get("engine") or "").strip().lower()
+    if engine not in ("paddle", "surya"):
+        raise HTTPException(status_code=400, detail="engine must be 'paddle' or 'surya'")
+    if config_manager is None or config_manager.config is None:
+        raise HTTPException(status_code=503, detail="config unavailable")
+    from codai.ocr.venv_build import build_async
+    try:
+        return build_async(config_manager.config.ocr, engine)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/admin/api/ocr/build-venv/status", summary="OCR isolated-venv build status")
+async def api_ocr_build_venv_status(engine: str, username: str = Depends(require_admin)):
+    engine = (engine or "").strip().lower()
+    if engine not in ("paddle", "surya"):
+        raise HTTPException(status_code=400, detail="engine must be 'paddle' or 'surya'")
+    from codai.ocr.venv_build import status
+    return status(engine)
+
+
 @router.get("/admin/api/ds4/default-models", summary="List downloadable ds4 default models")
 async def api_ds4_default_models(username: str = Depends(require_admin)):
     """Catalog of official DeepSeek V4 GGUF variants ds4 can serve. The UI offers
@@ -3401,6 +3475,71 @@ def build_settings_dict(c, gpu_cards):
             "extra_env": c.colibri.extra_env,
             "auto_build": c.colibri.auto_build,
         },
+        "k3": {
+            "enabled": c.k3.enabled,
+            "repo_url": c.k3.repo_url,
+            "install_dir": c.k3.install_dir,
+            "model_path": c.k3.model_path,
+            "trunk_dir": c.k3.trunk_dir,
+            "tok_dir": c.k3.tok_dir,
+            "model_id": c.k3.model_id,
+            "preset": c.k3.preset,
+            "trunk_gb": c.k3.trunk_gb,
+            "cache_gb": c.k3.cache_gb,
+            "ctx": c.k3.ctx,
+            "extra_args": c.k3.extra_args,
+            "extra_env": c.k3.extra_env,
+            "auto_build": c.k3.auto_build,
+        },
+        "ktransformers": {
+            "enabled": c.ktransformers.enabled,
+            "repo_url": c.ktransformers.repo_url,
+            "install_dir": c.ktransformers.install_dir,
+            "model_path": c.ktransformers.model_path,
+            "kt_weight_path": c.ktransformers.kt_weight_path,
+            "model_id": c.ktransformers.model_id,
+            "host": c.ktransformers.host,
+            "port": c.ktransformers.port,
+            "ctx": c.ktransformers.ctx,
+            "extra_args": c.ktransformers.extra_args,
+            "extra_env": c.ktransformers.extra_env,
+            "auto_build": c.ktransformers.auto_build,
+        },
+        "ocr": {
+            "enabled": c.ocr.enabled,
+            "default_engine": c.ocr.default_engine,
+            "dpi": c.ocr.dpi,
+            "max_concurrency": c.ocr.max_concurrency,
+            "lang": c.ocr.lang,
+            "paddle_enabled": c.ocr.paddle_enabled,
+            "paddle_use_gpu": c.ocr.paddle_use_gpu,
+            "paddle_instances": c.ocr.paddle_instances,
+            "paddle_structure": c.ocr.paddle_structure,
+            "paddle_lang": c.ocr.paddle_lang,
+            "paddle_det_model_dir": c.ocr.paddle_det_model_dir,
+            "paddle_rec_model_dir": c.ocr.paddle_rec_model_dir,
+            "paddle_venv": c.ocr.paddle_venv,
+            "paddle_auto_build": c.ocr.paddle_auto_build,
+            "doctr_enabled": c.ocr.doctr_enabled,
+            "doctr_use_gpu": c.ocr.doctr_use_gpu,
+            "doctr_instances": c.ocr.doctr_instances,
+            "doctr_det_arch": c.ocr.doctr_det_arch,
+            "doctr_reco_arch": c.ocr.doctr_reco_arch,
+            "surya_enabled": c.ocr.surya_enabled,
+            "surya_accept_license": c.ocr.surya_accept_license,
+            "surya_instances": c.ocr.surya_instances,
+            "surya_langs": c.ocr.surya_langs,
+            "surya_venv": c.ocr.surya_venv,
+            "surya_auto_build": c.ocr.surya_auto_build,
+            "detect_mode": c.ocr.detect_mode,
+            "detect_model_path": c.ocr.detect_model_path,
+            "detect_conf": c.ocr.detect_conf,
+            "extract_enabled": c.ocr.extract_enabled,
+            "extract_model_id": c.ocr.extract_model_id,
+            "extract_max_tokens": c.ocr.extract_max_tokens,
+            "extract_schema": c.ocr.extract_schema,
+            "extract_validate": c.ocr.extract_validate,
+        },
         "compaction": {
             "enabled": c.compaction.enabled,
             "pct": c.compaction.pct,
@@ -3776,6 +3915,134 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             c.colibri.extra_env = (d.get("extra_env") or "").strip()
         if "auto_build" in d:
             c.colibri.auto_build = bool(d["auto_build"])
+
+    if "k3" in data:
+        d = data["k3"]
+        c.k3.enabled = bool(d.get("enabled", c.k3.enabled))
+        if "repo_url" in d:
+            c.k3.repo_url = (d.get("repo_url") or c.k3.repo_url or "").strip()
+        if "install_dir" in d:
+            c.k3.install_dir = (d.get("install_dir") or "").strip() or None
+        if "model_path" in d:
+            c.k3.model_path = (d.get("model_path") or "").strip()
+        if "trunk_dir" in d:
+            c.k3.trunk_dir = (d.get("trunk_dir") or "").strip()
+        if "tok_dir" in d:
+            c.k3.tok_dir = (d.get("tok_dir") or "").strip()
+        if "model_id" in d:
+            c.k3.model_id = (d.get("model_id") or c.k3.model_id or "kimi-k3").strip()
+        if "preset" in d:
+            c.k3.preset = (d.get("preset") or "").strip()
+        if "trunk_gb" in d:
+            try:
+                c.k3.trunk_gb = float(d.get("trunk_gb") or c.k3.trunk_gb)
+            except (TypeError, ValueError):
+                pass
+        if "cache_gb" in d:
+            try:
+                c.k3.cache_gb = float(d.get("cache_gb") or c.k3.cache_gb)
+            except (TypeError, ValueError):
+                pass
+        if "ctx" in d:
+            try:
+                c.k3.ctx = max(32, int(d.get("ctx") or c.k3.ctx))
+            except (TypeError, ValueError):
+                pass
+        if "extra_args" in d:
+            c.k3.extra_args = (d.get("extra_args") or "").strip()
+        if "extra_env" in d:
+            c.k3.extra_env = (d.get("extra_env") or "").strip()
+        if "auto_build" in d:
+            c.k3.auto_build = bool(d["auto_build"])
+
+    if "ktransformers" in data:
+        d = data["ktransformers"]
+        c.ktransformers.enabled = bool(d.get("enabled", c.ktransformers.enabled))
+        if "repo_url" in d:
+            c.ktransformers.repo_url = (d.get("repo_url") or c.ktransformers.repo_url or "").strip()
+        if "install_dir" in d:
+            c.ktransformers.install_dir = (d.get("install_dir") or "").strip() or None
+        if "model_path" in d:
+            c.ktransformers.model_path = (d.get("model_path") or "").strip()
+        if "kt_weight_path" in d:
+            c.ktransformers.kt_weight_path = (d.get("kt_weight_path") or "").strip()
+        if "model_id" in d:
+            c.ktransformers.model_id = (d.get("model_id") or c.ktransformers.model_id or "ktransformers").strip()
+        if "host" in d:
+            c.ktransformers.host = (d.get("host") or "127.0.0.1").strip()
+        if "port" in d:
+            try:
+                c.ktransformers.port = int(d.get("port") or 0)
+            except (TypeError, ValueError):
+                pass
+        if "ctx" in d:
+            try:
+                c.ktransformers.ctx = max(512, int(d.get("ctx") or c.ktransformers.ctx))
+            except (TypeError, ValueError):
+                pass
+        if "extra_args" in d:
+            c.ktransformers.extra_args = (d.get("extra_args") or "").strip()
+        if "extra_env" in d:
+            c.ktransformers.extra_env = (d.get("extra_env") or "").strip()
+        if "auto_build" in d:
+            c.ktransformers.auto_build = bool(d["auto_build"])
+
+    if "ocr" in data:
+        d = data["ocr"]
+        o = c.ocr
+
+        def _s(key, default=""):
+            return (d.get(key) or default).strip() if isinstance(d.get(key), str) else d.get(key, default)
+
+        def _i(key, cur, lo=None):
+            try:
+                v = int(d.get(key, cur))
+                return max(lo, v) if lo is not None else v
+            except (TypeError, ValueError):
+                return cur
+
+        if "enabled" in d: o.enabled = bool(d["enabled"])
+        if "default_engine" in d: o.default_engine = (d.get("default_engine") or "paddle").strip()
+        if "dpi" in d: o.dpi = _i("dpi", o.dpi, 36)
+        if "max_concurrency" in d: o.max_concurrency = _i("max_concurrency", o.max_concurrency, 1)
+        if "lang" in d: o.lang = (d.get("lang") or "it").strip()
+        # PaddleOCR
+        if "paddle_enabled" in d: o.paddle_enabled = bool(d["paddle_enabled"])
+        if "paddle_use_gpu" in d: o.paddle_use_gpu = bool(d["paddle_use_gpu"])
+        if "paddle_instances" in d: o.paddle_instances = _i("paddle_instances", o.paddle_instances, 1)
+        if "paddle_structure" in d: o.paddle_structure = bool(d["paddle_structure"])
+        if "paddle_lang" in d: o.paddle_lang = (d.get("paddle_lang") or "it").strip()
+        if "paddle_det_model_dir" in d: o.paddle_det_model_dir = (d.get("paddle_det_model_dir") or "").strip()
+        if "paddle_rec_model_dir" in d: o.paddle_rec_model_dir = (d.get("paddle_rec_model_dir") or "").strip()
+        if "paddle_venv" in d: o.paddle_venv = (d.get("paddle_venv") or "").strip()
+        if "paddle_auto_build" in d: o.paddle_auto_build = bool(d["paddle_auto_build"])
+        # docTR
+        if "doctr_enabled" in d: o.doctr_enabled = bool(d["doctr_enabled"])
+        if "doctr_use_gpu" in d: o.doctr_use_gpu = bool(d["doctr_use_gpu"])
+        if "doctr_instances" in d: o.doctr_instances = _i("doctr_instances", o.doctr_instances, 1)
+        if "doctr_det_arch" in d: o.doctr_det_arch = (d.get("doctr_det_arch") or "db_resnet50").strip()
+        if "doctr_reco_arch" in d: o.doctr_reco_arch = (d.get("doctr_reco_arch") or "crnn_vgg16_bn").strip()
+        # Surya
+        if "surya_enabled" in d: o.surya_enabled = bool(d["surya_enabled"])
+        if "surya_accept_license" in d: o.surya_accept_license = bool(d["surya_accept_license"])
+        if "surya_instances" in d: o.surya_instances = _i("surya_instances", o.surya_instances, 1)
+        if "surya_langs" in d: o.surya_langs = (d.get("surya_langs") or "it").strip()
+        if "surya_venv" in d: o.surya_venv = (d.get("surya_venv") or "").strip()
+        if "surya_auto_build" in d: o.surya_auto_build = bool(d["surya_auto_build"])
+        # detection
+        if "detect_mode" in d: o.detect_mode = (d.get("detect_mode") or "off").strip()
+        if "detect_model_path" in d: o.detect_model_path = (d.get("detect_model_path") or "").strip()
+        if "detect_conf" in d:
+            try:
+                o.detect_conf = float(d.get("detect_conf") or o.detect_conf)
+            except (TypeError, ValueError):
+                pass
+        # extraction
+        if "extract_enabled" in d: o.extract_enabled = bool(d["extract_enabled"])
+        if "extract_model_id" in d: o.extract_model_id = (d.get("extract_model_id") or "").strip()
+        if "extract_max_tokens" in d: o.extract_max_tokens = _i("extract_max_tokens", o.extract_max_tokens, 64)
+        if "extract_schema" in d: o.extract_schema = (d.get("extract_schema") or "").strip()
+        if "extract_validate" in d: o.extract_validate = bool(d["extract_validate"])
 
     if "compaction" in data:
         cp = data["compaction"] or {}

@@ -450,6 +450,145 @@ class ColibriConfig:
 
 
 @dataclass
+class K3Config:
+    """Kimi-K3 via kimi-k3-in-c (FareedKhan-dev) native-engine configuration.
+
+    kimi-k3-in-c is a portable-C CPU inference engine for Kimi-K3 (2.78T params, 16/896
+    experts active) that streams the always-on dense trunk + routed experts from disk,
+    running the full model in as little as ~8 GB RAM. Upstream it is a one-shot batch
+    CLI; coderai applies ``packaging/patch-k3.py`` to add a resident serve loop that
+    speaks the SAME mux stdin/stdout protocol as colibri, so the existing
+    :class:`~codai.api.colibri_worker.MuxEngine` drives it. coderai owns the build, the
+    process, the Kimi-K3 chat template (rendered XTML string) and the protocol client.
+
+    The model is a *directory* (the HF checkpoint, ~1.56 TB) plus a packed dense
+    ``trunk`` produced by the repo's ``scripts/pack-trunk.sh`` (~109 GB). Routing
+    matches by ``model_id``/alias/``model_path`` or a ``backend: "k3"`` pin. There is no
+    auto-download of the multi-TB checkpoint. CPU-only: needs AVX2 + FMA and ~1.7 TB of
+    fast local storage.
+    """
+    enabled: bool = False
+    repo_url: str = "https://github.com/FareedKhan-dev/kimi-k3-in-c"
+    install_dir: Optional[str] = None      # None = ~/.coderai/kimi-k3-in-c
+    model_path: str = ""                   # the Kimi-K3 checkpoint directory (config + tokenizer + shards)
+    trunk_dir: str = ""                    # packed dense trunk dir (scripts/pack-trunk.sh); "" = resident (needs ~114 GB RAM)
+    tok_dir: str = ""                      # tokenizer dir; "" = use the checkpoint (model_path) dir
+    model_id: str = "kimi-k3"              # model id/alias that routes to k3
+    preset: str = ""                       # laptop|desktop|workstation|server|max (blank = use trunk_gb/cache_gb)
+    trunk_gb: float = 16.0                 # GiB of the packed trunk pinned resident (--trunk-gb)
+    cache_gb: float = 64.0                 # GiB expert LRU cache (--cache-gb)
+    ctx: int = 4096                        # serve context capacity (env K3_MAXT)
+    extra_args: str = ""                   # extra flags passed to the k3 binary
+    extra_env: str = ""                    # free-form KEY=VALUE env (K3_EXPERT_GB, K3_BITS, K3_DIRECT, K3_PIPE, …)
+    auto_build: bool = True                # clone+patch+build the binary if it's missing
+
+
+@dataclass
+class KtransformersConfig:
+    """ktransformers (kvcache-ai) via SGLang — CPU+GPU heterogeneous engine config.
+
+    ktransformers is a CPU+GPU heterogeneous MoE inference engine (Intel AMX/AVX512/AVX2
+    CPU kernels for quantized experts + GPU for the dense trunk/attention). It exposes an
+    OpenAI-compatible HTTP server through SGLang, so — like ds4 — coderai owns the whole
+    lifecycle: it launches ``python -m sglang.launch_server`` as a managed subprocess and
+    proxies ``/v1/chat/completions`` to it. It can serve many families (DeepSeek-V3/R1/V4,
+    Kimi-K2/K2.5, Qwen3, GLM-5/5.2, MiniMax), so it is selected PER MODEL via an explicit
+    ``backend: "kt"`` pin or the configured ``model_id`` alias — never by a broad name
+    marker (it would collide with every other engine).
+
+    Heavy dependencies (SGLang + kt-kernel, built once) — install them out of band and
+    point ``model_path`` at the HF model dir and ``kt_weight_path`` at the KT quantized
+    weights. Best throughput needs AMX/AVX-512 CPUs.
+    """
+    enabled: bool = False
+    repo_url: str = "https://github.com/kvcache-ai/ktransformers"
+    install_dir: Optional[str] = None      # None = ~/.coderai/ktransformers (kt-kernel build)
+    model_path: str = ""                   # HF model directory (--model)
+    kt_weight_path: str = ""               # KT quantized weights directory (--kt-weight-path)
+    model_id: str = "ktransformers"        # model id/alias that routes to kt (and --served-model-name)
+    host: str = "127.0.0.1"                # SGLang bind host
+    port: int = 0                          # 0 = auto-pick a free port
+    ctx: int = 32768                       # context length (--context-length)
+    extra_args: str = ""                   # extra flags for sglang.launch_server (e.g. --tp-size, KT knobs)
+    extra_env: str = ""                    # free-form KEY=VALUE env for the subprocess
+    auto_build: bool = False               # pip-install SGLang+kt-kernel if missing (heavy; off by default)
+
+
+@dataclass
+class OcrConfig:
+    """Dedicated OCR subsystem configuration.
+
+    coderai's OCR is done by PURPOSE-BUILT OCR engines (detection + recognition),
+    NOT a vision LLM — far faster, GPU-batchable, and it returns faithful text with
+    line/word bounding boxes and layout instead of hallucinating. Three engines are
+    supported and selectable per request (``engine`` field on ``/v1/ocr``), falling
+    back to ``default_engine``:
+
+    - ``paddle``  — PaddleOCR + PP-Structure (Apache-2.0; layout + tables; recommended)
+    - ``doctr``   — Mindee docTR (Apache-2.0; pure-PyTorch; easy install)
+    - ``surya``   — Surya (best layout/reading-order; LICENSE-GATED — GPL/commercial:
+      only loaded when ``surya_accept_license`` is True)
+
+    Heavy OCR dependencies are installed out of band (optional) so the base image
+    stays lean. Concurrency on a single GPU comes from loading multiple instances of
+    an engine (``*_instances``) and fanning requests across them (``max_concurrency``);
+    a continuous-batching path via vLLM is a deferred option (see docs/vllm.md).
+
+    Per document coderai can produce: (1) plain-text transcription, (2) structured
+    JSON of fields via an existing coderai text model (``extract_*``), and (3)
+    stamp/signature flags (``detect_*``).
+    """
+    enabled: bool = False
+    default_engine: str = "paddle"        # paddle|doctr|surya
+    dpi: int = 200                        # PDF rasterisation DPI
+    max_concurrency: int = 4             # global cap on in-flight OCR pages
+    lang: str = "it"                     # default document language
+
+    # --- PaddleOCR / PP-Structure ---
+    paddle_enabled: bool = True
+    paddle_use_gpu: bool = True
+    paddle_instances: int = 2            # copies loaded for concurrent OCR
+    paddle_structure: bool = True        # PP-Structure layout + tables + reading order
+    paddle_lang: str = "it"             # PaddleOCR lang code (it / latin / …)
+    paddle_det_model_dir: str = ""       # override detection model dir (blank = default)
+    paddle_rec_model_dir: str = ""       # override recognition model dir (blank = default)
+    # PaddleOCR runs in an ISOLATED venv subprocess (opencv-contrib clash + bundled CUDA).
+    paddle_venv: str = ""               # isolated venv dir; blank = ~/.coderai/paddle_venv
+    paddle_auto_build: bool = False     # create the venv + pip install requirements-ocr-paddle.txt on first use
+
+    # --- docTR (Mindee) --- runs IN-PROCESS (uses the main venv's torch)
+    doctr_enabled: bool = False
+    doctr_use_gpu: bool = True
+    doctr_instances: int = 1
+    doctr_det_arch: str = "db_resnet50"
+    doctr_reco_arch: str = "crnn_vgg16_bn"
+
+    # --- Surya (LICENSE-GATED) --- runs in an ISOLATED venv subprocess (pillow<11 clash)
+    surya_enabled: bool = False
+    surya_accept_license: bool = False   # MUST be explicitly set (GPL — compatible with coderai GPLv3)
+    surya_instances: int = 1
+    surya_langs: str = "it"
+    surya_venv: str = ""               # isolated venv dir; blank = ~/.coderai/surya_venv
+    surya_auto_build: bool = False     # create the venv + pip install requirements-surya.txt on first use
+
+    # --- stamp / signature detection ---  [O3]
+    detect_mode: str = "off"             # off|layout|detector|both
+    detect_model_path: str = ""          # YOLO signature/stamp weights (detector/both modes)
+    detect_conf: float = 0.35            # detector confidence threshold
+
+    # --- structured field extraction (via an existing coderai text model) ---  [O4]
+    extract_enabled: bool = False
+    extract_model_id: str = ""           # coderai text model id/alias used for extraction
+    extract_max_tokens: int = 2048
+    # Default extraction schema SPEC — not a hardcoded schema. Accepts a named schema
+    # (e.g. "italian_sentenza"; files in <config_dir>/ocr_schemas/ + built-in seeds),
+    # inline JSON (starts with '{'/'['), or blank/"auto" for generic key/value
+    # extraction. Overridable per request via the `schema` field. See codai/ocr/schemas.py.
+    extract_schema: str = ""
+    extract_validate: bool = True        # validate output against JSON Schema (jsonschema-typed schemas only)
+
+
+@dataclass
 class Config:
     """Main configuration class."""
     version: str = "1.0"
@@ -466,6 +605,9 @@ class Config:
     enhance: EnhanceConfig = field(default_factory=EnhanceConfig)
     ds4: Ds4Config = field(default_factory=Ds4Config)
     colibri: ColibriConfig = field(default_factory=ColibriConfig)
+    k3: K3Config = field(default_factory=K3Config)
+    ktransformers: KtransformersConfig = field(default_factory=KtransformersConfig)
+    ocr: OcrConfig = field(default_factory=OcrConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
     broker: BrokerConfig = field(default_factory=BrokerConfig)
     system_prompt: Optional[str] = None
@@ -652,6 +794,9 @@ class ConfigManager:
                 enhance=_dc(EnhanceConfig, config_data.get("enhance", {})),
                 ds4=_dc(Ds4Config, config_data.get("ds4", {})),
                 colibri=_dc(ColibriConfig, config_data.get("colibri", {})),
+                k3=_dc(K3Config, config_data.get("k3", {})),
+                ktransformers=_dc(KtransformersConfig, config_data.get("ktransformers", {})),
+                ocr=_dc(OcrConfig, config_data.get("ocr", {})),
                 compaction=_dc(CompactionConfig, config_data.get("compaction", {})),
                 broker=_dc(BrokerConfig, config_data.get("broker", {})),
                 system_prompt=config_data.get("system_prompt"),
@@ -850,6 +995,71 @@ class ConfigManager:
                 "extra_args": self.config.colibri.extra_args,
                 "extra_env": self.config.colibri.extra_env,
                 "auto_build": self.config.colibri.auto_build,
+            },
+            "k3": {
+                "enabled": self.config.k3.enabled,
+                "repo_url": self.config.k3.repo_url,
+                "install_dir": self.config.k3.install_dir,
+                "model_path": self.config.k3.model_path,
+                "trunk_dir": self.config.k3.trunk_dir,
+                "tok_dir": self.config.k3.tok_dir,
+                "model_id": self.config.k3.model_id,
+                "preset": self.config.k3.preset,
+                "trunk_gb": self.config.k3.trunk_gb,
+                "cache_gb": self.config.k3.cache_gb,
+                "ctx": self.config.k3.ctx,
+                "extra_args": self.config.k3.extra_args,
+                "extra_env": self.config.k3.extra_env,
+                "auto_build": self.config.k3.auto_build,
+            },
+            "ktransformers": {
+                "enabled": self.config.ktransformers.enabled,
+                "repo_url": self.config.ktransformers.repo_url,
+                "install_dir": self.config.ktransformers.install_dir,
+                "model_path": self.config.ktransformers.model_path,
+                "kt_weight_path": self.config.ktransformers.kt_weight_path,
+                "model_id": self.config.ktransformers.model_id,
+                "host": self.config.ktransformers.host,
+                "port": self.config.ktransformers.port,
+                "ctx": self.config.ktransformers.ctx,
+                "extra_args": self.config.ktransformers.extra_args,
+                "extra_env": self.config.ktransformers.extra_env,
+                "auto_build": self.config.ktransformers.auto_build,
+            },
+            "ocr": {
+                "enabled": self.config.ocr.enabled,
+                "default_engine": self.config.ocr.default_engine,
+                "dpi": self.config.ocr.dpi,
+                "max_concurrency": self.config.ocr.max_concurrency,
+                "lang": self.config.ocr.lang,
+                "paddle_enabled": self.config.ocr.paddle_enabled,
+                "paddle_use_gpu": self.config.ocr.paddle_use_gpu,
+                "paddle_instances": self.config.ocr.paddle_instances,
+                "paddle_structure": self.config.ocr.paddle_structure,
+                "paddle_lang": self.config.ocr.paddle_lang,
+                "paddle_det_model_dir": self.config.ocr.paddle_det_model_dir,
+                "paddle_rec_model_dir": self.config.ocr.paddle_rec_model_dir,
+                "paddle_venv": self.config.ocr.paddle_venv,
+                "paddle_auto_build": self.config.ocr.paddle_auto_build,
+                "doctr_enabled": self.config.ocr.doctr_enabled,
+                "doctr_use_gpu": self.config.ocr.doctr_use_gpu,
+                "doctr_instances": self.config.ocr.doctr_instances,
+                "doctr_det_arch": self.config.ocr.doctr_det_arch,
+                "doctr_reco_arch": self.config.ocr.doctr_reco_arch,
+                "surya_enabled": self.config.ocr.surya_enabled,
+                "surya_accept_license": self.config.ocr.surya_accept_license,
+                "surya_instances": self.config.ocr.surya_instances,
+                "surya_langs": self.config.ocr.surya_langs,
+                "surya_venv": self.config.ocr.surya_venv,
+                "surya_auto_build": self.config.ocr.surya_auto_build,
+                "detect_mode": self.config.ocr.detect_mode,
+                "detect_model_path": self.config.ocr.detect_model_path,
+                "detect_conf": self.config.ocr.detect_conf,
+                "extract_enabled": self.config.ocr.extract_enabled,
+                "extract_model_id": self.config.ocr.extract_model_id,
+                "extract_max_tokens": self.config.ocr.extract_max_tokens,
+                "extract_schema": self.config.ocr.extract_schema,
+                "extract_validate": self.config.ocr.extract_validate,
             },
             "compaction": {
                 "enabled": self.config.compaction.enabled,

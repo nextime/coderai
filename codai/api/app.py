@@ -142,6 +142,7 @@ from codai.api.characters import router as characters_router
 from codai.api.loras import router as loras_router
 from codai.api.spatial import router as spatial_router
 from codai.api.environments import router as environments_router
+from codai.api.ocr import router as ocr_router
 from codai.admin.routes import router as admin_router
 
 # Import and add middleware
@@ -574,6 +575,7 @@ app.include_router(characters_router, tags=["Characters"])
 app.include_router(loras_router, tags=["LoRAs"])
 app.include_router(environments_router, tags=["Environments"])
 app.include_router(spatial_router, tags=["Spatial / 3D"])
+app.include_router(ocr_router, tags=["OCR"])
 app.include_router(admin_router, tags=["Admin"])
 
 

@@ -1271,6 +1271,10 @@ def main():
     from codai.api.characters import set_global_args as set_chars_global_args
     set_chars_global_args(global_args)
 
+    # Set OCR module global args
+    from codai.api.ocr import set_global_args as set_ocr_global_args
+    set_ocr_global_args(global_args)
+
     # Set LoRA training module global args. Resolve job-recovery first (the
     # --no-resume-jobs flag overrides the persisted config setting), then call
     # set_global_args, which runs _load_jobs_on_start and honours the flag.

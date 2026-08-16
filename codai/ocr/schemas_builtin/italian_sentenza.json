@@ -1,0 +1,26 @@
+{
+  "name": "italian_sentenza",
+  "description": "Italian judicial decision (sentenza / provvedimento)",
+  "language": "it",
+  "type": "template",
+  "prompt_hint": "Il testo OCR puo' contenere errori di riconoscimento: correggili implicitamente dove ovvio. Le date in formato ISO YYYY-MM-DD.",
+  "schema": {
+    "tribunale": "string|null",
+    "sezione": "string|null",
+    "numero_sentenza": "string|null",
+    "data_sentenza": "YYYY-MM-DD|null",
+    "tipo_procedimento": "civile|penale|amministrativo|null",
+    "giudice": "string|null",
+    "parti": {
+      "attore_o_ricorrente": "string|null",
+      "convenuto_o_imputato": "string|null",
+      "pubblico_ministero": "string|null"
+    },
+    "oggetto": "string|null",
+    "dispositivo": "string|null",
+    "esito": "string|null",
+    "spese_di_giudizio": "string|null",
+    "riferimenti_normativi": ["string"],
+    "note": "string|null"
+  }
+}

@@ -37,6 +37,8 @@ CUSTOM_VENV=""
 PACKAGE=false
 DS4=false
 COLIBRI=false
+K3=false
+OCR=false
 
 # Parse arguments
 i=1
@@ -58,6 +60,12 @@ for arg in "$@"; do
         --colibri)
             COLIBRI=true
             ;;
+        --k3)
+            K3=true
+            ;;
+        --ocr)
+            OCR=true
+            ;;
     esac
     i=$((i + 1))
 done
@@ -77,7 +85,9 @@ if [[ "$BACKEND" != "nvidia" && "$BACKEND" != "vulkan" && "$BACKEND" != "vulkan-
     echo "Options:"
     echo "  --flash     - Install Flash Attention 2 for faster inference (NVIDIA only)"
     echo "  --ds4       - Clone + build the ds4 (DeepSeek V4) native engine"
-    echo "  --colibri   - Clone + build the colibri (GLM-5.2) native engine"
+    echo "  --colibri   - Clone + build the colibri (GLM-5.2 / DeepSeek-V4 / Kimi-K3) engines"
+    echo "  --k3        - Clone + patch + build the kimi-k3-in-c (Kimi-K3) native engine"
+    echo "  --ocr       - Install the dedicated OCR engine stack (requirements-ocr.txt: PaddleOCR/docTR/YOLO)"
     exit 1
 fi
 
@@ -827,13 +837,79 @@ build_colibri() {
     ( cd "$COLIBRI_DIR/c" && make -s $MAKE_ARGS ) || {
         echo -e "${YELLOW}Warning: colibri build failed; it can still be built at runtime.${NC}"; return 0; }
     if [ -x "$COLIBRI_DIR/c/colibri" ]; then
-        echo -e "${GREEN}✓ colibri built at $COLIBRI_DIR/c/colibri${NC}"
+        echo -e "${GREEN}✓ colibri (GLM-5.2) built at $COLIBRI_DIR/c/colibri${NC}"
         echo -e "${YELLOW}Note: the GLM-5.2 int4 container (~372 GB dir) is NOT downloaded; point colibri.model_path at it.${NC}"
     fi
+
+    # colibri v1.5.0 ships sibling engines for other families, each its own binary +
+    # make target. Build them too (non-fatal) so a single install serves DeepSeek-V4 and
+    # Kimi-K3 as well as GLM-5.2. Both are CPU engines that stream experts from disk:
+    # DeepSeek-V4 is AVX2 (no CUDA path, distinct from the separate ds4 CUDA engine) and
+    # Kimi-K3 is CPU + an opt-in Vulkan tier (COLI_K3_VK=1 → make VK=1, needs
+    # glslc/shaderc). The multi-GB model containers are NOT downloaded here.
+    ( cd "$COLIBRI_DIR/c" && make -s deepseek-v4 ) \
+        && [ -x "$COLIBRI_DIR/c/deepseek_v4" ] \
+        && echo -e "${GREEN}✓ colibri deepseek_v4 (CPU/AVX2) built at $COLIBRI_DIR/c/deepseek_v4${NC}" \
+        || echo -e "${YELLOW}Warning: colibri deepseek_v4 build skipped/failed (built on demand at runtime).${NC}"
+
+    local K3_ARGS="kimi_k3"
+    if [ "${COLI_K3_VK:-0}" = "1" ]; then K3_ARGS="kimi_k3 VK=1"; fi
+    ( cd "$COLIBRI_DIR/c" && make -s $K3_ARGS ) \
+        && [ -x "$COLIBRI_DIR/c/kimi_k3" ] \
+        && echo -e "${GREEN}✓ colibri kimi_k3 built at $COLIBRI_DIR/c/kimi_k3${NC}" \
+        || echo -e "${YELLOW}Warning: colibri kimi_k3 build skipped/failed (built on demand at runtime).${NC}"
 }
 
 if [ "$COLIBRI" = true ]; then
     build_colibri
+fi
+
+# Optionally clone + patch + build kimi-k3-in-c (Kimi-K3 native engine). Opt-in via
+# --k3. coderai patches in a resident serve loop (packaging/patch-k3.py) that speaks the
+# colibri mux protocol, then drives it via MuxEngine. CPU-only (AVX2+FMA); the ~1.56 TB
+# checkpoint + ~109 GB packed trunk are NOT downloaded here.
+build_k3() {
+    local K3_DIR="${CODERAI_K3_DIR:-$HOME/.coderai/kimi-k3-in-c}"
+    echo -e "${YELLOW}Building kimi-k3-in-c (Kimi-K3 engine) → $K3_DIR ...${NC}"
+    if [ ! -e "$K3_DIR/Makefile" ]; then
+        mkdir -p "$(dirname "$K3_DIR")"
+        git clone --depth 1 https://github.com/FareedKhan-dev/kimi-k3-in-c "$K3_DIR" || {
+            echo -e "${YELLOW}Warning: could not clone kimi-k3-in-c; skipping.${NC}"; return 0; }
+    fi
+    # Apply coderai's resident serve-loop patch (idempotent) so the engine stays warm.
+    if [ -f "$(dirname "$0")/packaging/patch-k3.py" ] && [ -f "$K3_DIR/src/cli/k3_run.c" ]; then
+        python3 "$(dirname "$0")/packaging/patch-k3.py" "$K3_DIR/src/cli/k3_run.c" || \
+            echo -e "${YELLOW}Warning: k3 serve-loop patch failed (serve mode will not work).${NC}"
+    fi
+    ( cd "$K3_DIR" && make -j ) || {
+        echo -e "${YELLOW}Warning: kimi-k3-in-c build failed; it can still be built at runtime.${NC}"; return 0; }
+    if [ -x "$K3_DIR/bin/k3" ]; then
+        echo -e "${GREEN}✓ kimi-k3-in-c built at $K3_DIR/bin/k3${NC}"
+        echo -e "${YELLOW}Note: the Kimi-K3 checkpoint (~1.56 TB) + packed trunk are NOT downloaded; point k3.model_path/k3.trunk_dir at them.${NC}"
+    fi
+}
+
+if [ "$K3" = true ]; then
+    build_k3
+fi
+
+# Optionally install the dedicated OCR engine stack (PaddleOCR/docTR/YOLO). Opt-in via
+# --ocr. Kept out of the base requirements so the default install/image stay lean; the
+# /v1/ocr subsystem returns HTTP 503 for any engine whose dependency is absent.
+install_ocr() {
+    echo -e "${YELLOW}Installing OCR engine stack (requirements-ocr.txt)...${NC}"
+    if [ -f "$(dirname "$0")/requirements-ocr.txt" ]; then
+        pip install -r "$(dirname "$0")/requirements-ocr.txt" || {
+            echo -e "${YELLOW}Warning: some OCR deps failed (PaddlePaddle is CUDA-version-specific).${NC}"
+            echo -e "${YELLOW}         See requirements-ocr.txt for the correct paddlepaddle-gpu wheel.${NC}"
+        }
+    else
+        echo -e "${YELLOW}Warning: requirements-ocr.txt not found; skipping OCR stack.${NC}"
+    fi
+}
+
+if [ "$OCR" = true ]; then
+    install_ocr
 fi
 
 # Create .backend file to track which backend was used

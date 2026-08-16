@@ -1,0 +1,17 @@
+# ---------------------------------------------------------------------------
+# CoderAI — Surya OCR ISOLATED venv.
+#
+# Surya caps pillow<11, which conflicts with the main coderai venv (pillow>=12), so it
+# CANNOT be installed alongside the rest of the stack. It runs in its own virtualenv +
+# subprocess worker (same isolation pattern as the DINOv2-SALAD embedder). Create the
+# venv separately, e.g.:
+#
+#     python3 -m venv ~/.coderai/surya_venv
+#     ~/.coderai/surya_venv/bin/pip install -r requirements-surya.txt
+#
+# The coderai Surya backend shells out to this venv's python. GPL license (compatible
+# with coderai's GPLv3); some releases add a revenue-capped commercial clause — check the
+# version you install for commercial use.
+# ---------------------------------------------------------------------------
+surya-ocr>=0.6.0
+pypdfium2>=4.20.0
