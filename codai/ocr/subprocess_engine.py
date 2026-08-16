@@ -88,28 +88,32 @@ class SubprocessOcrEngine(OcrEngine):
         py = self._venv_python()
         if os.path.isfile(py):
             return py
+
+        # Missing venv. If a build is already in flight (web trigger or a prior first-use
+        # request), report that. Otherwise, if auto-build is on, kick off a NON-BLOCKING
+        # background build and tell the caller to retry — never block the request for the
+        # minutes a torch/paddle install takes. If auto-build is off, point at the UI/CLI.
+        from codai.ocr import venv_build
+        if venv_build.is_running(self.name):
+            raise OcrError(f"{self.name}: isolated venv is still building — retry shortly",
+                           status=503)
         if not self._auto_build():
             raise OcrError(
                 f"{self.name}: isolated venv not found at {os.path.dirname(os.path.dirname(py))}. "
-                f"Create it (python3 -m venv <dir> && <dir>/bin/pip install -r "
-                f"{os.path.basename(self._requirements())}) or enable auto-build.",
+                f"Build it from Settings → OCR (\"Build {self.name} venv now\"), enable "
+                f"auto-build, or run: python3 -m venv <dir> && <dir>/bin/pip install -r "
+                f"{os.path.basename(self._requirements())}.",
                 status=503,
             )
-        venv_dir = os.path.expanduser(self._venv_dir())
         req = self._requirements()
         if not req or not os.path.isfile(req):
             raise OcrError(f"{self.name}: requirements file not found ({req})", status=500)
-        try:
-            print(f"[ocr.{self.name}] creating isolated venv at {venv_dir} …", flush=True)
-            os.makedirs(os.path.dirname(venv_dir) or ".", exist_ok=True)
-            subprocess.run([sys.executable, "-m", "venv", venv_dir], check=True)
-            subprocess.run([py, "-m", "pip", "install", "-U", "pip"], check=True)
-            subprocess.run(self._pip_install_cmd(py, req), check=True)
-        except subprocess.CalledProcessError as e:
-            raise OcrError(f"{self.name}: venv build failed: {e}", status=500)
-        if not os.path.isfile(py):
-            raise OcrError(f"{self.name}: venv python missing after build", status=500)
-        return py
+        venv_build.build_async(self.cfg, self.name)
+        raise OcrError(
+            f"{self.name}: isolated venv build started (installing dependencies) — "
+            f"retry in a few minutes; watch progress in Settings → OCR.",
+            status=503,
+        )
 
     def load(self) -> None:
         py = self._ensure_venv()
