@@ -13,7 +13,10 @@
 # exists for your Python — adjust the index URL / version if needed. For CPU-only, drop the
 # --extra-index-url line and use `paddlepaddle` instead of `paddlepaddle-gpu`.
 # ---------------------------------------------------------------------------
+# PIN the exact paddle wheel — an unpinned range makes pip's resolver backtrack for
+# hours across a 2 GB package while satisfying paddleocr/paddlex constraints.
+# 3.3.1 ships a cp313 GPU wheel (bundled CUDA; runs on GPU under a newer host CUDA).
 --extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu126/
-paddlepaddle-gpu>=3.0.0
+paddlepaddle-gpu==3.3.1
 paddleocr>=2.7.0
 pypdfium2>=4.20.0
