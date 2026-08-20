@@ -73,21 +73,44 @@ class PaddleWorker:
     def load(self):
         from paddleocr import PaddleOCR
         o = self.opts
-        kw = dict(lang=o.get("lang", "it"), use_angle_cls=True, show_log=False,
-                  use_gpu=bool(o.get("use_gpu", True)))
+        lang = o.get("lang", "it")
+        use_gpu = bool(o.get("use_gpu", True))
+        dev = "gpu" if use_gpu else "cpu"
+        extra = {}
         if o.get("det_model_dir"):
-            kw["det_model_dir"] = o["det_model_dir"]
+            extra["det_model_dir"] = o["det_model_dir"]
         if o.get("rec_model_dir"):
-            kw["rec_model_dir"] = o["rec_model_dir"]
-        self._ocr = _construct_tolerant(PaddleOCR, kw)
-        if o.get("structure", True):
+            extra["rec_model_dir"] = o["rec_model_dir"]
+        # PaddleOCR's constructor kwargs changed across 2.x→3.x (use_gpu→device,
+        # use_angle_cls→use_textline_orientation, show_log removed). Try newest first,
+        # peeling to a minimal ctor. It raises ValueError for unknown args (not TypeError).
+        attempts = [
+            dict(lang=lang, use_textline_orientation=True, device=dev, **extra),   # 3.x
+            dict(lang=lang, device=dev, **extra),                                   # 3.x minimal
+            dict(lang=lang, use_angle_cls=True, use_gpu=use_gpu, show_log=False, **extra),  # 2.x
+            dict(lang=lang),
+            dict(),
+        ]
+        last = None
+        for kw in attempts:
             try:
-                from paddleocr import PPStructure
-                self._structure = _construct_tolerant(
-                    PPStructure, dict(show_log=False, lang=o.get("lang", "it"),
-                                      use_gpu=bool(o.get("use_gpu", True))))
-            except Exception:
-                self._structure = None
+                self._ocr = PaddleOCR(**kw)
+                break
+            except (TypeError, ValueError) as e:
+                last = e
+        if self._ocr is None:
+            raise last
+        # PP-Structure moved to PPStructureV3 / paddlex in 3.x; best-effort only.
+        self._structure = None
+        if o.get("structure", True):
+            for modname, cls in (("paddleocr", "PPStructureV3"), ("paddleocr", "PPStructure")):
+                try:
+                    import importlib
+                    C = getattr(importlib.import_module(modname), cls)
+                    self._structure = C()
+                    break
+                except Exception:
+                    continue
 
     def ocr(self, img):
         import numpy as np
@@ -111,36 +134,59 @@ class PaddleWorker:
         out = []
         ocr = self._ocr
         raw = None
-        if hasattr(ocr, "ocr"):
+        # 3.x uses .predict() (returns dict-like OCRResult per image); 2.x uses .ocr().
+        if hasattr(ocr, "predict"):
+            try:
+                raw = ocr.predict(bgr)
+            except Exception:
+                raw = None
+        if raw is None and hasattr(ocr, "ocr"):
             try:
                 raw = ocr.ocr(bgr, cls=True)
             except TypeError:
-                raw = ocr.ocr(bgr)
-        elif hasattr(ocr, "predict"):
-            raw = ocr.predict(bgr)
-        if not raw:
-            return out
-        for page in raw:
-            if not page:
+                try:
+                    raw = ocr.ocr(bgr)
+                except Exception:
+                    raw = None
+            except Exception:
+                raw = None
+        for page in (raw or []):
+            if page is None:
                 continue
-            if isinstance(page, dict):
-                texts = page.get("rec_texts") or []
-                polys = page.get("dt_polys") or page.get("rec_polys") or []
-                scores = page.get("rec_scores") or []
+            # dict-like result (3.x OCRResult or a plain dict)
+            texts = None
+            try:
+                texts = page.get("rec_texts")
+            except Exception:
+                texts = None
+            if texts is not None:
+                polys = None
+                for k in ("dt_polys", "rec_polys"):
+                    try:
+                        polys = page.get(k)
+                    except Exception:
+                        polys = None
+                    if polys is not None:
+                        break
+                try:
+                    scores = page.get("rec_scores") or []
+                except Exception:
+                    scores = []
                 for i, t in enumerate(texts):
-                    box = polys[i] if i < len(polys) else [0, 0, 0, 0]
+                    box = polys[i] if (polys is not None and i < len(polys)) else [0, 0, 0, 0]
                     conf = float(scores[i]) if i < len(scores) else 0.0
                     out.append((box, str(t), conf))
                 continue
-            for item in page:
-                try:
+            # 2.x nested-list result
+            try:
+                for item in page:
                     box = item[0]; txt = item[1]
                     if isinstance(txt, (list, tuple)):
                         out.append((box, str(txt[0]), float(txt[1])))
                     else:
                         out.append((box, str(txt), 0.0))
-                except Exception:
-                    continue
+            except Exception:
+                continue
         return out
 
     def _run_structure(self, bgr):
