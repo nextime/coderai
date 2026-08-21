@@ -335,8 +335,15 @@ async def internal_engine_state():
     tasks = []
     try:
         from codai.tasks import task_registry
-        tasks = [t for t in task_registry.list()
-                 if t.get("status") in ("running", "queued", "paused")]
+        # Report active tasks AND the most recent terminal (done/cancelled/error) ones,
+        # so the front's Tasks page can show the last-N history for EVERY engine — not
+        # just running work. Without the terminal ones, finished generations on a
+        # non-primary engine (e.g. radeon) never reach the front and vanish from the
+        # page. Newest-first; cap the terminal slice to keep the ~2s status poll small.
+        _all = task_registry.list()   # newest-first (active + recent terminal)
+        _active = [t for t in _all if t.get("status") in ("running", "queued", "paused")]
+        _recent = [t for t in _all if t.get("status") not in ("running", "queued", "paused")]
+        tasks = _active + _recent[:10]
     except Exception:
         tasks = []
     # This engine's thermal cooldown state, so the front can show WHICH engine is
