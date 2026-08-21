@@ -21,3 +21,7 @@
 # det+recognition locally on torch (GPU), so it's the classic pin. See docs/ocr.md.
 surya-ocr==0.17.1
 pypdfium2>=4.20.0
+# NOTE: 0.17.1 is for ocr.surya_serve="local" (classic det+recognition on torch, runs in
+# THIS venv). For ocr.surya_serve="vllm"/"llamacpp" (the latest "Surya2" VLM, Qwen3.5-VL
+# `datalab-to/surya-ocr-2`), install surya-ocr>=0.20 instead (e.g. 0.22.1) — it needs an
+# external vLLM/llama-server backend, not local torch. One version per venv; see docs/ocr.md.

@@ -47,6 +47,23 @@ python3 -m venv ~/.coderai/paddle_venv
 python3 -m venv ~/.coderai/surya_venv
 ~/.coderai/surya_venv/bin/pip install -r requirements-surya.txt
 ```
+
+### Surya serving modes (`ocr.surya_serve`) — IMPORTANT: the venv version depends on the mode
+
+Surya changed architecture across versions, so the surya venv must hold the version that
+matches the chosen serving mode:
+
+| `surya_serve` | What it is | surya‑ocr version | How it runs |
+|---|---|---|---|
+| `local` (default) | classic detection + recognition on torch | **≤ 0.17.1** (`requirements-surya.txt` pins 0.17.1) | in the isolated venv, GPU |
+| `vllm` | the latest **"Surya2"** VLM (Qwen3.5‑VL, `datalab-to/surya-ocr-2`) | **≥ 0.20** (e.g. 0.22.1) | served by coderai's **vLLM backend**; Surya attaches via `SURYA_INFERENCE_URL` |
+| `llamacpp` | same Surya2 VLM | ≥ 0.20 | attaches to a `llama-server` at `ocr.surya_server_url` |
+
+Surya2 (≥0.20) is a VLM that CANNOT run standalone in the venv — it requires an external
+OpenAI server (vLLM/llama‑server). `vllm` mode is recommended: coderai serves
+`ocr.surya_model` through the vLLM backend (continuous batching) and points Surya at it.
+So: install **surya‑ocr 0.17.1** for `local`, or **surya‑ocr>=0.20** for `vllm`/`llamacpp` —
+one per venv.
 Or set `paddle_auto_build` / `surya_auto_build` to have coderai create the venv and install
 on first use. In the OCI image these venvs are **baked in** at `/opt/coderai/paddle_venv` /
 `/opt/coderai/surya_venv` (same as the `lipsync_venv` / `parler-venv`), so the image is
