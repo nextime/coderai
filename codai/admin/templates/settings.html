@@ -776,6 +776,11 @@
       <label class="form-label">Model path (HF dir or repo id)</label>
       <input type="text" id="s-vllm-model-path" class="form-input" placeholder="/nvme/Qwen3-8B or Qwen/Qwen3-8B">
     </div>
+    <div class="form-group">
+      <label class="form-label">GPU(s) <span class="muted">(CUDA_VISIBLE_DEVICES; blank = all NVIDIA)</span></label>
+      <input type="text" id="s-vllm-gpu" class="form-input" placeholder="e.g. 0  or  0,1">
+      <span class="form-hint">vLLM is CUDA/NVIDIA-only. Pin it to a specific card (e.g. <code>0</code>) to dedicate a GPU, or list several (<code>0,1</code>) with a matching TP size.</span>
+    </div>
     <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
       <div class="form-group" style="flex:1;min-width:130px"><label class="form-label">Max model len</label><input type="number" id="s-vllm-ctx" class="form-input" min="512" placeholder="32768"></div>
       <div class="form-group" style="flex:1;min-width:130px"><label class="form-label">GPU mem util</label><input type="number" id="s-vllm-gmu" class="form-input" min="0.1" max="1" step="0.05" placeholder="0.90"></div>
@@ -1643,6 +1648,7 @@ async function loadSettings(){
     document.getElementById('s-vllm-enabled').checked = !!vll.enabled;
     document.getElementById('s-vllm-model-id').value = vll.model_id ?? 'vllm';
     document.getElementById('s-vllm-model-path').value = vll.model_path ?? '';
+    document.getElementById('s-vllm-gpu').value = vll.gpu ?? '';
     document.getElementById('s-vllm-ctx').value = vll.ctx ?? 32768;
     document.getElementById('s-vllm-gmu').value = vll.gpu_memory_utilization ?? 0.90;
     document.getElementById('s-vllm-tp').value = vll.tensor_parallel_size ?? 1;
@@ -1821,6 +1827,7 @@ async function saveSettings(){
       enabled: document.getElementById('s-vllm-enabled').checked,
       model_id: document.getElementById('s-vllm-model-id').value.trim() || 'vllm',
       model_path: document.getElementById('s-vllm-model-path').value.trim(),
+      gpu: document.getElementById('s-vllm-gpu').value.trim(),
       ctx: parseInt(document.getElementById('s-vllm-ctx').value) || 32768,
       gpu_memory_utilization: parseFloat(document.getElementById('s-vllm-gmu').value) || 0.90,
       tensor_parallel_size: parseInt(document.getElementById('s-vllm-tp').value) || 1,

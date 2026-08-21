@@ -2759,6 +2759,30 @@ class MultiModelManager:
         except Exception:
             pass
 
+    def _total_vram_gb(self) -> float:
+        """Total VRAM (GB) of the largest visible NVIDIA GPU — used to size a vLLM
+        instance's gpu_memory_utilization footprint. Falls back to 24 GB."""
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            best = 0.0
+            for i in range(pynvml.nvmlDeviceGetCount()):
+                h = pynvml.nvmlDeviceGetHandleByIndex(i)
+                tot = pynvml.nvmlDeviceGetMemoryInfo(h).total / (1024 ** 3)
+                best = max(best, tot)
+            pynvml.nvmlShutdown()
+            if best > 0:
+                return best
+        except Exception:
+            pass
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        except Exception:
+            pass
+        return 24.0
+
     def _get_free_vram_gb(self) -> float:
         """Return estimated free VRAM in GB across the cards this engine can use.
 
@@ -3665,6 +3689,20 @@ class MultiModelManager:
                 except (TypeError, ValueError):
                     pass
                 return 14.0                          # modest default until measured
+            # vLLM (external, isolated venv) pre-allocates gpu_memory_utilization × total
+            # VRAM up front and manages it in its own process. Report THAT as its footprint
+            # so the standard evict-before-load path frees enough room (with gmu=0.9 this
+            # evicts ~everything, i.e. effectively exclusive; a low gmu co-tenants).
+            if vllm_should_handle(model_key) or (resolved_name and vllm_should_handle(resolved_name)):
+                measured = self._measured_vram_gb.get(model_key)
+                if not measured and resolved_name:
+                    measured = self._measured_vram_gb.get(resolved_name)
+                if measured:
+                    return float(measured)
+                vcfg = get_active_vllm_config()
+                gmu = float(getattr(vcfg, "gpu_memory_utilization", 0.9) or 0.9) if vcfg else 0.9
+                total = self._total_vram_gb()
+                return round(gmu * total, 1) if total > 0 else 20.0
         except Exception:
             pass
         # Resolve by basename/alias too — a model requested by basename would

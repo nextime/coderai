@@ -180,6 +180,10 @@ def ensure_service(cfg, model_path: Optional[str] = None,
         # via extra_env. (Set before extra_env so an explicit override wins.)
         env.setdefault("VLLM_USE_FLASHINFER", "0")
         env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+        # Pin this vLLM instance to specific NVIDIA GPU(s) if configured (CUDA-only).
+        gpu = (getattr(cfg, "gpu", "") or "").strip()
+        if gpu:
+            env["CUDA_VISIBLE_DEVICES"] = gpu
         extra_env = (getattr(cfg, "extra_env", "") or "").strip()
         applied = {}
         if extra_env:

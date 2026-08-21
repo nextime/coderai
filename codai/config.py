@@ -534,6 +534,8 @@ class VllmConfig:
     venv: str = ""                       # isolated venv dir; blank = auto (baked/cache/home)
     model_path: str = ""                 # HF model dir or repo id (--model)
     model_id: str = "vllm"               # id/alias that routes to vllm (and --served-model-name)
+    gpu: str = ""                        # CUDA device(s) for this vLLM instance (CUDA_VISIBLE_DEVICES,
+                                         # e.g. "0" or "0,1"); blank = all visible NVIDIA GPUs. CUDA-only.
     host: str = "127.0.0.1"
     port: int = 0                        # 0 = auto-pick a free port
     ctx: int = 32768                     # --max-model-len
@@ -1074,6 +1076,7 @@ class ConfigManager:
                 "venv": self.config.vllm.venv,
                 "model_path": self.config.vllm.model_path,
                 "model_id": self.config.vllm.model_id,
+                "gpu": self.config.vllm.gpu,
                 "host": self.config.vllm.host,
                 "port": self.config.vllm.port,
                 "ctx": self.config.vllm.ctx,

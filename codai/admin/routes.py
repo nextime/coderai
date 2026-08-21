@@ -3510,6 +3510,7 @@ def build_settings_dict(c, gpu_cards):
             "venv": c.vllm.venv,
             "model_path": c.vllm.model_path,
             "model_id": c.vllm.model_id,
+            "gpu": c.vllm.gpu,
             "host": c.vllm.host,
             "port": c.vllm.port,
             "ctx": c.vllm.ctx,
@@ -4014,6 +4015,7 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "venv" in d: v.venv = (d.get("venv") or "").strip()
         if "model_path" in d: v.model_path = (d.get("model_path") or "").strip()
         if "model_id" in d: v.model_id = (d.get("model_id") or v.model_id or "vllm").strip()
+        if "gpu" in d: v.gpu = (d.get("gpu") or "").strip()
         if "host" in d: v.host = (d.get("host") or "127.0.0.1").strip()
         if "port" in d:
             try: v.port = int(d.get("port") or 0)
