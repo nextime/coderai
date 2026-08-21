@@ -1,0 +1,16 @@
+# ---------------------------------------------------------------------------
+# CoderAI — vLLM high-concurrency backend, ISOLATED venv.
+#
+# vLLM pins its own torch/CUDA (e.g. torch==2.13.0 / cu13) which conflicts with the main
+# coderai venv, so it runs in a dedicated virtualenv + managed subprocess (same isolation
+# pattern as the OCR Paddle/Surya engines and ktransformers/SGLang). coderai launches
+# `python -m vllm.entrypoints.openai.api_server` from this venv and proxies to it
+# (codai/backends/vllm.py). Also serves Surya2 (a VLM) for the OCR subsystem.
+#
+#   python3 -m venv <dir> && <dir>/bin/pip install -r requirements-vllm.txt
+#   (or set vllm.auto_build = true to have coderai build it on first use)
+#
+# vLLM's wheel pulls its exact torch/torchvision/torchaudio + CUDA runtime, so do NOT pin
+# torch here — let vLLM choose the matching versions. Pin only vLLM itself.
+# ---------------------------------------------------------------------------
+vllm==0.27.1

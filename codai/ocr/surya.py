@@ -36,10 +36,44 @@ class SuryaEngine(SubprocessOcrEngine):
     def _worker_opts(self) -> dict:
         return {"langs": self.cfg.surya_langs or "it"}
 
+    def _serve_mode(self) -> str:
+        return (getattr(self.cfg, "surya_serve", "local") or "local").strip().lower()
+
+    def _worker_env(self) -> dict:
+        """For the served ("Surya2") modes, tell the worker to attach to an external
+        OpenAI server instead of running detection+recognition locally."""
+        mode = self._serve_mode()
+        if mode not in ("vllm", "llamacpp"):
+            return {}
+        url = self._server_url
+        if not url:
+            return {}
+        return {"SURYA_INFERENCE_BACKEND": mode, "SURYA_INFERENCE_URL": url}
+
     def load(self) -> None:
         if not self.cfg.surya_accept_license:
             raise OcrError(
                 "Surya is license-gated. Set ocr.surya_accept_license = true to use it.",
                 status=400,
             )
+        self._server_url = ""
+        mode = self._serve_mode()
+        if mode == "vllm":
+            # Serve the Surya2 VLM checkpoint via coderai's vLLM backend (continuous
+            # batching) and attach Surya to it. Requires vllm enabled/auto-buildable.
+            from codai.api import vllm_worker
+            from codai.models.manager import get_active_vllm_config
+            vcfg = get_active_vllm_config()
+            if vcfg is None:
+                raise OcrError("Surya vllm mode needs the vLLM backend configured", status=400)
+            model = (getattr(self.cfg, "surya_model", "") or "datalab-to/surya-ocr-2").strip()
+            base = vllm_worker.ensure_service(vcfg, model_path=model, served_name=model)
+            self._server_url = base.rstrip("/") + "/v1"
+        elif mode == "llamacpp":
+            url = (getattr(self.cfg, "surya_server_url", "") or "").strip()
+            if not url:
+                raise OcrError(
+                    "Surya llamacpp mode needs ocr.surya_server_url (a running llama-server "
+                    "OpenAI endpoint).", status=400)
+            self._server_url = url
         super().load()

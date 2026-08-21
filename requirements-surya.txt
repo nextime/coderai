@@ -13,9 +13,11 @@
 # with coderai's GPLv3); some releases add a revenue-capped commercial clause — check the
 # version you install for commercial use.
 # ---------------------------------------------------------------------------
-# PIN to a classic (pre-"Surya2") version. surya-ocr >=~0.15 rearchitected to a VLM that
-# requires an EXTERNAL vLLM-in-Docker or llama-server backend (SpawnError without them) —
-# unusable inside coderai's isolated venv. 0.6.4 runs det+recognition locally on torch,
-# matching the RecognitionPredictor(images, langs, det_predictor) API the worker uses.
-surya-ocr==0.6.4
+# PIN to the NEWEST classic (pre-"Surya2") version. surya-ocr >=0.20 rearchitected to a
+# VLM that needs an EXTERNAL backend — vLLM (defaults to a vllm-openai Docker image),
+# llama-server (LLAMA_CPP_BINARY), or any OpenAI endpoint (openai_client). That is the
+# right long-term path (serve Surya2 via coderai's planned vLLM/llama.cpp backend), but it
+# does NOT run standalone in this isolated venv. 0.17.1 is the last version that runs
+# det+recognition locally on torch (GPU), so it's the classic pin. See docs/ocr.md.
+surya-ocr==0.17.1
 pypdfium2>=4.20.0

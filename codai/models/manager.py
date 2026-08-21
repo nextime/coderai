@@ -80,6 +80,17 @@ def get_active_ktransformers_config():
     return None
 
 
+def get_active_vllm_config():
+    """Return the active VllmConfig from the server config, or None."""
+    try:
+        from codai.admin.routes import config_manager
+        if config_manager is not None and config_manager.config is not None:
+            return config_manager.config.vllm
+    except Exception:
+        pass
+    return None
+
+
 _GGUF_ARCH_CACHE: Dict[tuple, str] = {}
 
 
@@ -202,7 +213,7 @@ def _gguf_architecture(path: str):
 # --------------------------------------------------------------------------- #
 
 # Ordered by arbitration preference for ambiguous names. New engines append here.
-_ENGINE_BACKENDS = ("ds4", "colibri", "k3", "kt")
+_ENGINE_BACKENDS = ("ds4", "colibri", "k3", "kt", "vllm")
 
 
 def _engine_config(engine: str):
@@ -212,6 +223,7 @@ def _engine_config(engine: str):
         "colibri": get_active_colibri_config,
         "k3": get_active_k3_config,
         "kt": get_active_ktransformers_config,
+        "vllm": get_active_vllm_config,
     }.get(engine)
     return getter() if getter else None
 
@@ -318,11 +330,18 @@ def _kt_name_claims(model_name: str) -> bool:
     return False
 
 
+def _vllm_name_claims(model_name: str) -> bool:
+    """vLLM serves any HF/GGUF model, so it must NEVER auto-claim by a broad name marker.
+    Routes ONLY via an explicit ``backend: "vllm"`` pin or its configured ``model_id``."""
+    return False
+
+
 _ENGINE_NAME_CLAIMS = {
     "ds4": _ds4_name_claims,
     "colibri": _colibri_name_claims,
     "k3": _k3_name_claims,
     "kt": _kt_name_claims,
+    "vllm": _vllm_name_claims,
 }
 
 
@@ -380,6 +399,11 @@ def k3_should_handle(model_name: str) -> bool:
 def kt_should_handle(model_name: str) -> bool:
     """True when kt (ktransformers) is the resolved engine backend for ``model_name``."""
     return resolve_engine_backend(model_name) == "kt"
+
+
+def vllm_should_handle(model_name: str) -> bool:
+    """True when vllm is the resolved engine backend for ``model_name``."""
+    return resolve_engine_backend(model_name) == "vllm"
 
 
 def _trim_cpu_ram() -> None:
@@ -550,6 +574,17 @@ class ModelManager:
             print(f"Routing '{model_name}' to ktransformers (SGLang) backend")
             self.backend_type = "kt"
             self.backend = KtransformersBackend(get_active_ktransformers_config())
+            self.backend.load_model(model_name, **kwargs)
+            self.tool_parser = ModelParserAdapter(model_name=model_name)
+            return
+
+        # vLLM: when enabled, proxy matching models to the managed vLLM OpenAI server
+        # (isolated venv, continuous batching). Pin/alias-selected only.
+        if vllm_should_handle(model_name):
+            from codai.backends.vllm import VllmBackend
+            print(f"Routing '{model_name}' to vLLM backend")
+            self.backend_type = "vllm"
+            self.backend = VllmBackend(get_active_vllm_config())
             self.backend.load_model(model_name, **kwargs)
             self.tool_parser = ModelParserAdapter(model_name=model_name)
             return
@@ -2215,6 +2250,11 @@ class MultiModelManager:
         # ktransformers (SGLang) served models: accept for text when kt is the resolver's
         # pick (explicit backend:kt pin or the kt model_id alias).
         if model_type in (None, "text") and kt_should_handle(requested_or_resolved):
+            return True
+
+        # vLLM served models: accept for text when vllm is the resolver's pick
+        # (explicit backend:vllm pin or the vllm model_id alias).
+        if model_type in (None, "text") and vllm_should_handle(requested_or_resolved):
             return True
 
         # If a model_type is specified, reject models registered under a
@@ -5125,6 +5165,11 @@ class MultiModelManager:
         if kt_cfg is not None and getattr(kt_cfg, "enabled", False):
             mid = getattr(kt_cfg, "model_id", "ktransformers") or "ktransformers"
             _add(mid, "text", {"backend": "kt"})
+
+        vllm_cfg = get_active_vllm_config()
+        if vllm_cfg is not None and getattr(vllm_cfg, "enabled", False):
+            mid = getattr(vllm_cfg, "model_id", "vllm") or "vllm"
+            _add(mid, "text", {"backend": "vllm"})
 
         return models
 

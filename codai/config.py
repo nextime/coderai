@@ -515,6 +515,39 @@ class KtransformersConfig:
 
 
 @dataclass
+class VllmConfig:
+    """vLLM high-concurrency backend — the vLLM OpenAI server, driven as a subprocess.
+
+    vLLM (https://github.com/vllm-project/vllm) provides continuous batching + paged KV for
+    far higher aggregate throughput than serialized single-instance backends. Like ds4/kt,
+    coderai launches ``python -m vllm.entrypoints.openai.api_server`` as a managed
+    subprocess and proxies ``/v1/chat/completions`` to it (:mod:`codai.backends.vllm`).
+
+    vLLM pins its own torch/CUDA (e.g. torch 2.13 / cu13), which conflicts with the main
+    coderai venv, so it runs in an ISOLATED venv (``venv``; blank → baked
+    /opt/coderai/vllm_venv, else the /cache mount, else ~/.coderai/vllm_venv), built from
+    requirements-vllm.txt. Selected PER MODEL via a ``backend: "vllm"`` pin or the
+    ``model_id`` alias — never by a broad name marker (it would collide with every engine).
+    Also reused by the OCR subsystem to serve Surya2 (a VLM) with continuous batching.
+    """
+    enabled: bool = False
+    venv: str = ""                       # isolated venv dir; blank = auto (baked/cache/home)
+    model_path: str = ""                 # HF model dir or repo id (--model)
+    model_id: str = "vllm"               # id/alias that routes to vllm (and --served-model-name)
+    host: str = "127.0.0.1"
+    port: int = 0                        # 0 = auto-pick a free port
+    ctx: int = 32768                     # --max-model-len
+    gpu_memory_utilization: float = 0.90  # --gpu-memory-utilization
+    tensor_parallel_size: int = 1        # --tensor-parallel-size
+    max_num_seqs: int = 0                # --max-num-seqs (0 = vLLM default)
+    dtype: str = ""                      # --dtype (blank = auto; e.g. bfloat16/float16)
+    quantization: str = ""               # --quantization (blank = none; e.g. awq/gptq/fp8)
+    extra_args: str = ""                 # extra flags for the api_server
+    extra_env: str = ""                  # free-form KEY=VALUE env for the subprocess
+    auto_build: bool = False             # create the isolated venv + pip install vllm if missing
+
+
+@dataclass
 class OcrConfig:
     """Dedicated OCR subsystem configuration.
 
@@ -570,6 +603,14 @@ class OcrConfig:
     surya_langs: str = "it"
     surya_venv: str = ""               # isolated venv dir; blank = ~/.coderai/surya_venv
     surya_auto_build: bool = False     # create the venv + pip install requirements-surya.txt on first use
+    # Surya serving mode: "local" = classic det+recognition on torch in the isolated venv
+    # (surya-ocr <=0.17); "vllm"/"llamacpp" = the latest "Surya2" VLM served by an external
+    # OpenAI server that Surya attaches to (SURYA_INFERENCE_URL). "vllm" reuses coderai's
+    # vLLM backend to serve `surya_model` (continuous batching); "llamacpp" attaches to a
+    # llama.cpp server at `surya_server_url`.
+    surya_serve: str = "local"         # local | vllm | llamacpp
+    surya_model: str = "datalab-to/surya-ocr-2"   # HF checkpoint for the served (vllm) backend
+    surya_server_url: str = ""         # external OpenAI server URL (llamacpp/manual); blank = auto
 
     # --- stamp / signature detection ---  [O3]
     detect_mode: str = "off"             # off|layout|detector|both
@@ -607,6 +648,7 @@ class Config:
     colibri: ColibriConfig = field(default_factory=ColibriConfig)
     k3: K3Config = field(default_factory=K3Config)
     ktransformers: KtransformersConfig = field(default_factory=KtransformersConfig)
+    vllm: VllmConfig = field(default_factory=VllmConfig)
     ocr: OcrConfig = field(default_factory=OcrConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
     broker: BrokerConfig = field(default_factory=BrokerConfig)
@@ -796,6 +838,7 @@ class ConfigManager:
                 colibri=_dc(ColibriConfig, config_data.get("colibri", {})),
                 k3=_dc(K3Config, config_data.get("k3", {})),
                 ktransformers=_dc(KtransformersConfig, config_data.get("ktransformers", {})),
+                vllm=_dc(VllmConfig, config_data.get("vllm", {})),
                 ocr=_dc(OcrConfig, config_data.get("ocr", {})),
                 compaction=_dc(CompactionConfig, config_data.get("compaction", {})),
                 broker=_dc(BrokerConfig, config_data.get("broker", {})),
@@ -1026,6 +1069,23 @@ class ConfigManager:
                 "extra_env": self.config.ktransformers.extra_env,
                 "auto_build": self.config.ktransformers.auto_build,
             },
+            "vllm": {
+                "enabled": self.config.vllm.enabled,
+                "venv": self.config.vllm.venv,
+                "model_path": self.config.vllm.model_path,
+                "model_id": self.config.vllm.model_id,
+                "host": self.config.vllm.host,
+                "port": self.config.vllm.port,
+                "ctx": self.config.vllm.ctx,
+                "gpu_memory_utilization": self.config.vllm.gpu_memory_utilization,
+                "tensor_parallel_size": self.config.vllm.tensor_parallel_size,
+                "max_num_seqs": self.config.vllm.max_num_seqs,
+                "dtype": self.config.vllm.dtype,
+                "quantization": self.config.vllm.quantization,
+                "extra_args": self.config.vllm.extra_args,
+                "extra_env": self.config.vllm.extra_env,
+                "auto_build": self.config.vllm.auto_build,
+            },
             "ocr": {
                 "enabled": self.config.ocr.enabled,
                 "default_engine": self.config.ocr.default_engine,
@@ -1052,6 +1112,9 @@ class ConfigManager:
                 "surya_langs": self.config.ocr.surya_langs,
                 "surya_venv": self.config.ocr.surya_venv,
                 "surya_auto_build": self.config.ocr.surya_auto_build,
+                "surya_serve": self.config.ocr.surya_serve,
+                "surya_model": self.config.ocr.surya_model,
+                "surya_server_url": self.config.ocr.surya_server_url,
                 "detect_mode": self.config.ocr.detect_mode,
                 "detect_model_path": self.config.ocr.detect_model_path,
                 "detect_conf": self.config.ocr.detect_conf,

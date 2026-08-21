@@ -3505,6 +3505,23 @@ def build_settings_dict(c, gpu_cards):
             "extra_env": c.ktransformers.extra_env,
             "auto_build": c.ktransformers.auto_build,
         },
+        "vllm": {
+            "enabled": c.vllm.enabled,
+            "venv": c.vllm.venv,
+            "model_path": c.vllm.model_path,
+            "model_id": c.vllm.model_id,
+            "host": c.vllm.host,
+            "port": c.vllm.port,
+            "ctx": c.vllm.ctx,
+            "gpu_memory_utilization": c.vllm.gpu_memory_utilization,
+            "tensor_parallel_size": c.vllm.tensor_parallel_size,
+            "max_num_seqs": c.vllm.max_num_seqs,
+            "dtype": c.vllm.dtype,
+            "quantization": c.vllm.quantization,
+            "extra_args": c.vllm.extra_args,
+            "extra_env": c.vllm.extra_env,
+            "auto_build": c.vllm.auto_build,
+        },
         "ocr": {
             "enabled": c.ocr.enabled,
             "default_engine": c.ocr.default_engine,
@@ -3531,6 +3548,9 @@ def build_settings_dict(c, gpu_cards):
             "surya_langs": c.ocr.surya_langs,
             "surya_venv": c.ocr.surya_venv,
             "surya_auto_build": c.ocr.surya_auto_build,
+            "surya_serve": c.ocr.surya_serve,
+            "surya_model": c.ocr.surya_model,
+            "surya_server_url": c.ocr.surya_server_url,
             "detect_mode": c.ocr.detect_mode,
             "detect_model_path": c.ocr.detect_model_path,
             "detect_conf": c.ocr.detect_conf,
@@ -3987,6 +4007,35 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "auto_build" in d:
             c.ktransformers.auto_build = bool(d["auto_build"])
 
+    if "vllm" in data:
+        d = data["vllm"]
+        v = c.vllm
+        v.enabled = bool(d.get("enabled", v.enabled))
+        if "venv" in d: v.venv = (d.get("venv") or "").strip()
+        if "model_path" in d: v.model_path = (d.get("model_path") or "").strip()
+        if "model_id" in d: v.model_id = (d.get("model_id") or v.model_id or "vllm").strip()
+        if "host" in d: v.host = (d.get("host") or "127.0.0.1").strip()
+        if "port" in d:
+            try: v.port = int(d.get("port") or 0)
+            except (TypeError, ValueError): pass
+        if "ctx" in d:
+            try: v.ctx = max(512, int(d.get("ctx") or v.ctx))
+            except (TypeError, ValueError): pass
+        if "gpu_memory_utilization" in d:
+            try: v.gpu_memory_utilization = float(d.get("gpu_memory_utilization") or v.gpu_memory_utilization)
+            except (TypeError, ValueError): pass
+        if "tensor_parallel_size" in d:
+            try: v.tensor_parallel_size = max(1, int(d.get("tensor_parallel_size") or 1))
+            except (TypeError, ValueError): pass
+        if "max_num_seqs" in d:
+            try: v.max_num_seqs = max(0, int(d.get("max_num_seqs") or 0))
+            except (TypeError, ValueError): pass
+        if "dtype" in d: v.dtype = (d.get("dtype") or "").strip()
+        if "quantization" in d: v.quantization = (d.get("quantization") or "").strip()
+        if "extra_args" in d: v.extra_args = (d.get("extra_args") or "").strip()
+        if "extra_env" in d: v.extra_env = (d.get("extra_env") or "").strip()
+        if "auto_build" in d: v.auto_build = bool(d["auto_build"])
+
     if "ocr" in data:
         d = data["ocr"]
         o = c.ocr
@@ -4029,6 +4078,9 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "surya_langs" in d: o.surya_langs = (d.get("surya_langs") or "it").strip()
         if "surya_venv" in d: o.surya_venv = (d.get("surya_venv") or "").strip()
         if "surya_auto_build" in d: o.surya_auto_build = bool(d["surya_auto_build"])
+        if "surya_serve" in d: o.surya_serve = (d.get("surya_serve") or "local").strip()
+        if "surya_model" in d: o.surya_model = (d.get("surya_model") or "").strip()
+        if "surya_server_url" in d: o.surya_server_url = (d.get("surya_server_url") or "").strip()
         # detection
         if "detect_mode" in d: o.detect_mode = (d.get("detect_mode") or "off").strip()
         if "detect_model_path" in d: o.detect_model_path = (d.get("detect_model_path") or "").strip()

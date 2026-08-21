@@ -75,6 +75,10 @@ class SubprocessOcrEngine(OcrEngine):
     def _worker_opts(self) -> dict:
         return {}
 
+    def _worker_env(self) -> dict:
+        """Extra environment variables for the worker subprocess (overridable)."""
+        return {}
+
     def _pip_install_cmd(self, py: str, req: str):
         """Return the pip command list to build the venv. Overridable (e.g. paddle index)."""
         return [py, "-m", "pip", "install", "-r", req]
@@ -118,6 +122,7 @@ class SubprocessOcrEngine(OcrEngine):
     def load(self) -> None:
         py = self._ensure_venv()
         env = dict(os.environ)
+        env.update(self._worker_env())
         try:
             self._proc = subprocess.Popen(
                 [py, _WORKER, self._worker_engine],

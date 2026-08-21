@@ -233,15 +233,27 @@ class SuryaWorker:
         self._langs = [l.strip() for l in str(opts.get("langs", "it")).split(",") if l.strip()] or ["it"]
 
     def load(self):
+        from surya.detection import DetectionPredictor
+        # 0.17.x: RecognitionPredictor(FoundationPredictor()) — a shared VLM foundation.
+        try:
+            from surya.foundation import FoundationPredictor
+            from surya.recognition import RecognitionPredictor
+            self._rec = RecognitionPredictor(FoundationPredictor())
+            self._det = DetectionPredictor()
+            self._mode = "predictor"
+            return
+        except Exception:
+            pass
+        # 0.6–0.16: RecognitionPredictor() with no args.
         try:
             from surya.recognition import RecognitionPredictor
-            from surya.detection import DetectionPredictor
             self._rec = RecognitionPredictor()
             self._det = DetectionPredictor()
             self._mode = "predictor"
             return
         except Exception:
             pass
+        # very old: functional run_ocr API.
         from surya.ocr import run_ocr
         from surya.model.detection.model import (
             load_model as ldm, load_processor as ldp)
@@ -252,10 +264,29 @@ class SuryaWorker:
         self._rec = lrm(); self._rec_proc = lrp()
         self._mode = "run_ocr"
 
+    def _predict(self, img):
+        # Predictor API drifted across classic surya versions:
+        #   0.17.x: rec(images, task_names, det_predictor)   (task_names defaults internally)
+        #   0.6.x : rec(images, langs, det_predictor)
+        attempts = [
+            lambda: self._rec([img]),                                           # 0.20+ (VLM full-page, backend does it)
+            lambda: self._rec([img], full_page=True),                           # 0.20+ variant
+            lambda: self._rec([img], det_predictor=self._det),                  # 0.17.x (task_names default)
+            lambda: self._rec([img], ["ocr_with_boxes"], self._det),            # 0.17.x explicit
+            lambda: self._rec([img], [self._langs], self._det),                 # 0.6.x (langs)
+        ]
+        last = None
+        for call in attempts:
+            try:
+                return call()
+            except (TypeError, ValueError, AssertionError) as e:
+                last = e
+        raise last
+
     def ocr(self, img):
         img = img.convert("RGB")
         if self._mode == "predictor":
-            preds = self._rec([img], [self._langs], self._det)
+            preds = self._predict(img)
         else:
             preds = self._run_ocr([img], [self._langs], self._det, self._det_proc, self._rec, self._rec_proc)
         res = preds[0] if preds else None

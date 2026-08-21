@@ -80,7 +80,9 @@ def required_capability(model: Optional[str], path: Optional[str] = None,
                         k3_model_id: Optional[str] = None,
                         k3_enabled: bool = False,
                         kt_model_id: Optional[str] = None,
-                        kt_enabled: bool = False) -> Optional[str]:
+                        kt_enabled: bool = False,
+                        vllm_model_id: Optional[str] = None,
+                        vllm_enabled: bool = False) -> Optional[str]:
     """The capability an engine must have to serve this request.
 
     * ``whisper``      — whisper.cpp STT (transcription endpoint or a
@@ -101,7 +103,7 @@ def required_capability(model: Optional[str], path: Optional[str] = None,
         return "whisper"
     # 1. Explicit engine-backend pin wins (authoritative), like the manager resolver.
     b = (backend or "").lower()
-    if b in ("colibri", "ds4", "k3", "kt"):
+    if b in ("colibri", "ds4", "k3", "kt", "vllm"):
         return b
     m = (model or "").lower()
 
@@ -110,6 +112,8 @@ def required_capability(model: Optional[str], path: Optional[str] = None,
         return bool(mid) and (m == mid or m.split("/")[-1] == mid)
 
     # 2. An enabled engine's model_id alias.
+    if vllm_enabled and _alias(vllm_model_id):
+        return "vllm"
     if kt_enabled and _alias(kt_model_id):
         return "kt"
     if k3_enabled and _alias(k3_model_id):

@@ -756,6 +756,58 @@
   </div>
 </div>
 
+<!-- vLLM (high-concurrency) -->
+<div class="card">
+  <div class="card-title">vLLM (high-concurrency)</div>
+  <p class="form-hint" style="margin-bottom:.6rem">Serve an LLM (or VLM) through <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vLLM</a>'s OpenAI server with <b>continuous batching</b> — far higher aggregate throughput than serialized single-instance backends. coderai launches <code>vllm.entrypoints.openai.api_server</code> as a managed subprocess and proxies to it. vLLM pins its own torch/CUDA, so it runs in an <b>isolated venv</b> (CUDA-only). Selected per model via a <code>backend: vllm</code> pin or the model id below. Also serves Surya2 for OCR.</p>
+  <div class="form-row">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-vllm-enabled" onchange="toggleVllmFields()">
+      <span style="font-size:13px;font-weight:500">Enable vLLM</span>
+    </label>
+  </div>
+  <div id="vllm-fields" style="display:none">
+    <div class="form-group">
+      <label class="form-label">Model id (alias + --served-model-name)</label>
+      <input type="text" id="s-vllm-model-id" class="form-input" placeholder="vllm">
+      <span class="form-hint">This id routes to vLLM. Also matched by any model whose config <code>backend</code> is <code>vllm</code>.</span>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Model path (HF dir or repo id)</label>
+      <input type="text" id="s-vllm-model-path" class="form-input" placeholder="/nvme/Qwen3-8B or Qwen/Qwen3-8B">
+    </div>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:130px"><label class="form-label">Max model len</label><input type="number" id="s-vllm-ctx" class="form-input" min="512" placeholder="32768"></div>
+      <div class="form-group" style="flex:1;min-width:130px"><label class="form-label">GPU mem util</label><input type="number" id="s-vllm-gmu" class="form-input" min="0.1" max="1" step="0.05" placeholder="0.90"></div>
+      <div class="form-group" style="flex:1;min-width:110px"><label class="form-label">TP size</label><input type="number" id="s-vllm-tp" class="form-input" min="1" placeholder="1"></div>
+      <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">Max num seqs</label><input type="number" id="s-vllm-mns" class="form-input" min="0" placeholder="0 = default"></div>
+    </div>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">dtype</label><input type="text" id="s-vllm-dtype" class="form-input" placeholder="auto"></div>
+      <div class="form-group" style="flex:1;min-width:120px"><label class="form-label">Quantization</label><input type="text" id="s-vllm-quant" class="form-input" placeholder="none (awq/gptq/fp8)"></div>
+      <div class="form-group" style="flex:1;min-width:90px"><label class="form-label">Port</label><input type="number" id="s-vllm-port" class="form-input" min="0" placeholder="0 = auto"></div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Isolated venv dir</label>
+      <input type="text" id="s-vllm-venv" class="form-input" placeholder="(auto: /opt/coderai/vllm_venv, else /cache/vllm_venv)">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Extra args</label>
+      <input type="text" id="s-vllm-extra-args" class="form-input" placeholder="--enable-prefix-caching --swap-space 4">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Extra subprocess env</label>
+      <input type="text" id="s-vllm-extra-env" class="form-input" placeholder="CUDA_VISIBLE_DEVICES=0">
+    </div>
+    <div class="form-group">
+      <label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+        <input type="checkbox" id="s-vllm-auto-build">
+        <span>Auto-build the isolated venv (<code>pip install vllm</code>) on first use</span>
+      </label>
+    </div>
+  </div>
+</div>
+
 <!-- OCR (dedicated document OCR engines) -->
 <div class="card">
   <div class="card-title">OCR (document → text)</div>
@@ -1072,6 +1124,10 @@ function toggleKtFields(){
 function toggleOcrFields(){
   document.getElementById('ocr-fields').style.display =
     document.getElementById('s-ocr-enabled').checked ? 'block' : 'none';
+}
+function toggleVllmFields(){
+  document.getElementById('vllm-fields').style.display =
+    document.getElementById('s-vllm-enabled').checked ? 'block' : 'none';
 }
 
 // ---- OCR isolated-venv build (paddle/surya) ----
@@ -1582,6 +1638,24 @@ async function loadSettings(){
     document.getElementById('s-kt-extra-env').value = kt.extra_env ?? '';
     toggleKtFields();
 
+    // vLLM
+    const vll = d.vllm || {};
+    document.getElementById('s-vllm-enabled').checked = !!vll.enabled;
+    document.getElementById('s-vllm-model-id').value = vll.model_id ?? 'vllm';
+    document.getElementById('s-vllm-model-path').value = vll.model_path ?? '';
+    document.getElementById('s-vllm-ctx').value = vll.ctx ?? 32768;
+    document.getElementById('s-vllm-gmu').value = vll.gpu_memory_utilization ?? 0.90;
+    document.getElementById('s-vllm-tp').value = vll.tensor_parallel_size ?? 1;
+    document.getElementById('s-vllm-mns').value = vll.max_num_seqs ?? 0;
+    document.getElementById('s-vllm-dtype').value = vll.dtype ?? '';
+    document.getElementById('s-vllm-quant').value = vll.quantization ?? '';
+    document.getElementById('s-vllm-port').value = vll.port ?? 0;
+    document.getElementById('s-vllm-venv').value = vll.venv ?? '';
+    document.getElementById('s-vllm-extra-args').value = vll.extra_args ?? '';
+    document.getElementById('s-vllm-extra-env').value = vll.extra_env ?? '';
+    document.getElementById('s-vllm-auto-build').checked = !!vll.auto_build;
+    toggleVllmFields();
+
     // OCR subsystem
     const ocr = d.ocr || {};
     document.getElementById('s-ocr-enabled').checked = !!ocr.enabled;
@@ -1742,6 +1816,22 @@ async function saveSettings(){
       extra_args: document.getElementById('s-kt-extra-args').value.trim(),
       auto_build: document.getElementById('s-kt-auto-build').checked,
       extra_env: document.getElementById('s-kt-extra-env').value.trim(),
+    },
+    vllm:{
+      enabled: document.getElementById('s-vllm-enabled').checked,
+      model_id: document.getElementById('s-vllm-model-id').value.trim() || 'vllm',
+      model_path: document.getElementById('s-vllm-model-path').value.trim(),
+      ctx: parseInt(document.getElementById('s-vllm-ctx').value) || 32768,
+      gpu_memory_utilization: parseFloat(document.getElementById('s-vllm-gmu').value) || 0.90,
+      tensor_parallel_size: parseInt(document.getElementById('s-vllm-tp').value) || 1,
+      max_num_seqs: parseInt(document.getElementById('s-vllm-mns').value) || 0,
+      dtype: document.getElementById('s-vllm-dtype').value.trim(),
+      quantization: document.getElementById('s-vllm-quant').value.trim(),
+      port: parseInt(document.getElementById('s-vllm-port').value) || 0,
+      venv: document.getElementById('s-vllm-venv').value.trim(),
+      extra_args: document.getElementById('s-vllm-extra-args').value.trim(),
+      extra_env: document.getElementById('s-vllm-extra-env').value.trim(),
+      auto_build: document.getElementById('s-vllm-auto-build').checked,
     },
     ocr:{
       enabled: document.getElementById('s-ocr-enabled').checked,

@@ -1,9 +1,16 @@
-# vLLM backend (future option)
+# vLLM backend
 
-> **Status: NOT YET IMPLEMENTED — design note / decision record.**
-> For now, parallel throughput is achieved with **multiple llama.cpp instances**
-> of the same model (see the manager's multi-instance loading). This document
-> captures why and how we would add a vLLM backend later.
+> **Status: IMPLEMENTED (v0.1.86).** vLLM is a first-class managed engine backend,
+> wired exactly like ds4/ktransformers: a subprocess in an ISOLATED venv, proxied over
+> its OpenAI HTTP API, selected per-model via a `backend: "vllm"` pin or the `vllm.model_id`
+> alias (never auto-claimed). Config: `codai/config.py::VllmConfig`; worker:
+> `codai/api/vllm_worker.py`; proxy: `codai/backends/vllm.py`; manager wiring +
+> front-proxy capability (`vllm` on GPU nodes) + admin card. It also serves **Surya2**
+> for the OCR subsystem (`ocr.surya_serve = "vllm"`).
+>
+> Engine layering: nvidia/cuda/vulkan/opencl are **in-process base engines**; vLLM (like
+> ds4/colibri/k3/kt) is a **managed external engine** — it must be out-of-process because
+> it pins its own torch/CUDA (torch 2.13 / cu13) that conflicts with the main venv.
 
 ## Why add vLLM
 
