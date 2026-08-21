@@ -80,14 +80,16 @@ class VllmBackend(ModelBackend):
                                                served_name=self._served_name)
 
     def _resolve_model_dir(self, model_name: str) -> Optional[str]:
-        """Resolve the requested model to an HF model dir / id for vLLM."""
+        """Resolve the requested model to an HF model dir OR repo id for vLLM.
+
+        vLLM's --model accepts both a local directory and a bare HF repo id
+        (e.g. 'Qwen/Qwen2.5-0.5B-Instruct'), so we must NOT require a local dir."""
         import os
         cand = os.path.expanduser(model_name or "")
         if cand and os.path.isdir(cand):
             return os.path.abspath(cand)
-        mp = os.path.expanduser((getattr(self._cfg, "model_path", "") or "").strip())
-        if mp and os.path.isdir(mp):
-            return os.path.abspath(mp)
+        # Match the model list entry (by path/basename/alias/id) → use its path, which may
+        # be a local dir OR a repo id. Prefer a local dir; else accept the repo id string.
         try:
             from codai.admin.routes import config_manager
             md = getattr(config_manager, "models_data", {}) or {}
@@ -98,16 +100,26 @@ class VllmBackend(ModelBackend):
                 for m in lst:
                     if not isinstance(m, dict):
                         continue
-                    path = str(m.get("path") or "")
+                    path = str(m.get("path") or "").strip()
+                    if not path:
+                        continue
                     base = os.path.basename(path.rstrip("/")).lower()
                     cands = {path.lower(), base, str(m.get("alias") or "").lower(),
                              str(m.get("id") or "").lower()}
-                    if name_l in cands and path and os.path.isdir(os.path.expanduser(path)):
-                        return os.path.abspath(os.path.expanduser(path))
+                    if name_l in cands:
+                        exp = os.path.expanduser(path)
+                        return os.path.abspath(exp) if os.path.isdir(exp) else path
         except Exception:
             pass
-        # vLLM also accepts a bare HF repo id (not a local dir).
-        return mp or (getattr(self._cfg, "model_path", "") or "").strip() or None
+        # A bare repo id passed directly, or the single-model convenience path.
+        if cand and ("/" in cand or cand):
+            # model_name itself may be a repo id like "org/model".
+            if "/" in cand and not cand.startswith(("/", "~", ".")):
+                return cand
+        mp = os.path.expanduser((getattr(self._cfg, "model_path", "") or "").strip())
+        if mp and os.path.isdir(mp):
+            return os.path.abspath(mp)
+        return (getattr(self._cfg, "model_path", "") or "").strip() or None
 
     def get_model_name(self) -> str:
         return self._model_id
