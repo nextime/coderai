@@ -768,13 +768,13 @@
   </div>
   <div id="vllm-fields" style="display:none">
     <div class="form-group">
-      <label class="form-label">Model id (alias + --served-model-name)</label>
-      <input type="text" id="s-vllm-model-id" class="form-input" placeholder="vllm">
-      <span class="form-hint">This id routes to vLLM. Also matched by any model whose config <code>backend</code> is <code>vllm</code>.</span>
+      <label class="form-label">Model id <span class="muted">(optional — leave blank to serve models from the list)</span></label>
+      <input type="text" id="s-vllm-model-id" class="form-input" placeholder="(blank = per-model)">
+      <span class="form-hint">Leave blank and tag models in the <b>Models</b> list with <code>backend: vllm</code> (like nvidia/radeon) — vLLM serves each by its own path. Set an id/path only to serve a single model that has no list entry.</span>
     </div>
     <div class="form-group">
-      <label class="form-label">Model path (HF dir or repo id)</label>
-      <input type="text" id="s-vllm-model-path" class="form-input" placeholder="/nvme/Qwen3-8B or Qwen/Qwen3-8B">
+      <label class="form-label">Model path <span class="muted">(optional single model)</span></label>
+      <input type="text" id="s-vllm-model-path" class="form-input" placeholder="(blank = use the model list)">
     </div>
     <div class="form-group">
       <label class="form-label">GPU(s) <span class="muted">(CUDA_VISIBLE_DEVICES; blank = all NVIDIA)</span></label>
@@ -1646,7 +1646,7 @@ async function loadSettings(){
     // vLLM
     const vll = d.vllm || {};
     document.getElementById('s-vllm-enabled').checked = !!vll.enabled;
-    document.getElementById('s-vllm-model-id').value = vll.model_id ?? 'vllm';
+    document.getElementById('s-vllm-model-id').value = vll.model_id ?? '';
     document.getElementById('s-vllm-model-path').value = vll.model_path ?? '';
     document.getElementById('s-vllm-gpu').value = vll.gpu ?? '';
     document.getElementById('s-vllm-ctx').value = vll.ctx ?? 32768;
@@ -1825,7 +1825,7 @@ async function saveSettings(){
     },
     vllm:{
       enabled: document.getElementById('s-vllm-enabled').checked,
-      model_id: document.getElementById('s-vllm-model-id').value.trim() || 'vllm',
+      model_id: document.getElementById('s-vllm-model-id').value.trim(),
       model_path: document.getElementById('s-vllm-model-path').value.trim(),
       gpu: document.getElementById('s-vllm-gpu').value.trim(),
       ctx: parseInt(document.getElementById('s-vllm-ctx').value) || 32768,

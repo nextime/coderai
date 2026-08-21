@@ -71,9 +71,13 @@ class VllmBackend(ModelBackend):
         if _ctx > 0:
             self._ctx = _ctx
         model_path = self._resolve_model_dir(model_name)
+        # Per-model: serve each model-list entry under ITS OWN name (like nvidia/radeon),
+        # not a single engine-wide model_id. Fall back to the config model_id only for the
+        # single-model convenience (a model with no list entry).
+        self._served_name = (model_name or getattr(self._cfg, "model_id", "") or "vllm")
         _resolved, self._svc_key = vllm_worker.resolve_service_key(self._cfg, model_path)
-        self._url = vllm_worker.ensure_service(self._cfg, model_path=model_path)
-        self._served_name = getattr(self._cfg, "model_id", "vllm") or "vllm"
+        self._url = vllm_worker.ensure_service(self._cfg, model_path=model_path,
+                                               served_name=self._served_name)
 
     def _resolve_model_dir(self, model_name: str) -> Optional[str]:
         """Resolve the requested model to an HF model dir / id for vLLM."""

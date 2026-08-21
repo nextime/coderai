@@ -5204,10 +5204,14 @@ class MultiModelManager:
             mid = getattr(kt_cfg, "model_id", "ktransformers") or "ktransformers"
             _add(mid, "text", {"backend": "kt"})
 
+        # vLLM serves models from the model list (backend:vllm entries already surface
+        # via the normal path). Only add a synthetic entry when a single model_id is
+        # explicitly configured (the ds4/kt-style single-model convenience).
         vllm_cfg = get_active_vllm_config()
         if vllm_cfg is not None and getattr(vllm_cfg, "enabled", False):
-            mid = getattr(vllm_cfg, "model_id", "vllm") or "vllm"
-            _add(mid, "text", {"backend": "vllm"})
+            mid = (getattr(vllm_cfg, "model_id", "") or "").strip()
+            if mid:
+                _add(mid, "text", {"backend": "vllm"})
 
         return models
 

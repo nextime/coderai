@@ -526,14 +526,19 @@ class VllmConfig:
     vLLM pins its own torch/CUDA (e.g. torch 2.13 / cu13), which conflicts with the main
     coderai venv, so it runs in an ISOLATED venv (``venv``; blank → baked
     /opt/coderai/vllm_venv, else the /cache mount, else ~/.coderai/vllm_venv), built from
-    requirements-vllm.txt. Selected PER MODEL via a ``backend: "vllm"`` pin or the
-    ``model_id`` alias — never by a broad name marker (it would collide with every engine).
+    requirements-vllm.txt.
+
+    Like the nvidia/radeon engines, vLLM serves MODELS FROM THE MODEL LIST: tag a model
+    entry with ``backend: "vllm"`` and vLLM serves that model using its own ``path`` (each
+    served under its own name). ``model_id``/``model_path`` below are OPTIONAL — only a
+    convenience for serving a single model that has no model-list entry (ds4/kt style), and
+    the OCR subsystem passes its own model. Leave ``model_id`` blank for the model-list flow.
     Also reused by the OCR subsystem to serve Surya2 (a VLM) with continuous batching.
     """
     enabled: bool = False
     venv: str = ""                       # isolated venv dir; blank = auto (baked/cache/home)
-    model_path: str = ""                 # HF model dir or repo id (--model)
-    model_id: str = "vllm"               # id/alias that routes to vllm (and --served-model-name)
+    model_path: str = ""                 # OPTIONAL single-model HF dir/repo id (--model); blank = use the model list
+    model_id: str = ""                   # OPTIONAL single-model alias/served-name; blank = per-model from the list
     gpu: str = ""                        # CUDA device(s) for this vLLM instance (CUDA_VISIBLE_DEVICES,
                                          # e.g. "0" or "0,1"); blank = all visible NVIDIA GPUs. CUDA-only.
     host: str = "127.0.0.1"

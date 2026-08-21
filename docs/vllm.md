@@ -11,6 +11,15 @@
 > Engine layering: nvidia/cuda/vulkan/opencl are **in-process base engines**; vLLM (like
 > ds4/colibri/k3/kt) is a **managed external engine** — it must be out-of-process because
 > it pins its own torch/CUDA (torch 2.13 / cu13) that conflicts with the main venv.
+>
+> **Use it like nvidia/radeon — from the model list.** Tag a model entry with
+> `backend: vllm` and vLLM serves *that* model using its own `path`, each under its own
+> name; multiple models can be tagged (they swap on the GPU via normal VRAM eviction). The
+> `vllm.model_id`/`vllm.model_path` config fields are OPTIONAL — only for serving one model
+> with no list entry (ds4/kt style). Engine-level config (`venv`, `gpu`, `ctx`,
+> `gpu_memory_utilization`, `tensor_parallel_size`, `dtype`, `quantization`, `auto_build`)
+> applies to whatever model it serves. `gpu` → `CUDA_VISIBLE_DEVICES` pins the card(s);
+> CUDA-only.
 
 ## Why add vLLM
 
