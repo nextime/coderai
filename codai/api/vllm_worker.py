@@ -174,9 +174,12 @@ def ensure_service(cfg, model_path: Optional[str] = None,
         cmd = _launch_cmd(py, cfg, host, port, model, served_name)
 
         env = os.environ.copy()
-        # vLLM's venv bundles its own torch/CUDA; make sure its libs win.
-        vlib = os.path.join(os.path.expanduser(resolve_venv_dir(cfg)),
-                            "lib", "python3.13", "site-packages", "nvidia")
+        # flashinfer JIT-compiles CUDA kernels with ninja at runtime, which fails on
+        # hosts without a full build toolchain (nvcc/gcc wired for it). Default it OFF so
+        # vLLM uses FLASH_ATTN + a native sampler out of the box; the user can re-enable
+        # via extra_env. (Set before extra_env so an explicit override wins.)
+        env.setdefault("VLLM_USE_FLASHINFER", "0")
+        env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
         extra_env = (getattr(cfg, "extra_env", "") or "").strip()
         applied = {}
         if extra_env:
