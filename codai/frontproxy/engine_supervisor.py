@@ -338,6 +338,29 @@ class EngineSupervisor:
                     name=f"{name}-gguf", backend="nvidia", env=dict(env),
                     capabilities={"gguf"}))
                 next_id += 1
+
+        # vLLM is a first-class engine NODE (not just a capability): when enabled, spawn a
+        # dedicated engine on the NVIDIA card(s) whose ONLY capability is "vllm", so it
+        # shows up in the engine/task page alongside nvidia/nvidia-gguf/radeon and the
+        # router sends it exactly the models pinned backend:vllm. It's a real subprocess
+        # (own process/CUDA context), so routing/VRAM/thermal apply like any engine. CUDA-
+        # only. Its VllmBackend launches+proxies the actual vLLM server per model.
+        vllm_cfg = getattr(self.config, "vllm", None)
+        if vllm_cfg is not None and getattr(vllm_cfg, "enabled", False) and nvidia_gpus():
+            venv = vendor_env("nvidia", allow_cross=False)
+            gpu = (getattr(vllm_cfg, "gpu", "") or "").strip()
+            if gpu:
+                venv["CUDA_VISIBLE_DEVICES"] = gpu
+                venv["CODERAI_ENGINE_GPUS"] = gpu
+            else:
+                sels = _gpu_selectors({"backend": "nvidia", "gpus": "nvidia"}, venv)
+                if sels:
+                    venv["CODERAI_ENGINE_GPUS"] = ",".join(sels)
+            engines.append(Engine(
+                id=next_id, gpu=None, port=self._alloc_port(), primary=False,
+                name="vllm", backend="nvidia", env=venv, capabilities={"vllm"}))
+            next_id += 1
+
         self._set_cosited_urls(engines)
         return engines
 

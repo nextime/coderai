@@ -44,11 +44,11 @@ def _short_stem(key: str) -> str:
 # k3 (kimi-k3-in-c) is a CPU engine → any node can host it; kt (ktransformers/SGLang)
 # is CPU+GPU → the GPU-capable nodes.
 _DEFAULT_CAPS = {
-    "nvidia": {"transformers", "gguf", "whisper", "ds4", "colibri", "k3", "kt", "vllm"},
-    "cuda": {"transformers", "gguf", "whisper", "ds4", "colibri", "k3", "kt", "vllm"},
+    "nvidia": {"transformers", "gguf", "whisper", "ds4", "colibri", "k3", "kt"},
+    "cuda": {"transformers", "gguf", "whisper", "ds4", "colibri", "k3", "kt"},
     "vulkan": {"gguf", "whisper", "k3"},
     "opencl": {"gguf", "whisper", "k3"},
-    "auto": {"transformers", "gguf", "whisper", "ds4", "colibri", "k3", "kt", "vllm"},
+    "auto": {"transformers", "gguf", "whisper", "ds4", "colibri", "k3", "kt"},
 }
 
 
