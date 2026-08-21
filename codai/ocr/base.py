@@ -122,6 +122,15 @@ class OcrEngine(ABC):
             self.load()
             self._loaded = True
 
+    def cleanup(self) -> None:
+        """Free this instance's VRAM/resources. SYNC (may be called from the model
+        manager's VRAM-eviction thread). Overridden per engine."""
+        self._loaded = False
+
+    def vram_gb(self) -> float:
+        """Rough VRAM footprint (GB) of one loaded instance, for eviction accounting."""
+        return 1.0
+
 
 # ---------------------------------------------------------------------------
 # Input loading (images + PDF) → list of PIL pages

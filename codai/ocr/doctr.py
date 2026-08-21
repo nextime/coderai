@@ -65,6 +65,18 @@ class DoctrEngine(OcrEngine):
             except Exception:
                 pass
 
+    def cleanup(self) -> None:
+        self._model = None
+        self._loaded = False
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def vram_gb(self) -> float:
+        return 0.7   # measured ~0.66 GB peak per instance
+
     def recognize_image(self, image) -> OcrPage:
         import numpy as np
 

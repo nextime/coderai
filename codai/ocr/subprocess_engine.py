@@ -165,6 +165,16 @@ class SubprocessOcrEngine(OcrEngine):
             pass
         self._proc = None
 
+    def cleanup(self) -> None:
+        """Stop the worker subprocess (frees its VRAM). SYNC."""
+        self._kill()
+        self._loaded = False
+
+    def vram_gb(self) -> float:
+        # paddle ≈ 2.44 GB/inst measured; surya-local similar. (surya vLLM footprint is
+        # the separate vLLM server, not per-worker.)
+        return 2.5
+
     def recognize_image(self, image) -> OcrPage:
         import base64
         import io

@@ -71,6 +71,30 @@ def _engine_instances(cfg, name: str) -> int:
         return 1
 
 
+def _evict_for_ocr(needed_gb: float) -> None:
+    """Ask the model manager to free ``needed_gb`` of VRAM before an OCR pool loads,
+    so OCR instances contend for VRAM on equal footing with LLM/diffusion models
+    (evict LRU models rather than OOM). Best-effort: never breaks OCR if the manager
+    is unavailable."""
+    try:
+        if needed_gb <= 0:
+            return
+        from codai.models.manager import multi_model_manager
+        multi_model_manager._evict_models_for_vram(float(needed_gb))
+    except Exception as e:
+        print(f"[ocr] VRAM evict-before-build skipped: {e}")
+
+
+def _wait_thermal_safe() -> None:
+    """Block until GPU temps are within safe limits (shared thermal governor).
+    Runs OCR through the same cooldown gate as every other GPU workload."""
+    try:
+        from codai.models import thermal
+        thermal.wait_until_safe(context="ocr")
+    except Exception as e:
+        print(f"[ocr] thermal wait skipped: {e}")
+
+
 class _Pool:
     """A fixed-size pool of loaded engine instances, served via an asyncio.Queue."""
 
@@ -79,6 +103,7 @@ class _Pool:
         self.cfg = cfg
         self.size = size
         self._q: asyncio.Queue = asyncio.Queue()
+        self._instances = []          # every created instance (for release_sync)
         self._built = False
         self._build_lock = asyncio.Lock()
 
@@ -89,14 +114,40 @@ class _Pool:
             if self._built:
                 return
             factory = _ENGINE_FACTORIES[self.name]
+            self._instances = []
             for _ in range(self.size):
                 eng = factory(self.cfg)
                 # Load the first instance synchronously-in-thread so a missing
                 # dependency surfaces as OcrError(503) before we spawn the rest.
                 await asyncio.to_thread(eng.ensure_loaded)
+                # First instance: evict other models to make room (VRAM eviction), now
+                # that we know its real footprint. Mirrors the engine-load path.
+                if not self._instances:
+                    await asyncio.to_thread(_evict_for_ocr, self.size * eng.vram_gb())
+                self._instances.append(eng)
                 await self._q.put(eng)
             self._built = True
             print(f"[ocr] engine '{self.name}': {self.size} instance(s) ready")
+
+    def release_sync(self) -> float:
+        """Tear down all instances (free VRAM). SYNC — safe to call from the model
+        manager's eviction thread. Returns estimated GB freed."""
+        freed = 0.0
+        for eng in list(self._instances):
+            try:
+                freed += eng.vram_gb()
+                eng.cleanup()
+            except Exception:
+                pass
+        self._instances = []
+        # Drain the queue so a rebuild starts clean.
+        try:
+            while not self._q.empty():
+                self._q.get_nowait()
+        except Exception:
+            pass
+        self._built = False
+        return freed
 
     async def recognize(self, image) -> OcrPage:
         await self._ensure_built()
@@ -115,15 +166,50 @@ class OcrManager:
         self._pools: Dict[str, _Pool] = {}
         self._sem: Optional[asyncio.Semaphore] = None
         self._lock = asyncio.Lock()
+        self._releaser_registered = False
 
     def configure(self, cfg) -> None:
         """Point the manager at the current OcrConfig. Rebuilds pools if params changed."""
         prev = self._cfg
         self._cfg = cfg
         if prev is None or self._pool_params(prev) != self._pool_params(cfg):
-            # Drop stale pools (instances are GC'd; their models freed on unload/GC).
+            # Drop stale pools. Tear down live instances first so their VRAM is freed
+            # promptly (rather than waiting on GC of the subprocess workers / torch models).
+            for pool in self._pools.values():
+                try:
+                    pool.release_sync()
+                except Exception:
+                    pass
             self._pools = {}
             self._sem = asyncio.Semaphore(max(1, int(getattr(cfg, "max_concurrency", 4))))
+        self._register_releaser()
+
+    def _register_releaser(self) -> None:
+        """Register OCR VRAM as reclaimable by the model manager, so loading an
+        LLM/diffusion model can evict OCR pools (not just the reverse)."""
+        if self._releaser_registered:
+            return
+        try:
+            from codai.models.manager import multi_model_manager
+            multi_model_manager.register_external_vram_releaser(self._release_vram)
+            self._releaser_registered = True
+        except Exception as e:
+            print(f"[ocr] could not register VRAM releaser: {e}")
+
+    def _release_vram(self, needed_gb: float = 999.0) -> float:
+        """External VRAM releaser (called as ``fn(needed_gb)`` from the model manager's
+        eviction path, SYNC). Tears down every built OCR pool and returns the estimated
+        GB freed. Pools rebuild lazily on the next OCR request. ``needed_gb`` is advisory
+        — OCR pools are all-or-nothing per engine, so we release everything held."""
+        freed = 0.0
+        for pool in list(self._pools.values()):
+            try:
+                freed += pool.release_sync()
+            except Exception:
+                pass
+        if freed:
+            print(f"[ocr] released ~{freed:.1f} GB (pools torn down for VRAM eviction)")
+        return freed
 
     @staticmethod
     def _pool_params(cfg) -> tuple:
@@ -189,6 +275,9 @@ class OcrManager:
         cfg = self._require_cfg()
         use_dpi = int(dpi) if dpi else int(cfg.dpi)
         images = load_pages(data, filename=filename, content_type=content_type, dpi=use_dpi)
+        # Share the GPU thermal governor with every other workload: block here until
+        # temps are safe (wait_until_safe blocks, so run it off the event loop).
+        await asyncio.to_thread(_wait_thermal_safe)
         name, pages = await self.ocr_pages(images, engine=engine)
         full_text = "\n\n".join(p.text for p in pages)
 
