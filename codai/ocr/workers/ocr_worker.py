@@ -26,6 +26,18 @@ def _emit(obj):
     sys.stdout.flush()
 
 
+def _html_to_text(html: str) -> str:
+    """Strip HTML tags → plain text (Surya2 returns block content as HTML)."""
+    import re, html as _htmlmod
+    if not html:
+        return ""
+    s = re.sub(r"(?i)<br\s*/?>", "\n", html)
+    s = re.sub(r"(?i)</(p|div|li|tr|h[1-6])>", "\n", s)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = _htmlmod.unescape(s)
+    return "\n".join(ln.strip() for ln in s.splitlines() if ln.strip()).strip()
+
+
 def _poly_to_xyxy(poly):
     try:
         pts = list(poly)
@@ -294,18 +306,38 @@ class SuryaWorker:
         tl = getattr(res, "text_lines", None)
         if tl is None and isinstance(res, dict):
             tl = res.get("text_lines")
-        for t in (tl or []):
-            text = getattr(t, "text", None)
-            bbox = getattr(t, "bbox", None)
-            conf = getattr(t, "confidence", 0.0)
-            if text is None and isinstance(t, dict):
-                text = t.get("text"); bbox = t.get("bbox"); conf = t.get("confidence", 0.0)
-            if not text:
-                continue
-            bb = [float(v) for v in (bbox or [0, 0, 0, 0])][:4]
-            if len(bb) < 4:
-                bb = [0.0, 0.0, 0.0, 0.0]
-            lines.append({"text": str(text), "bbox": bb, "conf": float(conf or 0.0)})
+        if tl:
+            # Classic surya (<=0.17): result.text_lines[].{text,bbox,confidence}
+            for t in tl:
+                text = getattr(t, "text", None)
+                bbox = getattr(t, "bbox", None)
+                conf = getattr(t, "confidence", 0.0)
+                if text is None and isinstance(t, dict):
+                    text = t.get("text"); bbox = t.get("bbox"); conf = t.get("confidence", 0.0)
+                if not text:
+                    continue
+                bb = [float(v) for v in (bbox or [0, 0, 0, 0])][:4]
+                if len(bb) < 4:
+                    bb = [0.0, 0.0, 0.0, 0.0]
+                lines.append({"text": str(text), "bbox": bb, "conf": float(conf or 0.0)})
+        else:
+            # Surya2 (>=0.20): result.blocks[].{html,polygon,confidence,label,reading_order}
+            blocks = getattr(res, "blocks", None)
+            if blocks is None and isinstance(res, dict):
+                blocks = res.get("blocks")
+            for b in sorted(blocks or [], key=lambda x: getattr(x, "reading_order", 0) or 0):
+                html = getattr(b, "html", None)
+                if html is None and isinstance(b, dict):
+                    html = b.get("html")
+                text = _html_to_text(html or "")
+                if not text:
+                    continue
+                poly = getattr(b, "polygon", None) or (b.get("polygon") if isinstance(b, dict) else None)
+                conf = getattr(b, "confidence", 0.0)
+                if isinstance(b, dict):
+                    conf = b.get("confidence", conf)
+                lines.append({"text": text, "bbox": _poly_to_xyxy(poly or [0, 0, 0, 0]),
+                              "conf": float(conf or 0.0)})
         return {"index": 0, "width": img.width, "height": img.height,
                 "lines": lines, "regions": [], "tables": [], "text": "\n".join(l["text"] for l in lines)}
 
