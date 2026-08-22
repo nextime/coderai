@@ -243,5 +243,43 @@ def stop_all() -> None:
         stop_service(k)
 
 
+def is_running(cfg, model_path: Optional[str] = None, served_name: Optional[str] = None) -> bool:
+    """True if a vLLM service for this (model_path, served_name) is currently up."""
+    _resolved, svc_key = resolve_service_key(cfg, model_path)
+    if served_name:
+        svc_key = f"{svc_key}|{served_name}"
+    with _lock:
+        svc = _services.get(svc_key)
+        return bool(svc and svc["proc"].poll() is None)
+
+
+def stop_service_for(cfg, model_path: Optional[str] = None,
+                     served_name: Optional[str] = None) -> float:
+    """Stop the vLLM service for ONE specific (model_path, served_name), if running.
+
+    Used by the OCR subsystem as a VRAM releaser: the managed Surya-2 vLLM subprocess
+    isn't a manager-tracked model, so this is what lets on-request eviction reclaim its
+    VRAM. Returns an estimate of the GB it was holding (gpu_memory_utilization × total
+    VRAM), 0.0 if nothing was running."""
+    _resolved, svc_key = resolve_service_key(cfg, model_path)
+    if served_name:
+        svc_key = f"{svc_key}|{served_name}"
+    with _lock:
+        svc = _services.get(svc_key)
+        running = bool(svc and svc["proc"].poll() is None)
+    if not running:
+        return 0.0
+    gmu = float(getattr(cfg, "gpu_memory_utilization", 0) or 0)
+    stop_service(svc_key)
+    if gmu > 0:
+        try:
+            from codai.models.manager import multi_model_manager
+            total = multi_model_manager._total_vram_gb()
+        except Exception:
+            total = 24.0
+        return max(0.5, gmu * total)
+    return 4.6   # small VLM fallback estimate
+
+
 import atexit as _atexit
 _atexit.register(stop_all)

@@ -207,9 +207,32 @@ class OcrManager:
                 freed += pool.release_sync()
             except Exception:
                 pass
+        # The managed Surya-2 vLLM subprocess isn't a manager-tracked model and its VRAM
+        # (gpu_memory_utilization × card) isn't reclaimed by tearing down the worker pool
+        # above — it must be stopped explicitly. Do it here so on-request eviction can
+        # reclaim it; the next OCR request re-boots it via ensure_service.
+        freed += self._stop_surya_vllm()
         if freed:
-            print(f"[ocr] released ~{freed:.1f} GB (pools torn down for VRAM eviction)")
+            print(f"[ocr] released ~{freed:.1f} GB (pools + Surya vLLM torn down for VRAM eviction)")
         return freed
+
+    def _stop_surya_vllm(self) -> float:
+        """Stop the managed Surya-2 vLLM subprocess (if this build serves Surya via vLLM).
+        Returns estimated GB freed."""
+        cfg = self._cfg
+        if cfg is None or (getattr(cfg, "surya_serve", "") or "").strip().lower() != "vllm":
+            return 0.0
+        try:
+            from codai.api import vllm_worker
+            from codai.models.manager import get_active_vllm_config
+            vcfg = get_active_vllm_config()
+            if vcfg is None:
+                return 0.0
+            model = (getattr(cfg, "surya_model", "") or "datalab-to/surya-ocr-2").strip()
+            return vllm_worker.stop_service_for(vcfg, model_path=model, served_name=model)
+        except Exception as e:
+            print(f"[ocr] Surya vLLM stop skipped: {e}")
+            return 0.0
 
     @staticmethod
     def _pool_params(cfg) -> tuple:
