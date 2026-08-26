@@ -304,16 +304,46 @@ def _hf_model_type(model_name: str, trust: bool) -> str:
 
 def _resolve_repo_file(model_name: str, filename: str):
     """Local path to ``filename`` inside a model repo (local dir or HF cache), or
-    None if absent. Never hits the network (cache/local only)."""
+    None if absent. Never hits the network (cache/local only).
+
+    Tries hf_hub_download, then try_to_load_from_cache, then a direct glob of the HF
+    cache — the hub helpers can spuriously miss a cached file depending on process
+    context, so the filesystem glob is the reliable backstop."""
     import os
+    import glob
     if os.path.isdir(model_name):
         p = os.path.join(model_name, filename)
         return p if os.path.isfile(p) else None
     try:
         from huggingface_hub import hf_hub_download
-        return hf_hub_download(model_name, filename, local_files_only=True)
+        p = hf_hub_download(model_name, filename, local_files_only=True)
+        if p and os.path.isfile(p):
+            return p
     except Exception:
-        return None
+        pass
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        p = try_to_load_from_cache(model_name, filename)
+        if isinstance(p, str) and os.path.isfile(p):
+            return p
+    except Exception:
+        pass
+    # Direct filesystem glob: <cache>/models--org--name/snapshots/*/<filename>
+    repo = 'models--' + str(model_name).replace('/', '--')
+    _hf_home = os.environ.get('HF_HOME')
+    caches = [
+        os.environ.get('HUGGINGFACE_HUB_CACHE'),
+        os.path.join(_hf_home, 'hub') if _hf_home else None,
+        os.path.expanduser('~/.cache/huggingface/hub'),
+        '/cache/huggingface/hub',
+    ]
+    for c in caches:
+        if not c:
+            continue
+        for p in sorted(glob.glob(os.path.join(c, repo, 'snapshots', '*', filename))):
+            if os.path.isfile(p):
+                return p
+    return None
 
 
 # Multi-vector text embedders that carry a bge-m3-style sparse head. Detected by the
@@ -323,10 +353,21 @@ _BGE_M3_TYPES = ('dense', 'sparse', 'colbert')
 
 
 def _is_bge_m3(model_name: str, trust: bool) -> bool:
-    """True if the repo is a bge-m3-style model (XLM-RoBERTa + a sparse_linear head)."""
-    if _hf_model_type(model_name, trust) not in ('xlm-roberta', 'xlm_roberta'):
+    """True if the repo is a bge-m3-style multi-vector embedder.
+
+    The sparse_linear head is the definitive signal — plain bge/xlm-roberta dense
+    models don't ship one. We key off the FILE rather than the model_type string
+    (AutoConfig can fail to resolve in an offline/engine context, which would wrongly
+    demote bge-m3 to the dense path); we only exclude vision/dual encoders, which never
+    carry this head anyway."""
+    if _resolve_repo_file(model_name, 'sparse_linear.pt') is None:
         return False
-    return _resolve_repo_file(model_name, 'sparse_linear.pt') is not None
+    try:
+        if _is_vision_only(model_name, trust) or _is_dual_encoder(model_name, trust):
+            return False
+    except Exception:
+        pass
+    return True
 
 
 def _load_bge_m3(model_name: str, device, model_config):
