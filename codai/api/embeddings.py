@@ -337,6 +337,7 @@ def _load_bge_m3(model_name: str, device, model_config):
     (already in the stack) reproduce dense/sparse/colbert exactly."""
     import torch
     from transformers import AutoTokenizer, AutoModel
+    from codai.models.hf_loading import build_from_pretrained_kwargs
 
     fp = build_from_pretrained_kwargs(model_config)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -353,7 +354,11 @@ def _load_bge_m3(model_name: str, device, model_config):
         w = sd['weight']                       # (out_features, in_features)
         lin = torch.nn.Linear(w.shape[1], w.shape[0], bias=('bias' in sd))
         lin.load_state_dict(sd)
-        return lin.to(device).eval()
+        # Match the base model's dtype (e.g. bf16) so the head matmul over the last
+        # hidden state doesn't dtype-mismatch; no grad (inference only).
+        lin = lin.to(device=device, dtype=model.dtype).eval()
+        lin.requires_grad_(False)
+        return lin
 
     heads = {}
     sp = _load_head('sparse_linear.pt')
@@ -867,6 +872,7 @@ def _load_embedding_model(model_name: str, device: str, model_config: dict = Non
     # sparse_linear head; must come BEFORE the sentence-transformers branch (which would
     # otherwise load it dense-only and drop the sparse/colbert heads).
     if _is_bge_m3(model_name, trust):
+        print(f"[embeddings] loading '{model_name}' via bge-m3 multi-vector backend", flush=True)
         try:
             return _load_bge_m3(model_name, device, model_config)
         except Exception as e:
