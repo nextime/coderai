@@ -27,6 +27,7 @@ class EmbeddingsRequest(BaseModel):
     encoding_format: Optional[str] = Field("float", description="Return embeddings as 'float' arrays or 'base64'.")
     dimensions: Optional[int] = Field(None, description="Truncate embeddings to N dimensions (if the model supports it).")
     quantization: Optional[str] = Field(None, description="Optional TurboQuant vector quantization: 'turbo' (8-bit), 'turbo8', 'turbo6', 'turbo4' or 'turbo2'. With encoding_format='float' the (lossy) reconstructed vectors are returned; with 'base64' the compact packed bytes are returned plus a 'quantization' metadata block describing how to decode them.")
+    embedding_types: Optional[List[str]] = Field(None, description="For multi-vector models (e.g. BAAI/bge-m3): which vector types to compute — any of 'dense', 'sparse', 'colbert'. Overrides the model's configured default. 'dense' → the usual `embedding`; 'sparse' → `sparse_embedding` {indices, values}; 'colbert' → `colbert_embedding` (token-level multi-vector).")
     user: Optional[str] = Field(None, description="Opaque end-user identifier (passthrough).")
     model_config = ConfigDict(extra="allow")
 
@@ -34,7 +35,10 @@ class EmbeddingsRequest(BaseModel):
 class EmbeddingObject(BaseModel):
     object: str = "embedding"
     index: int
-    embedding: Union[List[float], str]     # float list or base64
+    embedding: Union[List[float], str]     # float list or base64 (dense; [] if dense not requested)
+    # Multi-vector outputs (bge-m3 and similar). Present only when requested.
+    sparse_embedding: Optional[Dict] = None       # {"indices": [token_id...], "values": [float...]}
+    colbert_embedding: Optional[List[List[float]]] = None   # token-level vectors
 
 
 class EmbeddingsResponse(BaseModel):

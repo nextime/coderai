@@ -240,6 +240,14 @@ class _EmbeddingModel:
             elif self.backend == 'sentence_transformers':
                 if hasattr(self.model, 'to'):
                     self.model.to('cpu')
+            elif self.backend == 'bge-m3':
+                # model is (tokenizer, hf_model, heads_dict, device)
+                _hf = self.model[1] if self.model else None
+                if _hf is not None and hasattr(_hf, 'to'):
+                    _hf.to('cpu')
+                for _h in (self.model[2] or {}).values() if self.model else []:
+                    if hasattr(_h, 'to'):
+                        _h.to('cpu')
             elif self.backend in ('clip', 'transformers', 'vision', 'qwenvl'):
                 # model is (processor_or_tokenizer, hf_model, device)
                 hf_model = self.model[1]
@@ -292,6 +300,69 @@ def _hf_model_type(model_name: str, trust: bool) -> str:
         return str(getattr(cfg, 'model_type', ''))
     except Exception:
         return ''
+
+
+def _resolve_repo_file(model_name: str, filename: str):
+    """Local path to ``filename`` inside a model repo (local dir or HF cache), or
+    None if absent. Never hits the network (cache/local only)."""
+    import os
+    if os.path.isdir(model_name):
+        p = os.path.join(model_name, filename)
+        return p if os.path.isfile(p) else None
+    try:
+        from huggingface_hub import hf_hub_download
+        return hf_hub_download(model_name, filename, local_files_only=True)
+    except Exception:
+        return None
+
+
+# Multi-vector text embedders that carry a bge-m3-style sparse head. Detected by the
+# presence of sparse_linear.pt (bge-large etc. are XLM-RoBERTa too but ship no head,
+# so they stay on the dense sentence-transformers path).
+_BGE_M3_TYPES = ('dense', 'sparse', 'colbert')
+
+
+def _is_bge_m3(model_name: str, trust: bool) -> bool:
+    """True if the repo is a bge-m3-style model (XLM-RoBERTa + a sparse_linear head)."""
+    if _hf_model_type(model_name, trust) not in ('xlm-roberta', 'xlm_roberta'):
+        return False
+    return _resolve_repo_file(model_name, 'sparse_linear.pt') is not None
+
+
+def _load_bge_m3(model_name: str, device, model_config):
+    """Load bge-m3 natively: XLM-RoBERTa base + the sparse (and colbert) linear heads.
+
+    Avoids the FlagEmbedding dependency (which pins older transformers/peft) — the
+    heads are plain Linear layers over the last hidden state, so transformers + torch
+    (already in the stack) reproduce dense/sparse/colbert exactly."""
+    import torch
+    from transformers import AutoTokenizer, AutoModel
+
+    fp = build_from_pretrained_kwargs(model_config)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name, **fp)
+    if 'quantization_config' not in fp and 'device_map' not in fp:
+        model = model.to(device)
+    model.eval()
+
+    def _load_head(fname):
+        path = _resolve_repo_file(model_name, fname)
+        if not path:
+            return None
+        sd = torch.load(path, map_location='cpu', weights_only=True)
+        w = sd['weight']                       # (out_features, in_features)
+        lin = torch.nn.Linear(w.shape[1], w.shape[0], bias=('bias' in sd))
+        lin.load_state_dict(sd)
+        return lin.to(device).eval()
+
+    heads = {}
+    sp = _load_head('sparse_linear.pt')
+    if sp is not None:
+        heads['sparse'] = sp
+    cb = _load_head('colbert_linear.pt')
+    if cb is not None:
+        heads['colbert'] = cb
+    return _EmbeddingModel('bge-m3', (tokenizer, model, heads, device))
 
 
 def _is_vision_only(model_name: str, trust: bool) -> bool:
@@ -792,6 +863,15 @@ def _load_embedding_model(model_name: str, device: str, model_config: dict = Non
         except Exception as e:
             raise RuntimeError(f"Cannot load Qwen-VL embedding model '{model_name}': {e}")
 
+    # bge-m3-style multi-vector embedders (dense + sparse + colbert). Detected by the
+    # sparse_linear head; must come BEFORE the sentence-transformers branch (which would
+    # otherwise load it dense-only and drop the sparse/colbert heads).
+    if _is_bge_m3(model_name, trust):
+        try:
+            return _load_bge_m3(model_name, device, model_config)
+        except Exception as e:
+            raise RuntimeError(f"Cannot load bge-m3 embedding model '{model_name}': {e}")
+
     # A dual encoder without an ST recipe must go down the transformers path so
     # text and images share one space; everything else prefers ST.
     prefer_clip = _is_dual_encoder(model_name, trust) and not _has_st_modules(model_name)
@@ -1119,6 +1199,132 @@ def _llama_vl_embed(model_obj, items, dimensions=None):
                     _L.llama_batch_free(batch)
             out.append(_seq_embedding())
     return _truncate_dims(out, dimensions)
+
+
+def _bge_m3_encode(model_obj, texts: List[str], types, max_length: int = 8192):
+    """Compute bge-m3 dense/sparse/colbert for a batch of texts.
+
+    Returns a list of per-text dicts with keys among 'dense' (normalized CLS vector),
+    'sparse' ({token_id: weight}) and 'colbert' (list of token vectors). Reproduces
+    FlagEmbedding's bge-m3 outputs natively: dense = L2-normalized CLS; sparse = per-token
+    relu(sparse_linear·h), max-pooled per token id, special tokens dropped; colbert =
+    L2-normalized colbert_linear·h per content token."""
+    import torch
+
+    tokenizer, model, heads, device = model_obj.model
+    enc = tokenizer(texts, padding=True, truncation=True,
+                    max_length=int(max_length), return_tensors='pt')
+    enc = {k: v.to(device) for k, v in enc.items()}
+    with torch.no_grad():
+        out = model(**enc)
+    last = out.last_hidden_state                     # (B, L, H)
+    input_ids = enc['input_ids'].cpu()
+    attn = enc['attention_mask'].cpu()
+    specials = set(getattr(tokenizer, 'all_special_ids', []) or [])
+    n = len(texts)
+    results = [dict() for _ in range(n)]
+
+    if 'dense' in types:
+        dense = torch.nn.functional.normalize(last[:, 0], p=2, dim=-1).cpu()
+        for i in range(n):
+            results[i]['dense'] = dense[i].tolist()
+
+    if 'sparse' in types:
+        w = torch.relu(heads['sparse'](last)).squeeze(-1).cpu()      # (B, L)
+        for i in range(n):
+            d = {}
+            ids_i, w_i, m_i = input_ids[i], w[i], attn[i]
+            for j in range(ids_i.shape[0]):
+                if int(m_i[j]) == 0:
+                    continue
+                tid = int(ids_i[j])
+                if tid in specials:
+                    continue
+                val = float(w_i[j])
+                if val > d.get(tid, 0.0):
+                    d[tid] = val
+            results[i]['sparse'] = d
+
+    if 'colbert' in types:
+        col = torch.nn.functional.normalize(heads['colbert'](last), p=2, dim=-1).cpu()
+        for i in range(n):
+            vecs = []
+            ids_i, m_i = input_ids[i], attn[i]
+            for j in range(ids_i.shape[0]):
+                if int(m_i[j]) == 0 or int(ids_i[j]) in specials:
+                    continue
+                vecs.append(col[i][j].tolist())
+            results[i]['colbert'] = vecs
+    return results
+
+
+async def _bge_m3_response(request, model_obj, texts, _emb_cfg):
+    """Build the extended /v1/embeddings response for a bge-m3 model: dense in the usual
+    `embedding` field, plus `sparse_embedding` / `colbert_embedding` per requested type.
+    Request `embedding_types` overrides the model-config default."""
+    _raw = _emb_cfg.get('_raw_cfg') if isinstance(_emb_cfg.get('_raw_cfg'), dict) else {}
+    req_types = getattr(request, 'embedding_types', None)
+    types = (req_types or _emb_cfg.get('embedding_types')
+             or _raw.get('embedding_types') or ['dense', 'sparse'])
+    types = [str(t).strip().lower() for t in types if t]
+    bad = [t for t in types if t not in _BGE_M3_TYPES]
+    if bad:
+        raise HTTPException(status_code=400,
+                            detail=f"Unsupported embedding_types {bad}; "
+                                   f"use any of {list(_BGE_M3_TYPES)}")
+    if not types:
+        raise HTTPException(status_code=400, detail="embedding_types is empty")
+    if not texts:
+        raise HTTPException(status_code=400, detail="bge-m3 is text-only; provide 'input'.")
+    heads = model_obj.model[2] or {}
+    for t in ('sparse', 'colbert'):
+        if t in types and t not in heads:
+            raise HTTPException(status_code=400,
+                                detail=f"This model has no {t} head.")
+    max_len = int(_emb_cfg.get('n_ctx') or _raw.get('n_ctx') or 8192)
+
+    def _run():
+        return _bge_m3_encode(model_obj, texts, types, max_len)
+
+    try:
+        results = await asyncio.get_event_loop().run_in_executor(None, _run)
+    except Exception as e:
+        s = str(e)
+        if not ('CUDA' in s or 'CUBLAS' in s or 'out of memory' in s.lower()):
+            raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
+        # encode-time OOM: free scratch room and retry once (same contract as the
+        # dense path), keeping this model marked active so it isn't evicted itself.
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            multi_model_manager.active_in_vram = multi_model_manager.current_model_key
+            await asyncio.get_event_loop().run_in_executor(
+                None, multi_model_manager._evict_models_for_vram, 2.0)
+            results = await asyncio.get_event_loop().run_in_executor(None, _run)
+        except Exception as e2:
+            raise HTTPException(status_code=500, detail=f"Embedding failed: {e2}")
+
+    _b64 = request.encoding_format == 'base64'
+    data = []
+    for i, r in enumerate(results):
+        dense = r.get('dense', [])
+        if _b64 and dense:
+            import struct
+            dense = base64.b64encode(struct.pack(f'{len(dense)}f', *dense)).decode()
+        obj = EmbeddingObject(index=i, embedding=dense)
+        if 'sparse' in r:
+            d = r['sparse']
+            obj.sparse_embedding = {'indices': list(d.keys()), 'values': list(d.values())}
+        if 'colbert' in r:
+            obj.colbert_embedding = r['colbert']
+        data.append(obj)
+    total_tokens = sum(len(t.split()) for t in texts)
+    return EmbeddingsResponse(
+        data=data, model=request.model,
+        usage={"prompt_tokens": total_tokens, "total_tokens": total_tokens})
 
 
 def _embed_texts(model_obj, texts: List[str], dimensions=None) -> List[List[float]]:
@@ -1520,6 +1726,11 @@ async def _run_embeddings(request: EmbeddingsRequest, http_request: Request = No
             detail=f"Model '{model_name}' is text-only; image embedding needs a "
                    "multimodal model (CLIP/SigLIP family, e.g. "
                    "sentence-transformers/clip-ViT-B-32 or jinaai/jina-clip-v2).")
+
+    # bge-m3 multi-vector path: returns dense + sparse (+ colbert) in one response,
+    # bypassing the dense-only vector pipeline below.
+    if getattr(model_obj, 'backend', None) == 'bge-m3':
+        return await _bge_m3_response(request, model_obj, texts, _emb_cfg)
 
     # Text vectors first, then image vectors — indices follow that order.
     vectors: List[List[float]] = []
