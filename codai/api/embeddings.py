@@ -1257,51 +1257,56 @@ def _bge_m3_encode(model_obj, texts: List[str], types, max_length: int = 8192):
     relu(sparse_linear·h), max-pooled per token id, special tokens dropped; colbert =
     L2-normalized colbert_linear·h per content token."""
     import torch
+    import torch.nn.functional as F
 
     tokenizer, model, heads, device = model_obj.model
     enc = tokenizer(texts, padding=True, truncation=True,
                     max_length=int(max_length), return_tensors='pt')
     enc = {k: v.to(device) for k, v in enc.items()}
-    with torch.no_grad():
-        out = model(**enc)
-    last = out.last_hidden_state                     # (B, L, H)
-    input_ids = enc['input_ids'].cpu()
-    attn = enc['attention_mask'].cpu()
-    specials = set(getattr(tokenizer, 'all_special_ids', []) or [])
-    n = len(texts)
+    input_ids = enc['input_ids']                     # (B, L) on device
+    attn = enc['attention_mask']                     # (B, L) on device
+    n = input_ids.shape[0]
     results = [dict() for _ in range(n)]
 
-    if 'dense' in types:
-        dense = torch.nn.functional.normalize(last[:, 0], p=2, dim=-1).cpu()
-        for i in range(n):
-            results[i]['dense'] = dense[i].tolist()
+    with torch.no_grad():
+        out = model(**enc)
+        last = out.last_hidden_state                 # (B, L, H)
 
-    if 'sparse' in types:
-        w = torch.relu(heads['sparse'](last)).squeeze(-1).cpu()      # (B, L)
-        for i in range(n):
-            d = {}
-            ids_i, w_i, m_i = input_ids[i], w[i], attn[i]
-            for j in range(ids_i.shape[0]):
-                if int(m_i[j]) == 0:
-                    continue
-                tid = int(ids_i[j])
-                if tid in specials:
-                    continue
-                val = float(w_i[j])
-                if val > d.get(tid, 0.0):
-                    d[tid] = val
-            results[i]['sparse'] = d
+        # Valid = attended AND not a special token (CLS/SEP/PAD/UNK/MASK). Computed on
+        # the GPU so aggregation never falls back to a Python per-token loop (the GIL
+        # bottleneck that starved the card between forward passes).
+        specials = sorted(set(getattr(tokenizer, 'all_special_ids', []) or []))
+        if specials:
+            valid = attn.bool() & ~torch.isin(
+                input_ids, torch.tensor(specials, device=device))
+        else:
+            valid = attn.bool()
 
-    if 'colbert' in types:
-        col = torch.nn.functional.normalize(heads['colbert'](last), p=2, dim=-1).cpu()
-        for i in range(n):
-            vecs = []
-            ids_i, m_i = input_ids[i], attn[i]
-            for j in range(ids_i.shape[0]):
-                if int(m_i[j]) == 0 or int(ids_i[j]) in specials:
-                    continue
-                vecs.append(col[i][j].tolist())
-            results[i]['colbert'] = vecs
+        if 'dense' in types:
+            dense = F.normalize(last[:, 0], p=2, dim=-1).cpu().tolist()   # (B, H)
+            for i in range(n):
+                results[i]['dense'] = dense[i]
+
+        if 'sparse' in types:
+            # relu(sparse_linear·h), invalid positions zeroed, then max-pooled per
+            # token id via a single GPU scatter_reduce (amax) into a (B, vocab) matrix.
+            w = torch.relu(heads['sparse'](last)).squeeze(-1).float()     # (B, L)
+            w = w.masked_fill(~valid, 0.0)
+            vocab = int(getattr(model.config, 'vocab_size', 0)) or int(input_ids.max()) + 1
+            sparse_mat = torch.zeros(n, vocab, device=device, dtype=w.dtype)
+            sparse_mat.scatter_reduce_(1, input_ids, w, reduce='amax', include_self=True)
+            sparse_mat = sparse_mat.cpu()
+            for i in range(n):
+                row = sparse_mat[i]
+                nz = torch.nonzero(row, as_tuple=True)[0]                 # token ids > 0
+                results[i]['sparse'] = dict(zip(nz.tolist(), row[nz].tolist()))
+
+        if 'colbert' in types:
+            col = F.normalize(heads['colbert'](last), p=2, dim=-1).cpu()  # (B, L, H)
+            valid_cpu = valid.cpu()
+            for i in range(n):
+                # one C-level tolist per row over its valid tokens (vs per-token)
+                results[i]['colbert'] = col[i][valid_cpu[i]].tolist()
     return results
 
 
