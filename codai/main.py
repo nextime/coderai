@@ -910,10 +910,27 @@ def main():
 
     if text_model_names:
         print(f"\nText model(s): {text_model_names}")
+        _seen_text_paths = set()
         for i, m in enumerate(text_models):
-            mid = _model_id(m)
-            if not mid:
+            path_id = _model_id(m)
+            if not path_id:
                 continue
+            _alias = m.get("alias") if isinstance(m, dict) else None
+            # Multi-config support: the per-model config is keyed by `mid`. A SECOND
+            # entry for the same file (a sibling config — e.g. a smaller-context
+            # variant) must be keyed by its ALIAS so it doesn't overwrite the primary
+            # config (keyed by path) — otherwise both resolve to the last-registered
+            # config. A sibling without an alias can't be addressed distinctly, so skip
+            # it rather than silently clobbering the primary.
+            if path_id in _seen_text_paths:
+                if not _alias:
+                    print(f"[config] skipping duplicate text config for '{path_id}' "
+                          f"(add an alias to address it as a separate config)")
+                    continue
+                mid = _alias
+            else:
+                mid = path_id
+                _seen_text_paths.add(path_id)
             cfg = _model_cfg(m, "text")
             if i == 0:
                 # Only the first text model becomes the default
@@ -927,8 +944,9 @@ def main():
                 multi_model_manager.model_backend_types[mid] = (
                     m.get("backend", "auto") if isinstance(m, dict) else "auto"
                 )
-            if isinstance(m, dict) and m.get("alias"):
-                multi_model_manager.set_model_alias(m["alias"], mid)
+            # Primary: alias -> path. Sibling: alias -> itself (its own config key).
+            if _alias:
+                multi_model_manager.set_model_alias(_alias, mid)
 
     # Audio models
     audio_models = models_config.get("audio_models", [])
