@@ -3012,6 +3012,30 @@ class MultiModelManager:
 
         _persist("measured_vram_gb", measured_vram, vram_guard=True)
         _persist("measured_ram_gb", measured_ram)
+
+        # --- Anti-ratchet guard for the learned GPU-layer split -------------
+        # Never let a VRAM-CONTENDED (offloaded-to-CPU) load overwrite a HIGHER
+        # known-good split. Without this, one unlucky load while another model
+        # holds the card fits fewer layers, persists that reduced count, and
+        # _learned_n_gpu_layers then reuses it as a hard cap FOREVER — the model
+        # stays half on CPU even once the card is free again. (Observed on the
+        # gemma-4-26B 32k config: a contended load ratcheted 31→20 and stuck,
+        # spilling ~5.8 GB of weights + KV to CPU on a card with 11 GB free.)
+        # A genuinely-too-big model still settles at its own free-card maximum
+        # on an uncontended load, so preserving the higher value is safe; the
+        # worst case is one offload-retry on a later truly-contended load.
+        _this_offloaded = bool(offloaded) or (measured_ram is not None and measured_ram > 0)
+        _prev_layers = cfgd.get("measured_n_gpu_layers")
+        if (measured_layers is not None and _prev_layers is not None and _this_offloaded):
+            try:
+                if int(measured_layers) < int(_prev_layers):
+                    print(f"  Keeping measured_n_gpu_layers={int(_prev_layers)} for "
+                          f"'{model_key}': this load offloaded to CPU and fit only "
+                          f"{int(measured_layers)} layers — not ratcheting down a "
+                          f"VRAM-contended split (would pin the model to CPU).")
+                    measured_layers = None
+            except (TypeError, ValueError):
+                pass
         _persist("measured_n_gpu_layers", measured_layers)
 
     def _learned_n_gpu_layers(self, model_key: str, configured):
