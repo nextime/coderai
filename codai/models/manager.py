@@ -124,11 +124,21 @@ def _resolve_local_gguf(model_name: str):
                 if not isinstance(lst, list):
                     continue
                 for m in lst:
-                    key = m if isinstance(m, str) else (m.get("path") or m.get("id") or "") if isinstance(m, dict) else ""
+                    if isinstance(m, dict):
+                        key = m.get("path") or m.get("id") or ""
+                        _alias = m.get("alias") or ""
+                    else:
+                        key = m if isinstance(m, str) else ""
+                        _alias = ""
                     if not key or not str(key).lower().endswith(".gguf"):
                         continue
                     kb = os.path.basename(key)
-                    if (key == model_name or kb == base or kb[:-5] == base_noext) and os.path.isfile(os.path.expanduser(key)):
+                    # Match by path / basename, OR by the entry's ALIAS — a same-file
+                    # sibling config (multi-config) is addressed by its alias, which
+                    # won't match the shared path/basename.
+                    if (key == model_name or kb == base or kb[:-5] == base_noext
+                            or (_alias and _alias == model_name)) \
+                            and os.path.isfile(os.path.expanduser(key)):
                         return os.path.expanduser(key)
     except Exception:
         pass
@@ -2991,7 +3001,10 @@ class MultiModelManager:
                 self.config[canon_key] = dict(working)
                 from codai.admin.routes import config_manager
                 if config_manager is not None:
-                    config_manager.persist_model_field(canon_key, field, value)
+                    # Target the exact entry by config_id so same-path sibling configs
+                    # (multi-config) don't cross-contaminate each other's measured fields.
+                    config_manager.persist_model_field(
+                        canon_key, field, value, config_id=cfgd.get("config_id"))
                 print(f"  Saved {field}={value} for '{model_key}' "
                       f"({'force_vram_update' if force_update else 'no used_vram_gb'})")
             except Exception as e:

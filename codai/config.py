@@ -1180,7 +1180,7 @@ class ConfigManager:
         with open(self.models_path, 'w') as f:
             json.dump(self.models_data, f, indent=2)
 
-    def persist_model_field(self, model_path: str, key: str, value) -> bool:
+    def persist_model_field(self, model_path: str, key: str, value, config_id: str = None) -> bool:
         """Set a SINGLE field on the matching model entry by RE-READING models.json
         from disk first, then writing back — never dumping this process's whole
         in-memory models_data.
@@ -1207,11 +1207,21 @@ class ConfigManager:
             for entry in lst:
                 if not isinstance(entry, dict):
                     continue
-                epath = entry.get("path") or entry.get("id") or ""
-                if epath == bare or epath.split("/")[-1] == bare.split("/")[-1]:
-                    if entry.get(key) != value:
-                        entry[key] = value
-                        changed = True
+                # When a config_id is given, target ONLY that exact entry — so a
+                # same-path sibling config (multi-config) doesn't inherit the other's
+                # measured footprint (which would make e.g. a small-ctx variant offload
+                # using the large-ctx variant's VRAM figure). Fall back to path/basename
+                # matching for legacy entries without a config_id.
+                if config_id:
+                    if entry.get("config_id") != config_id:
+                        continue
+                else:
+                    epath = entry.get("path") or entry.get("id") or ""
+                    if not (epath == bare or epath.split("/")[-1] == bare.split("/")[-1]):
+                        continue
+                if entry.get(key) != value:
+                    entry[key] = value
+                    changed = True
         if changed:
             tmp = str(self.models_path) + ".tmp"
             with open(tmp, 'w') as f:

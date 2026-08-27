@@ -897,7 +897,10 @@ def main():
     def _model_cfg(m, mtype):
         cfg = build_kwargs_from_config(m, mtype) if isinstance(m, dict) else {}
         if isinstance(m, dict):
-            for k in ("load_mode", "used_vram_gb", "alias", "max_instances"):
+            # config_id/config_name carry the entry's identity so runtime-measured
+            # fields persist back to the EXACT entry (multi-config siblings share a path).
+            for k in ("load_mode", "used_vram_gb", "alias", "max_instances",
+                      "config_id", "config_name"):
                 if k in m:
                     cfg[k] = m[k]
         return cfg
