@@ -73,6 +73,10 @@ class ModelCapabilities:
     model_3d_generation: bool = False   # text / image → 3D model (GLB)
     model_3d_to_image: bool = False     # 3D model → rendered 2D image / video
 
+    # Retrieval / document
+    reranking: bool = False             # cross-encoder query↔document reranking (bge-reranker, …)
+    ocr: bool = False                   # optical character recognition (paddle/doctr/surya)
+
     def to_list(self) -> List[str]:
         out = []
         for name, val in self.__dataclass_fields__.items():
@@ -95,6 +99,11 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
         return caps
 
     n = model_name.lower()
+
+    # ── Reranking (cross-encoder) ────────────────────────────────────────────
+    if 'rerank' in n or 'cross-encoder' in n or 'cross_encoder' in n:
+        caps.reranking = True
+        return caps
 
     # ── 3D generation ────────────────────────────────────────────────────────
     if any(x in n for x in ['triposr', 'tsr', 'shap-e', 'shape-e', 'point-e', 'pointe',

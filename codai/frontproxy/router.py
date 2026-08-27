@@ -29,6 +29,7 @@ _INFERENCE_PATHS = {
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/embeddings",
+    "/v1/rerank",
     "/v1/images/generations",
     "/v1/images/edits",
     "/v1/audio/speech",

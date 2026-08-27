@@ -5129,6 +5129,26 @@ class MultiModelManager:
         except Exception:
             pass
 
+        # --- OCR engines (a node subsystem, not model-manager models) ---
+        # Surfaced so clients can discover them via /v1/models; invoked at /v1/ocr
+        # with ?engine=<id>. Listed once per node (collect_models dedups by id).
+        try:
+            from codai.admin.routes import config_manager
+            ocr = getattr(config_manager, "config", None)
+            ocr = getattr(ocr, "ocr", None) if ocr is not None else None
+            if ocr is not None and getattr(ocr, "enabled", False):
+                _ocr_engines = []
+                if getattr(ocr, "paddle_enabled", False):
+                    _ocr_engines.append("paddle")
+                if getattr(ocr, "doctr_enabled", False):
+                    _ocr_engines.append("doctr")
+                if getattr(ocr, "surya_enabled", False) and getattr(ocr, "surya_accept_license", False):
+                    _ocr_engines.append("surya")
+                for _eng in _ocr_engines:
+                    _add(_eng, "ocr", {"capabilities": ["ocr"], "backend": "ocr"})
+        except Exception:
+            pass
+
         # --- Fallback: runtime default_model ---
         if not models and self.default_model:
             model_id = self.default_model
