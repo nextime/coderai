@@ -490,13 +490,39 @@ class EngineSupervisor:
     _LOAD_DONE_RE = re.compile(r'Model loaded successfully|failed to load|Error loading')
 
     def _pump_logs(self, tag, proc, tail, engine):
-        for raw in proc.stdout:
-            line = raw.rstrip()
-            if not line:
-                continue
-            tail.append(line)
-            self._note_load_progress(engine, line)
-            self._emit_log(tag, line)
+        # The loop below ends when the engine's stdout hits EOF (the write end was
+        # closed or redirected) or raises. Historically it did so SILENTLY — the
+        # thread just returned — so an engine that stops feeding its stdout (e.g. a
+        # native library redirecting fd 1, or the pipe iterator breaking) simply
+        # vanished from the logs with no trace, looking like "debug turned off".
+        # Wrap the body so a single bad line can't kill the pump, and always
+        # announce why/when the stream ended so the disappearance is diagnosable.
+        reason = "stdout EOF"
+        try:
+            for raw in proc.stdout:
+                try:
+                    line = raw.rstrip()
+                    if not line:
+                        continue
+                    tail.append(line)
+                    self._note_load_progress(engine, line)
+                    self._emit_log(tag, line)
+                except Exception as line_exc:
+                    try:
+                        self._emit_log(tag, f"[pump] dropped a log line: {line_exc!r}")
+                    except Exception:
+                        pass
+        except Exception as exc:
+            reason = f"pump error: {exc!r}"
+        alive = proc.poll() is None
+        try:
+            self._emit_log(
+                tag,
+                f"[pump] log stream ended ({reason}); engine "
+                + ("still ALIVE — its output is now lost until relaunch"
+                   if alive else f"exited rc={proc.returncode}"))
+        except Exception:
+            pass
 
     def _emit_log(self, tag, line):
         """Print an engine log line, rendering tqdm progress bars as a single

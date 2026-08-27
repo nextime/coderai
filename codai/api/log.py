@@ -58,6 +58,67 @@ def get_recent_activity():
     return list(_activity)
 
 
+# --- Durable request-debug sink -------------------------------------------
+# The FULL REQUEST DEBUG below is normally emitted with print(), i.e. to this
+# process's stdout, which the front pumps into the shared log. If an engine's
+# stdout stream dies (a native library closing/redirecting fd 1 after model
+# load has been observed on the radeon GGUF embedder), that print() output is
+# silently lost even though the engine keeps serving. To make the request
+# debug survive regardless of stdout, we ALSO append it — from the engine's own
+# process — straight to a file on the mounted cache. Each block is written with
+# a single O_APPEND write() so concurrent engines never interleave mid-block.
+import os as _os
+
+_DURABLE_FD = None
+_DURABLE_INIT = False
+
+
+def _durable_log_path():
+    lf = _os.environ.get("CODERAI_LOG_FILE")
+    d = (_os.path.dirname(lf) if lf else None) or _os.environ.get(
+        "CODERAI_LOG_DIR") or "/cache/logs"
+    return _os.path.join(d, "requests.log")
+
+
+def _durable_fd():
+    global _DURABLE_FD, _DURABLE_INIT
+    if _DURABLE_INIT:
+        return _DURABLE_FD
+    _DURABLE_INIT = True
+    try:
+        path = _durable_log_path()
+        _os.makedirs(_os.path.dirname(path), exist_ok=True)
+        _DURABLE_FD = _os.open(path, _os.O_WRONLY | _os.O_CREAT | _os.O_APPEND, 0o644)
+    except Exception:
+        _DURABLE_FD = None
+    return _DURABLE_FD
+
+
+def _engine_tag():
+    return (_os.environ.get("CODERAI_ENGINE_NAME")
+            or _os.environ.get("CODERAI_ENGINE_BACKEND") or "engine")
+
+
+def _durable_request_debug(method, url, parsed):
+    """Append one FULL REQUEST DEBUG block to the durable requests.log, tagged
+    like the pumped lines ([ts][engine]) so it reads the same. Best-effort;
+    never raises into the request path."""
+    fd = _durable_fd()
+    if fd is None:
+        return
+    try:
+        pre = f"[{time.strftime('%H:%M:%S')}][{_engine_tag()}] "
+        body = json.dumps(_redact_blobs(parsed), indent=2)
+        lines = [pre + "=" * 70,
+                 pre + "=== FULL REQUEST DEBUG ===",
+                 pre + f"Method: {method}  URL: {url}"]
+        lines += [pre + ln for ln in body.split("\n")]
+        lines.append(pre + "=" * 70)
+        _os.write(fd, ("\n".join(lines) + "\n").encode("utf-8", "replace"))
+    except Exception:
+        pass
+
+
 _TRACKED_PATHS = {
     "/v1/chat/completions": "chat",
     "/v1/completions": "completion",
@@ -120,6 +181,9 @@ async def log_requests(request: Request, call_next):
                     print(f"Method: {request.method}  URL: {request.url}")
                     print(json.dumps(_redact_blobs(parsed), indent=2))
                     print(f"{'='*80}\n")
+                    # Durable copy, independent of this process's stdout, so the
+                    # request body survives even if the engine's log stream dies.
+                    _durable_request_debug(request.method, request.url, parsed)
             except Exception as e:
                 if global_debug:
                     print(f"Error reading request body: {e}")
