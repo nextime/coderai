@@ -102,8 +102,11 @@ async def create_rerank(request: RerankRequest, http_request: Request = None):
         raise HTTPException(status_code=400, detail="'query' is required")
 
     # Resolve + reserve the model through the manager (thermal wait, caching, routing).
+    # Rerankers are registered in the embedding_models category (same transformers/nvidia
+    # infra), so resolve with model_type="embedding" to pass the manager's type
+    # validation; rerank.py then loads it as a cross-encoder (not an embedder).
     model_info = await asyncio.to_thread(
-        multi_model_manager.request_model, request.model, "rerank")
+        multi_model_manager.request_model, request.model, "embedding")
     model_name = model_info.get('model_name')
     if not model_name:
         raise HTTPException(status_code=404,
