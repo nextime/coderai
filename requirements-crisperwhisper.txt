@@ -1,0 +1,20 @@
+# Isolated venv for CrisperWhisper (nyrahealth/CrisperWhisper).
+#
+# CrisperWhisper's whole value is VERBATIM transcription with precise WORD
+# timestamps. Its custom generation config (forced_decoder_ids) is incompatible
+# with the coderai server's transformers 5.x — the word/segment timestamp
+# postprocessing crashes there. So it runs in its own venv pinned to a
+# transformers version whose Whisper word-timestamp path works, and coderai talks
+# to it over HTTP (codai/api/crisperwhisper_worker.py + tools/crisperwhisper_service.py).
+# Do NOT merge these into requirements.txt.
+#
+# CUDA build for the 3090; cu124 wheels run on this box's newer driver.
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1+cu124
+# 4.46.x is the last pre-5.x transformers (Whisper word-timestamp path still
+# works, unlike 5.x) AND allows tokenizers 0.20 which ships py3.13 wheels — 4.44
+# pinned an older tokenizers with no 3.13 wheel, forcing a Rust build that fails.
+transformers==4.46.3
+accelerate>=0.33.0
+soundfile>=0.12.0

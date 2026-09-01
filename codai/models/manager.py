@@ -1799,7 +1799,8 @@ class MultiModelManager:
         # transformers pipeline pulls lazily on first request. None should be
         # eagerly downloaded here (that would block engine startup), unlike a
         # faster-whisper size which set_audio_model resolves/caches below.
-        if _be in ("vosk", "nemo", "canary", "parakeet", "wav2vec2", "wav2vec"):
+        if _be in ("vosk", "nemo", "canary", "parakeet", "wav2vec2", "wav2vec",
+                   "whisper-hf", "whisper-transformers", "crisperwhisper"):
             print(f"Registered {_be} audio model: {model_name}")
             return
 

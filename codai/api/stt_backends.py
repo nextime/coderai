@@ -58,6 +58,10 @@ def _family(model_name: str, config: Optional[dict]) -> str:
     b = (cfg.get("backend") or "").strip().lower()
     if b in ("wav2vec2", "wav2vec", "transformers-asr", "hf-asr"):
         return "wav2vec2"
+    if b == "crisperwhisper":
+        return "crisperwhisper"
+    if b in ("whisper-hf", "whisper-transformers"):
+        return "whisper_hf"
     if b == "vosk":
         return "vosk"
     if b in ("nemo", "canary", "parakeet"):
@@ -67,6 +71,13 @@ def _family(model_name: str, config: Optional[dict]) -> str:
         return "vosk"
     if any(x in n for x in ("canary", "parakeet", "nemo", ".nemo")):
         return "nemo"
+    # CrisperWhisper runs in its own isolated venv worker (verbatim + word
+    # timestamps need a transformers version the shared 5.x venv can't provide).
+    if "crisperwhisper" in n:
+        return "crisperwhisper"
+    # Other HF Whisper checkpoints = seq2seq Whisper via the shared-venv pipeline.
+    if "whisper" in n:
+        return "whisper_hf"
     if any(x in n for x in ("wav2vec", "hubert", "mms-", "seamless", "wavlm")):
         return "wav2vec2"
     # Default for an unknown non-whisper audio model: treat as an HF ASR model.
@@ -118,6 +129,10 @@ class _Wav2Vec2Backend:
         self.model_name = model_name
         self.config = config or {}
         self._pipe = None
+        # Whisper HF checkpoints (e.g. CrisperWhisper) are seq2seq and take
+        # generate kwargs (language/task); CTC models (wav2vec2) don't.
+        self._is_whisper = bool(self.config.get("_is_whisper")) or \
+            "whisper" in (model_name or "").lower()
 
     def _ensure(self):
         if self._pipe is not None:
@@ -155,16 +170,58 @@ class _Wav2Vec2Backend:
                    word_timestamps: bool = False) -> dict:
         self._ensure()
         gen_kwargs = {}
-        # MMS / Seamless accept a target language; plain wav2vec2 ignores it.
-        if language and self.config.get("language_aware"):
+        if self._is_whisper:
+            # Whisper seq2seq: choose transcribe vs translate, pass source language.
+            gen_kwargs["task"] = "translate" if target_language else "transcribe"
+            if language:
+                gen_kwargs["language"] = language
+        elif language and self.config.get("language_aware"):
+            # MMS / Seamless accept a target language; plain wav2vec2 ignores it.
             gen_kwargs["language"] = language
-        # CTC models emit per-word timestamps with return_timestamps="word".
-        mode = "word" if word_timestamps else "chunk"
+        # return_timestamps: CTC uses "chunk" / "word". Whisper uses "word" or
+        # True (segment) — but some checkpoints (e.g. CrisperWhisper) ship a custom
+        # generation config whose timestamp postprocessing breaks on transformers
+        # 5.x. So default Whisper to TEXT-ONLY (None) and only attempt timestamps
+        # when explicitly requested, falling back to text on any failure.
+        if word_timestamps:
+            mode = "word"
+        elif self._is_whisper:
+            mode = None
+        else:
+            mode = "chunk"
+        # Decode to 16 kHz mono WAV first so any container (mp4/m4a/webm/…) is
+        # handled uniformly — feeding a raw mp4 path can yield empty audio.
+        wav = None
         try:
-            out = self._pipe(audio_path, return_timestamps=mode,
-                             generate_kwargs=gen_kwargs or None)
-        except (TypeError, ValueError):
-            out = self._pipe(audio_path)
+            wav = _to_wav_16k_mono(audio_path)
+            src = wav
+        except Exception:
+            src = audio_path
+
+        def _run(ts):
+            if ts is None:
+                return self._pipe(src, generate_kwargs=gen_kwargs or None)
+            return self._pipe(src, return_timestamps=ts, generate_kwargs=gen_kwargs or None)
+
+        try:
+            out = _run(mode)
+        except Exception as e:
+            if mode is None:
+                raise
+            # Timestamp path failed (checkpoint/transformers incompatibility) —
+            # retry text-only so transcription still succeeds.
+            print(f"[stt] {self.model_name}: return_timestamps={mode!r} failed "
+                  f"({type(e).__name__}); retrying text-only")
+            try:
+                out = _run(None)
+            except Exception:
+                out = self._pipe(src)
+        finally:
+            if wav:
+                try:
+                    os.unlink(wav)
+                except OSError:
+                    pass
         text = (out.get("text") if isinstance(out, dict) else str(out)) or ""
         segments, words = [], []
         for ch in (out.get("chunks") or []) if isinstance(out, dict) else []:
@@ -314,6 +371,51 @@ class _RemoteNemoBackend:
 
 
 # --------------------------------------------------------------------------- #
+# CrisperWhisper — isolated-venv worker (verbatim + word timestamps)
+# --------------------------------------------------------------------------- #
+
+class _RemoteCrisperWhisperBackend:
+    """Talks to the managed CrisperWhisper worker (isolated venv, pinned
+    transformers) — verbatim transcription with precise word timestamps."""
+
+    family = "crisperwhisper"
+
+    def __init__(self, model_name: str, config: dict, service_url: Optional[str] = None):
+        self.model_name = model_name
+        self.config = config or {}
+        self.service_url = (service_url or self.config.get("service_url") or "").rstrip("/")
+
+    def transcribe(self, audio_path: str, language: Optional[str] = None,
+                   prompt: Optional[str] = None, temperature: float = 0.0,
+                   target_language: Optional[str] = None,
+                   word_timestamps: bool = False) -> dict:
+        import requests
+        params = {"task": "translate" if target_language else "transcribe"}
+        if language:
+            params["language"] = language
+        with open(audio_path, "rb") as f:
+            resp = requests.post(f"{self.service_url}/transcribe", params=params,
+                                 data=f.read(), timeout=1800,
+                                 headers={"Content-Type": "application/octet-stream"})
+        if resp.status_code != 200:
+            raise RuntimeError(f"CrisperWhisper worker error {resp.status_code}: {resp.text[:300]}")
+        j = resp.json()
+        if j.get("error"):
+            raise RuntimeError(j["error"])
+        return {"text": (j.get("text") or "").strip(),
+                "segments": j.get("segments") or [],
+                "words": j.get("words") or [],
+                "language": j.get("language") or language}
+
+    def cleanup(self):
+        try:
+            from codai.api import crisperwhisper_worker
+            crisperwhisper_worker.stop_service(self.model_name)
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------- #
 # factory
 # --------------------------------------------------------------------------- #
 
@@ -337,11 +439,20 @@ def load_stt_backend(model_name: str, model_path: Optional[str], config: Optiona
         from codai.api import canary_worker
         url = canary_worker.ensure_service(real, config)
         return _RemoteNemoBackend(real, {**config, "service_url": url}, service_url=url)
+    if fam == "crisperwhisper":
+        if config.get("service_url"):
+            return _RemoteCrisperWhisperBackend(real, config)
+        from codai.api import crisperwhisper_worker
+        url = crisperwhisper_worker.ensure_service(real, config)
+        return _RemoteCrisperWhisperBackend(real, {**config, "service_url": url},
+                                            service_url=url)
+    if fam == "whisper_hf":
+        return _Wav2Vec2Backend(real, real, {**config, "_is_whisper": True})
     return _Wav2Vec2Backend(real, real, config)
 
 
 # Family names that this module (not whisper-server / faster-whisper) handles.
-STT_FAMILIES = {"wav2vec2", "vosk", "nemo"}
+STT_FAMILIES = {"wav2vec2", "vosk", "nemo", "whisper_hf", "crisperwhisper"}
 
 
 def resolve_family(model_name: str, config: Optional[dict]) -> str:

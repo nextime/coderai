@@ -557,6 +557,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             <option value="kt">ktransformers (SGLang, CPU+GPU)</option>
             <option value="vllm">vLLM (high-concurrency, CUDA)</option>
             <option value="wav2vec2">wav2vec2 / HF-ASR (speech-to-text)</option>
+            <option value="whisper-hf">whisper-hf / CrisperWhisper (HF transformers STT)</option>
             <option value="vosk">Vosk (offline STT, CPU, per-language dir)</option>
             <option value="nemo">NVIDIA NeMo — Canary / Parakeet (isolated venv)</option>
           </select>
@@ -3850,7 +3851,7 @@ function _collectColibri(){
 function _updateSttVisibility(){
   const be = (document.getElementById('cfg-backend').value || '');
   const row = document.getElementById('cfg-stt-row');
-  if (row) row.style.display = (be === 'wav2vec2' || be === 'vosk' || be === 'nemo') ? '' : 'none';
+  if (row) row.style.display = (be === 'wav2vec2' || be === 'vosk' || be === 'nemo' || be === 'whisper-hf') ? '' : 'none';
 }
 
 async function saveModelConfig(){

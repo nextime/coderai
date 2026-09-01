@@ -594,13 +594,20 @@ async def _run_transcription_inner(
             if family == 'nemo':
                 uses_gpu = True
                 needed_gb = float(stt_cfg.get('used_vram_gb') or 6.0)
-            elif family == 'wav2vec2':
+            elif family == 'crisperwhisper':
+                # Isolated-venv worker on the 3090 (whisper-large FP16).
+                uses_gpu = True
+                needed_gb = float(stt_cfg.get('used_vram_gb') or 3.0)
+            elif family in ('wav2vec2', 'whisper_hf'):
                 try:
                     import torch
                     uses_gpu = bool(torch.cuda.is_available())
                 except Exception:
                     uses_gpu = False
-                needed_gb = float(stt_cfg.get('used_vram_gb') or 2.0) if uses_gpu else 0.0
+                # whisper HF (e.g. CrisperWhisper large) is a bit bigger than
+                # wav2vec2; reserve a touch more by default.
+                _dflt = 3.0 if family == 'whisper_hf' else 2.0
+                needed_gb = float(stt_cfg.get('used_vram_gb') or _dflt) if uses_gpu else 0.0
 
             def _run_backend():
                 def _loader():
