@@ -34,6 +34,11 @@ _INFERENCE_PATHS = {
     "/v1/images/edits",
     "/v1/audio/speech",
     "/v1/audio/transcriptions",
+    "/v1/audio/diarization",
+    "/v1/audio/speaker-embeddings",
+    "/v1/audio/speakers",
+    "/v1/audio/speaker-identify",
+    "/v1/audio/speaker-verify",
     "/v1/video/generations",
 }
 
@@ -100,7 +105,10 @@ def required_capability(model: Optional[str], path: Optional[str] = None,
     alias, then an unambiguous name marker (a Kimi name claimed by BOTH colibri and k3
     falls through — the model must pin a backend)."""
     p = (path or "").split("?", 1)[0].rstrip("/")
-    if p == "/v1/audio/transcriptions" or (backend or "") == "whisper-server":
+    if p in ("/v1/audio/transcriptions", "/v1/audio/diarization",
+             "/v1/audio/speaker-embeddings", "/v1/audio/speakers",
+             "/v1/audio/speaker-identify", "/v1/audio/speaker-verify") \
+            or (backend or "") == "whisper-server":
         return "whisper"
     # 1. Explicit engine-backend pin wins (authoritative), like the manager resolver.
     b = (backend or "").lower()
@@ -157,6 +165,18 @@ def pick_engine(registry: EngineRegistry, path: str, method: str,
     """
     if method.upper() == "POST" and is_inference_path(path):
         cap = required_cap
+
+        # Speaker diarization (pyannote) must run on a CUDA engine to use the GPU.
+        # When the request carries no model to pin it, prefer the primary (nvidia)
+        # so it doesn't land on a Vulkan/CPU engine and run diarization on CPU. An
+        # explicit model pin (below) still wins.
+        if not pinned and not model and (path or "").split("?", 1)[0].rstrip("/") \
+                in ("/v1/audio/diarization", "/v1/audio/speaker-embeddings",
+                    "/v1/audio/speakers", "/v1/audio/speaker-identify",
+                    "/v1/audio/speaker-verify"):
+            prim = registry.primary()
+            if prim is not None and prim.can_serve(cap) and prim.is_alive():
+                return prim
 
         # 0. Per-model pin (models.json "engine") is a HARD constraint: the model
         # runs on that engine or not at all. Route there if it can serve and its

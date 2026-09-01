@@ -58,6 +58,7 @@ class ModelCapabilities:
     speech_to_text: bool = False        # Whisper transcription
     text_to_speech: bool = False        # Kokoro, Bark, XTTS
     subtitle_generation: bool = False   # WhisperX / forced alignment subtitles
+    speaker_diarization: bool = False   # pyannote "who spoke when"
 
     # Audio: generation & manipulation
     audio_generation: bool = False      # MusicGen, AudioLDM2, StableAudio
@@ -170,8 +171,13 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
         caps.audio_to_audio = True
         return caps
 
+    if any(x in n for x in ['pyannote', 'diariz', 'speaker-diarization']):
+        caps.speaker_diarization = True
+        return caps
+
     if any(x in n for x in ['whisper', 'faster-whisper', 'distil-whisper',
-                              'wav2vec', 'hubert', 'seamless']):
+                              'wav2vec', 'hubert', 'seamless', 'wavlm', 'mms-',
+                              'canary', 'parakeet', 'nemo', 'vosk']):
         caps.speech_to_text = True
         caps.subtitle_generation = True
         return caps

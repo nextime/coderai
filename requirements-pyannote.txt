@@ -1,0 +1,34 @@
+# Isolated venv for pyannote.audio speaker diarization.
+#
+# pyannote.audio pulls torch + pytorch-lightning + speechbrain + asteroid, which
+# conflict with the coderai server's transformers 5.x stack, so it must NOT be
+# installed into the shared venv. codai/api/pyannote_worker.py builds this venv
+# (baked at /opt/coderai/pyannote_venv by build.sh, or on demand under
+# ~/.coderai/pyannote_venv) and runs tools/pyannote_service.py inside it. Do NOT
+# merge these into requirements.txt.
+#
+# TORCH IS PINNED: the bleeding-edge torch (2.13/cu130) that `torch` resolves to
+# has a device-placement bug with pyannote's SincNet ("Expected all tensors to be
+# on the same device" — weights on cuda, input on cpu), which forces CPU. Pin to a
+# pyannote-compatible CUDA build so diarization runs on the 3090. cu124 wheels run
+# fine on this box's newer driver (backward compatible).
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchaudio==2.6.0+cu124
+# Pin pyannote.audio too: leaving it open let pip pick a version mismatched with
+# the pinned torch AND the modern huggingface_hub (older pyannote calls
+# hf_hub_download(use_auth_token=...), which new hf_hub removed → TypeError). 3.3.2
+# is stable, GPU-proven, and uses the modern token= API.
+pyannote.audio==3.3.2
+# pyannote 3.3.2 calls hf_hub_download(use_auth_token=...), which huggingface_hub
+# removed in 1.0 → "unexpected keyword argument 'use_auth_token'". Pin below 1.0
+# where it still works (deprecated but accepted).
+huggingface_hub<1.0
+soundfile>=0.12.0
+# pyannote 3.3.2 imports matplotlib (segmentation mixins) but doesn't always pull
+# it under the pinned resolution.
+matplotlib>=3.7
+# Speaker-embedding backends served from this venv: ECAPA-TDNN via speechbrain
+# (ungated), alongside pyannote's own embedding model.
+speechbrain>=1.0.0

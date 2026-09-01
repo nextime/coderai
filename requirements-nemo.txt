@@ -1,0 +1,20 @@
+# Isolated venv for NVIDIA NeMo ASR (Canary / Parakeet) speech-to-text.
+#
+# NeMo pins a transformers/huggingface-hub/numba stack that conflicts with the
+# coderai server's transformers 5.x, so it must NOT be installed into the shared
+# venv. codai/api/canary_worker.py builds this venv (baked at /opt/coderai/nemo_venv
+# by build.sh, or on demand under ~/.coderai/nemo_venv) and runs
+# tools/canary_service.py inside it. Do NOT merge these into requirements.txt.
+#
+# CUDA-only (needs an NVIDIA GPU). Install order matters: torch first, then nemo.
+
+torch
+torchaudio
+nemo_toolkit[asr]>=2.0.0
+cuda-python
+# NeMo transcribe I/O + audio decode
+soundfile>=0.12.0
+librosa>=0.10.0
+# HTTP client used by nothing here (service is stdlib http.server); requests is
+# pulled by nemo transitively but pin a floor to be safe.
+requests>=2.31.0

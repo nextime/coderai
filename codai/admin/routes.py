@@ -2701,7 +2701,9 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "turboquant", "engine", "engine_fallback",
                 "quant_backend", "kv_cache_budget_mb", "kv_cache_slots", "mmproj",
                 "auto_compact", "auto_compact_pct", "auto_compact_strategy",
-                "auto_compact_model", "suppress_reasoning"):
+                "auto_compact_model", "suppress_reasoning",
+                # Speech-to-text (wav2vec2 / vosk / NeMo-Canary) options.
+                "languages", "supports_translation", "keep_resident"):
         if key in data:
             entry[key] = data[key]
 

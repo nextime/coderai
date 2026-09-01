@@ -52,6 +52,7 @@ setproctitle>=1.1  # Process naming (replaces procname, Python 3.13 compatible)
 
 # Optional: Audio transcription dependencies
 faster-whisper>=0.10.0  # For NVIDIA/CUDA whisper transcription
+vosk>=0.3.45            # Offline Kaldi-based STT backend (CPU, per-language model dirs)
 whispercpp>=0.0.17  # Alternative whisper library (works without PyTorch)
 
 # LiteLLM for standardized API responses

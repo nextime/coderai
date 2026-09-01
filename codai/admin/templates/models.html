@@ -545,7 +545,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
         <div class="form-row" style="margin:0">
           <label class="form-label">Compute backend</label>
-          <select id="cfg-backend" class="form-input">
+          <select id="cfg-backend" class="form-input" onchange="_updateSttVisibility()">
             <option value="auto">Auto-detect</option>
             <option value="nvidia">NVIDIA (CUDA)</option>
             <option value="vulkan">Vulkan</option>
@@ -556,6 +556,9 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             <option value="k3">k3 (Kimi-K3 / kimi-k3-in-c)</option>
             <option value="kt">ktransformers (SGLang, CPU+GPU)</option>
             <option value="vllm">vLLM (high-concurrency, CUDA)</option>
+            <option value="wav2vec2">wav2vec2 / HF-ASR (speech-to-text)</option>
+            <option value="vosk">Vosk (offline STT, CPU, per-language dir)</option>
+            <option value="nemo">NVIDIA NeMo — Canary / Parakeet (isolated venv)</option>
           </select>
         </div>
         <div class="form-row" style="margin:0">
@@ -565,6 +568,24 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             <option value="on-request">On-request (load when needed)</option>
           </select>
         </div>
+      </div>
+      <!-- Speech-to-text language options (wav2vec2 / vosk / NeMo-Canary) -->
+      <div id="cfg-stt-row" style="margin-top:.75rem;display:none">
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Supported languages
+            <span class="muted">(comma-separated ISO codes, blank = accept any)</span></label>
+          <input id="cfg-stt-languages" class="form-input"
+                 placeholder="en, it, de, fr, es">
+        </div>
+        <label class="form-label" style="display:flex;align-items:center;gap:.5rem;margin-top:.5rem">
+          <input type="checkbox" id="cfg-stt-translation">
+          Supports translation (NeMo/Canary: enables the request's <code>target_language</code>)
+        </label>
+        <label class="form-label" style="display:flex;align-items:center;gap:.5rem;margin-top:.5rem">
+          <input type="checkbox" id="cfg-stt-keep-resident">
+          Keep resident (co-reside with the other small STT models — skip routine
+          eviction; still yields to a larger model as a last resort)
+        </label>
       </div>
       <div class="form-row" id="cfg-engine-row" style="margin-top:.75rem;display:none">
         <label class="form-label">Engine / card</label>
@@ -3364,6 +3385,10 @@ function openCfgModal(idx, cfgIdx){
     (configs.length > 1 || (isNewConfig && m.in_config)) ? '' : 'none';
   document.getElementById('cfg-backend').value = s.backend || 'auto';
   document.getElementById('cfg-load-mode').value = s.load_mode || 'on-request';
+  document.getElementById('cfg-stt-languages').value = (s.languages || []).join(', ');
+  document.getElementById('cfg-stt-translation').checked = !!s.supports_translation;
+  document.getElementById('cfg-stt-keep-resident').checked = !!s.keep_resident;
+  _updateSttVisibility();
   // Used VRAM
   const usedVram = s.used_vram_gb != null ? s.used_vram_gb : null;
   document.getElementById('cfg-used-vram').value = usedVram != null ? usedVram : '';
@@ -3821,6 +3846,13 @@ function _collectColibri(){
   return o;
 }
 
+// Show the speech-to-text language options only for STT backends.
+function _updateSttVisibility(){
+  const be = (document.getElementById('cfg-backend').value || '');
+  const row = document.getElementById('cfg-stt-row');
+  if (row) row.style.display = (be === 'wav2vec2' || be === 'vosk' || be === 'nemo') ? '' : 'none';
+}
+
 async function saveModelConfig(){
   const path = document.getElementById('cfg-path').value;
   const maxGpu = parseFloat(document.getElementById('cfg-max-gpu').value);
@@ -3840,6 +3872,10 @@ async function saveModelConfig(){
     config_name:       document.getElementById('cfg-config-name').value.trim() || null,
     backend:           document.getElementById('cfg-backend').value,
     load_mode:         document.getElementById('cfg-load-mode').value,
+    languages:         (function(){ const v=document.getElementById('cfg-stt-languages').value.trim();
+                          return v ? v.split(',').map(s=>s.trim()).filter(Boolean) : []; })(),
+    supports_translation: document.getElementById('cfg-stt-translation').checked,
+    keep_resident:     document.getElementById('cfg-stt-keep-resident').checked,
     used_vram_gb:      isNaN(usedVram) ? null : usedVram,
     force_vram_update: document.getElementById('cfg-force-vram-update').checked,
     max_instances:     parseInt(document.getElementById('cfg-max-instances').value) || 1,

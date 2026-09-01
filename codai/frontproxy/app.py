@@ -950,10 +950,47 @@ class FrontProxy:
 
     @staticmethod
     def _peek_model(body: bytes, content_type: str) -> Optional[str]:
-        if not body or "application/json" not in (content_type or "").lower():
+        ct = (content_type or "").lower()
+        if not body:
             return None
+        if "application/json" in ct:
+            try:
+                return (json.loads(body) or {}).get("model")
+            except Exception:
+                return None
+        # multipart/form-data (audio transcriptions/translations, image edits):
+        # the `model` is a small text field. Extract it WITHOUT fully parsing the
+        # body — it carries the (up to 100MB) uploaded file. Routing needs the
+        # model to honour its engine pin (e.g. a whisper-server pinned to radeon);
+        # without it the request routes by capability alone and can land on an
+        # engine that has no whisper-server registered → "Invalid model size".
+        if "multipart/form-data" in ct:
+            return FrontProxy._peek_model_multipart(body)
+        return None
+
+    @staticmethod
+    def _peek_model_multipart(body: bytes) -> Optional[str]:
+        """Pull the value of the `model` form field out of a multipart body.
+
+        Anchors on the part header ``Content-Disposition: … name="model"`` and
+        reads the value up to the next CRLF. A ``bytes.find`` for a short needle
+        over the whole body is C-fast even at 100MB, and the file part's own
+        ``name="file"`` never matches this anchor."""
         try:
-            return (json.loads(body) or {}).get("model")
+            marker = body.find(b'name="model"\r\n')
+            if marker == -1:
+                marker = body.find(b'name="model"')
+                if marker == -1:
+                    return None
+            sep = body.find(b"\r\n\r\n", marker)
+            if sep == -1:
+                return None
+            start = sep + 4
+            end = body.find(b"\r\n", start)
+            if end == -1:
+                return None
+            val = body[start:end].decode("utf-8", "replace").strip()
+            return val or None
         except Exception:
             return None
 

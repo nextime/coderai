@@ -150,6 +150,11 @@ class ModelInfo(BaseModel):
     port: Optional[int] = None
     gpu_device: Optional[int] = None
     load_mode: Optional[str] = None
+    # Speech-to-text: languages this model supports (empty/None = accepts any) and
+    # whether it can translate (source→target_language, e.g. NVIDIA Canary).
+    languages: Optional[List[str]] = None
+    supports_translation: Optional[bool] = None
+    speaker_diarization: Optional[bool] = None
 
 
 class ModelList(BaseModel):

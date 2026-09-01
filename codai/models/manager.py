@@ -820,6 +820,75 @@ class WhisperServerManager:
             return False
         return self.process.poll() is None
     
+    # Where the whisper.cpp runtime libs ship in the image.
+    _WHISPER_LIB_DIR = "/opt/coderai/local-libs"
+
+    def _whisper_workdir(self):
+        """A writable working directory for the whisper-server subprocess.
+
+        whisper.cpp's ``--convert`` shells out to ffmpeg and writes its temp files
+        relative to the process CWD. The engine runs in /opt/coderai/app (read-only),
+        so conversion fails with "FFmpeg conversion failed." unless we give the
+        subprocess a writable cwd."""
+        import tempfile
+        candidates = [
+            os.environ.get("CODERAI_TMP"),
+            "/cache/coderai-tmp",
+            tempfile.gettempdir(),
+        ]
+        for base in candidates:
+            if not base:
+                continue
+            d = os.path.join(base, "coderai-whisper-work")
+            try:
+                os.makedirs(d, exist_ok=True)
+                probe = os.path.join(d, ".wtest")
+                with open(probe, "w"):
+                    pass
+                os.remove(probe)
+                return d
+            except OSError:
+                continue
+        return None
+
+    def _whisper_lib_env(self) -> dict:
+        """Return an environment for the whisper-server subprocess with its runtime
+        libs on LD_LIBRARY_PATH, and the libwhisper soname symlink ensured.
+
+        The binary's RUNPATH points only at the (absent) build-machine dirs, so it
+        needs LD_LIBRARY_PATH to find libwhisper.so.1 and its ggml libs; and the
+        image ships libwhisper.so.1.8.3 without the libwhisper.so.1 soname symlink
+        the loader asks for. Without both, launch fails instantly."""
+        import glob
+        import tempfile
+        env = os.environ.copy()
+        lib_dirs = []
+        libd = self._WHISPER_LIB_DIR
+        if os.path.isdir(libd):
+            lib_dirs.append(libd)
+            soname = os.path.join(libd, "libwhisper.so.1")
+            if not os.path.exists(soname):
+                cands = sorted(glob.glob(os.path.join(libd, "libwhisper.so.1.*")))
+                if cands:
+                    try:
+                        os.symlink(cands[-1], soname)
+                    except OSError:
+                        # local-libs read-only: stage the soname link in a writable
+                        # dir and put it first on the search path.
+                        stage = os.path.join(tempfile.gettempdir(), "coderai-whisper-libs")
+                        try:
+                            os.makedirs(stage, exist_ok=True)
+                            link = os.path.join(stage, "libwhisper.so.1")
+                            if not os.path.exists(link):
+                                os.symlink(cands[-1], link)
+                            lib_dirs.insert(0, stage)
+                        except OSError:
+                            pass
+        if lib_dirs:
+            prev = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = ":".join(lib_dirs + ([prev] if prev else []))
+        return env
+
     def start(self, model_path: str = None, gpu_device: int = 0):
         """Start whisper-server with the specified model."""
         with self.lock:
@@ -849,11 +918,28 @@ class WhisperServerManager:
 
             print(f"Starting whisper-server: {' '.join(cmd)}")
 
+            # The whisper-server binary (a whisper.cpp build) has its RUNPATH baked to
+            # the build machine's dirs (absent here), so it finds libwhisper.so.1 +
+            # its ggml 0.9.7 libs only via LD_LIBRARY_PATH. The engine processes don't
+            # export one, so without this the binary dies at launch with
+            # "libwhisper.so.1: cannot open shared object file" and we see only the
+            # opaque "whisper-server failed to start". Its libs live in
+            # /opt/coderai/local-libs, which ships libwhisper.so.1.8.3 but no
+            # libwhisper.so.1 soname symlink — create it (self-heal), falling back to
+            # a writable staging dir if local-libs is read-only.
+            env = self._whisper_lib_env()
+            # whisper.cpp --convert writes ffmpeg temp files relative to CWD; the
+            # engine's own CWD (/opt/coderai/app) is read-only, which makes every
+            # conversion fail ("FFmpeg conversion failed."). Run from a writable dir.
+            workdir = self._whisper_workdir()
+
             try:
                 self.process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
+                    env=env,
+                    cwd=workdir,
                     preexec_fn=lambda: signal.signal(signal.SIGTERM, signal.SIG_DFL)
                 )
                 self.current_model = actual_model_path
@@ -862,7 +948,22 @@ class WhisperServerManager:
                     print(f"whisper-server started on {self.base_url}")
                     return actual_model_path
                 else:
-                    print("Error: whisper-server failed to start")
+                    # Surface WHY it failed instead of the opaque message: if the
+                    # process already exited, its stderr/stdout carry the reason
+                    # (missing lib, no GPU/ICD, bad model). Drain non-blocking.
+                    rc = self.process.poll() if self.process else None
+                    detail = ""
+                    if rc is not None and self.process is not None:
+                        try:
+                            out, err = self.process.communicate(timeout=2)
+                            tail = (err or b"").decode("utf-8", "replace").strip() \
+                                or (out or b"").decode("utf-8", "replace").strip()
+                            if tail:
+                                detail = " — " + " | ".join(tail.splitlines()[-5:])
+                        except Exception:
+                            pass
+                    print(f"Error: whisper-server failed to start"
+                          f" (exit={rc}){detail}")
                     self.stop()
                     return ""
             except Exception as e:
@@ -1131,6 +1232,11 @@ class MultiModelManager:
         self._global_max_instances: int = 1  # set from config at startup
         self._measured_vram_gb: Dict[str, float] = {}  # actual measured VRAM delta per model key
         self._last_load_errors: Dict[str, str] = {}  # model_key -> last failed load message
+        # Model keys marked "keep resident": the small STT/diarization set that
+        # should co-reside and be skipped by routine LRU eviction, so they don't
+        # thrash each other. They're still evicted as a LAST RESORT when a load
+        # (e.g. a big LLM) cannot otherwise fit — so they never block it.
+        self._keep_resident: set = set()
         # Callbacks that free VRAM held *outside* the model manager (e.g. the
         # LoRA trainer caches its SD/SDXL base model between jobs). Each returns
         # the GB it freed (or None). Invoked as a last resort during eviction.
@@ -1684,8 +1790,17 @@ class MultiModelManager:
         self.config[f"audio:{model_name}"] = config or {}
         self._remember_registered_type(model_name, "audio")
 
-        if isinstance(config, dict) and config.get("backend") == "whisper-server":
+        _be = (config or {}).get("backend") if isinstance(config, dict) else None
+        if _be == "whisper-server":
             print(f"Registered whisper-server audio model: {model_name}")
+            return
+        # vosk = a local model directory; nemo/canary = served by an isolated venv
+        # worker that pulls its own checkpoint; wav2vec2 = an HF model the
+        # transformers pipeline pulls lazily on first request. None should be
+        # eagerly downloaded here (that would block engine startup), unlike a
+        # faster-whisper size which set_audio_model resolves/caches below.
+        if _be in ("vosk", "nemo", "canary", "parakeet", "wav2vec2", "wav2vec"):
+            print(f"Registered {_be} audio model: {model_name}")
             return
 
         # Download/cache the model at startup if it's a URL or HF ID
@@ -4029,6 +4144,7 @@ class MultiModelManager:
         model_obj = self.models.pop(key, None)
         self.models_in_vram.discard(key)
         self._last_used.pop(key, None)
+        self._keep_resident.discard(key)
         # Debug-only: ground-truth the object state before cleanup so an
         # orphaned/detached backend (VRAM that won't free) is visible.
         try:
@@ -4232,9 +4348,13 @@ class MultiModelManager:
 
         _free_before = self._get_free_vram_gb()
 
-        # First pass: evict idle non-active models in LRU order.
+        # First pass: evict idle non-active models in LRU order. Skip the
+        # keep-resident set (the small co-resident STT/diarization models) — they
+        # are only evicted as a last resort below.
         for key in self._lru_order():
             if key == self.active_in_vram:
+                continue
+            if key in self._keep_resident:
                 continue
             if self._get_free_vram_gb() >= needed_gb:
                 break
@@ -4244,8 +4364,10 @@ class MultiModelManager:
             print(f"On-request VRAM eviction: unloading '{key}' ({_size_label(key)}) to free VRAM")
             _evict_key(key)
 
-        # Second pass: evict the active model if still not enough AND it is idle.
+        # Second pass: evict the active model if still not enough AND it is idle
+        # (unless it's keep-resident — that's handled by the last-resort pass).
         if (self._get_free_vram_gb() < needed_gb and self.active_in_vram
+                and self.active_in_vram not in self._keep_resident
                 and self.active_in_vram in self.models):
             _active = self.active_in_vram
             if self._is_key_busy(_active):
@@ -4258,6 +4380,25 @@ class MultiModelManager:
                 self.active_in_vram = None
             else:
                 print(f"  Active model '{_active}' still busy after wait — leaving it loaded")
+
+        # Last resort among tracked models: evict the keep-resident set (the small
+        # co-resident STT/diarization models) so a genuinely-larger load — e.g. a
+        # 26B LLM — can still fit. They yield rather than block it; that's the
+        # "never fight the LLM" half of the co-residency policy.
+        if self._get_free_vram_gb() < needed_gb and self._keep_resident:
+            for key in list(self._lru_order()):
+                if key not in self._keep_resident:
+                    continue
+                if self._get_free_vram_gb() >= needed_gb:
+                    break
+                if self._is_key_busy(key) and not self._wait_until_idle(key):
+                    print(f"  keep-resident '{key}' still busy — leaving it loaded")
+                    continue
+                print(f"On-request VRAM eviction (last resort): unloading keep-resident "
+                      f"'{key}' ({_size_label(key)}) to fit a larger load")
+                if key == self.active_in_vram:
+                    self.active_in_vram = None
+                _evict_key(key)
 
         # Last resort: ask external holders (e.g. the LoRA trainer's cached base
         # model) to release their VRAM. These aren't tracked models, so eviction
@@ -5000,6 +5141,55 @@ class MultiModelManager:
         self.active_in_vram = key
         self.models_in_vram.add(key)
 
+    def acquire_stt_backend(self, model_key: str, needed_gb: float,
+                            uses_gpu: bool, loader, keep_resident: bool = False):
+        """Load (or reuse) a non-whisper STT backend (wav2vec2 / vosk / NeMo) as a
+        VRAM-tracked, evictable model.
+
+        Mirrors :meth:`start_whisper_server` for the generic STT backends: evict
+        other models to make room for a GPU backend BEFORE loading, then register
+        the backend in the loaded-model maps so the normal eviction path can free
+        it later (``_evict_one`` calls the backend's ``cleanup()`` — which drops the
+        transformers pipeline / stops the isolated NeMo worker, releasing VRAM).
+        ``loader`` is a no-arg callable returning the backend instance."""
+        lock = getattr(self, "_stt_load_lock", None)
+        if lock is None:
+            import threading
+            lock = self._stt_load_lock = threading.RLock()
+        with lock:
+            if keep_resident:
+                self._keep_resident.add(model_key)
+            else:
+                self._keep_resident.discard(model_key)
+            existing = self.models.get(model_key)
+            if existing is not None:
+                self._last_used[model_key] = time.monotonic()
+                self.current_model_key = model_key
+                if uses_gpu:
+                    self.active_in_vram = model_key
+                    self.models_in_vram.add(model_key)
+                return existing
+            if uses_gpu and needed_gb and needed_gb > 0:
+                try:
+                    if self._get_free_vram_gb() < needed_gb:
+                        print(f"STT load: need ~{needed_gb:.1f} GB VRAM for "
+                              f"'{model_key}' — evicting to make room")
+                        self._evict_models_for_vram(needed_gb)
+                except Exception as e:
+                    print(f"  STT VRAM pre-eviction warning for '{model_key}': {e}")
+            backend = loader()
+            # Register like a loaded model so eviction/accounting can see + free it.
+            self.models[model_key] = backend
+            self.model_pools.pop(model_key, None)
+            self._last_used[model_key] = time.monotonic()
+            self.current_model_key = model_key
+            if uses_gpu:
+                self.models_in_vram.add(model_key)
+                self.active_in_vram = model_key
+                if needed_gb and needed_gb > 0:
+                    self._measured_vram_gb.setdefault(model_key, float(needed_gb))
+            return backend
+
     def acquire_model_instance(self, model_key: str, session_key=None):
         """Acquire an instance, incrementing its ref-count.
 
@@ -5119,6 +5309,8 @@ class MultiModelManager:
                 port=meta.get("port"),
                 gpu_device=meta.get("gpu_device"),
                 load_mode=meta.get("load_mode"),
+                languages=meta.get("languages") or None,
+                supports_translation=meta.get("supports_translation"),
             ))
 
         # --- Models from config (the authoritative source) ---
@@ -5183,6 +5375,20 @@ class MultiModelManager:
                     _ocr_engines.append("surya")
                 for _eng in _ocr_engines:
                     _add(_eng, "ocr", {"capabilities": ["ocr"], "backend": "ocr"})
+        except Exception:
+            pass
+
+        # --- Speaker diarization (pyannote) — a built-in endpoint, not a
+        # model-manager model, so surface its configured model here so /v1/models
+        # advertises it (served at /v1/audio/diarization). ---
+        try:
+            from codai.api import pyannote_worker
+            _diar = pyannote_worker._default_model()
+            if _diar:
+                _add(_diar, "audio", {"capabilities": ["speaker_diarization"],
+                                      "backend": "pyannote"})
+                _add("diarization", "audio", {"capabilities": ["speaker_diarization"],
+                                              "backend": "pyannote"})
         except Exception:
             pass
 

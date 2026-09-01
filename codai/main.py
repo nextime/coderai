@@ -984,6 +984,13 @@ def main():
             )
         else:
             multi_model_manager.set_audio_model(mid, config=_model_cfg(m, "audio"))
+            # Register the alias→path mapping (like image/vision models) so a
+            # request for e.g. "vosk-en" / "wav2vec2-it" / "canary" resolves to the
+            # model's real path and carries its config — otherwise the STT backend
+            # receives the bare alias as its model reference. (whisper-server
+            # entries take the branch above and manage their own round-robin alias.)
+            if isinstance(m, dict) and m.get("alias"):
+                multi_model_manager.set_model_alias(m["alias"], mid)
 
     # Image models
     image_models = models_config.get("image_models", [])
