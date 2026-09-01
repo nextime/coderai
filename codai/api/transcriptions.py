@@ -600,7 +600,7 @@ async def _run_transcription_inner(
                     uses_gpu = bool(torch.cuda.is_available())
                 except Exception:
                     uses_gpu = False
-                needed_gb = float(stt_cfg.get('used_vram_gb') or 3.0) if uses_gpu else 0.0
+                needed_gb = float(stt_cfg.get('used_vram_gb') or 2.0) if uses_gpu else 0.0
 
             def _run_backend():
                 def _loader():

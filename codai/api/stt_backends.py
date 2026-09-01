@@ -124,17 +124,30 @@ class _Wav2Vec2Backend:
             return
         import torch
         from transformers import pipeline
-        device = 0 if torch.cuda.is_available() else -1
+        use_cuda = torch.cuda.is_available()
+        device = 0 if use_cuda else -1
         target = self.config.get("model_path") or self.model_name
-        # chunk_length_s lets the pipeline transcribe arbitrarily long audio and
-        # emit per-chunk timestamps for segments.
-        self._pipe = pipeline(
-            "automatic-speech-recognition",
+        # Load in FP16 on GPU to roughly halve VRAM (~3GB→~1.5GB) — CTC inference is
+        # fine in half precision. CPU stays FP32. Override with config dtype
+        # (float16 | bfloat16 | float32).
+        pipe_kwargs = dict(
             model=target,
             device=device,
             chunk_length_s=int(self.config.get("chunk_length_s", 30) or 30),
             stride_length_s=int(self.config.get("stride_length_s", 5) or 5),
         )
+        if use_cuda:
+            dt = str(self.config.get("dtype") or "float16").lower()
+            dtype = {"float16": torch.float16, "fp16": torch.float16, "half": torch.float16,
+                     "bfloat16": torch.bfloat16, "bf16": torch.bfloat16}.get(dt)
+            if dtype is not None:
+                pipe_kwargs["torch_dtype"] = dtype
+        try:
+            self._pipe = pipeline("automatic-speech-recognition", **pipe_kwargs)
+        except Exception:
+            # Some checkpoints/ops reject half precision — fall back to FP32.
+            pipe_kwargs.pop("torch_dtype", None)
+            self._pipe = pipeline("automatic-speech-recognition", **pipe_kwargs)
 
     def transcribe(self, audio_path: str, language: Optional[str] = None,
                    prompt: Optional[str] = None, temperature: float = 0.0,
