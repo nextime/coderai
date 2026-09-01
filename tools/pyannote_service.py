@@ -175,11 +175,17 @@ def _hf_token():
             or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
 
 
-def _speaker_embed(wav_path: str, backend: str, model: str = None) -> dict:
+def _speaker_embed(wav_path: str, backend: str, model: str = None,
+                   window: float = None, step: float = None) -> dict:
     """Return a fixed-dim speaker embedding for the audio.
 
     Backends: ``ecapa`` (speechbrain ECAPA-TDNN, ungated), ``pyannote`` /
-    ``wespeaker`` (pyannote.audio embedding models — may be gated, use HF_TOKEN)."""
+    ``wespeaker`` (pyannote.audio embedding models — may be gated, use HF_TOKEN).
+
+    If ``window`` (seconds) is given, slide a window of that length with hop
+    ``step`` (default = window) over the audio and return one embedding per
+    window as ``windows``: [{start, end, embedding}], instead of a single
+    whole-file ``embedding``."""
     import torch
     backend = (backend or "ecapa").lower()
     key = f"{backend}:{model or 'default'}"
@@ -219,9 +225,35 @@ def _speaker_embed(wav_path: str, backend: str, model: str = None) -> dict:
         else:
             raise ValueError(f"unknown speaker-embedding backend: {backend}")
         _EMB_CACHE[key] = fn
+    _model_out = model or key.split(":", 1)[1]
+    if window and float(window) > 0:
+        import soundfile as sf
+        win = float(window)
+        hop = float(step) if step and float(step) > 0 else win
+        dur = float(sf.info(wav_path).duration)
+        windows = []
+        t = 0.0
+        while t < dur:
+            end = min(t + win, dur)
+            crop = _crop_wav(wav_path, t, end)
+            try:
+                emb = fn(crop)
+                windows.append({"start": round(t, 3), "end": round(end, 3),
+                                "embedding": emb})
+            finally:
+                try:
+                    os.unlink(crop)
+                except OSError:
+                    pass
+            if end >= dur:
+                break
+            t += hop
+        dim = len(windows[0]["embedding"]) if windows else 0
+        return {"windows": windows, "count": len(windows), "dim": dim,
+                "window": win, "step": hop, "backend": backend, "model": _model_out}
     emb = fn(wav_path)
     return {"embedding": emb, "dim": len(emb), "backend": backend,
-            "model": model or key.split(":", 1)[1]}
+            "model": _model_out}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -260,7 +292,8 @@ class Handler(BaseHTTPRequestHandler):
                 return v[0] if v else None
             wav = _to_wav_16k_mono(raw)
             if parsed.path == "/embed":
-                result = _speaker_embed(wav, backend=_q("backend"), model=_q("model"))
+                result = _speaker_embed(wav, backend=_q("backend"), model=_q("model"),
+                                        window=_q("window"), step=_q("step"))
                 self._send(200, json.dumps(result).encode())
                 return
             result = ENGINE.diarize(wav, num_speakers=_q("num_speakers"),

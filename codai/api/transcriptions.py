@@ -293,13 +293,19 @@ async def create_speaker_embedding(
     file: UploadFile = File(...),
     model: Optional[str] = Form(None),
     backend: Optional[str] = Form("ecapa"),
+    window: Optional[float] = Form(None),
+    step: Optional[float] = Form(None),
 ):
     """Speaker-embedding (voiceprint) endpoint.
 
     Returns a fixed-dim embedding for the speaker in the audio, usable for
     verification / clustering. ``backend``: ``ecapa`` (speechbrain ECAPA-TDNN,
     ungated, default), ``pyannote`` / ``wespeaker`` (pyannote embedding models,
-    may need HF_TOKEN). ``model`` overrides the backend's default checkpoint."""
+    may need HF_TOKEN). ``model`` overrides the backend's default checkpoint.
+
+    ``window`` (seconds) switches to sliding-window mode: one embedding per window
+    of that length, hop ``step`` (default = window), each tagged with start/end —
+    instead of a single whole-file embedding."""
     file_content = await file.read()
     if len(file_content) > _MAX_AUDIO_BYTES:
         raise HTTPException(status_code=413, detail="Audio file too large (max 100 MB)")
@@ -314,8 +320,24 @@ async def create_speaker_embedding(
     try:
         import codai.api.speaker_embeddings as spk
         result = await asyncio.to_thread(
-            spk.get_speaker_embedding, tmp_path, backend or "ecapa", model)
+            spk.get_speaker_embedding, tmp_path, backend or "ecapa", model, None,
+            window, step)
         task_registry.finish(_tid, "done")
+        if result.get("windows") is not None:
+            # Sliding-window mode: one embedding per window, each with its span.
+            return {
+                "object": "list",
+                "model": result.get("model"),
+                "backend": result.get("backend"),
+                "dim": result.get("dim"),
+                "window": result.get("window"),
+                "step": result.get("step"),
+                "count": result.get("count"),
+                "data": [{"object": "embedding", "index": i,
+                          "start": w.get("start"), "end": w.get("end"),
+                          "embedding": w.get("embedding")}
+                         for i, w in enumerate(result.get("windows") or [])],
+            }
         return {
             "object": "list",
             "model": result.get("model"),

@@ -29,8 +29,12 @@ from typing import Optional
 
 def get_speaker_embedding(audio_path: str, backend: str = "ecapa",
                           model: Optional[str] = None,
-                          config: Optional[dict] = None) -> dict:
-    """Return ``{"embedding":[...], "dim":N, "backend":..., "model":...}``."""
+                          config: Optional[dict] = None,
+                          window: Optional[float] = None,
+                          step: Optional[float] = None) -> dict:
+    """Return ``{"embedding":[...], "dim":N, "backend":..., "model":...}``, or —
+    when ``window`` (seconds) is given — ``{"windows":[{start,end,embedding}], ...}``
+    with one embedding per sliding window (hop ``step``, default = window)."""
     import requests
     from codai.api.diarization import _get_diarizer
     # _get_diarizer ensures the (VRAM-tracked, self-healing) pyannote worker is up
@@ -39,6 +43,10 @@ def get_speaker_embedding(audio_path: str, backend: str = "ecapa",
     params = {"backend": backend or "ecapa"}
     if model:
         params["model"] = model
+    if window and float(window) > 0:
+        params["window"] = float(window)
+        if step and float(step) > 0:
+            params["step"] = float(step)
     with open(audio_path, "rb") as f:
         resp = requests.post(f"{handle.url}/embed", params=params, data=f.read(),
                              timeout=600, headers={"Content-Type": "application/octet-stream"})
