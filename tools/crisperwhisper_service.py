@@ -71,8 +71,12 @@ class _Engine:
             torch_dtype=dtype, device=dev)
 
     # Whisper's receptive field is 30s; stay a touch under so each window is a
-    # single, non-chunked pass.
-    WINDOW_S = 28.0
+    # single, non-chunked pass. Advance by HOP_S (< WINDOW_S) so consecutive
+    # windows OVERLAP — Whisper drops/mangles words at a window's edges, so each
+    # word is re-seen with full context in the next window and de-duplicated by
+    # timestamp. (WINDOW_S - HOP_S) is the overlap.
+    WINDOW_S = 29.0
+    HOP_S = 24.0
 
     def _one(self, arr, sr, gen, offset):
         """Transcribe one ≤30s window; return (text, [word dicts]) with timestamps
@@ -97,22 +101,30 @@ class _Engine:
         if getattr(data, "ndim", 1) > 1:
             data = data.mean(axis=1)
         dur = len(data) / sr
-        texts, words = [], []
-        if dur <= 30.0:
-            t, w = self._one(data, sr, gen, 0.0)
-            texts.append(t); words.extend(w)
+        words = []
+        if dur <= self.WINDOW_S:
+            _, w = self._one(data, sr, gen, 0.0)
+            words.extend(w)
         else:
-            # Manual long-form windowing (avoids the pipeline's buggy stitching).
+            # Overlapping windows (WINDOW_S wide, advancing by HOP_S) so no audio
+            # is lost at the seams. De-dup the overlap region by keeping only words
+            # that start at/after the last kept word's end.
+            last_end = -1.0
             pos = 0.0
             while pos < dur:
                 a = int(pos * sr)
                 b = int(min(pos + self.WINDOW_S, dur) * sr)
-                t, w = self._one(data[a:b], sr, gen, pos)
-                if t:
-                    texts.append(t)
-                words.extend(w)
-                pos += self.WINDOW_S
-        text = " ".join(x for x in texts if x).strip()
+                _, w = self._one(data[a:b], sr, gen, pos)
+                for x in w:
+                    if x["start"] >= last_end - 0.05:   # skip words already captured
+                        words.append(x)
+                        last_end = max(last_end, x["end"])
+                if b >= len(data):
+                    break
+                pos += self.HOP_S
+        # Rebuild text from the de-duplicated words (word-first model), so the
+        # overlap isn't double-counted in the transcript either.
+        text = " ".join(x["word"] for x in words).strip()
         segments = []
         if words:
             segments = [{"start": words[0]["start"], "end": words[-1]["end"],
