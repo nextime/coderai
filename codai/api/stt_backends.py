@@ -348,9 +348,20 @@ class _RemoteNemoBackend:
         if word_timestamps:
             params["word_timestamps"] = "1"
         with open(audio_path, "rb") as f:
-            resp = requests.post(f"{self.service_url}/transcribe",
-                                 params=params, data=f.read(), timeout=1800,
+            audio = f.read()
+
+        def _post():
+            return requests.post(f"{self.service_url}/transcribe", params=params,
+                                 data=audio, timeout=1800,
                                  headers={"Content-Type": "application/octet-stream"})
+        try:
+            resp = _post()
+        except requests.exceptions.ConnectionError:
+            # Self-heal: worker died/restarted → re-ensure and retry once.
+            from codai.api import canary_worker
+            self.service_url = canary_worker.ensure_service(
+                self.model_name, self.config).rstrip("/")
+            resp = _post()
         if resp.status_code != 200:
             raise RuntimeError(f"NeMo worker error {resp.status_code}: {resp.text[:300]}")
         j = resp.json()
@@ -394,9 +405,21 @@ class _RemoteCrisperWhisperBackend:
         if language:
             params["language"] = language
         with open(audio_path, "rb") as f:
-            resp = requests.post(f"{self.service_url}/transcribe", params=params,
-                                 data=f.read(), timeout=1800,
+            audio = f.read()
+
+        def _post():
+            return requests.post(f"{self.service_url}/transcribe", params=params,
+                                 data=audio, timeout=1800,
                                  headers={"Content-Type": "application/octet-stream"})
+        try:
+            resp = _post()
+        except requests.exceptions.ConnectionError:
+            # Worker died/restarted since this handle was cached — re-ensure it and
+            # retry once (self-heal, so a stale service_url doesn't stick).
+            from codai.api import crisperwhisper_worker
+            self.service_url = crisperwhisper_worker.ensure_service(
+                self.model_name, self.config).rstrip("/")
+            resp = _post()
         if resp.status_code != 200:
             raise RuntimeError(f"CrisperWhisper worker error {resp.status_code}: {resp.text[:300]}")
         j = resp.json()

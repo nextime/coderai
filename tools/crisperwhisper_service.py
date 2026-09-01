@@ -62,29 +62,62 @@ class _Engine:
         self.model_name = model_name
         dev = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.float16 if dev == "cuda" else torch.float32
+        # NOTE: no chunk_length_s — the pipeline's internal long-form word-timestamp
+        # stitching crashes on CrisperWhisper (IndexError at the ~30s chunk
+        # boundary). We window manually below so every forward pass is ≤ WINDOW_S
+        # (one Whisper window), which is the path that works.
         self._pipe = pipeline(
             "automatic-speech-recognition", model=model_name,
-            torch_dtype=dtype, device=dev,
-            chunk_length_s=30, stride_length_s=5)
+            torch_dtype=dtype, device=dev)
+
+    # Whisper's receptive field is 30s; stay a touch under so each window is a
+    # single, non-chunked pass.
+    WINDOW_S = 28.0
+
+    def _one(self, arr, sr, gen, offset):
+        """Transcribe one ≤30s window; return (text, [word dicts]) with timestamps
+        shifted by `offset` seconds."""
+        out = self._pipe({"raw": arr, "sampling_rate": sr},
+                         return_timestamps="word", generate_kwargs=gen)
+        text = (out.get("text") if isinstance(out, dict) else str(out)) or ""
+        words = []
+        for ch in _adjust_pauses(out.get("chunks") or []) if isinstance(out, dict) else []:
+            ts = ch.get("timestamp") or (None, None)
+            words.append({"word": (ch.get("text") or "").strip(),
+                          "start": (ts[0] or 0.0) + offset,
+                          "end": (ts[1] or 0.0) + offset})
+        return text.strip(), words
 
     def transcribe(self, wav_path: str, language: str = None, task: str = None) -> dict:
+        import soundfile as sf
         gen = {"task": task or "transcribe"}
         if language:
             gen["language"] = language
-        out = self._pipe(wav_path, return_timestamps="word", generate_kwargs=gen)
-        text = (out.get("text") if isinstance(out, dict) else str(out)) or ""
-        chunks = _adjust_pauses(out.get("chunks") or []) if isinstance(out, dict) else []
-        words = []
-        for ch in chunks:
-            ts = ch.get("timestamp") or (None, None)
-            words.append({"word": (ch.get("text") or "").strip(),
-                          "start": ts[0] or 0.0, "end": ts[1] or 0.0})
-        # One segment spanning all words (CrisperWhisper is word-first).
+        data, sr = sf.read(wav_path, dtype="float32")
+        if getattr(data, "ndim", 1) > 1:
+            data = data.mean(axis=1)
+        dur = len(data) / sr
+        texts, words = [], []
+        if dur <= 30.0:
+            t, w = self._one(data, sr, gen, 0.0)
+            texts.append(t); words.extend(w)
+        else:
+            # Manual long-form windowing (avoids the pipeline's buggy stitching).
+            pos = 0.0
+            while pos < dur:
+                a = int(pos * sr)
+                b = int(min(pos + self.WINDOW_S, dur) * sr)
+                t, w = self._one(data[a:b], sr, gen, pos)
+                if t:
+                    texts.append(t)
+                words.extend(w)
+                pos += self.WINDOW_S
+        text = " ".join(x for x in texts if x).strip()
         segments = []
         if words:
             segments = [{"start": words[0]["start"], "end": words[-1]["end"],
-                         "text": text.strip()}]
-        return {"text": text.strip(), "words": words, "segments": segments,
+                         "text": text}]
+        return {"text": text, "words": words, "segments": segments,
                 "language": language}
 
 
