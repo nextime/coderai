@@ -912,7 +912,11 @@ class WhisperServerManager:
             if actual_model_path:
                 cmd.extend(["-m", actual_model_path])
             cmd.extend(["-dev", str(gpu_device)])
-            cmd.append("--convert")
+            # NOTE: no --convert. whisper.cpp's --convert shells out to ffmpeg with
+            # an undrained pipe and DEADLOCKS on non-wav input (e.g. mp4) — hanging
+            # the single-threaded server for hours and queuing every later request.
+            # We convert to 16k mono wav ourselves in transcribe() (drained +
+            # timed-out), so whisper-server only ever gets clean wav.
             cmd.extend(["--host", "127.0.0.1"])
             cmd.extend(["--port", str(self.port)])
 
@@ -992,6 +996,36 @@ class WhisperServerManager:
         other loaded model and actually release its GPU memory."""
         self.stop()
 
+    @staticmethod
+    def _to_wav_16k_mono(audio_data: bytes) -> bytes:
+        """Convert arbitrary audio bytes to 16 kHz mono PCM WAV via ffmpeg.
+
+        subprocess.run drains stdout/stderr (no pipe-fill deadlock) and a hard
+        timeout means a bad/streaming file fails fast instead of hanging forever —
+        the exact failure mode of whisper.cpp's own --convert."""
+        import tempfile as _tf
+        fd, src = _tf.mkstemp(suffix=".in")
+        os.write(fd, audio_data)
+        os.close(fd)
+        fd, out = _tf.mkstemp(suffix=".wav")
+        os.close(fd)
+        try:
+            p = subprocess.run(
+                ["ffmpeg", "-y", "-i", src, "-ar", "16000", "-ac", "1",
+                 "-c:a", "pcm_s16le", "-f", "wav", out],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+            if p.returncode != 0:
+                raise RuntimeError("ffmpeg conversion failed: "
+                                   + p.stderr.decode("utf-8", "replace")[-300:])
+            with open(out, "rb") as f:
+                return f.read()
+        finally:
+            for x in (src, out):
+                try:
+                    os.unlink(x)
+                except OSError:
+                    pass
+
     def transcribe(self, audio_data: bytes, language: str = None, prompt: str = None):
         """Send transcription request to whisper-server."""
         if not self.is_running():
@@ -999,6 +1033,11 @@ class WhisperServerManager:
         with self.lock:
             self._active_requests += 1
         try:
+            # Convert the upload to 16k mono WAV ourselves (drained pipes + a hard
+            # timeout) so whisper.cpp never runs its deadlock-prone --convert. Any
+            # container (mp4/m4a/webm/…) is normalised here; a genuinely bad file
+            # fails fast instead of hanging the server.
+            audio_data = self._to_wav_16k_mono(audio_data)
             files = {"file": ("audio.wav", audio_data, "audio/wav")}
             data = {}
             if language:
@@ -1861,6 +1900,13 @@ class MultiModelManager:
         if wsm is None:
             return False
         ws_key = f"audio:{model_id}"
+        # Honor keep_resident (co-residency group): a whisper-server model flagged
+        # keep_resident joins the set that routine LRU eviction skips (still
+        # last-resort-evictable for a bigger load), same as the STT backends.
+        _cfg = self.config.get(ws_key, {}) if isinstance(self.config.get(ws_key), dict) else {}
+        _raw = _cfg.get("_raw_cfg", _cfg) if isinstance(_cfg, dict) else {}
+        if isinstance(_raw, dict) and _raw.get("keep_resident"):
+            self._keep_resident.add(ws_key)
         if wsm.is_running():
             self.models[ws_key] = wsm
             self.models_in_vram.add(ws_key)
@@ -1898,6 +1944,7 @@ class MultiModelManager:
         self.model_pools.pop(ws_key, None)
         self.models_in_vram.discard(ws_key)
         self._measured_vram_gb.pop(ws_key, None)
+        self._keep_resident.discard(ws_key)
         if self.active_in_vram == ws_key:
             self.active_in_vram = None
         if self.current_model_key == ws_key:
