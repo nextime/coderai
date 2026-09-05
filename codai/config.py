@@ -555,6 +555,34 @@ class VllmConfig:
 
 
 @dataclass
+class RunpodConfig:
+    """RunPod remote-GPU backend — account-level settings.
+
+    RunPod (https://runpod.io) rents GPUs by the second, either as **Pods** (full GPU
+    containers coderai provisions, load-balances and scales itself) or **Serverless**
+    endpoints (RunPod autoscales; coderai just proxies). A model is sent to RunPod by
+    tagging its models.json entry with ``backend: "runpod"`` plus a per-model ``runpod``
+    block (mode/gpu/price/scaling — see codai.api.runpod_worker). This object holds only
+    the account-wide settings shared by every RunPod model.
+
+    The RunPod backend uses NO local VRAM: it runs as a thin HTTP proxy inside the
+    primary engine (like ds4/kt) and forwards OpenAI requests to the remote pod/endpoint
+    (:mod:`codai.backends.runpod`, :mod:`codai.api.runpod_worker`).
+    """
+    enabled: bool = False
+    api_key: str = ""                     # RunPod API key (masked in the UI, never logged)
+    cloud_type: str = "SECURE"            # SECURE | COMMUNITY (default; per-model can override)
+    api_base: str = "https://api.runpod.io/graphql"   # GraphQL endpoint (override for testing)
+    rest_base: str = "https://rest.runpod.io/v1"      # REST endpoint (pod lifecycle)
+    serverless_base: str = "https://api.runpod.ai/v2"  # serverless invoke base
+    default_gpu_type: str = ""            # fallback RunPod gpuTypeId when a model gives none
+    data_center: str = ""                 # optional data-center id filter (blank = any)
+    # Account-wide safety net: the scaler will not let the SUM of all running RunPod
+    # pods' hourly cost exceed this. 0 = no global cap (per-model $/hr still applies).
+    global_max_hourly_usd: float = 0.0
+
+
+@dataclass
 class OcrConfig:
     """Dedicated OCR subsystem configuration.
 
@@ -656,6 +684,7 @@ class Config:
     k3: K3Config = field(default_factory=K3Config)
     ktransformers: KtransformersConfig = field(default_factory=KtransformersConfig)
     vllm: VllmConfig = field(default_factory=VllmConfig)
+    runpod: RunpodConfig = field(default_factory=RunpodConfig)
     ocr: OcrConfig = field(default_factory=OcrConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
     broker: BrokerConfig = field(default_factory=BrokerConfig)
@@ -846,6 +875,7 @@ class ConfigManager:
                 k3=_dc(K3Config, config_data.get("k3", {})),
                 ktransformers=_dc(KtransformersConfig, config_data.get("ktransformers", {})),
                 vllm=_dc(VllmConfig, config_data.get("vllm", {})),
+                runpod=_dc(RunpodConfig, config_data.get("runpod", {})),
                 ocr=_dc(OcrConfig, config_data.get("ocr", {})),
                 compaction=_dc(CompactionConfig, config_data.get("compaction", {})),
                 broker=_dc(BrokerConfig, config_data.get("broker", {})),
@@ -1093,6 +1123,17 @@ class ConfigManager:
                 "extra_args": self.config.vllm.extra_args,
                 "extra_env": self.config.vllm.extra_env,
                 "auto_build": self.config.vllm.auto_build,
+            },
+            "runpod": {
+                "enabled": self.config.runpod.enabled,
+                "api_key": self.config.runpod.api_key,
+                "cloud_type": self.config.runpod.cloud_type,
+                "api_base": self.config.runpod.api_base,
+                "rest_base": self.config.runpod.rest_base,
+                "serverless_base": self.config.runpod.serverless_base,
+                "default_gpu_type": self.config.runpod.default_gpu_type,
+                "data_center": self.config.runpod.data_center,
+                "global_max_hourly_usd": self.config.runpod.global_max_hourly_usd,
             },
             "ocr": {
                 "enabled": self.config.ocr.enabled,

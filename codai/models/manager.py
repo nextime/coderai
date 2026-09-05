@@ -91,6 +91,17 @@ def get_active_vllm_config():
     return None
 
 
+def get_active_runpod_config():
+    """Return the active RunpodConfig from the server config, or None."""
+    try:
+        from codai.admin.routes import config_manager
+        if config_manager is not None and config_manager.config is not None:
+            return config_manager.config.runpod
+    except Exception:
+        pass
+    return None
+
+
 _GGUF_ARCH_CACHE: Dict[tuple, str] = {}
 
 

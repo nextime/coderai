@@ -3525,6 +3525,20 @@ def build_settings_dict(c, gpu_cards):
             "extra_env": c.vllm.extra_env,
             "auto_build": c.vllm.auto_build,
         },
+        "runpod": {
+            "enabled": c.runpod.enabled,
+            # API key is never returned in the clear — only whether it's set + a mask.
+            "api_key_set": bool(c.runpod.api_key),
+            "api_key_mask": (c.runpod.api_key[:4] + "…" + c.runpod.api_key[-4:])
+                            if len(c.runpod.api_key) > 10 else ("****" if c.runpod.api_key else ""),
+            "cloud_type": c.runpod.cloud_type,
+            "api_base": c.runpod.api_base,
+            "rest_base": c.runpod.rest_base,
+            "serverless_base": c.runpod.serverless_base,
+            "default_gpu_type": c.runpod.default_gpu_type,
+            "data_center": c.runpod.data_center,
+            "global_max_hourly_usd": c.runpod.global_max_hourly_usd,
+        },
         "ocr": {
             "enabled": c.ocr.enabled,
             "default_engine": c.ocr.default_engine,
@@ -4040,6 +4054,32 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "extra_env" in d: v.extra_env = (d.get("extra_env") or "").strip()
         if "auto_build" in d: v.auto_build = bool(d["auto_build"])
 
+    if "runpod" in data:
+        d = data["runpod"]
+        rp = c.runpod
+        rp.enabled = bool(d.get("enabled", rp.enabled))
+        if "api_key" in d:
+            newk = (d.get("api_key") or "").strip()
+            # Only overwrite when a real new key is supplied — the UI sends back the
+            # masked preview ("…") for an unchanged key, which must NOT clobber it.
+            if newk and "…" not in newk and newk != "****":
+                rp.api_key = newk
+        if "cloud_type" in d:
+            rp.cloud_type = (d.get("cloud_type") or "SECURE").strip().upper()
+        if "api_base" in d and (d.get("api_base") or "").strip():
+            rp.api_base = d["api_base"].strip()
+        if "rest_base" in d and (d.get("rest_base") or "").strip():
+            rp.rest_base = d["rest_base"].strip()
+        if "serverless_base" in d and (d.get("serverless_base") or "").strip():
+            rp.serverless_base = d["serverless_base"].strip()
+        if "default_gpu_type" in d:
+            rp.default_gpu_type = (d.get("default_gpu_type") or "").strip()
+        if "data_center" in d:
+            rp.data_center = (d.get("data_center") or "").strip()
+        if "global_max_hourly_usd" in d:
+            try: rp.global_max_hourly_usd = max(0.0, float(d.get("global_max_hourly_usd") or 0))
+            except (TypeError, ValueError): pass
+
     if "ocr" in data:
         d = data["ocr"]
         o = c.ocr
@@ -4149,6 +4189,54 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
 
     config_manager.save_config()
     return {"success": True, "warnings": _settings_warnings}
+
+
+# =============================================================================
+# RunPod remote-GPU backend
+# =============================================================================
+
+def _runpod_client_or_400():
+    """Build a RunpodClient from the live config, or raise HTTP 400 with why."""
+    from codai.api.runpod_client import RunpodClient, RunpodError
+    cfg = config_manager.config.runpod if config_manager and config_manager.config else None
+    if cfg is None or not getattr(cfg, "api_key", ""):
+        raise HTTPException(status_code=400,
+                            detail="RunPod API key not set (Settings → RunPod).")
+    try:
+        return RunpodClient(cfg)
+    except RunpodError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/admin/api/runpod/gpu-types", summary="List RunPod GPU types + prices")
+async def api_runpod_gpu_types(username: str = Depends(require_admin)):
+    """Probe the RunPod key and return the GPU catalog with USD/hr pricing.
+
+    This is the Phase-1 key-verification path — a 200 with a non-empty list proves
+    the stored API key works."""
+    from codai.api.runpod_client import RunpodError
+    client = _runpod_client_or_400()
+    try:
+        gpus = client.list_gpu_types()
+    except RunpodError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"success": True, "gpu_types": gpus, "count": len(gpus)}
+
+
+@router.get("/admin/api/runpod/status", summary="RunPod account pods + live cost")
+async def api_runpod_status(username: str = Depends(require_admin)):
+    """List the account's RunPod pods and the aggregate live $/hr (also a key check)."""
+    from codai.api.runpod_client import RunpodError
+    client = _runpod_client_or_400()
+    try:
+        me = client.ping()
+        pods = client.list_pods()
+    except RunpodError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    total = sum((p.get("cost_per_hr") or 0.0) for p in pods
+                if str(p.get("status")).upper() == "RUNNING")
+    return {"success": True, "account_id": me.get("id"), "pods": pods,
+            "total_hourly_usd": round(total, 4)}
 
 
 # =============================================================================

@@ -813,6 +813,62 @@
   </div>
 </div>
 
+<!-- RunPod (remote cloud GPUs) -->
+<div class="card">
+  <div class="card-title">RunPod (remote GPUs)</div>
+  <p class="form-hint" style="margin-bottom:.6rem">Burst inference to rented GPUs on <a href="https://runpod.io" target="_blank" rel="noopener">RunPod</a> — as <b>Pods</b> (coderai provisions, load-balances and autoscales them) or <b>Serverless</b> endpoints (RunPod autoscales). Uses no local VRAM: coderai proxies OpenAI requests to the remote GPU. Set the account key here, then tag a model in the <b>Models</b> list with <code>backend: runpod</code> and its per-model pod/serverless block. These are the account-wide settings shared by every RunPod model.</p>
+  <div class="form-row">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-runpod-enabled" onchange="toggleRunpodFields()">
+      <span style="font-size:13px;font-weight:500">Enable RunPod</span>
+    </label>
+  </div>
+  <div id="runpod-fields" style="display:none">
+    <div class="form-group">
+      <label class="form-label">API key</label>
+      <input type="password" id="s-runpod-api-key" class="form-input" autocomplete="off" placeholder="(unchanged)">
+      <span class="form-hint" id="s-runpod-key-hint">Your RunPod API key. Stored server-side, never logged. Leave blank to keep the current key.</span>
+    </div>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:150px">
+        <label class="form-label">Cloud type</label>
+        <select id="s-runpod-cloud" class="form-input">
+          <option value="SECURE">Secure</option>
+          <option value="COMMUNITY">Community (cheaper)</option>
+        </select>
+      </div>
+      <div class="form-group" style="flex:1;min-width:180px">
+        <label class="form-label">Default GPU type <span class="muted">(optional)</span></label>
+        <input type="text" id="s-runpod-default-gpu" class="form-input" placeholder="e.g. NVIDIA GeForce RTX 4090">
+      </div>
+      <div class="form-group" style="flex:1;min-width:140px">
+        <label class="form-label">Global $/hr cap</label>
+        <input type="number" id="s-runpod-budget" class="form-input" min="0" step="0.1" placeholder="0 = no cap">
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Data center <span class="muted">(optional filter)</span></label>
+      <input type="text" id="s-runpod-dc" class="form-input" placeholder="(any)">
+    </div>
+    <details style="margin:.4rem 0">
+      <summary style="cursor:pointer;font-size:12px" class="muted">Advanced API endpoints</summary>
+      <div class="form-group" style="margin-top:.5rem">
+        <label class="form-label">GraphQL base</label>
+        <input type="text" id="s-runpod-api-base" class="form-input" placeholder="https://api.runpod.io/graphql">
+      </div>
+      <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+        <div class="form-group" style="flex:1;min-width:200px"><label class="form-label">REST base</label><input type="text" id="s-runpod-rest-base" class="form-input" placeholder="https://rest.runpod.io/v1"></div>
+        <div class="form-group" style="flex:1;min-width:200px"><label class="form-label">Serverless base</label><input type="text" id="s-runpod-serverless-base" class="form-input" placeholder="https://api.runpod.ai/v2"></div>
+      </div>
+    </details>
+    <div class="form-row" style="display:flex;gap:.6rem;align-items:center;flex-wrap:wrap">
+      <button type="button" class="btn btn-secondary" onclick="runpodTest()">Test key &amp; list GPUs</button>
+      <span id="s-runpod-test-status" class="form-hint"></span>
+    </div>
+    <div id="s-runpod-gpu-list" style="margin-top:.6rem;font-size:12px;max-height:220px;overflow:auto"></div>
+  </div>
+</div>
+
 <!-- OCR (dedicated document OCR engines) -->
 <div class="card">
   <div class="card-title">OCR (document → text)</div>
@@ -1133,6 +1189,39 @@ function toggleOcrFields(){
 function toggleVllmFields(){
   document.getElementById('vllm-fields').style.display =
     document.getElementById('s-vllm-enabled').checked ? 'block' : 'none';
+}
+function toggleRunpodFields(){
+  document.getElementById('runpod-fields').style.display =
+    document.getElementById('s-runpod-enabled').checked ? 'block' : 'none';
+}
+async function runpodTest(){
+  const st = document.getElementById('s-runpod-test-status');
+  const box = document.getElementById('s-runpod-gpu-list');
+  st.textContent = 'saving settings + querying RunPod…'; st.style.color = '';
+  box.innerHTML = '';
+  try{
+    // Persist current settings first so the key just typed is used by the probe.
+    await saveSettings(true);
+    const r = await fetch(ROOT_PATH + '/admin/api/runpod/gpu-types');
+    const d = await r.json();
+    if(!r.ok){ throw new Error(d.detail || ('HTTP ' + r.status)); }
+    const gpus = (d.gpu_types || []).filter(g => g.on_demand_price != null)
+                   .sort((a,b) => (a.on_demand_price||1e9) - (b.on_demand_price||1e9));
+    st.textContent = '✓ key OK — ' + d.count + ' GPU types';
+    st.style.color = '#2e7d32';
+    if(gpus.length){
+      let html = '<table style="width:100%;border-collapse:collapse"><tr style="text-align:left">'
+        + '<th>GPU</th><th>VRAM</th><th>On-demand $/hr</th><th>Spot $/hr</th></tr>';
+      for(const g of gpus){
+        html += '<tr><td>' + (g.display_name||g.id) + '</td><td>' + (g.memory_gb ?? '?') + 'GB</td>'
+          + '<td>' + (g.on_demand_price!=null ? '$'+g.on_demand_price : '—') + '</td>'
+          + '<td>' + (g.spot_price!=null ? '$'+g.spot_price : '—') + '</td></tr>';
+      }
+      box.innerHTML = html + '</table>';
+    }
+  }catch(e){
+    st.textContent = '✗ ' + e.message; st.style.color = '#c62828';
+  }
 }
 
 // ---- OCR isolated-venv build (paddle/surya) ----
@@ -1662,6 +1751,22 @@ async function loadSettings(){
     document.getElementById('s-vllm-auto-build').checked = !!vll.auto_build;
     toggleVllmFields();
 
+    // RunPod remote GPUs
+    const rp = d.runpod || {};
+    document.getElementById('s-runpod-enabled').checked = !!rp.enabled;
+    document.getElementById('s-runpod-api-key').value = '';
+    document.getElementById('s-runpod-key-hint').textContent = rp.api_key_set
+      ? ('Current key: ' + (rp.api_key_mask || 'set') + ' — leave blank to keep it.')
+      : 'Your RunPod API key. Stored server-side, never logged.';
+    document.getElementById('s-runpod-cloud').value = rp.cloud_type || 'SECURE';
+    document.getElementById('s-runpod-default-gpu').value = rp.default_gpu_type ?? '';
+    document.getElementById('s-runpod-budget').value = rp.global_max_hourly_usd ?? 0;
+    document.getElementById('s-runpod-dc').value = rp.data_center ?? '';
+    document.getElementById('s-runpod-api-base').value = rp.api_base ?? '';
+    document.getElementById('s-runpod-rest-base').value = rp.rest_base ?? '';
+    document.getElementById('s-runpod-serverless-base').value = rp.serverless_base ?? '';
+    toggleRunpodFields();
+
     // OCR subsystem
     const ocr = d.ocr || {};
     document.getElementById('s-ocr-enabled').checked = !!ocr.enabled;
@@ -1702,7 +1807,7 @@ async function loadSettings(){
   }catch(e){ showAlert('error','Failed to load settings: '+e.message); }
 }
 
-async function saveSettings(){
+async function saveSettings(silent){
   const strOrNull = id => document.getElementById(id).value.trim() || null;
   const data = {
     server:{
@@ -1840,6 +1945,18 @@ async function saveSettings(){
       extra_env: document.getElementById('s-vllm-extra-env').value.trim(),
       auto_build: document.getElementById('s-vllm-auto-build').checked,
     },
+    runpod:{
+      enabled: document.getElementById('s-runpod-enabled').checked,
+      // Blank = keep the current key (backend ignores empty / masked values).
+      api_key: document.getElementById('s-runpod-api-key').value.trim(),
+      cloud_type: document.getElementById('s-runpod-cloud').value || 'SECURE',
+      default_gpu_type: document.getElementById('s-runpod-default-gpu').value.trim(),
+      global_max_hourly_usd: parseFloat(document.getElementById('s-runpod-budget').value) || 0,
+      data_center: document.getElementById('s-runpod-dc').value.trim(),
+      api_base: document.getElementById('s-runpod-api-base').value.trim(),
+      rest_base: document.getElementById('s-runpod-rest-base').value.trim(),
+      serverless_base: document.getElementById('s-runpod-serverless-base').value.trim(),
+    },
     ocr:{
       enabled: document.getElementById('s-ocr-enabled').checked,
       default_engine: document.getElementById('s-ocr-default-engine').value || 'paddle',
@@ -1907,14 +2024,15 @@ async function saveSettings(){
     });
     if(r.ok){
       const d = await r.json().catch(()=>({}));
-      if(d.warnings && d.warnings.length){
+      if(silent){ /* caller (e.g. runpodTest) handles its own status */ }
+      else if(d.warnings && d.warnings.length){
         showAlert('error', 'Saved, but: ' + d.warnings.join(' '));
       } else {
         showAlert('info','Settings saved. Archive and thermal-protection changes take effect immediately; restart CoderAI for other changes.');
       }
     }
-    else{ const e=await r.json(); showAlert('error', e.detail||'Save failed'); }
-  }catch(e){ showAlert('error','Error: '+e.message); }
+    else{ const e=await r.json(); if(!silent) showAlert('error', e.detail||'Save failed'); else throw new Error(e.detail||'Save failed'); }
+  }catch(e){ if(!silent) showAlert('error','Error: '+e.message); else throw e; }
 }
 
 loadSettings();
