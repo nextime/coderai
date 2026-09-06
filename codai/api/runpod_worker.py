@@ -190,13 +190,12 @@ def _pod_health_ok(url: str, timeout: float = 4.0) -> bool:
         return False
 
 
-def _select_gpu(client, mcfg: "RunpodModelConfig", account_cfg) -> dict:
-    """Choose a GPU across the model's allowed pools per its selection criteria.
-
-    Returns {gpu_type_id, display_name, memory_gb, cloud_type, price, is_spot,
-    bid} where ``price`` is the effective hourly cost we'll be billed and ``bid``
-    is the max bid to place for a spot pod. Raises RunpodError if nothing fits.
-    """
+def _rank_gpus(client, mcfg: "RunpodModelConfig", account_cfg) -> list:
+    """Ranked list of GPU options across the model's allowed pools per its selection
+    criteria (best first). Each item: {gpu_type_id, display_name, memory_gb,
+    cloud_type, price, is_spot, bid}. Raises RunpodError if nothing fits the
+    constraints. _provision_one tries them in order so a capacity miss on the top
+    pick falls through to the next."""
     from codai.api.runpod_client import RunpodError
     catalog = client.list_gpu_types()
     allowed = [c.upper() for c in (mcfg.cloud_types or ["SECURE"])] or ["SECURE"]
@@ -236,10 +235,15 @@ def _select_gpu(client, mcfg: "RunpodModelConfig", account_cfg) -> dict:
                                   -(c[3].get("memory_gb") or 0), c[0]))
     else:  # cheaper
         cands.sort(key=lambda c: (c[0], c[1] is False))
-    price, is_spot, ct, g, on_demand = cands[0]
-    return {"gpu_type_id": g["id"], "display_name": g["display_name"],
-            "memory_gb": g.get("memory_gb"), "cloud_type": ct, "price": price,
-            "is_spot": is_spot, "bid": on_demand if is_spot else 0.0}
+    return [{"gpu_type_id": g["id"], "display_name": g["display_name"],
+             "memory_gb": g.get("memory_gb"), "cloud_type": ct, "price": price,
+             "is_spot": is_spot, "bid": on_demand if is_spot else 0.0}
+            for (price, is_spot, ct, g, on_demand) in cands]
+
+
+def _select_gpu(client, mcfg: "RunpodModelConfig", account_cfg) -> dict:
+    """The single best GPU option (top of _rank_gpus)."""
+    return _rank_gpus(client, mcfg, account_cfg)[0]
 
 
 @_dc_pod
@@ -253,6 +257,18 @@ class PodHandle:
     healthy: bool = True
     inflight: int = 0
     last_used: float = 0.0
+    console_url: str = ""
+
+
+def _deploy_tag(account_cfg) -> str:
+    """Stable, filesystem-safe deployment tag baked into pod names."""
+    t = (getattr(account_cfg, "deployment_id", "") or "default").strip() or "default"
+    return "".join(c if (c.isalnum() or c in "-_") else "_" for c in t)[:24]
+
+
+# Pod ids currently mid-provision (created on RunPod but not yet in a pool). The
+# reaper must NOT kill these. Guarded by _pools_lock.
+_provisioning_ids: set = set()
 
 
 def _vllm_docker_args(mcfg: "RunpodModelConfig", served: str) -> str:
@@ -323,30 +339,54 @@ class RunpodPodPool:
         return ""
 
     # -- provisioning ----------------------------------------------------- #
+    def _create_with_fallback(self, client, ranked):
+        """Try ranked GPU candidates in order; skip capacity misses. Returns
+        (pod_id, sel). Raises if all fail."""
+        from codai.api.runpod_client import RunpodError
+        port = self.mcfg.port or 8000
+        image = self.mcfg.image or DEFAULT_POD_IMAGE
+        env = dict(self.mcfg.env or {})
+        args = _vllm_docker_args(self.mcfg, self.served)
+        dc = getattr(self.account, "data_center", "") or ""
+        last = None
+        for sel in ranked:
+            block = self._budget_blocks(sel["price"])
+            if block:
+                raise RunpodError(f"RunPod budget cap hit — not provisioning ({block}).")
+            name = (f"coderai-{_deploy_tag(self.account)}-"
+                    + str(self.model_key)[:20].replace("/", "_").replace(" ", "_")
+                    + "-" + uuid.uuid4().hex[:6])
+            print(f"[runpod] provisioning pod for {self.model_key!r}: {sel['display_name']} "
+                  f"({sel['cloud_type']}{'/spot' if sel['is_spot'] else ''}) ${sel['price']}/hr",
+                  flush=True)
+            try:
+                pod_id = client.create_pod(
+                    name=name, image=image, gpu_type_id=sel["gpu_type_id"], port=port,
+                    cloud_type=sel["cloud_type"], container_disk_gb=self.mcfg.container_disk_gb,
+                    volume_gb=self.mcfg.volume_gb, env=env, docker_args=args,
+                    is_spot=sel["is_spot"], bid_per_gpu=sel["bid"], data_center_id=dc)
+                return pod_id, sel
+            except RunpodError as exc:
+                msg = str(exc).lower()
+                if "no longer any instances" in msg or "no instances" in msg or "capacity" in msg:
+                    print(f"[runpod] {sel['display_name']} ({sel['cloud_type']}) unavailable — "
+                          "trying next candidate", flush=True)
+                    last = exc
+                    continue
+                raise
+        raise last or RunpodError("RunPod: no candidate GPU could be deployed (capacity).")
+
     def _provision_one(self):
         """Create + boot one pod; append it healthy. Blocking (minutes)."""
-        from codai.api.runpod_client import RunpodClient, RunpodError
+        from codai.api.runpod_client import RunpodClient, RunpodError, pod_console_url
         client = RunpodClient(self.account)
-        sel = _select_gpu(client, self.mcfg, self.account)
-        block = self._budget_blocks(sel["price"])
-        if block:
-            raise RunpodError(f"RunPod budget cap hit — not provisioning ({block}).")
-        name = ("coderai-" + str(self.model_key)[:24].replace("/", "_").replace(" ", "_")
-                + "-" + uuid.uuid4().hex[:6])
-        env = dict(self.mcfg.env or {})
-        image = self.mcfg.image or DEFAULT_POD_IMAGE
-        print(f"[runpod] provisioning pod for {self.model_key!r}: {sel['display_name']} "
-              f"({sel['cloud_type']}{'/spot' if sel['is_spot'] else ''}) ${sel['price']}/hr",
-              flush=True)
-        pod_id = client.create_pod(
-            name=name, image=image, gpu_type_id=sel["gpu_type_id"], port=self.mcfg.port or 8000,
-            cloud_type=sel["cloud_type"], container_disk_gb=self.mcfg.container_disk_gb,
-            volume_gb=self.mcfg.volume_gb, env=env,
-            docker_args=_vllm_docker_args(self.mcfg, self.served),
-            is_spot=sel["is_spot"], bid_per_gpu=sel["bid"],
-            data_center_id=getattr(self.account, "data_center", "") or "")
+        ranked = _rank_gpus(client, self.mcfg, self.account)
+        port = self.mcfg.port or 8000
+        pod_id, sel = self._create_with_fallback(client, ranked)
+        with _pools_lock:
+            _provisioning_ids.add(pod_id)   # shield from the reaper during boot
         try:
-            url = client.wait_ready(pod_id, self.mcfg.port or 8000, ready_timeout=900.0)
+            url = client.wait_ready(pod_id, port, ready_timeout=900.0)
             # Now wait for the OpenAI server inside the pod (image pull + model load).
             deadline = time.time() + 900.0
             while time.time() < deadline:
@@ -360,13 +400,17 @@ class RunpodPodPool:
                 client.terminate_pod(pod_id)
             except Exception:
                 pass
+            with _pools_lock:
+                _provisioning_ids.discard(pod_id)
             raise
         h = PodHandle(pod_id=pod_id, url=url, hourly_usd=sel["price"], started_at=time.time(),
                       gpu=sel["display_name"], is_spot=sel["is_spot"], healthy=True,
-                      last_used=time.time())
+                      last_used=time.time(), console_url=pod_console_url(pod_id))
         with self._cv:
             self.pods.append(h)
             self._cv.notify_all()
+        with _pools_lock:
+            _provisioning_ids.discard(pod_id)
         print(f"[runpod] pod {pod_id} ready for {self.model_key!r} at {url}", flush=True)
         return h
 
@@ -518,13 +562,73 @@ def pods_status() -> list:
                     "is_spot": p.is_spot, "healthy": p.healthy, "inflight": p.inflight,
                     "hourly_usd": p.hourly_usd, "uptime_s": int(now - p.started_at),
                     "live_cost_usd": round((now - p.started_at) / 3600.0 * p.hourly_usd, 4),
+                    "console_url": p.console_url,
                 })
     return out
 
 
+def _known_pod_ids() -> set:
+    """All pod ids this process is responsible for: live pool pods + mid-provision."""
+    ids = set()
+    with _pools_lock:
+        for pool in _pools.values():
+            with pool._cv:
+                ids.update(p.pod_id for p in pool.pods)
+        ids.update(_provisioning_ids)
+    return ids
+
+
+def reap_orphans() -> int:
+    """Terminate RunPod pods tagged as OURS that no live pool is tracking — stale
+    pods from a crash/restart that would otherwise bill silently. Only touches pods
+    named ``coderai-<our deployment_id>-*`` (never another deployment's), and never
+    a pod currently mid-provision. Returns the number reaped."""
+    try:
+        from codai.models.manager import get_active_runpod_config
+        acct = get_active_runpod_config()
+    except Exception:
+        acct = None
+    if acct is None or not getattr(acct, "enabled", False) or not getattr(acct, "api_key", ""):
+        return 0
+    from codai.api.runpod_client import RunpodClient, RunpodError
+    prefix = f"coderai-{_deploy_tag(acct)}-"
+    try:
+        client = RunpodClient(acct)
+        pods = client.list_pods()
+    except RunpodError as exc:
+        print(f"[runpod-reaper] list failed: {exc}", flush=True)
+        return 0
+    known = _known_pod_ids()
+    reaped = 0
+    for p in pods:
+        pid, name = p.get("id"), (p.get("name") or "")
+        status = str(p.get("status") or "").upper()
+        if not pid or not name.startswith(prefix):
+            continue                      # not ours (or another deployment's)
+        if pid in known:
+            continue                      # tracked by a live pool / provisioning
+        if status in ("TERMINATED", "EXITED"):
+            continue
+        try:
+            client.terminate_pod(pid)
+            reaped += 1
+            print(f"[runpod-reaper] terminated STALE pod {pid} ({name}) — "
+                  "not tracked by any pool", flush=True)
+        except Exception as exc:
+            print(f"[runpod-reaper] failed to terminate {pid}: {exc}", flush=True)
+    return reaped
+
+
 def _scaler_loop():
+    tick = 0
+    # Reap once promptly on start to catch orphans left by a crash/restart.
+    try:
+        reap_orphans()
+    except Exception as exc:
+        print(f"[runpod-reaper] startup: {exc}", flush=True)
     while True:
         time.sleep(15)
+        tick += 1
         try:
             with _pools_lock:
                 pools = list(_pools.values())
@@ -535,6 +639,12 @@ def _scaler_loop():
                     print(f"[runpod] scaler: {exc}", flush=True)
         except Exception:
             pass
+        # Independent stale-pod safety sweep every ~30s, even with no local pools.
+        if tick % 2 == 0:
+            try:
+                reap_orphans()
+            except Exception as exc:
+                print(f"[runpod-reaper] {exc}", flush=True)
 
 
 def _ensure_scaler():
@@ -544,6 +654,13 @@ def _ensure_scaler():
             return
         _scaler_started = True
     threading.Thread(target=_scaler_loop, daemon=True, name="runpod-scaler").start()
+
+
+def start_runpod_maintenance():
+    """Start the scaler + stale-pod reaper independently of any loaded model — call
+    at engine startup when RunPod is enabled so orphaned pods from a previous run are
+    reaped even before the first request."""
+    _ensure_scaler()
 
 
 def stop_all_pods():

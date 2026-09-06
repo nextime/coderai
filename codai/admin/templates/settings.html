@@ -866,9 +866,16 @@
         </select>
       </div>
     </div>
-    <div class="form-group">
-      <label class="form-label">Data center <span class="muted">(optional filter)</span></label>
-      <input type="text" id="s-runpod-dc" class="form-input" placeholder="(any)">
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:150px">
+        <label class="form-label">Data center <span class="muted">(optional filter)</span></label>
+        <input type="text" id="s-runpod-dc" class="form-input" placeholder="(any)">
+      </div>
+      <div class="form-group" style="flex:1;min-width:150px">
+        <label class="form-label">Deployment id</label>
+        <input type="text" id="s-runpod-deploy" class="form-input" placeholder="default">
+        <span class="form-hint" style="font-size:11px">Tags pods as yours (<code>coderai-&lt;id&gt;-…</code>) so the stale-pod reaper only ever stops your own pods. Use distinct ids for separate coderai deployments on one account.</span>
+      </div>
     </div>
     <details style="margin:.4rem 0">
       <summary style="cursor:pointer;font-size:12px" class="muted">Advanced API endpoints</summary>
@@ -1784,6 +1791,7 @@ async function loadSettings(){
     document.getElementById('s-runpod-cost-limit').value = rp.global_cost_limit_usd ?? 0;
     document.getElementById('s-runpod-cost-period').value = rp.global_cost_period || 'unlimited';
     document.getElementById('s-runpod-dc').value = rp.data_center ?? '';
+    document.getElementById('s-runpod-deploy').value = rp.deployment_id ?? 'default';
     document.getElementById('s-runpod-api-base').value = rp.api_base ?? '';
     document.getElementById('s-runpod-rest-base').value = rp.rest_base ?? '';
     document.getElementById('s-runpod-serverless-base').value = rp.serverless_base ?? '';
@@ -1977,6 +1985,7 @@ async function saveSettings(silent){
       global_cost_limit_usd: parseFloat(document.getElementById('s-runpod-cost-limit').value) || 0,
       global_cost_period: document.getElementById('s-runpod-cost-period').value || 'unlimited',
       data_center: document.getElementById('s-runpod-dc').value.trim(),
+      deployment_id: document.getElementById('s-runpod-deploy').value.trim() || 'default',
       api_base: document.getElementById('s-runpod-api-base').value.trim(),
       rest_base: document.getElementById('s-runpod-rest-base').value.trim(),
       serverless_base: document.getElementById('s-runpod-serverless-base').value.trim(),

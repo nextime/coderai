@@ -36,6 +36,11 @@ def pod_proxy_url(pod_id: str, port: int) -> str:
     return f"https://{pod_id}-{int(port)}.proxy.runpod.net"
 
 
+# Deep link to the pod in the RunPod web console (container + vLLM logs live there).
+def pod_console_url(pod_id: str) -> str:
+    return f"https://www.runpod.io/console/pods/{pod_id}"
+
+
 class RunpodClient:
     def __init__(self, cfg):
         self._cfg = cfg
@@ -268,6 +273,32 @@ class RunpodClient:
             "status": p.get("desiredStatus"), "cost_per_hr": p.get("costPerHr"),
             "image": p.get("imageName"),
         } for p in (me.get("pods") or [])]
+
+    def get_pod_logs(self, pod_id: str, tail: int = 200) -> dict:
+        """Best-effort container/vLLM logs for a pod via the REST API.
+
+        RunPod's log surface is the web console; this tries the REST logs route and
+        always returns a console URL to fall back to. Returns
+        {console_url, logs?: str, error?: str}."""
+        import requests
+        out = {"console_url": pod_console_url(pod_id)}
+        rest = (getattr(self._cfg, "rest_base", "") or "https://rest.runpod.io/v1").rstrip("/")
+        try:
+            r = requests.get(f"{rest}/pods/{pod_id}/logs",
+                             headers={"Authorization": f"Bearer {self._api_key}"},
+                             params={"tail": tail}, timeout=15)
+            if r.status_code == 200:
+                try:
+                    body = r.json()
+                    out["logs"] = body if isinstance(body, str) else \
+                        (body.get("logs") or body.get("data") or str(body))
+                except ValueError:
+                    out["logs"] = r.text
+            else:
+                out["error"] = f"logs API HTTP {r.status_code} — use the console link"
+        except requests.RequestException as exc:
+            out["error"] = f"logs API unreachable ({exc}) — use the console link"
+        return out
 
     def wait_ready(self, pod_id: str, port: int, ready_timeout: float = 900.0,
                    poll_every: float = 5.0) -> str:

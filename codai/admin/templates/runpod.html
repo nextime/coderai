@@ -32,9 +32,9 @@
   <div style="overflow-x:auto">
     <table style="width:100%;border-collapse:collapse;font-size:13px">
       <thead><tr style="text-align:left;color:var(--text-3)">
-        <th>Model</th><th>GPU</th><th>Pool</th><th>In-flight</th><th>$/hr</th><th>Uptime</th><th>Cost so far</th><th>Health</th>
+        <th>Model</th><th>GPU</th><th>Pool</th><th>In-flight</th><th>$/hr</th><th>Uptime</th><th>Cost so far</th><th>Health</th><th>Logs</th>
       </tr></thead>
-      <tbody id="rp-pods"><tr><td colspan="8" class="dim">No pods running.</td></tr></tbody>
+      <tbody id="rp-pods"><tr><td colspan="9" class="dim">No pods running.</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -83,7 +83,7 @@ async function rpRefresh(){
 
   // pods table
   const tb = document.getElementById('rp-pods');
-  if(!pods.length){ tb.innerHTML = '<tr><td colspan="8" class="dim">No pods running.</td></tr>'; }
+  if(!pods.length){ tb.innerHTML = '<tr><td colspan="9" class="dim">No pods running.</td></tr>'; }
   else {
     tb.innerHTML = pods.map(p => `<tr>
       <td>${p.model||''}</td>
@@ -94,6 +94,7 @@ async function rpRefresh(){
       <td>${_fmtDur(p.uptime_s)}</td>
       <td>${_usd(p.live_cost_usd)}</td>
       <td>${p.healthy?'<span style="color:#22c55e">healthy</span>':'<span style="color:#ef4444">down</span>'}</td>
+      <td><a href="#" onclick="rpLogs('${p.pod_id}');return false">view</a>${p.console_url?` · <a href="${p.console_url}" target="_blank" rel="noopener">console</a>`:''}</td>
     </tr>`).join('');
   }
 
@@ -111,7 +112,41 @@ async function rpRefresh(){
   const now = new Date();
   document.getElementById('rp-updated').textContent = 'updated ' + now.toLocaleTimeString();
 }
+async function rpLogs(podId){
+  const modal = document.getElementById('rp-log-modal');
+  const pre = document.getElementById('rp-log-pre');
+  const title = document.getElementById('rp-log-title');
+  title.textContent = 'Logs — pod ' + podId;
+  pre.textContent = 'loading…';
+  modal.style.display = 'flex';
+  try {
+    const r = await fetch(ROOT_PATH + '/admin/api/runpod/pod-logs?pod_id=' + encodeURIComponent(podId) + '&tail=300');
+    const d = await r.json();
+    let txt = d.logs || '';
+    if (!txt && d.error) txt = '(' + d.error + ')';
+    if (!txt) txt = '(no logs returned by the API)';
+    pre.textContent = txt;
+    const link = document.getElementById('rp-log-console');
+    if (d.console_url) { link.href = d.console_url; link.style.display = ''; }
+    else link.style.display = 'none';
+  } catch(e){ pre.textContent = 'error: ' + e.message; }
+}
+function rpCloseLogs(){ document.getElementById('rp-log-modal').style.display = 'none'; }
 rpRefresh();
 setInterval(rpRefresh, 10000);
 </script>
+
+<div id="rp-log-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);
+     z-index:1000;align-items:center;justify-content:center" onclick="if(event.target===this)rpCloseLogs()">
+  <div style="background:var(--bg-1,#1a1a1a);border:1px solid var(--border,#333);border-radius:10px;
+       width:min(900px,92vw);max-height:80vh;display:flex;flex-direction:column;padding:1rem">
+    <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.5rem">
+      <b id="rp-log-title">Logs</b>
+      <a id="rp-log-console" href="#" target="_blank" rel="noopener" class="dim small" style="display:none">open in RunPod console →</a>
+      <button class="btn btn-secondary" style="margin-left:auto" onclick="rpCloseLogs()">Close</button>
+    </div>
+    <pre id="rp-log-pre" style="overflow:auto;flex:1;font-size:12px;white-space:pre-wrap;
+         background:var(--bg-0,#111);padding:.6rem;border-radius:6px;margin:0"></pre>
+  </div>
+</div>
 {% endblock %}

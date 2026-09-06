@@ -3616,6 +3616,7 @@ def build_settings_dict(c, gpu_cards):
             "serverless_base": c.runpod.serverless_base,
             "default_gpu_type": c.runpod.default_gpu_type,
             "data_center": c.runpod.data_center,
+            "deployment_id": c.runpod.deployment_id,
             "global_max_hourly_usd": c.runpod.global_max_hourly_usd,
             "global_cost_limit_usd": c.runpod.global_cost_limit_usd,
             "global_cost_period": c.runpod.global_cost_period,
@@ -4157,6 +4158,8 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             rp.default_gpu_type = (d.get("default_gpu_type") or "").strip()
         if "data_center" in d:
             rp.data_center = (d.get("data_center") or "").strip()
+        if "deployment_id" in d:
+            rp.deployment_id = (d.get("deployment_id") or "default").strip() or "default"
         if "global_max_hourly_usd" in d:
             try: rp.global_max_hourly_usd = max(0.0, float(d.get("global_max_hourly_usd") or 0))
             except (TypeError, ValueError): pass
@@ -4352,6 +4355,21 @@ async def api_runpod_stats(username: str = Depends(require_admin)):
     return {"success": True, "pods": pods, "ledger": ledger, "caps": caps,
             "live_hourly_usd": round(live_hourly, 4),
             "live_uncommitted_usd": round(live_cost, 4)}
+
+
+@router.get("/admin/api/runpod/pod-logs", summary="Fetch a RunPod pod's container/vLLM logs")
+async def api_runpod_pod_logs(pod_id: str, tail: int = 200,
+                             username: str = Depends(require_admin)):
+    """Best-effort pod + vLLM logs via the RunPod API, plus a console deep-link
+    (the always-available fallback where the container/vLLM output lives)."""
+    from codai.api.runpod_client import RunpodError, pod_console_url
+    if not pod_id:
+        raise HTTPException(status_code=400, detail="pod_id required")
+    client = _runpod_client_or_400()
+    try:
+        return {"success": True, **client.get_pod_logs(pod_id, tail=tail)}
+    except RunpodError as exc:
+        return {"success": False, "error": str(exc), "console_url": pod_console_url(pod_id)}
 
 
 # =============================================================================

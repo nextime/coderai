@@ -1375,6 +1375,20 @@ def main():
         except ValueError:
             pass
 
+    # RunPod: on the PRIMARY engine (which hosts runpod pods), start the scaler +
+    # the independent stale-pod reaper as soon as RunPod is enabled — so pods
+    # orphaned by a previous crash/restart are terminated even before the first
+    # request. (The reaper only touches pods tagged with our deployment_id and not
+    # tracked by a live pool, and runs in the same process as the pools.)
+    try:
+        if (os.environ.get("CODERAI_ENGINE_PRIMARY") == "1"
+                and getattr(config, "runpod", None) and config.runpod.enabled):
+            from codai.api import runpod_worker
+            runpod_worker.start_runpod_maintenance()
+            print("[runpod] maintenance started (pod scaler + stale-pod reaper)", flush=True)
+    except Exception as _e:
+        print(f"[runpod] failed to start maintenance: {_e}", flush=True)
+
     # Configure Python logging so broker/API log calls reach the terminal.
     # uvicorn is started with log_config=None to keep our config in place.
     _log_level = logging.DEBUG if global_debug else logging.INFO

@@ -141,7 +141,9 @@ class RunpodBackend(ModelBackend):
         if not self._pool:
             raise RuntimeError("RunPod pod pool not initialised")
         pod, url = self._pool.acquire()
-        return url, (lambda: self._pool.release(pod))
+        # The pod runs a vLLM OpenAI server at /v1; its proxy URL has no path, so
+        # add /v1 to match the serverless base (which already ends in /openai/v1).
+        return url.rstrip("/") + "/v1", (lambda: self._pool.release(pod))
 
     def _store_usage(self, usage: dict) -> None:
         if usage:
