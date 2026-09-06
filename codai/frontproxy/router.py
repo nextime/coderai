@@ -112,7 +112,7 @@ def required_capability(model: Optional[str], path: Optional[str] = None,
         return "whisper"
     # 1. Explicit engine-backend pin wins (authoritative), like the manager resolver.
     b = (backend or "").lower()
-    if b in ("colibri", "ds4", "k3", "kt", "vllm"):
+    if b in ("colibri", "ds4", "k3", "kt", "vllm", "runpod"):
         return b
     m = (model or "").lower()
 

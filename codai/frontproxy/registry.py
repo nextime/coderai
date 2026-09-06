@@ -43,12 +43,15 @@ def _short_stem(key: str) -> str:
 # whisper, but not transformers, ds4 or colibri.
 # k3 (kimi-k3-in-c) is a CPU engine → any node can host it; kt (ktransformers/SGLang)
 # is CPU+GPU → the GPU-capable nodes.
+# RunPod ("runpod") proxies to a remote GPU and uses NO local VRAM, so every node
+# can host it — it's added to all cap sets. The front prefers the primary/default
+# engine to host it (routing falls to default_engine before least_loaded).
 _DEFAULT_CAPS = {
-    "nvidia": {"transformers", "gguf", "whisper", "ds4", "colibri", "k3", "kt"},
-    "cuda": {"transformers", "gguf", "whisper", "ds4", "colibri", "k3", "kt"},
-    "vulkan": {"gguf", "whisper", "k3"},
-    "opencl": {"gguf", "whisper", "k3"},
-    "auto": {"transformers", "gguf", "whisper", "ds4", "colibri", "k3", "kt"},
+    "nvidia": {"transformers", "gguf", "whisper", "ds4", "colibri", "k3", "kt", "runpod"},
+    "cuda": {"transformers", "gguf", "whisper", "ds4", "colibri", "k3", "kt", "runpod"},
+    "vulkan": {"gguf", "whisper", "k3", "runpod"},
+    "opencl": {"gguf", "whisper", "k3", "runpod"},
+    "auto": {"transformers", "gguf", "whisper", "ds4", "colibri", "k3", "kt", "runpod"},
 }
 
 

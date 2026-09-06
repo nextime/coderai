@@ -545,7 +545,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
         <div class="form-row" style="margin:0">
           <label class="form-label">Compute backend</label>
-          <select id="cfg-backend" class="form-input" onchange="_updateSttVisibility()">
+          <select id="cfg-backend" class="form-input" onchange="_updateSttVisibility();_updateRunpodVisibility()">
             <option value="auto">Auto-detect</option>
             <option value="nvidia">NVIDIA (CUDA)</option>
             <option value="vulkan">Vulkan</option>
@@ -556,6 +556,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             <option value="k3">k3 (Kimi-K3 / kimi-k3-in-c)</option>
             <option value="kt">ktransformers (SGLang, CPU+GPU)</option>
             <option value="vllm">vLLM (high-concurrency, CUDA)</option>
+            <option value="runpod">RunPod (remote cloud GPU — not stored locally)</option>
             <option value="wav2vec2">wav2vec2 / HF-ASR (speech-to-text)</option>
             <option value="whisper-hf">whisper-hf / CrisperWhisper (HF transformers STT)</option>
             <option value="vosk">Vosk (offline STT, CPU, per-language dir)</option>
@@ -675,6 +676,100 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           <span class="form-hint" style="font-size:11px"><code>KEY=VALUE</code> pairs for colibri's env-only tuning. Blank = inherit global.</span>
         </div>
       </div>
+
+      <!-- Per-model RunPod (remote GPU) config: shown when backend = runpod -->
+      <div id="cfg-runpod-row" style="margin-top:.75rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
+        <div style="font-weight:600;font-size:13px;margin-bottom:.3rem">RunPod — remote GPU</div>
+        <div class="form-hint" style="font-size:11px;margin-bottom:.5rem">This model runs on a rented RunPod GPU and is <b>not downloaded locally</b>. Set the model <b>Path/ID</b> (top) to the served model id (e.g. an HF repo) — the remote worker pulls it. Requires RunPod enabled in Settings.</div>
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Mode</label>
+          <select id="cfg-rp-mode" class="form-input" onchange="_updateRunpodModeHint()">
+            <option value="serverless">Serverless — RunPod autoscales workers; coderai proxies (simplest)</option>
+            <option value="pods">Pods — coderai provisions, load-balances &amp; autoscales GPU pods itself</option>
+            <option value="auto">Auto — pick pods vs serverless per request by the criteria below</option>
+          </select>
+          <span class="form-hint" id="cfg-rp-mode-hint" style="font-size:11px"></span>
+        </div>
+        <div class="form-row" style="margin:.5rem 0 0">
+          <label class="form-label">Served model <span class="muted">(HF id the remote worker loads)</span></label>
+          <input type="text" id="cfg-rp-served" class="form-input" placeholder="(blank = use the model Path/ID above)">
+        </div>
+        <div class="form-row" style="margin:.5rem 0 0">
+          <label class="form-label">Max context <span class="muted">(tokens, optional)</span></label>
+          <input type="number" id="cfg-rp-ctx" class="form-input" min="0" placeholder="0 = default">
+        </div>
+
+        <!-- Serverless-only -->
+        <div id="cfg-rp-serverless" style="margin-top:.5rem">
+          <div class="form-row" style="margin:0">
+            <label class="form-label">Serverless endpoint id</label>
+            <input type="text" id="cfg-rp-endpoint" class="form-input" placeholder="from your RunPod serverless (vLLM) endpoint">
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-top:.5rem">
+            <div class="form-row" style="margin:0"><label class="form-label">Min workers</label><input type="number" id="cfg-rp-min-workers" class="form-input" min="0" placeholder="0"></div>
+            <div class="form-row" style="margin:0"><label class="form-label">Max workers</label><input type="number" id="cfg-rp-max-workers" class="form-input" min="1" placeholder="1"></div>
+          </div>
+        </div>
+
+        <!-- Pods / auto -->
+        <div id="cfg-rp-pods" style="margin-top:.5rem;display:none">
+          <div class="form-row" style="margin:0">
+            <label class="form-label">Allowed pools</label>
+            <div style="display:flex;gap:1rem;flex-wrap:wrap;font-size:12px">
+              <label style="display:flex;align-items:center;gap:.3rem"><input type="checkbox" id="cfg-rp-pool-secure" style="width:auto" checked> Secure</label>
+              <label style="display:flex;align-items:center;gap:.3rem"><input type="checkbox" id="cfg-rp-pool-community" style="width:auto"> Community (cheaper)</label>
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-top:.5rem">
+            <div class="form-row" style="margin:0">
+              <label class="form-label">Selection</label>
+              <select id="cfg-rp-criteria" class="form-input">
+                <option value="cheaper">Cheaper — lowest $/hr</option>
+                <option value="faster">Faster — reliability + throughput</option>
+              </select>
+            </div>
+            <div class="form-row" style="margin:0">
+              <label class="form-label">GPU type <span class="muted">(optional)</span></label>
+              <input type="text" id="cfg-rp-gpu-type" class="form-input" placeholder="auto — e.g. NVIDIA GeForce RTX 4090">
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.5rem;margin-top:.5rem">
+            <div class="form-row" style="margin:0"><label class="form-label">Min VRAM (GB)</label><input type="number" id="cfg-rp-min-vram" class="form-input" min="0" placeholder="0 = any"></div>
+            <div class="form-row" style="margin:0"><label class="form-label">Max $/hr</label><input type="number" id="cfg-rp-max-hourly" class="form-input" min="0" step="0.01" placeholder="0 = no cap"></div>
+            <div class="form-row" style="margin:0;align-self:end"><label style="display:flex;align-items:center;gap:.3rem;font-size:12px"><input type="checkbox" id="cfg-rp-spot" style="width:auto"> Allow spot</label></div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.5rem;margin-top:.5rem">
+            <div class="form-row" style="margin:0"><label class="form-label">Min pods</label><input type="number" id="cfg-rp-min-pods" class="form-input" min="0" placeholder="0"></div>
+            <div class="form-row" style="margin:0"><label class="form-label">Max pods</label><input type="number" id="cfg-rp-max-pods" class="form-input" min="1" placeholder="1"></div>
+            <div class="form-row" style="margin:0"><label class="form-label">Idle timeout (s)</label><input type="number" id="cfg-rp-idle" class="form-input" min="0" placeholder="300"></div>
+          </div>
+          <div style="display:grid;grid-template-columns:2fr 1fr 1fr;gap:.5rem;margin-top:.5rem">
+            <div class="form-row" style="margin:0"><label class="form-label">Pod image <span class="muted">(blank = default vLLM)</span></label><input type="text" id="cfg-rp-image" class="form-input" placeholder="vllm/vllm-openai:latest"></div>
+            <div class="form-row" style="margin:0"><label class="form-label">Disk (GB)</label><input type="number" id="cfg-rp-disk" class="form-input" min="1" placeholder="40"></div>
+            <div class="form-row" style="margin:0"><label class="form-label">Port</label><input type="number" id="cfg-rp-port" class="form-input" min="1" placeholder="8000"></div>
+          </div>
+          <div class="form-row" style="margin:.5rem 0 0">
+            <label class="form-label">Pod env <span class="muted">(KEY=VAL, space-separated — e.g. HF_TOKEN=…)</span></label>
+            <input type="text" id="cfg-rp-env" class="form-input" placeholder="HF_TOKEN=hf_xxx">
+          </div>
+        </div>
+
+        <!-- Cost budget (cumulative spend cap, distinct from the $/hr rate cap) -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-top:.5rem">
+          <div class="form-row" style="margin:0"><label class="form-label">Spend limit ($)</label><input type="number" id="cfg-rp-cost-limit" class="form-input" min="0" step="0.01" placeholder="0 = unlimited"></div>
+          <div class="form-row" style="margin:0">
+            <label class="form-label">Per period</label>
+            <select id="cfg-rp-cost-period" class="form-input">
+              <option value="unlimited">Unlimited</option>
+              <option value="hour">Hour</option>
+              <option value="day">Day</option>
+              <option value="week">Week</option>
+              <option value="month">Month</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem;margin-top:.75rem">
         <div class="form-row" style="margin:0">
           <label class="form-label">Used VRAM <span class="muted">(GB)</span></label>
@@ -3451,6 +3546,7 @@ function openCfgModal(idx, cfgIdx){
     (s.split_secondary_cap_gb != null ? s.split_secondary_cap_gb : '');
   _populateDs4(m, s);
   _populateColibri(m, s);
+  _populateRunpod(s);
   document.getElementById('cfg-sysprompt').value = s.system_prompt || '';
   document.getElementById('cfg-parser').value = s.parser || (!m.in_config ? _autoDetectParser(m.path) : 'auto');
   document.getElementById('cfg-tools').checked = !!s.tools_closer_prompt;
@@ -3854,6 +3950,96 @@ function _updateSttVisibility(){
   if (row) row.style.display = (be === 'wav2vec2' || be === 'vosk' || be === 'nemo' || be === 'whisper-hf') ? '' : 'none';
 }
 
+// Show the RunPod block only when the backend is runpod; toggle mode sub-groups.
+function _updateRunpodVisibility(){
+  const be = (document.getElementById('cfg-backend').value || '');
+  const row = document.getElementById('cfg-runpod-row');
+  if (row) row.style.display = (be === 'runpod') ? '' : 'none';
+  _updateRunpodModeHint();
+}
+function _updateRunpodModeHint(){
+  const mode = (document.getElementById('cfg-rp-mode') || {}).value || 'serverless';
+  const sl = document.getElementById('cfg-rp-serverless');
+  const pd = document.getElementById('cfg-rp-pods');
+  if (sl) sl.style.display = (mode === 'serverless') ? '' : 'none';
+  if (pd) pd.style.display = (mode === 'serverless') ? 'none' : '';
+  const hint = document.getElementById('cfg-rp-mode-hint');
+  if (hint) hint.textContent = mode === 'serverless'
+    ? 'RunPod runs an autoscaling endpoint (min/max workers); coderai only proxies. Paste an existing serverless endpoint id below.'
+    : (mode === 'pods'
+       ? 'coderai provisions GPU pods within your price/size limits, load-balances requests, and destroys idle pods.'
+       : 'coderai picks pods vs serverless per request using the selection criteria (e.g. serverless for a cold single request, a pod for sustained load).');
+}
+function _populateRunpod(s){
+  const rp = (s && s.runpod) || {};
+  const set = (id,v)=>{ const el=document.getElementById(id); if(el!=null) el.value=(v==null?'':v); };
+  const chk = (id,v)=>{ const el=document.getElementById(id); if(el) el.checked=!!v; };
+  set('cfg-rp-mode', rp.mode || 'serverless');
+  set('cfg-rp-served', rp.served_model || '');
+  set('cfg-rp-ctx', rp.ctx || '');
+  set('cfg-rp-endpoint', rp.endpoint_id || '');
+  set('cfg-rp-min-workers', rp.min_workers != null ? rp.min_workers : '');
+  set('cfg-rp-max-workers', rp.max_workers != null ? rp.max_workers : '');
+  const pools = (rp.cloud_types || ['SECURE']).map(x=>String(x).toUpperCase());
+  chk('cfg-rp-pool-secure', pools.includes('SECURE'));
+  chk('cfg-rp-pool-community', pools.includes('COMMUNITY'));
+  set('cfg-rp-criteria', rp.selection_criteria || 'cheaper');
+  set('cfg-rp-gpu-type', rp.gpu_type || '');
+  set('cfg-rp-min-vram', rp.min_vram_gb != null ? rp.min_vram_gb : '');
+  set('cfg-rp-max-hourly', rp.max_hourly_usd != null ? rp.max_hourly_usd : '');
+  chk('cfg-rp-spot', rp.allow_spot);
+  set('cfg-rp-min-pods', rp.min_pods != null ? rp.min_pods : '');
+  set('cfg-rp-max-pods', rp.max_pods != null ? rp.max_pods : '');
+  set('cfg-rp-idle', rp.idle_timeout_s != null ? rp.idle_timeout_s : '');
+  set('cfg-rp-image', rp.image || '');
+  set('cfg-rp-disk', rp.container_disk_gb != null ? rp.container_disk_gb : '');
+  set('cfg-rp-port', rp.port != null ? rp.port : '');
+  const env = rp.env || {};
+  set('cfg-rp-env', Object.keys(env).map(k=>k+'='+env[k]).join(' '));
+  set('cfg-rp-cost-limit', rp.cost_limit_usd != null ? rp.cost_limit_usd : '');
+  set('cfg-rp-cost-period', rp.cost_period || 'unlimited');
+  _updateRunpodVisibility();
+}
+// Build the per-model runpod block. Only meaningful when backend=runpod; the
+// backend normalizes/drops empty fields.
+function _collectRunpod(){
+  if ((document.getElementById('cfg-backend').value || '') !== 'runpod') return undefined;
+  const val = id => (document.getElementById(id) || {}).value;
+  const numOrU = id => { const v = parseFloat(val(id)); return isNaN(v) ? undefined : v; };
+  const intOrU = id => { const v = parseInt(val(id)); return isNaN(v) ? undefined : v; };
+  const pools = [];
+  if (document.getElementById('cfg-rp-pool-secure').checked) pools.push('SECURE');
+  if (document.getElementById('cfg-rp-pool-community').checked) pools.push('COMMUNITY');
+  const env = {};
+  (val('cfg-rp-env') || '').trim().split(/\s+/).forEach(tok => {
+    const i = tok.indexOf('='); if (i > 0) env[tok.slice(0,i)] = tok.slice(i+1);
+  });
+  const o = {
+    mode:               val('cfg-rp-mode') || 'serverless',
+    served_model:       (val('cfg-rp-served') || '').trim(),
+    ctx:                intOrU('cfg-rp-ctx'),
+    endpoint_id:        (val('cfg-rp-endpoint') || '').trim(),
+    min_workers:        intOrU('cfg-rp-min-workers'),
+    max_workers:        intOrU('cfg-rp-max-workers'),
+    cloud_types:        pools,
+    selection_criteria: val('cfg-rp-criteria') || 'cheaper',
+    gpu_type:           (val('cfg-rp-gpu-type') || '').trim(),
+    min_vram_gb:        numOrU('cfg-rp-min-vram'),
+    max_hourly_usd:     numOrU('cfg-rp-max-hourly'),
+    allow_spot:         document.getElementById('cfg-rp-spot').checked,
+    min_pods:           intOrU('cfg-rp-min-pods'),
+    max_pods:           intOrU('cfg-rp-max-pods'),
+    idle_timeout_s:     intOrU('cfg-rp-idle'),
+    image:              (val('cfg-rp-image') || '').trim(),
+    container_disk_gb:  intOrU('cfg-rp-disk'),
+    port:               intOrU('cfg-rp-port'),
+    env:                Object.keys(env).length ? env : undefined,
+    cost_limit_usd:     numOrU('cfg-rp-cost-limit'),
+    cost_period:        val('cfg-rp-cost-period') || 'unlimited',
+  };
+  return o;
+}
+
 async function saveModelConfig(){
   const path = document.getElementById('cfg-path').value;
   const maxGpu = parseFloat(document.getElementById('cfg-max-gpu').value);
@@ -3872,6 +4058,7 @@ async function saveModelConfig(){
     alias:             document.getElementById('cfg-alias').value.trim() || null,
     config_name:       document.getElementById('cfg-config-name').value.trim() || null,
     backend:           document.getElementById('cfg-backend').value,
+    runpod:            _collectRunpod(),
     load_mode:         document.getElementById('cfg-load-mode').value,
     languages:         (function(){ const v=document.getElementById('cfg-stt-languages').value.trim();
                           return v ? v.split(',').map(s=>s.trim()).filter(Boolean) : []; })(),

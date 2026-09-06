@@ -234,7 +234,7 @@ def _gguf_architecture(path: str):
 # --------------------------------------------------------------------------- #
 
 # Ordered by arbitration preference for ambiguous names. New engines append here.
-_ENGINE_BACKENDS = ("ds4", "colibri", "k3", "kt", "vllm")
+_ENGINE_BACKENDS = ("ds4", "colibri", "k3", "kt", "vllm", "runpod")
 
 
 def _engine_config(engine: str):
@@ -245,6 +245,7 @@ def _engine_config(engine: str):
         "k3": get_active_k3_config,
         "kt": get_active_ktransformers_config,
         "vllm": get_active_vllm_config,
+        "runpod": get_active_runpod_config,
     }.get(engine)
     return getter() if getter else None
 
@@ -357,12 +358,19 @@ def _vllm_name_claims(model_name: str) -> bool:
     return False
 
 
+def _runpod_name_claims(model_name: str) -> bool:
+    """RunPod can serve any model, so it must NEVER auto-claim by a name marker.
+    Routes ONLY via an explicit ``backend: "runpod"`` pin on the model entry."""
+    return False
+
+
 _ENGINE_NAME_CLAIMS = {
     "ds4": _ds4_name_claims,
     "colibri": _colibri_name_claims,
     "k3": _k3_name_claims,
     "kt": _kt_name_claims,
     "vllm": _vllm_name_claims,
+    "runpod": _runpod_name_claims,
 }
 
 
@@ -425,6 +433,29 @@ def kt_should_handle(model_name: str) -> bool:
 def vllm_should_handle(model_name: str) -> bool:
     """True when vllm is the resolved engine backend for ``model_name``."""
     return resolve_engine_backend(model_name) == "vllm"
+
+
+def runpod_should_handle(model_name: str) -> bool:
+    """True when runpod is the resolved engine backend for ``model_name``."""
+    return resolve_engine_backend(model_name) == "runpod"
+
+
+def _model_is_runpod(model_name: str, config=None) -> bool:
+    """True for a RunPod-served model — from the runtime config's backend pin (or its
+    embedded _raw_cfg), else the resolver. Such models hold NO local weights, so the
+    manager must never download/cache them or estimate local VRAM for them."""
+    if isinstance(config, dict):
+        b = (config.get("backend") or "").strip().lower()
+        if not b:
+            raw = config.get("_raw_cfg")
+            if isinstance(raw, dict):
+                b = (raw.get("backend") or "").strip().lower()
+        if b == "runpod":
+            return True
+    try:
+        return resolve_engine_backend(model_name) == "runpod"
+    except Exception:
+        return False
 
 
 def _trim_cpu_ram() -> None:
@@ -606,6 +637,18 @@ class ModelManager:
             print(f"Routing '{model_name}' to vLLM backend")
             self.backend_type = "vllm"
             self.backend = VllmBackend(get_active_vllm_config())
+            self.backend.load_model(model_name, **kwargs)
+            self.tool_parser = ModelParserAdapter(model_name=model_name)
+            return
+
+        # RunPod: proxy matching models to a remote GPU on RunPod (serverless
+        # endpoint or a managed pod pool). Uses NO local VRAM and downloads
+        # nothing — the remote worker holds the weights. Pin-selected only.
+        if runpod_should_handle(model_name):
+            from codai.backends.runpod import RunpodBackend
+            print(f"Routing '{model_name}' to RunPod (remote GPU) backend")
+            self.backend_type = "runpod"
+            self.backend = RunpodBackend(get_active_runpod_config())
             self.backend.load_model(model_name, **kwargs)
             self.tool_parser = ModelParserAdapter(model_name=model_name)
             return
@@ -1474,6 +1517,13 @@ class MultiModelManager:
         self.config[model_name] = config or {}
         self.model_backend_types[model_name] = backend_type
         self._remember_registered_type(model_name, "text")
+
+        # RunPod-served models hold no local weights — the remote pod/endpoint pulls
+        # them. Never download/cache locally; the backend resolves the remote URL on
+        # first request.
+        if _model_is_runpod(model_name, self.config.get(model_name)):
+            print(f"Model '{model_name}' is RunPod-served — skipping local download/cache")
+            return
 
         # Download/cache the model at startup if it's a URL or HF ID
         resolved_model = self.load_model(model_name)

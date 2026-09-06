@@ -2673,8 +2673,11 @@ async def api_model_configure(request: Request, username: str = Depends(require_
     # Auto-estimate used_vram_gb from file size if not provided. For a not-yet-
     # downloaded HF model this returns None (nothing on disk to measure); the
     # download-completion backfill fills it in once the weights land.
+    # RunPod-served models hold NO local weights (the remote pod pulls them), so
+    # never estimate local VRAM for them.
+    _is_runpod = (str(data.get("backend") or "").strip().lower() == "runpod")
     used_vram_gb = data.get("used_vram_gb")
-    if used_vram_gb is None:
+    if used_vram_gb is None and not _is_runpod:
         used_vram_gb = _estimate_used_vram_gb(path)
 
     # Build settings entry
@@ -2753,6 +2756,82 @@ async def api_model_configure(request: Request, username: str = Depends(require_
             entry["colibri"] = co
         else:
             entry.pop("colibri", None)
+
+    # Per-model runpod block (mode/pools/criteria/gpu/price/scaling/cost/serverless).
+    # Stored as a normalized dict on the entry; the backend reads it via
+    # codai.api.runpod_worker.parse_model_runpod. Only meaningful for backend:runpod
+    # (pods|serverless|auto) or a local model's spillover target.
+    if "runpod" in data:
+        src = data.get("runpod") if isinstance(data.get("runpod"), dict) else {}
+        rpo = {}
+        # strings
+        for k in ("mode", "selection_criteria", "gpu_type", "image", "served_model",
+                  "endpoint_id", "cost_period"):
+            v = src.get(k)
+            if isinstance(v, str) and v.strip():
+                rpo[k] = v.strip()
+        # cloud_types: list or comma string
+        ct = src.get("cloud_types")
+        if isinstance(ct, str):
+            ct = [c.strip().upper() for c in ct.split(",") if c.strip()]
+        elif isinstance(ct, list):
+            ct = [str(c).strip().upper() for c in ct if str(c).strip()]
+        else:
+            ct = None
+        if ct:
+            rpo["cloud_types"] = ct
+        # bools
+        for k in ("allow_spot",):
+            if k in src and src.get(k) is not None and src.get(k) != "":
+                sv = src.get(k)
+                rpo[k] = (sv.lower() in ("1", "true", "on", "yes")
+                          if isinstance(sv, str) else bool(sv))
+        # ints
+        for k in ("container_disk_gb", "volume_gb", "port", "ctx", "min_pods",
+                  "max_pods", "scale_up_inflight_per_pod", "idle_timeout_s",
+                  "min_workers", "max_workers"):
+            v = src.get(k)
+            if v not in (None, ""):
+                try:
+                    rpo[k] = int(v)
+                except (TypeError, ValueError):
+                    pass
+        # floats
+        for k in ("min_vram_gb", "max_hourly_usd", "cost_limit_usd"):
+            v = src.get(k)
+            if v not in (None, ""):
+                try:
+                    rpo[k] = float(v)
+                except (TypeError, ValueError):
+                    pass
+        # env dict (extra pod env)
+        env = src.get("env")
+        if isinstance(env, dict) and env:
+            rpo["env"] = {str(k): str(v) for k, v in env.items()}
+        if rpo:
+            entry["runpod"] = rpo
+        else:
+            entry.pop("runpod", None)
+
+    # Per-model spillover-to-RunPod block for a LOCAL model (local is primary; burst
+    # to RunPod on the configured triggers). Kept separate from the `runpod` block so
+    # a model can be local-primary with a runpod overflow target.
+    if "runpod_spillover" in data:
+        src = data.get("runpod_spillover") if isinstance(data.get("runpod_spillover"), dict) else {}
+        sp = {}
+        for k in ("enabled", "on_concurrency_full", "on_no_gpu", "on_local_error"):
+            if k in src and src.get(k) is not None and src.get(k) != "":
+                sv = src.get(k)
+                sp[k] = (sv.lower() in ("1", "true", "on", "yes")
+                         if isinstance(sv, str) else bool(sv))
+        # the runpod target spec reuses the same shape as the `runpod` block
+        tgt = src.get("target")
+        if isinstance(tgt, dict) and tgt:
+            sp["target"] = tgt
+        if sp.get("enabled"):
+            entry["runpod_spillover"] = sp
+        else:
+            entry.pop("runpod_spillover", None)
 
     # A GGUF LLM is served by llama.cpp. Its multimodal projector (mmproj) gives
     # it VISION INPUT, which is the `image_to_text` capability served through
