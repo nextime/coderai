@@ -269,6 +269,8 @@ def _deploy_tag(account_cfg) -> str:
 # Pod ids currently mid-provision (created on RunPod but not yet in a pool). The
 # reaper must NOT kill these. Guarded by _pools_lock.
 _provisioning_ids: set = set()
+# Live info for booting pods (shown on the stats page as "provisioning").
+_provisioning_info: dict = {}
 
 
 def _vllm_docker_args(mcfg: "RunpodModelConfig", served: str) -> str:
@@ -339,9 +341,9 @@ class RunpodPodPool:
         return ""
 
     # -- provisioning ----------------------------------------------------- #
-    def _create_with_fallback(self, client, ranked):
-        """Try ranked GPU candidates in order; skip capacity misses. Returns
-        (pod_id, sel). Raises if all fail."""
+    def _create_with_fallback(self, client, ranked, start=0):
+        """Try ranked GPU candidates from ``start``; skip capacity misses. Returns
+        (pod_id, sel, next_index). Raises if all fail."""
         from codai.api.runpod_client import RunpodError
         port = self.mcfg.port or 8000
         image = self.mcfg.image or DEFAULT_POD_IMAGE
@@ -349,7 +351,8 @@ class RunpodPodPool:
         args = _vllm_docker_args(self.mcfg, self.served)
         dc = getattr(self.account, "data_center", "") or ""
         last = None
-        for sel in ranked:
+        for i in range(start, len(ranked)):
+            sel = ranked[i]
             block = self._budget_blocks(sel["price"])
             if block:
                 raise RunpodError(f"RunPod budget cap hit — not provisioning ({block}).")
@@ -365,7 +368,7 @@ class RunpodPodPool:
                     cloud_type=sel["cloud_type"], container_disk_gb=self.mcfg.container_disk_gb,
                     volume_gb=self.mcfg.volume_gb, env=env, docker_args=args,
                     is_spot=sel["is_spot"], bid_per_gpu=sel["bid"], data_center_id=dc)
-                return pod_id, sel
+                return pod_id, sel, i + 1
             except RunpodError as exc:
                 msg = str(exc).lower()
                 if "no longer any instances" in msg or "no instances" in msg or "capacity" in msg:
@@ -376,43 +379,99 @@ class RunpodPodPool:
                 raise
         raise last or RunpodError("RunPod: no candidate GPU could be deployed (capacity).")
 
+    # Port should appear once the pod's container is running; a much longer wait
+    # only bills for a pod that failed to start. The OpenAI server (image pull +
+    # model load) gets a longer, separate budget.
+    PORT_TIMEOUT_S = 300.0
+    HEALTH_TIMEOUT_S = 600.0
+
+    def _dump_pod_logs(self, client, pod_id, why):
+        """Fetch + log the pod's container/vLLM output so a failed boot is
+        self-diagnosing (the user's #1 cause: vLLM OOM / launch error)."""
+        try:
+            info = client.get_pod_logs(pod_id, tail=120)
+        except Exception as exc:
+            info = {"error": str(exc)}
+        logs = (info.get("logs") or "").strip()
+        console = info.get("console_url") or ""
+        if logs:
+            tail = "\n".join(logs.splitlines()[-40:])
+            print(f"[runpod] pod {pod_id} vLLM/container log ({why}):\n{tail}", flush=True)
+        else:
+            print(f"[runpod] pod {pod_id} logs unavailable via API ({info.get('error','')}); "
+                  f"check the console: {console}", flush=True)
+
+    # How many different machines to try before giving up. A pod that RunPod accepts
+    # but never actually starts (stuck pending — seen in practice) is retried on the
+    # NEXT candidate rather than failing the request.
+    MAX_PROVISION_ATTEMPTS = 3
+
     def _provision_one(self):
-        """Create + boot one pod; append it healthy. Blocking (minutes)."""
+        """Create + boot one pod; append it healthy. Blocking (minutes).
+
+        Retries on a different machine when a pod is accepted but never boots."""
         from codai.api.runpod_client import RunpodClient, RunpodError, pod_console_url
         client = RunpodClient(self.account)
         ranked = _rank_gpus(client, self.mcfg, self.account)
         port = self.mcfg.port or 8000
-        pod_id, sel = self._create_with_fallback(client, ranked)
-        with _pools_lock:
-            _provisioning_ids.add(pod_id)   # shield from the reaper during boot
-        try:
-            url = client.wait_ready(pod_id, port, ready_timeout=900.0)
-            # Now wait for the OpenAI server inside the pod (image pull + model load).
-            deadline = time.time() + 900.0
-            while time.time() < deadline:
-                if _pod_health_ok(url):
-                    break
-                time.sleep(5)
-            else:
-                raise RunpodError(f"pod {pod_id} OpenAI server not ready in time")
-        except Exception:
+        idx, attempts, last_exc = 0, 0, None
+
+        while idx < len(ranked) and attempts < self.MAX_PROVISION_ATTEMPTS:
+            pod_id, sel, idx = self._create_with_fallback(client, ranked, idx)
+            attempts += 1
+            console = pod_console_url(pod_id)
+            with _pools_lock:
+                _provisioning_ids.add(pod_id)   # shield from the reaper during boot
+                _provisioning_info[pod_id] = {
+                    "model": self.model_key, "gpu": sel["display_name"],
+                    "is_spot": sel["is_spot"], "hourly_usd": sel["price"],
+                    "console_url": console, "started_at": time.time()}
+            print(f"[runpod] pod {pod_id} created for {self.model_key!r} "
+                  f"({sel['display_name']} {sel['cloud_type']}) — booting; logs: {console}",
+                  flush=True)
             try:
-                client.terminate_pod(pod_id)
-            except Exception:
-                pass
+                url = client.wait_ready(pod_id, port, ready_timeout=self.PORT_TIMEOUT_S)
+                # Wait for the OpenAI server inside the pod (image pull + model load).
+                deadline = time.time() + self.HEALTH_TIMEOUT_S
+                while time.time() < deadline:
+                    if _pod_health_ok(url):
+                        break
+                    time.sleep(5)
+                else:
+                    raise RunpodError(f"pod {pod_id} OpenAI server (vLLM) did not answer "
+                                      f"/v1/models within {int(self.HEALTH_TIMEOUT_S)}s")
+            except Exception as exc:
+                # Self-diagnose: pull the vLLM/container log before tearing down, so
+                # the cause (OOM / bad args / model gate / stuck machine) is in the log.
+                last_exc = exc
+                print(f"[runpod] pod {pod_id} boot FAILED for {self.model_key!r}: {exc}",
+                      flush=True)
+                self._dump_pod_logs(client, pod_id, "boot failed")
+                try:
+                    client.terminate_pod(pod_id)
+                except Exception:
+                    pass
+                with _pools_lock:
+                    _provisioning_ids.discard(pod_id)
+                    _provisioning_info.pop(pod_id, None)
+                if attempts < self.MAX_PROVISION_ATTEMPTS and idx < len(ranked):
+                    print(f"[runpod] retrying on the next machine "
+                          f"(attempt {attempts + 1}/{self.MAX_PROVISION_ATTEMPTS})", flush=True)
+                    continue
+                raise
+            h = PodHandle(pod_id=pod_id, url=url, hourly_usd=sel["price"],
+                          started_at=time.time(), gpu=sel["display_name"],
+                          is_spot=sel["is_spot"], healthy=True, last_used=time.time(),
+                          console_url=console)
+            with self._cv:
+                self.pods.append(h)
+                self._cv.notify_all()
             with _pools_lock:
                 _provisioning_ids.discard(pod_id)
-            raise
-        h = PodHandle(pod_id=pod_id, url=url, hourly_usd=sel["price"], started_at=time.time(),
-                      gpu=sel["display_name"], is_spot=sel["is_spot"], healthy=True,
-                      last_used=time.time(), console_url=pod_console_url(pod_id))
-        with self._cv:
-            self.pods.append(h)
-            self._cv.notify_all()
-        with _pools_lock:
-            _provisioning_ids.discard(pod_id)
-        print(f"[runpod] pod {pod_id} ready for {self.model_key!r} at {url}", flush=True)
-        return h
+                _provisioning_info.pop(pod_id, None)
+            print(f"[runpod] pod {pod_id} ready for {self.model_key!r} at {url}", flush=True)
+            return h
+        raise last_exc or RunpodError("RunPod: could not provision a pod.")
 
     def ensure_ready(self):
         """Provision up to max(min_pods, 1) pods and block until ≥1 is healthy.
@@ -562,8 +621,22 @@ def pods_status() -> list:
                     "is_spot": p.is_spot, "healthy": p.healthy, "inflight": p.inflight,
                     "hourly_usd": p.hourly_usd, "uptime_s": int(now - p.started_at),
                     "live_cost_usd": round((now - p.started_at) / 3600.0 * p.hourly_usd, 4),
-                    "console_url": p.console_url,
+                    "console_url": p.console_url, "state": "ready",
                 })
+    # Booting pods (created, not yet serving) — visible so a slow/failing boot is
+    # obvious and its vLLM log is one click away.
+    with _pools_lock:
+        prov = list(_provisioning_info.items())
+    for pid, info in prov:
+        out.append({
+            "model": info.get("model"), "pod_id": pid, "gpu": info.get("gpu"),
+            "is_spot": info.get("is_spot"), "healthy": False, "inflight": 0,
+            "hourly_usd": info.get("hourly_usd"),
+            "uptime_s": int(now - (info.get("started_at") or now)),
+            "live_cost_usd": round((now - (info.get("started_at") or now)) / 3600.0
+                                   * (info.get("hourly_usd") or 0), 4),
+            "console_url": info.get("console_url"), "state": "provisioning",
+        })
     return out
 
 

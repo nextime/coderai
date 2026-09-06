@@ -93,7 +93,7 @@ async function rpRefresh(){
       <td>${_usd(p.hourly_usd)}</td>
       <td>${_fmtDur(p.uptime_s)}</td>
       <td>${_usd(p.live_cost_usd)}</td>
-      <td>${p.healthy?'<span style="color:#22c55e">healthy</span>':'<span style="color:#ef4444">down</span>'}</td>
+      <td>${p.state==='provisioning'?'<span style="color:#f59e0b">provisioning…</span>':(p.healthy?'<span style="color:#22c55e">healthy</span>':'<span style="color:#ef4444">down</span>')}</td>
       <td><a href="#" onclick="rpLogs('${p.pod_id}');return false">view</a>${p.console_url?` · <a href="${p.console_url}" target="_blank" rel="noopener">console</a>`:''}</td>
     </tr>`).join('');
   }
