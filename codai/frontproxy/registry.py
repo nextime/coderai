@@ -52,6 +52,9 @@ _DEFAULT_CAPS = {
     "vulkan": {"gguf", "whisper", "k3", "runpod"},
     "opencl": {"gguf", "whisper", "k3", "runpod"},
     "auto": {"transformers", "gguf", "whisper", "ds4", "colibri", "k3", "kt", "runpod"},
+    # An explicit CPU node (engine_specs backend:"cpu"): no GPU work, but it can
+    # still serve CPU llama.cpp/transformers and orchestrate RunPod.
+    "cpu": {"transformers", "gguf", "k3", "runpod"},
 }
 
 
@@ -103,7 +106,10 @@ class Engine:
         if not self.name:
             self.name = f"engine#{self.id}"
         if not self.capabilities:
-            self.capabilities = set(_DEFAULT_CAPS.get(self.backend, {"transformers", "gguf"}))
+            # Unknown backend: assume the local basics plus runpod (which needs no
+            # local hardware), so a RunPod-only deployment always has a host node.
+            self.capabilities = set(_DEFAULT_CAPS.get(
+                self.backend, {"transformers", "gguf", "runpod"}))
 
     def can_serve(self, required_cap: Optional[str]) -> bool:
         # The system worker (cache/downloads) never serves inference, so it must
