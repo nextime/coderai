@@ -283,10 +283,21 @@ class RunpodClient:
         import requests
         out = {"console_url": pod_console_url(pod_id)}
         rest = (getattr(self._cfg, "rest_base", "") or "https://rest.runpod.io/v1").rstrip("/")
-        try:
-            r = requests.get(f"{rest}/pods/{pod_id}/logs",
-                             headers={"Authorization": f"Bearer {self._api_key}"},
-                             params={"tail": tail}, timeout=15)
+        hdrs = {"Authorization": f"Bearer {self._api_key}"}
+        # RunPod's log surface has moved around; try the plausible routes in order and
+        # keep the first that answers. The console link is the always-available path.
+        attempts = [
+            (f"{rest}/pods/{pod_id}/logs", None),
+            (f"{rest}/pods/{pod_id}/logs", {"limit": tail}),
+            (f"{rest}/pods/{pod_id}/containerLogs", None),
+        ]
+        errors = []
+        for url, params in attempts:
+            try:
+                r = requests.get(url, headers=hdrs, params=params, timeout=15)
+            except requests.RequestException as exc:
+                errors.append(f"{url.rsplit('/', 1)[-1]}: unreachable ({exc})")
+                continue
             if r.status_code == 200:
                 try:
                     body = r.json()
@@ -294,10 +305,10 @@ class RunpodClient:
                         (body.get("logs") or body.get("data") or str(body))
                 except ValueError:
                     out["logs"] = r.text
-            else:
-                out["error"] = f"logs API HTTP {r.status_code} — use the console link"
-        except requests.RequestException as exc:
-            out["error"] = f"logs API unreachable ({exc}) — use the console link"
+                return out
+            errors.append(f"HTTP {r.status_code}")
+        out["error"] = ("logs API unavailable (" + "; ".join(errors[:3])
+                        + ") — use the console link")
         return out
 
     def wait_ready(self, pod_id: str, port: int, ready_timeout: float = 900.0,
