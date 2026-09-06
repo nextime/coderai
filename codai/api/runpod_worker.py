@@ -56,6 +56,9 @@ class RunpodModelConfig:
     max_pods: int = 1
     scale_up_inflight_per_pod: int = 4
     idle_timeout_s: int = 300                # destroy a pod this long after its last request
+    # Boot budgets — bigger models need longer (image pull + weight download).
+    boot_timeout_s: int = 300                # until the pod exposes its port
+    load_timeout_s: int = 600                # until vLLM answers /v1/models
     # --- serverless ---
     endpoint_id: str = ""                    # reference an existing serverless endpoint
     min_workers: int = 0
@@ -130,6 +133,8 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.scale_up_inflight_per_pod = max(1, _as_int(b.get("scale_up_inflight_per_pod"),
                                                    cfg.scale_up_inflight_per_pod))
     cfg.idle_timeout_s = max(0, _as_int(b.get("idle_timeout_s"), cfg.idle_timeout_s))
+    cfg.boot_timeout_s = max(30, _as_int(b.get("boot_timeout_s"), cfg.boot_timeout_s))
+    cfg.load_timeout_s = max(30, _as_int(b.get("load_timeout_s"), cfg.load_timeout_s))
     cfg.endpoint_id = (b.get("endpoint_id") or "").strip()
     cfg.min_workers = max(0, _as_int(b.get("min_workers"), cfg.min_workers))
     cfg.max_workers = max(1, _as_int(b.get("max_workers"), cfg.max_workers))
@@ -429,17 +434,19 @@ class RunpodPodPool:
             print(f"[runpod] pod {pod_id} created for {self.model_key!r} "
                   f"({sel['display_name']} {sel['cloud_type']}) — booting; logs: {console}",
                   flush=True)
+            boot_to = float(self.mcfg.boot_timeout_s or self.PORT_TIMEOUT_S)
+            load_to = float(self.mcfg.load_timeout_s or self.HEALTH_TIMEOUT_S)
             try:
-                url = client.wait_ready(pod_id, port, ready_timeout=self.PORT_TIMEOUT_S)
+                url = client.wait_ready(pod_id, port, ready_timeout=boot_to)
                 # Wait for the OpenAI server inside the pod (image pull + model load).
-                deadline = time.time() + self.HEALTH_TIMEOUT_S
+                deadline = time.time() + load_to
                 while time.time() < deadline:
                     if _pod_health_ok(url):
                         break
                     time.sleep(5)
                 else:
                     raise RunpodError(f"pod {pod_id} OpenAI server (vLLM) did not answer "
-                                      f"/v1/models within {int(self.HEALTH_TIMEOUT_S)}s")
+                                      f"/v1/models within {int(load_to)}s")
             except Exception as exc:
                 # Self-diagnose: pull the vLLM/container log before tearing down, so
                 # the cause (OOM / bad args / model gate / stuck machine) is in the log.

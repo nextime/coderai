@@ -2789,7 +2789,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         # ints
         for k in ("container_disk_gb", "volume_gb", "port", "ctx", "min_pods",
                   "max_pods", "scale_up_inflight_per_pod", "idle_timeout_s",
-                  "min_workers", "max_workers"):
+                  "boot_timeout_s", "load_timeout_s", "min_workers", "max_workers"):
             v = src.get(k)
             if v not in (None, ""):
                 try:

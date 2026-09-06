@@ -743,6 +743,18 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             <div class="form-row" style="margin:0"><label class="form-label">Max pods</label><input type="number" id="cfg-rp-max-pods" class="form-input" min="1" placeholder="1"></div>
             <div class="form-row" style="margin:0"><label class="form-label">Idle timeout (s)</label><input type="number" id="cfg-rp-idle" class="form-input" min="0" placeholder="300"></div>
           </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-top:.5rem">
+            <div class="form-row" style="margin:0">
+              <label class="form-label">Boot timeout (s)</label>
+              <input type="number" id="cfg-rp-boot" class="form-input" min="30" placeholder="300">
+              <span class="form-hint" style="font-size:11px">Wait for the pod to expose its port; a stuck machine is dropped and the next one tried.</span>
+            </div>
+            <div class="form-row" style="margin:0">
+              <label class="form-label">Model load timeout (s)</label>
+              <input type="number" id="cfg-rp-load" class="form-input" min="30" placeholder="600">
+              <span class="form-hint" style="font-size:11px">Wait for vLLM to serve the model — raise this for big models (long image pull + weight download).</span>
+            </div>
+          </div>
           <div style="display:grid;grid-template-columns:2fr 1fr 1fr;gap:.5rem;margin-top:.5rem">
             <div class="form-row" style="margin:0"><label class="form-label">Pod image <span class="muted">(blank = default vLLM)</span></label><input type="text" id="cfg-rp-image" class="form-input" placeholder="vllm/vllm-openai:latest"></div>
             <div class="form-row" style="margin:0"><label class="form-label">Disk (GB)</label><input type="number" id="cfg-rp-disk" class="form-input" min="1" placeholder="40"></div>
@@ -3991,6 +4003,8 @@ function _populateRunpod(s){
   set('cfg-rp-min-pods', rp.min_pods != null ? rp.min_pods : '');
   set('cfg-rp-max-pods', rp.max_pods != null ? rp.max_pods : '');
   set('cfg-rp-idle', rp.idle_timeout_s != null ? rp.idle_timeout_s : '');
+  set('cfg-rp-boot', rp.boot_timeout_s != null ? rp.boot_timeout_s : '');
+  set('cfg-rp-load', rp.load_timeout_s != null ? rp.load_timeout_s : '');
   set('cfg-rp-image', rp.image || '');
   set('cfg-rp-disk', rp.container_disk_gb != null ? rp.container_disk_gb : '');
   set('cfg-rp-port', rp.port != null ? rp.port : '');
@@ -4030,6 +4044,8 @@ function _collectRunpod(){
     min_pods:           intOrU('cfg-rp-min-pods'),
     max_pods:           intOrU('cfg-rp-max-pods'),
     idle_timeout_s:     intOrU('cfg-rp-idle'),
+    boot_timeout_s:     intOrU('cfg-rp-boot'),
+    load_timeout_s:     intOrU('cfg-rp-load'),
     image:              (val('cfg-rp-image') || '').trim(),
     container_disk_gb:  intOrU('cfg-rp-disk'),
     port:               intOrU('cfg-rp-port'),
