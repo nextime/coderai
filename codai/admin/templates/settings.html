@@ -15,6 +15,8 @@
 
 <div id="settings-alert" style="display:none"></div>
 
+<div id="settings-tabbar" style="display:flex;flex-wrap:wrap;gap:.4rem;margin:0 0 1rem;border-bottom:1px solid var(--border,#2a2a2a);padding-bottom:.6rem"></div>
+
 <!-- Server -->
 <div class="card mb-0">
   <div class="card-title">Server</div>
@@ -844,6 +846,24 @@
       <div class="form-group" style="flex:1;min-width:140px">
         <label class="form-label">Global $/hr cap</label>
         <input type="number" id="s-runpod-budget" class="form-input" min="0" step="0.1" placeholder="0 = no cap">
+        <span class="form-hint" style="font-size:11px">Instantaneous rate: total $/hr across all running pods.</span>
+      </div>
+    </div>
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:150px">
+        <label class="form-label">Global spend cap ($)</label>
+        <input type="number" id="s-runpod-cost-limit" class="form-input" min="0" step="1" placeholder="0 = unlimited">
+        <span class="form-hint" style="font-size:11px">Cumulative spend across all RunPod models over the period below.</span>
+      </div>
+      <div class="form-group" style="flex:1;min-width:150px">
+        <label class="form-label">Spend period</label>
+        <select id="s-runpod-cost-period" class="form-input">
+          <option value="unlimited">Unlimited</option>
+          <option value="hour">Hour</option>
+          <option value="day">Day</option>
+          <option value="week">Week</option>
+          <option value="month">Month</option>
+        </select>
       </div>
     </div>
     <div class="form-group">
@@ -1761,6 +1781,8 @@ async function loadSettings(){
     document.getElementById('s-runpod-cloud').value = rp.cloud_type || 'SECURE';
     document.getElementById('s-runpod-default-gpu').value = rp.default_gpu_type ?? '';
     document.getElementById('s-runpod-budget').value = rp.global_max_hourly_usd ?? 0;
+    document.getElementById('s-runpod-cost-limit').value = rp.global_cost_limit_usd ?? 0;
+    document.getElementById('s-runpod-cost-period').value = rp.global_cost_period || 'unlimited';
     document.getElementById('s-runpod-dc').value = rp.data_center ?? '';
     document.getElementById('s-runpod-api-base').value = rp.api_base ?? '';
     document.getElementById('s-runpod-rest-base').value = rp.rest_base ?? '';
@@ -1952,6 +1974,8 @@ async function saveSettings(silent){
       cloud_type: document.getElementById('s-runpod-cloud').value || 'SECURE',
       default_gpu_type: document.getElementById('s-runpod-default-gpu').value.trim(),
       global_max_hourly_usd: parseFloat(document.getElementById('s-runpod-budget').value) || 0,
+      global_cost_limit_usd: parseFloat(document.getElementById('s-runpod-cost-limit').value) || 0,
+      global_cost_period: document.getElementById('s-runpod-cost-period').value || 'unlimited',
       data_center: document.getElementById('s-runpod-dc').value.trim(),
       api_base: document.getElementById('s-runpod-api-base').value.trim(),
       rest_base: document.getElementById('s-runpod-rest-base').value.trim(),
@@ -2036,5 +2060,62 @@ async function saveSettings(silent){
 }
 
 loadSettings();
+
+// Group the settings cards into category tabs (JS-only: no markup/ID changes, so
+// the single Save still submits every field regardless of the visible tab).
+function _initSettingsTabs(){
+  const TABS = [
+    ["Server & Queue", ["Server","Concurrency","Storage","Background Jobs"]],
+    ["Engines",        ["DeepSeek","colibri","Kimi-K3","ktransformers","vLLM"]],
+    ["RunPod",         ["RunPod"]],
+    ["OCR",            ["OCR"]],
+    ["Media",          ["Video Enhancement","Generation Archive"]],
+    ["System",         ["Thermal","AISBF","Auto-compact","Credits"]],
+  ];
+  const bar = document.getElementById('settings-tabbar');
+  if (!bar) return;
+  // Assign each card to a tab by its title text.
+  const cards = Array.from(document.querySelectorAll('.card')).filter(c => c.querySelector('.card-title'));
+  const tabOf = (title) => {
+    for (const [name, keys] of TABS)
+      if (keys.some(k => title.toLowerCase().includes(k.toLowerCase()))) return name;
+    return "Other";
+  };
+  const present = [];
+  cards.forEach(c => {
+    const t = (c.querySelector('.card-title').textContent || '').trim();
+    const tab = tabOf(t);
+    c.dataset.setTab = tab;
+    if (!present.includes(tab)) present.push(tab);
+  });
+  // Order tabs as declared, then any extras (Other).
+  const order = TABS.map(t => t[0]).filter(n => present.includes(n))
+                .concat(present.filter(n => !TABS.some(t => t[0] === n)));
+  let active = null;
+  try { active = localStorage.getItem('coderai_settings_tab'); } catch(e){}
+  if (!order.includes(active)) active = order[0];
+  const show = (tab) => {
+    active = tab;
+    try { localStorage.setItem('coderai_settings_tab', tab); } catch(e){}
+    cards.forEach(c => { c.style.display = (c.dataset.setTab === tab) ? '' : 'none'; });
+    bar.querySelectorAll('button').forEach(b => {
+      const on = b.dataset.tab === tab;
+      b.style.background = on ? 'var(--accent,#6366f1)' : 'transparent';
+      b.style.color = on ? '#fff' : 'var(--text-2,#aaa)';
+      b.style.borderColor = on ? 'var(--accent,#6366f1)' : 'var(--border,#2a2a2a)';
+    });
+  };
+  bar.innerHTML = '';
+  order.forEach(tab => {
+    const b = document.createElement('button');
+    b.type = 'button'; b.dataset.tab = tab; b.textContent = tab;
+    b.style.cssText = 'padding:.4rem .8rem;border-radius:8px;border:1px solid var(--border,#2a2a2a);'
+      + 'background:transparent;color:var(--text-2,#aaa);cursor:pointer;font-size:13px;font-weight:500';
+    b.onclick = () => show(tab);
+    bar.appendChild(b);
+  });
+  show(active);
+}
+_initSettingsTabs();
 </script>
 {% endblock %}

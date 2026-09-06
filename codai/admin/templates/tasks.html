@@ -47,6 +47,16 @@
   <div id="engines-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:.6rem"></div>
 </div>
 
+<!-- RunPod remote-GPU box (shown only when RunPod is enabled) -->
+<div id="runpod-card" style="display:none;margin:0 0 1.25rem">
+  <div style="display:flex;align-items:baseline;gap:.5rem;margin-bottom:.5rem">
+    <h2 style="font-size:14px;margin:0">RunPod (remote GPUs)</h2>
+    <span class="dim small" id="runpod-rate"></span>
+    <a href="{{ root_path }}/admin/runpod" class="dim small" style="margin-left:auto">stats &amp; spend →</a>
+  </div>
+  <div id="runpod-body" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:.6rem"></div>
+</div>
+
 <style>
 .sys-tile{border:1px solid var(--border,#2a2a2a);border-radius:10px;padding:.7rem .85rem;
   background:var(--card-bg,rgba(255,255,255,.02))}
@@ -442,11 +452,42 @@ async function removeTask(id) {
   loadTasks();
 }
 
+async function loadRunpod(){
+  let d;
+  try {
+    const r = await fetch(ROOT_PATH + '/admin/api/runpod/stats');
+    if (!r.ok) { document.getElementById('runpod-card').style.display = 'none'; return; }
+    d = await r.json();
+  } catch(e) { document.getElementById('runpod-card').style.display = 'none'; return; }
+  const caps = d.caps || {};
+  const pods = d.pods || [];
+  // Show the box only when RunPod is enabled (or there are pods to report).
+  if (!caps.enabled && !pods.length) { document.getElementById('runpod-card').style.display = 'none'; return; }
+  document.getElementById('runpod-card').style.display = '';
+  const rate = d.live_hourly_usd || 0;
+  document.getElementById('runpod-rate').textContent =
+    pods.filter(p=>p.healthy).length + ' pod(s) · $' + Number(rate).toFixed(2) + '/hr';
+  const body = document.getElementById('runpod-body');
+  if (!pods.length) {
+    body.innerHTML = '<div class="dim small" style="padding:.5rem">No pods running (scaled to zero — a request will provision one).</div>';
+    return;
+  }
+  body.innerHTML = pods.map(p => `
+    <div class="sys-tile">
+      <div style="font-weight:600;font-size:13px">${p.model||''}</div>
+      <div class="dim small">${p.gpu||''}${p.is_spot?' (spot)':''}</div>
+      <div class="small" style="margin-top:.3rem">in-flight: <b>${p.inflight||0}</b> · $${Number(p.hourly_usd||0).toFixed(2)}/hr</div>
+      <div class="dim small">up ${Math.round((p.uptime_s||0)/60)}m · ${p.healthy?'<span style="color:#22c55e">healthy</span>':'<span style="color:#ef4444">down</span>'}</div>
+    </div>`).join('');
+}
+
 loadTasks();
 loadSystemStats();
 loadEngines();
+loadRunpod();
 setInterval(loadTasks, 1000);
 setInterval(loadSystemStats, 1000);
 setInterval(loadEngines, 5000);
+setInterval(loadRunpod, 5000);
 </script>
 {% endblock %}

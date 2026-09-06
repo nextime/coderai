@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block title %}RunPod — CoderAI{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>RunPod</h1>
+    <p>Remote-GPU pods, live cost, and spend against your budgets.</p>
+  </div>
+  <div class="header-actions">
+    <span id="rp-updated" class="dim small"></span>
+    <button class="btn btn-secondary" onclick="rpRefresh()">Refresh</button>
+  </div>
+</div>
+
+<div id="rp-disabled" style="display:none;margin:0 0 1rem;padding:.7rem .9rem;border-radius:8px;
+     background:rgba(148,163,184,.12);border:1px solid rgba(148,163,184,.4);font-size:13px">
+  RunPod is not enabled. Turn it on in <a href="{{ root_path }}/admin/settings">Settings → RunPod</a>.
+</div>
+
+<!-- Cost tiles -->
+<div id="rp-tiles" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:.75rem;margin-bottom:1rem">
+  <div class="card"><div class="dim small">Running pods</div><div id="rp-podcount" style="font-size:1.6rem;font-weight:700">—</div></div>
+  <div class="card"><div class="dim small">Live rate ($/hr)</div><div id="rp-rate" style="font-size:1.6rem;font-weight:700">—</div><div id="rp-rate-cap" class="dim small"></div></div>
+  <div class="card"><div class="dim small">Uncommitted cost</div><div id="rp-uncommitted" style="font-size:1.6rem;font-weight:700">—</div><div class="dim small">pods running, not yet billed to the ledger</div></div>
+  <div class="card"><div class="dim small">Global spend (period)</div><div id="rp-global-spend" style="font-size:1.6rem;font-weight:700">—</div><div id="rp-global-cap" class="dim small"></div></div>
+</div>
+
+<!-- Running pods -->
+<div class="card" style="margin-bottom:1rem">
+  <div class="card-title">Running pods</div>
+  <div style="overflow-x:auto">
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="text-align:left;color:var(--text-3)">
+        <th>Model</th><th>GPU</th><th>Pool</th><th>In-flight</th><th>$/hr</th><th>Uptime</th><th>Cost so far</th><th>Health</th>
+      </tr></thead>
+      <tbody id="rp-pods"><tr><td colspan="8" class="dim">No pods running.</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Spend per model -->
+<div class="card">
+  <div class="card-title">Spend by model (trailing)</div>
+  <div style="overflow-x:auto">
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="text-align:left;color:var(--text-3)">
+        <th>Model</th><th>Hour</th><th>Day</th><th>Week</th><th>Month</th>
+      </tr></thead>
+      <tbody id="rp-spend"><tr><td colspan="5" class="dim">No spend recorded yet.</td></tr></tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function _fmtDur(s){ s=Math.max(0,s|0); const h=(s/3600)|0, m=((s%3600)/60)|0; return h?`${h}h ${m}m`:`${m}m ${s%60}s`; }
+function _usd(v){ return (v==null)?'—':('$'+Number(v).toFixed(v<1?4:2)); }
+
+async function rpRefresh(){
+  let d;
+  try {
+    const r = await fetch(ROOT_PATH + '/admin/api/runpod/stats');
+    d = await r.json();
+    if(!r.ok) throw new Error(d.detail || ('HTTP '+r.status));
+  } catch(e){
+    document.getElementById('rp-updated').textContent = 'error: ' + e.message;
+    return;
+  }
+  const caps = d.caps || {};
+  document.getElementById('rp-disabled').style.display = caps.enabled ? 'none' : '';
+  const pods = d.pods || [];
+  const running = pods.filter(p=>p.healthy);
+  document.getElementById('rp-podcount').textContent = running.length + (pods.length>running.length ? ` (+${pods.length-running.length} unhealthy)` : '');
+  document.getElementById('rp-rate').textContent = _usd(d.live_hourly_usd);
+  document.getElementById('rp-rate-cap').textContent = caps.global_max_hourly_usd ? ('cap ' + _usd(caps.global_max_hourly_usd) + '/hr') : 'no rate cap';
+  document.getElementById('rp-uncommitted').textContent = _usd(d.live_uncommitted_usd);
+  const gperiod = caps.global_cost_period || 'unlimited';
+  const gspend = (d.ledger && d.ledger.global && gperiod!=='unlimited') ? d.ledger.global[gperiod] : null;
+  document.getElementById('rp-global-spend').textContent = (gperiod==='unlimited') ? 'unlimited' : _usd(gspend);
+  document.getElementById('rp-global-cap').textContent = (caps.global_cost_limit_usd && gperiod!=='unlimited') ? ('cap ' + _usd(caps.global_cost_limit_usd) + ' / ' + gperiod) : 'no spend cap';
+
+  // pods table
+  const tb = document.getElementById('rp-pods');
+  if(!pods.length){ tb.innerHTML = '<tr><td colspan="8" class="dim">No pods running.</td></tr>'; }
+  else {
+    tb.innerHTML = pods.map(p => `<tr>
+      <td>${p.model||''}</td>
+      <td>${p.gpu||''}${p.is_spot?' <span class="dim">(spot)</span>':''}</td>
+      <td>${p.is_spot?'spot':'on-demand'}</td>
+      <td>${p.inflight||0}</td>
+      <td>${_usd(p.hourly_usd)}</td>
+      <td>${_fmtDur(p.uptime_s)}</td>
+      <td>${_usd(p.live_cost_usd)}</td>
+      <td>${p.healthy?'<span style="color:#22c55e">healthy</span>':'<span style="color:#ef4444">down</span>'}</td>
+    </tr>`).join('');
+  }
+
+  // spend by model
+  const sb = document.getElementById('rp-spend');
+  const per = (d.ledger && d.ledger.per_model) || {};
+  const keys = Object.keys(per);
+  if(!keys.length){ sb.innerHTML = '<tr><td colspan="5" class="dim">No spend recorded yet.</td></tr>'; }
+  else {
+    sb.innerHTML = keys.map(k => {
+      const m = per[k] || {};
+      return `<tr><td>${k}</td><td>${_usd(m.hour)}</td><td>${_usd(m.day)}</td><td>${_usd(m.week)}</td><td>${_usd(m.month)}</td></tr>`;
+    }).join('');
+  }
+  const now = new Date();
+  document.getElementById('rp-updated').textContent = 'updated ' + now.toLocaleTimeString();
+}
+rpRefresh();
+setInterval(rpRefresh, 10000);
+</script>
+{% endblock %}

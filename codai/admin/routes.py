@@ -3617,6 +3617,8 @@ def build_settings_dict(c, gpu_cards):
             "default_gpu_type": c.runpod.default_gpu_type,
             "data_center": c.runpod.data_center,
             "global_max_hourly_usd": c.runpod.global_max_hourly_usd,
+            "global_cost_limit_usd": c.runpod.global_cost_limit_usd,
+            "global_cost_period": c.runpod.global_cost_period,
         },
         "ocr": {
             "enabled": c.ocr.enabled,
@@ -4158,6 +4160,11 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "global_max_hourly_usd" in d:
             try: rp.global_max_hourly_usd = max(0.0, float(d.get("global_max_hourly_usd") or 0))
             except (TypeError, ValueError): pass
+        if "global_cost_limit_usd" in d:
+            try: rp.global_cost_limit_usd = max(0.0, float(d.get("global_cost_limit_usd") or 0))
+            except (TypeError, ValueError): pass
+        if "global_cost_period" in d:
+            rp.global_cost_period = (d.get("global_cost_period") or "unlimited").strip().lower()
 
     if "ocr" in data:
         d = data["ocr"]
@@ -4316,6 +4323,35 @@ async def api_runpod_status(username: str = Depends(require_admin)):
                 if str(p.get("status")).upper() == "RUNNING")
     return {"success": True, "account_id": me.get("id"), "pods": pods,
             "total_hourly_usd": round(total, 4)}
+
+
+@router.get("/admin/api/runpod/stats", summary="RunPod pod usage + spend stats")
+async def api_runpod_stats(username: str = Depends(require_admin)):
+    """coderai-managed pod pool status + spend ledger (local view; no RunPod call).
+
+    Runs on the engine hosting the RunPod pool, so it sees the live pods and the
+    persistent spend ledger."""
+    from codai.api import runpod_worker, runpod_ledger
+    try:
+        pods = runpod_worker.pods_status()
+    except Exception:
+        pods = []
+    try:
+        ledger = runpod_ledger.totals()
+    except Exception:
+        ledger = {"per_model": {}, "global": {}}
+    live_hourly = sum((p.get("hourly_usd") or 0.0) for p in pods if p.get("healthy"))
+    live_cost = sum((p.get("live_cost_usd") or 0.0) for p in pods)
+    cfg = config_manager.config.runpod if config_manager and config_manager.config else None
+    caps = {}
+    if cfg is not None:
+        caps = {"global_max_hourly_usd": cfg.global_max_hourly_usd,
+                "global_cost_limit_usd": cfg.global_cost_limit_usd,
+                "global_cost_period": cfg.global_cost_period,
+                "enabled": cfg.enabled}
+    return {"success": True, "pods": pods, "ledger": ledger, "caps": caps,
+            "live_hourly_usd": round(live_hourly, 4),
+            "live_uncommitted_usd": round(live_cost, 4)}
 
 
 # =============================================================================

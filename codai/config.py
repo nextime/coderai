@@ -580,6 +580,11 @@ class RunpodConfig:
     # Account-wide safety net: the scaler will not let the SUM of all running RunPod
     # pods' hourly cost exceed this. 0 = no global cap (per-model $/hr still applies).
     global_max_hourly_usd: float = 0.0
+    # Account-wide CUMULATIVE spend cap over a rolling period (distinct from the $/hr
+    # rate cap above): the scaler refuses to provision when trailing spend across ALL
+    # RunPod models would exceed this. 0 / "unlimited" = no cap.
+    global_cost_limit_usd: float = 0.0
+    global_cost_period: str = "unlimited"   # hour | day | week | month | unlimited
 
 
 @dataclass
@@ -1134,6 +1139,8 @@ class ConfigManager:
                 "default_gpu_type": self.config.runpod.default_gpu_type,
                 "data_center": self.config.runpod.data_center,
                 "global_max_hourly_usd": self.config.runpod.global_max_hourly_usd,
+                "global_cost_limit_usd": self.config.runpod.global_cost_limit_usd,
+                "global_cost_period": self.config.runpod.global_cost_period,
             },
             "ocr": {
                 "enabled": self.config.ocr.enabled,

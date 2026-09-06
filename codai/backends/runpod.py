@@ -60,10 +60,12 @@ class RunpodBackend(ModelBackend):
         self._acct = cfg
         self._model_id = "runpod"
         self._served_name = "runpod"
-        self._url: Optional[str] = None
+        self._url: Optional[str] = None          # serverless: fixed base URL
         self._headers: Dict[str, str] = {}
         self._ctx = 32768
         self._mcfg = None
+        self._mode = "serverless"
+        self._pool = None                         # pods: RunpodPodPool
         self._last_usage: Dict = {}
 
     # ------------------------------------------------------------------ #
@@ -90,18 +92,24 @@ class RunpodBackend(ModelBackend):
         if _ctx > 0:
             self._ctx = _ctx
 
-        mode = (self._mcfg.mode or "pods").lower()
-        if mode == "serverless":
+        self._mode = (self._mcfg.mode or "pods").lower()
+        if self._mode == "serverless":
             self._url = runpod_worker.serverless_base_url(self._acct, self._mcfg)
             self._headers = runpod_worker.auth_headers(self._acct)
             print(f"[runpod] '{model_name}' -> serverless endpoint "
                   f"{self._mcfg.endpoint_id} ({self._url})", flush=True)
         else:
-            # pods / auto: provisioned pool — lands in the next phase.
-            raise RuntimeError(
-                f"RunPod mode '{mode}' is not available yet — the pod pool is "
-                "built in a later phase. Set the model's runpod mode to 'serverless' "
-                "for now.")
+            # pods / auto: coderai-managed pool of remote GPU pods. (auto currently
+            # behaves as pods; serverless-vs-pods auto-arbitration is a later refinement.)
+            self._pool = runpod_worker.get_pod_pool(
+                model_name, self._acct, self._mcfg, self._served_name)
+            self._headers = {}   # the pod's vLLM server needs no auth
+            # Eagerly warm a pod only when min_pods >= 1; otherwise provision lazily
+            # on the first request (min_pods=0 = scale-to-zero when idle).
+            if self._mcfg.min_pods >= 1:
+                self._pool.ensure_ready()
+            print(f"[runpod] '{model_name}' -> managed pod pool "
+                  f"(min={self._mcfg.min_pods}, max={self._mcfg.max_pods})", flush=True)
 
     def get_model_name(self) -> str:
         return self._model_id
@@ -124,6 +132,16 @@ class RunpodBackend(ModelBackend):
         if not self._url:
             raise RuntimeError("RunPod endpoint not resolved")
         return self._url
+
+    def _acquire_endpoint(self):
+        """Return (base_url, release_callable) for one request. Serverless yields the
+        fixed endpoint; pods pick (and provision-on-demand) a pod from the pool."""
+        if self._mode == "serverless":
+            return self._base(), (lambda: None)
+        if not self._pool:
+            raise RuntimeError("RunPod pod pool not initialised")
+        pod, url = self._pool.acquire()
+        return url, (lambda: self._pool.release(pod))
 
     def _store_usage(self, usage: dict) -> None:
         if usage:
@@ -162,33 +180,38 @@ class RunpodBackend(ModelBackend):
                       top_p=1.0, stop=None, tools=None, response_format=None):
         import requests
         self._enter_request()
+        base, release = self._acquire_endpoint()
         try:
             payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, False)
             if response_format and response_format.get("type") == "json_object":
                 payload["response_format"] = {"type": "json_object"}
             if tools:
                 payload["tools"] = tools
-            r = requests.post(self._base() + "/chat/completions", json=payload,
+            r = requests.post(base + "/chat/completions", json=payload,
                               headers=self._headers, timeout=3600)
             r.raise_for_status()
             data = r.json()
             self._store_usage(data.get("usage", {}))
             return data["choices"][0]["message"].get("content") or ""
         finally:
+            release()
             self._exit_request()
 
     async def generate_chat_stream(self, messages: List[Dict], max_tokens=None,
                                    temperature=0.7, top_p=1.0, stop=None, tools=None,
                                    response_format=None) -> AsyncGenerator[str, None]:
         self._enter_request()
+        # Pod acquire may provision (blocking) — do it off the event loop.
+        base, release = await asyncio.to_thread(self._acquire_endpoint)
         try:
             payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, True)
             if tools:
                 payload["tools"] = tools
-            async for chunk in self._stream(self._base() + "/chat/completions", payload,
+            async for chunk in self._stream(base + "/chat/completions", payload,
                                             delta_key="delta"):
                 yield chunk
         finally:
+            release()
             self._exit_request()
 
     # ------------------------------------------------------------------ #

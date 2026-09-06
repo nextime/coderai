@@ -638,7 +638,12 @@ class FrontProxy:
                        "load_status_updates": m.get("load_status_updates"),
                        # Per-model wait-keepalive mode (None = inherit global
                        # models.wait_status_mode): silent | invisible | visible.
-                       "wait_status_mode": m.get("wait_status_mode")}
+                       "wait_status_mode": m.get("wait_status_mode"),
+                       # Optional burst-to-RunPod spillover config for a LOCAL model
+                       # (enabled + triggers + serverless target). Used by the front
+                       # to reroute when local can't serve.
+                       "runpod_spillover": (m.get("runpod_spillover")
+                                            if isinstance(m.get("runpod_spillover"), dict) else None)}
                 for field_ in (m.get("path"), m.get("id"), m.get("alias")):
                     if not field_:
                         continue
@@ -667,6 +672,68 @@ class FrontProxy:
             })
         except Exception:
             pass
+
+    async def _spill_to_runpod(self, model, trigger, request, path, body_bytes):
+        """Burst a request to a RunPod SERVERLESS spillover target when the local
+        model can't serve it. Returns a Response/StreamingResponse on spill, or None
+        to keep normal (local) behaviour.
+
+        A serverless endpoint is OpenAI-compatible, so this is a plain reverse-proxy
+        hop to a remote HTTPS URL with a Bearer header — no request parsing. Fully
+        guarded: any problem returns None so the caller falls back to local.
+        (Pods-target spillover routes through the engine and is not handled here.)
+        """
+        try:
+            if not (model and body_bytes):
+                return None
+            sp = self._model_info(model).get("runpod_spillover")
+            if not isinstance(sp, dict) or not sp.get("enabled"):
+                return None
+            if not sp.get(trigger):
+                return None
+            target = sp.get("target") if isinstance(sp.get("target"), dict) else {}
+            if (target.get("mode") or "serverless").lower() != "serverless":
+                return None   # pods-target spill goes through the engine, not here
+            rp = getattr(self.config, "runpod", None)
+            if rp is None or not getattr(rp, "enabled", False) or not getattr(rp, "api_key", ""):
+                return None
+            eid = (target.get("endpoint_id") or "").strip()
+            if not eid:
+                return None
+            # /v1/chat/completions -> <serverless_base>/<eid>/openai/v1/chat/completions
+            p = path.split("?", 1)[0]
+            suffix = p[len("/v1"):] if p.startswith("/v1/") else "/chat/completions"
+            base = (getattr(rp, "serverless_base", "") or "https://api.runpod.ai/v2").rstrip("/")
+            url = f"{base}/{eid}/openai/v1{suffix}"
+            # Rewrite the model to the target's served name, if set.
+            body = body_bytes
+            served = (target.get("served_model") or "").strip()
+            if served:
+                try:
+                    import json as _j
+                    obj = _j.loads(body_bytes or b"{}")
+                    if isinstance(obj, dict):
+                        obj["model"] = served
+                        body = _j.dumps(obj).encode()
+                except Exception:
+                    body = body_bytes
+            headers = {"Authorization": f"Bearer {rp.api_key}",
+                       "Content-Type": "application/json"}
+            print("[runpod-spill] model=%s trigger=%s -> serverless %s"
+                  % (model, trigger, eid), flush=True)
+            rp_req = self._long.build_request("POST", url, headers=headers, content=body)
+            rp_resp = await self._long.send(rp_req, stream=True)
+            return StreamingResponse(
+                rp_resp.aiter_raw(), status_code=rp_resp.status_code,
+                headers=dict(self._filter_headers(rp_resp.headers, _DROP_RESP)),
+                media_type=rp_resp.headers.get("content-type"),
+                background=BackgroundTask(rp_resp.aclose))
+        except Exception as exc:
+            try:
+                print("[runpod-spill] failed, falling back to local: %s" % exc, flush=True)
+            except Exception:
+                pass
+            return None
 
     def _queue_key(self, model: Optional[str]) -> str:
         """Stable gate key for a model: its canonical id (so every alias/path of
@@ -824,6 +891,13 @@ class FrontProxy:
         """Per-model concurrency = its max_instances, falling back to the global
         server default. This is the number of front queue slots for the model."""
         info = self._model_info(model)
+        # RunPod-served models run on REMOTE GPUs with their own pod-level scaling
+        # (max_pods) — they must bypass the LOCAL global concurrency gate, which
+        # exists to protect local VRAM. Return an effectively-unlimited local cap so
+        # the front never queues them behind the small local default; RunPod's own
+        # max_pods / serverless workers are the real limit.
+        if (info.get("backend") or "").lower() == "runpod":
+            return 1_000_000
         mi = info.get("max_instances")
         if mi:
             try:
@@ -1877,6 +1951,11 @@ class FrontProxy:
             default_engine=self.default_engine, pinned=self._pin_for(model),
             pin_fallback=bool(self._model_info(model).get("engine_fallback")))
         if engine is None:
+            # No local engine can serve it (none ready / no GPU meeting specs).
+            # If this model has RunPod spillover for that case, burst to the cloud.
+            spilled = await self._spill_to_runpod(model, "on_no_gpu", request, path, body_bytes)
+            if spilled is not None:
+                return spilled
             return JSONResponse(
                 {"error": "No engine is ready yet (still starting/loading)."},
                 status_code=503)
@@ -1935,6 +2014,12 @@ class FrontProxy:
                     rid=engine.name + ":" + (model or ""), model=model or "",
                     engine=engine.name)
             except QueueFull:
+                # Local model at capacity — burst to RunPod if spillover is enabled
+                # for the concurrency case; else 503.
+                spilled = await self._spill_to_runpod(
+                    model, "on_concurrency_full", request, path, body_bytes)
+                if spilled is not None:
+                    return spilled
                 return JSONResponse(
                     {"error": "Server busy: the generation queue is full, "
                               "please retry shortly."}, status_code=503)
