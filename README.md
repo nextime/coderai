@@ -6,6 +6,11 @@
 
 A multimodal and multi-backend local model orchestrator with an OpenAI-compatible API server to run models on local GPUs, supporting multiple GPU backends: NVIDIA (CUDA), AMD (Vulkan), and Intel (Vulkan). Configuration-driven architecture with per-model settings and full multi-modal support.
 
+Text, images, video, speech, embeddings, OCR and LoRA training behind one API — served by
+whichever runtime each model actually needs, from PyTorch to native C MoE engines that
+stream a multi-terabyte model off disk, to a GPU **rented by the second** when the local
+one isn't enough.
+
 ## Features
 
 ### Core Capabilities
@@ -30,6 +35,57 @@ A multimodal and multi-backend local model orchestrator with an OpenAI-compatibl
 - **Intel GPUs**: iGPU/Arc support via Vulkan
 - **Auto-Detection**: Automatically selects best available backend
 - **Multi-GPU**: Automatic distribution across multiple devices
+- **Front / Engine Split**: A torch-free front proxy supervises one engine subprocess per
+  GPU, so the UI stays responsive while an engine is loading or generating
+
+### Inference Engines
+
+Beyond the built-in `transformers` and `gguf` paths, CoderAI can drive external native
+engines — each selected **per model** with a `backend` pin in `models.json`. They exist so a
+frontier-size MoE model can run on hardware that "shouldn't" be able to hold it, or so a
+model can be served with far higher concurrency.
+
+| `backend` | Engine | What it's for |
+|---|---|---|
+| `transformers` | PyTorch + HF Transformers | safetensors models on CUDA |
+| `gguf` | llama.cpp | GGUF models on CUDA or Vulkan |
+| `ds4` | [ds4 / DwarfStar](https://github.com/antirez/ds4) | DeepSeek-V4, native C/CUDA engine with its own OpenAI server |
+| `colibri` | [colibri](https://github.com/JustVugg/colibri) | GLM-5.2 / DeepSeek-V4 / Kimi-K3 — pure-C MoE engine streaming experts from disk; driven directly over its stdin/stdout mux protocol |
+| `k3` | [kimi-k3-in-c](https://github.com/FareedKhan-dev/kimi-k3-in-c) | Kimi-K3 (2.78T params) on **CPU**, streaming trunk + experts from disk in as little as ~8 GB RAM |
+| `kt` | [ktransformers](https://github.com/kvcache-ai/ktransformers) via SGLang | CPU+GPU heterogeneous MoE (DeepSeek / Kimi / Qwen / GLM / MiniMax) |
+| `vllm` | [vLLM](https://github.com/vllm-project/vllm) | continuous batching + paged KV for high aggregate throughput; runs in an isolated venv |
+| `runpod` | RunPod | a **remote rented GPU** — see below |
+
+CoderAI owns the full lifecycle of each: build, weight download, process supervision,
+health, VRAM co-tenancy and teardown. `ds4`, `kt`, `vllm` and `runpod` are HTTP-proxy
+backends; `colibri` and `k3` are driven over a native wire protocol. `vllm` also appears as
+a **first-class engine node** on the engines/tasks pages, alongside `nvidia` and `radeon`.
+
+See [`docs/`](docs/) for a per-engine guide.
+
+### Remote GPUs (RunPod)
+
+A model can be served on a **rented cloud GPU** instead of local hardware — same
+`/v1/models` entry, same `/v1/chat/completions`, same Tasks page, but the weights never
+touch your disk. Two per-model modes:
+
+- **Pods** — CoderAI provisions, health-checks, load-balances, scales and destroys the GPU
+  containers itself, with GPU/price/VRAM selection, spot support, capacity fallback and
+  stuck-boot retry.
+- **Serverless** — CoderAI proxies to a RunPod serverless endpoint you already created.
+
+Plus:
+- **Cost controls**: per-model and global `$/hr` rate caps, and cumulative spend budgets over
+  a trailing `hour`/`day`/`week`/`month` window, on a persistent ledger
+- **Cold start & idle teardown**: pods serve many requests, then self-destruct a configurable
+  time after the last one
+- **Stale-pod reaper**: a maintenance loop identifies pods this deployment created and
+  terminates any that shouldn't exist, so a crash can never leave a GPU billing
+- **Spillover**: a *local* model can burst to RunPod only when the local GPU is full or absent
+- **No local model required**: an instance with no GPU and no local weights can run purely as
+  a RunPod orchestrator
+
+Full guide: [`docs/runpod.md`](docs/runpod.md).
 
 ### Image Generation
 - **Text-to-Image**: Stable Diffusion, SDXL, Flux, and GGUF image models (via stable-diffusion.cpp)
@@ -61,11 +117,94 @@ A multimodal and multi-backend local model orchestrator with an OpenAI-compatibl
 
 ### Audio
 - **Text-to-Speech**: Kokoro TTS with voice selection and speed control
-- **Speech-to-Text**: Whisper transcription (faster-whisper / whispercpp)
 - **Music/SFX Generation**: MusicGen, AudioGen, AudioLDM2
 - **Voice Cloning**: F5-TTS zero-shot voice cloning from a reference audio clip
 - **Voice Conversion (SVC)**: Seed-VC — converts timbre while preserving pitch, melody and expression; **singing mode** for music
-- **Voice Profiles**: Save named voice profiles (reference audio + transcript) for reuse; voice profiles can now be extracted directly from video files and updated via PATCH
+- **Voice Profiles**: Save named voice profiles (reference audio + transcript) for reuse; voice profiles can be extracted directly from video files and updated via PATCH
+- **Stem Separation**: Demucs vocals/instrumental or 4-stem split (`/v1/audio/stems`)
+- **Restoration**: DeepFilterNet denoise, normalise, de-hum, de-click (`/v1/audio/cleanup`)
+
+### Speech-to-Text and Speaker Recognition
+
+`/v1/audio/transcriptions` is not tied to one Whisper implementation. The **STT backend is
+chosen per model** with the model entry's `backend` key:
+
+| `backend` | Engine | Notes |
+|---|---|---|
+| *(unset)* | whisper.cpp server → faster-whisper → whispercpp | the default fallback chain |
+| `whisper-server` | whisper.cpp GGUF | per-model runner; counts as a model load and is VRAM-evictable |
+| `whisper-hf` | CrisperWhisper (HF) | verbatim transcription with word timestamps; isolated venv |
+| `crisperwhisper` | CrisperWhisper worker | isolated venv, long-form overlap windowing |
+| `wav2vec2` | Wav2Vec2 (HF) | FP16 on GPU |
+| `vosk` | Vosk | CPU, per-language model directory |
+| `nemo` | NVIDIA NeMo (Canary / Parakeet) | isolated venv; the **translation-capable** family |
+
+- **Per-model languages**: a model entry can declare a `languages` list; a request for an
+  unlisted language is rejected with the allowed list, and `/v1/models` surfaces it
+- **Translation**: `target_language` on a model with `supports_translation: true`
+- **Word timestamps**: `timestamp_granularities=word` → a top-level `words[]`
+- **Diarization**: `diarize=true` tags every segment with a `speaker`, or call
+  `/v1/audio/diarization` directly (pyannote in an isolated venv, ungated-first with an
+  `HF_TOKEN` fallback)
+- **Speaker recognition**: enrol named voiceprints and then **identify** or **verify** a
+  voice (`ecapa` / `pyannote` / `wespeaker` backends). Diarization with `identify=true`
+  relabels the turns with the enrolled names instead of `SPEAKER_00`
+- **VRAM-aware**: every STT backend participates in VRAM eviction; `keep_resident: true`
+  keeps a small model co-resident
+
+### Embeddings and Reranking
+
+`/v1/embeddings` covers far more than text. The backend is inferred from the model itself:
+
+| Family | Serves |
+|---|---|
+| sentence-transformers / transformers | general text embeddings |
+| **BGE-M3** | native multi-vector: `dense`, `sparse` (lexical weights) and `colbert` (per-token) in one pass |
+| CLIP / vision (DINOv2, ViT) | image embeddings |
+| **GME-Qwen2-VL** | text and image in one shared space (native loader, no `trust_remote_code`) |
+| GGUF via llama.cpp | `llama` and `llama-vl` (with an `mmproj`) |
+| dinov2.cpp | GGUF DINOv2 through a `dinov2-embed` subprocess (Vulkan/CPU) |
+| **GeoCLIP** | `geoclip` (image) and `geoclip-location` (`"lat,lon"`) in one shared 512-d space — image geolocation |
+| **VPR** | `vpr` / EigenPlaces (2048-d) and `salad` / DINOv2-SALAD (8448-d, isolated venv) for visual place recognition |
+
+Request extras: `image` (URL, data URI, path or base64), `embedding_types` to pick
+dense/sparse/colbert, `dimensions` to truncate, and `quantization` (TurboQuant `turbo8` …
+`turbo2`) for packed low-bit vectors.
+
+**`POST /v1/rerank`** adds cross-encoder reranking (e.g. `bge-reranker-v2-m3`) — query +
+documents in, `relevance_score` per document out. No extra dependency; rerankers are
+registered in the embedding model category.
+
+### Document OCR
+
+A dedicated OCR subsystem (`/v1/ocr`) — real OCR engines, **not** a VLM prompted to read:
+
+- **Engines**: `doctr` (in-process), `paddle` (PaddleOCR + PP-Structure layout/tables, isolated
+  venv) and `surya` (opt-in, GPL; local, vLLM-served Surya-2, or an external llama-server)
+- **Input**: images or PDFs (rasterised at a configurable DPI), single or batch
+- **Output**: full text plus per-page `lines[]` with bounding boxes and confidence,
+  `regions[]` (layout) and `tables[]`
+- **Structured extraction**: `structured=true` runs a text model against a **schema** —
+  a JSON document, not code — to return typed fields. Schemas are data-driven and stored in
+  `<config>/ocr_schemas/`; built-ins cover `italian_sentenza`, `generic_document` and an
+  `invoice` JSON Schema (optionally validated)
+- **Stamp / signature detection**: `detect=layout|detector|both` — layout-marker matching
+  (EN + IT) and/or a small YOLO detector. It **locates** stamps and signatures; it does not
+  verify them
+- Also available as an `ocr` pipeline step, so OCR → LLM chains in one call
+
+### LoRA Training
+
+Train a LoRA on your own GPU from the API or the web UI (`/v1/loras/train`):
+
+- **Image or video targets** — SD1.x/SDXL UNet, or a Wan video DiT with 4-bit QLoRA
+- **Source images** from a saved character/environment profile, or uploaded inline
+- **Content-addressed blob store** (`/v1/loras/upload`, `/v1/loras/blob/{hash}`) so a client
+  can skip re-uploading a LoRA it already sent
+- **Resumable and non-blocking**: `wait=false` returns a `job_id`; progress is pollable by
+  job or by session, jobs survive a client disconnect and are restartable from the Tasks page
+- Scheduled centrally (one training at a time) and holds the GPU reservation, so a
+  concurrent model load can't OOM the trainer
 
 ### Character Profiles
 Named collections of reference images used to condition character appearance via IP-Adapter across any image or video generation. Up to 6 profiles can be selected per generation.
@@ -109,7 +248,15 @@ Built-in multi-step pipelines callable from the API or web UI:
 
 ### Advanced Features
 - **Memory Management**: Smart VRAM → RAM → Disk offloading (NVIDIA)
-- **Quantization**: 4-bit/8-bit via bitsandbytes (NVIDIA) or GGUF quantization (Vulkan)
+- **VRAM Eviction**: Every backend — including the external engines, OCR and STT workers —
+  is eviction-tracked, so a new load reclaims VRAM from an idle tenant instead of OOM-ing
+- **Global RAM Cap**: A server-wide host-RAM ceiling with a leak watcher and LRU
+  disk-offload eviction
+- **Thermal Protection**: The front supervises GPU temperature and cooperatively pauses
+  (then, if needed, SIGSTOPs) an engine that is cooking the card
+- **GPU Swap Gate**: When engines share a GPU, same-model requests are batched before the
+  card is handed over, so two engines don't thrash
+- **Quantization**: 4-bit/8-bit via bitsandbytes, GPTQModel/Marlin fast kernels, or GGUF
 - **Flash Attention 2**: Optional faster inference for supported NVIDIA GPUs
 - **Streaming**: Server-sent events for real-time token generation
 - **Tool Calling**: Function calling and tool use support
@@ -275,12 +422,50 @@ Notes:
 - `rnnoise` and `voicefixer` are optional alternates / complements.
 - Full music-dub quality depends on separation plus singing-capable conversion; even with this stack, output quality still depends heavily on source material and model/runtime availability.
 
+> **Status note:** `/v1/pipelines/audio-music-dub` is **not complete**. Only the
+> transcription step actually runs today; the separation, translation, voice-conversion and
+> remix steps are returned as placeholders. Use `/v1/audio/stems`, `/v1/audio/convert` and
+> `/v1/pipelines/audio-dub` directly until it is finished.
+
 ### Face Swap
 
 ```bash
 pip install insightface onnxruntime-gpu
 # inswapper_128.onnx downloads automatically on first use
 ```
+
+### Optional subsystems
+
+Several subsystems pin dependencies that conflict with the main environment, so they live in
+their own requirements files and — where the conflict is unavoidable — their own virtualenv,
+built on demand from the admin UI:
+
+| File | Subsystem | Isolated venv |
+|---|---|---|
+| `requirements-ocr.txt` | OCR core + docTR | no |
+| `requirements-ocr-paddle.txt` | PaddleOCR + PP-Structure | yes |
+| `requirements-surya.txt` | Surya OCR (GPL, opt-in) | yes |
+| `requirements-vllm.txt` | vLLM engine (pins its own torch/CUDA) | yes |
+| `requirements-nemo.txt` | NVIDIA NeMo Canary/Parakeet STT | yes |
+| `requirements-crisperwhisper.txt` | CrisperWhisper verbatim STT | yes |
+| `requirements-pyannote.txt` | Speaker diarization | yes |
+
+---
+
+## Documentation
+
+The [`docs/`](docs/) directory carries the deep dives — one per engine and subsystem:
+
+| Doc | Subject |
+|---|---|
+| [`frontend-engine-split.md`](docs/frontend-engine-split.md) | Front proxy, engine subprocesses, routing |
+| [`runpod.md`](docs/runpod.md) | Renting remote GPUs: pods, serverless, budgets, the reaper |
+| [`vllm.md`](docs/vllm.md) | vLLM as a first-class engine node |
+| [`deepseek-ds4.md`](docs/deepseek-ds4.md) · [`glm-colibri.md`](docs/glm-colibri.md) · [`kimi-k3.md`](docs/kimi-k3.md) · [`ktransformers.md`](docs/ktransformers.md) | The native MoE engines |
+| [`ocr.md`](docs/ocr.md) | The OCR subsystem and schema store |
+| [`zimage-lora-training.md`](docs/zimage-lora-training.md) | LoRA training |
+| [`expressive-tts.md`](docs/expressive-tts.md) · [`dtype-auto-selection.md`](docs/dtype-auto-selection.md) · [`gguf-process-isolation.md`](docs/gguf-process-isolation.md) | Subsystem notes |
+| [`reverse-proxy-nginx.md`](docs/reverse-proxy-nginx.md) | Deploying behind nginx |
 
 ---
 
@@ -381,7 +566,39 @@ Broker notes:
 `archive.directory` — absolute path, or empty to use `<config_dir>/archive`.
 `archive.retention` — one of: `1h`, `1d`, `2d`, `1w`, `1m`, `3m`, `6m`, `1y`, `never`.
 
+Other top-level blocks, each with its own tab on the Settings page:
+
+| Block | Purpose |
+|---|---|
+| `server.engine_specs` / `engines` / `engine_gpus` | The front/engine split — how many engines, which GPU each owns, and their capabilities |
+| `ds4`, `colibri`, `k3`, `ktransformers`, `vllm` | Per-engine enablement, install dirs, model ids and build settings |
+| `runpod` | RunPod account settings and global cost caps — see [`docs/runpod.md`](docs/runpod.md) |
+| `ocr` | OCR engines, DPI, concurrency, detection mode, structured-extraction model and venv paths |
+| `broker` | AISBF broker client (below) |
+
+### Front proxy and engines
+
+By default `coderai` starts a **torch-free front proxy** on the public port plus one
+**engine subprocess per GPU** on `127.0.0.1:8780+`. The front routes each request to an
+engine that can serve the model, aggregates status and tasks, and keeps the UI responsive
+while an engine is busy loading or generating.
+
+```bash
+coderai                                     # front + auto-detected engines (default)
+coderai --single-process                    # legacy single process
+coderai --engine-only --internal-port 8780  # an engine (normally spawned by the front)
+```
+
+Engine placement precedence: a per-model `engine` pin → an engine that already has the
+model resident → `server.default_engine` → the least-loaded compatible engine. Engines bind
+localhost only and require an internal token from the front. See
+[`docs/frontend-engine-split.md`](docs/frontend-engine-split.md).
+
 ### models.json
+
+Models are grouped by category — `text_models`, `image_models`, `video_models`,
+`audio_models`, `audio_gen_models`, `tts_models`, `vision_models`, `embedding_models`,
+`gguf_models`, `spatial_models`:
 
 ```json
 {
@@ -392,6 +609,37 @@ Broker notes:
   "video_models": []
 }
 ```
+
+Useful per-entry keys:
+
+| Key | Meaning |
+|---|---|
+| `backend` | Compute backend / engine pin: `auto`, `nvidia`, `vulkan`, `opencl`, `cpu`, or an engine (`colibri`, `ds4`, `k3`, `kt`, `vllm`, `runpod`), or an STT family (`whisper-server`, `whisper-hf`, `crisperwhisper`, `wav2vec2`, `vosk`, `nemo`) |
+| `engine` / `engine_fallback` | Pin the model to a named engine node (e.g. `nvidia`, `radeon`) |
+| `alias` | The name clients use — **required** to tell sibling configs apart |
+| `config_id` / `config_name` | Identity and label of one config of a model (see below) |
+| `capabilities` | e.g. `["reranking"]`, `["embeddings"]` |
+| `languages` / `supports_translation` | STT language allow-list and translation support |
+| `keep_resident` | Keep a small model co-resident instead of evicting it |
+| `embedding_types` | Default vector types for a multi-vector embedder |
+| `lora_train_base_model` | The UNet model this model's LoRAs are trained against |
+| `runpod` / `runpod_spillover` | RunPod placement and cloud-burst config |
+
+`measured_vram_gb`, `measured_ram_gb` and `measured_n_gpu_layers` are written back at
+runtime — CoderAI learns each model's real footprint and reuses it on the next load.
+
+#### Multiple configurations of one model
+
+The same weights can be registered more than once with different settings. Each entry gets
+a `config_id`, an optional `config_name` label, and a distinct **`alias`** — the alias is
+what makes the sibling addressable, so two configs without distinct aliases collapse into
+one. A real example: one `whisper-large-v3-q8_0.gguf` file registered three times as
+`whisper0`, `whisper1` and `whisper2`, pinned to different engine nodes so transcription
+runs in parallel across two GPUs. Or one GGUF LLM registered twice with different context
+sizes (`lisa`, `lisa-32k`).
+
+Create one from the Models page with the "new config" action; runtime-measured values are
+persisted per `config_id`, so the configs don't overwrite each other.
 
 ---
 
@@ -404,7 +652,9 @@ Broker notes:
 | `GET /v1/models` | List available models |
 | `POST /v1/chat/completions` | Chat completions (streaming supported) |
 | `POST /v1/completions` | Text completions |
-| `POST /v1/embeddings` | Text embeddings |
+| `POST /v1/embeddings` | Embeddings — text, image, multi-vector (dense/sparse/colbert), geolocation, VPR |
+| `POST /v1/rerank` | Cross-encoder reranking of documents against a query |
+| `GET /v1/files/{filename}` | Fetch a generated file |
 
 ### Image
 
@@ -441,8 +691,17 @@ Broker notes:
 | Endpoint | Description |
 |---|---|
 | `POST /v1/audio/speech` | Text-to-speech (supports `voice_profile` for F5-TTS cloning) |
-| `POST /v1/audio/transcriptions` | Speech-to-text (Whisper) |
+| `POST /v1/audio/transcriptions` | Speech-to-text — `language`, `target_language`, `timestamp_granularities`, `diarize` |
+| `POST /v1/audio/diarization` | Who spoke when — optionally `identify` against enrolled speakers |
+| `POST /v1/audio/speaker-embeddings` | Voiceprint vectors (`ecapa`/`pyannote`/`wespeaker`, optional sliding `window`) |
+| `GET \| POST /v1/audio/speakers` | List or enrol named speakers |
+| `DELETE /v1/audio/speakers/{name}` | Remove an enrolled speaker |
+| `POST /v1/audio/speaker-identify` | Best-matching enrolled speaker, or `unknown` |
+| `POST /v1/audio/speaker-verify` | Verify a clip against one enrolled speaker |
+| `POST /v1/audio/stems` | Stem separation (Demucs) — vocals/instrumental or 4-stem |
+| `POST /v1/audio/cleanup` | Denoise / normalise / de-hum / de-click (DeepFilterNet) |
 | `POST /v1/audio/generate` | Music/SFX generation |
+| `GET /v1/audio/progress` | Audio-generation progress |
 | `POST /v1/audio/clone` | Voice cloning TTS (F5-TTS) |
 | `POST /v1/audio/convert` | Voice conversion / SVC (Seed-VC) |
 | `GET /v1/audio/voices` | List saved voice profiles |
@@ -476,6 +735,26 @@ Broker notes:
 | `PATCH /v1/environments/{name}` | Update description or add/remove reference images |
 | `DELETE /v1/environments/{name}` | Delete an environment profile |
 
+### OCR
+
+| Endpoint | Description |
+|---|---|
+| `POST /v1/ocr` | Transcribe one image or PDF — `engine`, `dpi`, `structured`, `schema`, `detect` |
+| `POST /v1/ocr/batch` | Same, for many files; per-file errors are reported inline |
+| `GET \| POST /v1/ocr/schemas` | List or create structured-extraction schemas |
+| `GET \| PUT \| DELETE /v1/ocr/schemas/{name}` | Read, replace or delete a schema |
+
+### LoRA Training
+
+| Endpoint | Description |
+|---|---|
+| `POST /v1/loras/train` | Train a LoRA (image or video target); `wait=false` for a job id |
+| `GET /v1/loras/progress` | Progress by `job`, by `session`, or a global snapshot |
+| `POST /v1/loras/upload` | Upload a LoRA into the content-addressed blob store |
+| `GET /v1/loras/blob/{hash}` | Check whether a blob is already stored |
+| `GET \| DELETE /v1/loras/{name}` | Read or delete a registered LoRA |
+| `GET /v1/loras` | List registered LoRAs |
+
 ### 3D Generation
 
 | Endpoint | Description |
@@ -497,6 +776,8 @@ Broker notes:
 | `POST /v1/pipelines/video-dub` | Full video dubbing pipeline |
 | `POST /v1/pipelines/story` | LLM → images → video → TTS |
 | `POST /v1/pipelines/audio-dub` | Audio/video dub with voice cloning |
+| `POST /v1/pipelines/audio-understand` | Transcribe audio, then answer a question about it with a text model |
+| `POST /v1/pipelines/audio-music-dub` | Music dub — **partly a stub**, see the note below |
 | `GET /v1/pipelines/custom` | List custom pipelines |
 | `POST /v1/pipelines/custom` | Create custom pipeline |
 | `PUT /v1/pipelines/custom/{id}` | Update custom pipeline |
@@ -585,7 +866,9 @@ Fields per dialog line: `character` (profile name for lip-sync face selection), 
 
 Template variables: `{{input}}`, `{{stepN.output}}`, `{{stepN.url}}`.
 
-Available step types: `text_gen`, `image_gen`, `image_edit`, `image_inpaint`, `image_upscale`, `image_deblur`, `image_unpix`, `image_outfit`, `image_faceswap`, `image_to3d`, `video_gen`, `video_upscale`, `video_sub`, `video_interp`, `video_dub`, `video_to3d`, `tts`, `audio_gen`, `voice_clone`, `voice_convert`.
+Available step types: `text_gen`, `image_gen`, `image_edit`, `image_inpaint`, `image_upscale`, `image_deblur`, `image_unpix`, `image_outfit`, `image_faceswap`, `image_to3d`, `video_gen`, `video_upscale`, `video_sub`, `video_interp`, `video_dub`, `video_to3d`, `tts`, `audio_gen`, `voice_clone`, `voice_convert`, `ocr`.
+
+Call `GET /v1/pipelines/step-types` for the authoritative list on your build.
 
 ---
 
