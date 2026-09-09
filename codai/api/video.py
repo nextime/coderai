@@ -3635,23 +3635,29 @@ async def _maybe_build_identity_keyframe(request: VideoGenerationRequest,
         payload["seed"] = request.seed
 
     try:
-        import json as _json
-        from codai.broker.asgi_bridge import execute_api_request
         why = "forced by keyframe_identity=always" if setting == 'always' \
               else "this video model has no IP-Adapter"
         print(f"  [video][identity] rendering IP-Adapter keyframe for "
               f"{request.character_profiles or request.character_names or 'references'}"
               f" ({why})", flush=True)
-        resp = await execute_api_request(
-            http_request, method="POST", path="/v1/images/generations",
-            headers={"Content-Type": "application/json"},
-            body=_json.dumps(payload).encode())
-        if resp["status_code"] >= 400:
-            raise RuntimeError(resp["body"].decode()[:300])
-        data = _json.loads(resp["body"]).get("data", [])
-        b64 = (data[0].get("b64_json") if data else None)
+        # Call the image handler IN-PROCESS rather than routing back through the
+        # front. The front's GPU-swap gate has already made this video model the
+        # GPU owner for this request, so a nested HTTP call for a *different* model
+        # queues behind the very request that is waiting on it — a self-deadlock
+        # (observed: "[gpu-swap] queued 'sdxl' behind owner 'wan…'", GPU at 0%).
+        # In-process, the engine's own model manager handles the load/evict.
+        from codai.api.images import create_image_generation
+        from codai.pydantic.imagerequest import ImageGenerationRequest
+        resp = await create_image_generation(
+            ImageGenerationRequest(**payload), http_request)
+        data = getattr(resp, 'data', None)
+        if data is None and isinstance(resp, dict):
+            data = resp.get('data')
+        item = (data or [None])[0]
+        b64 = (item.get('b64_json') if isinstance(item, dict)
+               else getattr(item, 'b64_json', None))
         if not b64:
-            raise RuntimeError("image endpoint returned no b64_json")
+            raise RuntimeError("image generation returned no b64_json")
     except Exception as exc:
         msg = (f"character identity keyframe could not be rendered ({exc}); "
                f"identity falls back to the prompt hint and any per-character LoRA")
