@@ -63,8 +63,93 @@ def _run_ffmpeg(command):
         raise HTTPException(status_code=500, detail=detail)
 
 
+def _deepfilter_denoise(src: str, dst: str) -> str:
+    """DeepFilterNet speech enhancement. Raises ImportError when unavailable."""
+    from df.enhance import enhance, init_df, load_audio, save_audio  # noqa: F401
+
+    model, df_state, _ = init_df()
+    audio, _meta = load_audio(src, sr=df_state.sr())
+    enhanced = enhance(model, df_state, audio)
+    # save_audio() appends the suffix itself, so hand it the stem.
+    stem = dst[:-4] if dst.endswith(".wav") else dst
+    save_audio(stem, enhanced, df_state.sr())
+    return dst if os.path.exists(dst) else stem + ".wav"
+
+
+def _voicefixer_restore(src: str, dst: str) -> str:
+    """VoiceFixer general restoration. Raises ImportError when unavailable."""
+    from voicefixer import VoiceFixer
+
+    VoiceFixer().restore(input=src, output=dst, cuda=False, mode=0)
+    return dst
+
+
 def restore_with_provider(audio_bytes: bytes, options: dict, workdir: str) -> dict:
-    raise HTTPException(status_code=501, detail="ML audio restoration backend not installed")
+    """Real ML restoration.
+
+    DeepFilterNet is the primary denoiser; VoiceFixer is the fallback for clips it
+    can't handle. The remaining requested operations (hum removal, click repair,
+    loudness normalisation) are DSP, so they are applied with ffmpeg *after* the
+    learned pass rather than being skipped.
+    """
+    src = os.path.join(workdir, "input.wav")
+    with open(src, "wb") as handle:
+        handle.write(audio_bytes)
+
+    enhanced = os.path.join(workdir, "enhanced.wav")
+    engine = None
+    errors = []
+    if options.get("noise_reduction", True):
+        for name, fn in (("deepfilternet", _deepfilter_denoise),
+                         ("voicefixer", _voicefixer_restore)):
+            try:
+                enhanced = fn(src, enhanced)
+                engine = name
+                break
+            except ImportError as exc:
+                errors.append(f"{name}: {exc}")
+            except Exception as exc:
+                errors.append(f"{name} failed: {exc}")
+        if engine is None:
+            raise HTTPException(
+                status_code=501,
+                detail="ML audio restoration needs deepfilternet or voicefixer "
+                       "(" + "; ".join(errors) + "). Run: pip install deepfilternet — "
+                       "or call /v1/audio/cleanup with fallback_mode=true for the "
+                       "ffmpeg filter chain.")
+        applied = ["noise_reduction"]
+    else:
+        enhanced, applied = src, []
+
+    # DSP touch-ups the learned model doesn't do.
+    filters = []
+    if options.get("remove_hum"):
+        filters.append("highpass=f=60,lowpass=f=15000")
+        applied.append("remove_hum")
+    if options.get("repair_clicks"):
+        filters.append("adeclick=t=40")
+        applied.append("repair_clicks")
+    if options.get("normalize"):
+        filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+        applied.append("normalize")
+
+    out = enhanced
+    if filters:
+        out = os.path.join(workdir, "cleaned.wav")
+        _run_ffmpeg([_ffmpeg_binary(), "-y", "-i", enhanced, "-af", ",".join(filters), out])
+
+    if not applied:
+        raise HTTPException(status_code=400, detail="Select at least one cleanup operation")
+
+    return {
+        "path": out,
+        "engine": engine or "ffmpeg-filter-chain",
+        "applied": applied,
+        "limitations": [
+            "tuned for speech; music and wide-band material may be dulled",
+            "severe clipping or codec damage is not fully recoverable",
+        ],
+    }
 
 
 def _cleanup_audio(audio_bytes: bytes, options: dict, workdir: str) -> dict:

@@ -63,8 +63,126 @@ def _run_ffmpeg(command: List[str]):
         raise HTTPException(status_code=500, detail=detail)
 
 
+#: demucs stem order; "other" carries everything that is not drums/bass/vocals.
+_DEMUCS_STEMS = ("drums", "bass", "other", "vocals")
+
+
+def _demucs_separate(src: str, workdir: str) -> dict:
+    """Run demucs on ``src`` and write one wav per stem into ``workdir``.
+
+    Returns ``{stem_name: path}``. Prefers the in-process ``demucs.api`` (demucs 4.x)
+    and falls back to the CLI for builds that don't ship it. Raises ImportError when
+    demucs isn't installed at all, so the caller can report a clean 501.
+    """
+    try:
+        from demucs.api import Separator, save_audio
+    except ImportError:
+        return _demucs_separate_cli(src, workdir)
+
+    separator = Separator()          # default model (htdemucs)
+    _origin, stems = separator.separate_audio_file(src)
+    out = {}
+    for name, tensor in stems.items():
+        path = os.path.join(workdir, f"{name}.wav")
+        save_audio(tensor, path, samplerate=separator.samplerate)
+        out[name] = path
+    return out
+
+
+def _demucs_separate_cli(src: str, workdir: str) -> dict:
+    """Fallback path: drive demucs through its CLI (`python -m demucs`)."""
+    import sys
+
+    outdir = os.path.join(workdir, "demucs")
+    proc = subprocess.run(
+        [sys.executable, "-m", "demucs", "-o", outdir, src],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        if "No module named" in detail:
+            raise ImportError(detail)
+        raise HTTPException(status_code=500, detail=f"demucs failed: {detail[-500:]}")
+
+    # demucs writes <outdir>/<model>/<track-name>/<stem>.wav
+    out = {}
+    for root, _dirs, files in os.walk(outdir):
+        for fn in files:
+            stem = os.path.splitext(fn)[0]
+            if stem in _DEMUCS_STEMS:
+                out[stem] = os.path.join(root, fn)
+    if not out:
+        raise HTTPException(status_code=500, detail="demucs produced no stems")
+    return out
+
+
+def _mix_down(paths: List[str], dest: str) -> str:
+    """Sum several stems into one file (used to rebuild the instrumental)."""
+    ffmpeg = _ffmpeg_binary()
+    if len(paths) == 1:
+        _run_ffmpeg([ffmpeg, "-y", "-i", paths[0], dest])
+        return dest
+    cmd = [ffmpeg, "-y"]
+    for p in paths:
+        cmd += ["-i", p]
+    cmd += ["-filter_complex",
+            f"amix=inputs={len(paths)}:duration=longest:normalize=0",
+            dest]
+    _run_ffmpeg(cmd)
+    return dest
+
+
 def separate_with_provider(audio_bytes: bytes, stem_mode: str, workdir: str) -> dict:
-    raise HTTPException(status_code=501, detail="ML stem separation backend not installed")
+    """Real ML source separation via demucs.
+
+    ``vocals-instrumental`` keeps demucs' vocals stem and sums drums+bass+other back
+    into a single instrumental bed — which is what a music dub needs. ``4-stem``
+    returns demucs' four stems as-is.
+    """
+    src = os.path.join(workdir, "input.wav")
+    with open(src, "wb") as handle:
+        handle.write(audio_bytes)
+
+    try:
+        stems = _demucs_separate(src, workdir)
+    except ImportError:
+        raise HTTPException(
+            status_code=501,
+            detail="ML stem separation needs demucs. Run: pip install demucs "
+                   "(or call /v1/audio/stems with fallback_mode=true for the "
+                   "best-effort ffmpeg split).")
+
+    mode = stem_mode or "vocals-instrumental"
+    if mode == "vocals-instrumental":
+        vocals = stems.get("vocals")
+        backing = [p for name, p in stems.items() if name != "vocals"]
+        if not vocals or not backing:
+            raise HTTPException(status_code=500,
+                                detail="demucs did not return the expected stems")
+        instrumental = _mix_down(sorted(backing),
+                                 os.path.join(workdir, "instrumental.wav"))
+        artifacts = [
+            {"name": "vocals", "path": vocals, "role": "lead-vocal"},
+            {"name": "instrumental", "path": instrumental, "role": "backing-track"},
+        ]
+    elif mode == "4-stem":
+        artifacts = [{"name": n, "path": stems[n], "role": n}
+                     for n in _DEMUCS_STEMS if n in stems]
+        if not artifacts:
+            raise HTTPException(status_code=500, detail="demucs returned no stems")
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported stem_mode: {mode}")
+
+    return {
+        "stem_mode": mode,
+        "artifacts": artifacts,
+        "engine": "demucs",
+        "model": "htdemucs",
+        "limitations": [
+            "separation quality depends on the source mix",
+            "bleed between stems is normal on dense mixes",
+        ],
+    }
 
 
 def _split_audio(audio_bytes: bytes, mode: str, workdir: str) -> dict:

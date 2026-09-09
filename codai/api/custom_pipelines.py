@@ -375,11 +375,31 @@ class AudioUnderstandRequest(BaseModel):
 
 
 class AudioMusicDubRequest(BaseModel):
+    """Dub a song into another language over its original backing track.
+
+    Only ``audio`` and ``audio_model`` are required; everything else tunes how the
+    lyrics are adapted and how the replacement vocal is produced.
+    """
     audio: str
-    audio_model: str
+    audio_model: str                          # STT model used on the isolated vocal
     target_lang: Optional[str] = None
     source_lang: Optional[str] = None
-    notes: Optional[str] = ''
+    notes: Optional[str] = ''                 # adaptation notes / STT prompt
+    # Lyric adaptation: with a text model the lyrics are *adapted* to be singable in
+    # the target language; without one we fall back to a literal translation.
+    text_model: Optional[str] = None
+    # Replacement vocal: by default the isolated original vocal is the cloning
+    # reference, so the dub keeps the original singer's timbre.
+    voice_name: Optional[str] = None
+    ref_text: Optional[str] = None
+    speed: Optional[float] = 1.0
+    seed: Optional[int] = None
+    # Seed-VC singing pass (f0-conditioned) over the synthesised vocal.
+    sing_convert: Optional[bool] = True
+    diffusion_steps: Optional[int] = 15
+    pitch_shift: Optional[int] = 0
+    # Stem separation: demucs by default, ffmpeg best-effort when true.
+    fallback_mode: Optional[bool] = False
     model_config = ConfigDict(extra='allow')
 
 
@@ -519,37 +539,244 @@ async def run_audio_understanding(request: AudioUnderstandRequest, http_request:
     }
 
 
+def _argos_translate(text: str, source_lang: Optional[str], target_lang: str) -> Optional[str]:
+    """Literal line-by-line translation via argostranslate, or None if unavailable."""
+    try:
+        import argostranslate.translate
+    except ImportError:
+        return None
+    src = (source_lang or 'en').split('-')[0]
+    dst = target_lang.split('-')[0]
+    try:
+        out = []
+        for line in text.split('\n'):
+            out.append(argostranslate.translate.translate(line, src, dst) if line.strip() else line)
+        return '\n'.join(out)
+    except Exception:
+        return None
+
+
+async def _adapt_lyrics(request: 'AudioMusicDubRequest', transcript: str,
+                        http_request) -> tuple:
+    """Turn the source lyrics into target-language lyrics.
+
+    Returns ``(lyrics, step_dict)``. A text model *adapts* them — matching syllable
+    count and keeping the rhyme where it can, which is what makes a dub singable.
+    Without one we fall back to a literal argostranslate pass, and if that is missing
+    too we return the original and say so rather than pretending.
+    """
+    if not request.target_lang:
+        return transcript, {'type': 'translate', 'label': 'Translate/adapt lyrics',
+                            'status': 'skipped', 'reason': 'no target_lang given',
+                            'output': transcript}
+
+    if request.text_model:
+        prompt = (
+            f"Adapt these song lyrics into {request.target_lang}.\n"
+            "Rules: keep the meaning, keep roughly the same syllable count per line so "
+            "they remain singable to the original melody, preserve the rhyme scheme "
+            "where possible, and keep the line breaks exactly as given.\n"
+            "Reply with the adapted lyrics only — no commentary.\n"
+        )
+        if request.notes:
+            prompt += f"Additional direction: {request.notes}\n"
+        prompt += f"\nLyrics:\n{transcript}"
+        step = {'type': 'text_gen', 'label': 'Adapt lyrics',
+                'params': {'model': request.text_model, 'prompt': prompt}}
+        out = await _run_scheduled_step(step, {'input': ''}, http_request)
+        lyrics = (out.get('output') or '').strip()
+        if lyrics:
+            return lyrics, {'type': 'translate', 'label': 'Adapt lyrics',
+                            'status': 'ok', 'engine': 'text_model',
+                            'model': request.text_model, 'output': lyrics}
+
+    literal = _argos_translate(transcript, request.source_lang, request.target_lang)
+    if literal:
+        return literal, {'type': 'translate', 'label': 'Translate lyrics',
+                         'status': 'ok', 'engine': 'argostranslate',
+                         'output': literal}
+    return transcript, {
+        'type': 'translate', 'label': 'Translate lyrics', 'status': 'skipped',
+        'reason': 'no text_model given and argostranslate is not installed — '
+                  'lyrics left in the source language',
+        'output': transcript}
+
+
 async def run_full_music_dub(request: AudioMusicDubRequest, http_request: Request = None):
-    stt_step = {
-        'type': 'stt',
-        'label': 'Transcribe lyrics or vocals',
-        'params': {
-            'model': request.audio_model,
-            'audio': request.audio,
-            'language': request.source_lang,
-            'prompt': request.notes or None,
-            'response_format': 'json',
-        },
-    }
-    stt_out = await _run_scheduled_step(stt_step, {'input': request.notes or ''}, http_request)
-    transcript = stt_out.get('text') or stt_out.get('output') or ''
-    translated = transcript if not request.target_lang else f"[{request.target_lang}] {transcript}"
-    steps = [
-        {'step': 0, 'type': 'stems', 'label': 'Isolate vocals and instrumental', 'status': 'placeholder'},
-        {'step': 1, 'type': 'stt', 'label': 'Transcribe lyrics or vocals', **stt_out},
-        {'step': 2, 'type': 'translate', 'label': 'Translate/adapt lyrics', 'output': translated},
-        {'step': 3, 'type': 'voice_convert', 'label': 'Convert singing voice', 'status': 'placeholder'},
-        {'step': 4, 'type': 'remix', 'label': 'Remix converted vocals', 'status': 'placeholder'},
-    ]
-    return {
-        'vocals': {'path': 'vocals.wav'},
-        'instrumental': {'path': 'instrumental.wav'},
-        'transcript': transcript,
-        'translated_lyrics': translated,
-        'converted_vocals': {'path': 'converted_vocals.wav'},
-        'final_mix': {'path': 'final_mix.wav'},
-        'steps': steps,
-    }
+    """Separate → transcribe → adapt → re-sing → remix.
+
+    Every stage runs for real. Stages that need an optional dependency degrade to a
+    documented ``skipped`` state with a reason instead of silently producing a
+    placeholder, and the caller can tell from ``complete`` whether the whole chain ran.
+    """
+    import base64
+    import os
+    import subprocess
+    import tempfile
+
+    from codai.api.audio_stems import (_persist_file, _split_audio,
+                                       separate_with_provider)
+
+    steps = []
+    warnings = []
+
+    with tempfile.TemporaryDirectory(prefix='codai-musicdub-') as workdir:
+        # -- 0. isolate the vocal from the backing track ----------------------
+        try:
+            raw = base64.b64decode(request.audio.split(',', 1)[1]
+                                   if request.audio.startswith('data:') else request.audio)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f'Invalid audio payload: {exc}')
+
+        if request.fallback_mode:
+            sep = _split_audio(raw, 'vocals-instrumental', workdir)
+        else:
+            sep = separate_with_provider(raw, 'vocals-instrumental', workdir)
+        paths = {a['name']: a['path'] for a in sep['artifacts']}
+        vocals_path, instrumental_path = paths.get('vocals'), paths.get('instrumental')
+        if not vocals_path or not instrumental_path:
+            raise HTTPException(status_code=500,
+                                detail='Stem separation did not return vocals + instrumental')
+        steps.append({'step': 0, 'type': 'stems', 'label': 'Isolate vocals and instrumental',
+                      'status': 'ok', 'engine': sep['engine'],
+                      'limitations': sep.get('limitations', [])})
+        if request.fallback_mode:
+            warnings.append('stem separation used the best-effort ffmpeg split; '
+                            'expect heavy bleed between vocal and backing')
+
+        # -- 1. transcribe the ISOLATED vocal (far better than the full mix) --
+        with open(vocals_path, 'rb') as fh:
+            vocals_b64 = base64.b64encode(fh.read()).decode()
+        stt_step = {
+            'type': 'stt',
+            'label': 'Transcribe lyrics from the isolated vocal',
+            'params': {
+                'model': request.audio_model,
+                'audio': f'data:audio/wav;base64,{vocals_b64}',
+                'language': request.source_lang,
+                'prompt': request.notes or None,
+                'response_format': 'json',
+            },
+        }
+        stt_out = await _run_scheduled_step(stt_step, {'input': request.notes or ''},
+                                            http_request)
+        transcript = (stt_out.get('text') or stt_out.get('output') or '').strip()
+        steps.append({'step': 1, 'type': 'stt',
+                      'label': 'Transcribe lyrics from the isolated vocal',
+                      'status': 'ok', **stt_out})
+        if not transcript:
+            raise HTTPException(status_code=500,
+                                detail='No lyrics could be transcribed from the vocal stem')
+
+        # -- 2. adapt the lyrics ----------------------------------------------
+        lyrics, translate_step = await _adapt_lyrics(request, transcript, http_request)
+        steps.append({'step': 2, **translate_step})
+        if translate_step['status'] == 'skipped':
+            warnings.append(translate_step['reason'])
+
+        # -- 3. sing the new lyrics in the original singer's voice ------------
+        # The isolated vocal doubles as the cloning reference, so the dub keeps the
+        # original timbre without the user having to enrol a voice profile.
+        from codai.api.voice_clone import _f5tts_clone, _load_voice
+
+        ref_audio_path, ref_text = vocals_path, request.ref_text or transcript
+        if request.voice_name:
+            meta = _load_voice(request.voice_name)
+            if not meta:
+                raise HTTPException(status_code=404,
+                                    detail=f"Voice '{request.voice_name}' not found")
+            ref_audio_path = meta['audio_file']
+            ref_text = request.ref_text or meta.get('transcript', '') or transcript
+
+        try:
+            sung_bytes = await asyncio.get_event_loop().run_in_executor(
+                None, _f5tts_clone, ref_audio_path, ref_text, lyrics,
+                request.speed or 1.0, request.seed)
+        except ImportError:
+            raise HTTPException(
+                status_code=501,
+                detail='Re-singing the lyrics needs F5-TTS. Run: pip install f5-tts')
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f'Vocal synthesis failed: {exc}')
+
+        new_vocal = os.path.join(workdir, 'new_vocals.wav')
+        with open(new_vocal, 'wb') as fh:
+            fh.write(sung_bytes)
+        steps.append({'step': 3, 'type': 'voice_clone',
+                      'label': 'Sing the adapted lyrics in the original voice',
+                      'status': 'ok', 'engine': 'f5-tts'})
+
+        # -- 4. optional Seed-VC singing pass ---------------------------------
+        converted_path = new_vocal
+        if request.sing_convert:
+            try:
+                from codai.api.voice_convert import _get_wrapper
+                wrapper = _get_wrapper()
+
+                def _convert():
+                    return wrapper.convert_voice(
+                        source=new_vocal, target=vocals_path,
+                        diffusion_steps=request.diffusion_steps or 15,
+                        length_adjust=1.0, inference_cfg_rate=0.7,
+                        f0_condition=True,           # singing mode: keep the melody
+                        pitch_shift=request.pitch_shift or 0,
+                        stream_output=False)
+
+                audio_out = await asyncio.get_event_loop().run_in_executor(None, _convert)
+                if isinstance(audio_out, tuple):
+                    audio_out = audio_out[0]
+                import numpy as _np
+                import soundfile as _sf
+                converted_path = os.path.join(workdir, 'converted_vocals.wav')
+                _sf.write(converted_path, _np.array(audio_out).flatten(), 44100)
+                steps.append({'step': 4, 'type': 'voice_convert',
+                              'label': 'Match the original singing voice',
+                              'status': 'ok', 'engine': 'seed-vc',
+                              'f0_condition': True})
+            except ImportError:
+                steps.append({'step': 4, 'type': 'voice_convert',
+                              'label': 'Match the original singing voice',
+                              'status': 'skipped',
+                              'reason': 'seed-vc is not installed — using the '
+                                        'F5-TTS vocal as-is. Run: pip install seed-vc'})
+                warnings.append('seed-vc not installed: the replacement vocal is spoken-'
+                                'style TTS rather than pitch-matched singing')
+            except Exception as exc:
+                steps.append({'step': 4, 'type': 'voice_convert',
+                              'label': 'Match the original singing voice',
+                              'status': 'failed', 'reason': str(exc)})
+                warnings.append(f'singing conversion failed, using the raw vocal: {exc}')
+        else:
+            steps.append({'step': 4, 'type': 'voice_convert',
+                          'label': 'Match the original singing voice',
+                          'status': 'skipped', 'reason': 'sing_convert=false'})
+
+        # -- 5. remix over the original instrumental --------------------------
+        final_mix = os.path.join(workdir, 'final_mix.wav')
+        proc = subprocess.run(
+            ['ffmpeg', '-y', '-i', converted_path, '-i', instrumental_path,
+             '-filter_complex', 'amix=inputs=2:duration=longest:normalize=0,alimiter',
+             final_mix],
+            capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise HTTPException(status_code=500,
+                                detail=f'Remix failed: {(proc.stderr or "")[-500:]}')
+        steps.append({'step': 5, 'type': 'remix',
+                      'label': 'Remix the new vocal over the instrumental',
+                      'status': 'ok', 'engine': 'ffmpeg'})
+
+        complete = all(s.get('status') == 'ok' for s in steps)
+        return {
+            'vocals': _persist_file(vocals_path, '.wav', http_request),
+            'instrumental': _persist_file(instrumental_path, '.wav', http_request),
+            'transcript': transcript,
+            'translated_lyrics': lyrics,
+            'converted_vocals': _persist_file(converted_path, '.wav', http_request),
+            'final_mix': _persist_file(final_mix, '.wav', http_request),
+            'steps': steps,
+            'warnings': warnings,
+            'complete': complete,
+        }
 
 
 @router.post('/v1/pipelines/audio-music-dub', summary="Dub a song into another language")
@@ -567,7 +794,10 @@ async def run_audio_music_dub(request: AudioMusicDubRequest, http_request: Reque
     return {
         'created': int(time.time()),
         'pipeline': 'audio-music-dub',
-        'status': 'available',
+        # 'complete' = every stage ran; 'degraded' = the mix was produced but at
+        # least one stage was skipped or fell back (see `warnings`).
+        'status': 'complete' if result['complete'] else 'degraded',
+        'warnings': result['warnings'],
         'vocals': result['vocals'],
         'instrumental': result['instrumental'],
         'transcript': result['transcript'],

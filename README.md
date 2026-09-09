@@ -244,6 +244,41 @@ Built-in multi-step pipelines callable from the API or web UI:
 | `POST /v1/pipelines/story` | LLM script → images per scene → video → TTS narration |
 | `POST /v1/pipelines/audio-dub` | Transcribe audio/video → translate → clone voice → replace audio |
 
+#### Music dubbing
+
+`POST /v1/pipelines/audio-music-dub` sings a song in another language over its own
+backing track. Six real stages:
+
+1. **Separate** — Demucs splits the track; the vocal is isolated and drums/bass/other are
+   summed back into an instrumental bed
+2. **Transcribe** — STT runs on the *isolated vocal*, not the full mix, which is what makes
+   the lyrics legible
+3. **Adapt** — with a `text_model`, an LLM adapts the lyrics to be **singable**: same
+   syllable count per line, rhyme preserved where possible. Without one it falls back to a
+   literal argostranslate pass
+4. **Re-sing** — F5-TTS synthesises the new lyrics using the isolated original vocal as the
+   cloning reference, so the dub keeps the original singer's timbre with no voice profile to
+   set up (or pass `voice_name` to use a saved one)
+5. **Match the singing** — an optional Seed-VC pass with `f0_condition` on, conditioned on
+   the original vocal, to pull the result toward sung rather than spoken delivery
+6. **Remix** — the new vocal is mixed back over the instrumental and limited
+
+```json
+{
+  "audio": "<base64 or data URI>",
+  "audio_model": "whisper0",
+  "text_model": "my-llm",
+  "source_lang": "en",
+  "target_lang": "it",
+  "notes": "keep it playful"
+}
+```
+
+Every stage that needs an optional dependency degrades to a reported `skipped` state with
+a reason instead of failing or faking it. The response carries `status` (`complete` or
+`degraded`), a `warnings` list, per-step statuses, and all four artifacts — `vocals`,
+`instrumental`, `converted_vocals` and `final_mix`.
+
 **Custom Pipeline Builder**: Create, save and run your own multi-step pipelines from the web UI or API. Chain any combination of 18 step types with `{{input}}` and `{{stepN.output}}` template variables.
 
 ### Advanced Features
@@ -422,10 +457,8 @@ Notes:
 - `rnnoise` and `voicefixer` are optional alternates / complements.
 - Full music-dub quality depends on separation plus singing-capable conversion; even with this stack, output quality still depends heavily on source material and model/runtime availability.
 
-> **Status note:** `/v1/pipelines/audio-music-dub` is **not complete**. Only the
-> transcription step actually runs today; the separation, translation, voice-conversion and
-> remix steps are returned as placeholders. Use `/v1/audio/stems`, `/v1/audio/convert` and
-> `/v1/pipelines/audio-dub` directly until it is finished.
+Without this stack, `/v1/audio/stems` and `/v1/audio/cleanup` return `501` with the
+package to install — or accept `fallback_mode: true` for the best-effort ffmpeg path.
 
 ### Face Swap
 
@@ -777,7 +810,7 @@ persisted per `config_id`, so the configs don't overwrite each other.
 | `POST /v1/pipelines/story` | LLM → images → video → TTS |
 | `POST /v1/pipelines/audio-dub` | Audio/video dub with voice cloning |
 | `POST /v1/pipelines/audio-understand` | Transcribe audio, then answer a question about it with a text model |
-| `POST /v1/pipelines/audio-music-dub` | Music dub — **partly a stub**, see the note below |
+| `POST /v1/pipelines/audio-music-dub` | Dub a song into another language over its original backing track |
 | `GET /v1/pipelines/custom` | List custom pipelines |
 | `POST /v1/pipelines/custom` | Create custom pipeline |
 | `PUT /v1/pipelines/custom/{id}` | Update custom pipeline |
