@@ -652,6 +652,30 @@ async def _apply_vae_override(pipeline, vae_model_id: str):
         _log.warning("Could not load VAE override %s: %s", vae_model_id, e)
 
 
+def ip_adapter_image_arg(pipeline, images):
+    """Shape the reference images the way diffusers expects for `ip_adapter_image`.
+
+    diffusers matches the OUTER list against the number of loaded IP-Adapters, not the
+    number of reference images. Passing a character profile's four references as a flat
+    list therefore raised
+
+      `ip_adapter_image` must have same length as the number of IP Adapters.
+      Got 4 images and 1 IP Adapters.
+
+    Several images conditioning ONE adapter have to be nested one level deeper.
+    """
+    try:
+        n_adapters = len(pipeline.unet.encoder_hid_proj.image_projection_layers)
+    except Exception:
+        n_adapters = 1
+    if n_adapters <= 1:
+        return images[0] if len(images) == 1 else [images]
+    # One (possibly multi-image) entry per loaded adapter.
+    if len(images) == n_adapters:
+        return images
+    return [images] * n_adapters
+
+
 def _ensure_ip_adapter_loaded(pipeline) -> bool:
     """Lazily load IP-Adapter weights matching the pipeline architecture.
 
@@ -700,6 +724,99 @@ def _ensure_ip_adapter_loaded(pipeline) -> bool:
     except Exception:
         pass
 
+    # Second blocker, on a 4-bit model: diffusers' _load_ip_adapter_weights() finishes
+    # with `self.to(dtype=self.dtype)` on the denoiser. That is a no-op — it casts to
+    # the dtype the module already has — but bitsandbytes refuses *any* dtype argument
+    # on a quantized model ("Casting a quantized model to a new `dtype` is
+    # unsupported"), so the whole load aborted. Make that specific no-op tolerable for
+    # the duration of the load, honouring a device move if one was also requested.
+    def _tolerate_noop_dtype_cast(module):
+        original = module.to
+
+        def _to(*args, **kwargs):
+            try:
+                return original(*args, **kwargs)
+            except (ValueError, TypeError, NotImplementedError) as exc:
+                if 'quantized model' not in str(exc).lower():
+                    raise
+                import torch as _t
+                device = kwargs.get('device')
+                if device is None:
+                    for a in args:
+                        if isinstance(a, (str, _t.device)):
+                            device = a
+                            break
+                _log.debug("IP-Adapter: ignoring same-dtype cast on quantized %s",
+                           type(module).__name__)
+                return original(device) if device is not None else module
+
+        module.to = _to
+        return original
+
+    patched = []
+    for attr in ('unet', 'transformer'):
+        mod = getattr(pipeline, attr, None)
+        if mod is not None and hasattr(mod, 'to'):
+            try:
+                patched.append((mod, _tolerate_noop_dtype_cast(mod)))
+            except Exception:
+                pass
+
+    try:
+        ok = _do_load_ip_adapter(pipeline, attempts, sliced, _log)
+    finally:
+        for mod, original in patched:
+            try:
+                mod.to = original
+            except Exception:
+                pass
+    if ok and patched:
+        # The cast we just suppressed was diffusers' way of bringing the NEWLY added
+        # IP-Adapter modules up to the model dtype. Skipping it wholesale left them in
+        # the checkpoint's fp16 against a bf16 pipeline, which fails at the first matmul
+        # ("expected mat1 and mat2 to have the same dtype: BFloat16 != Half"). So do the
+        # cast ourselves, on the non-quantized modules only.
+        _align_ip_adapter_dtype(pipeline, _log)
+    return ok
+
+
+def _align_ip_adapter_dtype(pipeline, _log) -> None:
+    """Cast the IP-Adapter modules to the pipeline's real compute dtype."""
+    dtype = None
+    for attr in ('text_encoder', 'text_encoder_2', 'vae'):
+        module = getattr(pipeline, attr, None)
+        if module is None:
+            continue
+        try:
+            dtype = next(module.parameters()).dtype
+            break
+        except (StopIteration, AttributeError):
+            continue
+    if dtype is None:
+        return
+
+    denoiser = getattr(pipeline, 'unet', None) or getattr(pipeline, 'transformer', None)
+    targets = []
+    if getattr(denoiser, 'encoder_hid_proj', None) is not None:
+        targets.append(denoiser.encoder_hid_proj)
+    if getattr(pipeline, 'image_encoder', None) is not None:
+        targets.append(pipeline.image_encoder)
+    try:                       # IPAdapterAttnProcessor holds to_k_ip / to_v_ip Linears
+        targets.extend(p for p in denoiser.attn_processors.values() if hasattr(p, 'to'))
+    except Exception:
+        pass
+
+    cast = 0
+    for target in targets:
+        try:
+            target.to(dtype=dtype)
+            cast += 1
+        except Exception:
+            pass
+    _log.info("IP-Adapter: aligned %d module(s) to %s", cast, dtype)
+
+
+def _do_load_ip_adapter(pipeline, attempts, sliced, _log) -> bool:
     for repo, subfolder, weight_name in attempts:
         try:
             pipeline.load_ip_adapter(repo, subfolder=subfolder, weight_name=weight_name)
@@ -709,6 +826,7 @@ def _ensure_ip_adapter_loaded(pipeline) -> bool:
             return True
         except Exception as e:
             _log.warning("IP-Adapter load failed (%s/%s): %s", repo, weight_name, e)
+            _log.debug("IP-Adapter load traceback", exc_info=True)
 
     if sliced:      # restore the previous memory setting — the adapter isn't loaded
         try:
@@ -977,6 +1095,32 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
     # Inject IP-Adapter images if character references provided.  The pipeline
     # must have IP-Adapter *weights* loaded first — _ensure_ip_adapter_loaded
     # lazily downloads + loads the right checkpoint for the architecture.
+    # A pipeline is cached and reused across requests. Once an IP-Adapter is attached,
+    # the UNet config carries encoder_hid_dim_type='ip_image_proj' and every later call
+    # REQUIRES image_embeds — so a plain request with no character references on the same
+    # cached pipeline died with
+    #   ... has the config param `encoder_hid_dim_type` set to 'ip_image_proj' which
+    #   requires the keyword argument `image_embeds` to be passed in `added_cond_kwargs`
+    # Detach it again when this request doesn't need it.
+    if not char_images and getattr(pipeline, '_coderai_ip_state', None) == 'loaded':
+        try:
+            # unload_ip_adapter() restores the previous attention processors, which trips
+            # the same SlicedAttnProcessor(slice_size) constructor as the load — so keep
+            # slicing off across the unload too, then restore it.
+            if hasattr(pipeline, 'disable_attention_slicing'):
+                pipeline.disable_attention_slicing()
+            pipeline.unload_ip_adapter()
+            pipeline._coderai_ip_state = None
+            _log.info("IP-Adapter unloaded (no character references this request)")
+        except Exception as _e:
+            _log.warning("Could not unload IP-Adapter: %s", _e)
+        finally:
+            if hasattr(pipeline, 'enable_attention_slicing'):
+                try:
+                    pipeline.enable_attention_slicing()   # restore the memory setting
+                except Exception:
+                    pass
+
     if char_images and hasattr(pipeline, 'set_ip_adapter_scale'):
         try:
             if _ensure_ip_adapter_loaded(pipeline):
@@ -991,7 +1135,7 @@ async def _generate_with_diffusers(pipeline, request, global_args, http_request=
                         raw = base64.b64decode(ref)
                     ref_imgs.append(PILImage.open(io.BytesIO(raw)).convert('RGB'))
                 pipeline.set_ip_adapter_scale(strength)
-                call_kwargs['ip_adapter_image'] = ref_imgs[0] if len(ref_imgs) == 1 else ref_imgs
+                call_kwargs['ip_adapter_image'] = ip_adapter_image_arg(pipeline, ref_imgs)
             else:
                 print("Note: IP-Adapter weights unavailable for this pipeline — "
                       "relying on prompt/LoRA for character consistency")

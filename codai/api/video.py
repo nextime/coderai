@@ -1969,7 +1969,8 @@ def _apply_character_refs(kw: dict, character_references: List[str], strength: f
         imgs = [_pil_from_b64(r) for r in character_references]
         if hasattr(pipe, 'set_ip_adapter_scale'):
             pipe.set_ip_adapter_scale(strength)
-        kw['ip_adapter_image'] = imgs[0] if len(imgs) == 1 else imgs
+        from codai.api.images import ip_adapter_image_arg
+        kw['ip_adapter_image'] = ip_adapter_image_arg(pipe, imgs)
         print(f"IP-Adapter conditioning {len(imgs)} character reference(s) "
               f"at scale {strength}", flush=True)
         return True
