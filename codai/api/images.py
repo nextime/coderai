@@ -684,14 +684,37 @@ def _ensure_ip_adapter_loaded(pipeline) -> bool:
     else:
         attempts.append(("h94/IP-Adapter", "models", "ip-adapter_sd15.bin"))
 
+    # Attention slicing and IP-Adapter are mutually exclusive in diffusers: the
+    # adapter loader rebuilds every attention processor, and re-instantiating a
+    # SlicedAttnProcessor without its required slice_size raises
+    #   SlicedAttnProcessor.__init__() missing 1 required positional argument
+    # which is what silently killed every IP-Adapter load (we enable slicing for
+    # VRAM headroom). Turn it off for the load and leave it off while the adapter is
+    # in use — re-enabling would swap the IP-Adapter processors straight back out.
+    sliced = False
+    try:
+        if getattr(pipeline, '_attn_slicing_enabled', True) and \
+                hasattr(pipeline, 'disable_attention_slicing'):
+            pipeline.disable_attention_slicing()
+            sliced = True
+    except Exception:
+        pass
+
     for repo, subfolder, weight_name in attempts:
         try:
             pipeline.load_ip_adapter(repo, subfolder=subfolder, weight_name=weight_name)
             pipeline._coderai_ip_state = 'loaded'
-            _log.info("IP-Adapter loaded: %s/%s/%s", repo, subfolder, weight_name)
+            _log.info("IP-Adapter loaded: %s/%s/%s%s", repo, subfolder, weight_name,
+                      " (attention slicing disabled for it)" if sliced else "")
             return True
         except Exception as e:
             _log.warning("IP-Adapter load failed (%s/%s): %s", repo, weight_name, e)
+
+    if sliced:      # restore the previous memory setting — the adapter isn't loaded
+        try:
+            pipeline.enable_attention_slicing()
+        except Exception:
+            pass
 
     try:
         pipeline._coderai_ip_state = 'unsupported'
