@@ -1937,18 +1937,47 @@ def _pipeline_supports_ip_adapter(pipe) -> bool:
 
 
 def _apply_character_refs(kw: dict, character_references: List[str], strength: float,
-                           names: Optional[List[str]] = None, pipe=None):
-    """Apply character reference images to pipeline kwargs when supported."""
+                           names: Optional[List[str]] = None, pipe=None) -> bool:
+    """Condition the pipeline on character reference images via IP-Adapter.
+
+    Returns True when identity conditioning is actually active.
+
+    Two things used to be wrong here. The adapter *weights* were never loaded — only
+    the kwarg was set — so a pipeline that accepts ``ip_adapter_image`` (AnimateDiff)
+    would fail inside diffusers instead of transferring identity. And the scale was
+    passed as a call kwarg, which no pipeline accepts; it goes through
+    ``set_ip_adapter_scale()``.
+
+    Models like WanPipeline / CogVideoX / LTX / SVD have no IP-Adapter at all, so for
+    those the only mechanism remains the character-name prompt hint the caller adds —
+    and we say so out loud rather than looking like it worked.
+    """
     if not character_references:
-        return
-    # Only inject ip_adapter_image if the pipeline actually accepts it.
-    # Models like WanPipeline don't support IP-Adapter; for those we rely
-    # solely on the character-name text prompt hint added by the caller.
-    if pipe is not None and not _pipeline_supports_ip_adapter(pipe):
-        return
-    imgs = [_pil_from_b64(r) for r in character_references]
-    kw['ip_adapter_image'] = imgs[0] if len(imgs) == 1 else imgs
-    kw['ip_adapter_scale'] = strength
+        return False
+    if pipe is None or not _pipeline_supports_ip_adapter(pipe):
+        print(f"Note: {type(pipe).__name__ if pipe else 'pipeline'} has no IP-Adapter "
+              f"support — character identity relies on the prompt hint"
+              + (" and any per-character LoRA" if names else ""), flush=True)
+        return False
+
+    try:
+        from codai.api.images import _ensure_ip_adapter_loaded
+        if not _ensure_ip_adapter_loaded(pipe):
+            print("Note: IP-Adapter weights unavailable for this pipeline — "
+                  "character identity relies on the prompt hint/LoRA", flush=True)
+            return False
+        imgs = [_pil_from_b64(r) for r in character_references]
+        if hasattr(pipe, 'set_ip_adapter_scale'):
+            pipe.set_ip_adapter_scale(strength)
+        kw['ip_adapter_image'] = imgs[0] if len(imgs) == 1 else imgs
+        print(f"IP-Adapter conditioning {len(imgs)} character reference(s) "
+              f"at scale {strength}", flush=True)
+        return True
+    except Exception as exc:
+        print(f"Warning: IP-Adapter injection failed ({exc}) — continuing without "
+              f"character references", flush=True)
+        kw.pop('ip_adapter_image', None)
+        return False
 
 
 def _unload_video_loras(pipe):
@@ -2421,8 +2450,11 @@ def _generate_video(pipe, request: VideoGenerationRequest):
 # =============================================================================
 
 def _postprocess_video(mp4_bytes: bytes, request: VideoGenerationRequest,
-                       http_request, temp_paths: list) -> bytes:
-    """Apply upscale / interpolation / audio / dialog steps to a raw mp4 blob."""
+                       http_request, temp_paths: list,
+                       warnings: Optional[list] = None) -> bytes:
+    """Apply upscale / interpolation / audio / dialog steps to a raw mp4 blob.
+
+    ``warnings`` collects per-request notes (e.g. lip sync fell back) for the response."""
     path = _tmp_write(mp4_bytes, '.mp4')
     temp_paths.append(path)
 
@@ -2449,7 +2481,8 @@ def _postprocess_video(mp4_bytes: bytes, request: VideoGenerationRequest,
 
     if request.dialogs:
         path = _process_dialogs(path, request.dialogs,
-                                request.lip_sync_method or 'wav2lip', temp_paths)
+                                request.lip_sync_method or 'wav2lip', temp_paths,
+                                warnings)
 
     if request.generate_subtitles or request.burn_subtitles:
         path = _add_subtitles(path, request, temp_paths)
@@ -3332,14 +3365,21 @@ def _mix_dialog_audio(clips: list, temps: list) -> Optional[str]:
     return out2 if r2.returncode == 0 else None
 
 
-def _apply_lipsync(video_path: str, audio_path: str, method: str, temps: list) -> str:
-    """Apply lip sync to video using wav2lip or sadtalker. Returns new video path."""
+def _apply_lipsync(video_path: str, audio_path: str, method: str, temps: list,
+                    warnings: Optional[list] = None) -> str:
+    """Apply lip sync to video using wav2lip or sadtalker. Returns new video path.
+
+    On fallback the reason is appended to ``warnings`` (a per-request list) so the
+    caller can tell the client the audio was merely muxed — this used to return 200
+    with an unsynchronised video and no signal at all."""
     import logging, shutil
     _log = logging.getLogger(__name__)
+    failure = ''
     out = tempfile.mktemp(suffix='_lipsync.mp4')
     temps.append(out)
 
     if method == 'wav2lip':
+        # An explicit wav2lip binary still wins if the operator installed one.
         wav2lip_bin = shutil.which('wav2lip') or shutil.which('Wav2Lip')
         if wav2lip_bin:
             cmd = [wav2lip_bin, '--face', video_path, '--audio', audio_path, '--outfile', out]
@@ -3348,14 +3388,16 @@ def _apply_lipsync(video_path: str, audio_path: str, method: str, temps: list) -
                 return out
             _log.warning("wav2lip failed (rc=%d): %s", r.returncode, r.stderr.decode(errors='replace'))
         else:
-            # Try wav2lip Python API
+            # Otherwise use the managed install — code and weights are fetched and
+            # patched on first use, so lip sync works out of the box.
             try:
-                import inference as wav2lip_inference  # noqa
-                wav2lip_inference.main(face=video_path, audio=audio_path, outfile=out)
+                from codai.api.lipsync import run_wav2lip
+                run_wav2lip(video_path, audio_path, out)
                 if os.path.exists(out):
                     return out
             except Exception as e:
-                _log.warning("wav2lip Python API failed: %s", e)
+                _log.warning("wav2lip (managed) failed: %s", e)
+                failure = str(e)
 
     elif method == 'sadtalker':
         sadtalker_bin = shutil.which('sadtalker')
@@ -3372,7 +3414,11 @@ def _apply_lipsync(video_path: str, audio_path: str, method: str, temps: list) -
             _log.warning("sadtalker failed (rc=%d): %s", r.returncode, r.stderr.decode(errors='replace'))
 
     # Fallback: just mux audio onto video without lip sync
-    _log.warning("Lip sync unavailable (%s not found/working), merging audio only", method)
+    failure = failure or f"{method} not available"
+    _log.warning("Lip sync unavailable (%s), merging audio only: %s", method, failure)
+    if warnings is not None:
+        warnings.append(f"lip sync skipped ({method}): {failure} — the audio was "
+                        f"muxed onto the video without mouth synchronisation")
     out_fallback = tempfile.mktemp(suffix='_nosync.mp4')
     temps.append(out_fallback)
     cmd = ['ffmpeg', '-y', '-i', video_path, '-i', audio_path,
@@ -3381,7 +3427,8 @@ def _apply_lipsync(video_path: str, audio_path: str, method: str, temps: list) -
     return out_fallback if r.returncode == 0 else video_path
 
 
-def _process_dialogs(path: str, dialogs: list, lip_sync_method: str, temps: list) -> str:
+def _process_dialogs(path: str, dialogs: list, lip_sync_method: str, temps: list,
+                      warnings: Optional[list] = None) -> str:
     """
     Generate TTS for each dialog line, mix with correct timing, apply lip sync to full video.
     Returns new video path.
@@ -3421,7 +3468,7 @@ def _process_dialogs(path: str, dialogs: list, lip_sync_method: str, temps: list
     wants_lip_sync = any(getattr(line, 'lip_sync', True) for line in dialogs if line.text.strip())
 
     if wants_lip_sync and lip_sync_method:
-        return _apply_lipsync(path, mixed_audio, lip_sync_method, temps)
+        return _apply_lipsync(path, mixed_audio, lip_sync_method, temps, warnings)
 
     # No lip sync — just mux audio
     out = tempfile.mktemp(suffix='_dialog.mp4')
@@ -3919,6 +3966,7 @@ async def video_generations(request: VideoGenerationRequest,
 
     # Post-processing pipeline (upscale, audio, subtitles, …)
     temps = []
+    gen_warnings: list = []
     try:
         needs_post = any([
             request.upscale_output,
@@ -3930,7 +3978,8 @@ async def video_generations(request: VideoGenerationRequest,
         ])
         if needs_post:
             mp4_bytes = await asyncio.get_event_loop().run_in_executor(
-                None, _postprocess_video, mp4_bytes, request, http_request, temps)
+                None, _postprocess_video, mp4_bytes, request, http_request, temps,
+                gen_warnings)
     finally:
         for t in temps:
             try:
@@ -3990,7 +4039,12 @@ async def video_generations(request: VideoGenerationRequest,
     except Exception:
         pass
 
-    return VideoGenerationResponse(created=int(time.time()), data=[result])
+    resp = VideoGenerationResponse(created=int(time.time()), data=[result])
+    if gen_warnings:
+        # e.g. lip sync fell back to a plain audio mux — the client must be able to
+        # tell that apart from a genuinely synchronised result.
+        resp.warnings = gen_warnings
+    return resp
 
 
 # =============================================================================
