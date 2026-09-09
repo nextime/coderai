@@ -114,7 +114,7 @@ Full guide: [`docs/runpod.md`](docs/runpod.md).
 - **Character Profiles**: Apply up to 6 saved character profiles for visual consistency. Identity is conditioned via IP-Adapter on pipelines that support it (AnimateDiff and other SD-based video models); pipelines without IP-Adapter (Wan, CogVideoX, LTX, SVD) fall back to the prompt hint plus any per-character LoRA, and say so in the log
 - **Environment Profiles**: Apply up to 6 saved environment profiles to condition the scene
 - **Multi-Character Dialog**: Assign spoken lines to individual characters — each line picks a character profile, voice profile or TTS voice ID, and text; lines are **voice-cloned with F5-TTS** from the named profile, mixed with correct timing (sequential or manual), and lip-synced via Wav2Lip
-- **Lip Sync**: Wav2Lip is a **managed install** — the code and weights are fetched and patched on first use, so no manual setup. If it can't run, the response carries a `warnings` entry saying the audio was muxed without mouth sync rather than passing off an unsynced video as a success
+- **Lip Sync**: Wav2Lip and SadTalker. The Docker/OCI image ships both (launcher shims plus a dedicated lip-sync venv; checkpoints download on first use). A from-source install has no shims, so CoderAI falls back to a self-managed Wav2Lip that fetches and patches itself on first use. Either way, if lip sync can't run the response carries a `warnings` entry saying the audio was muxed without mouth sync — rather than passing off an unsynced video as a success
 
 ### Audio
 - **Text-to-Speech**: Kokoro TTS with voice selection and speed control

@@ -6,18 +6,24 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Managed Wav2Lip lip-sync.
+"""Self-contained Wav2Lip lip-sync for installs that don't ship the packaged shims.
 
-Wav2Lip has no pip package and no installable binary; upstream expects you to clone
-the repo and hunt down checkpoints whose original links have long since rotted. So
-this module owns the whole lifecycle the way :mod:`codai.api.ds4_worker` owns ds4:
-it fetches the code *and* the weights from a HuggingFace mirror on first use, patches
-the parts that no longer run on modern numpy/librosa/torch, and drives ``inference.py``
-as a subprocess.
+**The OCI image already handles lip sync properly** — ``packaging/linux/launcher/``
+installs ``wav2lip`` and ``sadtalker`` shims on PATH which run the baked repo code in a
+dedicated ``lipsync_venv`` and download the checkpoints on first use. When those shims
+are present :func:`codai.api.video._apply_lipsync` uses them and never reaches this
+module.
 
-That replaces the previous behaviour, which looked for a ``wav2lip`` executable on
-PATH — a file that essentially never exists — and silently returned an unsynchronised
-video when it was missing.
+This module covers the *other* case: a from-source install (``build.sh`` + ``venv_all``)
+where nothing is on PATH, which is where lip sync silently degraded to a plain audio mux.
+It owns the lifecycle the way :mod:`codai.api.ds4_worker` owns ds4 — fetching code *and*
+weights from a HuggingFace mirror on first use, patching what no longer runs on modern
+numpy/librosa/torch, and driving ``inference.py`` as a subprocess.
+
+It deliberately uses its **own** directory (``CODERAI_WAV2LIP_MANAGED_DIR``) rather than
+the packaged ``CODERAI_WAV2LIP_DIR``: that one is the shim's writable working copy, seeded
+from the baked read-only source and run against the lipsync venv's pinned dependencies.
+Patching it from here would corrupt a working packaged install.
 """
 
 import os
@@ -43,8 +49,11 @@ _ready: Optional[Tuple[Path, Path]] = None
 
 
 def default_install_dir() -> Path:
-    return Path(os.environ.get("CODERAI_WAV2LIP_DIR")
-                or os.path.expanduser("~/.coderai/wav2lip"))
+    # NOT CODERAI_WAV2LIP_DIR — that belongs to the packaged launcher shim. The
+    # distinct basename also avoids colliding with the shim's ~/.coderai/Wav2Lip on a
+    # case-insensitive filesystem.
+    return Path(os.environ.get("CODERAI_WAV2LIP_MANAGED_DIR")
+                or os.path.expanduser("~/.coderai/wav2lip-managed"))
 
 
 # --------------------------------------------------------------------------- #
@@ -131,7 +140,7 @@ def ensure_wav2lip(install_dir: Optional[Path] = None) -> Tuple[Path, Path]:
             raise RuntimeError(
                 f"could not download Wav2Lip assets from {WAV2LIP_REPO}: {exc}. "
                 f"Place the repo and checkpoints/wav2lip_gan.pth in {root} manually, "
-                f"or set CODERAI_WAV2LIP_DIR.") from exc
+                f"or set CODERAI_WAV2LIP_MANAGED_DIR.") from exc
 
     if not (root / "inference.py").exists():
         raise RuntimeError(f"Wav2Lip inference.py missing under {root}")
