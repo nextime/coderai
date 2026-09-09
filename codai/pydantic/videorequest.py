@@ -97,6 +97,16 @@ class VideoGenerationRequest(BaseModel):
     character_strength: Optional[float] = Field(0.8, description="IP-Adapter scale for character references.")
     character_names: Optional[List[str]] = Field(None, description="Optional names aligned with character_references.")
     character_profiles: Optional[List[str]] = Field(None, description="Saved character profile names to load (resolved server-side).")
+    keyframe_identity: Optional[str] = Field("auto", description=(
+        "How to lock character identity on video models that have no IP-Adapter "
+        "(Wan, CogVideoX, LTX, SVD — i.e. most of them). 'auto' (default) renders an "
+        "identity-conditioned first frame with the IMAGE endpoint, which does have real "
+        "IP-Adapter, then runs the video as ti2v from that keyframe; it is skipped when "
+        "the model can do IP-Adapter itself or a first frame was already supplied. "
+        "'always' forces the bridge, 'never' disables it (identity then relies on the "
+        "prompt hint plus any per-character LoRA)."))
+    keyframe_model: Optional[str] = Field(None, description="Image model for the identity keyframe (defaults to the server's image model).")
+    keyframe_steps: Optional[int] = Field(None, description="Denoising steps for the identity keyframe.")
 
     loras: Optional[List[VideoLoraConfig]] = Field(None, description="Per-request LoRA adapters (e.g. trained per-character identity LoRAs) fused into the pipeline.")
 

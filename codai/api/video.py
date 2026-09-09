@@ -3575,6 +3575,96 @@ async def get_video_progress():
 # Main generation endpoint
 # =============================================================================
 
+#: Video pipeline families that can do IP-Adapter themselves, so they don't need the
+#: keyframe bridge. Everything else (Wan, CogVideoX, LTX, SVD, …) does.
+_NATIVE_IP_ADAPTER_VIDEO = ('animatediff', 'animate-diff')
+
+
+async def _maybe_build_identity_keyframe(request: VideoGenerationRequest,
+                                          http_request) -> Optional[str]:
+    """Lock character identity on video models that have no IP-Adapter.
+
+    ``character_profiles`` can only condition identity where the pipeline supports
+    IP-Adapter — which the video pipelines people actually use (Wan, CogVideoX, LTX,
+    SVD) do not. On those, the profile previously did nothing but prepend a name to
+    the prompt.
+
+    The image endpoint *does* have real IP-Adapter, so we render the first frame
+    there, conditioned on the profiles, and hand it to the video model as a ti2v
+    keyframe — the same recipe tools/videogen.py drives by hand, done server-side.
+    It runs BEFORE the video pipeline is loaded, so the image model isn't fighting
+    the video model for VRAM, and it goes through the front so the image model may
+    live on another engine entirely.
+
+    Returns a short note when the bridge ran (for the response warnings), else None.
+    """
+    mode = (request.mode or 't2v').lower()
+    setting = str(getattr(request, 'keyframe_identity', 'auto') or 'auto').lower()
+    if setting in ('never', 'off', 'false', 'no', '0'):
+        return None
+    # Only useful when there is no first frame yet.
+    if mode != 't2v' or request.init_image or request.image:
+        return None
+    if not (request.character_profiles or request.characters or request.character_references):
+        return None
+    if setting == 'auto' and any(f in (request.model or '').lower()
+                                 for f in _NATIVE_IP_ADAPTER_VIDEO):
+        return None          # the pipeline can condition on the refs directly
+
+    payload = {
+        "prompt": request.prompt or "",
+        "n": 1,
+        "response_format": "b64_json",
+        "size": f"{request.width or 512}x{request.height or 512}",
+        "character_strength": request.character_strength or 0.8,
+    }
+    if request.character_profiles:
+        payload["character_profiles"] = list(request.character_profiles)
+    if request.character_references:
+        payload["character_references"] = list(request.character_references)
+    if getattr(request, 'environment_profiles', None):
+        payload["environment_profiles"] = list(request.environment_profiles)
+    if getattr(request, 'keyframe_model', None):
+        payload["model"] = request.keyframe_model
+    if getattr(request, 'keyframe_steps', None):
+        payload["steps"] = request.keyframe_steps
+    if request.negative_prompt:
+        payload["negative_prompt"] = request.negative_prompt
+    if request.seed is not None:
+        payload["seed"] = request.seed
+
+    try:
+        import json as _json
+        from codai.broker.asgi_bridge import execute_api_request
+        why = "forced by keyframe_identity=always" if setting == 'always' \
+              else "this video model has no IP-Adapter"
+        print(f"  [video][identity] rendering IP-Adapter keyframe for "
+              f"{request.character_profiles or request.character_names or 'references'}"
+              f" ({why})", flush=True)
+        resp = await execute_api_request(
+            http_request, method="POST", path="/v1/images/generations",
+            headers={"Content-Type": "application/json"},
+            body=_json.dumps(payload).encode())
+        if resp["status_code"] >= 400:
+            raise RuntimeError(resp["body"].decode()[:300])
+        data = _json.loads(resp["body"]).get("data", [])
+        b64 = (data[0].get("b64_json") if data else None)
+        if not b64:
+            raise RuntimeError("image endpoint returned no b64_json")
+    except Exception as exc:
+        msg = (f"character identity keyframe could not be rendered ({exc}); "
+               f"identity falls back to the prompt hint and any per-character LoRA")
+        print(f"  [video][identity] {msg}", flush=True)
+        if setting == 'always':
+            raise HTTPException(status_code=502, detail=msg)
+        return msg
+
+    request.init_image = f"data:image/png;base64,{b64}"
+    request.mode = 'ti2v'
+    print("  [video][identity] keyframe ready — running ti2v from it", flush=True)
+    return None
+
+
 @router.post("/v1/video/generations", response_model=VideoGenerationResponse, summary="Generate video")
 async def video_generations(request: VideoGenerationRequest,
                              http_request: Request = None):
@@ -3600,6 +3690,11 @@ async def video_generations(request: VideoGenerationRequest,
             request.mode = 'interp'
         elif request.video:
             request.mode = 'v2v'
+
+    # Character identity bridge. Must run BEFORE the video model is loaded: it
+    # generates an image, and doing that afterwards would put an image model and a
+    # video model on the card at once. May rewrite mode → ti2v + init_image.
+    _identity_note = await _maybe_build_identity_keyframe(request, http_request)
 
     # Run in a thread: request_model may block while waiting for a busy text
     # model to finish its in-flight request before evicting it.  Blocking here
@@ -3967,6 +4062,8 @@ async def video_generations(request: VideoGenerationRequest,
     # Post-processing pipeline (upscale, audio, subtitles, …)
     temps = []
     gen_warnings: list = []
+    if _identity_note:
+        gen_warnings.append(_identity_note)
     try:
         needs_post = any([
             request.upscale_output,
