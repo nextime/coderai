@@ -122,6 +122,10 @@ def _decode_b64_or_url(data: str) -> bytes:
 def _f5tts_clone(ref_audio_path: str, ref_text: str, gen_text: str,
                   speed: float = 1.0, seed: Optional[int] = None) -> bytes:
     """Run F5-TTS voice cloning, return WAV bytes."""
+    # F5-TTS can be configured with the BigVGAN vocoder, which still expects the
+    # pre-1.0 huggingface_hub mixin signature — see codai.api.hub_compat.
+    from codai.api.hub_compat import install_hub_legacy_kwargs_shim
+    install_hub_legacy_kwargs_shim()
     from f5_tts.api import F5TTS
     import soundfile as sf
     import numpy as np

@@ -727,8 +727,17 @@ async def run_full_music_dub(request: AudioMusicDubRequest, http_request: Reques
                     audio_out = audio_out[0]
                 import numpy as _np
                 import soundfile as _sf
-                converted_path = os.path.join(workdir, 'converted_vocals.wav')
-                _sf.write(converted_path, _np.array(audio_out).flatten(), 44100)
+                samples = _np.array(audio_out).flatten()
+                # Seed-VC can return a near-empty buffer when it finds nothing voiced
+                # to track. Only adopt the result once we know it is real audio —
+                # writing straight to converted_path would remix silence.
+                if samples.size < 1000:
+                    raise RuntimeError(
+                        f'conversion returned {samples.size} samples — no voiced '
+                        'content detected in the vocal stem')
+                candidate = os.path.join(workdir, 'converted_vocals.wav')
+                _sf.write(candidate, samples, 44100)
+                converted_path = candidate
                 steps.append({'step': 4, 'type': 'voice_convert',
                               'label': 'Match the original singing voice',
                               'status': 'ok', 'engine': 'seed-vc',

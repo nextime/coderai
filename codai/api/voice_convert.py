@@ -39,6 +39,11 @@ def set_global_file_path(path):
 def _get_wrapper():
     global _wrapper
     if _wrapper is None:
+        # seed-vc's vocoder (BigVGAN) still expects the pre-1.0 huggingface_hub
+        # mixin signature; without this it dies on load with "missing 2 required
+        # keyword-only arguments: 'proxies' and 'resume_download'".
+        from codai.api.hub_compat import install_hub_legacy_kwargs_shim
+        install_hub_legacy_kwargs_shim()
         from seed_vc.seed_vc_wrapper import SeedVCWrapper
         _wrapper = SeedVCWrapper()
     return _wrapper

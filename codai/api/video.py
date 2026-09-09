@@ -1851,11 +1851,48 @@ def _build_call_kwargs(request: VideoGenerationRequest) -> dict:
     return kw
 
 
-def _apply_camera_motion(kw: dict, camera_motion: str):
-    """Inject camera motion hint into pipeline kwargs (model-dependent)."""
-    # CogVideoX supports camera_motion natively
-    if camera_motion:
-        kw['camera_motion'] = camera_motion
+# How a camera_motion enum reads as a prompt hint. Text conditioning is the only
+# mechanism the current video pipelines actually have for this.
+_CAMERA_MOTION_HINTS = {
+    'zoom-in':    'the camera slowly zooms in',
+    'zoom-out':   'the camera slowly zooms out',
+    'pan-left':   'the camera pans left',
+    'pan-right':  'the camera pans right',
+    'tilt-up':    'the camera tilts up',
+    'tilt-down':  'the camera tilts down',
+    'rotate':     'the camera orbits around the subject',
+}
+
+
+def _apply_camera_motion(kw: dict, camera_motion: str, pipe=None):
+    """Apply a camera-motion hint in whatever way this pipeline actually supports.
+
+    No diffusers video pipeline accepts a ``camera_motion`` kwarg — passing one
+    unconditionally (as this used to) made every request carrying the field die with a
+    TypeError inside ``pipe(**kw)``. So: pass it through only when the signature really
+    takes it, otherwise fold it into the prompt, which is the only conditioning path
+    these models have for camera movement.
+    """
+    if not camera_motion:
+        return
+    motion = str(camera_motion).strip()
+    if not motion:
+        return
+
+    if pipe is not None:
+        import inspect
+        try:
+            if 'camera_motion' in inspect.signature(pipe.__call__).parameters:
+                kw['camera_motion'] = motion
+                return
+        except Exception:
+            pass
+
+    hint = _CAMERA_MOTION_HINTS.get(motion.lower().replace('_', '-'), f'camera motion: {motion}')
+    if kw.get('prompt'):
+        kw['prompt'] = f"{kw['prompt']}, {hint}"
+    else:
+        kw['prompt'] = hint
 
 
 def _resolve_character_inputs(request) -> tuple[List[str], List[str]]:
@@ -2274,7 +2311,7 @@ def _generate_video(pipe, request: VideoGenerationRequest):
     except Exception:
         pass
 
-    _apply_camera_motion(kw, request.camera_motion)
+    _apply_camera_motion(kw, request.camera_motion, pipe=pipe)
 
     char_images, char_names = _resolve_character_inputs(request)
     if char_images:
@@ -3130,9 +3167,13 @@ def _generate_tts(text: str, voice: Optional[str], speed: float,
         out = tempfile.mktemp(suffix='.mp3')
         temps.append(out)
         tts = edge_tts.Communicate(text, voice_id, rate=f"+{int((speed - 1) * 100)}%")
-        _aio.get_event_loop().run_until_complete(tts.save(out))
-        return out
-    except ImportError:
+        # Called from an executor thread, which has no event loop — get_event_loop()
+        # raised RuntimeError, and only ImportError was caught, so this propagated
+        # out of /v1/video/dub and the tts_text path instead of falling back.
+        _aio.run(tts.save(out))
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            return out
+    except Exception:
         pass
     try:
         from kokoro import KPipeline
@@ -3167,8 +3208,9 @@ def _generate_tts_for_line(line: CharacterDialogLine, temps: list) -> Optional[s
     speed = line.speed or 1.0
     lang = line.lang
 
-    # Try to load voice profile reference audio first (for kokoro/RVC cloning)
+    # Try to load voice profile reference audio first (for F5-TTS cloning)
     ref_audio = None
+    ref_text = ''
     if voice:
         try:
             from codai.api.voice_clone import _load_voice, _voice_path
@@ -3176,8 +3218,33 @@ def _generate_tts_for_line(line: CharacterDialogLine, temps: list) -> Optional[s
             audio_file = meta.get('audio_file') or meta.get('audio_path')
             if audio_file and os.path.isfile(audio_file):
                 ref_audio = audio_file
+                ref_text = meta.get('transcript') or ''
         except Exception:
             pass
+
+    # A saved voice profile means the caller asked for THAT person's voice, so clone
+    # it. This used to load the reference audio and then never use it — the profile
+    # only flipped the line onto a generic neural voice, silently discarding the
+    # identity the caller selected.
+    if ref_audio:
+        if not ref_text:
+            print(f"[dialog] voice profile '{voice}' has no transcript — "
+                  f"cannot clone, falling back to a generic voice", flush=True)
+        else:
+            try:
+                from codai.api.voice_clone import _f5tts_clone
+                wav = _f5tts_clone(ref_audio, ref_text, text, speed, getattr(line, 'seed', None))
+                out = tempfile.mktemp(suffix='.wav')
+                temps.append(out)
+                with open(out, 'wb') as fh:
+                    fh.write(wav)
+                if os.path.getsize(out) > 0:
+                    return out
+            except ImportError:
+                print("[dialog] f5-tts not installed — cannot clone the voice profile "
+                      f"'{voice}'. Run: pip install f5-tts", flush=True)
+            except Exception as exc:
+                print(f"[dialog] voice cloning failed for '{voice}': {exc}", flush=True)
 
     # edge_tts with voice id
     try:
@@ -3190,7 +3257,10 @@ def _generate_tts_for_line(line: CharacterDialogLine, temps: list) -> Optional[s
         out = tempfile.mktemp(suffix='.mp3')
         temps.append(out)
         tts = edge_tts.Communicate(text, voice_id, rate=f"+{int((speed - 1) * 100)}%")
-        _aio.get_event_loop().run_until_complete(tts.save(out))
+        # This runs inside an executor thread, which has no event loop of its own —
+        # get_event_loop() raised RuntimeError here and the failure was swallowed,
+        # so edge-tts never actually ran.
+        _aio.run(tts.save(out))
         if os.path.exists(out) and os.path.getsize(out) > 0:
             return out
     except Exception:
