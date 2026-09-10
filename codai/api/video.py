@@ -3583,9 +3583,163 @@ async def get_video_progress():
 _NATIVE_IP_ADAPTER_VIDEO = ('animatediff', 'animate-diff', 'minimax-h3', 'minimax_h3')
 
 
+def _load_h3_pipeline(model_path: str, model_cfg: dict, workflow: str, device):
+    """Load the H3 modular pipeline IN THIS ENGINE, like any other video model.
+
+    H3 is modular-only, so it can't come from ``_detect_pipeline_class()`` /
+    ``PClass.from_pretrained`` — but once loaded it is registered in the model
+    manager exactly like a Wan or LTX pipeline, so eviction, VRAM accounting and
+    the swap gate treat it the same.
+
+    ``workflow`` selects ONE of the two ~61.7 GB transformer partitions; loading
+    without it pulls both.
+    """
+    import torch
+    from diffusers import ModularPipeline
+
+    dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16,
+             "float32": torch.float32}.get(
+        str(model_cfg.get('dtype') or 'bfloat16').lower(), torch.bfloat16)
+
+    print(f"  [h3] loading {model_path} (workflow={workflow}, dtype={dtype}) in-engine")
+    pipe = ModularPipeline.from_pretrained(model_path, workflow=workflow)
+    load_kw = {"dtype": dtype}
+    if model_cfg.get('device_map'):
+        load_kw["device_map"] = model_cfg['device_map']
+    pipe.load_components(workflow=workflow, **load_kw)
+
+    # 33B doesn't fit a consumer card, so group offload is the default. The
+    # diffusers pipeline-level CPU-offload helpers don't exist on a
+    # ModularPipeline, hence per-component hooks.
+    strategy = str(model_cfg.get('offload_strategy') or 'group').lower()
+    if strategy in ('group', 'leaf', 'auto', 'auto-borderline', 'model', 'sequential'):
+        kind = 'leaf_level' if strategy == 'leaf' else 'block_level'
+        from diffusers.hooks import apply_group_offloading
+        for name in ('transformer', 'transformer_ref', 'text_encoder', 'vae', 'audio_vae'):
+            comp = getattr(pipe, name, None)
+            if comp is None:
+                continue
+            try:
+                kw = dict(onload_device=torch.device(device),
+                          offload_device=torch.device('cpu'),
+                          offload_type=kind, use_stream=True)
+                if kind == 'block_level':
+                    kw['num_blocks_per_group'] = 1
+                apply_group_offloading(comp, **kw)
+                print(f"  [h3] group offload ({kind}) on {name}")
+            except Exception as exc:
+                print(f"  [h3] group offload failed on {name} ({exc}); moving it to {device}")
+                try:
+                    comp.to(device)
+                except Exception:
+                    pass
+        pipe._coderai_load_strategy = f"group offload ({kind})"
+    elif not model_cfg.get('device_map'):
+        pipe.to(device)
+        pipe._coderai_load_strategy = 'full GPU'
+    pipe._coderai_h3_workflow = workflow
+    return pipe
+
+
+def _run_h3_in_engine(request, model_key: str, model_path: str, model_cfg: dict,
+                      payload: dict, device) -> bytes:
+    """Generate on an in-engine H3 pipeline; returns the muxed mp4 bytes."""
+    from codai.api import h3_worker
+    rules = h3_worker.rules()
+
+    workflow = rules.pick_workflow(payload)
+    pipe = multi_model_manager.models.get(model_key)
+    if pipe is not None and getattr(pipe, '_coderai_h3_workflow', None) != workflow:
+        # The other workflow is the OTHER transformer partition — there is no way
+        # to keep both resident, so drop this one first.
+        print(f"  [h3] workflow {getattr(pipe, '_coderai_h3_workflow', '?')} -> {workflow}: reloading")
+        multi_model_manager.unload_model(model_key)
+        pipe = None
+
+    if pipe is None:
+        _vram_before = multi_model_manager._get_free_vram_gb()
+        _ram_before = multi_model_manager._get_own_ram_gb()
+        pipe = _load_h3_pipeline(model_path, model_cfg, workflow, device)
+        multi_model_manager.models[model_key] = pipe
+        multi_model_manager.current_model_key = model_key
+        try:
+            multi_model_manager.clear_loading(model_key)
+        except Exception:
+            pass
+        try:
+            multi_model_manager.record_vram_delta(
+                model_key, _vram_before,
+                offloaded='offload' in str(getattr(pipe, '_coderai_load_strategy', '')),
+                ram_before=_ram_before)
+        except Exception:
+            pass
+
+    # LoRAs: fuse exactly the requested set (MiniMaxH3LoraLoaderMixin).
+    adapters = payload.get('loras') or []
+    if adapters or getattr(pipe, '_coderai_h3_loras', None):
+        try:
+            pipe.unload_lora_weights()
+        except Exception:
+            pass
+        names, weights = [], []
+        for i, lora in enumerate(adapters):
+            adapter = f"lora_{i}"
+            print(f"  [h3] loading LoRA {lora['path']} @ {lora.get('weight', 1.0)}")
+            pipe.load_lora_weights(lora['path'], adapter_name=adapter)
+            names.append(adapter)
+            weights.append(float(lora.get('weight') or 1.0))
+        if names:
+            try:
+                pipe.set_adapters(names, weights)
+            except Exception as exc:
+                print(f"  [h3] set_adapters failed ({exc}); adapters apply at 1.0")
+        pipe._coderai_h3_loras = adapters
+
+    import torch
+    kwargs = {
+        'prompt': payload['prompt'],
+        'num_frames': rules.snap_frames(payload.get('num_frames') or rules.H3_MIN_SECONDS * rules.H3_FPS),
+        'num_inference_steps': int(payload.get('num_inference_steps') or 50),
+        'output_type': 'pil',
+    }
+    if payload.get('width') and payload.get('height'):
+        kwargs['width'] = rules.snap_axis(payload['width'], 1344)
+        kwargs['height'] = rules.snap_axis(payload['height'], 768)
+    if payload.get('seed') is not None:
+        kwargs['generator'] = torch.Generator(device=device).manual_seed(int(payload['seed']))
+
+    temps: list = []
+    try:
+        if payload.get('image'):
+            kwargs['image'] = rules._load_image(payload['image'])
+        if payload.get('last_image'):
+            kwargs['last_image'] = rules._load_image(payload['last_image'])
+        if payload.get('references'):
+            kwargs['references'] = rules.build_references(payload['references'], temps)
+
+        print(f"  [h3] generating in-engine: workflow={workflow} "
+              f"frames={kwargs['num_frames']} steps={kwargs['num_inference_steps']}")
+        _vid_progress_reset(int(kwargs['num_inference_steps']))
+        out = pipe(output=['videos', 'audio', 'sampling_rate'], **kwargs)
+        videos = out['videos'] if isinstance(out, dict) else out.videos
+        audio = out.get('audio') if isinstance(out, dict) else getattr(out, 'audio', None)
+        rate = (out.get('sampling_rate') if isinstance(out, dict)
+                else getattr(out, 'sampling_rate', None))
+        frames = videos[0] if (videos and isinstance(videos, (list, tuple))) else videos
+        return rules.mux(frames, audio, rate), kwargs['num_frames'], workflow
+    finally:
+        _vid_progress_done()
+        for path in temps:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 async def _generate_h3(request: VideoGenerationRequest, model_name: str,
                        model_cfg: dict, http_request,
-                       identity_note: Optional[str] = None):
+                       identity_note: Optional[str] = None,
+                       model_key: Optional[str] = None):
     """Generate on MiniMax-H3 through the isolated worker.
 
     H3 differs from every other video model here in ways the request has to be
@@ -3678,17 +3832,28 @@ async def _generate_h3(request: VideoGenerationRequest, model_name: str,
         if adapters:
             payload["loras"] = adapters
 
-    _vid_progress_reset(int(payload["num_inference_steps"]))
-    try:
-        data = await asyncio.to_thread(h3_worker.generate, model_name, payload, model_cfg)
-    finally:
-        _vid_progress_done()
+    # In-engine when this engine's diffusers can do H3 (>= 0.40) — then it is a
+    # normal video model: same eviction, same VRAM accounting, same swap gate.
+    # Otherwise the isolated venv worker. `in_process` in the model config forces
+    # either side; see docs/minimax-h3.md.
+    model_path = h3_worker.resolve_model_path(model_name, model_cfg)
+    if h3_worker.use_worker(model_cfg):
+        _vid_progress_reset(int(payload["num_inference_steps"]))
+        try:
+            data = await asyncio.to_thread(h3_worker.generate, model_name, payload, model_cfg)
+        finally:
+            _vid_progress_done()
+        mp4_bytes = base64.b64decode(data.get("mp4_b64") or "")
+        frames_made, workflow_used = data.get("num_frames"), data.get("workflow")
+    else:
+        key = model_key or f"h3:{model_path}"
+        mp4_bytes, frames_made, workflow_used = await asyncio.to_thread(
+            _run_h3_in_engine, request, key, model_path, model_cfg, payload, _derive_device())
 
-    mp4_bytes = base64.b64decode(data.get("mp4_b64") or "")
     if not mp4_bytes:
         raise HTTPException(status_code=500, detail="MiniMax-H3 returned no video")
-    print(f"  [h3] {data.get('workflow')}: {data.get('num_frames')} frames "
-          f"({data.get('seconds')}s @ {data.get('fps')}fps), {len(mp4_bytes)/1e6:.1f} MB")
+    print(f"  [h3] {workflow_used}: {frames_made} frames "
+          f"({round((frames_made or 0) / 24, 2)}s @ 24fps), {len(mp4_bytes)/1e6:.1f} MB")
 
     temps: list = []
     try:
@@ -3714,9 +3879,9 @@ async def _generate_h3(request: VideoGenerationRequest, model_name: str,
         asyncio.get_event_loop().create_task(asyncio.to_thread(
             archive_manager.save_generation,
             "video", "/v1/video/generations", request.model, request.prompt or "",
-            {"mode": request.mode, "workflow": data.get("workflow"),
-             "num_frames": data.get("num_frames"), "fps": data.get("fps"),
-             "width": data.get("width"), "height": data.get("height"),
+            {"mode": request.mode, "workflow": workflow_used,
+             "num_frames": frames_made, "fps": 24,
+             "width": payload.get("width"), "height": payload.get("height"),
              "num_inference_steps": payload["num_inference_steps"],
              "seed": request.seed},
             [(mp4_bytes, "mp4")]))
@@ -3893,7 +4058,7 @@ async def video_generations(request: VideoGenerationRequest,
         _is_h3 = False
     if _is_h3:
         return await _generate_h3(request, model_name, _model_cfg, http_request,
-                                  _identity_note)
+                                  _identity_note, model_key)
 
     # Refuse to load onto a poisoned CUDA context — it would just re-assert.
     if getattr(multi_model_manager, 'cuda_context_poisoned', False):

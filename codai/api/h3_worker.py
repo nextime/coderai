@@ -62,6 +62,58 @@ _services: dict = {}          # model -> {"proc","port","url"}
 _bootstrapped = False
 
 
+# ── shared rules + in-engine capability ──────────────────────────────────────
+
+_rules = None
+
+
+def rules():
+    """The H3 checkpoint contracts, shared with the isolated worker.
+
+    Loaded by path from tools/h3_common.py: the isolated venv imports it as a
+    sibling module, and the engine can't reach it through the `codai.api` package
+    (importing that pulls the whole FastAPI app into the worker's venv).
+    """
+    global _rules
+    if _rules is None:
+        import importlib.util
+        path = _REPO_ROOT / "tools" / "h3_common.py"
+        spec = importlib.util.spec_from_file_location("h3_common", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _rules = module
+    return _rules
+
+
+def engine_supports_h3() -> bool:
+    """True when THIS process's diffusers carries the H3 modular pipeline.
+
+    H3 needs diffusers >= 0.40. When the engine has it, H3 loads in-engine like
+    every other video model (normal eviction, offload and VRAM accounting); when
+    it doesn't, the isolated worker is used instead. Auto-detected so the same
+    build works either side of a diffusers upgrade.
+    """
+    try:
+        from diffusers import MiniMaxH3ModularPipeline  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def use_worker(config: dict = None) -> bool:
+    """Whether this model should go through the isolated worker.
+
+    ``in_process`` in the model config forces the choice either way; otherwise it
+    follows what the engine's diffusers can actually do.
+    """
+    cfg = config or {}
+    if "in_process" in cfg:
+        return not bool(cfg.get("in_process"))
+    if str(cfg.get("backend") or "").lower() in ("h3-worker", "h3_worker"):
+        return True
+    return not engine_supports_h3()
+
+
 # ── detection ─────────────────────────────────────────────────────────────────
 
 def is_h3_model(model_name: str = "", config: dict = None) -> bool:
