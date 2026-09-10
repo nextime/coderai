@@ -39,3 +39,11 @@ samples
 # Build outputs
 build
 *.egg-info
+
+# Exported image tarballs (docker save output) and LoRA/training checkpoints:
+# tens of GB that would otherwise be sent as build context on every build.
+coderai-base-*.tar.gz
+coderai-*.tar.gz.partial
+checkpoints
+character_output
+tools/character_output
