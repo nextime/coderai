@@ -10,9 +10,13 @@ keeps local copies of the results:
   - GET  /v1/characters           list saved profiles
   - GET  /v1/characters/{name}    fetch a profile's reference images
   - PATCH/DELETE /v1/characters/  prune bad references / remove a profile
+  - POST /v1/loras/train          optionally train an identity LoRA straight from
+                                  the profile's crops (`character: <name>`), for
+                                  models where IP-Adapter alone drifts
+  - GET  /v1/loras/progress       poll / re-attach to that training job
   - POST /v1/video/generations    generate a new video with `character_profiles`
                                   (IP-Adapter, or the identity-keyframe bridge on
-                                  models without one)
+                                  models without one) plus any trained LoRAs
   - POST /v1/images/generations   optional identity portrait, as a quick sanity check
 
 Two front-ends over the same core:
@@ -20,6 +24,9 @@ Two front-ends over the same core:
   CLI     python tools/character_studio.py demo --name alice \
               --source clips/alice.mp4 --source photos/alice1.jpg \
               --prompt "walking through a neon-lit Tokyo street at night"
+
+Only use footage of people who agreed to it — your own actors, your own likeness,
+or characters you generated. The profile is whoever you put in it.
 
   Web UI  python tools/character_studio.py web --browser
           (drop files, review the extracted crops, drop the bad ones, generate)
@@ -257,6 +264,27 @@ class CoderAIClient:
     def delete_character(self, name: str) -> dict[str, Any]:
         return self._delete(f"/v1/characters/{urllib.parse.quote(name)}")
 
+    # ── LoRAs ───────────────────────────────────────────────────────────────
+    def list_loras(self) -> list[dict[str, Any]]:
+        try:
+            return self._get("/v1/loras").get("loras", [])
+        except Exception:
+            return []
+
+    def train_lora(self, body: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/v1/loras/train", body)
+
+    def lora_progress(self, job: str | None = None, session: str | None = None) -> dict[str, Any]:
+        query = ""
+        if job:
+            query = f"?job={urllib.parse.quote(job)}"
+        elif session:
+            query = f"?session={urllib.parse.quote(session)}"
+        try:
+            return self._get(f"/v1/loras/progress{query}", timeout=30)
+        except Exception:
+            return {}
+
     # ── generation ──────────────────────────────────────────────────────────
     def generate_image(self, body: dict[str, Any]) -> bytes:
         body = dict(body)
@@ -343,6 +371,148 @@ class CharacterStudio:
             emit("Contact sheet skipped (install Pillow to get one)")
         return mirrored
 
+    # ── step 1b: an identity LoRA trained from the same crops ───────────────
+    def _lora_jobs_path(self) -> Path:
+        return self.out_dir / "lora_jobs.json"
+
+    def _lora_jobs(self) -> dict[str, Any]:
+        try:
+            return json.loads(self._lora_jobs_path().read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _remember_lora_job(self, lora: str, job_id: str | None) -> None:
+        """Persist the server-side job id so a restarted client re-attaches to a
+        training already in flight instead of starting a second one."""
+        jobs = self._lora_jobs()
+        if job_id:
+            jobs[lora] = {"job_id": job_id, "session": self.session_token(), "at": time.time()}
+        else:
+            jobs.pop(lora, None)
+        self._lora_jobs_path().write_text(json.dumps(jobs, indent=2), encoding="utf-8")
+
+    def session_token(self) -> str:
+        """Stable per-out-dir token, so `?session=` recovery works across runs."""
+        path = self.out_dir / "session.txt"
+        try:
+            token = path.read_text(encoding="utf-8").strip()
+            if token:
+                return token
+        except Exception:
+            pass
+        token = f"charstudio-{uuid.uuid4().hex[:12]}"
+        path.write_text(token, encoding="utf-8")
+        return token
+
+    def train_identity_lora(self, name: str, opts: dict[str, Any], emit=log) -> str | None:
+        """Train a LoRA from a saved character profile's reference crops.
+
+        The server pulls the images itself (`character: <profile>`), so this is the
+        same set you reviewed and pruned — no re-upload. Returns the weights path.
+        """
+        lora_name = opts.get("lora_name") or f"{safe_slug(name)}_identity"
+        models = self.client.list_models()
+        target = (opts.get("target") or "video").strip()
+        cap = "video_generation" if target == "video" else "image_generation"
+        base_model = pick_model(
+            models, cap,
+            opts.get("base_model") or (self.args.video_model if target == "video" else self.args.image_model))
+        if not base_model:
+            raise RuntimeError(f"No {target} model available to train against — pass --base-model")
+
+        profile = self.client.get_character(name)
+        n_refs = int(profile.get("image_count") or 0)
+        if not n_refs:
+            raise RuntimeError(f"Character '{name}' has no reference images to train on")
+
+        trigger = opts.get("trigger") or safe_slug(name)
+        instance_prompt = opts.get("instance_prompt") or (
+            f"a photo of {trigger} person" if target == "image" else f"{trigger} person")
+        body = {
+            "name": lora_name,
+            "base_model": base_model,
+            "target": target,
+            "character": name,                 # server-side profile resolution
+            "instance_prompt": instance_prompt,
+            "steps": int(opts.get("steps") or 800),
+            "rank": int(opts.get("rank") or 16),
+            "learning_rate": float(opts.get("learning_rate") or 1e-4),
+            "resolution": int(opts.get("resolution") or 512),
+            "num_frames": int(opts.get("train_frames") or 1),
+            "quantize_4bit": bool(opts.get("quantize_4bit", True)),
+            "seed": int(opts.get("seed") or 42),
+            "wait": False,
+            "session": self.session_token(),
+        }
+        emit(f"Training LoRA '{lora_name}' on {base_model} ({target}) "
+             f"from {n_refs} reference(s), {body['steps']} steps, rank {body['rank']}")
+        emit(f"Trigger word: {trigger}  (put it in the scene prompt)")
+        return self._attach_or_start_lora(lora_name, body, emit=emit,
+                                          cancelled=opts.get("cancelled"))
+
+    def _attach_or_start_lora(self, lora_name: str, body: dict[str, Any], emit=log,
+                              cancelled=None) -> str | None:
+        """Start (or re-attach to) a server-side training job and poll it to the end."""
+        active = {"queued", "preparing", "training", "saving"}
+
+        def kickoff() -> str:
+            resp = self.client.train_lora(body)
+            job_id = resp.get("job_id")
+            if not job_id:
+                raise RuntimeError(f"training did not return a job_id: {resp}")
+            self._remember_lora_job(lora_name, job_id)
+            return job_id
+
+        known = (self._lora_jobs().get(lora_name) or {}).get("job_id")
+        if known:
+            progress = self.client.lora_progress(job=known)
+            status = (progress.get("status") or "").strip()
+            if status == "done" and progress.get("path"):
+                emit(f"Re-attached: '{lora_name}' was already trained")
+                self._remember_lora_job(lora_name, None)
+                return progress.get("path")
+            if status in active:
+                emit(f"Re-attached to the running job for '{lora_name}'")
+                job_id = known
+            else:
+                emit(f"Previous job was '{status or 'lost'}'; resubmitting (resumes from checkpoint)")
+                job_id = kickoff()
+        else:
+            job_id = kickoff()
+
+        started = time.time()
+        resubmits = 0
+        last_line = ""
+        while True:
+            if cancelled and cancelled():
+                raise RuntimeError("cancelled")
+            time.sleep(3.0)
+            progress = self.client.lora_progress(job=job_id)
+            status = (progress.get("status") or "").strip()
+            elapsed = int(time.time() - started)
+            mm, ss = divmod(elapsed, 60)
+            et = f"{mm}m{ss:02d}s" if mm else f"{ss}s"
+            if status == "done":
+                self._remember_lora_job(lora_name, None)
+                emit(f"LoRA '{lora_name}' trained in {et} -> {progress.get('path')}")
+                return progress.get("path")
+            if status == "error":
+                self._remember_lora_job(lora_name, None)
+                raise RuntimeError(progress.get("message") or "LoRA training failed")
+            if status in {"interrupted", "unknown", ""}:
+                if resubmits < 2:
+                    resubmits += 1
+                    emit(f"Job {status or 'lost'}; resubmitting to resume (#{resubmits})")
+                    job_id = kickoff()
+                    continue
+                raise RuntimeError(f"training {status or 'unknown'} and could not be resumed")
+            step, total = progress.get("step") or 0, progress.get("total") or body.get("steps") or 0
+            line = (f"  {status} {step}/{total} ({et})" if step
+                    else f"  {progress.get('message') or status} ({et})")
+            if line != last_line:
+                emit(line)
+                last_line = line
+
     # ── step 2: a brand-new video with that character ───────────────────────
     def make_video(self, name: str, prompt: str, opts: dict[str, Any], emit=log) -> Path:
         models = self.client.list_models()
@@ -380,10 +550,15 @@ class CharacterStudio:
             body["keyframe_steps"] = int(opts["keyframe_steps"])
         if opts.get("camera_motion"):
             body["camera_motion"] = opts["camera_motion"]
+        adapters = lora_specs(opts.get("loras"), float(opts.get("lora_weight") or 1.0))
+        if adapters:
+            body["loras"] = adapters
 
         emit(f"Video model: {video_model}  ({width}x{height}, seed {seed})")
         emit(f"Identity: character_profiles=['{name}'] strength={body['character_strength']} "
              f"keyframe_identity={keyframe_identity}")
+        if adapters:
+            emit("LoRAs: " + ", ".join(f"{a['id'][5:]}@{a['weight']}" for a in adapters))
         emit("Generating — this is the slow part...")
         started = time.time()
         mp4 = self.client.generate_video(body)
@@ -405,14 +580,19 @@ class CharacterStudio:
             emit("No image model available — skipping the identity portrait")
             return None
         emit(f"Rendering identity portrait with {image_model}...")
-        png = self.client.generate_image({
+        body = {
             "model": image_model,
             "prompt": prompt,
             "size": f"{int(opts.get('width') or 768)}x{int(opts.get('height') or 432)}",
             "steps": int(opts.get("keyframe_steps") or 24),
             "character_profiles": [name],
             "character_strength": float(opts.get("character_strength") or 0.8),
-        })
+        }
+        # Only image-target LoRAs belong on the image endpoint.
+        adapters = lora_specs(opts.get("image_loras"), float(opts.get("lora_weight") or 1.0))
+        if adapters:
+            body["loras"] = adapters
+        png = self.client.generate_image(body)
         out_dir = self.out_dir / "portraits"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{safe_slug(name)}_{int(time.time())}.png"
@@ -469,6 +649,24 @@ class CharacterStudio:
             emit(f"FAILED: {exc}")
             self._job_update(job_id, status="error", error=str(exc))
 
+    def train_job(self, job_id: str, payload: dict[str, Any]) -> None:
+        emit = lambda line: self._job_emit(job_id, line)
+        try:
+            self._job_update(job_id, status="running", progress=10)
+            name = (payload.get("name") or "").strip()
+            if not name:
+                raise RuntimeError("Pick a character profile to train from")
+            payload = dict(payload)
+            payload["cancelled"] = lambda: bool(self.get_job(job_id).get("cancel"))
+            path = self.train_identity_lora(name, payload, emit=emit)
+            self._job_update(job_id, status="done", progress=100, result={"path": path})
+        except Exception as exc:
+            emit(f"FAILED: {exc}")
+            self._job_update(job_id, status="error", error=str(exc))
+
+    def cancel_job(self, job_id: str) -> None:
+        self._job_update(job_id, cancel=True, message="cancelling")
+
     def video_job(self, job_id: str, payload: dict[str, Any]) -> None:
         emit = lambda line: self._job_emit(job_id, line)
         try:
@@ -492,6 +690,7 @@ class CharacterStudio:
         models = self.client.list_models()
         return {
             "characters": self.client.list_characters(),
+            "loras": self.client.list_loras(),
             "models": [
                 {"id": m.get("id"), "capabilities": m.get("capabilities") or []}
                 for m in models
@@ -502,6 +701,25 @@ class CharacterStudio:
             },
             "base_url": self.args.base_url,
         }
+
+
+def lora_specs(loras: Any, default_weight: float = 1.0) -> list[dict[str, Any]]:
+    """Normalise "name", "name:0.8" or {"name":..,"weight":..} into request LoRAs.
+
+    A registered LoRA is referenced server-side as `id: "name:<registered>"`.
+    """
+    out: list[dict[str, Any]] = []
+    for item in loras or []:
+        if isinstance(item, dict):
+            name, weight = item.get("name") or item.get("id") or "", item.get("weight")
+        else:
+            name, _, raw = str(item).partition(":")
+            weight = float(raw) if raw else None
+        name = (name or "").strip()
+        if not name:
+            continue
+        out.append({"id": f"name:{name}", "weight": float(weight if weight is not None else default_weight)})
+    return out
 
 
 def quote_rel(path: str) -> str:
@@ -588,9 +806,33 @@ video{width:100%;border-radius:14px;margin-top:12px;background:#000}
     </div>
   </div>
 
+    <div class="card">
+      <h2>3 &middot; Identity LoRA <span class="muted">(optional)</span></h2>
+      <div class="muted">IP-Adapter alone drifts on long shots and profile angles. Training a small
+      LoRA on the same crops locks the identity harder — minutes to hours, depending on the model.</div>
+      <div class="row">
+        <div><label>LoRA name</label><input id="lora_name" placeholder="(character)_identity"></div>
+        <div><label>Trigger word</label><input id="trigger" placeholder="(character name)"></div>
+      </div>
+      <div class="row3">
+        <div><label>Target</label><select id="train_target"><option value="video">video</option><option value="image">image</option></select></div>
+        <div><label>Steps</label><input id="train_steps" type="number" value="800"></div>
+        <div><label>Rank</label><input id="rank" type="number" value="16"></div>
+      </div>
+      <div class="row3">
+        <div><label>Resolution</label><input id="train_resolution" type="number" value="512"></div>
+        <div><label>Frames/sample</label><input id="train_frames" type="number" value="1"></div>
+        <div><label>Learning rate</label><input id="learning_rate" type="number" step="0.00001" value="0.0001"></div>
+      </div>
+      <div class="chk"><input id="quantize_4bit" type="checkbox" checked><span>4-bit QLoRA base (needed to fit a large video model on one GPU)</span></div>
+      <button class="btn" id="btn_train">Train identity LoRA</button>
+      <button class="btn secondary" id="btn_cancel_train" style="margin-left:8px" disabled>Cancel</button>
+    </div>
+  </div>
+
   <div>
     <div class="card">
-      <h2>3 &middot; New scene with that character</h2>
+      <h2>4 &middot; New scene with that character</h2>
       <label>Scene prompt</label>
       <textarea id="prompt" placeholder="walking through a neon-lit Tokyo street at night, cinematic, shallow depth of field"></textarea>
       <div class="row">
@@ -611,6 +853,10 @@ video{width:100%;border-radius:14px;margin-top:12px;background:#000}
         <div><label>Identity strength</label><input id="character_strength" type="number" step="0.05" value="0.8"></div>
         <div><label>Keyframe identity</label><select id="keyframe_identity"><option value="auto">auto</option><option value="always">always</option><option value="never">never</option></select></div>
         <div><label>Camera motion</label><select id="camera_motion"><option value="">(none)</option><option>zoom-in</option><option>zoom-out</option><option>pan-left</option><option>pan-right</option><option>tilt-up</option><option>tilt-down</option><option>rotate</option></select></div>
+      </div>
+      <div class="row">
+        <div><label>Apply LoRAs (ctrl-click for several)</label><select id="video_loras" multiple size="4"></select></div>
+        <div><label>LoRA weight</label><input id="lora_weight" type="number" step="0.05" value="1.0"></div>
       </div>
       <label>Negative prompt</label>
       <input id="negative_prompt" placeholder="(server default)">
@@ -645,6 +891,7 @@ $('drop').ondragover=e=>{e.preventDefault(); $('drop').classList.add('hot')};
 $('drop').ondragleave=()=>$('drop').classList.remove('hot');
 $('drop').ondrop=e=>{e.preventDefault(); $('drop').classList.remove('hot'); addFiles(e.dataTransfer.files)};
 
+function selected(sel){return sel?[...sel.selectedOptions].map(o=>o.value):[]}
 function options(list,sel){return list.map(v=>`<option ${v===sel?'selected':''}>${esc(v)}</option>`).join('')}
 function capModels(cap){return state.models.filter(m=>(m.capabilities||[]).includes(cap)).map(m=>m.id)}
 
@@ -654,6 +901,10 @@ async function loadState(){
   const keep=$('charsel').value;
   $('charsel').innerHTML=options(names, names.includes(keep)?keep:(state.characters[0]||{}).name);
   $('video_model').innerHTML=options(capModels('video_generation'), state.defaults.video_model);
+  const loraNames=(state.loras||[]).map(l=>l.name||l.id).filter(Boolean);
+  const keptLoras=selected($('video_loras'));
+  $('video_loras').innerHTML=loraNames.map(n=>`<option ${keptLoras.includes(n)?'selected':''}>${esc(n)}</option>`).join('')
+    ||'<option disabled>no LoRAs trained yet</option>';
   $('image_model').innerHTML=options(capModels('image_generation'), state.defaults.image_model);
   if($('charsel').value) loadRefs($('charsel').value);
 }
@@ -686,7 +937,8 @@ async function watch(job_id,done){
     const j=await api('/api/job/'+job_id);
     setLog((j.log||[]).join('\n'));
     if(j.status==='done'){clearInterval(timer); done(j)}
-    if(j.status==='error'){clearInterval(timer); logln('Error: '+(j.error||'unknown'))}
+    if(j.status==='error'){clearInterval(timer); logln('Error: '+(j.error||'unknown'))
+      $('btn_train').disabled=false; $('btn_cancel_train').disabled=true; $('btn_video').disabled=false}
   },1500);
 }
 
@@ -699,6 +951,29 @@ $('btn_extract').onclick=async()=>{
       max_images:+$('max_images').value||5, sources:pending.map(f=>f.data)})});
     watch(d.job_id, async j=>{pending=[]; renderFiles(); await loadState(); if(j.result) {$('charsel').value=j.result.name; loadRefs(j.result.name)} $('btn_extract').disabled=false});
   }catch(e){logln('Error: '+e.message); $('btn_extract').disabled=false}
+};
+
+let trainJob=null;
+$('btn_train').onclick=async()=>{
+  const name=$('charsel').value;
+  if(!name){alert('Extract or pick a character first'); return}
+  $('btn_train').disabled=true; $('btn_cancel_train').disabled=false;
+  setLog('Submitting training job...');
+  try{
+    const d=await api('/api/train',{method:'POST',body:JSON.stringify({
+      name, lora_name:$('lora_name').value, trigger:$('trigger').value,
+      target:$('train_target').value, base_model:$('video_model').value,
+      steps:+$('train_steps').value, rank:+$('rank').value,
+      resolution:+$('train_resolution').value, train_frames:+$('train_frames').value,
+      learning_rate:+$('learning_rate').value, quantize_4bit:$('quantize_4bit').checked})});
+    trainJob=d.job_id;
+    watch(d.job_id, async()=>{$('btn_train').disabled=false; $('btn_cancel_train').disabled=true; trainJob=null; await loadState()});
+  }catch(e){logln('Error: '+e.message); $('btn_train').disabled=false; $('btn_cancel_train').disabled=true}
+};
+$('btn_cancel_train').onclick=async()=>{
+  if(!trainJob) return;
+  await api('/api/job/'+trainJob+'/cancel',{method:'POST',body:'{}'});
+  logln('Cancel requested — the run stops at the next poll (checkpoint is kept).');
 };
 
 $('btn_video').onclick=async()=>{
@@ -714,6 +989,7 @@ $('btn_video').onclick=async()=>{
       fps:+$('fps').value, steps:+$('steps').value, guidance_scale:+$('guidance_scale').value,
       character_strength:+$('character_strength').value, keyframe_identity:$('keyframe_identity').value,
       camera_motion:$('camera_motion').value, negative_prompt:$('negative_prompt').value,
+      loras:selected($('video_loras')), lora_weight:+$('lora_weight').value,
       portrait:$('portrait').checked};
     const d=await api('/api/video',{method:'POST',body:JSON.stringify(body)});
     watch(d.job_id, j=>{
@@ -820,6 +1096,11 @@ def make_handler(studio: CharacterStudio):
                     self._json({"job_id": studio.start_job("extract", studio.extract_job, payload)})
                 elif path == "/api/video":
                     self._json({"job_id": studio.start_job("video", studio.video_job, payload)})
+                elif path == "/api/train":
+                    self._json({"job_id": studio.start_job("train", studio.train_job, payload)})
+                elif path.startswith("/api/job/") and path.endswith("/cancel"):
+                    studio.cancel_job(path.split("/")[-2])
+                    self._json({"ok": True})
                 elif path.startswith("/api/character/") and path.endswith("/prune"):
                     name = urllib.parse.unquote(path[len("/api/character/"):-len("/prune")])
                     drop = [int(i) for i in (payload.get("drop") or [])]
@@ -856,6 +1137,10 @@ def add_video_options(parser: argparse.ArgumentParser) -> None:
                                  "tilt-up", "tilt-down", "rotate"])
     parser.add_argument("--portrait", action="store_true",
                         help="Also render a still identity portrait (fast check before the slow video)")
+    parser.add_argument("--lora", action="append", default=[], metavar="NAME[:WEIGHT]",
+                        help="Apply a trained LoRA to the video (repeatable, e.g. alice_identity:0.9)")
+    parser.add_argument("--image-lora", action="append", default=[], metavar="NAME[:WEIGHT]",
+                        help="LoRA for the still portrait / identity keyframe (repeatable)")
 
 
 def video_opts(args: argparse.Namespace) -> dict[str, Any]:
@@ -874,6 +1159,42 @@ def video_opts(args: argparse.Namespace) -> dict[str, Any]:
         "keyframe_identity": args.keyframe_identity,
         "keyframe_steps": args.keyframe_steps,
         "camera_motion": args.camera_motion,
+        "loras": args.lora,
+        "image_loras": args.image_lora,
+    }
+
+
+def add_train_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--lora-name", default="", help="Output LoRA name (default: <character>_identity)")
+    parser.add_argument("--target", choices=["video", "image"], default="video",
+                        help="Pipeline the LoRA is trained for (default: video)")
+    parser.add_argument("--base-model", default="", help="Model to train against (default: the studio's video/image model)")
+    parser.add_argument("--trigger", default="", help="Trigger word (default: the character name)")
+    parser.add_argument("--instance-prompt", default="", help="Override the training caption")
+    parser.add_argument("--train-steps", type=int, default=800)
+    parser.add_argument("--rank", type=int, default=16)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--train-resolution", type=int, default=512)
+    parser.add_argument("--train-frames", type=int, default=1,
+                        help="Frames per training sample (1 = stills, as most identity LoRAs are trained)")
+    parser.add_argument("--no-quantize", action="store_true",
+                        help="Train the base in bf16 instead of 4-bit QLoRA (needs a lot more VRAM)")
+
+
+def train_opts(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "lora_name": args.lora_name,
+        "target": args.target,
+        "base_model": args.base_model,
+        "trigger": args.trigger,
+        "instance_prompt": args.instance_prompt,
+        "steps": args.train_steps,
+        "rank": args.rank,
+        "learning_rate": args.learning_rate,
+        "resolution": args.train_resolution,
+        "train_frames": args.train_frames,
+        "quantize_4bit": not args.no_quantize,
+        "seed": getattr(args, "seed", 42) or 42,
     }
 
 
@@ -890,7 +1211,9 @@ def build_parser() -> argparse.ArgumentParser:
             "  %(prog)s extract --name alice --source clips/alice.mp4 --max-images 6\n"
             "  %(prog)s show alice\n"
             "  %(prog)s prune alice --drop 2 --drop 4      # a bystander got picked up\n"
-            "  %(prog)s video alice --prompt 'riding a horse along a stormy beach'\n\n"
+            "  %(prog)s train alice --train-steps 1200     # identity LoRA from those crops\n"
+            "  %(prog)s video alice --prompt 'riding a horse along a stormy beach' \\\n"
+            "      --lora alice_identity:0.9\n\n"
             "  # browser UI\n"
             "  %(prog)s web --browser\n"
         ),
@@ -923,6 +1246,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_delete = sub.add_parser("delete", help="Delete a character profile")
     p_delete.add_argument("name")
 
+    p_train = sub.add_parser("train", help="Train an identity LoRA from a profile's reference crops")
+    p_train.add_argument("name")
+    p_train.add_argument("--seed", type=int, default=42)
+    add_train_options(p_train)
+
     p_video = sub.add_parser("video", help="Generate a new video starring a saved character")
     p_video.add_argument("name")
     add_video_options(p_video)
@@ -932,7 +1260,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_demo.add_argument("--source", action="append", required=True, metavar="PATH|URL")
     p_demo.add_argument("--description", default="")
     p_demo.add_argument("--max-images", type=int, default=5)
+    p_demo.add_argument("--train", action="store_true",
+                        help="Also train an identity LoRA from the crops and apply it to the video")
     add_video_options(p_demo)
+    add_train_options(p_demo)
 
     p_web = sub.add_parser("web", help="Serve the browser UI")
     p_web.add_argument("--host", default="0.0.0.0", help="Listen host (default: 0.0.0.0)")
@@ -995,6 +1326,12 @@ def main(argv: list[str] | None = None) -> int:
         log("Review the crops, drop any stray faces with `prune`, then run `video`.")
         return 0
 
+    if cmd == "train":
+        path = studio.train_identity_lora(args.name, train_opts(args))
+        lora = args.lora_name or f"{safe_slug(args.name)}_identity"
+        log(f"Apply it with: video {args.name} --prompt '...' --lora {lora}")
+        return 0 if path else 1
+
     if cmd == "video":
         if args.portrait:
             studio.make_portrait(args.name, args.prompt, video_opts(args))
@@ -1010,8 +1347,15 @@ def main(argv: list[str] | None = None) -> int:
             studio.make_portrait(args.name, args.prompt, video_opts(args))
         else:
             log(f"[2/3] {profile['image_count']} reference(s) ready — skipping the portrait check")
-        log("[3/3] generating the new video")
-        studio.make_video(args.name, args.prompt, video_opts(args))
+        opts = video_opts(args)
+        if args.train:
+            log("[3/4] training an identity LoRA from those crops")
+            lora = args.lora_name or f"{safe_slug(args.name)}_identity"
+            studio.train_identity_lora(args.name, train_opts(args))
+            opts["loras"] = list(opts.get("loras") or []) + [lora]
+        total = 4 if args.train else 3
+        log(f"[{total}/{total}] generating the new video")
+        studio.make_video(args.name, args.prompt, opts)
         return 0
 
     return 1
