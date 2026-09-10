@@ -1,0 +1,37 @@
+# Isolated venv for MiniMax-H3 video+audio generation.
+#
+# H3 exists ONLY as Modular Diffusers blocks (MiniMaxH3Blocks /
+# MiniMaxH3ModularPipeline), which landed in diffusers 0.40.0. The main coderai
+# venv is on diffusers 0.38.x, and moving the whole stack to 0.40 would shift the
+# floor under every Wan / LTX / Z-Image / SDXL pipeline at once — so H3 gets its
+# own venv, the same way pyannote, NeMo-Canary and vLLM do.
+# codai/api/h3_worker.py builds it (on demand under ~/.coderai/h3_venv or the
+# /cache mount) and runs tools/h3_service.py inside it.
+# Do NOT merge these into requirements.txt.
+
+# The transformer is 33B and the text encoder is Qwen3-VL, so this venv wants a
+# recent torch. Left unpinned deliberately: unlike pyannote there is no known-bad
+# version to dodge, and the H3 blocks track diffusers main.
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch
+torchvision
+torchaudio
+
+# The floor for MiniMax-H3 support.
+diffusers>=0.40.0
+# Qwen3VLForConditionalGeneration (H3's text encoder) needs transformers 5.x.
+transformers>=5.0
+accelerate>=1.0
+safetensors>=0.4
+huggingface_hub>=0.34
+
+# Media: export_to_video writes the frames, soundfile writes the jointly-generated
+# soundtrack, and ffmpeg (system binary, already on PATH in the image) muxes them.
+imageio>=2.34
+imageio-ffmpeg>=0.5
+soundfile>=0.12
+Pillow>=10.0
+numpy
+
+# peft carries the LoRA adapters MiniMaxH3LoraLoaderMixin loads.
+peft>=0.14

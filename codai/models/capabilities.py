@@ -116,6 +116,15 @@ def detect_model_capabilities(model_name: str) -> ModelCapabilities:
         return caps
 
     # ── Video generation ─────────────────────────────────────────────────────
+    # MiniMax-H3 generates video with a natively-synchronised soundtrack (one DiT
+    # denoises both), so it carries the audio capability too. Served through the
+    # isolated worker in codai/api/h3_worker.py, not the diffusers loader.
+    if 'minimax-h3' in n or 'minimax_h3' in n:
+        caps.video_generation = True
+        caps.image_to_video = True
+        caps.audio_generation = True
+        return caps
+
     if any(x in n for x in ['cogvideox', 'cogvideo', 'ltx-video', 'ltxvideo',
                               'hunyuan-video', 'mochi-1', 'dynamicrafter',
                               'animatediff', 'text2video', 'modelscope-t2v',

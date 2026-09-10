@@ -3576,9 +3576,157 @@ async def get_video_progress():
 # Main generation endpoint
 # =============================================================================
 
-#: Video pipeline families that can do IP-Adapter themselves, so they don't need the
-#: keyframe bridge. Everything else (Wan, CogVideoX, LTX, SVD, …) does.
-_NATIVE_IP_ADAPTER_VIDEO = ('animatediff', 'animate-diff')
+#: Video pipeline families that condition on character references themselves, so they
+#: don't need the keyframe bridge: AnimateDiff has real IP-Adapter, and MiniMax-H3's
+#: ref2va workflow takes the reference images directly (up to 9). Everything else
+#: (Wan, CogVideoX, LTX, SVD, …) needs the bridge.
+_NATIVE_IP_ADAPTER_VIDEO = ('animatediff', 'animate-diff', 'minimax-h3', 'minimax_h3')
+
+
+async def _generate_h3(request: VideoGenerationRequest, model_name: str,
+                       model_cfg: dict, http_request,
+                       identity_note: Optional[str] = None):
+    """Generate on MiniMax-H3 through the isolated worker.
+
+    H3 differs from every other video model here in ways the request has to be
+    translated for, not just forwarded:
+
+      * It is guidance-distilled — no negative prompt, no guidance scale. Both are
+        dropped (with a warning, so a caller that set them isn't left guessing).
+      * Video and audio are denoised jointly, so the returned mp4 already HAS a
+        soundtrack. The post-processing chain still runs on top for lip sync,
+        dialogs, subtitles and upscaling.
+      * Character identity is native: the profile's reference images go in as
+        ref2va references (up to 9) instead of through the keyframe bridge.
+      * Frame count and canvas are checkpoint contracts (24 fps, 17n+5 frames,
+        5-15 s, axes multiple of 32); the worker snaps them and reports what it
+        actually generated.
+    """
+    from codai.api import h3_worker
+
+    warnings: list = []
+    if identity_note:
+        warnings.append(identity_note)
+
+    mode = (request.mode or 't2v').lower()
+    if mode in ('v2v', 'interp'):
+        raise HTTPException(status_code=400, detail=(
+            f"MiniMax-H3 has no '{mode}' workflow — it supports t2va (prompt), "
+            "fl2va (first and/or last keyframe) and ref2va (reference media)."))
+    if request.negative_prompt:
+        warnings.append("MiniMax-H3 is guidance-distilled: negative_prompt ignored")
+    if request.guidance_scale is not None:
+        warnings.append("MiniMax-H3 is guidance-distilled: guidance_scale ignored")
+
+    def _as_b64(ref: str) -> str:
+        """Normalise a base64 / data-URI / URL reference to plain base64."""
+        return base64.b64encode(_decode_b64_or_url(ref)).decode()
+
+    payload = {
+        "prompt": request.prompt or "",
+        "num_inference_steps": request.num_inference_steps or 50,
+    }
+    if request.num_frames:
+        payload["num_frames"] = int(request.num_frames)
+    if request.fps and int(request.fps) != 24:
+        warnings.append("MiniMax-H3 generates at a fixed 24 fps; fps ignored")
+    if request.width and request.height:
+        payload["width"], payload["height"] = int(request.width), int(request.height)
+    if request.seed is not None:
+        payload["seed"] = int(request.seed)
+
+    first = request.init_image or request.image
+    if first:
+        payload["image"] = _as_b64(first)
+    if request.end_image:
+        payload["last_image"] = _as_b64(request.end_image)
+
+    # ── native identity conditioning (ref2va) ───────────────────────────────
+    refs: list = []
+    try:
+        if request.character_profiles:
+            from codai.api.characters import resolve_character_profiles
+            for img in resolve_character_profiles(list(request.character_profiles)):
+                refs.append({"type": "image", "data": _as_b64(img)})
+    except Exception as e:
+        print(f"  [h3] character profile resolution failed: {e}")
+    for img in (request.character_references or []):
+        refs.append({"type": "image", "data": _as_b64(img)})
+    for entry in (request.characters or []):
+        for img in (entry.get("images") or []):
+            refs.append({"type": "image", "data": _as_b64(img)})
+    if refs:
+        # The checkpoint takes at most 9 image references; keep the first ones,
+        # which is the order the caller considered most representative.
+        if len(refs) > 9:
+            warnings.append(f"MiniMax-H3 takes 9 image references; used the first 9 of {len(refs)}")
+            refs = refs[:9]
+        if payload.get("image") or payload.get("last_image"):
+            # fl2va and ref2va are different transformer partitions — a request
+            # can't be both. The explicit keyframe wins; say so.
+            warnings.append("MiniMax-H3: keyframe supplied, so character references were dropped "
+                            "(fl2va and ref2va are separate checkpoints)")
+        else:
+            payload["references"] = refs
+
+    if getattr(request, 'loras', None):
+        adapters = []
+        for lora in request.loras:
+            path = getattr(lora, 'model', None) or getattr(lora, 'path', None)
+            if path:
+                adapters.append({"path": path, "weight": float(getattr(lora, 'weight', 1.0) or 1.0)})
+        if adapters:
+            payload["loras"] = adapters
+
+    _vid_progress_reset(int(payload["num_inference_steps"]))
+    try:
+        data = await asyncio.to_thread(h3_worker.generate, model_name, payload, model_cfg)
+    finally:
+        _vid_progress_done()
+
+    mp4_bytes = base64.b64decode(data.get("mp4_b64") or "")
+    if not mp4_bytes:
+        raise HTTPException(status_code=500, detail="MiniMax-H3 returned no video")
+    print(f"  [h3] {data.get('workflow')}: {data.get('num_frames')} frames "
+          f"({data.get('seconds')}s @ {data.get('fps')}fps), {len(mp4_bytes)/1e6:.1f} MB")
+
+    temps: list = []
+    try:
+        needs_post = any([
+            request.upscale_output, request.interpolate_output, request.add_audio,
+            request.tts_text, request.dialogs, request.lip_sync,
+            request.generate_subtitles, request.burn_subtitles,
+        ])
+        if needs_post:
+            mp4_bytes = await asyncio.get_event_loop().run_in_executor(
+                None, _postprocess_video, mp4_bytes, request, http_request, temps, warnings)
+    finally:
+        for path in temps:
+            try:
+                if os.path.isfile(path):
+                    os.unlink(path)
+            except Exception:
+                pass
+
+    result = _save_file(mp4_bytes, 'mp4', http_request)
+    try:
+        from codai.api.archive import archive_manager
+        asyncio.get_event_loop().create_task(asyncio.to_thread(
+            archive_manager.save_generation,
+            "video", "/v1/video/generations", request.model, request.prompt or "",
+            {"mode": request.mode, "workflow": data.get("workflow"),
+             "num_frames": data.get("num_frames"), "fps": data.get("fps"),
+             "width": data.get("width"), "height": data.get("height"),
+             "num_inference_steps": payload["num_inference_steps"],
+             "seed": request.seed},
+            [(mp4_bytes, "mp4")]))
+    except Exception:
+        pass
+
+    resp = VideoGenerationResponse(created=int(time.time()), data=[result])
+    if warnings:
+        resp.warnings = warnings
+    return resp
 
 
 async def _maybe_build_identity_keyframe(request: VideoGenerationRequest,
@@ -3732,6 +3880,20 @@ async def video_generations(request: VideoGenerationRequest,
     pipe = model_info.get('model_object')
     # Always define _model_cfg — it's used later regardless of whether we load now.
     _model_cfg = model_info.get('config') or {}
+
+    # ── MiniMax-H3 ───────────────────────────────────────────────────────────
+    # H3 is Modular-Diffusers-only and needs diffusers >= 0.40, so it runs in an
+    # isolated venv behind codai/api/h3_worker.py rather than through the loader
+    # below. Branch before any of it: the worker owns the weights, the VRAM
+    # reservation and the eviction hook.
+    try:
+        from codai.api import h3_worker
+        _is_h3 = h3_worker.is_h3_model(model_name, _model_cfg)
+    except Exception:
+        _is_h3 = False
+    if _is_h3:
+        return await _generate_h3(request, model_name, _model_cfg, http_request,
+                                  _identity_note)
 
     # Refuse to load onto a poisoned CUDA context — it would just re-assert.
     if getattr(multi_model_manager, 'cuda_context_poisoned', False):

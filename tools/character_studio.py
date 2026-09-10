@@ -10,6 +10,8 @@ keeps local copies of the results:
   - GET  /v1/characters           list saved profiles
   - GET  /v1/characters/{name}    fetch a profile's reference images
   - PATCH/DELETE /v1/characters/  prune bad references / remove a profile
+  - POST /v1/audio/voices/extract clone the voice off the same footage, so the
+                                  character can speak in their own voice
   - POST /v1/loras/train          optionally train an identity LoRA straight from
                                   the profile's crops (`character: <name>`), for
                                   models where IP-Adapter alone drifts
@@ -65,6 +67,7 @@ DEFAULT_OUT_DIR = os.environ.get("CODERAI_CHARACTER_OUT", "character_output")
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
+AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
 
 DEFAULT_NEGATIVE = (
     "different person, face morphing, distorted face, extra fingers, blurry, "
@@ -264,6 +267,19 @@ class CoderAIClient:
     def delete_character(self, name: str) -> dict[str, Any]:
         return self._delete(f"/v1/characters/{urllib.parse.quote(name)}")
 
+    # ── voices ──────────────────────────────────────────────────────────────
+    def list_voices(self) -> list[dict[str, Any]]:
+        try:
+            return self._get("/v1/audio/voices").get("voices", [])
+        except Exception:
+            return []
+
+    def extract_voice(self, name: str, description: str, media: str,
+                      is_video: bool, transcript: str = "") -> dict[str, Any]:
+        body = {"name": name, "description": description, "transcript": transcript}
+        body["video" if is_video else "audio"] = media
+        return self._post("/v1/audio/voices/extract", body)
+
     # ── LoRAs ───────────────────────────────────────────────────────────────
     def list_loras(self) -> list[dict[str, Any]]:
         try:
@@ -358,7 +374,8 @@ class CharacterStudio:
 
     # ── step 1: extraction ──────────────────────────────────────────────────
     def extract(self, name: str, sources: list[str], description: str = "",
-                max_images: int = 5, emit=log) -> dict[str, Any]:
+                max_images: int = 5, emit=log, with_voice: bool = False,
+                transcript: str = "") -> dict[str, Any]:
         images, videos = split_sources(sources)
         emit(f"Extracting '{name}' from {len(images)} image(s) and {len(videos)} video(s)...")
         result = self.client.extract_character(name, description, images, videos, max_images)
@@ -369,7 +386,48 @@ class CharacterStudio:
             emit(f"Contact sheet: {mirrored['contact_sheet']}")
         else:
             emit("Contact sheet skipped (install Pillow to get one)")
+        if with_voice:
+            try:
+                mirrored["voice"] = self.extract_voice_profile(
+                    name, sources, emit=emit, transcript=transcript)
+            except Exception as exc:
+                emit(f"Voice clone failed ({exc}) — the character is still usable")
         return mirrored
+
+    # ── step 1a: the voice off the same footage ─────────────────────────────
+    def extract_voice_profile(self, name: str, sources: list[str], emit=log,
+                              transcript: str = "") -> str | None:
+        """Clone a voice profile from the first audio-bearing source.
+
+        The face and the voice come from the same clip, so the character can speak
+        in their own voice later (`--say`), instead of a stock TTS voice. Silently
+        returns None when only stills were supplied — there is nothing to clone.
+        """
+        media, is_video = None, True
+        for item in sources:
+            if item.startswith(("http://", "https://")):
+                if kind_of(Path(urllib.parse.urlparse(item).path)) == "video":
+                    media = item
+                    break
+                continue
+            if item.startswith("data:"):
+                if item[5:].split(";", 1)[0].startswith(("video/", "audio/")):
+                    media, is_video = item, item[5:].startswith("video/")
+                    break
+                continue
+            path = Path(item)
+            if kind_of(path) == "video" or path.suffix.lower() in AUDIO_EXTS:
+                media = data_uri_for_file(path)
+                is_video = kind_of(path) == "video"
+                break
+        if not media:
+            emit("No video/audio source — skipping the voice clone (stills carry no voice)")
+            return None
+        voice = f"{safe_slug(name)}_voice"
+        emit(f"Cloning voice '{voice}' from the source footage...")
+        self.client.extract_voice(voice, f"voice of {name}", media, is_video, transcript)
+        emit(f"Voice profile ready: {voice}")
+        return voice
 
     # ── step 1b: an identity LoRA trained from the same crops ───────────────
     def _lora_jobs_path(self) -> Path:
@@ -550,6 +608,22 @@ class CharacterStudio:
             body["keyframe_steps"] = int(opts["keyframe_steps"])
         if opts.get("camera_motion"):
             body["camera_motion"] = opts["camera_motion"]
+        say = (opts.get("say") or "").strip()
+        if say:
+            # A saved voice profile makes the server clone THAT voice for the line;
+            # a bare id (e.g. af_sarah) is a stock TTS voice. Lip sync is applied to
+            # the generated face either way.
+            voice = (opts.get("voice") or f"{safe_slug(name)}_voice").strip()
+            body["dialogs"] = [{"character": name, "voice": voice, "text": say,
+                                "lip_sync": bool(opts.get("lip_sync", True)),
+                                "speed": float(opts.get("speech_speed") or 1.0)}]
+            body["lip_sync"] = bool(opts.get("lip_sync", True))
+            if opts.get("lip_sync_method"):
+                body["lip_sync_method"] = opts["lip_sync_method"]
+            body["add_audio"] = True
+            body["audio_type"] = "speech"
+            emit(f"Dialog: '{say[:60]}' in voice '{voice}'"
+                 + (" with lip sync" if body["lip_sync"] else ""))
         adapters = lora_specs(opts.get("loras"), float(opts.get("lora_weight") or 1.0))
         if adapters:
             body["loras"] = adapters
@@ -643,6 +717,8 @@ class CharacterStudio:
                 description=payload.get("description") or "",
                 max_images=int(payload.get("max_images") or 5),
                 emit=emit,
+                with_voice=bool(payload.get("with_voice")),
+                transcript=payload.get("transcript") or "",
             )
             self._job_update(job_id, status="done", progress=100, result=profile)
         except Exception as exc:
@@ -691,6 +767,7 @@ class CharacterStudio:
         return {
             "characters": self.client.list_characters(),
             "loras": self.client.list_loras(),
+            "voices": self.client.list_voices(),
             "models": [
                 {"id": m.get("id"), "capabilities": m.get("capabilities") or []}
                 for m in models
@@ -790,6 +867,7 @@ video{width:100%;border-radius:14px;margin-top:12px;background:#000}
       <div class="drop" id="drop">Drop files here, or click to choose<br><span class="muted">jpg &middot; png &middot; webp &middot; mp4 &middot; mov &middot; mkv &middot; webm</span></div>
       <input id="picker" type="file" multiple accept="image/*,video/*" style="display:none">
       <div class="files" id="filelist"></div>
+      <div class="chk"><input id="with_voice" type="checkbox"><span>Also clone the voice from the same footage (needs a video/audio source)</span></div>
       <button class="btn" id="btn_extract">Extract character</button>
       <div class="warn">Files are base64-encoded into the request — keep source clips short (a few seconds is plenty; frames are sampled evenly).</div>
     </div>
@@ -858,6 +936,13 @@ video{width:100%;border-radius:14px;margin-top:12px;background:#000}
         <div><label>Apply LoRAs (ctrl-click for several)</label><select id="video_loras" multiple size="4"></select></div>
         <div><label>LoRA weight</label><input id="lora_weight" type="number" step="0.05" value="1.0"></div>
       </div>
+      <label>Spoken line <span class="muted">(lip-synced, in the cloned voice)</span></label>
+      <input id="say" placeholder="I told you I could ride">
+      <div class="row3">
+        <div><label>Voice</label><select id="voice"></select></div>
+        <div><label>Speed</label><input id="speech_speed" type="number" step="0.05" value="1.0"></div>
+        <div><label>Lip sync</label><select id="lip_sync"><option value="1">on</option><option value="0">off</option></select></div>
+      </div>
       <label>Negative prompt</label>
       <input id="negative_prompt" placeholder="(server default)">
       <div class="chk"><input id="portrait" type="checkbox"><span>Render a still identity portrait first (fast sanity check before the slow video)</span></div>
@@ -901,6 +986,9 @@ async function loadState(){
   const keep=$('charsel').value;
   $('charsel').innerHTML=options(names, names.includes(keep)?keep:(state.characters[0]||{}).name);
   $('video_model').innerHTML=options(capModels('video_generation'), state.defaults.video_model);
+  const voiceNames=(state.voices||[]).map(v=>v.name||v.id).filter(Boolean);
+  const keptVoice=$('voice').value;
+  $('voice').innerHTML='<option value="">(character\'s own voice)</option>'+options(voiceNames, keptVoice);
   const loraNames=(state.loras||[]).map(l=>l.name||l.id).filter(Boolean);
   const keptLoras=selected($('video_loras'));
   $('video_loras').innerHTML=loraNames.map(n=>`<option ${keptLoras.includes(n)?'selected':''}>${esc(n)}</option>`).join('')
@@ -948,7 +1036,8 @@ $('btn_extract').onclick=async()=>{
   try{
     const d=await api('/api/extract',{method:'POST',body:JSON.stringify({
       name:$('name').value, description:$('description').value,
-      max_images:+$('max_images').value||5, sources:pending.map(f=>f.data)})});
+      max_images:+$('max_images').value||5, with_voice:$('with_voice').checked,
+      sources:pending.map(f=>f.data)})});
     watch(d.job_id, async j=>{pending=[]; renderFiles(); await loadState(); if(j.result) {$('charsel').value=j.result.name; loadRefs(j.result.name)} $('btn_extract').disabled=false});
   }catch(e){logln('Error: '+e.message); $('btn_extract').disabled=false}
 };
@@ -990,6 +1079,8 @@ $('btn_video').onclick=async()=>{
       character_strength:+$('character_strength').value, keyframe_identity:$('keyframe_identity').value,
       camera_motion:$('camera_motion').value, negative_prompt:$('negative_prompt').value,
       loras:selected($('video_loras')), lora_weight:+$('lora_weight').value,
+      say:$('say').value, voice:$('voice').value,
+      lip_sync:$('lip_sync').value==='1', speech_speed:+$('speech_speed').value,
       portrait:$('portrait').checked};
     const d=await api('/api/video',{method:'POST',body:JSON.stringify(body)});
     watch(d.job_id, j=>{
@@ -1137,6 +1228,12 @@ def add_video_options(parser: argparse.ArgumentParser) -> None:
                                  "tilt-up", "tilt-down", "rotate"])
     parser.add_argument("--portrait", action="store_true",
                         help="Also render a still identity portrait (fast check before the slow video)")
+    parser.add_argument("--say", default="",
+                        help="Have the character speak this line, lip-synced, in their cloned voice")
+    parser.add_argument("--voice", default="",
+                        help="Voice profile or TTS voice id for --say (default: <character>_voice)")
+    parser.add_argument("--no-lip-sync", action="store_true", help="Speak without lip sync")
+    parser.add_argument("--speech-speed", type=float, default=1.0)
     parser.add_argument("--lora", action="append", default=[], metavar="NAME[:WEIGHT]",
                         help="Apply a trained LoRA to the video (repeatable, e.g. alice_identity:0.9)")
     parser.add_argument("--image-lora", action="append", default=[], metavar="NAME[:WEIGHT]",
@@ -1161,6 +1258,10 @@ def video_opts(args: argparse.Namespace) -> dict[str, Any]:
         "camera_motion": args.camera_motion,
         "loras": args.lora,
         "image_loras": args.image_lora,
+        "say": args.say,
+        "voice": args.voice,
+        "lip_sync": not args.no_lip_sync,
+        "speech_speed": args.speech_speed,
     }
 
 
@@ -1212,8 +1313,9 @@ def build_parser() -> argparse.ArgumentParser:
             "  %(prog)s show alice\n"
             "  %(prog)s prune alice --drop 2 --drop 4      # a bystander got picked up\n"
             "  %(prog)s train alice --train-steps 1200     # identity LoRA from those crops\n"
+            "  %(prog)s voice alice --source clips/alice.mp4  # clone her voice too\n"
             "  %(prog)s video alice --prompt 'riding a horse along a stormy beach' \\\n"
-            "      --lora alice_identity:0.9\n\n"
+            "      --lora alice_identity:0.9 --say 'I told you I could ride'\n\n"
             "  # browser UI\n"
             "  %(prog)s web --browser\n"
         ),
@@ -1232,6 +1334,10 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Photo, video, directory, glob or URL (repeatable)")
     p_extract.add_argument("--description", default="", help="Free-text description saved with the profile")
     p_extract.add_argument("--max-images", type=int, default=5, help="Max reference crops to keep")
+    p_extract.add_argument("--voice", action="store_true",
+                           help="Also clone the voice from the same footage (needs a video/audio source)")
+    p_extract.add_argument("--transcript", default="",
+                           help="Transcript of the reference audio (auto-transcribed when omitted)")
 
     sub.add_parser("list", help="List character profiles on the server")
 
@@ -1251,6 +1357,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--seed", type=int, default=42)
     add_train_options(p_train)
 
+    p_voice = sub.add_parser("voice", help="Clone a voice profile from a character's footage")
+    p_voice.add_argument("name")
+    p_voice.add_argument("--source", action="append", required=True, metavar="PATH|URL",
+                         help="Video or audio carrying the voice (repeatable)")
+    p_voice.add_argument("--transcript", default="")
+
     p_video = sub.add_parser("video", help="Generate a new video starring a saved character")
     p_video.add_argument("name")
     add_video_options(p_video)
@@ -1260,6 +1372,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_demo.add_argument("--source", action="append", required=True, metavar="PATH|URL")
     p_demo.add_argument("--description", default="")
     p_demo.add_argument("--max-images", type=int, default=5)
+    p_demo.add_argument("--clone-voice", dest="clone_voice", action="store_true",
+                        help="Also clone the voice from the same footage (use --say to speak with it)")
+    p_demo.add_argument("--transcript", default="")
     p_demo.add_argument("--train", action="store_true",
                         help="Also train an identity LoRA from the crops and apply it to the video")
     add_video_options(p_demo)
@@ -1320,9 +1435,18 @@ def main(argv: list[str] | None = None) -> int:
         log(f"Deleted character '{args.name}'")
         return 0
 
+    if cmd == "voice":
+        voice = studio.extract_voice_profile(args.name, expand_sources(args.source),
+                                             transcript=args.transcript)
+        if not voice:
+            return 1
+        log(f"Use it with: video {args.name} --prompt '...' --say 'hello' --voice {voice}")
+        return 0
+
     if cmd == "extract":
         studio.extract(args.name, expand_sources(args.source),
-                       description=args.description, max_images=args.max_images)
+                       description=args.description, max_images=args.max_images,
+                       with_voice=args.voice, transcript=args.transcript)
         log("Review the crops, drop any stray faces with `prune`, then run `video`.")
         return 0
 
@@ -1341,7 +1465,8 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "demo":
         log("[1/3] extracting the character from the supplied footage")
         profile = studio.extract(args.name, expand_sources(args.source),
-                                 description=args.description, max_images=args.max_images)
+                                 description=args.description, max_images=args.max_images,
+                                 with_voice=args.clone_voice, transcript=args.transcript)
         if args.portrait:
             log("[2/3] identity portrait")
             studio.make_portrait(args.name, args.prompt, video_opts(args))
