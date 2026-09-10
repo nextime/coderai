@@ -77,8 +77,8 @@ MAPS=()
 # volume so it's tailable on the host).
 DEBUG_SPEC=""
 LOG_FILE_CONT=""
-# Demo tool web UIs (video editor, videogen, township, parler). Empty = image
-# default (the three UIs on, parler off). Keyed by CODERAI_TOOL_* env var.
+# Demo tool web UIs (video editor, videogen, township, character studio, parler).
+# Empty = image default (the four UIs on, parler off). Keyed by CODERAI_TOOL_* env.
 declare -A TOOL_STATE=()
 DISABLE_ALL_TOOLS=0
 # Extra CLI args appended to a tool's command line, keyed by CODERAI_*_ARGS env var.
@@ -90,6 +90,7 @@ tool_env_var() {
     video-editor|video_editor|editor) echo CODERAI_TOOL_VIDEO_EDITOR ;;
     videogen|video-gen)               echo CODERAI_TOOL_VIDEOGEN ;;
     township|fighters)                echo CODERAI_TOOL_TOWNSHIP ;;
+    character-studio|character|chars) echo CODERAI_TOOL_CHARACTER_STUDIO ;;
     parler|tts)                       echo CODERAI_TOOL_PARLER ;;
     *) return 1 ;;
   esac
@@ -102,6 +103,7 @@ tool_args_var() {
     video-editor|video_editor|editor) echo CODERAI_VIDEO_EDITOR_ARGS ;;
     videogen|video-gen)               echo CODERAI_VIDEOGEN_ARGS ;;
     township|fighters)                echo CODERAI_TOWNSHIP_ARGS ;;
+    character-studio|character|chars) echo CODERAI_CHARACTER_STUDIO_ARGS ;;
     parler|tts)                       echo CODERAI_PARLER_ARGS ;;
     *) return 1 ;;
   esac
@@ -185,15 +187,16 @@ Upgrade (refresh the in-image code instead of running the server):
                       visible on the host under the cache mount). Implies a file
                       log even without --debug. tee'd, so `docker logs` still works.
   --no-tools          Disable ALL bundled demo tool web UIs (video editor,
-                      videogen, township). They're on by default.
+                      videogen, township, character studio). On by default.
   --enable-tool NAME  Force-enable a demo tool. Repeatable. NAME is one of:
-                        video-editor | videogen | township | parler
+                        video-editor | videogen | township | character-studio
+                        | parler
                       (parler TTS is off by default; this turns it on.)
   --disable-tool NAME Disable a single demo tool. Repeatable. Same NAMEs as above.
                       Explicit --enable/--disable-tool overrides --no-tools.
   --tool-arg TOOL VAL Append ONE extra CLI arg to a bundled tool's command line.
                       Repeatable. TOOL is one of video-editor|videogen|township|
-                      parler. e.g. --tool-arg township --web-port --tool-arg township 9000
+                      character-studio|parler. e.g. --tool-arg township --web-port --tool-arg township 9000
   --tool-args TOOL STR
                       Like --tool-arg but appends a whole whitespace-separated
                       string at once, e.g. --tool-args video-editor "--voice masculine".
@@ -292,11 +295,11 @@ while [[ $# -gt 0 ]]; do
     --no-tools) DISABLE_ALL_TOOLS=1; shift ;;
     --enable-tool)
       [[ $# -ge 2 ]] || { echo "Error: --enable-tool requires a tool name" >&2; exit 2; }
-      _v="$(tool_env_var "$2")" || { echo "Error: unknown tool '$2' (video-editor|videogen|township|parler)" >&2; exit 2; }
+      _v="$(tool_env_var "$2")" || { echo "Error: unknown tool '$2' (video-editor|videogen|township|character-studio|parler)" >&2; exit 2; }
       TOOL_STATE["$_v"]=true; shift 2 ;;
     --disable-tool)
       [[ $# -ge 2 ]] || { echo "Error: --disable-tool requires a tool name" >&2; exit 2; }
-      _v="$(tool_env_var "$2")" || { echo "Error: unknown tool '$2' (video-editor|videogen|township|parler)" >&2; exit 2; }
+      _v="$(tool_env_var "$2")" || { echo "Error: unknown tool '$2' (video-editor|videogen|township|character-studio|parler)" >&2; exit 2; }
       TOOL_STATE["$_v"]=false; shift 2 ;;
     # Append extra CLI args to a bundled tool's command. --tool-arg adds ONE token;
     # --tool-args adds a whitespace-separated string. Repeatable. e.g.
@@ -304,11 +307,11 @@ while [[ $# -gt 0 ]]; do
     #   --tool-args video-editor "--voice masculine"
     --tool-arg)
       [[ $# -ge 3 ]] || { echo "Error: --tool-arg requires TOOL and a value" >&2; exit 2; }
-      _v="$(tool_args_var "$2")" || { echo "Error: unknown tool '$2' (video-editor|videogen|township|parler)" >&2; exit 2; }
+      _v="$(tool_args_var "$2")" || { echo "Error: unknown tool '$2' (video-editor|videogen|township|character-studio|parler)" >&2; exit 2; }
       TOOL_ARGS["$_v"]="${TOOL_ARGS[$_v]:+${TOOL_ARGS[$_v]} }$3"; shift 3 ;;
     --tool-args)
       [[ $# -ge 3 ]] || { echo "Error: --tool-args requires TOOL and a string" >&2; exit 2; }
-      _v="$(tool_args_var "$2")" || { echo "Error: unknown tool '$2' (video-editor|videogen|township|parler)" >&2; exit 2; }
+      _v="$(tool_args_var "$2")" || { echo "Error: unknown tool '$2' (video-editor|videogen|township|character-studio|parler)" >&2; exit 2; }
       TOOL_ARGS["$_v"]="${TOOL_ARGS[$_v]:+${TOOL_ARGS[$_v]} }$3"; shift 3 ;;
     -d|--detach) DETACH=1; shift ;;
     --)
@@ -607,11 +610,12 @@ fi
 # Demo tool toggles → CODERAI_TOOL_* env. --no-tools turns the three UIs off
 # (unless a specific --enable-tool re-enabled one); explicit toggles always win.
 if [[ "$DISABLE_ALL_TOOLS" == "1" ]]; then
-  for _v in CODERAI_TOOL_VIDEO_EDITOR CODERAI_TOOL_VIDEOGEN CODERAI_TOOL_TOWNSHIP; do
+  for _v in CODERAI_TOOL_VIDEO_EDITOR CODERAI_TOOL_VIDEOGEN CODERAI_TOOL_TOWNSHIP \
+            CODERAI_TOOL_CHARACTER_STUDIO; do
     [[ -n "${TOOL_STATE[$_v]:-}" ]] || TOOL_STATE["$_v"]=false
   done
 fi
-TOOLS_NOTE="image defaults (video-editor, videogen, township on; parler off)"
+TOOLS_NOTE="image defaults (video-editor, videogen, township, character-studio on; parler off)"
 if [[ "${#TOOL_STATE[@]}" -gt 0 ]]; then
   TOOLS_NOTE=""
   for _v in "${!TOOL_STATE[@]}"; do

@@ -45,7 +45,7 @@ done
 [ "$up" = 1 ] && ok "front http://…:$PORT/ responds" || bad "front /" "no response"
 
 echo "== sub-path mounts =="
-for p in editor videogen township; do
+for p in editor videogen township character; do
   code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/$p/" || true)"
   case "$code" in 200|301|302|307) ok "/$p/ ($code)";; *) bad "/$p/" "http $code";; esac
 done

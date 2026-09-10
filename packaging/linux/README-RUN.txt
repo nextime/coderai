@@ -35,6 +35,7 @@ The image publishes ONE port (8776). nginx inside the container fronts:
   http://HOST:8776/            CoderAI server + OpenAI-compatible API + admin UI
   http://HOST:8776/editor/     Video editor
   http://HOST:8776/videogen/   Videogen studio
+  http://HOST:8776/character/  Character studio (real photos/video -> new video)
   http://HOST:8776/township/   Township fighters
 
 Three volumes hold all mutable state (everything else in the image is read-only):
@@ -87,7 +88,7 @@ change — only the host side does.
      coderai:local
 
    The launcher points HF_HOME at /cache/huggingface and writes tool outputs to
-   /cache/{videogen_output,township_output}, so /cache on the big disk captures
+   /cache/{videogen_output,township_output,character_output}, so /cache captures
    downloads AND produced artifacts.
 
 2) NFS (shared across machines) — back a Docker volume with the NFS driver:

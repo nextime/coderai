@@ -14,6 +14,7 @@ ways to mount each service; pick per service:
 | CoderAI server (`codai`)        | ✅               | ✅                 |
 | `tools/video_editor.py`         | ✅               | ✅                 |
 | `tools/videogen.py`             | ✅               | ⚠️ needs work      |
+| `tools/character_studio.py`     | ✅               | ✅                 |
 | `tools/review_outputs.py`       | ✅               | ⚠️ needs work      |
 | `tools/gen_township_fighters.py`| ✅               | ⚠️ needs work      |
 

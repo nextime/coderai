@@ -629,7 +629,8 @@ Run examples (run as your own UID; create+own the dirs first):
 (Drop --user to run as container-root, or use rootless/userns-remap Docker.)
 
 One published port (8776) fronts everything via nginx:
-  /  server+API+admin   /editor/  video editor   /videogen/  studio   /township/  fighters
+  /  server+API+admin  /editor/ video editor  /videogen/ studio  /township/ fighters
+  /character/  character studio (extract a person from photos/video -> new video)
 
 External storage: point /models and /cache at a big disk or NFS volume —
   -v /mnt/bigstorage/coderai/models:/models -v /mnt/bigstorage/coderai/cache:/cache
