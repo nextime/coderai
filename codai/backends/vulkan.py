@@ -231,8 +231,11 @@ _KV_TYPE_BITS = {
     'q8_0': 8.5, 'q5_1': 6.0, 'q5_0': 5.5, 'q4_1': 5.0, 'q4_0': 4.5, 'iq4_nl': 4.5,
 }
 
-#: Fallbacks tried, in order, when the KV cache fits nowhere as configured.
-_KV_FALLBACK_TYPES = ('q8_0', 'q4_0')
+#: KV type fallbacks, cheapest-quality-cost first, as (type_k, type_v) pairs.
+#: 4.5 bits (q4_0 / iq4_nl) is llama.cpp's floor for a KV cache — the sub-4-bit
+#: ggml types exist for weights, not for KV — so the ladder stops there. K is
+#: kept more precise than V in the middle rung: V tolerates quantization better.
+_KV_FALLBACK_TYPES = (('q8_0', 'q8_0'), ('q8_0', 'q4_0'), ('q4_0', 'q4_0'))
 
 _GGUF_KV_GEOM_CACHE: dict = {}
 
@@ -282,7 +285,8 @@ def _gguf_kv_geometry(path) -> dict:
                 raise ValueError(f"unknown gguf value type {vt}")
 
             wanted = ('.block_count', '.attention.head_count_kv', '.attention.head_count',
-                      '.attention.key_length', '.attention.value_length', '.embedding_length')
+                      '.attention.key_length', '.attention.value_length', '.embedding_length',
+                      '.attention.sliding_window')
             for _ in range(n_kv):
                 key = rd_str()
                 val = rd_val(struct.unpack('<I', f.read(4))[0])
@@ -1318,6 +1322,17 @@ class VulkanBackend(ModelBackend):
             print("  KV cache: offload_kqv=False — KV held in host RAM (saves VRAM, "
                   "slower decode)")
 
+        # Sliding-window KV allocation (llama.cpp swa_full). On a sliding-window
+        # model (Gemma's 1024-token window, 5:1 pattern) swa_full=True makes the
+        # sliding layers reserve the FULL context like the global ones; False
+        # reserves only the window. It costs no quality — it limits context reuse
+        # across requests, not attention — so it is the first thing to try when the
+        # KV doesn't fit, ahead of quantizing anything.
+        _swa_full = kwargs.get('swa_full', _raw_cfg.get('swa_full'))
+        if _swa_full is not None and _llama_accepts('swa_full'):
+            llama_kwargs['swa_full'] = bool(_swa_full)
+            print(f"  KV cache: swa_full={bool(_swa_full)} (from config)")
+
         # ── KV-cache placement plan ──────────────────────────────────────────
         # llama.cpp has no plan of its own: it tries to put the KV cache in VRAM,
         # and when that fails the retry silently allocates it in HOST RAM. For a
@@ -1371,35 +1386,49 @@ class VulkanBackend(ModelBackend):
                               f"holding the KV cache in host RAM. Decode crosses PCIe, "
                               f"so slower, but it fits and the context is kept.")
                     else:
-                        # Neither fits at full precision. Quantizing the KV is the
-                        # only way to keep the requested context; the ratio is what
-                        # scales, so apply it to the measured size.
+                        # Neither fits at full precision. Try the lossless lever
+                        # first, then quantize — least quality cost first.
                         _placed = False
+                        if (_geom.get('sliding_window') and _swa_full is None
+                                and _llama_accepts('swa_full')):
+                            llama_kwargs['swa_full'] = False
+                            print(f"  KV plan: {_meas:.1f} GB fits neither VRAM "
+                                  f"({_vram_head:.1f} GB) nor RAM ({_ram_head:.1f} GB) — "
+                                  f"setting swa_full=False first: the "
+                                  f"{_geom['sliding_window']}-token sliding layers stop "
+                                  f"reserving the full context. No quality cost. The next "
+                                  f"load re-measures; if it still doesn't fit, the KV gets "
+                                  f"quantized.")
+                            llama_kwargs['offload_kqv'] = False
+                            _placed = True
                         _base_bpt = _kv_bytes_per_token(_geom, _ck, _cv) or 1.0
-                        for _cand in _KV_FALLBACK_TYPES:
-                            _ratio = (_kv_bytes_per_token(_geom, _cand, _cand) / _base_bpt) if _geom else 0.5
+                        for _tk_name, _tv_name in (() if _placed else _KV_FALLBACK_TYPES):
+                            _ratio = (_kv_bytes_per_token(_geom, _tk_name, _tv_name) / _base_bpt) if _geom else 0.5
                             _q_gb = _meas * _ratio
                             _where = ('VRAM' if _q_gb <= _vram_head else
                                       ('RAM' if _q_gb <= _ram_head else None))
                             if not _where:
                                 continue
-                            _tkq = _ggml_kv_type(_cand)
-                            if _tkq is None:
+                            _tkq, _tvq = _ggml_kv_type(_tk_name), _ggml_kv_type(_tv_name)
+                            if _tkq is None or _tvq is None:
                                 continue
                             llama_kwargs['type_k'] = _tkq
-                            llama_kwargs['type_v'] = _tkq
-                            if _cand in _KV_NEEDS_FLASH:
+                            llama_kwargs['type_v'] = _tvq
+                            if _tk_name in _KV_NEEDS_FLASH or _tv_name in _KV_NEEDS_FLASH:
                                 llama_kwargs['flash_attn'] = True
                             if _where == 'RAM':
                                 llama_kwargs['offload_kqv'] = False
                             print(f"  KV plan: {_meas:.1f} GB fits neither VRAM nor RAM — "
-                                  f"quantizing the KV cache to {_cand} (~{_q_gb:.1f} GB) in "
-                                  f"{_where}. Slight quality cost; the context is kept.")
+                                  f"quantizing the KV cache to type_k={_tk_name}/"
+                                  f"type_v={_tv_name} (~{_q_gb:.1f} GB) in {_where}. "
+                                  f"Slight quality cost; the context is kept.")
                             _placed = True
                             break
                         if not _placed:
                             raise RuntimeError(
-                                f"KV cache for n_ctx={_ctx} measured {_meas:.1f} GB, but only "
+                                f"KV cache for n_ctx={_ctx} measured {_meas:.1f} GB — even at "
+                                f"q4_0 (llama.cpp's floor for a KV cache) that is "
+                                f"{_meas * (_kv_bytes_per_token(_geom, 'q4_0', 'q4_0') / (_base_bpt or 1.0)):.1f} GB, but only "
                                 f"{_vram_head:.1f} GB VRAM and {_ram_head:.1f} GB RAM are free, "
                                 f"and quantizing it is not enough. Refusing the load instead of "
                                 f"letting the OOM killer take the engine down. Free memory, "
