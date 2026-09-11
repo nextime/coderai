@@ -19,6 +19,7 @@
 
 import os
 import json
+import re
 import threading
 import time
 from typing import AsyncIterator, Optional, Union, List, Dict, Any
@@ -221,6 +222,123 @@ def _gguf_block_count(path) -> int:
         result = 0
     _GGUF_META_CACHE[path] = result
     return result
+
+
+#: Bits per element of a KV cache entry, by llama.cpp type. The quantized types
+#: carry a per-block scale, hence the halves (q8_0 = 34 bytes per 32 elements).
+_KV_TYPE_BITS = {
+    'f32': 32.0, 'f16': 16.0, 'bf16': 16.0,
+    'q8_0': 8.5, 'q5_1': 6.0, 'q5_0': 5.5, 'q4_1': 5.0, 'q4_0': 4.5, 'iq4_nl': 4.5,
+}
+
+#: Fallbacks tried, in order, when the KV cache fits nowhere as configured.
+_KV_FALLBACK_TYPES = ('q8_0', 'q4_0')
+
+_GGUF_KV_GEOM_CACHE: dict = {}
+
+
+def _gguf_kv_geometry(path) -> dict:
+    """Layer count, KV head count and key/value head dims from a GGUF header.
+
+    Same metadata-only read as :func:`_gguf_block_count`, but keeping the keys the
+    KV-cache size depends on. Returns {} when the header can't be parsed.
+    """
+    if not path:
+        return {}
+    if path in _GGUF_KV_GEOM_CACHE:
+        return _GGUF_KV_GEOM_CACHE[path]
+    import struct
+    geom: dict = {}
+    try:
+        with open(path, 'rb') as f:
+            if f.read(4) != b'GGUF':
+                _GGUF_KV_GEOM_CACHE[path] = {}
+                return {}
+            struct.unpack('<I', f.read(4))
+            struct.unpack('<Q', f.read(8))
+            n_kv = struct.unpack('<Q', f.read(8))[0]
+
+            def rd_str():
+                ln = struct.unpack('<Q', f.read(8))[0]
+                return f.read(ln).decode('utf-8', 'replace')
+
+            def rd_val(vt):
+                if vt == 0:  return struct.unpack('<B', f.read(1))[0]
+                if vt == 1:  return struct.unpack('<b', f.read(1))[0]
+                if vt == 2:  return struct.unpack('<H', f.read(2))[0]
+                if vt == 3:  return struct.unpack('<h', f.read(2))[0]
+                if vt == 4:  return struct.unpack('<I', f.read(4))[0]
+                if vt == 5:  return struct.unpack('<i', f.read(4))[0]
+                if vt == 6:  return struct.unpack('<f', f.read(4))[0]
+                if vt == 7:  return struct.unpack('<?', f.read(1))[0]
+                if vt == 8:  return rd_str()
+                if vt == 10: return struct.unpack('<Q', f.read(8))[0]
+                if vt == 11: return struct.unpack('<q', f.read(8))[0]
+                if vt == 12: return struct.unpack('<d', f.read(8))[0]
+                if vt == 9:
+                    et = struct.unpack('<I', f.read(4))[0]
+                    cnt = struct.unpack('<Q', f.read(8))[0]
+                    return [rd_val(et) for _ in range(cnt)]
+                raise ValueError(f"unknown gguf value type {vt}")
+
+            wanted = ('.block_count', '.attention.head_count_kv', '.attention.head_count',
+                      '.attention.key_length', '.attention.value_length', '.embedding_length')
+            for _ in range(n_kv):
+                key = rd_str()
+                val = rd_val(struct.unpack('<I', f.read(4))[0])
+                for suffix in wanted:
+                    if key.endswith(suffix):
+                        try:
+                            geom[suffix.rsplit('.', 1)[-1]] = int(
+                                val[0] if isinstance(val, list) and val else val)
+                        except (TypeError, ValueError):
+                            pass
+                        break
+    except Exception:
+        geom = {}
+    _GGUF_KV_GEOM_CACHE[path] = geom
+    return geom
+
+
+def _kv_bytes_per_token(geom: dict, type_k: str = None, type_v: str = None) -> float:
+    """Bytes of KV cache per token: layers x kv_heads x (k_dim + v_dim) x element size.
+
+    Returns 0.0 when the geometry is unknown, so callers fall back to their old
+    behaviour rather than acting on a guess.
+    """
+    layers = int(geom.get('block_count') or 0)
+    kv_heads = int(geom.get('head_count_kv') or geom.get('head_count') or 0)
+    if not layers or not kv_heads:
+        return 0.0
+    k_dim = int(geom.get('key_length') or 0)
+    v_dim = int(geom.get('value_length') or k_dim or 0)
+    if not k_dim:
+        heads = int(geom.get('head_count') or 0)
+        emb = int(geom.get('embedding_length') or 0)
+        k_dim = v_dim = (emb // heads) if (heads and emb) else 0
+    if not k_dim:
+        return 0.0
+
+    def _bits(name):
+        return _KV_TYPE_BITS.get(str(name or 'f16').strip().lower().replace('-', '_'), 16.0)
+
+    return layers * kv_heads * ((k_dim * _bits(type_k) + v_dim * _bits(type_v)) / 8.0)
+
+
+def _host_ram_free_gb() -> float:
+    """Host RAM actually available (MemAvailable), 0.0 when it can't be read."""
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) / (1024 ** 2)
+    except Exception:
+        pass
+    try:
+        import psutil
+        return psutil.virtual_memory().available / (1024 ** 3)
+    except Exception:
+        return 0.0
 
 
 def _amd_free_vram_gb(device: int = 0) -> float:
@@ -437,12 +555,26 @@ def _ggml_kv_type(name):
     return val
 
 
+#: KV buffer sizes llama.cpp reported during the CURRENT load, in GB, split by
+#: where they landed: {"gpu": x, "cpu": y}. Reset per load by the callback install.
+_KV_OBSERVED: dict = {"gpu": 0.0, "cpu": 0.0}
+_KV_BUF_RE = re.compile(
+    r"llama_kv_cache[^:]*:\s*(\S+)\s+KV buffer size\s*=\s*([0-9.]+)\s*MiB")
+
+
 def _install_layer_log_callback():
     """Replace llama.cpp's log callback with one that prints load-time layer/buffer
     messages directly to stdout.  Returns the callback object — keep a reference
-    alive for the duration of the load so ctypes doesn't garbage-collect it."""
+    alive for the duration of the load so ctypes doesn't garbage-collect it.
+
+    It also records the KV buffer sizes llama.cpp reports, which is the only
+    trustworthy number for how big a KV cache really is: predicting it from GGUF
+    metadata is architecture-specific (per-layer KV-head arrays, sliding-window
+    layers, shared KV) and was off by 5x on Gemma-4 in both directions."""
     if _llama_cpp is None:
         return None
+    _KV_OBSERVED["gpu"] = 0.0
+    _KV_OBSERVED["cpu"] = 0.0
 
     # Keywords that identify interesting load-phase messages
     _KEEP = (
@@ -456,6 +588,10 @@ def _install_layer_log_callback():
     def _cb(level, text, user_data):
         try:
             msg = (text.decode('utf-8', errors='replace') if isinstance(text, bytes) else str(text)).rstrip()
+            _m = _KV_BUF_RE.search(msg)
+            if _m:
+                _where = "cpu" if _m.group(1).upper().startswith("CPU") else "gpu"
+                _KV_OBSERVED[_where] += float(_m.group(2)) / 1024.0
             if msg and any(k in msg for k in _KEEP):
                 print(f"  [llama.cpp] {msg}", flush=True)
         except Exception:
@@ -1182,6 +1318,101 @@ class VulkanBackend(ModelBackend):
             print("  KV cache: offload_kqv=False — KV held in host RAM (saves VRAM, "
                   "slower decode)")
 
+        # ── KV-cache placement plan ──────────────────────────────────────────
+        # llama.cpp has no plan of its own: it tries to put the KV cache in VRAM,
+        # and when that fails the retry silently allocates it in HOST RAM. For a
+        # 128k context on Gemma-4-31B that was 45.7 GB on a 54 GB box — the engine
+        # got SIGKILLed by the OOM killer mid-request, four times in one evening,
+        # taking every other model on it down too.
+        #
+        # The context is never shrunk here: that is the caller's call. What this
+        # does is choose a placement that fits, preferring host RAM over VRAM when
+        # VRAM is short, and quantizing the KV only when neither can hold it.
+        #
+        # It acts ONLY on a MEASURED size (`measured_kv_gb`, per n_ctx, recorded
+        # from llama.cpp's own "KV buffer size" lines). Predicting KV from GGUF
+        # metadata is architecture-specific — per-layer KV-head arrays, sliding
+        # window layers, shared KV — and was off by 5x in BOTH directions on this
+        # very model, so an estimate is logged for visibility but never blocks a
+        # load.
+        if not no_ram and bool(_raw_cfg.get('kv_autoplan', True)):
+            try:
+                _ctx = int(self.n_ctx or 0)
+                _explicit = (_ck is not None or _cv is not None or _kv_off is not None)
+                _free_vram = _pooled_free_vram_gb(cross=bool(kwargs.get('gpu_split')))
+                _exp_w = float(kwargs.get('expected_vram_gb') or 0)
+                _nl = int(_gguf_block_count(model_path) or 0)
+                if self.n_gpu_layers not in (-1, None) and _nl > 0:
+                    _exp_w *= max(0, int(self.n_gpu_layers)) / float(_nl)
+                _vram_head = max(0.0, _free_vram - _exp_w - 1.5)   # 1.5 GB compute margin
+                _ram_head = max(0.0, _host_ram_free_gb() - 4.0)    # leave the box 4 GB
+
+                # Rough estimate — advisory only (see the note above).
+                _geom = _gguf_kv_geometry(model_path)
+                _bpt = _kv_bytes_per_token(_geom, _ck, _cv)
+                if _bpt > 0 and _ctx > 0:
+                    print(f"  KV estimate (approximate): ~{_bpt * _ctx / (1024 ** 3):.1f} GB "
+                          f"for n_ctx={_ctx} | VRAM headroom {_vram_head:.1f} GB, "
+                          f"RAM headroom {_ram_head:.1f} GB")
+
+                # Measured size from a previous load of this model at this n_ctx.
+                _meas = _raw_cfg.get('measured_kv_gb')
+                if isinstance(_meas, dict):
+                    _meas = _meas.get(str(_ctx)) or _meas.get(_ctx)
+                _meas = float(_meas) if _meas not in (None, '', 0) else 0.0
+
+                if _meas > 0 and _ctx > 0 and not _explicit:
+                    print(f"  KV plan: measured {_meas:.1f} GB at n_ctx={_ctx}")
+                    if _meas <= _vram_head:
+                        pass                                    # fits on the GPU
+                    elif _meas <= _ram_head:
+                        llama_kwargs['offload_kqv'] = False
+                        print(f"  KV plan: too big for VRAM ({_vram_head:.1f} GB free) — "
+                              f"holding the KV cache in host RAM. Decode crosses PCIe, "
+                              f"so slower, but it fits and the context is kept.")
+                    else:
+                        # Neither fits at full precision. Quantizing the KV is the
+                        # only way to keep the requested context; the ratio is what
+                        # scales, so apply it to the measured size.
+                        _placed = False
+                        _base_bpt = _kv_bytes_per_token(_geom, _ck, _cv) or 1.0
+                        for _cand in _KV_FALLBACK_TYPES:
+                            _ratio = (_kv_bytes_per_token(_geom, _cand, _cand) / _base_bpt) if _geom else 0.5
+                            _q_gb = _meas * _ratio
+                            _where = ('VRAM' if _q_gb <= _vram_head else
+                                      ('RAM' if _q_gb <= _ram_head else None))
+                            if not _where:
+                                continue
+                            _tkq = _ggml_kv_type(_cand)
+                            if _tkq is None:
+                                continue
+                            llama_kwargs['type_k'] = _tkq
+                            llama_kwargs['type_v'] = _tkq
+                            if _cand in _KV_NEEDS_FLASH:
+                                llama_kwargs['flash_attn'] = True
+                            if _where == 'RAM':
+                                llama_kwargs['offload_kqv'] = False
+                            print(f"  KV plan: {_meas:.1f} GB fits neither VRAM nor RAM — "
+                                  f"quantizing the KV cache to {_cand} (~{_q_gb:.1f} GB) in "
+                                  f"{_where}. Slight quality cost; the context is kept.")
+                            _placed = True
+                            break
+                        if not _placed:
+                            raise RuntimeError(
+                                f"KV cache for n_ctx={_ctx} measured {_meas:.1f} GB, but only "
+                                f"{_vram_head:.1f} GB VRAM and {_ram_head:.1f} GB RAM are free, "
+                                f"and quantizing it is not enough. Refusing the load instead of "
+                                f"letting the OOM killer take the engine down. Free memory, "
+                                f"lower n_ctx, or serve this model elsewhere "
+                                f"(kv_autoplan=false bypasses this check).")
+                elif _explicit:
+                    print("  KV plan: cache_type_k/v or kv_offload pinned in the model "
+                          "config — honouring it as-is")
+            except RuntimeError:
+                raise
+            except Exception as _kv_e:
+                print(f"  (KV placement planning skipped: {_kv_e})", flush=True)
+
         # Batch size (llama.cpp -b / n_batch) and physical micro-batch (-ub /
         # n_ubatch). The compute/graph buffer reserved for prompt ingestion scales
         # with the micro-batch, so lowering it shrinks a large VRAM allocation (the
@@ -1473,6 +1704,24 @@ class VulkanBackend(ModelBackend):
                     if _attempt > 0:
                         print(f"  Loaded after CPU offload "
                               f"(n_gpu_layers={llama_kwargs.get('n_gpu_layers')})")
+                    # What llama.cpp ACTUALLY allocated for the KV cache, read from
+                    # its own log lines. This is the number the placement plan above
+                    # trusts on the next load — so record it rather than re-learning
+                    # it by getting OOM-killed.
+                    try:
+                        _kv_gpu, _kv_cpu = _KV_OBSERVED["gpu"], _KV_OBSERVED["cpu"]
+                        if (_kv_gpu + _kv_cpu) > 0:
+                            self.last_kv_gb = round(_kv_gpu + _kv_cpu, 2)
+                            self.last_kv_ctx = int(self.n_ctx or 0)
+                            _hint = ""
+                            if _kv_cpu > 1.0:
+                                _hint = (f' — record as measured_kv_gb: '
+                                         f'{{"{self.last_kv_ctx}": {self.last_kv_gb}}}')
+                            print(f"  KV measured: {self.last_kv_gb:.1f} GB at "
+                                  f"n_ctx={self.last_kv_ctx} ({_kv_gpu:.1f} GB VRAM + "
+                                  f"{_kv_cpu:.1f} GB host RAM){_hint}", flush=True)
+                    except Exception:
+                        pass
                     break
                 except Exception as e:
                     _last_err = e
