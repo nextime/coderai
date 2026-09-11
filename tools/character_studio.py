@@ -46,6 +46,7 @@ import mimetypes
 import os
 import random
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -152,6 +153,67 @@ def split_sources(sources: Iterable[str]) -> tuple[list[str], list[str]]:
         payload = data_uri_for_file(path)
         (videos if kind_of(path) == "video" else images).append(payload)
     return images, videos
+
+
+def _ffmpeg(*args: str) -> bool:
+    """Run ffmpeg quietly; False when it isn't installed or the call failed."""
+    try:
+        proc = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *args],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=900)
+        return proc.returncode == 0
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
+
+def video_frames(path: Path, out_dir: Path, count: int = 24) -> list[Path]:
+    """Sample `count` evenly-spaced frames locally, mirroring what the server does.
+
+    A source clip is hundreds of MB; the frames the extractor actually looks at are
+    a few hundred KB. Sampling here means the upload carries the frames, not the
+    film — same result, orders of magnitude less traffic and memory.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for old in out_dir.glob("frame_*.png"):
+        old.unlink()
+    duration = 0.0
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=60)
+        duration = float((probe.stdout or "0").strip() or 0)
+    except Exception:
+        duration = 0.0
+    fps = max(0.05, count / duration) if duration > 0 else 1.0
+    ok = _ffmpeg("-i", str(path), "-vf", f"fps={fps:.4f},scale='min(1280,iw)':-2",
+                 "-frames:v", str(count * 2), str(out_dir / "frame_%04d.png"))
+    return sorted(out_dir.glob("frame_*.png")) if ok else []
+
+
+def audio_clip(path: Path, out_path: Path, seconds: int = 90) -> Path | None:
+    """Pull a short mono audio clip for voice cloning — not the whole soundtrack."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ok = _ffmpeg("-i", str(path), "-t", str(seconds), "-vn",
+                 "-ac", "1", "-ar", "24000", str(out_path))
+    return out_path if (ok and out_path.exists() and out_path.stat().st_size) else None
+
+
+def shrink_image(path: Path, out_path: Path, max_edge: int = 2048) -> Path:
+    """Downscale an oversized still; identity survives 2048px fine."""
+    try:
+        from PIL import Image
+        img = Image.open(path)
+        if max(img.size) <= max_edge:
+            return path
+        img = img.convert("RGB")
+        img.thumbnail((max_edge, max_edge))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        img.save(out_path)
+        return out_path
+    except Exception:
+        return path
 
 
 def contact_sheet(images: list[bytes], out_path: Path, columns: int = 5) -> Path | None:
@@ -375,8 +437,10 @@ class CharacterStudio:
     # ── step 1: extraction ──────────────────────────────────────────────────
     def extract(self, name: str, sources: list[str], description: str = "",
                 max_images: int = 5, emit=log, with_voice: bool = False,
-                transcript: str = "") -> dict[str, Any]:
-        images, videos = split_sources(sources)
+                transcript: str = "", max_upload_mb: float = 64.0) -> dict[str, Any]:
+        prepared = prepare_sources(sources, self.char_dir(name) / "_work",
+                                   max_mb=max_upload_mb, emit=emit)
+        images, videos = split_sources(prepared)
         emit(f"Extracting '{name}' from {len(images)} image(s) and {len(videos)} video(s)...")
         result = self.client.extract_character(name, description, images, videos, max_images)
         emit(f"Server saved {result.get('image_count')} reference image(s)")
@@ -389,14 +453,16 @@ class CharacterStudio:
         if with_voice:
             try:
                 mirrored["voice"] = self.extract_voice_profile(
-                    name, sources, emit=emit, transcript=transcript)
+                    name, sources, emit=emit, transcript=transcript,
+                    work_dir=self.char_dir(name) / "_work")
             except Exception as exc:
                 emit(f"Voice clone failed ({exc}) — the character is still usable")
         return mirrored
 
     # ── step 1a: the voice off the same footage ─────────────────────────────
     def extract_voice_profile(self, name: str, sources: list[str], emit=log,
-                              transcript: str = "") -> str | None:
+                              transcript: str = "", work_dir: Path | None = None,
+                              clip_seconds: int = 90) -> str | None:
         """Clone a voice profile from the first audio-bearing source.
 
         The face and the voice come from the same clip, so the character can speak
@@ -417,8 +483,15 @@ class CharacterStudio:
                 continue
             path = Path(item)
             if kind_of(path) == "video" or path.suffix.lower() in AUDIO_EXTS:
-                media = data_uri_for_file(path)
-                is_video = kind_of(path) == "video"
+                # Cloning needs a voice sample, not the whole soundtrack: a short
+                # mono clip keeps the request small and is what the server wants.
+                clip = audio_clip(path, (work_dir or self.out_dir / "_work")
+                                  / f"{safe_slug(name)}_voice.wav", clip_seconds)
+                if clip:
+                    emit(f"Using a {clip_seconds}s audio clip from {path.name} for the voice")
+                    media, is_video = data_uri_for_file(clip), False
+                else:
+                    media, is_video = data_uri_for_file(path), kind_of(path) == "video"
                 break
         if not media:
             emit("No video/audio source — skipping the voice clone (stills carry no voice)")
@@ -719,6 +792,7 @@ class CharacterStudio:
                 emit=emit,
                 with_voice=bool(payload.get("with_voice")),
                 transcript=payload.get("transcript") or "",
+                max_upload_mb=float(payload.get("max_upload_mb") or 64.0),
             )
             self._job_update(job_id, status="done", progress=100, result=profile)
         except Exception as exc:
@@ -778,6 +852,48 @@ class CharacterStudio:
             },
             "base_url": self.args.base_url,
         }
+
+
+def prepare_sources(sources: list[str], work_dir: Path, max_mb: float = 64.0,
+                    frames: int = 24, emit=log) -> list[str]:
+    """Shrink what actually goes over the wire.
+
+    Videos over `max_mb` are replaced by locally-sampled frames, oversized stills
+    are downscaled, and everything else passes through untouched. URLs are left
+    alone — the server fetches those itself.
+    """
+    if max_mb <= 0:
+        return list(sources)
+    out: list[str] = []
+    for item in sources:
+        if item.startswith(("http://", "https://", "data:")):
+            out.append(item)
+            continue
+        path = Path(item)
+        try:
+            size_mb = path.stat().st_size / 1e6
+        except OSError:
+            out.append(item)
+            continue
+        kind = kind_of(path)
+        if kind == "video" and size_mb > max_mb:
+            stem = safe_slug(path.stem)
+            picked = video_frames(path, work_dir / "frames" / stem, frames)
+            if picked:
+                emit(f"{path.name} ({size_mb:.0f} MB) -> {len(picked)} sampled frame(s) "
+                     f"instead of the whole clip")
+                out.extend(str(p) for p in picked)
+                continue
+            emit(f"{path.name} is {size_mb:.0f} MB and ffmpeg frame sampling failed — "
+                 "sending the file as-is")
+        elif kind == "image" and size_mb > max_mb / 8:
+            small = shrink_image(path, work_dir / "shrunk" / path.name)
+            if small != path:
+                emit(f"{path.name} ({size_mb:.0f} MB) downscaled for upload")
+            out.append(str(small))
+            continue
+        out.append(item)
+    return out
 
 
 def lora_specs(loras: Any, default_weight: float = 1.0) -> list[dict[str, Any]]:
@@ -868,8 +984,12 @@ video{width:100%;border-radius:14px;margin-top:12px;background:#000}
       <input id="picker" type="file" multiple accept="image/*,video/*" style="display:none">
       <div class="files" id="filelist"></div>
       <div class="chk"><input id="with_voice" type="checkbox"><span>Also clone the voice from the same footage (needs a video/audio source)</span></div>
+      <label>Sample frames locally for videos over (MB)</label>
+      <input id="max_upload_mb" type="number" value="64" min="0"
+             title="Videos bigger than this are frame-sampled here instead of being sent whole. 0 disables.">
       <button class="btn" id="btn_extract">Extract character</button>
-      <div class="warn">Files are base64-encoded into the request — keep source clips short (a few seconds is plenty; frames are sampled evenly).</div>
+      <div class="warn">Files stream straight to disk, so size is not a problem. Big videos are
+      frame-sampled locally before they reach the model, which is what the extractor looks at anyway.</div>
     </div>
 
     <div class="card">
@@ -966,9 +1086,26 @@ function logln(line){const el=$('log'); el.textContent+=(el.textContent?'\n':'')
 function setLog(line){$('log').textContent=line}
 async function api(path,opts){const r=await fetch(ROOT_PATH+path,Object.assign({headers:{'Content-Type':'application/json'}},opts||{})); const d=await r.json(); if(d.error) throw new Error(d.error); return d}
 
-function readFile(file){return new Promise((res,rej)=>{const fr=new FileReader(); fr.onload=()=>res({name:file.name,data:fr.result}); fr.onerror=rej; fr.readAsDataURL(file)})}
-function renderFiles(){$('filelist').innerHTML=pending.map(f=>`<span class="pill">${esc(f.name)}</span>`).join('')||'<span class="muted">No files selected.</span>'}
-async function addFiles(list){for(const f of list){pending.push(await readFile(f))} renderFiles()}
+function fmtMB(b){return (b/1e6).toFixed(b>1e8?0:1)+' MB'}
+function renderFiles(){$('filelist').innerHTML=pending.map(f=>`<span class="pill">${esc(f.name)} &middot; ${f.status||fmtMB(f.bytes)}</span>`).join('')||'<span class="muted">No files selected.</span>'}
+// Files are streamed to the studio as raw bodies — never base64'd in the browser,
+// so a multi-GB clip costs no more memory than a small one.
+async function uploadFile(file){
+  const entry={name:file.name,bytes:file.size,status:'uploading…'};
+  pending.push(entry); renderFiles();
+  try{
+    const r=await fetch(ROOT_PATH+'/api/upload',{method:'POST',
+      headers:{'X-Filename':encodeURIComponent(file.name),'Content-Type':'application/octet-stream'},
+      body:file});
+    const d=await r.json();
+    if(d.error) throw new Error(d.error);
+    entry.path=d.path; entry.status=fmtMB(d.bytes);
+  }catch(e){
+    entry.status='failed: '+e.message; logln('Upload failed for '+file.name+': '+e.message);
+  }
+  renderFiles();
+}
+async function addFiles(list){for(const f of list){await uploadFile(f)}}
 
 $('drop').onclick=()=>$('picker').click();
 $('picker').onchange=e=>addFiles(e.target.files);
@@ -1031,13 +1168,15 @@ async function watch(job_id,done){
 }
 
 $('btn_extract').onclick=async()=>{
-  if(!pending.length){alert('Add at least one photo or video'); return}
-  $('btn_extract').disabled=true; setLog('Uploading '+pending.length+' file(s)...');
+  const ready=pending.filter(f=>f.path);
+  if(!ready.length){alert('Add at least one photo or video (and let it finish uploading)'); return}
+  $('btn_extract').disabled=true; setLog('Extracting from '+ready.length+' file(s)...');
   try{
     const d=await api('/api/extract',{method:'POST',body:JSON.stringify({
       name:$('name').value, description:$('description').value,
       max_images:+$('max_images').value||5, with_voice:$('with_voice').checked,
-      sources:pending.map(f=>f.data)})});
+      max_upload_mb:+$('max_upload_mb').value||64,
+      sources:ready.map(f=>f.path)})});
     watch(d.job_id, async j=>{pending=[]; renderFiles(); await loadState(); if(j.result) {$('charsel').value=j.result.name; loadRefs(j.result.name)} $('btn_extract').disabled=false});
   }catch(e){logln('Error: '+e.message); $('btn_extract').disabled=false}
 };
@@ -1137,11 +1276,52 @@ def make_handler(studio: CharacterStudio):
                 path = path[len(prefix):] or "/"
             return path
 
+        # JSON requests carry prompts and settings, never media any more — media
+        # goes through /api/upload. Cap them so a bad request can't exhaust RAM.
+        MAX_JSON = 32 * 1024 * 1024
+
         def _read_json(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length") or 0)
             if not length:
                 return {}
+            if length > self.MAX_JSON:
+                raise ValueError(
+                    f"request body too large ({length/1e6:.0f} MB) — upload media "
+                    "via /api/upload instead of inlining it")
             return json.loads(self.rfile.read(length) or b"{}")
+
+        def _save_upload(self) -> dict[str, Any]:
+            """Stream one uploaded file to disk in chunks.
+
+            The browser POSTs the File object as the raw body, so nothing is ever
+            base64-encoded client-side and neither end holds the whole file in
+            memory — which is what made big videos impossible before.
+            """
+            name = urllib.parse.unquote(self.headers.get("X-Filename") or "upload.bin")
+            name = os.path.basename(name).strip() or "upload.bin"
+            suffix = Path(name).suffix.lower()
+            if suffix not in IMAGE_EXTS | VIDEO_EXTS | AUDIO_EXTS:
+                raise ValueError(f"unsupported file type '{suffix or name}'")
+            length = int(self.headers.get("Content-Length") or 0)
+            if not length:
+                raise ValueError("empty upload")
+
+            uploads = studio.out_dir / "uploads"
+            uploads.mkdir(parents=True, exist_ok=True)
+            dest = uploads / f"{uuid.uuid4().hex[:10]}_{safe_slug(Path(name).stem)}{suffix}"
+            written = 0
+            with dest.open("wb") as fh:
+                while written < length:
+                    chunk = self.rfile.read(min(1024 * 1024, length - written))
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    written += len(chunk)
+            if written < length:
+                dest.unlink(missing_ok=True)
+                raise ValueError(f"upload truncated at {written} of {length} bytes")
+            log(f"[upload] {name} -> {dest} ({written/1e6:.1f} MB)")
+            return {"path": str(dest), "name": name, "bytes": written}
 
         def _serve_media(self, rel: str) -> None:
             path = (studio.out_dir / urllib.parse.unquote(rel)).resolve()
@@ -1182,6 +1362,11 @@ def make_handler(studio: CharacterStudio):
         def do_POST(self) -> None:
             path = self._route(urllib.parse.urlparse(self.path).path)
             try:
+                # Media upload must be handled BEFORE the body is read as JSON —
+                # it is a raw binary stream, not a document.
+                if path == "/api/upload":
+                    self._json(self._save_upload())
+                    return
                 payload = self._read_json()
                 if path == "/api/extract":
                     self._json({"job_id": studio.start_job("extract", studio.extract_job, payload)})
@@ -1200,6 +1385,8 @@ def make_handler(studio: CharacterStudio):
                     self._json({"ok": True})
                 else:
                     self._json({"error": "not found"}, 404)
+            except ValueError as exc:
+                self._json({"error": str(exc)}, 400)
             except Exception as exc:
                 self._json({"error": str(exc)}, 500)
 
@@ -1338,6 +1525,9 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Also clone the voice from the same footage (needs a video/audio source)")
     p_extract.add_argument("--transcript", default="",
                            help="Transcript of the reference audio (auto-transcribed when omitted)")
+    p_extract.add_argument("--max-upload-mb", type=float, default=64.0,
+                           help="Frame-sample videos larger than this locally instead of "
+                                "uploading them whole (0 = always send the file)")
 
     sub.add_parser("list", help="List character profiles on the server")
 
@@ -1375,6 +1565,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_demo.add_argument("--clone-voice", dest="clone_voice", action="store_true",
                         help="Also clone the voice from the same footage (use --say to speak with it)")
     p_demo.add_argument("--transcript", default="")
+    p_demo.add_argument("--max-upload-mb", type=float, default=64.0)
     p_demo.add_argument("--train", action="store_true",
                         help="Also train an identity LoRA from the crops and apply it to the video")
     add_video_options(p_demo)
@@ -1446,7 +1637,8 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "extract":
         studio.extract(args.name, expand_sources(args.source),
                        description=args.description, max_images=args.max_images,
-                       with_voice=args.voice, transcript=args.transcript)
+                       with_voice=args.voice, transcript=args.transcript,
+                       max_upload_mb=args.max_upload_mb)
         log("Review the crops, drop any stray faces with `prune`, then run `video`.")
         return 0
 
@@ -1466,7 +1658,8 @@ def main(argv: list[str] | None = None) -> int:
         log("[1/3] extracting the character from the supplied footage")
         profile = studio.extract(args.name, expand_sources(args.source),
                                  description=args.description, max_images=args.max_images,
-                                 with_voice=args.clone_voice, transcript=args.transcript)
+                                 with_voice=args.clone_voice, transcript=args.transcript,
+                                 max_upload_mb=args.max_upload_mb)
         if args.portrait:
             log("[2/3] identity portrait")
             studio.make_portrait(args.name, args.prompt, video_opts(args))
