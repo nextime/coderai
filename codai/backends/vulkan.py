@@ -168,6 +168,46 @@ _KV_NEEDS_FLASH = {'q5_0', 'q5_1', 'q5', 'q4_0', 'q4_1', 'q4', 'iq4_nl'}
 _GGUF_META_CACHE: dict = {}
 
 
+#: A split-GGUF shard filename: "<stem>-00003-of-00008.gguf".
+_GGUF_SHARD_RE = re.compile(r"^(?P<stem>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$")
+
+
+def resolve_gguf_shards(path: str) -> str:
+    """Resolve a split-GGUF path to its FIRST shard, checking the set is complete.
+
+    llama.cpp opens a split GGUF at shard 00001 and discovers the rest itself;
+    handed any other shard it fails with a bare "Failed to load model from file",
+    which says nothing about what is wrong. Worse, a half-downloaded set fails the
+    same way — as it did here, with only shard 6 of 6 on disk.
+
+    Returns the path unchanged when it isn't a shard. Raises with the missing
+    shards named when the set is incomplete.
+    """
+    if not path:
+        return path
+    m = _GGUF_SHARD_RE.match(os.path.basename(path))
+    if not m:
+        return path
+    directory = os.path.dirname(path) or "."
+    stem, total = m.group("stem"), int(m.group("total"))
+    present, missing = [], []
+    for i in range(1, total + 1):
+        shard = os.path.join(directory, f"{stem}-{i:05d}-of-{total:05d}.gguf")
+        (present if os.path.isfile(shard) else missing).append(shard)
+    if missing:
+        raise FileNotFoundError(
+            f"'{os.path.basename(path)}' is shard {int(m.group('idx'))} of a "
+            f"{total}-part split GGUF, and {len(missing)} of the {total} shards are "
+            f"missing from {directory} — the download is incomplete. Present: "
+            f"{', '.join(os.path.basename(x) for x in present) or 'none'}. Missing: "
+            f"{', '.join(os.path.basename(x) for x in missing)}.")
+    first = os.path.join(directory, f"{stem}-00001-of-{total:05d}.gguf")
+    if os.path.abspath(first) != os.path.abspath(path):
+        print(f"  Split GGUF: {total} shards present — opening at "
+              f"{os.path.basename(first)} (llama.cpp loads the rest itself)")
+    return first
+
+
 def _gguf_block_count(path) -> int:
     """Layer (block) count from a GGUF header (``*.block_count``), 0 if unknown.
     Reads only the metadata KV section (no tensors). Cached per path."""
@@ -1088,6 +1128,12 @@ class VulkanBackend(ModelBackend):
                     model_path = _local
             except Exception as _rg_e:
                 print(f"  (local GGUF resolve skipped: {_rg_e})")
+
+        # A split GGUF must be opened at shard 1, and the whole set has to be on
+        # disk. Both are checked here so an incomplete download says so, instead of
+        # six identical "Failed to load model from file" retries.
+        if model_path.endswith('.gguf'):
+            model_path = resolve_gguf_shards(model_path)
 
         # Check if this looks like a GGUF model repo (e.g., "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF")
         is_gguf_repo = not model_path.endswith('.gguf') and not os.path.exists(model_path) and not model_path.startswith('http')
