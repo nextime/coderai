@@ -1281,7 +1281,22 @@ class VulkanBackend(ModelBackend):
                     # stay on GPU regardless — so reserve a context-scaled headroom
                     # and inflate the need, to err toward fitting (CPU layers are
                     # slow but a failed load is worse).
-                    _headroom = 2.0 + (self.n_ctx or 0) / 12000.0   # ~2 GB + ~1 GB per 12k ctx
+                    # Headroom for the KV cache + compute buffers on top of the
+                    # weights. The context-scaled guess below assumes the estimate
+                    # is weights-only AND that the KV is f16. When the config
+                    # carries a MEASURED footprint, that number already includes
+                    # the KV, so adding a context-scaled reserve on top double
+                    # counts — on a 27B at n_ctx 32000 with a q4_0 KV it reserved
+                    # 4.7 GB against a real KV of 0.55 GB and spilled 17 layers to
+                    # CPU for nothing. A quantized KV shrinks the reserve too.
+                    _measured_total = float((kwargs.get('_raw_cfg') or {}).get('measured_vram_gb') or 0)
+                    _kv_quantized = bool(_ck or _cv)
+                    if _measured_total > 0:
+                        _headroom = 1.5                      # compute buffers only
+                    elif _kv_quantized:
+                        _headroom = 1.5 + (self.n_ctx or 0) / 40000.0
+                    else:
+                        _headroom = 2.0 + (self.n_ctx or 0) / 12000.0   # ~2 GB + ~1 GB per 12k ctx
                     _usable = max(0.0, _free - _headroom)
                     _fit = int(_nlayers * _usable / (_exp * 1.20))
                     _fit = max(0, min(_nlayers - 1, _fit))
