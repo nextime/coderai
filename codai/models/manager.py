@@ -4656,6 +4656,15 @@ class MultiModelManager:
         room for per-request additions the base estimate can't know about (e.g.
         dynamically-applied LoRA adapters).
         """
+        # Already resident? Then there is nothing to reserve. Without this, a
+        # request for a model that is ALREADY loaded asks "do I have 22.9 GB free?"
+        # — and the answer is no precisely BECAUSE that model is occupying the card,
+        # so it evicts itself to make room for itself. It can look up as not-loaded
+        # under one of its ids (self.models is keyed by the alias, the reservation
+        # arrives with the path), so check every id this request answers to.
+        for _k in (model_key, resolved_name, requested_id):
+            if _k and _k in self.models:
+                return
         needed_gb = self._get_model_used_vram_gb(model_key, resolved_name, requested_id)
         if extra_vram_gb and extra_vram_gb > 0:
             needed_gb += extra_vram_gb
