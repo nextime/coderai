@@ -3909,7 +3909,8 @@ class MultiModelManager:
         except Exception:
             return 0.0
 
-    def _get_model_used_vram_gb(self, model_key: str, resolved_name: str = None) -> float:
+    def _get_model_used_vram_gb(self, model_key: str, resolved_name: str = None,
+                                requested_id: str = None) -> float:
         """Return VRAM requirement in GB for a model.
 
         Priority:
@@ -3980,15 +3981,18 @@ class MultiModelManager:
         # 12.6 GB free" evicted the very model that was already serving, then
         # reloaded it at 18 of 65 layers. Prefer the config of the name actually
         # REQUESTED whenever it names a same-path sibling.
-        if resolved_name and resolved_name != model_key:
-            _req = self._config_for_model(resolved_name)
+        for _cand in (requested_id, resolved_name):
+            if not _cand or _cand == model_key:
+                continue
+            _req = self._config_for_model(_cand)
             if _req and cfg and _req is not cfg:
                 _p1 = str((cfg.get('path') or cfg.get('model_path') or '')).strip()
                 _p2 = str((_req.get('path') or _req.get('model_path') or '')).strip()
                 if _p1 and _p1 == _p2:
-                    print(f"  [vram-est] '{resolved_name}' and '{model_key}' share "
+                    print(f"  [vram-est] '{_cand}' and '{model_key}' share "
                           f"{_p1.split('/')[-1]} — using the requested config's own size")
                     cfg = _req
+                    break
         # Unwrap a forwarded `_raw_cfg` so we see the ORIGINAL model entry the
         # same way the loaders do (build_kwargs_from_config only copies a few
         # keys to the top level — component_quantization lives ONLY in _raw_cfg).
@@ -4620,7 +4624,7 @@ class MultiModelManager:
         return max(0.0, after - before)
 
     def ensure_vram_for(self, model_key: str, resolved_name: str = None,
-                        extra_vram_gb: float = 0.0) -> None:
+                        extra_vram_gb: float = 0.0, requested_id: str = None) -> None:
         """Make room in VRAM for a model about to load — ANY type, ANY load mode.
 
         Universal guarantee: before loading a model that is not already resident,
@@ -4633,7 +4637,7 @@ class MultiModelManager:
         room for per-request additions the base estimate can't know about (e.g.
         dynamically-applied LoRA adapters).
         """
-        needed_gb = self._get_model_used_vram_gb(model_key, resolved_name)
+        needed_gb = self._get_model_used_vram_gb(model_key, resolved_name, requested_id)
         if extra_vram_gb and extra_vram_gb > 0:
             needed_gb += extra_vram_gb
         if needed_gb <= 0:
@@ -4709,6 +4713,10 @@ class MultiModelManager:
         mode = get_load_mode()
 
         # Step 1: Resolve the model name from aliases
+        # The id the caller actually asked for, kept intact through every
+        # resolution step: sibling configs sharing one weights file are only
+        # distinguishable by it (see the alias note below).
+        _requested_id = requested_model
         resolved_name = None
         model_key = None
         
@@ -4733,7 +4741,12 @@ class MultiModelManager:
             else:
                 resolved_name = self.default_model
         else:
-            # Resolve custom aliases
+            # Resolve custom aliases. Keep the ORIGINAL id: an alias can point at
+            # a weights file shared by several configs (lisa = 178000 ctx,
+            # lisa-32k = 32768 of the same file), and once it is collapsed to the
+            # path every downstream lookup picks whichever sibling registered the
+            # path — which sized lisa-32k at lisa's 51.97 GB and evicted the model
+            # that was serving the request.
             if requested_model in self.model_aliases:
                 requested_model = self.model_aliases[requested_model]
 
@@ -4909,7 +4922,8 @@ class MultiModelManager:
                     'already_loaded': True,
                 }
             # Not loaded — make room in VRAM (evict other models as needed).
-            self.ensure_vram_for(model_key, resolved_name, extra_vram_gb)
+            self.ensure_vram_for(model_key, resolved_name, extra_vram_gb,
+                                 requested_id=_requested_id)
             return {
                 'model_key': model_key,
                 'model_name': resolved_name,
@@ -4933,7 +4947,8 @@ class MultiModelManager:
             # A "load" model that is NOT currently resident was evicted to make
             # room for an on-request model (e.g. the text model bumped for a video
             # model).  Make room again so it returns to VRAM instead of CPU.
-            self.ensure_vram_for(model_key, resolved_name, extra_vram_gb)
+            self.ensure_vram_for(model_key, resolved_name, extra_vram_gb,
+                                 requested_id=_requested_id)
             return {
                 'model_key': model_key,
                 'model_name': resolved_name,
@@ -4959,7 +4974,8 @@ class MultiModelManager:
             # Model not loaded yet in loadall mode - caller needs to load it
             # (this happens for models not pre-loaded at startup, e.g., image models)
             print(f"Loadall mode: Model '{model_key}' not pre-loaded, will load now")
-            self.ensure_vram_for(model_key, resolved_name, extra_vram_gb)
+            self.ensure_vram_for(model_key, resolved_name, extra_vram_gb,
+                                 requested_id=_requested_id)
             return {
                 'model_key': model_key,
                 'model_name': resolved_name,
