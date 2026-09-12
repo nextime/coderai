@@ -3972,6 +3972,23 @@ class MultiModelManager:
         cfg = self._config_for_model(model_key)
         if not cfg and resolved_name:
             cfg = self._config_for_model(resolved_name)
+        # Multi-config: two entries can share one weights file and differ only in
+        # settings (lisa = the 26B at n_ctx 178000, lisa-32k = the same file at
+        # 32768 — measured 51.97 GB vs 14.33 GB). When the key we were given is the
+        # PATH, it matches whichever sibling registered it, so a request for the
+        # small one was sized with the big one's footprint: "need 52.0 GB, have
+        # 12.6 GB free" evicted the very model that was already serving, then
+        # reloaded it at 18 of 65 layers. Prefer the config of the name actually
+        # REQUESTED whenever it names a same-path sibling.
+        if resolved_name and resolved_name != model_key:
+            _req = self._config_for_model(resolved_name)
+            if _req and cfg and _req is not cfg:
+                _p1 = str((cfg.get('path') or cfg.get('model_path') or '')).strip()
+                _p2 = str((_req.get('path') or _req.get('model_path') or '')).strip()
+                if _p1 and _p1 == _p2:
+                    print(f"  [vram-est] '{resolved_name}' and '{model_key}' share "
+                          f"{_p1.split('/')[-1]} — using the requested config's own size")
+                    cfg = _req
         # Unwrap a forwarded `_raw_cfg` so we see the ORIGINAL model entry the
         # same way the loaders do (build_kwargs_from_config only copies a few
         # keys to the top level — component_quantization lives ONLY in _raw_cfg).
