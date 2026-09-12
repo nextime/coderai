@@ -165,6 +165,12 @@ _KV_TYPE_ALIASES = {
 # Sub-8-bit KV types that llama.cpp can only use with flash attention enabled.
 _KV_NEEDS_FLASH = {'q5_0', 'q5_1', 'q5', 'q4_0', 'q4_1', 'q4', 'iq4_nl'}
 
+#: Context floor for a model that arrives without a configured n_ctx. llama.cpp's
+#: own default is 2048, which silently truncates any real prompt — a request that
+#: reaches the engine before its config does would fail for a reason nothing in the
+#: log explains. Clamped to the model's native context when that is smaller.
+_DEFAULT_MIN_CTX = 32768
+
 _GGUF_META_CACHE: dict = {}
 
 
@@ -326,7 +332,7 @@ def _gguf_kv_geometry(path) -> dict:
 
             wanted = ('.block_count', '.attention.head_count_kv', '.attention.head_count',
                       '.attention.key_length', '.attention.value_length', '.embedding_length',
-                      '.attention.sliding_window')
+                      '.attention.sliding_window', '.context_length')
             for _ in range(n_kv):
                 key = rd_str()
                 val = rd_val(struct.unpack('<I', f.read(4))[0])
@@ -1295,10 +1301,31 @@ class VulkanBackend(ModelBackend):
         else:
             # Accept either 'n_ctx' (models.json / GGUF) or 'ctx' (CLI / older
             # configs); the manager passes both, but be robust to either alone.
-            n_ctx = kwargs.get('n_ctx')
-            if n_ctx is None:
-                n_ctx = kwargs.get('ctx', 2048)
-            self.n_ctx = n_ctx
+            n_ctx = kwargs.get('n_ctx') or kwargs.get('ctx')
+            if not n_ctx:
+                # Nothing was passed. That happens when the model reached this
+                # engine WITHOUT its config — e.g. an alias the front knows but
+                # this engine's registry does not yet (a models.json entry added
+                # since the engine started). Falling back to llama.cpp's 2048
+                # silently truncates every real prompt, so look the config up by
+                # the resolved path first.
+                try:
+                    from codai.models.manager import multi_model_manager
+                    _cfg = multi_model_manager._config_for_model(model_path) or {}
+                    n_ctx = _cfg.get('n_ctx') or _cfg.get('ctx')
+                    if n_ctx:
+                        print(f"  n_ctx recovered from the model config: {n_ctx} "
+                              f"(it was not passed with the load request)")
+                except Exception as _cx:
+                    print(f"  (config lookup for n_ctx failed: {_cx})")
+            if not n_ctx:
+                _native = int((_gguf_kv_geometry(model_path) or {}).get('context_length') or 0)
+                n_ctx = min(_native, _DEFAULT_MIN_CTX) if _native else _DEFAULT_MIN_CTX
+                print(f"  WARNING: no n_ctx configured for this model — using {n_ctx} "
+                      f"(native context {_native or 'unknown'}). llama.cpp's own default "
+                      f"is 2048, which would truncate any real prompt; set n_ctx in "
+                      f"models.json to choose deliberately.")
+            self.n_ctx = int(n_ctx)
         
         # Set verbose
         self.verbose = kwargs.get('verbose', True)
