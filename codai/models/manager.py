@@ -3988,6 +3988,18 @@ class MultiModelManager:
         # 12.6 GB free" evicted the very model that was already serving, then
         # reloaded it at 18 of 65 layers. Prefer the config of the name actually
         # REQUESTED whenever it names a same-path sibling.
+        # First, the reliable discriminator: an entry whose `alias` IS the id the
+        # caller asked for. Aliases are unique per entry, so this needs no path
+        # comparison and does not care how self.config happens to be keyed —
+        # _config_for_model() resolves an alias THROUGH the alias map to the shared
+        # path, which lands on the sibling and is exactly what went wrong here.
+        if requested_id:
+            for _k, _c in (self.config or {}).items():
+                if isinstance(_c, dict) and _c.get('alias') == requested_id and _c is not cfg:
+                    print(f"  [vram-est] sizing '{requested_id}' by its own config "
+                          f"(shares a weights file with '{str(model_key).split('/')[-1]}')")
+                    cfg = _c
+                    break
         for _cand in (requested_id, resolved_name):
             if not _cand or _cand == model_key:
                 continue
