@@ -1703,8 +1703,11 @@ class MultiModelManager:
                 self._model_ready_event.set()
                 return None
 
-    def _load_model_by_name(self, model_name: str):
-        """Load a model by name on demand (thread-safe)."""
+    def _load_model_by_name(self, model_name: str, requested_id: str = None):
+        """Load a model by name on demand (thread-safe).
+
+        ``requested_id`` is the id the caller asked for before alias resolution —
+        needed to tell same-path sibling configs apart when sizing VRAM."""
         if model_name in self.models and model_name not in self._pending_new_instance:
             return self._get_least_busy_instance(model_name)
 
@@ -1848,7 +1851,7 @@ class MultiModelManager:
                 # current model and OOMs (e.g. switching to a larger model).
                 if inst_num == 1:
                     try:
-                        self.ensure_vram_for(model_name)
+                        self.ensure_vram_for(model_name, requested_id=requested_id)
                     except Exception as _ev_e:
                         print(f"  (ensure_vram_for warning: {_ev_e})")
                 _snap = self.vram_before_load()
@@ -1856,7 +1859,8 @@ class MultiModelManager:
                 # Tell the backend how much VRAM this model is expected to need so
                 # it can decide whether Flash-Attention-2 is safe (FA2 requires the
                 # whole model on GPU; it device-side-asserts when layers offload).
-                kwargs['expected_vram_gb'] = self._get_model_used_vram_gb(model_name)
+                kwargs['expected_vram_gb'] = self._get_model_used_vram_gb(
+                    model_name, requested_id=requested_id)
                 # Reuse a learned stable GPU-layer split so the load jumps straight
                 # to the config that fit (skips the OOM→move-to-RAM→retry dance).
                 _ngl = self._learned_n_gpu_layers(model_name, kwargs.get('n_gpu_layers'))
@@ -2534,7 +2538,10 @@ class MultiModelManager:
         """Get the appropriate model manager for a request based on model name."""
         global global_args
         
-        # Resolve custom aliases first
+        # Resolve custom aliases first. Keep the id the caller asked for:
+        # sibling configs sharing one weights file (lisa / lisa-32k) are only
+        # told apart by it, and this is the path text generation takes.
+        _requested_id = requested_model
         if requested_model in self.model_aliases:
             requested_model = self.model_aliases[requested_model]
         
@@ -2609,7 +2616,7 @@ class MultiModelManager:
             return None
         
         # Model not found but allowed - try to load it
-        return self._load_model_by_name(requested_model)
+        return self._load_model_by_name(requested_model, requested_id=_requested_id)
     
     def resolve_model_name(self, requested_model: str) -> Optional[str]:
         """
