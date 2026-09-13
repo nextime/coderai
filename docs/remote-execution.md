@@ -184,8 +184,50 @@ Pod engines (`engine`):
 | `custom` | your `image`, `docker_args` verbatim | `health_path` |
 
 `coderai` is the default for a capability pool: the far side is a whole coderai,
-reached through the same API. You must supply `image` — a registry the pod can
-pull from — because coderai does not publish one for you.
+reached through the same API.
+
+### Where the images come from
+
+RunPod pulls the image from a registry over the public internet — it cannot use
+anything on your machine. What you need depends on the engine:
+
+| Engine | Image | You publish anything? |
+|---|---|---|
+| `vllm` | `vllm/vllm-openai:latest` | no — public |
+| `llamacpp` | `ghcr.io/ggml-org/llama.cpp:server-cuda` | no — public |
+| `coderai` / `custom` | yours | **yes** |
+
+So LLM pods need no work at all. A capability pod needs a coderai image somewhere
+RunPod can reach. Any registry works:
+
+* **GHCR** (`ghcr.io/<you>/coderai`) — the one `DISTRIBUTION.md` targets, free for
+  public images, tied to a GitHub token for private ones.
+* **Docker Hub** — one free private repo; watch the pull-rate limits.
+* **AWS ECR / Google Artifact Registry / Azure ACR** — if a pod runs in the same
+  region the pull is fast and egress is cheap.
+* **Your own registry** — needs to be reachable from RunPod's network and to
+  serve valid TLS.
+
+Publishing it:
+
+```bash
+docker tag coderai:base ghcr.io/<you>/coderai:base
+docker login ghcr.io -u <you>          # a PAT with write:packages
+docker push ghcr.io/<you>/coderai:base
+```
+
+Two warnings worth having in advance. The flattened `coderai:base` is ~26.6 GB —
+the first push takes a while, and **every cold pod pays that pull** before it
+answers `/healthz`, so raise `boot_timeout_s`/`load_timeout_s` and consider a
+larger `container_disk_gb`. And a full coderai carries every subsystem; if a pod
+only ever renders video, a trimmed image boots far faster and costs less per
+cold start.
+
+**Private registry:** RunPod stores the credentials for you — *Settings →
+Container Registry Credentials* — and gives each set an id. Put that id in
+`runpod.registry_auth_id` (account-wide) or in a pod block's `registry_auth_id`
+(per model or capability). Without it a private image fails to pull and the pod
+never becomes healthy. Public images need none.
 
 If a pod cannot be provisioned (RunPod disabled, budget cap hit, no GPU under
 the ceiling) the request fails with 502. It does **not** quietly fall back to

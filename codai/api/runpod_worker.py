@@ -56,6 +56,9 @@ class RunpodModelConfig:
     # Verbatim docker args, replacing whatever the engine would generate. The
     # escape hatch for `engine: custom` and for images with their own CLI.
     docker_args: str = ""
+    # RunPod container-registry credential id for a private image; blank falls
+    # back to the account-wide one.
+    registry_auth_id: str = ""
     served_model: str = ""                   # HF id the pod/endpoint serves
     # GGUF to pull on a llama.cpp pod, in llama.cpp's own `-hf` form:
     # "user/repo:Q4_K_M" or "user/repo:file.gguf". Needed because a local
@@ -226,6 +229,7 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.engine = (b.get("engine") or cfg.engine).strip().lower() or "auto"
     cfg.health_path = (b.get("health_path") or "").strip()
     cfg.docker_args = (b.get("docker_args") or "").strip()
+    cfg.registry_auth_id = (b.get("registry_auth_id") or "").strip()
     cfg.served_model = (b.get("served_model") or "").strip()
     cfg.hf_gguf = (b.get("hf_gguf") or "").strip()
     cfg.container_disk_gb = _as_int(b.get("container_disk_gb"), cfg.container_disk_gb)
@@ -491,7 +495,9 @@ class RunpodPodPool:
                     name=name, image=image, gpu_type_id=sel["gpu_type_id"], port=port,
                     cloud_type=sel["cloud_type"], container_disk_gb=self.mcfg.container_disk_gb,
                     volume_gb=self.mcfg.volume_gb, env=env, docker_args=args,
-                    is_spot=sel["is_spot"], bid_per_gpu=sel["bid"], data_center_id=dc)
+                    is_spot=sel["is_spot"], bid_per_gpu=sel["bid"], data_center_id=dc,
+                    registry_auth_id=(self.mcfg.registry_auth_id
+                                      or getattr(self.account, "registry_auth_id", "") or ""))
                 return pod_id, sel, i + 1
             except RunpodError as exc:
                 msg = str(exc).lower()

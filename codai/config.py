@@ -629,6 +629,10 @@ class RunpodConfig:
     serverless_base: str = "https://api.runpod.ai/v2"  # serverless invoke base
     default_gpu_type: str = ""            # fallback RunPod gpuTypeId when a model gives none
     data_center: str = ""                 # optional data-center id filter (blank = any)
+    # RunPod "Container Registry Credentials" id, for pods whose image lives in a
+    # private registry (your own coderai image, typically). Per-model/capability
+    # `registry_auth_id` overrides this. Blank = public images only.
+    registry_auth_id: str = ""
     # Stable tag baked into every pod name (coderai-<deployment_id>-<model>-<rand>) so the
     # reaper can identify OUR pods across restarts and never touch another deployment's.
     deployment_id: str = "default"
@@ -1207,6 +1211,7 @@ class ConfigManager:
                 "serverless_base": self.config.runpod.serverless_base,
                 "default_gpu_type": self.config.runpod.default_gpu_type,
                 "data_center": self.config.runpod.data_center,
+                "registry_auth_id": self.config.runpod.registry_auth_id,
                 "deployment_id": self.config.runpod.deployment_id,
                 "global_max_hourly_usd": self.config.runpod.global_max_hourly_usd,
                 "global_cost_limit_usd": self.config.runpod.global_cost_limit_usd,

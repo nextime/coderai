@@ -182,7 +182,8 @@ class RunpodClient:
                    container_disk_gb: int = 40, volume_gb: int = 0,
                    volume_mount_path: str = "/workspace", env: Optional[dict] = None,
                    docker_args: str = "", is_spot: bool = False,
-                   bid_per_gpu: float = 0.0, data_center_id: str = "") -> str:
+                   bid_per_gpu: float = 0.0, data_center_id: str = "",
+                   registry_auth_id: str = "") -> str:
         """Provision a pod (on-demand or interruptible/spot). Returns the pod id."""
         env_list = [{"key": str(k), "value": str(v)} for k, v in (env or {}).items()]
         ports = f"{int(port)}/http"
@@ -201,6 +202,11 @@ class RunpodClient:
         }
         if data_center_id:
             common["dataCenterId"] = data_center_id
+        # A private image needs credentials RunPod holds for you: create them under
+        # Settings -> Container Registry Credentials and paste the id here. Public
+        # images (vLLM, llama.cpp, a public coderai) need none.
+        if registry_auth_id:
+            common["containerRegistryAuthId"] = registry_auth_id
         if is_spot:
             common["bidPerGpu"] = float(bid_per_gpu)
             mutation = "podRentInterruptable"

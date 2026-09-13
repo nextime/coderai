@@ -3635,6 +3635,7 @@ def build_settings_dict(c, gpu_cards):
             "serverless_base": c.runpod.serverless_base,
             "default_gpu_type": c.runpod.default_gpu_type,
             "data_center": c.runpod.data_center,
+            "registry_auth_id": c.runpod.registry_auth_id,
             "deployment_id": c.runpod.deployment_id,
             "global_max_hourly_usd": c.runpod.global_max_hourly_usd,
             "global_cost_limit_usd": c.runpod.global_cost_limit_usd,
@@ -4209,6 +4210,8 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             rp.default_gpu_type = (d.get("default_gpu_type") or "").strip()
         if "data_center" in d:
             rp.data_center = (d.get("data_center") or "").strip()
+        if "registry_auth_id" in d:
+            rp.registry_auth_id = (d.get("registry_auth_id") or "").strip()
         if "deployment_id" in d:
             rp.deployment_id = (d.get("deployment_id") or "default").strip() or "default"
         if "global_max_hourly_usd" in d:
