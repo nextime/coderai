@@ -822,6 +822,18 @@ def ensure_engine(cfg, model_dir: Optional[str] = None, ctx: Optional[int] = Non
     directory (or ``cfg.model_path`` is set) the engine loads THAT. ``ctx`` sizes the
     per-turn generation budget (NGEN). Returns a live :class:`MuxEngine`.
     """
+    # An explicit `service_url` points at a colibri engine hosted by
+    # tools/mux_service.py somewhere else — another host, a rented pod — so
+    # nothing is built or launched here. The client speaks the same surface the
+    # backends use, so callers cannot tell it from a local MuxEngine.
+    _remote = (str(getattr(cfg, "service_url", "") or "")
+               or os.environ.get("CODERAI_COLIBRI_SERVICE_URL") or "").strip()
+    if _remote:
+        from codai.api.mux_remote import remote_engine_for
+        eng = remote_engine_for("colibri", _remote)
+        print(f"[colibri] using the configured remote engine at {eng.url}", flush=True)
+        return eng
+
     resolved, svc_key = resolve_service_key(cfg, model_dir)
     # Family is inferred from the resolved container (config.json / dir name) and
     # decides the binary, the make target, and the serve protocol.

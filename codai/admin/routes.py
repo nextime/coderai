@@ -3522,6 +3522,7 @@ def build_settings_dict(c, gpu_cards):
         },
         "ds4": {
             "enabled": c.ds4.enabled,
+            "service_url": c.ds4.service_url,
             "repo_url": c.ds4.repo_url,
             "install_dir": c.ds4.install_dir,
             "build_target": c.ds4.build_target,
@@ -3543,6 +3544,7 @@ def build_settings_dict(c, gpu_cards):
         },
         "colibri": {
             "enabled": c.colibri.enabled,
+            "service_url": c.colibri.service_url,
             "repo_url": c.colibri.repo_url,
             "install_dir": c.colibri.install_dir,
             "build_target": c.colibri.build_target,
@@ -3558,6 +3560,7 @@ def build_settings_dict(c, gpu_cards):
         },
         "k3": {
             "enabled": c.k3.enabled,
+            "service_url": c.k3.service_url,
             "repo_url": c.k3.repo_url,
             "install_dir": c.k3.install_dir,
             "model_path": c.k3.model_path,
@@ -3574,6 +3577,7 @@ def build_settings_dict(c, gpu_cards):
         },
         "ktransformers": {
             "enabled": c.ktransformers.enabled,
+            "service_url": c.ktransformers.service_url,
             "repo_url": c.ktransformers.repo_url,
             "install_dir": c.ktransformers.install_dir,
             "model_path": c.ktransformers.model_path,
@@ -3588,6 +3592,7 @@ def build_settings_dict(c, gpu_cards):
         },
         "vllm": {
             "enabled": c.vllm.enabled,
+            "service_url": c.vllm.service_url,
             "venv": c.vllm.venv,
             "model_path": c.vllm.model_path,
             "model_id": c.vllm.model_id,
@@ -3954,6 +3959,8 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
 
     if "ds4" in data:
         d = data["ds4"]
+        if "service_url" in d:
+            c.ds4.service_url = (d.get("service_url") or "").strip()
         c.ds4.enabled = bool(d.get("enabled", c.ds4.enabled))
         if "repo_url" in d:
             c.ds4.repo_url = (d.get("repo_url") or c.ds4.repo_url or "").strip()
@@ -4003,6 +4010,8 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
 
     if "colibri" in data:
         d = data["colibri"]
+        if "service_url" in d:
+            c.colibri.service_url = (d.get("service_url") or "").strip()
         c.colibri.enabled = bool(d.get("enabled", c.colibri.enabled))
         if "repo_url" in d:
             c.colibri.repo_url = (d.get("repo_url") or c.colibri.repo_url or "").strip()
@@ -4037,6 +4046,8 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
 
     if "k3" in data:
         d = data["k3"]
+        if "service_url" in d:
+            c.k3.service_url = (d.get("service_url") or "").strip()
         c.k3.enabled = bool(d.get("enabled", c.k3.enabled))
         if "repo_url" in d:
             c.k3.repo_url = (d.get("repo_url") or c.k3.repo_url or "").strip()
@@ -4076,6 +4087,8 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
 
     if "ktransformers" in data:
         d = data["ktransformers"]
+        if "service_url" in d:
+            c.ktransformers.service_url = (d.get("service_url") or "").strip()
         c.ktransformers.enabled = bool(d.get("enabled", c.ktransformers.enabled))
         if "repo_url" in d:
             c.ktransformers.repo_url = (d.get("repo_url") or c.ktransformers.repo_url or "").strip()
@@ -4108,6 +4121,8 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
 
     if "vllm" in data:
         d = data["vllm"]
+        if "service_url" in d:
+            c.vllm.service_url = (d.get("service_url") or "").strip()
         v = c.vllm
         v.enabled = bool(d.get("enabled", v.enabled))
         if "venv" in d: v.venv = (d.get("venv") or "").strip()

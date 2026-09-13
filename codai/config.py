@@ -368,6 +368,10 @@ class Ds4Config:
     contains ``deepseek-v4``) is routed to ds4 instead of the normal backends.
     """
     enabled: bool = False
+    # Point this at an engine already running somewhere else (another host, a
+    # container, a rented pod) and coderai proxies to it instead of building,
+    # downloading or launching anything locally. Blank = manage it here.
+    service_url: str = ""
     repo_url: str = "https://github.com/antirez/ds4"
     install_dir: Optional[str] = None      # None = ~/.coderai/ds4
     build_target: str = "auto"             # auto|cuda-generic|cuda-spark|metal|cpu
@@ -426,6 +430,10 @@ class ColibriConfig:
     ``colibri``) is routed to the colibri engine instead of the normal backends.
     """
     enabled: bool = False
+    # Point this at an engine already running somewhere else (another host, a
+    # container, a rented pod) and coderai proxies to it instead of building,
+    # downloading or launching anything locally. Blank = manage it here.
+    service_url: str = ""
     repo_url: str = "https://github.com/JustVugg/colibri"
     install_dir: Optional[str] = None      # None = ~/.coderai/colibri
     build_target: str = "auto"             # auto|cuda|hip|cpu (auto: CUDA if nvcc present)
@@ -468,6 +476,10 @@ class K3Config:
     fast local storage.
     """
     enabled: bool = False
+    # Point this at an engine already running somewhere else (another host, a
+    # container, a rented pod) and coderai proxies to it instead of building,
+    # downloading or launching anything locally. Blank = manage it here.
+    service_url: str = ""
     repo_url: str = "https://github.com/FareedKhan-dev/kimi-k3-in-c"
     install_dir: Optional[str] = None      # None = ~/.coderai/kimi-k3-in-c
     model_path: str = ""                   # the Kimi-K3 checkpoint directory (config + tokenizer + shards)
@@ -501,6 +513,10 @@ class KtransformersConfig:
     weights. Best throughput needs AMX/AVX-512 CPUs.
     """
     enabled: bool = False
+    # Point this at an engine already running somewhere else (another host, a
+    # container, a rented pod) and coderai proxies to it instead of building,
+    # downloading or launching anything locally. Blank = manage it here.
+    service_url: str = ""
     repo_url: str = "https://github.com/kvcache-ai/ktransformers"
     install_dir: Optional[str] = None      # None = ~/.coderai/ktransformers (kt-kernel build)
     model_path: str = ""                   # HF model directory (--model)
@@ -536,6 +552,10 @@ class VllmConfig:
     Also reused by the OCR subsystem to serve Surya2 (a VLM) with continuous batching.
     """
     enabled: bool = False
+    # Point this at an engine already running somewhere else (another host, a
+    # container, a rented pod) and coderai proxies to it instead of building,
+    # downloading or launching anything locally. Blank = manage it here.
+    service_url: str = ""
     venv: str = ""                       # isolated venv dir; blank = auto (baked/cache/home)
     model_path: str = ""                 # OPTIONAL single-model HF dir/repo id (--model); blank = use the model list
     model_id: str = ""                   # OPTIONAL single-model alias/served-name; blank = per-model from the list
@@ -1050,6 +1070,7 @@ class ConfigManager:
             },
             "ds4": {
                 "enabled": self.config.ds4.enabled,
+                "service_url": self.config.ds4.service_url,
                 "repo_url": self.config.ds4.repo_url,
                 "install_dir": self.config.ds4.install_dir,
                 "build_target": self.config.ds4.build_target,
@@ -1071,6 +1092,7 @@ class ConfigManager:
             },
             "colibri": {
                 "enabled": self.config.colibri.enabled,
+                "service_url": self.config.colibri.service_url,
                 "repo_url": self.config.colibri.repo_url,
                 "install_dir": self.config.colibri.install_dir,
                 "build_target": self.config.colibri.build_target,
@@ -1086,6 +1108,7 @@ class ConfigManager:
             },
             "k3": {
                 "enabled": self.config.k3.enabled,
+                "service_url": self.config.k3.service_url,
                 "repo_url": self.config.k3.repo_url,
                 "install_dir": self.config.k3.install_dir,
                 "model_path": self.config.k3.model_path,
@@ -1102,6 +1125,7 @@ class ConfigManager:
             },
             "ktransformers": {
                 "enabled": self.config.ktransformers.enabled,
+                "service_url": self.config.ktransformers.service_url,
                 "repo_url": self.config.ktransformers.repo_url,
                 "install_dir": self.config.ktransformers.install_dir,
                 "model_path": self.config.ktransformers.model_path,
@@ -1116,6 +1140,7 @@ class ConfigManager:
             },
             "vllm": {
                 "enabled": self.config.vllm.enabled,
+                "service_url": self.config.vllm.service_url,
                 "venv": self.config.vllm.venv,
                 "model_path": self.config.vllm.model_path,
                 "model_id": self.config.vllm.model_id,

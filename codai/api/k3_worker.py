@@ -158,6 +158,18 @@ def _build_env(cfg, ctx: int) -> dict:
 def ensure_engine(cfg, model_dir: Optional[str] = None, ctx: Optional[int] = None,
                   ready_timeout: float = 3600.0) -> MuxEngine:
     """Build (as needed), then start (or reuse) the k3 engine for a checkpoint."""
+    # An explicit `service_url` points at a k3 engine hosted by
+    # tools/mux_service.py somewhere else — another host, a rented pod — so
+    # nothing is built or launched here. The client speaks the same surface the
+    # backends use, so callers cannot tell it from a local MuxEngine.
+    _remote = (str(getattr(cfg, "service_url", "") or "")
+               or os.environ.get("CODERAI_K3_SERVICE_URL") or "").strip()
+    if _remote:
+        from codai.api.mux_remote import remote_engine_for
+        eng = remote_engine_for("k3", _remote, family="kimi_k3")
+        print(f"[k3] using the configured remote engine at {eng.url}", flush=True)
+        return eng
+
     ckpt, svc_key = resolve_service_key(cfg, model_dir)
     with _lock:
         eng = _services.get(svc_key)
