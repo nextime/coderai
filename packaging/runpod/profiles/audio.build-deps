@@ -1,0 +1,7 @@
+# apt packages needed only to BUILD this profile's wheels. Installed before pip
+# and purged in the same layer, so the toolchain never ships in the image.
+#
+# deepfilternet -> deepfilterlib has no cp312 wheel and compiles Rust extensions.
+cargo
+rustc
+build-essential

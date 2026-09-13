@@ -42,10 +42,21 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --upgrade pip \
     && python -m pip install --extra-index-url ${TORCH_INDEX} -r /tmp/profiles/core.txt
 
-# Then only what this capability adds.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python -m pip install --extra-index-url ${TORCH_INDEX} -r /tmp/profiles/${PROFILE}.txt \
-    && rm -rf /tmp/profiles
+# Then only what this capability adds. A profile may ship a `<name>.build-deps`
+# listing apt packages its wheels need to COMPILE (deepfilterlib wants a Rust
+# toolchain, for one). They are installed and purged inside this single layer, so
+# a 1 GB toolchain never ends up in the shipped image.
+RUN --mount=type=cache,target=/root/.cache/pip set -eux; \
+    deps=""; \
+    if [ -f "/tmp/profiles/${PROFILE}.build-deps" ]; then \
+        deps="$(grep -vE '^\s*(#|$)' /tmp/profiles/${PROFILE}.build-deps | tr '\n' ' ')"; \
+        apt-get update && apt-get install -y --no-install-recommends $deps; \
+    fi; \
+    python -m pip install --extra-index-url ${TORCH_INDEX} -r /tmp/profiles/${PROFILE}.txt; \
+    if [ -n "$deps" ]; then \
+        apt-get purge -y $deps && apt-get autoremove -y; \
+    fi; \
+    rm -rf /tmp/profiles /var/lib/apt/lists/* /root/.cargo /root/.rustup
 
 COPY . /opt/coderai/app
 

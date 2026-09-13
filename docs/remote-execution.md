@@ -259,9 +259,22 @@ stacks, and every cold pod pays for what it pulls. `packaging/runpod/` builds a
 coderai carrying one capability's dependencies:
 
 ```bash
+# all of them, with login, resume, push and the make-them-public URLs:
+./packaging/runpod/publish_capability_images.sh
+
+# or one at a time:
 ./packaging/runpod/build_capability_image.sh video ghcr.io/<you>/coderai-video:latest
-PUSH=1 ./packaging/runpod/build_capability_image.sh video ghcr.io/<you>/coderai-video:latest
 ```
+
+`publish_capability_images.sh` is resumable — it skips images already built for
+the current version, so re-running after a failure does not rebuild 7 GB of
+torch. Useful knobs: `PROFILES="images video"`, `REBUILD=1`, `NO_PUSH=1`,
+`NS=ghcr.io/<you>`, `YES=1` (no prompts).
+
+If a profile's wheels need a compiler, list the apt packages in
+`profiles/<profile>.build-deps`; they are installed and purged inside one layer,
+so the toolchain never ships. `audio` does this for deepfilterlib's Rust
+extensions, and costs ~50 MB more than a profile that needs nothing.
 
 Profiles live in `packaging/runpod/profiles/` — `core.txt` (what any pod needs to
 boot) plus one file per capability: images, video, tts, stt, voice, audio,
