@@ -1,0 +1,5 @@
+# apt packages needed only to BUILD this profile's wheels. Installed before pip
+# and purged in the same layer, so the toolchain never ships in the image.
+#
+# f5-tts/seed-vc -> webrtcvad is a C extension with no cp312 wheel.
+build-essential
