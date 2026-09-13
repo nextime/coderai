@@ -673,15 +673,18 @@ class FrontProxy:
         except Exception:
             pass
 
-    async def _spill_to_runpod(self, model, trigger, request, path, body_bytes):
-        """Burst a request to a RunPod SERVERLESS spillover target when the local
-        model can't serve it. Returns a Response/StreamingResponse on spill, or None
-        to keep normal (local) behaviour.
+    async def _spill_open(self, model, trigger, path, body_bytes):
+        """Open a burst request against this model's RunPod spillover target.
 
-        A serverless endpoint is OpenAI-compatible, so this is a plain reverse-proxy
-        hop to a remote HTTPS URL with a Bearer header — no request parsing. Fully
-        guarded: any problem returns None so the caller falls back to local.
-        (Pods-target spillover routes through the engine and is not handled here.)
+        Returns ``(response, done)`` where ``done`` is an awaitable that closes the
+        upstream response and releases whatever was borrowed, or ``None`` to keep
+        normal (local) behaviour. Fully guarded: every failure path returns None so
+        the caller falls back to local rather than erroring the request.
+
+        Two target kinds, same contract to the caller:
+          * serverless — a plain reverse-proxy hop to an OpenAI-compatible URL;
+          * pods       — borrow a pod from the managed pool (provision on demand,
+            health-gated, billed against the same caps), and give it straight back.
         """
         try:
             if not (model and body_bytes):
@@ -692,48 +695,155 @@ class FrontProxy:
             if not sp.get(trigger):
                 return None
             target = sp.get("target") if isinstance(sp.get("target"), dict) else {}
-            if (target.get("mode") or "serverless").lower() != "serverless":
-                return None   # pods-target spill goes through the engine, not here
             rp = getattr(self.config, "runpod", None)
             if rp is None or not getattr(rp, "enabled", False) or not getattr(rp, "api_key", ""):
                 return None
-            eid = (target.get("endpoint_id") or "").strip()
-            if not eid:
-                return None
-            # /v1/chat/completions -> <serverless_base>/<eid>/openai/v1/chat/completions
-            p = path.split("?", 1)[0]
-            suffix = p[len("/v1"):] if p.startswith("/v1/") else "/chat/completions"
-            base = (getattr(rp, "serverless_base", "") or "https://api.runpod.ai/v2").rstrip("/")
-            url = f"{base}/{eid}/openai/v1{suffix}"
-            # Rewrite the model to the target's served name, if set.
-            body = body_bytes
-            served = (target.get("served_model") or "").strip()
-            if served:
-                try:
-                    import json as _j
-                    obj = _j.loads(body_bytes or b"{}")
-                    if isinstance(obj, dict):
-                        obj["model"] = served
-                        body = _j.dumps(obj).encode()
-                except Exception:
-                    body = body_bytes
-            headers = {"Authorization": f"Bearer {rp.api_key}",
-                       "Content-Type": "application/json"}
-            print("[runpod-spill] model=%s trigger=%s -> serverless %s"
-                  % (model, trigger, eid), flush=True)
-            rp_req = self._long.build_request("POST", url, headers=headers, content=body)
-            rp_resp = await self._long.send(rp_req, stream=True)
-            return StreamingResponse(
-                rp_resp.aiter_raw(), status_code=rp_resp.status_code,
-                headers=dict(self._filter_headers(rp_resp.headers, _DROP_RESP)),
-                media_type=rp_resp.headers.get("content-type"),
-                background=BackgroundTask(rp_resp.aclose))
+            mode = (target.get("mode") or "serverless").lower()
+            if mode == "pods":
+                return await self._spill_open_pod(model, trigger, path, body_bytes,
+                                                  target, rp)
+            return await self._spill_open_serverless(model, trigger, path, body_bytes,
+                                                     target, rp)
         except Exception as exc:
             try:
                 print("[runpod-spill] failed, falling back to local: %s" % exc, flush=True)
             except Exception:
                 pass
             return None
+
+    async def _spill_open_serverless(self, model, trigger, path, body_bytes, target, rp):
+        """A serverless endpoint is OpenAI-compatible, so this is one proxy hop."""
+        eid = (target.get("endpoint_id") or "").strip()
+        if not eid:
+            return None
+        # /v1/chat/completions -> <serverless_base>/<eid>/openai/v1/chat/completions
+        p = path.split("?", 1)[0]
+        suffix = p[len("/v1"):] if p.startswith("/v1/") else "/chat/completions"
+        base = (getattr(rp, "serverless_base", "") or "https://api.runpod.ai/v2").rstrip("/")
+        url = f"{base}/{eid}/openai/v1{suffix}"
+        body = self._rewrite_model(body_bytes, (target.get("served_model") or "").strip())
+        headers = {"Authorization": f"Bearer {rp.api_key}",
+                   "Content-Type": "application/json"}
+        print("[runpod-spill] model=%s trigger=%s -> serverless %s"
+              % (model, trigger, eid), flush=True)
+        rp_req = self._long.build_request("POST", url, headers=headers, content=body)
+        rp_resp = await self._long.send(rp_req, stream=True)
+
+        async def _done():
+            await rp_resp.aclose()
+
+        return rp_resp, _done
+
+    async def _spill_open_pod(self, model, trigger, path, body_bytes, target, rp):
+        """Burst to a coderai-managed RunPod POD rather than a serverless endpoint.
+
+        The pool does the work — provision on demand, health-gate, scale, reap, and
+        bill against the same caps a fully-remote model uses. We borrow a pod for
+        this one request and give it straight back, so an overflow that never
+        recurs is torn down by the idle reaper instead of lingering.
+
+        This runs in the FRONT process, which is torch-free: runpod_worker and
+        runpod_client are stdlib + requests at import time, so that holds.
+        """
+        import asyncio as _asyncio
+        pool = handle = None
+        try:
+            from codai.api import runpod_worker as _rw
+            mcfg = _rw.parse_model_runpod(target)
+            key = "spill:" + (self._queue_key(model) or str(model))
+            served = (target.get("served_model") or "").strip() or (model or "")
+            pool = _rw.get_pod_pool(key, rp, mcfg, served)
+            # Provisioning blocks for minutes on a cold pod; keep the loop free.
+            handle, url = await _asyncio.to_thread(pool.acquire)
+        except Exception as exc:
+            print("[runpod-spill] pod acquire failed, falling back to local: %s" % exc,
+                  flush=True)
+            if pool is not None and handle is not None:
+                try:
+                    pool.release(handle)
+                except Exception:
+                    pass
+            return None
+
+        body = self._rewrite_model(body_bytes, (target.get("served_model") or "").strip())
+        dest = url.rstrip("/") + path.split("?", 1)[0]
+        print("[runpod-spill] model=%s trigger=%s -> pod %s" % (model, trigger, dest),
+              flush=True)
+        try:
+            rp_req = self._long.build_request(
+                "POST", dest, headers={"Content-Type": "application/json"}, content=body)
+            rp_resp = await self._long.send(rp_req, stream=True)
+        except Exception as exc:
+            try:
+                pool.release(handle)
+            except Exception:
+                pass
+            print("[runpod-spill] pod request failed, falling back to local: %s" % exc,
+                  flush=True)
+            return None
+
+        async def _done():
+            # Close the upstream response AND hand the pod back, whatever happened:
+            # a pod never released stays "in flight" forever, the idle reaper will
+            # not touch it, and the bill does not stop.
+            try:
+                await rp_resp.aclose()
+            finally:
+                try:
+                    pool.release(handle)
+                except Exception:
+                    pass
+
+        return rp_resp, _done
+
+    async def _spill_to_runpod(self, model, trigger, request, path, body_bytes):
+        """Burst one request to RunPod, as a Response. None = stay local."""
+        opened = await self._spill_open(model, trigger, path, body_bytes)
+        if opened is None:
+            return None
+        rp_resp, done = opened
+        return StreamingResponse(
+            rp_resp.aiter_raw(), status_code=rp_resp.status_code,
+            headers=dict(self._filter_headers(rp_resp.headers, _DROP_RESP)),
+            media_type=rp_resp.headers.get("content-type"),
+            background=BackgroundTask(done))
+
+    async def _spill_chunks(self, model, trigger, path, body_bytes):
+        """Burst one request to RunPod, as raw chunks for the SSE generator path.
+
+        Yields nothing and returns False when the burst is unavailable, so the
+        caller can fall back to the local queue having emitted nothing.
+        """
+        opened = await self._spill_open(model, trigger, path, body_bytes)
+        if opened is None:
+            return
+        rp_resp, done = opened
+        try:
+            async for chunk in rp_resp.aiter_raw():
+                yield chunk
+        finally:
+            await done()
+
+    @staticmethod
+    def _rewrite_model(body_bytes, served: str):
+        """Point the request at the name the remote knows the model by."""
+        if not served or not body_bytes:
+            return body_bytes
+        try:
+            import json as _j
+            obj = _j.loads(body_bytes or b"{}")
+            if isinstance(obj, dict):
+                obj["model"] = served
+                return _j.dumps(obj).encode()
+        except Exception:
+            pass
+        return body_bytes
+
+    def _spill_on_busy(self, model) -> bool:
+        """True when this model should offload the moment no local slot is free,
+        instead of queueing behind the running generation."""
+        sp = self._model_info(model).get("runpod_spillover")
+        return bool(isinstance(sp, dict) and sp.get("enabled") and sp.get("on_busy"))
 
     def _queue_key(self, model: Optional[str]) -> str:
         """Stable gate key for a model: its canonical id (so every alias/path of
@@ -1616,21 +1726,42 @@ class FrontProxy:
                 # 1. Front per-model queue slot (text only) — keepalive while waiting.
                 if is_text:
                     _qkey = self._queue_key(model)
-                    _acq = _asyncio.ensure_future(self.reqqueue.acquire(
-                        _qkey, self._model_capacity(model), self._queue_max_waiting(),
-                        rid=engine.name + ":" + (model or ""), model=model or "",
-                        engine=engine.name))
-                    while True:
-                        try:
-                            await _asyncio.wait_for(_asyncio.shield(_acq), timeout=_KA)
-                            break
-                        except _asyncio.TimeoutError:
-                            yield _ka("queued — waiting for a free slot")
-                        except QueueFull:
-                            yield (b'data: {"error":"Server busy: the generation '
-                                   b'queue is full, please retry shortly."}\n\n')
-                            return
-                    _qkey = _qkey   # slot held now
+                    _slot_held = False
+                    # `on_busy`: if there is no free local slot RIGHT NOW, burst
+                    # rather than queue behind the running generation. Nothing has
+                    # been emitted yet, so a burst that cannot be opened falls
+                    # through to the normal wait below.
+                    if self._spill_on_busy(model):
+                        _slot_held = await self.reqqueue.try_acquire(
+                            _qkey, self._model_capacity(model))
+                        if not _slot_held:
+                            _spilled = False
+                            async for _chunk in self._spill_chunks(
+                                    model, "on_busy", path, body_bytes):
+                                _spilled = True
+                                yield _chunk
+                            if _spilled:
+                                # No local slot was ever taken — clear the key so
+                                # the cleanup below does not release one, which
+                                # would hand a phantom slot to the next waiter.
+                                _qkey = None
+                                return
+                    if not _slot_held:
+                        _acq = _asyncio.ensure_future(self.reqqueue.acquire(
+                            _qkey, self._model_capacity(model), self._queue_max_waiting(),
+                            rid=engine.name + ":" + (model or ""), model=model or "",
+                            engine=engine.name))
+                        while True:
+                            try:
+                                await _asyncio.wait_for(_asyncio.shield(_acq), timeout=_KA)
+                                break
+                            except _asyncio.TimeoutError:
+                                yield _ka("queued — waiting for a free slot")
+                            except QueueFull:
+                                yield (b'data: {"error":"Server busy: the generation '
+                                       b'queue is full, please retry shortly."}\n\n')
+                                return
+                    # slot held now (granted immediately, or after the wait)
 
                 _rid = engine.enter_request(
                     {"model": model or "", "kind": self._task_kind(path), "path": path})
@@ -2008,11 +2139,28 @@ class FrontProxy:
         if (method == "POST" and _router.is_inference_path(path)
                 and self._task_kind(path) == "text"):
             _qkey = self._queue_key(model)
+            _slot_held = False
+            # `on_busy`: offload the moment there is no free local slot, rather
+            # than queueing behind the running generation. Local stays primary —
+            # the first request runs here; only the overlap goes to the cloud.
+            # Nothing has been acquired yet at this point (the swap/rate gates come
+            # later), so returning here needs no cleanup.
+            if self._spill_on_busy(model):
+                _slot_held = await self.reqqueue.try_acquire(
+                    _qkey, self._model_capacity(model))
+                if not _slot_held:
+                    spilled = await self._spill_to_runpod(
+                        model, "on_busy", request, path, body_bytes)
+                    if spilled is not None:
+                        return spilled
+                    # Burst unavailable (cold pod failed, budget cap, misconfig):
+                    # fall through and queue locally, exactly as before.
             try:
-                await self.reqqueue.acquire(
-                    _qkey, self._model_capacity(model), self._queue_max_waiting(),
-                    rid=engine.name + ":" + (model or ""), model=model or "",
-                    engine=engine.name)
+                if not _slot_held:
+                    await self.reqqueue.acquire(
+                        _qkey, self._model_capacity(model), self._queue_max_waiting(),
+                        rid=engine.name + ":" + (model or ""), model=model or "",
+                        engine=engine.name)
             except QueueFull:
                 # Local model at capacity — burst to RunPod if spillover is enabled
                 # for the concurrency case; else 503.

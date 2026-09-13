@@ -333,6 +333,51 @@ Notes:
 * Requests larger than `max_body_mb` are served locally rather than buffered in
   RAM; raise it if you forward large uploads.
 
+## Per-model placement: local, remote, or burst
+
+Three answers to "where does this model run", set per model.
+
+**Always remote** — `backend: "runpod"` on the model entry, with a `runpod` block
+choosing pods or serverless. No local VRAM, nothing downloaded here.
+
+**Local only** — the default. Requests queue behind the running generation, up to
+`max_instances` concurrently and `queue_max_waiting` in the queue.
+
+**Local first, burst on overlap** — local serves what it can; overflow goes to
+RunPod:
+
+```json
+{
+  "path": "/AI/guffcache/gemma-4-31B-Q4_0.gguf",
+  "max_instances": 1,
+  "runpod_spillover": {
+    "enabled": true,
+    "on_busy": true,
+    "target": {"mode": "pods", "engine": "llamacpp",
+               "hf_gguf": "bartowski/gemma-4-31B-GGUF:Q4_0",
+               "max_hourly_usd": 0.8, "idle_timeout_s": 180}
+  }
+}
+```
+
+Triggers, most eager first:
+
+| Trigger | Fires when |
+|---|---|
+| `on_busy` | no free local slot right now — the second concurrent request offloads instead of queueing |
+| `on_concurrency_full` | the wait queue itself is full (would otherwise be a 503) |
+| `on_no_gpu` | no local GPU can serve the model at all |
+
+`target.mode` is `pods` (a coderai-managed pod: provisioned on demand, health-
+gated, scaled, reaped, billed against the same caps) or `serverless` (your own
+RunPod endpoint id). `served_model` renames the model for the remote.
+
+The burst is a borrow: a pod is taken for one request and handed straight back,
+so an overlap that never recurs is reaped after `idle_timeout_s` rather than
+lingering. And a burst that cannot be opened — cold pod failed, budget cap hit,
+misconfigured — falls back to the local queue rather than erroring: local is
+always the safety net, never the other way round.
+
 ## Deployment shapes this enables
 
 * **One small coderai, many remote GPUs** — the local instance holds the API,

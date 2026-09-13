@@ -91,6 +91,23 @@ class FrontQueue:
                     await self._release_locked(key)
             raise
 
+    async def try_acquire(self, key: str, capacity: int) -> bool:
+        """Take a slot only if one is free RIGHT NOW; never wait.
+
+        This is what "burst on busy" is built on: a model configured to offload
+        rather than queue needs to know the local model is occupied *before*
+        committing to wait for it. A False here means the next request would have
+        been queued behind a running generation.
+        """
+        key = key or ""
+        capacity = max(1, int(capacity or 1))
+        async with self._lock:
+            active = self._active.get(key, 0)
+            if active < capacity:
+                self._active[key] = active + 1
+                return True
+        return False
+
     async def release(self, key: str) -> None:
         key = key or ""
         async with self._lock:

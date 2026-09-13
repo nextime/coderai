@@ -2826,7 +2826,10 @@ async def api_model_configure(request: Request, username: str = Depends(require_
     if "runpod_spillover" in data:
         src = data.get("runpod_spillover") if isinstance(data.get("runpod_spillover"), dict) else {}
         sp = {}
-        for k in ("enabled", "on_concurrency_full", "on_no_gpu", "on_local_error"):
+        # on_busy: offload as soon as the local model has no free slot, rather
+        # than waiting for the wait-queue to overflow (on_concurrency_full).
+        for k in ("enabled", "on_busy", "on_concurrency_full", "on_no_gpu",
+                  "on_local_error"):
             if k in src and src.get(k) is not None and src.get(k) != "":
                 sv = src.get(k)
                 sp[k] = (sv.lower() in ("1", "true", "on", "yes")
