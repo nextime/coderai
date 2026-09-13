@@ -1019,6 +1019,13 @@ def _train_lora_sync(req: LoraTrainRequest) -> dict:
         _arch = _detect_arch(video_path, _target) or "wan"
         if _arch != "wan":
             print(f"  [lora] training a {_arch} adapter for {video_path}")
+            # H3 and Krea 2 need diffusers >= 0.40 and this process has 0.38 — and
+            # diffusers is imported once per process, so they train in the overlay
+            # venv instead. LTX-2 needs nothing newer and stays in-process.
+            if _arch in ("h3", "krea") and not _diffusers_has(_arch):
+                return _train_via_overlay(_arch, req, video_path, images,
+                                          instance_prompt, steps, rank, resolution,
+                                          lr, seed, device)
             return _train_flow_dit(_arch, req, video_path, images, instance_prompt,
                                    steps, rank, resolution, lr, seed, device)
         return _train_wan(req, video_path, images, instance_prompt,
@@ -1727,6 +1734,100 @@ def _train_dit(req, base_path, images, instance_prompt,
     path = _lora_weight_file(name) or save_dir
     _set_progress(active=False, status="done", message="done", path=path)
     return {"name": name, "path": path}
+
+
+def _diffusers_has(arch: str) -> bool:
+    """Can THIS process train that architecture, or does it need the overlay?"""
+    try:
+        from codai.api.lora_archs import load_classes
+        load_classes(arch)
+        return True
+    except Exception:
+        return False
+
+
+def _train_via_overlay(arch, req, base_path, images, instance_prompt,
+                       steps, rank, resolution, lr, seed, device):
+    """Train in the overlay venv (diffusers >= 0.40) as a subprocess.
+
+    The reference images are written out as PNGs and the request is flattened to
+    JSON — nothing is shared but the filesystem, because the child runs a different
+    diffusers than we do. Progress is tailed back from the job file so the usual
+    /v1/loras/progress polling keeps working.
+    """
+    import json as _json
+    import subprocess
+    import tempfile
+    import threading
+
+    from codai.api import h3_worker
+    try:
+        py = h3_worker.overlay_python({})
+    except Exception as exc:
+        raise HTTPException(status_code=501, detail=(
+            f"{arch} LoRA training needs diffusers >= 0.40, which this process does "
+            f"not have, and the overlay venv could not be built: {exc}"))
+
+    work = tempfile.mkdtemp(prefix=f"lora_{arch}_")
+    img_paths = []
+    for i, im in enumerate(images):
+        pth = os.path.join(work, f"ref_{i:03d}.png")
+        im.save(pth)
+        img_paths.append(pth)
+    job_path = os.path.join(work, "job.json")
+    _json.dump({
+        "arch": arch, "base_path": base_path, "images": img_paths,
+        "instance_prompt": instance_prompt, "steps": steps, "rank": rank,
+        "resolution": resolution, "lr": lr, "seed": seed, "device": device,
+        "request": {k: getattr(req, k) for k in
+                    ("name", "num_frames", "quantize_4bit", "session", "target")
+                    if hasattr(req, k)},
+    }, open(job_path, "w"))
+
+    script = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))), "tools", "lora_train_worker.py")
+    print(f"  [lora][{arch}] training out-of-process in the overlay venv", flush=True)
+    proc = subprocess.Popen([py, script, "--job", job_path],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+
+    def _pump():
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                print(f"  [lora][{arch}] {line}", flush=True)
+    threading.Thread(target=_pump, daemon=True).start()
+
+    # Mirror the child's progress onto ours so the normal polling endpoint works.
+    prog_path = job_path + ".progress"
+    seen = 0
+    while proc.poll() is None:
+        time.sleep(2.0)
+        try:
+            _check_train_cancel()
+        except Exception:
+            proc.terminate()
+            raise
+        try:
+            lines = open(prog_path).read().splitlines() if os.path.exists(prog_path) else []
+            for ln in lines[seen:]:
+                try:
+                    _set_progress(**{k: v for k, v in _json.loads(ln).items() if k != "at"})
+                except Exception:
+                    pass
+            seen = len(lines)
+        except Exception:
+            pass
+
+    res_path = job_path + ".result"
+    if not os.path.exists(res_path):
+        raise HTTPException(status_code=500, detail=(
+            f"{arch} LoRA trainer exited (code {proc.returncode}) without a result"))
+    out = _json.load(open(res_path))
+    if not out.get("ok"):
+        raise HTTPException(status_code=500,
+                            detail=f"{arch} LoRA training failed: {out.get('error')}")
+    return out["result"]
 
 
 def _train_flow_dit(arch: str, req, base_path, images, instance_prompt,

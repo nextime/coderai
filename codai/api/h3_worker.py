@@ -176,6 +176,20 @@ def _diffusers_ok(py: Path) -> bool:
 
 
 def _bootstrap_venv(config: dict = None) -> Path:
+    """Build (or reuse) the venv H3 runs in, as an OVERLAY on this one.
+
+    H3 needs diffusers >= 0.40; the server runs 0.38 and upgrading it in place
+    changes output for models that are fine as they are (Z-Image drifts
+    measurably). Since diffusers is imported once per process, the split only has
+    to be per-process — so this venv is created with --system-site-packages and
+    given nothing but diffusers and huggingface_hub. torch, transformers and the
+    rest are inherited from the parent, which makes it ~75 MB instead of the
+    several GB a standalone venv costs, and keeps exactly one torch on the box.
+
+    Set CODERAI_H3_STANDALONE_VENV=1 to build a fully independent venv instead
+    (from requirements-h3.txt) — needed only if the parent's torch is ever too old
+    for H3.
+    """
     global _bootstrapped
     venv = resolve_venv_dir(config)
     py = _venv_python(venv)
@@ -184,25 +198,47 @@ def _bootstrap_venv(config: dict = None) -> Path:
     if py.exists() and _diffusers_ok(py):
         _bootstrapped = True
         return py
+    standalone = os.environ.get("CODERAI_H3_STANDALONE_VENV", "") in ("1", "true", "yes")
     if not py.exists():
-        print(f"[h3] creating isolated venv at {venv} …", flush=True)
+        kind = "standalone" if standalone else "overlay"
+        print(f"[h3] creating {kind} venv at {venv} …", flush=True)
         venv.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+        cmd = [sys.executable, "-m", "venv"]
+        if not standalone:
+            cmd.append("--system-site-packages")
+        subprocess.run(cmd + [str(venv)], check=True)
         py = _venv_python(venv)
     if not _diffusers_ok(py):
-        if not _REQUIREMENTS.exists():
-            raise RuntimeError(f"H3 requirements file missing: {_REQUIREMENTS}")
-        print("[h3] installing diffusers>=0.40 + torch into the isolated venv "
-              "(first run downloads several GB, this takes a while) …", flush=True)
-        subprocess.run([str(py), "-m", "pip", "install", "-U", "pip"], check=True)
-        subprocess.run([str(py), "-m", "pip", "install", "-r", str(_REQUIREMENTS)],
-                       check=True)
+        # NOTE: always `python -m pip`, never the venv's pip script — a venv that
+        # was copied carries a stale shebang and would install into the ORIGINAL
+        # interpreter's site-packages.
+        if standalone:
+            if not _REQUIREMENTS.exists():
+                raise RuntimeError(f"H3 requirements file missing: {_REQUIREMENTS}")
+            print("[h3] installing diffusers>=0.40 + torch into a standalone venv "
+                  "(first run downloads several GB, this takes a while) …", flush=True)
+            subprocess.run([str(py), "-m", "pip", "install", "-U", "pip"], check=True)
+            subprocess.run([str(py), "-m", "pip", "install", "-r", str(_REQUIREMENTS)],
+                           check=True)
+        else:
+            print("[h3] adding diffusers>=0.40 to the overlay (torch and the rest "
+                  "are inherited from the server's venv) …", flush=True)
+            subprocess.run([str(py), "-m", "pip", "install", "-q",
+                            "diffusers>=0.40.0", "huggingface_hub>=1.23"], check=True)
         if not _diffusers_ok(py):
             raise RuntimeError(
                 "H3 venv built but 'from diffusers import MiniMaxH3ModularPipeline' "
                 "still fails — MiniMax-H3 needs diffusers >= 0.40.0")
     _bootstrapped = True
     return py
+
+
+def overlay_python(config: dict = None) -> str:
+    """Path to the interpreter that has diffusers >= 0.40.
+
+    Shared with the LoRA trainers: H3 and Krea 2 adapters can't be trained in the
+    server process while it is on 0.38, so they run out-of-process against this."""
+    return str(_bootstrap_venv(config))
 
 
 # ── service lifecycle ─────────────────────────────────────────────────────────

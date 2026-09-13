@@ -1,37 +1,35 @@
-# Isolated venv for MiniMax-H3 video+audio generation.
+# Extra packages for the MiniMax-H3 venv.
 #
-# H3 exists ONLY as Modular Diffusers blocks (MiniMaxH3Blocks /
-# MiniMaxH3ModularPipeline), which landed in diffusers 0.40.0. The main coderai
-# venv is on diffusers 0.38.x, and moving the whole stack to 0.40 would shift the
-# floor under every Wan / LTX / Z-Image / SDXL pipeline at once — so H3 gets its
-# own venv, the same way pyannote, NeMo-Canary and vLLM do.
-# codai/api/h3_worker.py builds it (on demand under ~/.coderai/h3_venv or the
-# /cache mount) and runs tools/h3_service.py inside it.
-# Do NOT merge these into requirements.txt.
+# This venv is an OVERLAY: codai/api/h3_worker.py creates it with
+# --system-site-packages and installs only what follows, so torch, transformers and
+# everything else are inherited from the server's venv. That keeps it ~75 MB
+# instead of the several GB a standalone copy of torch costs, and keeps exactly one
+# torch on the machine.
+#
+# Why an overlay at all: H3 exists only as Modular Diffusers blocks
+# (MiniMaxH3Blocks / MiniMaxH3ModularPipeline) added in diffusers 0.40, while the
+# server runs 0.38 — and upgrading in place changes output for models that are fine
+# as they are (measured: Z-Image drifts, mean |diff| 0.0146, while SDXL is
+# bit-identical). diffusers is imported once per process, so the split only has to
+# be per-process.
+#
+# This file is used ONLY when CODERAI_H3_STANDALONE_VENV=1 forces a fully
+# independent venv — needed if the parent's torch is ever too old for H3.
 
-# The transformer is 33B and the text encoder is Qwen3-VL, so this venv wants a
-# recent torch. Left unpinned deliberately: unlike pyannote there is no known-bad
-# version to dodge, and the H3 blocks track diffusers main.
 --extra-index-url https://download.pytorch.org/whl/cu130
 torch
 torchvision
 torchaudio
 
-# The floor for MiniMax-H3 support.
 diffusers>=0.40.0
-# Qwen3VLForConditionalGeneration (H3's text encoder) needs transformers 5.x.
 transformers>=5.0
 accelerate>=1.0
 safetensors>=0.4
-huggingface_hub>=0.34
+huggingface_hub>=1.23
 
-# Media: export_to_video writes the frames, soundfile writes the jointly-generated
-# soundtrack, and ffmpeg (system binary, already on PATH in the image) muxes them.
 imageio>=2.34
 imageio-ffmpeg>=0.5
 soundfile>=0.12
 Pillow>=10.0
 numpy
-
-# peft carries the LoRA adapters MiniMaxH3LoraLoaderMixin loads.
 peft>=0.14
