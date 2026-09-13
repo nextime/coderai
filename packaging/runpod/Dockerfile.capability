@@ -1,0 +1,56 @@
+# CoderAI capability pod — a trimmed coderai that serves ONE capability.
+#
+# The full coderai:base is ~26.6 GB flattened, and a rented pod pays that pull
+# before it can answer a single request. A pod that only renders video has no
+# use for the STT, OCR, voice-cloning or LLM stacks, so this image installs just
+# the profile's dependencies on top of a common core.
+#
+# It is a normal coderai: the remote gateway talks to it over the same /v1 API,
+# and `engine: coderai` pods are ready as soon as /healthz answers.
+#
+#   docker build -f packaging/runpod/Dockerfile.capability \
+#       --build-arg PROFILE=video -t ghcr.io/<you>/coderai-video:latest .
+#
+# Or use packaging/runpod/build_capability_image.sh, which also smoke-tests the
+# result before you push it.
+
+ARG BASE=python:3.12-slim
+FROM ${BASE}
+
+ARG PROFILE=images
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
+ENV PROFILE=${PROFILE} \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HOME=/cache/huggingface \
+    CODERAI_HOME=/config
+
+# ffmpeg for every audio/video path; git because a few ML packages still want it
+# at install time; libgl/libglib for opencv.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg git curl ca-certificates libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/coderai/app
+
+# Dependencies first so a code change doesn't re-resolve the ML stack.
+COPY packaging/runpod/profiles/ /tmp/profiles/
+RUN python -m pip install --upgrade pip \
+    && python -m pip install -r /tmp/profiles/core.txt \
+    && python -m pip install --extra-index-url ${TORCH_INDEX} -r /tmp/profiles/${PROFILE}.txt \
+    && rm -rf /tmp/profiles
+
+COPY . /opt/coderai/app
+
+# Fail the BUILD, not the pod, if the profile is missing something the app needs
+# to import. A pod that cannot import coderai just never answers /healthz, and
+# you find out by watching a boot timeout.
+RUN python -c "import codai.api.app; print('coderai imports OK for profile ${PROFILE}')"
+
+EXPOSE 8000
+# /healthz is what a `coderai` pod is probed on, and it answers before any model
+# is loaded — which is correct: the pod is ready to be asked.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s \
+    CMD curl -fsS http://127.0.0.1:8000/healthz || exit 1
+
+CMD ["python", "-m", "uvicorn", "codai.api.app:app", "--host", "0.0.0.0", "--port", "8000"]

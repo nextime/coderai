@@ -1,0 +1,7 @@
+# /v1/embeddings and /v1/rerank
+torch>=2.5.0
+transformers>=4.35.0
+sentence-transformers>=2.7.0
+geoclip>=1.2.0
+geopy>=2.4
+geographiclib>=2.0

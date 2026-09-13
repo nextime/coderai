@@ -540,6 +540,34 @@ def test_generated_file_urls_are_rewritten_and_followed_back(gateway_app, monkey
         shutdown()
 
 
+def test_capabilities_can_share_one_pod_pool(monkeypatch):
+    """A pod is a whole GPU. Three capabilities naming one pool must rent one
+    card between them, not three."""
+    import codai.api.runpod_worker as rw
+
+    class _Acct:
+        enabled = True
+
+    monkeypatch.setattr("codai.models.manager.get_active_runpod_config", lambda: _Acct())
+    monkeypatch.setattr(rw, "_pools", {})
+    monkeypatch.setattr(rw, "_ensure_scaler", lambda: None)
+
+    settings = {"pool": "media", "image": "reg/coderai:base", "max_pods": 3,
+                "max_hourly_usd": 0.6}
+    images = rw.get_capability_pool("images", settings)
+    video = rw.get_capability_pool("video", {"pool": "media"})
+    tts = rw.get_capability_pool("tts", {"pool": "media"})
+
+    assert images is video is tts
+    assert images.model_key == "capability:media"
+    # A bare reference must not reset the pool it points at to defaults.
+    assert images.mcfg.max_pods == 3 and images.mcfg.image == "reg/coderai:base"
+
+    # Without `pool`, every capability still gets its own.
+    ocr = rw.get_capability_pool("ocr", {"image": "reg/coderai:base"})
+    assert ocr is not images and ocr.model_key == "capability:ocr"
+
+
 def test_unreachable_remote_is_a_clean_502(gateway_app):
     client, gw, _ = gateway_app
     gw.capability_endpoints = lambda: {"images": "http://127.0.0.1:1"}

@@ -1,0 +1,14 @@
+# Core — what every capability pod needs to boot coderai and answer /healthz.
+# The routers import lazily, so a pod only needs the libraries its own capability
+# actually touches; this file is the floor under all of them.
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+python-multipart>=0.0.6
+requests>=2.31.0
+psutil>=5.9.0
+setproctitle>=1.1
+Pillow>=10.0.0
+numpy>=1.24.0
+safetensors>=0.4.0
+huggingface_hub>=0.25.0

@@ -1,0 +1,9 @@
+# /v1/audio/transcriptions + diarization/speaker endpoints
+torch>=2.5.0
+torchaudio
+transformers>=4.35.0
+faster-whisper>=0.10.0
+openai-whisper>=20231117
+vosk>=0.3.45
+soundfile>=0.12.0
+scipy>=1.11.0

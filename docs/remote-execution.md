@@ -252,6 +252,51 @@ larger `container_disk_gb`. And a full coderai carries every subsystem; if a pod
 only ever renders video, a trimmed image boots far faster and costs less per
 cold start.
 
+### Trimmed capability images
+
+A pod that only renders video has no use for the STT, OCR, voice-cloning or LLM
+stacks, and every cold pod pays for what it pulls. `packaging/runpod/` builds a
+coderai carrying one capability's dependencies:
+
+```bash
+./packaging/runpod/build_capability_image.sh video ghcr.io/<you>/coderai-video:latest
+PUSH=1 ./packaging/runpod/build_capability_image.sh video ghcr.io/<you>/coderai-video:latest
+```
+
+Profiles live in `packaging/runpod/profiles/` — `core.txt` (what any pod needs to
+boot) plus one file per capability: images, video, tts, stt, voice, audio,
+embeddings, ocr, faceswap. Add or trim entries there; the routers import lazily,
+so a pod only needs the libraries its own endpoints touch.
+
+The build fails if the profile is missing something the app imports, and the
+script then boots the container and waits for `/healthz` — because a pod that
+builds but never answers is a failure you would otherwise discover as a boot
+timeout on a rented GPU.
+
+Point the capability at it:
+
+```json
+"pods": {"video": {"image": "ghcr.io/<you>/coderai-video:latest"}}
+```
+
+### Sharing one pod between capabilities
+
+A pod is a whole GPU, and one coderai can serve several capabilities from it.
+Name a shared `pool` and they use the same pods and the same budget:
+
+```json
+"pods": {
+  "images": {"pool": "media", "image": "ghcr.io/<you>/coderai-media:latest",
+             "max_pods": 2, "max_hourly_usd": 0.6},
+  "video":  {"pool": "media"},
+  "tts":    {"pool": "media"}
+}
+```
+
+Configure the pool once, on whichever capability carries the settings; the others
+just reference it. Without `pool`, each capability rents its own card — three
+capabilities, three GPUs, to do what one can.
+
 **Private registry:** RunPod stores the credentials for you — *Settings →
 Container Registry Credentials* — and gives each set an id. Put that id in
 `runpod.registry_auth_id` (account-wide) or in a pod block's `registry_auth_id`

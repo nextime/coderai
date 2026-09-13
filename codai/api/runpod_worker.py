@@ -740,6 +740,11 @@ def get_capability_pool(capability: str, block: dict):
 
     Defaults to `engine: coderai`, since a capability is served by a whole
     coderai on the far side rather than by an LLM server.
+
+    A block may name a shared ``pool``: capabilities naming the same pool share
+    one set of pods and one budget. That matters — a pod is a whole GPU, and one
+    coderai can serve images, video and TTS from it; without this, three
+    capabilities would rent three cards to do what one can.
     """
     from codai.models.manager import get_active_runpod_config
     acct = get_active_runpod_config()
@@ -750,8 +755,18 @@ def get_capability_pool(capability: str, block: dict):
             "capability at a URL instead.")
     b = dict(block or {})
     b.setdefault("engine", "coderai")
+    shared = str(b.get("pool") or "").strip().lower()
     mcfg = parse_model_runpod(b)
-    return get_pod_pool(f"capability:{capability}", acct, mcfg, capability)
+    key = f"capability:{shared or capability}"
+    # A shared pool is configured once (on whichever capability carries the
+    # settings) and referenced by the others, so don't let a bare `{"pool": …}`
+    # reference overwrite the real config with defaults.
+    if shared:
+        with _pools_lock:
+            existing = _pools.get(key)
+        if existing is not None and len(b) <= 2:
+            return existing
+    return get_pod_pool(key, acct, mcfg, shared or capability)
 
 
 def _all_pools_hourly_rate() -> float:

@@ -1,0 +1,9 @@
+# /v1/audio/clone, /v1/audio/voices, /v1/audio/convert, watermarking
+torch>=2.5.0
+torchaudio
+transformers>=4.35.0
+f5-tts>=1.1.0
+seed-vc>=0.4.0
+soundfile>=0.12.0
+scipy>=1.11.0
+audioseal>=0.1.4
