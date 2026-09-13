@@ -440,10 +440,22 @@ def runpod_should_handle(model_name: str) -> bool:
     return resolve_engine_backend(model_name) == "runpod"
 
 
-def _model_is_runpod(model_name: str, config=None) -> bool:
-    """True for a RunPod-served model — from the runtime config's backend pin (or its
-    embedded _raw_cfg), else the resolver. Such models hold NO local weights, so the
-    manager must never download/cache them or estimate local VRAM for them."""
+def _model_is_remote(model_name: str, config=None) -> bool:
+    """True for a model served from somewhere else — RunPod, or any endpoint named
+    by ``service_url``.
+
+    From the runtime config's backend pin (or its embedded ``_raw_cfg``), else the
+    resolver. Such models hold NO local weights, so the manager must never
+    download/cache them or estimate local VRAM for them.
+    """
+    if isinstance(config, dict) and str(config.get("service_url") or "").strip():
+        return True
+    try:
+        from codai.backends.remote_openai import remote_should_handle
+        if remote_should_handle(model_name):
+            return True
+    except Exception:
+        pass
     if isinstance(config, dict):
         b = (config.get("backend") or "").strip().lower()
         if not b:
@@ -456,6 +468,10 @@ def _model_is_runpod(model_name: str, config=None) -> bool:
         return resolve_engine_backend(model_name) == "runpod"
     except Exception:
         return False
+
+
+#: Back-compat alias — the predicate grew past RunPod to cover any remote endpoint.
+_model_is_runpod = _model_is_remote
 
 
 def _trim_cpu_ram() -> None:
@@ -593,6 +609,22 @@ class ModelManager:
             print(f"Routing '{model_name}' to ds4 (DeepSeek V4) backend")
             self.backend_type = "ds4"
             self.backend = Ds4Backend(get_active_ds4_config())
+            self.backend.load_model(model_name, **kwargs)
+            self.tool_parser = ModelParserAdapter(model_name=model_name)
+            return
+
+        # Remote: a model entry carrying `service_url` is served from somewhere
+        # else entirely (another coderai, a llama.cpp/vLLM/SGLang server, a
+        # rented pod). This is checked FIRST because it overrides every local
+        # decision — no weights, no VRAM, no engine here. It is also what makes
+        # the GGUF/llama.cpp catalogue remotizable: those models load in-process,
+        # so pointing the model itself at a URL is the only redirect there is.
+        from codai.backends.remote_openai import remote_should_handle
+        if remote_should_handle(model_name):
+            from codai.backends.remote_openai import RemoteOpenAIBackend
+            print(f"Routing '{model_name}' to a remote OpenAI endpoint")
+            self.backend_type = "remote"
+            self.backend = RemoteOpenAIBackend()
             self.backend.load_model(model_name, **kwargs)
             self.tool_parser = ModelParserAdapter(model_name=model_name)
             return
@@ -1521,8 +1553,8 @@ class MultiModelManager:
         # RunPod-served models hold no local weights — the remote pod/endpoint pulls
         # them. Never download/cache locally; the backend resolves the remote URL on
         # first request.
-        if _model_is_runpod(model_name, self.config.get(model_name)):
-            print(f"Model '{model_name}' is RunPod-served — skipping local download/cache")
+        if _model_is_remote(model_name, self.config.get(model_name)):
+            print(f"Model '{model_name}' is served remotely — skipping local download/cache")
             return
 
         # Download/cache the model at startup if it's a URL or HF ID

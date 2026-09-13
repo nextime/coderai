@@ -2675,7 +2675,10 @@ async def api_model_configure(request: Request, username: str = Depends(require_
     # download-completion backfill fills it in once the weights land.
     # RunPod-served models hold NO local weights (the remote pod pulls them), so
     # never estimate local VRAM for them.
-    _is_runpod = (str(data.get("backend") or "").strip().lower() == "runpod")
+    # Same for a model pointed at an explicit `service_url` — the endpoint holds
+    # the weights, so there is nothing local to measure.
+    _is_runpod = (str(data.get("backend") or "").strip().lower() == "runpod"
+                  or bool(str(data.get("service_url") or "").strip()))
     used_vram_gb = data.get("used_vram_gb")
     if used_vram_gb is None and not _is_runpod:
         used_vram_gb = _estimate_used_vram_gb(path)
@@ -2706,7 +2709,11 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "auto_compact", "auto_compact_pct", "auto_compact_strategy",
                 "auto_compact_model", "suppress_reasoning",
                 # Speech-to-text (wav2vec2 / vosk / NeMo-Canary) options.
-                "languages", "supports_translation", "keep_resident"):
+                "languages", "supports_translation", "keep_resident",
+                # Serve this model from somewhere else instead of loading it here:
+                # any OpenAI-compatible endpoint (another coderai, llama-server,
+                # vLLM, a rented pod). See codai/backends/remote_openai.py.
+                "service_url", "served_model", "api_key"):
         if key in data:
             entry[key] = data[key]
 

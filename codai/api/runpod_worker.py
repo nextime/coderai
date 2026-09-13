@@ -44,8 +44,17 @@ class RunpodModelConfig:
     max_hourly_usd: float = 0.0              # per-model $/hr GPU ceiling (0 = none)
     allow_spot: bool = False
     # --- serving (pods) ---
-    image: str = ""                          # blank = default vLLM-OpenAI image
+    image: str = ""                          # blank = image picked from `engine`
+    # Which server the pod runs. "auto" reads the model: an HF repo goes to vLLM,
+    # a GGUF goes to llama.cpp (vLLM's GGUF support is experimental — single-file
+    # only, a limited architecture list, and it still wants the original repo's
+    # tokenizer — so it is not a drop-in for the llama.cpp catalogue).
+    engine: str = "auto"                     # auto | vllm | llamacpp
     served_model: str = ""                   # HF id the pod/endpoint serves
+    # GGUF to pull on a llama.cpp pod, in llama.cpp's own `-hf` form:
+    # "user/repo:Q4_K_M" or "user/repo:file.gguf". Needed because a local
+    # /AI/…/foo.gguf path means nothing on a rented machine.
+    hf_gguf: str = ""
     container_disk_gb: int = 40
     volume_gb: int = 0
     port: int = 8000
@@ -75,6 +84,60 @@ class RunpodModelConfig:
 # Default OpenAI-compatible pod image (vLLM's official OpenAI server). The pod
 # pulls the model named by ``served_model`` (needs HF_TOKEN in env for gated repos).
 DEFAULT_POD_IMAGE = "vllm/vllm-openai:latest"
+
+# llama.cpp's own server image. Its OpenAI surface (/v1/models, /v1/chat/completions)
+# matches vLLM's closely enough that the readiness probe and the proxy are unchanged.
+# This is what serves the GGUF catalogue remotely: those models have no safetensors
+# repo to hand vLLM, and vLLM's GGUF loader is experimental (single-file only, a
+# limited architecture list, and it needs the original repo for the tokenizer).
+LLAMACPP_POD_IMAGE = "ghcr.io/ggml-org/llama.cpp:server-cuda"
+
+
+def _looks_like_gguf(name: str) -> bool:
+    return (name or "").strip().lower().endswith(".gguf")
+
+
+def resolve_pod_engine(mcfg: "RunpodModelConfig", model_key: str = "",
+                       model_path: str = "") -> str:
+    """Decide which server a pod runs for this model: "vllm" or "llamacpp".
+
+    An explicit ``engine`` wins. Otherwise: a GGUF (by `hf_gguf`, by the model's
+    own path, or by the served name) goes to llama.cpp; anything else — an HF
+    repo id — goes to vLLM.
+    """
+    want = (mcfg.engine or "auto").strip().lower()
+    if want in ("vllm", "llamacpp"):
+        return want
+    if mcfg.hf_gguf:
+        return "llamacpp"
+    if _looks_like_gguf(mcfg.served_model) or _looks_like_gguf(model_path) \
+            or _looks_like_gguf(model_key):
+        return "llamacpp"
+    return "vllm"
+
+
+def _llamacpp_docker_args(mcfg: "RunpodModelConfig", served: str) -> str:
+    """Args for the llama.cpp server image so it downloads and serves the GGUF.
+
+    llama.cpp pulls weights itself with ``-hf user/repo:QUANT``; a local path is
+    meaningless on a rented machine, so ``hf_gguf`` (or an HF-shaped
+    ``served_model``) is required.
+    """
+    src = (mcfg.hf_gguf or "").strip()
+    if not src:
+        cand = (served or "").strip()
+        if cand and "/" in cand and not cand.startswith("/"):
+            src = cand
+    if not src:
+        raise RuntimeError(
+            "RunPod llama.cpp pod: set `hf_gguf` on the model's runpod block to the "
+            "GGUF to serve (\"user/repo:Q4_K_M\"). A local .gguf path does not exist "
+            "on a rented pod, and coderai does not upload multi-GB weights.")
+    args = ["--host", "0.0.0.0", "--port", str(mcfg.port or 8000),
+            "-hf", src, "--alias", served or src, "-ngl", "999"]
+    if mcfg.ctx and mcfg.ctx > 0:
+        args += ["-c", str(mcfg.ctx)]
+    return " ".join(args)
 
 
 def _as_bool(v, default=False):
@@ -122,7 +185,9 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.max_hourly_usd = _as_float(b.get("max_hourly_usd"), cfg.max_hourly_usd)
     cfg.allow_spot = _as_bool(b.get("allow_spot"), cfg.allow_spot)
     cfg.image = (b.get("image") or "").strip()
+    cfg.engine = (b.get("engine") or cfg.engine).strip().lower() or "auto"
     cfg.served_model = (b.get("served_model") or "").strip()
+    cfg.hf_gguf = (b.get("hf_gguf") or "").strip()
     cfg.container_disk_gb = _as_int(b.get("container_disk_gb"), cfg.container_disk_gb)
     cfg.volume_gb = _as_int(b.get("volume_gb"), cfg.volume_gb)
     cfg.port = _as_int(b.get("port"), cfg.port) or 8000
@@ -141,6 +206,16 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.cost_limit_usd = _as_float(b.get("cost_limit_usd"), cfg.cost_limit_usd)
     cfg.cost_period = (b.get("cost_period") or cfg.cost_period).strip().lower()
     return cfg
+
+
+def _model_path_for(model_name: str) -> str:
+    """The model's local path from models.json (used to spot a GGUF), or ''."""
+    try:
+        from codai.models.manager import _model_entry_for
+        entry = _model_entry_for(model_name) or {}
+        return str(entry.get("path") or "")
+    except Exception:
+        return ""
 
 
 def model_runpod_block(model_name: str) -> dict:
@@ -351,9 +426,15 @@ class RunpodPodPool:
         (pod_id, sel, next_index). Raises if all fail."""
         from codai.api.runpod_client import RunpodError
         port = self.mcfg.port or 8000
-        image = self.mcfg.image or DEFAULT_POD_IMAGE
+        engine = resolve_pod_engine(self.mcfg, str(self.model_key),
+                                    _model_path_for(self.model_key))
+        if engine == "llamacpp":
+            image = self.mcfg.image or LLAMACPP_POD_IMAGE
+            args = _llamacpp_docker_args(self.mcfg, self.served)
+        else:
+            image = self.mcfg.image or DEFAULT_POD_IMAGE
+            args = _vllm_docker_args(self.mcfg, self.served)
         env = dict(self.mcfg.env or {})
-        args = _vllm_docker_args(self.mcfg, self.served)
         dc = getattr(self.account, "data_center", "") or ""
         last = None
         for i in range(start, len(ranked)):
@@ -445,7 +526,7 @@ class RunpodPodPool:
                         break
                     time.sleep(5)
                 else:
-                    raise RunpodError(f"pod {pod_id} OpenAI server (vLLM) did not answer "
+                    raise RunpodError(f"pod {pod_id} OpenAI server did not answer "
                                       f"/v1/models within {int(load_to)}s")
             except Exception as exc:
                 # Self-diagnose: pull the vLLM/container log before tearing down, so
