@@ -1,0 +1,17 @@
+# Isolated venv for MeloTTS — the base speaker model OpenVoice V2 uses.
+#
+# MeloTTS pins an older transformers/tokenizers line and pulls unidic + a Japanese
+# tokenizer chain, the same class of conflict that makes parler-tts unsafe to
+# install into the shared venv (see requirements.txt). So it runs in its own venv:
+# codai/api/melotts_worker.py builds it (baked at /opt/coderai/melotts_venv when
+# present, else on demand under ~/.coderai/melotts_venv) and runs
+# tools/melotts_service.py inside it.
+# Do NOT merge these into requirements.txt.
+
+melotts>=0.1.2
+# MeloTTS resolves its dictionaries through cached_path at first use.
+cached_path
+# English g2p; the package pulls language-specific extras itself on first run.
+txtsplit
+soundfile>=0.12.0
+numpy

@@ -24,6 +24,9 @@ Read the existing implementations before proposing changes to understand the cur
 
 # TODO: review MoneyPrinterTurbo for ideas worth borrowing
 
+(Tracked alongside the other reference projects in docs/reference-projects.md.)
+
+
 https://github.com/harry0703/MoneyPrinterTurbo/blob/main/README-en.md
 
 An automated short-video generation stack (script → stock/generated footage →
@@ -35,6 +38,10 @@ footage, subtitle generation/burn-in, the TTS/voice pipeline, and how its web UI
 is organised. Not yet evaluated — this entry is only a reminder to look.
 
 # TODO: OpenVoice features missing from our voice cloning
+
+**Update 2026-09-13: mostly DONE — see docs/reference-projects.md for the record.**
+Remaining: true multi-clip embedding averaging (we pick the best clip instead).
+
 
 https://github.com/myshell-ai/OpenVoice (MIT). We clone with F5-TTS
 (`codai/api/voice_clone.py`, in-context: reference audio + its transcript) and

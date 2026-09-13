@@ -50,6 +50,8 @@ def _family(model_name: str) -> str:
         return "parler"
     if "bark" in n:
         return "bark"
+    if "melo" in n:
+        return "melo"
     return "transformers"
 
 
@@ -376,11 +378,16 @@ class _BarkBackend:
 # (parler-tts pins an old transformers that conflicts with this server's stack).
 # --------------------------------------------------------------------------- #
 
-class _RemoteParlerBackend:
-    family = "parler"
+class _RemoteSpeechBackend:
+    """A TTS engine that runs in its own venv and answers over HTTP.
+
+    Used for the engines whose dependencies can't share this venv: parler-tts and
+    MeloTTS. Both expose the same tiny contract — POST /speak -> WAV bytes."""
     default_voice = ""
 
-    def __init__(self, config: dict, managed_model: Optional[str] = None):
+    def __init__(self, config: dict, family: str = "parler",
+                 managed_model: Optional[str] = None):
+        self.family = family
         self._cfg = config or {}
         self._url = str(self._cfg["service_url"]).rstrip("/")
         # When coderai launched the worker itself, remember the model so the
@@ -426,16 +433,26 @@ def load_backend(model_name: str, model_path: Optional[str], config: Optional[di
         return _CoquiBackend(model_name, config)
     if fam == "bark":
         return _BarkBackend(model_name, config)
+    if fam == "melo":
+        # MeloTTS is OpenVoice V2's base speaker model. Its pins conflict with this
+        # stack the way parler's do, so it runs in an isolated venv worker and is
+        # reached over HTTP — same contract, same managed lifecycle.
+        if config.get("service_url"):
+            return _RemoteSpeechBackend(config, family="melo")
+        from codai.api import melotts_worker
+        url = melotts_worker.ensure_service(model_name)
+        return _RemoteSpeechBackend({**config, "service_url": url}, family="melo",
+                                    managed_model=model_name)
     if fam == "parler":
         # An explicit service_url points at an externally-run service. Otherwise
         # coderai fully manages the worker: bootstrap its venv, spawn it, and
         # route to it — no manual setup needed.
         if config.get("service_url"):
-            return _RemoteParlerBackend(config)
+            return _RemoteSpeechBackend(config, family="parler")
         from codai.api import parler_worker
         url = parler_worker.ensure_service(model_name)
-        return _RemoteParlerBackend({**config, "service_url": url},
-                                    managed_model=model_name)
+        return _RemoteSpeechBackend({**config, "service_url": url},
+                                    family="parler", managed_model=model_name)
     return _TransformersBackend(model_name, config)
 
 

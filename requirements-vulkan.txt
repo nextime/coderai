@@ -35,3 +35,7 @@ onnxruntime>=1.20.0            # CPU ONNX runtime (use onnxruntime-gpu for GPU a
 
 # PDF rasterisation for the OCR subsystem (/v1/ocr); self-contained, no system poppler
 pypdfium2>=4.20.0
+
+# Inaudible watermarking for synthesised speech (codai/api/voice_clone.py).
+# MIT, Meta. Without it cloning still works, just unmarked.
+audioseal>=0.1.4

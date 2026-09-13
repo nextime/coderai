@@ -128,3 +128,7 @@ onnxruntime-gpu>=1.20.0        # GPU-accelerated ONNX runtime for insightface
 #
 # If you see "No such file or directory: '0.0'" errors, you forgot to use quotes!
 # The shell interprets >= as redirection. Fix: pip install "torch>=2.0.0" (with quotes)
+
+# Inaudible watermarking for synthesised speech (codai/api/voice_clone.py).
+# MIT, Meta. Without it cloning still works, just unmarked.
+audioseal>=0.1.4

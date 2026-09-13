@@ -96,3 +96,7 @@ llama-cpp-python>=0.2.0
 causal-conv1d
 # flash-linear-attention requires CUDA and must be installed from source:
 # pip install git+https://github.com/fla-org/flash-linear-attention --no-build-isolation
+
+# Inaudible watermarking for synthesised speech (codai/api/voice_clone.py).
+# MIT, Meta. Without it cloning still works, just unmarked.
+audioseal>=0.1.4
