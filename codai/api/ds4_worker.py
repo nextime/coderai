@@ -352,6 +352,19 @@ def ensure_service(cfg, model_file: Optional[str] = None,
     downloading ``cfg.model_variant``. ``ctx`` overrides the ds4 global context
     (so the per-model n_ctx configuration wins). Returns the base URL.
     """
+    # An explicit `service_url` points at a ds4-server running somewhere else — another
+    # host, a container, a rented pod — so nothing is built, spawned or downloaded
+    # here and coderai just proxies to it. This function already returns a URL, so
+    # its callers cannot tell the difference.
+    _remote = (str(getattr(cfg, "service_url", "") or "") or os.environ.get("CODERAI_DS4_SERVICE_URL") or "").strip()
+    if _remote:
+        _remote = str(_remote).rstrip("/")
+        if not _health_ok(_remote):
+            raise RuntimeError(
+                f"configured service_url {_remote} is not answering its health check")
+        print(f"[ds4] using the configured remote service at {_remote}", flush=True)
+        return _remote
+
     resolved, svc_key = resolve_service_key(cfg, model_file)
     with _lock:
         svc = _services.get(svc_key)

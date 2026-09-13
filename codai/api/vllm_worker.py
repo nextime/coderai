@@ -144,6 +144,18 @@ def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
     return cmd
 
 
+def _remote_serves(url: str, name: str) -> bool:
+    """True when a remote vLLM's /v1/models lists ``name`` (or a suffix match)."""
+    import requests
+    try:
+        r = requests.get(url + "/v1/models", timeout=5)
+        ids = [str(m.get("id", "")) for m in (r.json().get("data") or [])]
+    except Exception:
+        return False
+    tail = name.rstrip("/").split("/")[-1]
+    return any(i == name or i.rstrip("/").split("/")[-1] == tail for i in ids)
+
+
 def ensure_service(cfg, model_path: Optional[str] = None,
                    served_name: Optional[str] = None,
                    ready_timeout: float = 3600.0) -> str:
@@ -151,6 +163,27 @@ def ensure_service(cfg, model_path: Optional[str] = None,
 
     ``model_path``/``served_name`` override the config (used by the OCR subsystem to serve
     surya-2 on its own vLLM instance alongside any LLM instance)."""
+    # An explicit `service_url` points at a vLLM running somewhere else — another
+    # host, a container, a rented RunPod pod (where vLLM's own image is the ready-
+    # made option) — so nothing is spawned or downloaded here. This function
+    # already returns a URL, so its callers cannot tell the difference.
+    _remote = (str(getattr(cfg, "service_url", "") or "")
+               or os.environ.get("CODERAI_VLLM_SERVICE_URL") or "").strip()
+    if _remote:
+        _remote = _remote.rstrip("/")
+        if not _health_ok(_remote):
+            raise RuntimeError(
+                f"configured service_url {_remote} is not answering its health check")
+        # A remote vLLM serves whatever it was started with. When the caller asks
+        # for a specific model (the OCR path does, for surya-2), make sure that
+        # model is actually there rather than silently proxying to the wrong one.
+        _want = (served_name or model_path or "").strip()
+        if _want and not _remote_serves(_remote, _want):
+            raise RuntimeError(
+                f"configured service_url {_remote} does not serve {_want}")
+        print(f"[vllm] using the configured remote service at {_remote}", flush=True)
+        return _remote
+
     resolved, svc_key = resolve_service_key(cfg, model_path)
     if served_name:
         svc_key = f"{svc_key}|{served_name}"

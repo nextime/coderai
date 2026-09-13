@@ -123,11 +123,28 @@ def _health_ok(url: str) -> bool:
         return False
 
 
-def ensure_service(model_name: str, ready_timeout: float = 1800.0) -> str:
+def ensure_service(model_name: str, ready_timeout: float = 1800.0,
+                   config: dict = None) -> str:
     """Start (or reuse) the worker for ``model_name`` and return its base URL.
 
     First call bootstraps the venv and downloads the model, so the timeout is
     generous. Raises RuntimeError if the service never comes up."""
+    # An explicit `service_url` points at a service running somewhere else —
+    # another host, a container, a rented RunPod pod — so nothing is spawned or
+    # downloaded here and coderai just proxies to it. Same contract the TTS
+    # backends have used for parler/melo, and the hook that makes a per-engine
+    # remote pod possible without changing anything downstream: this function
+    # already returns a URL, so its callers cannot tell the difference.
+    _remote = ((config or {}).get("service_url")
+               or os.environ.get("CODERAI_MELOTTS_SERVICE_URL") or "").strip()
+    if _remote:
+        _remote = _remote.rstrip("/")
+        if not _health_ok(_remote):
+            raise RuntimeError(
+                f"configured service_url {_remote} is not answering its health check")
+        print(f"[melotts] using the configured remote service at {_remote}", flush=True)
+        return _remote
+
     with _lock:
         svc = _services.get(model_name)
         if svc and svc["proc"].poll() is None and _health_ok(svc["url"]):

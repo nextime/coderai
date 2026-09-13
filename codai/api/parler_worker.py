@@ -124,6 +124,19 @@ def ensure_service(model_name: str, ready_timeout: float = 1800.0) -> str:
 
     First call bootstraps the venv and downloads the model, so the timeout is
     generous. Raises RuntimeError if the service never comes up."""
+    # An explicit service URL points at a parler worker running somewhere else —
+    # another host, a container, a rented pod — so nothing is built, spawned or
+    # downloaded here. The per-model `service_url` is handled one level up in
+    # tts_backends; this env var covers direct callers too.
+    _remote = (os.environ.get("CODERAI_PARLER_SERVICE_URL") or "").strip()
+    if _remote:
+        _remote = _remote.rstrip("/")
+        if not _health_ok(_remote):
+            raise RuntimeError(
+                f"configured service_url {_remote} is not answering its health check")
+        print(f"[parler] using the configured remote service at {_remote}", flush=True)
+        return _remote
+
     with _lock:
         svc = _services.get(model_name)
         if svc and svc["proc"].poll() is None and _health_ok(svc["url"]):

@@ -151,6 +151,21 @@ def ensure_service(model_name: str = None, config: dict = None,
                    ready_timeout: float = 1800.0) -> str:
     """Start (or reuse) the pyannote worker and return its base URL."""
     config = config or {}
+    # An explicit `service_url` points at a service running somewhere else —
+    # another host, a container, a rented RunPod pod — so nothing is spawned or
+    # downloaded here and coderai just proxies to it. Same contract the TTS
+    # backends have used for parler/melo, and the hook that makes a per-engine
+    # remote pod possible without changing anything downstream: this function
+    # already returns a URL, so its callers cannot tell the difference.
+    _remote = (config.get("service_url") or os.environ.get("CODERAI_PYANNOTE_SERVICE_URL") or "").strip()
+    if _remote:
+        _remote = str(_remote).rstrip("/")
+        if not _health_ok(_remote):
+            raise RuntimeError(
+                f"configured service_url {_remote} is not answering its health check")
+        print(f"[pyannote] using the configured remote service at {_remote}", flush=True)
+        return _remote
+
     model_name = model_name or config.get("model_path") or _default_model()
     with _lock:
         svc = _services.get(model_name)

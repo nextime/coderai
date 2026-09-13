@@ -124,6 +124,19 @@ def _launch_cmd(cfg, host: str, port: int, model_path: str) -> list:
 def ensure_service(cfg, model_path: Optional[str] = None,
                    ready_timeout: float = 3600.0) -> str:
     """Launch (or reuse) the SGLang server for a ktransformers model; return its base URL."""
+    # An explicit `service_url` points at a SGLang server running somewhere else — another
+    # host, a container, a rented pod — so nothing is built, spawned or downloaded
+    # here and coderai just proxies to it. This function already returns a URL, so
+    # its callers cannot tell the difference.
+    _remote = (str(getattr(cfg, "service_url", "") or "") or os.environ.get("CODERAI_KT_SERVICE_URL") or "").strip()
+    if _remote:
+        _remote = str(_remote).rstrip("/")
+        if not _health_ok(_remote):
+            raise RuntimeError(
+                f"configured service_url {_remote} is not answering its health check")
+        print(f"[kt] using the configured remote service at {_remote}", flush=True)
+        return _remote
+
     resolved, svc_key = resolve_service_key(cfg, model_path)
     with _lock:
         svc = _services.get(svc_key)
