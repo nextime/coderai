@@ -49,7 +49,13 @@ class RunpodModelConfig:
     # a GGUF goes to llama.cpp (vLLM's GGUF support is experimental — single-file
     # only, a limited architecture list, and it still wants the original repo's
     # tokenizer — so it is not a drop-in for the llama.cpp catalogue).
-    engine: str = "auto"                     # auto | vllm | llamacpp
+    engine: str = "auto"                     # auto | vllm | llamacpp | coderai | custom
+    # Readiness probe path. Blank = the engine's default (/v1/models for the
+    # OpenAI servers, /healthz for a coderai pod).
+    health_path: str = ""
+    # Verbatim docker args, replacing whatever the engine would generate. The
+    # escape hatch for `engine: custom` and for images with their own CLI.
+    docker_args: str = ""
     served_model: str = ""                   # HF id the pod/endpoint serves
     # GGUF to pull on a llama.cpp pod, in llama.cpp's own `-hf` form:
     # "user/repo:Q4_K_M" or "user/repo:file.gguf". Needed because a local
@@ -106,7 +112,7 @@ def resolve_pod_engine(mcfg: "RunpodModelConfig", model_key: str = "",
     repo id — goes to vLLM.
     """
     want = (mcfg.engine or "auto").strip().lower()
-    if want in ("vllm", "llamacpp"):
+    if want in ("vllm", "llamacpp", "coderai", "custom"):
         return want
     if mcfg.hf_gguf:
         return "llamacpp"
@@ -114,6 +120,38 @@ def resolve_pod_engine(mcfg: "RunpodModelConfig", model_key: str = "",
             or _looks_like_gguf(model_key):
         return "llamacpp"
     return "vllm"
+
+
+#: Readiness probe per engine. A coderai pod answers /healthz long before any
+#: model is loaded, which is exactly what we want: it is ready to be asked.
+_HEALTH_PATHS = {"vllm": "/v1/models", "llamacpp": "/v1/models",
+                 "coderai": "/healthz", "custom": "/healthz"}
+
+
+def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
+             model_path: str = "") -> dict:
+    """Everything needed to launch one pod: image, docker args, health path.
+
+    This is the seam that lets a pool serve something other than an LLM — a whole
+    coderai (so images/video/TTS/… can run on a rented GPU with the same budgets,
+    autoscaling and idle reaping), or any image at all with `engine: custom`.
+    """
+    engine = resolve_pod_engine(mcfg, model_key, model_path)
+    if engine == "llamacpp":
+        image = mcfg.image or LLAMACPP_POD_IMAGE
+        args = mcfg.docker_args or _llamacpp_docker_args(mcfg, served)
+    elif engine in ("coderai", "custom"):
+        if not mcfg.image:
+            raise RuntimeError(
+                f"RunPod {engine} pod: set `image` on the runpod block to the image "
+                "to run (coderai does not publish one to a registry for you).")
+        image = mcfg.image
+        args = mcfg.docker_args          # usually blank: the image's entrypoint serves
+    else:
+        image = mcfg.image or DEFAULT_POD_IMAGE
+        args = mcfg.docker_args or _vllm_docker_args(mcfg, served)
+    return {"engine": engine, "image": image, "args": args,
+            "health_path": mcfg.health_path or _HEALTH_PATHS.get(engine, "/v1/models")}
 
 
 def _llamacpp_docker_args(mcfg: "RunpodModelConfig", served: str) -> str:
@@ -186,6 +224,8 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.allow_spot = _as_bool(b.get("allow_spot"), cfg.allow_spot)
     cfg.image = (b.get("image") or "").strip()
     cfg.engine = (b.get("engine") or cfg.engine).strip().lower() or "auto"
+    cfg.health_path = (b.get("health_path") or "").strip()
+    cfg.docker_args = (b.get("docker_args") or "").strip()
     cfg.served_model = (b.get("served_model") or "").strip()
     cfg.hf_gguf = (b.get("hf_gguf") or "").strip()
     cfg.container_disk_gb = _as_int(b.get("container_disk_gb"), cfg.container_disk_gb)
@@ -260,11 +300,11 @@ import uuid
 from dataclasses import dataclass as _dc_pod
 
 
-def _pod_health_ok(url: str, timeout: float = 4.0) -> bool:
-    """True when the pod's OpenAI server answers /v1/models (vLLM is up)."""
+def _pod_health_ok(url: str, timeout: float = 4.0, path: str = "/v1/models") -> bool:
+    """True when the server inside the pod answers its readiness path."""
     import requests
     try:
-        r = requests.get(url.rstrip("/") + "/v1/models", timeout=timeout)
+        r = requests.get(url.rstrip("/") + "/" + path.lstrip("/"), timeout=timeout)
         return r.status_code == 200
     except Exception:
         return False
@@ -380,6 +420,8 @@ class RunpodPodPool:
         self.mcfg = mcfg
         self.served = served_name
         self.pods: list = []
+        #: Set from the pod plan at provision time; the default suits an LLM pod.
+        self.health_path = mcfg.health_path or "/v1/models"
         self._cv = threading.Condition(threading.RLock())
         self._provisioning = False
         self._closed = False
@@ -426,14 +468,10 @@ class RunpodPodPool:
         (pod_id, sel, next_index). Raises if all fail."""
         from codai.api.runpod_client import RunpodError
         port = self.mcfg.port or 8000
-        engine = resolve_pod_engine(self.mcfg, str(self.model_key),
-                                    _model_path_for(self.model_key))
-        if engine == "llamacpp":
-            image = self.mcfg.image or LLAMACPP_POD_IMAGE
-            args = _llamacpp_docker_args(self.mcfg, self.served)
-        else:
-            image = self.mcfg.image or DEFAULT_POD_IMAGE
-            args = _vllm_docker_args(self.mcfg, self.served)
+        plan = pod_plan(self.mcfg, self.served, str(self.model_key),
+                        _model_path_for(self.model_key))
+        image, args = plan["image"], plan["args"]
+        self.health_path = plan["health_path"]
         env = dict(self.mcfg.env or {})
         dc = getattr(self.account, "data_center", "") or ""
         last = None
@@ -522,7 +560,7 @@ class RunpodPodPool:
                 # Wait for the OpenAI server inside the pod (image pull + model load).
                 deadline = time.time() + load_to
                 while time.time() < deadline:
-                    if _pod_health_ok(url):
+                    if _pod_health_ok(url, path=self.health_path):
                         break
                     time.sleep(5)
                 else:
@@ -683,6 +721,31 @@ def get_pod_pool(model_key, account_cfg, mcfg: "RunpodModelConfig", served_name)
             pool.account, pool.mcfg, pool.served = account_cfg, mcfg, served_name
     _ensure_scaler()
     return pool
+
+
+def get_capability_pool(capability: str, block: dict):
+    """A managed pod pool for a whole capability (images, video, tts, …).
+
+    The pool machinery never cared that it was serving one model: it provisions,
+    health-checks, scales and reaps whatever image it is given. Pointing it at a
+    capability is what brings budgets, autoscaling and idle teardown to the
+    subsystems that have no local engine to pin — the remote gateway asks for a
+    URL here exactly the way the chat backend does.
+
+    Defaults to `engine: coderai`, since a capability is served by a whole
+    coderai on the far side rather than by an LLM server.
+    """
+    from codai.models.manager import get_active_runpod_config
+    acct = get_active_runpod_config()
+    if acct is None or not getattr(acct, "enabled", False):
+        raise RuntimeError(
+            "RunPod is not enabled — cannot provision a pod for capability "
+            f"{capability!r}. Enable it (and set an API key) or point the "
+            "capability at a URL instead.")
+    b = dict(block or {})
+    b.setdefault("engine", "coderai")
+    mcfg = parse_model_runpod(b)
+    return get_pod_pool(f"capability:{capability}", acct, mcfg, capability)
 
 
 def _all_pools_hourly_rate() -> float:

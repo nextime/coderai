@@ -124,6 +124,24 @@ def capability_endpoints() -> dict:
     return out
 
 
+def capability_pods() -> dict:
+    """The configured capability -> RunPod pod block map (``remotes.pods``).
+
+    A capability listed here is served by a coderai-managed pod: provisioned on
+    the first request, health-checked, scaled to ``max_pods``, and reaped after
+    ``idle_timeout_s`` — the same budgets and lifecycle a RunPod-served LLM gets,
+    which is what stops a forgotten image/video pod billing all night.
+    """
+    cfg = _remotes_config()
+    if cfg is None or not getattr(cfg, "enabled", True):
+        return {}
+    pods = getattr(cfg, "pods", None)
+    if not isinstance(pods, dict):
+        return {}
+    return {str(k).strip().lower(): (v if isinstance(v, dict) else {})
+            for k, v in pods.items()}
+
+
 def _model_remote(model: str) -> str:
     if not model:
         return ""
@@ -153,7 +171,7 @@ def any_remote_configured() -> bool:
 
 
 def _any_remote_configured_uncached() -> bool:
-    if capability_endpoints():
+    if capability_endpoints() or capability_pods():
         return True
     try:
         from codai.admin.routes import config_manager
@@ -191,9 +209,25 @@ def _model_from_body(body: bytes, content_type: str) -> str:
     return ""
 
 
+class Target:
+    """Where a request is going: a fixed URL, or a pod pool to borrow one from."""
+
+    def __init__(self, url: str = "", pool=None, reason: str = ""):
+        self.url = (url or "").rstrip("/")
+        self.pool = pool
+        self.reason = reason
+
+    def acquire(self):
+        """Return (base_url, release). A pool provisions on demand and bills."""
+        if self.pool is None:
+            return self.url, (lambda: None)
+        handle, url = self.pool.acquire()
+        return url.rstrip("/"), (lambda: self.pool.release(handle))
+
+
 def resolve_target(path: str, method: str, query: str, body: bytes,
-                   content_type: str) -> Optional[Tuple[str, str]]:
-    """Decide where this request should go. Returns (base_url, reason) or None."""
+                   content_type: str) -> Optional["Target"]:
+    """Decide where this request should go, or None to serve it locally."""
     if not path.startswith("/v1/") or path in _SKIP_PATHS:
         return None
     cap = capability_for(path)
@@ -203,11 +237,19 @@ def resolve_target(path: str, method: str, query: str, body: bytes,
         model = (parse_qs(query).get("model") or [""])[0]
     url = _model_remote(model)
     if url:
-        return url, f"model {model!r}"
-    if cap:
-        url = capability_endpoints().get(cap, "")
-        if url:
-            return url, f"capability {cap!r}"
+        return Target(url=url, reason=f"model {model!r}")
+    if not cap:
+        return None
+    url = capability_endpoints().get(cap, "")
+    # "runpod" as the endpoint is shorthand for "use the pod block for this
+    # capability" — so the common case needs no second config block.
+    if url and url.strip().lower() != "runpod":
+        return Target(url=url, reason=f"capability {cap!r}")
+    pods = capability_pods()
+    if url or cap in pods:
+        from codai.api.runpod_worker import get_capability_pool
+        return Target(pool=get_capability_pool(cap, pods.get(cap) or {}),
+                      reason=f"capability {cap!r} on a RunPod pod")
     return None
 
 
@@ -256,16 +298,31 @@ class RemoteGatewayMiddleware:
         if body is None:                       # over the cap mid-stream
             return await self._app(scope, replay, send)
 
-        target = resolve_target(path, scope.get("method", "GET"),
-                                (scope.get("query_string") or b"").decode("latin-1"),
-                                body, headers.get("content-type", ""))
+        try:
+            target = resolve_target(path, scope.get("method", "GET"),
+                                    (scope.get("query_string") or b"").decode("latin-1"),
+                                    body, headers.get("content-type", ""))
+        except Exception as exc:
+            # A misconfigured remote must not silently fall back to running the
+            # model here — that is how you discover it by watching local VRAM.
+            return await _error(send, 502, f"remote routing failed: {exc}")
         if not target:
             return await self._app(scope, replay, send)
+        await self._forward(scope, headers, body, target, send)
 
-        url, reason = target
-        await self._forward(scope, headers, body, url, reason, send)
+    async def _forward(self, scope, headers, body, target, send):
+        import asyncio
+        try:
+            base, release = await asyncio.to_thread(target.acquire)
+        except Exception as exc:
+            return await _error(send, 502,
+                                f"could not reach a remote for this request: {exc}")
+        try:
+            await self._send_upstream(scope, headers, body, base, target.reason, send)
+        finally:
+            release()
 
-    async def _forward(self, scope, headers, body, base, reason, send):
+    async def _send_upstream(self, scope, headers, body, base, reason, send):
         import asyncio
         path = scope.get("path")
         qs = (scope.get("query_string") or b"").decode("latin-1")
@@ -288,12 +345,7 @@ class RemoteGatewayMiddleware:
         try:
             resp = await asyncio.to_thread(_call)
         except Exception as exc:
-            msg = json.dumps({"error": {"message": f"remote endpoint {base} unreachable: {exc}",
-                                        "type": "remote_gateway_error"}}).encode()
-            await send({"type": "http.response.start", "status": 502,
-                        "headers": [(b"content-type", b"application/json"),
-                                    (b"content-length", str(len(msg)).encode())]})
-            return await send({"type": "http.response.body", "body": msg})
+            return await _error(send, 502, f"remote endpoint {base} unreachable: {exc}")
 
         out = [(b"content-type", (resp.headers.get("Content-Type") or "application/json")
                 .encode("latin-1"))]
@@ -310,6 +362,15 @@ class RemoteGatewayMiddleware:
             await send({"type": "http.response.body", "body": chunk, "more_body": True})
         await send({"type": "http.response.body", "body": b""})
         resp.close()
+
+
+async def _error(send, status: int, message: str):
+    msg = json.dumps({"error": {"message": message,
+                                "type": "remote_gateway_error"}}).encode()
+    await send({"type": "http.response.start", "status": status,
+                "headers": [(b"content-type", b"application/json"),
+                            (b"content-length", str(len(msg)).encode())]})
+    await send({"type": "http.response.body", "body": msg})
 
 
 async def _drain(receive, cap: int):

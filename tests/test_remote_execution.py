@@ -373,6 +373,99 @@ def test_chat_is_never_gatewayed(gateway_app):
                        json={"model": "anything"}).json()["served_by"] == "local"
 
 
+def test_capability_served_by_a_managed_pod(gateway_app, monkeypatch):
+    """A capability can point at a RunPod pool instead of a fixed URL: the
+    gateway borrows a pod for the request and gives it back afterwards."""
+    client, gw, url = gateway_app
+    released = []
+
+    class _Handle:
+        pod_id = "pod-1"
+
+    class _Pool:
+        def acquire(self):
+            return _Handle(), url
+
+        def release(self, handle):
+            released.append(handle.pod_id)
+
+    import codai.api.runpod_worker as rw
+    monkeypatch.setattr(rw, "get_capability_pool", lambda cap, block: _Pool())
+    gw.capability_pods = lambda: {"images": {"max_pods": 2}}
+    gw.capability_endpoints = lambda: {}
+
+    r = client.post("/v1/images/generations", json={"model": "sdxl", "prompt": "cat"})
+    assert r.json()["served_by"] == "remote"
+    # The pod is handed back even on the happy path, so the idle reaper can see it.
+    assert released == ["pod-1"]
+
+
+def test_runpod_shorthand_endpoint_uses_the_pool(gateway_app, monkeypatch):
+    client, gw, url = gateway_app
+    import codai.api.runpod_worker as rw
+    asked = []
+
+    class _Pool:
+        def acquire(self):
+            return object(), url
+
+        def release(self, handle):
+            pass
+
+    monkeypatch.setattr(rw, "get_capability_pool",
+                        lambda cap, block: asked.append(cap) or _Pool())
+    gw.capability_endpoints = lambda: {"video": "runpod"}
+    gw.capability_pods = lambda: {}
+
+    assert client.post("/v1/video/generations",
+                       json={"model": "wan"}).json()["served_by"] == "remote"
+    assert asked == ["video"]
+
+
+def test_pod_that_cannot_be_provisioned_is_a_502_not_a_local_run(gateway_app, monkeypatch):
+    """Falling back to local would quietly load a 30 GB model on the wrong box."""
+    client, gw, _ = gateway_app
+    import codai.api.runpod_worker as rw
+
+    def _boom(cap, block):
+        raise RuntimeError("RunPod is not enabled")
+
+    monkeypatch.setattr(rw, "get_capability_pool", _boom)
+    gw.capability_pods = lambda: {"images": {}}
+    gw.capability_endpoints = lambda: {}
+
+    r = client.post("/v1/images/generations", json={"model": "sdxl"})
+    assert r.status_code == 502 and "RunPod is not enabled" in r.json()["error"]["message"]
+
+
+def test_pod_plan_per_engine():
+    from codai.api.runpod_worker import (parse_model_runpod, pod_plan,
+                                         LLAMACPP_POD_IMAGE, DEFAULT_POD_IMAGE)
+
+    vllm = pod_plan(parse_model_runpod({"served_model": "Qwen/Qwen3.5-9B"}),
+                    "Qwen/Qwen3.5-9B")
+    assert vllm["image"] == DEFAULT_POD_IMAGE and vllm["health_path"] == "/v1/models"
+
+    gguf = pod_plan(parse_model_runpod({"hf_gguf": "user/repo:Q4_K_M"}), "m",
+                    model_path="/AI/m.gguf")
+    assert gguf["image"] == LLAMACPP_POD_IMAGE and "-hf user/repo:Q4_K_M" in gguf["args"]
+
+    # A coderai pod serves whole capabilities; it is ready as soon as /healthz answers.
+    cod = pod_plan(parse_model_runpod({"engine": "coderai", "image": "reg/coderai:base"}),
+                   "images")
+    assert cod["image"] == "reg/coderai:base" and cod["health_path"] == "/healthz"
+
+    # …but it needs an image: we cannot invent a registry the pod can pull from.
+    with pytest.raises(RuntimeError, match="set `image`"):
+        pod_plan(parse_model_runpod({"engine": "coderai"}), "images")
+
+    # `custom` takes verbatim args and an explicit probe.
+    cus = pod_plan(parse_model_runpod({"engine": "custom", "image": "me/thing:1",
+                                       "docker_args": "--serve", "health_path": "/ping"}),
+                   "x")
+    assert cus["args"] == "--serve" and cus["health_path"] == "/ping"
+
+
 def test_unreachable_remote_is_a_clean_502(gateway_app):
     client, gw, _ = gateway_app
     gw.capability_endpoints = lambda: {"images": "http://127.0.0.1:1"}

@@ -142,6 +142,56 @@ Capability keys: `images`, `video`, `embeddings`, `rerank`, `ocr`, `tts`, `stt`,
 
 Precedence: a model's own `service_url` wins over the capability map.
 
+### Letting coderai rent the pod
+
+A URL means you started the machine and you own its bill. To have coderai
+provision, scale and reap the pod instead, give the capability a pod block —
+the same fields a model's `runpod` block takes:
+
+```json
+{
+  "remotes": {
+    "endpoints": {"images": "runpod"},
+    "pods": {
+      "images": {
+        "image": "registry.example.com/coderai:base",
+        "min_vram_gb": 24, "max_hourly_usd": 0.6,
+        "max_pods": 2, "idle_timeout_s": 300,
+        "cost_limit_usd": 20, "cost_period": "day"
+      }
+    }
+  }
+}
+```
+
+`"endpoints": {"images": "runpod"}` is shorthand for "use the pod block for
+images"; a capability listed under `pods` is routed there even without it.
+
+The first matching request provisions a pod, the gateway borrows it for the
+duration of the request and hands it back, and the scaler tears it down after
+`idle_timeout_s` — so an idle capability costs nothing. Rate caps, rolling spend
+limits, the global budget, the stale-pod reaper and the stats page all apply
+exactly as they do for a RunPod-served LLM; capability pools show up there as
+`capability:<name>`.
+
+Pod engines (`engine`):
+
+| value | image | ready when |
+|---|---|---|
+| `auto` | vLLM, or llama.cpp for a GGUF | `/v1/models` |
+| `vllm` / `llamacpp` | forced | `/v1/models` |
+| `coderai` | your `image` (required) | `/healthz` |
+| `custom` | your `image`, `docker_args` verbatim | `health_path` |
+
+`coderai` is the default for a capability pool: the far side is a whole coderai,
+reached through the same API. You must supply `image` — a registry the pod can
+pull from — because coderai does not publish one for you.
+
+If a pod cannot be provisioned (RunPod disabled, budget cap hit, no GPU under
+the ceiling) the request fails with 502. It does **not** quietly fall back to
+running the model locally — that failure mode is only discovered by noticing
+your own VRAM disappear.
+
 Notes:
 
 * `/v1/chat/completions` and `/v1/completions` are deliberately **not** gatewayed
@@ -159,6 +209,9 @@ Notes:
 * **One small coderai, many remote GPUs** — the local instance holds the API,
   auth, catalogue and UI; each capability points at a box or pod that owns one
   model family.
+* **Rent per capability, pay only while used** — capabilities with a pod block
+  scale from zero on demand and are reaped when idle, under the same budgets as
+  a RunPod-served LLM.
 * **Per-engine pod images** — vLLM's and llama.cpp's own images serve LLMs with
   no coderai on the far side; the coderai image is only needed where a coderai
   subsystem runs (the mux service, or a gateway target).

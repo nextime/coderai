@@ -380,6 +380,12 @@ class RemotesConfig:
     api_key: str = ""                        # bearer token for the remote(s)
     max_body_mb: int = 512                   # bigger requests are served locally
     endpoints: dict = field(default_factory=dict)   # capability -> base URL
+    # capability -> RunPod pod block (same fields as a model's `runpod` block).
+    # coderai then provisions, health-checks, scales and reaps that pod itself,
+    # so an image or video capability gets the budgets and idle teardown a
+    # RunPod-served LLM has. `"endpoints": {"images": "runpod"}` is shorthand
+    # for "use the pod block for images" (defaults apply when there is none).
+    pods: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -1101,6 +1107,7 @@ class ConfigManager:
                 "api_key": self.config.remotes.api_key,
                 "max_body_mb": self.config.remotes.max_body_mb,
                 "endpoints": dict(self.config.remotes.endpoints or {}),
+                "pods": dict(self.config.remotes.pods or {}),
             },
             "ds4": {
                 "enabled": self.config.ds4.enabled,

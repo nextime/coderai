@@ -3532,6 +3532,7 @@ def build_settings_dict(c, gpu_cards):
             "api_key": c.remotes.api_key,
             "max_body_mb": c.remotes.max_body_mb,
             "endpoints": dict(c.remotes.endpoints or {}),
+            "pods": dict(c.remotes.pods or {}),
         },
         "ds4": {
             "enabled": c.ds4.enabled,
@@ -3986,6 +3987,11 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             c.remotes.endpoints = ({str(k).strip().lower(): str(v).strip()
                                     for k, v in eps.items() if str(v).strip()}
                                    if isinstance(eps, dict) else {})
+        if "pods" in d:
+            pods = d.get("pods")
+            c.remotes.pods = ({str(k).strip().lower(): v
+                               for k, v in pods.items() if isinstance(v, dict)}
+                              if isinstance(pods, dict) else {})
 
     if "ds4" in data:
         d = data["ds4"]
