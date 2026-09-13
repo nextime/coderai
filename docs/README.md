@@ -16,6 +16,7 @@ reference; these are the deep dives.
 | [kimi-k3.md](kimi-k3.md) | Kimi-K3 on CPU via kimi-k3-in-c |
 | [ktransformers.md](ktransformers.md) | ktransformers / SGLang CPU+GPU heterogeneous MoE |
 | [runpod.md](runpod.md) | Renting remote GPUs: pods, serverless, budgets, the reaper, spillover |
+| [remote-execution.md](remote-execution.md) | Serving any model from another machine: worker `service_url`, the mux service, remote text models, the capability gateway |
 
 ## Subsystems
 

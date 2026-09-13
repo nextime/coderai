@@ -149,6 +149,13 @@ from codai.admin.routes import router as admin_router
 # Import and add middleware
 from codai.api.log import log_requests
 from codai.api.ratelimit import RateLimitMiddleware, BearerAuthMiddleware
+# Remote gateway: /v1 requests addressed to a model or capability configured as
+# remote are replayed to that endpoint instead of being served here. Registered
+# FIRST so it ends up innermost — auth, rate limiting and request logging all run
+# before it. It no-ops without touching the body when nothing is configured remote.
+from codai.api.remote_gateway import RemoteGatewayMiddleware
+app.add_middleware(RemoteGatewayMiddleware)
+
 app.middleware("http")(log_requests)
 app.add_middleware(RateLimitMiddleware)
 app.add_middleware(BearerAuthMiddleware)

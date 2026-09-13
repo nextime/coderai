@@ -3527,6 +3527,12 @@ def build_settings_dict(c, gpu_cards):
             "allow_ffmpeg": c.enhance.allow_ffmpeg,
             "allow_rife_ncnn": c.enhance.allow_rife_ncnn,
         },
+        "remotes": {
+            "enabled": c.remotes.enabled,
+            "api_key": c.remotes.api_key,
+            "max_body_mb": c.remotes.max_body_mb,
+            "endpoints": dict(c.remotes.endpoints or {}),
+        },
         "ds4": {
             "enabled": c.ds4.enabled,
             "service_url": c.ds4.service_url,
@@ -3963,6 +3969,23 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
                 ga.enhance_allow_rife_ncnn = c.enhance.allow_rife_ncnn
         except Exception:
             pass
+
+    if "remotes" in data:
+        d = data["remotes"] if isinstance(data["remotes"], dict) else {}
+        if "enabled" in d:
+            c.remotes.enabled = bool(d["enabled"])
+        if "api_key" in d:
+            c.remotes.api_key = (d.get("api_key") or "").strip()
+        if "max_body_mb" in d:
+            try:
+                c.remotes.max_body_mb = max(1, int(d["max_body_mb"]))
+            except (TypeError, ValueError):
+                pass
+        if "endpoints" in d:
+            eps = d.get("endpoints")
+            c.remotes.endpoints = ({str(k).strip().lower(): str(v).strip()
+                                    for k, v in eps.items() if str(v).strip()}
+                                   if isinstance(eps, dict) else {})
 
     if "ds4" in data:
         d = data["ds4"]

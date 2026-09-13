@@ -357,6 +357,32 @@ class CompactionConfig:
 
 
 @dataclass
+class RemotesConfig:
+    """Serve whole capabilities from another coderai instead of locally.
+
+    Every subsystem that loads its model in-process — images, video, embeddings,
+    rerank, OCR, TTS, STT, voice cloning, audio generation, stems, 3D, pipelines
+    — has no service of its own to redirect. But another coderai exposes the same
+    API, so it can BE the service: map a capability to a base URL here and
+    :class:`~codai.api.remote_gateway.RemoteGatewayMiddleware` replays matching
+    /v1 requests there and streams the answer back.
+
+    A model's own ``service_url`` (models.json) wins over this map. Chat and
+    completions are not routed here — they go through RemoteOpenAIBackend.
+
+    Example::
+
+        "remotes": {"enabled": true,
+                    "endpoints": {"images": "http://gpu-box:8000",
+                                  "video": "https://pod-xyz-8000.proxy.runpod.net"}}
+    """
+    enabled: bool = True
+    api_key: str = ""                        # bearer token for the remote(s)
+    max_body_mb: int = 512                   # bigger requests are served locally
+    endpoints: dict = field(default_factory=dict)   # capability -> base URL
+
+
+@dataclass
 class Ds4Config:
     """DeepSeek V4 via ds4 (antirez/DwarfStar) external-worker configuration.
 
@@ -707,6 +733,7 @@ class Config:
     thermal: ThermalConfig = field(default_factory=ThermalConfig)
     jobs: JobsConfig = field(default_factory=JobsConfig)
     enhance: EnhanceConfig = field(default_factory=EnhanceConfig)
+    remotes: RemotesConfig = field(default_factory=RemotesConfig)
     ds4: Ds4Config = field(default_factory=Ds4Config)
     colibri: ColibriConfig = field(default_factory=ColibriConfig)
     k3: K3Config = field(default_factory=K3Config)
@@ -898,6 +925,7 @@ class ConfigManager:
                 thermal=_dc(ThermalConfig, config_data.get("thermal", {})),
                 jobs=_dc(JobsConfig, config_data.get("jobs", {})),
                 enhance=_dc(EnhanceConfig, config_data.get("enhance", {})),
+                remotes=_dc(RemotesConfig, config_data.get("remotes", {})),
                 ds4=_dc(Ds4Config, config_data.get("ds4", {})),
                 colibri=_dc(ColibriConfig, config_data.get("colibri", {})),
                 k3=_dc(K3Config, config_data.get("k3", {})),
@@ -1067,6 +1095,12 @@ class ConfigManager:
             "enhance": {
                 "allow_ffmpeg": self.config.enhance.allow_ffmpeg,
                 "allow_rife_ncnn": self.config.enhance.allow_rife_ncnn,
+            },
+            "remotes": {
+                "enabled": self.config.remotes.enabled,
+                "api_key": self.config.remotes.api_key,
+                "max_body_mb": self.config.remotes.max_body_mb,
+                "endpoints": dict(self.config.remotes.endpoints or {}),
             },
             "ds4": {
                 "enabled": self.config.ds4.enabled,
