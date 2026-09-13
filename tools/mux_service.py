@@ -135,6 +135,17 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
 
+class MuxServer(ThreadingHTTPServer):
+    """A client that hangs up mid-generation is the cancel signal, not an error —
+    don't dump a broken-pipe traceback every time someone stops a stream."""
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def main():
     global ENGINE, KIND
     ap = argparse.ArgumentParser(description=__doc__)
@@ -159,7 +170,7 @@ def main():
           flush=True)
     ENGINE = _build_engine(args.kind, cfg, args.model_dir, args.ctx)
     print(f"[mux-service] {args.kind} ready, serving on {args.host}:{args.port}", flush=True)
-    ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+    MuxServer((args.host, args.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":
