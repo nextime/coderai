@@ -478,6 +478,11 @@
         <input type="text" id="s-ds4-install-dir" class="form-input" placeholder="~/.coderai/ds4">
       </div>
     </div>
+    <div class="form-group">
+      <label class="form-label">Remote service URL <span class="muted">(optional)</span></label>
+      <input type="text" id="s-ds4-service-url" class="form-input" placeholder="blank = run it here">
+      <span class="form-hint">Point at a ds4-server running on another host or a rented pod. Nothing is built, downloaded or launched locally — coderai proxies to it and checks its health first.</span>
+    </div>
     <div class="form-row">
       <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
         <input type="checkbox" id="s-ds4-auto-build">
@@ -619,6 +624,11 @@
       </div>
     </div>
     <div class="form-group">
+      <label class="form-label">Remote service URL <span class="muted">(optional)</span></label>
+      <input type="text" id="s-colibri-service-url" class="form-input" placeholder="blank = run it here">
+      <span class="form-hint">Point at a colibri engine hosted by tools/mux_service.py elsewhere. Nothing is built, downloaded or launched locally — coderai proxies to it and checks its health first.</span>
+    </div>
+    <div class="form-group">
       <label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
         <input type="checkbox" id="s-colibri-auto-build">
         <span>Auto clone + build the colibri engine binary if missing</span>
@@ -657,6 +667,11 @@
       <label class="form-label">Checkpoint path</label>
       <input type="text" id="s-k3-model-path" class="form-input" placeholder="/nvme/Kimi-K3">
       <span class="form-hint">The Kimi-K3 checkpoint <b>directory</b> (config.json + tokenizer + safetensors shards).</span>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Remote service URL <span class="muted">(optional)</span></label>
+      <input type="text" id="s-k3-service-url" class="form-input" placeholder="blank = run it here">
+      <span class="form-hint">Point at a k3 engine hosted by tools/mux_service.py elsewhere. Nothing is built, downloaded or launched locally — coderai proxies to it and checks its health first.</span>
     </div>
     <div class="form-group">
       <label class="form-label">Packed trunk dir</label>
@@ -721,6 +736,11 @@
     <div class="form-group">
       <label class="form-label">Model path (HF dir)</label>
       <input type="text" id="s-kt-model-path" class="form-input" placeholder="/nvme/DeepSeek-V4-Flash">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Remote service URL <span class="muted">(optional)</span></label>
+      <input type="text" id="s-kt-service-url" class="form-input" placeholder="blank = run it here">
+      <span class="form-hint">Point at an SGLang server running elsewhere. Nothing is built, downloaded or launched locally — coderai proxies to it and checks its health first.</span>
     </div>
     <div class="form-group">
       <label class="form-label">KT weight path</label>
@@ -799,6 +819,11 @@
       <input type="text" id="s-vllm-venv" class="form-input" placeholder="(auto: /opt/coderai/vllm_venv, else /cache/vllm_venv)">
     </div>
     <div class="form-group">
+      <label class="form-label">Remote service URL <span class="muted">(optional)</span></label>
+      <input type="text" id="s-vllm-service-url" class="form-input" placeholder="blank = run it here">
+      <span class="form-hint">Point at a vLLM OpenAI server elsewhere — RunPod publishes a ready-made vLLM image. Nothing is built, downloaded or launched locally — coderai proxies to it and checks its health first.</span>
+    </div>
+    <div class="form-group">
       <label class="form-label">Extra args</label>
       <input type="text" id="s-vllm-extra-args" class="form-input" placeholder="--enable-prefix-caching --swap-space 4">
     </div>
@@ -871,6 +896,11 @@
         <label class="form-label">Data center <span class="muted">(optional filter)</span></label>
         <input type="text" id="s-runpod-dc" class="form-input" placeholder="(any)">
       </div>
+      <div class="form-group" style="flex:1;min-width:180px">
+        <label class="form-label">Registry credential id <span class="muted">(private images)</span></label>
+        <input type="text" id="s-runpod-registry-auth" class="form-input" placeholder="blank = public images only">
+        <span class="form-hint" style="font-size:11px">From RunPod → Settings → Container Registry Credentials. Needed for a private pod image; public ones (vLLM, llama.cpp) need none.</span>
+      </div>
       <div class="form-group" style="flex:1;min-width:150px">
         <label class="form-label">Deployment id</label>
         <input type="text" id="s-runpod-deploy" class="form-input" placeholder="default">
@@ -893,6 +923,34 @@
       <span id="s-runpod-test-status" class="form-hint"></span>
     </div>
     <div id="s-runpod-gpu-list" style="margin-top:.6rem;font-size:12px;max-height:220px;overflow:auto"></div>
+  </div>
+</div>
+
+<!-- Remote capabilities: serve whole subsystems from another coderai / a pod -->
+<div class="card">
+  <div class="card-title">Remote capabilities</div>
+  <p class="form-hint" style="margin-bottom:.6rem">Images, video, embeddings, TTS, STT and the rest load their model <b>in this process</b>, so there is no per-model way to move them. Point a capability somewhere else and matching <code>/v1</code> requests are forwarded there instead — to another coderai, or to a RunPod pod coderai provisions, scales and reaps for you. Per-model <code>service_url</code> still wins over anything set here. Chat and completions are not listed: those are per-model, on the model's own page.</p>
+  <div class="form-row">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-remotes-enabled" onchange="toggleRemotesFields()">
+      <span style="font-size:13px;font-weight:500">Enable remote capabilities</span>
+    </label>
+  </div>
+  <div id="remotes-fields" style="display:none">
+    <div class="form-row" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <div class="form-group" style="flex:1;min-width:200px">
+        <label class="form-label">Bearer token for remotes <span class="muted">(optional)</span></label>
+        <input type="text" id="s-remotes-key" class="form-input" placeholder="sent to plain URL targets">
+        <span class="form-hint" style="font-size:11px">A managed pod uses its own generated token instead; this is for URLs you run yourself.</span>
+      </div>
+      <div class="form-group" style="flex:1;min-width:160px">
+        <label class="form-label">Max forwarded body (MB)</label>
+        <input type="number" id="s-remotes-max-body" class="form-input" min="1" placeholder="512">
+        <span class="form-hint" style="font-size:11px">Larger uploads are served locally rather than buffered in RAM.</span>
+      </div>
+    </div>
+    <div id="s-remotes-rows" style="margin-top:.4rem"></div>
+    <p class="form-hint" style="margin-top:.5rem">A pod row needs an image you have pushed to a registry RunPod can pull from — see <code>packaging/runpod/publish_capability_images.sh</code>. Give several capabilities the same <b>pool</b> name and they share one pod and one budget.</p>
   </div>
 </div>
 
@@ -1702,6 +1760,7 @@ async function loadSettings(){
     document.getElementById('s-ds4-ssd-streaming').checked = !!ds4.ssd_streaming;
     document.getElementById('s-ds4-build-target').value = ds4.build_target ?? 'auto';
     document.getElementById('s-ds4-install-dir').value = ds4.install_dir ?? '';
+    document.getElementById('s-ds4-service-url').value = ds4.service_url ?? '';
     document.getElementById('s-ds4-auto-build').checked = ds4.auto_build !== false;
     document.getElementById('s-ds4-host').value = ds4.host ?? '127.0.0.1';
     document.getElementById('s-ds4-port').value = ds4.port ?? 0;
@@ -1727,6 +1786,7 @@ async function loadSettings(){
     document.getElementById('s-colibri-cuda-expert-gb').value = colibri.cuda_expert_gb ?? '';
     document.getElementById('s-colibri-build-target').value = colibri.build_target ?? 'auto';
     document.getElementById('s-colibri-install-dir').value = colibri.install_dir ?? '';
+    document.getElementById('s-colibri-service-url').value = colibri.service_url ?? '';
     document.getElementById('s-colibri-auto-build').checked = colibri.auto_build !== false;
     document.getElementById('s-colibri-repo-url').value = colibri.repo_url ?? 'https://github.com/JustVugg/colibri';
     document.getElementById('s-colibri-extra-env').value = colibri.extra_env ?? '';
@@ -1737,6 +1797,7 @@ async function loadSettings(){
     document.getElementById('s-k3-enabled').checked = !!k3.enabled;
     document.getElementById('s-k3-model-id').value = k3.model_id ?? 'kimi-k3';
     document.getElementById('s-k3-model-path').value = k3.model_path ?? '';
+    document.getElementById('s-k3-service-url').value = k3.service_url ?? '';
     document.getElementById('s-k3-trunk-dir').value = k3.trunk_dir ?? '';
     document.getElementById('s-k3-preset').value = k3.preset ?? '';
     document.getElementById('s-k3-trunk-gb').value = k3.trunk_gb ?? 16;
@@ -1750,6 +1811,7 @@ async function loadSettings(){
     document.getElementById('s-kt-enabled').checked = !!kt.enabled;
     document.getElementById('s-kt-model-id').value = kt.model_id ?? 'ktransformers';
     document.getElementById('s-kt-model-path').value = kt.model_path ?? '';
+    document.getElementById('s-kt-service-url').value = kt.service_url ?? '';
     document.getElementById('s-kt-weight-path').value = kt.kt_weight_path ?? '';
     document.getElementById('s-kt-host').value = kt.host ?? '127.0.0.1';
     document.getElementById('s-kt-port').value = kt.port ?? 0;
@@ -1773,6 +1835,7 @@ async function loadSettings(){
     document.getElementById('s-vllm-quant').value = vll.quantization ?? '';
     document.getElementById('s-vllm-port').value = vll.port ?? 0;
     document.getElementById('s-vllm-venv').value = vll.venv ?? '';
+    document.getElementById('s-vllm-service-url').value = vll.service_url ?? '';
     document.getElementById('s-vllm-extra-args').value = vll.extra_args ?? '';
     document.getElementById('s-vllm-extra-env').value = vll.extra_env ?? '';
     document.getElementById('s-vllm-auto-build').checked = !!vll.auto_build;
@@ -1788,6 +1851,9 @@ async function loadSettings(){
     document.getElementById('s-runpod-cloud').value = rp.cloud_type || 'SECURE';
     document.getElementById('s-runpod-default-gpu').value = rp.default_gpu_type ?? '';
     document.getElementById('s-runpod-budget').value = rp.global_max_hourly_usd ?? 0;
+    document.getElementById('s-runpod-registry-auth').value = rp.registry_auth_id ?? '';
+    // Remote capabilities
+    _populateRemotes(d.remotes || {});
     document.getElementById('s-runpod-cost-limit').value = rp.global_cost_limit_usd ?? 0;
     document.getElementById('s-runpod-cost-period').value = rp.global_cost_period || 'unlimited';
     document.getElementById('s-runpod-dc').value = rp.data_center ?? '';
@@ -1908,6 +1974,7 @@ async function saveSettings(silent){
       ssd_streaming: document.getElementById('s-ds4-ssd-streaming').checked,
       build_target: document.getElementById('s-ds4-build-target').value,
       install_dir: document.getElementById('s-ds4-install-dir').value.trim(),
+      service_url: document.getElementById('s-ds4-service-url').value.trim(),
       auto_build: document.getElementById('s-ds4-auto-build').checked,
       host: document.getElementById('s-ds4-host').value.trim() || '127.0.0.1',
       port: parseInt(document.getElementById('s-ds4-port').value) || 0,
@@ -1930,6 +1997,7 @@ async function saveSettings(silent){
       cuda_expert_gb: document.getElementById('s-colibri-cuda-expert-gb').value.trim(),
       build_target: document.getElementById('s-colibri-build-target').value,
       install_dir: document.getElementById('s-colibri-install-dir').value.trim(),
+      service_url: document.getElementById('s-colibri-service-url').value.trim(),
       auto_build: document.getElementById('s-colibri-auto-build').checked,
       repo_url: document.getElementById('s-colibri-repo-url').value.trim() || 'https://github.com/JustVugg/colibri',
       extra_env: document.getElementById('s-colibri-extra-env').value.trim(),
@@ -1938,6 +2006,7 @@ async function saveSettings(silent){
       enabled: document.getElementById('s-k3-enabled').checked,
       model_id: document.getElementById('s-k3-model-id').value.trim() || 'kimi-k3',
       model_path: document.getElementById('s-k3-model-path').value.trim(),
+      service_url: document.getElementById('s-k3-service-url').value.trim(),
       trunk_dir: document.getElementById('s-k3-trunk-dir').value.trim(),
       preset: document.getElementById('s-k3-preset').value,
       trunk_gb: parseFloat(document.getElementById('s-k3-trunk-gb').value) || 16,
@@ -1950,6 +2019,7 @@ async function saveSettings(silent){
       enabled: document.getElementById('s-kt-enabled').checked,
       model_id: document.getElementById('s-kt-model-id').value.trim() || 'ktransformers',
       model_path: document.getElementById('s-kt-model-path').value.trim(),
+      service_url: document.getElementById('s-kt-service-url').value.trim(),
       kt_weight_path: document.getElementById('s-kt-weight-path').value.trim(),
       host: document.getElementById('s-kt-host').value.trim() || '127.0.0.1',
       port: parseInt(document.getElementById('s-kt-port').value) || 0,
@@ -1971,10 +2041,12 @@ async function saveSettings(silent){
       quantization: document.getElementById('s-vllm-quant').value.trim(),
       port: parseInt(document.getElementById('s-vllm-port').value) || 0,
       venv: document.getElementById('s-vllm-venv').value.trim(),
+      service_url: document.getElementById('s-vllm-service-url').value.trim(),
       extra_args: document.getElementById('s-vllm-extra-args').value.trim(),
       extra_env: document.getElementById('s-vllm-extra-env').value.trim(),
       auto_build: document.getElementById('s-vllm-auto-build').checked,
     },
+    remotes: _collectRemotes(),
     runpod:{
       enabled: document.getElementById('s-runpod-enabled').checked,
       // Blank = keep the current key (backend ignores empty / masked values).
@@ -1982,6 +2054,7 @@ async function saveSettings(silent){
       cloud_type: document.getElementById('s-runpod-cloud').value || 'SECURE',
       default_gpu_type: document.getElementById('s-runpod-default-gpu').value.trim(),
       global_max_hourly_usd: parseFloat(document.getElementById('s-runpod-budget').value) || 0,
+      registry_auth_id: document.getElementById('s-runpod-registry-auth').value.trim(),
       global_cost_limit_usd: parseFloat(document.getElementById('s-runpod-cost-limit').value) || 0,
       global_cost_period: document.getElementById('s-runpod-cost-period').value || 'unlimited',
       data_center: document.getElementById('s-runpod-dc').value.trim(),
@@ -2126,5 +2199,136 @@ function _initSettingsTabs(){
   show(active);
 }
 _initSettingsTabs();
+
+// ---------------------------------------------------------------------------
+// Remote capabilities: one row per capability, each Local / URL / RunPod pod.
+// ---------------------------------------------------------------------------
+const REMOTE_CAPS = [
+  ['images','Images','/v1/images/*'],
+  ['video','Video','/v1/video/*'],
+  ['embeddings','Embeddings','/v1/embeddings'],
+  ['rerank','Rerank','/v1/rerank'],
+  ['ocr','OCR','/v1/ocr'],
+  ['tts','Text-to-speech','/v1/audio/speech'],
+  ['stt','Transcription','/v1/audio/transcriptions'],
+  ['voice','Voice cloning','/v1/audio/clone, /v1/audio/voices'],
+  ['speaker','Diarization / speakers','/v1/audio/diarization, speaker-*'],
+  ['audio_gen','Audio generation','/v1/audio/generate'],
+  ['stems','Stem separation','/v1/audio/stems'],
+  ['audio_clean','Audio cleanup','/v1/audio/cleanup'],
+  ['spatial','3D','/v1/3d/*, to3d, from3d'],
+  ['faceswap','Face swap','/v1/images/faceswap'],
+  ['loras','LoRA training','/v1/loras/*'],
+  ['characters','Characters','/v1/characters/*'],
+  ['environments','Environments','/v1/environments/*'],
+  ['pipelines','Pipelines','/v1/pipelines/*'],
+];
+
+function toggleRemotesFields(){
+  const on = document.getElementById('s-remotes-enabled').checked;
+  document.getElementById('remotes-fields').style.display = on ? 'block' : 'none';
+}
+
+function _remoteRowHtml(cap, label, paths){
+  return `
+  <div class="form-row" style="display:flex;gap:.5rem;align-items:flex-start;flex-wrap:wrap;border-top:1px solid var(--border,#2a2a2a);padding-top:.45rem;margin-top:.45rem">
+    <div style="flex:0 0 190px">
+      <div style="font-size:13px;font-weight:500">${label}</div>
+      <div class="muted" style="font-size:11px"><code>${paths}</code></div>
+    </div>
+    <select id="rc-${cap}-where" class="form-input" style="flex:0 0 150px" onchange="_updateRemoteRow('${cap}')">
+      <option value="local">Local</option>
+      <option value="url">Remote URL</option>
+      <option value="pod">RunPod pod</option>
+    </select>
+    <input type="text" id="rc-${cap}-url" class="form-input" style="flex:1;min-width:200px;display:none" placeholder="http://gpu-box:8000">
+    <div id="rc-${cap}-pod" style="display:none;flex:1;min-width:320px">
+      <div style="display:flex;gap:.4rem;flex-wrap:wrap">
+        <input type="text" id="rc-${cap}-image" class="form-input" style="flex:2;min-width:200px" placeholder="ghcr.io/you/coderai-${cap}:latest">
+        <input type="text" id="rc-${cap}-pool" class="form-input" style="flex:1;min-width:90px" placeholder="pool (share)">
+      </div>
+      <div style="display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.35rem">
+        <input type="number" id="rc-${cap}-vram" class="form-input" style="flex:1;min-width:80px" min="0" placeholder="min VRAM">
+        <input type="number" id="rc-${cap}-hourly" class="form-input" style="flex:1;min-width:80px" min="0" step="0.01" placeholder="max $/hr">
+        <input type="number" id="rc-${cap}-maxpods" class="form-input" style="flex:1;min-width:70px" min="1" placeholder="max pods">
+        <input type="number" id="rc-${cap}-idle" class="form-input" style="flex:1;min-width:80px" min="0" placeholder="idle s">
+      </div>
+    </div>
+  </div>`;
+}
+
+function _updateRemoteRow(cap){
+  const where = (document.getElementById('rc-' + cap + '-where') || {}).value || 'local';
+  const url = document.getElementById('rc-' + cap + '-url');
+  const pod = document.getElementById('rc-' + cap + '-pod');
+  if (url) url.style.display = (where === 'url') ? '' : 'none';
+  if (pod) pod.style.display = (where === 'pod') ? '' : 'none';
+}
+
+function _populateRemotes(rem){
+  document.getElementById('s-remotes-enabled').checked = rem.enabled !== false && (
+    Object.keys(rem.endpoints || {}).length > 0 || Object.keys(rem.pods || {}).length > 0);
+  document.getElementById('s-remotes-key').value = rem.api_key ?? '';
+  document.getElementById('s-remotes-max-body').value = rem.max_body_mb ?? '';
+  const host = document.getElementById('s-remotes-rows');
+  host.innerHTML = REMOTE_CAPS.map(c => _remoteRowHtml(c[0], c[1], c[2])).join('');
+  const eps = rem.endpoints || {}, pods = rem.pods || {};
+  REMOTE_CAPS.forEach(([cap]) => {
+    const set = (sfx, v) => { const el = document.getElementById('rc-' + cap + '-' + sfx);
+                              if (el) el.value = (v == null ? '' : v); };
+    const ep = eps[cap], pd = pods[cap];
+    // "runpod" as the endpoint is the shorthand for "use the pod block".
+    if (pd || (ep && String(ep).toLowerCase() === 'runpod')) {
+      set('where', 'pod');
+      const b = pd || {};
+      set('image', b.image); set('pool', b.pool); set('vram', b.min_vram_gb);
+      set('hourly', b.max_hourly_usd); set('maxpods', b.max_pods); set('idle', b.idle_timeout_s);
+    } else if (ep) {
+      set('where', 'url'); set('url', ep);
+    } else {
+      set('where', 'local');
+    }
+    _updateRemoteRow(cap);
+  });
+  toggleRemotesFields();
+}
+
+function _collectRemotes(){
+  const endpoints = {}, pods = {};
+  const val = id => (document.getElementById(id) || {}).value;
+  const numOrU = id => { const v = parseFloat(val(id)); return isNaN(v) ? undefined : v; };
+  const intOrU = id => { const v = parseInt(val(id)); return isNaN(v) ? undefined : v; };
+  REMOTE_CAPS.forEach(([cap]) => {
+    const where = val('rc-' + cap + '-where') || 'local';
+    if (where === 'url') {
+      const u = (val('rc-' + cap + '-url') || '').trim();
+      if (u) endpoints[cap] = u;
+    } else if (where === 'pod') {
+      const b = {};
+      const img = (val('rc-' + cap + '-image') || '').trim();
+      const pool = (val('rc-' + cap + '-pool') || '').trim();
+      if (img) b.image = img;
+      if (pool) b.pool = pool;
+      const vram = numOrU('rc-' + cap + '-vram');
+      const hourly = numOrU('rc-' + cap + '-hourly');
+      const maxpods = intOrU('rc-' + cap + '-maxpods');
+      const idle = intOrU('rc-' + cap + '-idle');
+      if (vram != null) b.min_vram_gb = vram;
+      if (hourly != null) b.max_hourly_usd = hourly;
+      if (maxpods != null) b.max_pods = maxpods;
+      if (idle != null) b.idle_timeout_s = idle;
+      pods[cap] = b;
+    }
+    // 'local' -> absent from both maps, which is what "run it here" means.
+  });
+  return {
+    enabled: document.getElementById('s-remotes-enabled').checked,
+    api_key: (val('s-remotes-key') || '').trim(),
+    max_body_mb: intOrU('s-remotes-max-body') ?? 512,
+    endpoints: endpoints,
+    pods: pods,
+  };
+}
+
 </script>
 {% endblock %}

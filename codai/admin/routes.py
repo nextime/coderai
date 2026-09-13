@@ -2710,12 +2710,23 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "auto_compact_model", "suppress_reasoning",
                 # Speech-to-text (wav2vec2 / vosk / NeMo-Canary) options.
                 "languages", "supports_translation", "keep_resident",
-                # Serve this model from somewhere else instead of loading it here:
-                # any OpenAI-compatible endpoint (another coderai, llama-server,
-                # vLLM, a rented pod). See codai/backends/remote_openai.py.
-                "service_url", "served_model", "api_key"):
+                ):
         if key in data:
             entry[key] = data[key]
+
+    # Serve this model from somewhere else instead of loading it here: any
+    # OpenAI-compatible endpoint (another coderai, llama-server, vLLM, a rented
+    # pod). See codai/backends/remote_openai.py. Blank REMOVES the setting — a
+    # key that is merely absent would leave a stale remote in place, and the
+    # model would keep going to a machine the user thought they had detached.
+    for key in ("service_url", "served_model", "api_key"):
+        if key in data:
+            val = (data.get(key) or "").strip() if isinstance(data.get(key), str) \
+                else data.get(key)
+            if val:
+                entry[key] = val
+            else:
+                entry.pop(key, None)
 
     # Per-model ds4 launch overrides (only meaningful for a deepseek4 model served
     # via the ds4 engine). Normalize to a small dict and drop it when empty, so the
@@ -2773,7 +2784,10 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         rpo = {}
         # strings
         for k in ("mode", "selection_criteria", "gpu_type", "image", "served_model",
-                  "endpoint_id", "cost_period"):
+                  "endpoint_id", "cost_period",
+                  # engine selection, private registries, and the pod's own token
+                  "engine", "hf_gguf", "health_path", "docker_args",
+                  "registry_auth_id", "api_key"):
             v = src.get(k)
             if isinstance(v, str) and v.strip():
                 rpo[k] = v.strip()
@@ -2788,14 +2802,15 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         if ct:
             rpo["cloud_types"] = ct
         # bools
-        for k in ("allow_spot",):
+        for k in ("allow_spot", "allow_open_pod", "sticky_sessions"):
             if k in src and src.get(k) is not None and src.get(k) != "":
                 sv = src.get(k)
                 rpo[k] = (sv.lower() in ("1", "true", "on", "yes")
                           if isinstance(sv, str) else bool(sv))
         # ints
         for k in ("container_disk_gb", "volume_gb", "port", "ctx", "min_pods",
-                  "max_pods", "scale_up_inflight_per_pod", "idle_timeout_s",
+                  "max_pods", "scale_up_inflight_per_pod", "max_inflight_per_pod",
+                  "idle_timeout_s",
                   "boot_timeout_s", "load_timeout_s", "min_workers", "max_workers"):
             v = src.get(k)
             if v not in (None, ""):

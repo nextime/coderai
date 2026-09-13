@@ -755,14 +755,78 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
               <span class="form-hint" style="font-size:11px">Wait for vLLM to serve the model — raise this for big models (long image pull + weight download).</span>
             </div>
           </div>
+          <div style="display:grid;grid-template-columns:1fr 2fr;gap:.5rem;margin-top:.5rem">
+            <div class="form-row" style="margin:0">
+              <label class="form-label">Pod engine</label>
+              <select id="cfg-rp-engine" class="form-input" onchange="_updateRunpodEngineHint()">
+                <option value="auto">Auto — vLLM, or llama.cpp for a GGUF</option>
+                <option value="vllm">vLLM (HF repo)</option>
+                <option value="llamacpp">llama.cpp (GGUF)</option>
+                <option value="coderai">coderai (a capability image)</option>
+                <option value="custom">Custom image</option>
+              </select>
+              <span class="form-hint" id="cfg-rp-engine-hint" style="font-size:11px"></span>
+            </div>
+            <div class="form-row" style="margin:0">
+              <label class="form-label">GGUF to serve <span class="muted">(llama.cpp pods)</span></label>
+              <input type="text" id="cfg-rp-hf-gguf" class="form-input" placeholder="user/repo:Q4_K_M">
+              <span class="form-hint" style="font-size:11px">A local .gguf path means nothing on a rented machine — name the HF repo the pod should download.</span>
+            </div>
+          </div>
           <div style="display:grid;grid-template-columns:2fr 1fr 1fr;gap:.5rem;margin-top:.5rem">
-            <div class="form-row" style="margin:0"><label class="form-label">Pod image <span class="muted">(blank = default vLLM)</span></label><input type="text" id="cfg-rp-image" class="form-input" placeholder="vllm/vllm-openai:latest"></div>
+            <div class="form-row" style="margin:0"><label class="form-label">Pod image <span class="muted">(blank = engine default)</span></label><input type="text" id="cfg-rp-image" class="form-input" placeholder="vllm/vllm-openai:latest"></div>
             <div class="form-row" style="margin:0"><label class="form-label">Disk (GB)</label><input type="number" id="cfg-rp-disk" class="form-input" min="1" placeholder="40"></div>
             <div class="form-row" style="margin:0"><label class="form-label">Port</label><input type="number" id="cfg-rp-port" class="form-input" min="1" placeholder="8000"></div>
           </div>
           <div class="form-row" style="margin:.5rem 0 0">
             <label class="form-label">Pod env <span class="muted">(KEY=VAL, space-separated — e.g. HF_TOKEN=…)</span></label>
             <input type="text" id="cfg-rp-env" class="form-input" placeholder="HF_TOKEN=hf_xxx">
+          </div>
+
+          <!-- Access. A RunPod proxy URL is reachable by anyone who learns it. -->
+          <div style="display:grid;grid-template-columns:2fr 1fr;gap:.5rem;margin-top:.5rem">
+            <div class="form-row" style="margin:0">
+              <label class="form-label">Pod bearer token <span class="muted">(blank = generated)</span></label>
+              <input type="text" id="cfg-rp-api-key" class="form-input" placeholder="auto-generated per pool">
+              <span class="form-hint" style="font-size:11px">The pod is launched requiring this token and coderai sends it. Blank does NOT mean open — one is generated.</span>
+            </div>
+            <div class="form-row" style="margin:0;align-self:end">
+              <label style="display:flex;align-items:center;gap:.3rem;font-size:12px"><input type="checkbox" id="cfg-rp-open" style="width:auto"> Leave pod open
+              </label>
+              <span class="form-hint" style="font-size:11px;color:var(--warn,#b58900)">Anyone with the pod URL can use your GPU. Only for images with no auth support.</span>
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-top:.5rem">
+            <div class="form-row" style="margin:0">
+              <label class="form-label">Registry credential id <span class="muted">(private images)</span></label>
+              <input type="text" id="cfg-rp-registry-auth" class="form-input" placeholder="blank = account default / public image">
+            </div>
+            <div class="form-row" style="margin:0">
+              <label class="form-label">Health path <span class="muted">(custom images)</span></label>
+              <input type="text" id="cfg-rp-health-path" class="form-input" placeholder="/v1/models — /healthz for a coderai pod">
+            </div>
+          </div>
+          <div class="form-row" style="margin:.5rem 0 0">
+            <label class="form-label">Docker args <span class="muted">(custom images — replaces the generated ones)</span></label>
+            <input type="text" id="cfg-rp-docker-args" class="form-input" placeholder="blank = generated for the engine above">
+          </div>
+
+          <!-- Concurrency: how the pool tracks real load. -->
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.5rem;margin-top:.5rem">
+            <div class="form-row" style="margin:0">
+              <label class="form-label">Scale up at <span class="muted">(in-flight/pod)</span></label>
+              <input type="number" id="cfg-rp-scale-up" class="form-input" min="1" placeholder="4">
+              <span class="form-hint" style="font-size:11px">Add a pod once the least-loaded one carries this many requests.</span>
+            </div>
+            <div class="form-row" style="margin:0">
+              <label class="form-label">Max in-flight per pod</label>
+              <input type="number" id="cfg-rp-max-inflight" class="form-input" min="0" placeholder="0 = unlimited">
+              <span class="form-hint" style="font-size:11px">Above this a request waits for a slot instead of piling on.</span>
+            </div>
+            <div class="form-row" style="margin:0;align-self:end">
+              <label style="display:flex;align-items:center;gap:.3rem;font-size:12px"><input type="checkbox" id="cfg-rp-sticky" style="width:auto" checked> Sticky sessions</label>
+              <span class="form-hint" style="font-size:11px">Send a conversation back to the pod whose cache still holds it.</span>
+            </div>
           </div>
         </div>
 
@@ -778,6 +842,76 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
               <option value="week">Week</option>
               <option value="month">Month</option>
             </select>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ Where this model runs ============ -->
+      <div class="form-section" style="margin-top:.75rem">
+        <div class="form-section-title">Placement — where this model runs</div>
+
+        <!-- (1) Served from another machine entirely. -->
+        <div class="form-row" style="margin:0">
+          <label class="form-label">Serve from a remote URL <span class="muted">(any OpenAI-compatible endpoint)</span></label>
+          <input type="text" id="cfg-remote-url" class="form-input" placeholder="blank = run it here — e.g. http://gpu-box:8080">
+          <span class="form-hint" style="font-size:11px">Another coderai, llama-server, vLLM, a pod. Nothing is downloaded and no local VRAM is used.</span>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-top:.5rem">
+          <div class="form-row" style="margin:0"><label class="form-label">Name on the remote <span class="muted">(optional)</span></label><input type="text" id="cfg-remote-served" class="form-input" placeholder="blank = this model's own name"></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Remote bearer token <span class="muted">(optional)</span></label><input type="text" id="cfg-remote-key" class="form-input" placeholder="if the remote requires one"></div>
+        </div>
+
+        <!-- (2) Local primary, burst the overflow to RunPod. -->
+        <div class="form-row" style="margin:.75rem 0 0">
+          <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer">
+            <input type="checkbox" id="cfg-spill-enabled" style="width:auto" onchange="_updateSpillVisibility()">
+            <span class="form-label" style="margin:0">Burst to RunPod when local can't keep up</span>
+          </label>
+          <span class="form-hint" style="font-size:11px">Local stays primary. If a burst can't be opened the request just queues locally.</span>
+        </div>
+        <div id="cfg-spill-box" style="display:none;margin-top:.5rem">
+          <div class="form-row" style="margin:0">
+            <label class="form-label">Burst when…</label>
+            <div style="display:flex;gap:1rem;flex-wrap:wrap;font-size:12px">
+              <label style="display:flex;align-items:center;gap:.3rem"><input type="checkbox" id="cfg-spill-busy" style="width:auto"> No free local slot <span class="muted">(the 2nd concurrent request)</span></label>
+              <label style="display:flex;align-items:center;gap:.3rem"><input type="checkbox" id="cfg-spill-queue" style="width:auto"> The wait queue is full</label>
+              <label style="display:flex;align-items:center;gap:.3rem"><input type="checkbox" id="cfg-spill-nogpu" style="width:auto"> No local GPU can serve it</label>
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-top:.5rem">
+            <div class="form-row" style="margin:0">
+              <label class="form-label">Burst target</label>
+              <select id="cfg-spill-mode" class="form-input" onchange="_updateSpillVisibility()">
+                <option value="pods">Pods — coderai provisions, scales and reaps them</option>
+                <option value="serverless">Serverless — your own RunPod endpoint</option>
+              </select>
+            </div>
+            <div class="form-row" style="margin:0"><label class="form-label">Name on the target <span class="muted">(optional)</span></label><input type="text" id="cfg-spill-served" class="form-input" placeholder="blank = this model's own name"></div>
+          </div>
+          <div id="cfg-spill-serverless" style="margin-top:.5rem;display:none">
+            <div class="form-row" style="margin:0"><label class="form-label">Serverless endpoint id</label><input type="text" id="cfg-spill-endpoint" class="form-input" placeholder="from your RunPod serverless endpoint"></div>
+          </div>
+          <div id="cfg-spill-pods" style="margin-top:.5rem">
+            <div style="display:grid;grid-template-columns:1fr 2fr;gap:.5rem">
+              <div class="form-row" style="margin:0">
+                <label class="form-label">Engine</label>
+                <select id="cfg-spill-engine" class="form-input">
+                  <option value="auto">Auto</option>
+                  <option value="vllm">vLLM (HF repo)</option>
+                  <option value="llamacpp">llama.cpp (GGUF)</option>
+                  <option value="coderai">coderai image</option>
+                  <option value="custom">Custom image</option>
+                </select>
+              </div>
+              <div class="form-row" style="margin:0"><label class="form-label">GGUF to serve / image</label><input type="text" id="cfg-spill-hf-gguf" class="form-input" placeholder="user/repo:Q4_K_M"></div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:.5rem;margin-top:.5rem">
+              <div class="form-row" style="margin:0"><label class="form-label">Min VRAM (GB)</label><input type="number" id="cfg-spill-min-vram" class="form-input" min="0" placeholder="0 = any"></div>
+              <div class="form-row" style="margin:0"><label class="form-label">Max $/hr</label><input type="number" id="cfg-spill-max-hourly" class="form-input" min="0" step="0.01" placeholder="0 = no cap"></div>
+              <div class="form-row" style="margin:0"><label class="form-label">Max pods</label><input type="number" id="cfg-spill-max-pods" class="form-input" min="1" placeholder="1"></div>
+              <div class="form-row" style="margin:0"><label class="form-label">Idle timeout (s)</label><input type="number" id="cfg-spill-idle" class="form-input" min="0" placeholder="300"></div>
+            </div>
+            <div class="form-row" style="margin:.5rem 0 0"><label class="form-label">Pod image <span class="muted">(coderai / custom engines)</span></label><input type="text" id="cfg-spill-image" class="form-input" placeholder="ghcr.io/you/coderai-images:0.2.0"></div>
           </div>
         </div>
       </div>
@@ -4012,7 +4146,100 @@ function _populateRunpod(s){
   set('cfg-rp-env', Object.keys(env).map(k=>k+'='+env[k]).join(' '));
   set('cfg-rp-cost-limit', rp.cost_limit_usd != null ? rp.cost_limit_usd : '');
   set('cfg-rp-cost-period', rp.cost_period || 'unlimited');
+  set('cfg-rp-engine', rp.engine || 'auto');
+  set('cfg-rp-hf-gguf', rp.hf_gguf || '');
+  set('cfg-rp-api-key', rp.api_key || '');
+  chk('cfg-rp-open', rp.allow_open_pod);
+  set('cfg-rp-registry-auth', rp.registry_auth_id || '');
+  set('cfg-rp-health-path', rp.health_path || '');
+  set('cfg-rp-docker-args', rp.docker_args || '');
+  set('cfg-rp-scale-up', rp.scale_up_inflight_per_pod != null ? rp.scale_up_inflight_per_pod : '');
+  set('cfg-rp-max-inflight', rp.max_inflight_per_pod != null ? rp.max_inflight_per_pod : '');
+  chk('cfg-rp-sticky', rp.sticky_sessions !== false);
   _updateRunpodVisibility();
+  _updateRunpodEngineHint();
+  _populatePlacement(s);
+}
+
+// Placement: a remote URL for this model, and/or burst-to-RunPod spillover.
+function _populatePlacement(s){
+  const set = (id,v)=>{ const el=document.getElementById(id); if(el!=null) el.value=(v==null?'':v); };
+  const chk = (id,v)=>{ const el=document.getElementById(id); if(el) el.checked=!!v; };
+  set('cfg-remote-url', (s && s.service_url) || '');
+  set('cfg-remote-served', (s && s.served_model) || '');
+  set('cfg-remote-key', (s && s.api_key) || '');
+  const sp = (s && s.runpod_spillover) || {};
+  const tg = sp.target || {};
+  chk('cfg-spill-enabled', sp.enabled);
+  chk('cfg-spill-busy', sp.on_busy);
+  chk('cfg-spill-queue', sp.on_concurrency_full);
+  chk('cfg-spill-nogpu', sp.on_no_gpu);
+  set('cfg-spill-mode', tg.mode || 'pods');
+  set('cfg-spill-served', tg.served_model || '');
+  set('cfg-spill-endpoint', tg.endpoint_id || '');
+  set('cfg-spill-engine', tg.engine || 'auto');
+  set('cfg-spill-hf-gguf', tg.hf_gguf || '');
+  set('cfg-spill-min-vram', tg.min_vram_gb != null ? tg.min_vram_gb : '');
+  set('cfg-spill-max-hourly', tg.max_hourly_usd != null ? tg.max_hourly_usd : '');
+  set('cfg-spill-max-pods', tg.max_pods != null ? tg.max_pods : '');
+  set('cfg-spill-idle', tg.idle_timeout_s != null ? tg.idle_timeout_s : '');
+  set('cfg-spill-image', tg.image || '');
+  _updateSpillVisibility();
+}
+
+function _updateSpillVisibility(){
+  const on = (document.getElementById('cfg-spill-enabled') || {}).checked;
+  const box = document.getElementById('cfg-spill-box');
+  if (box) box.style.display = on ? '' : 'none';
+  const mode = (document.getElementById('cfg-spill-mode') || {}).value || 'pods';
+  const sl = document.getElementById('cfg-spill-serverless');
+  const pd = document.getElementById('cfg-spill-pods');
+  if (sl) sl.style.display = (mode === 'serverless') ? '' : 'none';
+  if (pd) pd.style.display = (mode === 'serverless') ? 'none' : '';
+}
+
+function _updateRunpodEngineHint(){
+  const el = document.getElementById('cfg-rp-engine');
+  const hint = document.getElementById('cfg-rp-engine-hint');
+  if (!el || !hint) return;
+  const HINTS = {
+    auto: 'A GGUF goes to llama.cpp, anything else to vLLM.',
+    vllm: 'Serves an HF repo. vLLM\'s GGUF support is experimental — use llama.cpp for those.',
+    llamacpp: 'Serves the GGUF named on the right; the pod downloads it itself.',
+    coderai: 'A whole coderai serving one capability. Needs a pod image you have pushed.',
+    custom: 'Your image, your docker args, your health path.',
+  };
+  hint.textContent = HINTS[el.value] || '';
+}
+
+// Build the per-model spillover block. Undefined when disabled, so the entry
+// stays clean and the model is simply local.
+function _collectSpillover(){
+  const on = (document.getElementById('cfg-spill-enabled') || {}).checked;
+  if (!on) return undefined;
+  const val = id => (document.getElementById(id) || {}).value;
+  const numOrU = id => { const v = parseFloat(val(id)); return isNaN(v) ? undefined : v; };
+  const intOrU = id => { const v = parseInt(val(id)); return isNaN(v) ? undefined : v; };
+  const mode = val('cfg-spill-mode') || 'pods';
+  const target = { mode: mode, served_model: (val('cfg-spill-served') || '').trim() };
+  if (mode === 'serverless') {
+    target.endpoint_id = (val('cfg-spill-endpoint') || '').trim();
+  } else {
+    target.engine        = val('cfg-spill-engine') || 'auto';
+    target.hf_gguf       = (val('cfg-spill-hf-gguf') || '').trim();
+    target.min_vram_gb   = numOrU('cfg-spill-min-vram');
+    target.max_hourly_usd= numOrU('cfg-spill-max-hourly');
+    target.max_pods      = intOrU('cfg-spill-max-pods');
+    target.idle_timeout_s= intOrU('cfg-spill-idle');
+    target.image         = (val('cfg-spill-image') || '').trim();
+  }
+  return {
+    enabled: true,
+    on_busy:             (document.getElementById('cfg-spill-busy') || {}).checked,
+    on_concurrency_full: (document.getElementById('cfg-spill-queue') || {}).checked,
+    on_no_gpu:           (document.getElementById('cfg-spill-nogpu') || {}).checked,
+    target: target,
+  };
 }
 // Build the per-model runpod block. Only meaningful when backend=runpod; the
 // backend normalizes/drops empty fields.
@@ -4052,6 +4279,16 @@ function _collectRunpod(){
     env:                Object.keys(env).length ? env : undefined,
     cost_limit_usd:     numOrU('cfg-rp-cost-limit'),
     cost_period:        val('cfg-rp-cost-period') || 'unlimited',
+    engine:             val('cfg-rp-engine') || 'auto',
+    hf_gguf:            (val('cfg-rp-hf-gguf') || '').trim(),
+    api_key:            (val('cfg-rp-api-key') || '').trim(),
+    allow_open_pod:     document.getElementById('cfg-rp-open').checked,
+    registry_auth_id:   (val('cfg-rp-registry-auth') || '').trim(),
+    health_path:        (val('cfg-rp-health-path') || '').trim(),
+    docker_args:        (val('cfg-rp-docker-args') || '').trim(),
+    scale_up_inflight_per_pod: intOrU('cfg-rp-scale-up'),
+    max_inflight_per_pod:      intOrU('cfg-rp-max-inflight'),
+    sticky_sessions:    document.getElementById('cfg-rp-sticky').checked,
   };
   return o;
 }
@@ -4075,6 +4312,13 @@ async function saveModelConfig(){
     config_name:       document.getElementById('cfg-config-name').value.trim() || null,
     backend:           document.getElementById('cfg-backend').value,
     runpod:            _collectRunpod(),
+    // Placement: serve this model from elsewhere, and/or burst the overflow.
+    // Always sent, even when blank: an empty value is how you REMOVE a remote,
+    // and a key that is simply absent leaves the old one in place.
+    service_url:       (document.getElementById('cfg-remote-url').value || '').trim(),
+    served_model:      (document.getElementById('cfg-remote-served').value || '').trim(),
+    api_key:           (document.getElementById('cfg-remote-key').value || '').trim(),
+    runpod_spillover:  _collectSpillover(),
     load_mode:         document.getElementById('cfg-load-mode').value,
     languages:         (function(){ const v=document.getElementById('cfg-stt-languages').value.trim();
                           return v ? v.split(',').map(s=>s.trim()).filter(Boolean) : []; })(),
