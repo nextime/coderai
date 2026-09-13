@@ -1013,7 +1013,14 @@ video{width:100%;border-radius:14px;margin-top:12px;background:#000}
         <div><label>Trigger word</label><input id="trigger" placeholder="(character name)"></div>
       </div>
       <div class="row3">
-        <div><label>Target</label><select id="train_target"><option value="video">video</option><option value="image">image</option></select></div>
+        <div><label>Target</label><select id="train_target">
+          <option value="video">video (auto)</option>
+          <option value="wan">wan</option>
+          <option value="ltx2">ltx2</option>
+          <option value="h3">minimax-h3</option>
+          <option value="krea">krea 2</option>
+          <option value="image">image (sd/sdxl/z-image)</option>
+        </select></div>
         <div><label>Steps</label><input id="train_steps" type="number" value="800"></div>
         <div><label>Rank</label><input id="rank" type="number" value="16"></div>
       </div>
@@ -1454,8 +1461,12 @@ def video_opts(args: argparse.Namespace) -> dict[str, Any]:
 
 def add_train_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lora-name", default="", help="Output LoRA name (default: <character>_identity)")
-    parser.add_argument("--target", choices=["video", "image"], default="video",
-                        help="Pipeline the LoRA is trained for (default: video)")
+    parser.add_argument("--target", default="video",
+                        choices=["video", "image", "wan", "ltx2", "h3", "krea"],
+                        help="Which architecture to train the LoRA for. 'video' picks "
+                             "it from the model id (Wan unless it looks like LTX-2 or "
+                             "H3); the explicit names force one. 'image' is the "
+                             "SD1.x/SDXL/Z-Image trainer. (default: video)")
     parser.add_argument("--base-model", default="", help="Model to train against (default: the studio's video/image model)")
     parser.add_argument("--trigger", default="", help="Trigger word (default: the character name)")
     parser.add_argument("--instance-prompt", default="", help="Override the training caption")

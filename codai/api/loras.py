@@ -431,6 +431,9 @@ class LoraTrainRequest(BaseModel):
     # Target pipeline for the LoRA: "image" (default, SD1.x/SDXL UNet) or "video"
     # (Wan video DiT). For "video", `base_model` is the VIDEO model id/path and the
     # LoRA is trained against that exact model so it loads on the video pipeline.
+    # image | video | wan | ltx2 | h3 | krea. "video" auto-detects the architecture
+    # from the model id (Wan unless it looks like LTX-2 / H3); the explicit names
+    # force one. See codai/api/lora_archs.py.
     target: Optional[str] = "image"
     # Quantize the (large) video transformer to 4-bit for training (QLoRA). Lets a
     # 14B video model's LoRA fit on a consumer GPU. Ignored for image targets.
@@ -976,8 +979,11 @@ def _train_lora_sync(req: LoraTrainRequest) -> dict:
     # ── Video (Wan DiT) LoRA target ───────────────────────────────────────────
     # Train directly against the configured VIDEO model so the resulting LoRA
     # loads on the video pipeline. No SD UNet fallback here — the base IS the DiT.
-    if (req.target or "image").lower() == "video":
-        video_path = _resolve_base_model_path(req.base_model, category="video")
+    from codai.api.lora_archs import detect_arch as _detect_arch
+    _target = (req.target or "image").lower()
+    if _target in ("video", "wan", "ltx2", "h3", "krea"):
+        _cat = "image" if _target == "krea" else "video"
+        video_path = _resolve_base_model_path(req.base_model, category=_cat)
         steps = max(50, min(5000, int(req.steps or 800)))
         rank = max(2, min(128, int(req.rank or 16)))
         resolution = int(req.resolution or 512)
@@ -1007,6 +1013,14 @@ def _train_lora_sync(req: LoraTrainRequest) -> dict:
         except Exception as e:
             print(f"  [lora] could not unload models before training: {e}")
         device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+        # Which flow-matching architecture is this? An explicit target wins,
+        # otherwise it is read off the model id — so `target: video` keeps meaning
+        # Wan for existing configs, while an LTX-2 or H3 path routes itself.
+        _arch = _detect_arch(video_path, _target) or "wan"
+        if _arch != "wan":
+            print(f"  [lora] training a {_arch} adapter for {video_path}")
+            return _train_flow_dit(_arch, req, video_path, images, instance_prompt,
+                                   steps, rank, resolution, lr, seed, device)
         return _train_wan(req, video_path, images, instance_prompt,
                           steps, rank, resolution, lr, seed, device)
 
@@ -1713,6 +1727,193 @@ def _train_dit(req, base_path, images, instance_prompt,
     path = _lora_weight_file(name) or save_dir
     _set_progress(active=False, status="done", message="done", path=path)
     return {"name": name, "path": path}
+
+
+def _train_flow_dit(arch: str, req, base_path, images, instance_prompt,
+                    steps, rank, resolution, lr, seed, device):
+    """LoRA for a flow-matching DiT — LTX-2, MiniMax-H3, Krea 2.
+
+    All three are the same training problem as Wan: encode the references to VAE
+    latents, encode the prompt once, add a rectified-flow adapter to the
+    transformer's attention projections, and regress the velocity. Only the
+    classes, the latent rank and the timestep shift differ, so those live in
+    codai/api/lora_archs.py and this loop is shared rather than copied.
+
+    NOT yet run against real weights for any of the three — the classes and the
+    contracts are right, the arithmetic is the same as the proven Wan path, but
+    treat the first real run as a debugging session.
+    """
+    import torch
+    import torch.nn.functional as F
+    from peft import LoraConfig as PeftLoraConfig
+    from peft.utils import get_peft_model_state_dict
+    from torchvision import transforms
+    from diffusers.utils import convert_state_dict_to_diffusers
+
+    from codai.api.lora_archs import load_classes
+    tr_cls, vae_cls, te_cls, tok_cls, spec = load_classes(arch)
+
+    name = req.name
+    torch.manual_seed(seed)
+    compute_dtype = torch.bfloat16
+    quantize = bool(getattr(req, "quantize_4bit", True))
+    is_video = spec["kind"] == "video"
+    num_frames = max(1, int(getattr(req, "num_frames", 1) or 1)) if is_video else 1
+
+    q_cfg = None
+    if quantize:
+        try:
+            from diffusers import BitsAndBytesConfig as _DiffBnb
+            q_cfg = _DiffBnb(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                             bnb_4bit_compute_dtype=compute_dtype)
+        except Exception as e:
+            print(f"  [lora][{arch}] 4-bit unavailable ({e}); loading in bf16")
+
+    _set_progress(status="preparing", message=f"loading {spec['label']}: {base_path}")
+    vae = vae_cls.from_pretrained(base_path, subfolder="vae", torch_dtype=torch.float32)
+    vae.requires_grad_(False)
+    vae.eval()
+    tokenizer = tok_cls.from_pretrained(base_path, subfolder="tokenizer")
+    text_encoder = te_cls.from_pretrained(base_path, subfolder="text_encoder",
+                                          torch_dtype=compute_dtype)
+    text_encoder.requires_grad_(False)
+    text_encoder.eval()
+    tr_kwargs = dict(subfolder="transformer", torch_dtype=compute_dtype)
+    if q_cfg is not None:
+        tr_kwargs["quantization_config"] = q_cfg
+    transformer = tr_cls.from_pretrained(base_path, **tr_kwargs)
+    if q_cfg is None:
+        transformer = transformer.to(device)
+
+    # ── 1. references -> latents ──────────────────────────────────────────────
+    _set_progress(status="preparing", message="encoding reference images (VAE)")
+    vae.to(device)
+    spatial = (resolution // 32) * 32          # every one of these VAEs likes /32
+    tfm = transforms.Compose([
+        transforms.Resize(spatial, interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.CenterCrop(spatial),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
+    scale = float(getattr(getattr(vae, "config", None), "scaling_factor", 1.0) or 1.0)
+    latents_list = []
+    with torch.no_grad():
+        for img in images:
+            px = tfm(img)
+            if is_video:
+                vid = px.unsqueeze(0).unsqueeze(2)              # [1,3,1,H,W]
+                if num_frames > 1:
+                    vid = vid.repeat(1, 1, num_frames, 1, 1)
+                sample = vid
+            else:
+                sample = px.unsqueeze(0)                        # [1,3,H,W]
+            enc = vae.encode(sample.to(device, dtype=torch.float32))
+            lat = enc.latent_dist.sample() if hasattr(enc, "latent_dist") else enc.latents
+            latents_list.append((lat * scale).to(compute_dtype).cpu())
+    vae.to("cpu")
+    _free_train_vram()
+    if not latents_list:
+        raise HTTPException(status_code=400, detail="No reference images could be encoded")
+
+    # ── 2. prompt -> one cached embedding ─────────────────────────────────────
+    text_encoder.to(device)
+    with torch.no_grad():
+        tok = tokenizer(instance_prompt, padding="max_length",
+                        max_length=int(spec.get("max_text_len", 256)),
+                        truncation=True, return_tensors="pt")
+        ids = tok.input_ids.to(device)
+        mask = tok.attention_mask.to(device)
+        out = text_encoder(ids, attention_mask=mask)
+        enc = getattr(out, "last_hidden_state", None)
+        if enc is None:
+            enc = out[0]
+        encoder_hidden_states = (enc * mask.unsqueeze(-1)).to(compute_dtype).cpu()
+    text_encoder.to("cpu")
+    _free_train_vram()
+
+    # ── 3. adapter ────────────────────────────────────────────────────────────
+    lora_cfg = PeftLoraConfig(r=rank, lora_alpha=rank, init_lora_weights="gaussian",
+                              target_modules=["to_k", "to_q", "to_v", "to_out.0"])
+    transformer.requires_grad_(False)
+    _ensure_peft_awq_compat()
+    transformer.add_adapter(lora_cfg, adapter_name="default")
+    try:
+        transformer.enable_gradient_checkpointing()
+    except Exception:
+        pass
+    transformer.train()
+    lora_params = [p for p in transformer.parameters() if p.requires_grad]
+    if not lora_params:
+        raise HTTPException(status_code=500,
+                            detail=f"{arch} LoRA: no trainable adapter params were created")
+    optimizer = torch.optim.AdamW(lora_params, lr=lr)
+
+    start_step = 0
+    _ck = (_load_train_state(name, base_path=base_path, target=arch, rank=rank,
+                             session=getattr(req, "session", None))
+           if _resume_allowed(req) else None)
+    if _ck:
+        try:
+            _apply_peft_checkpoint(name, "t", transformer)
+            start_step = int(_ck["step"])
+            _set_progress(step=start_step, message=f"resuming from step {start_step}/{steps}")
+        except Exception as exc:
+            print(f"  [lora][{arch}] checkpoint ignored: {exc}")
+            start_step = 0
+
+    # ── 4. rectified-flow training ────────────────────────────────────────────
+    shift = float(spec.get("shift", 3.0))
+    num_train_t = 1000.0
+    _set_progress(status="training", message=f"training ({spec['label']} LoRA)")
+    n = len(latents_list)
+    for step in range(start_step, steps):
+        _check_train_cancel()
+        x0 = latents_list[step % n].to(device, dtype=compute_dtype)
+        noise = torch.randn_like(x0)
+        u = torch.rand(1, device=device, dtype=torch.float32)
+        sigma = (shift * u) / (1.0 + (shift - 1.0) * u)
+        s = sigma.view(*([-1] + [1] * (x0.dim() - 1)))
+        x0f = x0.float()
+        x_t = ((1.0 - s) * x0f + s * noise.float()).to(compute_dtype)
+        target = (noise.float() - x0f).to(compute_dtype)
+        timestep = (sigma * num_train_t).to(torch.float32)
+        pred = transformer(hidden_states=x_t, timestep=timestep,
+                           encoder_hidden_states=encoder_hidden_states.to(device),
+                           return_dict=False)[0]
+        loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
+        optimizer.step()
+        optimizer.zero_grad()
+        if (step + 1) % 10 == 0 or step + 1 == steps:
+            _set_progress(step=step + 1, total=steps,
+                          message=f"step {step + 1}/{steps} loss={loss.item():.4f}")
+        if (step + 1) % 100 == 0:
+            _save_train_checkpoint(name, {"step": step + 1, "base_path": base_path,
+                                          "target": arch, "rank": rank,
+                                          "session": getattr(req, "session", None)},
+                                   {"t": get_peft_model_state_dict(transformer)})
+
+    # ── 5. save ───────────────────────────────────────────────────────────────
+    _set_progress(status="saving", message="saving adapter")
+    save_dir = _lora_dir(name)
+    os.makedirs(save_dir, exist_ok=True)
+    layers = convert_state_dict_to_diffusers(get_peft_model_state_dict(transformer))
+    try:
+        from safetensors.torch import save_file
+        save_file({k: v.contiguous() for k, v in layers.items()},
+                  os.path.join(save_dir, "pytorch_lora_weights.safetensors"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Saving the adapter failed: {exc}")
+    _write_meta(name, req, base_path, len(images), arch, instance_prompt)
+    _clear_train_checkpoint(name)
+    try:
+        transformer.delete_adapters(["default"])
+    except Exception:
+        pass
+    del transformer
+    _free_train_vram()
+    return {"name": name, "path": save_dir, "arch": arch, "steps": steps}
 
 
 def _train_wan(req, base_path, images, instance_prompt,
