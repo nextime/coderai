@@ -82,25 +82,53 @@ DEFAULT_VOICE = {"feminine": "af_sarah", "masculine": "am_michael"}
 SPEED_FACTORS = [2, 4, 8, 16, 32, 64, 128, 240]
 
 
-def tts_emotions(model: str) -> list:
-    """Emotions the configured TTS model can steer, or [] when unavailable.
-
-    Looked up from the CoderAI backend's family map when importable; the editor
-    only offers an emotion picker when this is non-empty."""
-    try:
-        from codai.api.tts_backends import family_emotions
-        return family_emotions(model or "")
-    except Exception:
-        return []
+_TTS_CAPS_CACHE: dict = {}
 
 
-def tts_styles(model: str) -> list:
+def _tts_caps(model: str, cfg=None) -> dict:
+    """Emotions/styles for a TTS model, asked of the CoderAI API.
+
+    Over HTTP rather than by importing codai.api.tts_backends, so the editor works
+    when it runs somewhere else entirely — its own container, talking to coderai
+    through a proxy. Falls back to the local import when the endpoint isn't there
+    (older server), and to {} when neither works: the pickers simply don't appear.
+    """
+    key = model or ""
+    base = (getattr(cfg, "base_url", "") or "").rstrip("/")
+    cache_key = (base, key)
+    if cache_key in _TTS_CAPS_CACHE:
+        return _TTS_CAPS_CACHE[cache_key]
+    caps = {}
+    if base:
+        try:
+            import requests
+            api_key = getattr(cfg, "api_key", "") or ""
+            r = requests.get(f"{base}/v1/audio/speech/capabilities",
+                             params={"model": key},
+                             headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+                             timeout=15)
+            if r.ok:
+                caps = r.json() or {}
+        except Exception:
+            caps = {}
+    if not caps:
+        try:    # same process as the server (bundled deployment)
+            from codai.api.tts_backends import family_emotions, family_styles
+            caps = {"emotions": family_emotions(key), "styles": family_styles(key)}
+        except Exception:
+            caps = {}
+    _TTS_CAPS_CACHE[cache_key] = caps
+    return caps
+
+
+def tts_emotions(model: str, cfg=None) -> list:
+    """Emotions the configured TTS model can steer, or [] when unavailable."""
+    return list(_tts_caps(model, cfg).get("emotions") or [])
+
+
+def tts_styles(model: str, cfg=None) -> list:
     """Delivery styles (whisper/shout/tone/…) the model can steer, or []."""
-    try:
-        from codai.api.tts_backends import family_styles
-        return family_styles(model or "")
-    except Exception:
-        return []
+    return list(_tts_caps(model, cfg).get("styles") or [])
 
 
 # --------------------------------------------------------------------------- #
@@ -1431,8 +1459,8 @@ def make_handler(editor: Editor):
                 "voices": VOICES,
                 "speedFactors": SPEED_FACTORS,
                 "ttsModel": cfg.tts_model,
-                "ttsEmotions": tts_emotions(cfg.tts_model),
-                "ttsStyles": tts_styles(cfg.tts_model),
+                "ttsEmotions": tts_emotions(cfg.tts_model, cfg),
+                "ttsStyles": tts_styles(cfg.tts_model, cfg),
                 "sttModel": cfg.stt_model,
                 "audioModel": cfg.audio_model,
                 "defaultVideo": cfg.default_video,

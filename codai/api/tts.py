@@ -79,6 +79,25 @@ class TTSResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+@router.get("/v1/audio/speech/capabilities", summary="What a TTS model can steer")
+async def speech_capabilities(model: str = ""):
+    """Emotions and delivery styles the given TTS model supports.
+
+    Exposed over HTTP because the bundled tools need it: the video editor used to
+    import codai.api.tts_backends directly to populate its emotion/style pickers,
+    which only works while the tool shares a process tree with the server. Over the
+    API it works from anywhere — including a tool running in its own container.
+    """
+    from codai.api import tts_backends
+    name = (model or "").strip()
+    return {
+        "model": name,
+        "family": tts_backends._family(name),
+        "emotions": tts_backends.family_emotions(name),
+        "styles": tts_backends.family_styles(name),
+    }
+
+
 @router.post("/v1/audio/speech", summary="Text-to-speech synthesis")
 async def create_speech(request: TTSRequest, http_request: Request = None):
     """
