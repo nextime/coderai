@@ -466,6 +466,80 @@ def test_pod_plan_per_engine():
     assert cus["args"] == "--serve" and cus["health_path"] == "/ping"
 
 
+def test_every_v1_endpoint_is_either_mapped_or_deliberately_skipped():
+    """A new /v1 endpoint that nobody mapped would silently stay local."""
+    import re
+    from codai.api.remote_gateway import capability_for, _SKIP_PATHS
+
+    root = Path(__file__).resolve().parents[1] / "codai" / "api"
+    pat = re.compile(r'@router\.(?:post|get|put|delete)\("(/v1[^"]*)"')
+    paths = {m for f in root.glob("*.py") for m in pat.findall(f.read_text())}
+    assert paths, "no /v1 routes found — did the decorator style change?"
+
+    unmapped = sorted(p for p in paths
+                      if not capability_for(p) and p not in _SKIP_PATHS)
+    assert unmapped == [], f"unmapped /v1 endpoints: {unmapped}"
+
+
+def test_generated_file_urls_are_rewritten_and_followed_back(gateway_app, monkeypatch):
+    """`response_format: url` returns a URL built from the REMOTE's base. Left
+    alone it points at a host the client may not reach, and fetching it here is a
+    404 — the file is on the pod."""
+    client, gw, url = gateway_app
+    from fastapi import Request
+
+    app = client.app
+
+    @app.post("/v1/images/edits")
+    async def edits(req: Request):          # pragma: no cover - remote in this test
+        return {"served_by": "local"}
+
+    @app.get("/v1/files/{name}")
+    async def files(name: str):             # pragma: no cover - remote in this test
+        return {"served_by": "local", "name": name}
+
+    class _Files(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def _send(self, obj):
+            raw = json.dumps(obj).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(n)
+            # exactly what a remote coderai answers with response_format=url
+            self._send({"data": [{"url": "http://pod-xyz:8000/v1/files/out-1.png"}]})
+
+        def do_GET(self):
+            self._send({"served_by": "remote-files", "path": self.path})
+
+    remote, shutdown = _serve(_Files)
+    try:
+        gw.capability_endpoints = lambda: {"images": remote}
+        r = client.post("/v1/images/edits", json={"model": "sdxl"})
+        got = r.json()["data"][0]["url"]
+        # rewritten to this instance...
+        assert got.endswith("/v1/files/out-1.png") and "pod-xyz" not in got
+        # ...and we remember which remote actually holds it
+        assert gw.file_origin("out-1.png") == remote
+
+        # so fetching it follows back to that remote, not to the local route
+        gw.capability_endpoints = lambda: {}
+        assert client.get("/v1/files/out-1.png").json()["served_by"] == "remote-files"
+        # a file we never saw is served locally
+        assert client.get("/v1/files/unknown.png").json()["served_by"] == "local"
+    finally:
+        shutdown()
+
+
 def test_unreachable_remote_is_a_clean_502(gateway_app):
     client, gw, _ = gateway_app
     gw.capability_endpoints = lambda: {"images": "http://127.0.0.1:1"}

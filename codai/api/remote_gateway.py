@@ -56,6 +56,8 @@ _CAPABILITY_PREFIXES = (
     ("/v1/audio/convert", "voice"),
     ("/v1/audio/watermark", "voice"),
     ("/v1/audio/generate", "audio_gen"),
+    # Progress polling has to follow the job: it is the remote that is rendering.
+    ("/v1/audio/progress", "audio_gen"),
     ("/v1/audio/stems", "stems"),
     ("/v1/audio/cleanup", "audio_clean"),
     ("/v1/images/to3d", "spatial"),
@@ -75,6 +77,30 @@ _CAPABILITY_PREFIXES = (
     ("/v1/pipelines", "pipelines"),
     ("/v1/faceswap", "faceswap"),
 )
+
+#: filename -> the remote base that produced it. A generated file lives on the
+#: machine that rendered it, and `response_format: "url"` hands the client a URL
+#: built from THAT machine's base — unreachable from here, and a 404 if fetched
+#: locally. So rewrite those URLs to point at this instance and remember where to
+#: fetch them from. Bounded: this is a routing hint, not a store.
+_FILE_ORIGINS: "OrderedDict[str, str]" = None
+_FILE_ORIGINS_MAX = 4096
+
+
+def _remember_file(filename: str, base: str) -> None:
+    global _FILE_ORIGINS
+    from collections import OrderedDict
+    if _FILE_ORIGINS is None:
+        _FILE_ORIGINS = OrderedDict()
+    _FILE_ORIGINS[filename] = base
+    _FILE_ORIGINS.move_to_end(filename)
+    while len(_FILE_ORIGINS) > _FILE_ORIGINS_MAX:
+        _FILE_ORIGINS.popitem(last=False)
+
+
+def file_origin(filename: str) -> str:
+    return (_FILE_ORIGINS or {}).get(filename, "")
+
 
 #: Handled by RemoteOpenAIBackend instead — see the module docstring.
 _SKIP_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/models")
@@ -230,6 +256,10 @@ def resolve_target(path: str, method: str, query: str, body: bytes,
     """Decide where this request should go, or None to serve it locally."""
     if not path.startswith("/v1/") or path in _SKIP_PATHS:
         return None
+    # A generated file is fetched from whichever remote rendered it.
+    if path.startswith("/v1/files/"):
+        base = file_origin(path[len("/v1/files/"):])
+        return Target(url=base, reason="generated file") if base else None
     cap = capability_for(path)
     model = _model_from_body(body, content_type)
     if not model and query:
@@ -347,11 +377,26 @@ class RemoteGatewayMiddleware:
         except Exception as exc:
             return await _error(send, 502, f"remote endpoint {base} unreachable: {exc}")
 
-        out = [(b"content-type", (resp.headers.get("Content-Type") or "application/json")
-                .encode("latin-1"))]
+        ctype = resp.headers.get("Content-Type") or "application/json"
+        out = [(b"content-type", ctype.encode("latin-1"))]
         for h in ("content-disposition", "cache-control"):
             if resp.headers.get(h):
                 out.append((h.encode(), resp.headers[h].encode("latin-1")))
+
+        # A JSON answer may carry /v1/files/… URLs built from the REMOTE's base.
+        # Those are useless to the client (wrong host, and a 404 if fetched here),
+        # so rewrite them to this instance and remember where the file actually
+        # is. Small bodies only: everything else streams through untouched.
+        if "json" in ctype.lower():
+            raw = await asyncio.to_thread(lambda: resp.content)
+            resp.close()
+            raw = _rewrite_file_urls(raw, base, _local_base(scope, headers))
+            out = [h for h in out if h[0] != b"content-length"]
+            out.append((b"content-length", str(len(raw)).encode()))
+            await send({"type": "http.response.start", "status": resp.status_code,
+                        "headers": out})
+            return await send({"type": "http.response.body", "body": raw})
+
         await send({"type": "http.response.start", "status": resp.status_code,
                     "headers": out})
         it = resp.iter_content(chunk_size=65536)
@@ -362,6 +407,31 @@ class RemoteGatewayMiddleware:
             await send({"type": "http.response.body", "body": chunk, "more_body": True})
         await send({"type": "http.response.body", "body": b""})
         resp.close()
+
+
+#: Any absolute URL pointing at a served file.
+_FILE_URL = re.compile(rb'https?://[^"\s]*?/v1/files/([^"\s/?]+)')
+
+
+def _local_base(scope, headers) -> str:
+    """This instance's public base URL, as the client reached it."""
+    proto = (headers.get("x-forwarded-proto") or scope.get("scheme") or "http").split(",")[0]
+    host = headers.get("host") or ""
+    prefix = (headers.get("x-forwarded-prefix") or "").rstrip("/")
+    return f"{proto}://{host}{prefix}" if host else prefix
+
+
+def _rewrite_file_urls(raw: bytes, remote_base: str, local_base: str) -> bytes:
+    """Point every /v1/files/ URL at us, and note which remote holds the file."""
+    if b"/v1/files/" not in raw:
+        return raw
+
+    def _sub(m):
+        name = m.group(1).decode("latin-1")
+        _remember_file(name, remote_base)
+        return (local_base.encode("latin-1") if local_base else b"") + b"/v1/files/" + m.group(1)
+
+    return _FILE_URL.sub(_sub, raw)
 
 
 async def _error(send, status: int, message: str):

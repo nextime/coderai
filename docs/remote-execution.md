@@ -142,6 +142,35 @@ Capability keys: `images`, `video`, `embeddings`, `rerank`, `ocr`, `tts`, `stt`,
 
 Precedence: a model's own `service_url` wins over the capability map.
 
+Every `/v1` endpoint is mapped to one of these capabilities — a test asserts it,
+so a newly added endpoint cannot quietly stay local. Three are excluded on
+purpose: `/v1/chat/completions` and `/v1/completions` (RemoteOpenAIBackend serves
+those) and `/v1/models` (the catalogue is this instance's own).
+
+What is **not** gatewayed, by design:
+
+* `/admin/**` — administers *this* instance: its model list, its engines, its
+  settings. To manage a remote coderai, open its own admin.
+* `/internal/**` — the front↔engine control plane (VRAM reservations, thermal
+  pause, config reload), already gated by the internal token.
+* `/chat`, `/login`, `/logout`, `/healthz`, `/coderai/capabilities` — this
+  instance's own UI and identity.
+
+### Generated files
+
+With the default `response_format: "url"` a render answers with a URL built from
+the base of the machine that produced it — `http://pod-xyz:8000/v1/files/out.png`
+— which the client usually cannot reach, and which 404s if fetched here because
+the file is on the pod. So the gateway rewrites those URLs to point at this
+instance and remembers which remote holds each file; a later
+`GET /v1/files/<name>` is forwarded back there. Nothing to configure.
+
+Two consequences worth knowing: the file lives on the pod, so **a pod reaped for
+idleness takes its outputs with it** — fetch what you need, or ask for
+`response_format: "b64_json"` and get the bytes inline. And the mapping is a
+routing hint held in memory (bounded, newest 4096), not a store: it does not
+survive a restart.
+
 ### Letting coderai rent the pod
 
 A URL means you started the machine and you own its bill. To have coderai
