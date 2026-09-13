@@ -62,19 +62,59 @@ embedding. Worth revisiting if we ever store our own embeddings on the profile.
 
 ---
 
-## MoneyPrinterTurbo — harry0703/MoneyPrinterTurbo · NOTED, not yet evaluated
+## MoneyPrinterTurbo — harry0703/MoneyPrinterTurbo · MIT · EVALUATED 2026-09-13 (README level)
 
 https://github.com/harry0703/MoneyPrinterTurbo/blob/main/README-en.md
+MIT, Python, ~123k stars, actively pushed. Read at README level — not the source.
 
-Automated short-video generation: script → stock/generated footage → subtitles →
-TTS → assembled clip. Directly relevant to the promo-tool goal, and overlapping
-with `tools/videogen.py`, `tools/video_editor.py` and `tools/character_studio.py`.
+**Its pipeline**, one topic in, a finished short out:
 
-To check when we get to it: how it plans a whole video from one prompt, how it
-sources and cuts footage, subtitle generation and burn-in, its TTS/voice pipeline,
-and how its web UI is organised. Nothing here has been verified yet.
+    topic -> LLM script -> LLM search terms -> stock/AI footage -> TTS voiceover
+          -> subtitles -> background music -> assemble 9:16 / 16:9 / 1:1 -> publish
 
----
+Everything heavy is somebody's cloud: a dozen LLM vendors for the script, Pexels /
+Pixabay / Coverr for footage, Edge/Azure/ElevenLabs/Fish for voice, with Whisper
+run locally for subtitles. `config.toml` is mostly API keys. Streamlit UI, FastAPI
+service with Swagger, a CLI with batch manifests, and direct upload to TikTok,
+Instagram and YouTube Shorts.
+
+**What it has that we don't:**
+
+1. **A planner.** One topic becomes a script, and the script becomes per-scene
+   search terms. Our video tools all start from prompts *you* write —
+   `gen_township_fighters.py` is the only one that asks an LLM to plan anything.
+   We have local LLMs on tap, so this is the cheapest gap to close and the one the
+   promo tools actually need.
+2. **Stock footage.** Pexels/Pixabay/Coverr. We generate every frame, which is
+   minutes of GPU per clip; for promo B-roll a stock lookup is seconds and often
+   looks better. Nothing in coderai sources stock media today.
+3. **Vertical as a first-class format.** 9:16 / 1:1 presets throughout. Our tools
+   default to 16:9 (768x432) and `video_editor.py`'s "vertical" control is a zoom
+   axis, not an aspect preset.
+4. **Publishing.** Direct upload to TikTok / Instagram / YouTube Shorts. We have
+   `tools/township_upload.py` for one site and nothing social.
+5. Batch manifests and task history as a first-class CLI concern.
+
+**What we have that it doesn't:** all of it local and key-free; character identity
+(profiles, IP-Adapter, per-character LoRA); voice cloning of a *specific* person
+plus conversion and lip sync; dubbing with diarisation and speaker ID; MiniMax H3
+with natively synchronised audio. Its quality ceiling is whatever its vendors give
+it; ours is the models we run.
+
+Already covered on our side: subtitles (`generate_subtitles`, `burn_subtitles`,
+`subtitle_style` = default/karaoke/minimal), background music with volume control
+(`videogen.py`), and assembly/concat (`video_editor.py`).
+
+**Proposal for the promo tool** — take its *shape*, not its dependencies:
+
+    topic -> our LLM writes script + scene plan -> per scene: stock lookup OR
+    generate (character studio / H3 / Wan) -> our TTS or a cloned voice ->
+    our subtitles -> assemble 9:16 -> review -> publish
+
+Which needs, in order: an LLM planner endpoint or tool step; an optional stock
+provider (Pexels/Pixabay keys, degrading to generation when absent); aspect presets
+including 9:16; and publishing adapters. The first two are where the leverage is —
+the rest we already have.
 
 ## Playtime-AI (Hugging Face) — EVALUATED 2026-09-10
 
