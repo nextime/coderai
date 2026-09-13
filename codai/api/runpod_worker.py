@@ -25,6 +25,7 @@ The account settings (API key, endpoints, global caps) live in
 """
 
 import os
+from collections import OrderedDict as _OrderedDict
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -59,6 +60,15 @@ class RunpodModelConfig:
     # RunPod container-registry credential id for a private image; blank falls
     # back to the account-wide one.
     registry_auth_id: str = ""
+    # Bearer token the pod requires on every request. A RunPod proxy URL is
+    # reachable by anyone who learns it, so a pod without one is an open GPU on
+    # the public internet. Blank does NOT mean "no auth": the pool generates a
+    # random token per pool and launches the pod with it. Set it explicitly only
+    # when something other than coderai must also call the pod.
+    api_key: str = ""
+    # Escape hatch for a pod whose server genuinely cannot take a token (an image
+    # with no auth support). Explicit, so it can never happen by accident.
+    allow_open_pod: bool = False
     served_model: str = ""                   # HF id the pod/endpoint serves
     # GGUF to pull on a llama.cpp pod, in llama.cpp's own `-hf` form:
     # "user/repo:Q4_K_M" or "user/repo:file.gguf". Needed because a local
@@ -72,7 +82,19 @@ class RunpodModelConfig:
     # --- scaling (pods) ---
     min_pods: int = 0
     max_pods: int = 1
+    # Grow the pool when the least-loaded pod already has this many requests in
+    # flight. This is what makes a pool track real concurrency: without it the
+    # pool only ever grows when it has NO healthy pod, so fifty concurrent
+    # requests would all pile onto pod #1 while max_pods sat unused.
     scale_up_inflight_per_pod: int = 4
+    # Hard ceiling on concurrent requests per pod (0 = no ceiling, let the remote
+    # server's own batching absorb them). Above it, a request waits for a slot
+    # instead of being piled on — use it for engines that degrade badly under
+    # concurrency rather than queueing internally.
+    max_inflight_per_pod: int = 0
+    # Send a conversation back to the pod that already served it, so the remote's
+    # prefix/KV cache still holds its context. Off = always pick the least-loaded.
+    sticky_sessions: bool = True
     idle_timeout_s: int = 300                # destroy a pod this long after its last request
     # Boot budgets — bigger models need longer (image pull + weight download).
     boot_timeout_s: int = 300                # until the pod exposes its port
@@ -132,7 +154,7 @@ _HEALTH_PATHS = {"vllm": "/v1/models", "llamacpp": "/v1/models",
 
 
 def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
-             model_path: str = "") -> dict:
+             model_path: str = "", api_key: str = "") -> dict:
     """Everything needed to launch one pod: image, docker args, health path.
 
     This is the seam that lets a pool serve something other than an LLM — a whole
@@ -153,7 +175,22 @@ def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
     else:
         image = mcfg.image or DEFAULT_POD_IMAGE
         args = mcfg.docker_args or _vllm_docker_args(mcfg, served)
-    return {"engine": engine, "image": image, "args": args,
+    # Lock the pod to a bearer token. Each server takes it differently: the two
+    # OpenAI servers as a flag, a coderai pod through the environment its auth
+    # middleware reads.
+    env = {}
+    if api_key:
+        if engine in ("vllm", "llamacpp"):
+            if "--api-key" not in args:
+                args = (args + " " if args else "") + f"--api-key {api_key}"
+        elif engine == "coderai":
+            env["CODERAI_API_TOKEN"] = api_key
+        else:
+            # A custom image: we cannot know its flag, so pass it in the
+            # environment under both the coderai and the common vLLM name.
+            env["CODERAI_API_TOKEN"] = api_key
+            env["VLLM_API_KEY"] = api_key
+    return {"engine": engine, "image": image, "args": args, "env": env,
             "health_path": mcfg.health_path or _HEALTH_PATHS.get(engine, "/v1/models")}
 
 
@@ -230,6 +267,8 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.health_path = (b.get("health_path") or "").strip()
     cfg.docker_args = (b.get("docker_args") or "").strip()
     cfg.registry_auth_id = (b.get("registry_auth_id") or "").strip()
+    cfg.api_key = (b.get("api_key") or "").strip()
+    cfg.allow_open_pod = _as_bool(b.get("allow_open_pod"), cfg.allow_open_pod)
     cfg.served_model = (b.get("served_model") or "").strip()
     cfg.hf_gguf = (b.get("hf_gguf") or "").strip()
     cfg.container_disk_gb = _as_int(b.get("container_disk_gb"), cfg.container_disk_gb)
@@ -241,6 +280,9 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.max_pods = max(1, _as_int(b.get("max_pods"), cfg.max_pods))
     cfg.scale_up_inflight_per_pod = max(1, _as_int(b.get("scale_up_inflight_per_pod"),
                                                    cfg.scale_up_inflight_per_pod))
+    cfg.max_inflight_per_pod = max(0, _as_int(b.get("max_inflight_per_pod"),
+                                              cfg.max_inflight_per_pod))
+    cfg.sticky_sessions = _as_bool(b.get("sticky_sessions"), cfg.sticky_sessions)
     cfg.idle_timeout_s = max(0, _as_int(b.get("idle_timeout_s"), cfg.idle_timeout_s))
     cfg.boot_timeout_s = max(30, _as_int(b.get("boot_timeout_s"), cfg.boot_timeout_s))
     cfg.load_timeout_s = max(30, _as_int(b.get("load_timeout_s"), cfg.load_timeout_s))
@@ -304,11 +346,18 @@ import uuid
 from dataclasses import dataclass as _dc_pod
 
 
-def _pod_health_ok(url: str, timeout: float = 4.0, path: str = "/v1/models") -> bool:
-    """True when the server inside the pod answers its readiness path."""
+def _pod_health_ok(url: str, timeout: float = 4.0, path: str = "/v1/models",
+                   api_key: str = "") -> bool:
+    """True when the server inside the pod answers its readiness path.
+
+    The token matters here: a pod locked with an api-key answers 401 on /v1/models
+    without it, which would look exactly like "never became ready".
+    """
     import requests
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
-        r = requests.get(url.rstrip("/") + "/" + path.lstrip("/"), timeout=timeout)
+        r = requests.get(url.rstrip("/") + "/" + path.lstrip("/"), timeout=timeout,
+                         headers=headers)
         return r.status_code == 200
     except Exception:
         return False
@@ -424,6 +473,16 @@ class RunpodPodPool:
         self.mcfg = mcfg
         self.served = served_name
         self.pods: list = []
+        #: affinity key -> pod_id, bounded. A conversation that comes back finds
+        #: the pod whose prefix cache still holds its context; without this, a
+        #: round-robin across pods re-prefills every turn from scratch.
+        self._affinity = _OrderedDict()
+        #: Bearer token this pool's pods are launched with. Generated when none is
+        #: configured, so a pod is never left open on a public proxy URL.
+        self.api_key = (getattr(mcfg, "api_key", "") or "").strip()
+        if not self.api_key and not getattr(mcfg, "allow_open_pod", False):
+            import secrets
+            self.api_key = "cra-" + secrets.token_urlsafe(32)
         #: Set from the pod plan at provision time; the default suits an LLM pod.
         self.health_path = mcfg.health_path or "/v1/models"
         self._cv = threading.Condition(threading.RLock())
@@ -473,10 +532,11 @@ class RunpodPodPool:
         from codai.api.runpod_client import RunpodError
         port = self.mcfg.port or 8000
         plan = pod_plan(self.mcfg, self.served, str(self.model_key),
-                        _model_path_for(self.model_key))
+                        _model_path_for(self.model_key), api_key=self.api_key)
         image, args = plan["image"], plan["args"]
         self.health_path = plan["health_path"]
         env = dict(self.mcfg.env or {})
+        env.update(plan.get("env") or {})
         dc = getattr(self.account, "data_center", "") or ""
         last = None
         for i in range(start, len(ranked)):
@@ -566,7 +626,8 @@ class RunpodPodPool:
                 # Wait for the OpenAI server inside the pod (image pull + model load).
                 deadline = time.time() + load_to
                 while time.time() < deadline:
-                    if _pod_health_ok(url, path=self.health_path):
+                    if _pod_health_ok(url, path=self.health_path,
+                                      api_key=self.api_key):
                         break
                     time.sleep(5)
                 else:
@@ -619,23 +680,91 @@ class RunpodPodPool:
                 print(f"[runpod] ensure_ready: {exc}", flush=True)
                 raise
 
-    def acquire(self, timeout: float = 1200.0):
-        """Return (PodHandle, url) for a ready pod, provisioning on demand. Bumps
-        in-flight. Caller MUST call release(pod). Raises on failure/timeout."""
+    def _pick(self, healthy: list, affinity: str):
+        """Which pod serves this request: the one that already holds the
+        conversation's cache, else the least loaded."""
+        cap = int(getattr(self.mcfg, "max_inflight_per_pod", 0) or 0)
+        free = [p for p in healthy if cap <= 0 or p.inflight < cap]
+        if not free:
+            return None
+        if affinity and getattr(self.mcfg, "sticky_sessions", True):
+            pid = self._affinity.get(affinity)
+            for p in free:
+                if p.pod_id == pid:
+                    return p
+        return min(free, key=lambda x: x.inflight)
+
+    def _remember_affinity(self, affinity: str, pod: "PodHandle") -> None:
+        if not affinity or not getattr(self.mcfg, "sticky_sessions", True):
+            return
+        self._affinity[affinity] = pod.pod_id
+        self._affinity.move_to_end(affinity)
+        while len(self._affinity) > 4096:
+            self._affinity.popitem(last=False)
+
+    def _should_grow(self, healthy: list) -> bool:
+        """True when real concurrency justifies another pod.
+
+        The pool used to grow only when it had NO healthy pod, so every request
+        beyond the first piled onto pod #1 and max_pods never came into play.
+        """
+        if len(self.pods) >= self.mcfg.max_pods or self._provisioning:
+            return False
+        if not healthy:
+            return True
+        threshold = max(1, int(self.mcfg.scale_up_inflight_per_pod or 1))
+        return min(p.inflight for p in healthy) >= threshold
+
+    def _grow_in_background(self):
+        """Provision another pod without making the triggering request wait for it.
+
+        Scale-up is anticipatory: this request is already being served by an
+        existing pod, and the new one absorbs the NEXT burst. A cold pod takes
+        minutes, so blocking here would punish exactly the request that proved
+        the pool needs to grow.
+        """
+        def _run():
+            try:
+                self._provision_one()
+            except Exception as exc:
+                print(f"[runpod] scale-up for {self.model_key!r} failed: {exc}", flush=True)
+            finally:
+                with self._cv:
+                    self._provisioning = False
+                    self._cv.notify_all()
+        threading.Thread(target=_run, daemon=True,
+                         name=f"runpod-grow-{self.model_key}").start()
+
+    def acquire(self, timeout: float = 1200.0, affinity: str = ""):
+        """Return (PodHandle, url) for a ready pod, provisioning on demand.
+
+        Bumps in-flight; the caller MUST pair it with release(pod). Picks the pod
+        holding this conversation's cache when ``affinity`` is given, else the
+        least-loaded one, and grows the pool in the background once the least
+        loaded pod is at ``scale_up_inflight_per_pod``.
+        """
         from codai.api.runpod_client import RunpodError
         deadline = time.time() + timeout
         while True:
+            grow_now = False
             with self._cv:
                 healthy = [p for p in self.pods if p.healthy]
-                if healthy:
-                    p = min(healthy, key=lambda x: x.inflight)
-                    p.inflight += 1
-                    p.last_used = time.time()
-                    return p, p.url
-                can_grow = (len(self.pods) < self.mcfg.max_pods) and not self._provisioning
-                if can_grow:
+                chosen = self._pick(healthy, affinity) if healthy else None
+                if self._should_grow(healthy):
                     self._provisioning = True
-            if can_grow:
+                    grow_now = True
+                if chosen is not None:
+                    chosen.inflight += 1
+                    chosen.last_used = time.time()
+                    self._remember_affinity(affinity, chosen)
+                    url = chosen.url
+            if chosen is not None:
+                if grow_now:
+                    self._grow_in_background()      # absorbs the NEXT request
+                return chosen, url
+
+            if grow_now:
+                # Nothing to serve this request yet — provision inline and retry.
                 try:
                     self._provision_one()
                 finally:
@@ -643,15 +772,18 @@ class RunpodPodPool:
                         self._provisioning = False
                         self._cv.notify_all()
                 continue
-            # Someone else is provisioning, or we're at max — wait for a free pod.
+
+            # At max_pods with every pod at its in-flight ceiling, or someone else
+            # is provisioning: wait for a slot rather than piling on.
             with self._cv:
-                if not any(p.healthy for p in self.pods):
-                    remaining = deadline - time.time()
-                    if remaining <= 0:
-                        raise RunpodError(
-                            f"RunPod: no pod available for {self.model_key!r} "
-                            f"(max_pods={self.mcfg.max_pods}) within {timeout}s.")
-                    self._cv.wait(min(remaining, 10.0))
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise RunpodError(
+                        f"RunPod: no pod slot available for {self.model_key!r} "
+                        f"(max_pods={self.mcfg.max_pods}, "
+                        f"max_inflight_per_pod={self.mcfg.max_inflight_per_pod}) "
+                        f"within {timeout}s.")
+                self._cv.wait(min(remaining, 10.0))
 
     def release(self, pod: PodHandle):
         with self._cv:

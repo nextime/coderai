@@ -770,8 +770,12 @@ class FrontProxy:
         print("[runpod-spill] model=%s trigger=%s -> pod %s" % (model, trigger, dest),
               flush=True)
         try:
-            rp_req = self._long.build_request(
-                "POST", dest, headers={"Content-Type": "application/json"}, content=body)
+            _hdrs = {"Content-Type": "application/json"}
+            _key = getattr(pool, "api_key", "")
+            if _key:
+                # The pod refuses anything without the token it was launched with.
+                _hdrs["Authorization"] = f"Bearer {_key}"
+            rp_req = self._long.build_request("POST", dest, headers=_hdrs, content=body)
             rp_resp = await self._long.send(rp_req, stream=True)
         except Exception as exc:
             try:

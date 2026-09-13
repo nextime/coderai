@@ -103,7 +103,11 @@ class RunpodBackend(ModelBackend):
             # behaves as pods; serverless-vs-pods auto-arbitration is a later refinement.)
             self._pool = runpod_worker.get_pod_pool(
                 model_name, self._acct, self._mcfg, self._served_name)
-            self._headers = {}   # the pod's vLLM server needs no auth
+            # A RunPod proxy URL is reachable by anyone who learns it, so the pod
+            # is launched locked to a bearer token (generated when none is
+            # configured) and every request we send must carry it.
+            _key = getattr(self._pool, "api_key", "")
+            self._headers = {"Authorization": f"Bearer {_key}"} if _key else {}
             # Eagerly warm a pod only when min_pods >= 1; otherwise provision lazily
             # on the first request (min_pods=0 = scale-to-zero when idle).
             if self._mcfg.min_pods >= 1:

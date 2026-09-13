@@ -21,6 +21,7 @@ Endpoints covered:
   /v1/completions           — legacy completions
 """
 
+import hmac
 import os
 import time
 import threading
@@ -43,6 +44,19 @@ _PROGRESS_PATHS = {
     "/v1/audio/progress",
     "/v1/loras/progress",
 }
+
+
+def _unauthorized():
+    return JSONResponse(
+        status_code=401,
+        content={
+            "error": {
+                "message": "Invalid API key. Provide a valid Bearer token.",
+                "type": "invalid_request_error",
+                "code": "invalid_api_key",
+            }
+        },
+    )
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -72,13 +86,26 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if _int and request.headers.get("x-coderai-broker-authed", "") == _int:
             return await call_next(request)
 
+        # A token supplied by the environment. This is how a REMOTE coderai — a
+        # capability pod — is locked: it has no auth.json to seed, and a RunPod
+        # proxy URL is reachable by anyone who learns it, so the pod must refuse
+        # requests that don't carry the token its owner launched it with.
+        auth_header = request.headers.get("authorization", "")
+        _env_token = os.environ.get("CODERAI_API_TOKEN", "")
+        if _env_token and auth_header.lower().startswith("bearer "):
+            if hmac.compare_digest(auth_header[7:].strip(), _env_token):
+                return await call_next(request)
+
         from codai.admin import routes as _admin_routes
         sm = _admin_routes.session_manager
         if sm is None:
+            # No local user database. With an env token configured we have already
+            # checked it above, so anything reaching here is unauthenticated.
+            if _env_token:
+                return _unauthorized()
             return await call_next(request)
 
         # Accept a valid Bearer token
-        auth_header = request.headers.get("authorization", "")
         if auth_header.lower().startswith("bearer "):
             token = auth_header[7:].strip()
             if sm.verify_token(token):
@@ -91,16 +118,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if cookie and sm.validate_session(cookie):
             return await call_next(request)
 
-        return JSONResponse(
-            status_code=401,
-            content={
-                "error": {
-                    "message": "Invalid API key. Provide a valid Bearer token.",
-                    "type": "invalid_request_error",
-                    "code": "invalid_api_key",
-                }
-            },
-        )
+        return _unauthorized()
 
 
 # Per-route-prefix defaults: (max_requests, window_seconds)

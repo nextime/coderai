@@ -242,12 +242,16 @@ class Target:
         self.url = (url or "").rstrip("/")
         self.pool = pool
         self.reason = reason
+        self.api_key = ""
 
     def acquire(self):
         """Return (base_url, release). A pool provisions on demand and bills."""
         if self.pool is None:
             return self.url, (lambda: None)
         handle, url = self.pool.acquire()
+        # The pod is locked to the pool's bearer token; carry it or every
+        # forwarded request comes back 401.
+        self.api_key = getattr(self.pool, "api_key", "") or self.api_key
         return url.rstrip("/"), (lambda: self.pool.release(handle))
 
 
@@ -348,11 +352,13 @@ class RemoteGatewayMiddleware:
             return await _error(send, 502,
                                 f"could not reach a remote for this request: {exc}")
         try:
-            await self._send_upstream(scope, headers, body, base, target.reason, send)
+            await self._send_upstream(scope, headers, body, base, target.reason, send,
+                                      api_key=target.api_key)
         finally:
             release()
 
-    async def _send_upstream(self, scope, headers, body, base, reason, send):
+    async def _send_upstream(self, scope, headers, body, base, reason, send,
+                             api_key: str = ""):
         import asyncio
         path = scope.get("path")
         qs = (scope.get("query_string") or b"").decode("latin-1")
@@ -360,7 +366,8 @@ class RemoteGatewayMiddleware:
         fwd = {k: v for k, v in headers.items()
                if k in ("content-type", "accept", "accept-language")}
         cfg = _remotes_config()
-        key = (getattr(cfg, "api_key", "") if cfg else "") \
+        # A pod's own token wins: it is the one that pod was launched with.
+        key = api_key or (getattr(cfg, "api_key", "") if cfg else "") \
             or os.environ.get("CODERAI_REMOTE_API_KEY", "")
         if key:
             fwd["Authorization"] = f"Bearer {key}"

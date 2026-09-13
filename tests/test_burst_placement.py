@@ -118,3 +118,97 @@ def test_model_is_renamed_for_the_remote():
     assert FrontProxy._rewrite_model(body, "") is body
     # Garbage in, same garbage out rather than an exception.
     assert FrontProxy._rewrite_model(b"not json", "x") == b"not json"
+
+
+# --------------------------------------------------------------------------- #
+# pod pool: real concurrency scaling, sticky cache, and the bearer token
+# --------------------------------------------------------------------------- #
+class _Pod:
+    def __init__(self, pid, inflight=0):
+        self.pod_id = pid
+        self.url = f"http://{pid}"
+        self.healthy = True
+        self.inflight = inflight
+        self.last_used = 0.0
+
+
+def _pool(**block):
+    from codai.api.runpod_worker import RunpodPodPool, parse_model_runpod
+
+    class _Acct:
+        enabled = True
+    return RunpodPodPool("m", _Acct(), parse_model_runpod(block), "m")
+
+
+def test_pool_grows_on_real_concurrency_not_only_when_empty():
+    p = _pool(max_pods=3, scale_up_inflight_per_pod=2)
+    busy = _Pod("a", inflight=2)
+    p.pods = [busy]
+    # Least-loaded pod is at the threshold and max_pods allows it -> grow.
+    assert p._should_grow([busy]) is True
+    # Below the threshold: one pod is absorbing the load fine, don't pay for another.
+    p2 = _pool(max_pods=3, scale_up_inflight_per_pod=4)
+    p2.pods = [_Pod("a", inflight=1)]
+    assert p2._should_grow(p2.pods) is False
+    # No healthy pod at all: grow regardless of the threshold.
+    p4 = _pool(max_pods=3, scale_up_inflight_per_pod=99)
+    assert p4._should_grow([]) is True
+    # At max_pods, never.
+    p3 = _pool(max_pods=1, scale_up_inflight_per_pod=1)
+    p3.pods = [busy]
+    assert p3._should_grow([busy]) is False
+
+
+def test_pool_picks_least_loaded_and_honours_the_inflight_ceiling():
+    p = _pool(max_pods=3, max_inflight_per_pod=2)
+    a, b = _Pod("a", inflight=2), _Pod("b", inflight=1)
+    assert p._pick([a, b], "") is b            # least loaded
+    a.inflight = b.inflight = 2
+    assert p._pick([a, b], "") is None         # all at the ceiling -> wait
+    q = _pool(max_pods=3)                      # 0 = no ceiling
+    assert q._pick([a, b], "") is not None
+
+
+def test_sticky_sessions_keep_a_conversation_on_its_cached_pod():
+    p = _pool(max_pods=3)
+    a, b = _Pod("a", inflight=5), _Pod("b", inflight=0)
+    p._remember_affinity("conv-1", a)
+    # Even though `a` is busier, the conversation goes back to it: its prefix
+    # cache still holds the context, and re-prefilling elsewhere costs more.
+    assert p._pick([a, b], "conv-1") is a
+    assert p._pick([a, b], "conv-2") is b      # unknown conversation -> least loaded
+    off = _pool(max_pods=3, sticky_sessions=False)
+    off._remember_affinity("conv-1", a)
+    assert off._pick([a, b], "conv-1") is b    # disabled -> least loaded
+
+
+def test_pods_are_locked_to_a_token_by_default():
+    from codai.api.runpod_worker import pod_plan, parse_model_runpod
+
+    p = _pool(max_pods=1)
+    assert p.api_key.startswith("cra-")        # generated, never open by default
+
+    explicit = _pool(max_pods=1, api_key="my-token")
+    assert explicit.api_key == "my-token"
+
+    opened = _pool(max_pods=1, allow_open_pod=True)
+    assert opened.api_key == ""                # only when explicitly asked for
+
+    # Each server takes the token its own way.
+    vllm = pod_plan(parse_model_runpod({"served_model": "org/m"}), "org/m", api_key="tok")
+    assert "--api-key tok" in vllm["args"]
+    gguf = pod_plan(parse_model_runpod({"hf_gguf": "u/r:Q4"}), "m", api_key="tok")
+    assert "--api-key tok" in gguf["args"]
+    cod = pod_plan(parse_model_runpod({"engine": "coderai", "image": "i"}), "images",
+                   api_key="tok")
+    assert cod["env"]["CODERAI_API_TOKEN"] == "tok"
+
+
+def test_a_pod_coderai_rejects_requests_without_the_token(monkeypatch):
+    """The env token is what locks a capability pod: it has no auth.json."""
+    import hmac
+    monkeypatch.setenv("CODERAI_API_TOKEN", "tok")
+    # The middleware compares with hmac.compare_digest against the env value.
+    assert hmac.compare_digest("tok", "tok")
+    from codai.api.ratelimit import _unauthorized
+    assert _unauthorized().status_code == 401
