@@ -3266,7 +3266,11 @@ def _generate_tts_for_line(line: CharacterDialogLine, temps: list) -> Optional[s
                   f"cannot clone, falling back to a generic voice", flush=True)
         else:
             try:
-                from codai.api.voice_clone import _f5tts_clone
+                from codai.api.voice_clone import _f5tts_clone, _trim_reference
+                # Dialogs are the heaviest user of cloning — one call per line —
+                # so trim the prompt here too rather than feeding F5 a minutes-long
+                # profile clip on every line.
+                ref_audio = _trim_reference(ref_audio, temps)
                 wav = _f5tts_clone(ref_audio, ref_text, text, speed, getattr(line, 'seed', None))
                 out = tempfile.mktemp(suffix='.wav')
                 temps.append(out)

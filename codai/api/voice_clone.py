@@ -15,6 +15,7 @@ import io
 import json
 import os
 import subprocess
+import threading
 import tempfile
 import time
 from typing import Optional
@@ -119,24 +120,110 @@ def _decode_b64_or_url(data: str) -> bytes:
     return base64.b64decode(data)
 
 
+#: F5-TTS prompts on the reference clip, and longer is NOT better: past roughly
+#: 15 s the extra context stops helping and starts costing quality and time (the
+#: upstream tooling clips to the same ballpark). Profiles here can hold minutes of
+#: audio — the character studio uploads a 90 s clip — so trim at use time.
+MAX_REF_SECONDS = float(os.environ.get("CODERAI_F5_MAX_REF_SECONDS", "15"))
+
+_f5_engine = None          # cached F5TTS instance (device -> engine)
+_f5_engine_device = None
+_f5_lock = threading.Lock()
+
+
+def _f5_device() -> Optional[str]:
+    if global_args:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return 'cuda'
+        except Exception:
+            pass
+    return None
+
+
+def _get_f5_engine():
+    """Return a cached F5TTS engine.
+
+    It used to be constructed per request, which reloaded the whole model (and its
+    vocoder) on every single line of dialogue — seconds of latency and a fresh VRAM
+    allocation each time. seed-vc next door already keeps a singleton; this brings
+    F5 in line. Rebuilt only if the device changes under us."""
+    global _f5_engine, _f5_engine_device
+    device = _f5_device()
+    with _f5_lock:
+        if _f5_engine is not None and _f5_engine_device == device:
+            return _f5_engine
+        from codai.api.hub_compat import install_hub_legacy_kwargs_shim
+        install_hub_legacy_kwargs_shim()
+        from f5_tts.api import F5TTS
+        print(f"  [voice-clone] loading F5-TTS engine (device={device or 'cpu'})", flush=True)
+        _f5_engine = F5TTS(device=device)
+        _f5_engine_device = device
+        return _f5_engine
+
+
+def release_f5_engine() -> None:
+    """Drop the cached engine (VRAM eviction hook)."""
+    global _f5_engine, _f5_engine_device
+    with _f5_lock:
+        if _f5_engine is None:
+            return
+        _f5_engine = None
+        _f5_engine_device = None
+    try:
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    print("  [voice-clone] F5-TTS engine released", flush=True)
+
+
+# Caching the engine means it holds VRAM between requests, so let the model
+# manager reclaim it when a generation needs the card — same contract the LoRA
+# base cache and the OCR engines use.
+try:
+    from codai.models.manager import multi_model_manager as _mmm
+    _mmm.register_external_vram_releaser(release_f5_engine)
+except Exception:
+    pass
+
+
+def _trim_reference(path: str, temps: list, max_seconds: float = None) -> str:
+    """Clip an over-long reference to MAX_REF_SECONDS, returning a path to use.
+
+    Returns the original path when it is already short enough or can't be read."""
+    limit = MAX_REF_SECONDS if max_seconds is None else max_seconds
+    if limit <= 0:
+        return path
+    try:
+        import soundfile as sf
+        info = sf.info(path)
+        duration = info.frames / float(info.samplerate or 1)
+        if duration <= limit:
+            return path
+        data, sr = sf.read(path, frames=int(limit * info.samplerate))
+        out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        out.close()
+        sf.write(out.name, data, sr)
+        temps.append(out.name)
+        print(f"  [voice-clone] reference trimmed {duration:.0f}s -> {limit:.0f}s "
+              f"(F5-TTS gains nothing past that)", flush=True)
+        return out.name
+    except Exception as exc:
+        print(f"  [voice-clone] reference trim skipped: {exc}", flush=True)
+        return path
+
+
 def _f5tts_clone(ref_audio_path: str, ref_text: str, gen_text: str,
                   speed: float = 1.0, seed: Optional[int] = None) -> bytes:
     """Run F5-TTS voice cloning, return WAV bytes."""
-    # F5-TTS can be configured with the BigVGAN vocoder, which still expects the
-    # pre-1.0 huggingface_hub mixin signature — see codai.api.hub_compat.
-    from codai.api.hub_compat import install_hub_legacy_kwargs_shim
-    install_hub_legacy_kwargs_shim()
-    from f5_tts.api import F5TTS
     import soundfile as sf
-    import numpy as np
 
-    device = None
-    if global_args:
-        import torch
-        if torch.cuda.is_available():
-            device = 'cuda'
-
-    tts = F5TTS(device=device)
+    tts = _get_f5_engine()
     wav, sr, _ = tts.infer(
         ref_file=ref_audio_path,
         ref_text=ref_text,
@@ -395,6 +482,9 @@ async def clone_voice(request: VoiceCloneRequest, http_request: Request = None):
 
         if not ref_text:
             raise HTTPException(status_code=400, detail="ref_text (transcript of reference audio) is required for voice cloning")
+
+        # A saved profile can hold minutes of audio; F5-TTS wants ~15 s of prompt.
+        ref_audio_path = _trim_reference(ref_audio_path, temps)
 
         try:
             audio_bytes = await asyncio.get_event_loop().run_in_executor(
