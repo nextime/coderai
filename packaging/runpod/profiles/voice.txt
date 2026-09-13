@@ -1,5 +1,4 @@
 # /v1/audio/clone, /v1/audio/voices, /v1/audio/convert, watermarking
-torch>=2.5.0
 torchaudio
 transformers>=4.35.0
 f5-tts>=1.1.0

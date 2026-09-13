@@ -1,5 +1,4 @@
 # /v1/audio/speech
-torch>=2.5.0
 torchaudio
 transformers>=4.35.0
 soundfile>=0.12.0

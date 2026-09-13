@@ -21,7 +21,6 @@ ARG PROFILE=images
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
 ENV PROFILE=${PROFILE} \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
     HF_HOME=/cache/huggingface \
     CODERAI_HOME=/config
 
@@ -35,9 +34,17 @@ WORKDIR /opt/coderai/app
 
 # Dependencies first so a code change doesn't re-resolve the ML stack.
 COPY packaging/runpod/profiles/ /tmp/profiles/
-RUN python -m pip install --upgrade pip \
-    && python -m pip install -r /tmp/profiles/core.txt \
-    && python -m pip install --extra-index-url ${TORCH_INDEX} -r /tmp/profiles/${PROFILE}.txt \
+# A BuildKit cache mount, so building all nine profiles downloads torch ONCE
+# instead of nine times. The cache lives on the builder, never in the image.
+# Core in its OWN layer: identical for every profile, so all nine images share
+# it and it is pushed and pulled once.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --upgrade pip \
+    && python -m pip install --extra-index-url ${TORCH_INDEX} -r /tmp/profiles/core.txt
+
+# Then only what this capability adds.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --extra-index-url ${TORCH_INDEX} -r /tmp/profiles/${PROFILE}.txt \
     && rm -rf /tmp/profiles
 
 COPY . /opt/coderai/app

@@ -1,5 +1,4 @@
 # /v1/audio/generate, /v1/audio/stems, /v1/audio/cleanup
-torch>=2.5.0
 torchaudio
 transformers>=4.35.0
 diffusers>=0.25.0

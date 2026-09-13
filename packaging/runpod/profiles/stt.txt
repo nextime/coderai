@@ -1,5 +1,4 @@
 # /v1/audio/transcriptions + diarization/speaker endpoints
-torch>=2.5.0
 torchaudio
 transformers>=4.35.0
 faster-whisper>=0.10.0

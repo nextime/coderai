@@ -1,5 +1,4 @@
 # /v1/ocr — see also requirements-ocr.txt / requirements-surya.txt for the
 # engine-specific extras a given OCR backend needs.
-torch>=2.5.0
 transformers>=4.35.0
 pypdfium2>=4.20.0

@@ -1,5 +1,4 @@
 # /v1/video/* — generation, interpolation, upscale. The heaviest profile.
-torch>=2.5.0
 torchvision
 torchaudio
 transformers>=4.35.0

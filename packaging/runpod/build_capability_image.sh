@@ -27,7 +27,8 @@ if [[ ! -f "$PROFILES_DIR/$PROFILE.txt" ]]; then
 fi
 
 echo "==> building $TAG from profile '$PROFILE'"
-docker build -f packaging/runpod/Dockerfile.capability \
+# BuildKit for the pip cache mount: nine profiles, one torch download.
+DOCKER_BUILDKIT=1 docker build -f packaging/runpod/Dockerfile.capability \
     --build-arg "PROFILE=$PROFILE" \
     -t "$TAG" .
 

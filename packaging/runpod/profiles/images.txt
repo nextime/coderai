@@ -1,5 +1,4 @@
 # /v1/images/* — generation, edits, inpaint, outfit, upscale, deblur, segment, depth
-torch>=2.5.0
 torchvision
 transformers>=4.35.0
 accelerate>=0.24.0

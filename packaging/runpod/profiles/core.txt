@@ -1,6 +1,11 @@
 # Core — what every capability pod needs to boot coderai and answer /healthz.
 # The routers import lazily, so a pod only needs the libraries its own capability
 # actually touches; this file is the floor under all of them.
+# torch lives here rather than in each profile so it becomes ONE shared layer:
+# nine images that each built their own copy would duplicate ~5 GB nine times,
+# on disk and on every push. Profiles add torchvision/torchaudio as they need.
+torch>=2.5.0
+
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 pydantic>=2.5.0
@@ -12,3 +17,18 @@ Pillow>=10.0.0
 numpy>=1.24.0
 safetensors>=0.4.0
 huggingface_hub>=0.25.0
+
+# Imported at MODULE level somewhere in the graph `import codai.api.app` walks,
+# so every pod needs them regardless of profile — app.py mounts every router, and
+# a few of those touch these at import time rather than lazily:
+#   cv2, PIL   codai/api/faceswap.py
+#   soundfile  codai/api/voice_convert.py
+#   litellm    codai/models/parser.py
+#   websockets codai/broker/client.py
+# Verified by a static walk of the import graph, and enforced by the Dockerfile's
+# `import codai.api.app` build step. torch/transformers are NOT here: those are
+# imported lazily, so they stay per-profile.
+opencv-python-headless>=4.8.0
+soundfile>=0.12.0
+litellm>=1.40.0
+websockets>=12.0
