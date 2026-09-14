@@ -94,5 +94,6 @@ def test_admin_accepts_every_pod_field_the_ui_sends():
     for key in ("engine", "hf_gguf", "health_path", "docker_args",
                 "registry_auth_id", "api_key", "allow_open_pod",
                 "sticky_sessions", "max_inflight_per_pod", "on_busy",
-                "service_url", "served_model"):
+                "service_url", "served_model", "source", "hf_repo",
+                "model_url", "keep_warm", "placement"):
         assert f'"{key}"' in routes, f"admin API drops the {key} field"

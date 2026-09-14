@@ -95,6 +95,18 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
+    # Start any RunPod pod configured to stay warm. Pools are otherwise created
+    # on first use, so the first request after a restart would still pay the cold
+    # boot that `keep_warm` exists to avoid. In a thread: provisioning blocks for
+    # minutes and must not hold up startup.
+    try:
+        import threading as _th
+        from codai.api.runpod_worker import warm_configured_pools
+        _th.Thread(target=warm_configured_pools, daemon=True,
+                   name="runpod-warm").start()
+    except Exception:
+        pass
+
     yield
 
     if broker_service is not None:
@@ -592,6 +604,8 @@ app.include_router(environments_router, tags=["Environments"])
 app.include_router(spatial_router, tags=["Spatial / 3D"])
 app.include_router(ocr_router, tags=["OCR"])
 app.include_router(rerank_router, tags=["Rerank"])
+from codai.api.models_transfer import router as models_transfer_router
+app.include_router(models_transfer_router, tags=["Models"])
 app.include_router(admin_router, tags=["Admin"])
 
 

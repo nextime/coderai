@@ -2710,6 +2710,10 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "auto_compact_model", "suppress_reasoning",
                 # Speech-to-text (wav2vec2 / vosk / NeMo-Canary) options.
                 "languages", "supports_translation", "keep_resident",
+                # "local" pins the model here even when its whole capability is
+                # configured remote — the opt-out that lets two models of the
+                # same kind be placed differently.
+                "placement",
                 ):
         if key in data:
             entry[key] = data[key]
@@ -2787,7 +2791,9 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                   "endpoint_id", "cost_period",
                   # engine selection, private registries, and the pod's own token
                   "engine", "hf_gguf", "health_path", "docker_args",
-                  "registry_auth_id", "api_key", "pool"):
+                  "registry_auth_id", "api_key", "pool",
+                  # where the POD gets the weights
+                  "source", "hf_repo", "model_url", "quantization"):
             v = src.get(k)
             if isinstance(v, str) and v.strip():
                 rpo[k] = v.strip()
@@ -2802,7 +2808,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         if ct:
             rpo["cloud_types"] = ct
         # bools
-        for k in ("allow_spot", "allow_open_pod", "sticky_sessions"):
+        for k in ("allow_spot", "allow_open_pod", "sticky_sessions", "keep_warm"):
             if k in src and src.get(k) is not None and src.get(k) != "":
                 sv = src.get(k)
                 rpo[k] = (sv.lower() in ("1", "true", "on", "yes")

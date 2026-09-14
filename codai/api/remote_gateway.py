@@ -99,8 +99,12 @@ def file_origin(filename: str) -> str:
     return (_FILE_ORIGINS or {}).get(filename, "")
 
 
-#: Handled by RemoteOpenAIBackend instead — see the module docstring.
-_SKIP_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/models")
+#: Handled by RemoteOpenAIBackend instead — see the module docstring. The two
+#: transfer endpoints are here for a different reason: an upload is addressed to
+#: the instance it is sent to (that is the whole point of sending it), so
+#: forwarding one would bounce the weights straight back out again.
+_SKIP_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/models",
+               "/v1/models/upload", "/v1/models/uploaded")
 
 #: Orchestration endpoints: a sequence of calls to other endpoints, not a model.
 #: They are NEVER forwarded as a whole — the chain stays here and each step goes
@@ -276,6 +280,9 @@ class Target:
         self.pool = pool
         self.reason = reason
         self.api_key = ""
+        #: The model entry whose weights must be pushed before serving, when the
+        #: remote has no way to fetch them (`source: "upload"`).
+        self.upload_entry = None
 
     def acquire(self):
         """Return (base_url, release). A pool provisions on demand and bills."""
@@ -313,9 +320,14 @@ def resolve_target(path: str, method: str, query: str, body: bytes,
         return Target(url=detail, reason=f"model {model!r}")
     if where == "pod":
         entry, block = detail
-        from codai.api.runpod_worker import get_model_pod_pool
-        return Target(pool=get_model_pod_pool(model, entry, block),
-                      reason=f"model {model!r} on its own RunPod pod")
+        from codai.api.runpod_worker import (get_model_pod_pool, parse_model_runpod,
+                                             resolve_model_source)
+        target = Target(pool=get_model_pod_pool(model, entry, block),
+                        reason=f"model {model!r} on its own RunPod pod")
+        kind, _ = resolve_model_source(entry, parse_model_runpod(block))
+        if kind == "upload":
+            target.upload_entry = entry
+        return target
     if not cap:
         return None
     url = capability_endpoints().get(cap, "")
@@ -396,6 +408,10 @@ class RemoteGatewayMiddleware:
             return await _error(send, 502,
                                 f"could not reach a remote for this request: {exc}")
         try:
+            # Weights the remote cannot fetch itself, when asked to upload them.
+            if target.upload_entry:
+                await asyncio.to_thread(ensure_model_uploaded, base, target.api_key,
+                                        target.upload_entry)
             # Ship any LoRA the request names, so the remote can actually load it.
             if b'"loras"' in (body or b"") and "json" in headers.get("content-type", ""):
                 body = await asyncio.to_thread(
@@ -558,6 +574,73 @@ def sync_loras(base: str, api_key: str, body: bytes) -> bytes:
         spec["id"] = f"sha256:{digest}"
         changed = True
     return json.dumps(obj).encode() if changed else body
+
+
+#: (base_url, model name) already pushed — a pod keeps what it was sent, so the
+#: check is worth skipping on the second request. A new pod has a new URL, so it
+#: pays the upload again: pod storage is disposable.
+_UPLOADED: set = set()
+
+
+def ensure_model_uploaded(base: str, api_key: str, entry: dict) -> None:
+    """Push a model's weights to a remote that cannot fetch them itself.
+
+    Only for `source: "upload"` — coderai resolves a HuggingFace repo id or a URL
+    first, because those cost nothing here and run at datacenter speed. Uploading
+    is the deliberate fallback for weights that exist nowhere else: a local merge,
+    a file whose host is gone, something you are not going to publish.
+    """
+    import requests
+
+    path = str((entry or {}).get("path") or "")
+    if not path or not os.path.exists(path):
+        return
+    name = os.path.basename(path.rstrip("/"))
+    if (base, name) in _UPLOADED:
+        return
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    is_dir = os.path.isdir(path)
+    size = (os.path.getsize(path) if not is_dir else
+            sum(os.path.getsize(os.path.join(r, f))
+                for r, _, fs in os.walk(path) for f in fs))
+    try:
+        have = requests.get(f"{base}/v1/models/uploaded",
+                            params={"name": name, "bytes": 0 if is_dir else size},
+                            headers=headers, timeout=30)
+        if have.status_code == 200:
+            _UPLOADED.add((base, name))
+            return
+    except Exception as exc:
+        print(f"[remote-gateway] upload check failed for {name}: {exc}", flush=True)
+        return
+
+    section = (entry.get("model_type") or "text_models")
+    params = {"name": name, "model_type": section, "tar": 1 if is_dir else 0}
+    if entry.get("alias"):
+        params["alias"] = entry["alias"]
+    print(f"[remote-gateway] uploading {name} ({size / 1e9:.1f} GB) to {base} — "
+          "this is the cold cost of `source: upload`", flush=True)
+    try:
+        if is_dir:
+            import subprocess
+            proc = subprocess.Popen(
+                ["tar", "-cf", "-", "-C", os.path.dirname(path), name],
+                stdout=subprocess.PIPE)
+            resp = requests.post(f"{base}/v1/models/upload", params=params,
+                                 data=proc.stdout, headers=headers, timeout=None)
+            proc.stdout.close()
+            proc.wait()
+        else:
+            with open(path, "rb") as fh:
+                resp = requests.post(f"{base}/v1/models/upload", params=params,
+                                     data=fh, headers=headers, timeout=None)
+        resp.raise_for_status()
+        _UPLOADED.add((base, name))
+        print(f"[remote-gateway] uploaded {name} to {base}", flush=True)
+    except Exception as exc:
+        # Don't cache a failure: the next request retries rather than serving
+        # from a pod that has half a model.
+        print(f"[remote-gateway] upload of {name} to {base} failed: {exc}", flush=True)
 
 
 async def _error(send, status: int, message: str):

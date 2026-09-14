@@ -382,6 +382,49 @@ Triggers, most eager first:
 gated, scaled, reaped, billed against the same caps) or `serverless` (your own
 RunPod endpoint id). `served_model` renames the model for the remote.
 
+### Where a pod gets the weights
+
+A pod cannot see this machine's disk, so a local path means nothing there. One of
+these has to resolve (`source` on the model's runpod block):
+
+| `source` | The pod gets the model by |
+|---|---|
+| `auto` (default) | an explicit `hf_repo`, a path that already IS a repo id, or a repo id **recovered from the HuggingFace cache path** (`models--Owner--Repo`), then `model_url` |
+| `hf` | downloading `hf_repo` from HuggingFace |
+| `url` | downloading `model_url` directly — how most one-off GGUFs are had |
+| `upload` | receiving the weights from here |
+
+`auto` covers most of a normal catalogue without anyone typing anything: weights
+downloaded through coderai live in the HuggingFace cache, whose directory names
+still say which repo they came from.
+
+Not every server can take every source, and the mismatch is refused at
+configuration time rather than after a pod has booted for five minutes:
+
+* **vLLM** is launched `--model <id>` and can only take a HuggingFace repo id.
+* **llama.cpp** takes `-hf user/repo:QUANT` or downloads a URL with `-mu`.
+* **Upload works only on a coderai pod.** vLLM and llama.cpp need the file to
+  exist before their container starts; a coderai pod loads models on demand, so
+  it can be given them afterwards.
+
+Uploading is a deliberate choice, not a fallback: it is the cold cost of every
+NEW pod, since pod storage is disposable. On a fast symmetric link that may be
+perfectly reasonable — a 30 GB model is a few minutes at gigabit — but a
+HuggingFace repo id or a URL costs nothing here and pulls at datacenter speed. A
+RunPod network volume is the better answer for weights used repeatedly.
+
+### Keeping a pod warm
+
+`keep_warm` on a model's runpod block (or a capability's) keeps one pod running
+at all times, so no request waits for a cold boot — image pull plus weight
+download, which is minutes. **Off by default, deliberately**: a warm pod bills
+every hour of every day, including the ones nobody uses it. With it off, a pool
+scales to zero and an idle model costs nothing.
+
+Pods configured warm are started at startup rather than on first use, so the
+first request after a restart does not pay the boot that `keep_warm` exists to
+avoid.
+
 ### Several models on one pod
 
 Two models that would each rent a card can share one, until it saturates:

@@ -743,6 +743,13 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             <div class="form-row" style="margin:0"><label class="form-label">Max pods</label><input type="number" id="cfg-rp-max-pods" class="form-input" min="1" placeholder="1"></div>
             <div class="form-row" style="margin:0"><label class="form-label">Idle timeout (s)</label><input type="number" id="cfg-rp-idle" class="form-input" min="0" placeholder="300"></div>
           </div>
+          <div class="form-row" style="margin:.5rem 0 0">
+            <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer">
+              <input type="checkbox" id="cfg-rp-keep-warm" style="width:auto">
+              <span class="form-label" style="margin:0">Always keep a pod running for this model</span>
+            </label>
+            <span class="form-hint" style="font-size:11px">No cold-boot wait (image pull + weight download, minutes) — but it bills every hour of every day, including the ones nobody uses it. Off by default.</span>
+          </div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-top:.5rem">
             <div class="form-row" style="margin:0">
               <label class="form-label">Boot timeout (s)</label>
@@ -771,6 +778,23 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
               <label class="form-label">GGUF to serve <span class="muted">(llama.cpp pods)</span></label>
               <input type="text" id="cfg-rp-hf-gguf" class="form-input" placeholder="user/repo:Q4_K_M">
               <span class="form-hint" style="font-size:11px">A local .gguf path means nothing on a rented machine — name the HF repo the pod should download.</span>
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 2fr;gap:.5rem;margin-top:.5rem">
+            <div class="form-row" style="margin:0">
+              <label class="form-label">Weights come from</label>
+              <select id="cfg-rp-source" class="form-input" onchange="_updateRunpodSource()">
+                <option value="auto">Auto — work it out</option>
+                <option value="hf">HuggingFace repo</option>
+                <option value="url">Direct URL</option>
+                <option value="upload">Upload from here</option>
+              </select>
+              <span class="form-hint" id="cfg-rp-source-hint" style="font-size:11px"></span>
+            </div>
+            <div class="form-row" style="margin:0">
+              <label class="form-label" id="cfg-rp-source-label">Repo / URL</label>
+              <input type="text" id="cfg-rp-hf-repo" class="form-input" placeholder="Qwen/Qwen3.5-9B">
+              <input type="text" id="cfg-rp-model-url" class="form-input" style="display:none" placeholder="https://host/model-Q4_K_M.gguf">
             </div>
           </div>
           <div class="form-row" style="margin:.5rem 0 0">
@@ -854,6 +878,14 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       <!-- ============ Where this model runs ============ -->
       <div class="form-section" style="margin-top:.75rem">
         <div class="form-section-title">Placement — where this model runs</div>
+
+        <div class="form-row" style="margin:0 0 .6rem">
+          <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer">
+            <input type="checkbox" id="cfg-placement-local" style="width:auto">
+            <span class="form-label" style="margin:0">Always run this model locally</span>
+          </label>
+          <span class="form-hint" style="font-size:11px">Pins it here even when its whole capability is set remote — so one video model can stay local while another runs on a pod.</span>
+        </div>
 
         <!-- (1) Served from another machine entirely. -->
         <div class="form-row" style="margin:0">
@@ -4157,6 +4189,11 @@ function _populateRunpod(s){
   set('cfg-rp-engine', rp.engine || 'auto');
   set('cfg-rp-hf-gguf', rp.hf_gguf || '');
   set('cfg-rp-pool', rp.pool || '');
+  set('cfg-rp-source', rp.source || 'auto');
+  set('cfg-rp-hf-repo', rp.hf_repo || '');
+  set('cfg-rp-model-url', rp.model_url || '');
+  chk('cfg-rp-keep-warm', rp.keep_warm);
+  _updateRunpodSource();
   set('cfg-rp-api-key', rp.api_key || '');
   chk('cfg-rp-open', rp.allow_open_pod);
   set('cfg-rp-registry-auth', rp.registry_auth_id || '');
@@ -4174,6 +4211,7 @@ function _populateRunpod(s){
 function _populatePlacement(s){
   const set = (id,v)=>{ const el=document.getElementById(id); if(el!=null) el.value=(v==null?'':v); };
   const chk = (id,v)=>{ const el=document.getElementById(id); if(el) el.checked=!!v; };
+  chk('cfg-placement-local', String((s && s.placement) || '').toLowerCase() === 'local');
   set('cfg-remote-url', (s && s.service_url) || '');
   set('cfg-remote-served', (s && s.served_model) || '');
   set('cfg-remote-key', (s && s.api_key) || '');
@@ -4206,6 +4244,29 @@ function _updateSpillVisibility(){
   const pd = document.getElementById('cfg-spill-pods');
   if (sl) sl.style.display = (mode === 'serverless') ? '' : 'none';
   if (pd) pd.style.display = (mode === 'serverless') ? 'none' : '';
+}
+
+// A pod cannot see this machine's disk: it downloads the weights itself, or is
+// sent them. This picks which, and shows the field that matters.
+function _updateRunpodSource(){
+  const el = document.getElementById('cfg-rp-source');
+  if (!el) return;
+  const v = el.value || 'auto';
+  const repo = document.getElementById('cfg-rp-hf-repo');
+  const url = document.getElementById('cfg-rp-model-url');
+  const label = document.getElementById('cfg-rp-source-label');
+  const hint = document.getElementById('cfg-rp-source-hint');
+  if (repo) repo.style.display = (v === 'url' || v === 'upload') ? 'none' : '';
+  if (url) url.style.display = (v === 'url') ? '' : 'none';
+  if (label) label.textContent = (v === 'url') ? 'Download URL'
+    : (v === 'upload') ? 'Uploaded from this machine' : 'HuggingFace repo id';
+  const HINTS = {
+    auto: 'Uses the repo id if the model has one — including one recovered from the HuggingFace cache path.',
+    hf: 'The pod downloads it from HuggingFace at datacenter speed. Costs nothing here.',
+    url: 'The pod downloads it directly — how most one-off GGUFs are had.',
+    upload: 'Sent from this machine. Needed only when the weights exist nowhere else; every NEW pod pays the upload again.',
+  };
+  if (hint) hint.textContent = HINTS[v] || '';
 }
 
 function _updateRunpodEngineHint(){
@@ -4293,6 +4354,10 @@ function _collectRunpod(){
     engine:             val('cfg-rp-engine') || 'auto',
     hf_gguf:            (val('cfg-rp-hf-gguf') || '').trim(),
     pool:               (val('cfg-rp-pool') || '').trim(),
+    source:             val('cfg-rp-source') || 'auto',
+    hf_repo:            (val('cfg-rp-hf-repo') || '').trim(),
+    model_url:          (val('cfg-rp-model-url') || '').trim(),
+    keep_warm:          document.getElementById('cfg-rp-keep-warm').checked,
     api_key:            (val('cfg-rp-api-key') || '').trim(),
     allow_open_pod:     document.getElementById('cfg-rp-open').checked,
     registry_auth_id:   (val('cfg-rp-registry-auth') || '').trim(),
@@ -4327,6 +4392,7 @@ async function saveModelConfig(){
     // Placement: serve this model from elsewhere, and/or burst the overflow.
     // Always sent, even when blank: an empty value is how you REMOVE a remote,
     // and a key that is simply absent leaves the old one in place.
+    placement:         document.getElementById('cfg-placement-local').checked ? 'local' : '',
     service_url:       (document.getElementById('cfg-remote-url').value || '').trim(),
     served_model:      (document.getElementById('cfg-remote-served').value || '').trim(),
     api_key:           (document.getElementById('cfg-remote-key').value || '').trim(),

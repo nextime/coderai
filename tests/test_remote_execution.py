@@ -776,3 +776,77 @@ def test_an_unresolvable_lora_is_left_for_the_remote(monkeypatch):
     monkeypatch.setattr("codai.api.loras.resolve_lora_ref", lambda spec: None)
     body = json.dumps({"loras": [{"model": "org/some-lora", "weight": 1.0}]}).encode()
     assert gw.sync_loras("http://pod:8000", "", body) is body
+
+
+# --------------------------------------------------------------------------- #
+# where a pod gets the weights
+# --------------------------------------------------------------------------- #
+def test_hf_repo_id_is_recovered_from_a_local_cache_path():
+    """Most local models came from HuggingFace: the cache path still says which
+    repo, so a pod can fetch them without anyone typing an id."""
+    from codai.api.runpod_worker import resolve_model_source, parse_model_runpod
+
+    cached = {"path": "/AI/huggingface/hub/models--Qwen--Qwen3.5-9B/"
+                      "snapshots/abc123/model.safetensors"}
+    assert resolve_model_source(cached, parse_model_runpod({})) == ("hf", "Qwen/Qwen3.5-9B")
+    # An entry whose path IS a repo id needs nothing.
+    assert resolve_model_source({"path": "Qwen/Qwen3.5-9B"},
+                                parse_model_runpod({})) == ("hf", "Qwen/Qwen3.5-9B")
+    # A bare local file with nothing else: we cannot invent a source.
+    assert resolve_model_source({"path": "/AI/guffcache/merged.gguf"},
+                                parse_model_runpod({})) == ("", "")
+
+
+def test_explicit_url_and_upload_sources():
+    from codai.api.runpod_worker import resolve_model_source, parse_model_runpod
+
+    entry = {"path": "/AI/guffcache/merged-Q4.gguf"}
+    url = parse_model_runpod({"model_url": "https://host/merged-Q4.gguf"})
+    assert resolve_model_source(entry, url) == ("url", "https://host/merged-Q4.gguf")
+    up = parse_model_runpod({"source": "upload"})
+    assert resolve_model_source(entry, up) == ("upload", "/AI/guffcache/merged-Q4.gguf")
+
+
+def test_each_pod_server_gets_a_source_it_can_actually_use():
+    from codai.api.runpod_worker import (_llamacpp_docker_args, _vllm_docker_args,
+                                         parse_model_runpod)
+
+    gguf = {"path": "/AI/guffcache/merged-Q4.gguf"}
+    # llama.cpp downloads a URL itself (-mu) — the usual way to serve a one-off GGUF.
+    args = _llamacpp_docker_args(parse_model_runpod({"model_url": "https://h/m.gguf"}),
+                                 "m", gguf)
+    assert "-mu https://h/m.gguf" in args
+
+    # vLLM is launched with --model and can only take a repo id; say so rather
+    # than boot a pod for minutes and fail.
+    with pytest.raises(RuntimeError, match="cannot fetch"):
+        _vllm_docker_args(parse_model_runpod({"model_url": "https://h/m.bin"}),
+                          "/AI/local/m", {"path": "/AI/local/m"})
+    # Upload cannot work for a server that needs the file before it starts.
+    with pytest.raises(RuntimeError, match="cannot work here"):
+        _llamacpp_docker_args(parse_model_runpod({"source": "upload"}), "m", gguf)
+    # Nothing at all: a clear instruction, not a mystery.
+    with pytest.raises(RuntimeError, match="where to get the weights"):
+        _llamacpp_docker_args(parse_model_runpod({}), "m", gguf)
+
+
+def test_a_coderai_pod_is_seeded_with_something_it_can_fetch():
+    from codai.api.runpod_worker import pod_plan, parse_model_runpod
+
+    entry = {"path": "/AI/models/my-merge", "model_type": "video_models"}
+    plan = pod_plan(parse_model_runpod({"model_url": "https://host/my-merge.safetensors"}),
+                    "my-merge", "my-merge", entry=entry)
+    seeded = json.loads(plan["env"]["CODERAI_SEED_MODELS"])[0]
+    # The local path is replaced by something the pod can actually resolve.
+    assert seeded["path"] == "https://host/my-merge.safetensors"
+
+
+def test_keep_warm_is_off_by_default_and_means_one_pod():
+    from codai.api.runpod_worker import parse_model_runpod
+
+    assert parse_model_runpod({}).keep_warm is False
+    assert parse_model_runpod({}).min_pods == 0          # scale to zero: costs nothing idle
+    warm = parse_model_runpod({"keep_warm": True})
+    assert warm.keep_warm is True and warm.min_pods == 1
+    # An explicit larger min_pods is not reduced by it.
+    assert parse_model_runpod({"keep_warm": True, "min_pods": 3}).min_pods == 3

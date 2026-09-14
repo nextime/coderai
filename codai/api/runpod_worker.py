@@ -70,6 +70,18 @@ class RunpodModelConfig:
     # entry's load_in_4bit/8bit does NOT carry over: that is how the transformers
     # backend loads weights here, and vLLM quantizes its own way.
     quantization: str = ""
+    # Where the POD gets the weights. A local path is meaningless there, so one
+    # of these must resolve:
+    #   auto   — work it out: an explicit hf_repo, a path that IS a repo id, or a
+    #            repo id recovered from the HuggingFace cache path; then model_url.
+    #   hf     — download `hf_repo` from HuggingFace.
+    #   url    — download `model_url` directly (how most one-off GGUFs are had).
+    #   upload — push the local weights to the pod. Only a coderai pod can take
+    #            this: vLLM and llama.cpp are launched with the model and need it
+    #            to exist before the container starts.
+    source: str = "auto"                     # auto | hf | url | upload
+    hf_repo: str = ""                        # explicit HuggingFace repo id
+    model_url: str = ""                      # explicit direct download URL
     # Bearer token the pod requires on every request. A RunPod proxy URL is
     # reachable by anyone who learns it, so a pod without one is an open GPU on
     # the public internet. Blank does NOT mean "no auth": the pool generates a
@@ -91,6 +103,11 @@ class RunpodModelConfig:
     env: dict = field(default_factory=dict)  # extra pod env (HF_TOKEN, etc.)
     # --- scaling (pods) ---
     min_pods: int = 0
+    # Keep one pod running for this model at all times, so a request never waits
+    # for a cold boot (image pull + weight download — minutes). OFF by default and
+    # deliberately so: a warm pod bills every hour of every day, including the
+    # ones where nobody asks it anything.
+    keep_warm: bool = False
     max_pods: int = 1
     # Grow the pool when the least-loaded pod already has this many requests in
     # flight. This is what makes a pool track real concurrency: without it the
@@ -200,6 +217,67 @@ def default_capability_image(capability: str) -> str:
     return f"{CAPABILITY_IMAGE_REPO}-{name}:{CAPABILITY_IMAGE_TAG}"
 
 
+def _looks_like_repo_id(name: str) -> bool:
+    """'Org/Model' — something HuggingFace can resolve, not a filesystem path."""
+    n = (name or "").strip()
+    return bool(n) and "/" in n and not n.startswith(("/", "~", ".")) \
+        and not n.startswith(("http://", "https://")) and n.count("/") == 1
+
+
+def resolve_model_source(entry: dict, mcfg: "RunpodModelConfig") -> tuple:
+    """Where the POD gets this model's weights: ("hf"|"url"|"upload"|"", value).
+
+    A local path exists only on this machine. The pod has to fetch the model
+    itself — or be given it — so this works out which, preferring what costs
+    nothing: a HuggingFace repo id the pod pulls at datacenter speed, then an
+    explicit URL, and only then an upload from here.
+
+    The repo id is often recoverable even when the configured path is local:
+    weights downloaded through coderai live in the HuggingFace cache, whose
+    directory names encode the repo (``models--Org--Name``).
+    """
+    entry = entry or {}
+    want = (getattr(mcfg, "source", "auto") or "auto").lower()
+    url = (getattr(mcfg, "model_url", "") or "").strip()
+    path = str(entry.get("path") or "").strip()
+
+    if want == "upload":
+        return ("upload", path)
+    if want == "url":
+        return ("url", url) if url else ("", "")
+    if want == "hf":
+        repo = (getattr(mcfg, "hf_repo", "") or "").strip()
+        return ("hf", repo) if repo else ("", "")
+
+    # auto, most-preferred first
+    for cand in (getattr(mcfg, "hf_repo", ""), getattr(mcfg, "served_model", ""), path):
+        if _looks_like_repo_id(cand):
+            return ("hf", cand.strip())
+    if path.startswith(("http://", "https://")):
+        return ("url", path)
+    from_cache = _hf_repo_id_from_cache_path(path)
+    if from_cache:
+        return ("hf", from_cache)
+    if url:
+        return ("url", url)
+    return ("", "")
+
+
+def _hf_repo_id_from_cache_path(path: str) -> str:
+    """Recover 'Owner/Repo' from a HuggingFace hub cache path, or ''.
+
+    Cache layout: .../hub/models--OWNER--REPO/snapshots/<hash>/<file>. The first
+    '--' after 'models--' separates owner from repo.
+    """
+    for part in str(path or "").replace("\\", "/").split("/"):
+        if part.startswith("models--"):
+            rest = part[len("models--"):]
+            sep = rest.find("--")
+            if sep != -1:
+                return rest[:sep] + "/" + rest[sep + 2:]
+    return ""
+
+
 def _looks_like_gguf(name: str) -> bool:
     return (name or "").strip().lower().endswith(".gguf")
 
@@ -248,7 +326,7 @@ def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
     engine = resolve_pod_engine(mcfg, model_key, model_path, entry)
     if engine == "llamacpp":
         image = mcfg.image or LLAMACPP_POD_IMAGE
-        args = mcfg.docker_args or _llamacpp_docker_args(mcfg, served)
+        args = mcfg.docker_args or _llamacpp_docker_args(mcfg, served, entry)
     elif engine in ("coderai", "custom"):
         cap = model_capability(entry or {})
         if not mcfg.image and cap:
@@ -270,7 +348,7 @@ def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
         args = mcfg.docker_args          # usually blank: the image's entrypoint serves
     else:
         image = mcfg.image or DEFAULT_POD_IMAGE
-        args = mcfg.docker_args or _vllm_docker_args(mcfg, served)
+        args = mcfg.docker_args or _vllm_docker_args(mcfg, served, entry)
     # Lock the pod to a bearer token. Each server takes it differently: the two
     # OpenAI servers as a flag, a coderai pod through the environment its auth
     # middleware reads.
@@ -290,19 +368,20 @@ def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
             "health_path": mcfg.health_path or _HEALTH_PATHS.get(engine, "/v1/models")}
 
 
-def _plan(engine, image, args, mcfg, api_key, entry, served) -> dict:
+def _plan(engine, image, args, mcfg, api_key, entry, served) -> dict:  # noqa: D401
     """Finish a plan for a coderai pod: auth plus the model it must serve."""
     env = {}
     if api_key:
         env["CODERAI_API_TOKEN"] = api_key
-    seed = seed_model_env(entry, served)
+    kind, value = resolve_model_source(entry or {}, mcfg)
+    seed = seed_model_env(entry, served, value if kind in ("hf", "url") else "")
     if seed:
         env["CODERAI_SEED_MODELS"] = seed
     return {"engine": engine, "image": image, "args": args, "env": env,
             "health_path": mcfg.health_path or _HEALTH_PATHS.get(engine, "/healthz")}
 
 
-def seed_model_env(entry: dict, served: str = "") -> str:
+def seed_model_env(entry: dict, served: str = "", source: str = "") -> str:
     """The model entry to register on a fresh pod, as JSON for CODERAI_SEED_MODELS.
 
     A pod starts with an EMPTY catalogue: it would refuse a request for a model
@@ -316,39 +395,58 @@ def seed_model_env(entry: dict, served: str = "") -> str:
     if not isinstance(entry, dict) or not entry:
         return ""
     path = str(entry.get("path") or "").strip()
-    if not path or path.startswith("/"):
-        # A local path cannot be resolved on a rented machine. The pod would have
-        # to download it from somewhere, and we have no repo id to give it.
+    if source:
+        # Give the pod something it can actually fetch: a repo id it pulls from
+        # HuggingFace, or a URL it downloads (coderai's loader takes both).
+        path = source
+    elif not path or path.startswith("/"):
+        # A local path cannot be resolved on a rented machine, and nothing said
+        # where else to get it.
         return ""
     keep = ("path", "model_type", "model_types", "video_subtypes", "capabilities",
             "alias", "config_name", "load_in_4bit", "load_in_8bit", "n_ctx",
             "flash_attention", "model_template", "acceleration", "component_quantization",
             "languages", "supports_translation", "parser", "max_instances")
     out = {k: entry[k] for k in keep if k in entry and entry[k] is not None}
+    out["path"] = path
     if served and served != path:
         out["alias"] = served
     return _json.dumps([out])
 
 
-def _llamacpp_docker_args(mcfg: "RunpodModelConfig", served: str) -> str:
+def _llamacpp_docker_args(mcfg: "RunpodModelConfig", served: str,
+                          entry: dict = None) -> str:
     """Args for the llama.cpp server image so it downloads and serves the GGUF.
 
     llama.cpp pulls weights itself with ``-hf user/repo:QUANT``; a local path is
     meaningless on a rented machine, so ``hf_gguf`` (or an HF-shaped
     ``served_model``) is required.
     """
-    src = (mcfg.hf_gguf or "").strip()
-    if not src:
-        cand = (served or "").strip()
-        if cand and "/" in cand and not cand.startswith("/"):
-            src = cand
-    if not src:
-        raise RuntimeError(
-            "RunPod llama.cpp pod: set `hf_gguf` on the model's runpod block to the "
-            "GGUF to serve (\"user/repo:Q4_K_M\"). A local .gguf path does not exist "
-            "on a rented pod, and coderai does not upload multi-GB weights.")
     args = ["--host", "0.0.0.0", "--port", str(mcfg.port or 8000),
-            "-hf", src, "--alias", served or src, "-ngl", "999"]
+            "--alias", served or "model", "-ngl", "999"]
+    src = (mcfg.hf_gguf or "").strip()
+    if src:
+        args += ["-hf", src]
+    else:
+        kind, value = resolve_model_source(entry or {}, mcfg)
+        if kind == "hf" and value:
+            args += ["-hf", value]
+        elif kind == "url" and value:
+            # llama-server downloads the file itself; the usual way to serve a
+            # one-off GGUF that lives on a plain HTTP host rather than on HF.
+            args += ["-mu", value]
+        elif kind == "upload":
+            raise RuntimeError(
+                "RunPod llama.cpp pod: `source: upload` cannot work here — the "
+                "server is launched with the model and needs the file before the "
+                "container starts. Use `hf_gguf`/`hf_repo`, or `model_url`, or run "
+                "this model on a coderai pod (engine: coderai), which can be given "
+                "the weights after it boots.")
+        else:
+            raise RuntimeError(
+                "RunPod llama.cpp pod: nothing tells the pod where to get the "
+                "weights. Set `hf_gguf` (\"user/repo:Q4_K_M\"), or `model_url` for a "
+                "direct download. A local .gguf path does not exist on a rented pod.")
     if mcfg.ctx and mcfg.ctx > 0:
         args += ["-c", str(mcfg.ctx)]
     return " ".join(args)
@@ -405,6 +503,9 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.registry_auth_id = (b.get("registry_auth_id") or "").strip()
     cfg.pool = (b.get("pool") or "").strip().lower()
     cfg.quantization = (b.get("quantization") or "").strip()
+    cfg.source = (b.get("source") or cfg.source).strip().lower() or "auto"
+    cfg.hf_repo = (b.get("hf_repo") or "").strip()
+    cfg.model_url = (b.get("model_url") or "").strip()
     cfg.api_key = (b.get("api_key") or "").strip()
     cfg.allow_open_pod = _as_bool(b.get("allow_open_pod"), cfg.allow_open_pod)
     cfg.served_model = (b.get("served_model") or "").strip()
@@ -415,6 +516,11 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.ctx = _as_int(b.get("ctx"), cfg.ctx)
     cfg.env = {str(k): str(v) for k, v in env.items()}
     cfg.min_pods = max(0, _as_int(b.get("min_pods"), cfg.min_pods))
+    cfg.keep_warm = _as_bool(b.get("keep_warm"), cfg.keep_warm)
+    if cfg.keep_warm:
+        # "Always warm" IS min_pods >= 1; keep one knob authoritative rather than
+        # two that can disagree.
+        cfg.min_pods = max(1, cfg.min_pods)
     cfg.max_pods = max(1, _as_int(b.get("max_pods"), cfg.max_pods))
     cfg.scale_up_inflight_per_pod = max(1, _as_int(b.get("scale_up_inflight_per_pod"),
                                                    cfg.scale_up_inflight_per_pod))
@@ -593,7 +699,8 @@ _provisioning_ids: set = set()
 _provisioning_info: dict = {}
 
 
-def _vllm_docker_args(mcfg: "RunpodModelConfig", served: str) -> str:
+def _vllm_docker_args(mcfg: "RunpodModelConfig", served: str,
+                      entry: dict = None) -> str:
     """Args appended to the vLLM OpenAI image entrypoint so it serves ``served``
     on the pod's port, reachable through the RunPod proxy.
 
@@ -603,12 +710,21 @@ def _vllm_docker_args(mcfg: "RunpodModelConfig", served: str) -> str:
     front instead.
     """
     name = (served or "").strip()
-    if not name or name.startswith("/") or name.startswith("~"):
-        raise RuntimeError(
-            f"RunPod vLLM pod: {name or '(nothing)'} is a local path, which does not "
-            "exist on a rented machine. Set `served_model` on the model's runpod "
-            "block to the HuggingFace repo id the pod should download (e.g. "
-            "\"Qwen/Qwen3.5-9B\"); coderai does not upload model weights.")
+    if not _looks_like_repo_id(name):
+        kind, value = resolve_model_source(entry or {}, mcfg)
+        if kind == "hf" and value:
+            name = value
+        elif kind in ("url", "upload"):
+            raise RuntimeError(
+                f"RunPod vLLM pod: vLLM is launched with `--model` and can only take "
+                f"a HuggingFace repo id — it cannot fetch {kind!r}. Set `hf_repo`, or "
+                "serve this model on a coderai pod (engine: coderai), which accepts a "
+                "URL or an upload.")
+        else:
+            raise RuntimeError(
+                f"RunPod vLLM pod: {name or '(nothing)'} is not a HuggingFace repo id, "
+                "and nothing else says where the pod should get the weights. Set "
+                "`hf_repo` (e.g. \"Qwen/Qwen3.5-9B\") on the model's runpod block.")
     args = ["--host", "0.0.0.0", "--port", str(mcfg.port or 8000),
             "--model", name, "--served-model-name", name]
     if mcfg.ctx and mcfg.ctx > 0:
@@ -1121,6 +1237,55 @@ def get_capability_pool(capability: str, block: dict):
     mcfg = parse_model_runpod(b)
     key = f"capability:{shared or capability}"
     return get_pod_pool(key, acct, mcfg, shared or capability, shared=bool(shared))
+
+
+def warm_configured_pools() -> int:
+    """Start the pods that are configured to stay warm, without waiting for a
+    request to ask for them.
+
+    A pool is normally created lazily on first use, which would mean the first
+    request after a restart still pays the cold boot that `keep_warm` exists to
+    avoid. Called at startup; returns how many pools it warmed.
+    """
+    warmed = 0
+    try:
+        from codai.admin.routes import config_manager
+        md = getattr(config_manager, "models_data", None) or {}
+        cfg = getattr(config_manager, "config", None)
+    except Exception:
+        return 0
+
+    for section, lst in (md.items() if isinstance(md, dict) else []):
+        if not isinstance(lst, list):
+            continue
+        for entry in lst:
+            if not isinstance(entry, dict):
+                continue
+            block = entry.get("runpod")
+            if not isinstance(block, dict) or not _as_bool(block.get("keep_warm"), False):
+                continue
+            name = entry.get("alias") or entry.get("path") or ""
+            try:
+                pool = get_model_pod_pool(name, entry, block)
+                pool.ensure_ready()
+                warmed += 1
+                print(f"[runpod] keeping a pod warm for {name!r}", flush=True)
+            except Exception as exc:
+                print(f"[runpod] could not warm {name!r}: {exc}", flush=True)
+
+    remotes = getattr(cfg, "remotes", None)
+    pods = getattr(remotes, "pods", None) if remotes is not None else None
+    for cap, block in (pods.items() if isinstance(pods, dict) else []):
+        if not isinstance(block, dict) or not _as_bool(block.get("keep_warm"), False):
+            continue
+        try:
+            pool = get_capability_pool(str(cap), block)
+            pool.ensure_ready()
+            warmed += 1
+            print(f"[runpod] keeping a pod warm for capability {cap!r}", flush=True)
+        except Exception as exc:
+            print(f"[runpod] could not warm capability {cap!r}: {exc}", flush=True)
+    return warmed
 
 
 def _all_pools_hourly_rate() -> float:
