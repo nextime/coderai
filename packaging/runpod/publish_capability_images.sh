@@ -154,7 +154,10 @@ if [[ "$REGISTRY" == "ghcr.io" ]]; then
     say "registry-credential id, so open each of these and set Visibility → Public:"
     say
     for t in "${built[@]}"; do
-        name="${t#*/}"; name="${name%%:*}"
+        # The package name is the LAST path segment: ghcr.io/<owner>/<name>:<tag>.
+        # Stripping only the registry would leave the owner in the name and the
+        # URL would 404.
+        name="${t##*/}"; name="${name%%:*}"
         say "  https://github.com/users/${owner}/packages/container/${name}/settings"
     done
     say
