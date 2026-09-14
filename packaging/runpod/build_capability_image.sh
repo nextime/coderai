@@ -26,10 +26,24 @@ if [[ ! -f "$PROFILES_DIR/$PROFILE.txt" ]]; then
     exit 2
 fi
 
+# The shared core image. Built once and reused by every profile, so the nine
+# images share those layers by construction — the registry stores and transfers
+# the core once instead of nine near-identical ~7 GB copies. Rebuild it with
+# REBUILD_CORE=1 (needed when core.txt changes).
+CORE_BASE="${CORE_BASE:-coderai-capability-base:latest}"
+if [[ "${REBUILD_CORE:-0}" == "1" ]] || ! docker image inspect "$CORE_BASE" >/dev/null 2>&1; then
+    echo "==> building the shared core $CORE_BASE"
+    DOCKER_BUILDKIT=1 docker build -f packaging/runpod/Dockerfile.capability-base \
+        -t "$CORE_BASE" . || { echo "core build failed" >&2; exit 1; }
+else
+    echo "==> reusing the shared core $CORE_BASE"
+fi
+
 echo "==> building $TAG from profile '$PROFILE'"
 # BuildKit for the pip cache mount: nine profiles, one torch download.
 DOCKER_BUILDKIT=1 docker build -f packaging/runpod/Dockerfile.capability \
     --build-arg "PROFILE=$PROFILE" \
+    --build-arg "CORE_BASE=$CORE_BASE" \
     -t "$TAG" .
 
 # The Dockerfile already proves the app imports. This proves it SERVES: a pod is

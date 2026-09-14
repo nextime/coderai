@@ -1,0 +1,39 @@
+# Shared core for every coderai capability image.
+#
+# This exists for one reason: layer sharing. Installing the same core.txt in each
+# profile image ought to produce the same layer, but it does not — an identical
+# `pip install` writes non-identical bytes (dist-info metadata, RECORD files), so
+# the layer digests differ and every image carries its own ~7 GB copy. Measured
+# on the first build of all nine: only 4 of 11 layers were shared.
+#
+# Building the core ONCE as its own image makes the sharing structural rather
+# than hopeful: the profile images are FROM this, so they share its layers by
+# construction. The registry stores and transfers it once, and a cold pod pulling
+# a second capability image already has most of it.
+#
+#   docker build -f packaging/runpod/Dockerfile.capability-base \
+#       -t coderai-capability-base:0.2.2 .
+
+ARG BASE=python:3.12-slim
+FROM ${BASE}
+
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
+ENV PYTHONUNBUFFERED=1 \
+    HF_HOME=/cache/huggingface \
+    CODERAI_HOME=/config
+
+# ffmpeg for every audio/video path; git because a few ML packages still want it
+# at install time; libgl/libglib for opencv.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg git curl ca-certificates libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/coderai/app
+
+# torch and the import-time requirements every capability needs. A BuildKit cache
+# mount keeps the wheels on the builder across rebuilds; they never enter the image.
+COPY packaging/runpod/profiles/core.txt /tmp/core.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --upgrade pip \
+    && python -m pip install --extra-index-url ${TORCH_INDEX} -r /tmp/core.txt \
+    && rm -f /tmp/core.txt

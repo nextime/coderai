@@ -14,33 +14,18 @@
 # Or use packaging/runpod/build_capability_image.sh, which also smoke-tests the
 # result before you push it.
 
-ARG BASE=python:3.12-slim
-FROM ${BASE}
+# The shared core (OS + apt + torch + import-time deps). Built once by
+# build_capability_image.sh; every profile is FROM it, so all nine images share
+# those layers by construction rather than by coincidence.
+ARG CORE_BASE=coderai-capability-base:latest
+FROM ${CORE_BASE}
 
 ARG PROFILE=images
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
-ENV PROFILE=${PROFILE} \
-    PYTHONUNBUFFERED=1 \
-    HF_HOME=/cache/huggingface \
-    CODERAI_HOME=/config
-
-# ffmpeg for every audio/video path; git because a few ML packages still want it
-# at install time; libgl/libglib for opencv.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg git curl ca-certificates libgl1 libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+ENV PROFILE=${PROFILE}
 
 WORKDIR /opt/coderai/app
-
-# Dependencies first so a code change doesn't re-resolve the ML stack.
 COPY packaging/runpod/profiles/ /tmp/profiles/
-# A BuildKit cache mount, so building all nine profiles downloads torch ONCE
-# instead of nine times. The cache lives on the builder, never in the image.
-# Core in its OWN layer: identical for every profile, so all nine images share
-# it and it is pushed and pulled once.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python -m pip install --upgrade pip \
-    && python -m pip install --extra-index-url ${TORCH_INDEX} -r /tmp/profiles/core.txt
 
 # Then only what this capability adds. A profile may ship a `<name>.build-deps`
 # listing apt packages its wheels need to COMPILE (deepfilterlib wants a Rust

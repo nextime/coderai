@@ -148,21 +148,17 @@ fi
 if [[ "$REGISTRY" == "ghcr.io" ]]; then
     owner="${NS#*/}"
     say
-    say "${c_warn}GHCR publishes new packages as PRIVATE.${c_off} A RunPod pod cannot pull a"
-    say "private image without a registry-credential id, so make each one public:"
+    say "${c_warn}GHCR publishes new packages as PRIVATE, and there is no API to change${c_off}"
+    say "${c_warn}that${c_off} — the Packages REST API is list/get/delete/restore only, so this is a"
+    say "click per package. A RunPod pod cannot pull a private image without a"
+    say "registry-credential id, so open each of these and set Visibility → Public:"
+    say
     for t in "${built[@]}"; do
         name="${t#*/}"; name="${name%%:*}"
         say "  https://github.com/users/${owner}/packages/container/${name}/settings"
     done
-    if command -v gh >/dev/null 2>&1 && ask "Try to flip them with the gh CLI?"; then
-        for t in "${built[@]}"; do
-            name="${t#*/}"; name="${name%%:*}"
-            gh api --method PATCH "/user/packages/container/${name}" \
-                -f visibility=public >/dev/null 2>&1 \
-                && say "  ${c_ok}public${c_off}  ${name}" \
-                || say "  ${c_warn}could not set ${name} — use the URL above${c_off}"
-        done
-    fi
+    say
+    say "(Scroll to 'Danger Zone' → 'Change visibility' → Public.)"
 fi
 
 # ---- what to do with them ----------------------------------------------- #
