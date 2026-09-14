@@ -70,7 +70,11 @@ def _probe_for(capability: str, model: str):
         return "/v1/rerank", {"model": model, "query": "cat",
                               "documents": ["a cat", "a car"]}
     if capability == "tts":
-        return "/v1/audio/speech", {"model": model, "input": "test", "voice": "default"}
+        # No `voice`: TTSRequest's own default is a voice the shipped models
+        # actually have. Passing "default" failed on Kokoro with "Voice default
+        # not found in available voices" — the probe inventing a voice name, not
+        # the model being broken.
+        return "/v1/audio/speech", {"model": model, "input": "test"}
     return "", None
 
 
@@ -350,9 +354,18 @@ def _no_remote_reason(model: str, entry: dict, capability: str) -> str:
     if not entry:
         return (f"{model!r} is not in the model list, so nothing can say where it "
                 "should run")
+    if not capability:
+        # A text/LLM model. Do NOT offer a 'text' capability remote as the fix:
+        # /v1/chat/completions is deliberately outside the gateway (the backend
+        # owns it), so configuring one would route nothing and the test would
+        # then report a remote pass for a request served locally.
+        return (f"nothing configures {model!r} to run remotely — set a service_url "
+                "on the model, or backend 'runpod' with a runpod block on it. A "
+                "capability remote does not apply to chat: that path is served by "
+                "the backend, not the gateway")
     return (f"nothing configures {model!r} to run remotely — set a service_url, or "
             "backend 'runpod' with a runpod block on the model, or a remote for "
-            f"its {capability or 'text'} capability")
+            f"its {capability} capability")
 
 
 def _pod_diagnostics() -> list:
@@ -401,6 +414,12 @@ def _remote_catalogue(url: str, api_key: str) -> list:
         return [f"({exc})"]
 
 
+#: OCR engines are selected by name, not registered in models.json like a model.
+#: Without this an OCR test answered "'surya' is not in the model list, so
+#: nothing can say where it should run" — true of the catalogue, and useless.
+_OCR_ENGINES = ("paddle", "doctr", "surya")
+
+
 def _describe(model: str):
     """(entry, capability) for a model — capability '' means a text/LLM model."""
     try:
@@ -408,6 +427,8 @@ def _describe(model: str):
         entry = _model_entry_for(model) or {}
     except Exception:
         entry = {}
+    if not entry and (model or "").strip().lower() in _OCR_ENGINES:
+        return {"path": model, "model_type": "ocr"}, "ocr"
     try:
         from codai.api.runpod_worker import model_capability
         return entry, model_capability(entry)
