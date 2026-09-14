@@ -2794,7 +2794,8 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                   "engine", "hf_gguf", "health_path", "docker_args",
                   "registry_auth_id", "api_key", "pool",
                   # where the POD gets the weights
-                  "source", "hf_repo", "model_url", "quantization"):
+                  "source", "hf_repo", "model_url", "quantization",
+                  "network_volume_id", "volume_mount_path"):
             v = src.get(k)
             if isinstance(v, str) and v.strip():
                 rpo[k] = v.strip()
@@ -3662,6 +3663,8 @@ def build_settings_dict(c, gpu_cards):
             "default_gpu_type": c.runpod.default_gpu_type,
             "data_center": c.runpod.data_center,
             "registry_auth_id": c.runpod.registry_auth_id,
+            "network_volume_id": c.runpod.network_volume_id,
+            "volume_mount_path": c.runpod.volume_mount_path,
             "deployment_id": c.runpod.deployment_id,
             "global_max_hourly_usd": c.runpod.global_max_hourly_usd,
             "global_cost_limit_usd": c.runpod.global_cost_limit_usd,
@@ -4238,6 +4241,11 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             rp.data_center = (d.get("data_center") or "").strip()
         if "registry_auth_id" in d:
             rp.registry_auth_id = (d.get("registry_auth_id") or "").strip()
+        if "network_volume_id" in d:
+            rp.network_volume_id = (d.get("network_volume_id") or "").strip()
+        if "volume_mount_path" in d:
+            rp.volume_mount_path = ((d.get("volume_mount_path") or "").strip()
+                                    or "/workspace")
         if "deployment_id" in d:
             rp.deployment_id = (d.get("deployment_id") or "default").strip() or "default"
         if "global_max_hourly_usd" in d:

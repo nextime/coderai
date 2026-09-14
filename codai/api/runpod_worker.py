@@ -60,6 +60,10 @@ class RunpodModelConfig:
     # RunPod container-registry credential id for a private image; blank falls
     # back to the account-wide one.
     registry_auth_id: str = ""
+    # Attach a RunPod network volume to this pool's pods. Blank falls back to the
+    # account-wide one. Weights, uploads and adapters on it outlive the pod.
+    network_volume_id: str = ""
+    volume_mount_path: str = ""              # blank = the account default
     # Share one set of pods with every other model naming the same pool, instead
     # of renting a card each. Only possible when the pod's server can serve more
     # than one model: a coderai pod is a whole coderai and picks the model from
@@ -449,6 +453,39 @@ def _add_staging(plan: dict, mcfg: "RunpodModelConfig", entry: dict, engine: str
     print(f"[runpod] pod will download before serving: {names}", flush=True)
 
 
+def volume_for(mcfg: "RunpodModelConfig", account) -> tuple:
+    """(volume_id, mount_path) for this pool, or ('', '')."""
+    vol = (getattr(mcfg, "network_volume_id", "") or "").strip() \
+        or (getattr(account, "network_volume_id", "") or "").strip()
+    if not vol:
+        return "", ""
+    mount = (getattr(mcfg, "volume_mount_path", "") or "").strip() \
+        or (getattr(account, "volume_mount_path", "") or "").strip() or "/workspace"
+    return vol, mount.rstrip("/") or "/workspace"
+
+
+def volume_env(mount: str) -> dict:
+    """Point everything that writes big files at the volume.
+
+    This is what makes a volume worth attaching. Without it a pod downloads its
+    weights to container disk and throws them away on teardown, so every cold pod
+    pays the download again; with it, the second pod finds them already there.
+    The same path is where uploaded models and LoRA adapters land, so a file sent
+    once is visible to every later pod — the "bounce host" role, without a third
+    party in the middle.
+    """
+    if not mount:
+        return {}
+    return {
+        "HF_HOME": f"{mount}/huggingface",
+        "HUGGINGFACE_HUB_CACHE": f"{mount}/huggingface/hub",
+        "TRANSFORMERS_CACHE": f"{mount}/huggingface/transformers",
+        "DIFFUSERS_CACHE": f"{mount}/diffusers",
+        "CODERAI_MODELS_DIR": f"{mount}/models",
+        "CODERAI_CACHE_DIR": f"{mount}/cache",
+    }
+
+
 def _plan(engine, image, args, mcfg, api_key, entry, served,
           seed_entries: list = None) -> dict:  # noqa: D401
     """Finish a plan for a coderai pod: auth plus the models it must serve."""
@@ -634,6 +671,12 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.health_path = (b.get("health_path") or "").strip()
     cfg.docker_args = (b.get("docker_args") or "").strip()
     cfg.registry_auth_id = (b.get("registry_auth_id") or "").strip()
+    cfg.network_volume_id = (b.get("network_volume_id") or "").strip()
+    if cfg.network_volume_id:
+        # RunPod offers network volumes on Secure Cloud only; leaving COMMUNITY
+        # in the list just produces candidates the attach would reject.
+        cfg.cloud_types = ["SECURE"]
+    cfg.volume_mount_path = (b.get("volume_mount_path") or "").strip()
     cfg.pool = (b.get("pool") or "").strip().lower()
     cfg.quantization = (b.get("quantization") or "").strip()
     cfg.source = (b.get("source") or cfg.source).strip().lower() or "auto"
@@ -874,9 +917,20 @@ def _vllm_docker_args(mcfg: "RunpodModelConfig", served: str,
     return " ".join(args)
 
 
-#: Where a staged download lands inside the pod. Container disk, wiped with the
-#: pod — size `container_disk_gb` for what you are staging.
+#: Where a staged download lands inside the pod. Container disk by default —
+#: wiped with the pod, so size `container_disk_gb` for what you stage. With a
+#: network volume attached this moves onto it (see staging_dir), and a staged
+#: file then survives for every later pod.
 STAGE_DIR = "/runpod-volume/staged"
+
+
+def staging_dir(mcfg: "RunpodModelConfig" = None, account=None) -> str:
+    """Where staged downloads land: the volume when there is one, else container disk."""
+    try:
+        vol_id, mount = volume_for(mcfg, account) if mcfg is not None else ("", "")
+    except Exception:
+        vol_id, mount = "", ""
+    return f"{mount}/staged" if vol_id and mount else STAGE_DIR
 
 #: Fetch with whatever the image actually has. vLLM's image ships python3 but not
 #: always curl; llama.cpp's ships curl. Trying in order beats assuming.
@@ -1024,6 +1078,8 @@ class RunpodPodPool:
         self.entry = entry if isinstance(entry, dict) else None
         #: Models a CAPABILITY pod should register at boot (it serves many).
         self.seed_entries: list = []
+        #: Looked up once: the data center the network volume lives in.
+        self._volume_dc = None
         self.model_key = model_key
         self.account = account_cfg
         self.mcfg = mcfg
@@ -1082,6 +1138,27 @@ class RunpodPodPool:
         return ""
 
     # -- provisioning ----------------------------------------------------- #
+    def _data_center_for_volume(self, volume_id: str) -> str:
+        """The data center a network volume lives in, or ''.
+
+        A pod can only attach a volume in its own data center, so this pins
+        placement instead of letting GPU ranking pick a region where the attach
+        will simply fail.
+        """
+        try:
+            from codai.api.runpod_client import RunpodClient
+            for vol in RunpodClient(self.account).list_network_volumes():
+                if str(vol.get("id") or "") == str(volume_id):
+                    dc = str(vol.get("dataCenterId") or "")
+                    if dc:
+                        print(f"[runpod] volume {volume_id} is in {dc} — pinning pods "
+                              "there", flush=True)
+                    return dc
+        except Exception as exc:
+            print(f"[runpod] could not resolve the volume's data center: {exc}",
+                  flush=True)
+        return ""
+
     def _create_with_fallback(self, client, ranked, start=0):
         """Try ranked GPU candidates from ``start``; skip capacity misses. Returns
         (pod_id, sel, next_index). Raises if all fail."""
@@ -1094,6 +1171,16 @@ class RunpodPodPool:
         self.health_path = plan["health_path"]
         env = dict(self.mcfg.env or {})
         env.update(plan.get("env") or {})
+
+        # A network volume, when configured: caches and upload targets move onto
+        # it so weights survive the pod. RunPod requires Secure Cloud and the
+        # pod's data center to match the volume's, so both are forced here rather
+        # than surfacing later as an unexplained capacity error.
+        vol_id, vol_mount = volume_for(self.mcfg, self.account)
+        if vol_id:
+            env.update(volume_env(vol_mount))
+            if getattr(self, "_volume_dc", None) is None:
+                self._volume_dc = self._data_center_for_volume(vol_id)
         dc = getattr(self.account, "data_center", "") or ""
         last = None
         for i in range(start, len(ranked)):
@@ -1112,7 +1199,10 @@ class RunpodPodPool:
                     name=name, image=image, gpu_type_id=sel["gpu_type_id"], port=port,
                     cloud_type=sel["cloud_type"], container_disk_gb=self.mcfg.container_disk_gb,
                     volume_gb=self.mcfg.volume_gb, env=env, docker_args=args,
-                    is_spot=sel["is_spot"], bid_per_gpu=sel["bid"], data_center_id=dc,
+                    is_spot=sel["is_spot"], bid_per_gpu=sel["bid"],
+                    data_center_id=(getattr(self, "_volume_dc", "") or dc),
+                    network_volume_id=vol_id,
+                    volume_mount_path=(vol_mount or "/workspace"),
                     registry_auth_id=(self.mcfg.registry_auth_id
                                       or getattr(self.account, "registry_auth_id", "") or ""),
                     entrypoint=plan.get("entrypoint"), start_cmd=plan.get("start_cmd"))

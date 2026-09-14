@@ -185,7 +185,8 @@ class RunpodClient:
                    bid_per_gpu: float = 0.0, data_center_id: str = "",
                    registry_auth_id: str = "",
                    entrypoint: Optional[list] = None,
-                   start_cmd: Optional[list] = None) -> str:
+                   start_cmd: Optional[list] = None,
+                   network_volume_id: str = "") -> str:
         """Provision a pod (on-demand or interruptible/spot). Returns the pod id.
 
         ``entrypoint``/``start_cmd`` override the image's ENTRYPOINT/CMD, which is
@@ -196,6 +197,7 @@ class RunpodClient:
         """
         if entrypoint or start_cmd:
             return self._create_pod_rest(
+                network_volume_id=network_volume_id,
                 name=name, image=image, gpu_type_id=gpu_type_id, port=port,
                 cloud_type=cloud_type, gpu_count=gpu_count,
                 container_disk_gb=container_disk_gb, volume_gb=volume_gb,
@@ -225,6 +227,11 @@ class RunpodClient:
         # images (vLLM, llama.cpp, a public coderai) need none.
         if registry_auth_id:
             common["containerRegistryAuthId"] = registry_auth_id
+        # A network volume persists across pods: weights downloaded once are
+        # there for every later pod, which is the difference between paying a
+        # cold model download per pod and paying it once.
+        if network_volume_id:
+            common["networkVolumeId"] = network_volume_id
         if is_spot:
             common["bidPerGpu"] = float(bid_per_gpu)
             mutation = "podRentInterruptable"
@@ -246,7 +253,8 @@ class RunpodClient:
     def _create_pod_rest(self, *, name, image, gpu_type_id, port, cloud_type,
                          gpu_count, container_disk_gb, volume_gb, volume_mount_path,
                          env, is_spot, bid_per_gpu, data_center_id,
-                         registry_auth_id, entrypoint, start_cmd) -> str:
+                         registry_auth_id, entrypoint, start_cmd,
+                         network_volume_id: str = "") -> str:
         """Create a pod through the REST API, which accepts entrypoint overrides."""
         import requests
         rest = (getattr(self._cfg, "rest_base", "") or "https://rest.runpod.io/v1").rstrip("/")
@@ -270,6 +278,8 @@ class RunpodClient:
             body["dataCenterIds"] = [data_center_id]
         if registry_auth_id:
             body["containerRegistryAuthId"] = registry_auth_id
+        if network_volume_id:
+            body["networkVolumeId"] = network_volume_id
         if is_spot:
             body["interruptible"] = True
             body["bidPerGpu"] = float(bid_per_gpu)
@@ -286,6 +296,27 @@ class RunpodClient:
         if not pod_id:
             raise RunpodError(f"RunPod REST create returned no pod id: {str(data)[:300]}")
         return pod_id
+
+    def list_network_volumes(self) -> list:
+        """The account's network volumes: [{id, name, size, dataCenterId}, …].
+
+        Needed because a pod must run in the volume's OWN data center — a volume
+        in EU-RO-1 cannot be attached to a pod anywhere else, and the failure
+        arrives as an unhelpful capacity error.
+        """
+        import requests
+        rest = (getattr(self._cfg, "rest_base", "") or "https://rest.runpod.io/v1").rstrip("/")
+        try:
+            r = requests.get(f"{rest}/networkvolumes",
+                             headers={"Authorization": f"Bearer {self._api_key}"},
+                             timeout=30)
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            return data if isinstance(data, list) else (data.get("data") or [])
+        except Exception as exc:
+            print(f"[runpod] could not list network volumes: {exc}", flush=True)
+            return []
 
     def get_pod(self, pod_id: str) -> dict:
         """Return {id, status, uptime_s, cost_per_hr, ports:[...], ready:bool, url?}."""

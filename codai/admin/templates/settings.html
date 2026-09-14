@@ -897,6 +897,15 @@
         <input type="text" id="s-runpod-dc" class="form-input" placeholder="(any)">
       </div>
       <div class="form-group" style="flex:1;min-width:180px">
+        <label class="form-label">Network volume id <span class="muted">(optional)</span></label>
+        <input type="text" id="s-runpod-volume" class="form-input" placeholder="blank = none (create it in the RunPod console)">
+        <span class="form-hint" style="font-size:11px">Pods attach it at launch, so downloaded weights, uploaded models and LoRA adapters survive the pod — the second pod does not re-download. Secure Cloud only, and pods are pinned to the volume's data center.</span>
+      </div>
+      <div class="form-group" style="flex:1;min-width:140px">
+        <label class="form-label">Volume mount path</label>
+        <input type="text" id="s-runpod-volume-mount" class="form-input" placeholder="/workspace">
+      </div>
+      <div class="form-group" style="flex:1;min-width:180px">
         <label class="form-label">Registry credential id <span class="muted">(private images)</span></label>
         <input type="text" id="s-runpod-registry-auth" class="form-input" placeholder="blank = public images only">
         <span class="form-hint" style="font-size:11px">From RunPod → Settings → Container Registry Credentials. Needed for a private pod image; public ones (vLLM, llama.cpp) need none.</span>
@@ -1852,6 +1861,8 @@ async function loadSettings(){
     document.getElementById('s-runpod-default-gpu').value = rp.default_gpu_type ?? '';
     document.getElementById('s-runpod-budget').value = rp.global_max_hourly_usd ?? 0;
     document.getElementById('s-runpod-registry-auth').value = rp.registry_auth_id ?? '';
+    document.getElementById('s-runpod-volume').value = rp.network_volume_id ?? '';
+    document.getElementById('s-runpod-volume-mount').value = rp.volume_mount_path ?? '';
     // Remote capabilities
     _populateRemotes(d.remotes || {});
     document.getElementById('s-runpod-cost-limit').value = rp.global_cost_limit_usd ?? 0;
@@ -2055,6 +2066,8 @@ async function saveSettings(silent){
       default_gpu_type: document.getElementById('s-runpod-default-gpu').value.trim(),
       global_max_hourly_usd: parseFloat(document.getElementById('s-runpod-budget').value) || 0,
       registry_auth_id: document.getElementById('s-runpod-registry-auth').value.trim(),
+      network_volume_id: document.getElementById('s-runpod-volume').value.trim(),
+      volume_mount_path: document.getElementById('s-runpod-volume-mount').value.trim(),
       global_cost_limit_usd: parseFloat(document.getElementById('s-runpod-cost-limit').value) || 0,
       global_cost_period: document.getElementById('s-runpod-cost-period').value || 'unlimited',
       data_center: document.getElementById('s-runpod-dc').value.trim(),

@@ -633,6 +633,14 @@ class RunpodConfig:
     # private registry (your own coderai image, typically). Per-model/capability
     # `registry_auth_id` overrides this. Blank = public images only.
     registry_auth_id: str = ""
+    # A RunPod network volume (created by hand in the RunPod console) that pods
+    # attach at launch. Weights downloaded onto it survive the pod, so the second
+    # pod does not re-download a 30 GB model — and it doubles as the place to put
+    # uploaded models and LoRA adapters, since every pod sees the same files.
+    # Constraints RunPod imposes: Secure Cloud only, and the pod MUST run in the
+    # volume's own data center.
+    network_volume_id: str = ""
+    volume_mount_path: str = "/workspace"    # where pods mount it
     # Stable tag baked into every pod name (coderai-<deployment_id>-<model>-<rand>) so the
     # reaper can identify OUR pods across restarts and never touch another deployment's.
     deployment_id: str = "default"
@@ -1218,6 +1226,8 @@ class ConfigManager:
                 "default_gpu_type": self.config.runpod.default_gpu_type,
                 "data_center": self.config.runpod.data_center,
                 "registry_auth_id": self.config.runpod.registry_auth_id,
+                "network_volume_id": self.config.runpod.network_volume_id,
+                "volume_mount_path": self.config.runpod.volume_mount_path,
                 "deployment_id": self.config.runpod.deployment_id,
                 "global_max_hourly_usd": self.config.runpod.global_max_hourly_usd,
                 "global_cost_limit_usd": self.config.runpod.global_cost_limit_usd,

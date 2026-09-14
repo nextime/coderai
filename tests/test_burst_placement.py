@@ -380,3 +380,55 @@ def test_a_borrowed_pod_is_released_not_terminated(monkeypatch):
     pool.pods = [borrowed]
     pool._terminate(borrowed, "idle")
     assert killed == [] and pool.pods == []
+
+
+# --------------------------------------------------------------------------- #
+# network volumes
+# --------------------------------------------------------------------------- #
+def test_a_volume_moves_the_caches_off_container_disk():
+    """The point of a volume: weights land somewhere that outlives the pod, so
+    the second pod does not re-download them."""
+    from codai.api.runpod_worker import volume_for, volume_env, staging_dir, \
+        parse_model_runpod
+
+    class _Acct:
+        network_volume_id = ""
+        volume_mount_path = "/workspace"
+
+    cfg = parse_model_runpod({"network_volume_id": "vol-abc"})
+    assert volume_for(cfg, _Acct()) == ("vol-abc", "/workspace")
+
+    env = volume_env("/workspace")
+    # Downloads, uploads and every cache go to the volume.
+    assert env["HF_HOME"] == "/workspace/huggingface"
+    assert env["CODERAI_MODELS_DIR"] == "/workspace/models"
+    assert staging_dir(cfg, _Acct()) == "/workspace/staged"
+
+    # Without one, nothing changes: container disk, wiped with the pod.
+    plain = parse_model_runpod({})
+    assert volume_for(plain, _Acct()) == ("", "")
+    assert staging_dir(plain, _Acct()).startswith("/runpod-volume")
+
+
+def test_an_account_wide_volume_applies_and_a_pod_can_override():
+    from codai.api.runpod_worker import volume_for, parse_model_runpod
+
+    class _Acct:
+        network_volume_id = "vol-account"
+        volume_mount_path = "/workspace"
+
+    assert volume_for(parse_model_runpod({}), _Acct())[0] == "vol-account"
+    assert volume_for(parse_model_runpod({"network_volume_id": "vol-own"}),
+                      _Acct())[0] == "vol-own"
+
+
+def test_a_volume_forces_secure_cloud():
+    """RunPod offers network volumes on Secure Cloud only: keeping COMMUNITY in
+    the list would just produce candidates the attach rejects."""
+    from codai.api.runpod_worker import parse_model_runpod
+
+    cfg = parse_model_runpod({"network_volume_id": "vol-abc",
+                              "cloud_types": ["SECURE", "COMMUNITY"]})
+    assert cfg.cloud_types == ["SECURE"]
+    # Without a volume the choice is left alone.
+    assert parse_model_runpod({"cloud_types": ["COMMUNITY"]}).cloud_types == ["COMMUNITY"]

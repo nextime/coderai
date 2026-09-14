@@ -496,6 +496,51 @@ A model that resolves to none of those — a local path with no `hf_repo`,
 `model_url` or `source: upload` — is refused with that reason rather than
 registered as something the pod could never load.
 
+### Network volumes (optional)
+
+A pod's own disk dies with the pod, so every cold pod re-downloads its weights.
+A RunPod **network volume** — created by hand in the RunPod console, coderai
+never creates one — turns that into a one-off:
+
+```json
+{"runpod": {"network_volume_id": "abc123", "volume_mount_path": "/workspace"}}
+```
+
+Account-wide in Settings, or per pool in its pod block. What changes when one is
+attached:
+
+| | Without a volume | With one |
+|---|---|---|
+| Downloaded weights | re-fetched by every cold pod | fetched once, reused |
+| Uploaded models / LoRA adapters | re-uploaded to every new pod | sent once |
+| Staged downloads (`source: url`) | container disk | on the volume |
+
+coderai points `HF_HOME`, the diffusers/transformers caches, `CODERAI_MODELS_DIR`
+and the staging directory at the mount, which is what actually makes the volume
+do anything — attaching one without redirecting the caches changes nothing.
+
+**That also makes the volume your bounce host.** An upload lands on it and every
+later pod sees the file, so "upload a QLoRA or a local model once, use it from
+any pod" needs no third-party storage and no public IP.
+
+Two constraints RunPod imposes, both handled for you:
+
+* **Secure Cloud only** — `cloud_types` is forced to `SECURE`, because a
+  COMMUNITY candidate would just fail the attach.
+* **Same data center as the volume** — the volume's region is looked up once and
+  pods are pinned there, rather than letting GPU price ranking pick a region
+  where the attach fails as an unexplained capacity error.
+
+A volume is attached at deploy time and cannot be added to a running pod. Cost is
+about $0.07/GB/month. And RunPod warns that several workers **writing** the same
+volume at once can corrupt it — coderai's writes are write-once (content-addressed
+adapter blobs, named model files), but keep that in mind before pointing many
+pods at one volume for anything else.
+
+**Container images cannot come from a volume.** A pod pulls its image from a
+registry before any volume exists; the volume holds model weights and adapters,
+not the image.
+
 ### Keeping a pod warm
 
 `keep_warm` on a model's runpod block (or a capability's) keeps one pod running
