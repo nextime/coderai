@@ -95,6 +95,38 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
+    # Models this instance was seeded with (CODERAI_SEED_MODELS). A pod image
+    # runs uvicorn on this app directly — it never executes codai/main.py — so
+    # the startup registration that lives there does not happen here, and a
+    # seeded pod would answer "not available" for everything. Registering in the
+    # lifespan covers BOTH entry points.
+    try:
+        import codai.admin.routes as _admin_routes
+        from codai.api.models_transfer import register_model_runtime
+        _cm = getattr(_admin_routes, "config_manager", None)
+        if _cm is None:
+            # Nobody built one: under bare uvicorn neither main.py nor
+            # build_system_app ran, so config_manager is still the module's
+            # initial None and BOTH the seed list and the catalogue write below
+            # would silently do nothing. Build it here — it is the same
+            # ConfigManager over the same config_dir the other entry points use,
+            # and loading it is what parses CODERAI_SEED_MODELS.
+            from codai.platform_paths import legacy_style_config_dir
+            from codai.config import ConfigManager
+            _cm = ConfigManager(str(legacy_style_config_dir()))
+            _cm.load()
+            _admin_routes.set_config_manager(_cm)
+            print("[seed] config manager bootstrapped for a bare-uvicorn start",
+                  flush=True)
+        _seeds = [e for e in (getattr(_cm, "_pending_seed_entries", None) or [])
+                  if isinstance(e, dict) and e.get("path")]
+        print(f"[seed] {len(_seeds)} seeded model(s) to register", flush=True)
+        for _entry in _seeds:
+            register_model_runtime(_entry,
+                                   _entry.get("model_type") or "text_models")
+    except Exception as _exc:
+        print(f"[seed] could not register seeded models: {_exc}", flush=True)
+
     # Start any RunPod pod configured to stay warm. Pools are otherwise created
     # on first use, so the first request after a restart would still pay the cold
     # boot that `keep_warm` exists to avoid. In a thread: provisioning blocks for

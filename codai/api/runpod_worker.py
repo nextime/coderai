@@ -1382,7 +1382,7 @@ class RunpodPodPool:
                     "console_url": console, "started_at": time.time()}
             # …and from every SIBLING engine's reaper, which cannot see the set
             # above: each engine has its own pools and its own reaper.
-            register_pod(pod_id, str(self.model_key))   # url recorded once ready
+            register_pod(pod_id, str(self.model_key), api_key=self.api_key)  # url once ready
             print(f"[runpod] pod {pod_id} created for {self.model_key!r} "
                   f"({sel['display_name']} {sel['cloud_type']}) — booting; logs: {console}",
                   flush=True)
@@ -1443,7 +1443,7 @@ class RunpodPodPool:
                 _provisioning_info.pop(pod_id, None)
             # Publish the URL so a sibling engine needing the same pool reuses
             # this pod instead of renting a second GPU for the same work.
-            register_pod(pod_id, str(self.model_key), url)
+            register_pod(pod_id, str(self.model_key), url, self.api_key)
             print(f"[runpod] pod {pod_id} ready for {self.model_key!r} at {url}", flush=True)
             return h
         raise last_exc or RunpodError("RunPod: could not provision a pod.")
@@ -1559,8 +1559,22 @@ class RunpodPodPool:
                         self._cv.notify_all()
                         self._cv.wait(15.0)
                     continue
-                shared_id, shared_url = find_shared_pod(
+                shared_id, shared_url, shared_key = find_shared_pod(
                     str(self.model_key), self.health_path, self.api_key)
+                if shared_url and shared_key and shared_key != self.api_key:
+                    # That pod only answers to the token it was launched with.
+                    # Adopt the token so this pool — and the pods it rents next —
+                    # speak the same one. Only safe while we hold no pod of our
+                    # own; otherwise leave it to be reaped rather than end up
+                    # with a pool whose pods want two different tokens.
+                    with self._cv:
+                        adoptable = not self.pods
+                    if not adoptable:
+                        shared_id, shared_url = None, ""
+                    else:
+                        self.api_key = shared_key
+                        print(f"[runpod] adopting pod {shared_id}'s bearer token",
+                              flush=True)
                 if shared_url:
                     print(f"[runpod] reusing pod {shared_id} from another engine "
                           f"for {self.model_key!r}", flush=True)
@@ -1954,18 +1968,25 @@ def _registry_update(fn):
         return {}
 
 
-def register_pod(pod_id: str, pool_key: str = "", url: str = "") -> None:
+def register_pod(pod_id: str, pool_key: str = "", url: str = "",
+                 api_key: str = "") -> None:
     """Record a pod as owned by this deployment.
 
     Two reasons, both about processes that cannot see each other: no sibling's
     reaper may treat it as an orphan, and a sibling that needs the SAME pool can
     reuse this pod instead of renting a second GPU for the same work.
+
+    The bearer token goes in too. A pool that was not given one generates a
+    random token and launches its pods with it, so a pod that outlives the
+    process that rented it — a restart, a crash — is adopted by the next pool
+    with a DIFFERENT token and answers 401 to every request for the rest of its
+    paid life. Observed live: a surviving pod reported "serves: (HTTP 401)".
     """
     if not pod_id:
         return
     _registry_update(lambda d: d.__setitem__(
         str(pod_id), {"pool": str(pool_key), "pid": os.getpid(), "at": time.time(),
-                      "url": str(url or "")})
+                      "url": str(url or ""), "key": str(api_key or "")})
         or True)
 
 
@@ -1995,7 +2016,11 @@ def sibling_is_provisioning(pool_key: str) -> bool:
 
 def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
                     api_key: str = "") -> tuple:
-    """A pod another process already has for this pool: (pod_id, url) or (None, '').
+    """A pod another process already has for this pool: (pod_id, url, key).
+
+    ``key`` is the token that pod was launched with, which is not necessarily
+    ours — see register_pod. Empty when unknown (an entry from before tokens were
+    recorded), in which case the caller's own token is tried.
 
     coderai runs one engine per GPU, and each has its own pools — so the same
     capability was rented a pod PER ENGINE, paying twice for one job while
@@ -2004,7 +2029,7 @@ def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
     """
     data = _registry_update(lambda d: False)
     if not isinstance(data, dict):
-        return None, ""
+        return None, "", ""
     mine = os.getpid()
     for pod_id, info in data.items():
         if not isinstance(info, dict) or info.get("pool") != str(pool_key):
@@ -2014,9 +2039,10 @@ def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
         url = str(info.get("url") or "")
         if not url:
             continue
-        if _pod_health_ok(url, path=health_path, api_key=api_key):
-            return pod_id, url
-    return None, ""
+        key = str(info.get("key") or "") or api_key
+        if _pod_health_ok(url, path=health_path, api_key=key):
+            return pod_id, url, key
+    return None, "", ""
 
 
 def unregister_pod(pod_id: str) -> None:

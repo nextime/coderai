@@ -348,18 +348,18 @@ def test_a_sibling_engines_pod_is_reused_not_duplicated(tmp_path, monkeypatch):
         "pod-from-nvidia", {"pool": "capability:embeddings", "pid": 999999,
                             "at": 0, "url": "http://pod-a:8000"}) or True)
 
-    pod_id, url = rw.find_shared_pod("capability:embeddings")
+    pod_id, url, key = rw.find_shared_pod("capability:embeddings")
     assert (pod_id, url) == ("pod-from-nvidia", "http://pod-a:8000")
 
     # A different pool must not borrow it.
-    assert rw.find_shared_pod("capability:images") == (None, "")
+    assert rw.find_shared_pod("capability:images") == (None, "", "")
 
     # Our own pods are left to the local pool, not "borrowed" from ourselves.
     import os
     rw._registry_update(lambda d: d.__setitem__(
         "pod-mine", {"pool": "capability:images", "pid": os.getpid(),
                      "at": 0, "url": "http://pod-b:8000"}) or True)
-    assert rw.find_shared_pod("capability:images") == (None, "")
+    assert rw.find_shared_pod("capability:images") == (None, "", "")
 
 
 def test_a_borrowed_pod_is_released_not_terminated(monkeypatch):
@@ -515,3 +515,30 @@ def test_a_sibling_waits_for_a_booting_pod_instead_of_renting_one(tmp_path, monk
         "ancient", {"pool": "capability:video", "pid": 999998,
                     "at": 0, "url": ""}) or True)
     assert rw.sibling_is_provisioning("capability:video") is False
+
+
+def test_a_surviving_pods_token_is_remembered_across_a_restart(tmp_path, monkeypatch):
+    """A pool generates a random bearer token and launches its pods with it. When
+    the process dies and the pod does not, the next pool generates a DIFFERENT
+    token and the surviving pod answers 401 to everything for the rest of its
+    paid life — observed live: the test run reported 'serves: (HTTP 401)'."""
+    import codai.api.runpod_worker as rw
+
+    monkeypatch.setattr(rw, "_pod_registry_path", lambda: str(tmp_path / "pods.json"))
+    seen = {}
+
+    def _health(url, path="/v1/models", api_key="", **kw):
+        seen["key"] = api_key
+        return api_key == "cra-original"      # the pod only knows its own token
+
+    monkeypatch.setattr(rw, "_pod_health_ok", _health)
+
+    # The pod the dead process rented, with the token it was launched with.
+    rw.register_pod("pod-survivor", "capability:embeddings",
+                    "http://pod-a:8000", "cra-original")
+    monkeypatch.setattr(rw.os, "getpid", lambda: 424242)   # a NEW process
+
+    pod_id, url, key = rw.find_shared_pod("capability:embeddings",
+                                          api_key="cra-freshly-generated")
+    assert (pod_id, url, key) == ("pod-survivor", "http://pod-a:8000", "cra-original")
+    assert seen["key"] == "cra-original", "probed with the pod's token, not ours"
