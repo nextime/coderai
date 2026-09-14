@@ -1104,6 +1104,10 @@ class FrontProxy:
             for f in ("server", "backend", "models", "offload", "vulkan", "image",
                       "whisper", "archive", "thermal", "jobs", "enhance", "ds4", "colibri",
                       "k3", "ktransformers", "vllm",
+                      # The front's burst-to-RunPod path reads config.runpod, and
+                      # `remotes` decides capability routing: without these a
+                      # settings save reached neither until a restart.
+                      "runpod", "remotes",
                       "compaction", "broker", "system_prompt", "tools_closer_prompt",
                       "grammar_guided", "parser", "tmp_dir"):
                 if hasattr(new, f):

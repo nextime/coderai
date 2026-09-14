@@ -559,6 +559,26 @@ async def internal_reload_config(request: Request):
             n = sum(len(config_manager.models_data.get(c, []) or []) for c in _cats)
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+    # Also re-read config.json. The admin API is served by the SYSTEM worker, so
+    # a settings save updates that process's config — not this engine's, which is
+    # where the remote gateway and the engine blocks are read. Without this,
+    # configuring a remote capability or a RunPod account silently does nothing
+    # until a restart.
+    try:
+        from codai.config import ConfigManager
+        from codai.admin.routes import config_manager as _cm
+        if _cm is not None and getattr(_cm, "config_dir", None):
+            fresh = ConfigManager(str(_cm.config_dir))
+            fresh.load()
+            for _f in ("remotes", "runpod", "ds4", "colibri", "k3", "ktransformers",
+                       "vllm", "server", "models", "offload", "image", "jobs",
+                       "enhance", "ocr", "thermal", "broker"):
+                if hasattr(fresh.config, _f):
+                    setattr(_cm.config, _f, getattr(fresh.config, _f))
+    except Exception as exc:
+        print(f"[reload] config.json refresh failed: {exc}", flush=True)
+
     try:
         from codai.models.manager import multi_model_manager
         assigned = data.get("assigned")
