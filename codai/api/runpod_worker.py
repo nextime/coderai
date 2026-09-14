@@ -66,6 +66,10 @@ class RunpodModelConfig:
     # the request, while a vLLM pod is launched `--model X` and a llama.cpp pod
     # `-hf one.gguf` — those serve exactly one, and sharing is refused.
     pool: str = ""
+    # vLLM's own quantization flag (awq, gptq, bitsandbytes, fp8 …). A local
+    # entry's load_in_4bit/8bit does NOT carry over: that is how the transformers
+    # backend loads weights here, and vLLM quantizes its own way.
+    quantization: str = ""
     # Bearer token the pod requires on every request. A RunPod proxy URL is
     # reachable by anyone who learns it, so a pod without one is an open GPU on
     # the public internet. Blank does NOT mean "no auth": the pool generates a
@@ -157,6 +161,37 @@ _CAPABILITY_IMAGE_ALIASES = {
 }
 
 
+#: models.json section -> the capability whose pod image serves it. This is what
+#: lets a NON-TEXT model be sent to RunPod individually: the pod image follows
+#: from what the model is, not from whether its path ends in .gguf.
+MODEL_TYPE_CAPABILITY = {
+    "image_models": "images",
+    "video_models": "video",
+    "audio_models": "stt",
+    "tts_models": "tts",
+    "embedding_models": "embeddings",
+    "spatial_models": "spatial",
+    "audio_gen_models": "audio_gen",
+}
+
+#: Sections served by an LLM pod (vLLM / llama.cpp) rather than a capability pod.
+_LLM_MODEL_TYPES = ("text_models", "gguf_models", "vision_models")
+
+
+def model_capability(entry: dict) -> str:
+    """The capability a model entry belongs to, or '' for a text/LLM model."""
+    if not isinstance(entry, dict):
+        return ""
+    types = entry.get("model_types") or [entry.get("model_type") or ""]
+    for mt in types:
+        if mt in _LLM_MODEL_TYPES:
+            return ""
+        cap = MODEL_TYPE_CAPABILITY.get(mt)
+        if cap:
+            return cap
+    return ""
+
+
 def default_capability_image(capability: str) -> str:
     """The published image for a capability, or '' when there is none."""
     name = _CAPABILITY_IMAGE_ALIASES.get(capability, capability)
@@ -170,16 +205,22 @@ def _looks_like_gguf(name: str) -> bool:
 
 
 def resolve_pod_engine(mcfg: "RunpodModelConfig", model_key: str = "",
-                       model_path: str = "") -> str:
-    """Decide which server a pod runs for this model: "vllm" or "llamacpp".
+                       model_path: str = "", entry: dict = None) -> str:
+    """Decide which server a pod runs for this model.
 
-    An explicit ``engine`` wins. Otherwise: a GGUF (by `hf_gguf`, by the model's
-    own path, or by the served name) goes to llama.cpp; anything else — an HF
-    repo id — goes to vLLM.
+    An explicit ``engine`` wins. Otherwise the model's OWN KIND decides: an
+    image/video/TTS/STT/embedding model goes to a coderai capability pod (vLLM
+    cannot serve a diffusion pipeline), a GGUF to llama.cpp, and an HF repo id to
+    vLLM.
     """
     want = (mcfg.engine or "auto").strip().lower()
     if want in ("vllm", "llamacpp", "coderai", "custom"):
         return want
+    # A non-text model is served by a whole coderai carrying that capability.
+    if entry is None:
+        entry = _model_entry(model_key)
+    if model_capability(entry or {}):
+        return "coderai"
     if mcfg.hf_gguf:
         return "llamacpp"
     if _looks_like_gguf(mcfg.served_model) or _looks_like_gguf(model_path) \
@@ -195,18 +236,30 @@ _HEALTH_PATHS = {"vllm": "/v1/models", "llamacpp": "/v1/models",
 
 
 def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
-             model_path: str = "", api_key: str = "") -> dict:
+             model_path: str = "", api_key: str = "", entry: dict = None) -> dict:
     """Everything needed to launch one pod: image, docker args, health path.
 
     This is the seam that lets a pool serve something other than an LLM — a whole
     coderai (so images/video/TTS/… can run on a rented GPU with the same budgets,
     autoscaling and idle reaping), or any image at all with `engine: custom`.
     """
-    engine = resolve_pod_engine(mcfg, model_key, model_path)
+    if entry is None:
+        entry = _model_entry(model_key)
+    engine = resolve_pod_engine(mcfg, model_key, model_path, entry)
     if engine == "llamacpp":
         image = mcfg.image or LLAMACPP_POD_IMAGE
         args = mcfg.docker_args or _llamacpp_docker_args(mcfg, served)
     elif engine in ("coderai", "custom"):
+        cap = model_capability(entry or {})
+        if not mcfg.image and cap:
+            # A model of a known kind gets that capability's published image.
+            image = default_capability_image(cap)
+            if not image:
+                raise RuntimeError(
+                    f"RunPod: no published pod image for {cap!r} models — set "
+                    "`image` on this model's runpod block to one you have built.")
+            args = mcfg.docker_args
+            return _plan(engine, image, args, mcfg, api_key, entry, served)
         if not mcfg.image:
             raise RuntimeError(
                 f"RunPod {engine} pod: set `image` on the runpod block to the image "
@@ -235,6 +288,46 @@ def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
             env["VLLM_API_KEY"] = api_key
     return {"engine": engine, "image": image, "args": args, "env": env,
             "health_path": mcfg.health_path or _HEALTH_PATHS.get(engine, "/v1/models")}
+
+
+def _plan(engine, image, args, mcfg, api_key, entry, served) -> dict:
+    """Finish a plan for a coderai pod: auth plus the model it must serve."""
+    env = {}
+    if api_key:
+        env["CODERAI_API_TOKEN"] = api_key
+    seed = seed_model_env(entry, served)
+    if seed:
+        env["CODERAI_SEED_MODELS"] = seed
+    return {"engine": engine, "image": image, "args": args, "env": env,
+            "health_path": mcfg.health_path or _HEALTH_PATHS.get(engine, "/healthz")}
+
+
+def seed_model_env(entry: dict, served: str = "") -> str:
+    """The model entry to register on a fresh pod, as JSON for CODERAI_SEED_MODELS.
+
+    A pod starts with an EMPTY catalogue: it would refuse a request for a model
+    it has never heard of. So a pod rented for one model is told about that model
+    at launch, and pulls the weights from HF on first use. Only the fields that
+    describe the model travel — never local paths, which mean nothing there, and
+    never this deployment's placement settings, which would make the pod try to
+    rent pods of its own.
+    """
+    import json as _json
+    if not isinstance(entry, dict) or not entry:
+        return ""
+    path = str(entry.get("path") or "").strip()
+    if not path or path.startswith("/"):
+        # A local path cannot be resolved on a rented machine. The pod would have
+        # to download it from somewhere, and we have no repo id to give it.
+        return ""
+    keep = ("path", "model_type", "model_types", "video_subtypes", "capabilities",
+            "alias", "config_name", "load_in_4bit", "load_in_8bit", "n_ctx",
+            "flash_attention", "model_template", "acceleration", "component_quantization",
+            "languages", "supports_translation", "parser", "max_instances")
+    out = {k: entry[k] for k in keep if k in entry and entry[k] is not None}
+    if served and served != path:
+        out["alias"] = served
+    return _json.dumps([out])
 
 
 def _llamacpp_docker_args(mcfg: "RunpodModelConfig", served: str) -> str:
@@ -311,6 +404,7 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.docker_args = (b.get("docker_args") or "").strip()
     cfg.registry_auth_id = (b.get("registry_auth_id") or "").strip()
     cfg.pool = (b.get("pool") or "").strip().lower()
+    cfg.quantization = (b.get("quantization") or "").strip()
     cfg.api_key = (b.get("api_key") or "").strip()
     cfg.allow_open_pod = _as_bool(b.get("allow_open_pod"), cfg.allow_open_pod)
     cfg.served_model = (b.get("served_model") or "").strip()
@@ -336,6 +430,15 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.cost_limit_usd = _as_float(b.get("cost_limit_usd"), cfg.cost_limit_usd)
     cfg.cost_period = (b.get("cost_period") or cfg.cost_period).strip().lower()
     return cfg
+
+
+def _model_entry(model_name: str) -> dict:
+    """The model's models.json entry, or {}."""
+    try:
+        from codai.models.manager import _model_entry_for
+        return _model_entry_for(model_name) or {}
+    except Exception:
+        return {}
 
 
 def _model_path_for(model_name: str) -> str:
@@ -492,11 +595,26 @@ _provisioning_info: dict = {}
 
 def _vllm_docker_args(mcfg: "RunpodModelConfig", served: str) -> str:
     """Args appended to the vLLM OpenAI image entrypoint so it serves ``served``
-    on the pod's port, reachable through the RunPod proxy."""
+    on the pod's port, reachable through the RunPod proxy.
+
+    ``served`` must be something the POD can resolve — an HF repo id it will
+    download. A local directory is as meaningless there as a local .gguf, and
+    surfaces as a pod that boots for minutes and then dies, so it is refused up
+    front instead.
+    """
+    name = (served or "").strip()
+    if not name or name.startswith("/") or name.startswith("~"):
+        raise RuntimeError(
+            f"RunPod vLLM pod: {name or '(nothing)'} is a local path, which does not "
+            "exist on a rented machine. Set `served_model` on the model's runpod "
+            "block to the HuggingFace repo id the pod should download (e.g. "
+            "\"Qwen/Qwen3.5-9B\"); coderai does not upload model weights.")
     args = ["--host", "0.0.0.0", "--port", str(mcfg.port or 8000),
-            "--model", served, "--served-model-name", served]
+            "--model", name, "--served-model-name", name]
     if mcfg.ctx and mcfg.ctx > 0:
         args += ["--max-model-len", str(mcfg.ctx)]
+    if mcfg.quantization:
+        args += ["--quantization", mcfg.quantization]
     return " ".join(args)
 
 
@@ -511,7 +629,11 @@ class RunpodPodPool:
       and keeps ``min_pods`` warm.
     """
 
-    def __init__(self, model_key, account_cfg, mcfg: "RunpodModelConfig", served_name):
+    def __init__(self, model_key, account_cfg, mcfg: "RunpodModelConfig", served_name,
+                 entry: dict = None):
+        #: The model's models.json entry, when this pool serves one specific
+        #: model: it decides the pod image and is seeded into the pod.
+        self.entry = entry if isinstance(entry, dict) else None
         self.model_key = model_key
         self.account = account_cfg
         self.mcfg = mcfg
@@ -576,7 +698,8 @@ class RunpodPodPool:
         from codai.api.runpod_client import RunpodError
         port = self.mcfg.port or 8000
         plan = pod_plan(self.mcfg, self.served, str(self.model_key),
-                        _model_path_for(self.model_key), api_key=self.api_key)
+                        _model_path_for(self.model_key), api_key=self.api_key,
+                        entry=self.entry)
         image, args = plan["image"], plan["args"]
         self.health_path = plan["health_path"]
         env = dict(self.mcfg.env or {})
@@ -920,7 +1043,7 @@ def shared_pool_key(mcfg: "RunpodModelConfig", model_key: str,
 
 
 def get_pod_pool(model_key, account_cfg, mcfg: "RunpodModelConfig", served_name,
-                 shared: bool = False) -> RunpodPodPool:
+                 shared: bool = False, entry: dict = None) -> RunpodPodPool:
     """The pool for ``model_key``, created on first use.
 
     ``shared`` marks a pool several models joined by name. The first model to
@@ -931,13 +1054,34 @@ def get_pod_pool(model_key, account_cfg, mcfg: "RunpodModelConfig", served_name,
     with _pools_lock:
         pool = _pools.get(model_key)
         if pool is None:
-            pool = RunpodPodPool(model_key, account_cfg, mcfg, served_name)
+            pool = RunpodPodPool(model_key, account_cfg, mcfg, served_name, entry)
             _pools[model_key] = pool
         elif not shared:
             # refresh config each load so edits take effect
             pool.account, pool.mcfg, pool.served = account_cfg, mcfg, served_name
     _ensure_scaler()
     return pool
+
+
+def get_model_pod_pool(model_name: str, entry: dict, block: dict):
+    """A managed pod pool for ONE non-text model (an image/video/TTS model…).
+
+    The model's own kind picks the pod image — a diffusion model cannot be served
+    by vLLM — and the pod is told about the model at launch so it can serve a
+    catalogue it would otherwise know nothing about. This is what lets two models
+    of the same kind be placed differently: one video model local, another on its
+    own pod, with its own budget.
+    """
+    from codai.models.manager import get_active_runpod_config
+    acct = get_active_runpod_config()
+    if acct is None or not getattr(acct, "enabled", False):
+        raise RuntimeError(
+            f"RunPod is not enabled — cannot provision a pod for {model_name!r}.")
+    mcfg = parse_model_runpod(block or {})
+    key = shared_pool_key(mcfg, model_name, str(entry.get("path") or ""))
+    served = (mcfg.served_model or "").strip() or str(entry.get("path") or model_name)
+    return get_pod_pool(key, acct, mcfg, served, shared=(key != model_name),
+                        entry=entry)
 
 
 def get_capability_pool(capability: str, block: dict):

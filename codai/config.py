@@ -978,6 +978,12 @@ class ConfigManager:
                 "aliases": {}
             }
         
+        # A pod rented for one model starts with an empty catalogue and would
+        # refuse every request for it. CODERAI_SEED_MODELS carries the entries it
+        # must know about, merged in at startup (existing entries win, so this
+        # can never overwrite a real deployment's catalogue).
+        self._seed_models_from_env()
+
         # Load auth.json
         if self.auth_path.exists():
             with open(self.auth_path, 'r') as f:
@@ -1298,6 +1304,39 @@ class ConfigManager:
         with open(self.config_path, 'w') as f:
             json.dump(config_dict, f, indent=2)
     
+    def _seed_models_from_env(self) -> None:
+        """Register models named by CODERAI_SEED_MODELS (JSON list of entries).
+
+        Used by RunPod capability pods, which are rented for a specific model and
+        have no models.json of their own. Never persisted: a pod is disposable,
+        and writing it would surprise anyone who set the variable on a real
+        installation.
+        """
+        raw = os.environ.get("CODERAI_SEED_MODELS", "").strip()
+        if not raw:
+            return
+        try:
+            entries = json.loads(raw)
+        except Exception as exc:
+            print(f"[seed] CODERAI_SEED_MODELS is not valid JSON: {exc}", flush=True)
+            return
+        if isinstance(entries, dict):
+            entries = [entries]
+        if not isinstance(entries, list):
+            return
+        for e in entries:
+            if not isinstance(e, dict) or not e.get("path"):
+                continue
+            section = e.get("model_type") or "text_models"
+            lst = self.models_data.setdefault(section, [])
+            if not isinstance(lst, list):
+                continue
+            path = str(e["path"])
+            if any(isinstance(m, dict) and m.get("path") == path for m in lst):
+                continue            # a real entry already covers it — leave it alone
+            lst.append(dict(e))
+            print(f"[seed] registered {path} in {section}", flush=True)
+
     def save_models(self):
         """Save models.json to disk."""
         with open(self.models_path, 'w') as f:

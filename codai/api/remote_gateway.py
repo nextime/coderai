@@ -72,9 +72,6 @@ _CAPABILITY_PREFIXES = (
     ("/v1/rerank", "rerank"),
     ("/v1/ocr", "ocr"),
     ("/v1/loras", "loras"),
-    ("/v1/characters", "characters"),
-    ("/v1/environments", "environments"),
-    ("/v1/pipelines", "pipelines"),
     ("/v1/faceswap", "faceswap"),
 )
 
@@ -104,6 +101,14 @@ def file_origin(filename: str) -> str:
 
 #: Handled by RemoteOpenAIBackend instead — see the module docstring.
 _SKIP_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/models")
+
+#: Orchestration endpoints: a sequence of calls to other endpoints, not a model.
+#: They are NEVER forwarded as a whole — the chain stays here and each step goes
+#: out as its own /v1 request through the front (codai/broker/asgi_bridge.py), so
+#: every step is placed by its OWN model's configuration. Forwarding the
+#: orchestration instead would move the logic to a pod and place every step by
+#: that pod's catalogue, which is the opposite of what these are for.
+_ORCHESTRATION_PREFIXES = ("/v1/pipelines", "/v1/characters", "/v1/environments")
 
 #: `model` field in a multipart body, without paying for a full form parse.
 _MULTIPART_MODEL = re.compile(
@@ -166,6 +171,34 @@ def capability_pods() -> dict:
         return {}
     return {str(k).strip().lower(): (v if isinstance(v, dict) else {})
             for k, v in pods.items()}
+
+
+def model_placement(model: str) -> tuple:
+    """Where this specific model runs: ("local"|"url"|"pod"|"", detail).
+
+    Per-model placement beats the capability map, so two models of the SAME kind
+    can differ — one video model pinned local while another runs on a pod. A
+    model with nothing set returns "" and falls through to the capability
+    setting.
+    """
+    if not model:
+        return "", None
+    try:
+        from codai.models.manager import _model_entry_for
+        entry = _model_entry_for(model) or {}
+    except Exception:
+        entry = {}
+    # An explicit local pin opts this model OUT of a capability-wide remote.
+    if str(entry.get("placement") or "").strip().lower() == "local":
+        return "local", None
+    url = _model_remote(model)
+    if url:
+        return "url", url
+    backend = str(entry.get("backend") or "").strip().lower()
+    block = entry.get("runpod") if isinstance(entry.get("runpod"), dict) else None
+    if backend == "runpod" and block is not None:
+        return "pod", (entry, block)
+    return "", None
 
 
 def _model_remote(model: str) -> str:
@@ -260,6 +293,8 @@ def resolve_target(path: str, method: str, query: str, body: bytes,
     """Decide where this request should go, or None to serve it locally."""
     if not path.startswith("/v1/") or path in _SKIP_PATHS:
         return None
+    if path.startswith(_ORCHESTRATION_PREFIXES):
+        return None
     # A generated file is fetched from whichever remote rendered it.
     if path.startswith("/v1/files/"):
         base = file_origin(path[len("/v1/files/"):])
@@ -269,9 +304,18 @@ def resolve_target(path: str, method: str, query: str, body: bytes,
     if not model and query:
         from urllib.parse import parse_qs
         model = (parse_qs(query).get("model") or [""])[0]
-    url = _model_remote(model)
-    if url:
-        return Target(url=url, reason=f"model {model!r}")
+
+    # Per model first, so two models of the same kind can be placed differently.
+    where, detail = model_placement(model)
+    if where == "local":
+        return None                              # pinned here, whatever the capability says
+    if where == "url":
+        return Target(url=detail, reason=f"model {model!r}")
+    if where == "pod":
+        entry, block = detail
+        from codai.api.runpod_worker import get_model_pod_pool
+        return Target(pool=get_model_pod_pool(model, entry, block),
+                      reason=f"model {model!r} on its own RunPod pod")
     if not cap:
         return None
     url = capability_endpoints().get(cap, "")
@@ -352,6 +396,10 @@ class RemoteGatewayMiddleware:
             return await _error(send, 502,
                                 f"could not reach a remote for this request: {exc}")
         try:
+            # Ship any LoRA the request names, so the remote can actually load it.
+            if b'"loras"' in (body or b"") and "json" in headers.get("content-type", ""):
+                body = await asyncio.to_thread(
+                    sync_loras, base, target.api_key, body)
             await self._send_upstream(scope, headers, body, base, target.reason, send,
                                       api_key=target.api_key)
         finally:
@@ -439,6 +487,77 @@ def _rewrite_file_urls(raw: bytes, remote_base: str, local_base: str) -> bytes:
         return (local_base.encode("latin-1") if local_base else b"") + b"/v1/files/" + m.group(1)
 
     return _FILE_URL.sub(_sub, raw)
+
+
+def sync_loras(base: str, api_key: str, body: bytes) -> bytes:
+    """Make sure a remote can load the LoRAs this request names.
+
+    A LoRA lives as a file on THIS machine — trained here, or uploaded here. A
+    pod has never seen it, so a request naming `{"model": "/AI/loras/x.safetensors"}`
+    would fail there. The blob store is content-addressed, so each adapter is
+    hashed, checked against the remote's /v1/loras/blob/<hash>, uploaded only
+    when missing, and the reference rewritten to that id. Repeat requests upload
+    nothing.
+
+    QLoRA adapters need no special handling: the quantisation lives in how the
+    BASE model is loaded, while the adapter is the same safetensors file.
+
+    Anything that cannot be resolved to a local file — an HF repo id, a URL —
+    is left untouched: the remote can fetch those itself. Failure anywhere
+    returns the body unchanged, so the request still goes out and fails (or
+    succeeds) on the remote's own terms rather than here.
+    """
+    import hashlib
+    import requests
+
+    try:
+        obj = json.loads(body or b"{}")
+    except Exception:
+        return body
+    if not isinstance(obj, dict):
+        return body
+    specs = obj.get("loras")
+    if not isinstance(specs, list) or not specs:
+        return body
+
+    from codai.api.loras import resolve_lora_ref
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    changed = False
+    for spec in specs:
+        if not isinstance(spec, dict):
+            continue
+        if str(spec.get("id") or "").startswith("sha256:"):
+            continue                       # already content-addressed
+        try:
+            local = resolve_lora_ref(spec)
+        except Exception:
+            local = None
+        if not local or not os.path.isfile(local):
+            continue                       # an HF id or URL — the remote resolves it
+        try:
+            with open(local, "rb") as fh:
+                data = fh.read()
+            digest = hashlib.sha256(data).hexdigest()
+            have = requests.get(f"{base}/v1/loras/blob/{digest}",
+                                headers=headers, timeout=30)
+            if have.status_code != 200:
+                up = requests.post(f"{base}/v1/loras/upload", data=data,
+                                   headers={**headers,
+                                            "Content-Type": "application/octet-stream"},
+                                   timeout=1800)
+                up.raise_for_status()
+                print(f"[remote-gateway] uploaded LoRA {os.path.basename(local)} "
+                      f"({len(data) / 1e6:.0f} MB) to {base}", flush=True)
+        except Exception as exc:
+            print(f"[remote-gateway] could not send LoRA {local} to {base}: {exc}",
+                  flush=True)
+            continue
+        # Keep weight/name; drop the local path, which means nothing over there.
+        for key in ("model", "path", "url", "file", "data"):
+            spec.pop(key, None)
+        spec["id"] = f"sha256:{digest}"
+        changed = True
+    return json.dumps(obj).encode() if changed else body
 
 
 async def _error(send, status: int, message: str):

@@ -476,8 +476,11 @@ def test_every_v1_endpoint_is_either_mapped_or_deliberately_skipped():
     paths = {m for f in root.glob("*.py") for m in pat.findall(f.read_text())}
     assert paths, "no /v1 routes found — did the decorator style change?"
 
+    from codai.api.remote_gateway import _ORCHESTRATION_PREFIXES
+
     unmapped = sorted(p for p in paths
-                      if not capability_for(p) and p not in _SKIP_PATHS)
+                      if not capability_for(p) and p not in _SKIP_PATHS
+                      and not p.startswith(_ORCHESTRATION_PREFIXES))
     assert unmapped == [], f"unmapped /v1 endpoints: {unmapped}"
 
 
@@ -625,3 +628,151 @@ def test_a_capability_pool_picks_up_the_default_image(monkeypatch):
     monkeypatch.setattr(rw, "_pools", {})
     own = rw.get_capability_pool("video", {"image": "me/mine:1"})
     assert own.mcfg.image == "me/mine:1"
+
+
+# --------------------------------------------------------------------------- #
+# per-model placement: two models of the SAME kind, placed differently
+# --------------------------------------------------------------------------- #
+@pytest.fixture()
+def video_models(monkeypatch):
+    entries = {
+        "wan-local": {"path": "Wan-AI/Wan2.2-I2V-A14B", "model_type": "video_models",
+                      "placement": "local"},
+        "wan-remote": {"path": "Wan-AI/Wan2.2-TI2V-5B", "model_type": "video_models",
+                       "backend": "runpod",
+                       "runpod": {"mode": "pods", "max_hourly_usd": 0.9}},
+        "wan-plain": {"path": "some/other-video", "model_type": "video_models"},
+    }
+    import codai.models.manager as mgr
+    import codai.api.runpod_worker as rw
+    monkeypatch.setattr(mgr, "_model_entry_for", lambda n: entries.get(n))
+    monkeypatch.setattr(mgr, "get_active_runpod_config",
+                        lambda: type("A", (), {"enabled": True})())
+    monkeypatch.setattr(rw, "_pools", {})
+    monkeypatch.setattr(rw, "_ensure_scaler", lambda: None)
+    return entries
+
+
+def _body(model):
+    return json.dumps({"model": model, "prompt": "x"}).encode()
+
+
+def test_two_video_models_can_be_placed_differently(video_models, monkeypatch):
+    import codai.api.remote_gateway as gw
+    from codai.api.remote_gateway import resolve_target
+    import codai.api.runpod_worker as rw
+
+    path = "/v1/video/generations"
+    # The whole video capability is remote…
+    monkeypatch.setattr(gw, "capability_endpoints", lambda: {"video": "http://pod:8000"})
+
+    # …but a model pinned local stays local.
+    assert resolve_target(path, "POST", "", _body("wan-local"), "application/json") is None
+
+    # A model pinned to RunPod gets its OWN pod, with its own budget.
+    t = resolve_target(path, "POST", "", _body("wan-remote"), "application/json")
+    assert t.pool is not None and t.pool.mcfg.max_hourly_usd == 0.9
+
+    # And a model with nothing set follows the capability.
+    t2 = resolve_target(path, "POST", "", _body("wan-plain"), "application/json")
+    assert t2.url == "http://pod:8000" and t2.pool is None
+
+
+def test_a_video_models_pod_uses_the_video_image_and_is_told_about_the_model(video_models):
+    from codai.api.runpod_worker import pod_plan, parse_model_runpod
+
+    entry = video_models["wan-remote"]
+    plan = pod_plan(parse_model_runpod(entry["runpod"]), "wan-remote", "wan-remote",
+                    entry=entry, api_key="tok")
+    # vLLM cannot serve a diffusion model: the model's KIND picks the image.
+    assert plan["image"] == "ghcr.io/nextime/coderai-video:latest"
+    assert plan["health_path"] == "/healthz"
+    # A fresh pod has an empty catalogue and must be told what it is serving.
+    seeded = json.loads(plan["env"]["CODERAI_SEED_MODELS"])
+    assert seeded[0]["path"] == "Wan-AI/Wan2.2-TI2V-5B"
+    assert seeded[0]["model_type"] == "video_models"
+    assert plan["env"]["CODERAI_API_TOKEN"] == "tok"
+
+
+def test_a_local_only_path_is_not_seeded():
+    """A /AI/... path means nothing on a rented machine; don't pretend it does."""
+    from codai.api.runpod_worker import seed_model_env
+    assert seed_model_env({"path": "/AI/models/local-only", "model_type": "video_models"}) == ""
+    assert seed_model_env({"path": "org/repo", "model_type": "video_models"}) != ""
+
+
+# --------------------------------------------------------------------------- #
+# orchestration stays local
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("path", [
+    "/v1/pipelines/story", "/v1/pipelines/image-to-video",
+    "/v1/characters/generate", "/v1/environments/generate"])
+def test_orchestration_endpoints_are_never_forwarded(path, monkeypatch):
+    """These are a sequence of calls to other endpoints. The chain stays here and
+    each step is placed by its own model; forwarding the chain would place every
+    step by the pod's catalogue instead."""
+    import codai.api.remote_gateway as gw
+    from codai.api.remote_gateway import resolve_target, capability_for
+
+    monkeypatch.setattr(gw, "capability_endpoints",
+                        lambda: {"pipelines": "http://pod:8000",
+                                 "characters": "http://pod:8000",
+                                 "environments": "http://pod:8000"})
+    monkeypatch.setattr(gw, "_model_remote", lambda m: "http://pod:8000")
+    assert capability_for(path) == ""
+    assert resolve_target(path, "POST", "", b'{"model":"x"}', "application/json") is None
+
+
+# --------------------------------------------------------------------------- #
+# LoRAs follow the request to the remote
+# --------------------------------------------------------------------------- #
+def test_loras_are_uploaded_to_the_remote_once(tmp_path, monkeypatch):
+    import hashlib
+    from codai.api import remote_gateway as gw
+
+    weights = tmp_path / "style.safetensors"
+    weights.write_bytes(b"fake-lora-weights" * 100)
+    digest = hashlib.sha256(weights.read_bytes()).hexdigest()
+
+    monkeypatch.setattr("codai.api.loras.resolve_lora_ref",
+                        lambda spec: str(weights) if spec.get("model") else None)
+
+    calls = {"checked": 0, "uploaded": 0}
+    have = {"blob": False}
+
+    class _Resp:
+        def __init__(self, code): self.status_code = code
+        def raise_for_status(self): pass
+
+    def fake_get(url, **kw):
+        calls["checked"] += 1
+        return _Resp(200 if have["blob"] else 404)
+
+    def fake_post(url, **kw):
+        calls["uploaded"] += 1
+        have["blob"] = True
+        return _Resp(200)
+
+    monkeypatch.setattr("requests.get", fake_get)
+    monkeypatch.setattr("requests.post", fake_post)
+
+    body = json.dumps({"model": "sdxl", "prompt": "x",
+                       "loras": [{"model": str(weights), "weight": 0.8}]}).encode()
+    out = gw.sync_loras("http://pod:8000", "tok", body)
+    spec = json.loads(out)["loras"][0]
+    # The local path is replaced by the content hash the remote now holds.
+    assert spec["id"] == f"sha256:{digest}" and spec["weight"] == 0.8
+    assert "model" not in spec
+    assert calls["uploaded"] == 1
+
+    # Second request: the remote already has it, so nothing is uploaded again.
+    gw.sync_loras("http://pod:8000", "tok", out)
+    assert calls["uploaded"] == 1
+
+
+def test_an_unresolvable_lora_is_left_for_the_remote(monkeypatch):
+    """An HF repo id is not a local file — the remote fetches it itself."""
+    from codai.api import remote_gateway as gw
+    monkeypatch.setattr("codai.api.loras.resolve_lora_ref", lambda spec: None)
+    body = json.dumps({"loras": [{"model": "org/some-lora", "weight": 1.0}]}).encode()
+    assert gw.sync_loras("http://pod:8000", "", body) is body
