@@ -1176,7 +1176,7 @@ class RunpodPodPool:
                     "console_url": console, "started_at": time.time()}
             # …and from every SIBLING engine's reaper, which cannot see the set
             # above: each engine has its own pools and its own reaper.
-            register_pod(pod_id, str(self.model_key))
+            register_pod(pod_id, str(self.model_key))   # url recorded once ready
             print(f"[runpod] pod {pod_id} created for {self.model_key!r} "
                   f"({sel['display_name']} {sel['cloud_type']}) — booting; logs: {console}",
                   flush=True)
@@ -1223,6 +1223,9 @@ class RunpodPodPool:
             with _pools_lock:
                 _provisioning_ids.discard(pod_id)
                 _provisioning_info.pop(pod_id, None)
+            # Publish the URL so a sibling engine needing the same pool reuses
+            # this pod instead of renting a second GPU for the same work.
+            register_pod(pod_id, str(self.model_key), url)
             print(f"[runpod] pod {pod_id} ready for {self.model_key!r} at {url}", flush=True)
             return h
         raise last_exc or RunpodError("RunPod: could not provision a pod.")
@@ -1325,6 +1328,23 @@ class RunpodPodPool:
                 return chosen, url
 
             if grow_now:
+                # Before renting: is a sibling process already running a pod for
+                # this exact pool? One engine per GPU means the same capability
+                # was being rented a card each.
+                shared_id, shared_url = find_shared_pod(
+                    str(self.model_key), self.health_path, self.api_key)
+                if shared_url:
+                    print(f"[runpod] reusing pod {shared_id} from another engine "
+                          f"for {self.model_key!r}", flush=True)
+                    handle = PodHandle(pod_id=shared_id, url=shared_url,
+                                       hourly_usd=0.0,  # billed by its owner
+                                       started_at=time.time(), gpu="(shared)",
+                                       healthy=True, last_used=time.time())
+                    with self._cv:
+                        self.pods.append(handle)
+                        self._provisioning = False
+                        self._cv.notify_all()
+                    continue
                 # Nothing to serve this request yet — provision inline and retry.
                 try:
                     self._provision_one()
@@ -1353,6 +1373,15 @@ class RunpodPodPool:
             self._cv.notify_all()
 
     def _terminate(self, pod: PodHandle, reason: str):
+        if getattr(pod, "gpu", "") == "(shared)":
+            # Borrowed from another engine: it owns the lifecycle and the bill.
+            # Terminating it here would kill a pod that process is still using.
+            print(f"[runpod] releasing borrowed pod {pod.pod_id} ({reason}); its "
+                  "owner reaps it", flush=True)
+            with self._cv:
+                if pod in self.pods:
+                    self.pods.remove(pod)
+            return
         from codai.api.runpod_client import RunpodClient
         from codai.api import runpod_ledger
         cost = (time.time() - pod.started_at) / 3600.0 * pod.hourly_usd
@@ -1697,13 +1726,45 @@ def _registry_update(fn):
         return {}
 
 
-def register_pod(pod_id: str, pool_key: str = "") -> None:
-    """Record a pod as owned by this deployment, so no sibling process reaps it."""
+def register_pod(pod_id: str, pool_key: str = "", url: str = "") -> None:
+    """Record a pod as owned by this deployment.
+
+    Two reasons, both about processes that cannot see each other: no sibling's
+    reaper may treat it as an orphan, and a sibling that needs the SAME pool can
+    reuse this pod instead of renting a second GPU for the same work.
+    """
     if not pod_id:
         return
     _registry_update(lambda d: d.__setitem__(
-        str(pod_id), {"pool": str(pool_key), "pid": os.getpid(), "at": time.time()})
+        str(pod_id), {"pool": str(pool_key), "pid": os.getpid(), "at": time.time(),
+                      "url": str(url or "")})
         or True)
+
+
+def find_shared_pod(pool_key: str, health_path: str = "/v1/models",
+                    api_key: str = "") -> tuple:
+    """A pod another process already has for this pool: (pod_id, url) or (None, '').
+
+    coderai runs one engine per GPU, and each has its own pools — so the same
+    capability was rented a pod PER ENGINE, paying twice for one job while
+    max_pods said 1. Checked against the shared registry and health-probed, so a
+    dead entry is never handed out.
+    """
+    data = _registry_update(lambda d: False)
+    if not isinstance(data, dict):
+        return None, ""
+    mine = os.getpid()
+    for pod_id, info in data.items():
+        if not isinstance(info, dict) or info.get("pool") != str(pool_key):
+            continue
+        if info.get("pid") == mine:
+            continue                       # our own; the local pool handles it
+        url = str(info.get("url") or "")
+        if not url:
+            continue
+        if _pod_health_ok(url, path=health_path, api_key=api_key):
+            return pod_id, url
+    return None, ""
 
 
 def unregister_pod(pod_id: str) -> None:

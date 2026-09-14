@@ -332,3 +332,51 @@ def test_a_young_pod_is_never_reaped(monkeypatch, tmp_path):
     monkeypatch.setattr("codai.api.runpod_client.RunpodClient", _Client)
     assert rw.reap_orphans() == 1
     assert killed == ["ancient"]        # the 30-second-old pod survives
+
+
+def test_a_sibling_engines_pod_is_reused_not_duplicated(tmp_path, monkeypatch):
+    """One engine per GPU means each had its own pool: the same capability was
+    rented a card PER ENGINE while max_pods said 1. Observed live — nvidia took
+    pod y6tg…, radeon took yymi… for the same 'capability:embeddings'."""
+    import codai.api.runpod_worker as rw
+
+    monkeypatch.setattr(rw, "_pod_registry_path", lambda: str(tmp_path / "pods.json"))
+    monkeypatch.setattr(rw, "_pod_health_ok", lambda url, **kw: True)
+
+    # Another process recorded a healthy pod for this pool.
+    rw._registry_update(lambda d: d.__setitem__(
+        "pod-from-nvidia", {"pool": "capability:embeddings", "pid": 999999,
+                            "at": 0, "url": "http://pod-a:8000"}) or True)
+
+    pod_id, url = rw.find_shared_pod("capability:embeddings")
+    assert (pod_id, url) == ("pod-from-nvidia", "http://pod-a:8000")
+
+    # A different pool must not borrow it.
+    assert rw.find_shared_pod("capability:images") == (None, "")
+
+    # Our own pods are left to the local pool, not "borrowed" from ourselves.
+    import os
+    rw._registry_update(lambda d: d.__setitem__(
+        "pod-mine", {"pool": "capability:images", "pid": os.getpid(),
+                     "at": 0, "url": "http://pod-b:8000"}) or True)
+    assert rw.find_shared_pod("capability:images") == (None, "")
+
+
+def test_a_borrowed_pod_is_released_not_terminated(monkeypatch):
+    """Terminating a pod we merely borrowed would kill it under the engine that
+    owns it — and that engine is the one paying for it."""
+    import codai.api.runpod_worker as rw
+
+    killed = []
+
+    class _Client:
+        def __init__(self, *a, **k): pass
+        def terminate_pod(self, pid): killed.append(pid)
+
+    monkeypatch.setattr("codai.api.runpod_client.RunpodClient", _Client)
+    pool = _pool(max_pods=1)
+    borrowed = rw.PodHandle(pod_id="pod-x", url="http://x", hourly_usd=0.0,
+                            started_at=0.0, gpu="(shared)")
+    pool.pods = [borrowed]
+    pool._terminate(borrowed, "idle")
+    assert killed == [] and pool.pods == []
