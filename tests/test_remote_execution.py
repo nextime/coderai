@@ -1411,3 +1411,32 @@ def test_registering_a_model_makes_it_usable_not_just_listed(monkeypatch):
     assert _MM.model_aliases["bge-m3"] == "BAAI/bge-m3"
     # …AND not filtered out by an engine assignment it was never part of.
     assert {"BAAI/bge-m3", "bge-m3"} <= registered["assigned"]
+
+
+def test_a_test_run_reports_what_the_pods_are_serving(monkeypatch, test_run):
+    """Three failures in a row were diagnosed by finding the pod URL in engine
+    logs and asking it by hand. The answer should carry that itself."""
+    import codai.api.runpod_worker as rw
+    from codai.api import model_test as mt
+
+    monkeypatch.setattr(rw, "pods_status", lambda: [
+        {"pod_id": "pod-1", "model": "capability:embeddings", "gpu": "RTX 2000 Ada",
+         "state": "ready", "uptime_s": 140, "live_cost_usd": 0.009}])
+
+    class _Pool:
+        api_key = "tok"
+        _cv = __import__("threading").Condition()
+        pods = [rw.PodHandle(pod_id="pod-1", url="http://pod-1:8000",
+                             hourly_usd=0.24, started_at=0.0)]
+
+    monkeypatch.setattr(rw, "_pools", {"capability:embeddings": _Pool()})
+    monkeypatch.setattr(mt, "_remote_catalogue",
+                        lambda url, key: ["BAAI/bge-m3", "bge-m3"])
+
+    out = _run_test("my-llm")
+    pods = out["pods"]
+    assert pods[0]["pod"] == "pod-1" and pods[0]["gpu"] == "RTX 2000 Ada"
+    assert pods[0]["url"] == "http://pod-1:8000"
+    # The catalogue is the fact that mattered: an empty list is the whole story.
+    assert pods[0]["serves"] == ["BAAI/bge-m3", "bge-m3"]
+    assert pods[0]["usd_so_far"] == 0.009

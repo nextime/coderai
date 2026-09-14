@@ -1227,6 +1227,33 @@ class RunpodPodPool:
         return ""
 
     # -- provisioning ----------------------------------------------------- #
+    def _log_pod_catalogue(self, url: str) -> None:
+        """Log what the pod says it can serve, the moment it is up.
+
+        The one check that would have turned a confusing "Model 'x' is not
+        available. Use one of: " into an obvious "the pod registered nothing",
+        minutes earlier and without reading a single line of our own code.
+        """
+        import requests
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        try:
+            r = requests.get(url.rstrip("/") + "/v1/models", headers=headers, timeout=20)
+            if r.status_code != 200:
+                print(f"[runpod] pod catalogue unreadable: HTTP {r.status_code} "
+                      f"{(r.text or '')[:120]}", flush=True)
+                return
+            ids = [str(m.get("id")) for m in (r.json().get("data") or [])]
+        except Exception as exc:
+            print(f"[runpod] pod catalogue unreadable: {exc}", flush=True)
+            return
+        if ids:
+            print(f"[runpod] pod serves {len(ids)} model(s): "
+                  f"{', '.join(ids[:8])}{' …' if len(ids) > 8 else ''}", flush=True)
+        else:
+            print("[runpod] pod serves NO models — it will refuse every request. "
+                  "Seeding did not take effect (check CODERAI_SEED_MODELS in the "
+                  "pod's env and the pod's own startup log).", flush=True)
+
     def _data_center_for_volume(self, volume_id: str) -> str:
         """The data center a network volume lives in, or ''.
 
@@ -1361,13 +1388,25 @@ class RunpodPodPool:
                   flush=True)
             boot_to = float(self.mcfg.boot_timeout_s or self.PORT_TIMEOUT_S)
             load_to = float(self.mcfg.load_timeout_s or self.HEALTH_TIMEOUT_S)
+            # Phase timings. A cold pod takes minutes and "it was slow" is not a
+            # diagnosis: the image pull, the server start and the model load are
+            # different problems with different fixes.
+            t_created = time.time()
             try:
                 url = client.wait_ready(pod_id, port, ready_timeout=boot_to)
+                t_port = time.time()
+                print(f"[runpod] pod {pod_id}: port open after "
+                      f"{t_port - t_created:.0f}s (image pull + container start)",
+                      flush=True)
                 # Wait for the OpenAI server inside the pod (image pull + model load).
                 deadline = time.time() + load_to
                 while time.time() < deadline:
                     if _pod_health_ok(url, path=self.health_path,
                                       api_key=self.api_key):
+                        print(f"[runpod] pod {pod_id}: serving after "
+                              f"{time.time() - t_port:.0f}s more "
+                              f"({time.time() - t_created:.0f}s total)", flush=True)
+                        self._log_pod_catalogue(url)
                         break
                     time.sleep(5)
                 else:

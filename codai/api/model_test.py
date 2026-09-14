@@ -147,6 +147,10 @@ async def test_model(req: ModelTestRequest, request: Request,
            "where": placement["where"], "target": placement["target"],
            "ran": path, "status": status, "ok": 200 <= status < 300,
            "seconds": seconds}
+    # What the remote actually is, and what it thinks it can serve. Without this
+    # a failure means reading engine logs to find the pod URL and asking it by
+    # hand — which is how the last three failures were diagnosed.
+    out["pods"] = _pod_diagnostics()
     if out["ok"]:
         out["sample"] = _sample(raw, capability)
         empty = _empty_result(raw, capability)
@@ -213,6 +217,52 @@ def _no_remote_reason(model: str, entry: dict, capability: str) -> str:
     return (f"nothing configures {model!r} to run remotely — set a service_url, or "
             "backend 'runpod' with a runpod block on the model, or a remote for "
             f"its {capability or 'text'} capability")
+
+
+def _pod_diagnostics() -> list:
+    """Live pods and what each is serving, for the answer to stand on its own."""
+    try:
+        from codai.api.runpod_worker import pods_status, _pools, _pools_lock
+    except Exception:
+        return []
+    out = []
+    try:
+        for pod in pods_status():
+            row = {"pod": pod.get("pod_id"), "for": pod.get("model"),
+                   "gpu": pod.get("gpu"), "state": pod.get("state"),
+                   "uptime_s": pod.get("uptime_s"),
+                   "usd_so_far": pod.get("live_cost_usd")}
+            out.append(row)
+        # Add the URL and catalogue for the pods this process holds.
+        with _pools_lock:
+            pools = list(_pools.values())
+        urls = {}
+        for pool in pools:
+            with pool._cv:
+                for p in pool.pods:
+                    urls[p.pod_id] = (p.url, getattr(pool, "api_key", ""))
+        for row in out:
+            url, key = urls.get(row["pod"], ("", ""))
+            if not url:
+                continue
+            row["url"] = url
+            row["serves"] = _remote_catalogue(url, key)
+    except Exception as exc:
+        return [{"error": f"pod diagnostics unavailable: {exc}"}]
+    return out
+
+
+def _remote_catalogue(url: str, api_key: str) -> list:
+    """The model ids a remote lists, or a short reason it cannot be asked."""
+    import requests
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        r = requests.get(url.rstrip("/") + "/v1/models", headers=headers, timeout=15)
+        if r.status_code != 200:
+            return [f"(HTTP {r.status_code})"]
+        return [str(m.get("id")) for m in (r.json().get("data") or [])] or ["(none)"]
+    except Exception as exc:
+        return [f"({exc})"]
 
 
 def _describe(model: str):
