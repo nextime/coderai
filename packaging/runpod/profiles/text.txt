@@ -1,0 +1,13 @@
+# Text generation (HuggingFace safetensors) — a coderai pod that serves LLMs.
+#
+# This is the profile that makes a LOCAL text LoRA usable on RunPod: vLLM and
+# llama.cpp pods can only load adapters they can resolve themselves (a HF repo
+# id), while a coderai pod is sent the adapter and applies it with PEFT.
+transformers>=4.35.0
+accelerate>=0.24.0
+peft>=0.10.0
+# QLoRA: the adapter is ordinary, but the BASE must load 4-bit the way it was
+# trained, which is what bitsandbytes does.
+bitsandbytes>=0.43.0
+sentencepiece>=0.1.99
+protobuf>=3.20.0

@@ -430,13 +430,32 @@ Each runtime applies them its own way, and what reaches a pod differs:
 | vLLM | `--enable-lora --lora-modules` at launch | **HuggingFace repo ids only** |
 | diffusers (image/video) | `load_lora_weights` | uploaded to the remote automatically, content-addressed |
 
-The asymmetry is worth knowing: a **diffusion** LoRA is sent to the remote with
-the request (hashed, uploaded once, referenced by content id), because that API
-carries adapters per request. A **text** LoRA is part of how the model is
-*loaded*, so it has to be resolvable when the pod starts — which means a
-HuggingFace repo id for a vLLM or llama.cpp pod. A local adapter path is reported
-and skipped rather than baked into a launch command that would fail minutes later
-inside a pod. Publish it to HuggingFace, or serve that model on a coderai pod.
+The asymmetry is worth knowing: a **diffusion** LoRA is sent with the request
+(hashed, uploaded once, referenced by content id), because that API carries
+adapters per request. A **text** LoRA is part of how the model is *loaded*, so it
+has to be on the pod before the model loads there.
+
+**A local text adapter still works on RunPod** — it just decides which pod. A
+model whose adapter exists only on this machine is routed to a **coderai text
+pod** (`ghcr.io/<you>/coderai-text`), because that is the only pod image with an
+endpoint that can receive one. The sequence:
+
+1. the pod is created and told the adapter's `sha256:` id — computed here, so
+   the two agree before the pod exists;
+2. the adapter is sent to the pod's content-addressed blob store before the
+   first request, once per pod;
+3. the pod resolves `sha256:<hex>` back to a file and applies it with PEFT.
+
+A **published** adapter (a HuggingFace repo id) skips all of that and goes to a
+vLLM pod, which fetches it itself — cheaper and faster, so publish adapters you
+use often. A PEFT adapter **directory** cannot be sent (the blob store holds
+single files); publish that one.
+
+Build and push the text image before using it:
+
+```bash
+PROFILES=text ./packaging/runpod/publish_capability_images.sh
+```
 
 ### Keeping a pod warm
 

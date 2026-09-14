@@ -283,6 +283,9 @@ class Target:
         #: The model entry whose weights must be pushed before serving, when the
         #: remote has no way to fetch them (`source: "upload"`).
         self.upload_entry = None
+        #: The model entry whose LOCAL text adapters must be pushed before the
+        #: pod loads the model. Only a coderai pod can receive them.
+        self.lora_entry = None
 
     def acquire(self):
         """Return (base_url, release). A pool provisions on demand and bills."""
@@ -324,9 +327,22 @@ def resolve_target(path: str, method: str, query: str, body: bytes,
                                              resolve_model_source)
         target = Target(pool=get_model_pod_pool(model, entry, block),
                         reason=f"model {model!r} on its own RunPod pod")
-        kind, _ = resolve_model_source(entry, parse_model_runpod(block))
+        mcfg = parse_model_runpod(block)
+        kind, _ = resolve_model_source(entry, mcfg)
         if kind == "upload":
             target.upload_entry = entry
+        # Local adapters only reach a coderai pod: vLLM and llama.cpp images have
+        # no endpoint to receive an upload.
+        try:
+            from codai.api.runpod_worker import resolve_pod_engine
+            from codai.models.text_loras import configured_specs, portable_specs
+            if resolve_pod_engine(mcfg, model, str(entry.get("path") or ""), entry) \
+                    in ("coderai", "custom"):
+                _, needs_sending = portable_specs(configured_specs(entry))
+                if needs_sending:
+                    target.lora_entry = entry
+        except Exception:
+            pass
         return target
     if not cap:
         return None
@@ -412,6 +428,12 @@ class RemoteGatewayMiddleware:
             if target.upload_entry:
                 await asyncio.to_thread(ensure_model_uploaded, base, target.api_key,
                                         target.upload_entry)
+            # A text LoRA is applied when the model LOADS, so the adapter has to
+            # be on the pod before the first request — not carried by it.
+            if target.lora_entry is not None:
+                await asyncio.to_thread(ensure_text_loras, base, target.api_key,
+                                        target.lora_entry)
+                target.lora_entry = None        # sent once per pod
             # Ship any LoRA the request names, so the remote can actually load it.
             if b'"loras"' in (body or b"") and "json" in headers.get("content-type", ""):
                 body = await asyncio.to_thread(
@@ -580,6 +602,92 @@ def sync_loras(base: str, api_key: str, body: bytes) -> bytes:
 #: check is worth skipping on the second request. A new pod has a new URL, so it
 #: pays the upload again: pod storage is disposable.
 _UPLOADED: set = set()
+
+
+def push_lora_file(base: str, api_key: str, path: str) -> str:
+    """Put one adapter file in a remote's blob store; return its ``sha256:`` id.
+
+    Content-addressed, so a pod that already has it is told nothing and a repeat
+    costs one HEAD-shaped check. Returns '' when the transfer fails, which the
+    caller reports rather than silently serving a model without its adapter.
+    """
+    import hashlib
+    import requests
+
+    if not path or not os.path.isfile(path):
+        return ""
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        digest = hashlib.sha256(data).hexdigest()
+        have = requests.get(f"{base}/v1/loras/blob/{digest}", headers=headers, timeout=30)
+        if have.status_code != 200:
+            up = requests.post(f"{base}/v1/loras/upload", data=data,
+                               headers={**headers,
+                                        "Content-Type": "application/octet-stream"},
+                               timeout=1800)
+            up.raise_for_status()
+            print(f"[remote-gateway] sent adapter {os.path.basename(path)} "
+                  f"({len(data) / 1e6:.0f} MB) to {base}", flush=True)
+        return f"sha256:{digest}"
+    except Exception as exc:
+        print(f"[remote-gateway] could not send adapter {path} to {base}: {exc}",
+              flush=True)
+        return ""
+
+
+def ensure_text_loras(base: str, api_key: str, entry: dict) -> dict:
+    """Send a text model's LOCAL adapters to a coderai pod.
+
+    A text LoRA is part of how the model loads, not something the request
+    carries, so it has to be on the pod before the model is loaded there. Only a
+    coderai pod can receive one — a vLLM or llama.cpp pod has no endpoint to
+    upload to, which is why those need a HuggingFace repo id instead.
+
+    Returns the config the REMOTE should use: the same entry with local adapter
+    paths replaced by the content ids it now holds. An adapter that could not be
+    sent is dropped from that config, so the pod loads the model without it
+    rather than failing on a path it cannot see.
+    """
+    from codai.models.text_loras import configured_specs, local_path, is_portable
+
+    specs = configured_specs(entry or {})
+    if not specs:
+        return dict(entry or {})
+
+    rewritten, dropped = [], []
+    for spec in specs:
+        source = str(spec.get("source") or "")
+        if is_portable(source):
+            rewritten.append({**spec, "source": source})
+            continue
+        path = local_path(source)
+        if not path:
+            dropped.append(source)
+            continue
+        if os.path.isdir(path):
+            # A PEFT adapter directory is several files; the blob store holds
+            # single files. Publishing it to HuggingFace is the way to move it.
+            dropped.append(source)
+            print(f"[remote-gateway] {source} is a directory — publish it to "
+                  "HuggingFace to use it on a pod", flush=True)
+            continue
+        blob = push_lora_file(base, api_key, path)
+        if blob:
+            rewritten.append({**spec, "source": blob})
+        else:
+            dropped.append(source)
+
+    out = {k: v for k, v in (entry or {}).items()
+           if k not in ("lora_path", "lora_model_dir", "loras", "lora_scale")}
+    if rewritten:
+        out["loras"] = [{"path": s["source"], "weight": s.get("weight", 1.0),
+                         "name": s.get("name")} for s in rewritten]
+    if dropped:
+        print(f"[remote-gateway] adapters not available remotely: {', '.join(dropped)}",
+              flush=True)
+    return out
 
 
 def ensure_model_uploaded(base: str, api_key: str, entry: dict) -> None:

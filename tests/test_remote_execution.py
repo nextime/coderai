@@ -925,6 +925,113 @@ def test_a_coderai_pod_is_told_about_the_models_adapters():
     seeded = json.loads(seed_model_env(
         {"path": "org/model", "model_type": "text_models",
          "lora_path": "org/adapter", "lora_scale": 0.6, "load_in_4bit": True}))[0]
-    assert seeded["lora_path"] == "org/adapter"
-    assert seeded["lora_scale"] == 0.6
+    # Normalised to one shape the pod can act on, weight preserved.
+    assert seeded["loras"] == [{"path": "org/adapter", "weight": 0.6,
+                                "name": "adapter"}]
+    # load_in_4bit is what makes a QLoRA adapter load against its own base.
     assert seeded["load_in_4bit"] is True
+
+
+# --------------------------------------------------------------------------- #
+# a LOCAL text adapter on RunPod
+# --------------------------------------------------------------------------- #
+def test_a_local_text_adapter_routes_to_a_coderai_pod():
+    """vLLM and llama.cpp resolve adapters themselves at launch and have no
+    endpoint to receive one, so an adapter that exists only here forces the pod
+    that CAN be sent it."""
+    from codai.api.runpod_worker import resolve_pod_engine, pod_plan, parse_model_runpod
+
+    plain = {"path": "Qwen/Qwen3.5-9B", "model_type": "text_models"}
+    assert resolve_pod_engine(parse_model_runpod({}), "q", plain["path"], plain) == "vllm"
+
+    local = dict(plain, lora_path="/AI/loras/mine.safetensors")
+    assert resolve_pod_engine(parse_model_runpod({}), "q", plain["path"], local) == "coderai"
+    assert pod_plan(parse_model_runpod({}), "q", "q",
+                    entry=local)["image"].endswith("coderai-text:latest")
+
+    # A published adapter needs none of that: vLLM can fetch it itself.
+    published = dict(plain, lora_path="org/published-lora")
+    assert resolve_pod_engine(parse_model_runpod({}), "q", plain["path"],
+                              published) == "vllm"
+
+
+def test_the_pod_is_told_the_adapters_content_id(tmp_path, monkeypatch):
+    """The pod is created before the adapter can be sent, so it is told the hash
+    the file WILL have — computed here — and sent the bytes afterwards."""
+    import hashlib
+    from codai.api.runpod_worker import seed_model_env
+
+    adapter = tmp_path / "mine.safetensors"
+    adapter.write_bytes(b"adapter-bytes" * 50)
+    digest = hashlib.sha256(adapter.read_bytes()).hexdigest()
+
+    seeded = json.loads(seed_model_env(
+        {"path": "Qwen/Qwen3.5-9B", "model_type": "text_models",
+         "lora_path": str(adapter), "lora_scale": 0.7}))[0]
+    assert seeded["loras"] == [{"path": f"sha256:{digest}", "weight": 0.7,
+                                "name": "mine"}]
+    # The local path must not survive: it means nothing on the pod.
+    assert "lora_path" not in seeded
+
+
+def test_local_adapters_are_sent_to_the_pod_once(tmp_path, monkeypatch):
+    from codai.api import remote_gateway as gw
+
+    adapter = tmp_path / "mine.safetensors"
+    adapter.write_bytes(b"weights" * 100)
+
+    calls = {"get": 0, "post": 0}
+    have = {"blob": False}
+
+    class _R:
+        def __init__(self, code): self.status_code = code
+        def raise_for_status(self): pass
+
+    monkeypatch.setattr("requests.get",
+                        lambda url, **kw: (calls.__setitem__("get", calls["get"] + 1),
+                                           _R(200 if have["blob"] else 404))[1])
+
+    def _post(url, **kw):
+        calls["post"] += 1
+        have["blob"] = True
+        return _R(200)
+
+    monkeypatch.setattr("requests.post", _post)
+
+    entry = {"path": "Qwen/Qwen3.5-9B", "model_type": "text_models",
+             "lora_path": str(adapter), "lora_scale": 0.5}
+    out = gw.ensure_text_loras("http://pod:8000", "tok", entry)
+    assert calls["post"] == 1
+    # The config handed to the remote names the adapter by content, not by path.
+    assert out["loras"][0]["path"].startswith("sha256:")
+    assert out["loras"][0]["weight"] == 0.5
+    assert "lora_path" not in out
+
+    gw.ensure_text_loras("http://pod:8000", "tok", entry)
+    assert calls["post"] == 1          # already there — nothing re-sent
+
+
+def test_a_published_adapter_is_not_uploaded(monkeypatch):
+    from codai.api import remote_gateway as gw
+
+    def _boom(*a, **k):
+        raise AssertionError("an HF repo id must never be uploaded")
+
+    monkeypatch.setattr("requests.post", _boom)
+    out = gw.ensure_text_loras("http://pod:8000", "tok",
+                               {"path": "org/m", "lora_path": "org/adapter"})
+    assert out["loras"][0]["path"] == "org/adapter"
+
+
+def test_a_content_addressed_adapter_resolves_through_the_blob_store(monkeypatch):
+    """On the pod the adapter arrives in the blob store and the config names it
+    by hash — which has to resolve back to a file."""
+    from codai.models import text_loras
+
+    monkeypatch.setattr("codai.api.loras.resolve_lora_ref",
+                        lambda spec: "/blobs/abc" if spec.get("id") else None)
+    monkeypatch.setattr(text_loras.os.path, "exists", lambda p: p == "/blobs/abc")
+    assert text_loras.local_path("sha256:" + "a" * 64) == "/blobs/abc"
+    # And it is not mistaken for something a remote could fetch by name.
+    assert text_loras.is_portable("sha256:" + "a" * 64) is False
+    assert text_loras.is_portable("org/adapter") is True

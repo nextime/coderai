@@ -110,9 +110,62 @@ def _default_name(source: str) -> str:
 
 
 def local_path(source: str) -> str:
-    """The adapter as a local path, or '' when it is a repo id / not present."""
-    p = os.path.expanduser(str(source or ""))
+    """The adapter as a path on THIS machine, or '' when it is not here.
+
+    Understands the content-addressed forms as well as plain paths —
+    ``sha256:<hex>`` and ``name:<registered>`` — which is how an adapter that was
+    uploaded rather than downloaded is referenced. That matters on a pod: the
+    file arrives in the blob store, and the model config names it by hash.
+    """
+    src = str(source or "").strip()
+    if not src:
+        return ""
+    if src.startswith(("sha256:", "name:")) or (len(src) == 64 and all(
+            c in "0123456789abcdef" for c in src.lower())):
+        try:
+            from codai.api.loras import resolve_lora_ref
+            resolved = resolve_lora_ref({"id": src})
+        except Exception:
+            resolved = None
+        return resolved if resolved and os.path.exists(resolved) else ""
+    p = os.path.expanduser(src)
     return p if p and os.path.exists(p) else ""
+
+
+def is_portable(source: str) -> bool:
+    """True when a REMOTE could resolve this adapter on its own.
+
+    A HuggingFace repo id can be downloaded anywhere. A local path cannot: it
+    has to be sent, and only a coderai pod has anywhere to put it.
+    """
+    src = str(source or "").strip()
+    return bool(src) and "/" in src and not src.startswith(("/", "~", ".")) \
+        and not src.startswith(("sha256:", "name:", "http://", "https://")) \
+        and src.count("/") == 1
+
+
+def blob_id(path: str) -> str:
+    """The ``sha256:<hex>`` id an adapter file will have in any blob store.
+
+    Computed here, so a pod can be TOLD the id when it is created and be SENT the
+    bytes afterwards — the two agree without the pod having to exist yet.
+    """
+    import hashlib
+    if not path or not os.path.isfile(path):
+        return ""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return f"sha256:{h.hexdigest()}"
+
+
+def portable_specs(specs: List[dict]) -> tuple:
+    """Split adapters into (remote-resolvable, must-be-sent)."""
+    portable, local = [], []
+    for spec in specs:
+        (portable if is_portable(spec.get("source", "")) else local).append(spec)
+    return portable, local
 
 
 def gguf_adapter(spec: dict) -> str:

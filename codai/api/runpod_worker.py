@@ -166,6 +166,10 @@ CAPABILITY_IMAGE_TAG = os.environ.get("CODERAI_CAPABILITY_IMAGE_TAG", "latest")
 PUBLISHED_CAPABILITY_IMAGES = (
     "images", "video", "embeddings", "ocr", "tts", "stt", "voice", "audio",
     "faceswap",
+    # Text: a coderai pod that serves LLMs. Unlike a vLLM/llama.cpp pod it can be
+    # SENT a local LoRA adapter, which is the only way a local text adapter runs
+    # on RunPod. Build and push it with packaging/runpod before using it.
+    "text",
 )
 
 #: Capabilities served by a published image other than their own name.
@@ -182,6 +186,9 @@ _CAPABILITY_IMAGE_ALIASES = {
 #: lets a NON-TEXT model be sent to RunPod individually: the pod image follows
 #: from what the model is, not from whether its path ends in .gguf.
 MODEL_TYPE_CAPABILITY = {
+    "text_models": "text",
+    "gguf_models": "text",
+    "vision_models": "text",
     "image_models": "images",
     "video_models": "video",
     "audio_models": "stt",
@@ -195,13 +202,19 @@ MODEL_TYPE_CAPABILITY = {
 _LLM_MODEL_TYPES = ("text_models", "gguf_models", "vision_models")
 
 
-def model_capability(entry: dict) -> str:
-    """The capability a model entry belongs to, or '' for a text/LLM model."""
+def model_capability(entry: dict, include_text: bool = False) -> str:
+    """The capability a model entry belongs to.
+
+    Text models return '' by default: they normally go to vLLM or llama.cpp, not
+    to a coderai pod. ``include_text`` asks for the capability anyway, which is
+    what picks the image once something HAS decided a text model needs a coderai
+    pod (a local LoRA adapter, today).
+    """
     if not isinstance(entry, dict):
         return ""
     types = entry.get("model_types") or [entry.get("model_type") or ""]
     for mt in types:
-        if mt in _LLM_MODEL_TYPES:
+        if mt in _LLM_MODEL_TYPES and not include_text:
             return ""
         cap = MODEL_TYPE_CAPABILITY.get(mt)
         if cap:
@@ -299,6 +312,19 @@ def resolve_pod_engine(mcfg: "RunpodModelConfig", model_key: str = "",
         entry = _model_entry(model_key)
     if model_capability(entry or {}):
         return "coderai"
+    # A text model whose LoRA lives only on this disk has one option: a coderai
+    # pod, which can be sent the adapter. vLLM and llama.cpp resolve adapters
+    # themselves at launch and have no endpoint to receive one.
+    try:
+        from codai.models.text_loras import configured_specs, portable_specs
+        _portable, _local = portable_specs(configured_specs(entry or {}))
+        if _local:
+            print(f"[lora] {model_key!r} has adapters that exist only here "
+                  f"({', '.join(str(s.get('source')) for s in _local)}) — using a "
+                  "coderai pod, which can be sent them", flush=True)
+            return "coderai"
+    except Exception:
+        pass
     if mcfg.hf_gguf:
         return "llamacpp"
     if _looks_like_gguf(mcfg.served_model) or _looks_like_gguf(model_path) \
@@ -328,7 +354,7 @@ def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
         image = mcfg.image or LLAMACPP_POD_IMAGE
         args = mcfg.docker_args or _llamacpp_docker_args(mcfg, served, entry)
     elif engine in ("coderai", "custom"):
-        cap = model_capability(entry or {})
+        cap = model_capability(entry or {}, include_text=True)
         if not mcfg.image and cap:
             # A model of a known kind gets that capability's published image.
             image = default_capability_image(cap)
@@ -413,6 +439,35 @@ def seed_model_env(entry: dict, served: str = "", source: str = "") -> str:
             "lora_path", "lora_model_dir", "lora_scale", "loras")
     out = {k: entry[k] for k in keep if k in entry and entry[k] is not None}
     out["path"] = path
+    # Adapters the pod cannot resolve by name are named by CONTENT id instead.
+    # The hash is computed here, so the pod is told the id when it is created and
+    # sent the bytes before the first request — the two agree without the pod
+    # having to exist yet. codai/api/remote_gateway.ensure_text_loras does the
+    # sending.
+    try:
+        from codai.models.text_loras import configured_specs, is_portable, blob_id, local_path
+        specs = configured_specs(entry)
+        if specs:
+            rewritten = []
+            for spec in specs:
+                src = str(spec.get("source") or "")
+                if is_portable(src) or src.startswith("sha256:"):
+                    rewritten.append({"path": src, "weight": spec.get("weight", 1.0),
+                                      "name": spec.get("name")})
+                    continue
+                local = local_path(src)
+                bid = blob_id(local) if local and os.path.isfile(local) else ""
+                if bid:
+                    rewritten.append({"path": bid, "weight": spec.get("weight", 1.0),
+                                      "name": spec.get("name")})
+            for key in ("lora_path", "lora_model_dir", "lora_scale"):
+                out.pop(key, None)
+            if rewritten:
+                out["loras"] = rewritten
+            else:
+                out.pop("loras", None)
+    except Exception as exc:
+        print(f"[seed] could not prepare adapters: {exc}", flush=True)
     if served and served != path:
         out["alias"] = served
     return _json.dumps([out])
