@@ -212,3 +212,67 @@ def test_a_pod_coderai_rejects_requests_without_the_token(monkeypatch):
     assert hmac.compare_digest("tok", "tok")
     from codai.api.ratelimit import _unauthorized
     assert _unauthorized().status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# sharing one pod between models
+# --------------------------------------------------------------------------- #
+def test_two_models_on_one_coderai_pod_share_a_pool(monkeypatch):
+    """Both models name the same pool, so the overflow from both lands on one
+    card until it saturates — rather than renting a GPU each."""
+    import codai.api.runpod_worker as rw
+
+    monkeypatch.setattr(rw, "_pools", {})
+    monkeypatch.setattr(rw, "_ensure_scaler", lambda: None)
+
+    class _Acct:
+        enabled = True
+
+    block = {"pool": "shared", "engine": "coderai", "image": "reg/coderai:base",
+             "max_pods": 2, "max_hourly_usd": 0.5}
+    a_cfg = rw.parse_model_runpod(block)
+    b_cfg = rw.parse_model_runpod({"pool": "shared", "engine": "coderai"})
+
+    ka = rw.shared_pool_key(a_cfg, "model-a")
+    kb = rw.shared_pool_key(b_cfg, "model-b")
+    assert ka == kb == "pool:shared"
+
+    pa = rw.get_pod_pool(ka, _Acct(), a_cfg, "model-a", shared=True)
+    pb = rw.get_pod_pool(kb, _Acct(), b_cfg, "model-b", shared=True)
+    assert pa is pb
+    # The first model's settings define the shared pod; a later joiner must not
+    # silently redefine the budget everyone is sharing.
+    assert pa.mcfg.max_hourly_usd == 0.5 and pa.mcfg.image == "reg/coderai:base"
+
+
+def test_a_model_without_a_pool_name_still_gets_its_own():
+    import codai.api.runpod_worker as rw
+    cfg = rw.parse_model_runpod({"engine": "coderai", "image": "i"})
+    assert rw.shared_pool_key(cfg, "model-a") == "model-a"
+
+
+def test_sharing_is_refused_for_single_model_pod_servers():
+    """A vLLM pod is launched `--model X` and llama.cpp `-hf one.gguf`: sharing
+    would answer with the wrong model's weights, or 404."""
+    import codai.api.runpod_worker as rw
+
+    vllm = rw.parse_model_runpod({"pool": "shared", "served_model": "org/model-a"})
+    with pytest.raises(RuntimeError, match="cannot serve another"):
+        rw.shared_pool_key(vllm, "model-a")
+
+    gguf = rw.parse_model_runpod({"pool": "shared", "hf_gguf": "u/r:Q4"})
+    with pytest.raises(RuntimeError, match="cannot serve another"):
+        rw.shared_pool_key(gguf, "model-b", "/AI/m.gguf")
+
+
+def test_a_shared_pod_grows_when_it_saturates():
+    """Sharing must not mean queueing forever: once the pod is carrying
+    scale_up_inflight_per_pod requests, the pool rents a second one."""
+    p = _pool(pool="shared", engine="coderai", image="i", max_pods=2,
+              scale_up_inflight_per_pod=3)
+    pod = _Pod("a", inflight=3)
+    p.pods = [pod]
+    assert p._should_grow([pod]) is True
+    quiet = _Pod("a", inflight=1)
+    p.pods = [quiet]
+    assert p._should_grow([quiet]) is False   # not saturated -> keep sharing

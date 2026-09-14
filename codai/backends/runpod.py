@@ -101,8 +101,14 @@ class RunpodBackend(ModelBackend):
         else:
             # pods / auto: coderai-managed pool of remote GPU pods. (auto currently
             # behaves as pods; serverless-vs-pods auto-arbitration is a later refinement.)
+            # A model may join a shared pool rather than rent its own card; the
+            # request carries its own model name, so one multi-model pod serves
+            # them all until it saturates and the pool grows.
+            _pkey = runpod_worker.shared_pool_key(
+                self._mcfg, model_name, runpod_worker._model_path_for(model_name))
             self._pool = runpod_worker.get_pod_pool(
-                model_name, self._acct, self._mcfg, self._served_name)
+                _pkey, self._acct, self._mcfg, self._served_name,
+                shared=(_pkey != model_name))
             # A RunPod proxy URL is reachable by anyone who learns it, so the pod
             # is launched locked to a bearer token (generated when none is
             # configured) and every request we send must carry it.

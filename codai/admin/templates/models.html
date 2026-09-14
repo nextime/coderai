@@ -773,6 +773,11 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
               <span class="form-hint" style="font-size:11px">A local .gguf path means nothing on a rented machine — name the HF repo the pod should download.</span>
             </div>
           </div>
+          <div class="form-row" style="margin:.5rem 0 0">
+            <label class="form-label">Share pod pool <span class="muted">(optional name)</span></label>
+            <input type="text" id="cfg-rp-pool" class="form-input" placeholder="blank = this model rents its own pods">
+            <span class="form-hint" style="font-size:11px">Models naming the same pool share one set of pods and one budget until it saturates. Needs a <b>coderai</b> or custom multi-model image — a vLLM or llama.cpp pod is launched for ONE model and sharing is refused.</span>
+          </div>
           <div style="display:grid;grid-template-columns:2fr 1fr 1fr;gap:.5rem;margin-top:.5rem">
             <div class="form-row" style="margin:0"><label class="form-label">Pod image <span class="muted">(blank = engine default)</span></label><input type="text" id="cfg-rp-image" class="form-input" placeholder="vllm/vllm-openai:latest"></div>
             <div class="form-row" style="margin:0"><label class="form-label">Disk (GB)</label><input type="number" id="cfg-rp-disk" class="form-input" min="1" placeholder="40"></div>
@@ -911,7 +916,10 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
               <div class="form-row" style="margin:0"><label class="form-label">Max pods</label><input type="number" id="cfg-spill-max-pods" class="form-input" min="1" placeholder="1"></div>
               <div class="form-row" style="margin:0"><label class="form-label">Idle timeout (s)</label><input type="number" id="cfg-spill-idle" class="form-input" min="0" placeholder="300"></div>
             </div>
-            <div class="form-row" style="margin:.5rem 0 0"><label class="form-label">Pod image <span class="muted">(coderai / custom engines)</span></label><input type="text" id="cfg-spill-image" class="form-input" placeholder="ghcr.io/you/coderai-images:0.2.0"></div>
+            <div style="display:grid;grid-template-columns:2fr 1fr;gap:.5rem;margin-top:.5rem">
+              <div class="form-row" style="margin:0"><label class="form-label">Pod image <span class="muted">(coderai / custom engines)</span></label><input type="text" id="cfg-spill-image" class="form-input" placeholder="ghcr.io/you/coderai-images:0.2.0"></div>
+              <div class="form-row" style="margin:0"><label class="form-label">Share pool <span class="muted">(optional)</span></label><input type="text" id="cfg-spill-pool" class="form-input" placeholder="blank = its own pods"></div>
+            </div>
           </div>
         </div>
       </div>
@@ -4148,6 +4156,7 @@ function _populateRunpod(s){
   set('cfg-rp-cost-period', rp.cost_period || 'unlimited');
   set('cfg-rp-engine', rp.engine || 'auto');
   set('cfg-rp-hf-gguf', rp.hf_gguf || '');
+  set('cfg-rp-pool', rp.pool || '');
   set('cfg-rp-api-key', rp.api_key || '');
   chk('cfg-rp-open', rp.allow_open_pod);
   set('cfg-rp-registry-auth', rp.registry_auth_id || '');
@@ -4184,6 +4193,7 @@ function _populatePlacement(s){
   set('cfg-spill-max-pods', tg.max_pods != null ? tg.max_pods : '');
   set('cfg-spill-idle', tg.idle_timeout_s != null ? tg.idle_timeout_s : '');
   set('cfg-spill-image', tg.image || '');
+  set('cfg-spill-pool', tg.pool || '');
   _updateSpillVisibility();
 }
 
@@ -4232,6 +4242,7 @@ function _collectSpillover(){
     target.max_pods      = intOrU('cfg-spill-max-pods');
     target.idle_timeout_s= intOrU('cfg-spill-idle');
     target.image         = (val('cfg-spill-image') || '').trim();
+    target.pool          = (val('cfg-spill-pool') || '').trim();
   }
   return {
     enabled: true,
@@ -4281,6 +4292,7 @@ function _collectRunpod(){
     cost_period:        val('cfg-rp-cost-period') || 'unlimited',
     engine:             val('cfg-rp-engine') || 'auto',
     hf_gguf:            (val('cfg-rp-hf-gguf') || '').trim(),
+    pool:               (val('cfg-rp-pool') || '').trim(),
     api_key:            (val('cfg-rp-api-key') || '').trim(),
     allow_open_pod:     document.getElementById('cfg-rp-open').checked,
     registry_auth_id:   (val('cfg-rp-registry-auth') || '').trim(),

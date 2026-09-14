@@ -60,6 +60,12 @@ class RunpodModelConfig:
     # RunPod container-registry credential id for a private image; blank falls
     # back to the account-wide one.
     registry_auth_id: str = ""
+    # Share one set of pods with every other model naming the same pool, instead
+    # of renting a card each. Only possible when the pod's server can serve more
+    # than one model: a coderai pod is a whole coderai and picks the model from
+    # the request, while a vLLM pod is launched `--model X` and a llama.cpp pod
+    # `-hf one.gguf` — those serve exactly one, and sharing is refused.
+    pool: str = ""
     # Bearer token the pod requires on every request. A RunPod proxy URL is
     # reachable by anyone who learns it, so a pod without one is an open GPU on
     # the public internet. Blank does NOT mean "no auth": the pool generates a
@@ -267,6 +273,7 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.health_path = (b.get("health_path") or "").strip()
     cfg.docker_args = (b.get("docker_args") or "").strip()
     cfg.registry_auth_id = (b.get("registry_auth_id") or "").strip()
+    cfg.pool = (b.get("pool") or "").strip().lower()
     cfg.api_key = (b.get("api_key") or "").strip()
     cfg.allow_open_pod = _as_bool(b.get("allow_open_pod"), cfg.allow_open_pod)
     cfg.served_model = (b.get("served_model") or "").strip()
@@ -848,13 +855,48 @@ _pools: dict = {}          # model_key -> RunpodPodPool
 _scaler_started = False
 
 
-def get_pod_pool(model_key, account_cfg, mcfg: "RunpodModelConfig", served_name) -> RunpodPodPool:
+#: Pod servers that are pinned to a single model at launch, so several models
+#: can never share one. A coderai (or comparable) image picks the model per
+#: request and can.
+_SINGLE_MODEL_ENGINES = ("vllm", "llamacpp")
+
+
+def shared_pool_key(mcfg: "RunpodModelConfig", model_key: str,
+                    model_path: str = "") -> str:
+    """The pool key for this model: its own, or a shared one it opted into.
+
+    Raises when the configured engine cannot serve more than one model — better
+    a clear error now than a pod that answers every request with the wrong
+    model's weights (or a 404 from a server that was launched for another one).
+    """
+    shared = (getattr(mcfg, "pool", "") or "").strip().lower()
+    if not shared:
+        return str(model_key)
+    engine = resolve_pod_engine(mcfg, model_key, model_path)
+    if engine in _SINGLE_MODEL_ENGINES:
+        raise RuntimeError(
+            f"RunPod: model {model_key!r} asks to share pod pool {shared!r}, but a "
+            f"{engine} pod is launched for ONE model and cannot serve another. "
+            "Share a pool only between models on a coderai (or custom multi-model) "
+            "pod image, or drop the pool name so this model gets its own pods.")
+    return f"pool:{shared}"
+
+
+def get_pod_pool(model_key, account_cfg, mcfg: "RunpodModelConfig", served_name,
+                 shared: bool = False) -> RunpodPodPool:
+    """The pool for ``model_key``, created on first use.
+
+    ``shared`` marks a pool several models joined by name. The first model to
+    create it sets its shape (image, GPU class, budgets, scaling) and later
+    joiners do NOT overwrite it — otherwise whichever model happened to load
+    last would silently redefine the budget for everyone sharing the pod.
+    """
     with _pools_lock:
         pool = _pools.get(model_key)
         if pool is None:
             pool = RunpodPodPool(model_key, account_cfg, mcfg, served_name)
             _pools[model_key] = pool
-        else:
+        elif not shared:
             # refresh config each load so edits take effect
             pool.account, pool.mcfg, pool.served = account_cfg, mcfg, served_name
     _ensure_scaler()
@@ -890,15 +932,7 @@ def get_capability_pool(capability: str, block: dict):
     shared = str(b.get("pool") or "").strip().lower()
     mcfg = parse_model_runpod(b)
     key = f"capability:{shared or capability}"
-    # A shared pool is configured once (on whichever capability carries the
-    # settings) and referenced by the others, so don't let a bare `{"pool": …}`
-    # reference overwrite the real config with defaults.
-    if shared:
-        with _pools_lock:
-            existing = _pools.get(key)
-        if existing is not None and len(b) <= 2:
-            return existing
-    return get_pod_pool(key, acct, mcfg, shared or capability)
+    return get_pod_pool(key, acct, mcfg, shared or capability, shared=bool(shared))
 
 
 def _all_pools_hourly_rate() -> float:

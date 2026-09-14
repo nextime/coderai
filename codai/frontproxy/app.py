@@ -750,9 +750,16 @@ class FrontProxy:
         try:
             from codai.api import runpod_worker as _rw
             mcfg = _rw.parse_model_runpod(target)
-            key = "spill:" + (self._queue_key(model) or str(model))
             served = (target.get("served_model") or "").strip() or (model or "")
-            pool = _rw.get_pod_pool(key, rp, mcfg, served)
+            # Two models bursting to the same pool share its pods: the overflow
+            # from both lands on one card until it saturates, rather than each
+            # renting its own. Refused for engines pinned to a single model.
+            shared = (target.get("pool") or "").strip().lower()
+            key = f"spill:pool:{shared}" if shared else \
+                "spill:" + (self._queue_key(model) or str(model))
+            if shared:
+                _rw.shared_pool_key(mcfg, model or "", "")   # raises if not shareable
+            pool = _rw.get_pod_pool(key, rp, mcfg, served, shared=bool(shared))
             # Provisioning blocks for minutes on a cold pod; keep the loop free.
             handle, url = await _asyncio.to_thread(pool.acquire)
         except Exception as exc:

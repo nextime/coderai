@@ -372,6 +372,32 @@ Triggers, most eager first:
 gated, scaled, reaped, billed against the same caps) or `serverless` (your own
 RunPod endpoint id). `served_model` renames the model for the remote.
 
+### Several models on one pod
+
+Two models that would each rent a card can share one, until it saturates:
+
+```json
+{"runpod": {"pool": "shared", "engine": "coderai",
+            "image": "ghcr.io/<you>/coderai-images:0.2.0",
+            "max_pods": 2, "scale_up_inflight_per_pod": 4}}
+```
+
+Give the second model the same `pool` name. Both requests land on the same pod —
+each carries its own model name, and a coderai pod picks the model per request —
+and the pool rents a second pod only once the first is carrying
+`scale_up_inflight_per_pod` requests. The same `pool` field works on a burst
+target, so two models' overflow shares one card.
+
+**This needs a multi-model pod image.** A vLLM pod is launched `--model X` and a
+llama.cpp pod `-hf one.gguf`: they serve exactly one model, so sharing is refused
+with an explicit error rather than sending requests to a pod that would answer
+with the wrong weights. Use `engine: coderai` (or a custom multi-model image) for
+a shared pool.
+
+The first model to create a shared pool sets its shape — image, GPU class,
+budget, scaling — and later joiners do not overwrite it, so whichever model
+happens to load last can't silently redefine the budget everyone is sharing.
+
 The burst is a borrow: a pod is taken for one request and handed straight back,
 so an overlap that never recurs is reaped after `idle_timeout_s` rather than
 lingering. And a burst that cannot be opened — cold pod failed, budget cap hit,

@@ -2787,7 +2787,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                   "endpoint_id", "cost_period",
                   # engine selection, private registries, and the pod's own token
                   "engine", "hf_gguf", "health_path", "docker_args",
-                  "registry_auth_id", "api_key"):
+                  "registry_auth_id", "api_key", "pool"):
             v = src.get(k)
             if isinstance(v, str) and v.strip():
                 rpo[k] = v.strip()
