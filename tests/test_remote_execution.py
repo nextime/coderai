@@ -1173,7 +1173,9 @@ def test_a_test_run_can_force_where_it_runs(test_run):
 
     _run_test("my-llm", where="local")
     assert test_run["headers"][PLACEMENT_HEADER] == "local"
-    _run_test("my-llm", where="runpod")
+    # Forcing remote only dispatches for a model that really is configured
+    # remote; my-embed has a service_url.
+    _run_test("my-embed", where="runpod")
     assert test_run["headers"][PLACEMENT_HEADER] == "remote"
 
 
@@ -1212,3 +1214,41 @@ def test_the_placement_override_is_honoured_by_the_router():
     with pytest.raises(RuntimeError, match="nothing configures"):
         resolve_target("/v1/images/generations", "POST", "", body,
                        "application/json", force="remote")
+
+
+def test_forcing_runpod_fails_when_nothing_is_configured_remote(test_run):
+    """The bug this exists to prevent: /v1/chat/completions is outside the
+    gateway, so a forced header is ignored there — a text model with no remote
+    config would have been served LOCALLY while the result said "remote"."""
+    out = _run_test("my-llm", where="runpod")
+    assert out["ok"] is False
+    assert "nothing configures" in out["error"]
+    assert out["ran"] == ""          # nothing was dispatched at all
+
+    # A model that IS configured remote still runs.
+    out2 = _run_test("my-video", where="runpod")
+    assert out2["where"] == "runpod" and "nothing configures" not in str(out2)
+
+
+def test_a_200_with_no_output_is_not_a_pass(test_run, monkeypatch):
+    """A reasoning model can answer with nothing when the token budget is tight.
+    HTTP 200 plus zero content is a failure, not a pass."""
+    import codai.broker.asgi_bridge as bridge
+
+    async def empty_reply(request, *, method, path, headers=None, body=b""):
+        return {"status_code": 200, "body": json.dumps(
+            {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
+             "usage": {"completion_tokens": 0}}).encode()}
+
+    monkeypatch.setattr(bridge, "execute_api_request", empty_reply)
+    out = _run_test("my-llm")
+    assert out["status"] == 200
+    assert out["ok"] is False
+    assert "no text" in out["error"] and "completion_tokens=0" in out["error"]
+
+
+def test_the_text_probe_leaves_room_for_a_reasoning_model():
+    from codai.api.model_test import _probe_for
+
+    _, body = _probe_for("text", "m")
+    assert body["max_tokens"] >= 64

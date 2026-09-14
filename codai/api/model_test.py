@@ -52,8 +52,11 @@ class ModelTestRequest(BaseModel):
 #: exercises a real generation.
 def _probe_for(capability: str, model: str):
     if capability in ("", "text"):
+        # 64, not 8: a reasoning model spends its budget thinking and answers
+        # with nothing at all if the cap is tight — which looks like a pass
+        # (HTTP 200) while proving the model produced no output.
         return "/v1/chat/completions", {
-            "model": model, "max_tokens": 8, "temperature": 0.0,
+            "model": model, "max_tokens": 64, "temperature": 0.0,
             "messages": [{"role": "user", "content": "Reply with exactly: OK"}]}
     if capability == "images":
         return "/v1/images/generations", {
@@ -96,6 +99,18 @@ async def test_model(req: ModelTestRequest, request: Request,
     entry, capability = _describe(req.model)
     placement = _placement_summary(req.model, entry, force)
 
+    # Forcing remote has to be verified HERE, not left to the gateway. Chat and
+    # completions are deliberately outside the gateway (RemoteOpenAIBackend owns
+    # them), so a forced header is ignored on that path and the request would be
+    # served locally while this reported "remote" — a test passing in the wrong
+    # place, which is worse than no test at all.
+    if force == "remote":
+        why = _no_remote_reason(req.model, entry, capability)
+        if why:
+            return {"model": req.model, "capability": capability or "text",
+                    "where": "remote", "target": "(not configured)",
+                    "ran": "", "ok": False, "seconds": 0.0, "error": why}
+
     path, body = _probe_for(capability, req.model)
     if not path:
         reason = _REACHABILITY_ONLY.get(capability, "no cheap probe for this kind")
@@ -134,9 +149,70 @@ async def test_model(req: ModelTestRequest, request: Request,
            "seconds": seconds}
     if out["ok"]:
         out["sample"] = _sample(raw, capability)
+        empty = _empty_result(raw, capability)
+        if empty:
+            # A 200 that carried no output is not a working model. Reporting it
+            # as a pass is worse than reporting nothing.
+            out["ok"] = False
+            out["error"] = empty
     else:
         out["error"] = _error_text(raw)
     return out
+
+
+def _empty_result(raw: bytes, capability: str) -> str:
+    """'' when the response carries real output, else why it does not."""
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return "" if raw else "the response was empty"
+    if capability in ("", "text"):
+        choice = (obj.get("choices") or [{}])[0]
+        content = ((choice.get("message") or {}).get("content") or "").strip()
+        if content:
+            return ""
+        produced = (obj.get("usage") or {}).get("completion_tokens", 0)
+        return (f"the model returned no text (completion_tokens={produced}, "
+                f"finish_reason={choice.get('finish_reason')!r}) — it answered the "
+                "request with nothing")
+    if capability == "embeddings":
+        try:
+            return "" if obj["data"][0]["embedding"] else "the embedding was empty"
+        except Exception:
+            return "no embedding in the response"
+    if capability == "images":
+        try:
+            d = (obj.get("data") or [{}])[0]
+            return "" if (d.get("b64_json") or d.get("url")) else "no image in the response"
+        except Exception:
+            return "no image in the response"
+    if capability == "rerank":
+        return "" if (obj.get("results") or obj.get("data")) else "no ranking returned"
+    return ""
+
+
+def _no_remote_reason(model: str, entry: dict, capability: str) -> str:
+    """'' when this model really is configured to run remotely, else why not."""
+    entry = entry or {}
+    if str(entry.get("service_url") or "").strip():
+        return ""
+    if str(entry.get("backend") or "").strip().lower() == "runpod":
+        return ""
+    if isinstance(entry.get("runpod"), dict) and entry["runpod"]:
+        return ""
+    try:
+        from codai.api.remote_gateway import capability_endpoints, capability_pods
+        if capability and (capability in capability_endpoints()
+                           or capability in capability_pods()):
+            return ""
+    except Exception:
+        pass
+    if not entry:
+        return (f"{model!r} is not in the model list, so nothing can say where it "
+                "should run")
+    return (f"nothing configures {model!r} to run remotely — set a service_url, or "
+            "backend 'runpod' with a runpod block on the model, or a remote for "
+            f"its {capability or 'text'} capability")
 
 
 def _describe(model: str):
