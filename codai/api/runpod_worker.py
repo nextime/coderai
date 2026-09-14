@@ -1510,6 +1510,16 @@ class RunpodPodPool:
                 # Before renting: is a sibling process already running a pod for
                 # this exact pool? One engine per GPU means the same capability
                 # was being rented a card each.
+                if sibling_is_provisioning(str(self.model_key)):
+                    # Another engine is already booting one for this pool. Wait
+                    # for it rather than renting a second card for the same work.
+                    print(f"[runpod] another engine is booting a pod for "
+                          f"{self.model_key!r} — waiting for it", flush=True)
+                    with self._cv:
+                        self._provisioning = False
+                        self._cv.notify_all()
+                        self._cv.wait(15.0)
+                    continue
                 shared_id, shared_url = find_shared_pod(
                     str(self.model_key), self.health_path, self.api_key)
                 if shared_url:
@@ -1918,6 +1928,30 @@ def register_pod(pod_id: str, pool_key: str = "", url: str = "") -> None:
         str(pod_id), {"pool": str(pool_key), "pid": os.getpid(), "at": time.time(),
                       "url": str(url or "")})
         or True)
+
+
+def sibling_is_provisioning(pool_key: str) -> bool:
+    """True when another process has a pod for this pool that is still booting.
+
+    Registered at creation with no URL yet. Without this the sibling rents its
+    own during the ~2.5 minutes a pod takes to boot — which is exactly what
+    happened live: two pods for one capability, 45 seconds apart.
+    """
+    data = _registry_update(lambda d: False)
+    if not isinstance(data, dict):
+        return False
+    mine = os.getpid()
+    now = time.time()
+    for info in data.values():
+        if not isinstance(info, dict) or info.get("pool") != str(pool_key):
+            continue
+        if info.get("pid") == mine or info.get("url"):
+            continue
+        # Only while it could plausibly still be booting; a stale entry from a
+        # dead process must not block provisioning forever.
+        if now - float(info.get("at") or 0) < REAP_GRACE_SECONDS:
+            return True
+    return False
 
 
 def find_shared_pod(pool_key: str, health_path: str = "/v1/models",

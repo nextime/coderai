@@ -1369,3 +1369,45 @@ def test_a_model_the_pod_could_never_fetch_is_refused_with_a_reason(learning_pod
     # that would fail later at load time.
     assert gw.teach_model(url, "", "local-only") is False
     assert _LearningPod.known == set()
+
+
+def test_registering_a_model_makes_it_usable_not_just_listed(monkeypatch):
+    """Writing models_data alone is not enough: request validation asks the
+    MODEL MANAGER for its allowed identifiers. A live pod proved it — seeded
+    with 5 models and still answering "not available. Use one of: " with an
+    empty list."""
+    import codai.admin.routes as ar
+    from codai.api import models_transfer as mt
+
+    registered = {}
+
+    class _MM:
+        model_aliases = {}
+        _assigned_model_keys = set()
+
+        def set_embedding_model(self, path, config=None):
+            registered["path"] = path
+            registered["config"] = config
+
+        def set_assigned_models(self, keys):
+            registered["assigned"] = set(keys)
+
+    class _CM:
+        models_data = {}
+
+    monkeypatch.setattr(ar, "config_manager", _CM())
+    import codai.models.manager as mgr
+    monkeypatch.setattr(mgr, "multi_model_manager", _MM())
+
+    state = mt.register_model_runtime(
+        {"path": "BAAI/bge-m3", "model_type": "embedding_models", "alias": "bge-m3"},
+        "embedding_models")
+    assert state == "added"
+    # In the catalogue…
+    assert _CM.models_data["embedding_models"][0]["path"] == "BAAI/bge-m3"
+    # …AND known to the manager, which is what validation consults.
+    assert registered["path"] == "BAAI/bge-m3"
+    # …AND reachable by the alias a request will actually use.
+    assert _MM.model_aliases["bge-m3"] == "BAAI/bge-m3"
+    # …AND not filtered out by an engine assignment it was never part of.
+    assert {"BAAI/bge-m3", "bge-m3"} <= registered["assigned"]

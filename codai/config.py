@@ -1346,6 +1346,12 @@ class ConfigManager:
                 continue            # a real entry already covers it — leave it alone
             lst.append(dict(e))
             print(f"[seed] registered {path} in {section}", flush=True)
+        # The catalogue alone is not enough: request validation asks the MODEL
+        # MANAGER for its allowed identifiers, and a seeded pod whose manager was
+        # never told still answers "not available" with an empty list. The
+        # manager is set up after this runs, so the work is deferred to it.
+        self._pending_seed_entries = [e for e in entries if isinstance(e, dict)
+                                      and e.get("path")]
 
     def save_models(self):
         """Save models.json to disk."""

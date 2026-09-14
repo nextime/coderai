@@ -870,6 +870,31 @@ def main():
         except Exception as _e:
             print(f"[engine] assignment filter failed ({_e}); registering all models")
 
+    # Models seeded by CODERAI_SEED_MODELS live in memory only — a pod is
+    # disposable, so they are deliberately not written to models.json. The front
+    # computes its engine assignment FROM that file, so it assigns none of them
+    # and the filter above would drop exactly the models this pod was rented to
+    # serve. Observed on a live pod: "not available. Use one of: " with nothing
+    # after the colon. Put them back.
+    _seeded = list(getattr(config_mgr, "_pending_seed_entries", None) or [])
+    if _seeded:
+        _keys = set()
+        for _e in _seeded:
+            _sec = _e.get("model_type") or "text_models"
+            _lst = models_config.setdefault(_sec, [])
+            if isinstance(_lst, list) and not any(
+                    isinstance(x, dict) and x.get("path") == _e.get("path")
+                    for x in _lst):
+                _lst.append(_e)
+            _keys.add(_e.get("alias") or _e.get("path"))
+        try:
+            _cur = getattr(multi_model_manager, "_assigned_model_keys", None)
+            if _cur is not None:
+                multi_model_manager.set_assigned_models(set(_cur) | _keys)
+        except Exception:
+            pass
+        print(f"[seed] {len(_seeded)} seeded model(s) registered on this engine")
+
     # Helper to find model config
     def get_model_cfg(model_type, model_id):
         key = f"{model_type}:{model_id}"

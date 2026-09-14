@@ -142,25 +142,81 @@ async def register_models(request: Request, _auth=Depends(_require_api_auth)):
     return {"added": added, "already_known": known, "refused": refused}
 
 
-def _register_entry(entry: dict, section: str) -> str:
-    """Add one entry to the in-memory catalogue. Returns 'added' or 'known'."""
+#: models.json section -> the manager method that makes a model USABLE. Writing
+#: models_data alone is not enough: request validation asks the manager for its
+#: allowed identifiers, so a model registered only in the catalogue file is still
+#: refused with "not available" — observed on a live pod, with an empty list
+#: after the colon.
+_SECTION_SETTER = {
+    "text_models": "set_default_model",
+    "gguf_models": "set_default_model",
+    "vision_models": "set_vision_model",
+    "image_models": "set_image_model",
+    "audio_models": "set_audio_model",
+    "tts_models": "set_tts_model",
+    "video_models": "set_video_model",
+    "audio_gen_models": "set_audio_gen_model",
+    "embedding_models": "set_embedding_model",
+    "spatial_models": "set_spatial_model",
+}
+
+
+def register_model_runtime(entry: dict, section: str) -> str:
+    """Make a model known AND usable on this instance. 'added' or 'known'.
+
+    Two steps, both required: the entry goes into models_data (so the catalogue
+    and the admin pages see it) and the model manager is told about it (so
+    request validation accepts it).
+    """
+    path = entry.get("path")
+    already = False
     try:
         from codai.admin.routes import config_manager
         md = getattr(config_manager, "models_data", None)
-        if not isinstance(md, dict):
-            return "known"
-        lst = md.setdefault(section, [])
-        if not isinstance(lst, list):
-            return "known"
-        path = entry.get("path")
-        if any(isinstance(m, dict) and m.get("path") == path for m in lst):
-            return "known"
-        lst.append(dict(entry))
-        print(f"[register] {path} added to {section}", flush=True)
-        return "added"
+        if isinstance(md, dict):
+            lst = md.setdefault(section, [])
+            if isinstance(lst, list):
+                already = any(isinstance(m, dict) and m.get("path") == path
+                              for m in lst)
+                if not already:
+                    lst.append(dict(entry))
     except Exception as exc:
-        print(f"[register] failed: {exc}", flush=True)
-        return "known"
+        print(f"[register] catalogue update failed: {exc}", flush=True)
+
+    setter = _SECTION_SETTER.get(section)
+    if setter:
+        try:
+            from codai.models.manager import multi_model_manager
+            cfg = {k: v for k, v in entry.items() if k not in ("path",)}
+            cfg.setdefault("load_mode", "on-request")
+            getattr(multi_model_manager, setter)(path, config=cfg)
+            if entry.get("alias"):
+                # An alias is how a request usually names it (bge-m3 vs BAAI/bge-m3).
+                try:
+                    multi_model_manager.model_aliases[str(entry["alias"])] = path
+                except Exception:
+                    pass
+            # An engine only lists models the front assigned it, and a model
+            # registered at runtime was assigned by nobody. Widen the set, or it
+            # would be usable but invisible in /v1/models.
+            try:
+                cur = getattr(multi_model_manager, "_assigned_model_keys", None)
+                if cur is not None:
+                    multi_model_manager.set_assigned_models(
+                        set(cur) | {path, entry.get("alias") or path})
+            except Exception:
+                pass
+        except Exception as exc:
+            print(f"[register] {path} could not be made usable: {exc}", flush=True)
+            return "known" if already else "added"
+    if not already:
+        print(f"[register] {path} registered in {section}", flush=True)
+    return "known" if already else "added"
+
+
+def _register_entry(entry: dict, section: str) -> str:
+    """Back-compat wrapper."""
+    return register_model_runtime(entry, section)
 
 
 @router.post("/v1/models/upload", summary="Upload model weights")

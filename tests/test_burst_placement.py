@@ -485,3 +485,33 @@ def test_the_venv_marker_is_written_last_and_builders_are_serialised():
     assert s.index('touch "$MARK"') < s.index('[ -f "$MARK" ] ||')
     # mkdir is the atomic lock; a loser waits instead of installing too.
     assert 'mkdir "$LOCK"' in s and "another pod is building" in s
+
+
+def test_a_sibling_waits_for_a_booting_pod_instead_of_renting_one(tmp_path, monkeypatch):
+    """A pod takes ~2.5 minutes to boot. Live, the second engine looked during
+    that window, saw no READY pod, and rented its own — two cards, 45s apart."""
+    import codai.api.runpod_worker as rw
+
+    monkeypatch.setattr(rw, "_pod_registry_path", lambda: str(tmp_path / "pods.json"))
+
+    # A sibling registered a pod that has not finished booting (no url yet).
+    rw._registry_update(lambda d: d.__setitem__(
+        "booting", {"pool": "capability:embeddings", "pid": 999999,
+                    "at": __import__("time").time(), "url": ""}) or True)
+    assert rw.sibling_is_provisioning("capability:embeddings") is True
+    assert rw.sibling_is_provisioning("capability:images") is False
+
+    # Once it is serving, it is adoptable rather than merely blocking.
+    monkeypatch.setattr(rw, "_pod_health_ok", lambda url, **kw: True)
+    rw._registry_update(lambda d: d.__setitem__(
+        "booting", {"pool": "capability:embeddings", "pid": 999999,
+                    "at": __import__("time").time(),
+                    "url": "http://pod:8000"}) or True)
+    assert rw.sibling_is_provisioning("capability:embeddings") is False
+    assert rw.find_shared_pod("capability:embeddings")[1] == "http://pod:8000"
+
+    # A stale entry from a dead process must not block provisioning forever.
+    rw._registry_update(lambda d: d.__setitem__(
+        "ancient", {"pool": "capability:video", "pid": 999998,
+                    "at": 0, "url": ""}) or True)
+    assert rw.sibling_is_provisioning("capability:video") is False
