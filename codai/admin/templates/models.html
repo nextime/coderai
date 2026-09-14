@@ -800,6 +800,17 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
               </label>
             </div>
           </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-top:.5rem">
+            <div class="form-row" style="margin:0">
+              <label class="form-label">Network volume id <span class="muted">(this model)</span></label>
+              <input type="text" id="cfg-rp-volume" class="form-input" placeholder="blank = the account default, or none">
+              <span class="form-hint" style="font-size:11px">Weights, uploads and adapters land here and outlive the pod. Secure Cloud only; pods are pinned to the volume's region.</span>
+            </div>
+            <div class="form-row" style="margin:0;align-self:start">
+              <label style="display:flex;align-items:center;gap:.3rem;font-size:12px;margin-top:1.4rem"><input type="checkbox" id="cfg-rp-venv-volume" style="width:auto"> Keep dependencies on the volume</label>
+              <span class="form-hint" style="font-size:11px">Boots a small image and runs from a venv on the volume — the first pod builds it, later pods skip the 7 GB pull. Needs a volume; imports are slower off network storage.</span>
+            </div>
+          </div>
           <div class="form-row" style="margin:.5rem 0 0">
             <label class="form-label">Share pod pool <span class="muted">(optional name)</span></label>
             <input type="text" id="cfg-rp-pool" class="form-input" placeholder="blank = this model rents its own pods">
@@ -4207,6 +4218,8 @@ function _populateRunpod(s){
   set('cfg-rp-engine', rp.engine || 'auto');
   set('cfg-rp-hf-gguf', rp.hf_gguf || '');
   set('cfg-rp-pool', rp.pool || '');
+  set('cfg-rp-volume', rp.network_volume_id || '');
+  chk('cfg-rp-venv-volume', rp.venv_on_volume);
   set('cfg-rp-source', rp.source || 'auto');
   set('cfg-rp-hf-repo', rp.hf_repo || '');
   set('cfg-rp-model-url', rp.model_url || '');
@@ -4375,6 +4388,8 @@ function _collectRunpod(){
     engine:             val('cfg-rp-engine') || 'auto',
     hf_gguf:            (val('cfg-rp-hf-gguf') || '').trim(),
     pool:               (val('cfg-rp-pool') || '').trim(),
+    network_volume_id:  (val('cfg-rp-volume') || '').trim(),
+    venv_on_volume:     document.getElementById('cfg-rp-venv-volume').checked,
     source:             val('cfg-rp-source') || 'auto',
     hf_repo:            (val('cfg-rp-hf-repo') || '').trim(),
     model_url:          (val('cfg-rp-model-url') || '').trim(),

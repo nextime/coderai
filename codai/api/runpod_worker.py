@@ -64,6 +64,14 @@ class RunpodModelConfig:
     # account-wide one. Weights, uploads and adapters on it outlive the pod.
     network_volume_id: str = ""
     volume_mount_path: str = ""              # blank = the account default
+    # Keep this pod's Python dependencies on the VOLUME instead of in the image,
+    # and boot a small image that uses them. The first pod builds the venv (a few
+    # minutes); every pod after skips both the 7 GB image pull and the install.
+    # Needs a network volume. Opt-in per pool — never a default, because it
+    # trades a fast pull for slower imports off network storage.
+    venv_on_volume: bool = False
+    venv_name: str = ""                      # blank = the profile/capability name
+    slim_image: str = ""                     # blank = the published slim image
     # Share one set of pods with every other model naming the same pool, instead
     # of renting a card each. Only possible when the pod's server can serve more
     # than one model: a coderai pod is a whole coderai and picks the model from
@@ -366,9 +374,9 @@ def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
         # them meant a pod with an explicit image got no models and refused
         # everything with "not available".
         image = mcfg.image
+        capability_hint = model_capability(entry or {}, include_text=True)
         if not image:
-            cap = model_capability(entry or {}, include_text=True)
-            image = default_capability_image(cap) if cap else ""
+            image = default_capability_image(capability_hint) if capability_hint else ""
         if not image:
             raise RuntimeError(
                 f"RunPod {engine} pod: set `image` on the runpod block to the image "
@@ -376,7 +384,7 @@ def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
                 f"{CAPABILITY_IMAGE_REPO}-<capability> image; this one has none, so "
                 "name it explicitly.")
         return _plan(engine, image, mcfg.docker_args, mcfg, api_key, entry, served,
-                     seed_entries)
+                     seed_entries, capability=capability_hint)
     else:
         image = mcfg.image or DEFAULT_POD_IMAGE
         args = mcfg.docker_args or _vllm_docker_args(mcfg, served, entry)
@@ -464,6 +472,55 @@ def volume_for(mcfg: "RunpodModelConfig", account) -> tuple:
     return vol, mount.rstrip("/") or "/workspace"
 
 
+#: The dependency-free image that runs coderai from a venv on a volume.
+SLIM_POD_IMAGE = os.environ.get("CODERAI_SLIM_POD_IMAGE",
+                                f"{CAPABILITY_IMAGE_REPO}-slim:{CAPABILITY_IMAGE_TAG}")
+
+
+def venv_bootstrap_script(mount: str, profile: str, venv_name: str = "",
+                          port: int = 8000) -> str:
+    """Start command for a slim pod: build the venv on the volume if needed, run.
+
+    The first pod to use a given venv pays for the install; every pod after finds
+    it and starts in seconds. A completion marker is written LAST and checked
+    first, so a pod that dies mid-install cannot leave a half-built venv that
+    later pods would import from and fail on in confusing ways.
+
+    Concurrent builders are the other hazard — two pods starting together would
+    install into the same directory. A lock directory (mkdir is atomic) makes the
+    second one wait for the first rather than interleave with it.
+    """
+    name = (venv_name or profile or "default").strip()
+    venv = f"{mount}/venvs/{name}"
+    reqs = "/opt/coderai/app/packaging/runpod/profiles"
+    return "\n".join([
+        "set -eu",
+        f'VENV={_sh_quote(venv)}',
+        f'LOCK={_sh_quote(venv + ".lock")}',
+        f'MARK={_sh_quote(venv + "/.ready")}',
+        # Wait for another pod that is already building this venv.
+        'for i in $(seq 1 180); do',
+        '  [ -f "$MARK" ] && break',
+        '  if mkdir "$LOCK" 2>/dev/null; then',
+        '    echo "[venv] building $VENV (first pod pays for this)"',
+        '    python -m venv "$VENV"',
+        f'    "$VENV/bin/python" -m pip install --upgrade pip',
+        f'    "$VENV/bin/python" -m pip install -r {reqs}/core.txt',
+        f'    "$VENV/bin/python" -m pip install -r {reqs}/{profile}.txt',
+        '    touch "$MARK"',        # last: a crash leaves no usable marker
+        '    rmdir "$LOCK" || true',
+        '    break',
+        '  fi',
+        '  echo "[venv] another pod is building $VENV — waiting"',
+        '  sleep 10',
+        'done',
+        '[ -f "$MARK" ] || { echo "[venv] $VENV never became ready"; exit 1; }',
+        'echo "[venv] using $VENV"',
+        f'exec "$VENV/bin/python" -m uvicorn codai.api.app:app --host 0.0.0.0 '
+        f'--port {int(port)}',
+    ])
+
+
 def volume_env(mount: str) -> dict:
     """Point everything that writes big files at the volume.
 
@@ -487,7 +544,7 @@ def volume_env(mount: str) -> dict:
 
 
 def _plan(engine, image, args, mcfg, api_key, entry, served,
-          seed_entries: list = None) -> dict:  # noqa: D401
+          seed_entries: list = None, capability: str = "") -> dict:  # noqa: D401
     """Finish a plan for a coderai pod: auth plus the models it must serve."""
     import json as _json
     env = {}
@@ -514,8 +571,37 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
             unique.append(s)
         env["CODERAI_SEED_MODELS"] = _json.dumps(unique)
         print(f"[runpod] pod will be told about {len(unique)} model(s)", flush=True)
-    return {"engine": engine, "image": image, "args": args, "env": env,
+    plan = {"engine": engine, "image": image, "args": args, "env": env,
             "health_path": mcfg.health_path or _HEALTH_PATHS.get(engine, "/healthz")}
+
+    # Dependencies on the volume instead of in the image: a small image, and a
+    # venv the first pod builds and every later pod reuses.
+    if getattr(mcfg, "venv_on_volume", False):
+        vol_id, mount = volume_for(mcfg, _account_hint())
+        if not vol_id:
+            raise RuntimeError(
+                "RunPod: `venv_on_volume` needs a network volume — the venv has "
+                "nowhere to live otherwise. Set network_volume_id (account-wide "
+                "or on this pod block), or turn venv_on_volume off.")
+        profile = (capability or model_capability(entry or {}, include_text=True)
+                   or "text")
+        plan["image"] = mcfg.slim_image or SLIM_POD_IMAGE
+        plan["entrypoint"] = ["/bin/sh", "-c"]
+        plan["start_cmd"] = [venv_bootstrap_script(
+            mount, profile, mcfg.venv_name, mcfg.port or 8000)]
+        print(f"[runpod] pod will run from a venv on the volume "
+              f"({mount}/venvs/{mcfg.venv_name or profile}) with image "
+              f"{plan['image']}", flush=True)
+    return plan
+
+
+def _account_hint():
+    """The active RunPod account config, for defaults the plan needs."""
+    try:
+        from codai.models.manager import get_active_runpod_config
+        return get_active_runpod_config()
+    except Exception:
+        return None
 
 
 def seed_model_env(entry: dict, served: str = "", source: str = "") -> str:
@@ -677,6 +763,9 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
         # in the list just produces candidates the attach would reject.
         cfg.cloud_types = ["SECURE"]
     cfg.volume_mount_path = (b.get("volume_mount_path") or "").strip()
+    cfg.venv_on_volume = _as_bool(b.get("venv_on_volume"), cfg.venv_on_volume)
+    cfg.venv_name = (b.get("venv_name") or "").strip()
+    cfg.slim_image = (b.get("slim_image") or "").strip()
     cfg.pool = (b.get("pool") or "").strip().lower()
     cfg.quantization = (b.get("quantization") or "").strip()
     cfg.source = (b.get("source") or cfg.source).strip().lower() or "auto"

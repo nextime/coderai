@@ -2795,7 +2795,8 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                   "registry_auth_id", "api_key", "pool",
                   # where the POD gets the weights
                   "source", "hf_repo", "model_url", "quantization",
-                  "network_volume_id", "volume_mount_path"):
+                  "network_volume_id", "volume_mount_path",
+                  "venv_name", "slim_image"):
             v = src.get(k)
             if isinstance(v, str) and v.strip():
                 rpo[k] = v.strip()
@@ -2811,7 +2812,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
             rpo["cloud_types"] = ct
         # bools
         for k in ("allow_spot", "allow_open_pod", "sticky_sessions", "keep_warm",
-                  "model_url_is_tar"):
+                  "model_url_is_tar", "venv_on_volume"):
             if k in src and src.get(k) is not None and src.get(k) != "":
                 sv = src.get(k)
                 rpo[k] = (sv.lower() in ("1", "true", "on", "yes")

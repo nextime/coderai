@@ -432,3 +432,56 @@ def test_a_volume_forces_secure_cloud():
     assert cfg.cloud_types == ["SECURE"]
     # Without a volume the choice is left alone.
     assert parse_model_runpod({"cloud_types": ["COMMUNITY"]}).cloud_types == ["COMMUNITY"]
+
+
+def test_venv_on_volume_uses_a_small_image_and_the_volumes_venv(monkeypatch):
+    """The 7 GB image is nearly all torch. With a volume, those libraries can
+    live there and the pod pulls a small image instead."""
+    import codai.api.runpod_worker as rw
+
+    class _Acct:
+        network_volume_id = "vol-abc"
+        volume_mount_path = "/workspace"
+        enabled = True
+
+    monkeypatch.setattr(rw, "_account_hint", lambda: _Acct())
+    cfg = rw.parse_model_runpod({"engine": "coderai", "venv_on_volume": True})
+    plan = rw.pod_plan(cfg, "embeddings", "capability:embeddings",
+                       api_key="tok", entry={"path": "org/e", 
+                                             "model_type": "embedding_models"})
+    assert plan["image"].endswith("coderai-slim:latest")
+    assert plan["entrypoint"] == ["/bin/sh", "-c"]
+    script = plan["start_cmd"][0]
+    assert "/workspace/venvs/embeddings" in script
+    assert "profiles/embeddings.txt" in script      # the right profile installed
+    assert script.rstrip().endswith("--port 8000")
+
+
+def test_venv_on_volume_without_a_volume_is_refused(monkeypatch):
+    """The venv would have nowhere to live; say so rather than boot a pod that
+    installs 7 GB onto container disk and throws it away."""
+    import codai.api.runpod_worker as rw
+
+    class _NoVol:
+        network_volume_id = ""
+        volume_mount_path = "/workspace"
+
+    monkeypatch.setattr(rw, "_account_hint", lambda: _NoVol())
+    cfg = rw.parse_model_runpod({"engine": "coderai", "image": "img",
+                                 "venv_on_volume": True})
+    with pytest.raises(RuntimeError, match="needs a network volume"):
+        rw.pod_plan(cfg, "x", "capability:embeddings", entry={})
+
+
+def test_the_venv_marker_is_written_last_and_builders_are_serialised():
+    """Two hazards: a pod that dies mid-install leaving a venv later pods import
+    from, and two pods installing into the same directory at once."""
+    from codai.api.runpod_worker import venv_bootstrap_script
+
+    s = venv_bootstrap_script("/workspace", "tts")
+    # The marker is created after the installs, not before.
+    assert s.index("pip install -r") < s.index('touch "$MARK"')
+    # And the ready check gates the exec.
+    assert s.index('touch "$MARK"') < s.index('[ -f "$MARK" ] ||')
+    # mkdir is the atomic lock; a loser waits instead of installing too.
+    assert 'mkdir "$LOCK"' in s and "another pod is building" in s

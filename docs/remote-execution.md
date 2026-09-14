@@ -537,6 +537,39 @@ volume at once can corrupt it — coderai's writes are write-once (content-addre
 adapter blobs, named model files), but keep that in mind before pointing many
 pods at one volume for anything else.
 
+#### Dependencies on the volume, small image in the registry
+
+A capability image is ~7 GB and nearly all of it is torch. With a volume those
+libraries can live there instead, and the pod boots a **slim** image — OS,
+Python and coderai only — that runs from a venv on the volume:
+
+```json
+{"runpod": {"network_volume_id": "abc123", "venv_on_volume": true}}
+```
+
+The first pod to use a given venv builds it (a few minutes of pip); every pod
+after finds it ready and skips both the big pull and the install. The venv is
+named after the capability by default, so `embeddings` and `video` pods get their
+own; `venv_name` overrides that to share or separate them deliberately.
+
+Build and push the slim image once:
+
+```bash
+PUSH=1 ./packaging/runpod/build_capability_image.sh slim ghcr.io/<you>/coderai-slim:latest
+```
+
+**The trade-off is real and unmeasured on your workload.** The pull gets much
+smaller, but importing torch from network-backed storage is slower than from
+local disk, so some of the saving comes back at import time. Whether it is a net
+win depends on how often your pods cold-start. It is opt-in per pool, never a
+default.
+
+Two failure modes are handled rather than left to chance: the ready marker is
+written **after** the install, so a pod that dies mid-build cannot leave a
+half-built venv that later pods import from; and a lock directory (mkdir is
+atomic) makes a second pod **wait** for the first rather than installing into the
+same directory at the same time.
+
 **Container images cannot come from a volume.** A pod pulls its image from a
 registry before any volume exists; the volume holds model weights and adapters,
 not the image.

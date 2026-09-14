@@ -16,6 +16,20 @@ PROFILE="${1:-}"
 TAG="${2:-coderai-${PROFILE}:latest}"
 PROFILES_DIR="packaging/runpod/profiles"
 
+# The slim image carries no ML dependencies: it runs coderai from a venv on a
+# network volume (see venv_on_volume). Built from its own Dockerfile, with no
+# profile and no import smoke test — there is nothing to import yet.
+if [[ "$PROFILE" == "slim" ]]; then
+    TAG="${2:-coderai-slim:latest}"
+    echo "==> building $TAG (no ML dependencies; runs from a venv on a volume)"
+    DOCKER_BUILDKIT=1 docker build -f packaging/runpod/Dockerfile.capability-slim \
+        -t "$TAG" . || exit 1
+    size=$(docker image inspect "$TAG" --format '{{.Size}}')
+    echo "==> $TAG built ($(( size / 1000000 )) MB)"
+    if [[ "${PUSH:-0}" == "1" ]]; then docker push "$TAG"; fi
+    exit 0
+fi
+
 if [[ -z "$PROFILE" ]]; then
     echo "usage: $0 <profile> [tag]" >&2
     echo "profiles: $(ls "$PROFILES_DIR" | grep -v '^core.txt$' | sed 's/\.txt$//' | tr '\n' ' ')" >&2

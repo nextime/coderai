@@ -1,0 +1,41 @@
+# A coderai pod image with NO machine-learning dependencies.
+#
+# The full capability images are ~7 GB, nearly all of it torch and friends, and
+# every cold pod pulls that before it can answer anything. When a network volume
+# is attached, those libraries can live on the volume instead: this image carries
+# only the OS packages, Python and coderai itself, and the pod's start command
+# points it at a venv on the volume — built once by the first pod, reused by
+# every pod after.
+#
+# The trade is real but not free, and worth measuring for your own workload:
+#   * the image is small (hundreds of MB, not 7 GB), so the pull is quick;
+#   * but importing torch from network-backed storage is slower than from local
+#     disk, so some of what the pull saved comes back at import time.
+#
+# It is opt-in per pool (`venv_on_volume`), never a default.
+#
+#   docker build -f packaging/runpod/Dockerfile.capability-slim \
+#       -t ghcr.io/<you>/coderai-slim:latest .
+
+ARG BASE=python:3.12-slim
+FROM ${BASE}
+
+ENV PYTHONUNBUFFERED=1 \
+    CODERAI_HOME=/config
+
+# The same runtime libraries the full images carry: ffmpeg for audio/video,
+# libgl/libglib for opencv. These are OS packages, not Python ones, so they stay
+# in the image — a venv on a volume cannot provide them.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg git curl ca-certificates libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/coderai/app
+COPY . /opt/coderai/app
+
+# Nothing is imported at build time: the dependencies are not here yet. The pod's
+# start command builds (or reuses) the venv on the volume and runs coderai from
+# it — see venv_bootstrap_script() in codai/api/runpod_worker.py.
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=600s \
+    CMD curl -fsS http://127.0.0.1:8000/healthz || exit 1
