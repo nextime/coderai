@@ -97,6 +97,72 @@ async def model_uploaded(name: str = Query(...), bytes: int = Query(0),
     return {"name": os.path.basename(target), "path": target, "bytes": size}
 
 
+@router.post("/v1/models/register", summary="Register a model at runtime")
+async def register_models(request: Request, _auth=Depends(_require_api_auth)):
+    """Teach a running instance about models it did not start with.
+
+    A pod is seeded at boot with what its owner knew then. But a pod is meant to
+    be an EXTENSION of the local system: a request can name any model at any
+    time, and the pod must be able to learn it, fetch it and serve it rather than
+    answer "not available" for the rest of its life.
+
+    Body: one model entry, or a list of them — the same shape models.json uses.
+    Each needs a ``path`` the receiver can actually fetch (a HuggingFace repo id
+    or a URL); a local path from another machine means nothing here. Registration
+    is in memory only, like the boot seed: a pod is disposable.
+
+    Idempotent: a model already known is left exactly as it is, so re-registering
+    never disturbs a loaded model.
+    """
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid JSON: {exc}")
+    entries = body if isinstance(body, list) else [body]
+    added, known, refused = [], [], []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        path = str(entry.get("path") or "").strip()
+        section = str(entry.get("model_type") or "text_models")
+        if not path:
+            refused.append("(no path)")
+            continue
+        if section not in _SECTIONS:
+            refused.append(f"{path} (unknown model_type {section!r})")
+            continue
+        if path.startswith("/") and not os.path.exists(path):
+            # A path from the sender's filesystem. Say so plainly rather than
+            # register something that will fail at load time.
+            refused.append(f"{path} (local path that does not exist here — send a "
+                           "HuggingFace id, a URL, or upload the weights)")
+            continue
+        state = _register_entry(entry, section)
+        (added if state == "added" else known).append(path)
+    return {"added": added, "already_known": known, "refused": refused}
+
+
+def _register_entry(entry: dict, section: str) -> str:
+    """Add one entry to the in-memory catalogue. Returns 'added' or 'known'."""
+    try:
+        from codai.admin.routes import config_manager
+        md = getattr(config_manager, "models_data", None)
+        if not isinstance(md, dict):
+            return "known"
+        lst = md.setdefault(section, [])
+        if not isinstance(lst, list):
+            return "known"
+        path = entry.get("path")
+        if any(isinstance(m, dict) and m.get("path") == path for m in lst):
+            return "known"
+        lst.append(dict(entry))
+        print(f"[register] {path} added to {section}", flush=True)
+        return "added"
+    except Exception as exc:
+        print(f"[register] failed: {exc}", flush=True)
+        return "known"
+
+
 @router.post("/v1/models/upload", summary="Upload model weights")
 async def upload_model(request: Request, name: str = Query(...),
                        model_type: str = Query("text_models"),

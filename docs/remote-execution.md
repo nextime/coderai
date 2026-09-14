@@ -473,6 +473,29 @@ Build and push the text image before using it:
 PROFILES=text ./packaging/runpod/publish_capability_images.sh
 ```
 
+### A pod is an extension of this system, not a fixed catalogue
+
+A pod starts knowing only what it was seeded with: the one model a per-model pool
+rented it for, or the models of its capability. That is not enough — a request
+can name any model at any time, and a pod that answers "not available" for the
+rest of its life is a dead end rather than an extension of the local system.
+
+So when a remote refuses a model it does not know, coderai **teaches it and
+retries once**:
+
+1. the remote answers `Model 'x' is not available`;
+2. the gateway resolves that model to something the remote can fetch — a
+   HuggingFace repo id, a URL, or an upload when it exists nowhere else — and
+   posts it to `/v1/models/register`;
+3. the request is replayed, and the remote downloads and serves the model.
+
+Registration is in memory (a pod is disposable) and idempotent, so a model
+already loaded is never disturbed. Each model is taught to each pod once.
+
+A model that resolves to none of those — a local path with no `hf_repo`,
+`model_url` or `source: upload` — is refused with that reason rather than
+registered as something the pod could never load.
+
 ### Keeping a pod warm
 
 `keep_warm` on a model's runpod block (or a capability's) keeps one pod running

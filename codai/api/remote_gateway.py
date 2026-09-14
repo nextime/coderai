@@ -104,7 +104,7 @@ def file_origin(filename: str) -> str:
 #: the instance it is sent to (that is the whole point of sending it), so
 #: forwarding one would bounce the weights straight back out again.
 _SKIP_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/models",
-               "/v1/models/upload", "/v1/models/uploaded",
+               "/v1/models/upload", "/v1/models/uploaded", "/v1/models/register",
                # The test run dispatches its own probe; forwarding the test
                # itself would test the remote's routing, not ours.
                "/v1/models/test")
@@ -478,7 +478,7 @@ class RemoteGatewayMiddleware:
             release()
 
     async def _send_upstream(self, scope, headers, body, base, reason, send,
-                             api_key: str = ""):
+                             api_key: str = "", retried: bool = False):
         import asyncio
         path = scope.get("path")
         qs = (scope.get("query_string") or b"").decode("latin-1")
@@ -517,6 +517,18 @@ class RemoteGatewayMiddleware:
         if "json" in ctype.lower():
             raw = await asyncio.to_thread(lambda: resp.content)
             resp.close()
+
+            # "I do not know that model" is recoverable: teach the remote and try
+            # once more. This is what makes a pod an extension of this system
+            # rather than a fixed catalogue frozen at boot — any request may name
+            # a model the pod has never heard of.
+            if _is_unknown_model(resp.status_code, raw) and not retried:
+                model = _model_from_body(body, headers.get("content-type", ""))
+                if await asyncio.to_thread(teach_model, base, api_key, model):
+                    return await self._send_upstream(
+                        scope, headers, body, base, reason, send,
+                        api_key=api_key, retried=True)
+
             raw = _rewrite_file_urls(raw, base, _local_base(scope, headers))
             out = [h for h in out if h[0] != b"content-length"]
             out.append((b"content-length", str(len(raw)).encode()))
@@ -724,6 +736,70 @@ def ensure_text_loras(base: str, api_key: str, entry: dict) -> dict:
     return out
 
 
+#: (base_url, model) already taught to a remote. A pod keeps what it learns, and
+#: a new pod has a new URL, so this never goes stale in a harmful way.
+_REGISTERED: set = set()
+
+
+def teach_model(base: str, api_key: str, model: str) -> bool:
+    """Tell a remote about a model it does not know, so it can fetch and serve it.
+
+    A pod is seeded at boot with what we knew then. Making it an EXTENSION of the
+    local system means any request can name any model afterwards — so when a
+    remote says "not available", we send it that model's entry (resolved to
+    something it can fetch) and let it try again. Uploading is used only when the
+    model exists nowhere else.
+
+    Returns True when something was registered, i.e. a retry is worth making.
+    """
+    import requests
+
+    if not model or (base, model) in _REGISTERED:
+        return False
+    try:
+        from codai.models.manager import _model_entry_for
+        entry = _model_entry_for(model) or {}
+    except Exception:
+        entry = {}
+    if not entry:
+        return False
+
+    from codai.api.runpod_worker import (parse_model_runpod, resolve_model_source,
+                                         seed_model_env)
+    block = entry.get("runpod") if isinstance(entry.get("runpod"), dict) else {}
+    mcfg = parse_model_runpod(block)
+    kind, value = resolve_model_source(entry, mcfg)
+    if kind == "upload":
+        ensure_model_uploaded(base, api_key, entry)
+        _REGISTERED.add((base, model))
+        return True
+    if kind not in ("hf", "url") or not value:
+        print(f"[remote-gateway] cannot teach {model!r} to {base}: no HuggingFace id "
+              "or URL it could fetch — set hf_repo/model_url, or source: upload",
+              flush=True)
+        return False
+
+    payload = seed_model_env(entry, "", value)
+    if not payload:
+        return False
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        r = requests.post(f"{base}/v1/models/register", data=payload,
+                          headers=headers, timeout=60)
+        if not r.ok:
+            print(f"[remote-gateway] {base} refused {model!r}: "
+                  f"{r.status_code} {(r.text or '')[:160]}", flush=True)
+            return False
+        print(f"[remote-gateway] taught {base} about {model!r} ({value})", flush=True)
+        _REGISTERED.add((base, model))
+        return True
+    except Exception as exc:
+        print(f"[remote-gateway] could not teach {model!r} to {base}: {exc}", flush=True)
+        return False
+
+
 def ensure_model_uploaded(base: str, api_key: str, entry: dict) -> None:
     """Push a model's weights to a remote that cannot fetch them itself.
 
@@ -783,6 +859,22 @@ def ensure_model_uploaded(base: str, api_key: str, entry: dict) -> None:
         # Don't cache a failure: the next request retries rather than serving
         # from a pod that has half a model.
         print(f"[remote-gateway] upload of {name} to {base} failed: {exc}", flush=True)
+
+
+#: What a coderai says when a model is not in its catalogue.
+_UNKNOWN_MODEL = ("is not available", "not allowed", "unknown model",
+                  "model not found")
+
+
+def _is_unknown_model(status: int, raw: bytes) -> bool:
+    """True when the remote refused because it does not know the model."""
+    if status not in (400, 404):
+        return False
+    try:
+        text = (raw or b"").decode("utf-8", "replace").lower()
+    except Exception:
+        return False
+    return any(marker in text for marker in _UNKNOWN_MODEL)
 
 
 async def _error(send, status: int, message: str):

@@ -1284,3 +1284,88 @@ def test_a_capability_pod_is_told_what_it_can_serve(monkeypatch):
     assert [r["path"] for r in registered] == ["BAAI/bge-m3"]
     # The token must survive the same path — both travel in the pod's env.
     assert plan["env"]["CODERAI_API_TOKEN"] == "tok"
+
+
+# --------------------------------------------------------------------------- #
+# a pod as an extension of this system: it learns models at runtime
+# --------------------------------------------------------------------------- #
+class _LearningPod(BaseHTTPRequestHandler):
+    """A pod with an empty catalogue that can be taught."""
+    protocol_version = "HTTP/1.1"
+    known: set = set()
+    seen: list = []
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, obj):
+        raw = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(n) or b"{}")
+        type(self).seen.append(self.path)
+        if self.path == "/v1/models/register":
+            for e in (body if isinstance(body, list) else [body]):
+                type(self).known.add(e["path"])
+            return self._send(200, {"added": sorted(type(self).known)})
+        if body.get("model") not in type(self).known:
+            return self._send(404, {"detail": f"Model '{body.get('model')}' is not "
+                                              "available. Use one of: "})
+        return self._send(200, {"data": [{"embedding": [0.1] * 8}]})
+
+
+@pytest.fixture()
+def learning_pod(monkeypatch):
+    _LearningPod.known = set()
+    _LearningPod.seen = []
+    url, shutdown = _serve(_LearningPod)
+    import codai.models.manager as mgr
+    from codai.api import remote_gateway as gw
+    monkeypatch.setattr(mgr, "_model_entry_for", lambda n: (
+        {"path": "BAAI/bge-m3", "model_type": "embedding_models"}
+        if n == "BAAI/bge-m3" else None))
+    monkeypatch.setattr(gw, "_REGISTERED", set())
+    yield url, gw
+    shutdown()
+
+
+def test_an_unknown_model_answer_is_recognised():
+    from codai.api.remote_gateway import _is_unknown_model
+
+    assert _is_unknown_model(404, b'{"detail": "Model \'x\' is not available. Use one of: "}')
+    assert _is_unknown_model(400, b'{"error": "unknown model"}')
+    # A real failure must not be mistaken for one, or we would retry forever.
+    assert not _is_unknown_model(500, b'{"detail": "out of memory"}')
+    assert not _is_unknown_model(200, b'{"data": []}')
+
+
+def test_a_pod_is_taught_a_model_it_does_not_know(learning_pod):
+    url, gw = learning_pod
+    assert _LearningPod.known == set()            # empty catalogue at boot
+
+    assert gw.teach_model(url, "", "BAAI/bge-m3") is True
+    assert "BAAI/bge-m3" in _LearningPod.known
+
+    # Teaching the same pod twice is wasted work: it keeps what it learns.
+    _LearningPod.seen.clear()
+    assert gw.teach_model(url, "", "BAAI/bge-m3") is False
+    assert _LearningPod.seen == []
+
+
+def test_a_model_the_pod_could_never_fetch_is_refused_with_a_reason(learning_pod,
+                                                                    monkeypatch):
+    url, gw = learning_pod
+    import codai.models.manager as mgr
+    monkeypatch.setattr(mgr, "_model_entry_for",
+                        lambda n: {"path": "/AI/local/only",
+                                   "model_type": "embedding_models"})
+    # A local path means nothing on a pod: say so rather than register something
+    # that would fail later at load time.
+    assert gw.teach_model(url, "", "local-only") is False
+    assert _LearningPod.known == set()
