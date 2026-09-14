@@ -1252,3 +1252,35 @@ def test_the_text_probe_leaves_room_for_a_reasoning_model():
 
     _, body = _probe_for("text", "m")
     assert body["max_tokens"] >= 64
+
+
+def test_a_capability_pod_is_told_what_it_can_serve(monkeypatch):
+    """Observed live: a healthy embeddings pod answered "Model 'bge-m3' is not
+    available. Use one of: " with nothing after the colon. A pod starts with an
+    empty catalogue; a capability pod serves many models, so it is seeded with
+    this deployment's models of that capability."""
+    import codai.admin.routes as ar
+    import codai.api.runpod_worker as rw
+
+    class _CM:
+        models_data = {
+            "embedding_models": [
+                {"path": "BAAI/bge-m3", "model_type": "embedding_models"},
+                {"path": "/AI/local/only", "model_type": "embedding_models"},
+            ],
+            "image_models": [{"path": "org/sdxl", "model_type": "image_models"}],
+        }
+
+    monkeypatch.setattr(ar, "config_manager", _CM())
+    seeds = rw.capability_seed_entries("embeddings")
+    # Only what the pod can fetch: a local path would register a model it could
+    # never load, turning "not available" into a confusing load failure.
+    assert [s["path"] for s in seeds] == ["BAAI/bge-m3"]
+
+    plan = rw.pod_plan(rw.parse_model_runpod({"engine": "coderai", "image": "img"}),
+                       "embeddings", "capability:embeddings", api_key="tok",
+                       seed_entries=seeds)
+    registered = json.loads(plan["env"]["CODERAI_SEED_MODELS"])
+    assert [r["path"] for r in registered] == ["BAAI/bge-m3"]
+    # The token must survive the same path — both travel in the pod's env.
+    assert plan["env"]["CODERAI_API_TOKEN"] == "tok"

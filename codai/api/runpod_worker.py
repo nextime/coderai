@@ -342,7 +342,8 @@ _HEALTH_PATHS = {"vllm": "/v1/models", "llamacpp": "/v1/models",
 
 
 def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
-             model_path: str = "", api_key: str = "", entry: dict = None) -> dict:
+             model_path: str = "", api_key: str = "", entry: dict = None,
+             seed_entries: list = None) -> dict:
     """Everything needed to launch one pod: image, docker args, health path.
 
     This is the seam that lets a pool serve something other than an LLM — a whole
@@ -356,24 +357,22 @@ def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
         image = mcfg.image or LLAMACPP_POD_IMAGE
         args = mcfg.docker_args or _llamacpp_docker_args(mcfg, served, entry)
     elif engine in ("coderai", "custom"):
-        cap = model_capability(entry or {}, include_text=True)
-        if not mcfg.image and cap:
-            # A model of a known kind gets that capability's published image.
-            image = default_capability_image(cap)
-            if not image:
-                raise RuntimeError(
-                    f"RunPod: no published pod image for {cap!r} models — set "
-                    "`image` on this model's runpod block to one you have built.")
-            args = mcfg.docker_args
-            return _plan(engine, image, args, mcfg, api_key, entry, served)
-        if not mcfg.image:
+        # One path, whether the image is configured or defaulted: _plan() carries
+        # the auth token AND the catalogue the pod must know about. Splitting
+        # them meant a pod with an explicit image got no models and refused
+        # everything with "not available".
+        image = mcfg.image
+        if not image:
+            cap = model_capability(entry or {}, include_text=True)
+            image = default_capability_image(cap) if cap else ""
+        if not image:
             raise RuntimeError(
                 f"RunPod {engine} pod: set `image` on the runpod block to the image "
                 "to run. Capability pods default to the published "
                 f"{CAPABILITY_IMAGE_REPO}-<capability> image; this one has none, so "
                 "name it explicitly.")
-        image = mcfg.image
-        args = mcfg.docker_args          # usually blank: the image's entrypoint serves
+        return _plan(engine, image, mcfg.docker_args, mcfg, api_key, entry, served,
+                     seed_entries)
     else:
         image = mcfg.image or DEFAULT_POD_IMAGE
         args = mcfg.docker_args or _vllm_docker_args(mcfg, served, entry)
@@ -450,15 +449,34 @@ def _add_staging(plan: dict, mcfg: "RunpodModelConfig", entry: dict, engine: str
     print(f"[runpod] pod will download before serving: {names}", flush=True)
 
 
-def _plan(engine, image, args, mcfg, api_key, entry, served) -> dict:  # noqa: D401
-    """Finish a plan for a coderai pod: auth plus the model it must serve."""
+def _plan(engine, image, args, mcfg, api_key, entry, served,
+          seed_entries: list = None) -> dict:  # noqa: D401
+    """Finish a plan for a coderai pod: auth plus the models it must serve."""
+    import json as _json
     env = {}
     if api_key:
         env["CODERAI_API_TOKEN"] = api_key
-    kind, value = resolve_model_source(entry or {}, mcfg)
-    seed = seed_model_env(entry, served, value if kind in ("hf", "url") else "")
-    if seed:
-        env["CODERAI_SEED_MODELS"] = seed
+    seeds = []
+    if entry:
+        kind, value = resolve_model_source(entry, mcfg)
+        one = seed_model_env(entry, served, value if kind in ("hf", "url") else "")
+        if one:
+            seeds.extend(_json.loads(one))
+    for extra in (seed_entries or []):
+        one = seed_model_env(extra, "", "")
+        if one:
+            seeds.extend(_json.loads(one))
+    if seeds:
+        # De-duplicate by path: a capability pod's list can overlap the one model
+        # a per-model pool also seeds.
+        seen, unique = set(), []
+        for s in seeds:
+            if s.get("path") in seen:
+                continue
+            seen.add(s.get("path"))
+            unique.append(s)
+        env["CODERAI_SEED_MODELS"] = _json.dumps(unique)
+        print(f"[runpod] pod will be told about {len(unique)} model(s)", flush=True)
     return {"engine": engine, "image": image, "args": args, "env": env,
             "health_path": mcfg.health_path or _HEALTH_PATHS.get(engine, "/healthz")}
 
@@ -1004,6 +1022,8 @@ class RunpodPodPool:
         #: The model's models.json entry, when this pool serves one specific
         #: model: it decides the pod image and is seeded into the pod.
         self.entry = entry if isinstance(entry, dict) else None
+        #: Models a CAPABILITY pod should register at boot (it serves many).
+        self.seed_entries: list = []
         self.model_key = model_key
         self.account = account_cfg
         self.mcfg = mcfg
@@ -1069,7 +1089,7 @@ class RunpodPodPool:
         port = self.mcfg.port or 8000
         plan = pod_plan(self.mcfg, self.served, str(self.model_key),
                         _model_path_for(self.model_key), api_key=self.api_key,
-                        entry=self.entry)
+                        entry=self.entry, seed_entries=self.seed_entries)
         image, args = plan["image"], plan["args"]
         self.health_path = plan["health_path"]
         env = dict(self.mcfg.env or {})
@@ -1459,6 +1479,42 @@ def get_model_pod_pool(model_name: str, entry: dict, block: dict):
                         entry=entry)
 
 
+def capability_seed_entries(capability: str, limit: int = 40) -> list:
+    """The models a capability pod should know about.
+
+    A pod starts with an EMPTY catalogue and refuses every model — observed
+    live: a healthy embeddings pod answered "Model 'bge-m3' is not available.
+    Use one of: " with nothing after the colon. A per-model pod is seeded with
+    its one model; a capability pod serves whatever the capability serves, so it
+    is seeded with this deployment's models OF THAT CAPABILITY.
+
+    Only models the pod can actually fetch travel — a HuggingFace repo id or a
+    URL. A local path would register a model the pod could never load, turning a
+    clear "not available" into a confusing load failure.
+    """
+    try:
+        from codai.admin.routes import config_manager
+        md = getattr(config_manager, "models_data", None) or {}
+    except Exception:
+        return []
+    out = []
+    for section, lst in (md.items() if isinstance(md, dict) else []):
+        if MODEL_TYPE_CAPABILITY.get(section) != capability:
+            continue
+        if not isinstance(lst, list):
+            continue
+        for entry in lst:
+            if not isinstance(entry, dict):
+                continue
+            path = str(entry.get("path") or "")
+            if not (_looks_like_repo_id(path) or path.startswith(("http://", "https://"))):
+                continue                      # the pod could never fetch it
+            out.append(entry)
+            if len(out) >= limit:
+                return out
+    return out
+
+
 def get_capability_pool(capability: str, block: dict):
     """A managed pod pool for a whole capability (images, video, tts, …).
 
@@ -1495,7 +1551,12 @@ def get_capability_pool(capability: str, block: dict):
     shared = str(b.get("pool") or "").strip().lower()
     mcfg = parse_model_runpod(b)
     key = f"capability:{shared or capability}"
-    return get_pod_pool(key, acct, mcfg, shared or capability, shared=bool(shared))
+    pool = get_pod_pool(key, acct, mcfg, shared or capability, shared=bool(shared))
+    # Tell the pod what it may serve; without this its catalogue is empty and it
+    # refuses every request with "not available".
+    if not getattr(pool, "seed_entries", None):
+        pool.seed_entries = capability_seed_entries(capability)
+    return pool
 
 
 def warm_configured_pools() -> int:
