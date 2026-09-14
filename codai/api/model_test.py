@@ -30,7 +30,9 @@ and say so rather than implying more than was proven.
 
 import io
 import json
+import os
 import time
+import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -74,6 +76,12 @@ def _probe_for(capability: str, model: str):
 
 #: Kinds whose smallest real request is still expensive (a video is minutes of
 #: GPU and real money) or needs input we cannot synthesise honestly.
+#:
+#: 'stt' and 'ocr' used to be here. They are not any more: an audio clip and a
+#: document image CAN be synthesised — espeak says a known sentence, PIL draws
+#: known words — and the round trip is checked against what went in. A
+#: reachability check on those two reported ok:true while proving only that a
+#: URL was configured, which is the kind of pass that hides a broken pod.
 _REACHABILITY_ONLY = {
     "video": "a video generation costs minutes of GPU time and real money",
     "voice": "voice cloning needs a reference sample",
@@ -82,9 +90,98 @@ _REACHABILITY_ONLY = {
     "audio_gen": "audio generation is minutes of GPU time",
     "stems": "stem separation needs an audio file",
     "audio_clean": "cleanup needs an audio file",
-    "stt": "transcription needs an audio file",
-    "ocr": "OCR needs a document image",
 }
+
+#: What the synthesised probes say. Checked against the result, so the test
+#: fails when a model returns confident nonsense as well as when it errors.
+_SPOKEN = "the quick brown fox jumps over the lazy dog"
+_PRINTED = "CODERAI OCR TEST"
+
+
+def _multipart(fields: dict, filename: str, content: bytes,
+               file_field: str = "file",
+               content_type: str = "application/octet-stream") -> tuple:
+    """Build a multipart/form-data body by hand: (content_type, body).
+
+    The probe goes through the ASGI bridge as raw bytes, so there is no client
+    library here to do it — and the upload has to look exactly like a real one,
+    because the multipart path is itself part of what is being tested.
+    """
+    boundary = "----coderai-probe-" + uuid.uuid4().hex
+    out = bytearray()
+    for key, value in fields.items():
+        if value is None:
+            continue
+        out += (f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{key}"\r\n\r\n'
+                f"{value}\r\n").encode()
+    out += (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{file_field}"; '
+            f'filename="{filename}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n").encode()
+    out += content + b"\r\n"
+    out += f"--{boundary}--\r\n".encode()
+    return f"multipart/form-data; boundary={boundary}", bytes(out)
+
+
+def _spoken_wav() -> bytes:
+    """A few seconds of synthetic speech saying _SPOKEN, as a 16 kHz mono WAV.
+
+    espeak is not a pleasant voice, but it is intelligible to every STT model
+    worth shipping — and it needs no network, no model and no GPU to produce.
+    """
+    import subprocess, tempfile
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
+        path = fh.name
+    try:
+        subprocess.run(["espeak", "-w", path, "-s", "130", _SPOKEN],
+                       check=True, capture_output=True, timeout=30)
+        with open(path, "rb") as fh:
+            return fh.read()
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _printed_png() -> bytes:
+    """A clean white image with _PRINTED written on it, as PNG."""
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", (900, 220), "white")
+    draw = ImageDraw.Draw(img)
+    try:
+        from PIL import ImageFont
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 64)
+    except Exception:
+        font = None      # the bitmap default is small but still legible
+    draw.text((40, 70), _PRINTED, fill="black", font=font)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _upload_probe(capability: str, model: str):
+    """(path, content_type, body) for a capability whose input is a file.
+
+    Returns (None, '', b'') when the input cannot be produced here — a missing
+    espeak, no fonts — so the caller falls back to a reachability check and says
+    why, rather than failing a model for a gap on this side.
+    """
+    try:
+        if capability == "stt":
+            ct, body = _multipart({"model": model, "response_format": "json"},
+                                  "probe.wav", _spoken_wav(),
+                                  content_type="audio/wav")
+            return "/v1/audio/transcriptions", ct, body
+        if capability == "ocr":
+            ct, body = _multipart({"engine": model}, "probe.png", _printed_png(),
+                                  content_type="image/png")
+            return "/v1/ocr", ct, body
+    except Exception as exc:
+        print(f"[test] could not synthesise a {capability} probe: {exc}", flush=True)
+    return None, "", b""
 
 
 @router.post("/v1/models/test", summary="Test run a model where it is configured")
@@ -112,6 +209,11 @@ async def test_model(req: ModelTestRequest, request: Request,
                     "ran": "", "ok": False, "seconds": 0.0, "error": why}
 
     path, body = _probe_for(capability, req.model)
+    content_type = "application/json"
+    raw_body = json.dumps(body).encode() if path else b""
+    if not path:
+        # An upload-shaped probe: synthesised speech, a rendered document.
+        path, content_type, raw_body = _upload_probe(capability, req.model)
     if not path:
         reason = _REACHABILITY_ONLY.get(capability, "no cheap probe for this kind")
         ok, detail = _reachable(placement)
@@ -120,7 +222,7 @@ async def test_model(req: ModelTestRequest, request: Request,
                 "ran": "reachability", "ok": ok, "detail": detail,
                 "note": f"no generation was run: {reason}"}
 
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": content_type}
     if force:
         from codai.api.remote_gateway import PLACEMENT_HEADER
         headers[PLACEMENT_HEADER] = force
@@ -132,8 +234,7 @@ async def test_model(req: ModelTestRequest, request: Request,
     try:
         from codai.broker.asgi_bridge import execute_api_request
         resp = await execute_api_request(request, method="POST", path=path,
-                                         headers=headers,
-                                         body=json.dumps(body).encode())
+                                         headers=headers, body=raw_body)
     except Exception as exc:
         return {"model": req.model, "capability": capability or "text",
                 "where": placement["where"], "target": placement["target"],
@@ -192,6 +293,41 @@ def _empty_result(raw: bytes, capability: str) -> str:
             return "no image in the response"
     if capability == "rerank":
         return "" if (obj.get("results") or obj.get("data")) else "no ranking returned"
+    if capability in ("stt", "ocr"):
+        # The probe put known words in, so check they come back. A model that
+        # returns fluent nonsense is broken in a way an "is it non-empty?" check
+        # waves straight through — and on a rented pod the usual cause is a
+        # half-loaded model, not a bad transcription.
+        want = _SPOKEN if capability == "stt" else _PRINTED
+        got = _text_of(obj).lower()
+        if not got.strip():
+            return f"the {capability} model returned no text"
+        hits = sum(1 for w in want.lower().split() if w in got)
+        need = max(1, len(want.split()) // 3)
+        if hits < need:
+            return (f"the {capability} result does not match what was sent: "
+                    f"expected words from {want!r}, got {got[:120]!r}")
+    return ""
+
+
+def _text_of(obj) -> str:
+    """Whatever text a transcription or OCR response carries, flattened.
+
+    The two endpoints do not share a response shape, and the OCR engines differ
+    among themselves (a flat string, pages, blocks), so this looks for text
+    rather than insisting on one layout.
+    """
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, list):
+        return " ".join(_text_of(x) for x in obj)
+    if isinstance(obj, dict):
+        for key in ("text", "content", "full_text", "transcript"):
+            if isinstance(obj.get(key), str) and obj[key].strip():
+                return obj[key]
+        return " ".join(_text_of(obj[k]) for k in ("pages", "blocks", "lines",
+                                                   "segments", "results", "data")
+                        if k in obj)
     return ""
 
 
@@ -331,6 +467,8 @@ def _sample(raw: bytes, capability: str) -> str:
             return f"image returned ({len(b64) * 3 // 4} bytes)"
         except Exception:
             return str(obj)[:120]
+    if capability in ("stt", "ocr"):
+        return (_text_of(obj) or str(obj))[:120]
     return str(obj)[:120]
 
 

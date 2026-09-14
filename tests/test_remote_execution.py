@@ -1440,3 +1440,54 @@ def test_a_test_run_reports_what_the_pods_are_serving(monkeypatch, test_run):
     # The catalogue is the fact that mattered: an empty list is the whole story.
     assert pods[0]["serves"] == ["BAAI/bge-m3", "bge-m3"]
     assert pods[0]["usd_so_far"] == 0.009
+
+
+# --- synthesised probes for upload-shaped capabilities -------------------- #
+
+def test_stt_and_ocr_probes_are_real_files_not_reachability_checks():
+    """These two were reachability-only, which reported ok:true for a pod that
+    had never served a request. espeak and PIL can produce honest input."""
+    from codai.api.model_test import _upload_probe, _REACHABILITY_ONLY
+
+    assert "stt" not in _REACHABILITY_ONLY and "ocr" not in _REACHABILITY_ONLY
+
+    path, ct, body = _upload_probe("stt", "whisper0")
+    assert path == "/v1/audio/transcriptions"
+    assert ct.startswith("multipart/form-data; boundary=")
+    assert b"RIFF" in body and b'name="model"' in body
+
+    path, ct, body = _upload_probe("ocr", "surya")
+    assert path == "/v1/ocr"
+    assert b"\x89PNG" in body and b'name="engine"' in body
+
+
+def test_a_transcription_that_does_not_match_what_was_spoken_fails():
+    """A model returning fluent nonsense passes any 'is it non-empty?' check.
+    The probe speaks known words, so the result is checked against them."""
+    import json
+    from codai.api.model_test import _empty_result, _SPOKEN, _PRINTED
+
+    ok = json.dumps({"text": _SPOKEN.upper() + "."}).encode()
+    assert _empty_result(ok, "stt") == ""
+
+    wrong = json.dumps({"text": "entirely unrelated output"}).encode()
+    assert "does not match what was sent" in _empty_result(wrong, "stt")
+
+    silent = json.dumps({"text": "   "}).encode()
+    assert "returned no text" in _empty_result(silent, "stt")
+
+    # OCR responses are not one shape: flat, paged, or blocked all count.
+    paged = json.dumps({"pages": [{"blocks": [{"text": _PRINTED}]}]}).encode()
+    assert _empty_result(paged, "ocr") == ""
+
+
+def test_an_upload_probe_falls_back_rather_than_failing_the_model(monkeypatch):
+    """No espeak on this box is our gap, not the model's: fall back to the
+    reachability check instead of reporting the model broken."""
+    import codai.api.model_test as mt
+
+    def _boom():
+        raise FileNotFoundError("espeak")
+
+    monkeypatch.setattr(mt, "_spoken_wav", _boom)
+    assert mt._upload_probe("stt", "whisper0") == (None, "", b"")

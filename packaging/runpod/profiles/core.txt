@@ -32,3 +32,10 @@ opencv-python-headless>=4.8.0
 soundfile>=0.12.0
 litellm>=1.40.0
 websockets>=12.0
+
+# Quantization. models.json carries quant settings for EVERY model type, not just
+# LLMs, and diffusers/transformers refuse to load a quantized checkpoint without
+# this — a rented images pod failed with "No package metadata was found for
+# bitsandbytes" after a 10-minute SDXL download. Shared here rather than per
+# profile: one layer, downloaded once, reused by all ten images.
+bitsandbytes>=0.43.0
