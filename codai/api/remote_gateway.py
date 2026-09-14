@@ -104,7 +104,10 @@ def file_origin(filename: str) -> str:
 #: the instance it is sent to (that is the whole point of sending it), so
 #: forwarding one would bounce the weights straight back out again.
 _SKIP_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/models",
-               "/v1/models/upload", "/v1/models/uploaded")
+               "/v1/models/upload", "/v1/models/uploaded",
+               # The test run dispatches its own probe; forwarding the test
+               # itself would test the remote's routing, not ours.
+               "/v1/models/test")
 
 #: Orchestration endpoints: a sequence of calls to other endpoints, not a model.
 #: They are NEVER forwarded as a whole — the chain stays here and each step goes
@@ -298,9 +301,24 @@ class Target:
         return url.rstrip("/"), (lambda: self.pool.release(handle))
 
 
+#: Header that overrides placement for ONE request: "local" keeps it here,
+#: "remote" insists on the configured remote. It exists for the test run — you
+#: cannot verify that a pod works by sending it a request that the configuration
+#: decides to serve locally — and is never sent by normal clients.
+PLACEMENT_HEADER = "x-coderai-placement"
+
+
 def resolve_target(path: str, method: str, query: str, body: bytes,
-                   content_type: str) -> Optional["Target"]:
-    """Decide where this request should go, or None to serve it locally."""
+                   content_type: str, force: str = "") -> Optional["Target"]:
+    """Decide where this request should go, or None to serve it locally.
+
+    ``force`` is the one-request override: "local" pins it here whatever the
+    configuration says, "remote" refuses to fall back to local so a test cannot
+    quietly pass by running in the wrong place.
+    """
+    force = (force or "").strip().lower()
+    if force == "local":
+        return None
     if not path.startswith("/v1/") or path in _SKIP_PATHS:
         return None
     if path.startswith(_ORCHESTRATION_PREFIXES):
@@ -345,6 +363,11 @@ def resolve_target(path: str, method: str, query: str, body: bytes,
             pass
         return target
     if not cap:
+        if force == "remote":
+            raise RuntimeError(
+                f"nothing configures {model or path!r} to run remotely — set a "
+                "service_url or a RunPod pod on the model, or a remote for its "
+                "capability")
         return None
     url = capability_endpoints().get(cap, "")
     # "runpod" as the endpoint is shorthand for "use the pod block for this
@@ -356,6 +379,11 @@ def resolve_target(path: str, method: str, query: str, body: bytes,
         from codai.api.runpod_worker import get_capability_pool
         return Target(pool=get_capability_pool(cap, pods.get(cap) or {}),
                       reason=f"capability {cap!r} on a RunPod pod")
+    if force == "remote":
+        raise RuntimeError(
+            f"nothing configures {model or cap!r} to run remotely — set a "
+            "service_url or a RunPod pod on the model, or a remote for its "
+            "capability")
     return None
 
 
@@ -384,7 +412,12 @@ class RemoteGatewayMiddleware:
         path = scope.get("path") or ""
         if not path.startswith("/v1/") or path in _SKIP_PATHS:
             return await self._app(scope, receive, send)
-        if not any_remote_configured():
+        headers_early = {k.decode("latin-1").lower(): v.decode("latin-1")
+                         for k, v in scope.get("headers") or []}
+        if headers_early.get(PLACEMENT_HEADER, "").strip().lower() == "local":
+            return await self._app(scope, receive, send)
+        if not any_remote_configured() \
+                and headers_early.get(PLACEMENT_HEADER, "").strip().lower() != "remote":
             return await self._app(scope, receive, send)
 
         headers = {k.decode("latin-1").lower(): v.decode("latin-1")
@@ -407,7 +440,8 @@ class RemoteGatewayMiddleware:
         try:
             target = resolve_target(path, scope.get("method", "GET"),
                                     (scope.get("query_string") or b"").decode("latin-1"),
-                                    body, headers.get("content-type", ""))
+                                    body, headers.get("content-type", ""),
+                                    force=headers.get(PLACEMENT_HEADER, ""))
         except Exception as exc:
             # A misconfigured remote must not silently fall back to running the
             # model here — that is how you discover it by watching local VRAM.

@@ -309,11 +309,21 @@ def gateway_app():
     app.add_middleware(RemoteGatewayMiddleware)
     _EchoRemote.hits = []
     url, shutdown = _serve(_EchoRemote)
+    # Restore on teardown: these tests replace module-level functions, and a
+    # leftover "every model is remote" lambda silently changes what LATER tests
+    # are measuring.
+    saved = {name: getattr(gw, name)
+             for name in ("any_remote_configured", "capability_endpoints",
+                          "capability_pods", "_model_remote")}
     gw.any_remote_configured = lambda: True
     gw.capability_endpoints = lambda: {}
     gw._model_remote = lambda m: ""
-    yield TestClient(app), gw, url
-    shutdown()
+    try:
+        yield TestClient(app), gw, url
+    finally:
+        for name, fn in saved.items():
+            setattr(gw, name, fn)
+        shutdown()
 
 
 def test_gateway_is_transparent_when_nothing_is_remote(gateway_app):
@@ -1102,3 +1112,103 @@ def test_no_staging_when_nothing_needs_downloading():
     plan = pod_plan(parse_model_runpod({}), "Qwen/Qwen3.5-9B", "q",
                     entry={"path": "Qwen/Qwen3.5-9B", "model_type": "text_models"})
     assert "entrypoint" not in plan and "start_cmd" not in plan
+
+
+# --------------------------------------------------------------------------- #
+# test run
+# --------------------------------------------------------------------------- #
+@pytest.fixture()
+def test_run(monkeypatch):
+    """The test-run endpoint with a fake dispatcher, so no model is loaded."""
+    import codai.models.manager as mgr
+    import codai.broker.asgi_bridge as bridge
+
+    entries = {
+        "my-llm": {"path": "Qwen/Qwen3.5-9B", "model_type": "text_models"},
+        "my-video": {"path": "org/wan", "model_type": "video_models",
+                     "backend": "runpod", "runpod": {"mode": "pods"}},
+        "my-embed": {"path": "org/e5", "model_type": "embedding_models",
+                     "service_url": "http://box:8000"},
+        "pinned": {"path": "org/x", "model_type": "text_models", "placement": "local"},
+    }
+    monkeypatch.setattr(mgr, "_model_entry_for", lambda n: entries.get(n))
+    sent = {}
+
+    async def fake_exec(request, *, method, path, headers=None, body=b""):
+        sent.update({"path": path, "headers": headers or {}, "body": json.loads(body)})
+        if path == "/v1/chat/completions":
+            return {"status_code": 200, "body": json.dumps(
+                {"choices": [{"message": {"content": "OK"}}]}).encode()}
+        if path == "/v1/embeddings":
+            return {"status_code": 200, "body": json.dumps(
+                {"data": [{"embedding": [0.0] * 768}]}).encode()}
+        return {"status_code": 503, "body": json.dumps({"detail": "no engine"}).encode()}
+
+    monkeypatch.setattr(bridge, "execute_api_request", fake_exec)
+    return sent
+
+
+def _run_test(model, where="auto"):
+    from codai.api.model_test import test_model, ModelTestRequest
+
+    class _Req:
+        headers = {}
+
+    return asyncio.run(test_model(ModelTestRequest(model=model, where=where), _Req()))
+
+
+def test_a_test_run_makes_a_real_request_for_the_models_kind(test_run):
+    llm = _run_test("my-llm")
+    assert llm["ok"] and llm["ran"] == "/v1/chat/completions" and llm["sample"] == "OK"
+
+    emb = _run_test("my-embed")
+    assert emb["ran"] == "/v1/embeddings" and emb["sample"] == "768 dimensions"
+    # It reports WHERE it ran — the point of the test.
+    assert emb["where"] == "remote" and emb["target"] == "http://box:8000"
+
+
+def test_a_test_run_can_force_where_it_runs(test_run):
+    """You cannot verify a pod by sending it a request the config serves locally."""
+    from codai.api.remote_gateway import PLACEMENT_HEADER
+
+    _run_test("my-llm", where="local")
+    assert test_run["headers"][PLACEMENT_HEADER] == "local"
+    _run_test("my-llm", where="runpod")
+    assert test_run["headers"][PLACEMENT_HEADER] == "remote"
+
+
+def test_expensive_kinds_report_reachability_and_say_so(test_run):
+    """A video generation is minutes of GPU and real money — don't run one and
+    don't pretend the check proved more than it did."""
+    out = _run_test("my-video")
+    assert out["ran"] == "reachability"
+    assert out["where"] == "runpod"
+    assert "no generation was run" in out["note"]
+
+
+def test_a_failing_probe_reports_the_real_error(test_run):
+    out = _run_test("pinned")          # the fake dispatcher 503s for this path? no:
+    assert out["where"] == "local"     # pinned local is honoured
+    # A kind whose probe fails surfaces the server's own message, not a generic one.
+    import codai.models.manager as mgr
+    entry = {"path": "org/tts", "model_type": "tts_models"}
+    saved = mgr._model_entry_for
+    mgr._model_entry_for = lambda n: entry
+    try:
+        bad = _run_test("my-tts")
+    finally:
+        mgr._model_entry_for = saved
+    assert bad["ok"] is False and bad["error"] == "no engine" and bad["status"] == 503
+
+
+def test_the_placement_override_is_honoured_by_the_router():
+    """'local' must win over any configuration, and 'remote' must refuse to fall
+    back — otherwise a forced test could quietly pass in the wrong place."""
+    from codai.api.remote_gateway import resolve_target
+
+    body = json.dumps({"model": "anything"}).encode()
+    assert resolve_target("/v1/images/generations", "POST", "", body,
+                          "application/json", force="local") is None
+    with pytest.raises(RuntimeError, match="nothing configures"):
+        resolve_target("/v1/images/generations", "POST", "", body,
+                       "application/json", force="remote")

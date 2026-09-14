@@ -1403,8 +1403,17 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:13px"><input type="checkbox" id="cfg-grammar"> Grammar-guided generation</label>
       </div>
 
+      <div id="cfg-test-result" class="form-hint" style="display:none;margin-top:1rem;padding:.6rem;border-radius:6px;font-size:12px;white-space:pre-wrap"></div>
+
       <div class="form-actions" style="margin-top:1.5rem;display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
         <button class="btn btn-primary" onclick="saveModelConfig()">Save</button>
+        <button class="btn btn-secondary" onclick="testRunModel()" id="cfg-test-btn"
+                title="Run the smallest real request for this model, where it is configured to run">Test run</button>
+        <select id="cfg-test-where" class="form-input" style="width:auto;min-width:130px" title="Force where the test runs">
+          <option value="auto">As configured</option>
+          <option value="local">Force local</option>
+          <option value="runpod">Force RunPod</option>
+        </select>
         <button class="btn btn-secondary" id="cfg-save-new-btn" onclick="saveNewModelConfig()" style="display:none" title="Save as a separate configuration for the same model file">Save as new config</button>
         <button class="btn btn-ghost" onclick="closeModal('cfg-modal')">Cancel</button>
         <button class="btn btn-danger btn-sm" id="cfg-remove-config-btn" onclick="removeThisConfig()" style="display:none;margin-left:auto" title="Remove only this configuration (keeps other configs and the model file)">Remove this config</button>
@@ -4693,5 +4702,50 @@ async function startUpload(){
     }catch(e){ showAlert('Upload error: '+e.message); return; }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Test run: the smallest real request for this model, through the real routing.
+// Saves first — testing the form while the server still has the old config
+// would report on a configuration that does not exist.
+// ---------------------------------------------------------------------------
+async function testRunModel(){
+  const btn = document.getElementById('cfg-test-btn');
+  const box = document.getElementById('cfg-test-result');
+  const where = (document.getElementById('cfg-test-where') || {}).value || 'auto';
+  const model = (document.getElementById('cfg-alias').value.trim()
+                 || document.getElementById('cfg-path').value.trim());
+  if (!model) { alert('No model to test'); return; }
+  const show = (text, kind) => {
+    box.style.display = 'block';
+    box.textContent = text;
+    box.style.background = kind === 'ok' ? 'rgba(60,160,90,.12)'
+      : kind === 'bad' ? 'rgba(200,70,70,.12)' : 'rgba(128,128,128,.10)';
+  };
+  btn.disabled = true;
+  const label = btn.textContent;
+  btn.textContent = 'Testing…';
+  show('Running… a cold RunPod pod can take several minutes (image pull + weights).', 'busy');
+  try {
+    const r = await fetch('/v1/models/test', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({model: model, where: where})});
+    const d = await r.json();
+    if (d.ran === 'reachability') {
+      show(`${d.model}\nwhere: ${d.where} (${d.target})\n${d.note}\n${d.detail || ''}`, 'busy');
+    } else if (d.ok) {
+      show(`OK — ${d.ran} in ${d.seconds}s\nwhere: ${d.where} (${d.target})\n`
+           + `reply: ${d.sample || '(no sample)'}`, 'ok');
+    } else {
+      show(`FAILED — ${d.ran || ''} ${d.status || ''} after ${d.seconds || '?'}s\n`
+           + `where: ${d.where} (${d.target})\n${d.error || JSON.stringify(d)}`, 'bad');
+    }
+  } catch (e) {
+    show('Test could not be run: ' + e, 'bad');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+}
+
 </script>
 {% endblock %}

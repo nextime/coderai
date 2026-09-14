@@ -517,6 +517,41 @@ lingering. And a burst that cannot be opened — cold pod failed, budget cap hit
 misconfigured — falls back to the local queue rather than erroring: local is
 always the safety net, never the other way round.
 
+## Test run
+
+Placement has a lot of moving parts — image, weights, adapters, auth, budgets —
+and most of them fail minutes into a pod boot, in a log nobody is watching. Every
+model page has a **Test run** button, and the endpoint behind it:
+
+```
+POST /v1/models/test  {"model": "…", "where": "auto" | "local" | "runpod"}
+```
+
+It sends the smallest real request for the model's kind — a chat completion, a
+256×256 image, an embedding, a rerank, a short TTS line — **through the front**,
+so it exercises the same routing, auth, pod provisioning and staging a real
+request would. A test that simulated the path would prove nothing about it.
+
+`where` forces placement for that one request: `local` ignores any remote
+configuration, `runpod` refuses to fall back to local — so a pod that is not
+actually reachable fails the test instead of quietly passing here.
+
+The answer says where it ran, how long it took, and a sample of the output:
+
+```json
+{"model": "qwen38", "where": "runpod", "target": "its own pod",
+ "ran": "/v1/chat/completions", "ok": true, "seconds": 184.2, "sample": "OK"}
+```
+
+Some kinds have no cheap synthetic input: a video generation is minutes of GPU
+and real money, a face swap needs faces, transcription needs audio. Those report
+a **reachability** check instead and say plainly that no generation was run,
+rather than implying more than was proven.
+
+Expect a cold RunPod pod to take several minutes the first time — image pull plus
+weight download — which is exactly what the test is there to surface before a
+user hits it.
+
 ## Deployment shapes this enables
 
 * **One small coderai, many remote GPUs** — the local instance holds the API,
