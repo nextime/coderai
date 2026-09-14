@@ -276,3 +276,59 @@ def test_a_shared_pod_grows_when_it_saturates():
     quiet = _Pod("a", inflight=1)
     p.pods = [quiet]
     assert p._should_grow([quiet]) is False   # not saturated -> keep sharing
+
+
+# --------------------------------------------------------------------------- #
+# the reaper must not eat a sibling engine's pods
+# --------------------------------------------------------------------------- #
+def test_pods_are_registered_across_processes(tmp_path, monkeypatch):
+    """coderai runs one engine per GPU, each with its own pools AND its own
+    reaper. Observed live: nvidia created a pod, radeon terminated it four
+    seconds later, then the reverse — a mutual kill loop. The registry is the
+    shared view that stops it."""
+    import codai.api.runpod_worker as rw
+
+    monkeypatch.setattr(rw, "_pod_registry_path", lambda: str(tmp_path / "pods.json"))
+    monkeypatch.setattr(rw, "_pools", {})
+
+    rw.register_pod("pod-a", "capability:embeddings")
+    rw.register_pod("pod-b", "some-model")
+    assert rw.registered_pod_ids() == {"pod-a", "pod-b"}
+
+    # A process with NO pools of its own still sees them — which is exactly the
+    # situation the second engine was in when it killed the first one's pod.
+    assert {"pod-a", "pod-b"} <= rw._known_pod_ids()
+
+    rw.unregister_pod("pod-a")
+    assert rw.registered_pod_ids() == {"pod-b"}
+
+
+def test_a_young_pod_is_never_reaped(monkeypatch, tmp_path):
+    """The backstop for the race the registry cannot close: a process that died
+    between creating a pod and recording it."""
+    import codai.api.runpod_worker as rw
+
+    monkeypatch.setattr(rw, "_pod_registry_path", lambda: str(tmp_path / "pods.json"))
+    monkeypatch.setattr(rw, "_pools", {})
+
+    class _Acct:
+        enabled = True
+        api_key = "k"
+        deployment_id = "default"
+
+    monkeypatch.setattr("codai.models.manager.get_active_runpod_config", lambda: _Acct())
+
+    young = {"id": "fresh", "name": "coderai-default-x", "status": "RUNNING",
+             "uptime_s": 30}
+    old = {"id": "ancient", "name": "coderai-default-y", "status": "RUNNING",
+           "uptime_s": rw.REAP_GRACE_SECONDS + 60}
+    killed = []
+
+    class _Client:
+        def __init__(self, *a, **k): pass
+        def list_pods(self): return [young, old]
+        def terminate_pod(self, pid): killed.append(pid)
+
+    monkeypatch.setattr("codai.api.runpod_client.RunpodClient", _Client)
+    assert rw.reap_orphans() == 1
+    assert killed == ["ancient"]        # the 30-second-old pod survives

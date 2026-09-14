@@ -1149,11 +1149,14 @@ class RunpodPodPool:
             attempts += 1
             console = pod_console_url(pod_id)
             with _pools_lock:
-                _provisioning_ids.add(pod_id)   # shield from the reaper during boot
+                _provisioning_ids.add(pod_id)   # shield from THIS process's reaper
                 _provisioning_info[pod_id] = {
                     "model": self.model_key, "gpu": sel["display_name"],
                     "is_spot": sel["is_spot"], "hourly_usd": sel["price"],
                     "console_url": console, "started_at": time.time()}
+            # …and from every SIBLING engine's reaper, which cannot see the set
+            # above: each engine has its own pools and its own reaper.
+            register_pod(pod_id, str(self.model_key))
             print(f"[runpod] pod {pod_id} created for {self.model_key!r} "
                   f"({sel['display_name']} {sel['cloud_type']}) — booting; logs: {console}",
                   flush=True)
@@ -1337,6 +1340,7 @@ class RunpodPodPool:
             RunpodClient(self.account).terminate_pod(pod.pod_id)
         except Exception as exc:
             print(f"[runpod] terminate {pod.pod_id} failed: {exc}", flush=True)
+        unregister_pod(pod.pod_id)
         runpod_ledger.record_spend(self.model_key, cost,
                                    {"pod_id": pod.pod_id, "gpu": pod.gpu, "is_spot": pod.is_spot})
         print(f"[runpod] pod {pod.pod_id} for {self.model_key!r} terminated ({reason}); "
@@ -1586,15 +1590,109 @@ def pods_status() -> list:
     return out
 
 
+#: Pods this DEPLOYMENT owns, shared across processes.
+#:
+#: coderai runs a front plus one engine per GPU. Each engine has its own pool
+#: registry AND its own reaper, so a process-local view of "our pods" means every
+#: engine sees its siblings' pods as orphans. Observed live: the nvidia engine
+#: created a pod and the radeon engine terminated it four seconds later, then the
+#: reverse — a mutual kill loop that rented and destroyed pods until stopped.
+def _pod_registry_path() -> str:
+    try:
+        from codai.admin.routes import config_manager
+        base = str(getattr(config_manager, "config_dir", "") or "")
+    except Exception:
+        base = ""
+    base = base or os.path.expanduser("~/.coderai")
+    return os.path.join(base, "runpod-pods.json")
+
+
+def _registry_update(fn):
+    """Read-modify-write the shared registry under an exclusive lock."""
+    import fcntl
+    import json as _json
+    path = _pod_registry_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a+") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            fh.seek(0)
+            raw = fh.read().strip()
+            try:
+                data = _json.loads(raw) if raw else {}
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            if fn(data):
+                fh.seek(0)
+                fh.truncate()
+                _json.dump(data, fh)
+                fh.flush()
+            return data
+    except Exception as exc:
+        print(f"[runpod] pod registry unavailable ({exc}) — falling back to this "
+              "process's view", flush=True)
+        return {}
+
+
+def register_pod(pod_id: str, pool_key: str = "") -> None:
+    """Record a pod as owned by this deployment, so no sibling process reaps it."""
+    if not pod_id:
+        return
+    _registry_update(lambda d: d.__setitem__(
+        str(pod_id), {"pool": str(pool_key), "pid": os.getpid(), "at": time.time()})
+        or True)
+
+
+def unregister_pod(pod_id: str) -> None:
+    """Forget a pod we terminated, so the registry does not grow without bound."""
+    if not pod_id:
+        return
+    _registry_update(lambda d: d.pop(str(pod_id), None) is not None)
+
+
+def registered_pod_ids() -> set:
+    data = _registry_update(lambda d: False)
+    return set(data.keys()) if isinstance(data, dict) else set()
+
+
 def _known_pod_ids() -> set:
-    """All pod ids this process is responsible for: live pool pods + mid-provision."""
+    """Every pod id this DEPLOYMENT owns — not just this process's."""
     ids = set()
     with _pools_lock:
         for pool in _pools.values():
             with pool._cv:
                 ids.update(p.pod_id for p in pool.pods)
         ids.update(_provisioning_ids)
+    ids.update(registered_pod_ids())
     return ids
+
+
+#: Never reap a pod younger than this, whatever the registry says. Longer than
+#: any boot budget, so a pod still pulling its image cannot be mistaken for a
+#: leftover — the backstop for the race a registry cannot close (a process that
+#: died between creating a pod and recording it).
+REAP_GRACE_SECONDS = float(os.environ.get("CODERAI_RUNPOD_REAP_GRACE", "1200"))
+
+
+def _pod_age_seconds(pod: dict):
+    """Seconds since the pod was created, or None when RunPod does not say."""
+    for key in ("uptime_s", "uptimeSeconds", "runtimeSeconds"):
+        val = pod.get(key)
+        if isinstance(val, (int, float)) and val >= 0:
+            return float(val)
+    for key in ("createdAt", "created_at"):
+        val = pod.get(key)
+        if not val:
+            continue
+        try:
+            from datetime import datetime, timezone
+            return (datetime.now(timezone.utc) - datetime.fromisoformat(
+                str(val).replace("Z", "+00:00"))).total_seconds()
+        except Exception:
+            continue
+    return None
 
 
 def reap_orphans() -> int:
@@ -1628,6 +1726,9 @@ def reap_orphans() -> int:
             continue                      # tracked by a live pool / provisioning
         if status in ("TERMINATED", "EXITED"):
             continue
+        age = _pod_age_seconds(p)
+        if age is not None and age < REAP_GRACE_SECONDS:
+            continue                      # too young to be a leftover
         try:
             client.terminate_pod(pid)
             reaped += 1
