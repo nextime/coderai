@@ -2697,6 +2697,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 "max_instances", "preload_all_instances", "capabilities",
                 "model_template", "vae_path", "t5xxl_path", "clip_l_path",
                 "clip_g_path", "clip_vision_path", "lora_path", "lora_model_dir",
+                "lora_scale",
                 "lora_train_base_model",
                 "max_vram", "sdcpp_flash_attn", "sdcpp_diffusion_flash_attn", "vae_tiling",
                 "component_quantization", "output_crf", "force_vram_update",

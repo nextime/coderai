@@ -413,6 +413,31 @@ perfectly reasonable — a 30 GB model is a few minutes at gigabit — but a
 HuggingFace repo id or a URL costs nothing here and pulls at datacenter speed. A
 RunPod network volume is the better answer for weights used repeatedly.
 
+### LoRA adapters
+
+Image and video models have had LoRA support for a long time. Text models now do
+too, locally and remotely — `lora_path` (a local path **or** a HuggingFace repo
+id), `lora_model_dir`, or a `loras` list, with `lora_scale` for strength. A
+**QLoRA** adapter needs nothing special: the quantisation describes how the base
+model loads (`load_in_4bit`), and the adapter itself is an ordinary LoRA.
+
+Each runtime applies them its own way, and what reaches a pod differs:
+
+| Runtime | How | On a pod |
+|---|---|---|
+| transformers (HF) | PEFT `load_adapter`, several at once | via a coderai pod, adapters travel with the seed |
+| llama.cpp (GGUF) | one adapter, **GGUF-converted** | needs the file; use a HF repo id or a coderai pod |
+| vLLM | `--enable-lora --lora-modules` at launch | **HuggingFace repo ids only** |
+| diffusers (image/video) | `load_lora_weights` | uploaded to the remote automatically, content-addressed |
+
+The asymmetry is worth knowing: a **diffusion** LoRA is sent to the remote with
+the request (hashed, uploaded once, referenced by content id), because that API
+carries adapters per request. A **text** LoRA is part of how the model is
+*loaded*, so it has to be resolvable when the pod starts — which means a
+HuggingFace repo id for a vLLM or llama.cpp pod. A local adapter path is reported
+and skipped rather than baked into a launch command that would fail minutes later
+inside a pod. Publish it to HuggingFace, or serve that model on a coderai pod.
+
 ### Keeping a pod warm
 
 `keep_warm` on a model's runpod block (or a capability's) keeps one pod running

@@ -1660,6 +1660,9 @@ class MultiModelManager:
                 # Configured precision → torch dtype (parity with hf_loading); the
                 # nvidia backend defaults fp16/fp32 when unset.
                 kwargs['precision'] = config.get('precision')
+                # The whole entry, so the backend can read settings it owns —
+                # LoRA adapters among them (codai/models/text_loras.py).
+                kwargs['model_config'] = config
                 # KV-cache quantization (llama.cpp type_k/type_v) — pass through
                 # to the backend, with the raw models.json entry as a fallback.
                 _raw = config.get('_raw_cfg') if isinstance(config.get('_raw_cfg'), dict) else {}
@@ -1827,6 +1830,9 @@ class MultiModelManager:
                 # Configured precision → torch dtype (parity with hf_loading); the
                 # nvidia backend defaults fp16/fp32 when unset.
                 kwargs['precision'] = config.get('precision')
+                # The whole entry, so the backend can read settings it owns —
+                # LoRA adapters among them (codai/models/text_loras.py).
+                kwargs['model_config'] = config
                 # KV-cache quantization (llama.cpp type_k/type_v) — pass through
                 # to the backend, with the raw models.json entry as a fallback.
                 _raw = config.get('_raw_cfg') if isinstance(config.get('_raw_cfg'), dict) else {}

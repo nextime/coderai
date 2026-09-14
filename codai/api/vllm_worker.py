@@ -114,7 +114,7 @@ def resolve_service_key(cfg, model_path: Optional[str] = None):
 
 
 def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
-                served_name: Optional[str] = None) -> list:
+                served_name: Optional[str] = None, model_config: dict = None) -> list:
     mid = served_name or (getattr(cfg, "model_id", "vllm") or "vllm")
     cmd = [py, "-m", "vllm.entrypoints.openai.api_server",
            "--host", host, "--port", str(port),
@@ -138,10 +138,48 @@ def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
     quant = (getattr(cfg, "quantization", "") or "").strip()
     if quant:
         cmd += ["--quantization", quant]
+    # LoRA adapters configured on the MODEL (not on the vLLM backend): vLLM takes
+    # them at launch as name=source pairs, where source is a path on this host or
+    # a HuggingFace repo id. A QLoRA adapter is an ordinary LoRA here — the
+    # quantisation is how the base model loads, which --quantization covers.
+    cmd += _lora_args(model_config)
+
     extra = (getattr(cfg, "extra_args", "") or "").strip()
     if extra:
         cmd += shlex.split(extra)
     return cmd
+
+
+def _lora_args(model_config: dict) -> list:
+    """`--enable-lora --lora-modules …` for the adapters a model config asks for."""
+    try:
+        from codai.models.text_loras import configured_specs, describe
+        specs = configured_specs(model_config or {})
+    except Exception:
+        return []
+    if not specs:
+        return []
+    args = ["--enable-lora"]
+    mods = []
+    for spec in specs:
+        mods.append(f"{spec['name']}={spec['source']}")
+    args += ["--lora-modules"] + mods
+    # vLLM rejects an adapter whose rank exceeds --max-lora-rank (default 16),
+    # and the message points at the flag rather than the adapter, so raise the
+    # ceiling to what vLLM supports rather than have a trained LoRA refused.
+    args += ["--max-lora-rank", "64"]
+    print(f"[lora] vLLM will serve adapters: {describe(specs)}", flush=True)
+    return args
+
+
+def _model_config_for(model_name: str) -> dict:
+    """The model's models.json entry — vLLM serves models from the model list, so
+    its LoRA settings live on the model, not on the vLLM backend config."""
+    try:
+        from codai.models.manager import _model_entry_for
+        return _model_entry_for(model_name) or {}
+    except Exception:
+        return {}
 
 
 def _remote_serves(url: str, name: str) -> bool:
@@ -204,7 +242,8 @@ def ensure_service(cfg, model_path: Optional[str] = None,
         port = int(getattr(cfg, "port", 0) or 0) or _free_port()
         url_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
         url = f"http://{url_host}:{port}"
-        cmd = _launch_cmd(py, cfg, host, port, model, served_name)
+        cmd = _launch_cmd(py, cfg, host, port, model, served_name,
+                          model_config=_model_config_for(resolved or model))
 
         env = os.environ.copy()
         # flashinfer JIT-compiles CUDA kernels with ninja at runtime, which fails on

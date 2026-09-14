@@ -1361,6 +1361,33 @@ class VulkanBackend(ModelBackend):
         if no_ram:
             llama_kwargs['use_mmap'] = False
             print("DEBUG: --no-ram mode: use_mmap=False, n_gpu_layers=-1")
+
+        # LoRA adapters configured on the model. llama.cpp takes ONE adapter and
+        # it must be GGUF-converted — a PEFT safetensors directory cannot be
+        # loaded here, so say that plainly instead of failing inside the load.
+        try:
+            from codai.models.text_loras import configured_specs, gguf_adapter, local_path
+            _specs = configured_specs(kwargs.get('model_config') or kwargs)
+            if _specs:
+                if len(_specs) > 1:
+                    print(f"[lora] {len(_specs)} adapters configured but llama.cpp "
+                          f"applies one — using {_specs[0]['name']!r}", flush=True)
+                _adapter = gguf_adapter(_specs[0])
+                if _adapter:
+                    llama_kwargs['lora_path'] = _adapter
+                    llama_kwargs['lora_scale'] = float(_specs[0].get('weight', 1.0))
+                    print(f"[lora] applying {_specs[0]['name']!r} "
+                          f"(scale {llama_kwargs['lora_scale']:g}) to this GGUF",
+                          flush=True)
+                elif local_path(_specs[0]['source']):
+                    print(f"[lora] {_specs[0]['source']} is not a GGUF adapter — "
+                          "llama.cpp needs one converted with convert_lora_to_gguf.py; "
+                          "skipping it", flush=True)
+                else:
+                    print(f"[lora] {_specs[0]['source']} not found locally; skipping",
+                          flush=True)
+        except Exception as _exc:
+            print(f"[lora] could not apply a configured adapter: {_exc}", flush=True)
         
         # Add optional parameters
         if 'n_threads' in kwargs:

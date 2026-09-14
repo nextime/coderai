@@ -406,7 +406,11 @@ def seed_model_env(entry: dict, served: str = "", source: str = "") -> str:
     keep = ("path", "model_type", "model_types", "video_subtypes", "capabilities",
             "alias", "config_name", "load_in_4bit", "load_in_8bit", "n_ctx",
             "flash_attention", "model_template", "acceleration", "component_quantization",
-            "languages", "supports_translation", "parser", "max_instances")
+            "languages", "supports_translation", "parser", "max_instances",
+            # LoRA settings travel too: a coderai pod applies them itself, and
+            # load_in_4bit above is what makes a QLoRA adapter load against the
+            # base it was trained on.
+            "lora_path", "lora_model_dir", "lora_scale", "loras")
     out = {k: entry[k] for k in keep if k in entry and entry[k] is not None}
     out["path"] = path
     if served and served != path:
@@ -731,7 +735,38 @@ def _vllm_docker_args(mcfg: "RunpodModelConfig", served: str,
         args += ["--max-model-len", str(mcfg.ctx)]
     if mcfg.quantization:
         args += ["--quantization", mcfg.quantization]
+    args += _pod_lora_args(entry or {})
     return " ".join(args)
+
+
+def _pod_lora_args(entry: dict) -> list:
+    """vLLM `--lora-modules` for a POD, using only adapters the pod can resolve.
+
+    A pod cannot read this machine's disk, so a local adapter path is no more
+    usable there than a local model path. Only HuggingFace repo ids travel; a
+    local adapter is reported and skipped rather than baked into a launch command
+    that would fail minutes later, inside a pod, with a path nobody can inspect.
+    """
+    try:
+        from codai.models.text_loras import configured_specs
+        specs = configured_specs(entry or {})
+    except Exception:
+        return []
+    usable, local = [], []
+    for spec in specs:
+        src = str(spec.get("source") or "")
+        (usable if _looks_like_repo_id(src) else local).append(spec)
+    if local:
+        names = ", ".join(str(s.get("source")) for s in local)
+        print(f"[lora] not sent to the pod (local paths — publish them to "
+              f"HuggingFace, or serve this model on a coderai pod, which is sent "
+              f"adapters with the request): {names}", flush=True)
+    if not usable:
+        return []
+    args = ["--enable-lora", "--lora-modules"]
+    args += [f"{s['name']}={s['source']}" for s in usable]
+    args += ["--max-lora-rank", "64"]
+    return args
 
 
 class RunpodPodPool:

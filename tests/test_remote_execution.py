@@ -850,3 +850,81 @@ def test_keep_warm_is_off_by_default_and_means_one_pod():
     assert warm.keep_warm is True and warm.min_pods == 1
     # An explicit larger min_pods is not reduced by it.
     assert parse_model_runpod({"keep_warm": True, "min_pods": 3}).min_pods == 3
+
+
+# --------------------------------------------------------------------------- #
+# LoRA / QLoRA on TEXT models
+# --------------------------------------------------------------------------- #
+def test_text_lora_config_shapes_all_resolve():
+    """The config grew several shapes over time; all of them must work."""
+    from codai.models.text_loras import configured_specs
+
+    one = configured_specs({"lora_path": "/AI/loras/style.safetensors", "lora_scale": 0.7})
+    assert one == [{"source": "/AI/loras/style.safetensors", "weight": 0.7,
+                    "name": "style"}]
+
+    many = configured_specs({"loras": [
+        {"path": "org/adapter-a", "weight": 0.5, "name": "a"},
+        {"model": "/AI/loras/b.safetensors"}]})
+    assert [s["name"] for s in many] == ["a", "b"]
+    assert many[0]["weight"] == 0.5 and many[1]["weight"] == 1.0
+
+    # The same adapter named twice is applied once, not twice.
+    dup = configured_specs({"lora_path": ["org/x", "org/x"]})
+    assert len(dup) == 1
+    assert configured_specs({}) == []
+
+
+def test_llamacpp_needs_a_gguf_adapter(tmp_path):
+    """llama.cpp cannot load a PEFT safetensors: report it instead of failing
+    deep inside the model load."""
+    from codai.models.text_loras import gguf_adapter
+
+    peft = tmp_path / "adapter"
+    peft.mkdir()
+    (peft / "adapter_model.safetensors").write_bytes(b"x")
+    assert gguf_adapter({"source": str(peft)}) == ""
+
+    conv = tmp_path / "adapter.gguf"
+    conv.write_bytes(b"x")
+    assert gguf_adapter({"source": str(conv)}) == str(conv)
+
+
+def test_vllm_serves_configured_adapters():
+    from codai.api.vllm_worker import _lora_args
+
+    args = _lora_args({"lora_path": "/AI/loras/style.safetensors"})
+    assert "--enable-lora" in args
+    assert "style=/AI/loras/style.safetensors" in args
+    # A rank ceiling that refuses real adapters is a bad default to inherit.
+    assert "--max-lora-rank" in args
+    assert _lora_args({}) == []
+
+
+def test_a_pod_only_gets_adapters_it_can_resolve(capsys):
+    """A pod cannot read this disk. An HF repo id travels; a local path does not,
+    and must be reported rather than baked into a doomed launch command."""
+    from codai.api.runpod_worker import _vllm_docker_args, parse_model_runpod
+
+    remote_ok = _vllm_docker_args(parse_model_runpod({}), "Qwen/Qwen3.5-9B",
+                                  {"path": "Qwen/Qwen3.5-9B", "lora_path": "org/my-lora"})
+    assert "--enable-lora" in remote_ok and "my-lora=org/my-lora" in remote_ok
+
+    local_only = _vllm_docker_args(parse_model_runpod({}), "Qwen/Qwen3.5-9B",
+                                   {"path": "Qwen/Qwen3.5-9B",
+                                    "lora_path": "/AI/loras/local.safetensors"})
+    assert "--enable-lora" not in local_only
+    assert "not sent to the pod" in capsys.readouterr().out
+
+
+def test_a_coderai_pod_is_told_about_the_models_adapters():
+    """A coderai pod applies LoRAs itself, so its seed must carry them — along
+    with load_in_4bit, which is what makes a QLoRA load against its own base."""
+    from codai.api.runpod_worker import seed_model_env
+
+    seeded = json.loads(seed_model_env(
+        {"path": "org/model", "model_type": "text_models",
+         "lora_path": "org/adapter", "lora_scale": 0.6, "load_in_4bit": True}))[0]
+    assert seeded["lora_path"] == "org/adapter"
+    assert seeded["lora_scale"] == 0.6
+    assert seeded["load_in_4bit"] is True

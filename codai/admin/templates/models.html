@@ -1351,6 +1351,11 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <label class="form-label">LoRA file <span class="muted">(optional — applied at load)</span></label>
         <select id="cfg-lora-sel" class="form-input" onchange="_onCompPick('lora')"></select>
         <input type="text" id="cfg-lora-path" class="form-input" style="display:none;margin-top:.3rem" placeholder="Custom LoRA path…">
+        <div style="display:flex;gap:.5rem;align-items:center;margin-top:.3rem">
+          <span class="form-hint" style="font-size:11px;color:var(--text-3);flex:1">Works on text models too (LoRA and QLoRA). A HuggingFace repo id also works — and is the only form a vLLM/llama.cpp <b>pod</b> can load, since it cannot read this disk. llama.cpp needs a GGUF-converted adapter.</span>
+          <label class="form-label" style="margin:0;font-size:11px">Strength</label>
+          <input type="number" id="cfg-lora-scale" class="form-input" style="width:90px" min="0" step="0.05" placeholder="1.0">
+        </div>
         <span class="form-hint" style="font-size:11px;color:var(--text-3)">Tip: use &lt;lora:name:strength&gt; in prompts to apply at inference time</span>
       </div>
       <div class="form-row">
@@ -3752,6 +3757,7 @@ function openCfgModal(idx, cfgIdx){
   _setCompField('clip-vision',s.clip_vision_path|| '');
   _setCompField('lora',       s.lora_path       || '');
   document.getElementById('cfg-lora-dir').value = s.lora_model_dir || '';
+  document.getElementById('cfg-lora-scale').value = s.lora_scale != null ? s.lora_scale : '';
   document.getElementById('cfg-lora-train-base').value = s.lora_train_base_model || '';
   _populateAccel(s.acceleration);
   _populateTurboQuant(s.turboquant);
@@ -4460,6 +4466,7 @@ async function saveModelConfig(){
     clip_vision_path:  _readCompField('clip-vision') || null,
     lora_path:         _readCompField('lora')        || null,
     lora_model_dir:    document.getElementById('cfg-lora-dir').value.trim() || null,
+    lora_scale:        parseFloat(document.getElementById('cfg-lora-scale').value) || null,
     lora_train_base_model: document.getElementById('cfg-lora-train-base').value.trim() || null,
     max_vram:          parseFloat(document.getElementById('cfg-max-vram').value) || 0,
     sdcpp_flash_attn:  document.getElementById('cfg-sdcpp-flash').checked,

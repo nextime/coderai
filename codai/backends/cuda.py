@@ -74,6 +74,51 @@ def _make_thermal_criteria():
     return _ThermalPause()
 
 
+def _apply_text_loras(model, config) -> None:
+    """Load the LoRA adapters a text model's config asks for, via PEFT.
+
+    A QLoRA adapter needs nothing special: the quantisation describes how the
+    BASE model was loaded (4-bit), and the adapter is an ordinary LoRA — so it
+    loads like any other, provided the base is loaded the way it was trained.
+    Several adapters can be active at once; PEFT combines them.
+
+    Never fatal: a model that loads without its adapter is still useful, and the
+    alternative is a model that will not load at all because of a bad path.
+    """
+    try:
+        from codai.models.text_loras import configured_specs, describe
+        specs = configured_specs(config if isinstance(config, dict) else {})
+        if not specs:
+            return
+        from codai.models.peft_compat import ensure_peft_awq_compat
+        ensure_peft_awq_compat()
+        from peft import PeftModel  # noqa: F401  (import proves peft is usable)
+    except Exception as exc:
+        print(f"[lora] cannot apply text adapters: {exc}", flush=True)
+        return
+
+    loaded = []
+    for spec in specs:
+        try:
+            model.load_adapter(spec["source"], adapter_name=spec["name"])
+            loaded.append(spec)
+        except Exception as exc:
+            print(f"[lora] failed to load {spec['source']}: {exc}", flush=True)
+    if not loaded:
+        return
+    try:
+        names = [s["name"] for s in loaded]
+        weights = [float(s.get("weight", 1.0)) for s in loaded]
+        if hasattr(model, "set_adapters"):
+            model.set_adapters(names, weights)
+        elif hasattr(model, "set_adapter"):
+            model.set_adapter(names[0])
+    except Exception as exc:
+        print(f"[lora] adapters loaded but could not be activated: {exc}", flush=True)
+        return
+    print(f"[lora] applied {describe(loaded)}", flush=True)
+
+
 class NvidiaBackend(ModelBackend):
     """Backend for NVIDIA GPUs using HuggingFace Transformers."""
     
@@ -1162,9 +1207,10 @@ class NvidiaBackend(ModelBackend):
             raise RuntimeError("Failed to load model: Out of memory even with minimum GPU usage")
         
         self.model = model
+        _apply_text_loras(self.model, kwargs.get('model_config') or kwargs)
         self.model.eval()
         self.model_name = model_name
-        
+
         print(f"\nModel loaded successfully")
         print(f"Model device: {next(self.model.parameters()).device}")
         
