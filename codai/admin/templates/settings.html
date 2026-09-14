@@ -950,7 +950,7 @@
       </div>
     </div>
     <div id="s-remotes-rows" style="margin-top:.4rem"></div>
-    <p class="form-hint" style="margin-top:.5rem">A pod row needs an image you have pushed to a registry RunPod can pull from — see <code>packaging/runpod/publish_capability_images.sh</code>. Give several capabilities the same <b>pool</b> name and they share one pod and one budget.</p>
+    <p class="form-hint" style="margin-top:.5rem">A pod row left blank uses the published <code>ghcr.io/nextime/coderai-&lt;capability&gt;</code> image — a trimmed coderai carrying only that capability. Override it to run your own build (<code>packaging/runpod/publish_capability_images.sh</code>). Give several capabilities the same <b>pool</b> name and they share one pod and one budget.</p>
   </div>
 </div>
 
@@ -2224,6 +2224,19 @@ const REMOTE_CAPS = [
   ['pipelines','Pipelines','/v1/pipelines/*'],
 ];
 
+// The published capability images (packaging/runpod/). A pod row left blank uses
+// the one for its capability, so enabling a capability needs no image typed in;
+// mirrors default_capability_image() in codai/api/runpod_worker.py.
+const CAP_IMAGE_REPO = 'ghcr.io/nextime/coderai';
+const CAP_IMAGE_PUBLISHED = ['images','video','embeddings','ocr','tts','stt',
+                             'voice','audio','faceswap'];
+const CAP_IMAGE_ALIASES = {rerank:'embeddings', speaker:'stt', stems:'audio',
+                           audio_clean:'audio', audio_gen:'audio'};
+function _defaultCapImage(cap){
+  const name = CAP_IMAGE_ALIASES[cap] || cap;
+  return CAP_IMAGE_PUBLISHED.includes(name) ? `${CAP_IMAGE_REPO}-${name}:latest` : '';
+}
+
 function toggleRemotesFields(){
   const on = document.getElementById('s-remotes-enabled').checked;
   document.getElementById('remotes-fields').style.display = on ? 'block' : 'none';
@@ -2244,7 +2257,7 @@ function _remoteRowHtml(cap, label, paths){
     <input type="text" id="rc-${cap}-url" class="form-input" style="flex:1;min-width:200px;display:none" placeholder="http://gpu-box:8000">
     <div id="rc-${cap}-pod" style="display:none;flex:1;min-width:320px">
       <div style="display:flex;gap:.4rem;flex-wrap:wrap">
-        <input type="text" id="rc-${cap}-image" class="form-input" style="flex:2;min-width:200px" placeholder="ghcr.io/you/coderai-${cap}:latest">
+        <input type="text" id="rc-${cap}-image" class="form-input" style="flex:2;min-width:200px" placeholder="${_defaultCapImage(cap) || 'image required — no published one for this capability'}">
         <input type="text" id="rc-${cap}-pool" class="form-input" style="flex:1;min-width:90px" placeholder="pool (share)">
       </div>
       <div style="display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.35rem">

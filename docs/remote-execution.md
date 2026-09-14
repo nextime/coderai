@@ -135,6 +135,16 @@ endpoint and streams the answer back:
 }
 ```
 
+A pod row with no `image` uses the published one for its capability —
+`ghcr.io/nextime/coderai-<capability>:latest`, a trimmed coderai carrying only
+that capability's dependencies — so turning a capability remote is one choice,
+not an image name you have to know. `rerank` rides the `embeddings` image,
+`speaker` the `stt` one, and `stems`/`audio_clean`/`audio_gen` the `audio` one.
+`loras`, `characters`, `environments` and `pipelines` have no published image and
+need one named explicitly. Point the whole set at your own build with
+`CODERAI_CAPABILITY_IMAGE_REPO` / `CODERAI_CAPABILITY_IMAGE_TAG`, or override a
+single row's `image`.
+
 Capability keys: `images`, `video`, `embeddings`, `rerank`, `ocr`, `tts`, `stt`,
 `voice`, `speaker`, `audio_gen`, `stems`, `audio_clean`, `spatial`, `faceswap`,
 `loras`, `characters`, `environments`, `pipelines`. Env equivalents:

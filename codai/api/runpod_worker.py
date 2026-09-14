@@ -129,6 +129,41 @@ DEFAULT_POD_IMAGE = "vllm/vllm-openai:latest"
 # limited architecture list, and it needs the original repo for the tokenizer).
 LLAMACPP_POD_IMAGE = "ghcr.io/ggml-org/llama.cpp:server-cuda"
 
+#: Published trimmed coderai images, one per capability — a whole coderai
+#: carrying only that capability's dependencies (packaging/runpod/). A capability
+#: pod with no `image` uses the one for its own capability, so turning a
+#: capability remote needs no image name typed in. Override per capability with
+#: `image`, or point the whole set elsewhere with CODERAI_CAPABILITY_IMAGE_REPO
+#: (e.g. your own fork, or a private registry).
+CAPABILITY_IMAGE_REPO = os.environ.get(
+    "CODERAI_CAPABILITY_IMAGE_REPO", "ghcr.io/nextime/coderai")
+CAPABILITY_IMAGE_TAG = os.environ.get("CODERAI_CAPABILITY_IMAGE_TAG", "latest")
+
+#: Capabilities with a published image. One without a row here has no image of
+#: its own and needs `image` set explicitly — better than defaulting to a tag
+#: that does not exist and failing at pull time, minutes into a pod boot.
+PUBLISHED_CAPABILITY_IMAGES = (
+    "images", "video", "embeddings", "ocr", "tts", "stt", "voice", "audio",
+    "faceswap",
+)
+
+#: Capabilities served by a published image other than their own name.
+_CAPABILITY_IMAGE_ALIASES = {
+    "rerank": "embeddings",      # same sentence-transformers stack
+    "speaker": "stt",            # diarization/voiceprints ride the STT deps
+    "stems": "audio",
+    "audio_clean": "audio",
+    "audio_gen": "audio",
+}
+
+
+def default_capability_image(capability: str) -> str:
+    """The published image for a capability, or '' when there is none."""
+    name = _CAPABILITY_IMAGE_ALIASES.get(capability, capability)
+    if name not in PUBLISHED_CAPABILITY_IMAGES:
+        return ""
+    return f"{CAPABILITY_IMAGE_REPO}-{name}:{CAPABILITY_IMAGE_TAG}"
+
 
 def _looks_like_gguf(name: str) -> bool:
     return (name or "").strip().lower().endswith(".gguf")
@@ -175,7 +210,9 @@ def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
         if not mcfg.image:
             raise RuntimeError(
                 f"RunPod {engine} pod: set `image` on the runpod block to the image "
-                "to run (coderai does not publish one to a registry for you).")
+                "to run. Capability pods default to the published "
+                f"{CAPABILITY_IMAGE_REPO}-<capability> image; this one has none, so "
+                "name it explicitly.")
         image = mcfg.image
         args = mcfg.docker_args          # usually blank: the image's entrypoint serves
     else:
@@ -929,6 +966,13 @@ def get_capability_pool(capability: str, block: dict):
             "capability at a URL instead.")
     b = dict(block or {})
     b.setdefault("engine", "coderai")
+    # A capability pod with no image uses the published one for that capability,
+    # so enabling a capability is a single choice rather than an image name the
+    # user has to know. A shared pool keeps whatever image it was created with.
+    if not str(b.get("image") or "").strip() and b.get("engine") == "coderai":
+        _img = default_capability_image(capability)
+        if _img:
+            b["image"] = _img
     shared = str(b.get("pool") or "").strip().lower()
     mcfg = parse_model_runpod(b)
     key = f"capability:{shared or capability}"

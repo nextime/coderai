@@ -575,3 +575,53 @@ def test_unreachable_remote_is_a_clean_502(gateway_app):
     r = client.post("/v1/images/generations", json={"model": "sdxl"})
     assert r.status_code == 502
     assert "unreachable" in r.json()["error"]["message"]
+
+
+def test_capability_pods_default_to_the_published_images():
+    """Turning a capability remote should not require knowing an image name."""
+    from codai.api.runpod_worker import default_capability_image
+
+    assert default_capability_image("images") == "ghcr.io/nextime/coderai-images:latest"
+    assert default_capability_image("video") == "ghcr.io/nextime/coderai-video:latest"
+    # Capabilities that ride another profile's dependency set.
+    assert default_capability_image("rerank").endswith("coderai-embeddings:latest")
+    assert default_capability_image("speaker").endswith("coderai-stt:latest")
+    assert default_capability_image("stems").endswith("coderai-audio:latest")
+    # No published image: say so rather than default to a tag that 404s minutes
+    # into a pod boot.
+    assert default_capability_image("pipelines") == ""
+    assert default_capability_image("loras") == ""
+
+
+def test_the_default_image_repo_is_overridable(monkeypatch):
+    """A fork or a private registry must be able to take over the whole set."""
+    import importlib
+    monkeypatch.setenv("CODERAI_CAPABILITY_IMAGE_REPO", "registry.example.com/me/cai")
+    monkeypatch.setenv("CODERAI_CAPABILITY_IMAGE_TAG", "0.2.2")
+    import codai.api.runpod_worker as rw
+    importlib.reload(rw)
+    try:
+        assert rw.default_capability_image("tts") == "registry.example.com/me/cai-tts:0.2.2"
+    finally:
+        monkeypatch.undo()
+        importlib.reload(rw)
+
+
+def test_a_capability_pool_picks_up_the_default_image(monkeypatch):
+    import codai.api.runpod_worker as rw
+
+    class _Acct:
+        enabled = True
+
+    monkeypatch.setattr("codai.models.manager.get_active_runpod_config", lambda: _Acct())
+    monkeypatch.setattr(rw, "_pools", {})
+    monkeypatch.setattr(rw, "_ensure_scaler", lambda: None)
+
+    pool = rw.get_capability_pool("video", {})          # nothing configured at all
+    assert pool.mcfg.image == "ghcr.io/nextime/coderai-video:latest"
+    assert pool.mcfg.engine == "coderai"
+
+    # An explicit image still wins.
+    monkeypatch.setattr(rw, "_pools", {})
+    own = rw.get_capability_pool("video", {"image": "me/mine:1"})
+    assert own.mcfg.image == "me/mine:1"
