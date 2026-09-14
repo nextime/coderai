@@ -45,14 +45,27 @@ say "=============================================================="
 command -v docker >/dev/null || { say "${c_err}docker not found${c_off}"; exit 1; }
 docker info >/dev/null 2>&1 || { say "${c_err}cannot talk to the docker daemon${c_off}"; exit 1; }
 
-free_gb=$(df -BG --output=avail /var/lib/docker 2>/dev/null | tail -1 | tr -dc '0-9')
-[[ -z "$free_gb" ]] && free_gb=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-need=$(( $(count $PROFILES) * 8 ))
-say "disk: ${free_gb} GB free, roughly ${need} GB needed (images share a ~7 GB core layer,"
-say "      so the real cost is much lower after the first one)"
-if (( free_gb < 30 )); then
-    say "${c_err}less than 30 GB free — stopping before docker fills the disk${c_off}"
-    exit 1
+# Only BUILDING needs disk. A push uploads what already exists, so a low-space
+# check that blocks it is just an outage of its own — which is exactly what it
+# did the first time: ten images built, none pushed.
+to_build=""
+for p in $PROFILES; do
+    docker image inspect "${NS}/coderai-${p}:${VERSION}" >/dev/null 2>&1 || to_build="$to_build $p"
+done
+if [[ -n "${to_build// /}" ]]; then
+    dockerroot=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+    free_gb=$(df -BG --output=avail "${dockerroot:-/var/lib/docker}" 2>/dev/null | tail -1 | tr -dc '0-9')
+    [[ -z "$free_gb" ]] && free_gb=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+    need=$(( $(count $to_build) * 8 ))
+    say "disk: ${free_gb} GB free, roughly ${need} GB needed to build:${to_build}"
+    say "      (images share a ~7 GB core layer, so the real cost is much lower"
+    say "       after the first one)"
+    if (( free_gb < 15 )); then
+        say "${c_err}less than 15 GB free — stopping before docker fills the disk${c_off}"
+        exit 1
+    fi
+else
+    say "all ${VERSION} images are already built — nothing to build, only push"
 fi
 
 # ---- registry login ----------------------------------------------------- #
