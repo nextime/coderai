@@ -23,6 +23,13 @@ DEST="${DEST:-coderai:base}"
 STAMP="${STAMP:-$(date +%Y%m%d%H%M)}"
 FLAT_TAG="${FLAT_TAG:-coderai:flat-${STAMP}}"
 RETAG="${RETAG:-1}"
+# How many previous bases to keep as `<dest>-pre-<stamp>` rollback tags. Each one
+# pins a whole ~26 GB image, so they pile up fast; 1 keeps a rollback without
+# hoarding every build. 0 keeps none (nothing to roll back to but git).
+KEEP_BACKUPS="${KEEP_BACKUPS:-1}"
+# The intermediate `flat-<stamp>` tag is what DEST points at; it is the same
+# image, so keeping it around just makes `docker image ls` noisy. 0 drops it.
+KEEP_FLAT_TAG="${KEEP_FLAT_TAG:-0}"
 # Drop secret-valued env vars from the flattened config. A token baked into an
 # image is readable by anyone who can pull it — `docker image inspect` is enough,
 # no need to run anything. These arrive by `docker commit` of a container that was
@@ -139,13 +146,31 @@ then
 fi
 
 if [[ "$RETAG" == "1" ]]; then
-    if "${DK[@]}" image inspect "$DEST" >/dev/null 2>&1; then
-        backup="${DEST%%:*}:$(echo "${DEST#*:}")-pre-${STAMP}"
+    repo="${DEST%%:*}"
+    tag="${DEST#*:}"
+    if "${DK[@]}" image inspect "$DEST" >/dev/null 2>&1 && [[ "$KEEP_BACKUPS" != "0" ]]; then
+        backup="${repo}:${tag}-pre-${STAMP}"
         "${DK[@]}" tag "$DEST" "$backup"
         echo "== previous $DEST backed up as $backup =="
     fi
     "${DK[@]}" tag "$FLAT_TAG" "$DEST"
     echo "== $DEST now points at $("${DK[@]}" image inspect "$DEST" --format '{{.Id}}' | cut -c8-19) =="
+
+    # Retire older rollback tags. Every one of these pins a whole ~26 GB image,
+    # and a handful of builds is a quarter-terabyte of disk that nothing reads.
+    # Sorted by name, which is chronological because the stamp is a timestamp.
+    mapfile -t old_backups < <("${DK[@]}" image ls "$repo" --format '{{.Tag}}' \
+        | grep -E "^${tag}-pre-" | sort -r | tail -n +$(( KEEP_BACKUPS + 1 )))
+    for b in "${old_backups[@]:-}"; do
+        [[ -n "$b" ]] || continue
+        echo "   retiring old backup ${repo}:${b}"
+        "${DK[@]}" rmi "${repo}:${b}" >/dev/null 2>&1 || true
+    done
+
+    if [[ "$KEEP_FLAT_TAG" == "0" && "$FLAT_TAG" != "$DEST" ]]; then
+        # Same image as DEST — dropping the tag frees no space, just noise.
+        "${DK[@]}" rmi "$FLAT_TAG" >/dev/null 2>&1 || true
+    fi
 fi
 
 "${DK[@]}" image ls "${DEST%%:*}" --format '{{.Repository}}:{{.Tag}}  {{.Size}}  {{.ID}}' | head -5
