@@ -795,6 +795,9 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
               <label class="form-label" id="cfg-rp-source-label">Repo / URL</label>
               <input type="text" id="cfg-rp-hf-repo" class="form-input" placeholder="Qwen/Qwen3.5-9B">
               <input type="text" id="cfg-rp-model-url" class="form-input" style="display:none" placeholder="https://host/model-Q4_K_M.gguf">
+              <label style="display:none;align-items:center;gap:.3rem;font-size:11px;margin-top:.3rem" id="cfg-rp-tar-row">
+                <input type="checkbox" id="cfg-rp-url-tar" style="width:auto"> The URL is a tar of a multi-file model
+              </label>
             </div>
           </div>
           <div class="form-row" style="margin:.5rem 0 0">
@@ -4198,6 +4201,7 @@ function _populateRunpod(s){
   set('cfg-rp-source', rp.source || 'auto');
   set('cfg-rp-hf-repo', rp.hf_repo || '');
   set('cfg-rp-model-url', rp.model_url || '');
+  chk('cfg-rp-url-tar', rp.model_url_is_tar);
   chk('cfg-rp-keep-warm', rp.keep_warm);
   _updateRunpodSource();
   set('cfg-rp-api-key', rp.api_key || '');
@@ -4264,12 +4268,14 @@ function _updateRunpodSource(){
   const hint = document.getElementById('cfg-rp-source-hint');
   if (repo) repo.style.display = (v === 'url' || v === 'upload') ? 'none' : '';
   if (url) url.style.display = (v === 'url') ? '' : 'none';
+  const tarRow = document.getElementById('cfg-rp-tar-row');
+  if (tarRow) tarRow.style.display = (v === 'url') ? 'flex' : 'none';
   if (label) label.textContent = (v === 'url') ? 'Download URL'
     : (v === 'upload') ? 'Uploaded from this machine' : 'HuggingFace repo id';
   const HINTS = {
     auto: 'Uses the repo id if the model has one — including one recovered from the HuggingFace cache path.',
     hf: 'The pod downloads it from HuggingFace at datacenter speed. Costs nothing here.',
-    url: 'The pod downloads it directly — how most one-off GGUFs are had.',
+    url: 'The pod downloads it before its server starts — works for vLLM and llama.cpp pods too, so weights on any HTTP host you control can be served.',
     upload: 'Sent from this machine. Needed only when the weights exist nowhere else; every NEW pod pays the upload again.',
   };
   if (hint) hint.textContent = HINTS[v] || '';
@@ -4363,6 +4369,7 @@ function _collectRunpod(){
     source:             val('cfg-rp-source') || 'auto',
     hf_repo:            (val('cfg-rp-hf-repo') || '').trim(),
     model_url:          (val('cfg-rp-model-url') || '').trim(),
+    model_url_is_tar:   document.getElementById('cfg-rp-url-tar').checked,
     keep_warm:          document.getElementById('cfg-rp-keep-warm').checked,
     api_key:            (val('cfg-rp-api-key') || '').trim(),
     allow_open_pod:     document.getElementById('cfg-rp-open').checked,

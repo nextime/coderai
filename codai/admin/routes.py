@@ -2809,7 +2809,8 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         if ct:
             rpo["cloud_types"] = ct
         # bools
-        for k in ("allow_spot", "allow_open_pod", "sticky_sessions", "keep_warm"):
+        for k in ("allow_spot", "allow_open_pod", "sticky_sessions", "keep_warm",
+                  "model_url_is_tar"):
             if k in src and src.get(k) is not None and src.get(k) != "":
                 sv = src.get(k)
                 rpo[k] = (sv.lower() in ("1", "true", "on", "yes")

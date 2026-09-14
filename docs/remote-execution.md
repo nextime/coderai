@@ -398,14 +398,30 @@ these has to resolve (`source` on the model's runpod block):
 downloaded through coderai live in the HuggingFace cache, whose directory names
 still say which repo they came from.
 
-Not every server can take every source, and the mismatch is refused at
-configuration time rather than after a pod has booted for five minutes:
+How each server gets there differs, and a combination that cannot work is
+refused at configuration time rather than after a pod has booted for five
+minutes:
 
-* **vLLM** is launched `--model <id>` and can only take a HuggingFace repo id.
-* **llama.cpp** takes `-hf user/repo:QUANT` or downloads a URL with `-mu`.
+* **llama.cpp** takes `-hf user/repo:QUANT`, or downloads a URL itself (`-mu`).
+* **vLLM** is launched `--model <id>` and downloads nothing but a HuggingFace
+  repo — *so the pod downloads it first*: with `source: url`, coderai overrides
+  the image's entrypoint with a small script that fetches the file (curl, wget or
+  python — whichever the image has), extracts it when `model_url_is_tar` is set,
+  and then execs vLLM pointed at what it staged. This is the "external bounce"
+  route: put the weights on any HTTP host the pod can reach — an object store,
+  your own HTTPS server — and a vLLM pod can serve them.
 * **Upload works only on a coderai pod.** vLLM and llama.cpp need the file to
-  exist before their container starts; a coderai pod loads models on demand, so
-  it can be given them afterwards.
+  exist before their container starts and have no endpoint to receive one; a
+  coderai pod loads models on demand, so it can be given them afterwards.
+
+The same staging carries **adapters given as a URL**: a vLLM pod gets
+`--lora-modules name=<staged path>`, a llama.cpp pod `--lora`/`--lora-scaled`.
+So a local adapter can reach a vLLM pod after all — put it on a URL rather than
+uploading it.
+
+Staging uses RunPod's REST pod API, which is the only one that accepts
+`dockerEntrypoint`/`dockerStartCmd`; pods that need no staging are created
+through the GraphQL path exactly as before.
 
 Uploading is a deliberate choice, not a fallback: it is the cold cost of every
 NEW pod, since pod storage is disposable. On a fast symmetric link that may be

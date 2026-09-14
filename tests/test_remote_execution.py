@@ -817,11 +817,11 @@ def test_each_pod_server_gets_a_source_it_can_actually_use():
                                  "m", gguf)
     assert "-mu https://h/m.gguf" in args
 
-    # vLLM is launched with --model and can only take a repo id; say so rather
-    # than boot a pod for minutes and fail.
-    with pytest.raises(RuntimeError, match="cannot fetch"):
-        _vllm_docker_args(parse_model_runpod({"model_url": "https://h/m.bin"}),
-                          "/AI/local/m", {"path": "/AI/local/m"})
+    # vLLM cannot download a URL itself, but the POD can before vLLM starts, so
+    # the args name the staged path rather than refusing the URL.
+    staged = _vllm_docker_args(parse_model_runpod({"model_url": "https://h/m.bin"}),
+                               "/AI/local/m", {"path": "/AI/local/m"})
+    assert "--model /runpod-volume/staged/m.bin" in staged
     # Upload cannot work for a server that needs the file before it starts.
     with pytest.raises(RuntimeError, match="cannot work here"):
         _llamacpp_docker_args(parse_model_runpod({"source": "upload"}), "m", gguf)
@@ -1035,3 +1035,70 @@ def test_a_content_addressed_adapter_resolves_through_the_blob_store(monkeypatch
     # And it is not mistaken for something a remote could fetch by name.
     assert text_loras.is_portable("sha256:" + "a" * 64) is False
     assert text_loras.is_portable("org/adapter") is True
+
+
+# --------------------------------------------------------------------------- #
+# staging: the pod downloads before its server starts
+# --------------------------------------------------------------------------- #
+def test_a_vllm_pod_can_download_a_model_before_starting():
+    """The third way onto a vLLM pod: not on HuggingFace, not uploadable (no
+    receiver) — but downloadable from any host the pod can reach, BEFORE vLLM
+    starts. That needs the image's ENTRYPOINT overridden, since vLLM is it."""
+    from codai.api.runpod_worker import pod_plan, parse_model_runpod, STAGE_DIR
+
+    entry = {"path": "/AI/models/merged", "model_type": "text_models"}
+    plan = pod_plan(parse_model_runpod(
+        {"engine": "vllm", "model_url": "https://host/merged.tar",
+         "model_url_is_tar": True}), "m", "m", entry=entry)
+
+    assert plan["entrypoint"] == ["/bin/sh", "-c"]
+    script = plan["start_cmd"][0]
+    # Downloads the tar, extracts to a directory of the same name without the
+    # suffix, and serves THAT — one definition of the path, not two.
+    assert f"{STAGE_DIR}/merged.tar" in script          # the archive
+    assert f"-C '{STAGE_DIR}/merged'" in script          # extracted here
+    assert script.rstrip().endswith(f"--served-model-name {STAGE_DIR}/merged")
+    assert script.count("--model ") == 1                 # never two --model flags
+
+
+def test_llamacpp_downloads_its_own_model_but_stages_an_adapter():
+    """llama-server fetches a model URL itself (-mu), so only the adapter needs
+    staging — and it takes one, with its scale."""
+    from codai.api.runpod_worker import pod_plan, parse_model_runpod, STAGE_DIR
+
+    entry = {"path": "Qwen/Qwen3.5-9B", "model_type": "text_models",
+             "loras": [{"path": "https://host/a.safetensors", "weight": 0.7,
+                        "name": "mine"}]}
+    plan = pod_plan(parse_model_runpod({"engine": "llamacpp", "hf_gguf": "u/r:Q4"}),
+                    "q", "q", entry=entry)
+    script = plan["start_cmd"][0]
+    assert f"--lora-scaled {STAGE_DIR}/loras/a.safetensors 0.7" in script
+    assert "-hf u/r:Q4" in script          # the model still comes from HF
+
+
+def test_upload_to_a_vllm_pod_says_what_to_do_instead():
+    from codai.api.runpod_worker import _vllm_docker_args, parse_model_runpod
+
+    with pytest.raises(RuntimeError, match="model_url"):
+        _vllm_docker_args(parse_model_runpod({"source": "upload"}),
+                          "/AI/local/m", {"path": "/AI/local/m"})
+
+
+def test_staging_quotes_what_it_downloads():
+    """The URL is configuration, but it still ends up in a shell command."""
+    from codai.api.runpod_worker import stage_script
+
+    script = stage_script(
+        [{"url": "https://host/a'; rm -rf /; echo '", "dest": "/tmp/x"}], "server")
+    # The quote is escaped, so the injected text stays one argument.
+    assert "rm -rf /" in script and "'\\''" in script
+    assert script.rstrip().endswith("exec server")
+
+
+def test_no_staging_when_nothing_needs_downloading():
+    """An HF repo id needs no entrypoint override — leave the image alone."""
+    from codai.api.runpod_worker import pod_plan, parse_model_runpod
+
+    plan = pod_plan(parse_model_runpod({}), "Qwen/Qwen3.5-9B", "q",
+                    entry={"path": "Qwen/Qwen3.5-9B", "model_type": "text_models"})
+    assert "entrypoint" not in plan and "start_cmd" not in plan

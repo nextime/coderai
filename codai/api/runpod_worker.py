@@ -82,6 +82,8 @@ class RunpodModelConfig:
     source: str = "auto"                     # auto | hf | url | upload
     hf_repo: str = ""                        # explicit HuggingFace repo id
     model_url: str = ""                      # explicit direct download URL
+    # The URL points at a tar of a multi-file model, to be extracted on the pod.
+    model_url_is_tar: bool = False
     # Bearer token the pod requires on every request. A RunPod proxy URL is
     # reachable by anyone who learns it, so a pod without one is an open GPU on
     # the public internet. Blank does NOT mean "no auth": the pool generates a
@@ -390,8 +392,62 @@ def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
             # environment under both the coderai and the common vLLM name.
             env["CODERAI_API_TOKEN"] = api_key
             env["VLLM_API_KEY"] = api_key
-    return {"engine": engine, "image": image, "args": args, "env": env,
+    plan = {"engine": engine, "image": image, "args": args, "env": env,
             "health_path": mcfg.health_path or _HEALTH_PATHS.get(engine, "/v1/models")}
+    _add_staging(plan, mcfg, entry or {}, engine)
+    return plan
+
+
+#: How to start each server when we override the image's ENTRYPOINT to stage
+#: downloads first. `command -v` keeps it working if the binary moves.
+_SERVER_CMD = {
+    "vllm": "python3 -m vllm.entrypoints.openai.api_server",
+    "llamacpp": '"$(command -v llama-server || echo /app/llama-server)"',
+}
+
+
+def _add_staging(plan: dict, mcfg: "RunpodModelConfig", entry: dict, engine: str) -> None:
+    """Make the pod fetch what it needs before its server starts.
+
+    The third way to get weights onto a vLLM/llama.cpp pod, alongside "it is on
+    HuggingFace" and "it is a coderai pod we can upload to": put the file on any
+    HTTP host the pod can reach and have the pod download it at boot. Those
+    images run their server AS the entrypoint, so this overrides the entrypoint
+    and execs the server after fetching.
+    """
+    if engine not in _SERVER_CMD:
+        return
+    downloads = staged_downloads(mcfg, entry, engine)
+    if not downloads:
+        return
+
+    args = plan["args"]
+    # The server args already name the staged path (staged_model_dest), so only
+    # add --model when nothing set it — never a second one.
+    for item in downloads:
+        if item.get("lora_name") or "--model " in args:
+            continue
+        args += f" --model {item['dest']}"
+    staged_loras = [i for i in downloads if i.get("lora_name")]
+    if staged_loras:
+        if engine == "vllm" and "--enable-lora" not in args:
+            mods = " ".join(f"{i['lora_name']}={i['dest']}" for i in staged_loras)
+            args += f" --enable-lora --lora-modules {mods} --max-lora-rank 64"
+        elif engine == "llamacpp" and "--lora" not in args:
+            # llama-server takes one adapter file, with an optional scale.
+            first = staged_loras[0]
+            weight = float(first.get("weight", 1.0) or 1.0)
+            args += (f" --lora-scaled {first['dest']} {weight:g}" if weight != 1.0
+                     else f" --lora {first['dest']}")
+            if len(staged_loras) > 1:
+                print(f"[lora] llama.cpp applies one adapter — using "
+                      f"{first['lora_name']!r}", flush=True)
+
+    plan["args"] = args
+    plan["entrypoint"] = ["/bin/sh", "-c"]
+    plan["start_cmd"] = [stage_script(downloads, f"{_SERVER_CMD[engine]} {args}")]
+    names = ", ".join(i["dest"].rsplit("/", 1)[-1] for i in downloads)
+    print(f"[runpod] pod will download before serving: {names}", flush=True)
 
 
 def _plan(engine, image, args, mcfg, api_key, entry, served) -> dict:  # noqa: D401
@@ -565,6 +621,7 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.source = (b.get("source") or cfg.source).strip().lower() or "auto"
     cfg.hf_repo = (b.get("hf_repo") or "").strip()
     cfg.model_url = (b.get("model_url") or "").strip()
+    cfg.model_url_is_tar = _as_bool(b.get("model_url_is_tar"), cfg.model_url_is_tar)
     cfg.api_key = (b.get("api_key") or "").strip()
     cfg.allow_open_pod = _as_bool(b.get("allow_open_pod"), cfg.allow_open_pod)
     cfg.served_model = (b.get("served_model") or "").strip()
@@ -773,12 +830,17 @@ def _vllm_docker_args(mcfg: "RunpodModelConfig", served: str,
         kind, value = resolve_model_source(entry or {}, mcfg)
         if kind == "hf" and value:
             name = value
-        elif kind in ("url", "upload"):
+        elif kind == "url" and value:
+            # vLLM cannot download a URL itself, but the pod can before vLLM
+            # starts: _add_staging fetches it and this points --model at the file.
+            name = staged_model_dest(mcfg, value)
+        elif kind == "upload":
             raise RuntimeError(
-                f"RunPod vLLM pod: vLLM is launched with `--model` and can only take "
-                f"a HuggingFace repo id — it cannot fetch {kind!r}. Set `hf_repo`, or "
-                "serve this model on a coderai pod (engine: coderai), which accepts a "
-                "URL or an upload.")
+                "RunPod vLLM pod: `source: upload` has no receiver — the vLLM image "
+                "has no endpoint to upload to, and its server needs the model at "
+                "launch. Put the weights on any HTTP host the pod can reach and set "
+                "`model_url` (the pod downloads them before starting), publish them "
+                "to HuggingFace, or serve this model on a coderai pod.")
         else:
             raise RuntimeError(
                 f"RunPod vLLM pod: {name or '(nothing)'} is not a HuggingFace repo id, "
@@ -792,6 +854,108 @@ def _vllm_docker_args(mcfg: "RunpodModelConfig", served: str,
         args += ["--quantization", mcfg.quantization]
     args += _pod_lora_args(entry or {})
     return " ".join(args)
+
+
+#: Where a staged download lands inside the pod. Container disk, wiped with the
+#: pod — size `container_disk_gb` for what you are staging.
+STAGE_DIR = "/runpod-volume/staged"
+
+#: Fetch with whatever the image actually has. vLLM's image ships python3 but not
+#: always curl; llama.cpp's ships curl. Trying in order beats assuming.
+_FETCH = ('if command -v curl >/dev/null 2>&1; then curl -fsSL "$U" -o "$F"; '
+          'elif command -v wget >/dev/null 2>&1; then wget -qO "$F" "$U"; '
+          'else python3 -c "import sys,urllib.request;'
+          'urllib.request.urlretrieve(sys.argv[1],sys.argv[2])" "$U" "$F"; fi')
+
+
+def stage_script(downloads: list, server_cmd: str) -> str:
+    """A start command that fetches things, then execs the server.
+
+    This is what lets a vLLM or llama.cpp pod serve weights that live neither on
+    HuggingFace nor on the pod: they are downloaded from a URL you control — an
+    object store, your own HTTPS host, anything the pod can reach — before the
+    server starts. Uploading to the pod cannot work for these images because
+    their server needs the file at launch; downloading happens *before* it.
+
+    ``downloads`` is a list of {url, dest, tar} dicts. A tar is extracted into
+    ``dest`` and removed, which is how a multi-file model travels.
+    """
+    lines = ["set -eu", f"mkdir -p {STAGE_DIR}"]
+    for item in downloads:
+        url = str(item.get("url") or "").strip()
+        dest = str(item.get("dest") or "").strip()
+        if not url or not dest:
+            continue
+        lines.append(f'U={_sh_quote(url)}')
+        if item.get("tar"):
+            lines.append(f'F={_sh_quote(dest + ".tar")}')
+            lines.append(_FETCH)
+            lines.append(f'mkdir -p {_sh_quote(dest)}')
+            lines.append(f'tar -xf {_sh_quote(dest + ".tar")} -C {_sh_quote(dest)}')
+            lines.append(f'rm -f {_sh_quote(dest + ".tar")}')
+        else:
+            lines.append(f'F={_sh_quote(dest)}')
+            lines.append(f'mkdir -p "$(dirname {_sh_quote(dest)})"')
+            lines.append(_FETCH)
+        lines.append(f'echo "[stage] fetched {dest}"')
+    lines.append("exec " + server_cmd)
+    return "\n".join(lines)
+
+
+def _sh_quote(s: str) -> str:
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+def staged_model_dest(mcfg: "RunpodModelConfig", url: str) -> str:
+    """Where a staged model URL lands in the pod.
+
+    One definition, used by the download step AND by the server args — computing
+    it twice is how you get a pod that downloads to one path and serves another.
+    A tar becomes a DIRECTORY of that name without the suffix.
+    """
+    name = str(url or "").rstrip("/").split("/")[-1] or "model"
+    if getattr(mcfg, "model_url_is_tar", False):
+        for suffix in (".tar.gz", ".tgz", ".tar"):
+            if name.endswith(suffix):
+                name = name[: -len(suffix)]
+                break
+    return f"{STAGE_DIR}/{name}"
+
+
+def staged_downloads(mcfg: "RunpodModelConfig", entry: dict, engine: str) -> list:
+    """What this pod must fetch before its server can start.
+
+    The model itself when it is a URL (a vLLM/llama.cpp server cannot download
+    one), plus any adapter that has a URL rather than a repo id.
+    """
+    out = []
+    kind, value = resolve_model_source(entry or {}, mcfg)
+    if kind == "url" and value and engine == "vllm":
+        # llama.cpp downloads a model URL itself with -mu; vLLM cannot.
+        out.append({"url": value, "dest": staged_model_dest(mcfg, value),
+                    "tar": bool(mcfg.model_url_is_tar)})
+    for spec in _adapter_urls(entry or {}):
+        out.append(spec)
+    return out
+
+
+def _adapter_urls(entry: dict) -> list:
+    """Adapters given as a URL — staged so a vLLM pod can load them by path."""
+    out = []
+    try:
+        from codai.models.text_loras import configured_specs
+        specs = configured_specs(entry or {})
+    except Exception:
+        return out
+    for spec in specs:
+        src = str(spec.get("source") or "")
+        if not src.startswith(("http://", "https://")):
+            continue
+        name = src.rstrip("/").split("/")[-1] or spec.get("name") or "adapter"
+        out.append({"url": src, "dest": f"{STAGE_DIR}/loras/{name}",
+                    "tar": name.endswith((".tar", ".tar.gz", ".tgz")),
+                    "lora_name": spec.get("name"), "weight": spec.get("weight", 1.0)})
+    return out
 
 
 def _pod_lora_args(entry: dict) -> list:
@@ -930,7 +1094,8 @@ class RunpodPodPool:
                     volume_gb=self.mcfg.volume_gb, env=env, docker_args=args,
                     is_spot=sel["is_spot"], bid_per_gpu=sel["bid"], data_center_id=dc,
                     registry_auth_id=(self.mcfg.registry_auth_id
-                                      or getattr(self.account, "registry_auth_id", "") or ""))
+                                      or getattr(self.account, "registry_auth_id", "") or ""),
+                    entrypoint=plan.get("entrypoint"), start_cmd=plan.get("start_cmd"))
                 return pod_id, sel, i + 1
             except RunpodError as exc:
                 msg = str(exc).lower()

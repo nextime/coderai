@@ -183,8 +183,26 @@ class RunpodClient:
                    volume_mount_path: str = "/workspace", env: Optional[dict] = None,
                    docker_args: str = "", is_spot: bool = False,
                    bid_per_gpu: float = 0.0, data_center_id: str = "",
-                   registry_auth_id: str = "") -> str:
-        """Provision a pod (on-demand or interruptible/spot). Returns the pod id."""
+                   registry_auth_id: str = "",
+                   entrypoint: Optional[list] = None,
+                   start_cmd: Optional[list] = None) -> str:
+        """Provision a pod (on-demand or interruptible/spot). Returns the pod id.
+
+        ``entrypoint``/``start_cmd`` override the image's ENTRYPOINT/CMD, which is
+        what lets a pod fetch something before its server starts — an image whose
+        ENTRYPOINT is the server itself (vllm/vllm-openai) otherwise treats every
+        argument as the server's own. Only the REST API accepts those, so the
+        request goes there when they are given and stays on GraphQL otherwise.
+        """
+        if entrypoint or start_cmd:
+            return self._create_pod_rest(
+                name=name, image=image, gpu_type_id=gpu_type_id, port=port,
+                cloud_type=cloud_type, gpu_count=gpu_count,
+                container_disk_gb=container_disk_gb, volume_gb=volume_gb,
+                volume_mount_path=volume_mount_path, env=env,
+                is_spot=is_spot, bid_per_gpu=bid_per_gpu,
+                data_center_id=data_center_id, registry_auth_id=registry_auth_id,
+                entrypoint=entrypoint, start_cmd=start_cmd)
         env_list = [{"key": str(k), "value": str(v)} for k, v in (env or {}).items()]
         ports = f"{int(port)}/http"
         common = {
@@ -223,6 +241,50 @@ class RunpodClient:
         pod_id = node.get("id")
         if not pod_id:
             raise RunpodError(f"RunPod did not return a pod id for {name!r} (capacity? {data}).")
+        return pod_id
+
+    def _create_pod_rest(self, *, name, image, gpu_type_id, port, cloud_type,
+                         gpu_count, container_disk_gb, volume_gb, volume_mount_path,
+                         env, is_spot, bid_per_gpu, data_center_id,
+                         registry_auth_id, entrypoint, start_cmd) -> str:
+        """Create a pod through the REST API, which accepts entrypoint overrides."""
+        import requests
+        rest = (getattr(self._cfg, "rest_base", "") or "https://rest.runpod.io/v1").rstrip("/")
+        body = {
+            "name": name,
+            "imageName": image,
+            "gpuTypeIds": [gpu_type_id],
+            "gpuCount": int(gpu_count),
+            "cloudType": (cloud_type or "SECURE").upper(),
+            "containerDiskInGb": int(container_disk_gb),
+            "volumeInGb": int(volume_gb),
+            "volumeMountPath": volume_mount_path,
+            "ports": [f"{int(port)}/http"],
+            "env": {str(k): str(v) for k, v in (env or {}).items()},
+        }
+        if entrypoint:
+            body["dockerEntrypoint"] = list(entrypoint)
+        if start_cmd:
+            body["dockerStartCmd"] = list(start_cmd)
+        if data_center_id:
+            body["dataCenterIds"] = [data_center_id]
+        if registry_auth_id:
+            body["containerRegistryAuthId"] = registry_auth_id
+        if is_spot:
+            body["interruptible"] = True
+            body["bidPerGpu"] = float(bid_per_gpu)
+        r = requests.post(f"{rest}/pods", json=body,
+                          headers={"Authorization": f"Bearer {self._api_key}",
+                                   "Content-Type": "application/json"},
+                          timeout=90)
+        if r.status_code >= 400:
+            raise RunpodError(f"RunPod REST create failed ({r.status_code}): "
+                              f"{(r.text or '')[:400]}")
+        data = r.json() if r.content else {}
+        pod_id = (data.get("id") or (data.get("pod") or {}).get("id")
+                  or (data.get("data") or {}).get("id"))
+        if not pod_id:
+            raise RunpodError(f"RunPod REST create returned no pod id: {str(data)[:300]}")
         return pod_id
 
     def get_pod(self, pod_id: str) -> dict:
