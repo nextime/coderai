@@ -14,9 +14,16 @@
 # actually uses listed here. --no-deps is reckless in a shared venv and routine
 # in an isolated one — nothing here can reach the server's stack.
 --extra-index-url https://download.pytorch.org/whl/cu121
-torch==2.2.2
-torchaudio==2.2.2
-torchvision==0.17.2
+# torch 2.5.1, not the 2.1.0 audiocraft asks for and not the 2.2.2 tried before.
+# The binding constraint is xformers, which audiocraft imports at module load:
+# its cp312 wheels start at 0.0.27, and every version below that can only build
+# from source — which needs torch installed already and fails in a fresh venv
+# with "No module named 'torch'". xformers 0.0.28.post3 requires torch==2.5.1
+# exactly, so the pair is chosen by what actually has wheels for this Python,
+# not by what the libraries would prefer.
+torch==2.5.1
+torchaudio==2.5.1
+torchvision==0.20.1
 
 # audiocraft's real runtime dependencies. Its dev-only ones (pytest, flake8,
 # mypy, coverage, pdoc3) and gradio are deliberately absent: a pod serves an
@@ -25,9 +32,9 @@ torchvision==0.17.2
 #
 # xformers IS needed: audiocraft imports it at module load, so leaving it out
 # turned the build's import check into a ModuleNotFoundError — which is exactly
-# what that check is for. Its pin (<0.0.23) pairs with the torch it cannot have
-# here; 0.0.25.post1 is the build that matches torch 2.2.2.
-xformers==0.0.25.post1
+# what that check is for. Pinned to the version whose wheel matches the torch
+# above; see the note there for why that torch and not audiocraft's.
+xformers==0.0.28.post3
 av>=11.0.0
 einops
 flashy>=0.0.1
