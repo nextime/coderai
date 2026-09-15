@@ -339,6 +339,9 @@ async def test_model(req: ModelTestRequest, request: Request,
     # a failure means reading engine logs to find the pod URL and asking it by
     # hand — which is how the last three failures were diagnosed.
     out["pods"] = _pod_diagnostics()
+    warn = _weight_warning(req.model, entry)
+    if warn:
+        out["warning"] = warn
     if out["ok"]:
         out["sample"] = _sample(raw, capability)
         empty = _empty_result(raw, capability)
@@ -466,6 +469,24 @@ def _no_remote_reason(model: str, entry: dict, capability: str) -> str:
     return (f"nothing configures {model!r} to run remotely — set a service_url, or "
             "backend 'runpod' with a runpod block on the model, or a remote for "
             f"its {capability} capability")
+
+
+def _weight_warning(model: str, entry: dict) -> str:
+    """The 'this downloads 150 GB every cold boot' warning, if it applies.
+
+    Said here as well as at provision time: by the time a pod is booting the
+    money is already being spent, and a test run is where someone looks BEFORE
+    committing to a configuration.
+    """
+    try:
+        from codai.api.runpod_worker import (weight_transfer_warning,
+                                             parse_model_runpod)
+        block = (entry or {}).get("runpod")
+        if not isinstance(block, dict):
+            return ""
+        return weight_transfer_warning(entry, parse_model_runpod(block))
+    except Exception:
+        return ""
 
 
 def _pod_diagnostics() -> list:

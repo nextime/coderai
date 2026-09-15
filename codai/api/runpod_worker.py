@@ -487,6 +487,40 @@ def _add_staging(plan: dict, mcfg: "RunpodModelConfig", entry: dict, engine: str
     print(f"[runpod] pod will download before serving: {names}", flush=True)
 
 
+#: Engines that serve frontier-size mixture-of-experts models. Their weights are
+#: not "large" in the way a diffusion model is large — DeepSeek-V4 is ~154 GB and
+#: they go well past that — so a pod that downloads them pays an hour or two of
+#: rental before it answers anything, every cold start.
+_HUGE_WEIGHT_ENGINES = ("colibri", "ds4", "k3", "ktransformers")
+
+
+def weight_transfer_warning(entry: dict, mcfg: "RunpodModelConfig",
+                            account=None) -> str:
+    """A warning to show prominently, or '' when there is nothing to warn about.
+
+    The cost of these models is the DOWNLOAD, not the GPU: the machinery around
+    it (price ranking, idle reaping, spend caps) is tuned for images of ~10 GB
+    and models of a few. Renting a card and then spending ninety minutes filling
+    its disk is a different shape of expensive, and it should never be a
+    surprise — so it is said at configuration time, at provision time, and in
+    the test run.
+    """
+    engine = str(getattr(mcfg, "engine", "") or "").strip().lower()
+    backend = str((entry or {}).get("backend") or "").strip().lower()
+    if engine not in _HUGE_WEIGHT_ENGINES and backend not in _HUGE_WEIGHT_ENGINES:
+        return ""
+    vol, _mount = volume_for(mcfg, account)
+    if vol:
+        return ""
+    name = str((entry or {}).get("path") or "this model")
+    return (f"{name} runs on a {engine or backend} engine, whose models are "
+            f"100 GB and up — DeepSeek-V4 alone is ~154 GB. With no network "
+            f"volume configured, EVERY cold pod downloads all of it before it "
+            f"can answer, which is typically one to two hours of rental per "
+            f"boot. Attach a network volume (network_volume_id) so the weights "
+            f"are fetched once and every later pod attaches to them instead.")
+
+
 def volume_for(mcfg: "RunpodModelConfig", account) -> tuple:
     """(volume_id, mount_path) for this pool, or ('', '')."""
     vol = (getattr(mcfg, "network_volume_id", "") or "").strip() \
@@ -1499,6 +1533,13 @@ class RunpodPodPool:
             # …and from every SIBLING engine's reaper, which cannot see the set
             # above: each engine has its own pools and its own reaper.
             register_pod(pod_id, str(self.model_key), api_key=self.api_key)  # url once ready
+            _warn = weight_transfer_warning(entry, self.mcfg, self.account)
+            if _warn:
+                print("[runpod] " + "!" * 68, flush=True)
+                for _line in _warn.split(". "):
+                    if _line.strip():
+                        print(f"[runpod] !! {_line.strip().rstrip('.')}.", flush=True)
+                print("[runpod] " + "!" * 68, flush=True)
             print(f"[runpod] pod {pod_id} created for {self.model_key!r} "
                   f"({sel['display_name']} {sel['cloud_type']}) — booting; logs: {console}",
                   flush=True)

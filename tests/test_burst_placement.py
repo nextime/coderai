@@ -678,3 +678,25 @@ def test_a_pod_is_told_where_its_baked_venvs_are():
     env = pod_plan(mcfg, "ocr", entry={"path": "surya",
                                        "model_type": "ocr_models"})["env"]
     assert env["CODERAI_OCR_SURYA_VENV"] == "/usr/local"
+
+
+def test_a_150gb_model_warns_before_anyone_rents_a_card():
+    """The machinery around pods is tuned for ~10 GB images and models of a
+    few. A frontier MoE model is 100 GB and up — DeepSeek-V4 alone is ~154 GB —
+    so a pod spends an hour or two filling its disk before it answers anything,
+    on every cold start. That must never be a surprise."""
+    from codai.api.runpod_worker import weight_transfer_warning, parse_model_runpod
+
+    for engine in ("colibri", "ds4", "k3", "ktransformers"):
+        warn = weight_transfer_warning({"path": "big/model"},
+                                       parse_model_runpod({"engine": engine}))
+        assert "network volume" in warn and "cold pod" in warn, engine
+
+    # A volume is the fix, so the warning goes away when one is attached.
+    assert weight_transfer_warning(
+        {"path": "big/model"},
+        parse_model_runpod({"engine": "ds4", "network_volume_id": "vol-1"})) == ""
+
+    # And an ordinary capability model says nothing at all.
+    assert weight_transfer_warning(
+        {"path": "bge-m3"}, parse_model_runpod({"engine": "coderai"})) == ""
