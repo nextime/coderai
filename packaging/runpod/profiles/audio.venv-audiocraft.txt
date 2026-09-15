@@ -22,6 +22,12 @@ torchvision==0.17.2
 # mypy, coverage, pdoc3) and gradio are deliberately absent: a pod serves an
 # API, it does not run the library's test suite or its demo UI. torchtext is
 # absent too — it is abandoned, unbuildable here, and unused at inference.
+#
+# xformers IS needed: audiocraft imports it at module load, so leaving it out
+# turned the build's import check into a ModuleNotFoundError — which is exactly
+# what that check is for. Its pin (<0.0.23) pairs with the torch it cannot have
+# here; 0.0.25.post1 is the build that matches torch 2.2.2.
+xformers==0.0.25.post1
 av>=11.0.0
 einops
 flashy>=0.0.1
