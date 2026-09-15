@@ -653,6 +653,52 @@ Expect a cold RunPod pod to take several minutes the first time — image pull p
 weight download — which is exactly what the test is there to surface before a
 user hits it.
 
+Two kinds are no longer reachability-only. `stt` and `ocr` inputs *can* be
+synthesised honestly — espeak speaks a known sentence, PIL draws known words —
+and the result is checked **against what went in**, so a model returning fluent
+nonsense fails just as an empty one does. When the synthesis itself cannot run
+(no espeak, no fonts) the probe falls back to the reachability check and says so,
+rather than blaming the model for a gap on this side.
+
+### Testing one model without moving the rest
+
+`remotes.endpoints["images"] = "runpod"` is a **production routing switch**: it
+moves every request of that kind. Using it to test a single model is how an
+embeddings remote, left enabled after a test, quietly sent real traffic to a
+rented pod while the local GPU sat idle — noticed only because the card was
+quiet.
+
+Use the per-model path instead. `tools/runpod_model_test.py` writes a `runpod`
+block on the **single model entry** and restores `models.json` afterwards,
+including on Ctrl-C:
+
+```bash
+python3 tools/runpod_model_test.py bge-m3
+python3 tools/runpod_model_test.py --engine vllm Qwen/Qwen2.5-0.5B-Instruct
+# pin the exact build under test; production keeps following :latest
+python3 tools/runpod_model_test.py --image ghcr.io/nextime/coderai-stt:0.2.12 wav2vec2-en
+```
+
+Its siblings of the same capability do not move — per-model placement beats the
+capability map, which is the same mechanism that lets one video model run local
+while another runs on a pod.
+
+**Writing the config is not enough to test it.** The front pushes a reload and
+an engine takes it only when idle, so a harness that writes and immediately runs
+is testing the *previous* configuration. That produced a whole pass of false
+"nothing configures this to run remotely" failures, and could equally have
+reported a remote pass for a request served locally. `GET /v1/models/test/state`
+answers for the process that actually serves the request:
+
+```json
+{"pid": 41, "remotes_enabled": true, "capability_endpoints": [],
+ "model": "bge-m3", "known": true, "capability": "embeddings",
+ "placement": "pod", "backend": "runpod", "has_runpod_block": true}
+```
+
+The harness polls it until the placement it wrote is visible, and refuses to
+test if it never becomes visible.
+
 ## Deployment shapes this enables
 
 * **One small coderai, many remote GPUs** — the local instance holds the API,

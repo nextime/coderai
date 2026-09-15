@@ -290,9 +290,34 @@ streaming-concurrency trigger and `on_local_error` are not wired yet.
   spend broken down by model. Polls every 10s.
 - **Tasks page** — a RunPod engine box alongside the local engines, showing RunPod
   work in the same place as everything else. Appears only when RunPod is enabled.
-- **Pod logs** — the stats page's "view" action fetches the pod's container/vLLM
-  log. RunPod's log API is inconsistent, so CoderAI tries several routes and falls
-  back to the console deep-link, which is always reliable.
+- **There is no RunPod pod-log API.** This was checked against their published
+  OpenAPI spec (`rest.runpod.io/v1/openapi.json`): 23 routes, covering pods,
+  billing, endpoints and volumes, and not one of them serves logs. GraphQL
+  refuses introspection and its documented `Pod` type exposes no log field
+  either. The web console is a human surface, not an API. Code that "tried
+  several routes" was guessing at URLs that never existed, which is why it
+  always ended in `HTTP 400`.
+- **A coderai pod reports on itself instead.** `packaging/runpod/boot.sh` is the
+  entrypoint and prints timestamped phases from the first instant the container
+  exists:
+
+  ```
+  [boot +0s] container started
+  [boot +0s] profile=embeddings image=…
+  [boot +0s] seed models: [{"path":"BAAI/bge-m3",…}]   ← or NONE
+  [boot +1s] gpu: NVIDIA RTX 2000 Ada, 16376 MiB
+  [boot +1s] starting uvicorn on 0.0.0.0:8000
+  ```
+
+  The same record — plus the application's own phases — is served at **`GET
+  /boot`**, readable the instant the port opens and long before the pod is
+  useful. A failed boot asks the pod for it before falling back to a console
+  link. That seed line alone identifies the most common pod failure ("Model 'x'
+  is not available. Use one of: " with nothing after the colon) in one look.
+- **The pull window is diagnosed from outside**, because no code of ours is
+  running during it: `wait_ready` reports status and uptime every 60 seconds
+  (`still no port after 180s (status=RUNNING uptime=42s) — image pull in
+  progress`) rather than going silent for minutes.
 - Every created pod logs its **pod id and console URL immediately**, before the
   boot wait — so a pod is traceable even if the boot then fails.
 
@@ -331,6 +356,20 @@ These come from live testing on a real account, not from the docs:
 - **Cold start is expensive in wall-clock, not money.** A successful cold pods
   request in testing took ~9.5 minutes end to end (through two unavailable GPUs
   and one failed boot) and cost about half a cent.
+- **The port appears only after the image is pulled**, so the boot budget has to
+  cover the download. This was originally 300s on the assumption the container
+  was already there, and it broke exactly as you would expect: the same 7.3 GB
+  capability image opened its port in **133s** on a machine that had the layers
+  cached, and failed repeatedly at 300s on cold ones — each failure renting a
+  *fresh* machine that pulled the whole image again, three times over. The
+  default is now **900s** (`boot_timeout_s` per model). Being wrong by fifteen
+  minutes on a $0.25/hr card costs six cents; being wrong by too little cost
+  three pods and still failed.
+- **A machine may serve a cached `:latest`.** An images pod reported a
+  dependency missing that had already been published under that tag. Pin an
+  immutable version tag when a result has to mean something — the test harness
+  takes `--image ghcr.io/nextime/coderai-<capability>:<version>` for this, while
+  production keeps following `:latest`.
 - **Set `idle_timeout_s` deliberately.** Too short and you re-pay the cold start;
   too long and you rent an idle GPU. For interactive use, a few minutes is sane;
   for batch work, `min_pods: 1` for the duration of the batch is cheaper than

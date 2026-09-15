@@ -84,8 +84,16 @@ Plus:
 - **Spillover**: a *local* model can burst to RunPod only when the local GPU is full or absent
 - **No local model required**: an instance with no GPU and no local weights can run purely as
   a RunPod orchestrator
+- **Test run, per model**: `POST /v1/models/test` (or the Test run button) sends the smallest
+  real request for the model's kind *through the front*, so it exercises the same routing,
+  auth and pod provisioning a user would. `tools/runpod_model_test.py` places **one** model on
+  a pod without moving the rest of its capability
+- **A pod that says what it is doing**: each pod logs timestamped boot phases from the first
+  instant the container exists and serves the record at `/boot` — RunPod publishes no pod-log
+  API, so the pod reports on itself
 
-Full guide: [`docs/runpod.md`](docs/runpod.md).
+Full guide: [`docs/runpod.md`](docs/runpod.md) ·
+remote placement of every other model type: [`docs/remote-execution.md`](docs/remote-execution.md).
 
 ### Image Generation
 - **Text-to-Image**: Stable Diffusion, SDXL, Flux, and GGUF image models (via stable-diffusion.cpp)
@@ -494,6 +502,7 @@ The [`docs/`](docs/) directory carries the deep dives — one per engine and sub
 |---|---|
 | [`frontend-engine-split.md`](docs/frontend-engine-split.md) | Front proxy, engine subprocesses, routing |
 | [`runpod.md`](docs/runpod.md) | Renting remote GPUs: pods, serverless, budgets, the reaper |
+| [`remote-execution.md`](docs/remote-execution.md) | Running any model type elsewhere: the capability gateway, per-model placement, weights and adapters on a pod, test runs |
 | [`vllm.md`](docs/vllm.md) | vLLM as a first-class engine node |
 | [`deepseek-ds4.md`](docs/deepseek-ds4.md) · [`glm-colibri.md`](docs/glm-colibri.md) · [`kimi-k3.md`](docs/kimi-k3.md) · [`ktransformers.md`](docs/ktransformers.md) | The native MoE engines |
 | [`ocr.md`](docs/ocr.md) | The OCR subsystem and schema store |

@@ -102,7 +102,8 @@ def _find(data: dict, model: str):
     return None, None, None
 
 
-def _pin_to_runpod(model: str, engine: str, vram: float, usd: float) -> bool:
+def _pin_to_runpod(model: str, engine: str, vram: float, usd: float,
+                   image: str = "") -> bool:
     """Give this ONE model a runpod block. True when the catalogue changed."""
     data = _load_models()
     section, index, entry = _find(data, model)
@@ -113,6 +114,13 @@ def _pin_to_runpod(model: str, engine: str, vram: float, usd: float) -> bool:
     entry["backend"] = "runpod"
     entry["runpod"] = {"mode": "pods", "engine": engine, "min_vram_gb": vram,
                        "max_hourly_usd": usd, "max_pods": 1, "idle_timeout_s": 120}
+    if image:
+        # Test against an IMMUTABLE tag. A machine that already pulled `:latest`
+        # may serve its cached copy, so a test against a floating tag cannot say
+        # which build it exercised — an images pod reported a dependency missing
+        # that had already been published under that very tag. Production still
+        # runs `:latest`; this override exists so a result means something.
+        entry["runpod"]["image"] = image
     data[section][index] = entry
     _save_models(data)
     os.utime(MODELS, None)           # the front watches this mtime to push a reload
@@ -167,6 +175,12 @@ def main() -> int:
     ap.add_argument("--usd", type=float, default=1.0, help="max $/hr per pod")
     ap.add_argument("--keep-pods", action="store_true",
                     help="do not terminate pods after each test")
+    ap.add_argument("--image", default="",
+                    help="exact pod image to run, e.g. "
+                         "ghcr.io/nextime/coderai-embeddings:0.2.12. Use a "
+                         "VERSIONED tag when testing: a machine may serve a "
+                         "cached ':latest' and the result would not say which "
+                         "build it exercised.")
     args = ap.parse_args()
 
     backup = MODELS + ".testrun-backup"
@@ -188,7 +202,8 @@ def main() -> int:
     try:
         for model in args.models:
             print(f"================ {model} ================", flush=True)
-            if not _pin_to_runpod(model, args.engine, args.vram, args.usd):
+            if not _pin_to_runpod(model, args.engine, args.vram, args.usd,
+                                  args.image):
                 results.append((model, {"error": "not in models.json"}))
                 continue
             problem = _wait_for_engine(model)
