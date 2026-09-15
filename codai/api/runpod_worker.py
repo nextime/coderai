@@ -1533,7 +1533,8 @@ class RunpodPodPool:
             # …and from every SIBLING engine's reaper, which cannot see the set
             # above: each engine has its own pools and its own reaper.
             register_pod(pod_id, str(self.model_key), api_key=self.api_key)  # url once ready
-            _warn = weight_transfer_warning(entry, self.mcfg, self.account)
+            _warn = weight_transfer_warning(_model_entry(self.served or self.model_key),
+                                            self.mcfg, self.account)
             if _warn:
                 print("[runpod] " + "!" * 68, flush=True)
                 for _line in _warn.split(". "):

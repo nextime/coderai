@@ -700,3 +700,21 @@ def test_a_150gb_model_warns_before_anyone_rents_a_card():
     # And an ordinary capability model says nothing at all.
     assert weight_transfer_warning(
         {"path": "bge-m3"}, parse_model_runpod({"engine": "coderai"})) == ""
+
+
+def test_the_provision_path_itself_is_free_of_undefined_names():
+    """The 150 GB warning was unit-tested and passed — and then every pod test
+    failed in two seconds with NameError: name 'entry' is not defined, because
+    the call site in _provision_one used a name that did not exist there. A
+    helper can be correct while the line that calls it is not. pyflakes sees
+    exactly this class of bug, so run it on the modules a pod boot goes through."""
+    import subprocess, sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    mods = ["codai/api/runpod_worker.py", "codai/api/remote_gateway.py",
+            "codai/api/model_test.py", "codai/api/runpod_client.py"]
+    out = subprocess.run([sys.executable, "-m", "pyflakes", *mods],
+                         cwd=root, capture_output=True, text=True).stdout
+    undefined = [l for l in out.splitlines() if "undefined name" in l]
+    assert not undefined, "\n".join(undefined)
