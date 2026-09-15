@@ -160,10 +160,39 @@ class _TransformersMusicGen:
             return self._model.generate(**inputs, **gen)   # (batch, channels, samples)
 
 
-def _load_musicgen(model_name: str, device: str):
+def _audio_backend(model_config: dict = None) -> str:
+    """Which MusicGen implementation to use: 'audiocraft', 'transformers', 'auto'.
+
+    Per model first, then the environment (which is how a pod is told), then
+    'auto' — audiocraft when it is importable, transformers otherwise.
+
+    The choice is worth exposing because the two are not equivalent: audiocraft
+    has melody conditioning and AudioGen, transformers has neither but needs
+    nothing beyond what every image already carries.
+    """
+    import os as _os
+    chosen = str((model_config or {}).get("audio_backend") or "").strip().lower()
+    if not chosen:
+        chosen = str(_os.environ.get("CODERAI_AUDIO_BACKEND", "")).strip().lower()
+    return chosen if chosen in ("audiocraft", "transformers") else "auto"
+
+
+def _load_musicgen(model_name: str, device: str, model_config: dict = None):
+    backend = _audio_backend(model_config)
+    if backend == "transformers":
+        print(f"[audio] {model_name}: transformers backend requested "
+              "(no melody conditioning)", flush=True)
+        return _TransformersMusicGen(model_name, device)
     try:
         from audiocraft.models import MusicGen, AudioGen
     except ImportError:
+        if backend == "audiocraft":
+            # Asked for explicitly and not here: say so rather than quietly
+            # serving something with different capabilities.
+            raise RuntimeError(
+                "audio_backend is set to 'audiocraft' but audiocraft is not "
+                "installed. Install it, or set audio_backend to 'transformers' "
+                "(which cannot do melody conditioning).")
         # Next best: audiocraft in its own venv. It pins torch==2.1.0, which has
         # no build for the CUDA this server runs, so it cannot share this venv —
         # but it can live next door and be driven as a subprocess, which is what
@@ -339,7 +368,7 @@ async def audio_generate(request: AudioGenerationRequest, http_request: Request 
             with loading_task(model_name, model_type="audio"):
                 if model_type in ('musicgen', 'audiogen'):
                     pipe = await asyncio.get_event_loop().run_in_executor(
-                        None, _load_musicgen, model_name, device)
+                        None, _load_musicgen, model_name, device, _ag_cfg)
                 else:
                     pipe = await asyncio.get_event_loop().run_in_executor(
                         None, _load_audioldm, model_name, device, _ag_cfg)

@@ -599,6 +599,13 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
     # disabled (enable it in Settings → OCR)" — a settings screen nobody will
     # open on a machine that exists for the next four minutes.
     cap = capability or model_capability(entry or {}, include_text=True)
+    if cap == "audio_gen":
+        # audiocraft and transformers are not equivalent — melody conditioning
+        # and AudioGen exist only in the first — so the choice travels to the pod
+        # rather than being decided by whatever happens to be installed there.
+        choice = str((entry or {}).get("audio_backend") or "").strip().lower()
+        if choice in ("audiocraft", "transformers"):
+            env["CODERAI_AUDIO_BACKEND"] = choice
     if cap == "ocr":
         env["CODERAI_OCR_ENABLED"] = "1"
         wanted = str((entry or {}).get("path") or "").strip().lower()
@@ -672,7 +679,10 @@ def seed_model_env(entry: dict, served: str = "", source: str = "") -> str:
             # LoRA settings travel too: a coderai pod applies them itself, and
             # load_in_4bit above is what makes a QLoRA adapter load against the
             # base it was trained on.
-            "lora_path", "lora_model_dir", "lora_scale", "loras")
+            "lora_path", "lora_model_dir", "lora_scale", "loras",
+            # Which MusicGen implementation to use. Describes the model, not
+            # this deployment's placement, so it travels.
+            "audio_backend")
     out = {k: entry[k] for k in keep if k in entry and entry[k] is not None}
     out["path"] = path
     # Adapters the pod cannot resolve by name are named by CONTENT id instead.

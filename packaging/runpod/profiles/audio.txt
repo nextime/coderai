@@ -6,3 +6,37 @@ demucs>=4.0.1
 deepfilternet>=0.5.6
 soundfile>=0.12.0
 scipy>=1.11.0
+
+# audiocraft (MusicGen/AudioGen), in THIS venv rather than one of its own.
+#
+# It declares torch==2.1.0, torchvision==0.16.0 and torchtext==0.16.0, which is
+# what sent this down the isolated-venv road: those are unsatisfiable here and
+# installing them would have destroyed the CUDA build pin. But audiocraft is
+# pure Python — the pins are declared, not ABI — so --no-deps sidesteps them.
+#
+# The one real constraint is xformers, which audiocraft imports at module load.
+# 0.0.35 ships a py39-none wheel (works on any Python 3.9+) and requires
+# torch>=2.10, which this image satisfies. Verified in the built core image:
+# torch 2.11.0+cu128 with xformers 0.0.35, MusicGen and AudioGen both import,
+# and ops.memory_efficient_attention is present.
+#
+# Cost here: ~950 MB. The isolated venv cost 6.2 GB, because it carried a second
+# torch and a second CUDA stack to avoid a conflict that was never real.
+xformers>=0.0.35
+
+# audiocraft's own dependencies, since it is installed --no-deps (audio.nodeps).
+av>=11.0.0
+einops
+flashy>=0.0.1
+hydra-core>=1.1
+hydra_colorlog
+julius
+num2words
+sentencepiece
+spacy>=3.6.1
+huggingface_hub
+tqdm
+librosa
+torchmetrics
+encodec
+protobuf

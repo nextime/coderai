@@ -1677,3 +1677,56 @@ def test_musicgen_falls_back_in_order(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", _no_audiocraft)
     got = ag._load_musicgen("facebook/musicgen-small", "cpu")
     assert got == "VENV" and calls == [("venv", "facebook/musicgen-small")]
+
+
+def test_audio_backend_is_selectable_and_travels_to_a_pod(monkeypatch):
+    """audiocraft and transformers are not equivalent — melody conditioning and
+    AudioGen exist only in the first — so the choice must be the operator's, and
+    must not be decided by whatever happens to be installed on a pod."""
+    from codai.api.audio_gen import _audio_backend
+    from codai.api.runpod_worker import pod_plan, parse_model_runpod
+
+    assert _audio_backend(None) == "auto"
+    assert _audio_backend({"audio_backend": "transformers"}) == "transformers"
+    assert _audio_backend({"audio_backend": "nonsense"}) == "auto"
+
+    monkeypatch.setenv("CODERAI_AUDIO_BACKEND", "audiocraft")
+    assert _audio_backend(None) == "audiocraft"
+    # a model's own setting beats the environment it lands in
+    assert _audio_backend({"audio_backend": "transformers"}) == "transformers"
+
+    mcfg = parse_model_runpod({"engine": "coderai", "image": "x:1"})
+    entry = {"path": "facebook/musicgen-small", "model_type": "audio_gen_models",
+             "audio_backend": "transformers"}
+    assert pod_plan(mcfg, "audio_gen", entry=entry)["env"]["CODERAI_AUDIO_BACKEND"] \
+        == "transformers"
+
+    # unset means the pod decides for itself, rather than being told wrongly
+    entry.pop("audio_backend")
+    assert "CODERAI_AUDIO_BACKEND" not in pod_plan(mcfg, "audio_gen", entry=entry)["env"]
+
+
+def test_asking_for_audiocraft_when_absent_is_an_error_not_a_substitution():
+    """Silently serving transformers when audiocraft was asked for would hand
+    back something that cannot do what the caller requested."""
+    import builtins
+    import codai.api.audio_gen as ag
+
+    real = builtins.__import__
+
+    def _no_audiocraft(name, *a, **k):
+        if name.startswith("audiocraft"):
+            raise ImportError("not installed")
+        return real(name, *a, **k)
+
+    builtins.__import__ = _no_audiocraft
+    try:
+        try:
+            ag._load_musicgen("facebook/musicgen-small", "cpu",
+                              {"audio_backend": "audiocraft"})
+        except RuntimeError as exc:
+            assert "audiocraft is not installed" in str(exc)
+        else:
+            raise AssertionError("expected a RuntimeError")
+    finally:
+        builtins.__import__ = real

@@ -45,6 +45,12 @@ RUN --mount=type=cache,target=/root/.cache/pip set -eux; \
     fi; \
     python -m pip install --extra-index-url ${TORCH_INDEX} -r /tmp/profiles/${PROFILE}.txt; \
     python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"; \
+    if [ -f "/tmp/profiles/${PROFILE}.nodeps" ]; then \
+        python -m pip install --no-deps -r "/tmp/profiles/${PROFILE}.nodeps"; \
+        for pkg in $(grep -vE '^\s*(#|$)' "/tmp/profiles/${PROFILE}.nodeps" | sed 's/[<>=!].*//'); do \
+            python -c "import ${pkg}; print('${pkg}', getattr(${pkg}, '__version__', 'ok'), '(installed --no-deps)')"; \
+        done; \
+    fi; \
     if [ -n "$deps" ]; then \
         apt-get purge -y $deps && apt-get autoremove -y; \
     fi; \

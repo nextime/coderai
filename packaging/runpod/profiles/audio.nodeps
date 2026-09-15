@@ -1,0 +1,5 @@
+# --no-deps: audiocraft's declared torch pins are unsatisfiable on this Python
+# and would undo the CUDA build pin if they were not. Everything it actually
+# imports is in audio.txt beside this file, and the build's import check fails
+# the image if something is missing.
+audiocraft==1.3.0

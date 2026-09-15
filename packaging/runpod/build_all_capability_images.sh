@@ -12,7 +12,10 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 NS="${1:-}"
 VERSION="${VERSION:-$(python3 -c 'import re,pathlib; print(re.search(r"__version__ = \"([^\"]+)\"", pathlib.Path("codai/__init__.py").read_text()).group(1))')}"
-PROFILES="${PROFILES:-$(ls packaging/runpod/profiles/*.txt | xargs -n1 basename | sed 's/\.txt$//' | grep -v '^core$' | tr '\n' ' ')}"
+# A profile's extra-venv specs live beside it as <profile>.venv-<name>.txt, so
+# a bare *.txt glob would invent a profile called "audio.venv-audiocraft" and
+# try to build an image for it.
+PROFILES="${PROFILES:-$(ls packaging/runpod/profiles/*.txt | xargs -n1 basename | sed 's/\.txt$//' | grep -v '^core$' | grep -v '\.venv-' | tr '\n' ' ')}"
 
 if [[ -z "$NS" ]]; then
     echo "usage: $0 <registry/namespace>   e.g. ghcr.io/nextime" >&2
