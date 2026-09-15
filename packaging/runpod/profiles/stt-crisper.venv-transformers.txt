@@ -1,0 +1,6 @@
+# CrisperWhisper's stack, baked at /opt/coderai/transformers.
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1+cu124
+transformers==4.46.3
+accelerate>=0.33.0
+soundfile>=0.12.0

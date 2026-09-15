@@ -1,0 +1,8 @@
+# /v1/audio/transcriptions with NVIDIA NeMo Canary.
+#
+# nemo_toolkit[asr] brings a large stack and its own torch expectations. It gets
+# an image rather than 6 GB on the stt image that most transcription uses.
+torchaudio
+transformers>=4.35.0
+soundfile>=0.12.0
+scipy>=1.11.0

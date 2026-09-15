@@ -6,3 +6,13 @@ openai-whisper>=20231117
 vosk>=0.3.45
 soundfile>=0.12.0
 scipy>=1.11.0
+
+# Speaker recognition — enrol/identify/verify voiceprints — is the `speaker`
+# capability, which is served by THIS image. It shipped nothing for it: a
+# speaker pod could boot and had no way to embed a voice. speechbrain imports
+# fine on torch 2.11, so it needs no venv of its own.
+#
+# pyannote diarization is the part that genuinely cannot live here: it calls
+# torchaudio.AudioMetaData, removed in torchaudio 2.11. That goes in the
+# separate speaker image.
+speechbrain>=1.0.0

@@ -644,3 +644,37 @@ def test_env_can_enable_a_subsystem_without_writing_config(tmp_path, monkeypatch
     on_disk = json.loads((tmp_path / "config.json").read_text())
     assert on_disk.get("ocr", {}).get("enabled") is not True, \
         "the env override leaked into config.json"
+
+
+def test_a_capability_whose_stack_cannot_share_gets_its_own_image():
+    """`speaker` used to point at the STT image on the assumption it was 'the
+    STT deps plus a bit'. That image shipped nothing for diarization or
+    voiceprints, so a speaker pod booted with no way to embed a voice."""
+    from codai.api.runpod_worker import (default_capability_image,
+                                         PUBLISHED_CAPABILITY_IMAGES)
+
+    assert default_capability_image("speaker").endswith("coderai-speaker:latest")
+    for name in ("speaker", "tts-xtts", "stt-nemo", "stt-crisper", "ocr-paddle"):
+        assert name in PUBLISHED_CAPABILITY_IMAGES, name
+
+    # Capabilities that genuinely DO share a stack still do.
+    assert default_capability_image("rerank").endswith("coderai-embeddings:latest")
+    assert default_capability_image("stems").endswith("coderai-audio:latest")
+
+
+def test_a_pod_is_told_where_its_baked_venvs_are():
+    """Otherwise the worker tries to build one, on a machine rented by the
+    second, installing what the image already contains."""
+    from codai.api.runpod_worker import pod_plan, parse_model_runpod
+
+    mcfg = parse_model_runpod({"engine": "coderai", "image": "x:1"})
+    env = pod_plan(mcfg, "speaker", entry={"path": "pyannote/speaker-diarization-3.1",
+                                           "model_type": "audio_models"})["env"]
+    assert env["CODERAI_PYANNOTE_VENV"] == "/opt/coderai/venvs/pyannote"
+    assert env["CODERAI_NEMO_VENV"] == "/opt/coderai/venvs/nemo"
+
+    # Surya is the opposite case: it fits the main venv, so it is pointed at the
+    # pod's own interpreter rather than a venv that would only duplicate it.
+    env = pod_plan(mcfg, "ocr", entry={"path": "surya",
+                                       "model_type": "ocr_models"})["env"]
+    assert env["CODERAI_OCR_SURYA_VENV"] == "/usr/local"

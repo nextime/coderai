@@ -1,0 +1,8 @@
+# /v1/audio/speech and /v1/audio/clone with coqui XTTS-v2.
+#
+# coqui-tts imports isin_mps_friendly from transformers.pytorch_utils, removed
+# in transformers 5.x. The main images run 5.17, and pinning 4.x there would
+# break every other capability — so XTTS gets an image whose venv can be on 4.x.
+torchaudio
+soundfile>=0.12.0
+scipy>=1.11.0

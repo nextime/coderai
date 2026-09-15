@@ -598,7 +598,10 @@ def test_capability_pods_default_to_the_published_images():
     assert default_capability_image("video") == "ghcr.io/nextime/coderai-video:latest"
     # Capabilities that ride another profile's dependency set.
     assert default_capability_image("rerank").endswith("coderai-embeddings:latest")
-    assert default_capability_image("speaker").endswith("coderai-stt:latest")
+    # `speaker` had its own image once it turned out the STT image shipped
+    # nothing for diarization or voiceprints — see the speaker test in
+    # test_burst_placement.py.
+    assert default_capability_image("speaker").endswith("coderai-speaker:latest")
     assert default_capability_image("stems").endswith("coderai-audio:latest")
     # No published image: say so rather than default to a tag that 404s minutes
     # into a pod boot.

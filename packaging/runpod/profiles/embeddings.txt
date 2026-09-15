@@ -4,3 +4,10 @@ sentence-transformers>=2.7.0
 geoclip>=1.2.0
 geopy>=2.4
 geographiclib>=2.0
+
+# DINOv2-SALAD and the VPR embedders need pytorch_lightning. The local install
+# keeps them in a venv (`/cache/salad-venv`) because of an old conflict; both
+# import cleanly on torch 2.11 now, so a pod carries them directly and place
+# recognition works without one.
+pytorch_lightning>=2.0.0
+pytorch_metric_learning>=2.0.0

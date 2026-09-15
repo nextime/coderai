@@ -1,0 +1,13 @@
+# /v1/audio/diarization, /v1/audio/speaker* — pyannote + voiceprints.
+#
+# A SEPARATE image because pyannote.audio 3.3.2 calls
+# torchaudio.AudioMetaData, which torchaudio 2.11 removed. It is not a
+# conservative pin like audiocraft's was — the attribute is genuinely gone — so
+# it needs an interpreter on an older torch, and that means its own venv (see
+# speaker.venv-pyannote.txt) and its own image rather than 6 GB added to the
+# stt image that most users pull for transcription alone.
+torchaudio
+transformers>=4.35.0
+soundfile>=0.12.0
+scipy>=1.11.0
+speechbrain>=1.0.0

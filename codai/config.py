@@ -1346,6 +1346,13 @@ class ConfigManager:
             for name in ("paddle", "doctr", "surya"):
                 if _flag(f"CODERAI_OCR_{name.upper()}_ENABLED"):
                     setattr(self.config.ocr, f"{name}_enabled", True)
+                # Where that engine's interpreter lives. A pod image that ships
+                # the engine in its OWN venv points this at that interpreter, so
+                # the subprocess engine runs it instead of trying to build a venv
+                # on a machine rented by the second.
+                venv = (_os.environ.get(f"CODERAI_OCR_{name.upper()}_VENV") or "").strip()
+                if venv:
+                    setattr(self.config.ocr, f"{name}_venv", venv)
             if _flag("CODERAI_OCR_SURYA_ACCEPT_LICENSE"):
                 # Surya is GPL and gated on an explicit acceptance. The pod
                 # inherits the decision made here; it cannot make it itself.

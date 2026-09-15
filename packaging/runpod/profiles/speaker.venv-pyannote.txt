@@ -1,0 +1,9 @@
+# pyannote on the torch it actually works with. Baked at /opt/coderai/pyannote,
+# which is where _resolve_venv_dir already looks for an image-provided venv, so
+# no code change and no venv build on a rented machine.
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchaudio==2.6.0+cu124
+pyannote.audio==3.3.2
+huggingface_hub<1.0
+soundfile>=0.12.0

@@ -1,0 +1,7 @@
+# coqui-tts on transformers 4.x, baked at /opt/coderai/TTS.
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1+cu124
+torchaudio==2.5.1+cu124
+transformers==4.46.3
+coqui-tts>=0.24.0
+soundfile>=0.12.0

@@ -1,0 +1,5 @@
+# Paddle in its own venv, baked at /opt/coderai/paddleocr, from Paddle's index.
+--extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu126/
+paddlepaddle-gpu==3.3.1
+paddleocr>=2.7.0
+pypdfium2>=4.20.0

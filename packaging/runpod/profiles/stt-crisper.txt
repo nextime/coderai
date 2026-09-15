@@ -1,0 +1,7 @@
+# /v1/audio/transcriptions with CrisperWhisper (verbatim, disfluency-aware).
+#
+# It pins transformers==4.46.3 AND torch==2.5.1 — a conflict on both axes with
+# the main images, so it cannot share one.
+torchaudio
+soundfile>=0.12.0
+scipy>=1.11.0

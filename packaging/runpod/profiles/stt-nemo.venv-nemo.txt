@@ -1,0 +1,7 @@
+# NeMo in its own venv, baked at /opt/coderai/nemo.
+torch
+torchaudio
+nemo_toolkit[asr]>=2.0.0
+cuda-python
+soundfile>=0.12.0
+librosa>=0.10.0

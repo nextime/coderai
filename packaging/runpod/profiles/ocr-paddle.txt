@@ -1,0 +1,8 @@
+# /v1/ocr with PaddleOCR + PP-Structure (layout, tables, reading order).
+#
+# paddlepaddle-gpu ships its OWN CUDA runtime, not just its own torch — the one
+# stack here that cannot share anything with the main venv.
+transformers>=4.35.0
+pypdfium2>=4.20.0
+python-doctr>=0.8.0
+jsonschema>=4.0.0

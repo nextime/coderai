@@ -180,6 +180,15 @@ CAPABILITY_IMAGE_TAG = os.environ.get("CODERAI_CAPABILITY_IMAGE_TAG", "latest")
 PUBLISHED_CAPABILITY_IMAGES = (
     "images", "video", "embeddings", "ocr", "tts", "stt", "voice", "audio",
     "faceswap",
+    # Stacks that cannot share the main venv get an image of their own, rather
+    # than 6 GB added to one everybody pulls. Each carries a baked venv — see
+    # packaging/runpod/profiles/<name>.venv-*.txt — and each exists because a
+    # real conflict was measured, not assumed:
+    "speaker",       # pyannote: torchaudio.AudioMetaData removed in 2.11
+    "tts-xtts",      # coqui-tts: imports a transformers 4.x symbol
+    "stt-nemo",      # NeMo Canary: large, and its own torch
+    "stt-crisper",   # CrisperWhisper: transformers 4.46 AND torch 2.5
+    "ocr-paddle",    # paddlepaddle-gpu: brings its own CUDA runtime
     # Text: a coderai pod that serves LLMs. Unlike a vLLM/llama.cpp pod it can be
     # SENT a local LoRA adapter, which is the only way a local text adapter runs
     # on RunPod. Build and push it with packaging/runpod before using it.
@@ -189,7 +198,11 @@ PUBLISHED_CAPABILITY_IMAGES = (
 #: Capabilities served by a published image other than their own name.
 _CAPABILITY_IMAGE_ALIASES = {
     "rerank": "embeddings",      # same sentence-transformers stack
-    "speaker": "stt",            # diarization/voiceprints ride the STT deps
+    # `speaker` used to ride the STT image on the assumption it was "the STT
+    # deps plus a bit". It was not: that image shipped nothing for diarization
+    # or voiceprints at all, so a speaker pod booted with no way to embed a
+    # voice. pyannote needs a torch the main venv cannot have, so it has its own
+    # image now.
     "stems": "audio",
     "audio_clean": "audio",
     "audio_gen": "audio",
@@ -606,6 +619,15 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
         choice = str((entry or {}).get("audio_backend") or "").strip().lower()
         if choice in ("audiocraft", "transformers"):
             env["CODERAI_AUDIO_BACKEND"] = choice
+    # Subsystems whose image bakes a venv: tell the worker where it is, or it
+    # tries to build one on a machine rented by the second. Harmless on an image
+    # that has no such venv — the worker falls back to its own search.
+    for _var, _name in (("CODERAI_PYANNOTE_VENV", "pyannote"),
+                        ("CODERAI_NEMO_VENV", "nemo"),
+                        ("CODERAI_CRISPERWHISPER_VENV", "transformers"),
+                        ("CODERAI_XTTS_VENV", "TTS")):
+        env.setdefault(_var, f"/opt/coderai/venvs/{_name}")
+
     if cap == "ocr":
         env["CODERAI_OCR_ENABLED"] = "1"
         wanted = str((entry or {}).get("path") or "").strip().lower()
@@ -616,6 +638,17 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
         # The subsystem flag is not enough: each engine has a gate of its own,
         # and doctr and surya both default to off.
         env[f"CODERAI_OCR_{wanted.upper()}_ENABLED"] = "1"
+        if wanted == "paddle":
+            # The paddle image bakes it, because paddlepaddle brings its own
+            # CUDA runtime. Point the engine at that interpreter rather than
+            # letting it try to build a venv on a rented machine.
+            env["CODERAI_OCR_PADDLE_VENV"] = "/opt/coderai/venvs/paddleocr"
+        if wanted == "surya":
+            # Surya is installed in the pod's main venv — its old pillow<11 cap
+            # no longer applies — so point its subprocess engine at that
+            # interpreter. Building a venv on a pod would cost minutes of rental
+            # to install what is already there.
+            env["CODERAI_OCR_SURYA_VENV"] = "/usr/local"
         if wanted == "surya" or _surya_accepted():
             # Surya is GPL and gated on an explicit acceptance. The pod inherits
             # the decision made HERE — it cannot make it for itself, and asking

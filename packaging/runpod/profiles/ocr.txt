@@ -17,3 +17,13 @@ pypdfium2>=4.20.0
 python-doctr>=0.8.0
 ultralytics>=8.1.0
 jsonschema>=4.0.0
+
+# Surya too, in THIS venv. Its isolated venv exists because Surya used to cap
+# pillow<11 against a main venv on pillow>=12 — no longer true at 0.17.1, which
+# imports beside docTR on torch 2.11 with pillow 10.4 and transformers 5.17.
+# Verified before adding, because that venv decision was inherited rather than
+# re-checked, exactly like audiocraft's torch==2.1.0.
+#
+# SuryaEngine still runs as a subprocess (it is a SubprocessOcrEngine), so the
+# pod points ocr.surya_venv at this interpreter rather than building one.
+surya-ocr==0.17.1
