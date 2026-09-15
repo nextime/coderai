@@ -1179,13 +1179,31 @@ def test_a_test_run_can_force_where_it_runs(test_run):
     assert test_run["headers"][PLACEMENT_HEADER] == "remote"
 
 
-def test_expensive_kinds_report_reachability_and_say_so(test_run):
-    """A video generation is minutes of GPU and real money — don't run one and
-    don't pretend the check proved more than it did."""
-    out = _run_test("my-video")
+def test_kinds_without_honest_input_report_reachability_and_say_so(test_run):
+    """A face swap needs real faces: a drawn one does not survive face
+    detection, and borrowing a real person's photo is not ours to do. Don't run
+    one, and don't pretend the check proved more than it did.
+
+    Video USED to be here on cost grounds. It is probed for real now — the
+    smallest clip a model can make — because "expensive" was an argument for
+    asking for less, not for proving nothing."""
+    import codai.models.manager as mgr
+    entry = {"path": "org/swap", "model_type": "image_models"}
+    saved = mgr._model_entry_for
+    mgr._model_entry_for = lambda n: entry
+    try:
+        import codai.api.model_test as mt
+        saved_describe = mt._describe
+        mt._describe = lambda m: (entry, "faceswap")
+        try:
+            out = _run_test("my-swap")
+        finally:
+            mt._describe = saved_describe
+    finally:
+        mgr._model_entry_for = saved
     assert out["ran"] == "reachability"
-    assert out["where"] == "runpod"
     assert "no generation was run" in out["note"]
+    assert "real images" in out["note"]
 
 
 def test_a_failing_probe_reports_the_real_error(test_run):
@@ -1561,3 +1579,39 @@ def test_the_harness_refuses_to_test_a_config_the_engine_has_not_taken(monkeypat
                                          "has_runpod_block": False})
     problem = mod._wait_for_engine("org/a")
     assert "never picked up the config" in problem
+
+
+def test_voice_audio_and_video_are_probed_for_real(monkeypatch):
+    """Three of these were listed as un-probeable. Only one of the reasons was
+    true: voice cloning needs a reference sample AND its transcript, which is
+    exactly what espeak produces, and audio/video only needed asking for less."""
+    from codai.api.model_test import _probe_for, _REACHABILITY_ONLY, _SPOKEN
+
+    assert "voice" not in _REACHABILITY_ONLY
+    assert "audio_gen" not in _REACHABILITY_ONLY
+    assert "video" not in _REACHABILITY_ONLY
+
+    path, body = _probe_for("voice", "m")
+    assert path == "/v1/audio/clone"
+    assert body["ref_text"] == _SPOKEN and body["ref_audio"], "no reference sample"
+
+    path, body = _probe_for("audio_gen", "m")
+    assert path == "/v1/audio/generate" and body["duration"] == 2.0
+
+    path, body = _probe_for("video", "m")
+    assert path == "/v1/video/generations"
+    assert body["num_frames"] == 9 and body["num_inference_steps"] == 4
+
+    # A face swap genuinely cannot be synthesised, and says why.
+    assert "real images" in _REACHABILITY_ONLY["faceswap"]
+
+
+def test_a_200_carrying_no_media_is_not_a_pass():
+    """There is no ground truth for generated audio or video, so the check is
+    'did anything come back' — but a 200 with an empty body must still fail."""
+    from codai.api.model_test import _empty_result
+
+    assert _empty_result(json.dumps({"b64_wav": "QUJD"}).encode(), "voice") == ""
+    assert _empty_result(json.dumps({"url": "/v1/files/x.mp4"}).encode(), "video") == ""
+    for cap in ("voice", "audio_gen", "video"):
+        assert "no media" in _empty_result(json.dumps({"ok": True}).encode(), cap)

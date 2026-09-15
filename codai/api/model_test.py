@@ -23,9 +23,12 @@ simulated the path would prove nothing about the path.
 configuration, "runpod" refuses to fall back to local, so a pod that is not
 actually reachable fails the test instead of quietly passing here.
 
-Some kinds have no cheap synthetic input (faceswap needs faces, video costs real
-money and minutes). Those report a reachability check instead of a generation,
-and say so rather than implying more than was proven.
+A few kinds still have no honest synthetic input — a face swap needs real faces,
+stem separation needs audio worth separating — and those report a reachability
+check instead of a generation, saying so rather than implying more than was
+proven. Everything else is probed for real: espeak speaks a known sentence for
+transcription and for voice cloning, PIL draws known words for OCR, and video is
+asked for the smallest clip it can make.
 """
 
 import io
@@ -122,6 +125,30 @@ def _probe_for(capability: str, model: str):
         # not found in available voices" — the probe inventing a voice name, not
         # the model being broken.
         return "/v1/audio/speech", {"model": model, "input": "test"}
+    if capability == "voice":
+        # Voice cloning needs a reference sample AND its transcript, which is
+        # exactly what espeak produces: we choose the sentence, so the transcript
+        # is known rather than guessed. This was listed as un-probeable, which
+        # was true only for as long as nobody tried.
+        import base64
+        return "/v1/audio/clone", {
+            "model": model, "text": "cloned voice test",
+            "ref_audio": base64.b64encode(_spoken_wav()).decode(),
+            "ref_text": _SPOKEN, "response_format": "b64_wav"}
+    if capability == "audio_gen":
+        # 2 seconds, not the 10s default: this proves the model renders audio,
+        # and the remaining 8 seconds would only prove it more expensively.
+        return "/v1/audio/generate", {
+            "model": model, "prompt": "a short beep", "duration": 2.0,
+            "response_format": "b64_wav"}
+    if capability == "video":
+        # The cheapest thing a video model can be asked for: smallest frame
+        # count, smallest resolution, fewest steps. Still the most expensive
+        # probe here, which is why it stays behind an explicit request.
+        return "/v1/video/generations", {
+            "model": model, "prompt": "a red square on white",
+            "width": 256, "height": 256, "num_frames": 9,
+            "num_inference_steps": 4, "mode": "t2v"}
     return "", None
 
 
@@ -134,13 +161,11 @@ def _probe_for(capability: str, model: str):
 #: reachability check on those two reported ok:true while proving only that a
 #: URL was configured, which is the kind of pass that hides a broken pod.
 _REACHABILITY_ONLY = {
-    "video": "a video generation costs minutes of GPU time and real money",
-    "voice": "voice cloning needs a reference sample",
-    "faceswap": "a face swap needs a source and target face",
+    "faceswap": "a face swap needs a source and target face, and a drawn one "
+                "does not survive face detection — give it real images instead",
     "spatial": "3D generation needs an image or a mesh",
-    "audio_gen": "audio generation is minutes of GPU time",
-    "stems": "stem separation needs an audio file",
-    "audio_clean": "cleanup needs an audio file",
+    "stems": "stem separation needs an audio file to separate",
+    "audio_clean": "cleanup needs an audio file to clean",
 }
 
 #: What the synthesised probes say. Checked against the result, so the test
@@ -344,6 +369,15 @@ def _empty_result(raw: bytes, capability: str) -> str:
             return "no image in the response"
     if capability == "rerank":
         return "" if (obj.get("results") or obj.get("data")) else "no ranking returned"
+    if capability in ("voice", "audio_gen", "video"):
+        # No content check is possible — there is no ground truth for generated
+        # audio or video — so this asks only whether anything was actually
+        # produced. A 200 carrying no media is still a failure.
+        for key in ("b64_wav", "b64_mp3", "audio", "url", "b64_video", "video",
+                    "data"):
+            if isinstance(obj, dict) and obj.get(key):
+                return ""
+        return f"the {capability} model returned a 200 with no media in it"
     if capability in ("stt", "ocr"):
         # The probe put known words in, so check they come back. A model that
         # returns fluent nonsense is broken in a way an "is it non-empty?" check
@@ -537,6 +571,23 @@ def _sample(raw: bytes, capability: str) -> str:
             return str(obj)[:120]
     if capability in ("stt", "ocr"):
         return (_text_of(obj) or str(obj))[:120]
+    if capability in ("voice", "audio_gen", "tts"):
+        for key in ("b64_wav", "b64_mp3", "audio", "url"):
+            val = obj.get(key) if isinstance(obj, dict) else None
+            if val:
+                return (f"{key}: {len(val) * 3 // 4} bytes" if key != "url"
+                        else f"url: {val}")[:120]
+        return str(obj)[:120]
+    if capability == "video":
+        for key in ("url", "b64_video", "video"):
+            val = obj.get(key) if isinstance(obj, dict) else None
+            if val:
+                return (f"{key}: {val}" if key == "url"
+                        else f"{key}: {len(val) * 3 // 4} bytes")[:120]
+        data = obj.get("data") if isinstance(obj, dict) else None
+        if isinstance(data, list) and data:
+            return f"video returned ({str(data[0])[:80]})"
+        return str(obj)[:120]
     return str(obj)[:120]
 
 
