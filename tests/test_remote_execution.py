@@ -1635,3 +1635,45 @@ def test_the_gateway_finds_the_ocr_engine_field():
 
     # JSON bodies honour the field too.
     assert _model_from_body(b'{"engine":"doctr"}', "application/json", "engine") == "doctr"
+
+
+def test_audiocraft_runs_in_its_own_venv_and_looks_like_musicgen(monkeypatch):
+    """audiocraft pins torch==2.1.0, which has no build for the CUDA this
+    server runs — installing it beside the server leaves the GPU unusable. It
+    gets its own venv, like parler-tts and the OCR engines, and the generation
+    path must not be able to tell the difference."""
+    from codai.api import audiocraft_worker as aw
+
+    # The surface the audio path actually calls.
+    for name in ("sample_rate", "set_generation_params", "generate",
+                 "generate_with_chroma"):
+        assert hasattr(aw.AudiocraftModel, name), name
+
+    # available() is honest when there is no venv to talk to.
+    monkeypatch.setattr(aw, "_VENV", Path("/nonexistent/venv"))
+    assert aw.available() is False
+
+
+def test_musicgen_falls_back_in_order(monkeypatch):
+    """In-process audiocraft, then the isolated venv, then transformers. The
+    last one has no melody conditioning, so it must be last, not first."""
+    import codai.api.audio_gen as ag
+    from codai.api import audiocraft_worker as aw
+
+    calls = []
+    monkeypatch.setattr(aw, "available", lambda: True)
+    monkeypatch.setattr(aw, "AudiocraftModel",
+                        lambda name: calls.append(("venv", name)) or "VENV")
+
+    # No in-process audiocraft: the venv wins over transformers.
+    import builtins
+    real_import = builtins.__import__
+
+    def _no_audiocraft(name, *a, **k):
+        if name == "audiocraft.models" or name == "audiocraft":
+            raise ImportError("no audiocraft here")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _no_audiocraft)
+    got = ag._load_musicgen("facebook/musicgen-small", "cpu")
+    assert got == "VENV" and calls == [("venv", "facebook/musicgen-small")]

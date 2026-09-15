@@ -50,6 +50,21 @@ RUN --mount=type=cache,target=/root/.cache/pip set -eux; \
     fi; \
     rm -rf /tmp/profiles /var/lib/apt/lists/* /root/.cargo /root/.rustup
 
+# A profile may need a second venv for a library that cannot share the first —
+# audiocraft pins torch==2.1.0, which has no build for this image's CUDA. Built
+# here rather than on first use: a pod is rented by the second, and installing a
+# library during a cold start costs more than carrying the layer.
+ARG PROFILE
+COPY packaging/runpod/profiles/ /tmp/venv-profiles/
+RUN set -eux; \
+    extra="/tmp/venv-profiles/${PROFILE}.venv-audiocraft.txt"; \
+    if [ -f "$extra" ]; then \
+        python -m venv /opt/coderai/venvs/audiocraft; \
+        /opt/coderai/venvs/audiocraft/bin/pip install --no-cache-dir -r "$extra"; \
+        /opt/coderai/venvs/audiocraft/bin/python -c "import audiocraft; print('audiocraft', audiocraft.__version__)"; \
+    fi; \
+    rm -rf /tmp/venv-profiles
+
 COPY . /opt/coderai/app
 
 # Fail the BUILD, not the pod, if the profile is missing something the app needs

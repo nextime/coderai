@@ -164,8 +164,20 @@ def _load_musicgen(model_name: str, device: str):
     try:
         from audiocraft.models import MusicGen, AudioGen
     except ImportError:
+        # Next best: audiocraft in its own venv. It pins torch==2.1.0, which has
+        # no build for the CUDA this server runs, so it cannot share this venv —
+        # but it can live next door and be driven as a subprocess, which is what
+        # keeps melody conditioning available at all.
+        try:
+            from codai.api import audiocraft_worker
+            if audiocraft_worker.available():
+                print(f"[audio] using audiocraft from {audiocraft_worker._VENV}",
+                      flush=True)
+                return audiocraft_worker.AudiocraftModel(model_name)
+        except Exception as exc:
+            print(f"[audio] isolated audiocraft venv unusable ({exc})", flush=True)
         print(f"[audio] audiocraft not installed — serving {model_name} through "
-              "transformers instead", flush=True)
+              "transformers instead (no melody conditioning)", flush=True)
         return _TransformersMusicGen(model_name, device)
     name_lower = model_name.lower()
     if 'audiogen' in name_lower:
