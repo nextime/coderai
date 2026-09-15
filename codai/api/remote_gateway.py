@@ -107,7 +107,12 @@ _SKIP_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/models",
                "/v1/models/upload", "/v1/models/uploaded", "/v1/models/register",
                # The test run dispatches its own probe; forwarding the test
                # itself would test the remote's routing, not ours.
-               "/v1/models/test")
+               "/v1/models/test",
+               # …and this one answers "what does THIS process believe?", which
+               # is only meaningful locally. Forwarded, it would report the pod's
+               # view of a config the pod does not have — the exact confusion it
+               # was added to end.
+               "/v1/models/test/state")
 
 #: Orchestration endpoints: a sequence of calls to other endpoints, not a model.
 #: They are NEVER forwarded as a whole — the chain stays here and each step goes

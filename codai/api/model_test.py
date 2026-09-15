@@ -50,6 +50,53 @@ class ModelTestRequest(BaseModel):
     timeout: float = Field(1800.0, description="Give up after this many seconds.")
 
 
+@router.get("/v1/models/test/state", summary="What this engine currently believes")
+async def test_state(model: str = "", _auth=Depends(_require_api_auth)):
+    """The engine's LIVE view of a model's placement and the remote config.
+
+    Editing config.json or models.json is not enough to change where a request
+    goes: the engine re-reads them only when the front pushes a reload, and that
+    push is deferred while the engine is busy. So a caller that writes a config
+    and immediately tests is testing the OLD one — which is exactly what
+    happened: a whole test pass reported "nothing configures this to run
+    remotely" while the file on disk said otherwise, and an earlier pass sent
+    production embeddings to a pod because the engine still held a stale remote.
+
+    Poll this until it reflects what you wrote, then test. It answers for the
+    process that actually serves the request, so "the engine has it" is a fact
+    here rather than an assumption.
+    """
+    try:
+        from codai.admin.routes import config_manager
+        remotes = getattr(getattr(config_manager, "config", None), "remotes", None)
+    except Exception:
+        remotes = None
+    out = {
+        "pid": os.getpid(),
+        "remotes_enabled": bool(getattr(remotes, "enabled", False)),
+        "capability_endpoints": sorted((getattr(remotes, "endpoints", None) or {}).keys()),
+        "capability_pods": sorted((getattr(remotes, "pods", None) or {}).keys()),
+    }
+    if model:
+        entry, capability = _describe(model)
+        where, _ = ("", None)
+        try:
+            from codai.api.remote_gateway import model_placement
+            where, _ = model_placement(model)
+        except Exception:
+            pass
+        out.update({
+            "model": model,
+            "known": bool(entry),
+            "capability": capability or "text",
+            "placement": where or "(none — falls through to the capability map)",
+            "backend": str((entry or {}).get("backend") or ""),
+            "has_runpod_block": isinstance((entry or {}).get("runpod"), dict)
+                                and bool(entry["runpod"]),
+        })
+    return out
+
+
 #: capability -> (path, body builder). The body is the smallest thing that still
 #: exercises a real generation.
 def _probe_for(capability: str, model: str):

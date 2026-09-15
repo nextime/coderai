@@ -1491,3 +1491,73 @@ def test_an_upload_probe_falls_back_rather_than_failing_the_model(monkeypatch):
 
     monkeypatch.setattr(mt, "_spoken_wav", _boom)
     assert mt._upload_probe("stt", "whisper0") == (None, "", b"")
+
+
+# --- the test harness must not move a whole capability --------------------- #
+
+def test_the_state_endpoint_reports_the_serving_process_view(monkeypatch):
+    """Writing models.json does not change routing: the engine takes the reload
+    only when idle. A whole test pass reported false 'not configured' failures
+    because it trusted the file instead of asking the process."""
+    import asyncio
+    import codai.api.model_test as mt
+
+    entry = {"path": "org/m", "model_type": "image_models", "backend": "runpod",
+             "runpod": {"mode": "pods"}}
+    monkeypatch.setattr(mt, "_describe", lambda m: (entry, "images"))
+    monkeypatch.setattr("codai.api.remote_gateway.model_placement",
+                        lambda m: ("pod", (entry, entry["runpod"])))
+
+    state = asyncio.run(mt.test_state(model="org/m"))
+    assert state["placement"] == "pod"
+    assert state["backend"] == "runpod" and state["has_runpod_block"] is True
+    assert "pid" in state          # which process answered, not which file exists
+
+
+def test_the_harness_pins_one_model_and_never_a_capability(tmp_path, monkeypatch):
+    """remotes.endpoints[capability] moves EVERY request of that kind — that is
+    how production embeddings ended up on a rented pod. The harness must edit
+    the single model entry instead."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "runpod_model_test", "tools/runpod_model_test.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    models = tmp_path / "models.json"
+    models.write_text(json.dumps({
+        "image_models": [{"path": "org/a", "alias": "a"},
+                         {"path": "org/b", "alias": "b"}],
+        "text_models": [{"path": "org/t"}],
+    }))
+    monkeypatch.setattr(mod, "MODELS", str(models))
+
+    assert mod._pin_to_runpod("a", "coderai", 24, 1.0) is True
+    after = json.loads(models.read_text())
+
+    pinned = after["image_models"][0]
+    assert pinned["backend"] == "runpod" and pinned["runpod"]["engine"] == "coderai"
+    # Its sibling of the SAME capability is untouched: that is the whole point.
+    assert after["image_models"][1] == {"path": "org/b", "alias": "b"}
+    assert after["text_models"] == [{"path": "org/t"}]
+    # And nothing anywhere set a capability-wide endpoint.
+    assert "remotes" not in after
+
+
+def test_the_harness_refuses_to_test_a_config_the_engine_has_not_taken(monkeypatch):
+    """Testing against a stale config is worse than not testing: it once
+    reported a remote pass for a request that ran somewhere else."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "runpod_model_test", "tools/runpod_model_test.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    monkeypatch.setattr(mod, "CONFIG_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(mod, "_curl",
+                        lambda *a, **k: {"placement": "(none)", "backend": "",
+                                         "has_runpod_block": False})
+    problem = mod._wait_for_engine("org/a")
+    assert "never picked up the config" in problem
