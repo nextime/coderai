@@ -258,8 +258,14 @@ def _any_remote_configured_uncached() -> bool:
     return False
 
 
-def _model_from_body(body: bytes, content_type: str) -> str:
-    """Pull the requested model out of a JSON or multipart body."""
+def _model_from_body(body: bytes, content_type: str, field: str = "model") -> str:
+    """Pull the requested model out of a JSON or multipart body.
+
+    ``field`` because not every endpoint calls it "model": /v1/ocr names its
+    engine in a field called `engine`, so a per-model placement for OCR resolved
+    correctly and was then refused by the gateway, which could not see which
+    engine the request was for.
+    """
     if not body:
         return ""
     ctype = (content_type or "").lower()
@@ -268,16 +274,24 @@ def _model_from_body(body: bytes, content_type: str) -> str:
             obj = json.loads(body)
         except Exception:
             return ""
-        return str(obj.get("model") or "") if isinstance(obj, dict) else ""
+        return str(obj.get(field) or "") if isinstance(obj, dict) else ""
     if "multipart/form-data" in ctype:
-        m = _MULTIPART_MODEL.search(body[:262144])
+        pat = (_MULTIPART_MODEL if field == "model"
+               else re.compile(rb'name="' + field.encode() +
+                               rb'"\r?\n(?:[^\r\n]*\r?\n)*?\r?\n([^\r\n]*)',
+                               re.IGNORECASE))
+        m = pat.search(body[:262144])
         if m:
             return m.group(1).decode("utf-8", "replace").strip()
     if "application/x-www-form-urlencoded" in ctype:
         from urllib.parse import parse_qs
-        vals = parse_qs(body.decode("utf-8", "replace")).get("model")
+        vals = parse_qs(body.decode("utf-8", "replace")).get(field)
         return (vals or [""])[0]
     return ""
+
+
+#: Endpoints whose "which model" field is not called `model`.
+_MODEL_FIELD = {"/v1/ocr": "engine", "/v1/ocr/batch": "engine"}
 
 
 class Target:
@@ -333,10 +347,11 @@ def resolve_target(path: str, method: str, query: str, body: bytes,
         base = file_origin(path[len("/v1/files/"):])
         return Target(url=base, reason="generated file") if base else None
     cap = capability_for(path)
-    model = _model_from_body(body, content_type)
+    field = _MODEL_FIELD.get(path, "model")
+    model = _model_from_body(body, content_type, field)
     if not model and query:
         from urllib.parse import parse_qs
-        model = (parse_qs(query).get("model") or [""])[0]
+        model = (parse_qs(query).get(field) or [""])[0]
 
     # Per model first, so two models of the same kind can be placed differently.
     where, detail = model_placement(model)

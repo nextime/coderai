@@ -1615,3 +1615,23 @@ def test_a_200_carrying_no_media_is_not_a_pass():
     assert _empty_result(json.dumps({"url": "/v1/files/x.mp4"}).encode(), "video") == ""
     for cap in ("voice", "audio_gen", "video"):
         assert "no media" in _empty_result(json.dumps({"ok": True}).encode(), cap)
+
+
+def test_the_gateway_finds_the_ocr_engine_field():
+    """/v1/ocr names its engine in a field called `engine`, not `model`. The
+    gateway could not see it, so a per-model OCR placement resolved correctly
+    and was then refused: 'nothing configures ocr to run remotely'."""
+    from codai.api.remote_gateway import _model_from_body, _MODEL_FIELD
+
+    assert _MODEL_FIELD["/v1/ocr"] == "engine"
+
+    body = (b'--B\r\nContent-Disposition: form-data; name="engine"\r\n\r\nsurya\r\n'
+            b'--B\r\nContent-Disposition: form-data; name="file"; '
+            b'filename="a.png"\r\n\r\n\x89PNG\r\n--B--\r\n')
+    ct = "multipart/form-data; boundary=B"
+    assert _model_from_body(body, ct, "engine") == "surya"
+    # and the default field is still `model`, absent here
+    assert _model_from_body(body, ct) == ""
+
+    # JSON bodies honour the field too.
+    assert _model_from_body(b'{"engine":"doctr"}', "application/json", "engine") == "doctr"
