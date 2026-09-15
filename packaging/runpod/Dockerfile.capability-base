@@ -17,7 +17,7 @@
 ARG BASE=python:3.12-slim
 FROM ${BASE}
 
-ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
 ENV PYTHONUNBUFFERED=1 \
     HF_HOME=/cache/huggingface \
     CODERAI_HOME=/config
@@ -33,7 +33,25 @@ WORKDIR /opt/coderai/app
 # torch and the import-time requirements every capability needs. A BuildKit cache
 # mount keeps the wheels on the builder across rebuilds; they never enter the image.
 COPY packaging/runpod/profiles/core.txt /tmp/core.txt
+# torch FIRST, from the CUDA index alone (--index-url, not --extra-index-url).
+# --extra-index-url only ADDS an index: pip then takes the highest version across
+# all of them, and PyPI's default torch is built for a newer CUDA than the pin
+# names. So the pin never applied — every image shipped a CUDA-13 torch and died
+# on any machine with an older driver ("The NVIDIA driver on your system is too
+# old (found version 12080)"). RunPod's fleet is mixed, so the same GPU model
+# would work or fail depending on which machine you landed on.
+#
+# cu128 rather than cu124: the machine that failed reports driver 12.8, so it can
+# run a CUDA-12.8 build — and cu128 resolves to torch 2.11, the same version the
+# local install runs, where cu124 tops out at 2.6 and would put pods years behind
+# the transformers-5 code they execute.
+#
+# torchvision and torchaudio come from the same index here rather than from the
+# profiles: installed later from PyPI they would drag a matching CUDA-13 torch
+# back in and undo this.
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --upgrade pip \
-    && python -m pip install --extra-index-url ${TORCH_INDEX} -r /tmp/core.txt \
+    && python -m pip install --index-url ${TORCH_INDEX} torch torchvision torchaudio \
+    && python -m pip install -r /tmp/core.txt \
+    && python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)" \
     && rm -f /tmp/core.txt
