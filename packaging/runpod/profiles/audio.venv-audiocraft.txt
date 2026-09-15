@@ -25,15 +25,17 @@ torch==2.5.1
 torchaudio==2.5.1
 torchvision==0.20.1
 
-# audiocraft's real runtime dependencies. Its dev-only ones (pytest, flake8,
-# mypy, coverage, pdoc3) and gradio are deliberately absent: a pod serves an
-# API, it does not run the library's test suite or its demo UI. torchtext is
-# absent too — it is abandoned, unbuildable here, and unused at inference.
+# EVERYTHING audiocraft declares, minus only the torch pins above and its
+# dev-only tools (pytest, flake8, mypy, coverage, pdoc3).
 #
-# xformers IS needed: audiocraft imports it at module load, so leaving it out
-# turned the build's import check into a ModuleNotFoundError — which is exactly
-# what that check is for. Pinned to the version whose wheel matches the torch
-# above; see the note there for why that torch and not audiocraft's.
+# The earlier version of this list was trimmed against what the MAIN venv has —
+# transformers, demucs and the rest. That is exactly wrong: this venv is
+# isolated, so it starts with nothing, and the trimming produced three build
+# cycles that each died on a different missing module. An isolated venv needs
+# the whole list.
+# xformers: audiocraft imports it at module load (audiocraft/modules/
+# transformer.py), so without it the import check dies. Pinned to the version
+# whose cp312 wheel matches the torch above — see the note there.
 xformers==0.0.28.post3
 av>=11.0.0
 einops
@@ -46,7 +48,10 @@ sentencepiece
 spacy>=3.6.1
 huggingface_hub
 tqdm
+transformers>=4.31.0
+demucs
 librosa
+gradio
 torchmetrics
 encodec
 protobuf
