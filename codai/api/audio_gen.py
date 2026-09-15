@@ -109,8 +109,64 @@ def _save_audio_response(audio_data: bytes, ext: str, http_request: Request) -> 
         return {f"b64_{ext}": b64}
 
 
+class _TransformersMusicGen:
+    """MusicGen through transformers, wearing audiocraft's interface.
+
+    audiocraft is Meta's library and is optional on purpose: it pins an old
+    torch, so installing it into a pod image would drag torch backwards and
+    undo the CUDA build pin. transformers ships MusicGen itself, so a pod can
+    serve the model without it — a rented pod failed with "No module named
+    'audiocraft'" and there was no reason for it to need one.
+
+    Only what the generation path calls is implemented: set_generation_params,
+    generate, sample_rate. Melody conditioning is not — that is audiocraft's
+    generate_with_chroma, and a caller asking for it gets audiocraft's own
+    ImportError rather than a silently different result.
+    """
+
+    def __init__(self, model_name: str, device: str):
+        from transformers import AutoProcessor, MusicgenForConditionalGeneration
+        self._processor = AutoProcessor.from_pretrained(model_name)
+        self._model = MusicgenForConditionalGeneration.from_pretrained(model_name)
+        self._device = device
+        self._model.to(device)
+        self._params = {"duration": 30.0}
+
+    def set_generation_params(self, **kwargs):
+        self._params.update({k: v for k, v in kwargs.items() if v is not None})
+
+    @property
+    def sample_rate(self) -> int:
+        return int(self._model.config.audio_encoder.sampling_rate)
+
+    def generate(self, prompts):
+        import torch
+        inputs = self._processor(text=list(prompts), padding=True,
+                                 return_tensors="pt").to(self._device)
+        # transformers counts tokens, audiocraft counts seconds. 50 Hz is
+        # MusicGen's frame rate, which is what makes `duration` mean anything.
+        frame_rate = getattr(self._model.config.audio_encoder, "frame_rate", 50)
+        max_new = max(1, int(float(self._params.get("duration", 30.0)) * frame_rate))
+        gen = {"max_new_tokens": max_new, "do_sample": True}
+        if self._params.get("temperature"):
+            gen["temperature"] = float(self._params["temperature"])
+        if self._params.get("top_k"):
+            gen["top_k"] = int(self._params["top_k"])
+        if self._params.get("top_p"):
+            gen["top_p"] = float(self._params["top_p"])
+        if self._params.get("cfg_coef"):
+            gen["guidance_scale"] = float(self._params["cfg_coef"])
+        with torch.no_grad():
+            return self._model.generate(**inputs, **gen)   # (batch, channels, samples)
+
+
 def _load_musicgen(model_name: str, device: str):
-    from audiocraft.models import MusicGen, AudioGen
+    try:
+        from audiocraft.models import MusicGen, AudioGen
+    except ImportError:
+        print(f"[audio] audiocraft not installed — serving {model_name} through "
+              "transformers instead", flush=True)
+        return _TransformersMusicGen(model_name, device)
     name_lower = model_name.lower()
     if 'audiogen' in name_lower:
         model = AudioGen.get_pretrained(model_name)

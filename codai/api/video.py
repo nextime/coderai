@@ -2285,6 +2285,21 @@ def _maybe_i2v_fallback(pipe, kw, mode):
     return view, 'ti2v'
 
 
+def _pipeline_takes(pipe, name: str) -> bool:
+    """True when this pipeline's __call__ accepts ``name`` as a keyword.
+
+    Diffusers pipelines differ in what they accept, and passing one an argument
+    it has never heard of fails at call time rather than at setup — the most
+    expensive moment possible, because the weights are already loaded.
+    """
+    import inspect
+    try:
+        params = inspect.signature(type(pipe).__call__).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params
+
+
 def _generate_video(pipe, request: VideoGenerationRequest):
     mode = request.mode or ('i2v' if (request.image or request.init_image)
                              else 'v2v' if request.video else 't2v')
@@ -2336,10 +2351,18 @@ def _generate_video(pipe, request: VideoGenerationRequest):
             pass
         return callback_kwargs
 
-    try:
+    # Only when the pipeline actually takes it. Older ones (TextToVideoSDPipeline)
+    # do not, and diffusers raises TypeError inside the call — minutes in, after
+    # the model is loaded and the GPU is paid for: "TextToVideoSDPipeline.
+    # __call__() got an unexpected keyword argument 'callback_on_step_end'".
+    # The try/except that used to be here caught nothing: assigning to a dict
+    # never raises, and the failure happens later, somewhere else.
+    if _pipeline_takes(pipe, 'callback_on_step_end'):
         kw['callback_on_step_end'] = _vid_step_cb
-    except Exception:
-        pass
+    else:
+        print(f"[video] {type(pipe).__name__} does not accept "
+              "callback_on_step_end — generating without step progress",
+              flush=True)
 
     _apply_camera_motion(kw, request.camera_motion, pipe=pipe)
 

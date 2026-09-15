@@ -46,12 +46,16 @@ COPY packaging/runpod/profiles/core.txt /tmp/core.txt
 # local install runs, where cu124 tops out at 2.6 and would put pods years behind
 # the transformers-5 code they execute.
 #
-# torchvision and torchaudio come from the same index here rather than from the
-# profiles: installed later from PyPI they would drag a matching CUDA-13 torch
-# back in and undo this.
+# torchvision, torchaudio and torchcodec come from the same index here rather
+# than from the profiles: installed later from PyPI they would drag a matching
+# CUDA-13 torch back in and undo this. torchcodec is the one that proved the
+# point — it arrived as a transitive dependency of f5-tts, PyPI served the
+# CUDA-13 build, and voice cloning died on a rented pod with "libnvrtc.so.13:
+# cannot open shared object file" after loading the model. Anything linked
+# against CUDA belongs on this line.
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --upgrade pip \
-    && python -m pip install --index-url ${TORCH_INDEX} torch torchvision torchaudio \
+    && python -m pip install --index-url ${TORCH_INDEX} torch torchvision torchaudio torchcodec \
     && python -m pip install -r /tmp/core.txt \
     && python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)" \
     && rm -f /tmp/core.txt
