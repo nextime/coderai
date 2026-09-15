@@ -587,3 +587,48 @@ def test_a_model_can_declare_a_capability_its_section_does_not_imply():
     llm = {"path": "org/m", "model_type": "text_models"}
     assert model_capability(llm) == ""
     assert model_capability(dict(llm, capability="text")) == "text"
+
+
+def test_an_ocr_pod_arrives_with_ocr_switched_on():
+    """OCR ships disabled — right for a fresh install, wrong for a pod rented to
+    do OCR. One booted, took the request and answered 'OCR subsystem is disabled
+    (enable it in Settings → OCR)', which is a settings screen nobody will open
+    on a machine that exists for four more minutes."""
+    from codai.api.runpod_worker import pod_plan, parse_model_runpod
+
+    mcfg = parse_model_runpod({"engine": "coderai", "image": "x:1"})
+    env = pod_plan(mcfg, "ocr", entry={"path": "surya",
+                                       "model_type": "ocr_models"})["env"]
+    assert env["CODERAI_OCR_ENABLED"] == "1"
+    assert env["CODERAI_OCR_DEFAULT_ENGINE"] == "surya"
+    # Asking for surya by name IS the licence decision; the pod cannot make it.
+    assert env["CODERAI_OCR_SURYA_ACCEPT_LICENSE"] == "1"
+
+    # A non-gated engine does not carry the licence flag unless we accepted it.
+    env = pod_plan(mcfg, "ocr", entry={"path": "paddle",
+                                       "model_type": "ocr_models"})["env"]
+    assert env["CODERAI_OCR_DEFAULT_ENGINE"] == "paddle"
+
+    # And a pod for anything else is untouched.
+    env = pod_plan(mcfg, "images", entry={"path": "org/sd",
+                                          "model_type": "image_models"})["env"]
+    assert not any(k.startswith("CODERAI_OCR") for k in env)
+
+
+def test_env_can_enable_a_subsystem_without_writing_config(tmp_path, monkeypatch):
+    """Like the seed list, this describes one disposable pod — it must never
+    land in a real deployment's config.json."""
+    from codai.config import ConfigManager
+
+    monkeypatch.setenv("CODERAI_OCR_ENABLED", "1")
+    monkeypatch.setenv("CODERAI_OCR_DEFAULT_ENGINE", "doctr")
+    cm = ConfigManager(str(tmp_path))
+    cm.load()
+    assert cm.config.ocr.enabled is True
+    assert cm.config.ocr.default_engine == "doctr"
+    assert cm.config.ocr.surya_accept_license is False   # not asked for
+
+    import json
+    on_disk = json.loads((tmp_path / "config.json").read_text())
+    assert on_disk.get("ocr", {}).get("enabled") is not True, \
+        "the env override leaked into config.json"

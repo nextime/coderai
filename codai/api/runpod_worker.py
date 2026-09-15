@@ -556,6 +556,16 @@ def volume_env(mount: str) -> dict:
     }
 
 
+def _surya_accepted() -> bool:
+    """Whether this deployment has accepted Surya's licence."""
+    try:
+        from codai.admin.routes import config_manager
+        return bool(getattr(getattr(config_manager, "config", None),
+                            "ocr", None).surya_accept_license)
+    except Exception:
+        return False
+
+
 def _plan(engine, image, args, mcfg, api_key, entry, served,
           seed_entries: list = None, capability: str = "") -> dict:  # noqa: D401
     """Finish a plan for a coderai pod: auth plus the models it must serve."""
@@ -584,6 +594,22 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
             unique.append(s)
         env["CODERAI_SEED_MODELS"] = _json.dumps(unique)
         print(f"[runpod] pod will be told about {len(unique)} model(s)", flush=True)
+    # A pod rented for a subsystem that ships disabled has to arrive with it on.
+    # An OCR pod booted, accepted the request and answered "OCR subsystem is
+    # disabled (enable it in Settings → OCR)" — a settings screen nobody will
+    # open on a machine that exists for the next four minutes.
+    cap = capability or model_capability(entry or {}, include_text=True)
+    if cap == "ocr":
+        env["CODERAI_OCR_ENABLED"] = "1"
+        wanted = str((entry or {}).get("path") or "").strip().lower()
+        if wanted in ("paddle", "doctr", "surya"):
+            env["CODERAI_OCR_DEFAULT_ENGINE"] = wanted
+        if wanted == "surya" or _surya_accepted():
+            # Surya is GPL and gated on an explicit acceptance. The pod inherits
+            # the decision made HERE — it cannot make it for itself, and asking
+            # for surya by name is that decision.
+            env["CODERAI_OCR_SURYA_ACCEPT_LICENSE"] = "1"
+
     plan = {"engine": engine, "image": image, "args": args, "env": env,
             "health_path": mcfg.health_path or _HEALTH_PATHS.get(engine, "/healthz")}
 

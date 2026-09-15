@@ -991,6 +991,7 @@ class ConfigManager:
         # must know about, merged in at startup (existing entries win, so this
         # can never overwrite a real deployment's catalogue).
         self._seed_models_from_env()
+        self._enable_subsystems_from_env()
 
         # Load auth.json
         if self.auth_path.exists():
@@ -1314,6 +1315,35 @@ class ConfigManager:
         with open(self.config_path, 'w') as f:
             json.dump(config_dict, f, indent=2)
     
+    def _enable_subsystems_from_env(self) -> None:
+        """Switch on a subsystem a pod was rented to provide.
+
+        Some subsystems are off by default because they are heavy or
+        license-gated, which is right for a fresh install and wrong for a pod
+        rented specifically to serve them: an OCR pod booted, took the request,
+        and answered "OCR subsystem is disabled (enable it in Settings → OCR)"
+        — a setting screen nobody is going to open on a machine that exists for
+        the next four minutes.
+
+        Env only, never written to disk: like the seed list, this describes one
+        disposable instance, not a deployment.
+        """
+        import os as _os
+
+        def _flag(name: str) -> bool:
+            return str(_os.environ.get(name, "")).strip().lower() in (
+                "1", "true", "yes", "on")
+
+        if _flag("CODERAI_OCR_ENABLED"):
+            self.config.ocr.enabled = True
+            engine = (_os.environ.get("CODERAI_OCR_DEFAULT_ENGINE") or "").strip()
+            if engine:
+                self.config.ocr.default_engine = engine
+            if _flag("CODERAI_OCR_SURYA_ACCEPT_LICENSE"):
+                # Surya is GPL and gated on an explicit acceptance. The pod
+                # inherits the decision made here; it cannot make it itself.
+                self.config.ocr.surya_accept_license = True
+
     def _seed_models_from_env(self) -> None:
         """Register models named by CODERAI_SEED_MODELS (JSON list of entries).
 
