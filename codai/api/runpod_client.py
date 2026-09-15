@@ -433,16 +433,31 @@ class RunpodClient:
             last = info
             if info.get("status") in ("TERMINATED", "FAILED"):
                 raise RunpodError(f"Pod {pod_id} entered status {info.get('status')} before ready.")
+            if info.get("status") == "EXITED" and time.time() - started > 45:
+                # The container started and died. A pod reported EXITED with
+                # uptime 0s from its very first poll and the loop waited out the
+                # full budget on it — three machines in a row — while printing
+                # "image pull in progress", which it never was. A short grace
+                # period covers RunPod's own restart-on-exit; past that, EXITED
+                # means the process crashed on boot and no amount of waiting
+                # changes that. Fail fast so the retry lands on the real cause.
+                raise RunpodError(
+                    f"Pod {pod_id} container EXITED on boot (uptime "
+                    f"{info.get('uptime_s')}s) — the image pulled but the process "
+                    f"died immediately. Not a pull problem: check the image's "
+                    f"entrypoint and the console log.")
             if info.get("ready"):
                 return pod_proxy_url(pod_id, port)
             # A multi-GB image pull is minutes of silence otherwise, which reads
             # exactly like a hung pod. Say what is actually being waited on.
             if time.time() >= next_report:
                 next_report = time.time() + 60.0
+                why = ("image pull in progress" if info.get("status") != "EXITED"
+                       else "container has EXITED — waiting for a restart")
                 print(f"[runpod] pod {pod_id}: still no port after "
                       f"{time.time() - started:.0f}s "
                       f"(status={info.get('status')} uptime={info.get('uptime_s')}s) "
-                      f"— image pull in progress", flush=True)
+                      f"— {why}", flush=True)
             time.sleep(poll_every)
         raise RunpodError(
             f"Pod {pod_id} did not expose port {port} within {ready_timeout}s "

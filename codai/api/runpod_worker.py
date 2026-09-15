@@ -138,7 +138,11 @@ class RunpodModelConfig:
     sticky_sessions: bool = True
     idle_timeout_s: int = 300                # destroy a pod this long after its last request
     # Boot budgets — bigger models need longer (image pull + weight download).
-    boot_timeout_s: int = 300                # until the pod exposes its port
+    # Until the pod exposes its port. The port appears only AFTER the image is
+    # pulled, so this covers the download: 15 GB at a cold machine's ~25 MB/s
+    # is ten minutes. 900 was set on the pool class and this default was left at
+    # 300 — two numbers for one thing, and the smaller one silently won.
+    boot_timeout_s: int = 900
     load_timeout_s: int = 600                # until vLLM answers /v1/models
     # --- serverless ---
     endpoint_id: str = ""                    # reference an existing serverless endpoint

@@ -14,7 +14,12 @@
 # when the log API does not), and the same phases written to a file the app
 # serves at /boot, so the moment the port opens we can ask the pod where it is
 # instead of guessing.
-set -u
+# NOT set -u, and NOT set -e. Every line before the exec is a diagnostic: it
+# exists to tell us what the pod is, and a diagnostic must never be able to
+# stop the boot it describes. A speaker pod died with EXITED at uptime 0s on
+# three machines in a row — the image booted fine locally — because an
+# environment difference tripped a strict-mode abort before uvicorn was ever
+# reached. The one line that matters is the last one.
 
 BOOT_LOG="${CODERAI_BOOT_LOG:-/tmp/coderai-boot.log}"
 : > "$BOOT_LOG"
@@ -29,6 +34,7 @@ phase() {
 
 phase "container started"
 phase "profile=${PROFILE:-unknown} image=${CODERAI_IMAGE_TAG:-unknown}"
+phase "user=$(id -un 2>/dev/null || echo unknown) cwd=$(pwd 2>/dev/null || echo unknown)"
 phase "python=$(python -V 2>&1)"
 
 # What the pod was actually told to serve. A pod that answers "not available"
@@ -42,7 +48,7 @@ else
 fi
 
 if command -v nvidia-smi >/dev/null 2>&1; then
-    phase "gpu: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | head -1)"
+    phase "gpu: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | head -1 || echo 'nvidia-smi query failed')"
 else
     phase "gpu: nvidia-smi not present"
 fi
