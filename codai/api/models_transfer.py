@@ -45,7 +45,7 @@ router = APIRouter()
 _SECTIONS = {
     "text_models", "image_models", "audio_models", "gguf_models", "tts_models",
     "vision_models", "video_models", "audio_gen_models", "embedding_models",
-    "spatial_models",
+    "spatial_models", "ocr_models",
 }
 
 

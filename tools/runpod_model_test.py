@@ -102,11 +102,26 @@ def _find(data: dict, model: str):
     return None, None, None
 
 
+#: Picked by name rather than registered like a model, so there is nothing in the
+#: catalogue to pin. A temporary entry gives them the same per-model placement —
+#: the alternative was moving the whole OCR capability, which is a production
+#: routing switch.
+_OCR_ENGINES = ("paddle", "doctr", "surya")
+
+
 def _pin_to_runpod(model: str, engine: str, vram: float, usd: float,
                    image: str = "") -> bool:
     """Give this ONE model a runpod block. True when the catalogue changed."""
     data = _load_models()
     section, index, entry = _find(data, model)
+    if entry is None and model.strip().lower() in _OCR_ENGINES:
+        section = "ocr_models"
+        data.setdefault(section, [])
+        data[section].append({"path": model, "model_type": "ocr_models"})
+        index = len(data[section]) - 1
+        entry = data[section][index]
+        print(f"   {model}: OCR engine — added a temporary catalogue entry",
+              flush=True)
     if entry is None:
         print(f"   {model}: not in models.json — nothing to place", flush=True)
         return False

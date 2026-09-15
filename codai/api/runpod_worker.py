@@ -209,6 +209,12 @@ MODEL_TYPE_CAPABILITY = {
     "tts_models": "tts",
     "embedding_models": "embeddings",
     "spatial_models": "spatial",
+    # OCR engines are picked by name (paddle|doctr|surya) rather than registered
+    # like a model, so nothing could place one individually: a test had to move
+    # the whole capability, which is a production routing switch. An entry in
+    # this section gives an engine the same per-model placement everything else
+    # already has.
+    "ocr_models": "ocr",
     "audio_gen_models": "audio_gen",
 }
 
