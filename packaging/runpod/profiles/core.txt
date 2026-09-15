@@ -39,3 +39,9 @@ websockets>=12.0
 # bitsandbytes" after a 10-minute SDXL download. Shared here rather than per
 # profile: one layer, downloaded once, reused by all ten images.
 bitsandbytes>=0.43.0
+
+# torchcodec's CUDA build links against NVIDIA Performance Primitives
+# (libnppicc.so.12). torch does not use NPP, so nothing else pulls it in, and
+# torchcodec — which arrives as a transitive dependency of f5-tts — then fails
+# to load with a message that blames FFmpeg and the torch version. It is neither.
+nvidia-npp-cu12

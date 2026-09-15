@@ -28,6 +28,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg git curl ca-certificates libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
+# Installing NPP is not enough: torch preloads its own nvidia libs and NPP is
+# not among them, so nothing adds this directory to the loader's search path and
+# libnppicc.so.12 stays invisible. Both halves are needed.
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/npp/lib:${LD_LIBRARY_PATH}
+
 WORKDIR /opt/coderai/app
 
 # torch and the import-time requirements every capability needs. A BuildKit cache
