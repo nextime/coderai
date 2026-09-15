@@ -4,4 +4,9 @@ torch==2.5.1+cu124
 torchaudio==2.5.1+cu124
 transformers==4.46.3
 coqui-tts>=0.24.0
+# coqui-tts imports click at module load but does not declare it, so the venv
+# installs cleanly and then fails its import check. Found by iterating the venv
+# in a container — two minutes — rather than one image build per missing module,
+# which is what the audiocraft venv cost before that lesson took.
+click>=8.0
 soundfile>=0.12.0
