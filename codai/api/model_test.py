@@ -161,6 +161,9 @@ def _probe_for(capability: str, model: str):
 #: reachability check on those two reported ok:true while proving only that a
 #: URL was configured, which is the kind of pass that hides a broken pod.
 _REACHABILITY_ONLY = {
+    # 'speaker' is not here: diarization takes audio, espeak makes audio, and a
+    # pod with no diarization stack cannot return a labelled turn — which is the
+    # failure this catches.
     "faceswap": "a face swap needs a source and target face, and a drawn one "
                 "does not survive face detection — give it real images instead",
     "spatial": "3D generation needs an image or a mesh",
@@ -255,6 +258,14 @@ def _upload_probe(capability: str, model: str):
             ct, body = _multipart({"engine": model}, "probe.png", _printed_png(),
                                   content_type="image/png")
             return "/v1/ocr", ct, body
+        if capability == "speaker":
+            # Diarization needs audio, and espeak provides it. One speaker
+            # saying one sentence is a thin test musically but an honest one
+            # here: the model has to return at least one labelled turn, which is
+            # exactly what a pod with no diarization stack cannot do.
+            ct, body = _multipart({"model": model}, "probe.wav", _spoken_wav(),
+                                  content_type="audio/wav")
+            return "/v1/audio/diarization", ct, body
     except Exception as exc:
         print(f"[test] could not synthesise a {capability} probe: {exc}", flush=True)
     return None, "", b""
@@ -378,6 +389,14 @@ def _empty_result(raw: bytes, capability: str) -> str:
             if isinstance(obj, dict) and obj.get(key):
                 return ""
         return f"the {capability} model returned a 200 with no media in it"
+    if capability == "speaker":
+        # No ground truth for who is speaking — espeak is one voice — so this
+        # asks only whether the model returned labelled turns at all.
+        turns = obj.get("segments") or obj.get("turns") or obj.get("speakers") \
+            if isinstance(obj, dict) else None
+        if not turns:
+            return "no speaker turns in the response"
+        return ""
     if capability in ("stt", "ocr"):
         # The probe put known words in, so check they come back. A model that
         # returns fluent nonsense is broken in a way an "is it non-empty?" check
@@ -569,6 +588,10 @@ def _sample(raw: bytes, capability: str) -> str:
             return f"image returned ({len(b64) * 3 // 4} bytes)"
         except Exception:
             return str(obj)[:120]
+    if capability == "speaker":
+        turns = (obj.get("segments") or obj.get("turns") or
+                 obj.get("speakers") or []) if isinstance(obj, dict) else []
+        return f"{len(turns)} speaker turn(s)"
     if capability in ("stt", "ocr"):
         return (_text_of(obj) or str(obj))[:120]
     if capability in ("voice", "audio_gen", "tts"):
