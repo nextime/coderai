@@ -157,6 +157,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libsndfile1 \
       libvulkan1 \
       lm-sensors \
+      espeak \
       mesa-vulkan-drivers \
       pciutils \
       openssl \

@@ -51,7 +51,11 @@ RUN /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir "nv
 # (git is present but the CUDA runtime base ships no ssh). Tiny; keep the overlay
 # still fast. `|| true` keeps offline overlay builds working (HTTPS upgrade still
 # works without it).
-RUN apt-get update && apt-get install -y --no-install-recommends openssh-client \
+# espeak: the model test run synthesises a spoken sentence to probe an STT
+# model with real audio instead of a reachability check. Without it the probe
+# degrades silently to "configured, not verified" — caught by inspecting a built
+# image, not by any test, because the fallback is deliberately not an error.
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client espeak \
     && rm -rf /var/lib/apt/lists/* || true
 
 # ENTRYPOINT / EXPOSE / VOLUME / ENV / WORKDIR are inherited from the base image.
