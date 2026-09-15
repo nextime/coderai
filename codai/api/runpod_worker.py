@@ -1333,15 +1333,44 @@ class RunpodPodPool:
                 raise
         raise last or RunpodError("RunPod: no candidate GPU could be deployed (capacity).")
 
-    # Port should appear once the pod's container is running; a much longer wait
-    # only bills for a pod that failed to start. The OpenAI server (image pull +
-    # model load) gets a longer, separate budget.
-    PORT_TIMEOUT_S = 300.0
+    # The port appears only AFTER the image is pulled, so this budget has to
+    # cover the download — the original 300s assumed the container was already
+    # there. Measured on the same 7.3 GB capability image: 133s on a machine
+    # that had the layers cached, and repeated failures at 300s on cold ones,
+    # which needs a sustained ~25 MB/s to beat. Each failure then rented a fresh
+    # machine and paid for the whole pull again, three times over.
+    #
+    # 15 minutes is bounded and cheap to be wrong about (a quarter-hour of a
+    # $0.25/hr card is 6 cents) where being too tight costs three pods and still
+    # fails. Override per model with `boot_timeout_s`.
+    PORT_TIMEOUT_S = 900.0
     HEALTH_TIMEOUT_S = 600.0
 
-    def _dump_pod_logs(self, client, pod_id, why):
-        """Fetch + log the pod's container/vLLM output so a failed boot is
-        self-diagnosing (the user's #1 cause: vLLM OOM / launch error)."""
+    def _dump_pod_logs(self, client, pod_id, why, url: str = ""):
+        """Say what the pod was doing, from whichever source can still answer.
+
+        RunPod publishes no pod-log API — the REST OpenAPI spec lists 23 routes
+        and none of them serve logs, which is why every attempt came back 400.
+        The console is a human surface. So a coderai pod keeps its own boot
+        record and serves it at /boot: if the port ever opened, that is the real
+        log, and it covers the container phases too (boot.sh writes them to the
+        same file). Tried first, because it is the only one that ever works.
+        """
+        if url:
+            try:
+                import requests
+                headers = ({"Authorization": f"Bearer {self.api_key}"}
+                           if self.api_key else {})
+                r = requests.get(url.rstrip("/") + "/boot", headers=headers, timeout=15)
+                if r.status_code == 200:
+                    data = r.json()
+                    lines = list(data.get("container") or []) + list(data.get("phases") or [])
+                    if lines:
+                        print(f"[runpod] pod {pod_id} boot record ({why}):\n  "
+                              + "\n  ".join(lines[-40:]), flush=True)
+                        return
+            except Exception:
+                pass          # port never opened, or it died before answering
         try:
             info = client.get_pod_logs(pod_id, tail=120)
         except Exception as exc:
@@ -1392,6 +1421,7 @@ class RunpodPodPool:
             # diagnosis: the image pull, the server start and the model load are
             # different problems with different fixes.
             t_created = time.time()
+            url = ""
             try:
                 url = client.wait_ready(pod_id, port, ready_timeout=boot_to)
                 t_port = time.time()
@@ -1418,7 +1448,7 @@ class RunpodPodPool:
                 last_exc = exc
                 print(f"[runpod] pod {pod_id} boot FAILED for {self.model_key!r}: {exc}",
                       flush=True)
-                self._dump_pod_logs(client, pod_id, "boot failed")
+                self._dump_pod_logs(client, pod_id, "boot failed", url)
                 try:
                     client.terminate_pod(pod_id)
                 except Exception:

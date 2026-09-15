@@ -542,3 +542,30 @@ def test_a_surviving_pods_token_is_remembered_across_a_restart(tmp_path, monkeyp
                                           api_key="cra-freshly-generated")
     assert (pod_id, url, key) == ("pod-survivor", "http://pod-a:8000", "cra-original")
     assert seen["key"] == "cra-original", "probed with the pod's token, not ours"
+
+
+def test_the_port_wait_covers_a_cold_image_pull(monkeypatch):
+    """The port appears only after the image is pulled, so the budget has to
+    cover the download. At 300s the same 7.3 GB image succeeded on a machine
+    with cached layers (133s) and failed on cold ones — three times, renting a
+    fresh machine and re-pulling for each."""
+    import codai.api.runpod_worker as rw
+
+    assert rw.RunpodPodPool.PORT_TIMEOUT_S >= 900.0
+
+
+def test_a_port_timeout_says_what_it_was_waiting_on(monkeypatch):
+    """'did not expose port 8000 within 300.0s' gives nothing to act on."""
+    import codai.api.runpod_client as rc
+
+    client = rc.RunpodClient.__new__(rc.RunpodClient)
+    monkeypatch.setattr(client, "get_pod",
+                        lambda pid: {"status": "RUNNING", "uptime_s": 42,
+                                     "ready": False}, raising=False)
+    try:
+        client.wait_ready("pod-x", 8000, ready_timeout=0.1, poll_every=0.01)
+    except rc.RunpodError as exc:
+        assert "last status='RUNNING'" in str(exc) or "status=RUNNING" in str(exc)
+        assert "boot_timeout_s" in str(exc)
+    else:
+        raise AssertionError("expected a RunpodError")

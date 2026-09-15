@@ -376,8 +376,15 @@ class RunpodClient:
     def get_pod_logs(self, pod_id: str, tail: int = 200) -> dict:
         """Best-effort container/vLLM logs for a pod via the REST API.
 
-        RunPod's log surface is the web console; this tries the REST logs route and
-        always returns a console URL to fall back to. Returns
+        There is no public pod-log API. RunPod's REST OpenAPI spec lists 23
+        routes (pods, billing, endpoints, volumes) and not one of them serves
+        logs; GraphQL refuses introspection, and its documented Pod type exposes
+        none either. The console is a human surface, not an API.
+
+        The routes below are kept because they cost one request on a path that
+        only runs when a boot already failed, and RunPod has moved this surface
+        before. The real answer is the pod's own /boot record — see
+        RunpodPodPool._dump_pod_logs, which asks the pod first. Returns
         {console_url, logs?: str, error?: str}."""
         import requests
         out = {"console_url": pod_console_url(pod_id)}
@@ -406,8 +413,9 @@ class RunpodClient:
                     out["logs"] = r.text
                 return out
             errors.append(f"HTTP {r.status_code}")
-        out["error"] = ("logs API unavailable (" + "; ".join(errors[:3])
-                        + ") — use the console link")
+        out["error"] = ("RunPod publishes no pod-log API (" + "; ".join(errors[:3])
+                        + "); a coderai pod serves its own boot record at /boot — "
+                        "for other images use the console link")
         return out
 
     def wait_ready(self, pod_id: str, port: int, ready_timeout: float = 900.0,
@@ -417,11 +425,27 @@ class RunpodClient:
         Only waits for the port to be exposed — the HTTP service inside (vLLM) is
         health-checked separately by the worker."""
         deadline = time.time() + ready_timeout
+        started = time.time()
+        next_report = started + 60.0
+        last = {}
         while time.time() < deadline:
             info = self.get_pod(pod_id)
+            last = info
             if info.get("status") in ("TERMINATED", "FAILED"):
                 raise RunpodError(f"Pod {pod_id} entered status {info.get('status')} before ready.")
             if info.get("ready"):
                 return pod_proxy_url(pod_id, port)
+            # A multi-GB image pull is minutes of silence otherwise, which reads
+            # exactly like a hung pod. Say what is actually being waited on.
+            if time.time() >= next_report:
+                next_report = time.time() + 60.0
+                print(f"[runpod] pod {pod_id}: still no port after "
+                      f"{time.time() - started:.0f}s "
+                      f"(status={info.get('status')} uptime={info.get('uptime_s')}s) "
+                      f"— image pull in progress", flush=True)
             time.sleep(poll_every)
-        raise RunpodError(f"Pod {pod_id} did not expose port {port} within {ready_timeout}s.")
+        raise RunpodError(
+            f"Pod {pod_id} did not expose port {port} within {ready_timeout}s "
+            f"(last status={last.get('status')} uptime={last.get('uptime_s')}s). "
+            f"A cold machine pulling a multi-GB image is the usual cause — raise "
+            f"`boot_timeout_s` on the model if this repeats.")

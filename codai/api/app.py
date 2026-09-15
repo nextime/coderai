@@ -21,6 +21,7 @@ Contains the FastAPI app initialization, lifespan, and core endpoints.
 
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import List
 
@@ -67,10 +68,29 @@ def set_global_file_path_wrapper(path: str):
     set_global_file_path(path)
 
 
+#: Boot phases recorded on the way up, served by /boot. Bounded and trivial:
+#: this must never be a reason a process fails to start.
+_BOOT_PHASES: list = []
+_BOOT_T0 = time.time()
+
+
+def boot_phase(what: str) -> None:
+    """Record and print one boot step, with seconds since process start.
+
+    Printed as well as recorded: the phases have to be in the pod console for
+    the window before the port opens, and readable over HTTP after it.
+    """
+    line = f"[boot +{time.time() - _BOOT_T0:.1f}s] {what}"
+    if len(_BOOT_PHASES) < 200:
+        _BOOT_PHASES.append(line)
+    print(line, flush=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown."""
     import asyncio as _asyncio
+    boot_phase("lifespan start")
 
     async def _archive_cleanup_loop():
         from codai.api.archive import archive_manager
@@ -273,6 +293,30 @@ if admin_static_dir.exists():
 # Serve a favicon at the conventional /favicon.ico path so browsers stop 404-ing on it.
 from fastapi.responses import FileResponse, Response as _FaviconResponse
 _favicon_path = admin_static_dir / "favicon.ico"
+
+
+@app.get("/boot", include_in_schema=False)
+async def boot_progress():
+    """What this process did on the way up, with timings.
+
+    A pod is opaque: from container start to the first answered request there
+    were minutes of silence, and a boot that failed looked exactly like a boot
+    that was merely slow. The RunPod log API answered HTTP 400 when we went
+    looking, so the pod has to be able to say it itself — this is readable the
+    instant the port opens, which is well before the pod is useful.
+
+    Includes boot.sh's phases (container start, GPU, seed list) when present, so
+    one request covers the whole boot rather than just the Python half.
+    """
+    import os as _os
+    out = {"ok": True, "pid": _os.getpid(), "phases": list(_BOOT_PHASES)}
+    log = _os.environ.get("CODERAI_BOOT_LOG", "/tmp/coderai-boot.log")
+    try:
+        with open(log) as fh:
+            out["container"] = [ln.rstrip("\n") for ln in fh][-40:]
+    except OSError:
+        pass          # not a pod, or the wrapper was bypassed
+    return out
 
 
 @app.get("/healthz", include_in_schema=False)

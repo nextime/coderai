@@ -56,4 +56,10 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s \
     CMD curl -fsS http://127.0.0.1:8000/healthz || exit 1
 
-CMD ["python", "-m", "uvicorn", "codai.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+COPY packaging/runpod/boot.sh /opt/coderai/boot.sh
+RUN chmod +x /opt/coderai/boot.sh
+
+# Not uvicorn directly: boot.sh logs each phase with a timestamp from the first
+# instant the container exists, so a slow boot and a failed one stop looking the
+# same from outside.
+CMD ["/opt/coderai/boot.sh"]
