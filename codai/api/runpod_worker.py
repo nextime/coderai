@@ -609,8 +609,13 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
     if cap == "ocr":
         env["CODERAI_OCR_ENABLED"] = "1"
         wanted = str((entry or {}).get("path") or "").strip().lower()
-        if wanted in ("paddle", "doctr", "surya"):
-            env["CODERAI_OCR_DEFAULT_ENGINE"] = wanted
+        if wanted not in ("paddle", "doctr", "surya"):
+            # The pod images ship docTR, the only engine that runs in-process.
+            wanted = "doctr"
+        env["CODERAI_OCR_DEFAULT_ENGINE"] = wanted
+        # The subsystem flag is not enough: each engine has a gate of its own,
+        # and doctr and surya both default to off.
+        env[f"CODERAI_OCR_{wanted.upper()}_ENABLED"] = "1"
         if wanted == "surya" or _surya_accepted():
             # Surya is GPL and gated on an explicit acceptance. The pod inherits
             # the decision made HERE — it cannot make it for itself, and asking

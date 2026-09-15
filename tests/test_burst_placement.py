@@ -603,11 +603,23 @@ def test_an_ocr_pod_arrives_with_ocr_switched_on():
     assert env["CODERAI_OCR_DEFAULT_ENGINE"] == "surya"
     # Asking for surya by name IS the licence decision; the pod cannot make it.
     assert env["CODERAI_OCR_SURYA_ACCEPT_LICENSE"] == "1"
+    # …and the engine's OWN gate, which is separate from the subsystem's. A pod
+    # with only the subsystem enabled answered "OCR engine 'surya' is not
+    # enabled" — a second refusal from a second flag, a round later.
+    assert env["CODERAI_OCR_SURYA_ENABLED"] == "1"
 
     # A non-gated engine does not carry the licence flag unless we accepted it.
     env = pod_plan(mcfg, "ocr", entry={"path": "paddle",
                                        "model_type": "ocr_models"})["env"]
     assert env["CODERAI_OCR_DEFAULT_ENGINE"] == "paddle"
+    assert env["CODERAI_OCR_PADDLE_ENABLED"] == "1"
+
+    # An unnamed engine falls to docTR: the only one the images ship, because it
+    # is the only one that runs in-process. The others need a venv of their own.
+    env = pod_plan(mcfg, "ocr", entry={"path": "whatever",
+                                       "model_type": "ocr_models"})["env"]
+    assert env["CODERAI_OCR_DEFAULT_ENGINE"] == "doctr"
+    assert env["CODERAI_OCR_DOCTR_ENABLED"] == "1"
 
     # And a pod for anything else is untouched.
     env = pod_plan(mcfg, "images", entry={"path": "org/sd",

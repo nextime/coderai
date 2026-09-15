@@ -1,4 +1,19 @@
-# /v1/ocr — see also requirements-ocr.txt / requirements-surya.txt for the
-# engine-specific extras a given OCR backend needs.
+# /v1/ocr
+#
+# docTR, in this venv. The image used to install NO OCR engine at all — only
+# transformers and pypdfium2 — so an OCR pod could boot, pass its health check,
+# accept a request and then have nothing to do it with. Three separate gates
+# (subsystem enabled, engine enabled, licence accepted) reported their own
+# refusal first, which hid the real problem for three rounds.
+#
+# docTR and not the others, because it is the only one that runs IN-PROCESS:
+# Surya caps pillow<11 and lives in an isolated venv by design, and paddle wants
+# paddlepaddle in one of its own. Either would mean a second torch in the image
+# — 6 GB to avoid a Pillow conflict. Surya remains available on a local install,
+# and can be baked in later with the <profile>.venv-<name>.txt mechanism if a
+# pod ever needs its layout quality.
 transformers>=4.35.0
 pypdfium2>=4.20.0
+python-doctr>=0.8.0
+ultralytics>=8.1.0
+jsonschema>=4.0.0

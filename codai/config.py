@@ -1339,6 +1339,13 @@ class ConfigManager:
             engine = (_os.environ.get("CODERAI_OCR_DEFAULT_ENGINE") or "").strip()
             if engine:
                 self.config.ocr.default_engine = engine
+            # Each engine has its OWN gate on top of the subsystem's, and two of
+            # the three default to off. Enabling the subsystem alone got a pod as
+            # far as "OCR engine 'surya' is not enabled" — a second refusal from
+            # a second flag, one round later.
+            for name in ("paddle", "doctr", "surya"):
+                if _flag(f"CODERAI_OCR_{name.upper()}_ENABLED"):
+                    setattr(self.config.ocr, f"{name}_enabled", True)
             if _flag("CODERAI_OCR_SURYA_ACCEPT_LICENSE"):
                 # Surya is GPL and gated on an explicit acceptance. The pod
                 # inherits the decision made here; it cannot make it itself.
