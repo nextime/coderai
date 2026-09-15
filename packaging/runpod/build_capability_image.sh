@@ -57,6 +57,7 @@ echo "==> building $TAG from profile '$PROFILE'"
 # BuildKit for the pip cache mount: nine profiles, one torch download.
 DOCKER_BUILDKIT=1 docker build -f packaging/runpod/Dockerfile.capability \
     --build-arg "PROFILE=$PROFILE" \
+    --build-arg "IMAGE_TAG=$TAG" \
     --build-arg "CORE_BASE=$CORE_BASE" \
     -t "$TAG" .
 

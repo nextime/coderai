@@ -140,12 +140,16 @@ async def lifespan(app: FastAPI):
                   flush=True)
         _seeds = [e for e in (getattr(_cm, "_pending_seed_entries", None) or [])
                   if isinstance(e, dict) and e.get("path")]
-        print(f"[seed] {len(_seeds)} seeded model(s) to register", flush=True)
+        boot_phase(f"registering {len(_seeds)} seeded model(s)")
         for _entry in _seeds:
             register_model_runtime(_entry,
                                    _entry.get("model_type") or "text_models")
+        if _seeds:
+            boot_phase("seeded models registered: "
+                       + ", ".join(str(e.get("alias") or e.get("path"))
+                                   for e in _seeds)[:200])
     except Exception as _exc:
-        print(f"[seed] could not register seeded models: {_exc}", flush=True)
+        boot_phase(f"SEED REGISTRATION FAILED: {_exc}")
 
     # Start any RunPod pod configured to stay warm. Pools are otherwise created
     # on first use, so the first request after a restart would still pay the cold
@@ -158,6 +162,8 @@ async def lifespan(app: FastAPI):
                    name="runpod-warm").start()
     except Exception:
         pass
+
+    boot_phase("startup complete — accepting requests")
 
     yield
 

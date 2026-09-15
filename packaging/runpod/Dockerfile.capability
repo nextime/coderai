@@ -23,6 +23,12 @@ FROM ${CORE_BASE}
 ARG PROFILE=images
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
 ENV PROFILE=${PROFILE}
+# Baked at build time so the pod can say WHICH build it is. A machine may serve
+# a cached `:latest`, and an images pod once reported a dependency missing that
+# had already been published under that tag — with no way to tell from outside
+# whether the pod ran the new image or an old one. Now it says so at boot.
+ARG IMAGE_TAG=unknown
+ENV CODERAI_IMAGE_TAG=${IMAGE_TAG}
 
 WORKDIR /opt/coderai/app
 COPY packaging/runpod/profiles/ /tmp/profiles/
