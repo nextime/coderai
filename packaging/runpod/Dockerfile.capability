@@ -57,12 +57,18 @@ RUN --mount=type=cache,target=/root/.cache/pip set -eux; \
 ARG PROFILE
 COPY packaging/runpod/profiles/ /tmp/venv-profiles/
 RUN set -eux; \
-    extra="/tmp/venv-profiles/${PROFILE}.venv-audiocraft.txt"; \
-    if [ -f "$extra" ]; then \
-        python -m venv /opt/coderai/venvs/audiocraft; \
-        /opt/coderai/venvs/audiocraft/bin/pip install --no-cache-dir -r "$extra"; \
-        /opt/coderai/venvs/audiocraft/bin/python -c "import audiocraft; print('audiocraft', audiocraft.__version__)"; \
-    fi; \
+    for extra in /tmp/venv-profiles/${PROFILE}.venv-*.txt; do \
+        [ -f "$extra" ] || continue; \
+        name="$(basename "$extra" .txt)"; name="${name#${PROFILE}.venv-}"; \
+        vdir="/opt/coderai/venvs/${name}"; \
+        python -m venv "$vdir"; \
+        "$vdir/bin/pip" install --no-cache-dir -r "$extra"; \
+        nodeps="${extra%.txt}.nodeps"; \
+        if [ -f "$nodeps" ]; then \
+            "$vdir/bin/pip" install --no-cache-dir --no-deps -r "$nodeps"; \
+        fi; \
+        "$vdir/bin/python" -c "import ${name}; print('${name}', getattr(${name}, '__version__', 'ok'), 'in its own venv')"; \
+    done; \
     rm -rf /tmp/venv-profiles
 
 COPY . /opt/coderai/app

@@ -1,0 +1,7 @@
+# Installed with --no-deps into the venv described by the .txt beside this file.
+# audiocraft's declared pins (torch==2.1.0, torchvision==0.16.0,
+# torchtext==0.16.0) cannot all be satisfied on this Python, and its inference
+# code does not need those exact versions — the pin is the library being
+# conservative. The import check in the build fails the image if that judgement
+# turns out to be wrong.
+audiocraft==1.3.0
