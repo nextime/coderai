@@ -569,3 +569,21 @@ def test_a_port_timeout_says_what_it_was_waiting_on(monkeypatch):
         assert "boot_timeout_s" in str(exc)
     else:
         raise AssertionError("expected a RunpodError")
+
+
+def test_a_model_can_declare_a_capability_its_section_does_not_imply():
+    """Voice cloning runs on a TTS model (XTTS, F5) but is a different endpoint
+    and a different pod image. Section alone maps it to 'tts', so it could never
+    be placed as 'voice' — which is why the voice image went untested."""
+    from codai.api.runpod_worker import model_capability
+
+    xtts = {"path": "coqui/XTTS-v2", "model_type": "tts_models"}
+    assert model_capability(xtts) == "tts"
+
+    xtts_as_voice = dict(xtts, capability="voice")
+    assert model_capability(xtts_as_voice) == "voice"
+
+    # The override wins for text too, where the default is deliberately blank.
+    llm = {"path": "org/m", "model_type": "text_models"}
+    assert model_capability(llm) == ""
+    assert model_capability(dict(llm, capability="text")) == "text"

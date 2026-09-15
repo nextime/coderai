@@ -232,6 +232,13 @@ def model_capability(entry: dict, include_text: bool = False) -> str:
     """
     if not isinstance(entry, dict):
         return ""
+    # An explicit override, for a model that serves something its section does
+    # not imply. Voice cloning is the case that forced this: it runs on a TTS
+    # model (XTTS, F5) but is a different endpoint and a different pod image, so
+    # section alone maps it to 'tts' and it could never be placed as 'voice'.
+    explicit = str(entry.get("capability") or "").strip().lower()
+    if explicit:
+        return explicit
     types = entry.get("model_types") or [entry.get("model_type") or ""]
     for mt in types:
         if mt in _LLM_MODEL_TYPES and not include_text:

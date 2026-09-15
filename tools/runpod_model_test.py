@@ -110,22 +110,33 @@ _OCR_ENGINES = ("paddle", "doctr", "surya")
 
 
 def _pin_to_runpod(model: str, engine: str, vram: float, usd: float,
-                   image: str = "") -> bool:
+                   image: str = "", add_as: str = "",
+                   capability: str = "") -> bool:
     """Give this ONE model a runpod block. True when the catalogue changed."""
     data = _load_models()
     section, index, entry = _find(data, model)
     if entry is None and model.strip().lower() in _OCR_ENGINES:
-        section = "ocr_models"
+        add_as = add_as or "ocr_models"
+    if entry is None and add_as:
+        # Testing a capability whose images nobody has a model configured for
+        # (music generation, a small video model) should not require editing the
+        # real catalogue by hand first. The entry is temporary like every other
+        # change this makes, and restored on the way out.
+        section = add_as
         data.setdefault(section, [])
-        data[section].append({"path": model, "model_type": "ocr_models"})
+        data[section].append({"path": model, "model_type": add_as})
         index = len(data[section]) - 1
         entry = data[section][index]
-        print(f"   {model}: OCR engine — added a temporary catalogue entry",
-              flush=True)
+        print(f"   {model}: added a temporary {add_as} entry", flush=True)
     if entry is None:
         print(f"   {model}: not in models.json — nothing to place", flush=True)
         return False
     entry = dict(entry)
+    if capability:
+        # Section alone maps XTTS to 'tts', but voice cloning is a different
+        # endpoint served by a different pod image. An explicit capability is
+        # the only way to place it as what it actually is.
+        entry["capability"] = capability
     entry["backend"] = "runpod"
     entry["runpod"] = {"mode": "pods", "engine": engine, "min_vram_gb": vram,
                        "max_hourly_usd": usd, "max_pods": 1, "idle_timeout_s": 120}
@@ -190,6 +201,15 @@ def main() -> int:
     ap.add_argument("--usd", type=float, default=1.0, help="max $/hr per pod")
     ap.add_argument("--keep-pods", action="store_true",
                     help="do not terminate pods after each test")
+    ap.add_argument("--add-as", dest="add_as", default="",
+                    help="models.json section to create a TEMPORARY entry in "
+                         "when the model is not configured, e.g. "
+                         "audio_gen_models. Restored afterwards like every "
+                         "other change this makes.")
+    ap.add_argument("--capability", default="",
+                    help="place the model as this capability instead of the one "
+                         "its section implies (voice cloning runs on a TTS "
+                         "model but is a different image).")
     ap.add_argument("--image", default="",
                     help="exact pod image to run, e.g. "
                          "ghcr.io/nextime/coderai-embeddings:0.2.12. Use a "
@@ -218,7 +238,7 @@ def main() -> int:
         for model in args.models:
             print(f"================ {model} ================", flush=True)
             if not _pin_to_runpod(model, args.engine, args.vram, args.usd,
-                                  args.image):
+                                  args.image, args.add_as, args.capability):
                 results.append((model, {"error": "not in models.json"}))
                 continue
             problem = _wait_for_engine(model)
