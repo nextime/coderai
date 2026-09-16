@@ -210,6 +210,12 @@ def model_placement(model: str) -> tuple:
     block = entry.get("runpod") if isinstance(entry.get("runpod"), dict) else None
     if backend == "runpod" and block is not None:
         return "pod", (entry, block)
+    # A capability image on a machine you already have: an endpoint and a
+    # token, optionally a command to start it. Same acquire/release shape as a
+    # pod, none of the renting machinery.
+    hblock = entry.get("host") if isinstance(entry.get("host"), dict) else None
+    if backend == "host" and hblock is not None and str(hblock.get("url") or "").strip():
+        return "host", (entry, hblock)
     return "", None
 
 
@@ -358,7 +364,24 @@ def resolve_target(path: str, method: str, query: str, body: bytes,
     if where == "local":
         return None                              # pinned here, whatever the capability says
     if where == "url":
-        return Target(url=detail, reason=f"model {model!r}")
+        target = Target(url=detail, reason=f"model {model!r}")
+        # A capability image locks itself with CODERAI_API_TOKEN, so a
+        # hand-run one behind a plain service_url answers 401 to everything
+        # unless the entry carries its token. `service_token` is that.
+        try:
+            from codai.models.manager import _model_entry_for
+            target.api_key = str((_model_entry_for(model) or {}).get("service_token")
+                                 or "").strip()
+        except Exception:
+            pass
+        return target
+    if where == "host":
+        entry, hblock = detail
+        from codai.api.host_worker import get_host_pool
+        target = Target(pool=get_host_pool(model, hblock),
+                        reason=f"model {model!r} on a host you run")
+        target.api_key = str(hblock.get("api_key") or "").strip()
+        return target
     if where == "pod":
         entry, block = detail
         from codai.api.runpod_worker import (get_model_pod_pool, parse_model_runpod,

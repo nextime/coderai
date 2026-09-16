@@ -1771,3 +1771,87 @@ def test_xtts_falls_through_to_its_own_venv_when_not_importable(monkeypatch):
         assert "/opt/coderai/venvs/TTS" in str(e)
     else:
         raise AssertionError("expected MissingEngineError")
+
+
+# --- the host backend: a capability image on a machine you already have ---- #
+
+def test_a_model_can_be_placed_on_a_host_you_run(monkeypatch):
+    """The capability images are ordinary containers. A box you own, a server
+    rented by the month, a second GPU down the hall — coderai uses it per model
+    with an endpoint and a token, and none of RunPod's renting machinery."""
+    import codai.models.manager as mgr
+    from codai.api.remote_gateway import model_placement
+
+    entry = {"path": "org/m", "model_type": "image_models", "backend": "host",
+             "host": {"url": "http://gpubox:8000", "api_key": "k"}}
+    monkeypatch.setattr(mgr, "_model_entry_for", lambda n: entry)
+    kind, detail = model_placement("m")
+    assert kind == "host" and detail[1]["url"] == "http://gpubox:8000"
+
+    # No url, no placement — silently routing to nowhere is worse than local.
+    entry["host"] = {"api_key": "k"}
+    assert model_placement("m") == ("", None)
+
+
+def test_an_always_on_host_that_is_down_says_so_instead_of_starting_nothing(monkeypatch):
+    from codai.api import host_worker as hw
+
+    monkeypatch.setattr(hw, "_health_ok", lambda *a, **k: False)
+    pool = hw.HostPool("m", hw.parse_host({"url": "http://gpubox:8000"}))
+    try:
+        pool.acquire()
+    except hw.HostError as e:
+        assert "always-on" in str(e) and "no start_cmd" in str(e)
+    else:
+        raise AssertionError("expected HostError")
+
+
+def test_an_on_demand_host_is_started_used_and_stopped_after_idle(monkeypatch):
+    """start_cmd runs, health is awaited, and after idle_timeout_s with nothing
+    in flight stop_cmd runs. A request arriving during the idle window keeps it
+    alive. Verified for real against a capability container as well; this is
+    the fast version."""
+    import time
+    from codai.api import host_worker as hw
+
+    ran = []
+    up = {"v": False}
+    def _run(self, cmd):
+        ran.append(cmd)
+        up["v"] = cmd.startswith("start")
+    monkeypatch.setattr(hw.HostPool, "_run", _run)
+    monkeypatch.setattr(hw, "_health_ok", lambda *a, **k: up["v"])
+
+    pool = hw.HostPool("m", hw.parse_host({
+        "url": "http://gpubox:8000", "start_cmd": "start it", "stop_cmd": "stop it",
+        "boot_timeout_s": 5, "idle_timeout_s": 1}))
+    h, url = pool.acquire()
+    assert ran == ["start it"] and url == "http://gpubox:8000" and pool._started_by_us
+    pool.release(h)
+    time.sleep(1.6)
+    assert ran == ["start it", "stop it"] and not pool._started_by_us
+
+    # A host we did NOT start is never stopped by us, even with a stop_cmd.
+    ran.clear(); up["v"] = True
+    pool2 = hw.HostPool("m2", hw.parse_host({
+        "url": "http://gpubox:8000", "start_cmd": "start it", "stop_cmd": "stop it",
+        "idle_timeout_s": 1}))
+    h2, _ = pool2.acquire(); pool2.release(h2)
+    time.sleep(1.6)
+    assert ran == [], "stopped a host we never started"
+
+
+def test_a_plain_service_url_carries_its_token(monkeypatch):
+    """A capability image locks itself with CODERAI_API_TOKEN, so a hand-run one
+    behind a bare service_url answered 401 to everything: the URL routed, the
+    token never travelled."""
+    import codai.models.manager as mgr
+    from codai.api import remote_gateway as rg
+
+    entry = {"path": "org/m", "model_type": "image_models",
+             "service_url": "http://gpubox:8000", "service_token": "tok-123"}
+    monkeypatch.setattr(mgr, "_model_entry_for", lambda n: entry)
+    monkeypatch.setattr(rg, "_model_remote", lambda m: "http://gpubox:8000")
+    t = rg.resolve_target("/v1/images/generations", "POST", "",
+                          b'{"model":"m"}', "application/json")
+    assert t is not None and t.url == "http://gpubox:8000" and t.api_key == "tok-123"

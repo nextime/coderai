@@ -854,7 +854,11 @@ def seed_model_env(entry: dict, served: str = "", source: str = "") -> str:
             "lora_path", "lora_model_dir", "lora_scale", "loras",
             # Which MusicGen implementation to use. Describes the model, not
             # this deployment's placement, so it travels.
-            "audio_backend")
+            "audio_backend",
+            # NOT `host`, `service_url` or `service_token`: those say where a
+            # model runs from HERE. On the far side they would make a pod try
+            # to forward to itself, or to a machine it cannot reach.
+            )
     out = {k: entry[k] for k in keep if k in entry and entry[k] is not None}
     out["path"] = path
     # Adapters the pod cannot resolve by name are named by CONTENT id instead.
