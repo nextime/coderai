@@ -192,6 +192,9 @@ and the local colibri has no GPU backend at all — neither would run on an A100
 The image builds them in a CUDA 12.8 toolchain stage for every generation RunPod
 rents (sm_80 A100, sm_86, sm_89 L40S/4090, sm_90 H100, sm_120a RTX 50 / RTX PRO
 Blackwell) and a portable x86-64-v3 CPU baseline, then keeps only the binaries.
+The runtime side is the light core plus NVIDIA's cuda-runtime and cuBLAS 12.8
+wheels — the engines are C, coderai only drives them, so there is no torch in
+it: 2.4 GB, the smallest capability image.
 
 ```bash
 ./packaging/runpod/build_capability_image.sh engines ghcr.io/nextime/coderai-engines:0.2.18

@@ -980,6 +980,7 @@ def test_the_engines_image_is_built_from_source_for_every_pod_gpu():
     for arch in ("sm_80", "sm_86", "sm_89", "sm_90", "sm_120"):
         assert arch in df
     assert "CUDA_ARCH=portable" in df and "x86-64-v3" in df
+    assert "base-light" in df, "the engines are C: no torch needed"
     assert "patch-k3.py" in df and "not found" in df
     for var in ("CODERAI_DS4_DIR", "CODERAI_COLIBRI_DIR", "CODERAI_K3_DIR"):
         assert var in df

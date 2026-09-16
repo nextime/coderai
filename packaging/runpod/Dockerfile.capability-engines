@@ -9,13 +9,14 @@
 # Blackwell) and for a portable x86-64-v3 CPU baseline — then keeps only the
 # binaries and the scripts beside them. The toolchain never reaches the image.
 #
-# The runtime side is the ordinary full core: torch's cu128 wheels carry the
-# libcudart.so.12 / libcublas.so.12 the engines link, so nothing else is added.
+# The runtime side is the LIGHT core (no torch — coderai only drives these
+# binaries) plus NVIDIA's cuda-runtime and cublas 12.8 wheels, the only
+# libraries the engines link. About 2 GB instead of 9.
 #
 # Built by build_capability_image.sh engines, which first stages the engine
 # source trees into packaging/runpod/engines-src/ (they live outside the repo).
 
-ARG CORE_BASE=coderai-capability-base:latest
+ARG CORE_BASE=coderai-capability-base-light:latest
 ARG CUDA_DEVEL=nvidia/cuda:12.8.1-devel-ubuntu24.04
 
 # ---------------------------------------------------------------- build stage
@@ -81,7 +82,9 @@ WORKDIR /opt/coderai/app
 COPY packaging/runpod/profiles/ /tmp/profiles/
 RUN --mount=type=cache,target=/root/.cache/pip set -eux; \
     python -m pip install --extra-index-url ${TORCH_INDEX} -r /tmp/profiles/${PROFILE}.txt; \
-    python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"; \
+    if python -c "import torch" 2>/dev/null; then \
+        echo "ERROR: engines is a light-core image but torch reached its main venv" >&2; exit 1; \
+    fi; echo "main venv: no torch (light core, as intended)"; \
     rm -rf /tmp/profiles
 
 COPY --from=engines /out/ds4/ /opt/coderai/ds4/
@@ -89,7 +92,7 @@ COPY --from=engines /out/colibri/ /opt/coderai/colibri/
 COPY --from=engines /out/kimi-k3-in-c/ /opt/coderai/kimi-k3-in-c/
 
 # Where the workers look (codai/api/{ds4,colibri,k3}_worker.default_install_dir),
-# and the CUDA runtime the engines link, from torch's own wheels.
+# and the CUDA runtime the engines link, from NVIDIA's wheels.
 ENV CODERAI_DS4_DIR=/opt/coderai/ds4 \
     CODERAI_COLIBRI_DIR=/opt/coderai/colibri \
     CODERAI_K3_DIR=/opt/coderai/kimi-k3-in-c \

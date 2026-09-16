@@ -4,9 +4,15 @@
 #
 # The engines are not pip packages: they are compiled in a CUDA 12.8 toolchain
 # stage of Dockerfile.capability-engines (see the `engines.dockerfile` marker)
-# for EVERY pod GPU generation (sm_80/86/89/90/120), not the one card this
-# machine has, and copied in beside their download scripts. The Python side
-# needs nothing beyond the core: the engines bring their own tokenizers.
+# for EVERY pod GPU generation (sm_80/86/89/90/120a), not the one card this
+# machine has, and copied in beside their download scripts.
+#
+# LIGHT core: the engines are C binaries and coderai only drives them, so the
+# 5 GB of torch in the full core would be dead weight. All they link is the
+# CUDA runtime and cuBLAS, which NVIDIA ships as wheels — 12.8 to match the
+# toolchain they were compiled with. The engines bring their own tokenizers.
+nvidia-cuda-runtime-cu12==12.8.90
+nvidia-cublas-cu12==12.8.4.1
 #
 # THE WEIGHTS ARE THE COST. DeepSeek-V4 is ~154 GB, Kimi-K3 is measured in
 # terabytes. Put them on a network volume (docs/runpod.md, "Engine pods") —
