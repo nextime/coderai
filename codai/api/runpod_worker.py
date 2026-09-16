@@ -525,6 +525,88 @@ def weight_transfer_warning(entry: dict, mcfg: "RunpodModelConfig",
             f"are fetched once and every later pod attaches to them instead.")
 
 
+#: Room the pod needs beyond the weights: the image unpacks onto the same disk
+#: (a 9 GB image is ~15 GB unpacked), plus HF's download cache keeps the .incomplete
+#: file beside the final one until it is done.
+_DISK_HEADROOM_GB = 25
+#: A model this large is not something to size a disk for by guesswork — it is
+#: the huge-weight case, and belongs on a volume. The warning covers it.
+_DISK_SIZING_CAP_GB = 400
+
+
+def estimate_weights_gb(entry: dict, mcfg: "RunpodModelConfig" = None) -> float:
+    """How many GB the model's weights will take on the pod, or 0.0 if unknown.
+
+    Asked of HuggingFace before renting, because the alternative was observed:
+    a pod boots, pulls the image, starts the download, fills its disk, and dies
+    at load_timeout_s having paid for every minute of it. The size of a repo is
+    one metadata call; the disk it needs is that plus headroom.
+    """
+    try:
+        from codai.api.runpod_worker import resolve_model_source
+        kind, value = resolve_model_source(entry or {}, mcfg) if mcfg else ("hf", "")
+    except Exception:
+        kind, value = "hf", ""
+    repo = value if kind == "hf" and value else str((entry or {}).get("path") or "")
+    if not repo or repo.startswith(("/", "~", ".")) or "/" not in repo:
+        return 0.0                       # a local path or a URL: nothing to ask
+    try:
+        from huggingface_hub import model_info as _hf_model_info
+        files = _hf_model_info(repo, files_metadata=True).siblings or []
+    except Exception:
+        return 0.0
+    pattern = str((entry or {}).get("file_pattern") or "")
+    if pattern:
+        import fnmatch
+        pats = [pattern] if "/" in pattern else [f"*{pattern}"]
+        files = [f for f in files if any(fnmatch.fnmatch(f.rfilename, q) for q in pats)]
+        return sum((f.size or 0) for f in files) / 1e9
+    # No pattern: count the weights a load will actually fetch, not the whole
+    # repo. SDXL's repo is 77 GB, of which a diffusers load pulls 28: the rest is
+    # the same weights again as Flax .msgpack, legacy .bin and ONNX exports.
+    # Sizing a disk to the repo would rent 100 GB for a 28 GB model.
+    def _loaded(name: str) -> bool:
+        low = name.lower()
+        if low.endswith((".onnx", ".onnx_data", ".msgpack", ".h5", ".tflite", ".ot")):
+            return False
+        if low.endswith(".bin") and any(f.rfilename.endswith(".safetensors") for f in files):
+            return False                 # .bin only matters when no safetensors exist
+        if "onnx" in low or "/flax" in low or "openvino" in low:
+            return False
+        return low.endswith((".safetensors", ".bin", ".gguf", ".pt", ".pth", ".ckpt",
+                             ".json", ".txt", ".model", ".tiktoken", ".spm"))
+    return sum((f.size or 0) for f in files if _loaded(f.rfilename)) / 1e9
+
+
+def disk_for(entry: dict, mcfg: "RunpodModelConfig", account=None) -> tuple:
+    """(container_disk_gb, note) — the configured disk, grown to fit the weights.
+
+    Grows, never shrinks: an explicit container_disk_gb larger than the estimate
+    is respected, and one too small for the model is raised with a note saying
+    by how much and why. Says nothing when the estimate is unavailable.
+
+    With a network volume attached the weights land THERE, not on the container
+    disk — that is the point of the volume — so the disk only has to hold the
+    unpacked image and is left at its configured size.
+    """
+    configured = int(getattr(mcfg, "container_disk_gb", 40) or 40)
+    vol, _ = volume_for(mcfg, account)
+    if vol:
+        return configured, ""
+    weights = estimate_weights_gb(entry, mcfg)
+    if weights <= 0:
+        return configured, ""
+    needed = int(weights + _DISK_HEADROOM_GB + 0.999)
+    if needed > _DISK_SIZING_CAP_GB:
+        return configured, (f"weights are ~{weights:.0f} GB — beyond what a container "
+                            f"disk should hold; this model belongs on a network volume")
+    if needed <= configured:
+        return configured, ""
+    return needed, (f"container disk raised {configured} -> {needed} GB: the weights "
+                    f"are ~{weights:.1f} GB and the image and download cache need "
+                    f"~{_DISK_HEADROOM_GB} GB beside them")
+
+
 def volume_for(mcfg: "RunpodModelConfig", account) -> tuple:
     """(volume_id, mount_path) for this pool, or ('', '')."""
     vol = (getattr(mcfg, "network_volume_id", "") or "").strip() \
@@ -1436,9 +1518,13 @@ class RunpodPodPool:
                   f"({sel['cloud_type']}{'/spot' if sel['is_spot'] else ''}) ${sel['price']}/hr",
                   flush=True)
             try:
+                _disk_gb, _disk_note = disk_for(
+                    _model_entry(self.served or self.model_key), self.mcfg, self.account)
+                if _disk_note:
+                    print(f"[runpod] {_disk_note}", flush=True)
                 pod_id = client.create_pod(
                     name=name, image=image, gpu_type_id=sel["gpu_type_id"], port=port,
-                    cloud_type=sel["cloud_type"], container_disk_gb=self.mcfg.container_disk_gb,
+                    cloud_type=sel["cloud_type"], container_disk_gb=_disk_gb,
                     volume_gb=self.mcfg.volume_gb, env=env, docker_args=args,
                     is_spot=sel["is_spot"], bid_per_gpu=sel["bid"],
                     data_center_id=(getattr(self, "_volume_dc", "") or dc),

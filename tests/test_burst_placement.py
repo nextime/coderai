@@ -718,3 +718,49 @@ def test_the_provision_path_itself_is_free_of_undefined_names():
                          cwd=root, capture_output=True, text=True).stdout
     undefined = [l for l in out.splitlines() if "undefined name" in l]
     assert not undefined, "\n".join(undefined)
+
+
+def test_the_container_disk_grows_to_fit_the_weights_unless_a_volume_holds_them(monkeypatch):
+    """A pod that boots, pulls the image, starts the download and fills its disk
+    dies at load_timeout_s having paid for every minute. The repo's size is one
+    metadata call before renting. And with a volume attached the weights land
+    there, so the disk stays at its configured size."""
+    import codai.api.runpod_worker as rw
+
+    monkeypatch.setattr(rw, "estimate_weights_gb", lambda e, m=None: 35.2)
+    mcfg = rw.parse_model_runpod({"engine": "coderai"})
+    gb, note = rw.disk_for({"path": "org/big"}, mcfg)
+    assert gb == 61 and "raised 40 -> 61" in note
+
+    # An explicit disk already large enough is respected, not shrunk.
+    big = rw.parse_model_runpod({"engine": "coderai", "container_disk_gb": 200})
+    assert rw.disk_for({"path": "org/big"}, big) == (200, "")
+
+    # A volume holds the weights: the disk only needs the image.
+    vol = rw.parse_model_runpod({"engine": "coderai", "network_volume_id": "vol-1"})
+    assert rw.disk_for({"path": "org/big"}, vol) == (40, "")
+
+    # Unknown size: say nothing, change nothing.
+    monkeypatch.setattr(rw, "estimate_weights_gb", lambda e, m=None: 0.0)
+    assert rw.disk_for({"path": "/local/x.gguf"}, mcfg) == (40, "")
+
+
+def test_the_weight_estimate_counts_what_a_load_fetches_not_the_whole_repo(monkeypatch):
+    """SDXL's repo is 77 GB; a diffusers load pulls 28. The rest is the same
+    weights again as Flax, legacy .bin and ONNX. Sizing to the repo would rent
+    100 GB for a 28 GB model."""
+    import types
+    import codai.api.runpod_worker as rw
+
+    def _fake_info(repo, files_metadata=True):
+        F = lambda n, s: types.SimpleNamespace(rfilename=n, size=s)
+        return types.SimpleNamespace(siblings=[
+            F("unet/diffusion_pytorch_model.safetensors", 10_000_000_000),
+            F("unet/diffusion_pytorch_model.bin", 10_000_000_000),        # dupe of ^
+            F("unet/diffusion_flax_model.msgpack", 10_000_000_000),       # Flax dupe
+            F("unet/model.onnx_data", 10_000_000_000),                    # ONNX dupe
+            F("model_index.json", 1_000),
+        ])
+    monkeypatch.setattr("huggingface_hub.model_info", _fake_info)
+    gb = rw.estimate_weights_gb({"path": "org/sdxl"}, rw.parse_model_runpod({"engine": "coderai"}))
+    assert abs(gb - 10.0) < 0.01, f"counted dupes: {gb} GB"
