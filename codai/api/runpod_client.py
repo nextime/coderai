@@ -325,6 +325,7 @@ class RunpodClient:
           pod(input: $input) {
             id
             desiredStatus
+            lastStatusChange
             costPerHr
             runtime {
               uptimeInSeconds
@@ -339,6 +340,11 @@ class RunpodClient:
         return {
             "id": p.get("id") or pod_id,
             "status": p.get("desiredStatus"),
+            # The one field that says WHY a pod is EXITED. It reads like
+            # "Rented by User: ..." or "container exited with code 1" — and it
+            # was never fetched, so a dead pod produced three hundred seconds
+            # of "still no port" and no reason at all.
+            "last_change": p.get("lastStatusChange") or "",
             "uptime_s": rt.get("uptimeInSeconds") or 0,
             "cost_per_hr": p.get("costPerHr"),
             "ports": ports,
@@ -444,8 +450,8 @@ class RunpodClient:
                 raise RunpodError(
                     f"Pod {pod_id} container EXITED on boot (uptime "
                     f"{info.get('uptime_s')}s) — the image pulled but the process "
-                    f"died immediately. Not a pull problem: check the image's "
-                    f"entrypoint and the console log.")
+                    f"died immediately. RunPod says: "
+                    f"{info.get('last_change') or '(no reason given)'}")
             if info.get("ready"):
                 return pod_proxy_url(pod_id, port)
             # A multi-GB image pull is minutes of silence otherwise, which reads
@@ -453,7 +459,7 @@ class RunpodClient:
             if time.time() >= next_report:
                 next_report = time.time() + 60.0
                 why = ("image pull in progress" if info.get("status") != "EXITED"
-                       else "container has EXITED — waiting for a restart")
+                       else f"container has EXITED ({info.get('last_change') or 'no reason given'})")
                 print(f"[runpod] pod {pod_id}: still no port after "
                       f"{time.time() - started:.0f}s "
                       f"(status={info.get('status')} uptime={info.get('uptime_s')}s) "
