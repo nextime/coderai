@@ -97,9 +97,19 @@ Plus:
   each carrying its own torch on a torch-free core so it stays under RunPod's image size
   limit. Fourteen have completed a real inference on a rented GPU; `faceswap` is the one
   that needs real faces to test
+- **The native MoE engines on rented GPUs**: an `engines` image compiles ds4, colibri and
+  kimi-k3-in-c for every pod GPU generation (Ampere → Blackwell) rather than copying this
+  machine's builds; a model names its engine on its runpod block and the pod arrives with
+  it enabled and configured. ⚠ Their weights are 100 GB–1.5 TB: put them on a network
+  volume (`volume_path`) or every cold pod downloads them — the UI warns, loudly
+- **Multi-GPU pods**: `gpu_count` rents one machine with N cards, priced and VRAM-checked as
+  a whole; vLLM and llama.cpp are told to shard across them
 - **Or a machine you already have**: `"backend": "host"` points a model at a capability
   image running anywhere — always-on, or started by a command and stopped after idle —
-  with none of the renting machinery
+  with none of the renting machinery. Both are one choice on the model page: *Runs on →
+  this machine / RunPod only / a machine of yours*
+- **Visible while it runs**: every request sent to a pod or host is a row on the Tasks page
+  naming the machine it landed on, and `/admin/runpod` lists the live pods
 
 Full guide: [`docs/runpod.md`](docs/runpod.md) ·
 remote placement of every model type, the capability images and the `host` backend:

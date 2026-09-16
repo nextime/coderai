@@ -55,3 +55,6 @@ tools/coderai_media/
 .oci-*.log
 venv_build.log
 .build.pid
+
+# staged engine sources for the engines pod image (build_capability_image.sh)
+packaging/runpod/engines-src/

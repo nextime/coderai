@@ -654,6 +654,10 @@ volume at once can corrupt it — coderai's writes are write-once (content-addre
 adapter blobs, named model files), but keep that in mind before pointing many
 pods at one volume for anything else.
 
+**Engine models live here or nowhere.** DeepSeek-V4 on ds4 is ~154 GB, Kimi-K3
+is terabytes; the engines pod image loads them from `volume_path` on the volume
+rather than downloading. See "Engine pods" in `docs/runpod.md` — and its warning.
+
 #### Dependencies on the volume, small image in the registry
 
 A capability image is ~7 GB and nearly all of it is torch. With a volume those

@@ -1,0 +1,15 @@
+# Native MoE engines — ds4 (DeepSeek-V4, CUDA), colibri (GLM-5.2 CUDA;
+# DeepSeek-V4 and Kimi-K3 CPU) and kimi-k3-in-c — a coderai pod that serves
+# frontier-size models through the same C engines the local install uses.
+#
+# The engines are not pip packages: they are compiled in a CUDA 12.8 toolchain
+# stage of Dockerfile.capability-engines (see the `engines.dockerfile` marker)
+# for EVERY pod GPU generation (sm_80/86/89/90/120), not the one card this
+# machine has, and copied in beside their download scripts. The Python side
+# needs nothing beyond the core: the engines bring their own tokenizers.
+#
+# THE WEIGHTS ARE THE COST. DeepSeek-V4 is ~154 GB, Kimi-K3 is measured in
+# terabytes. Put them on a network volume (docs/runpod.md, "Engine pods") —
+# a pod without one downloads all of it on every cold start.
+sentencepiece>=0.1.99
+protobuf>=3.20.0

@@ -1,0 +1,119 @@
+# CoderAI engines pod — ds4, colibri and kimi-k3-in-c, compiled for any pod GPU.
+#
+# The local install carries these engines as binaries built on THIS machine:
+# ds4-server for the one card here (sm_86) against the host's CUDA 13, colibri
+# without a GPU backend at all. Copying them into a pod image would ship an
+# engine that fails at first kernel launch on an A100 and cannot find
+# libcudart.so.13 anywhere. So this image builds them itself, in a CUDA 12.8
+# toolchain stage, for every GPU generation RunPod rents (Ampere through
+# Blackwell) and for a portable x86-64-v3 CPU baseline — then keeps only the
+# binaries and the scripts beside them. The toolchain never reaches the image.
+#
+# The runtime side is the ordinary full core: torch's cu128 wheels carry the
+# libcudart.so.12 / libcublas.so.12 the engines link, so nothing else is added.
+#
+# Built by build_capability_image.sh engines, which first stages the engine
+# source trees into packaging/runpod/engines-src/ (they live outside the repo).
+
+ARG CORE_BASE=coderai-capability-base:latest
+ARG CUDA_DEVEL=nvidia/cuda:12.8.1-devel-ubuntu24.04
+
+# ---------------------------------------------------------------- build stage
+FROM ${CUDA_DEVEL} AS engines
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git python3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# SASS for every card RunPod rents. colibri's Makefile spells its own list as
+# CUDA_ARCH=portable (plus a PTX fallback); ds4 takes the raw flags, and its
+# Blackwell kernels use block-scaled MXF4 MMA, which exists only on the
+# arch-specific sm_120a target — plain sm_120 fails in ptxas, and so would a
+# PTX fallback, so there is none: a card newer than this list gets no ds4.
+ENV GENCODE="-gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_120a,code=sm_120a"
+
+WORKDIR /src
+COPY packaging/runpod/engines-src/ /src/
+COPY packaging/patch-k3.py /src/patch-k3.py
+
+# ds4: CUDA, all archs, portable CPU flags. `-B` because the staged tree may
+# carry the host's .o files, which would "already be built" for the wrong card.
+RUN set -eux; cd /src/ds4; \
+    make -B ds4-server CUDA_ARCH=sm_80 NVCC_ARCH_FLAGS="${GENCODE}" \
+        NATIVE_CPU_FLAG=-march=x86-64-v3 -j"$(nproc)"; \
+    ./ds4-server --help >/dev/null 2>&1 || true; \
+    ls -la ds4-server
+
+# colibri: the GLM engine with the CUDA backend; DeepSeek-V4 and Kimi-K3 are
+# CPU engines by design (their Makefiles have no CUDA path) and only need the
+# portable ARCH so they run on whatever CPU the pod has.
+RUN set -eux; cd /src/colibri/c; \
+    rm -f *.o .build-config; \
+    make colibri CUDA=1 CUDA_ARCH=portable ARCH=x86-64-v3 -j"$(nproc)"; \
+    make deepseek-v4 ARCH=x86-64-v3 -j"$(nproc)"; \
+    make kimi_k3 ARCH=x86-64-v3 -j"$(nproc)"; \
+    ls -la colibri deepseek_v4 kimi_k3
+
+# kimi-k3-in-c: coderai's resident serve-loop patch, then the portable build.
+RUN set -eux; cd /src/kimi-k3-in-c; \
+    rm -rf build; \
+    python3 /src/patch-k3.py src/cli/k3_run.c; \
+    make portable -j"$(nproc)"; \
+    ls -la bin/k3
+
+# What ships: binaries, scripts, docs — no objects, no toolchain, no git.
+RUN set -eux; mkdir -p /out/ds4 /out/colibri /out/kimi-k3-in-c; \
+    cd /src/ds4 && cp -a ds4-server download_model.sh README.md LICENSE /out/ds4/ 2>/dev/null || true; \
+    cd /src/colibri && cp -a . /out/colibri/ && find /out/colibri -name '*.o' -delete && rm -rf /out/colibri/.git; \
+    cd /src/kimi-k3-in-c && mkdir -p /out/kimi-k3-in-c/bin && cp -a bin/k3 /out/kimi-k3-in-c/bin/ \
+        && cp -a README.md LICENSE Makefile /out/kimi-k3-in-c/ 2>/dev/null || true; \
+    du -sh /out/*
+
+# -------------------------------------------------------------- runtime stage
+FROM ${CORE_BASE}
+
+ARG PROFILE=engines
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+ENV PROFILE=${PROFILE}
+ARG IMAGE_TAG=unknown
+ENV CODERAI_IMAGE_TAG=${IMAGE_TAG}
+
+WORKDIR /opt/coderai/app
+COPY packaging/runpod/profiles/ /tmp/profiles/
+RUN --mount=type=cache,target=/root/.cache/pip set -eux; \
+    python -m pip install --extra-index-url ${TORCH_INDEX} -r /tmp/profiles/${PROFILE}.txt; \
+    python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"; \
+    rm -rf /tmp/profiles
+
+COPY --from=engines /out/ds4/ /opt/coderai/ds4/
+COPY --from=engines /out/colibri/ /opt/coderai/colibri/
+COPY --from=engines /out/kimi-k3-in-c/ /opt/coderai/kimi-k3-in-c/
+
+# Where the workers look (codai/api/{ds4,colibri,k3}_worker.default_install_dir),
+# and the CUDA runtime the engines link, from torch's own wheels.
+ENV CODERAI_DS4_DIR=/opt/coderai/ds4 \
+    CODERAI_COLIBRI_DIR=/opt/coderai/colibri \
+    CODERAI_K3_DIR=/opt/coderai/kimi-k3-in-c \
+    LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.12/site-packages/nvidia/cublas/lib:${LD_LIBRARY_PATH}
+
+# Fail the BUILD if a binary is missing a library: the alternative is a pod that
+# boots, takes the request, and dies at the engine's first exec.
+RUN set -eux; for b in /opt/coderai/ds4/ds4-server /opt/coderai/colibri/c/colibri \
+        /opt/coderai/colibri/c/deepseek_v4 /opt/coderai/colibri/c/kimi_k3 \
+        /opt/coderai/kimi-k3-in-c/bin/k3; do \
+        test -x "$b"; \
+        if ldd "$b" | grep -q 'not found'; then echo "ERROR: $b:" >&2; ldd "$b" | grep 'not found' >&2; exit 1; fi; \
+        echo "ok: $b"; \
+    done; \
+    n=$(grep -a -o '\.target sm_[0-9]*a\?' /opt/coderai/ds4/ds4-server | sort -u | wc -l); \
+    echo "ds4-server SASS targets: $n"; test "$n" -ge 5
+
+COPY . /opt/coderai/app
+RUN python -c "import codai.api.app; print('coderai imports OK for profile ${PROFILE}')"
+
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s \
+    CMD curl -fsS http://127.0.0.1:8000/healthz || exit 1
+
+COPY packaging/runpod/boot.sh /opt/coderai/boot.sh
+RUN chmod +x /opt/coderai/boot.sh
+CMD ["/opt/coderai/boot.sh"]

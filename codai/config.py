@@ -1358,6 +1358,40 @@ class ConfigManager:
                 # inherits the decision made here; it cannot make it itself.
                 self.config.ocr.surya_accept_license = True
 
+        # The native engines — ds4, colibri, k3 — ship disabled for the same
+        # reason OCR does, and an engines pod is rented to run exactly one of
+        # them. CODERAI_<ENGINE>_ENABLED switches it on; CODERAI_<ENGINE>_CONFIG
+        # carries the renting install's settings for it (context, expert
+        # cache, download variant…) as JSON, applied field by field onto the
+        # dataclass — only fields it already has, so a stray key cannot plant
+        # anything. Where the binary lives is the image's business
+        # (CODERAI_<ENGINE>_DIR, read by the worker itself), not this block's.
+        for name in ("ds4", "colibri", "k3"):
+            if not _flag(f"CODERAI_{name.upper()}_ENABLED"):
+                continue
+            eng = getattr(self.config, name, None)
+            if eng is None:
+                continue
+            eng.enabled = True
+            raw = (_os.environ.get(f"CODERAI_{name.upper()}_CONFIG") or "").strip()
+            if not raw:
+                continue
+            try:
+                forwarded = json.loads(raw)
+            except Exception as exc:
+                print(f"[seed] CODERAI_{name.upper()}_CONFIG is not valid JSON: {exc}",
+                      flush=True)
+                continue
+            if not isinstance(forwarded, dict):
+                continue
+            for k, v in forwarded.items():
+                if k in ("enabled", "install_dir", "repo_url", "service_url",
+                         "host", "port", "model_path", "auto_build"):
+                    continue            # local to whichever machine set them
+                if hasattr(eng, k):
+                    setattr(eng, k, v)
+            print(f"[seed] {name} enabled with {sorted(forwarded)}", flush=True)
+
     def _seed_models_from_env(self) -> None:
         """Register models named by CODERAI_SEED_MODELS (JSON list of entries).
 

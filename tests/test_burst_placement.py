@@ -872,3 +872,116 @@ def test_a_multi_gpu_pod_is_priced_and_sharded_as_a_whole(monkeypatch):
     assert "--split-mode layer" in rw._llamacpp_docker_args(ml, "m", {})
     # A single card asks for neither: no needless flags on the common case.
     assert "tensor-parallel" not in rw._vllm_docker_args(m1, "org/m", {"path": "org/m"})
+
+
+def test_an_engine_model_gets_the_engines_image_and_its_engine_switched_on(monkeypatch):
+    """The local ds4-server is an sm_86 build against CUDA 13 and the local
+    colibri has no GPU backend: neither can be copied into a pod. The engines
+    image builds them for every pod GPU, and a model that names an engine —
+    on its runpod block, since `backend: runpod` takes the pin slot — lands on
+    that image with the engine enabled and this install's settings for it."""
+    import json
+    import codai.api.runpod_worker as rw
+    from codai.api.runpod_worker import pod_plan, parse_model_runpod
+
+    class _Cfg:
+        ctx = 65536; ssd_streaming = True; extra_args = "--foo"; extra_env = ""
+        model_variant = "q4-imatrix"; auto_download = False
+        expert_cache_reserve_gb = 0; model_id = "deepseek-v4"
+        install_dir = "/home/me/.coderai/ds4"; port = 1234
+    class _Root:
+        ds4 = _Cfg()
+    class _CM:
+        config = _Root()
+    monkeypatch.setattr("codai.admin.routes.config_manager", _CM(), raising=False)
+
+    entry = {"path": "/AI/gguf/DeepSeek-V4-Q4.gguf", "model_type": "text_models",
+             "backend": "runpod", "weights_gb": 154,
+             "ds4": {"ssd_streaming": True}}
+    mcfg = parse_model_runpod({"engine": "ds4"})
+    plan = pod_plan(mcfg, "deepseek", entry=entry)
+    assert plan["engine"] == "coderai"
+    assert plan["image"].endswith("coderai-engines:latest")
+    env = plan["env"]
+    assert env["CODERAI_DS4_ENABLED"] == "1"
+    fwd = json.loads(env["CODERAI_DS4_CONFIG"])
+    assert fwd["ctx"] == 65536 and fwd["ssd_streaming"] is True
+    assert fwd["auto_download"] is True, "a pod that cannot fetch answers nothing"
+    assert "install_dir" not in fwd and "port" not in fwd
+
+    seed = json.loads(env["CODERAI_SEED_MODELS"])[0]
+    assert seed["backend"] == "ds4", "the pod must run ds4 for it, not transformers"
+    assert seed["ds4"] == {"ssd_streaming": True}
+    assert "weights_gb" not in seed          # sizes the disk here, not the model there
+    assert seed["path"] == "DeepSeek-V4-Q4.gguf", "a local path means nothing there"
+
+    # Weights already on the volume: the seed points straight at them.
+    mcfg = parse_model_runpod({"engine": "ds4", "network_volume_id": "vol1",
+                               "volume_path": "models/DeepSeek-V4-Q4.gguf"})
+    seed = json.loads(pod_plan(mcfg, "deepseek", entry=entry)["env"]["CODERAI_SEED_MODELS"])[0]
+    assert seed["path"] == "/workspace/models/DeepSeek-V4-Q4.gguf"
+
+    # A local model pinned to the engine itself, bursting: same answer.
+    local = {"path": "/AI/glm52", "model_type": "text_models", "backend": "colibri"}
+    plan = pod_plan(parse_model_runpod({"network_volume_id": "v", "volume_path": "glm52"}),
+                    "glm", entry=local)
+    assert plan["image"].endswith("coderai-engines:latest")
+    assert plan["env"]["CODERAI_COLIBRI_ENABLED"] == "1"
+    assert json.loads(plan["env"]["CODERAI_SEED_MODELS"])[0]["backend"] == "colibri"
+
+    # The other pins describe THIS machine and are stripped from the seed.
+    vk = {"path": "org/m", "model_type": "text_models", "backend": "vulkan"}
+    seed = json.loads(pod_plan(parse_model_runpod({"engine": "coderai", "image": "x"}),
+                               "m", entry=vk)["env"]["CODERAI_SEED_MODELS"])[0]
+    assert "backend" not in seed
+
+    # ktransformers has no pod image, and says so instead of shipping a pod
+    # that cannot run it.
+    import pytest
+    with pytest.raises(RuntimeError, match="ktransformers"):
+        pod_plan(parse_model_runpod({"engine": "kt"}), "m",
+                 entry={"path": "org/m", "model_type": "text_models"})
+
+    # The volume env points ds4's downloader at the volume too.
+    assert rw.volume_env("/workspace")["DS4_GGUF_DIR"] == "/workspace/cache/ds4"
+
+
+def test_a_pod_switches_its_engine_on_from_env_and_takes_the_settings(tmp_path, monkeypatch):
+    import json
+    from codai.config import ConfigManager
+
+    monkeypatch.setenv("CODERAI_DS4_ENABLED", "1")
+    monkeypatch.setenv("CODERAI_DS4_CONFIG", json.dumps(
+        {"ctx": 65536, "auto_download": True, "install_dir": "/nope",
+         "port": 9, "not_a_field": 1}))
+    cm = ConfigManager(str(tmp_path))
+    cm.load()
+    assert cm.config.ds4.enabled is True
+    assert cm.config.ds4.ctx == 65536 and cm.config.ds4.auto_download is True
+    assert cm.config.ds4.install_dir != "/nope" and cm.config.ds4.port != 9
+    assert not hasattr(cm.config.ds4, "not_a_field")
+    assert cm.config.colibri.enabled is False       # only what was asked for
+    on_disk = json.loads((tmp_path / "config.json").read_text())
+    assert on_disk.get("ds4", {}).get("enabled") is not True
+
+
+def test_the_engines_image_is_built_from_source_for_every_pod_gpu():
+    """Shipping this machine's binaries would ship an sm_86-only ds4 linked
+    to CUDA 13. The image compiles in a CUDA 12.8 stage for Ampere through
+    Blackwell, and the build fails if a binary cannot find its libraries."""
+    from pathlib import Path
+    from codai.api.runpod_worker import PUBLISHED_CAPABILITY_IMAGES, default_capability_image
+    assert "engines" in PUBLISHED_CAPABILITY_IMAGES
+    assert default_capability_image("engines").endswith("coderai-engines:latest")
+    prof = Path("packaging/runpod/profiles")
+    assert (prof / "engines.txt").exists()
+    assert (prof / "engines.dockerfile").read_text().strip() == "Dockerfile.capability-engines"
+    df = Path("packaging/runpod/Dockerfile.capability-engines").read_text()
+    for arch in ("sm_80", "sm_86", "sm_89", "sm_90", "sm_120"):
+        assert arch in df
+    assert "CUDA_ARCH=portable" in df and "x86-64-v3" in df
+    assert "patch-k3.py" in df and "not found" in df
+    for var in ("CODERAI_DS4_DIR", "CODERAI_COLIBRI_DIR", "CODERAI_K3_DIR"):
+        assert var in df
+    sh = Path("packaging/runpod/build_capability_image.sh").read_text()
+    assert ".dockerfile" in sh and "engines-src" in sh

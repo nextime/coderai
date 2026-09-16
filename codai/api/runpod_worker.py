@@ -70,6 +70,7 @@ class RunpodModelConfig:
     # account-wide one. Weights, uploads and adapters on it outlive the pod.
     network_volume_id: str = ""
     volume_mount_path: str = ""              # blank = the account default
+    volume_path: str = ""                    # weights already on the volume (file or dir)
     # Keep this pod's Python dependencies on the VOLUME instead of in the image,
     # and boot a small image that uses them. The first pod builds the venv (a few
     # minutes); every pod after skips both the 7 GB image pull and the install.
@@ -203,7 +204,18 @@ PUBLISHED_CAPABILITY_IMAGES = (
     # SENT a local LoRA adapter, which is the only way a local text adapter runs
     # on RunPod. Build and push it with packaging/runpod before using it.
     "text",
+    # The native MoE engines — ds4, colibri, kimi-k3-in-c — compiled for every
+    # pod GPU generation rather than copied from this machine (whose ds4 is an
+    # sm_86 build against CUDA 13, and whose colibri has no GPU backend). Picked
+    # by a model's `backend`, not its section: it is still a text model.
+    "engines",
 )
+
+#: Model backends served by the engines image. `kt` (ktransformers) is NOT here:
+#: it is a Python stack (kt-kernel + SGLang) built for AMX CPUs, several GB in
+#: its own venv, and has never been built for a pod — a model pinned to it is
+#: refused with that reason rather than sent to an image that cannot run it.
+_ENGINE_POD_BACKENDS = ("ds4", "colibri", "k3")
 
 #: Capabilities served by a published image other than their own name.
 _CAPABILITY_IMAGE_ALIASES = {
@@ -355,12 +367,24 @@ def resolve_pod_engine(mcfg: "RunpodModelConfig", model_key: str = "",
     vLLM.
     """
     want = (mcfg.engine or "auto").strip().lower()
+    if "kt" in (want, str((entry or {}).get("backend") or "").strip().lower()):
+        raise RuntimeError(
+            "RunPod: this model is pinned to ktransformers, which has no pod "
+            "image — it is a CPU-AMX Python stack (kt-kernel + SGLang) that "
+            "has never been built for a rented machine. Serve it from a host "
+            "you own (backend: host), or pin the model to ds4/colibri/k3, "
+            "which the engines image carries.")
     if want in ("vllm", "llamacpp", "coderai", "custom"):
         return want
     # A non-text model is served by a whole coderai carrying that capability.
     if entry is None:
         entry = _model_entry(model_key)
     if model_capability(entry or {}):
+        return "coderai"
+    # A model pinned to a native engine is served by a coderai carrying that
+    # engine: vLLM cannot load a DeepSeek-V4 GGUF laid out for ds4, and there
+    # is no colibri outside of coderai.
+    if engine_pod_backend(entry or {}, mcfg):
         return "coderai"
     # A text model whose LoRA lives only on this disk has one option: a coderai
     # pod, which can be sent the adapter. vLLM and llama.cpp resolve adapters
@@ -381,6 +405,22 @@ def resolve_pod_engine(mcfg: "RunpodModelConfig", model_key: str = "",
             or _looks_like_gguf(model_key):
         return "llamacpp"
     return "vllm"
+
+
+def engine_pod_backend(entry: dict, mcfg: "RunpodModelConfig" = None) -> str:
+    """The native engine a pod must run for this model, or ''.
+
+    Two ways to say it. A RunPod-only model has `backend: runpod` — that slot
+    is taken — so it names the engine on its runpod block (`engine: ds4`),
+    beside vllm and llamacpp. A LOCAL model pinned to `backend: ds4` that
+    bursts to RunPod carries the pin itself. Either way the answer is the
+    same image and the same seed.
+    """
+    want = str(getattr(mcfg, "engine", "") or "").strip().lower() if mcfg else ""
+    if want in _ENGINE_POD_BACKENDS:
+        return want
+    b = str((entry or {}).get("backend") or "").strip().lower()
+    return b if b in _ENGINE_POD_BACKENDS else ""
 
 
 #: Readiness probe per engine. A coderai pod answers /healthz long before any
@@ -411,6 +451,8 @@ def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
         # everything with "not available".
         image = mcfg.image
         capability_hint = model_capability(entry or {}, include_text=True)
+        if not image and engine_pod_backend(entry or {}, mcfg):
+            image = default_capability_image("engines")
         if not image:
             image = default_capability_image(capability_hint) if capability_hint else ""
         if not image:
@@ -687,6 +729,61 @@ def venv_bootstrap_script(mount: str, profile: str, venv_name: str = "",
     ])
 
 
+#: Engine settings that describe the MODEL and how to run it, and so travel to
+#: a pod. Not in the list, deliberately: enabled (the pod gets its own switch),
+#: install_dir / repo_url / auto_build (the image has the binary), host / port /
+#: service_url (this machine's wiring), model_path (a local file).
+_ENGINE_FORWARDED_FIELDS = {
+    "ds4": ("ctx", "ssd_streaming", "extra_args", "extra_env", "model_variant",
+            "auto_download", "expert_cache_reserve_gb", "model_id"),
+    "colibri": ("ctx", "kv_slots", "cap", "cuda_expert_gb", "extra_args",
+                "extra_env", "model_id"),
+    "k3": ("ctx", "preset", "trunk_gb", "cache_gb", "extra_args", "extra_env",
+           "model_id"),
+}
+
+
+def engine_config_for_pod(engine: str) -> dict:
+    """This install's settings for a native engine, minus what is local to it."""
+    try:
+        from codai.admin.routes import config_manager
+        cfg = getattr(getattr(config_manager, "config", None), engine, None)
+    except Exception:
+        cfg = None
+    if cfg is None:
+        return {}
+    out = {}
+    for k in _ENGINE_FORWARDED_FIELDS.get(engine, ()):
+        if not hasattr(cfg, k):
+            continue
+        v = getattr(cfg, k)
+        if v in (None, "", 0, False):
+            continue
+        out[k] = v
+    if engine == "ds4" and "auto_download" not in out:
+        # A pod that cannot fetch its own weights is a pod that answers
+        # nothing. Locally this is opt-in because the download is 154 GB onto
+        # someone's disk; on a pod the disk was rented for exactly that.
+        out["auto_download"] = True
+    return out
+
+
+def pod_volume_path(mcfg: "RunpodModelConfig", account=None) -> str:
+    """Where the weights already are ON THE POD, or ''.
+
+    `volume_path` on the runpod block names a file or directory on the network
+    volume — relative to its mount, or absolute. It is how a 150 GB engine
+    model is used without any pod ever downloading it: put it there once.
+    """
+    rel = str(getattr(mcfg, "volume_path", "") or "").strip()
+    if not rel:
+        return ""
+    if rel.startswith("/"):
+        return rel
+    _vol, mount = volume_for(mcfg, account)
+    return f"{mount.rstrip('/')}/{rel}"
+
+
 def volume_env(mount: str) -> dict:
     """Point everything that writes big files at the volume.
 
@@ -706,6 +803,10 @@ def volume_env(mount: str) -> dict:
         "DIFFUSERS_CACHE": f"{mount}/diffusers",
         "CODERAI_MODELS_DIR": f"{mount}/models",
         "CODERAI_CACHE_DIR": f"{mount}/cache",
+        # ds4's download_model.sh writes here; on the volume it survives the
+        # pod, and the move into the GGUF cache beside it is a rename rather
+        # than a 154 GB copy.
+        "DS4_GGUF_DIR": f"{mount}/cache/ds4",
     }
 
 
@@ -743,7 +844,9 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
     seeds = []
     if entry:
         kind, value = resolve_model_source(entry, mcfg)
-        one = seed_model_env(entry, served, value if kind in ("hf", "url") else "")
+        one = seed_model_env(entry, served, value if kind in ("hf", "url") else "",
+                             volume_path=pod_volume_path(mcfg, _account_hint()),
+                             engine=engine_pod_backend(entry, mcfg))
         if one:
             seeds.extend(_json.loads(one))
     for extra in (seed_entries or []):
@@ -836,6 +939,20 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
             # for surya by name is that decision.
             env["CODERAI_OCR_SURYA_ACCEPT_LICENSE"] = "1"
 
+    eng = engine_pod_backend(entry or {}, mcfg)
+    if eng:
+        # The engine ships disabled, like OCR does, and its settings live in
+        # THIS install's config.json (ctx, expert cache, extra args, download
+        # variant). The pod gets the switch and the settings as environment —
+        # never its install_dir or ports, which describe this machine.
+        env[f"CODERAI_{eng.upper()}_ENABLED"] = "1"
+        forwarded = engine_config_for_pod(eng)
+        if forwarded:
+            env[f"CODERAI_{eng.upper()}_CONFIG"] = _json.dumps(forwarded)
+        warn = weight_transfer_warning(entry, mcfg, _account_hint())
+        if warn:
+            print(f"[runpod] WARNING: {warn}", flush=True)
+
     plan = {"engine": engine, "image": image, "args": args, "env": env,
             "health_path": mcfg.health_path or _HEALTH_PATHS.get(engine, "/healthz")}
 
@@ -869,7 +986,8 @@ def _account_hint():
         return None
 
 
-def seed_model_env(entry: dict, served: str = "", source: str = "") -> str:
+def seed_model_env(entry: dict, served: str = "", source: str = "",
+                   volume_path: str = "", engine: str = "") -> str:
     """The model entry to register on a fresh pod, as JSON for CODERAI_SEED_MODELS.
 
     A pod starts with an EMPTY catalogue: it would refuse a request for a model
@@ -887,12 +1005,25 @@ def seed_model_env(entry: dict, served: str = "", source: str = "") -> str:
         # Give the pod something it can actually fetch: a repo id it pulls from
         # HuggingFace, or a URL it downloads (coderai's loader takes both).
         path = source
+    elif volume_path:
+        path = volume_path
+    elif (engine or engine_pod_backend(entry)) and path:
+        # An engine model named by a local file: the basename travels. ds4
+        # resolves it against the pod's GGUF cache — where its own download
+        # lands, or where a volume already holds it — and colibri/k3 say
+        # plainly that they never download when nothing is there.
+        path = path.rsplit("/", 1)[-1]
     elif not path or path.startswith("/"):
         # A local path cannot be resolved on a rented machine, and nothing said
         # where else to get it.
         return ""
     keep = ("path", "model_type", "model_types", "video_subtypes", "capabilities",
             "alias", "config_name", "load_in_4bit", "load_in_8bit", "n_ctx",
+            # The native engine a model is pinned to, and its per-model tuning
+            # block — what makes the pod run ds4-server for it rather than try
+            # to load a 154 GB GGUF with transformers. Other backend pins are
+            # stripped below: vulkan/opencl say something about THIS machine.
+            "backend", "ds4", "colibri", "k3",
             "flash_attention", "model_template", "acceleration", "component_quantization",
             "languages", "supports_translation", "parser", "max_instances",
             # LoRA settings travel too: a coderai pod applies them itself, and
@@ -908,6 +1039,20 @@ def seed_model_env(entry: dict, served: str = "", source: str = "") -> str:
             )
     out = {k: entry[k] for k in keep if k in entry and entry[k] is not None}
     out["path"] = path
+    if engine:
+        # The pod runs this native engine for the model, whichever way it was
+        # said here (the runpod block's engine, or the model's own pin).
+        out["backend"] = engine
+    elif "backend" in out and not engine_pod_backend(out):
+        # runpod, host, vulkan, nvidia…: placement and hardware of THIS install.
+        # On the pod they would mean "rent a pod" or "use a card it lacks".
+        out.pop("backend", None)
+    if volume_path:
+        # The weights already sit on the network volume, put there once by
+        # hand or by an earlier pod. The pod's engine resolves this path the
+        # way it resolves a local one here: a directory for colibri/k3, a
+        # .gguf for ds4. No download, no size check, no surprise.
+        out["path"] = volume_path
     # Adapters the pod cannot resolve by name are named by CONTENT id instead.
     # The hash is computed here, so the pod is told the id when it is created and
     # sent the bytes before the first request — the two agree without the pod
@@ -1038,6 +1183,7 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
         # in the list just produces candidates the attach would reject.
         cfg.cloud_types = ["SECURE"]
     cfg.volume_mount_path = (b.get("volume_mount_path") or "").strip()
+    cfg.volume_path = (b.get("volume_path") or "").strip()
     cfg.venv_on_volume = _as_bool(b.get("venv_on_volume"), cfg.venv_on_volume)
     cfg.venv_name = (b.get("venv_name") or "").strip()
     cfg.slim_image = (b.get("slim_image") or "").strip()

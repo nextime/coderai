@@ -2795,7 +2795,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                   "registry_auth_id", "api_key", "pool",
                   # where the POD gets the weights
                   "source", "hf_repo", "model_url", "quantization",
-                  "network_volume_id", "volume_mount_path",
+                  "network_volume_id", "volume_mount_path", "volume_path",
                   "venv_name", "slim_image"):
             v = src.get(k)
             if isinstance(v, str) and v.strip():

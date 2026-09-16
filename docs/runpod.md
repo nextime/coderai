@@ -173,6 +173,73 @@ entirely — CoderAI logs `Model 'X' is RunPod-served — skipping local downloa
 and never fetches weights. So a RunPod model can be configured, enabled and served
 on a machine that has neither the disk space nor the GPU for it.
 
+### Engine pods — ds4, colibri, k3 on a rented GPU
+
+> ⚠ **The weights are the cost, not the GPU.** Models on these engines are
+> 100 GB and up — DeepSeek-V4 is ~154 GB, Kimi-K3 is measured in terabytes.
+> A pod with **no network volume downloads all of it on every cold start**,
+> which is typically one to two hours of rental per boot, before it answers
+> anything. The model page shows this warning the moment you pick one of these
+> engines; the provisioning log repeats it; the test run reports it. Attach a
+> network volume, and put the weights on it once.
+
+The native MoE engines run on RunPod through the **engines image**
+(`ghcr.io/nextime/coderai-engines`), a coderai pod that carries `ds4-server`,
+colibri's `colibri` / `deepseek_v4` / `kimi_k3` and kimi-k3-in-c's `k3`. They
+are **compiled in the image**, not copied from your machine: the local
+`ds4-server` is built for the one card here (sm_86) against the host's CUDA 13,
+and the local colibri has no GPU backend at all — neither would run on an A100.
+The image builds them in a CUDA 12.8 toolchain stage for every generation RunPod
+rents (sm_80 A100, sm_86, sm_89 L40S/4090, sm_90 H100, sm_120a RTX 50 / RTX PRO
+Blackwell) and a portable x86-64-v3 CPU baseline, then keeps only the binaries.
+
+```bash
+./packaging/runpod/build_capability_image.sh engines ghcr.io/nextime/coderai-engines:0.2.18
+```
+
+It stages the engine sources from `~/.coderai/{ds4,colibri,kimi-k3-in-c}` (or
+`CODERAI_DS4_DIR` etc.), so the pod runs the same engine code the local install
+does.
+
+**Naming the engine.** A RunPod-only model has `backend: runpod` — that slot is
+taken — so the engine goes on the runpod block, beside `vllm` and `llamacpp`:
+
+```json
+{ "path": "DeepSeek-V4-Pro-Q4K.gguf", "backend": "runpod",
+  "runpod": { "engine": "ds4", "network_volume_id": "abc123",
+              "volume_path": "models/DeepSeek-V4-Pro-Q4K.gguf",
+              "min_vram_gb": 80, "boot_timeout_s": 900, "load_timeout_s": 3600 } }
+```
+
+A *local* model pinned to `backend: ds4` / `colibri` / `k3` that bursts to
+RunPod carries the pin itself; either way it lands on the engines image with
+that engine switched on (`CODERAI_DS4_ENABLED=1`) and **this install's settings
+for it** forwarded as `CODERAI_DS4_CONFIG` — context, expert cache, extra args,
+the ds4 download variant — minus anything local (install dir, ports, paths).
+`ds4.auto_download` is forced on for the pod: a pod that cannot fetch its own
+weights answers nothing.
+
+**Where the weights come from, per engine:**
+
+| Engine | On the pod | Without `volume_path` |
+|---|---|---|
+| `ds4` | loads `volume_path` if set | runs `download_model.sh <model_variant>` into `<volume>/cache/ds4` (or the container disk — see the warning) |
+| `colibri` | loads the container directory at `volume_path` | **never downloads**: fails with "no model container resolved" |
+| `k3` | loads the checkpoint directory at `volume_path` | **never downloads**: the checkpoint is ~1.56 TB |
+
+`volume_path` is relative to the volume mount (`/workspace` by default) or
+absolute. Put the weights there once — from a pod, with `scp` through the RunPod
+console, or by letting one ds4 pod download and every later one attach.
+
+**ktransformers is not in the image.** It is a Python stack (kt-kernel +
+SGLang) for AMX CPUs, several GB in a venv of its own, and has never been built
+for a pod. A model pinned to `kt` is refused with that reason at provision time;
+serve it from a machine you own with the `host` backend instead.
+
+**The engines are CPU-hungry too.** colibri's DeepSeek-V4 and Kimi-K3 engines
+and `k3` stream experts through RAM by design (no CUDA path); pick a pod with
+the RAM they need, not just the VRAM — `min_vram_gb` says nothing about RAM.
+
 ---
 
 ## 3. Request flow
