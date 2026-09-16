@@ -1906,3 +1906,36 @@ def test_a_request_sent_to_a_remote_appears_on_the_tasks_page(gateway_app, monke
     assert t["status"] == "done"
     assert url.split("//")[1].split("/")[0] in t["message"], t["message"]
     assert t["cancellable"] is False        # it is on another machine's GPU
+
+
+def test_the_model_form_offers_runpod_only_and_host_as_a_placement_choice():
+    """"How do I set it to work only on RunPod?" — it was a backend dropdown
+    entry among CUDA/Vulkan/OpenCL, invisible as a *placement*. The Placement
+    section now asks "Runs on" outright, and the host backend, which was
+    JSON-only, has a form of its own."""
+    from pathlib import Path
+    html = Path("codai/admin/templates/models.html").read_text()
+    # The choice is made where placement is made, not buried under compute.
+    runs_on = html.index('name="cfg-runs-on"')
+    placement = html.index("Placement — where this model runs")
+    assert placement < runs_on
+    for where in ("local", "runpod", "host"):
+        assert f'name="cfg-runs-on" value="{where}"' in html
+    # The RunPod block lives in that section too, right under the choice.
+    assert placement < html.index('id="cfg-runpod-row"')
+    # The host block carries every field parse_host reads.
+    for f in ("url", "key", "start", "stop", "health", "boot", "idle"):
+        assert f'id="cfg-host-{f}"' in html
+    assert "_collectHost()" in html and "_populateHost(s)" in html
+    # And the radios and the backend select are one choice, kept in sync.
+    assert "_setRunsOn(" in html and 'querySelectorAll(\'input[name="cfg-runs-on"]\')' in html
+
+
+def test_a_host_model_holds_no_local_weights(monkeypatch):
+    """Like a pod, a host owns the weights: the manager must not download,
+    cache or size local VRAM for it."""
+    import codai.models.manager as mgr
+    assert mgr._model_is_remote("m", {"backend": "host"}) is True
+    assert mgr._model_is_remote("m", {"backend": "runpod"}) is True
+    monkeypatch.setattr(mgr, "resolve_engine_backend", lambda n: None)
+    assert mgr._model_is_remote("m", {"backend": "vulkan"}) is False

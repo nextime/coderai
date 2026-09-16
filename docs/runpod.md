@@ -67,9 +67,10 @@ In `config.json` the same block is:
 
 ## 2. Putting a model on RunPod
 
-Set the model's **backend** to `runpod` on the model page, then fill in the RunPod
-sub-form that appears. In `models.json` that is a `backend` pin plus a `runpod`
-block:
+On the model page, under **Placement — where this model runs**, set **Runs on**
+to *RunPod only* and fill in the RunPod block that appears. (It is the same
+thing as choosing `runpod` in the compute-backend dropdown; the two stay in
+sync.) In `models.json` that is a `backend` pin plus a `runpod` block:
 
 ```json
 {

@@ -462,7 +462,9 @@ def _model_is_remote(model_name: str, config=None) -> bool:
             raw = config.get("_raw_cfg")
             if isinstance(raw, dict):
                 b = (raw.get("backend") or "").strip().lower()
-        if b == "runpod":
+        # A host is a machine of yours running a capability image: like a pod,
+        # it holds the weights, and nothing about the model exists here.
+        if b in ("runpod", "host"):
             return True
     try:
         return resolve_engine_backend(model_name) == "runpod"

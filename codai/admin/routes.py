@@ -2677,7 +2677,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
     # never estimate local VRAM for them.
     # Same for a model pointed at an explicit `service_url` — the endpoint holds
     # the weights, so there is nothing local to measure.
-    _is_runpod = (str(data.get("backend") or "").strip().lower() == "runpod"
+    _is_runpod = (str(data.get("backend") or "").strip().lower() in ("runpod", "host")
                   or bool(str(data.get("service_url") or "").strip()))
     used_vram_gb = data.get("used_vram_gb")
     if used_vram_gb is None and not _is_runpod:
@@ -2845,6 +2845,31 @@ async def api_model_configure(request: Request, username: str = Depends(require_
             entry["runpod"] = rpo
         else:
             entry.pop("runpod", None)
+
+    # Per-model `host` block: a capability image on a machine of yours, reached
+    # by URL and token, optionally started and stopped by commands. Read by
+    # codai.api.host_worker.parse_host. Only meaningful for backend:host.
+    if "host" in data:
+        src = data.get("host") if isinstance(data.get("host"), dict) else {}
+        ho = {}
+        for k in ("url", "api_key", "start_cmd", "stop_cmd", "health_path"):
+            v = src.get(k)
+            if isinstance(v, str) and v.strip():
+                ho[k] = v.strip()
+        for k in ("boot_timeout_s", "idle_timeout_s"):
+            v = src.get(k)
+            if v not in (None, ""):
+                try:
+                    ho[k] = int(v)
+                except (TypeError, ValueError):
+                    pass
+        env = src.get("env")
+        if isinstance(env, dict) and env:
+            ho["env"] = {str(k): str(v) for k, v in env.items()}
+        if ho:
+            entry["host"] = ho
+        else:
+            entry.pop("host", None)
 
     # Per-model spillover-to-RunPod block for a LOCAL model (local is primary; burst
     # to RunPod on the configured triggers). Kept separate from the `runpod` block so

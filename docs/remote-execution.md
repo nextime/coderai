@@ -462,7 +462,8 @@ RunPod endpoint id). `served_model` renames the model for the remote.
 The capability images are ordinary containers. Nothing about them needs RunPod
 — a pod is just a machine that pulls one. The same image runs on a box you own,
 a server rented by the month, a second GPU down the hall, and coderai uses it
-per model, with an endpoint and a token:
+per model, with an endpoint and a token. On the model page it is **Runs on →
+A machine of yours** under Placement; in `models.json`:
 
 ```json
 { "backend": "host",

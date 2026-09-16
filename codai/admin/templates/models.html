@@ -545,7 +545,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
         <div class="form-row" style="margin:0">
           <label class="form-label">Compute backend</label>
-          <select id="cfg-backend" class="form-input" onchange="_updateSttVisibility();_updateRunpodVisibility()">
+          <select id="cfg-backend" class="form-input" onchange="_updateSttVisibility();_updateRunpodVisibility()" title="RunPod and Host are also set from 'Runs on' in the Placement section below">
             <option value="auto">Auto-detect</option>
             <option value="nvidia">NVIDIA (CUDA)</option>
             <option value="vulkan">Vulkan</option>
@@ -557,6 +557,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             <option value="kt">ktransformers (SGLang, CPU+GPU)</option>
             <option value="vllm">vLLM (high-concurrency, CUDA)</option>
             <option value="runpod">RunPod (remote cloud GPU — not stored locally)</option>
+            <option value="host">Host (a machine of yours, set in Placement below)</option>
             <option value="wav2vec2">wav2vec2 / HF-ASR (speech-to-text)</option>
             <option value="whisper-hf">whisper-hf / CrisperWhisper (HF transformers STT)</option>
             <option value="vosk">Vosk (offline STT, CPU, per-language dir)</option>
@@ -677,8 +678,22 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         </div>
       </div>
 
+      <!-- ============ Where this model runs ============ -->
+      <div class="form-section" style="margin-top:.75rem">
+        <div class="form-section-title">Placement — where this model runs</div>
+
+        <div class="form-row" style="margin:0 0 .6rem">
+          <label class="form-label">Runs on</label>
+          <div style="display:flex;gap:1rem;flex-wrap:wrap;font-size:12px" id="cfg-runs-on">
+            <label style="display:flex;align-items:center;gap:.3rem;cursor:pointer"><input type="radio" name="cfg-runs-on" value="local" style="width:auto" onchange="_setRunsOn('local')"> This machine</label>
+            <label style="display:flex;align-items:center;gap:.3rem;cursor:pointer"><input type="radio" name="cfg-runs-on" value="runpod" style="width:auto" onchange="_setRunsOn('runpod')"> RunPod only — a rented GPU, nothing local</label>
+            <label style="display:flex;align-items:center;gap:.3rem;cursor:pointer"><input type="radio" name="cfg-runs-on" value="host" style="width:auto" onchange="_setRunsOn('host')"> A machine of yours — a capability image you start and stop</label>
+          </div>
+          <span class="form-hint" style="font-size:11px">RunPod and Host are exclusive: the model is never loaded here. To keep it local and only <i>overflow</i> to RunPod, leave "This machine" and use "Burst" below.</span>
+        </div>
+
       <!-- Per-model RunPod (remote GPU) config: shown when backend = runpod -->
-      <div id="cfg-runpod-row" style="margin-top:.75rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
+      <div id="cfg-runpod-row" style="margin:0 0 .6rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
         <div style="font-weight:600;font-size:13px;margin-bottom:.3rem">RunPod — remote GPU</div>
         <div class="form-hint" style="font-size:11px;margin-bottom:.5rem">This model runs on a rented RunPod GPU and is <b>not downloaded locally</b>. Set the model <b>Path/ID</b> (top) to the served model id (e.g. an HF repo) — the remote worker pulls it. Requires RunPod enabled in Settings.</div>
         <div class="form-row" style="margin:0">
@@ -890,9 +905,24 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         </div>
       </div>
 
-      <!-- ============ Where this model runs ============ -->
-      <div class="form-section" style="margin-top:.75rem">
-        <div class="form-section-title">Placement — where this model runs</div>
+        <!-- Host: a capability image on a box you own or rent by the month. -->
+        <div id="cfg-host-row" style="margin:0 0 .6rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
+          <div style="font-weight:600;font-size:13px;margin-bottom:.3rem">Host — your own machine</div>
+          <div class="form-hint" style="font-size:11px;margin-bottom:.5rem">A coderai capability image (or any coderai) running on a machine you control. Always-on if the start command is blank; otherwise coderai runs the start command, waits for <code>/healthz</code>, and runs the stop command after the idle timeout. See <code>docs/remote-execution.md</code>.</div>
+          <div style="display:grid;grid-template-columns:2fr 1fr;gap:.5rem">
+            <div class="form-row" style="margin:0"><label class="form-label">URL</label><input type="text" id="cfg-host-url" class="form-input" placeholder="http://gpubox:8000"></div>
+            <div class="form-row" style="margin:0"><label class="form-label">Bearer token <span class="muted">(its CODERAI_API_TOKEN)</span></label><input type="text" id="cfg-host-key" class="form-input" placeholder="optional"></div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-top:.5rem">
+            <div class="form-row" style="margin:0"><label class="form-label">Start command <span class="muted">(blank = always on)</span></label><input type="text" id="cfg-host-start" class="form-input" placeholder="ssh gpubox docker start coderai-images"></div>
+            <div class="form-row" style="margin:0"><label class="form-label">Stop command <span class="muted">(after idle)</span></label><input type="text" id="cfg-host-stop" class="form-input" placeholder="ssh gpubox docker stop coderai-images"></div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.5rem;margin-top:.5rem">
+            <div class="form-row" style="margin:0"><label class="form-label">Health path</label><input type="text" id="cfg-host-health" class="form-input" placeholder="/healthz"></div>
+            <div class="form-row" style="margin:0"><label class="form-label">Boot timeout (s)</label><input type="number" id="cfg-host-boot" class="form-input" min="5" placeholder="300"></div>
+            <div class="form-row" style="margin:0"><label class="form-label">Idle timeout (s)</label><input type="number" id="cfg-host-idle" class="form-input" min="0" placeholder="600"></div>
+          </div>
+        </div>
 
         <div class="form-row" style="margin:0 0 .6rem">
           <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer">
@@ -3762,6 +3792,7 @@ function openCfgModal(idx, cfgIdx){
   _populateDs4(m, s);
   _populateColibri(m, s);
   _populateRunpod(s);
+  _populateHost(s);
   document.getElementById('cfg-sysprompt').value = s.system_prompt || '';
   document.getElementById('cfg-parser').value = s.parser || (!m.in_config ? _autoDetectParser(m.path) : 'auto');
   document.getElementById('cfg-tools').checked = !!s.tools_closer_prompt;
@@ -4171,7 +4202,45 @@ function _updateRunpodVisibility(){
   const be = (document.getElementById('cfg-backend').value || '');
   const row = document.getElementById('cfg-runpod-row');
   if (row) row.style.display = (be === 'runpod') ? '' : 'none';
+  const hrow = document.getElementById('cfg-host-row');
+  if (hrow) hrow.style.display = (be === 'host') ? '' : 'none';
+  // The "Runs on" radios in Placement are the same choice, seen from the
+  // other side: a RunPod-only or host model IS its backend. Keep them agreeing.
+  const where = (be === 'runpod' || be === 'host') ? be : 'local';
+  document.querySelectorAll('input[name="cfg-runs-on"]').forEach(r => { r.checked = (r.value === where); });
   _updateRunpodModeHint();
+}
+// The Placement radios write the backend select, which is what is stored.
+// Going back to "This machine" restores auto-detect only if the backend was
+// one of the remote ones — a pinned CUDA/Vulkan choice is left alone.
+function _setRunsOn(where){
+  const sel = document.getElementById('cfg-backend');
+  const cur = sel.value || '';
+  if (where === 'runpod' || where === 'host') sel.value = where;
+  else if (cur === 'runpod' || cur === 'host') sel.value = 'auto';
+  _updateSttVisibility(); _updateRunpodVisibility();
+}
+function _populateHost(s){
+  const h = (s && s.host) || {};
+  const set = (id,v)=>{ const el=document.getElementById(id); if(el!=null) el.value=(v==null?'':v); };
+  set('cfg-host-url', h.url || '');
+  set('cfg-host-key', h.api_key || '');
+  set('cfg-host-start', h.start_cmd || '');
+  set('cfg-host-stop', h.stop_cmd || '');
+  set('cfg-host-health', h.health_path || '');
+  set('cfg-host-boot', h.boot_timeout_s != null ? h.boot_timeout_s : '');
+  set('cfg-host-idle', h.idle_timeout_s != null ? h.idle_timeout_s : '');
+}
+function _collectHost(){
+  if ((document.getElementById('cfg-backend').value || '') !== 'host') return undefined;
+  const val = id => ((document.getElementById(id) || {}).value || '').trim();
+  const intOrU = id => { const v = parseInt(val(id)); return isNaN(v) ? undefined : v; };
+  return {
+    url: val('cfg-host-url'), api_key: val('cfg-host-key'),
+    start_cmd: val('cfg-host-start'), stop_cmd: val('cfg-host-stop'),
+    health_path: val('cfg-host-health'),
+    boot_timeout_s: intOrU('cfg-host-boot'), idle_timeout_s: intOrU('cfg-host-idle'),
+  };
 }
 function _updateRunpodModeHint(){
   const mode = (document.getElementById('cfg-rp-mode') || {}).value || 'serverless';
@@ -4429,6 +4498,7 @@ async function saveModelConfig(){
     config_name:       document.getElementById('cfg-config-name').value.trim() || null,
     backend:           document.getElementById('cfg-backend').value,
     runpod:            _collectRunpod(),
+    host:              _collectHost(),
     // Placement: serve this model from elsewhere, and/or burst the overflow.
     // Always sent, even when blank: an empty value is how you REMOVE a remote,
     // and a key that is simply absent leaves the old one in place.
