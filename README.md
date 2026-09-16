@@ -97,10 +97,11 @@ Plus:
   each carrying its own torch on a torch-free core so it stays under RunPod's image size
   limit. Fourteen have completed a real inference on a rented GPU; `faceswap` is the one
   that needs real faces to test
-- **The native MoE engines on rented GPUs**: an `engines` image compiles ds4, colibri and
-  kimi-k3-in-c for every pod GPU generation (Ampere → Blackwell) rather than copying this
-  machine's builds; a model names its engine on its runpod block and the pod arrives with
-  it enabled and configured. ⚠ Their weights are 100 GB–1.5 TB: put them on a network
+- **The native MoE engines on rented GPUs**: an `engines` image (2.4 GB) compiles ds4, colibri
+  and kimi-k3-in-c for every pod GPU generation (Ampere → Blackwell) rather than copying this
+  machine's builds, and `engines-kt` carries ktransformers (SGLang + kt-kernel) in its own
+  venv; a model names its engine on its runpod block and the pod arrives with it enabled
+  and configured. ⚠ Their weights are 100 GB–1.5 TB: put them on a network
   volume (`volume_path`) or every cold pod downloads them — the UI warns, loudly
 - **Multi-GPU pods**: `gpu_count` rents one machine with N cards, priced and VRAM-checked as
   a whole; vLLM and llama.cpp are told to shard across them

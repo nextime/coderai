@@ -1,0 +1,9 @@
+# Deep check for the sglang venv: the launch module and the kt-kernel ops must
+# import — a pod that has sglang but not the kernel fails at the first expert.
+import importlib
+import sglang.launch_server                                  # noqa
+kt = importlib.import_module("kt_kernel")
+print("kt-kernel", getattr(kt, "__version__", "ok"), "imports;",
+      "backends:", [n for n in dir(kt) if "backend" in n.lower()][:6] or "n/a")
+import torch
+print("torch", torch.__version__, "cuda", torch.version.cuda)

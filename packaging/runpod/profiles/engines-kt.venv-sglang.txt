@@ -1,0 +1,6 @@
+# SGLang with the ktransformers integration, and kt-kernel. sglang-kt pins the
+# torch it was built against (2.9.1) and flashinfer; kt-kernel ships prebuilt
+# manylinux wheels that dispatch at runtime — AMX, AVX-512, AVX2 (llamafile),
+# AMD BLIS — so one build serves whatever CPU a pod host has.
+sglang-kt==0.7.0.post4
+kt-kernel==0.7.0.post4

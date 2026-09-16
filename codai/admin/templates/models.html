@@ -789,6 +789,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
                 <option value="ds4">ds4 — DeepSeek-V4 (engines image)</option>
                 <option value="colibri">colibri — GLM-5.2 / DeepSeek-V4 / Kimi-K3 (engines image)</option>
                 <option value="k3">k3 — Kimi-K3 (engines image)</option>
+                <option value="kt">ktransformers — SGLang + kt-kernel, experts on CPU (engines-kt image)</option>
                 <option value="custom">Custom image</option>
               </select>
               <span class="form-hint" id="cfg-rp-engine-hint" style="font-size:11px"></span>
@@ -4398,11 +4399,12 @@ function _updateRunpodEngineHint(){
     ds4: 'ds4-server on the engines image, built for every pod GPU. Downloads the configured variant unless the weights are on the volume.',
     colibri: 'colibri on the engines image (GLM-5.2 on CUDA; DeepSeek-V4 and Kimi-K3 on CPU). Never downloads: the container dir must be on the volume.',
     k3: 'kimi-k3-in-c on the engines image (CPU). Never downloads: the checkpoint must be on the volume.',
+    kt: 'SGLang + kt-kernel on the engines-kt image: attention on the GPU, experts on the CPU (fastest on AMX hosts). Downloads an HF repo id into the volume\'s cache.',
     custom: 'Your image, your docker args, your health path.',
   };
   hint.textContent = HINTS[el.value] || '';
   const warn = document.getElementById('cfg-rp-engine-warn');
-  if (warn) warn.style.display = (el.value === 'ds4' || el.value === 'colibri' || el.value === 'k3') ? '' : 'none';
+  if (warn) warn.style.display = (['ds4','colibri','k3','kt'].includes(el.value)) ? '' : 'none';
 }
 
 // Build the per-model spillover block. Undefined when disabled, so the entry

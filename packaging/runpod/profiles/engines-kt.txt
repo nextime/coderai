@@ -1,0 +1,7 @@
+# ktransformers — SGLang + kt-kernel serving a MoE model with experts on the
+# CPU and attention on the GPU. LIGHT core: the whole stack lives in the
+# `sglang` venv (engines-kt.venv-sglang.txt) because kt-kernel and sglang-kt
+# pin their own torch, and the main venv only proxies to the SGLang server.
+#
+# THE WEIGHTS ARE THE COST: the models this exists for are 100 GB and up.
+# Put them on a network volume (docs/runpod.md, "Engine pods").

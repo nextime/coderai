@@ -229,15 +229,23 @@ weights answers nothing.
 | `ds4` | loads `volume_path` if set | runs `download_model.sh <model_variant>` into `<volume>/cache/ds4` (or the container disk — see the warning) |
 | `colibri` | loads the container directory at `volume_path` | **never downloads**: fails with "no model container resolved" |
 | `k3` | loads the checkpoint directory at `volume_path` | **never downloads**: the checkpoint is ~1.56 TB |
+| `kt` | loads the HF model directory at `volume_path` | SGLang downloads the HF repo id into the volume's HF cache |
 
 `volume_path` is relative to the volume mount (`/workspace` by default) or
 absolute. Put the weights there once — from a pod, with `scp` through the RunPod
 console, or by letting one ds4 pod download and every later one attach.
 
-**ktransformers is not in the image.** It is a Python stack (kt-kernel +
-SGLang) for AMX CPUs, several GB in a venv of its own, and has never been built
-for a pod. A model pinned to `kt` is refused with that reason at provision time;
-serve it from a machine you own with the `host` backend instead.
+**ktransformers has an image of its own**, `coderai-engines-kt`: SGLang with
+the kt integration plus `kt-kernel`, in a venv of their own on the light core
+(they pin their own torch). `kt-kernel` dispatches at runtime — AMX, AVX-512,
+AVX2 (llamafile), AMD BLIS — so one image serves whatever CPU the pod host
+has; AMX hosts are the fast ones. `engine: kt` on the runpod block selects it;
+the pod launches SGLang from that venv (`CODERAI_KT_VENV`). The model path may
+be a HuggingFace repo id — SGLang downloads it into the volume's HF cache — or a
+directory on the volume; `ktransformers.extra_args` travels for the KT knobs
+(`--kt-cpuinfer`, `--kt-weight-path` …). Note the kt backend has not been run
+end to end on this machine either: the image is import-checked at build and
+`/healthz`-checked at boot, and the first real inference will be on a pod.
 
 **The engines are CPU-hungry too.** colibri's DeepSeek-V4 and Kimi-K3 engines
 and `k3` stream experts through RAM by design (no CUDA path); pick a pod with

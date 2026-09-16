@@ -209,13 +209,18 @@ PUBLISHED_CAPABILITY_IMAGES = (
     # sm_86 build against CUDA 13, and whose colibri has no GPU backend). Picked
     # by a model's `backend`, not its section: it is still a text model.
     "engines",
+    # ktransformers: SGLang + kt-kernel in their own venv on the light core.
+    # kt-kernel dispatches at runtime (AMX → AVX-512 → AVX2 llamafile → AMD
+    # BLIS), so one image serves whatever CPU the pod host has.
+    "engines-kt",
 )
 
-#: Model backends served by the engines image. `kt` (ktransformers) is NOT here:
-#: it is a Python stack (kt-kernel + SGLang) built for AMX CPUs, several GB in
-#: its own venv, and has never been built for a pod — a model pinned to it is
-#: refused with that reason rather than sent to an image that cannot run it.
-_ENGINE_POD_BACKENDS = ("ds4", "colibri", "k3")
+#: Model backends served by an engine image, and which image. ds4, colibri
+#: and k3 are C binaries and share one image. ktransformers is a Python stack
+#: (kt-kernel + SGLang, pinning their own torch) that takes a venv of its own,
+#: so it has an image of its own rather than doubling the first.
+_ENGINE_POD_BACKENDS = ("ds4", "colibri", "k3", "kt")
+_ENGINE_POD_IMAGE = {"kt": "engines-kt"}
 
 #: Capabilities served by a published image other than their own name.
 _CAPABILITY_IMAGE_ALIASES = {
@@ -367,13 +372,6 @@ def resolve_pod_engine(mcfg: "RunpodModelConfig", model_key: str = "",
     vLLM.
     """
     want = (mcfg.engine or "auto").strip().lower()
-    if "kt" in (want, str((entry or {}).get("backend") or "").strip().lower()):
-        raise RuntimeError(
-            "RunPod: this model is pinned to ktransformers, which has no pod "
-            "image — it is a CPU-AMX Python stack (kt-kernel + SGLang) that "
-            "has never been built for a rented machine. Serve it from a host "
-            "you own (backend: host), or pin the model to ds4/colibri/k3, "
-            "which the engines image carries.")
     if want in ("vllm", "llamacpp", "coderai", "custom"):
         return want
     # A non-text model is served by a whole coderai carrying that capability.
@@ -451,8 +449,9 @@ def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
         # everything with "not available".
         image = mcfg.image
         capability_hint = model_capability(entry or {}, include_text=True)
-        if not image and engine_pod_backend(entry or {}, mcfg):
-            image = default_capability_image("engines")
+        _eng = engine_pod_backend(entry or {}, mcfg)
+        if not image and _eng:
+            image = default_capability_image(_ENGINE_POD_IMAGE.get(_eng, "engines"))
         if not image:
             image = default_capability_image(capability_hint) if capability_hint else ""
         if not image:
@@ -740,14 +739,18 @@ _ENGINE_FORWARDED_FIELDS = {
                 "extra_env", "model_id"),
     "k3": ("ctx", "preset", "trunk_gb", "cache_gb", "extra_args", "extra_env",
            "model_id"),
+    "kt": ("ctx", "extra_args", "extra_env", "model_id"),
 }
+#: The config attribute behind each engine name (ktransformers is the odd one).
+_ENGINE_CONFIG_ATTR = {"kt": "ktransformers"}
 
 
 def engine_config_for_pod(engine: str) -> dict:
     """This install's settings for a native engine, minus what is local to it."""
     try:
         from codai.admin.routes import config_manager
-        cfg = getattr(getattr(config_manager, "config", None), engine, None)
+        cfg = getattr(getattr(config_manager, "config", None),
+                      _ENGINE_CONFIG_ATTR.get(engine, engine), None)
     except Exception:
         cfg = None
     if cfg is None:
@@ -946,6 +949,10 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
         # variant). The pod gets the switch and the settings as environment —
         # never its install_dir or ports, which describe this machine.
         env[f"CODERAI_{eng.upper()}_ENABLED"] = "1"
+        if eng == "kt":
+            # SGLang + kt-kernel live in the image's own venv; the worker must
+            # launch from there, not from coderai's interpreter.
+            env.setdefault("CODERAI_KT_VENV", "/opt/coderai/venvs/sglang")
         forwarded = engine_config_for_pod(eng)
         if forwarded:
             env[f"CODERAI_{eng.upper()}_CONFIG"] = _json.dumps(forwarded)

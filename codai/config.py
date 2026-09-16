@@ -551,6 +551,7 @@ class KtransformersConfig:
     service_url: str = ""
     repo_url: str = "https://github.com/kvcache-ai/ktransformers"
     install_dir: Optional[str] = None      # None = ~/.coderai/ktransformers (kt-kernel build)
+    venv: str = ""                         # venv holding SGLang + kt-kernel (they pin their own torch); blank = main
     model_path: str = ""                   # HF model directory (--model)
     kt_weight_path: str = ""               # KT quantized weights directory (--kt-weight-path)
     model_id: str = "ktransformers"        # model id/alias that routes to kt (and --served-model-name)
@@ -1366,10 +1367,11 @@ class ConfigManager:
         # dataclass — only fields it already has, so a stray key cannot plant
         # anything. Where the binary lives is the image's business
         # (CODERAI_<ENGINE>_DIR, read by the worker itself), not this block's.
-        for name in ("ds4", "colibri", "k3"):
+        for name, attr in (("ds4", "ds4"), ("colibri", "colibri"), ("k3", "k3"),
+                           ("kt", "ktransformers")):
             if not _flag(f"CODERAI_{name.upper()}_ENABLED"):
                 continue
-            eng = getattr(self.config, name, None)
+            eng = getattr(self.config, attr, None)
             if eng is None:
                 continue
             eng.enabled = True
@@ -1386,7 +1388,7 @@ class ConfigManager:
                 continue
             for k, v in forwarded.items():
                 if k in ("enabled", "install_dir", "repo_url", "service_url",
-                         "host", "port", "model_path", "auto_build"):
+                         "host", "port", "model_path", "auto_build", "venv"):
                     continue            # local to whichever machine set them
                 if hasattr(eng, k):
                     setattr(eng, k, v)

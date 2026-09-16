@@ -935,12 +935,21 @@ def test_an_engine_model_gets_the_engines_image_and_its_engine_switched_on(monke
                                "m", entry=vk)["env"]["CODERAI_SEED_MODELS"])[0]
     assert "backend" not in seed
 
-    # ktransformers has no pod image, and says so instead of shipping a pod
-    # that cannot run it.
-    import pytest
-    with pytest.raises(RuntimeError, match="ktransformers"):
-        pod_plan(parse_model_runpod({"engine": "kt"}), "m",
-                 entry={"path": "org/m", "model_type": "text_models"})
+    # ktransformers is a Python stack pinning its own torch: its own image,
+    # its own venv, and the worker is told where that venv is.
+    class _Kt:
+        ctx = 32768; extra_args = "--tp-size 1"; extra_env = ""; model_id = "ktransformers"
+        venv = "/local/venv"; install_dir = "/home/me/.coderai/ktransformers"
+    _Root.ktransformers = _Kt()
+    plan = pod_plan(parse_model_runpod({"engine": "kt"}), "m",
+                    entry={"path": "org/m", "model_type": "text_models"})
+    assert plan["image"].endswith("coderai-engines-kt:latest")
+    assert plan["env"]["CODERAI_KT_ENABLED"] == "1"
+    assert plan["env"]["CODERAI_KT_VENV"] == "/opt/coderai/venvs/sglang"
+    fwd = json.loads(plan["env"]["CODERAI_KT_CONFIG"])
+    assert fwd["ctx"] == 32768 and fwd["extra_args"] == "--tp-size 1"
+    assert "venv" not in fwd and "install_dir" not in fwd
+    assert json.loads(plan["env"]["CODERAI_SEED_MODELS"])[0]["backend"] == "kt"
 
     # The volume env points ds4's downloader at the volume too.
     assert rw.volume_env("/workspace")["DS4_GGUF_DIR"] == "/workspace/cache/ds4"
@@ -961,6 +970,14 @@ def test_a_pod_switches_its_engine_on_from_env_and_takes_the_settings(tmp_path, 
     assert cm.config.ds4.install_dir != "/nope" and cm.config.ds4.port != 9
     assert not hasattr(cm.config.ds4, "not_a_field")
     assert cm.config.colibri.enabled is False       # only what was asked for
+
+    # kt's config lives under `ktransformers`; the env name is the short one.
+    monkeypatch.setenv("CODERAI_KT_ENABLED", "1")
+    monkeypatch.setenv("CODERAI_KT_CONFIG", json.dumps({"ctx": 8192, "venv": "/nope"}))
+    cm2 = ConfigManager(str(tmp_path / "b"))
+    cm2.load()
+    assert cm2.config.ktransformers.enabled is True and cm2.config.ktransformers.ctx == 8192
+    assert cm2.config.ktransformers.venv != "/nope"
     on_disk = json.loads((tmp_path / "config.json").read_text())
     assert on_disk.get("ds4", {}).get("enabled") is not True
 
@@ -971,9 +988,12 @@ def test_the_engines_image_is_built_from_source_for_every_pod_gpu():
     Blackwell, and the build fails if a binary cannot find its libraries."""
     from pathlib import Path
     from codai.api.runpod_worker import PUBLISHED_CAPABILITY_IMAGES, default_capability_image
-    assert "engines" in PUBLISHED_CAPABILITY_IMAGES
+    assert "engines" in PUBLISHED_CAPABILITY_IMAGES and "engines-kt" in PUBLISHED_CAPABILITY_IMAGES
     assert default_capability_image("engines").endswith("coderai-engines:latest")
     prof = Path("packaging/runpod/profiles")
+    assert (prof / "engines-kt.light").exists()
+    assert "sglang-kt" in (prof / "engines-kt.venv-sglang.txt").read_text()
+    assert (prof / "engines-kt.venv-sglang.check").exists()
     assert (prof / "engines.txt").exists()
     assert (prof / "engines.dockerfile").read_text().strip() == "Dockerfile.capability-engines"
     df = Path("packaging/runpod/Dockerfile.capability-engines").read_text()
@@ -986,3 +1006,26 @@ def test_the_engines_image_is_built_from_source_for_every_pod_gpu():
         assert var in df
     sh = Path("packaging/runpod/build_capability_image.sh").read_text()
     assert ".dockerfile" in sh and "engines-src" in sh
+
+
+def test_the_kt_worker_launches_from_its_own_venv(tmp_path, monkeypatch):
+    """SGLang + kt-kernel pin their own torch and cannot share coderai's
+    venv; on a pod they are baked into one of their own, and the worker
+    must launch from THAT interpreter — sys.executable has no sglang."""
+    import sys
+    from codai.api import kt_worker as kw
+
+    class _Cfg:
+        venv = ""; model_id = "ktransformers"; kt_weight_path = ""; ctx = 0; extra_args = ""
+    monkeypatch.delenv("CODERAI_KT_VENV", raising=False)
+    assert kw._venv_python(_Cfg()) == sys.executable
+
+    venv = tmp_path / "sglang"; (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text("#!/bin/sh\n")
+    monkeypatch.setenv("CODERAI_KT_VENV", str(venv))
+    assert kw._venv_python(_Cfg()) == str(venv / "bin" / "python")
+    cmd = kw._launch_cmd(_Cfg(), "127.0.0.1", 1234, "org/m")
+    assert cmd[0] == str(venv / "bin" / "python") and "sglang.launch_server" in cmd
+    # A venv that is configured but missing falls back rather than crashing.
+    monkeypatch.setenv("CODERAI_KT_VENV", str(tmp_path / "missing"))
+    assert kw._venv_python(_Cfg()) == sys.executable

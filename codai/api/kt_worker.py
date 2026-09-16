@@ -57,9 +57,36 @@ def _health_ok(url: str) -> bool:
         return False
 
 
-def _sglang_available() -> bool:
-    import importlib.util
-    return importlib.util.find_spec("sglang") is not None
+def _venv_python(cfg=None) -> str:
+    """The interpreter that has SGLang + kt-kernel.
+
+    They pin their own torch (2.9.1 for kt-kernel 0.7) and cannot share the
+    main venv, so a pod image bakes them into a venv of their own and says
+    where with CODERAI_KT_VENV (a local install may set ktransformers.venv).
+    Blank means the main interpreter, which is where a hand install lands.
+    """
+    venv = (str(getattr(cfg, "venv", "") or "") if cfg is not None else "") \
+        or os.environ.get("CODERAI_KT_VENV", "")
+    venv = os.path.expanduser(venv.strip())
+    if venv:
+        cand = os.path.join(venv, "bin", "python")
+        if os.path.isfile(cand):
+            return cand
+        print(f"[kt] CODERAI_KT_VENV={venv} has no bin/python — using {sys.executable}",
+              flush=True)
+    return sys.executable
+
+
+def _sglang_available(cfg=None) -> bool:
+    py = _venv_python(cfg)
+    if py == sys.executable:
+        import importlib.util
+        return importlib.util.find_spec("sglang") is not None
+    try:
+        return subprocess.run([py, "-c", "import sglang"], capture_output=True,
+                              timeout=120).returncode == 0
+    except Exception:
+        return False
 
 
 def ensure_built(cfg) -> None:
@@ -69,7 +96,7 @@ def ensure_built(cfg) -> None:
     With ``auto_build`` we attempt a best-effort ``pip install sglang``, but the kt-kernel
     wheel/build must be provided out of band — otherwise raise a clear, actionable error.
     """
-    if _sglang_available():
+    if _sglang_available(cfg):
         return
     if not getattr(cfg, "auto_build", False):
         raise RuntimeError(
@@ -105,7 +132,7 @@ def resolve_service_key(cfg, model_path: Optional[str] = None):
 
 def _launch_cmd(cfg, host: str, port: int, model_path: str) -> list:
     mid = (getattr(cfg, "model_id", "ktransformers") or "ktransformers")
-    cmd = [sys.executable, "-m", "sglang.launch_server",
+    cmd = [_venv_python(cfg), "-m", "sglang.launch_server",
            "--host", host, "--port", str(port),
            "--model", model_path,
            "--served-model-name", mid]
@@ -146,11 +173,16 @@ def ensure_service(cfg, model_path: Optional[str] = None,
             _services.pop(svc_key, None)   # died — restart below
 
         ensure_built(cfg)
-        if not resolved or not os.path.isdir(resolved):
+        # A directory, or a HuggingFace repo id — SGLang resolves the latter
+        # itself and downloads into HF_HOME, which on a pod is the network
+        # volume. A bare name that is neither is the error it always was.
+        looks_like_repo = bool(resolved) and resolved.count("/") == 1 \
+            and not resolved.startswith(("/", "~", "."))
+        if not resolved or not (os.path.isdir(resolved) or looks_like_repo):
             raise RuntimeError(
-                "ktransformers: no model directory resolved for this request. Point the "
-                "model at the HF model dir (or set ktransformers.model_path); also set "
-                "ktransformers.kt_weight_path. There is no auto-download.")
+                "ktransformers: no model resolved for this request. Point the model "
+                "at the HF model dir or repo id (or set ktransformers.model_path); "
+                "also set ktransformers.kt_weight_path for pre-quantized experts.")
 
         host = (getattr(cfg, "host", "127.0.0.1") or "127.0.0.1").strip()
         port = int(getattr(cfg, "port", 0) or 0) or _free_port()
