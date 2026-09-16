@@ -827,3 +827,48 @@ def test_a_stated_weights_size_beats_the_estimate(monkeypatch):
                                         "weights_gb": 30})
     import json
     assert "weights_gb" not in json.dumps(json.loads(plan["env"].get("CODERAI_SEED_MODELS", "[]")))
+
+
+def test_a_multi_gpu_pod_is_priced_and_sharded_as_a_whole(monkeypatch):
+    """RunPod rents multi-GPU pods. gpu_count was plumbed to the API and used
+    by nothing: the ceiling checked one card's price, min_vram_gb one card's
+    memory, and the engine loaded onto GPU 0 while the rest sat idle."""
+    import codai.api.runpod_worker as rw
+
+    catalog = [{"id": "a100", "display_name": "A100", "memory_gb": 80,
+                "secure_price": 1.5, "community_price": None, "spot_price": None}]
+    class _C:
+        def list_gpu_types(self): return catalog
+
+    # One card: $1.50 fits a $2 ceiling, 80 GB fails a 160 GB floor.
+    m1 = rw.parse_model_runpod({"engine": "vllm", "max_hourly_usd": 2.0, "min_vram_gb": 160})
+    try:
+        rw._rank_gpus(_C(), m1, None)
+    except Exception as e:
+        assert "160" in str(e)
+    else:
+        raise AssertionError("one 80 GB card must not satisfy a 160 GB floor")
+
+    # Two cards: 160 GB total satisfies the floor, but $3.00 exceeds a $2 ceiling.
+    m2 = rw.parse_model_runpod({"engine": "vllm", "gpu_count": 2,
+                                "max_hourly_usd": 2.0, "min_vram_gb": 160})
+    try:
+        rw._rank_gpus(_C(), m2, None)
+    except Exception as e:
+        assert "$2.0" in str(e) or "2.0/hr" in str(e)
+    else:
+        raise AssertionError("two $1.50 cards must not pass a $2 ceiling")
+
+    # Two cards under a $4 ceiling: priced and labelled as the pod.
+    m3 = rw.parse_model_runpod({"engine": "vllm", "gpu_count": 2,
+                                "max_hourly_usd": 4.0, "min_vram_gb": 160})
+    sel = rw._rank_gpus(_C(), m3, None)[0]
+    assert sel["price"] == 3.0 and sel["memory_gb"] == 160
+    assert sel["gpu_count"] == 2 and sel["display_name"] == "2x A100"
+
+    # And the engines are told to use every card they were rented.
+    assert "--tensor-parallel-size 2" in rw._vllm_docker_args(m3, "org/m", {"path": "org/m"})
+    ml = rw.parse_model_runpod({"engine": "llamacpp", "gpu_count": 2, "hf_gguf": "u/r:Q4"})
+    assert "--split-mode layer" in rw._llamacpp_docker_args(ml, "m", {})
+    # A single card asks for neither: no needless flags on the common case.
+    assert "tensor-parallel" not in rw._vllm_docker_args(m1, "org/m", {"path": "org/m"})

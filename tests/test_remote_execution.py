@@ -1883,3 +1883,26 @@ def test_a_pod_that_cannot_serve_surya_is_asked_for_doctr_in_the_request_itself(
     # A field that is not there is left alone, with the body byte-identical.
     same, h2 = _rewrite_request_field(body, {"content-type": ct}, "model", "x")
     assert same == body and "content-length" not in h2
+
+
+def test_a_request_sent_to_a_remote_appears_on_the_tasks_page(gateway_app, monkeypatch):
+    """A request that spends minutes on a rented GPU showed up nowhere: nothing
+    registered it as a task. It is one — it just runs somewhere else — and the
+    entry says where, from acquiring (renting, booting) through to the answer."""
+    import json as _json
+    from codai.tasks import task_registry
+    import codai.api.remote_gateway as rg
+
+    before = {t["id"] for t in task_registry.list()}
+    client, gw, url = gateway_app
+    gw.capability_endpoints = lambda: {"images": url}
+    r = client.post("/v1/images/generations", json={"model": "sdxl", "prompt": "x"})
+    assert r.status_code == 200
+
+    new = [t for t in task_registry.list() if t["id"] not in before]
+    assert len(new) == 1, new
+    t = new[0]
+    assert t["kind"] == "remote" and t["model"] == "sdxl"
+    assert t["status"] == "done"
+    assert url.split("//")[1].split("/")[0] in t["message"], t["message"]
+    assert t["cancellable"] is False        # it is on another machine's GPU

@@ -733,8 +733,9 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
               <input type="text" id="cfg-rp-gpu-type" class="form-input" placeholder="auto — e.g. NVIDIA GeForce RTX 4090">
             </div>
           </div>
-          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.5rem;margin-top:.5rem">
-            <div class="form-row" style="margin:0"><label class="form-label">Min VRAM (GB)</label><input type="number" id="cfg-rp-min-vram" class="form-input" min="0" placeholder="0 = any"></div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:.5rem;margin-top:.5rem">
+            <div class="form-row" style="margin:0"><label class="form-label">GPUs per pod</label><input type="number" id="cfg-rp-gpu-count" class="form-input" min="1" max="8" placeholder="1" title="Multi-GPU pod: VRAM floor and $/hr cap apply to the whole pod; the engine shards across every card"></div>
+            <div class="form-row" style="margin:0"><label class="form-label">Min VRAM (GB, total)</label><input type="number" id="cfg-rp-min-vram" class="form-input" min="0" placeholder="0 = any"></div>
             <div class="form-row" style="margin:0"><label class="form-label">Max $/hr</label><input type="number" id="cfg-rp-max-hourly" class="form-input" min="0" step="0.01" placeholder="0 = no cap"></div>
             <div class="form-row" style="margin:0;align-self:end"><label style="display:flex;align-items:center;gap:.3rem;font-size:12px"><input type="checkbox" id="cfg-rp-spot" style="width:auto"> Allow spot</label></div>
           </div>
@@ -4201,6 +4202,7 @@ function _populateRunpod(s){
   set('cfg-rp-criteria', rp.selection_criteria || 'cheaper');
   set('cfg-rp-gpu-type', rp.gpu_type || '');
   set('cfg-rp-min-vram', rp.min_vram_gb != null ? rp.min_vram_gb : '');
+  set('cfg-rp-gpu-count', rp.gpu_count != null ? rp.gpu_count : '');
   set('cfg-rp-max-hourly', rp.max_hourly_usd != null ? rp.max_hourly_usd : '');
   chk('cfg-rp-spot', rp.allow_spot);
   set('cfg-rp-min-pods', rp.min_pods != null ? rp.min_pods : '');
@@ -4371,6 +4373,7 @@ function _collectRunpod(){
     cloud_types:        pools,
     selection_criteria: val('cfg-rp-criteria') || 'cheaper',
     gpu_type:           (val('cfg-rp-gpu-type') || '').trim(),
+    gpu_count:          intOrU('cfg-rp-gpu-count'),
     min_vram_gb:        numOrU('cfg-rp-min-vram'),
     max_hourly_usd:     numOrU('cfg-rp-max-hourly'),
     allow_spot:         document.getElementById('cfg-rp-spot').checked,

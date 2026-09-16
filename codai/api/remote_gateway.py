@@ -535,11 +535,34 @@ class RemoteGatewayMiddleware:
 
     async def _forward(self, scope, headers, body, target, send):
         import asyncio
+        # A request that goes to a pod can spend minutes on a rented GPU, and
+        # it appeared NOWHERE on the Tasks page: nothing registered it. It is a
+        # task like any other — it just runs somewhere else, and the entry says
+        # where, from "acquiring" (which may mean renting and booting a pod)
+        # through to the answer.
+        from codai.tasks import task_registry
+        path = scope.get("path") or ""
+        cap = capability_for(path) or "remote"
+        model = _model_from_body(body, headers.get("content-type", ""),
+                                 _MODEL_FIELD.get(path, "model"))
+        tid = task_registry.register("remote", title=f"{cap} {path}",
+                                     model=model or cap, cancellable=False,
+                                     pausable=False)
+        task_registry.start(tid)
+        try:
+            task_registry.update(tid, message=f"acquiring: {target.reason}")
+        except Exception:
+            pass
         try:
             base, release = await asyncio.to_thread(target.acquire)
         except Exception as exc:
+            task_registry.finish(tid, "error", f"no remote: {exc}"[:200])
             return await _error(send, 502,
                                 f"could not reach a remote for this request: {exc}")
+        try:
+            task_registry.update(tid, message=f"on {base}")
+        except Exception:
+            pass
         try:
             if target.rewrite_field:
                 body, headers = _rewrite_request_field(
@@ -560,6 +583,10 @@ class RemoteGatewayMiddleware:
                     sync_loras, base, target.api_key, body)
             await self._send_upstream(scope, headers, body, base, target.reason, send,
                                       api_key=target.api_key)
+            task_registry.finish(tid, "done")
+        except Exception as exc:
+            task_registry.finish(tid, "error", str(exc)[:200])
+            raise
         finally:
             release()
 

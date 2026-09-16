@@ -43,6 +43,12 @@ class RunpodModelConfig:
     gpu_type: str = ""                       # explicit RunPod gpuTypeId (optional)
     min_vram_gb: float = 0.0
     max_hourly_usd: float = 0.0              # per-model $/hr GPU ceiling (0 = none)
+    # GPUs per pod. RunPod rents multi-GPU pods, and a 154 GB model on one 80 GB
+    # card is exactly where you want two or four. Three things have to agree:
+    # the price ceiling is for the WHOLE pod (N cards), min_vram_gb is the total
+    # across them, and the engine has to shard — vLLM by tensor parallelism,
+    # llama.cpp by split mode. All three are handled from this one number.
+    gpu_count: int = 1
     allow_spot: bool = False
     # --- serving (pods) ---
     image: str = ""                          # blank = image picked from `engine`
@@ -946,6 +952,8 @@ def _llamacpp_docker_args(mcfg: "RunpodModelConfig", served: str,
     """
     args = ["--host", "0.0.0.0", "--port", str(mcfg.port or 8000),
             "--alias", served or "model", "-ngl", "999"]
+    if max(1, int(getattr(mcfg, "gpu_count", 1) or 1)) > 1:
+        args += ["--split-mode", "layer"]      # spread layers across the pod's cards
     src = (mcfg.hf_gguf or "").strip()
     if src:
         args += ["-hf", src]
@@ -1017,6 +1025,7 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
     cfg.gpu_type = (b.get("gpu_type") or "").strip()
     cfg.min_vram_gb = _as_float(b.get("min_vram_gb"), cfg.min_vram_gb)
     cfg.max_hourly_usd = _as_float(b.get("max_hourly_usd"), cfg.max_hourly_usd)
+    cfg.gpu_count = max(1, min(8, _as_int(b.get("gpu_count"), cfg.gpu_count)))
     cfg.allow_spot = _as_bool(b.get("allow_spot"), cfg.allow_spot)
     cfg.image = (b.get("image") or "").strip()
     cfg.engine = (b.get("engine") or cfg.engine).strip().lower() or "auto"
@@ -1158,13 +1167,18 @@ def _rank_gpus(client, mcfg: "RunpodModelConfig", account_cfg) -> list:
     catalog = client.list_gpu_types()
     allowed = [c.upper() for c in (mcfg.cloud_types or ["SECURE"])] or ["SECURE"]
     ceiling = mcfg.max_hourly_usd or 0.0
+    n = max(1, int(getattr(mcfg, "gpu_count", 1) or 1))
+    # The catalogue prices ONE card. A pod with N of them costs N times that and
+    # holds N times the VRAM, so both the ceiling and the VRAM floor are checked
+    # against the pod, not the card — or a 4-GPU pod would pass a $1/hr ceiling
+    # at $0.90 a card and bill $3.60.
     explicit = (mcfg.gpu_type or getattr(account_cfg, "default_gpu_type", "") or "").strip()
 
     cands = []   # (price, is_spot, cloud_type, gpu, on_demand_price)
     for g in catalog:
         if explicit and g["id"] != explicit and g["display_name"] != explicit:
             continue
-        mem = g.get("memory_gb") or 0
+        mem = (g.get("memory_gb") or 0) * n
         if mcfg.min_vram_gb and mem < mcfg.min_vram_gb:
             continue
         for ct in allowed:
@@ -1176,9 +1190,10 @@ def _rank_gpus(client, mcfg: "RunpodModelConfig", account_cfg) -> list:
             for price, is_spot in options:
                 if price is None or price <= 0:
                     continue
+                price = price * n
                 if ceiling > 0 and price > ceiling:
                     continue
-                cands.append((price, is_spot, ct, g, on_demand or price))
+                cands.append((price, is_spot, ct, g, (on_demand or price) * n))
     if not cands:
         raise RunpodError(
             f"RunPod: no GPU in pools {allowed} with ≥{mcfg.min_vram_gb}GB under "
@@ -1193,9 +1208,10 @@ def _rank_gpus(client, mcfg: "RunpodModelConfig", account_cfg) -> list:
                                   -(c[3].get("memory_gb") or 0), c[0]))
     else:  # cheaper
         cands.sort(key=lambda c: (c[0], c[1] is False))
-    return [{"gpu_type_id": g["id"], "display_name": g["display_name"],
-             "memory_gb": g.get("memory_gb"), "cloud_type": ct, "price": price,
-             "is_spot": is_spot, "bid": on_demand if is_spot else 0.0}
+    return [{"gpu_type_id": g["id"],
+             "display_name": (f"{n}x {g['display_name']}" if n > 1 else g["display_name"]),
+             "memory_gb": (g.get("memory_gb") or 0) * n, "cloud_type": ct, "price": price,
+             "is_spot": is_spot, "bid": on_demand if is_spot else 0.0, "gpu_count": n}
             for (price, is_spot, ct, g, on_demand) in cands]
 
 
@@ -1264,6 +1280,12 @@ def _vllm_docker_args(mcfg: "RunpodModelConfig", served: str,
                 "`hf_repo` (e.g. \"Qwen/Qwen3.5-9B\") on the model's runpod block.")
     args = ["--host", "0.0.0.0", "--port", str(mcfg.port or 8000),
             "--model", name, "--served-model-name", name]
+    n = max(1, int(getattr(mcfg, "gpu_count", 1) or 1))
+    if n > 1:
+        # A multi-GPU pod is only useful if the engine shards across the cards;
+        # without this vLLM would load onto GPU 0 alone and the other N-1 cards
+        # would be rented and idle.
+        args += ["--tensor-parallel-size", str(n)]
     if mcfg.ctx and mcfg.ctx > 0:
         args += ["--max-model-len", str(mcfg.ctx)]
     if mcfg.quantization:
@@ -1587,6 +1609,7 @@ class RunpodPodPool:
                     print(f"[runpod] {_disk_note}", flush=True)
                 pod_id = client.create_pod(
                     name=name, image=image, gpu_type_id=sel["gpu_type_id"], port=port,
+                    gpu_count=int(sel.get("gpu_count") or 1),
                     cloud_type=sel["cloud_type"], container_disk_gb=_disk_gb,
                     volume_gb=self.mcfg.volume_gb, env=env, docker_args=args,
                     is_spot=sel["is_spot"], bid_per_gpu=sel["bid"],

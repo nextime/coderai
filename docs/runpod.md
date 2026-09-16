@@ -116,8 +116,9 @@ block:
 | `cloud_types` | `["SECURE"]` | Pools to consider. Select both to widen availability. |
 | `selection_criteria` | `cheaper` | `cheaper` = lowest price first. `faster` = SECURE before COMMUNITY, on-demand before spot, more VRAM, then price. |
 | `gpu_type` | — | Pin an explicit RunPod `gpuTypeId` instead of searching. |
-| `min_vram_gb` | `0` | Reject GPUs smaller than this. |
-| `max_hourly_usd` | `0` (none) | Per-model $/hr ceiling for a single GPU. |
+| `gpu_count` | `1` | GPUs per pod (1–8). A multi-GPU pod is one machine with N cards: `min_vram_gb` is checked against the total, `max_hourly_usd` against the whole pod, and the engine is told to shard across every card (vLLM `--tensor-parallel-size N`, llama.cpp `--split-mode layer`). For a model too big for any single card. |
+| `min_vram_gb` | `0` | Reject pods with less total VRAM than this (all `gpu_count` cards together). |
+| `max_hourly_usd` | `0` (none) | Per-model $/hr ceiling for the whole pod (price × `gpu_count`). |
 | `allow_spot` | `false` | Allow interruptible/spot instances (cheaper, can be reclaimed). |
 
 **Serving (pods)**
