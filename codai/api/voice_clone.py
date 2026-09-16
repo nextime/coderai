@@ -289,6 +289,24 @@ def _trim_reference(path: str, temps: list, max_seconds: float = None) -> str:
         return path
 
 
+class _NoProgress:
+    """A progress sink f5-tts can call either way.
+
+    Older f5-tts called ``progress(iterable)``; current releases default the
+    argument to the tqdm MODULE and call ``progress.tqdm(iterable)``. A bare
+    lambda satisfied the first and broke the second with "'function' object has
+    no attribute 'tqdm'" — on a rented pod, after the model had loaded. This
+    answers both shapes and shows nothing, which is what a server wants.
+    """
+
+    def __call__(self, iterable, **_kw):
+        return iterable
+
+    @staticmethod
+    def tqdm(iterable, **_kw):
+        return iterable
+
+
 def _f5tts_clone(ref_audio_path: str, ref_text: str, gen_text: str,
                   speed: float = 1.0, seed: Optional[int] = None) -> bytes:
     """Run F5-TTS voice cloning, return WAV bytes."""
@@ -302,7 +320,7 @@ def _f5tts_clone(ref_audio_path: str, ref_text: str, gen_text: str,
         speed=speed,
         seed=seed,
         show_info=lambda x: None,
-        progress=lambda x, **kw: x,
+        progress=_NoProgress(),
     )
 
     buf = io.BytesIO()
