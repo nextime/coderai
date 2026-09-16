@@ -199,15 +199,27 @@ class _CoquiBackend:
     default_voice = ""
 
     def __init__(self, model_name: str, config: dict):
+        self._cfg = config or {}
         try:
-            from TTS.api import TTS  # coqui-tts
+            from TTS.api import TTS  # coqui-tts, in this venv
         except ImportError as e:
+            # Not here — but coqui-tts cannot share a transformers-5 venv, so
+            # "not here" is the normal case. Look for it in a venv of its own,
+            # the way parler and the OCR engines are found. A pod image with a
+            # verified TTS venv used to answer "pip install coqui-tts" at this
+            # exact line: the venv was there and nothing knew to use it.
+            from codai.api import xtts_worker
+            if xtts_worker.available():
+                print(f"[tts] coqui-tts from {xtts_worker.venv_dir()}", flush=True)
+                self._tts = xtts_worker.XttsSubprocess(model_name)
+                return
             raise MissingEngineError(
-                "Coqui/XTTS models need the coqui-tts package: "
-                "pip install coqui-tts"
+                "Coqui/XTTS models need the coqui-tts package, and no venv "
+                "containing it was found (CODERAI_XTTS_VENV, /opt/coderai/venvs/TTS, "
+                "~/.coderai/xtts_venv). It cannot be installed beside "
+                "transformers 5.x: build it in its own venv."
             ) from e
         import torch
-        self._cfg = config or {}
         self._tts = TTS(model_name).to("cuda" if torch.cuda.is_available() else "cpu")
 
     def synthesize(self, text: str, voice: str, speed: float, lang: str,

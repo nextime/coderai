@@ -1733,3 +1733,41 @@ def test_asking_for_audiocraft_when_absent_is_an_error_not_a_substitution():
             raise AssertionError("expected a RuntimeError")
     finally:
         builtins.__import__ = real
+
+
+def test_xtts_falls_through_to_its_own_venv_when_not_importable(monkeypatch):
+    """coqui-tts cannot share a transformers-5 venv, so 'not importable here' is
+    the normal case. A pod image with a verified TTS venv used to answer 'pip
+    install coqui-tts' — the venv was there and nothing knew to use it."""
+    import builtins, numpy as np
+    from codai.api import tts_backends, xtts_worker
+
+    real = builtins.__import__
+    def _no_tts(name, *a, **k):
+        if name == "TTS.api" or name == "TTS":
+            raise ImportError("not in this venv")
+        return real(name, *a, **k)
+    monkeypatch.setattr(builtins, "__import__", _no_tts)
+
+    class _FakeSub:
+        def __init__(self, model):
+            self.speakers = ["Ana Florence"]
+            self.synthesizer = type("S", (), {"output_sample_rate": 24000})()
+        def tts(self, **kw):
+            assert kw["speaker"] == "Ana Florence" and kw["language"] == "en"
+            return np.zeros(2400, dtype=np.float32)
+    monkeypatch.setattr(xtts_worker, "available", lambda: True)
+    monkeypatch.setattr(xtts_worker, "XttsSubprocess", _FakeSub)
+
+    b = tts_backends._CoquiBackend("coqui/XTTS-v2", {})
+    wav, sr = b.synthesize("hello", voice="", speed=1.0, lang="en")
+    assert sr == 24000 and len(wav) == 2400
+
+    # and with no venv either, the error says where it looked
+    monkeypatch.setattr(xtts_worker, "available", lambda: False)
+    try:
+        tts_backends._CoquiBackend("coqui/XTTS-v2", {})
+    except tts_backends.MissingEngineError as e:
+        assert "/opt/coderai/venvs/TTS" in str(e)
+    else:
+        raise AssertionError("expected MissingEngineError")
