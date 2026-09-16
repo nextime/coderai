@@ -1,0 +1,12 @@
+# Deep check for the pyannote venv, run at build time by the venv's own python.
+#
+# 'import pyannote.audio' passes without matplotlib; instantiating a pipeline
+# does not. A bare import check is what let this venv ship broken, so this
+# imports the modules the REAL load reaches — without a GPU or a token, which a
+# build has neither of. If pyannote adds another undeclared import, this is
+# where it fails: in the build, not on a rented card.
+from pyannote.audio import Pipeline                                   # noqa
+from pyannote.audio.tasks.segmentation.multilabel import MultiLabelSegmentation  # noqa
+import pyannote.audio.pipelines.speaker_diarization                   # noqa
+import speechbrain                                                    # noqa
+print("pyannote deep check: pipeline modules import")

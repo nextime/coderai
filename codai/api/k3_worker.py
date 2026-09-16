@@ -100,7 +100,7 @@ def ensure_built(cfg) -> Path:
     binary = _engine_bin(install_dir)
     if not binary.exists():
         raise RuntimeError("k3 build completed but bin/k3 is missing. Last output: "
-                           + " | ".join(list(tail)[-5:]))
+                           + " | ".join(l.strip()[:300] for l in list(tail) if l.strip()))
     print(f"[k3] built {binary}", flush=True)
     return binary
 

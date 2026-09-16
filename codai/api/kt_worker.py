@@ -94,7 +94,7 @@ def ensure_built(cfg) -> None:
         raise RuntimeError(
             "ktransformers: SGLang still not importable after pip install. Install "
             "SGLang + kt-kernel manually per the ktransformers docs. Last output: "
-            + " | ".join(list(tail)[-5:]))
+            + " | ".join(l.strip()[:300] for l in list(tail) if l.strip()))
 
 
 def resolve_service_key(cfg, model_path: Optional[str] = None):
@@ -179,7 +179,7 @@ def ensure_service(cfg, model_path: Optional[str] = None,
         _services[svc_key] = {"proc": proc, "port": port, "url": url}
 
     def _tail_msg():
-        joined = " | ".join(list(tail)[-5:]).strip()
+        joined = " | ".join(l.strip()[:300] for l in list(tail) if l.strip()).strip()
         return f". Last output: {joined}" if joined else ""
 
     deadline = time.time() + ready_timeout

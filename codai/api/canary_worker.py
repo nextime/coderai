@@ -176,7 +176,7 @@ def ensure_service(model_name: str, config: dict = None,
         _services[model_name] = {"proc": proc, "port": port, "url": url}
 
     def _tail_msg():
-        joined = " | ".join(list(tail)[-5:]).strip()
+        joined = " | ".join(l.strip()[:300] for l in list(tail) if l.strip()).strip()
         return f". Last output: {joined}" if joined else ""
 
     deadline = time.time() + ready_timeout

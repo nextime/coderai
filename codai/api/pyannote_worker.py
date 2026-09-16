@@ -203,7 +203,13 @@ def ensure_service(model_name: str = None, config: dict = None,
         _services[model_name] = {"proc": proc, "port": port, "url": url}
 
     def _tail_msg():
-        joined = " | ".join(list(tail)[-5:]).strip()
+        # The whole tail, not the last five lines. A Python traceback's last
+        # five lines are frame headers — the exception itself is the FINAL
+        # line, and cutting to five dropped it whenever the trace was deep: a
+        # pod reported 'File ".../mixins.py", line 3' and nothing else, which
+        # said where it died and not why. Long lines are cut, the count is not.
+        lines = [l.strip()[:300] for l in list(tail) if l.strip()]
+        joined = " | ".join(lines)
         return f". Last output: {joined}" if joined else ""
 
     deadline = time.time() + ready_timeout

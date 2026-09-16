@@ -173,7 +173,7 @@ def ensure_service(model_name: str, ready_timeout: float = 1800.0) -> str:
         _services[model_name] = {"proc": proc, "port": port, "url": url}
 
     def _tail_msg():
-        joined = " | ".join(list(tail)[-5:]).strip()
+        joined = " | ".join(l.strip()[:300] for l in list(tail) if l.strip()).strip()
         if "offline" in joined.lower() or "not" in joined.lower() and "found" in joined.lower():
             return (f". The model isn't in coderai's cache — download "
                     f"'{model_name}' from the model interface first. ({joined})")

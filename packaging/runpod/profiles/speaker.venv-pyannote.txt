@@ -9,3 +9,8 @@ huggingface_hub<1.0
 soundfile>=0.12.0
 # speechbrain (speaker ID) lives here too: this venv is where the torch is.
 speechbrain>=1.0.0
+# pyannote's segmentation tasks import matplotlib.pyplot at module load — not
+# declared, and not reached by 'import pyannote.audio', so the build's import
+# check passed and the pod died instantiating the pipeline with
+# ModuleNotFoundError. Reproduced by running the real service with a GPU.
+matplotlib>=3.7

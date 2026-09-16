@@ -198,7 +198,7 @@ def _run_logged(cmd, cwd, label, tail, **kw):
             print(f"[colibri] {line}", flush=True)
     proc.wait()
     if proc.returncode != 0:
-        joined = " | ".join(list(tail)[-5:])
+        joined = " | ".join(l.strip()[:300] for l in list(tail) if l.strip())
         raise RuntimeError(f"{label} failed (exit {proc.returncode}). {joined}")
 
 
@@ -252,7 +252,7 @@ def ensure_built(cfg, family: str = "glm") -> Path:
     if not binary.exists():
         raise RuntimeError(
             f"colibri {family} build completed but {binary} is missing. Last output: "
-            + " | ".join(list(tail)[-5:]))
+            + " | ".join(l.strip()[:300] for l in list(tail) if l.strip()))
     _built = True
     print(f"[colibri] built {binary}", flush=True)
     return binary
@@ -398,7 +398,7 @@ class MuxEngine:
             pass
 
     def log_tail(self) -> str:
-        return " | ".join(list(self._log_tail)[-5:]).strip()
+        return " | ".join(l.strip()[:300] for l in list(self._log_tail) if l.strip()).strip()
 
     def is_alive(self) -> bool:
         return (not self.closed and self.dispatcher_error is None

@@ -87,7 +87,7 @@ def _run_logged(cmd, cwd, label, tail, **kw):
             print(f"[ds4] {line}", flush=True)
     proc.wait()
     if proc.returncode != 0:
-        joined = " | ".join(list(tail)[-5:])
+        joined = " | ".join(l.strip()[:300] for l in list(tail) if l.strip())
         raise RuntimeError(f"{label} failed (exit {proc.returncode}). {joined}")
 
 
@@ -120,7 +120,7 @@ def ensure_built(cfg) -> Path:
     if not binary.exists():
         raise RuntimeError(
             f"ds4 build completed but {binary} is missing. Last output: "
-            + " | ".join(list(tail)[-5:]))
+            + " | ".join(l.strip()[:300] for l in list(tail) if l.strip()))
     _built = True
     print(f"[ds4] built {binary}", flush=True)
     return binary
@@ -279,7 +279,7 @@ def ensure_model(cfg, model_name: Optional[str] = None) -> Optional[str]:
     if not default_model.exists():
         raise RuntimeError(
             f"ds4 download_model.sh finished but {default_model} is missing. "
-            "Last output: " + " | ".join(list(tail)[-5:]))
+            "Last output: " + " | ".join(l.strip()[:300] for l in list(tail) if l.strip()))
     final = _relocate_into_cache(str(default_model))
     _register_downloaded_model(cfg, final, model_name)
     return final
@@ -473,7 +473,7 @@ def ensure_service(cfg, model_file: Optional[str] = None,
         _services[svc_key] = {"proc": proc, "port": port, "url": url}
 
     def _tail_msg():
-        joined = " | ".join(list(tail)[-5:]).strip()
+        joined = " | ".join(l.strip()[:300] for l in list(tail) if l.strip()).strip()
         return f". Last output: {joined}" if joined else ""
 
     deadline = time.time() + ready_timeout

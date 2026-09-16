@@ -80,6 +80,10 @@ RUN set -eux; \
             "$vdir/bin/pip" install --no-cache-dir --no-deps -r "$nodeps"; \
         fi; \
         "$vdir/bin/python" -c "import ${name}; print('${name}', getattr(${name}, '__version__', 'ok'), 'in its own venv')"; \
+        check="/tmp/venv-profiles/${PROFILE}.venv-${name}.check"; \
+        if [ -f "$check" ]; then \
+            "$vdir/bin/python" "$check" || { echo "ERROR: ${name} venv failed its deep check" >&2; exit 1; }; \
+        fi; \
     done; \
     rm -rf /tmp/venv-profiles
 

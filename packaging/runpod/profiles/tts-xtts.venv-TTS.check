@@ -1,0 +1,5 @@
+# Deep check for the coqui-tts venv: reach the XTTS model class, not just TTS.api.
+from TTS.api import TTS                                   # noqa
+from TTS.tts.models.xtts import Xtts                      # noqa
+import click                                              # noqa  (undeclared, found the hard way)
+print("coqui-tts deep check: XTTS model class imports")
