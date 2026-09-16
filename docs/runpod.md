@@ -459,6 +459,12 @@ These come from live testing on a real account, not from the docs:
   whole repo — SDXL's repo is 77 GB, of which a diffusers load pulls 28; the
   rest is the same weights again as Flax, legacy `.bin` and ONNX. With a
   network volume attached the weights land there, so the disk stays put.
+- **The build disk can fill with layers Docker cannot see.** Twice, 500 GB of
+  overlay2 belonged to old flattened bases pinned by container mount records
+  the daemon had lost; `docker system df` said 90 GB. `sudo
+  tools/docker_leak_audit.py` reports them, `--fix` removes them with the
+  daemon stopped. Push a capability image and delete it locally — every one
+  of them is rebuildable from the two cores.
 - **A machine may serve a cached `:latest`.** An images pod reported a
   dependency missing that had already been published under that tag. Pin an
   immutable version tag when a result has to mean something — the test harness
