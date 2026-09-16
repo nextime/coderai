@@ -597,16 +597,16 @@ def test_an_ocr_pod_arrives_with_ocr_switched_on():
     from codai.api.runpod_worker import pod_plan, parse_model_runpod
 
     mcfg = parse_model_runpod({"engine": "coderai", "image": "x:1"})
+    # Surya 0.22 is a VLM that needs a server the pod image does not carry —
+    # vLLM (which it spawns in Docker) or llama-server on a GGUF. A pod asked
+    # for surya serves the request with docTR, and says so, rather than loading
+    # surya, reaching inference and dying on "docker binary not found".
     env = pod_plan(mcfg, "ocr", entry={"path": "surya",
                                        "model_type": "ocr_models"})["env"]
     assert env["CODERAI_OCR_ENABLED"] == "1"
-    assert env["CODERAI_OCR_DEFAULT_ENGINE"] == "surya"
-    # Asking for surya by name IS the licence decision; the pod cannot make it.
-    assert env["CODERAI_OCR_SURYA_ACCEPT_LICENSE"] == "1"
-    # …and the engine's OWN gate, which is separate from the subsystem's. A pod
-    # with only the subsystem enabled answered "OCR engine 'surya' is not
-    # enabled" — a second refusal from a second flag, a round later.
-    assert env["CODERAI_OCR_SURYA_ENABLED"] == "1"
+    assert env["CODERAI_OCR_DEFAULT_ENGINE"] == "doctr"
+    assert env["CODERAI_OCR_DOCTR_ENABLED"] == "1"
+    assert "CODERAI_OCR_SURYA_ENABLED" not in env
 
     # A non-gated engine does not carry the licence flag unless we accepted it.
     env = pod_plan(mcfg, "ocr", entry={"path": "paddle",
@@ -673,11 +673,12 @@ def test_a_pod_is_told_where_its_baked_venvs_are():
     assert env["CODERAI_PYANNOTE_VENV"] == "/opt/coderai/venvs/pyannote"
     assert env["CODERAI_NEMO_VENV"] == "/opt/coderai/venvs/nemo"
 
-    # Surya is the opposite case: it fits the main venv, so it is pointed at the
-    # pod's own interpreter rather than a venv that would only duplicate it.
-    env = pod_plan(mcfg, "ocr", entry={"path": "surya",
-                                       "model_type": "ocr_models"})["env"]
-    assert env["CODERAI_OCR_SURYA_VENV"] == "/usr/local"
+    # A pod asked for coqui XTTS inherits the CPML acceptance: the alternative
+    # is an interactive prompt on a pipe, which corrupts the worker protocol
+    # and then blocks forever on input().
+    env = pod_plan(mcfg, "tts", entry={"path": "coqui/XTTS-v2",
+                                       "model_type": "tts_models"})["env"]
+    assert env["COQUI_TOS_AGREED"] == "1"
 
 
 def test_a_150gb_model_warns_before_anyone_rents_a_card():

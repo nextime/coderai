@@ -762,9 +762,28 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
                         ("CODERAI_XTTS_VENV", "TTS")):
         env.setdefault(_var, f"/opt/coderai/venvs/{_name}")
 
+    if cap in ("tts", "voice"):
+        # coqui XTTS is under the CPML licence and asks for acceptance with an
+        # interactive prompt on stdout — which on a pod both corrupts the worker
+        # protocol and blocks forever on input(). The decision is made HERE by
+        # configuring the model at all, exactly as surya's licence is; the pod
+        # inherits it and coqui skips the prompt.
+        env.setdefault("COQUI_TOS_AGREED", "1")
+
     if cap == "ocr":
         env["CODERAI_OCR_ENABLED"] = "1"
         wanted = str((entry or {}).get("path") or "").strip().lower()
+        if wanted == "surya":
+            # Surya 0.22 is a VLM ("surya-ocr-2"), not a self-contained OCR
+            # library: it needs a server — vLLM, which it spawns IN DOCKER (a
+            # pod cannot), or llama-server on a GGUF, which the image does not
+            # ship. Locally it rides coderai's own vLLM engine; a pod has none.
+            # So a pod asked for surya serves the request with docTR, which is
+            # in the image and has passed — rather than loading surya, reaching
+            # inference, and dying on "docker binary not found".
+            print("[runpod] surya on a pod needs a VLM server the image does not "
+                  "carry — this OCR request will be served by docTR", flush=True)
+            wanted = "doctr"
         if wanted not in ("paddle", "doctr", "surya"):
             # The pod images ship docTR, the only engine that runs in-process.
             wanted = "doctr"
@@ -777,12 +796,6 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
             # CUDA runtime. Point the engine at that interpreter rather than
             # letting it try to build a venv on a rented machine.
             env["CODERAI_OCR_PADDLE_VENV"] = "/opt/coderai/venvs/paddleocr"
-        if wanted == "surya":
-            # Surya is installed in the pod's main venv — its old pillow<11 cap
-            # no longer applies — so point its subprocess engine at that
-            # interpreter. Building a venv on a pod would cost minutes of rental
-            # to install what is already there.
-            env["CODERAI_OCR_SURYA_VENV"] = "/usr/local"
         if wanted == "surya" or _surya_accepted():
             # Surya is GPL and gated on an explicit acceptance. The pod inherits
             # the decision made HERE — it cannot make it for itself, and asking

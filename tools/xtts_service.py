@@ -93,6 +93,14 @@ def _tts(req: dict) -> dict:
 
 
 def main() -> int:
+    # stdout is the PROTOCOL: one JSON object per line. coqui prints a licence
+    # prompt and progress to stdout during load, which the caller then tried to
+    # parse — "unparseable worker reply". So the real stdout is kept for the
+    # protocol and everything else the process prints goes to stderr, where the
+    # caller's log tail can still see it.
+    import os
+    proto = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
+    sys.stdout = sys.stderr
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -111,8 +119,8 @@ def main() -> int:
         except Exception as exc:
             # One bad request must not take the loaded model down with it.
             out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        sys.stdout.write(json.dumps(out) + "\n")
-        sys.stdout.flush()
+        proto.write(json.dumps(out) + "\n")
+        proto.flush()
     return 0
 
 

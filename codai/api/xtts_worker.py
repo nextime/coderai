@@ -74,7 +74,10 @@ class XttsSubprocess:
         self._proc = subprocess.Popen(
             [str(venv_python()), str(_SERVICE)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"})
+            env={**os.environ, "PYTHONUNBUFFERED": "1",
+                 # CPML acceptance: configuring an XTTS model IS the decision,
+                 # and the alternative is an interactive prompt on a pipe.
+                 "COQUI_TOS_AGREED": os.environ.get("COQUI_TOS_AGREED", "1")})
         reply = self._call({"op": "load", "model": model_name})
         if not reply.get("ok"):
             self.close()
