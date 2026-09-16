@@ -764,3 +764,36 @@ def test_the_weight_estimate_counts_what_a_load_fetches_not_the_whole_repo(monke
     monkeypatch.setattr("huggingface_hub.model_info", _fake_info)
     gb = rw.estimate_weights_gb({"path": "org/sdxl"}, rw.parse_model_runpod({"engine": "coderai"}))
     assert abs(gb - 10.0) < 0.01, f"counted dupes: {gb} GB"
+
+
+def test_a_gated_model_pod_gets_the_hf_token_and_nothing_else_does(monkeypatch):
+    """pyannote is gated. The local install has HF_TOKEN in its environment; a
+    pod had nothing, so it loaded from its venv, reached from_pretrained and
+    stopped at 'the model is gated'. The token is a secret: it travels as pod
+    ENVIRONMENT and must never land in the seed list or the catalogue."""
+    import json
+    from codai.api.runpod_worker import pod_plan, parse_model_runpod
+
+    monkeypatch.setenv("HF_TOKEN", "hf_secret_for_test")
+    mcfg = parse_model_runpod({"engine": "coderai", "image": "x:1"})
+    entry = {"path": "pyannote/speaker-diarization-3.1", "model_type": "audio_models"}
+    plan = pod_plan(mcfg, "speaker", entry=entry)
+
+    assert plan["env"]["HF_TOKEN"] == "hf_secret_for_test"
+    # The seed list is JSON the pod parses; it must carry the model, not the secret.
+    seeds = json.loads(plan["env"].get("CODERAI_SEED_MODELS", "[]"))
+    assert "hf_secret_for_test" not in json.dumps(seeds)
+    # And nothing else in the plan carries it either.
+    for key, val in plan.items():
+        if key != "env":
+            assert "hf_secret_for_test" not in json.dumps(val, default=str), key
+
+    # An explicit per-model token beats the ambient one. The merge happens at
+    # provision time, and it used to run the other way round — the plan's
+    # resolved token silently replaced the one a model was configured with.
+    monkeypatch.setenv("HF_TOKEN", "hf_ambient")
+    mcfg2 = parse_model_runpod({"engine": "coderai", "image": "x:1",
+                                "env": {"HF_TOKEN": "hf_explicit"}})
+    plan2 = pod_plan(mcfg2, "speaker", entry=entry)
+    merged = dict(plan2["env"]); merged.update(mcfg2.env or {})
+    assert merged["HF_TOKEN"] == "hf_explicit"

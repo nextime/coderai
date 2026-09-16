@@ -739,6 +739,20 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
         choice = str((entry or {}).get("audio_backend") or "").strip().lower()
         if choice in ("audiocraft", "transformers"):
             env["CODERAI_AUDIO_BACKEND"] = choice
+    # A HuggingFace token, for gated models. The local install has one in its
+    # environment; a pod has nothing unless it is sent — so pyannote, which is
+    # gated, loaded from its venv, reached from_pretrained, and stopped there
+    # with "the model is gated/unavailable". Sent as pod ENVIRONMENT only: it is
+    # a secret, and never belongs in an image, a log, or the catalogue.
+    if "HF_TOKEN" not in env:
+        try:
+            from codai.api.pyannote_worker import _resolve_hf_token
+            _tok = _resolve_hf_token(entry or {})
+        except Exception:
+            _tok = ""
+        if _tok:
+            env["HF_TOKEN"] = _tok
+
     # Subsystems whose image bakes a venv: tell the worker where it is, or it
     # tries to build one on a machine rented by the second. Harmless on an image
     # that has no such venv — the worker falls back to its own search.
@@ -1492,8 +1506,12 @@ class RunpodPodPool:
                         entry=self.entry, seed_entries=self.seed_entries)
         image, args = plan["image"], plan["args"]
         self.health_path = plan["health_path"]
-        env = dict(self.mcfg.env or {})
-        env.update(plan.get("env") or {})
+        # The plan's env, then the model's OWN env on top: an explicit
+        # per-model value must beat one the plan resolved from the ambient
+        # environment. The other order silently replaced a model's configured
+        # HF_TOKEN with whatever this process happened to have.
+        env = dict(plan.get("env") or {})
+        env.update(self.mcfg.env or {})
 
         # A network volume, when configured: caches and upload targets move onto
         # it so weights survive the pod. RunPod requires Secure Cloud and the
