@@ -1855,3 +1855,31 @@ def test_a_plain_service_url_carries_its_token(monkeypatch):
     t = rg.resolve_target("/v1/images/generations", "POST", "",
                           b'{"model":"m"}', "application/json")
     assert t is not None and t.url == "http://gpubox:8000" and t.api_key == "tok-123"
+
+
+def test_a_pod_that_cannot_serve_surya_is_asked_for_doctr_in_the_request_itself():
+    """The pod's env said docTR and the pod still answered 'surya is not
+    enabled', because the request carried engine=surya and the OCR route
+    honours the request's field over its configured default. The env sets the
+    default; the gateway has to change what the request ASKS for."""
+    from codai.api.remote_gateway import _rewrite_request_field, _model_from_body
+    from codai.api.model_test import _multipart
+    from codai.api.runpod_worker import pod_ocr_engine
+
+    assert pod_ocr_engine("surya") == "doctr"
+    assert pod_ocr_engine("paddle") == "paddle"
+    assert pod_ocr_engine("doctr") == "doctr"
+
+    ct, body = _multipart({"engine": "surya"}, "p.png", b"\x89PNG", content_type="image/png")
+    new, hdrs = _rewrite_request_field(body, {"content-type": ct}, "engine", "doctr")
+    assert _model_from_body(new, ct, "engine") == "doctr"
+    assert hdrs["content-length"] == str(len(new))
+    assert b"\x89PNG" in new and b'filename="p.png"' in new   # the file is untouched
+
+    j, _ = _rewrite_request_field(b'{"engine":"surya"}', {"content-type": "application/json"},
+                                  "engine", "doctr")
+    assert json.loads(j)["engine"] == "doctr"
+
+    # A field that is not there is left alone, with the body byte-identical.
+    same, h2 = _rewrite_request_field(body, {"content-type": ct}, "model", "x")
+    assert same == body and "content-length" not in h2

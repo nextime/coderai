@@ -689,6 +689,20 @@ def volume_env(mount: str) -> dict:
     }
 
 
+def pod_ocr_engine(requested: str) -> str:
+    """The OCR engine a pod will actually serve for a request naming ``requested``.
+
+    Mirrors the env a pod is launched with: surya needs a VLM server the image
+    does not carry, so a pod serves docTR for it. The gateway uses this to
+    rewrite the request's own `engine` field, because the pod honours what the
+    request asks for over its configured default.
+    """
+    r = (requested or "").strip().lower()
+    if r == "surya":
+        return "doctr"
+    return r if r in ("paddle", "doctr") else "doctr"
+
+
 def _surya_accepted() -> bool:
     """Whether this deployment has accepted Surya's licence."""
     try:

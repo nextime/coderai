@@ -300,6 +300,35 @@ def _model_from_body(body: bytes, content_type: str, field: str = "model") -> st
 _MODEL_FIELD = {"/v1/ocr": "engine", "/v1/ocr/batch": "engine"}
 
 
+def _rewrite_request_field(body: bytes, headers: dict, field: str, value: str):
+    """Replace one field's value in a JSON or multipart body. (body, headers).
+
+    Multipart is edited in place on the bytes — the boundary and every other
+    part are untouched — and Content-Length is corrected, because the length
+    of the value changed and a stale length truncates or hangs the upload.
+    """
+    ctype = (headers.get("content-type") or "").lower()
+    if "json" in ctype or (body[:1] in (b"{", b"[")):
+        try:
+            obj = json.loads(body)
+            if isinstance(obj, dict):
+                obj[field] = value
+                body = json.dumps(obj).encode()
+        except Exception:
+            return body, headers
+    elif "multipart/form-data" in ctype:
+        pat = re.compile(rb'(name="' + field.encode() +
+                         rb'"\r?\n(?:[^\r\n]*\r?\n)*?\r?\n)([^\r\n]*)', re.IGNORECASE)
+        body, n = pat.subn(lambda m: m.group(1) + value.encode(), body, count=1)
+        if not n:
+            return body, headers
+    else:
+        return body, headers
+    headers = dict(headers)
+    headers["content-length"] = str(len(body))
+    return body, headers
+
+
 class Target:
     """Where a request is going: a fixed URL, or a pod pool to borrow one from."""
 
@@ -314,6 +343,13 @@ class Target:
         #: The model entry whose LOCAL text adapters must be pushed before the
         #: pod loads the model. Only a coderai pod can receive them.
         self.lora_entry = None
+        #: (field, value): rewrite one request field before forwarding. A pod
+        #: told to serve OCR with docTR still received `engine=surya` in the
+        #: request itself, and the OCR route honours the request's field over
+        #: its configured default — so the pod's env said docTR and the pod
+        #: still answered "surya is not enabled". The env sets the default; this
+        #: sets what the request asks for.
+        self.rewrite_field = None
 
     def acquire(self):
         """Return (base_url, release). A pool provisions on demand and bills."""
@@ -385,9 +421,13 @@ def resolve_target(path: str, method: str, query: str, body: bytes,
     if where == "pod":
         entry, block = detail
         from codai.api.runpod_worker import (get_model_pod_pool, parse_model_runpod,
-                                             resolve_model_source)
+                                             resolve_model_source, pod_ocr_engine)
         target = Target(pool=get_model_pod_pool(model, entry, block),
                         reason=f"model {model!r} on its own RunPod pod")
+        if cap == "ocr":
+            served = pod_ocr_engine(model)
+            if served and served != model.strip().lower():
+                target.rewrite_field = (_MODEL_FIELD.get(path, "model"), served)
         mcfg = parse_model_runpod(block)
         kind, _ = resolve_model_source(entry, mcfg)
         if kind == "upload":
@@ -501,6 +541,9 @@ class RemoteGatewayMiddleware:
             return await _error(send, 502,
                                 f"could not reach a remote for this request: {exc}")
         try:
+            if target.rewrite_field:
+                body, headers = _rewrite_request_field(
+                    body, headers, *target.rewrite_field)
             # Weights the remote cannot fetch itself, when asked to upload them.
             if target.upload_entry:
                 await asyncio.to_thread(ensure_model_uploaded, base, target.api_key,
