@@ -55,10 +55,11 @@ model can be served with far higher concurrency.
 | `kt` | [ktransformers](https://github.com/kvcache-ai/ktransformers) via SGLang | CPU+GPU heterogeneous MoE (DeepSeek / Kimi / Qwen / GLM / MiniMax) |
 | `vllm` | [vLLM](https://github.com/vllm-project/vllm) | continuous batching + paged KV for high aggregate throughput; runs in an isolated venv |
 | `runpod` | RunPod | a **remote rented GPU** — see below |
+| `host` | a machine you have | a capability image on **your own box** — always-on, or started by command |
 
 CoderAI owns the full lifecycle of each: build, weight download, process supervision,
-health, VRAM co-tenancy and teardown. `ds4`, `kt`, `vllm` and `runpod` are HTTP-proxy
-backends; `colibri` and `k3` are driven over a native wire protocol. `vllm` also appears as
+health, VRAM co-tenancy and teardown. `ds4`, `kt`, `vllm`, `runpod` and `host` are
+HTTP-proxy backends; `colibri` and `k3` are driven over a native wire protocol. `vllm` also appears as
 a **first-class engine node** on the engines/tasks pages, alongside `nvidia` and `radeon`.
 
 See [`docs/`](docs/) for a per-engine guide.
@@ -91,9 +92,18 @@ Plus:
 - **A pod that says what it is doing**: each pod logs timestamped boot phases from the first
   instant the container exists and serves the record at `/boot` — RunPod publishes no pod-log
   API, so the pod reports on itself
+- **Fifteen capability images, every model type served**: ten ordinary ones plus five for
+  stacks that cannot share a venv (pyannote, coqui XTTS, NeMo, CrisperWhisper, PaddleOCR),
+  each carrying its own torch on a torch-free core so it stays under RunPod's image size
+  limit. Fourteen have completed a real inference on a rented GPU; `faceswap` is the one
+  that needs real faces to test
+- **Or a machine you already have**: `"backend": "host"` points a model at a capability
+  image running anywhere — always-on, or started by a command and stopped after idle —
+  with none of the renting machinery
 
 Full guide: [`docs/runpod.md`](docs/runpod.md) ·
-remote placement of every other model type: [`docs/remote-execution.md`](docs/remote-execution.md).
+remote placement of every model type, the capability images and the `host` backend:
+[`docs/remote-execution.md`](docs/remote-execution.md).
 
 ### Image Generation
 - **Text-to-Image**: Stable Diffusion, SDXL, Flux, and GGUF image models (via stable-diffusion.cpp)

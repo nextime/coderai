@@ -14,6 +14,7 @@ by what you are moving.
 | colibri / k3 (mux engines) | `service_url` + `tools/mux_service.py` on the far side | `colibri.service_url` / `k3.service_url` |
 | Any text model, GGUF included | `service_url` on the model entry | models.json |
 | Images, video, embeddings, rerank, OCR, TTS, STT, voice, audio, stems, 3D, pipelines | remote gateway | `remotes.endpoints` in config.json |
+| Any model, on a machine you already have (always-on or started by command) | `host` backend | `"backend": "host"` on the model entry |
 
 ---
 
@@ -138,8 +139,9 @@ endpoint and streams the answer back:
 A pod row with no `image` uses the published one for its capability —
 `ghcr.io/nextime/coderai-<capability>:latest`, a trimmed coderai carrying only
 that capability's dependencies — so turning a capability remote is one choice,
-not an image name you have to know. `rerank` rides the `embeddings` image,
-`speaker` the `stt` one, and `stems`/`audio_clean`/`audio_gen` the `audio` one.
+not an image name you have to know. `rerank` rides the `embeddings` image and
+`stems`/`audio_clean`/`audio_gen` the `audio` one; `speaker` has an image of its
+own, because the STT image shipped nothing for diarization or voiceprints.
 `loras`, `characters`, `environments` and `pipelines` have no published image and
 need one named explicitly. Point the whole set at your own build with
 `CODERAI_CAPABILITY_IMAGE_REPO` / `CODERAI_CAPABILITY_IMAGE_TAG`, or override a
@@ -287,14 +289,87 @@ so the toolchain never ships. `audio` does this for deepfilterlib's Rust
 extensions, and costs ~50 MB more than a profile that needs nothing.
 
 Profiles live in `packaging/runpod/profiles/` — `core.txt` (what any pod needs to
-boot) plus one file per capability: images, video, tts, stt, voice, audio,
-embeddings, ocr, faceswap. Add or trim entries there; the routers import lazily,
-so a pod only needs the libraries its own endpoints touch.
+boot) plus one file per capability. There are fifteen images, and they come in
+two kinds:
 
-The build fails if the profile is missing something the app imports, and the
-script then boots the container and waits for `/healthz` — because a pod that
-builds but never answers is a failure you would otherwise discover as a boot
-timeout on a rented GPU.
+| image | serves | core |
+|---|---|---|
+| `images`, `video`, `tts`, `stt`, `text`, `voice`, `audio`, `embeddings`, `ocr`, `faceswap` | one capability, in the main venv | full (torch + CUDA) |
+| `speaker`, `tts-xtts`, `stt-nemo`, `stt-crisper`, `ocr-paddle` | a stack that **cannot** share the main venv | light (no torch) |
+
+The routers import lazily, so a pod only needs the libraries its own endpoints
+touch. The build fails if a profile is missing something the app imports, and
+the script then boots the container and waits for `/healthz` — because a pod
+that builds but never answers is a failure you would otherwise discover as a
+boot timeout on a rented GPU.
+
+#### Images for stacks that cannot share a venv
+
+Some libraries genuinely cannot live beside torch 2.11 and transformers 5.x:
+pyannote calls a torchaudio attribute removed in 2.11; coqui-tts imports a
+transformers 4.x symbol; CrisperWhisper pins transformers 4.46 **and** torch 2.5;
+NeMo wants its own torch; paddlepaddle brings its own CUDA runtime. Each was
+measured, not assumed — three others that the local install keeps in isolated
+venvs (Surya, speechbrain, pytorch_lightning) turned out to import cleanly and
+went into the ordinary images instead.
+
+The conflicting ones each get an image carrying the stack in a venv of its own,
+declared beside the profile:
+
+```
+profiles/speaker.txt                  # what the API layer needs (no torch)
+profiles/speaker.light                # marker: build on the LIGHT core
+profiles/speaker.venv-pyannote.txt    # the venv: its own torch, pyannote, ...
+profiles/speaker.venv-pyannote.check  # run at build time INSIDE that venv
+```
+
+The `.check` script matters more than it looks. `import pyannote.audio` passes
+without matplotlib; instantiating a pipeline does not — and a bare import
+check shipped a broken venv four times before this existed. A check imports
+what the *real load* reaches (pipeline modules, model classes), without a GPU
+or a token, which a build has neither of.
+
+Why a *light* core: the first build of these images sat on the full core, so
+each carried 7 GB of CUDA, torch and triton that its main venv never used —
+beside the venv that did the work. They came out at 14–16 GB, and **RunPod
+refuses images above a size line**: a 10.1 GB image boots, a 14.5 GB one is
+"Exited by Runpod" two seconds after rent, on every machine, with no other
+reason given (container disk, layer format and image config were each ruled
+out). On the light core — coderai's Python dependencies and no GPU stack at
+all, 1.2 GB — the same five images are 6.9–8.4 GB. A specialised container
+carries one GPU stack, not two.
+
+`speaker` used to point at the `stt` image on the assumption it was "the STT
+deps plus a bit". That image shipped nothing for diarization or voiceprints;
+a speaker pod booted with no way to embed a voice.
+
+#### What a pod is told at launch
+
+A pod is disposable, so a few decisions made here travel with it as environment
+— never baked into an image, never written to its config:
+
+- **`HF_TOKEN`**, for gated models. pyannote loaded from its venv, reached
+  `from_pretrained`, and stopped at "the model is gated" until this was sent.
+- **Licence acceptances** — Surya's (`CODERAI_OCR_SURYA_ACCEPT_LICENSE`) and
+  coqui's CPML (`COQUI_TOS_AGREED`). Configuring the model here *is* the
+  decision; a pod cannot make it, and coqui's alternative is an interactive
+  prompt on a pipe that corrupts the worker protocol and then blocks forever.
+- **Where its baked venvs are** (`CODERAI_PYANNOTE_VENV` etc.), or the worker
+  tries to build one on a machine rented by the second.
+- **Which OCR engine to enable.** OCR ships disabled, and each engine has a gate
+  of its own on top; a pod rented to do OCR arrives with both open.
+
+#### Surya on a pod
+
+Surya 0.22 is a VLM (`surya-ocr-2`), not a self-contained OCR library. It needs
+a server: vLLM, which it spawns *in Docker* (impossible inside a container), or
+`llama-server` on a GGUF, which the image does not carry. Locally it rides
+coderai's own vLLM engine. A pod asked for `surya` serves the request with
+docTR — the gateway rewrites the request's `engine` field on the way out,
+because the OCR route honours what the request asks for over the pod's
+configured default — and logs why. Surya on a pod belongs with the engine
+images, where a `llama-server` and the GGUF are the same work as colibri and
+ds4.
 
 Point the capability at it:
 
@@ -381,6 +456,47 @@ Triggers, most eager first:
 `target.mode` is `pods` (a coderai-managed pod: provisioned on demand, health-
 gated, scaled, reaped, billed against the same caps) or `serverless` (your own
 RunPod endpoint id). `served_model` renames the model for the remote.
+
+### A machine you already have: the `host` backend
+
+The capability images are ordinary containers. Nothing about them needs RunPod
+— a pod is just a machine that pulls one. The same image runs on a box you own,
+a server rented by the month, a second GPU down the hall, and coderai uses it
+per model, with an endpoint and a token:
+
+```json
+{ "backend": "host",
+  "host": { "url": "http://gpubox:8000", "api_key": "…" } }
+```
+
+That is the always-on shape: the container is already running and coderai
+just talks to it. If it is down, coderai says so rather than starting nothing.
+Add a command and it becomes on-demand:
+
+```json
+{ "backend": "host",
+  "host": { "url": "http://gpubox:8000", "api_key": "…",
+            "start_cmd": "ssh gpubox docker start coderai-images",
+            "stop_cmd":  "ssh gpubox docker stop coderai-images",
+            "boot_timeout_s": 120, "idle_timeout_s": 600 } }
+```
+
+`start_cmd` is whatever starts the thing — `docker run`, `ssh … docker start`,
+a systemd unit, a script. coderai runs it, waits for `/healthz` up to
+`boot_timeout_s`, uses the host, and runs `stop_cmd` after `idle_timeout_s`
+with nothing in flight. It only ever stops a host it started itself; one that
+was already up when coderai arrived is never touched. Both commands are
+optional — `start_cmd` without `stop_cmd` starts on demand and leaves it running.
+
+Deliberately absent: GPU search, price ranking, budgets, spot, capacity
+fallback, the orphan reaper. Those exist because a cloud rents an anonymous
+card by the second and can lose it. A host is a named machine you are
+responsible for — that machinery would be wrong, not just unnecessary.
+
+Run the container with the same token: `-e CODERAI_API_TOKEN=…`. A capability
+image locks itself with it, and a plain `service_url` used to carry no token at
+all — a hand-run image behind one answered 401 to everything. `service_token`
+on a model entry fixes that for the `service_url` path too.
 
 ### Where a pod gets the weights
 

@@ -128,7 +128,7 @@ block:
 | `image` | `vllm/vllm-openai:latest` | Container image. Must expose an OpenAI-compatible server. |
 | `port` | `8000` | Port the server listens on inside the container. |
 | `ctx` | — | Passed as vLLM's `--max-model-len`. |
-| `container_disk_gb` | `40` | Must fit the image **and** the downloaded weights. |
+| `container_disk_gb` | `40` | Grown automatically to fit the weights (one HF metadata call) unless a network volume holds them; an explicit larger value is respected. |
 | `volume_gb` | `0` | Optional persistent volume. |
 | `env` | `{}` | Extra pod environment — put `HF_TOKEN` here for gated repos. |
 
@@ -140,12 +140,14 @@ block:
 | `max_pods` | `1` | Hard ceiling on concurrent pods for this model. |
 | `scale_up_inflight_per_pod` | `4` | Add a pod when in-flight requests per pod exceeds this. |
 | `idle_timeout_s` | `300` | Destroy a pod this long after its **last** request. |
-| `boot_timeout_s` | `300` | Give up if the pod never exposes its port. |
+| `boot_timeout_s` | `900` | Give up if the pod never exposes its port. The port appears only *after* the image is pulled, so this covers the download — 15 GB at a cold machine's ~25 MB/s is ten minutes. |
 | `load_timeout_s` | `600` | Give up if the server never answers `/v1/models`. |
 
 `boot_timeout_s` and `load_timeout_s` exist because a 70B model can spend many
 minutes pulling the image and downloading weights before it ever answers. Raise
-them for big models; the defaults suit a ~7–14B model on a warm image.
+them for big models. While waiting, the log reports status and uptime every 60s
+rather than going silent, and a container that `EXITED` is failed fast with
+RunPod's own reason instead of waited out.
 
 **Serverless**
 
@@ -365,6 +367,28 @@ These come from live testing on a real account, not from the docs:
   default is now **900s** (`boot_timeout_s` per model). Being wrong by fifteen
   minutes on a $0.25/hr card costs six cents; being wrong by too little cost
   three pods and still failed.
+- **RunPod refuses images above a size line.** Measured: a 10.1 GB image boots;
+  a 14.5 GB one is `Exited by Runpod` two seconds after rent, on every machine,
+  with no other reason given. Container disk (tried 80 GB), layer format and
+  the full image config were each ruled out — size was the only difference.
+  The specialised capability images sit at 6.9–8.4 GB on a torch-free core for
+  exactly this reason; the ordinary ones at 8.9–10.1 GB are close to the line,
+  and `ocr` (9.7 GB) is the one to watch if anything is added to it.
+- **`EXITED` at uptime 0s is a dead pod, not a slow pull.** `wait_ready` used to
+  treat only `TERMINATED`/`FAILED` as terminal and waited out the whole budget
+  on a container that had died in its first second — three machines in a row,
+  printing "image pull in progress". It now fails fast past a short restart
+  grace and reports RunPod's own `lastStatusChange`, the one field that says
+  why. "Exited by Runpod" means the platform refused the image; "exited with
+  code N" means the process died.
+- **The container disk is sized for the weights before renting.** A pod that
+  fills its 40 GB disk mid-download dies at `load_timeout_s` having paid for
+  every minute. One HuggingFace metadata call gives the size; the disk grows to
+  weights + ~25 GB (unpacked image and download cache) and never shrinks an
+  explicit `container_disk_gb`. It counts what a load will *fetch*, not the
+  whole repo — SDXL's repo is 77 GB, of which a diffusers load pulls 28; the
+  rest is the same weights again as Flax, legacy `.bin` and ONNX. With a
+  network volume attached the weights land there, so the disk stays put.
 - **A machine may serve a cached `:latest`.** An images pod reported a
   dependency missing that had already been published under that tag. Pin an
   immutable version tag when a result has to mean something — the test harness
