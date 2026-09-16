@@ -1,0 +1,45 @@
+# The LIGHT core: coderai's Python dependencies with no GPU stack at all.
+#
+# For images whose capability runs in a venv of its own. RunPod refuses images
+# above a size threshold — measured: a 10.1 GB image boots, a 14.5 GB one is
+# "Exited by Runpod" two seconds after rent, on every machine, with no other
+# reason given (container disk, layer format and image config were each ruled
+# out; size was the only difference). The specialised images were all above the
+# line because each carried the FULL core — 7 GB of CUDA, torch and triton that
+# the main venv never used on that pod — beside the venv that did the work.
+#
+# Starting here, the capability's own venv is the only GPU stack in the image.
+# The main interpreter still boots the API, serves /healthz and /boot, and
+# drives the subprocess worker: codai.api.app imports with no torch present,
+# verified before this file was written.
+#
+#   docker build -f packaging/runpod/Dockerfile.capability-base-light \
+#       -t coderai-capability-base-light:latest .
+
+ARG BASE=python:3.12-slim
+FROM ${BASE}
+
+ENV PYTHONUNBUFFERED=1 \
+    HF_HOME=/cache/huggingface \
+    CODERAI_HOME=/config
+
+# ffmpeg for every audio/video path; git because a few ML packages still want it
+# at install time; libgl/libglib for opencv.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg git curl ca-certificates libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/coderai/app
+
+COPY packaging/runpod/profiles/core-light.txt /tmp/core.txt
+# No torch here, on purpose — and the build FAILS if one arrives anyway, because
+# a transitive dependency pulling torch in would silently put the image right
+# back over the size line it exists to stay under.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --upgrade pip \
+    && python -m pip install -r /tmp/core.txt \
+    && if python -c "import torch" 2>/dev/null; then \
+           echo "ERROR: torch leaked into the light core" >&2; exit 1; \
+       fi \
+    && echo "light core: no torch, as intended" \
+    && rm -f /tmp/core.txt

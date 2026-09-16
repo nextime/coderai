@@ -1,8 +1,9 @@
-# /v1/ocr with PaddleOCR + PP-Structure (layout, tables, reading order).
-#
-# paddlepaddle-gpu ships its OWN CUDA runtime, not just its own torch — the one
-# stack here that cannot share anything with the main venv.
-transformers>=4.35.0
+# Main-venv deps for a LIGHT-core image: only what the API layer needs to
+# accept the request and hand it to the subprocess worker. No torch, no
+# torchaudio, no transformers here — those live in the capability's own venv
+# (the .venv-*.txt beside this file), and on the light core a torch arriving in
+# the main venv fails the build on purpose: it is the 7 GB that put these images
+# over RunPod's size line in the first place.
+# /v1/ocr with PaddleOCR, in the paddleocr venv. pypdfium2 rasterises PDFs API-side.
 pypdfium2>=4.20.0
-python-doctr>=0.8.0
 jsonschema>=4.0.0

@@ -1,0 +1,59 @@
+# The core WITHOUT the GPU stack — for images whose capability runs in a venv
+# of its own.
+#
+# RunPod refuses images above a size threshold with a two-second "Exited by
+# Runpod" and no other reason: a 14.8 GB speaker image was rejected on three
+# machines while 10.1 GB images boot fine (disk, layer format and image config
+# were each ruled out; size is the only difference). The five specialised images
+# were all above the line because each carried the full core — 7 GB of CUDA and
+# torch the main venv never uses on that pod — beside the venv that actually
+# does the work.
+#
+# So a specialised image starts from THIS: coderai's Python dependencies and
+# nothing GPU-side. The capability's own venv brings the one torch it needs.
+# The main interpreter can still boot the API, serve /healthz and /boot, and
+# drive the subprocess worker — none of that needs torch.
+# Core — what every capability pod needs to boot coderai and answer /healthz.
+# The routers import lazily, so a pod only needs the libraries its own capability
+# actually touches; this file is the floor under all of them.
+# torch lives here rather than in each profile so it becomes ONE shared layer:
+# nine images that each built their own copy would duplicate ~5 GB nine times,
+# on disk and on every push. Profiles add torchvision/torchaudio as they need.
+
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+python-multipart>=0.0.6
+requests>=2.31.0
+psutil>=5.9.0
+setproctitle>=1.1
+Pillow>=10.0.0
+numpy>=1.24.0
+safetensors>=0.4.0
+huggingface_hub>=0.25.0
+
+# Imported at MODULE level somewhere in the graph `import codai.api.app` walks,
+# so every pod needs them regardless of profile — app.py mounts every router, and
+# a few of those touch these at import time rather than lazily:
+#   cv2, PIL   codai/api/faceswap.py
+#   soundfile  codai/api/voice_convert.py
+#   litellm    codai/models/parser.py
+#   websockets codai/broker/client.py
+# Verified by a static walk of the import graph, and enforced by the Dockerfile's
+# `import codai.api.app` build step. torch/transformers are NOT here: those are
+# imported lazily, so they stay per-profile.
+opencv-python-headless>=4.8.0
+soundfile>=0.12.0
+litellm>=1.40.0
+websockets>=12.0
+
+# Quantization. models.json carries quant settings for EVERY model type, not just
+# LLMs, and diffusers/transformers refuse to load a quantized checkpoint without
+# this — a rented images pod failed with "No package metadata was found for
+# bitsandbytes" after a 10-minute SDXL download. Shared here rather than per
+# profile: one layer, downloaded once, reused by all ten images.
+
+# torchcodec's CUDA build links against NVIDIA Performance Primitives
+# (libnppicc.so.12). torch does not use NPP, so nothing else pulls it in, and
+# torchcodec — which arrives as a transitive dependency of f5-tts — then fails
+# to load with a message that blames FFmpeg and the torch version. It is neither.

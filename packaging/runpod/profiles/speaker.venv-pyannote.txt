@@ -7,3 +7,5 @@ torchaudio==2.6.0+cu124
 pyannote.audio==3.3.2
 huggingface_hub<1.0
 soundfile>=0.12.0
+# speechbrain (speaker ID) lives here too: this venv is where the torch is.
+speechbrain>=1.0.0

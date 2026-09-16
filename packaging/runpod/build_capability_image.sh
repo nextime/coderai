@@ -44,10 +44,21 @@ fi
 # images share those layers by construction — the registry stores and transfers
 # the core once instead of nine near-identical ~7 GB copies. Rebuild it with
 # REBUILD_CORE=1 (needed when core.txt changes).
-CORE_BASE="${CORE_BASE:-coderai-capability-base:latest}"
+# A profile that runs its capability in a venv of its own starts from the LIGHT
+# core — coderai's deps and no GPU stack — marked by a `<profile>.light` file.
+# RunPod refuses images above a size line (10.1 GB boots, 14.5 GB is refused),
+# and a specialised image on the full core carried 7 GB of torch and CUDA its
+# main venv never touched. See Dockerfile.capability-base-light.
+if [[ -f "packaging/runpod/profiles/${PROFILE}.light" ]]; then
+    CORE_BASE="${CORE_BASE:-coderai-capability-base-light:latest}"
+    CORE_DOCKERFILE=packaging/runpod/Dockerfile.capability-base-light
+else
+    CORE_BASE="${CORE_BASE:-coderai-capability-base:latest}"
+    CORE_DOCKERFILE=packaging/runpod/Dockerfile.capability-base
+fi
 if [[ "${REBUILD_CORE:-0}" == "1" ]] || ! docker image inspect "$CORE_BASE" >/dev/null 2>&1; then
     echo "==> building the shared core $CORE_BASE"
-    DOCKER_BUILDKIT=1 docker build -f packaging/runpod/Dockerfile.capability-base \
+    DOCKER_BUILDKIT=1 docker build -f "$CORE_DOCKERFILE" \
         -t "$CORE_BASE" . || { echo "core build failed" >&2; exit 1; }
 else
     echo "==> reusing the shared core $CORE_BASE"

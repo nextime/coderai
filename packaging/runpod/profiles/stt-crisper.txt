@@ -1,7 +1,9 @@
-# /v1/audio/transcriptions with CrisperWhisper (verbatim, disfluency-aware).
-#
-# It pins transformers==4.46.3 AND torch==2.5.1 — a conflict on both axes with
-# the main images, so it cannot share one.
-torchaudio
+# Main-venv deps for a LIGHT-core image: only what the API layer needs to
+# accept the request and hand it to the subprocess worker. No torch, no
+# torchaudio, no transformers here — those live in the capability's own venv
+# (the .venv-*.txt beside this file), and on the light core a torch arriving in
+# the main venv fails the build on purpose: it is the 7 GB that put these images
+# over RunPod's size line in the first place.
+# /v1/audio/transcriptions with CrisperWhisper, in the transformers venv.
 soundfile>=0.12.0
 scipy>=1.11.0
