@@ -19,7 +19,7 @@
 # right long-term path (serve Surya2 via coderai's planned vLLM/llama.cpp backend), but it
 # does NOT run standalone in this isolated venv. 0.17.1 is the last version that runs
 # det+recognition locally on torch (GPU), so it's the classic pin. See docs/ocr.md.
-surya-ocr==0.17.1
+surya-ocr==0.22.1
 pypdfium2>=4.20.0
 # NOTE: 0.17.1 is for ocr.surya_serve="local" (classic det+recognition on torch, runs in
 # THIS venv). For ocr.surya_serve="vllm"/"llamacpp" (the latest "Surya2" VLM, Qwen3.5-VL

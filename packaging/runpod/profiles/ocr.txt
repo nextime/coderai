@@ -26,4 +26,4 @@ jsonschema>=4.0.0
 #
 # SuryaEngine still runs as a subprocess (it is a SubprocessOcrEngine), so the
 # pod points ocr.surya_venv at this interpreter rather than building one.
-surya-ocr==0.17.1
+surya-ocr==0.22.1

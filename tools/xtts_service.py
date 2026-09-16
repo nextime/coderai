@@ -31,10 +31,33 @@ import sys
 _state = {"tts": None, "sr": 24000}
 
 
+#: HuggingFace repo id -> the name coqui's own catalogue uses. coqui's TTS(name)
+#: splits on "/" and wants exactly four parts (type/lang/dataset/model); a HF
+#: id has two, and fails with "not enough values to unpack (expected 4, got 2)".
+#: The rest of coderai names models by HF id, so the translation lives here.
+_HF_TO_COQUI = {
+    "coqui/xtts-v2": "tts_models/multilingual/multi-dataset/xtts_v2",
+    "coqui/xtts-v1.1": "tts_models/multilingual/multi-dataset/xtts_v1.1",
+}
+
+
+def _coqui_name(name: str) -> str:
+    n = (name or "").strip()
+    if n.count("/") == 3:
+        return n                                  # already coqui's own naming
+    mapped = _HF_TO_COQUI.get(n.lower())
+    if mapped:
+        return mapped
+    if "/" in n and "xtts" in n.lower():
+        # An unknown XTTS repo: the v2 architecture is the safe assumption.
+        return "tts_models/multilingual/multi-dataset/xtts_v2"
+    return n
+
+
 def _load(name: str) -> dict:
     import torch
     from TTS.api import TTS
-    tts = TTS(name).to("cuda" if torch.cuda.is_available() else "cpu")
+    tts = TTS(_coqui_name(name)).to("cuda" if torch.cuda.is_available() else "cpu")
     _state["tts"] = tts
     # XTTS reports its output rate on the synthesizer; fall back to its default.
     try:

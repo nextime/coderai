@@ -245,27 +245,37 @@ class SuryaWorker:
         self._langs = [l.strip() for l in str(opts.get("langs", "it")).split(",") if l.strip()] or ["it"]
 
     def load(self):
+        """Load surya, matching the API of whichever release is installed.
+
+        Three layouts exist. They are told apart by what IMPORTS — not by
+        catching whatever went wrong and moving on. The old version of this
+        caught Exception around each tier, so a real failure inside the right
+        tier (a config attribute missing under a newer transformers) was
+        swallowed, the loader fell through two tiers, and the error reported
+        was from an API that has not existed for a year: "No module named
+        surya.ocr". The cause was invisible.
+        """
         from surya.detection import DetectionPredictor
-        # 0.17.x: RecognitionPredictor(FoundationPredictor()) — a shared VLM foundation.
+        from surya.recognition import RecognitionPredictor
         try:
-            from surya.foundation import FoundationPredictor
-            from surya.recognition import RecognitionPredictor
+            from surya.foundation import FoundationPredictor      # 0.17.x only
+        except ImportError:
+            FoundationPredictor = None
+        if FoundationPredictor is not None:
+            # 0.17.x: recognition rides a shared VLM foundation.
             self._rec = RecognitionPredictor(FoundationPredictor())
-            self._det = DetectionPredictor()
-            self._mode = "predictor"
-            return
-        except Exception:
-            pass
-        # 0.6–0.16: RecognitionPredictor() with no args.
-        try:
-            from surya.recognition import RecognitionPredictor
+        else:
+            # 0.6–0.16 and 0.22+: no foundation; RecognitionPredictor() alone.
+            # (0.22 dropped surya.foundation and takes an optional inference
+            # manager instead — the no-arg form is right for both.)
             self._rec = RecognitionPredictor()
-            self._det = DetectionPredictor()
-            self._mode = "predictor"
-            return
-        except Exception:
-            pass
-        # very old: functional run_ocr API.
+        self._det = DetectionPredictor()
+        self._mode = "predictor"
+        return
+
+    def _load_legacy(self):
+        # very old (<0.6): the functional run_ocr API. Kept reachable but no
+        # longer a silent fallback — a modern install never gets here.
         from surya.ocr import run_ocr
         from surya.model.detection.model import (
             load_model as ldm, load_processor as ldp)
