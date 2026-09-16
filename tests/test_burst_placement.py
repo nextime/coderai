@@ -798,3 +798,32 @@ def test_a_gated_model_pod_gets_the_hf_token_and_nothing_else_does(monkeypatch):
     plan2 = pod_plan(mcfg2, "speaker", entry=entry)
     merged = dict(plan2["env"]); merged.update(mcfg2.env or {})
     assert merged["HF_TOKEN"] == "hf_explicit"
+
+
+def test_a_stated_weights_size_beats_the_estimate(monkeypatch):
+    """The estimator cannot see a URL download, an upload or a local file, and
+    for an HF repo it errs high on purpose. A size the operator states is the
+    honest answer, and it wins wherever it is written."""
+    import codai.api.runpod_worker as rw
+
+    monkeypatch.setattr("huggingface_hub.model_info",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no network")))
+    mcfg = rw.parse_model_runpod({"engine": "coderai"})
+
+    # on the entry
+    assert rw.estimate_weights_gb({"path": "/local/x.gguf", "weights_gb": 30}, mcfg) == 30.0
+    assert rw.disk_for({"path": "/local/x.gguf", "weights_gb": 30}, mcfg)[0] == 55
+    # in the runpod block
+    assert rw.estimate_weights_gb({"path": "/local/x.gguf",
+                                   "runpod": {"weights_gb": "12.5"}}, mcfg) == 12.5
+    # beats HF even when HF would answer
+    monkeypatch.setattr(rw, "_hf_weights", lambda *a, **k: 35.0, raising=False)
+    assert rw.estimate_weights_gb({"path": "org/repo", "weights_gb": 7}, mcfg) == 7.0
+    # a nonsense value is ignored, not trusted
+    assert rw.estimate_weights_gb({"path": "/local/x.gguf", "weights_gb": "lots"}, mcfg) == 0.0
+    # and it is never seeded to a pod: it describes the pod's disk, not the model
+    plan = rw.pod_plan(rw.parse_model_runpod({"engine": "coderai", "image": "x:1"}),
+                       "images", entry={"path": "org/m", "model_type": "image_models",
+                                        "weights_gb": 30})
+    import json
+    assert "weights_gb" not in json.dumps(json.loads(plan["env"].get("CODERAI_SEED_MODELS", "[]")))

@@ -537,11 +537,25 @@ _DISK_SIZING_CAP_GB = 400
 def estimate_weights_gb(entry: dict, mcfg: "RunpodModelConfig" = None) -> float:
     """How many GB the model's weights will take on the pod, or 0.0 if unknown.
 
-    Asked of HuggingFace before renting, because the alternative was observed:
-    a pod boots, pulls the image, starts the download, fills its disk, and dies
-    at load_timeout_s having paid for every minute of it. The size of a repo is
-    one metadata call; the disk it needs is that plus headroom.
+    A stated size wins: `weights_gb` on the model entry (or the runpod block)
+    is taken as-is. It is the only honest answer for a URL download, an upload,
+    or a local file — none of which the estimator can see — and for an HF repo
+    it beats a heuristic that deliberately errs high. Set it when you know.
+
+    Otherwise asked of HuggingFace before renting, because the alternative was
+    observed: a pod boots, pulls the image, starts the download, fills its disk,
+    and dies at load_timeout_s having paid for every minute of it. The size of a
+    repo is one metadata call; the disk it needs is that plus headroom.
     """
+    for src in (entry or {}, (entry or {}).get("runpod") or {}):
+        stated = src.get("weights_gb") if isinstance(src, dict) else None
+        if stated is not None:
+            try:
+                val = float(stated)
+                if val > 0:
+                    return val
+            except (TypeError, ValueError):
+                pass
     try:
         from codai.api.runpod_worker import resolve_model_source
         kind, value = resolve_model_source(entry or {}, mcfg) if mcfg else ("hf", "")

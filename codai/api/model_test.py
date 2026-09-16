@@ -88,6 +88,24 @@ async def test_state(model: str = "", _auth=Depends(_require_api_auth)):
             where, _ = model_placement(model)
         except Exception:
             pass
+        if isinstance((entry or {}).get("runpod"), dict):
+            # What a pod would be rented with, and why — decided before any
+            # money is spent. `weights_gb` on the entry overrides the estimate.
+            try:
+                from codai.api.runpod_worker import (disk_for, estimate_weights_gb,
+                                                     parse_model_runpod)
+                mcfg = parse_model_runpod(entry["runpod"])
+                gb, note = disk_for(entry, mcfg)
+                stated = (entry.get("weights_gb")
+                          or (entry.get("runpod") or {}).get("weights_gb"))
+                out["pod_disk"] = {
+                    "container_disk_gb": gb,
+                    "weights_gb": round(estimate_weights_gb(entry, mcfg), 1),
+                    "weights_source": "stated (weights_gb)" if stated else "estimated from HuggingFace",
+                    "note": note or "configured size is enough",
+                }
+            except Exception as exc:
+                out["pod_disk"] = {"error": str(exc)}
         out.update({
             "model": model,
             "known": bool(entry),

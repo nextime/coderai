@@ -128,7 +128,8 @@ block:
 | `image` | `vllm/vllm-openai:latest` | Container image. Must expose an OpenAI-compatible server. |
 | `port` | `8000` | Port the server listens on inside the container. |
 | `ctx` | — | Passed as vLLM's `--max-model-len`. |
-| `container_disk_gb` | `40` | Grown automatically to fit the weights (one HF metadata call) unless a network volume holds them; an explicit larger value is respected. |
+| `container_disk_gb` | `40` | Grown automatically to fit the weights unless a network volume holds them; an explicit larger value is respected. |
+| `weights_gb` | — | State the model's size and the estimate is skipped. The only honest answer for a URL download, an upload or a local file — the estimator cannot see those — and for an HF repo it beats a heuristic that errs high. Also accepted on the model entry itself. |
 | `volume_gb` | `0` | Optional persistent volume. |
 | `env` | `{}` | Extra pod environment — put `HF_TOKEN` here for gated repos. |
 
