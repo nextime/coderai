@@ -74,11 +74,20 @@ RUN set -eux; \
         name="$(basename "$extra" .txt)"; name="${name#${PROFILE}.venv-}"; \
         vdir="/opt/coderai/venvs/${name}"; \
         python -m venv "$vdir"; \
-        "$vdir/bin/pip" install --no-cache-dir -r "$extra"; \
+        if [ -f "${extra%.txt}.uv" ]; then \
+            # pip's resolver spent an hour and gigabytes of RAM on sglang-kt's
+            # forty exact pins without installing a byte; uv resolved the same
+            # set in seconds. A `<profile>.venv-<name>.uv` marker asks for it.
+            python -m pip install --no-cache-dir uv; \
+            uv pip install --python "$vdir/bin/python" --no-cache -r "$extra"; \
+        else \
+            "$vdir/bin/pip" install --no-cache-dir -r "$extra"; \
+        fi; \
         nodeps="${extra%.txt}.nodeps"; \
         if [ -f "$nodeps" ]; then \
             "$vdir/bin/pip" install --no-cache-dir --no-deps -r "$nodeps"; \
         fi; \
+        find "$vdir" -name __pycache__ -type d -prune -exec rm -rf {} +; \
         "$vdir/bin/python" -c "import ${name}; print('${name}', getattr(${name}, '__version__', 'ok'), 'in its own venv')"; \
         check="/tmp/venv-profiles/${PROFILE}.venv-${name}.check"; \
         if [ -f "$check" ]; then \
