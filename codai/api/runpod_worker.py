@@ -71,6 +71,10 @@ class RunpodModelConfig:
     network_volume_id: str = ""
     volume_mount_path: str = ""              # blank = the account default
     volume_path: str = ""                    # weights already on the volume (file or dir)
+    # Reach the pod at its public ip:port instead of through RunPod's HTTP proxy.
+    # The proxy is fronted by Cloudflare: TLS, but a 100 s idle limit per request
+    # and a request-body cap. Direct TCP has neither — and no TLS either.
+    direct_tcp: bool = False
     # Keep this pod's Python dependencies on the VOLUME instead of in the image,
     # and boot a small image that uses them. The first pod builds the venv (a few
     # minutes); every pod after skips both the 7 GB image pull and the install.
@@ -1191,6 +1195,7 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
         cfg.cloud_types = ["SECURE"]
     cfg.volume_mount_path = (b.get("volume_mount_path") or "").strip()
     cfg.volume_path = (b.get("volume_path") or "").strip()
+    cfg.direct_tcp = _as_bool(b.get("direct_tcp"), False)
     cfg.venv_on_volume = _as_bool(b.get("venv_on_volume"), cfg.venv_on_volume)
     cfg.venv_name = (b.get("venv_name") or "").strip()
     cfg.slim_image = (b.get("slim_image") or "").strip()
@@ -1771,7 +1776,8 @@ class RunpodPodPool:
                     volume_mount_path=(vol_mount or "/workspace"),
                     registry_auth_id=(self.mcfg.registry_auth_id
                                       or getattr(self.account, "registry_auth_id", "") or ""),
-                    entrypoint=plan.get("entrypoint"), start_cmd=plan.get("start_cmd"))
+                    entrypoint=plan.get("entrypoint"), start_cmd=plan.get("start_cmd"),
+                    direct_tcp=bool(getattr(self.mcfg, "direct_tcp", False)))
                 return pod_id, sel, i + 1
             except RunpodError as exc:
                 msg = str(exc).lower()
@@ -1881,7 +1887,8 @@ class RunpodPodPool:
             t_created = time.time()
             url = ""
             try:
-                url = client.wait_ready(pod_id, port, ready_timeout=boot_to)
+                url = client.wait_ready(pod_id, port, ready_timeout=boot_to,
+                                        direct_tcp=bool(getattr(self.mcfg, "direct_tcp", False)))
                 t_port = time.time()
                 print(f"[runpod] pod {pod_id}: port open after "
                       f"{t_port - t_created:.0f}s (image pull + container start)",

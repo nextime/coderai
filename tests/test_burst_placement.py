@@ -1029,3 +1029,43 @@ def test_the_kt_worker_launches_from_its_own_venv(tmp_path, monkeypatch):
     # A venv that is configured but missing falls back rather than crashing.
     monkeypatch.setenv("CODERAI_KT_VENV", str(tmp_path / "missing"))
     assert kw._venv_python(_Cfg()) == sys.executable
+
+
+def test_direct_tcp_reaches_the_pod_without_the_proxy(monkeypatch):
+    """The proxy hostname is fronted by Cloudflare: a 100 s idle limit per
+    request cuts off a slow non-streaming render. direct_tcp exposes the
+    port as tcp and talks to the public ip:port instead — read from the
+    runtime, because the public port is random per pod."""
+    from codai.api import runpod_client as rc
+    from codai.api.runpod_worker import parse_model_runpod
+
+    assert parse_model_runpod({}).direct_tcp is False              # proxy by default
+    assert parse_model_runpod({"direct_tcp": True}).direct_tcp is True
+
+    ports = [{"ip": "203.0.113.7", "isIpPublic": True, "privatePort": 8000,
+              "publicPort": 41234, "type": "tcp"}]
+    assert rc.direct_tcp_url(ports, 8000) == "http://203.0.113.7:41234"
+    assert rc.direct_tcp_url(ports, 8001) == ""                    # wrong port
+    assert rc.direct_tcp_url([{**ports[0], "type": "http"}], 8000) == ""
+    assert rc.direct_tcp_url([{**ports[0], "isIpPublic": False}], 8000) == ""
+    assert rc.pod_proxy_url("abc", 8000) == "https://abc-8000.proxy.runpod.net"
+
+    # create_pod asks for the tcp mapping only when told to.
+    seen = {}
+    class _C(rc.RunpodClient):
+        def __init__(self): pass
+        def _gql(self, q, v, timeout=30.0):
+            seen["ports"] = v["input"]["ports"]; return {"podFindAndDeployOnDemand": {"id": "p1"}}
+    _C().create_pod(name="n", image="i", gpu_type_id="g", port=8000)
+    assert seen["ports"] == "8000/http"
+    _C().create_pod(name="n", image="i", gpu_type_id="g", port=8000, direct_tcp=True)
+    assert seen["ports"] == "8000/tcp"
+
+    # wait_ready keeps waiting until the runtime reports the public mapping.
+    infos = iter([{"status": "RUNNING", "ready": True, "ports": [], "uptime_s": 1},
+                  {"status": "RUNNING", "ready": True, "ports": ports, "uptime_s": 2}])
+    class _W(rc.RunpodClient):
+        def __init__(self): pass
+        def get_pod(self, pod_id): return next(infos)
+    monkeypatch.setattr(rc.time, "sleep", lambda s: None)
+    assert _W().wait_ready("p1", 8000, direct_tcp=True) == "http://203.0.113.7:41234"

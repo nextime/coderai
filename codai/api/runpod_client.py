@@ -32,8 +32,34 @@ def _mask(key: str) -> str:
 
 
 # A pod's public HTTP proxy hostname is derived from its id + the container port.
+# That hostname is fronted by Cloudflare: TLS for free, but a 100 s idle limit
+# per request and a request-body cap. See direct_tcp_url for the other way in.
 def pod_proxy_url(pod_id: str, port: int) -> str:
     return f"https://{pod_id}-{int(port)}.proxy.runpod.net"
+
+
+def direct_tcp_url(ports: list, port: int) -> str:
+    """The pod's public ip:port for ``port`` exposed as `<port>/tcp`, or ''.
+
+    A TCP port is mapped straight to the machine — no RunPod proxy, no
+    Cloudflare in front, so no 100 s idle timeout on a slow non-streaming
+    request and no body-size cap. Plain HTTP, though: the bearer token
+    travels unencrypted, so use it where the network is trusted or the
+    request must not be cut off. The public port is random per pod, which is
+    why it is read from the runtime rather than derived.
+    """
+    for p in ports or []:
+        try:
+            if int(p.get("privatePort") or 0) != int(port):
+                continue
+        except (TypeError, ValueError):
+            continue
+        if str(p.get("type") or "").lower() != "tcp" or not p.get("isIpPublic"):
+            continue
+        ip, pub = p.get("ip"), p.get("publicPort")
+        if ip and pub:
+            return f"http://{ip}:{int(pub)}"
+    return ""
 
 
 # Deep link to the pod in the RunPod web console (container + vLLM logs live there).
@@ -186,8 +212,11 @@ class RunpodClient:
                    registry_auth_id: str = "",
                    entrypoint: Optional[list] = None,
                    start_cmd: Optional[list] = None,
-                   network_volume_id: str = "") -> str:
+                   network_volume_id: str = "", direct_tcp: bool = False) -> str:
         """Provision a pod (on-demand or interruptible/spot). Returns the pod id.
+
+        ``direct_tcp`` exposes the port as `<port>/tcp` (public ip + random
+        public port, no proxy, no Cloudflare) instead of `<port>/http`.
 
         ``entrypoint``/``start_cmd`` override the image's ENTRYPOINT/CMD, which is
         what lets a pod fetch something before its server starts — an image whose
@@ -204,9 +233,9 @@ class RunpodClient:
                 volume_mount_path=volume_mount_path, env=env,
                 is_spot=is_spot, bid_per_gpu=bid_per_gpu,
                 data_center_id=data_center_id, registry_auth_id=registry_auth_id,
-                entrypoint=entrypoint, start_cmd=start_cmd)
+                entrypoint=entrypoint, start_cmd=start_cmd, direct_tcp=direct_tcp)
         env_list = [{"key": str(k), "value": str(v)} for k, v in (env or {}).items()]
-        ports = f"{int(port)}/http"
+        ports = f"{int(port)}/{'tcp' if direct_tcp else 'http'}"
         common = {
             "cloudType": (cloud_type or "SECURE").upper(),
             "gpuCount": int(gpu_count),
@@ -267,7 +296,7 @@ class RunpodClient:
             "containerDiskInGb": int(container_disk_gb),
             "volumeInGb": int(volume_gb),
             "volumeMountPath": volume_mount_path,
-            "ports": [f"{int(port)}/http"],
+            "ports": [f"{int(port)}/{'tcp' if direct_tcp else 'http'}"],
             "env": {str(k): str(v) for k, v in (env or {}).items()},
         }
         if entrypoint:
@@ -425,8 +454,12 @@ class RunpodClient:
         return out
 
     def wait_ready(self, pod_id: str, port: int, ready_timeout: float = 900.0,
-                   poll_every: float = 5.0) -> str:
-        """Poll until the pod exposes its proxy port; return the proxy base URL.
+                   poll_every: float = 5.0, direct_tcp: bool = False) -> str:
+        """Poll until the pod exposes its port; return the base URL to talk to.
+
+        The proxy URL is derivable the moment any port shows; a direct TCP
+        mapping is only usable once the runtime reports the public ip:port,
+        so the wait continues until it does.
 
         Only waits for the port to be exposed — the HTTP service inside (vLLM) is
         health-checked separately by the worker."""
@@ -453,7 +486,11 @@ class RunpodClient:
                     f"died immediately. RunPod says: "
                     f"{info.get('last_change') or '(no reason given)'}")
             if info.get("ready"):
-                return pod_proxy_url(pod_id, port)
+                if not direct_tcp:
+                    return pod_proxy_url(pod_id, port)
+                direct = direct_tcp_url(info.get("ports"), port)
+                if direct:
+                    return direct
             # A multi-GB image pull is minutes of silence otherwise, which reads
             # exactly like a hung pod. Say what is actually being waited on.
             if time.time() >= next_report:

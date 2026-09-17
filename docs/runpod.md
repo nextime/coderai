@@ -129,6 +129,7 @@ sync.) In `models.json` that is a `backend` pin plus a `runpod` block:
 | `served_model` | — | The HF repo id the pod actually serves. **Required for pods.** |
 | `image` | `vllm/vllm-openai:latest` | Container image. Must expose an OpenAI-compatible server. |
 | `port` | `8000` | Port the server listens on inside the container. |
+| `direct_tcp` | `false` | Talk to the pod at its public `ip:port` instead of through RunPod's HTTPS proxy. The proxy (`<pod>-<port>.proxy.runpod.net`) sits behind **Cloudflare**: TLS for free, but a 100 s idle limit per request — a slow *non-streaming* request (a long render, a cold 150 GB engine's first token) can be cut off with a 524 while the pod is still working — and a request-body cap. Direct TCP has neither limit, over plain HTTP: the bearer token is not encrypted in transit. |
 | `ctx` | — | Passed as vLLM's `--max-model-len`. |
 | `container_disk_gb` | `40` | Grown automatically to fit the weights unless a network volume holds them; an explicit larger value is respected. |
 | `weights_gb` | — | State the model's size and the estimate is skipped. The only honest answer for a URL download, an upload or a local file — the estimator cannot see those — and for an HF repo it beats a heuristic that errs high. Also accepted on the model entry itself. |
@@ -257,6 +258,7 @@ the RAM they need, not just the VRAM — `min_vram_gb` says nothing about RAM.
 
 ```
 client ──▶ front proxy ──▶ primary engine ──▶ RunpodBackend ──▶ https://<pod>-8000.proxy.runpod.net/v1
+                                                            (or http://<public-ip>:<port>/v1 with direct_tcp)
                                                             └─▶ https://api.runpod.ai/v2/<eid>/openai/v1
 ```
 
