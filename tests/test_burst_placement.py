@@ -454,7 +454,7 @@ def test_venv_on_volume_uses_a_small_image_and_the_volumes_venv(monkeypatch):
     script = plan["start_cmd"][0]
     assert "/workspace/venvs/embeddings" in script
     assert "profiles/embeddings.txt" in script      # the right profile installed
-    assert script.rstrip().endswith("--port 8000")
+    assert "--port 8000" in script.rstrip().splitlines()[-1]   # (+ TLS args when sent)
 
 
 def test_venv_on_volume_without_a_volume_is_refused(monkeypatch):

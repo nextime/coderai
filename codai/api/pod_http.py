@@ -92,13 +92,21 @@ def request(method: str, url: str, **kw):
     return requests.request(method, url, **kw)
 
 
+# The verb helpers delegate to requests' own verbs for ordinary URLs, not to
+# requests.request: callers (and tests) that patch requests.get keep working.
 def get(url: str, **kw):
-    return request("GET", url, **kw)
+    if is_pinned_url(url):
+        return request("GET", url, **kw)
+    return requests.get(url, **kw)
 
 
 def post(url: str, **kw):
-    return request("POST", url, **kw)
+    if is_pinned_url(url):
+        return request("POST", url, **kw)
+    return requests.post(url, **kw)
 
 
 def head(url: str, **kw):
-    return request("HEAD", url, **kw)
+    if is_pinned_url(url):
+        return request("HEAD", url, **kw)
+    return requests.head(url, **kw)
