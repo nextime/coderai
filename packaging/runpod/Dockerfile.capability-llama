@@ -1,0 +1,61 @@
+# CoderAI llama pod — llama-cpp-python with CUDA, for every pod GPU generation.
+#
+# The upstream llama.cpp server image serves a GGUF perfectly well, but it is
+# not a coderai: no TLS on the direct-TCP path, no /boot record, no seeding,
+# no local LoRA upload, nothing on the Tasks page. This image is coderai's
+# text path with llama-cpp-python compiled for CUDA in a toolchain stage —
+# SASS for Ampere through Blackwell plus PTX for what comes next — on the
+# full core, because the CUDA GGUF backend asks torch about the card.
+
+ARG CORE_BASE=coderai-capability-base:latest
+ARG CUDA_DEVEL=nvidia/cuda:12.8.1-devel-ubuntu24.04
+ARG LLAMA_CPP_PYTHON=0.3.30
+
+# ---------------------------------------------------------------- build stage
+FROM ${CUDA_DEVEL} AS wheel
+ARG LLAMA_CPP_PYTHON
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git python3 python3-pip python3-venv ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+# Ubuntu 24.04's python3 is 3.12, the same as the core: the wheel is cp312 either way.
+RUN python3 -m venv /bw && /bw/bin/pip install --no-cache-dir -U pip build scikit-build-core
+ENV CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=80;86;89;90;120 -DGGML_NATIVE=off -DGGML_AVX2=on"
+RUN --mount=type=cache,target=/root/.cache/pip set -eux; \
+    /bw/bin/pip wheel --no-cache-dir --no-deps --no-binary llama-cpp-python \
+        "llama-cpp-python==${LLAMA_CPP_PYTHON}" -w /wheels; \
+    ls -la /wheels
+
+# -------------------------------------------------------------- runtime stage
+FROM ${CORE_BASE}
+
+ARG PROFILE=llama
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+ENV PROFILE=${PROFILE}
+ARG IMAGE_TAG=unknown
+ENV CODERAI_IMAGE_TAG=${IMAGE_TAG}
+
+WORKDIR /opt/coderai/app
+COPY packaging/runpod/profiles/ /tmp/profiles/
+COPY --from=wheel /wheels/ /tmp/wheels/
+RUN --mount=type=cache,target=/root/.cache/pip set -eux; \
+    python -m pip install --extra-index-url ${TORCH_INDEX} -r /tmp/profiles/${PROFILE}.txt; \
+    python -m pip install --no-cache-dir /tmp/wheels/llama_cpp_python-*.whl; \
+    python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"; \
+    rm -rf /tmp/profiles /tmp/wheels
+
+# The CUDA runtime the wheel links, from torch's own wheels; fail the BUILD if
+# libllama cannot find a library, rather than the pod at its first load.
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.12/site-packages/nvidia/cublas/lib:${LD_LIBRARY_PATH}
+COPY packaging/runpod/check_llama_wheel.py /tmp/check_llama_wheel.py
+RUN python /tmp/check_llama_wheel.py && rm /tmp/check_llama_wheel.py
+
+COPY . /opt/coderai/app
+RUN python -c "import codai.api.app; print('coderai imports OK for profile ${PROFILE}')"
+
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s \
+    CMD curl -fsS http://127.0.0.1:8000/healthz || curl -fsSk https://127.0.0.1:8000/healthz || exit 1
+
+COPY packaging/runpod/boot.sh /opt/coderai/boot.sh
+RUN chmod +x /opt/coderai/boot.sh
+CMD ["/opt/coderai/boot.sh"]

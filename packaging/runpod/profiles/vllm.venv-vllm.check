@@ -1,0 +1,4 @@
+# Deep check for the vllm venv: the OpenAI server module must import.
+import vllm.entrypoints.openai.api_server                 # noqa
+import torch, vllm
+print("vllm", vllm.__version__, "torch", torch.__version__, "cuda", torch.version.cuda)

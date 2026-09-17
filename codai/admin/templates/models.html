@@ -783,8 +783,10 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
               <label class="form-label">Pod engine</label>
               <select id="cfg-rp-engine" class="form-input" onchange="_updateRunpodEngineHint()">
                 <option value="auto">Auto — vLLM, or llama.cpp for a GGUF</option>
-                <option value="vllm">vLLM (HF repo)</option>
-                <option value="llamacpp">llama.cpp (GGUF)</option>
+                <option value="vllm">vLLM — upstream vllm/vllm-openai image (HF repo)</option>
+                <option value="llamacpp">llama.cpp — upstream ggml-org image (GGUF)</option>
+                <option value="coderai-vllm">vLLM as a coderai pod (coderai-vllm image)</option>
+                <option value="coderai-llama">llama.cpp as a coderai pod (coderai-llama image, GGUF)</option>
                 <option value="coderai">coderai (a capability image)</option>
                 <option value="ds4">ds4 — DeepSeek-V4 (engines image)</option>
                 <option value="colibri">colibri — GLM-5.2 / DeepSeek-V4 / Kimi-K3 (engines image)</option>
@@ -4400,6 +4402,8 @@ function _updateRunpodEngineHint(){
     auto: 'A GGUF goes to llama.cpp, anything else to vLLM.',
     vllm: 'Serves an HF repo. vLLM\'s GGUF support is experimental — use llama.cpp for those.',
     llamacpp: 'Serves the GGUF named on the right; the pod downloads it itself.',
+    'coderai-vllm': 'vLLM inside a coderai pod: the same server as upstream, plus TLS on the direct path, /boot, seeding and the Tasks page. Your local vLLM settings (dtype, quantization, memory utilization…) travel to the pod.',
+    'coderai-llama': 'llama-cpp-python (CUDA, every pod GPU) inside a coderai pod for a GGUF: same kernels as upstream, plus what a coderai pod gives — including local LoRAs.',
     coderai: 'A whole coderai serving one capability. Needs a pod image you have pushed.',
     ds4: 'ds4-server on the engines image, built for every pod GPU. Downloads the configured variant unless the weights are on the volume.',
     colibri: 'colibri on the engines image (GLM-5.2 on CUDA; DeepSeek-V4 and Kimi-K3 on CPU). Never downloads: the container dir must be on the volume.',

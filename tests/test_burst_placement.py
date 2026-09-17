@@ -1122,3 +1122,65 @@ def test_a_direct_tcp_pod_speaks_tls_the_renting_coderai_can_verify(tmp_path, mo
     from pathlib import Path
     boot = Path("packaging/runpod/boot.sh").read_text()
     assert "CODERAI_TLS_CERT" in boot and "--ssl-certfile" in boot and "unset CODERAI_TLS_KEY" in boot
+
+
+def test_the_llm_servers_can_run_as_coderai_pods_instead_of_upstream_images(monkeypatch):
+    """coderai-text was transformers only, so a GGUF or a vLLM-served repo
+    still went to an upstream image — no TLS on the direct path, no /boot,
+    no local LoRAs. coderai-llama and coderai-vllm are those servers as
+    coderai pods; the upstream engines stay selectable."""
+    import json
+    from codai.api.runpod_worker import (pod_plan, parse_model_runpod,
+                                         PUBLISHED_CAPABILITY_IMAGES, resolve_pod_engine)
+    assert "llama" in PUBLISHED_CAPABILITY_IMAGES and "vllm" in PUBLISHED_CAPABILITY_IMAGES
+
+    class _V:
+        ctx = 16384; gpu_memory_utilization = 0.85; tensor_parallel_size = 2
+        max_num_seqs = 0; dtype = "bfloat16"; quantization = ""; extra_args = ""; extra_env = ""
+        venv = "/local/vllm_venv"; port = 9
+    class _Root:
+        vllm = _V()
+    class _CM:
+        config = _Root()
+    monkeypatch.setattr("codai.admin.routes.config_manager", _CM(), raising=False)
+
+    entry = {"path": "org/m", "model_type": "text_models", "backend": "runpod"}
+    # Upstream stays upstream.
+    assert resolve_pod_engine(parse_model_runpod({"engine": "vllm"}), "m", entry=entry) == "vllm"
+    up = pod_plan(parse_model_runpod({"engine": "vllm"}), "org/m", entry=entry)
+    assert up["image"].startswith("vllm/") and "CODERAI_VLLM_ENABLED" not in up["env"]
+
+    # vLLM as a coderai pod: its image, the engine on, local settings forwarded
+    # — except tensor parallelism, which follows the pod's own card count.
+    plan = pod_plan(parse_model_runpod({"engine": "coderai-vllm", "gpu_count": 2}),
+                    "org/m", entry=entry)
+    assert plan["engine"] == "coderai" and plan["image"].endswith("coderai-vllm:latest")
+    env = plan["env"]
+    assert env["CODERAI_VLLM_ENABLED"] == "1" and env["CODERAI_VLLM_VENV"] == "/opt/coderai/venvs/vllm"
+    fwd = json.loads(env["CODERAI_VLLM_CONFIG"])
+    assert fwd["dtype"] == "bfloat16" and fwd["ctx"] == 16384 and fwd["tensor_parallel_size"] == 2
+    assert "venv" not in fwd and "port" not in fwd
+    assert json.loads(env["CODERAI_SEED_MODELS"])[0]["backend"] == "vllm"
+    one = pod_plan(parse_model_runpod({"engine": "coderai-vllm"}), "org/m", entry=entry)
+    assert "tensor_parallel_size" not in json.loads(one["env"]["CODERAI_VLLM_CONFIG"])
+
+    # llama.cpp as a coderai pod: the GGUF goes to coderai's own CUDA backend.
+    gg = {"path": "org/m-GGUF", "model_type": "text_models", "backend": "runpod"}
+    plan = pod_plan(parse_model_runpod({"engine": "coderai-llama", "hf_gguf": "org/m-GGUF:Q4_K_M"}),
+                    "org/m-GGUF", entry=gg)
+    assert plan["engine"] == "coderai" and plan["image"].endswith("coderai-llama:latest")
+    assert "backend" not in json.loads(plan["env"]["CODERAI_SEED_MODELS"])[0]
+
+    # The worker finds the baked venv from env, ahead of the home-dir default.
+    from codai.api import vllm_worker as vw
+    class _Cfg: venv = ""
+    monkeypatch.setenv("CODERAI_VLLM_VENV", "/opt/coderai/venvs/vllm")
+    assert vw.resolve_venv_dir(_Cfg()) == "/opt/coderai/venvs/vllm"
+
+    from pathlib import Path
+    prof = Path("packaging/runpod/profiles")
+    assert (prof / "llama.dockerfile").read_text().strip() == "Dockerfile.capability-llama"
+    df = Path("packaging/runpod/Dockerfile.capability-llama").read_text()
+    assert "GGML_CUDA=on" in df and "80;86;89;90;120" in df and "check_llama_wheel" in df
+    assert (prof / "vllm.light").exists() and (prof / "vllm.venv-vllm.uv").exists()
+    assert "vllm==" in (prof / "vllm.venv-vllm.txt").read_text()

@@ -1,0 +1,11 @@
+# llama.cpp as a coderai pod: llama-cpp-python built with CUDA for every pod
+# GPU generation, driving GGUF models through coderai's own CUDA backend —
+# the same kernels as the upstream ghcr.io/ggml-org/llama.cpp image, plus what
+# a coderai pod gives (TLS on the direct path, /boot, seeding, local LoRAs,
+# the Tasks page). FULL core: the GGUF backend asks torch about the card.
+#
+# The wheel itself is compiled in Dockerfile.capability-llama's toolchain
+# stage (see the `llama.dockerfile` marker); this file lists what else the
+# text path needs.
+sentencepiece>=0.1.99
+protobuf>=3.20.0

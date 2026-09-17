@@ -1,0 +1,3 @@
+# The version the local vLLM node runs (requirements-vllm.txt). vLLM pins its
+# own torch and CUDA libraries, which is why it cannot share the main venv.
+vllm==0.27.1

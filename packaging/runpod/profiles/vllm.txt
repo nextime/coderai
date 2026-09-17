@@ -1,0 +1,5 @@
+# vLLM as a coderai pod: vLLM in its own venv (vllm.venv-vllm.txt, resolved
+# with uv) on the LIGHT core, driven by coderai's vLLM proxy backend — the
+# same server as the upstream vllm/vllm-openai image, plus what a coderai pod
+# gives (TLS on the direct path, /boot, seeding, the Tasks page). The main
+# venv only proxies; nothing here touches torch.

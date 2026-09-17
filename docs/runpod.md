@@ -205,6 +205,22 @@ It stages the engine sources from `~/.coderai/{ds4,colibri,kimi-k3-in-c}` (or
 `CODERAI_DS4_DIR` etc.), so the pod runs the same engine code the local install
 does.
 
+### The LLM servers as coderai pods
+
+`engine: vllm` and `engine: llamacpp` run the **upstream** images
+(`vllm/vllm-openai`, `ghcr.io/ggml-org/llama.cpp:server-cuda`): well-tested,
+but not coderai — no TLS on the direct-TCP path, no `/boot`, no seeding, no
+local LoRAs, nothing on the Tasks page. Two more images run the same servers
+*inside* a coderai pod:
+
+| `engine` | Image | What it is |
+|---|---|---|
+| `coderai-vllm` | `coderai-vllm` (light core + vLLM venv, ~10 GB) | vLLM driven by coderai's vLLM backend. Your local **vLLM settings travel** (`dtype`, `quantization`, `gpu_memory_utilization`, `max_num_seqs`, `extra_args`); tensor parallelism follows the pod's `gpu_count`. |
+| `coderai-llama` | `coderai-llama` (full core + llama-cpp-python CUDA, ~9 GB) | A GGUF on coderai's own CUDA backend — llama-cpp-python compiled for every pod GPU generation. Local LoRAs work. |
+
+`coderai-text` remains the transformers pod (HF safetensors, 4/8-bit, PEFT
+adapters). Throughput under concurrency is vLLM's game on either image.
+
 **Naming the engine.** A RunPod-only model has `backend: runpod` — that slot is
 taken — so the engine goes on the runpod block, beside `vllm` and `llamacpp`:
 

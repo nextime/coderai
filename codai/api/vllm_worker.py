@@ -37,7 +37,8 @@ _REQ = os.path.join(os.path.dirname(__file__), "..", "..", "requirements-vllm.tx
 
 def resolve_venv_dir(cfg) -> str:
     """Isolated vLLM venv: config > baked /opt/coderai/vllm_venv > /cache mount > ~/.coderai."""
-    configured = (getattr(cfg, "venv", "") or "").strip()
+    configured = (getattr(cfg, "venv", "") or "").strip() \
+        or (os.environ.get("CODERAI_VLLM_VENV") or "").strip()
     if configured:
         return configured
     baked = "/opt/coderai/vllm_venv"

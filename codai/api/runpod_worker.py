@@ -218,14 +218,25 @@ PUBLISHED_CAPABILITY_IMAGES = (
     # kt-kernel dispatches at runtime (AMX → AVX-512 → AVX2 llamafile → AMD
     # BLIS), so one image serves whatever CPU the pod host has.
     "engines-kt",
+    # The two LLM servers as coderai pods rather than upstream images: the
+    # same kernels, plus what a coderai pod gives — TLS on the direct path,
+    # /boot, seeding, local LoRAs, the Tasks page. `llama` is llama-cpp-python
+    # built with CUDA for every pod GPU on the full core (the GGUF backend
+    # asks torch about the card); `vllm` is vLLM in its own venv on the light
+    # core, driven by coderai's vLLM proxy backend.
+    "llama",
+    "vllm",
 )
 
 #: Model backends served by an engine image, and which image. ds4, colibri
 #: and k3 are C binaries and share one image. ktransformers is a Python stack
 #: (kt-kernel + SGLang, pinning their own torch) that takes a venv of its own,
 #: so it has an image of its own rather than doubling the first.
-_ENGINE_POD_BACKENDS = ("ds4", "colibri", "k3", "kt")
-_ENGINE_POD_IMAGE = {"kt": "engines-kt"}
+_ENGINE_POD_BACKENDS = ("ds4", "colibri", "k3", "kt", "vllm")
+_ENGINE_POD_IMAGE = {"kt": "engines-kt", "vllm": "vllm"}
+#: runpod-block `engine` values that mean "a coderai pod running THIS server",
+#: as opposed to `vllm`/`llamacpp`, which mean the upstream images.
+_CODERAI_SERVER_ENGINES = {"coderai-vllm": "vllm", "coderai-llama": "llama"}
 
 #: Capabilities served by a published image other than their own name.
 _CAPABILITY_IMAGE_ALIASES = {
@@ -377,6 +388,8 @@ def resolve_pod_engine(mcfg: "RunpodModelConfig", model_key: str = "",
     vLLM.
     """
     want = (mcfg.engine or "auto").strip().lower()
+    if want in _CODERAI_SERVER_ENGINES:
+        return "coderai"
     if want in ("vllm", "llamacpp", "coderai", "custom"):
         return want
     # A non-text model is served by a whole coderai carrying that capability.
@@ -422,6 +435,8 @@ def engine_pod_backend(entry: dict, mcfg: "RunpodModelConfig" = None) -> str:
     want = str(getattr(mcfg, "engine", "") or "").strip().lower() if mcfg else ""
     if want in _ENGINE_POD_BACKENDS:
         return want
+    if want == "coderai-vllm":
+        return "vllm"
     b = str((entry or {}).get("backend") or "").strip().lower()
     return b if b in _ENGINE_POD_BACKENDS else ""
 
@@ -455,6 +470,9 @@ def pod_plan(mcfg: "RunpodModelConfig", served: str, model_key: str = "",
         image = mcfg.image
         capability_hint = model_capability(entry or {}, include_text=True)
         _eng = engine_pod_backend(entry or {}, mcfg)
+        _want = str(mcfg.engine or "").strip().lower()
+        if not image and _want in _CODERAI_SERVER_ENGINES:
+            image = default_capability_image(_CODERAI_SERVER_ENGINES[_want])
         if not image and _eng:
             image = default_capability_image(_ENGINE_POD_IMAGE.get(_eng, "engines"))
         if not image:
@@ -752,6 +770,8 @@ _ENGINE_FORWARDED_FIELDS = {
     "k3": ("ctx", "preset", "trunk_gb", "cache_gb", "extra_args", "extra_env",
            "model_id"),
     "kt": ("ctx", "extra_args", "extra_env", "model_id"),
+    "vllm": ("ctx", "gpu_memory_utilization", "tensor_parallel_size", "max_num_seqs",
+             "dtype", "quantization", "extra_args", "extra_env"),
 }
 #: The config attribute behind each engine name (ktransformers is the odd one).
 _ENGINE_CONFIG_ATTR = {"kt": "ktransformers"}
@@ -965,7 +985,15 @@ def _plan(engine, image, args, mcfg, api_key, entry, served,
             # SGLang + kt-kernel live in the image's own venv; the worker must
             # launch from there, not from coderai's interpreter.
             env.setdefault("CODERAI_KT_VENV", "/opt/coderai/venvs/sglang")
+        if eng == "vllm":
+            env.setdefault("CODERAI_VLLM_VENV", "/opt/coderai/venvs/vllm")
         forwarded = engine_config_for_pod(eng)
+        if eng == "vllm" and "tensor_parallel_size" in forwarded:
+            # The pod was rented with gpu_count cards; the local setting
+            # describes this machine's cards. The pod's count wins.
+            forwarded.pop("tensor_parallel_size", None)
+        if eng == "vllm" and int(getattr(mcfg, "gpu_count", 1) or 1) > 1:
+            forwarded["tensor_parallel_size"] = int(mcfg.gpu_count)
         if forwarded:
             env[f"CODERAI_{eng.upper()}_CONFIG"] = _json.dumps(forwarded)
         warn = weight_transfer_warning(entry, mcfg, _account_hint())
