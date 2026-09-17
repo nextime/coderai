@@ -27,6 +27,7 @@ Model entry fields:
   api_key         bearer token for the remote, when it wants one.
 """
 
+from codai.api import pod_http
 import os
 from typing import Dict, Optional
 
@@ -110,7 +111,7 @@ class RemoteOpenAIBackend(RunpodBackend):
     def health(self) -> Optional[dict]:
         import requests
         try:
-            r = requests.get(self._base() + "/models", headers=self._headers, timeout=10)
+            r = pod_http.get(self._base() + "/models", headers=self._headers, timeout=10)
             return r.json() if r.ok else None
         except Exception:
             return None

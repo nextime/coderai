@@ -107,7 +107,7 @@ EXPOSE 8000
 # /healthz is what a `coderai` pod is probed on, and it answers before any model
 # is loaded — which is correct: the pod is ready to be asked.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s \
-    CMD curl -fsS http://127.0.0.1:8000/healthz || exit 1
+    CMD curl -fsS http://127.0.0.1:8000/healthz || curl -fsSk https://127.0.0.1:8000/healthz || exit 1
 
 COPY packaging/runpod/boot.sh /opt/coderai/boot.sh
 RUN chmod +x /opt/coderai/boot.sh

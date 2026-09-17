@@ -20,6 +20,7 @@ Phase 2: the serverless path is live. Pods mode raises a clear error until the
 pod pool lands in the next phase.
 """
 
+from codai.api import pod_http
 import asyncio
 import threading
 from typing import AsyncGenerator, Dict, List, Optional
@@ -199,7 +200,7 @@ class RunpodBackend(ModelBackend):
                 payload["response_format"] = {"type": "json_object"}
             if tools:
                 payload["tools"] = tools
-            r = requests.post(base + "/chat/completions", json=payload,
+            r = pod_http.post(base + "/chat/completions", json=payload,
                               headers=self._headers, timeout=3600)
             r.raise_for_status()
             data = r.json()
@@ -275,7 +276,7 @@ class RunpodBackend(ModelBackend):
         def _worker():
             import requests
             try:
-                with requests.post(url, json=payload, headers=headers,
+                with pod_http.post(url, json=payload, headers=headers,
                                    stream=True, timeout=3600) as r:
                     r.raise_for_status()
                     buf = b""

@@ -1069,3 +1069,56 @@ def test_direct_tcp_reaches_the_pod_without_the_proxy(monkeypatch):
         def get_pod(self, pod_id): return next(infos)
     monkeypatch.setattr(rc.time, "sleep", lambda s: None)
     assert _W().wait_ready("p1", 8000, direct_tcp=True) == "http://203.0.113.7:41234"
+
+
+def test_a_direct_tcp_pod_speaks_tls_the_renting_coderai_can_verify(tmp_path, monkeypatch):
+    """direct_tcp removed the 100 s proxy cutoff at the price of plain HTTP.
+    Now the pod brings TLS: a leaf from this install's CA, sent as env, and
+    this side verifies against that CA alone — no hostname check, since the
+    pod's IP is unknown when the cert is issued and a foreign cert fails the
+    chain before any name is compared."""
+    import http.server, json, ssl, threading
+    from codai.api import pod_tls, pod_http, runpod_client as rc
+
+    monkeypatch.setattr(pod_tls, "tls_dir", lambda: str(tmp_path / "tls"))
+    env = pod_tls.pod_env("deploy-mymodel")
+    assert env["CODERAI_TLS_CERT"].startswith("-----BEGIN CERTIFICATE-----")
+    assert "PRIVATE KEY" in env["CODERAI_TLS_KEY"]
+    assert (tmp_path / "tls" / "ca.pem").exists()
+
+    # A "pod": an https server on 127.0.0.1 using exactly what boot.sh writes.
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    cert.write_text(env["CODERAI_TLS_CERT"]); key.write_text(env["CODERAI_TLS_KEY"])
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps({"ok": True, "auth": self.headers.get("Authorization")}).encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(body)))
+            self.end_headers(); self.wfile.write(body)
+        def log_message(self, *a): pass
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(str(cert), str(key))
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"https://127.0.0.1:{srv.server_address[1]}"
+
+    # The URL a direct-TCP TLS pod gets: https to its bare public IP.
+    ports = [{"ip": "127.0.0.1", "isIpPublic": True, "privatePort": 8000,
+              "publicPort": srv.server_address[1], "type": "tcp"}]
+    assert rc.direct_tcp_url(ports, 8000, tls=True) == url
+    assert pod_http.is_pinned_url(url) and not pod_http.is_pinned_url("https://x-8000.proxy.runpod.net")
+
+    monkeypatch.setattr(pod_http, "_session", None)
+    r = pod_http.get(url + "/healthz", headers={"Authorization": "Bearer t"}, timeout=5)
+    assert r.status_code == 200 and r.json()["auth"] == "Bearer t"
+    # Plain requests would refuse it — that is the whole reason pod_http exists.
+    import requests, pytest
+    with pytest.raises(requests.exceptions.SSLError):
+        requests.get(url + "/healthz", timeout=5)
+    srv.shutdown()
+
+    # Provisioning issues a cert only for coderai pods on the direct path.
+    from codai.api.runpod_worker import parse_model_runpod
+    assert parse_model_runpod({"direct_tcp": True}).direct_tcp is True
+    from pathlib import Path
+    boot = Path("packaging/runpod/boot.sh").read_text()
+    assert "CODERAI_TLS_CERT" in boot and "--ssl-certfile" in boot and "unset CODERAI_TLS_KEY" in boot

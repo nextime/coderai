@@ -39,6 +39,7 @@ The pool wears the same acquire()/release() shape as RunpodPodPool so the
 gateway and the test run treat both identically.
 """
 
+from codai.api import pod_http
 import shlex
 import subprocess
 import threading
@@ -84,7 +85,7 @@ def _health_ok(url: str, path: str, api_key: str, timeout: float = 5.0) -> bool:
     import requests
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
-        r = requests.get(url.rstrip("/") + path, headers=headers, timeout=timeout)
+        r = pod_http.get(url.rstrip("/") + path, headers=headers, timeout=timeout)
         return r.status_code == 200
     except Exception:
         return False

@@ -841,7 +841,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           </div>
           <div class="form-row" style="margin:.5rem 0 0">
             <label style="display:flex;align-items:center;gap:.3rem;font-size:12px"><input type="checkbox" id="cfg-rp-direct-tcp" style="width:auto"> Direct TCP to the pod (bypass RunPod's proxy / Cloudflare)</label>
-            <span class="form-hint" style="font-size:11px">Default is RunPod's HTTPS proxy, which sits behind Cloudflare: TLS, but a 100 s idle limit per request and a body-size cap — a slow non-streaming render can be cut off with a 524. Direct TCP talks to the pod's public ip:port with neither limit, over plain HTTP (the bearer token is not encrypted in transit).</span>
+            <span class="form-hint" style="font-size:11px">Default is RunPod's HTTPS proxy, which sits behind Cloudflare: TLS, but a 100 s idle limit per request and a body-size cap — a slow non-streaming render can be cut off with a 524. Direct TCP talks to the pod's public ip:port with neither limit. coderai pods serve HTTPS on it with a certificate from this install's own CA, so nothing travels in clear; vLLM / llama.cpp images cannot take a certificate and stay plain HTTP on this path.</span>
           </div>
           <div class="form-row" style="margin:.5rem 0 0">
             <label class="form-label">Share pod pool <span class="muted">(optional name)</span></label>

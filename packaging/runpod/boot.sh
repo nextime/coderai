@@ -53,6 +53,22 @@ else
     phase "gpu: nvidia-smi not present"
 fi
 
-phase "starting uvicorn on 0.0.0.0:8000"
+# TLS, when the renting coderai sent a certificate: it reaches this pod at a
+# public ip:port with nothing in between (direct_tcp), so the pod terminates
+# TLS itself. The cert is signed by that install's own CA and only it
+# verifies it. PEM in env → files, because uvicorn wants paths. Absent env
+# means the RunPod proxy is in front, which speaks plain HTTP to us.
+TLS_ARGS=""
+if [ -n "$CODERAI_TLS_CERT" ] && [ -n "$CODERAI_TLS_KEY" ]; then
+    mkdir -p /run/coderai-tls && chmod 700 /run/coderai-tls
+    printf '%s\n' "$CODERAI_TLS_CERT" > /run/coderai-tls/cert.pem
+    printf '%s\n' "$CODERAI_TLS_KEY" > /run/coderai-tls/key.pem
+    chmod 600 /run/coderai-tls/key.pem
+    unset CODERAI_TLS_KEY
+    TLS_ARGS="--ssl-certfile /run/coderai-tls/cert.pem --ssl-keyfile /run/coderai-tls/key.pem"
+    phase "tls: serving https with the certificate the renting coderai sent"
+fi
+
+phase "starting uvicorn on 0.0.0.0:8000${TLS_ARGS:+ (https)}"
 exec python -m uvicorn codai.api.app:app --host 0.0.0.0 --port 8000 \
-     --log-level "${CODERAI_LOG_LEVEL:-info}"
+     --log-level "${CODERAI_LOG_LEVEL:-info}" $TLS_ARGS

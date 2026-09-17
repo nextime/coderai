@@ -38,7 +38,7 @@ def pod_proxy_url(pod_id: str, port: int) -> str:
     return f"https://{pod_id}-{int(port)}.proxy.runpod.net"
 
 
-def direct_tcp_url(ports: list, port: int) -> str:
+def direct_tcp_url(ports: list, port: int, tls: bool = False) -> str:
     """The pod's public ip:port for ``port`` exposed as `<port>/tcp`, or ''.
 
     A TCP port is mapped straight to the machine — no RunPod proxy, no
@@ -58,7 +58,7 @@ def direct_tcp_url(ports: list, port: int) -> str:
             continue
         ip, pub = p.get("ip"), p.get("publicPort")
         if ip and pub:
-            return f"http://{ip}:{int(pub)}"
+            return f"{'https' if tls else 'http'}://{ip}:{int(pub)}"
     return ""
 
 
@@ -454,7 +454,8 @@ class RunpodClient:
         return out
 
     def wait_ready(self, pod_id: str, port: int, ready_timeout: float = 900.0,
-                   poll_every: float = 5.0, direct_tcp: bool = False) -> str:
+                   poll_every: float = 5.0, direct_tcp: bool = False,
+                   tls: bool = False) -> str:
         """Poll until the pod exposes its port; return the base URL to talk to.
 
         The proxy URL is derivable the moment any port shows; a direct TCP
@@ -488,7 +489,7 @@ class RunpodClient:
             if info.get("ready"):
                 if not direct_tcp:
                     return pod_proxy_url(pod_id, port)
-                direct = direct_tcp_url(info.get("ports"), port)
+                direct = direct_tcp_url(info.get("ports"), port, tls=tls)
                 if direct:
                     return direct
             # A multi-GB image pull is minutes of silence otherwise, which reads

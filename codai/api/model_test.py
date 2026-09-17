@@ -31,6 +31,7 @@ transcription and for voice cloning, PIL draws known words for OCR, and video is
 asked for the smallest clip it can make.
 """
 
+from codai.api import pod_http
 import io
 import json
 import os
@@ -548,7 +549,7 @@ def _remote_catalogue(url: str, api_key: str) -> list:
     import requests
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
-        r = requests.get(url.rstrip("/") + "/v1/models", headers=headers, timeout=15)
+        r = pod_http.get(url.rstrip("/") + "/v1/models", headers=headers, timeout=15)
         if r.status_code != 200:
             return [f"(HTTP {r.status_code})"]
         return [str(m.get("id")) for m in (r.json().get("data") or [])] or ["(none)"]

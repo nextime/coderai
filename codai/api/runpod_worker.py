@@ -24,6 +24,7 @@ The account settings (API key, endpoints, global caps) live in
 :class:`codai.config.RunpodConfig`; this module reads the per-model block.
 """
 
+from codai.api import pod_http
 import os
 from collections import OrderedDict as _OrderedDict
 from dataclasses import dataclass, field
@@ -727,8 +728,15 @@ def venv_bootstrap_script(mount: str, profile: str, venv_name: str = "",
         'done',
         '[ -f "$MARK" ] || { echo "[venv] $VENV never became ready"; exit 1; }',
         'echo "[venv] using $VENV"',
+        # TLS from env, as boot.sh does it (this script replaces boot.sh).
+        'TLS=""; if [ -n "$CODERAI_TLS_CERT" ] && [ -n "$CODERAI_TLS_KEY" ]; then '
+        'mkdir -p /run/coderai-tls && chmod 700 /run/coderai-tls; '
+        'printf "%s\\n" "$CODERAI_TLS_CERT" > /run/coderai-tls/cert.pem; '
+        'printf "%s\\n" "$CODERAI_TLS_KEY" > /run/coderai-tls/key.pem; '
+        'chmod 600 /run/coderai-tls/key.pem; unset CODERAI_TLS_KEY; '
+        'TLS="--ssl-certfile /run/coderai-tls/cert.pem --ssl-keyfile /run/coderai-tls/key.pem"; fi',
         f'exec "$VENV/bin/python" -m uvicorn codai.api.app:app --host 0.0.0.0 '
-        f'--port {int(port)}',
+        f'--port {int(port)} $TLS',
     ])
 
 
@@ -1308,7 +1316,7 @@ def _pod_health_ok(url: str, timeout: float = 4.0, path: str = "/v1/models",
     import requests
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
-        r = requests.get(url.rstrip("/") + "/" + path.lstrip("/"), timeout=timeout,
+        r = pod_http.get(url.rstrip("/") + "/" + path.lstrip("/"), timeout=timeout,
                          headers=headers)
         return r.status_code == 200
     except Exception:
@@ -1683,7 +1691,7 @@ class RunpodPodPool:
         import requests
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         try:
-            r = requests.get(url.rstrip("/") + "/v1/models", headers=headers, timeout=20)
+            r = pod_http.get(url.rstrip("/") + "/v1/models", headers=headers, timeout=20)
             if r.status_code != 200:
                 print(f"[runpod] pod catalogue unreadable: HTTP {r.status_code} "
                       f"{(r.text or '')[:120]}", flush=True)
@@ -1747,6 +1755,24 @@ class RunpodPodPool:
             env.update(volume_env(vol_mount))
             if getattr(self, "_volume_dc", None) is None:
                 self._volume_dc = self._data_center_for_volume(vol_id)
+        # Direct TCP puts nothing between here and the pod, so the pod brings
+        # its own TLS: a certificate from this install's CA, sent like the
+        # token. Only a coderai image knows what to do with it — vLLM's and
+        # llama.cpp's images stay plain HTTP on this path, and say so.
+        self._tls = False
+        if getattr(self.mcfg, "direct_tcp", False):
+            # coderai pods only: boot.sh and the venv-on-volume bootstrap both
+            # read the env; a custom image is anyone's guess and vLLM's and
+            # llama.cpp's images ignore it, which would leave us speaking
+            # https to a plain-HTTP server.
+            if plan.get("engine") == "coderai":
+                from codai.api.pod_tls import pod_env as _tls_env
+                env.update(_tls_env(f"{_deploy_tag(self.account)}-{self.model_key}"))
+                self._tls = True
+            else:
+                print(f"[runpod] direct_tcp on a {plan.get('engine')} image: plain "
+                      f"HTTP — that image cannot take a certificate; the bearer "
+                      f"token travels unencrypted", flush=True)
         dc = getattr(self.account, "data_center", "") or ""
         last = None
         for i in range(start, len(ranked)):
@@ -1817,7 +1843,7 @@ class RunpodPodPool:
                 import requests
                 headers = ({"Authorization": f"Bearer {self.api_key}"}
                            if self.api_key else {})
-                r = requests.get(url.rstrip("/") + "/boot", headers=headers, timeout=15)
+                r = pod_http.get(url.rstrip("/") + "/boot", headers=headers, timeout=15)
                 if r.status_code == 200:
                     data = r.json()
                     lines = list(data.get("container") or []) + list(data.get("phases") or [])
@@ -1888,7 +1914,8 @@ class RunpodPodPool:
             url = ""
             try:
                 url = client.wait_ready(pod_id, port, ready_timeout=boot_to,
-                                        direct_tcp=bool(getattr(self.mcfg, "direct_tcp", False)))
+                                        direct_tcp=bool(getattr(self.mcfg, "direct_tcp", False)),
+                                        tls=bool(getattr(self, "_tls", False)))
                 t_port = time.time()
                 print(f"[runpod] pod {pod_id}: port open after "
                       f"{t_port - t_created:.0f}s (image pull + container start)",

@@ -37,6 +37,7 @@ Cost: when nothing is configured as remote the middleware returns on its first
 branch and the body is never buffered.
 """
 
+from codai.api import pod_http
 import json
 import os
 import re
@@ -610,7 +611,7 @@ class RemoteGatewayMiddleware:
 
         def _call():
             import requests
-            return requests.request(scope.get("method", "POST"), dest, data=body or None,
+            return pod_http.request(scope.get("method", "POST"), dest, data=body or None,
                                     headers=fwd, stream=True, timeout=(30, 3600))
         try:
             resp = await asyncio.to_thread(_call)
@@ -735,10 +736,10 @@ def sync_loras(base: str, api_key: str, body: bytes) -> bytes:
             with open(local, "rb") as fh:
                 data = fh.read()
             digest = hashlib.sha256(data).hexdigest()
-            have = requests.get(f"{base}/v1/loras/blob/{digest}",
+            have = pod_http.get(f"{base}/v1/loras/blob/{digest}",
                                 headers=headers, timeout=30)
             if have.status_code != 200:
-                up = requests.post(f"{base}/v1/loras/upload", data=data,
+                up = pod_http.post(f"{base}/v1/loras/upload", data=data,
                                    headers={**headers,
                                             "Content-Type": "application/octet-stream"},
                                    timeout=1800)
@@ -780,9 +781,9 @@ def push_lora_file(base: str, api_key: str, path: str) -> str:
         with open(path, "rb") as fh:
             data = fh.read()
         digest = hashlib.sha256(data).hexdigest()
-        have = requests.get(f"{base}/v1/loras/blob/{digest}", headers=headers, timeout=30)
+        have = pod_http.get(f"{base}/v1/loras/blob/{digest}", headers=headers, timeout=30)
         if have.status_code != 200:
-            up = requests.post(f"{base}/v1/loras/upload", data=data,
+            up = pod_http.post(f"{base}/v1/loras/upload", data=data,
                                headers={**headers,
                                         "Content-Type": "application/octet-stream"},
                                timeout=1800)
@@ -899,7 +900,7 @@ def teach_model(base: str, api_key: str, model: str) -> bool:
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     try:
-        r = requests.post(f"{base}/v1/models/register", data=payload,
+        r = pod_http.post(f"{base}/v1/models/register", data=payload,
                           headers=headers, timeout=60)
         if not r.ok:
             print(f"[remote-gateway] {base} refused {model!r}: "
@@ -935,7 +936,7 @@ def ensure_model_uploaded(base: str, api_key: str, entry: dict) -> None:
             sum(os.path.getsize(os.path.join(r, f))
                 for r, _, fs in os.walk(path) for f in fs))
     try:
-        have = requests.get(f"{base}/v1/models/uploaded",
+        have = pod_http.get(f"{base}/v1/models/uploaded",
                             params={"name": name, "bytes": 0 if is_dir else size},
                             headers=headers, timeout=30)
         if have.status_code == 200:
@@ -957,13 +958,13 @@ def ensure_model_uploaded(base: str, api_key: str, entry: dict) -> None:
             proc = subprocess.Popen(
                 ["tar", "-cf", "-", "-C", os.path.dirname(path), name],
                 stdout=subprocess.PIPE)
-            resp = requests.post(f"{base}/v1/models/upload", params=params,
+            resp = pod_http.post(f"{base}/v1/models/upload", params=params,
                                  data=proc.stdout, headers=headers, timeout=None)
             proc.stdout.close()
             proc.wait()
         else:
             with open(path, "rb") as fh:
-                resp = requests.post(f"{base}/v1/models/upload", params=params,
+                resp = pod_http.post(f"{base}/v1/models/upload", params=params,
                                      data=fh, headers=headers, timeout=None)
         resp.raise_for_status()
         _UPLOADED.add((base, name))

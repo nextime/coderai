@@ -38,4 +38,4 @@ COPY . /opt/coderai/app
 # it — see venv_bootstrap_script() in codai/api/runpod_worker.py.
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=600s \
-    CMD curl -fsS http://127.0.0.1:8000/healthz || exit 1
+    CMD curl -fsS http://127.0.0.1:8000/healthz || curl -fsSk https://127.0.0.1:8000/healthz || exit 1
