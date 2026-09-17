@@ -1184,3 +1184,41 @@ def test_the_llm_servers_can_run_as_coderai_pods_instead_of_upstream_images(monk
     assert "GGML_CUDA=on" in df and "80;86;89;90;120" in df and "check_llama_wheel" in df
     assert (prof / "vllm.light").exists() and (prof / "vllm.venv-vllm.uv").exists()
     assert "vllm==" in (prof / "vllm.venv-vllm.txt").read_text()
+
+
+def test_the_gguf_backend_can_size_the_card_without_torch(monkeypatch):
+    """The llama pod image carried 5 GB of torch so the CUDA GGUF backend
+    could ask it three questions about the card — 11.6 GB, over RunPod's
+    line. NVML answers the same three from a 1 MB package; torch stays
+    preferred where it exists."""
+    import sys, types
+    from codai.backends import gpu_probe as gp
+
+    # No torch: NVML answers.
+    monkeypatch.setattr(gp, "_torch", lambda: None)
+    class _Mem:  total = 80 * 1024**3; free = 70 * 1024**3
+    nv = types.SimpleNamespace(
+        nvmlInit=lambda: None, nvmlDeviceGetCount=lambda: 2,
+        nvmlDeviceGetHandleByIndex=lambda i: i,
+        nvmlDeviceGetMemoryInfo=lambda h: _Mem(),
+        nvmlSystemGetDriverVersion=lambda: b"570.86")
+    monkeypatch.setitem(sys.modules, "pynvml", nv)
+    assert gp.cuda_available() is True
+    assert gp.total_memory_bytes() == [80 * 1024**3] * 2
+    assert gp.free_memory_bytes() == 70 * 1024**3
+    assert "NVML" in gp.runtime_label() and "570.86" in gp.runtime_label()
+
+    # Neither: honest zeros, not a crash.
+    monkeypatch.setitem(sys.modules, "pynvml", None)
+    assert gp.cuda_available() is False and gp.total_memory_bytes() == []
+    assert gp.free_memory_bytes() is None
+
+    # The backend goes through the probe, not torch.
+    from pathlib import Path
+    src = Path("codai/backends/cuda.py").read_text()
+    i = src.index("def _detect_device"); j = src.index("def _get_gpu_memory_map")
+    assert "import torch" not in src[i:src.index("def _get_available_vram")]
+    assert "gpu_probe" in src[i:j]
+    prof = Path("packaging/runpod/profiles")
+    assert (prof / "llama.light").exists()
+    assert "nvidia-ml-py" in (prof / "llama.txt").read_text()

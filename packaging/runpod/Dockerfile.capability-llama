@@ -5,9 +5,9 @@
 # no local LoRA upload, nothing on the Tasks page. This image is coderai's
 # text path with llama-cpp-python compiled for CUDA in a toolchain stage —
 # SASS for Ampere through Blackwell plus PTX for what comes next — on the
-# full core, because the CUDA GGUF backend asks torch about the card.
+# LIGHT core: the GGUF backend asks NVML about the card, not torch.
 
-ARG CORE_BASE=coderai-capability-base:latest
+ARG CORE_BASE=coderai-capability-base-light:latest
 ARG CUDA_DEVEL=nvidia/cuda:12.8.1-devel-ubuntu24.04
 ARG LLAMA_CPP_PYTHON=0.3.30
 
@@ -40,12 +40,14 @@ COPY --from=wheel /wheels/ /tmp/wheels/
 RUN --mount=type=cache,target=/root/.cache/pip set -eux; \
     python -m pip install --extra-index-url ${TORCH_INDEX} -r /tmp/profiles/${PROFILE}.txt; \
     python -m pip install --no-cache-dir /tmp/wheels/llama_cpp_python-*.whl; \
-    python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"; \
+    if python -c "import torch" 2>/dev/null; then \
+        echo "ERROR: llama is a light-core image but torch reached its main venv" >&2; exit 1; \
+    fi; echo "main venv: no torch (light core, as intended)"; \
     rm -rf /tmp/profiles /tmp/wheels
 
-# The CUDA runtime the wheel links, from torch's own wheels; fail the BUILD if
-# libllama cannot find a library, rather than the pod at its first load.
-ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.12/site-packages/nvidia/cublas/lib:${LD_LIBRARY_PATH}
+# The CUDA runtime, cuBLAS and NCCL the wheel links, from NVIDIA's wheels; fail
+# the BUILD if libllama cannot find a library, rather than the pod at its load.
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.12/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.12/site-packages/nvidia/nccl/lib:${LD_LIBRARY_PATH}
 COPY packaging/runpod/check_llama_wheel.py /tmp/check_llama_wheel.py
 RUN python /tmp/check_llama_wheel.py && rm /tmp/check_llama_wheel.py
 

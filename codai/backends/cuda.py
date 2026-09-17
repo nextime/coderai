@@ -174,29 +174,20 @@ class NvidiaBackend(ModelBackend):
     
     def _detect_device(self) -> str:
         """Auto-detect available GPU or fall back to CPU."""
-        import torch
-        if torch.cuda.is_available():
-            if hasattr(torch.version, 'hip') and torch.version.hip is not None:
-                print(f"ROCm/HIP detected: {torch.version.hip}")
-                return "cuda"
-            else:
-                print(f"CUDA detected: {torch.version.cuda}")
-                return "cuda"
-        else:
-            print("No GPU detected, using CPU")
-            return "cpu"
+        # torch when present, NVML otherwise: a GGUF pod image carries no torch
+        # (see codai/backends/gpu_probe.py), and llama.cpp drives the card itself.
+        from codai.backends import gpu_probe
+        if gpu_probe.cuda_available():
+            print(f"{gpu_probe.runtime_label() or 'GPU'} detected")
+            return "cuda"
+        print("No GPU detected, using CPU")
+        return "cpu"
     
     def _get_available_vram(self) -> int:
         """Get available VRAM in bytes."""
-        import torch
-        if not torch.cuda.is_available():
-            return 0
+        from codai.backends import gpu_probe
         try:
-            total_vram = 0
-            for i in range(torch.cuda.device_count()):
-                props = torch.cuda.get_device_properties(i)
-                total_vram += props.total_memory
-            return total_vram
+            return sum(gpu_probe.total_memory_bytes())
         except Exception as e:
             print(f"Warning: Could not detect VRAM: {e}")
             return 0
@@ -447,8 +438,10 @@ class NvidiaBackend(ModelBackend):
         fixed 8 GB if it can't be read.
         """
         try:
-            import torch
-            free, _ = torch.cuda.mem_get_info()
+            from codai.backends import gpu_probe
+            free = gpu_probe.free_memory_bytes()
+            if free is None:
+                raise RuntimeError("no GPU memory probe")
             # Leave ~2 GB for activations/compute; KV above that goes to CPU.
             return max(int(2 * 1024 ** 3), int(free - 2 * 1024 ** 3))
         except Exception:

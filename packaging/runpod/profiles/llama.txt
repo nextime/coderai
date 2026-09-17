@@ -2,10 +2,17 @@
 # GPU generation, driving GGUF models through coderai's own CUDA backend —
 # the same kernels as the upstream ghcr.io/ggml-org/llama.cpp image, plus what
 # a coderai pod gives (TLS on the direct path, /boot, seeding, local LoRAs,
-# the Tasks page). FULL core: the GGUF backend asks torch about the card.
+# the Tasks page). LIGHT core: the GGUF backend used to ask torch about the
+# card; it asks NVML now (codai/backends/gpu_probe.py), so the 5 GB of torch
+# that put this image at 11.6 GB is gone. The wheel links the CUDA runtime,
+# cuBLAS and NCCL, which NVIDIA ships as wheels at the 12.8 it was built with.
 #
 # The wheel itself is compiled in Dockerfile.capability-llama's toolchain
 # stage (see the `llama.dockerfile` marker); this file lists what else the
 # text path needs.
+nvidia-cuda-runtime-cu12==12.8.90
+nvidia-cublas-cu12==12.8.4.1
+nvidia-nccl-cu12>=2.26
+nvidia-ml-py>=12.0.0
 sentencepiece>=0.1.99
 protobuf>=3.20.0
