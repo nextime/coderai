@@ -40,6 +40,7 @@ branch and the body is never buffered.
 from codai.api import pod_http
 import json
 import os
+import time
 import re
 from typing import Optional, Tuple
 
@@ -299,6 +300,18 @@ def _model_from_body(body: bytes, content_type: str, field: str = "model") -> st
 
 #: Endpoints whose "which model" field is not called `model`.
 _MODEL_FIELD = {"/v1/ocr": "engine", "/v1/ocr/batch": "engine"}
+
+
+#: base url -> when it first answered, for the first-minute retry above.
+_READY_AT: dict = {}
+
+
+def _pod_ready_at(base: str) -> float:
+    """When ``base`` was first handed out by a pool; now, if never seen."""
+    b = (base or "").rstrip("/")
+    if b not in _READY_AT:
+        _READY_AT[b] = time.time()
+    return _READY_AT[b]
 
 
 def _rewrite_request_field(body: bytes, headers: dict, field: str, value: str):
@@ -615,6 +628,24 @@ class RemoteGatewayMiddleware:
                                     headers=fwd, stream=True, timeout=(30, 3600))
         try:
             resp = await asyncio.to_thread(_call)
+            # The first request into a pod that came up seconds ago can land
+            # before the far side is really serving — RunPod's proxy answers
+            # 404 until its route settles, a catalogue may lag its /v1/models
+            # listing by a moment. Two verification runs failed exactly this
+            # way, 0 s after "ready", and passed unchanged a minute later. A
+            # not-found/unavailable answer in the first minute is retried a
+            # few times before it is believed.
+            for _wait in (3, 6, 10):
+                if resp.status_code not in (404, 502, 503):
+                    break
+                if time.time() - _pod_ready_at(base) > 60:
+                    break
+                print(f"[remote-gateway] {base} answered {resp.status_code} "
+                      f"{time.time() - _pod_ready_at(base):.0f}s after coming up — "
+                      f"retrying in {_wait}s", flush=True)
+                resp.close()
+                await asyncio.sleep(_wait)
+                resp = await asyncio.to_thread(_call)
         except Exception as exc:
             return await _error(send, 502, f"remote endpoint {base} unreachable: {exc}")
 

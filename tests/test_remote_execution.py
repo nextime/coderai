@@ -275,6 +275,17 @@ class _EchoRemote(BaseHTTPRequestHandler):
         type(self).hits.append({"path": self.path, "len": len(body),
                                 "ctype": self.headers.get("Content-Type", ""),
                                 "body": body})
+        # A remote that is "not ready yet": the first N requests 404, like
+        # RunPod's proxy before its route settles. See the readiness-race test.
+        if getattr(type(self), "not_ready", 0) > 0:
+            type(self).not_ready -= 1
+            out = b'{"detail":"Not Found"}'
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
         out = json.dumps({"served_by": "remote"}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -1939,3 +1950,32 @@ def test_a_host_model_holds_no_local_weights(monkeypatch):
     assert mgr._model_is_remote("m", {"backend": "runpod"}) is True
     monkeypatch.setattr(mgr, "resolve_engine_backend", lambda n: None)
     assert mgr._model_is_remote("m", {"backend": "vulkan"}) is False
+
+
+def test_a_fresh_pods_first_not_found_is_retried_not_believed(gateway_app, monkeypatch):
+    """Two verification runs failed with a 404 issued 0 s after the pod was
+    declared ready and passed unchanged a minute later: RunPod's proxy
+    answers 404 until its route settles. The first minute's not-found /
+    unavailable answers are retried before they are believed."""
+    import codai.api.remote_gateway as gw
+    client, gwm, url = gateway_app
+    gwm.capability_endpoints = lambda: {"images": url}
+    import asyncio as _aio
+    monkeypatch.setattr(_aio, "sleep", _fast_sleep)
+    gw._READY_AT.clear()
+    _EchoRemote.not_ready = 2
+    r = client.post("/v1/images/generations", json={"prompt": "x"})
+    assert r.status_code == 200 and r.json()["served_by"] == "remote"
+    assert len([h for h in _EchoRemote.hits if h["path"] == "/v1/images/generations"]) == 3
+
+    # A base that has been up for a while gets no such benefit of the doubt.
+    _EchoRemote.hits = []
+    _EchoRemote.not_ready = 1
+    gw._READY_AT[url.rstrip("/")] = 0.0
+    r = client.post("/v1/images/generations", json={"prompt": "x"})
+    assert r.status_code == 404
+    assert len(_EchoRemote.hits) == 1
+
+
+async def _fast_sleep(_s):
+    return None
