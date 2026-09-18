@@ -1,3 +1,15 @@
-# The version the local vLLM node runs (requirements-vllm.txt). vLLM pins its
-# own torch and CUDA libraries, which is why it cannot share the main venv.
-vllm==0.27.1
+# The version the local vLLM node runs (requirements-vllm.txt) — but NOT the
+# PyPI wheel: that one is built against CUDA 13 (torch 2.13+cu130), and a pod
+# whose host driver is CUDA 12.8 dies at engine start with "The NVIDIA driver
+# on your system is too old (found version 12080)". vLLM publishes a +cu129
+# variant on its own index, with torch's cu129 wheels; CUDA 12.x minor-version
+# compatibility runs a 12.9 runtime on a 12.8 driver. Resolved with uv (the
+# .uv marker): pip cannot cope with the pin set. The venv is ~10.5 GB (torch's
+# CUDA libraries, of which only cusolver is unused at import) and the image
+# ~12 GB; if RunPod refuses it, run this model with venv_on_volume instead.
+--extra-index-url https://wheels.vllm.ai/0.27.1/cu129
+--extra-index-url https://download.pytorch.org/whl/cu129
+vllm==0.27.1+cu129
+torch==2.13.0+cu129
+torchvision==0.28.0+cu129
+torchaudio==2.11.0+cu129

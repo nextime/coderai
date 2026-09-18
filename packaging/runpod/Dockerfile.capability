@@ -87,7 +87,10 @@ RUN set -eux; \
             # forty exact pins without installing a byte; uv resolved the same
             # set in seconds. A `<profile>.venv-<name>.uv` marker asks for it.
             python -m pip install --no-cache-dir uv; \
-            uv pip install --python "$vdir/bin/python" --no-cache -r "$extra"; \
+            # best-match across indexes: the torch index also carries stale copies
+            # of ordinary packages, and first-index-wins would pin those.
+            uv pip install --python "$vdir/bin/python" --no-cache \
+                --index-strategy unsafe-best-match -r "$extra"; \
         else \
             "$vdir/bin/pip" install --no-cache-dir -r "$extra"; \
         fi; \
