@@ -1039,8 +1039,18 @@ def test_direct_tcp_reaches_the_pod_without_the_proxy(monkeypatch):
     from codai.api import runpod_client as rc
     from codai.api.runpod_worker import parse_model_runpod
 
-    assert parse_model_runpod({}).direct_tcp is False              # proxy by default
-    assert parse_model_runpod({"direct_tcp": True}).direct_tcp is True
+    from codai.api.runpod_worker import direct_tcp_for
+    # Unset = decide by image: our images go direct (they serve TLS there),
+    # upstream images stay behind the proxy (it is the only TLS they have).
+    assert parse_model_runpod({}).direct_tcp is None
+    assert direct_tcp_for(parse_model_runpod({}), "coderai") is True
+    assert direct_tcp_for(parse_model_runpod({}), "vllm") is False
+    assert direct_tcp_for(parse_model_runpod({}), "llamacpp") is False
+    assert direct_tcp_for(parse_model_runpod({}), "custom") is False
+    # An explicit setting wins either way.
+    assert direct_tcp_for(parse_model_runpod({"direct_tcp": True}), "vllm") is True
+    assert direct_tcp_for(parse_model_runpod({"direct_tcp": False}), "coderai") is False
+    assert parse_model_runpod({"direct_tcp": "auto"}).direct_tcp is None
 
     ports = [{"ip": "203.0.113.7", "isIpPublic": True, "privatePort": 8000,
               "publicPort": 41234, "type": "tcp"}]
@@ -1119,6 +1129,7 @@ def test_a_direct_tcp_pod_speaks_tls_the_renting_coderai_can_verify(tmp_path, mo
     # Provisioning issues a cert only for coderai pods on the direct path.
     from codai.api.runpod_worker import parse_model_runpod
     assert parse_model_runpod({"direct_tcp": True}).direct_tcp is True
+    assert parse_model_runpod({"direct_tcp": "off"}).direct_tcp is False
     from pathlib import Path
     boot = Path("packaging/runpod/boot.sh").read_text()
     assert "CODERAI_TLS_CERT" in boot and "--ssl-certfile" in boot and "unset CODERAI_TLS_KEY" in boot

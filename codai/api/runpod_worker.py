@@ -74,8 +74,11 @@ class RunpodModelConfig:
     volume_path: str = ""                    # weights already on the volume (file or dir)
     # Reach the pod at its public ip:port instead of through RunPod's HTTP proxy.
     # The proxy is fronted by Cloudflare: TLS, but a 100 s idle limit per request
-    # and a request-body cap. Direct TCP has neither — and no TLS either.
-    direct_tcp: bool = False
+    # and a request-body cap. Direct TCP has neither, and a coderai image brings
+    # its own TLS on it — so it is the DEFAULT for our images (None = decide by
+    # image: direct for coderai, proxy for vLLM/llama.cpp/custom, which cannot
+    # take a certificate). True/False force it either way.
+    direct_tcp: Optional[bool] = None
     # Keep this pod's Python dependencies on the VOLUME instead of in the image,
     # and boot a small image that uses them. The first pod builds the venv (a few
     # minutes); every pod after skips both the 7 GB image pull and the install.
@@ -421,6 +424,20 @@ def resolve_pod_engine(mcfg: "RunpodModelConfig", model_key: str = "",
             or _looks_like_gguf(model_key):
         return "llamacpp"
     return "vllm"
+
+
+def direct_tcp_for(mcfg: "RunpodModelConfig", engine: str) -> bool:
+    """Whether this pod is reached at its public ip:port rather than the proxy.
+
+    An explicit setting wins. Otherwise a coderai image goes direct — it
+    serves TLS on that path, and the proxy's 100 s cutoff has already cost a
+    voice clone — while vLLM's, llama.cpp's and custom images stay behind the
+    proxy, which is the only TLS they have.
+    """
+    explicit = getattr(mcfg, "direct_tcp", None)
+    if explicit is not None:
+        return bool(explicit)
+    return (engine or "") == "coderai"
 
 
 def engine_pod_backend(entry: dict, mcfg: "RunpodModelConfig" = None) -> str:
@@ -1231,7 +1248,8 @@ def parse_model_runpod(block: Optional[dict]) -> RunpodModelConfig:
         cfg.cloud_types = ["SECURE"]
     cfg.volume_mount_path = (b.get("volume_mount_path") or "").strip()
     cfg.volume_path = (b.get("volume_path") or "").strip()
-    cfg.direct_tcp = _as_bool(b.get("direct_tcp"), False)
+    _dt = b.get("direct_tcp")
+    cfg.direct_tcp = None if _dt in (None, "", "auto") else _as_bool(_dt, False)
     cfg.venv_on_volume = _as_bool(b.get("venv_on_volume"), cfg.venv_on_volume)
     cfg.venv_name = (b.get("venv_name") or "").strip()
     cfg.slim_image = (b.get("slim_image") or "").strip()
@@ -1788,7 +1806,8 @@ class RunpodPodPool:
         # token. Only a coderai image knows what to do with it — vLLM's and
         # llama.cpp's images stay plain HTTP on this path, and say so.
         self._tls = False
-        if getattr(self.mcfg, "direct_tcp", False):
+        self._direct = direct_tcp_for(self.mcfg, plan.get("engine"))
+        if self._direct:
             # coderai pods only: boot.sh and the venv-on-volume bootstrap both
             # read the env; a custom image is anyone's guess and vLLM's and
             # llama.cpp's images ignore it, which would leave us speaking
@@ -1831,7 +1850,7 @@ class RunpodPodPool:
                     registry_auth_id=(self.mcfg.registry_auth_id
                                       or getattr(self.account, "registry_auth_id", "") or ""),
                     entrypoint=plan.get("entrypoint"), start_cmd=plan.get("start_cmd"),
-                    direct_tcp=bool(getattr(self.mcfg, "direct_tcp", False)))
+                    direct_tcp=bool(getattr(self, "_direct", False)))
                 return pod_id, sel, i + 1
             except RunpodError as exc:
                 msg = str(exc).lower()
@@ -1942,7 +1961,7 @@ class RunpodPodPool:
             url = ""
             try:
                 url = client.wait_ready(pod_id, port, ready_timeout=boot_to,
-                                        direct_tcp=bool(getattr(self.mcfg, "direct_tcp", False)),
+                                        direct_tcp=bool(getattr(self, "_direct", False)),
                                         tls=bool(getattr(self, "_tls", False)))
                 t_port = time.time()
                 print(f"[runpod] pod {pod_id}: port open after "

@@ -111,7 +111,7 @@ _OCR_ENGINES = ("paddle", "doctr", "surya")
 
 def _pin_to_runpod(model: str, engine: str, vram: float, usd: float,
                    image: str = "", add_as: str = "",
-                   capability: str = "", direct_tcp: bool = False) -> bool:
+                   capability: str = "", direct_tcp=None) -> bool:
     """Give this ONE model a runpod block. True when the catalogue changed."""
     data = _load_models()
     section, index, entry = _find(data, model)
@@ -147,11 +147,9 @@ def _pin_to_runpod(model: str, engine: str, vram: float, usd: float,
         # that had already been published under that very tag. Production still
         # runs `:latest`; this override exists so a result means something.
         entry["runpod"]["image"] = image
-    if direct_tcp:
-        # The pod's public ip:port instead of the Cloudflare-fronted proxy —
-        # with TLS the pod brings itself on a coderai image. Exercised here
-        # because nothing else does until a request runs past 100 s.
-        entry["runpod"]["direct_tcp"] = True
+    if direct_tcp is not None:
+        # Force the path; None leaves the default (direct for coderai images).
+        entry["runpod"]["direct_tcp"] = bool(direct_tcp)
     data[section][index] = entry
     _save_models(data)
     os.utime(MODELS, None)           # the front watches this mtime to push a reload
@@ -222,8 +220,10 @@ def main() -> int:
                          "cached ':latest' and the result would not say which "
                          "build it exercised.")
     ap.add_argument("--direct-tcp", action="store_true",
-                    help="reach the pod at its public ip:port (TLS on coderai "
-                         "images) instead of RunPod's Cloudflare-fronted proxy")
+                    help="force the pod's public ip:port (the default for coderai "
+                         "images already); --proxy forces RunPod's proxy instead")
+    ap.add_argument("--proxy", action="store_true",
+                    help="force RunPod's Cloudflare-fronted proxy")
     args = ap.parse_args()
 
     backup = MODELS + ".testrun-backup"
@@ -247,7 +247,7 @@ def main() -> int:
             print(f"================ {model} ================", flush=True)
             if not _pin_to_runpod(model, args.engine, args.vram, args.usd,
                                   args.image, args.add_as, args.capability,
-                                  direct_tcp=args.direct_tcp):
+                                  direct_tcp=(True if args.direct_tcp else (False if args.proxy else None))):
                 results.append((model, {"error": "not in models.json"}))
                 continue
             problem = _wait_for_engine(model)

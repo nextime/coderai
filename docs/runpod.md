@@ -129,7 +129,7 @@ sync.) In `models.json` that is a `backend` pin plus a `runpod` block:
 | `served_model` | — | The HF repo id the pod actually serves. **Required for pods.** |
 | `image` | `vllm/vllm-openai:latest` | Container image. Must expose an OpenAI-compatible server. |
 | `port` | `8000` | Port the server listens on inside the container. |
-| `direct_tcp` | `false` | Talk to the pod at its public `ip:port` instead of through RunPod's HTTPS proxy. The proxy (`<pod>-<port>.proxy.runpod.net`) sits behind **Cloudflare**: TLS for free, but a 100 s idle limit per request — a slow *non-streaming* request (a long render, a cold 150 GB engine's first token) can be cut off with a 524 while the pod is still working — and a request-body cap. Direct TCP has neither limit. **coderai pods bring their own TLS on this path**: a certificate from this install's CA (`<config>/runpod/tls/ca.pem`, created on first use with `openssl`) is issued per pod and sent as environment; the pod serves HTTPS on it and this side verifies against that CA — so the token and the payloads stay encrypted. vLLM's and llama.cpp's images cannot take the certificate and stay plain HTTP on this path (the log says so). |
+| `direct_tcp` | *auto* | **Auto = direct for coderai images, proxy for vLLM / llama.cpp / custom.** Talk to the pod at its public `ip:port` instead of through RunPod's HTTPS proxy. The proxy (`<pod>-<port>.proxy.runpod.net`) sits behind **Cloudflare**: TLS for free, but a 100 s idle limit per request — a slow *non-streaming* request (a long render, a cold 150 GB engine's first token) can be cut off with a 524 while the pod is still working — and a request-body cap. Direct TCP has neither limit. **coderai pods bring their own TLS on this path**: a certificate from this install's CA (`<config>/runpod/tls/ca.pem`, created on first use with `openssl`) is issued per pod and sent as environment; the pod serves HTTPS on it and this side verifies against that CA — so the token and the payloads stay encrypted. vLLM's and llama.cpp's images cannot take the certificate and stay plain HTTP on this path (the log says so). |
 | `ctx` | — | Passed as vLLM's `--max-model-len`. |
 | `container_disk_gb` | `40` | Grown automatically to fit the weights unless a network volume holds them; an explicit larger value is respected. |
 | `weights_gb` | — | State the model's size and the estimate is skipped. The only honest answer for a URL download, an upload or a local file — the estimator cannot see those — and for an HF repo it beats a heuristic that errs high. Also accepted on the model entry itself. |
@@ -273,8 +273,8 @@ the RAM they need, not just the VRAM — `min_vram_gb` says nothing about RAM.
 ## 3. Request flow
 
 ```
-client ──▶ front proxy ──▶ primary engine ──▶ RunpodBackend ──▶ https://<pod>-8000.proxy.runpod.net/v1
-                                                            (or http://<public-ip>:<port>/v1 with direct_tcp)
+client ──▶ front proxy ──▶ primary engine ──▶ RunpodBackend ──▶ https://<public-ip>:<port>/v1   (coderai images: direct, pod TLS)
+                                                            or https://<pod>-8000.proxy.runpod.net/v1 (vLLM / llama.cpp images)
                                                             └─▶ https://api.runpod.ai/v2/<eid>/openai/v1
 ```
 

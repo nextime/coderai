@@ -842,8 +842,13 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             </div>
           </div>
           <div class="form-row" style="margin:.5rem 0 0">
-            <label style="display:flex;align-items:center;gap:.3rem;font-size:12px"><input type="checkbox" id="cfg-rp-direct-tcp" style="width:auto"> Direct TCP to the pod (bypass RunPod's proxy / Cloudflare)</label>
-            <span class="form-hint" style="font-size:11px">Default is RunPod's HTTPS proxy, which sits behind Cloudflare: TLS, but a 100 s idle limit per request and a body-size cap — a slow non-streaming render can be cut off with a 524. Direct TCP talks to the pod's public ip:port with neither limit. coderai pods serve HTTPS on it with a certificate from this install's own CA, so nothing travels in clear; vLLM / llama.cpp images cannot take a certificate and stay plain HTTP on this path.</span>
+            <label class="form-label">Reach the pod</label>
+            <select id="cfg-rp-direct-tcp" class="form-input">
+              <option value="auto">Auto — direct for coderai images, RunPod's proxy for vLLM / llama.cpp / custom</option>
+              <option value="on">Direct TCP — the pod's public ip:port (coderai images serve TLS on it)</option>
+              <option value="off">RunPod proxy — behind Cloudflare: 100 s idle cutoff per request, body-size cap</option>
+            </select>
+            <span class="form-hint" style="font-size:11px">Direct has no request cutoff and no body cap; coderai images bring a certificate from this install's own CA so nothing travels in clear. vLLM / llama.cpp images cannot take a certificate, so on the direct path they would be plain HTTP — the proxy is their TLS.</span>
           </div>
           <div class="form-row" style="margin:.5rem 0 0">
             <label class="form-label">Share pod pool <span class="muted">(optional name)</span></label>
@@ -4310,7 +4315,7 @@ function _populateRunpod(s){
   set('cfg-rp-volume', rp.network_volume_id || '');
   set('cfg-rp-volume-path', rp.volume_path || '');
   chk('cfg-rp-venv-volume', rp.venv_on_volume);
-  chk('cfg-rp-direct-tcp', rp.direct_tcp);
+  set('cfg-rp-direct-tcp', rp.direct_tcp === true ? 'on' : (rp.direct_tcp === false ? 'off' : 'auto'));
   set('cfg-rp-source', rp.source || 'auto');
   set('cfg-rp-hf-repo', rp.hf_repo || '');
   set('cfg-rp-model-url', rp.model_url || '');
@@ -4491,7 +4496,7 @@ function _collectRunpod(){
     network_volume_id:  (val('cfg-rp-volume') || '').trim(),
     volume_path:        (val('cfg-rp-volume-path') || '').trim(),
     venv_on_volume:     document.getElementById('cfg-rp-venv-volume').checked,
-    direct_tcp:         document.getElementById('cfg-rp-direct-tcp').checked,
+    direct_tcp:         val('cfg-rp-direct-tcp') || 'auto',
     source:             val('cfg-rp-source') || 'auto',
     hf_repo:            (val('cfg-rp-hf-repo') || '').trim(),
     model_url:          (val('cfg-rp-model-url') || '').trim(),

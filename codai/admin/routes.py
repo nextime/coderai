@@ -2812,7 +2812,7 @@ async def api_model_configure(request: Request, username: str = Depends(require_
             rpo["cloud_types"] = ct
         # bools
         for k in ("allow_spot", "allow_open_pod", "sticky_sessions", "keep_warm",
-                  "model_url_is_tar", "venv_on_volume", "direct_tcp"):
+                  "model_url_is_tar", "venv_on_volume"):
             if k in src and src.get(k) is not None and src.get(k) != "":
                 sv = src.get(k)
                 rpo[k] = (sv.lower() in ("1", "true", "on", "yes")
@@ -2837,6 +2837,13 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                     rpo[k] = float(v)
                 except (TypeError, ValueError):
                     pass
+        # direct_tcp is three-state: absent/"auto" = decide by image (direct
+        # for coderai images), "on"/"off" or a bool force it.
+        dt = src.get("direct_tcp")
+        if isinstance(dt, bool):
+            rpo["direct_tcp"] = dt
+        elif isinstance(dt, str) and dt.strip().lower() in ("on", "off", "true", "false", "1", "0"):
+            rpo["direct_tcp"] = dt.strip().lower() in ("on", "true", "1")
         # env dict (extra pod env)
         env = src.get("env")
         if isinstance(env, dict) and env:
