@@ -76,7 +76,10 @@ RUN --mount=type=cache,target=/root/.cache/pip set -eux; \
 # library during a cold start costs more than carrying the layer.
 ARG PROFILE
 COPY packaging/runpod/profiles/ /tmp/venv-profiles/
-RUN set -eux; \
+# Cache mounts for both installers: a venv rebuild (the apt layer above it
+# changed, say) re-downloads nothing — which matters, because PyPI's CDN
+# throttles a machine that has pulled 100 GB of wheels in a day to ~400 KB/s.
+RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=/root/.cache/uv set -eux; \
     for extra in /tmp/venv-profiles/${PROFILE}.venv-*.txt; do \
         [ -f "$extra" ] || continue; \
         name="$(basename "$extra" .txt)"; name="${name#${PROFILE}.venv-}"; \
@@ -89,14 +92,14 @@ RUN set -eux; \
             python -m pip install --no-cache-dir uv; \
             # best-match across indexes: the torch index also carries stale copies
             # of ordinary packages, and first-index-wins would pin those.
-            uv pip install --python "$vdir/bin/python" --no-cache \
+            uv pip install --python "$vdir/bin/python" \
                 --index-strategy unsafe-best-match -r "$extra"; \
         else \
-            "$vdir/bin/pip" install --no-cache-dir -r "$extra"; \
+            "$vdir/bin/pip" install -r "$extra"; \
         fi; \
         nodeps="${extra%.txt}.nodeps"; \
         if [ -f "$nodeps" ]; then \
-            "$vdir/bin/pip" install --no-cache-dir --no-deps -r "$nodeps"; \
+            "$vdir/bin/pip" install --no-deps -r "$nodeps"; \
         fi; \
         find "$vdir" -name __pycache__ -type d -prune -exec rm -rf {} +; \
         "$vdir/bin/python" -c "import ${name}; print('${name}', getattr(${name}, '__version__', 'ok'), 'in its own venv')"; \
