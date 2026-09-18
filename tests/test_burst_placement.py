@@ -1222,3 +1222,45 @@ def test_the_gguf_backend_can_size_the_card_without_torch(monkeypatch):
     prof = Path("packaging/runpod/profiles")
     assert (prof / "llama.light").exists()
     assert "nvidia-ml-py" in (prof / "llama.txt").read_text()
+
+
+def test_a_pod_that_refuses_connections_is_dropped_and_the_request_retried(monkeypatch):
+    """The harness reaped a pod by API; the engine's pool still held it as
+    healthy until the next timed probe, and the next request died on
+    'connection refused' for something the pool could have known."""
+    import requests
+    from codai.backends import runpod as rb
+    from codai.api.runpod_worker import PodHandle
+
+    dead = PodHandle(pod_id="dead", url="https://203.0.113.9:1", hourly_usd=0.3, started_at=0)
+    live = PodHandle(pod_id="live", url="https://203.0.113.10:1", hourly_usd=0.3, started_at=0)
+    handed = iter([dead, live])
+    class _Pool:
+        pods = [dead, live]; discarded = []
+        def acquire(self, timeout=1200.0, affinity=""):
+            p = next(handed); return p, p.url
+        def release(self, p): pass
+        def discard(self, p, reason=""): self.discarded.append((p.pod_id, reason)); self.pods.remove(p)
+    pool = _Pool()
+
+    b = rb.RunpodBackend.__new__(rb.RunpodBackend)
+    b._mode = "pods"; b._pool = pool; b._headers = {}; b._url = ""
+    b._enter_request = lambda: None; b._exit_request = lambda: None
+    b._chat_payload = lambda *a, **k: {"messages": []}
+    b._store_usage = lambda u: None
+
+    calls = []
+    class _R:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {"choices": [{"message": {"content": "hi"}}], "usage": {}}
+    def _post(url, **kw):
+        calls.append(url)
+        if "203.0.113.9" in url:
+            raise requests.exceptions.ConnectionError("refused")
+        return _R()
+    monkeypatch.setattr(rb.pod_http, "post", _post)
+
+    assert b.generate_chat([{"role": "user", "content": "x"}]) == "hi"
+    assert [u.split("/")[2] for u in calls] == ["203.0.113.9:1", "203.0.113.10:1"]
+    assert pool.discarded == [("dead", "connection refused")] and dead not in pool.pods

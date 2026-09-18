@@ -154,7 +154,19 @@ class RunpodBackend(ModelBackend):
         pod, url = self._pool.acquire()
         # The pod runs a vLLM OpenAI server at /v1; its proxy URL has no path, so
         # add /v1 to match the serverless base (which already ends in /openai/v1).
+        self._last_pod = pod
         return url.rstrip("/") + "/v1", (lambda: self._pool.release(pod))
+
+    def _unreachable(self) -> None:
+        """The pod refused the connection: drop it and let the caller retry.
+
+        A pod terminated behind the pool's back (the test harness reaping by
+        API, a reclaimed spot machine) stays "healthy" until the next timed
+        probe; without this, one request in that window fails for nothing.
+        """
+        pod = getattr(self, "_last_pod", None)
+        if pod is not None and self._pool is not None:
+            self._pool.discard(pod, "connection refused")
 
     def _store_usage(self, usage: dict) -> None:
         if usage:
@@ -193,38 +205,62 @@ class RunpodBackend(ModelBackend):
                       top_p=1.0, stop=None, tools=None, response_format=None):
         import requests
         self._enter_request()
-        base, release = self._acquire_endpoint()
         try:
-            payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, False)
-            if response_format and response_format.get("type") == "json_object":
-                payload["response_format"] = {"type": "json_object"}
-            if tools:
-                payload["tools"] = tools
-            r = pod_http.post(base + "/chat/completions", json=payload,
-                              headers=self._headers, timeout=3600)
-            r.raise_for_status()
-            data = r.json()
-            self._store_usage(data.get("usage", {}))
-            return data["choices"][0]["message"].get("content") or ""
+            for attempt in (1, 2):
+                base, release = self._acquire_endpoint()
+                try:
+                    payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, False)
+                    if response_format and response_format.get("type") == "json_object":
+                        payload["response_format"] = {"type": "json_object"}
+                    if tools:
+                        payload["tools"] = tools
+                    r = pod_http.post(base + "/chat/completions", json=payload,
+                                      headers=self._headers, timeout=3600)
+                except requests.exceptions.ConnectionError:
+                    # Nothing answered at all: the pod is gone. Once, on a
+                    # fresh pod — a second refusal is a real outage.
+                    release()
+                    self._unreachable()
+                    if attempt == 2:
+                        raise
+                    continue
+                try:
+                    r.raise_for_status()
+                    data = r.json()
+                    self._store_usage(data.get("usage", {}))
+                    return data["choices"][0]["message"].get("content") or ""
+                finally:
+                    release()
         finally:
-            release()
             self._exit_request()
 
     async def generate_chat_stream(self, messages: List[Dict], max_tokens=None,
                                    temperature=0.7, top_p=1.0, stop=None, tools=None,
                                    response_format=None) -> AsyncGenerator[str, None]:
+        import requests
         self._enter_request()
-        # Pod acquire may provision (blocking) — do it off the event loop.
-        base, release = await asyncio.to_thread(self._acquire_endpoint)
         try:
-            payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, True)
-            if tools:
-                payload["tools"] = tools
-            async for chunk in self._stream(base + "/chat/completions", payload,
-                                            delta_key="delta"):
-                yield chunk
+            for attempt in (1, 2):
+                # Pod acquire may provision (blocking) — do it off the event loop.
+                base, release = await asyncio.to_thread(self._acquire_endpoint)
+                payload = self._chat_payload(messages, max_tokens, temperature, top_p, stop, True)
+                if tools:
+                    payload["tools"] = tools
+                try:
+                    async for chunk in self._stream(base + "/chat/completions", payload,
+                                                    delta_key="delta"):
+                        yield chunk
+                except requests.exceptions.ConnectionError:
+                    # Refused before a byte arrived: the pod is gone. Drop it
+                    # and go again on a fresh one, once.
+                    self._unreachable()
+                    if attempt == 2:
+                        raise
+                    continue
+                finally:
+                    release()
+                return
         finally:
-            release()
             self._exit_request()
 
     # ------------------------------------------------------------------ #

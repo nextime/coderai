@@ -2164,6 +2164,23 @@ class RunpodPodPool:
             pod.last_used = time.time()
             self._cv.notify_all()
 
+    def discard(self, pod: PodHandle, reason: str = "unreachable") -> None:
+        """Drop a pod that refused a connection, now, not at the next sweep.
+
+        The maintenance loop probes on a timer; between two probes a pod that
+        was terminated behind the pool's back (the test harness reaping by
+        API, RunPod reclaiming a spot machine) is still handed out, and the
+        request fails with "connection refused" for something the pool could
+        have known. The caller retries on a fresh acquire.
+        """
+        with self._cv:
+            if pod not in self.pods:
+                return
+            pod.healthy = False
+            self.pods.remove(pod)
+        print(f"[runpod] pod {pod.pod_id} dropped from the pool: {reason}", flush=True)
+        threading.Thread(target=self._terminate, args=(pod, reason), daemon=True).start()
+
     def _terminate(self, pod: PodHandle, reason: str):
         if getattr(pod, "gpu", "") == "(shared)":
             # Borrowed from another engine: it owns the lifecycle and the bill.
