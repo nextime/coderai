@@ -1,0 +1,4 @@
+# Triton JIT-compiles vLLM's kernels at run time and needs a C compiler for its
+# launcher stubs; without one the engine core dies before it registers.
+gcc
+libc6-dev

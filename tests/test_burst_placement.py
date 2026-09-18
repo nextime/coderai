@@ -1264,3 +1264,16 @@ def test_a_pod_that_refuses_connections_is_dropped_and_the_request_retried(monke
     assert b.generate_chat([{"role": "user", "content": "x"}]) == "hi"
     assert [u.split("/")[2] for u in calls] == ["203.0.113.9:1", "203.0.113.10:1"]
     assert pool.discarded == [("dead", "connection refused")] and dead not in pool.pods
+
+
+def test_the_vllm_worker_reports_the_root_cause_not_the_wrapper_traceback():
+    """On a pod the 503 body is all anyone gets, and it carried the last six
+    lines — vLLM's own "Engine core initialization failed. See root cause
+    above". The root cause IS above; surface it."""
+    from pathlib import Path
+    src = Path("codai/api/vllm_worker.py").read_text()
+    assert "keyed = " in src and '"Traceback"' in src
+    prof = Path("packaging/runpod/profiles")
+    for p in ("vllm", "engines-kt"):
+        assert "gcc" in (prof / f"{p}.apt").read_text(), f"{p}: Triton needs a C compiler"
+    assert ".apt" in Path("packaging/runpod/Dockerfile.capability").read_text()

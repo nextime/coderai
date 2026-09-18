@@ -275,7 +275,19 @@ def ensure_service(cfg, model_path: Optional[str] = None,
         _services[svc_key] = {"proc": proc, "port": port, "url": url}
 
     def _tail_msg():
-        joined = " | ".join(list(tail)[-6:]).strip()
+        # The last six lines of a vLLM crash are the wrapper's own traceback
+        # ("Engine core initialization failed. See root cause above.") — the
+        # root cause IS above, and on a pod this message is all anyone gets.
+        # Prefer the lines that name an error; fall back to a longer tail.
+        lines = [l.strip() for l in tail if l.strip()]
+        keyed = [l for l in lines if any(k in l for k in ("Error", "error:", "not found",
+                                                          "No such", "CUDA", "Traceback"))]
+        chosen = (keyed[-8:] if keyed else []) + lines[-6:]
+        seen, out = set(), []
+        for l in chosen:
+            if l not in seen:
+                seen.add(l); out.append(l[:300])
+        joined = " | ".join(out)
         return f". Last output: {joined}" if joined else ""
 
     deadline = time.time() + ready_timeout
