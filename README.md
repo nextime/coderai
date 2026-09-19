@@ -17,6 +17,14 @@ one isn't enough.
 
 ### Core Capabilities
 - **OpenAI-Compatible API**: Drop-in replacement for OpenAI's API endpoints
+- **Orchestration**: one front routes every request to the right runtime, card, machine or
+  cloud — engines per GPU here, other coderai installs as **cluster nodes**, pools of hosts
+  and remotes, RunPod pods — by capability, load and per-model pins
+- **Distribution**: one model over several machines' cards — a GGUF over llama.cpp RPC,
+  an HF model over vLLM on Ray or SGLang multi-node — as easily as over two local GPUs
+- **Escalation**: when the local cards are not enough, the same model runs on a machine you
+  own, then on a GPU rented by the second, with budgets and a reaper; remote or bursting,
+  chosen per model. See [`docs/cluster.md`](docs/cluster.md), [`docs/remote-execution.md`](docs/remote-execution.md), [`docs/runpod.md`](docs/runpod.md)
 - **Web Studio**: Modern UI for all generation tasks — chat, image, video, audio, pipelines
 - **Configuration-Based**: JSON config files for all settings — no complex CLI arguments
 - **Multi-Modal**: Text, image, video, audio, TTS, STT, embeddings
