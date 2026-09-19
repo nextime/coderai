@@ -25,7 +25,6 @@ one isn't enough.
 - **Escalation**: when the local cards are not enough, the same model runs on a machine you
   own, then on a GPU rented by the second, with budgets and a reaper; remote or bursting,
   chosen per model. See [`docs/cluster.md`](docs/cluster.md), [`docs/remote-execution.md`](docs/remote-execution.md), [`docs/runpod.md`](docs/runpod.md)
-- **Web Studio**: Modern UI for all generation tasks — chat, image, video, audio, pipelines
 - **Configuration-Based**: JSON config files for all settings — no complex CLI arguments
 - **Multi-Modal**: Text, image, video, audio, TTS, STT, embeddings
 - **Per-Model Configuration**: Individual settings for each model (GPU layers, quantization, context size)
@@ -38,6 +37,11 @@ one isn't enough.
 - **Prompt Aggregation**: Batch concurrent requests into a single inference pass for higher throughput
 - **Custom Pipelines**: Create and save multi-step workflows combining any generation tasks
 - **Pre-Built Pipelines**: Ready-to-use pipelines for common workflows (image-to-video, dubbing, story generation)
+
+### Interfaces
+- **Web Studio**: a UI for every generation task — chat, image, video, audio, pipelines
+- **Admin dashboard**: models, engines, tasks, cluster, RunPod, tokens and settings, served by
+  the torch-free front so it stays live while an engine is busy
 
 ### GPU Backend Support
 - **NVIDIA (CUDA)**: PyTorch + Transformers for HuggingFace models
