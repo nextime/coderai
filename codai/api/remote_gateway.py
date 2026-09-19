@@ -575,12 +575,13 @@ def resolve_target(path: str, method: str, query: str, body: bytes,
                 "service_url or a RunPod pod on the model, or a remote for its "
                 "capability")
         return None
-    urls = capability_endpoint_lists().get(cap, [])
-    url = urls[0] if urls else ""
+    url = capability_endpoints().get(cap, "")
     # "runpod" as the endpoint is shorthand for "use the pod block for this
     # capability" — so the common case needs no second config block.
     if url and url.strip().lower() != "runpod":
-        if len(urls) > 1:
+        # Several URLs for the capability form a pool with failover.
+        urls = capability_endpoint_lists().get(cap, [])
+        if len(urls) > 1 and urls[0] == url:
             return Target(pool=get_endpoint_pool(cap, urls),
                           reason=f"capability {cap!r} ({len(urls)} remotes)")
         return Target(url=url, reason=f"capability {cap!r}")

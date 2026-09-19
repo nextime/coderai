@@ -43,6 +43,7 @@ from codai.api import pod_http
 import shlex
 import subprocess
 import threading
+from typing import Optional
 import time
 from dataclasses import dataclass, field
 
@@ -110,7 +111,10 @@ def parse_hosts(block: dict) -> list:
     for h in (extra or []):
         if not isinstance(h, dict) or not str(h.get("url") or "").strip():
             continue
-        merged = {k: v for k, v in b.items() if k not in ("hosts", "urls")}
+        # Token, health path, timeouts and env carry over; a start/stop command
+        # names ONE machine and never applies to another.
+        merged = {k: v for k, v in b.items()
+                  if k not in ("hosts", "urls", "url", "start_cmd", "stop_cmd")}
         merged.update({k: v for k, v in h.items() if v not in (None, "")})
         cfg = parse_host(merged)
         if cfg.url and all(cfg.url != o.url for o in out):
@@ -153,10 +157,15 @@ class HostPool:
         self._lock = threading.RLock()
         self._inflight = {c.url: 0 for c in cfgs}
         self._last_used = 0.0
-        self._started_by_us = {c.url: False for c in cfgs}
+        self._started = {c.url: False for c in cfgs}
         self._stoppers = {}
         self._healthy_until = {}
         self._down_until = {}
+
+    @property
+    def _started_by_us(self) -> bool:
+        """True while any host of this pool is up because we started it."""
+        return any(self._started.values())
 
     def _by_url(self, url: str) -> HostConfig:
         for c in self.cfgs:
@@ -190,9 +199,9 @@ class HostPool:
                 if not startable:
                     urls = ", ".join(c.url for c in self.cfgs)
                     raise HostError(
-                        f"no host for {self.model_key!r} is answering ({urls}), and "
-                        f"none has a start_cmd — they are configured as always-on, "
-                        f"so they should be up.")
+                        f"host for {self.model_key!r} at {urls} is not answering "
+                        f"{self.cfg.health_path}, and it has no start_cmd — it is "
+                        f"configured as always-on, so it should be up.")
                 chosen = startable[0]
                 self._start(chosen)
             self._inflight[chosen.url] = self._inflight.get(chosen.url, 0) + 1
@@ -208,7 +217,7 @@ class HostPool:
                 self._inflight[url] -= 1
             self._last_used = time.time()
             cfg = self._by_url(url)
-            if cfg.stop_cmd and self._started_by_us.get(url) and cfg.idle_timeout_s:
+            if cfg.stop_cmd and self._started.get(url) and cfg.idle_timeout_s:
                 self._arm_stopper(cfg)
 
     def failover(self, failed_url: str):
@@ -229,12 +238,12 @@ class HostPool:
     def _start(self, cfg: HostConfig) -> None:
         print(f"[host] starting {self.model_key!r} on {cfg.url}: {cfg.start_cmd}",
               flush=True)
-        self._run(cfg, cfg.start_cmd)
+        self._run(cfg.start_cmd)
         deadline = time.time() + cfg.boot_timeout_s
         t0 = time.time()
         while time.time() < deadline:
             if _health_ok(cfg.url, cfg.health_path, cfg.api_key):
-                self._started_by_us[cfg.url] = True
+                self._started[cfg.url] = True
                 self._healthy_until[cfg.url] = time.time() + self._HEALTH_TTL
                 print(f"[host] {self.model_key!r} up after {time.time() - t0:.0f}s "
                       f"at {cfg.url}", flush=True)
@@ -259,9 +268,9 @@ class HostPool:
                 print(f"[host] {self.model_key!r} on {cfg.url} idle {idle:.0f}s — "
                       f"{cfg.stop_cmd}", flush=True)
                 try:
-                    self._run(cfg, cfg.stop_cmd)
+                    self._run(cfg.stop_cmd)
                 finally:
-                    self._started_by_us[cfg.url] = False
+                    self._started[cfg.url] = False
                     self._healthy_until.pop(cfg.url, None)
                     self._stoppers.pop(cfg.url, None)
 
@@ -270,8 +279,10 @@ class HostPool:
         self._stoppers[cfg.url] = t
         t.start()
 
-    def _run(self, cfg: HostConfig, cmd: str) -> None:
+    def _run(self, cmd: str) -> None:
         import os
+        # The env of the host whose command this is (several hosts may differ).
+        cfg = next((c for c in self.cfgs if cmd in (c.start_cmd, c.stop_cmd)), self.cfg)
         env = {**os.environ, **cfg.env}
         try:
             r = subprocess.run(shlex.split(cmd), env=env, capture_output=True,
@@ -289,17 +300,17 @@ class HostPool:
                 t.cancel()
             self._stoppers.clear()
             for cfg in self.cfgs:
-                if cfg.stop_cmd and self._started_by_us.get(cfg.url):
+                if cfg.stop_cmd and self._started.get(cfg.url):
                     try:
-                        self._run(cfg, cfg.stop_cmd)
+                        self._run(cfg.stop_cmd)
                     finally:
-                        self._started_by_us[cfg.url] = False
+                        self._started[cfg.url] = False
 
     def status(self) -> list:
         return [{"url": c.url, "on_demand": bool(c.start_cmd),
                  "inflight": self._inflight.get(c.url, 0),
                  "healthy": self._healthy(c, probe=False),
-                 "started_by_us": self._started_by_us.get(c.url, False)}
+                 "started_by_us": self._started.get(c.url, False)}
                 for c in self.cfgs]
 
 

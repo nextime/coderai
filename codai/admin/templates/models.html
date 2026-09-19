@@ -1017,7 +1017,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             <div class="form-row" style="margin:0"><label class="form-label">Idle timeout (s)</label><input type="number" id="cfg-host-idle" class="form-input" min="0" placeholder="600"></div>
           </div>
           <div class="form-row" style="margin:.5rem 0 0">
-            <label class="form-label">More machines <span class="muted">— one per line: <code>url | token | start command | stop command</code> (blank fields inherit the ones above)</span></label>
+            <label class="form-label">More machines <span class="muted">— one per line: <code>url | token | start command | stop command</code> (a blank token inherits the one above; start/stop commands are per machine)</span></label>
             <textarea id="cfg-host-hosts" class="form-input" rows="2" style="font-family:monospace;font-size:11px" placeholder="http://gpubox2:8000 | tokenB | ssh gpubox2 docker start coderai-images | ssh gpubox2 docker stop coderai-images"></textarea>
             <span class="form-hint" style="font-size:11px">Several machines form a pool: each request goes to the healthy one with the fewest in flight, a dead one is skipped for 30 s and the request moves on, and an on-demand machine is started only when none is up.</span>
           </div>
