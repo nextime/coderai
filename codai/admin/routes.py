@@ -2778,6 +2778,16 @@ async def api_model_configure(request: Request, username: str = Depends(require_
             entry["distribute"] = blk
         else:
             entry.pop("distribute", None)
+    # Parts of a video pipeline on other machines (codai/cluster/components.py).
+    if "components" in data:
+        src = data.get("components") if isinstance(data.get("components"), dict) else {}
+        blk = {k: str(v).strip() for k, v in src.items()
+               if k in ("text_encoder", "low_noise", "vae") and isinstance(v, str)
+               and v.strip() and v.strip().lower() not in ("local", "here", "auto")}
+        if blk:
+            entry["components"] = blk
+        else:
+            entry.pop("components", None)
     # Per-model engine blocks laid over the global template: vLLM (parallelism,
     # ray nodes), SGLang/kt (nnodes, ranks' commands). A block with nothing set
     # is dropped so the entry stays clean.

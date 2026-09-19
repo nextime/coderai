@@ -637,6 +637,15 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           </div>
         </div>
       </div>
+      <div class="form-row" id="cfg-comp-row" style="margin-top:.75rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
+        <label class="form-label" style="font-weight:600">Pipeline parts on other machines <span class="muted" style="font-weight:400">— video models (Wan)</span></label>
+        <span class="form-hint" style="font-size:11px;line-height:1.5">A video model is several models run one after the other; what passes between them is small. Name a cluster node for a part and that part runs there: the <b>text encoder</b> (UMT5-XXL, 11 GB) encodes the prompt elsewhere; the <b>low-noise expert</b> of a Wan 2.2 dual-expert model takes over at the expert boundary (latents handed over, a few MB); the <b>VAE</b> decodes elsewhere and returns the finished video. Blank = here. The node needs the same model.</span>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.6rem;margin-top:.4rem">
+          <div class="form-row" style="margin:0"><label class="form-label">Text encoder on</label><input type="text" id="cfg-comp-te" class="form-input" placeholder="here"></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Low-noise expert on</label><input type="text" id="cfg-comp-low" class="form-input" placeholder="here"></div>
+          <div class="form-row" style="margin:0"><label class="form-label">VAE decode on</label><input type="text" id="cfg-comp-vae" class="form-input" placeholder="here"></div>
+        </div>
+      </div>
       <div class="form-row" id="cfg-rpc-row" style="margin-top:.75rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
         <label class="form-label" style="font-weight:600">Cards on other machines <span class="muted" style="font-weight:400">— llama.cpp RPC servers, one model over several machines</span></label>
         <input type="text" id="cfg-rpc-servers" class="form-input" list="cfg-rpc-known" placeholder="host:50052, host2:50052   (blank = this machine only)">
@@ -4344,6 +4353,10 @@ function _updateDistVisibility(){
 function _populateCluster(m, s){
   window._cfgCurrentPath = (m && (m.path || m.id)) || '';
   const set = (id,v)=>{ const el=document.getElementById(id); if(el!=null) el.value=(v==null?'':v); };
+  const cp = s.components || {};
+  set('cfg-comp-te', cp.text_encoder || ''); set('cfg-comp-low', cp.low_noise || ''); set('cfg-comp-vae', cp.vae || '');
+  const crow = document.getElementById('cfg-comp-row');
+  if (crow) { const isVideo = [...document.querySelectorAll('.cfg-type-cb')].some(cb => cb.checked && cb.value === 'video_models') || !!cp.text_encoder || !!cp.low_noise || !!cp.vae; crow.style.display = isVideo ? '' : 'none'; }
   const dz = s.distribute || {};
   document.getElementById('cfg-dist-enabled').checked = !!dz.enabled;
   set('cfg-dist-nodes', Array.isArray(dz.nodes) ? dz.nodes.join(', ') : (dz.nodes || ''));
@@ -4376,6 +4389,7 @@ function _collectCluster(){
   const out = {
     node_path: val('cfg-node-path'),
     rpc_servers: val('cfg-rpc-servers'),
+    components: { text_encoder: val('cfg-comp-te'), low_noise: val('cfg-comp-low'), vae: val('cfg-comp-vae') },
     distribute: {
       enabled: !!document.getElementById('cfg-dist-enabled').checked,
       nodes: val('cfg-dist-nodes'), max_parts: num('cfg-dist-max'),

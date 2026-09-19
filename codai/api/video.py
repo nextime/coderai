@@ -37,6 +37,7 @@ import uuid
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from codai.models.manager import multi_model_manager
 from codai.pydantic.videorequest import (
@@ -2161,6 +2162,161 @@ def _build_vace_conditioning(cond_frames, num_frames: int, width: int, height: i
     return video, mask
 
 
+class _HandoffPayload:
+    """What a component run answers instead of frames: the endpoint returns
+    it as JSON to the machine that asked (latents, embeddings, or the video
+    when this machine held the VAE)."""
+
+    def __init__(self, payload: dict):
+        self.payload = payload
+
+
+def _wan_embeds_into_kw(pipe, kw: dict, pe_b64: str, ne_b64: str) -> None:
+    from codai.cluster.components import b64_to_tensor
+    import torch as _torch
+    dev = pipe._execution_device
+    dt = getattr(pipe, 'transformer', None)
+    dt = getattr(dt, 'dtype', None) or _torch.float32
+    kw['prompt_embeds'] = b64_to_tensor(pe_b64, device=dev, dtype=dt)
+    if ne_b64:
+        kw['negative_prompt_embeds'] = b64_to_tensor(ne_b64, device=dev, dtype=dt)
+    kw.pop('prompt', None)
+    kw.pop('negative_prompt', None)
+
+
+def _run_handoff(pipe, kw: dict, request, h: dict):
+    """This machine's part of a run that started elsewhere (see components.py)."""
+    from codai.cluster.components import SlicedTimesteps, b64_to_tensor, tensor_to_b64
+    import torch as _torch
+    op = str(h.get('op'))
+    if op == 'encode':
+        dev = pipe._execution_device
+        pe, ne = pipe.encode_prompt(
+            prompt=kw.get('prompt') or '', negative_prompt=kw.get('negative_prompt'),
+            do_classifier_free_guidance=True, num_videos_per_prompt=1,
+            max_sequence_length=int(kw.get('max_sequence_length') or 512), device=dev)
+        print(f"  [video][components] encoded the prompt for {request.model}", flush=True)
+        return _HandoffPayload({'prompt_embeds': tensor_to_b64(pe),
+                                'negative_prompt_embeds': tensor_to_b64(ne) if ne is not None else ''})
+    if h.get('prompt_embeds'):
+        _wan_embeds_into_kw(pipe, kw, h['prompt_embeds'], h.get('negative_prompt_embeds') or '')
+    dt = getattr(getattr(pipe, 'transformer', None), 'dtype', None) or _torch.float32
+    latents = b64_to_tensor(h['latents'], device=pipe._execution_device, dtype=dt)
+    kw['latents'] = latents
+    steps = int(kw.get('num_inference_steps') or 25)
+    if op == 'decode':
+        start = steps                              # no denoising: straight to the VAE
+    elif op == 'denoise':
+        start = int(h.get('start_step') or 0)
+    else:
+        raise ValueError(f"unknown handoff op {op!r}")
+    want_latent = (h.get('return') == 'latent')
+    if want_latent:
+        kw['output_type'] = 'latent'
+    print(f"  [video][components] {op} from step {start}/{steps} for {request.model}"
+          f"{' → latents' if want_latent else ' → video'}", flush=True)
+    with SlicedTimesteps(pipe.scheduler, start):
+        result = pipe(**kw)
+    if want_latent:
+        out = getattr(result, 'frames', None)
+        if out is None:
+            out = result[0]
+        return _HandoffPayload({'latents': tensor_to_b64(out), 'start_step': start})
+    return _frames_from_result(result)
+
+
+def _run_pipeline_split(pipe, kw: dict, request, comp: dict):
+    """The head's side: encode where the text encoder is, denoise up to the
+    expert boundary here, hand the latents to the low-noise machine, decode
+    where the VAE is. Returns frames, or the far machine's finished answer."""
+    from codai.cluster.components import (SlicedTimesteps, b64_to_tensor, boundary_step,
+                                          call_handoff, request_json, tensor_to_b64)
+    import torch as _torch
+    req_json = request_json(request)
+    steps = int(kw.get('num_inference_steps') or 25)
+    embeds = {}
+    if comp.get('text_encoder'):
+        r = call_handoff(comp['text_encoder'], req_json, {'op': 'encode'})
+        embeds = {'prompt_embeds': r['prompt_embeds'],
+                  'negative_prompt_embeds': r.get('negative_prompt_embeds') or ''}
+        _wan_embeds_into_kw(pipe, kw, embeds['prompt_embeds'], embeds['negative_prompt_embeds'])
+        print(f"  [video][components] prompt encoded on {comp['text_encoder']}", flush=True)
+    k = boundary_step(pipe, kw) if comp.get('low_noise') else None
+    if k is not None and k <= 0:
+        k = None                     # every step is low-noise: nothing to do here
+    vae_remote = comp.get('vae')
+    if k is None and not vae_remote:
+        return _run_pipeline(pipe, kw)
+
+    # Run here up to the boundary (or the whole loop), keeping latents.
+    user_cb = kw.get('callback_on_step_end')
+    captured = {}
+
+    def _cb(p, i, t, cb_kwargs):
+        out = user_cb(p, i, t, cb_kwargs) if user_cb else cb_kwargs
+        if k is not None and i + 1 >= k:
+            captured['latents'] = (out or cb_kwargs).get('latents', cb_kwargs.get('latents'))
+            p._interrupt = True
+        return out
+    kw['callback_on_step_end'] = _cb
+    kw['callback_on_step_end_tensor_inputs'] = ['latents']
+    kw['output_type'] = 'latent'
+    pipe._interrupt = False
+    try:
+        result = pipe(**kw)
+    finally:
+        pipe._interrupt = False
+    latents = captured.get('latents')
+    if latents is None:
+        latents = getattr(result, 'frames', None)
+        if latents is None:
+            latents = result[0]
+    kw['callback_on_step_end'] = user_cb
+    kw.pop('callback_on_step_end_tensor_inputs', None)
+    kw.pop('output_type', None)
+
+    if k is not None:
+        # The low-noise expert lives elsewhere: hand over and, when the VAE is
+        # there too, let it finish the video.
+        handoff = {'op': 'denoise', 'start_step': k, 'latents': tensor_to_b64(latents),
+                   'return': 'latent' if not vae_remote else 'video', **embeds}
+        print(f"  [video][components] steps {k}..{steps} on {comp['low_noise']}"
+              f"{' with its VAE' if vae_remote else ''}", flush=True)
+        r = call_handoff(comp['low_noise'], req_json, handoff)
+        if vae_remote:
+            return _HandoffPayload(r)
+        latents = b64_to_tensor(r['latents'], device=pipe._execution_device,
+                                dtype=getattr(pipe.transformer, 'dtype', _torch.float32))
+    elif vae_remote:
+        print(f"  [video][components] decoding on {vae_remote}", flush=True)
+        r = call_handoff(vae_remote, req_json, {'op': 'decode', 'latents': tensor_to_b64(latents),
+                                                'return': 'video', **embeds})
+        return _HandoffPayload(r)
+
+    # Decode here: a zero-step run straight into the VAE and the video processor.
+    kw['latents'] = latents
+    with SlicedTimesteps(pipe.scheduler, steps):
+        result = pipe(**kw)
+    return _frames_from_result(result)
+
+
+def _frames_from_result(result):
+    frames_raw = getattr(result, 'frames', None)
+    if frames_raw is None:
+        frames_raw = result[0]
+    if isinstance(frames_raw, list):
+        if frames_raw and isinstance(frames_raw[0], list):
+            return frames_raw[0]
+        return frames_raw
+    try:
+        import numpy as _np
+        if isinstance(frames_raw, _np.ndarray) and frames_raw.ndim == 5:
+            frames_raw = frames_raw[0]
+    except Exception:
+        pass
+    return list(frames_raw)
+
+
 def _run_pipeline(pipe, kw: dict):
     result = pipe(**kw)
     # NB: `getattr(result, 'frames', None) or result[0]` is WRONG — when .frames
@@ -2449,7 +2605,21 @@ def _generate_video(pipe, request: VideoGenerationRequest):
     # Left loaded after the run so the next clip with the same set pays nothing.
     _sync_video_loras(pipe, getattr(request, 'loras', None))
     try:
-        frames = _run_pipeline(pipe, kw)
+        # Parts of this pipeline on other machines (codai/cluster/components.py),
+        # or this machine doing ITS part of someone else's run.
+        _handoff = getattr(request, '_handoff', None)
+        if isinstance(_handoff, dict) and _handoff.get('op'):
+            frames = _run_handoff(pipe, kw, request, _handoff)
+        else:
+            from codai.cluster.components import components_for as _components_for
+            _comp = _components_for(getattr(request, 'model', '') or '')
+            if _comp and type(pipe).__name__ in ('WanPipeline', 'WanImageToVideoPipeline'):
+                frames = _run_pipeline_split(pipe, kw, request, _comp)
+            else:
+                if _comp:
+                    print(f"  [video][components] {type(pipe).__name__} cannot be split "
+                          f"across machines; running here", flush=True)
+                frames = _run_pipeline(pipe, kw)
     except TaskCancelled:
         _vid_progress_done()
         raise  # global handler finishes the task (cancelled) + returns HTTP 499
@@ -4405,6 +4575,11 @@ async def video_generations(request: VideoGenerationRequest,
     if _last_err is not None:
         raise HTTPException(status_code=500,
                             detail=f"Video generation failed: {_last_err}")
+
+    # A component run (or a finished video from the machine holding the VAE):
+    # the answer is already what the caller wants.
+    if isinstance(frames, _HandoffPayload):
+        return JSONResponse(frames.payload)
 
     # Encode raw frames to MP4 (per-model output quality via CRF when configured).
     try:
