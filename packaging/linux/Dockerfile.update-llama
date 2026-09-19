@@ -80,4 +80,6 @@ assert "libggml-rpc" in names or "ggml_backend_rpc" in syms, \
     "RPC backend missing from the rebuilt llama-cpp-python"
 print("llama-cpp-python links cleanly and carries the RPC backend: OK")
 PY
-RUN /opt/coderai/python/bin/rpc-server --help | head -2
+# Run it the way the launcher does (local-libs on the library path); fail the
+# build if it cannot start, not just print an error and carry on.
+RUN LD_LIBRARY_PATH=/opt/coderai/python/lib:/opt/coderai/local-libs /opt/coderai/python/bin/rpc-server --help >/dev/null
