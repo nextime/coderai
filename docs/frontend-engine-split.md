@@ -291,3 +291,10 @@ it is **respawned**; the front and sibling engines keep serving. The front's own
   transformers), matching the engine's own `is_gguf` heuristic. A transformers model
   whose name happens to contain "gguf" would be mis-routed — rename or declare an
   alias if that ever bites.
+
+## Engines on other machines
+
+A **cluster node** — another coderai install — joins the registry as one
+more engine: polled on its `/cluster/state`, assigned models, pinned by
+name, routed by capability and load, never spawned. See
+[`cluster.md`](cluster.md).

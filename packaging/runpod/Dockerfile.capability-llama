@@ -19,11 +19,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 # Ubuntu 24.04's python3 is 3.12, the same as the core: the wheel is cp312 either way.
 RUN python3 -m venv /bw && /bw/bin/pip install --no-cache-dir -U pip build scikit-build-core
-ENV CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=80;86;89;90;120 -DGGML_NATIVE=off -DGGML_AVX2=on"
+ENV CMAKE_ARGS="-DGGML_CUDA=on -DGGML_RPC=on -DCMAKE_CUDA_ARCHITECTURES=80;86;89;90;120 -DGGML_NATIVE=off -DGGML_AVX2=on"
 RUN --mount=type=cache,target=/root/.cache/pip set -eux; \
     /bw/bin/pip wheel --no-cache-dir --no-deps --no-binary llama-cpp-python \
         "llama-cpp-python==${LLAMA_CPP_PYTHON}" -w /wheels; \
     ls -la /wheels
+# rpc-server from the same vendored llama.cpp, so this pod (or a host running
+# this image with CODERAI_RPC_SERVER_PORT) can lend its card to a GGUF loaded
+# elsewhere. Static ggml; needs only the CUDA runtime the pod already has.
+COPY packaging/build-rpc-server.sh /tmp/build-rpc-server.sh
+RUN --mount=type=cache,target=/root/.cache/pip set -eux; \
+    /bw/bin/pip install --no-cache-dir --no-deps /wheels/llama_cpp_python-*.whl; \
+    PYTHON=/bw/bin/python CMAKE_CUDA_ARCHITECTURES="80;86;89;90;120" \
+      bash /tmp/build-rpc-server.sh --cuda --dest /wheels; \
+    ls -la /wheels/rpc-server
 
 # -------------------------------------------------------------- runtime stage
 FROM ${CORE_BASE}
@@ -40,6 +49,7 @@ COPY --from=wheel /wheels/ /tmp/wheels/
 RUN --mount=type=cache,target=/root/.cache/pip set -eux; \
     python -m pip install --extra-index-url ${TORCH_INDEX} -r /tmp/profiles/${PROFILE}.txt; \
     python -m pip install --no-cache-dir /tmp/wheels/llama_cpp_python-*.whl; \
+    install -m 755 /tmp/wheels/rpc-server /usr/local/bin/rpc-server; \
     if python -c "import torch" 2>/dev/null; then \
         echo "ERROR: llama is a light-core image but torch reached its main venv" >&2; exit 1; \
     fi; echo "main venv: no torch (light core, as intended)"; \

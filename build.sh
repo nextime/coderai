@@ -170,6 +170,21 @@ echo ""
 echo -e "${BLUE}Installing dependencies for $BACKEND backend...${NC}"
 echo ""
 
+# rpc-server: the process a machine runs to lend its cards to a GGUF loaded
+# elsewhere. Built from the very llama.cpp the wheel above vendors — the RPC
+# protocol is versioned and the two must match. Best effort: a missing cmake
+# or toolkit must not fail the install; the cluster page says when it is absent.
+build_rpc_server() {
+    if command -v cmake >/dev/null 2>&1; then
+        echo -e "${YELLOW}Building llama.cpp rpc-server (cluster: cards on other machines)...${NC}"
+        PYTHON="$(command -v python)" bash "$(dirname "$0")/packaging/build-rpc-server.sh" \
+            || echo -e "${YELLOW}Warning: rpc-server build failed — run packaging/build-rpc-server.sh later${NC}"
+    else
+        echo -e "${YELLOW}cmake not found: skipping rpc-server (packaging/build-rpc-server.sh)${NC}"
+    fi
+}
+
+
 if [ "$BACKEND" = "nvidia" ]; then
     # NVIDIA/CUDA backend
     echo -e "${YELLOW}Installing PyTorch with CUDA support...${NC}"
@@ -274,7 +289,7 @@ elif [ "$BACKEND" = "vulkan" ]; then
     
     # Build with Vulkan support (add CUDA too if available)
     echo -e "${YELLOW}Building llama-cpp-python with Vulkan support...${NC}"
-    _LLAMA_CMAKE="-DGGML_VULKAN=ON"
+    _LLAMA_CMAKE="-DGGML_VULKAN=ON -DGGML_RPC=ON"
     if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
         _LLAMA_CMAKE="$_LLAMA_CMAKE -DGGML_CUDA=ON"
         echo -e "${GREEN}  ✓ Also enabling CUDA support (NVIDIA detected)${NC}"
@@ -284,6 +299,7 @@ elif [ "$BACKEND" = "vulkan" ]; then
         exit 1
     }
     
+    build_rpc_server
     echo -e "${YELLOW}Installing Vulkan-specific requirements...${NC}"
     pip install -r requirements-vulkan.txt
     echo -e "${YELLOW}Building whispercpp with Vulkan support for GPU-accelerated transcription...${NC}"
@@ -388,7 +404,7 @@ elif [ "$BACKEND" = "vulkan-nvidia" ]; then
     # Note: llama.cpp doesn't have a compile-time option to disable specific GPUs
     # The device selection happens at runtime via environment variables
     echo -e "${YELLOW}Building llama-cpp-python with Vulkan support...${NC}"
-    _LLAMA_CMAKE="-DGGML_VULKAN=ON"
+    _LLAMA_CMAKE="-DGGML_VULKAN=ON -DGGML_RPC=ON"
     if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
         _LLAMA_CMAKE="$_LLAMA_CMAKE -DGGML_CUDA=ON"
         echo -e "${GREEN}  ✓ Also enabling CUDA support (NVIDIA detected)${NC}"
@@ -398,6 +414,7 @@ elif [ "$BACKEND" = "vulkan-nvidia" ]; then
         exit 1
     }
     
+    build_rpc_server
     echo -e "${YELLOW}Installing Vulkan-specific requirements...${NC}"
     pip install -r requirements-vulkan.txt
     
@@ -452,7 +469,7 @@ elif [ "$BACKEND" = "cuda" ]; then
     # Build llama-cpp-python with CUDA support (add Vulkan too if available)
     echo -e "${YELLOW}Building llama-cpp-python with CUDA support...${NC}"
     echo -e "${YELLOW}This may take several minutes...${NC}"
-    _LLAMA_CMAKE="-DGGML_CUDA=ON"
+    _LLAMA_CMAKE="-DGGML_CUDA=ON -DGGML_RPC=ON"
     if pkg-config --exists vulkan 2>/dev/null; then
         _LLAMA_CMAKE="$_LLAMA_CMAKE -DGGML_VULKAN=ON"
         echo -e "${GREEN}  ✓ Also enabling Vulkan support (Vulkan detected)${NC}"
@@ -467,6 +484,7 @@ elif [ "$BACKEND" = "cuda" ]; then
         exit 1
     }
     
+    build_rpc_server
     echo -e "${YELLOW}Installing Vulkan-specific requirements...${NC}"
     pip install -r requirements-vulkan.txt
     
@@ -645,6 +663,10 @@ elif [ "$BACKEND" = "all" ]; then
         fi
         echo -e "${GREEN}  ✓ Enabling Vulkan support${NC}"
     fi
+    # The RPC backend: cards on other machines as ggml devices (docs/cluster.md).
+    if [ -n "$CMAKE_ARGS" ]; then
+        CMAKE_ARGS="$CMAKE_ARGS -DGGML_RPC=ON"
+    fi
     
     if [ -n "$CMAKE_ARGS" ]; then
         echo -e "${YELLOW}  Building with: $CMAKE_ARGS${NC}"
@@ -658,6 +680,7 @@ elif [ "$BACKEND" = "all" ]; then
     fi
     
     # Install Vulkan-specific requirements
+    build_rpc_server
     echo -e "${YELLOW}Installing Vulkan-specific requirements...${NC}"
     pip install -r requirements-vulkan.txt || {
         echo -e "${YELLOW}Warning: Some Vulkan packages failed to install${NC}"

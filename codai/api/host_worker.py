@@ -81,6 +81,43 @@ def parse_host(block: dict) -> HostConfig:
     return cfg
 
 
+def parse_hosts(block: dict) -> list:
+    """Every machine a ``host`` block names, as one HostConfig each.
+
+    One machine: the flat fields (``url``, ``api_key``, ``start_cmd`` …).
+    Several: ``hosts`` — a list of blocks with the same fields, each falling
+    back to the flat ones — or ``urls``/lines of ``url | api_key | start_cmd |
+    stop_cmd``. The model then has a pool: the first healthy, least-busy host
+    takes each request, an on-demand host is started only when no host is up,
+    and one that stops answering is skipped until it is back.
+    """
+    b = block or {}
+    base = parse_host(b)
+    out = []
+    extra = b.get("hosts")
+    if isinstance(extra, str):
+        lines = [ln for ln in extra.replace("\r", "").split("\n") if ln.strip()]
+        extra = []
+        for ln in lines:
+            parts = [p.strip() for p in ln.split("|")]
+            d = {"url": parts[0]}
+            for i, k in enumerate(("api_key", "start_cmd", "stop_cmd"), 1):
+                if len(parts) > i and parts[i]:
+                    d[k] = parts[i]
+            extra.append(d)
+    if base.url:
+        out.append(base)
+    for h in (extra or []):
+        if not isinstance(h, dict) or not str(h.get("url") or "").strip():
+            continue
+        merged = {k: v for k, v in b.items() if k not in ("hosts", "urls")}
+        merged.update({k: v for k, v in h.items() if v not in (None, "")})
+        cfg = parse_host(merged)
+        if cfg.url and all(cfg.url != o.url for o in out):
+            out.append(cfg)
+    return out
+
+
 def _health_ok(url: str, path: str, api_key: str, timeout: float = 5.0) -> bool:
     import requests
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
@@ -96,87 +133,151 @@ class HostError(RuntimeError):
 
 
 class HostPool:
-    """One host, used by one model. acquire()/release() like a pod pool."""
+    """The host(s) behind one model. acquire()/release() like a pod pool.
 
-    def __init__(self, model_key: str, cfg: HostConfig):
+    With one host this is what it always was: check it, start it if it has a
+    start_cmd, use it, stop it after idling. With several, each request goes
+    to the healthy host with the fewest requests in flight; when none answers,
+    the first host with a start_cmd is started. ``failover`` lets the gateway
+    move a request whose host died mid-way.
+    """
+    _HEALTH_TTL = 10.0
+    _DOWN_FOR = 30.0
+
+    def __init__(self, model_key: str, cfgs):
         self.model_key = model_key
-        self.cfg = cfg
-        self.api_key = cfg.api_key
+        cfgs = list(cfgs) if isinstance(cfgs, (list, tuple)) else [cfgs]
+        self.cfgs = cfgs
+        self.cfg = cfgs[0]
+        self.api_key = self.cfg.api_key
         self._lock = threading.RLock()
-        self._inflight = 0
+        self._inflight = {c.url: 0 for c in cfgs}
         self._last_used = 0.0
-        self._started_by_us = False
-        self._stopper = None
+        self._started_by_us = {c.url: False for c in cfgs}
+        self._stoppers = {}
+        self._healthy_until = {}
+        self._down_until = {}
+
+    def _by_url(self, url: str) -> HostConfig:
+        for c in self.cfgs:
+            if c.url == url:
+                return c
+        return self.cfg
+
+    def _healthy(self, cfg: HostConfig, probe: bool = True) -> bool:
+        now = time.time()
+        if self._down_until.get(cfg.url, 0) > now:
+            return False
+        if self._healthy_until.get(cfg.url, 0) > now:
+            return True
+        if not probe:
+            return False
+        ok = _health_ok(cfg.url, cfg.health_path, cfg.api_key)
+        if ok:
+            self._healthy_until[cfg.url] = now + self._HEALTH_TTL
+        return ok
 
     # -- the shape the gateway expects ------------------------------------ #
     def acquire(self, timeout: float = 1200.0, affinity: str = ""):
         with self._lock:
-            if not _health_ok(self.cfg.url, self.cfg.health_path, self.api_key):
-                if not self.cfg.start_cmd:
+            order = sorted(self.cfgs, key=lambda c: self._inflight.get(c.url, 0))
+            chosen = next((c for c in order if self._healthy(c)), None)
+            if chosen is None:
+                # A host that just failed is not the one to start again now.
+                now = time.time()
+                startable = [c for c in order
+                             if c.start_cmd and self._down_until.get(c.url, 0) <= now]
+                if not startable:
+                    urls = ", ".join(c.url for c in self.cfgs)
                     raise HostError(
-                        f"host for {self.model_key!r} at {self.cfg.url} is not "
-                        f"answering {self.cfg.health_path}, and it has no start_cmd "
-                        f"— it is configured as always-on, so it should be up.")
-                self._start()
-            self._inflight += 1
+                        f"no host for {self.model_key!r} is answering ({urls}), and "
+                        f"none has a start_cmd — they are configured as always-on, "
+                        f"so they should be up.")
+                chosen = startable[0]
+                self._start(chosen)
+            self._inflight[chosen.url] = self._inflight.get(chosen.url, 0) + 1
             self._last_used = time.time()
-            return self, self.cfg.url
+            # The token of the host that was picked (they may differ).
+            self.api_key = chosen.api_key
+            return chosen.url, chosen.url
 
     def release(self, handle) -> None:
         with self._lock:
-            self._inflight = max(0, self._inflight - 1)
+            url = handle if isinstance(handle, str) else self.cfg.url
+            if self._inflight.get(url, 0) > 0:
+                self._inflight[url] -= 1
             self._last_used = time.time()
-            if self.cfg.stop_cmd and self._started_by_us and self.cfg.idle_timeout_s:
-                self._arm_stopper()
+            cfg = self._by_url(url)
+            if cfg.stop_cmd and self._started_by_us.get(url) and cfg.idle_timeout_s:
+                self._arm_stopper(cfg)
+
+    def failover(self, failed_url: str):
+        """Mark a host down and hand back another one, or None."""
+        with self._lock:
+            self._down_until[failed_url] = time.time() + self._DOWN_FOR
+            self._healthy_until.pop(failed_url, None)
+        self.release(failed_url)
+        if len(self.cfgs) < 2:
+            return None
+        try:
+            _h, url = self.acquire()
+            return url
+        except Exception:
+            return None
 
     # -- lifecycle ---------------------------------------------------------- #
-    def _start(self) -> None:
-        print(f"[host] starting {self.model_key!r}: {self.cfg.start_cmd}", flush=True)
-        self._run(self.cfg.start_cmd)
-        deadline = time.time() + self.cfg.boot_timeout_s
+    def _start(self, cfg: HostConfig) -> None:
+        print(f"[host] starting {self.model_key!r} on {cfg.url}: {cfg.start_cmd}",
+              flush=True)
+        self._run(cfg, cfg.start_cmd)
+        deadline = time.time() + cfg.boot_timeout_s
         t0 = time.time()
         while time.time() < deadline:
-            if _health_ok(self.cfg.url, self.cfg.health_path, self.api_key):
-                self._started_by_us = True
+            if _health_ok(cfg.url, cfg.health_path, cfg.api_key):
+                self._started_by_us[cfg.url] = True
+                self._healthy_until[cfg.url] = time.time() + self._HEALTH_TTL
                 print(f"[host] {self.model_key!r} up after {time.time() - t0:.0f}s "
-                      f"at {self.cfg.url}", flush=True)
+                      f"at {cfg.url}", flush=True)
                 return
             time.sleep(3)
         raise HostError(
-            f"host for {self.model_key!r} did not answer {self.cfg.health_path} "
-            f"within {self.cfg.boot_timeout_s}s of running start_cmd. Check the "
-            f"command, the URL, and that the token matches CODERAI_API_TOKEN.")
+            f"host for {self.model_key!r} at {cfg.url} did not answer "
+            f"{cfg.health_path} within {cfg.boot_timeout_s}s of running start_cmd. "
+            f"Check the command, the URL, and that the token matches CODERAI_API_TOKEN.")
 
-    def _arm_stopper(self) -> None:
-        if self._stopper is not None:
-            self._stopper.cancel()
+    def _arm_stopper(self, cfg: HostConfig) -> None:
+        old = self._stoppers.get(cfg.url)
+        if old is not None:
+            old.cancel()
 
         def _maybe_stop():
             with self._lock:
                 idle = time.time() - self._last_used
-                if self._inflight > 0 or idle < self.cfg.idle_timeout_s:
-                    self._arm_stopper()          # busy again, or not idle enough yet
+                if self._inflight.get(cfg.url, 0) > 0 or idle < cfg.idle_timeout_s:
+                    self._arm_stopper(cfg)          # busy again, or not idle enough yet
                     return
-                print(f"[host] {self.model_key!r} idle {idle:.0f}s — "
-                      f"{self.cfg.stop_cmd}", flush=True)
+                print(f"[host] {self.model_key!r} on {cfg.url} idle {idle:.0f}s — "
+                      f"{cfg.stop_cmd}", flush=True)
                 try:
-                    self._run(self.cfg.stop_cmd)
+                    self._run(cfg, cfg.stop_cmd)
                 finally:
-                    self._started_by_us = False
-                    self._stopper = None
+                    self._started_by_us[cfg.url] = False
+                    self._healthy_until.pop(cfg.url, None)
+                    self._stoppers.pop(cfg.url, None)
 
-        self._stopper = threading.Timer(self.cfg.idle_timeout_s, _maybe_stop)
-        self._stopper.daemon = True
-        self._stopper.start()
+        t = threading.Timer(cfg.idle_timeout_s, _maybe_stop)
+        t.daemon = True
+        self._stoppers[cfg.url] = t
+        t.start()
 
-    def _run(self, cmd: str) -> None:
+    def _run(self, cfg: HostConfig, cmd: str) -> None:
         import os
-        env = {**os.environ, **self.cfg.env}
+        env = {**os.environ, **cfg.env}
         try:
             r = subprocess.run(shlex.split(cmd), env=env, capture_output=True,
-                               text=True, timeout=self.cfg.boot_timeout_s)
+                               text=True, timeout=cfg.boot_timeout_s)
         except subprocess.TimeoutExpired:
-            raise HostError(f"command timed out after {self.cfg.boot_timeout_s}s: {cmd}")
+            raise HostError(f"command timed out after {cfg.boot_timeout_s}s: {cmd}")
         if r.returncode != 0:
             raise HostError(f"command failed ({r.returncode}): {cmd}\n"
                             f"{(r.stderr or r.stdout or '').strip()[:400]}")
@@ -184,14 +285,22 @@ class HostPool:
     def stop(self) -> None:
         """Explicit stop — the cleanup path, not the idle one."""
         with self._lock:
-            if self._stopper is not None:
-                self._stopper.cancel()
-                self._stopper = None
-            if self.cfg.stop_cmd and self._started_by_us:
-                try:
-                    self._run(self.cfg.stop_cmd)
-                finally:
-                    self._started_by_us = False
+            for t in self._stoppers.values():
+                t.cancel()
+            self._stoppers.clear()
+            for cfg in self.cfgs:
+                if cfg.stop_cmd and self._started_by_us.get(cfg.url):
+                    try:
+                        self._run(cfg, cfg.stop_cmd)
+                    finally:
+                        self._started_by_us[cfg.url] = False
+
+    def status(self) -> list:
+        return [{"url": c.url, "on_demand": bool(c.start_cmd),
+                 "inflight": self._inflight.get(c.url, 0),
+                 "healthy": self._healthy(c, probe=False),
+                 "started_by_us": self._started_by_us.get(c.url, False)}
+                for c in self.cfgs]
 
 
 _pools: dict = {}
@@ -202,6 +311,6 @@ def get_host_pool(model_key: str, block: dict) -> HostPool:
     with _pools_lock:
         pool = _pools.get(model_key)
         if pool is None:
-            pool = HostPool(model_key, parse_host(block))
+            pool = HostPool(model_key, parse_hosts(block))
             _pools[model_key] = pool
         return pool

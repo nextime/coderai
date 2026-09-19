@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+{% block title %}Cluster — CoderAI{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Cluster</h1>
+    <p>Everything this coderai can send work to — engines here, nodes on your network, RPC servers, hosts, remotes and pods — and whether it answers right now.</p>
+  </div>
+  <div class="header-actions">
+    <span id="cl-updated" class="dim small"></span>
+    <button class="btn btn-secondary" onclick="clRefresh()">Refresh</button>
+  </div>
+</div>
+
+<div id="cl-note" style="display:none;margin:0 0 1rem;padding:.7rem .9rem;border-radius:8px;
+     background:rgba(148,163,184,.12);border:1px solid rgba(148,163,184,.4);font-size:13px"></div>
+
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.75rem;margin-bottom:1rem">
+  <div class="card"><div class="dim small">Engines here</div><div id="cl-n-engines" style="font-size:1.6rem;font-weight:700">—</div></div>
+  <div class="card"><div class="dim small">Cluster nodes</div><div id="cl-n-nodes" style="font-size:1.6rem;font-weight:700">—</div><div id="cl-n-nodes-sub" class="dim small"></div></div>
+  <div class="card"><div class="dim small">RPC servers</div><div id="cl-n-rpc" style="font-size:1.6rem;font-weight:700">—</div><div id="cl-n-rpc-sub" class="dim small"></div></div>
+  <div class="card"><div class="dim small">Hosts + remotes</div><div id="cl-n-hosts" style="font-size:1.6rem;font-weight:700">—</div><div id="cl-n-hosts-sub" class="dim small"></div></div>
+  <div class="card"><div class="dim small">Pods</div><div id="cl-n-pods" style="font-size:1.6rem;font-weight:700">—</div></div>
+</div>
+
+<div class="card" style="margin-bottom:1rem">
+  <div class="card-title">Cluster nodes <span class="dim small">— other coderai installs used as engines of this one</span></div>
+  <div style="overflow-x:auto">
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="text-align:left;color:var(--text-3)">
+        <th>Node</th><th>URL</th><th>State</th><th>Capabilities</th><th>VRAM</th><th>Its engines</th><th>Loaded</th><th>Assigned</th><th>In-flight</th>
+      </tr></thead>
+      <tbody id="cl-nodes"><tr><td colspan="9" class="dim">No nodes configured — Settings → Cluster.</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card" style="margin-bottom:1rem">
+  <div class="card-title">Engines on this machine</div>
+  <div style="overflow-x:auto">
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="text-align:left;color:var(--text-3)">
+        <th>Engine</th><th>Backend</th><th>State</th><th>Capabilities</th><th>VRAM</th><th>Loaded</th><th>In-flight</th><th>PID</th>
+      </tr></thead>
+      <tbody id="cl-engines"><tr><td colspan="8" class="dim">—</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card" style="margin-bottom:1rem">
+  <div class="card-title">llama.cpp RPC servers <span class="dim small">— cards lent to a GGUF loaded elsewhere (per model: <em>Cards on other machines</em>)</span></div>
+  <div style="overflow-x:auto">
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="text-align:left;color:var(--text-3)">
+        <th>Where</th><th>Endpoint</th><th>Device</th><th>Mem cap</th><th>Process</th><th>Reachable</th><th>Last log line</th>
+      </tr></thead>
+      <tbody id="cl-rpc"><tr><td colspan="7" class="dim">None advertised — Settings → Cluster → RPC servers on this machine or on a node.</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem">
+  <div class="card">
+    <div class="card-title">Hosts <span class="dim small">— <code>backend: host</code> models</span></div>
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="text-align:left;color:var(--text-3)"><th>Model</th><th>URL</th><th>Mode</th><th>Answers</th></tr></thead>
+      <tbody id="cl-hosts"><tr><td colspan="4" class="dim">None.</td></tr></tbody>
+    </table>
+  </div>
+  <div class="card">
+    <div class="card-title">Capability remotes <span class="dim small">— Settings → Remote capabilities</span></div>
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="text-align:left;color:var(--text-3)"><th>Capability</th><th>URL</th><th>Answers</th></tr></thead>
+      <tbody id="cl-remotes"><tr><td colspan="3" class="dim">None.</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">RunPod pods <span class="dim small">— live list, costs on the <a href="{{ root_path }}/admin/runpod">RunPod page</a></span></div>
+  <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <thead><tr style="text-align:left;color:var(--text-3)"><th>Model / capability</th><th>Pod</th><th>GPU</th><th>State</th><th>In-flight</th><th>$/hr</th></tr></thead>
+    <tbody id="cl-pods"><tr><td colspan="6" class="dim">None running.</td></tr></tbody>
+  </table>
+</div>
+
+<style>
+  #cl-nodes td, #cl-engines td, #cl-rpc td, #cl-hosts td, #cl-remotes td, #cl-pods td { padding:.35rem .4rem; border-top:1px solid var(--border,#333); vertical-align:top }
+  .cl-ok { color:#2ecc71; font-weight:600 } .cl-bad { color:#e74c3c; font-weight:600 } .cl-dim { color:var(--text-3) }
+  .cl-pill { display:inline-block; padding:.05rem .4rem; border-radius:999px; border:1px solid var(--border,#444); font-size:11px; margin:0 .15rem .15rem 0 }
+</style>
+<script>
+const esc = v => (v == null ? '' : String(v)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const ok = (b, yes, no) => b === null || b === undefined ? '<span class="cl-dim">n/a</span>' : (b ? '<span class="cl-ok">' + (yes || 'up') + '</span>' : '<span class="cl-bad">' + (no || 'down') + '</span>');
+const gb = v => (v == null ? '—' : (Math.round(v * 10) / 10) + ' GB');
+const vram = v => v ? (gb(v.free) + ' free / ' + gb(v.total)) : '—';
+const pills = a => (a || []).map(x => '<span class="cl-pill">' + esc(x) + '</span>').join('') || '<span class="cl-dim">—</span>';
+const short = a => (a || []).length ? (a.length <= 3 ? a.map(esc).join('<br>') : esc(a.slice(0,3).join(', ')) + ' <span class="cl-dim">+' + (a.length - 3) + '</span>') : '<span class="cl-dim">—</span>';
+
+async function clRefresh(){
+  let d;
+  try {
+    const r = await fetch(ROOT_PATH + '/admin/api/cluster');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    d = await r.json();
+  } catch (e) { document.getElementById('cl-updated').textContent = 'error: ' + e.message; return; }
+  document.getElementById('cl-updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+  const note = document.getElementById('cl-note');
+  const notes = [];
+  if (!d.cluster_enabled) notes.push('Cluster nodes are <b>not enabled</b> (Settings → Cluster) — nodes listed there are ignored until then.');
+  if (d.serve === false) notes.push('This install does <b>not</b> answer other heads (cluster.serve is off).');
+  if (d.node_name) notes.push('This install calls itself <b>' + esc(d.node_name) + '</b> as a node.');
+  note.innerHTML = notes.join('<br>'); note.style.display = notes.length ? '' : 'none';
+
+  const nodes = d.nodes || [], engines = d.engines || [], rpc = d.rpc_servers || [], hosts = d.hosts || [], remotes = d.remotes || [], pods = d.pods || [];
+  document.getElementById('cl-n-engines').textContent = engines.length;
+  document.getElementById('cl-n-nodes').textContent = nodes.length;
+  document.getElementById('cl-n-nodes-sub').textContent = nodes.length ? (nodes.filter(n => n.healthy).length + ' reachable') : '';
+  document.getElementById('cl-n-rpc').textContent = rpc.length;
+  document.getElementById('cl-n-rpc-sub').textContent = rpc.length ? (rpc.filter(r => r.reachable).length + ' reachable') : '';
+  document.getElementById('cl-n-hosts').textContent = hosts.length + remotes.length;
+  document.getElementById('cl-n-hosts-sub').textContent = (hosts.length + remotes.length) ? ((hosts.filter(h => h.ok).length + remotes.filter(r => r.ok).length) + ' answering') : '';
+  document.getElementById('cl-n-pods').textContent = pods.length;
+
+  document.getElementById('cl-nodes').innerHTML = nodes.length ? nodes.map(n => `<tr>
+    <td><b>${esc(n.name)}</b></td><td class="cl-dim">${esc(n.url)}</td>
+    <td>${ok(n.healthy, 'reachable', 'unreachable')}${n.last_error ? '<br><span class="cl-dim" style="font-size:11px">' + esc(n.last_error) + '</span>' : ''}</td>
+    <td>${pills(n.capabilities)}</td><td>${vram(n.vram)}</td>
+    <td>${(n.node_engines || []).map(e => '<span class="cl-pill" title="' + esc(vram(e.vram)) + '">' + esc(e.name) + (e.healthy ? '' : ' ✗') + '</span>').join('') || '<span class="cl-dim">—</span>'}</td>
+    <td>${short(n.loaded_models)}</td><td>${short(n.assigned_models)}</td><td>${n.inflight || 0}</td></tr>`).join('')
+    : '<tr><td colspan="9" class="dim">No nodes configured — Settings → Cluster.</td></tr>';
+
+  document.getElementById('cl-engines').innerHTML = engines.length ? engines.map(e => `<tr>
+    <td><b>${esc(e.name)}</b>${e.primary ? ' <span class="cl-dim">(primary)</span>' : ''}</td><td>${esc(e.backend)}</td>
+    <td>${ok(e.healthy, 'ready', e.processing ? 'busy' : 'not responding')}${e.cooling ? ' <span class="cl-dim">cooling</span>' : ''}</td>
+    <td>${pills(e.capabilities)}</td><td>${vram(e.vram)}</td><td>${short(e.loaded_models)}</td><td>${e.inflight || 0}</td><td class="cl-dim">${esc(e.pid || '')}</td></tr>`).join('')
+    : '<tr><td colspan="8" class="dim">—</td></tr>';
+
+  document.getElementById('cl-rpc').innerHTML = rpc.length ? rpc.map(r => `<tr>
+    <td>${esc(r.node)}</td><td><code>${esc(r.endpoint)}</code></td><td>${esc(r.device || 'default')}</td><td>${r.mem_gb ? gb(r.mem_gb) : 'all'}</td>
+    <td>${r.node === '(this machine)' ? ok(r.alive, 'running' + (r.pid ? ' (pid ' + r.pid + ')' : ''), 'not running') : '<span class="cl-dim">on the node</span>'}</td>
+    <td>${ok(r.reachable, 'yes', 'no')}</td><td class="cl-dim" style="font-size:11px">${esc(r.last_log || '')}</td></tr>`).join('')
+    : '<tr><td colspan="7" class="dim">None advertised — Settings → Cluster → RPC servers on this machine or on a node.</td></tr>';
+
+  document.getElementById('cl-hosts').innerHTML = hosts.length ? hosts.map(h => `<tr>
+    <td>${esc(h.model)}</td><td class="cl-dim">${esc(h.url)}</td><td>${h.on_demand ? 'on demand' : 'always on'}</td>
+    <td>${ok(h.ok, 'yes', h.on_demand ? 'off (started on request)' : 'no')} <span class="cl-dim" style="font-size:11px">${esc(h.detail)}</span></td></tr>`).join('')
+    : '<tr><td colspan="4" class="dim">None.</td></tr>';
+
+  document.getElementById('cl-remotes').innerHTML = remotes.length ? remotes.map(r => `<tr>
+    <td>${esc(r.capability)}</td><td class="cl-dim">${esc(r.url)}</td>
+    <td>${ok(r.ok, 'yes', 'no')} <span class="cl-dim" style="font-size:11px">${esc(r.detail)}</span></td></tr>`).join('')
+    : '<tr><td colspan="3" class="dim">None.</td></tr>';
+
+  document.getElementById('cl-pods').innerHTML = pods.length ? pods.map(p => `<tr>
+    <td>${esc(p.model)}</td><td class="cl-dim">${esc(p.pod_id)}</td><td>${esc(p.gpu)}</td>
+    <td>${esc(p.state)}${p.healthy ? ' <span class="cl-ok">healthy</span>' : ''}</td><td>${p.inflight || 0}</td><td>${p.hourly_usd != null ? '$' + p.hourly_usd : '—'}</td></tr>`).join('')
+    : '<tr><td colspan="6" class="dim">None running.</td></tr>';
+}
+clRefresh();
+setInterval(clRefresh, 10000);
+</script>
+{% endblock %}

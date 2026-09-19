@@ -130,6 +130,14 @@ def _launch_cmd(py, cfg, host: str, port: int, model_path: str,
     tp = int(getattr(cfg, "tensor_parallel_size", 0) or 0)
     if tp > 0:
         cmd += ["--tensor-parallel-size", str(tp)]
+    pp = int(getattr(cfg, "pipeline_parallel_size", 0) or 0)
+    if pp > 1:
+        cmd += ["--pipeline-parallel-size", str(pp)]
+    executor = (getattr(cfg, "distributed_executor_backend", "") or "").strip()
+    if not executor and needs_ray(cfg):
+        executor = "ray"
+    if executor:
+        cmd += ["--distributed-executor-backend", executor]
     mns = int(getattr(cfg, "max_num_seqs", 0) or 0)
     if mns > 0:
         cmd += ["--max-num-seqs", str(mns)]
@@ -193,6 +201,52 @@ def _remote_serves(url: str, name: str) -> bool:
         return False
     tail = name.rstrip("/").split("/")[-1]
     return any(i == name or i.rstrip("/").split("/")[-1] == tail for i in ids)
+
+
+def needs_ray(cfg) -> bool:
+    """Multi-node: other machines' GPUs join through a ray cluster."""
+    from codai.cluster.multinode import parse_nodes
+    if (getattr(cfg, "distributed_executor_backend", "") or "").strip().lower() == "ray":
+        return True
+    if int(getattr(cfg, "pipeline_parallel_size", 1) or 1) > 1:
+        return True
+    if (getattr(cfg, "ray_address", "") or "").strip():
+        return True
+    return bool(parse_nodes(getattr(cfg, "nodes", None)))
+
+
+def _local_gpu_count(env: dict) -> int:
+    vis = (env.get("CUDA_VISIBLE_DEVICES") or "").strip()
+    if vis:
+        return len([x for x in vis.split(",") if x.strip()])
+    try:
+        from codai.backends.gpu_probe import total_memory_bytes
+        return max(1, len(total_memory_bytes()))
+    except Exception:
+        return 1
+
+
+def _start_ray(cfg, py: str, env: dict):
+    """Bring the ray cluster up for this launch; returns (RayCluster, address)."""
+    from codai.cluster.multinode import RayCluster
+    from codai.cluster.rpc import advertise_host
+    adv = ""
+    try:
+        from codai.admin.routes import config_manager
+        adv = getattr(getattr(config_manager.config, "cluster", None), "advertise_host", "") or ""
+    except Exception:
+        pass
+    adv = advertise_host(adv)
+    tp = max(1, int(getattr(cfg, "tensor_parallel_size", 1) or 1))
+    pp = max(1, int(getattr(cfg, "pipeline_parallel_size", 1) or 1))
+    cluster = RayCluster(py, adv, port=int(getattr(cfg, "ray_port", 6379) or 6379),
+                         address=getattr(cfg, "ray_address", "") or "",
+                         nodes=getattr(cfg, "nodes", None),
+                         ready_timeout_s=float(getattr(cfg, "nodes_ready_timeout_s", 600) or 600))
+    address = cluster.start(gpus_needed=tp * pp, local_gpus=_local_gpu_count(env))
+    env.setdefault("VLLM_HOST_IP", adv)
+    env["RAY_ADDRESS"] = address
+    return cluster, address
 
 
 def ensure_service(cfg, model_path: Optional[str] = None,
@@ -265,14 +319,22 @@ def ensure_service(cfg, model_path: Optional[str] = None,
                     k, v = tok.split("=", 1)
                     if k.strip():
                         env[k.strip()] = v; applied[k.strip()] = v
+        ray = None
+        if needs_ray(cfg):
+            ray, _addr = _start_ray(cfg, py, env)
         print(f"[vllm] launching: {' '.join(cmd)}"
               + (f"  ({' '.join(f'{k}={v}' for k, v in applied.items())})" if applied else ""),
               flush=True)
         tail = collections.deque(maxlen=80)
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, bufsize=1, env=env)
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1, env=env)
+        except Exception:
+            if ray is not None:
+                ray.stop()
+            raise
         threading.Thread(target=_pump_logs, args=(proc, tail), daemon=True).start()
-        _services[svc_key] = {"proc": proc, "port": port, "url": url}
+        _services[svc_key] = {"proc": proc, "port": port, "url": url, "ray": ray}
 
     def _tail_msg():
         # The last six lines of a vLLM crash are the wrapper's own traceback
@@ -320,6 +382,12 @@ def stop_service(svc_key: str) -> None:
             proc.kill()
         except Exception:
             pass
+    ray = svc.get("ray")
+    if ray is not None:
+        try:
+            ray.stop()
+        except Exception as exc:
+            print(f"[vllm] ray teardown for {svc_key} failed: {exc}", flush=True)
     print(f"[vllm] service for {svc_key} stopped", flush=True)
 
 

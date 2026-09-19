@@ -71,6 +71,10 @@ class VllmBackend(ModelBackend):
         if _ctx > 0:
             self._ctx = _ctx
         model_path = self._resolve_model_dir(model_name)
+        # This model's own `vllm` block over the global template: parallelism,
+        # the machines it spans, memory fraction, flags.
+        from codai.backends.overrides import VLLM_FIELDS, apply, model_block
+        self._cfg = apply(self._cfg, model_block(model_name, "vllm"), VLLM_FIELDS, "vllm")
         # Per-model: serve each model-list entry under ITS OWN name (like nvidia/radeon),
         # not a single engine-wide model_id. Fall back to the config model_id only for the
         # single-model convenience (a model with no list entry).

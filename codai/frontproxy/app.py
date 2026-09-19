@@ -137,6 +137,36 @@ class FrontProxy:
     async def aclose(self):
         await self._short.aclose()
         await self._long.aclose()
+        for e in self.registry.remotes():
+            for c in (e.http_short, e.http_long):
+                try:
+                    await c.aclose()
+                except Exception:
+                    pass
+
+    # A cluster node is reached through ITS clients (its token, its trust
+    # settings) and never with the caller's credentials: the head's user is not
+    # a user of the node. Local engines keep the shared clients.
+    def _lc(self, engine):
+        return engine.http_long if getattr(engine, "remote", False) and engine.http_long \
+            else self._long
+
+    def _sc(self, engine):
+        return engine.http_short if getattr(engine, "remote", False) and engine.http_short \
+            else self._short
+
+    @staticmethod
+    def _eh(engine, headers):
+        """Headers to send an engine: for a node, the caller's session/bearer
+        is dropped so the client's default (the node's token) applies."""
+        if not getattr(engine, "remote", False):
+            return headers
+        out = {}
+        for k, v in dict(headers or {}).items():
+            if k.lower() in ("authorization", "cookie", "x-coderai-internal"):
+                continue
+            out[k] = v
+        return out
 
     # ------------------------------------------------------------------ broker
     def start_broker(self):
@@ -231,7 +261,8 @@ class FrontProxy:
             models = None
             if e.healthy:
                 try:
-                    r = await self._short.get(e.url + "/v1/models", headers=headers)
+                    r = await self._sc(e).get(e.url + "/v1/models",
+                                              headers=self._eh(e, headers))
                     if r.status_code == 200:
                         try:
                             models = r.json().get("data") or []
@@ -376,8 +407,8 @@ class FrontProxy:
             for _attempt in range(6):
                 _last = (_attempt >= 5)
                 try:
-                    r = await self._long.request(method, engine.url + path,
-                                                 headers=send_headers,
+                    r = await self._lc(engine).request(method, engine.url + path,
+                                                 headers=self._eh(engine, send_headers),
                                                  params=query or {},
                                                  content=body or b"")
                 except Exception as exc:
@@ -524,11 +555,11 @@ class FrontProxy:
                 # (just (re)starting): wait + retry instead of relaying an instant
                 # "unreachable" (which lands as a single empty SSE chunk).
                 try:
-                    rp_req = self._long.build_request(method, engine.url + path,
-                                                      headers=send_headers,
+                    rp_req = self._lc(engine).build_request(method, engine.url + path,
+                                                      headers=self._eh(engine, send_headers),
                                                       params=query or {},
                                                       content=body or b"")
-                    rp_resp = await self._long.send(rp_req, stream=True)
+                    rp_resp = await self._lc(engine).send(rp_req, stream=True)
                 except Exception as exc:
                     if _is_infer and not _last:
                         if _status_on:
@@ -1107,7 +1138,7 @@ class FrontProxy:
                       # The front's burst-to-RunPod path reads config.runpod, and
                       # `remotes` decides capability routing: without these a
                       # settings save reached neither until a restart.
-                      "runpod", "remotes",
+                      "runpod", "remotes", "cluster",
                       "compaction", "broker", "system_prompt", "tools_closer_prompt",
                       "grammar_guided", "parser", "tmp_dir"):
                 if hasattr(new, f):
@@ -1484,7 +1515,14 @@ class FrontProxy:
                         "inflight": int(getattr(e, "inflight", 0) or 0),
                         "processing": (int(getattr(e, "inflight", 0) or 0) > 0
                                        or bool(getattr(e, "loading", None))),
-                        "pid": pid})
+                        "pid": pid,
+                        "capabilities": sorted(e.capabilities or ()),
+                        "remote": bool(getattr(e, "remote", False)),
+                        "url": e.url if getattr(e, "remote", False) else "",
+                        "node_engines": list(getattr(e, "node_engines", []) or []),
+                        "rpc_servers": list(getattr(e, "rpc_servers", []) or []),
+                        "last_error": getattr(e, "last_error", "") or "",
+                        "assigned_models": sorted(e.assigned_models or ())})
         return out
 
     def _running_models(self) -> list:
@@ -1541,13 +1579,29 @@ class FrontProxy:
                 pass
         return JSONResponse(data)
 
+    #: Admin actions a node accepts from a head, keyed by the head-side admin path.
+    _NODE_ADMIN_PATHS = {"/admin/api/model-load": "/cluster/model-load",
+                         "/admin/api/model-unload": "/cluster/model-unload"}
+
     async def _forward_to_engine(self, request: Request, engine, body: bytes):
-        """Re-issue an admin POST verbatim to a specific engine and relay its reply."""
+        """Re-issue an admin POST verbatim to a specific engine and relay its reply.
+
+        A cluster node has no session of ours: the few admin actions it takes
+        from a head (load/unload) go to its token-guarded /cluster/ twins."""
         send_headers = self._filter_headers(request.headers, _DROP_REQ)
+        path = request.url.path
+        if getattr(engine, "remote", False):
+            path = self._NODE_ADMIN_PATHS.get(path)
+            if path is None:
+                return JSONResponse(
+                    {"detail": f"{request.url.path} is not something a node takes "
+                               f"from a head — do it on {engine.name}'s own admin page"},
+                    status_code=501)
         try:
-            r = await self._long.request(
-                request.method, engine.url + request.url.path,
-                headers=send_headers, params=request.query_params, content=body or b"")
+            r = await self._lc(engine).request(
+                request.method, engine.url + path,
+                headers=self._eh(engine, send_headers), params=request.query_params,
+                content=body or b"")
         except Exception as exc:
             return JSONResponse(
                 {"detail": f"engine {engine.name} unreachable: {exc}"}, status_code=502)
@@ -1786,10 +1840,10 @@ class FrontProxy:
                 for _attempt in range(_MAX_TRIES):
                     _last = (_attempt >= _MAX_TRIES - 1)
                     try:
-                        rp_req = self._long.build_request(
-                            "POST", engine.url + path, headers=send_headers,
+                        rp_req = self._lc(engine).build_request(
+                            "POST", engine.url + path, headers=self._eh(engine, send_headers),
                             params=request.query_params, content=body_bytes)
-                        rp_resp = await self._long.send(rp_req, stream=True)
+                        rp_resp = await self._lc(engine).send(rp_req, stream=True)
                     except Exception as exc:
                         if not _last:
                             yield _ka("engine starting up")
@@ -2053,10 +2107,10 @@ class FrontProxy:
         headers = self._filter_headers(request.headers, _DROP_REQ)
         content = (request.stream()
                    if method in ("POST", "PUT", "PATCH") else None)
-        rp_req = self._long.build_request(method, url, headers=headers,
+        rp_req = self._lc(engine).build_request(method, url, headers=self._eh(engine, headers),
                                           params=request.query_params, content=content)
         try:
-            rp_resp = await self._long.send(rp_req, stream=True)
+            rp_resp = await self._lc(engine).send(rp_req, stream=True)
         except Exception as exc:
             return JSONResponse(
                 {"error": f"coderai-system worker unreachable: {exc}"}, status_code=502)
@@ -2117,9 +2171,9 @@ class FrontProxy:
                 and "text/event-stream"
                 not in (request.headers.get("accept", "").lower())):
             try:
-                r = await self._long.request(
+                r = await self._lc(engine).request(
                     "GET", engine.url + path,
-                    headers=self._filter_headers(request.headers, _DROP_REQ),
+                    headers=self._eh(engine, self._filter_headers(request.headers, _DROP_REQ)),
                     params=request.query_params,
                     timeout=httpx.Timeout(connect=10.0, read=12.0, write=12.0,
                                           pool=12.0))
@@ -2200,8 +2254,8 @@ class FrontProxy:
         except Exception:
             pass
 
-        rp_req = self._long.build_request(
-            method, url, headers=headers, params=request.query_params,
+        rp_req = self._lc(engine).build_request(
+            method, url, headers=self._eh(engine, headers), params=request.query_params,
             content=content)
         # Count this as in-flight on the chosen engine so a restart can drain it:
         # decremented only once the response is fully streamed (or send failed).
@@ -2213,7 +2267,7 @@ class FrontProxy:
         import time as _t
         _started = _t.time()
         try:
-            rp_resp = await self._long.send(rp_req, stream=True)
+            rp_resp = await self._lc(engine).send(rp_req, stream=True)
         except Exception as exc:
             engine.exit_request(_rid)
             if _qkey is not None:
@@ -2544,6 +2598,160 @@ def build_app(config, config_dir=None) -> FastAPI:
             return JSONResponse({"detail": "Unauthorized"}, status_code=401)
         ok = bool(front.supervisor and front.supervisor.restart_engine(eid))
         return JSONResponse({"success": ok}, status_code=200 if ok else 404)
+
+    # ------------------------------------------------------------ cluster
+    # This install as a NODE of another coderai (codai/cluster/nodes.py). The
+    # head holds an API token of this install; these answer from the front's
+    # own registry, so they stay live while an engine here is busy.
+    def _cluster_token_ok(request: Request) -> bool:
+        ccfg = getattr(config, "cluster", None)
+        if ccfg is not None and not getattr(ccfg, "serve", True):
+            return False
+        auth = request.headers.get("authorization", "")
+        if not auth.lower().startswith("bearer "):
+            return False
+        tok = auth[7:].strip()
+        if not tok or not config_dir:
+            return False
+        try:
+            from pathlib import Path
+            from codai.admin.auth import SessionManager
+            return SessionManager(Path(config_dir)).verify_token(tok)
+        except Exception:
+            return False
+
+    def _node_name() -> str:
+        ccfg = getattr(config, "cluster", None)
+        name = (getattr(ccfg, "node_name", "") or "").strip() if ccfg else ""
+        if not name:
+            import socket
+            name = socket.gethostname()
+        return name
+
+    def _rpc_endpoints() -> list:
+        sup = front.supervisor
+        mgr = getattr(sup, "rpc_manager", None) if sup else None
+        try:
+            return mgr.endpoints() if mgr else []
+        except Exception:
+            return []
+
+    @app.get("/cluster/state", include_in_schema=False)
+    async def _cluster_state(request: Request):
+        if not _cluster_token_ok(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        from codai.cluster.nodes import aggregate_state
+        st = aggregate_state(front.registry, rpc_endpoints=_rpc_endpoints(),
+                             node_name=_node_name())
+        return JSONResponse(st)
+
+    @app.get("/cluster/rpc-servers", include_in_schema=False)
+    async def _cluster_rpc(request: Request):
+        if not _cluster_token_ok(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        return JSONResponse({"rpc_servers": _rpc_endpoints()})
+
+    @app.post("/cluster/reload-config", include_in_schema=False)
+    async def _cluster_reload(request: Request):
+        """The head tells this node which of ITS models this node owns, with
+        the entries behind them. Entries this node's catalogue lacks are
+        registered in memory on the primary engine (a path that exists here,
+        else a HuggingFace id/URL), so the head can name a model this node
+        never heard of and have it served."""
+        if not _cluster_token_ok(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        entries = [e for e in (data.get("entries") or []) if isinstance(e, dict)]
+        assigned = list(data.get("assigned") or [])
+        # Registration is in memory, per engine process — and this front
+        # routes a model it did not assign itself to whichever of its engines
+        # fits, so EVERY engine here must know the entry, not just the primary.
+        targets = [e for e in front.registry.all()
+                   if getattr(e, "role", "engine") != "system" and not e.remote
+                   and e.healthy]
+        if not targets:
+            return JSONResponse({"ok": False, "error": "no engine is up here"},
+                                status_code=503)
+        refused, added, known = [], set(), set()
+        if entries:
+            from codai.cluster.nodes import localize_entries
+            payload, refused = localize_entries(entries, _node_name())
+            if payload:
+                hdrs = {"x-coderai-internal": front.internal_token,
+                        "authorization": request.headers.get("authorization", "")}
+                for e in targets:
+                    try:
+                        r = await front._long.post(e.url + "/v1/models/register",
+                                                   json=payload, headers=hdrs)
+                        if r.status_code == 200:
+                            d = r.json()
+                            added |= set(d.get("added") or [])
+                            known |= set(d.get("already_known") or [])
+                            for x in d.get("refused") or []:
+                                if x not in refused:
+                                    refused.append(x)
+                        else:
+                            refused.append(f"{e.name}: HTTP {r.status_code} "
+                                           f"{(r.text or '')[:120]}")
+                    except Exception as exc:
+                        refused.append(f"{e.name}: {exc}")
+        return JSONResponse({"ok": True, "assigned": len(assigned), "added": sorted(added),
+                             "already_known": sorted(known - added), "refused": refused})
+
+    async def _cluster_admin_twin(request: Request, admin_path: str, fn):
+        """Run one of the front's own admin actions on behalf of a head: the
+        node's token stands in for the admin session the action needs."""
+        if not _cluster_token_ok(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        from pathlib import Path
+        from codai.admin.auth import SessionManager
+        sm = SessionManager(Path(config_dir))
+        admin = next((u.get("username") for u in sm.list_users()
+                      if u.get("role") == "admin" and u.get("username")), None)
+        if not admin:
+            return JSONResponse({"detail": "no admin user on this node"}, status_code=503)
+        cookie = sm.create_session(admin)
+        try:
+            body = await request.body()
+            scope = dict(request.scope)
+            scope["path"] = admin_path
+            scope["raw_path"] = admin_path.encode()
+            scope["headers"] = [(k, v) for k, v in request.scope["headers"]
+                                if k not in (b"cookie", b"authorization")] + \
+                               [(b"cookie", f"session={cookie}".encode())]
+
+            async def _receive():
+                return {"type": "http.request", "body": body, "more_body": False}
+            fake = Request(scope, _receive)
+            return await fn(fake)
+        finally:
+            try:
+                sm.destroy_session(cookie)
+            except Exception:
+                pass
+
+    @app.post("/cluster/model-load", include_in_schema=False)
+    async def _cluster_model_load(request: Request):
+        return await _cluster_admin_twin(request, "/admin/api/model-load", front.model_load)
+
+    @app.post("/cluster/model-unload", include_in_schema=False)
+    async def _cluster_model_unload(request: Request):
+        return await _cluster_admin_twin(request, "/admin/api/model-unload", front.model_unload)
+
+    @app.get("/admin/api/cluster", include_in_schema=False)
+    async def _cluster_overview(request: Request):
+        """Everything this front can send work to, with reachability — the
+        /admin/cluster page. Front-native (registry + config), no engine hit."""
+        if not front._has_cred(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        import asyncio as _aio
+        from codai.cluster.overview import build_overview
+        data = await _aio.get_event_loop().run_in_executor(
+            None, build_overview, front, _rpc_endpoints())
+        return JSONResponse(data)
 
     # Serve the admin / Studio UI pages from the FRONT (rendered here, sessions
     # validated locally) so navigating the dashboard never waits on a GIL-busy

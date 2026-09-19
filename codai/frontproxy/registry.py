@@ -99,10 +99,27 @@ class Engine:
     # front can synthesize Tasks-page entries for work it dispatched — visible even
     # when the engine is too GIL-busy generating to answer its own /admin/api/tasks.
     active: dict = field(default_factory=dict, repr=False, compare=False)
+    # A cluster NODE: another coderai install used as an engine of this front.
+    # Nothing is spawned; the node's own front is polled on ``state_path`` and
+    # proxied to through ``http_short``/``http_long`` (clients carrying the
+    # node's token and trust settings — codai/cluster/nodes.py). The node's
+    # engines, cards and thermal state are its own business.
+    remote: bool = False
+    state_path: str = "/internal/engine-state"
+    http_short: object = field(default=None, repr=False, compare=False)
+    http_long: object = field(default=None, repr=False, compare=False)
+    http_sync: object = field(default=None, repr=False, compare=False)
+    node_engines: list = field(default_factory=list)   # what the node reports
+    rpc_servers: list = field(default_factory=list)    # RPC endpoints it advertises
+    last_error: str = ""
+    caps_fixed: bool = False       # cluster.nodes narrowed the capabilities: keep them
+    node_sig: object = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
         if not self.url:
             self.url = f"http://127.0.0.1:{self.port}"
+        if self.remote:
+            self.state_path = "/cluster/state"
         if not self.name:
             self.name = f"engine#{self.id}"
         if not self.capabilities:
@@ -130,6 +147,10 @@ class Engine:
         diverts new traffic elsewhere and the existing requests can finish."""
         if self.draining:
             return False
+        if self.remote:
+            # No process to ask: a node is alive exactly when its last poll
+            # answered. (A busy node still answers — its front is torch-free.)
+            return self.healthy
         p = self.proc
         try:
             return p is None or p.poll() is None
@@ -205,13 +226,32 @@ class EngineRegistry:
                 match = match or e
         return match
 
+    def remove(self, engine_id: int) -> None:
+        with self._lock:
+            self._engines.pop(engine_id, None)
+
+    def remotes(self) -> List[Engine]:
+        with self._lock:
+            return [e for e in self._engines.values() if e.remote]
+
     def update_state(self, engine_id: int, *, healthy: bool,
                      loaded_models=None, loaded_info=None, vram=None,
-                     tasks=None, cooling=False) -> None:
+                     tasks=None, cooling=False, capabilities=None,
+                     node_engines=None, rpc_servers=None, last_error=None) -> None:
         with self._lock:
             e = self._engines.get(engine_id)
             if not e:
                 return
+            # A node reports what it can do; believe it unless the operator
+            # narrowed the list in cluster.nodes.
+            if capabilities is not None and e.remote and not e.caps_fixed:
+                e.capabilities = set(capabilities) or e.capabilities
+            if node_engines is not None:
+                e.node_engines = list(node_engines)
+            if rpc_servers is not None:
+                e.rpc_servers = list(rpc_servers)
+            if last_error is not None:
+                e.last_error = last_error
             if e.draining:        # a restart is pending — stay out of rotation
                 healthy = False
             e.healthy = healthy

@@ -15,6 +15,8 @@ by what you are moving.
 | Any text model, GGUF included | `service_url` on the model entry | models.json |
 | Images, video, embeddings, rerank, OCR, TTS, STT, voice, audio, stems, 3D, pipelines | remote gateway | `remotes.endpoints` in config.json |
 | Any model, on a machine you already have (always-on or started by command) | `host` backend | `"backend": "host"` on the model entry |
+| Another whole coderai as an engine of this one (routing by capability/load, pins by name) | cluster node | `cluster.nodes` in config.json — [`cluster.md`](cluster.md) |
+| One model over several machines' cards | llama.cpp RPC / vLLM on Ray / SGLang multi-node | per model — [`cluster.md`](cluster.md) |
 
 ---
 

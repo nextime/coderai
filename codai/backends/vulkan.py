@@ -1246,6 +1246,16 @@ class VulkanBackend(ModelBackend):
                 # Otherwise we'd needlessly offload layers to CPU thinking only one
                 # card's free VRAM is available.
                 _free = _pooled_free_vram_gb(cross=bool(kwargs.get('gpu_split')))
+                # Remote cards (llama.cpp RPC) are part of the pool the layers can
+                # go to — otherwise their share would be spilled to CPU up front.
+                _rpc_pool = kwargs.get('rpc_servers', (kwargs.get('_raw_cfg') or {}).get('rpc_servers'))
+                if _rpc_pool:
+                    try:
+                        from codai.backends import ggml_rpc as _rpcm
+                        _rpcm.register_servers(_rpc_pool)
+                        _free += sum(_rpcm.free_gb(_rpc_pool))
+                    except Exception as _re:
+                        print(f"  rpc servers  : not counted in the VRAM pool ({_re})")
                 # Apply the VRAM caps to the usable pool too, so that capping a card
                 # proactively offloads the remainder to CPU here (rather than only
                 # reacting to an OOM in the load-retry loop). Per-model secondary cap
@@ -1616,6 +1626,20 @@ class VulkanBackend(ModelBackend):
         _ts = kwargs.get('tensor_split', _raw_cfg.get('tensor_split'))
         if _ts is None:
             _ts = kwargs.get('_global_tensor_split')
+        # Cards on OTHER machines, through llama.cpp's RPC backend: each
+        # ``host:port`` where an rpc-server listens becomes one more device in
+        # the split, after this machine's cards (codai/backends/ggml_rpc.py).
+        # A model that names RPC servers is split by definition.
+        from codai.backends import ggml_rpc as _rpc
+        _rpc_eps = _rpc.normalize_endpoints(
+            kwargs.get('rpc_servers', _raw_cfg.get('rpc_servers')))
+        _rpc_free = []
+        if _rpc_eps:
+            _rpc_devs = _rpc.register_servers(_rpc_eps)      # raises when unusable
+            _rpc_free = _rpc.free_gb(_rpc_eps)
+            _rpc_desc = ", ".join(ep + " (" + ", ".join(d) + ")" for ep, d in _rpc_devs.items())
+            print(f"  rpc servers  : {_rpc_desc} free {[round(f, 1) for f in _rpc_free]} GB")
+            _gpu_split = True
         # llama.cpp device order: all visible CUDA devices first, then Vulkan. Count
         # each so we can tell own-backend from foreign when both are exposed (the
         # engine was spawned with cross-GPU visibility for some split model).
@@ -1644,6 +1668,10 @@ class VulkanBackend(ModelBackend):
                 # Auto: distribute proportionally to each device's free VRAM (a 24 GB
                 # 3090 + 8 GB RX 580 → ~0.75/0.25), so the bigger card carries more.
                 _free_dev = _per_device_free_vram_gb()
+                if _rpc_free:
+                    # Remote cards come after the local ones in llama.cpp's
+                    # device order, so their free memory joins the ratio there.
+                    _free_dev = list(_free_dev) + list(_rpc_free)
                 # mmproj-aware headroom: a vision projector (CLIP/mmproj) ALWAYS loads
                 # on main_gpu (its own buffer + compute), and the model's output/KV
                 # anchor is there too. If the proportional split fills main_gpu to the
@@ -1844,7 +1872,8 @@ class VulkanBackend(ModelBackend):
             _max_attempts = 6   # initial try + 5 progressive CPU-offload retries
             for _attempt in range(_max_attempts):
                 try:
-                    self.model = Llama(**llama_kwargs)
+                    with _rpc.load_with_devices(_rpc_eps):
+                        self.model = Llama(**llama_kwargs)
                     if _attempt > 0:
                         print(f"  Loaded after CPU offload "
                               f"(n_gpu_layers={llama_kwargs.get('n_gpu_layers')})")

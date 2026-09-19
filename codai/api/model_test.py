@@ -466,8 +466,9 @@ def _no_remote_reason(model: str, entry: dict, capability: str) -> str:
         return ""
     if isinstance(entry.get("runpod"), dict) and entry["runpod"]:
         return ""
-    if str(entry.get("backend") or "").lower() == "host" and \
-            str((entry.get("host") or {}).get("url") or "").strip():
+    if str(entry.get("backend") or "").lower() == "host" and (
+            str((entry.get("host") or {}).get("url") or "").strip()
+            or (entry.get("host") or {}).get("hosts")):
         return ""
     try:
         from codai.api.remote_gateway import capability_endpoints, capability_pods
@@ -597,7 +598,12 @@ def _placement_summary(model: str, entry: dict, force: str) -> dict:
     if kind == "host":
         _entry, hblock = detail
         how = "started on demand" if str(hblock.get("start_cmd") or "").strip() else "always on"
-        return {"where": "remote", "target": f"host {hblock.get('url')} ({how})"}
+        try:
+            from codai.api.host_worker import parse_hosts
+            urls = [h.url for h in parse_hosts(hblock)]
+        except Exception:
+            urls = [hblock.get("url")]
+        return {"where": "remote", "target": f"host {', '.join(str(u) for u in urls)} ({how})"}
     backend = str((entry or {}).get("backend") or "").lower()
     if backend == "runpod":
         return {"where": "runpod", "target": "RunPod backend"}

@@ -655,7 +655,7 @@ async def internal_reload_config(request: Request):
             fresh.load()
             for _f in ("remotes", "runpod", "ds4", "colibri", "k3", "ktransformers",
                        "vllm", "server", "models", "offload", "image", "jobs",
-                       "enhance", "ocr", "thermal", "broker"):
+                       "enhance", "ocr", "thermal", "broker", "cluster"):
                 if hasattr(fresh.config, _f):
                     setattr(_cm.config, _f, getattr(fresh.config, _f))
     except Exception as exc:

@@ -41,6 +41,7 @@ from codai.api import pod_http
 import json
 import os
 import time
+import threading
 import re
 from typing import Optional, Tuple
 
@@ -150,23 +151,130 @@ def _remotes_config():
         return None
 
 
-def capability_endpoints() -> dict:
-    """The configured capability -> URL map (config first, then env)."""
+def _as_url_list(v) -> list:
+    """An endpoint value: one URL, a comma/newline-separated string, or a list."""
+    if isinstance(v, (list, tuple)):
+        items = [str(x) for x in v]
+    else:
+        items = str(v or "").replace("\n", ",").split(",")
+    out = []
+    for x in items:
+        x = x.strip().rstrip("/")
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+def capability_endpoint_lists() -> dict:
+    """capability -> [URL, …] (config first, then env). Several URLs for one
+    capability form a pool: the first healthy, least-busy one takes each
+    request, and a URL that stops answering is skipped until it is back."""
     cfg = _remotes_config()
     out = {}
     if cfg is not None and getattr(cfg, "enabled", True):
         eps = getattr(cfg, "endpoints", None)
         if isinstance(eps, dict):
-            out.update({str(k).strip().lower(): str(v).strip()
-                        for k, v in eps.items() if str(v).strip()})
+            for k, v in eps.items():
+                urls = _as_url_list(v)
+                if urls:
+                    out[str(k).strip().lower()] = urls
     # CODERAI_REMOTE_IMAGES_URL=… etc. — handy for a container with no config edit.
     for _, cap in _CAPABILITY_PREFIXES:
         if cap in out:
             continue
         val = os.environ.get(f"CODERAI_REMOTE_{cap.upper()}_URL", "").strip()
         if val:
-            out[cap] = val
+            out[cap] = _as_url_list(val)
     return out
+
+
+def capability_endpoints() -> dict:
+    """The configured capability -> URL map (the first URL of each pool)."""
+    return {cap: urls[0] for cap, urls in capability_endpoint_lists().items() if urls}
+
+
+class EndpointPool:
+    """Several fixed URLs serving one capability.
+
+    Health is probed lazily and remembered briefly; a URL that fails a request
+    is marked down for a while and the request moves to the next one
+    (``failover``). Nothing is started or billed — these are machines that
+    are simply there.
+    """
+    _HEALTH_TTL = 15.0
+    _DOWN_FOR = 30.0
+
+    def __init__(self, capability: str, urls: list, api_key: str = ""):
+        self.capability = capability
+        self.urls = list(urls)
+        self.api_key = api_key
+        self._lock = threading.Lock()
+        self._inflight = {u: 0 for u in self.urls}
+        self._down_until = {}
+        self._healthy_until = {}
+
+    def _healthy(self, url: str) -> bool:
+        now = time.time()
+        if self._down_until.get(url, 0) > now:
+            return False
+        if self._healthy_until.get(url, 0) > now:
+            return True
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        try:
+            r = pod_http.get(url + "/healthz", headers=headers, timeout=4)
+            ok = r.status_code == 200
+        except Exception:
+            ok = False
+        if ok:
+            self._healthy_until[url] = now + self._HEALTH_TTL
+        else:
+            self._down_until[url] = now + self._DOWN_FOR
+        return ok
+
+    def acquire(self, timeout: float = 0.0, affinity: str = ""):
+        with self._lock:
+            order = sorted(self.urls, key=lambda u: self._inflight.get(u, 0))
+        for url in order:
+            if self._healthy(url):
+                with self._lock:
+                    self._inflight[url] = self._inflight.get(url, 0) + 1
+                return url, url
+        raise RuntimeError(
+            f"none of the {len(self.urls)} remote(s) for {self.capability!r} answers "
+            f"/healthz: {', '.join(self.urls)}")
+
+    def release(self, handle) -> None:
+        with self._lock:
+            if handle in self._inflight and self._inflight[handle] > 0:
+                self._inflight[handle] -= 1
+
+    def failover(self, failed_url: str):
+        """Mark a URL down and hand back another healthy one, or None."""
+        with self._lock:
+            self._down_until[failed_url] = time.time() + self._DOWN_FOR
+            self._healthy_until.pop(failed_url, None)
+        self.release(failed_url)
+        try:
+            _handle, url = self.acquire()
+            return url
+        except Exception:
+            return None
+
+
+_ENDPOINT_POOLS: dict = {}
+_ENDPOINT_POOLS_LOCK = threading.Lock()
+
+
+def get_endpoint_pool(capability: str, urls: list) -> EndpointPool:
+    cfg = _remotes_config()
+    key = (capability, tuple(urls))
+    with _ENDPOINT_POOLS_LOCK:
+        pool = _ENDPOINT_POOLS.get(key)
+        if pool is None:
+            pool = EndpointPool(capability, urls,
+                                api_key=(getattr(cfg, "api_key", "") if cfg else "") or "")
+            _ENDPOINT_POOLS[key] = pool
+        return pool
 
 
 def capability_pods() -> dict:
@@ -216,7 +324,8 @@ def model_placement(model: str) -> tuple:
     # token, optionally a command to start it. Same acquire/release shape as a
     # pod, none of the renting machinery.
     hblock = entry.get("host") if isinstance(entry.get("host"), dict) else None
-    if backend == "host" and hblock is not None and str(hblock.get("url") or "").strip():
+    if backend == "host" and hblock is not None and (
+            str(hblock.get("url") or "").strip() or hblock.get("hosts")):
         return "host", (entry, hblock)
     return "", None
 
@@ -466,10 +575,14 @@ def resolve_target(path: str, method: str, query: str, body: bytes,
                 "service_url or a RunPod pod on the model, or a remote for its "
                 "capability")
         return None
-    url = capability_endpoints().get(cap, "")
+    urls = capability_endpoint_lists().get(cap, [])
+    url = urls[0] if urls else ""
     # "runpod" as the endpoint is shorthand for "use the pod block for this
     # capability" — so the common case needs no second config block.
     if url and url.strip().lower() != "runpod":
+        if len(urls) > 1:
+            return Target(pool=get_endpoint_pool(cap, urls),
+                          reason=f"capability {cap!r} ({len(urls)} remotes)")
         return Target(url=url, reason=f"capability {cap!r}")
     pods = capability_pods()
     if url or cap in pods:
@@ -595,8 +708,9 @@ class RemoteGatewayMiddleware:
             if b'"loras"' in (body or b"") and "json" in headers.get("content-type", ""):
                 body = await asyncio.to_thread(
                     sync_loras, base, target.api_key, body)
+            _fail = (target.pool.failover if hasattr(target.pool, "failover") else None)
             await self._send_upstream(scope, headers, body, base, target.reason, send,
-                                      api_key=target.api_key)
+                                      api_key=target.api_key, on_unreachable=_fail)
             task_registry.finish(tid, "done")
         except Exception as exc:
             task_registry.finish(tid, "error", str(exc)[:200])
@@ -605,7 +719,8 @@ class RemoteGatewayMiddleware:
             release()
 
     async def _send_upstream(self, scope, headers, body, base, reason, send,
-                             api_key: str = "", retried: bool = False):
+                             api_key: str = "", retried: bool = False,
+                             on_unreachable=None):
         import asyncio
         path = scope.get("path")
         qs = (scope.get("query_string") or b"").decode("latin-1")
@@ -647,6 +762,16 @@ class RemoteGatewayMiddleware:
                 await asyncio.sleep(_wait)
                 resp = await asyncio.to_thread(_call)
         except Exception as exc:
+            # A pool of remotes: this one is down, move the request to the
+            # next healthy one before giving up.
+            if on_unreachable is not None:
+                nxt = await asyncio.to_thread(on_unreachable, base)
+                if nxt and nxt != base:
+                    print(f"[remote-gateway] {base} unreachable ({exc}); "
+                          f"failing over to {nxt}", flush=True)
+                    return await self._send_upstream(
+                        scope, headers, body, nxt, reason, send, api_key=api_key,
+                        retried=retried, on_unreachable=on_unreachable)
             return await _error(send, 502, f"remote endpoint {base} unreachable: {exc}")
 
         ctype = resp.headers.get("Content-Type") or "application/json"

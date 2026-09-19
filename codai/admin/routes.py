@@ -2514,7 +2514,17 @@ def validate_engine_pin(engine_name: str, model_path: str, engine_specs,
     from codai.frontproxy.registry import _DEFAULT_CAPS
     from codai.frontproxy.router import required_capability
     specs = engine_specs or []
-    if specs:
+    # A cluster node is an engine too: what it can run is what it reports, or
+    # what cluster.nodes narrowed it to. Believed with the caveat printed.
+    node = _cluster_node_named(engine_name)
+    if node is not None:
+        backend = "node"
+        caps = set(node.get("capabilities") or [])
+        if not caps:
+            # Narrowed nowhere: the node reports its own set at run time, so
+            # only a backend no coderai can serve is refused here.
+            caps = set(_DEFAULT_CAPS["auto"]) - {"runpod"}
+    elif specs:
         spec = _resolve_engine_spec(engine_name, specs)
         if spec is None:
             names = [s.get("name") for s in specs if isinstance(s, dict) and s.get("name")]
@@ -2545,7 +2555,31 @@ def validate_engine_pin(engine_name: str, model_path: str, engine_specs,
                 f"it needs '{req}' capability but the engine only provides "
                 f"{sorted(caps)}. The request would fall back to a compatible engine — "
                 f"pick a different engine or adjust the engine's capabilities."]
+    # Same table the Models page filters with (codai/cluster/compat.py): a
+    # vendor backend on the other vendor's engine runs, but not the way it says.
+    try:
+        from codai.cluster.compat import check as _compat_check
+        ok, why = _compat_check(backend, caps, model_backend or "auto", model_path)
+        if not ok:
+            return [f"Engine '{engine_name}': {why}."]
+        if why:
+            return [f"Engine '{engine_name}': {why}."]
+    except Exception:
+        pass
     return []
+
+
+def _cluster_node_named(name: str):
+    """The cluster.nodes entry with this name, or None."""
+    try:
+        nodes = getattr(getattr(config_manager.config, "cluster", None), "nodes", None) or []
+    except Exception:
+        return None
+    n = (name or "").strip().lower()
+    for node in nodes:
+        if isinstance(node, dict) and str(node.get("name") or "").strip().lower() == n:
+            return node
+    return None
 
 
 @router.post("/admin/api/model-configure", summary="Update a model's configuration")
@@ -2715,9 +2749,41 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 # configured remote — the opt-out that lets two models of the
                 # same kind be placed differently.
                 "placement",
+                # Cards on other machines (llama.cpp RPC servers, "host:port,…")
+                # and where the weights are on a cluster node this model is
+                # pinned to (a path, or {node: path}).
+                "rpc_servers", "node_path", "node_paths",
                 ):
         if key in data:
             entry[key] = data[key]
+    # Per-model engine blocks laid over the global template: vLLM (parallelism,
+    # ray nodes), SGLang/kt (nnodes, ranks' commands). A block with nothing set
+    # is dropped so the entry stays clean.
+    for _blk, _fields in (("vllm", ("tensor_parallel_size", "pipeline_parallel_size",
+                                     "distributed_executor_backend", "ray_address",
+                                     "ray_port", "nodes", "nodes_ready_timeout_s",
+                                     "gpu", "gpu_memory_utilization", "max_num_seqs",
+                                     "dtype", "quantization", "extra_args", "extra_env")),
+                          ("kt", ("nnodes", "dist_init_addr", "tp_size", "nodes",
+                                   "kt_weight_path", "extra_args", "extra_env"))):
+        if _blk not in data:
+            continue
+        src = data.get(_blk) if isinstance(data.get(_blk), dict) else {}
+        blk = {}
+        for k in _fields:
+            v = src.get(k)
+            if v in (None, "", [], {}):
+                continue
+            if k == "nodes":
+                from codai.cluster.multinode import parse_nodes
+                v = parse_nodes(v)
+                if not v:
+                    continue
+            blk[k] = v
+        if blk:
+            entry[_blk] = blk
+        else:
+            entry.pop(_blk, None)
 
     # Serve this model from somewhere else instead of loading it here: any
     # OpenAI-compatible endpoint (another coderai, llama-server, vLLM, a rented
@@ -2873,6 +2939,13 @@ async def api_model_configure(request: Request, username: str = Depends(require_
         env = src.get("env")
         if isinstance(env, dict) and env:
             ho["env"] = {str(k): str(v) for k, v in env.items()}
+        # More machines for the same model: lines of `url | api_key | start |
+        # stop`, or a list of blocks — a pool with failover (host_worker.parse_hosts).
+        hosts = src.get("hosts")
+        if isinstance(hosts, str) and hosts.strip():
+            ho["hosts"] = hosts.strip()
+        elif isinstance(hosts, list) and hosts:
+            ho["hosts"] = [h for h in hosts if isinstance(h, dict) and h.get("url")]
         if ho:
             entry["host"] = ho
         else:
@@ -3664,6 +3737,10 @@ def build_settings_dict(c, gpu_cards):
             "extra_args": c.ktransformers.extra_args,
             "extra_env": c.ktransformers.extra_env,
             "auto_build": c.ktransformers.auto_build,
+            "nnodes": c.ktransformers.nnodes,
+            "dist_init_addr": c.ktransformers.dist_init_addr,
+            "tp_size": c.ktransformers.tp_size,
+            "nodes": list(c.ktransformers.nodes or []),
         },
         "vllm": {
             "enabled": c.vllm.enabled,
@@ -3683,6 +3760,24 @@ def build_settings_dict(c, gpu_cards):
             "extra_args": c.vllm.extra_args,
             "extra_env": c.vllm.extra_env,
             "auto_build": c.vllm.auto_build,
+            "pipeline_parallel_size": c.vllm.pipeline_parallel_size,
+            "distributed_executor_backend": c.vllm.distributed_executor_backend,
+            "ray_address": c.vllm.ray_address,
+            "ray_port": c.vllm.ray_port,
+            "nodes": list(c.vllm.nodes or []),
+            "nodes_ready_timeout_s": c.vllm.nodes_ready_timeout_s,
+        },
+        "cluster": {
+            "enabled": c.cluster.enabled,
+            "node_name": c.cluster.node_name,
+            "serve": c.cluster.serve,
+            "poll_timeout_s": c.cluster.poll_timeout_s,
+            "advertise_host": c.cluster.advertise_host,
+            "rpc_bin": c.cluster.rpc_bin,
+            # The node token is a secret of the NODE: masked like the RunPod key.
+            "nodes": [{**n, "api_key": "", "api_key_set": bool(n.get("api_key"))}
+                      for n in (c.cluster.nodes or []) if isinstance(n, dict)],
+            "rpc_servers": list(c.cluster.rpc_servers or []),
         },
         "runpod": {
             "enabled": c.runpod.enabled,
@@ -4048,9 +4143,15 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
                 pass
         if "endpoints" in d:
             eps = d.get("endpoints")
-            c.remotes.endpoints = ({str(k).strip().lower(): str(v).strip()
-                                    for k, v in eps.items() if str(v).strip()}
-                                   if isinstance(eps, dict) else {})
+            # One URL, or several (a list, or comma/newline separated) — several
+            # form a pool with failover (codai/api/remote_gateway.EndpointPool).
+            from codai.api.remote_gateway import _as_url_list
+            out = {}
+            for k, v in (eps.items() if isinstance(eps, dict) else []):
+                urls = _as_url_list(v)
+                if urls:
+                    out[str(k).strip().lower()] = urls[0] if len(urls) == 1 else urls
+            c.remotes.endpoints = out
         if "pods" in d:
             pods = d.get("pods")
             c.remotes.pods = ({str(k).strip().lower(): v
@@ -4218,6 +4319,21 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
             c.ktransformers.extra_env = (d.get("extra_env") or "").strip()
         if "auto_build" in d:
             c.ktransformers.auto_build = bool(d["auto_build"])
+        if "nnodes" in d:
+            try:
+                c.ktransformers.nnodes = max(1, int(d.get("nnodes") or 1))
+            except (TypeError, ValueError):
+                pass
+        if "tp_size" in d:
+            try:
+                c.ktransformers.tp_size = max(0, int(d.get("tp_size") or 0))
+            except (TypeError, ValueError):
+                pass
+        if "dist_init_addr" in d:
+            c.ktransformers.dist_init_addr = (d.get("dist_init_addr") or "").strip()
+        if "nodes" in d:
+            from codai.cluster.multinode import parse_nodes
+            c.ktransformers.nodes = parse_nodes(d.get("nodes"))
 
     if "vllm" in data:
         d = data["vllm"]
@@ -4250,6 +4366,80 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "extra_args" in d: v.extra_args = (d.get("extra_args") or "").strip()
         if "extra_env" in d: v.extra_env = (d.get("extra_env") or "").strip()
         if "auto_build" in d: v.auto_build = bool(d["auto_build"])
+        if "pipeline_parallel_size" in d:
+            try: v.pipeline_parallel_size = max(1, int(d.get("pipeline_parallel_size") or 1))
+            except (TypeError, ValueError): pass
+        if "distributed_executor_backend" in d:
+            v.distributed_executor_backend = (d.get("distributed_executor_backend") or "").strip().lower()
+        if "ray_address" in d: v.ray_address = (d.get("ray_address") or "").strip()
+        if "ray_port" in d:
+            try: v.ray_port = int(d.get("ray_port") or 6379)
+            except (TypeError, ValueError): pass
+        if "nodes_ready_timeout_s" in d:
+            try: v.nodes_ready_timeout_s = max(30, int(d.get("nodes_ready_timeout_s") or 600))
+            except (TypeError, ValueError): pass
+        if "nodes" in d:
+            from codai.cluster.multinode import parse_nodes
+            v.nodes = parse_nodes(d.get("nodes"))
+
+    if "cluster" in data:
+        d = data["cluster"] if isinstance(data["cluster"], dict) else {}
+        cl = c.cluster
+        if "enabled" in d: cl.enabled = bool(d["enabled"])
+        if "serve" in d: cl.serve = bool(d["serve"])
+        if "node_name" in d: cl.node_name = (d.get("node_name") or "").strip()
+        if "advertise_host" in d: cl.advertise_host = (d.get("advertise_host") or "").strip()
+        if "rpc_bin" in d: cl.rpc_bin = (d.get("rpc_bin") or "").strip()
+        if "poll_timeout_s" in d:
+            try: cl.poll_timeout_s = max(1.0, float(d.get("poll_timeout_s") or 4.0))
+            except (TypeError, ValueError): pass
+        if "nodes" in d and isinstance(d["nodes"], list):
+            # A blank api_key keeps the stored one (the UI never receives it).
+            old_keys = {str(n.get("name") or "").strip().lower(): n.get("api_key", "")
+                        for n in (cl.nodes or []) if isinstance(n, dict)}
+            nodes = []
+            for n in d["nodes"]:
+                if not isinstance(n, dict) or not str(n.get("url") or "").strip():
+                    continue
+                name = str(n.get("name") or "").strip()
+                key = str(n.get("api_key") or "").strip() or old_keys.get(name.lower(), "")
+                caps = n.get("capabilities")
+                if isinstance(caps, str):
+                    caps = [x.strip().lower() for x in caps.split(",") if x.strip()]
+                nodes.append({
+                    "name": name or f"node{len(nodes) + 1}",
+                    "url": str(n.get("url") or "").strip().rstrip("/"),
+                    "api_key": key,
+                    "verify": str(n.get("verify") or "system").strip().lower(),
+                    "ca_pem": str(n.get("ca_pem") or ""),
+                    "capabilities": [str(x) for x in (caps or [])],
+                    "enabled": bool(n.get("enabled", True)),
+                })
+            cl.nodes = nodes
+        if "rpc_servers" in d and isinstance(d["rpc_servers"], list):
+            out = []
+            for r in d["rpc_servers"]:
+                if not isinstance(r, dict):
+                    continue
+                try:
+                    port = int(r.get("port") or 0)
+                except (TypeError, ValueError):
+                    port = 0
+                if port <= 0:
+                    continue
+                item = {"name": str(r.get("name") or "").strip() or f"rpc{len(out) + 1}",
+                        "host": str(r.get("host") or "0.0.0.0").strip() or "0.0.0.0",
+                        "port": port,
+                        "device": str(r.get("device") or "").strip(),
+                        "enabled": bool(r.get("enabled", True)),
+                        "cache": bool(r.get("cache", False))}
+                for k, cast in (("mem_gb", float), ("threads", int)):
+                    try:
+                        item[k] = cast(r.get(k) or 0)
+                    except (TypeError, ValueError):
+                        item[k] = 0
+                out.append(item)
+            cl.rpc_servers = out
 
     if "runpod" in data:
         d = data["runpod"]

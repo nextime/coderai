@@ -69,6 +69,39 @@ if [ -n "$CODERAI_TLS_CERT" ] && [ -n "$CODERAI_TLS_KEY" ]; then
     phase "tls: serving https with the certificate the renting coderai sent"
 fi
 
+# A ray WORKER instead of a server: the vllm image joins a multi-node vLLM
+# launch whose head is the coderai that started this container
+# (codai/cluster/multinode.py). Nothing else runs; the head drives the GPUs.
+if [ -n "${CODERAI_RAY_ADDRESS:-}" ]; then
+    RAY_BIN="${CODERAI_VLLM_VENV:-/opt/coderai/venvs/vllm}/bin/ray"
+    [ -x "$RAY_BIN" ] || RAY_BIN="ray"
+    phase "ray worker: joining ${CODERAI_RAY_ADDRESS} with ${RAY_BIN}"
+    exec "$RAY_BIN" start --address="${CODERAI_RAY_ADDRESS}" --block \
+         ${CODERAI_RAY_NODE_IP:+--node-ip-address="$CODERAI_RAY_NODE_IP"} \
+         --disable-usage-stats
+fi
+
+# A llama.cpp rpc-server beside the app: this pod's/host's cards become
+# devices of a GGUF loaded elsewhere (codai/backends/ggml_rpc.py). The port
+# must be exposed (direct TCP on a pod, -p on docker). Unauthenticated
+# protocol — LAN, WireGuard or a pod's direct port with a firewall only.
+if [ -n "${CODERAI_RPC_SERVER_PORT:-}" ]; then
+    RPC_BIN="${CODERAI_RPC_SERVER_BIN:-/usr/local/bin/rpc-server}"
+    if [ -x "$RPC_BIN" ]; then
+        phase "rpc-server: listening on 0.0.0.0:${CODERAI_RPC_SERVER_PORT}${CODERAI_RPC_SERVER_DEVICE:+ device $CODERAI_RPC_SERVER_DEVICE}"
+        "$RPC_BIN" -H 0.0.0.0 -p "$CODERAI_RPC_SERVER_PORT" \
+            ${CODERAI_RPC_SERVER_DEVICE:+-d "$CODERAI_RPC_SERVER_DEVICE"} \
+            ${CODERAI_RPC_SERVER_MEM_MB:+-m "$CODERAI_RPC_SERVER_MEM_MB"} &
+        if [ "${CODERAI_RPC_SERVER_ONLY:-0}" = "1" ]; then
+            phase "rpc-server only: no API server on this pod"
+            wait
+            exit $?
+        fi
+    else
+        phase "rpc-server requested but $RPC_BIN is not in this image"
+    fi
+fi
+
 phase "starting uvicorn on 0.0.0.0:8000${TLS_ARGS:+ (https)}"
 exec python -m uvicorn codai.api.app:app --host 0.0.0.0 --port 8000 \
      --log-level "${CODERAI_LOG_LEVEL:-info}" $TLS_ARGS

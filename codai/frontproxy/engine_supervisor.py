@@ -132,6 +132,7 @@ class EngineSupervisor:
         self._health = {}                # engine_id -> last healthy bool (for debug)
         self._assign_mtime = 0.0         # models.json mtime → live re-assignment
         self._pending_reload = {}        # engine.name -> owned list awaiting an idle engine
+        self._reload_retry_at = {}       # node name -> epoch before which no push is retried
         self._stopped = threading.Event()
         self._poll_thread = None
         self._logs = {}   # engine_id -> deque tail
@@ -286,6 +287,7 @@ class EngineSupervisor:
                     backend=backend, env=env, capabilities=caps,
                 ))
             self._set_cosited_urls(engines)
+            engines.extend(self._build_remote_engines(len(engines)))
             return engines
 
         # Auto: one engine per GPU vendor actually present on this machine. Vendors
@@ -307,6 +309,7 @@ class EngineSupervisor:
         if not plan:
             engines.append(Engine(id=0, gpu=None, port=self._alloc_port(),
                                   primary=True, name="cpu", backend="auto", env={}))
+            engines.extend(self._build_remote_engines(1))
             return engines
 
         isolate = bool(getattr(srv, "isolate_gguf_engine", True))
@@ -362,7 +365,124 @@ class EngineSupervisor:
             next_id += 1
 
         self._set_cosited_urls(engines)
+        engines.extend(self._build_remote_engines(next_id))
         return engines
+
+    # ------------------------------------------------------------- cluster nodes
+    #: Remote nodes get ids from here up, so they never collide with local
+    #: engines (small ids) or the system worker (900).
+    _NODE_ID_BASE = 500
+
+    def _node_specs(self) -> list:
+        try:
+            from codai.cluster.nodes import enabled_nodes
+            return enabled_nodes(getattr(self.config, "cluster", None))
+        except Exception as exc:
+            print(f"[front] cluster nodes not read: {exc}", flush=True)
+            return []
+
+    def _make_remote_engine(self, spec, eid: int) -> Engine:
+        from codai.cluster.nodes import async_clients, sync_client
+        caps = set(spec.capabilities)
+        e = Engine(id=eid, gpu=None, port=0, primary=False, name=spec.name,
+                   backend="node", env={}, remote=True, url=spec.url,
+                   # Until the node reports, assume the common formats so the
+                   # assignment has something to work with; the first poll
+                   # replaces this with what the node actually offers.
+                   capabilities=caps or {"transformers", "gguf", "whisper"},
+                   caps_fixed=bool(caps))
+        e.http_short, e.http_long = async_clients(spec)
+        e.http_sync = sync_client(spec)
+        e.node_sig = self._node_sig(spec)
+        return e
+
+    def _build_remote_engines(self, next_id: int) -> list:
+        """One Engine per enabled ``cluster.nodes`` entry — polled, assigned and
+        routed like a local engine, spawned by nobody."""
+        out = []
+        for i, spec in enumerate(self._node_specs()):
+            e = self._make_remote_engine(spec, self._NODE_ID_BASE + i)
+            print(f"[front] cluster node '{spec.name}' at {spec.url} "
+                  f"({'caps ' + ','.join(sorted(spec.capabilities)) if spec.capabilities else 'capabilities as reported'})",
+                  flush=True)
+            out.append(e)
+        return out
+
+    @staticmethod
+    def _node_sig(spec) -> tuple:
+        return (spec.name, spec.url, spec.api_key, spec.verify, spec.ca_pem,
+                tuple(sorted(spec.capabilities)))
+
+    def _sync_cluster_nodes(self) -> None:
+        """Add/remove remote engines when cluster.nodes changes in config.json
+        (the front refreshes self.config in place on a settings save)."""
+        specs = {s.name: s for s in self._node_specs()}
+        current = {e.name: e for e in self.registry.remotes()}
+        changed = False
+        for name, e in current.items():
+            spec = specs.get(name)
+            if spec is not None and getattr(e, "node_sig", None) == self._node_sig(spec):
+                continue
+            print(f"[front] cluster node '{name}' "
+                  f"{'changed' if spec else 'removed'} — dropping its engine", flush=True)
+            self.registry.remove(e.id)
+            try:
+                e.http_sync.close()
+            except Exception:
+                pass
+            changed = True
+        used = {e.id for e in self.registry.remotes()}
+        kept = {e.name for e in self.registry.remotes()}
+        for i, (name, spec) in enumerate(specs.items()):
+            if name in kept:
+                continue
+            eid = self._NODE_ID_BASE + i
+            while eid in used:
+                eid += 1
+            used.add(eid)
+            e = self._make_remote_engine(spec, eid)
+            self.registry.add(e)
+            if name not in current:
+                print(f"[front] cluster node '{name}' added at {spec.url}", flush=True)
+            changed = True
+        if changed:
+            self._assign_mtime = 0.0     # force a fresh assignment push
+
+    def _entries_for(self, idents: list) -> list:
+        """The models.json entries (as dicts) behind these routable ids — what a
+        node needs to register a model it does not have in its own catalogue."""
+        if not self.models_path or not idents:
+            return []
+        try:
+            with open(self.models_path) as f:
+                data = json.load(f)
+        except Exception:
+            return []
+        from codai.frontproxy.assignment import _CATEGORIES, _route_key
+        want = set(idents)
+        out = []
+        for cat in _CATEGORIES:
+            for entry in data.get(cat, []) or []:
+                if isinstance(entry, dict) and _route_key(entry) in want:
+                    from codai.cluster.nodes import portable_entry
+                    e = portable_entry(entry)
+                    e.setdefault("model_type", cat)
+                    out.append(e)
+        return out
+
+    def _push_node_reload(self, engine: Engine, owned: list) -> None:
+        payload = {"assigned": owned, "entries": self._entries_for(owned)}
+        r = engine.http_sync.post(engine.url + "/cluster/reload-config", json=payload)
+        if r.status_code != 200:
+            raise RuntimeError(f"{r.status_code} {(r.text or '')[:160]}")
+        try:
+            d = r.json()
+        except Exception:
+            d = {}
+        refused = d.get("refused") or []
+        if refused:
+            print(f"[front] node '{engine.name}' could not register: "
+                  f"{'; '.join(str(x) for x in refused[:5])}", flush=True)
 
     # ------------------------------------------------------------------ spawning
     def _engine_cmd(self, port: int, mode: str = "--engine-only") -> list:
@@ -387,6 +507,8 @@ class EngineSupervisor:
                 mode, "--internal-port", str(port)]
 
     def _spawn(self, engine: Engine) -> None:
+        if engine.remote:
+            return            # a node runs itself; the poll below finds it
         env = dict(os.environ)
         # Engine stdout is a pipe (not a TTY), so CPython block-buffers print()
         # output — debug lines (e.g. --debug-requests) would stall in the buffer
@@ -612,6 +734,10 @@ class EngineSupervisor:
         for engine in engines:
             self.registry.add(engine)
             self._spawn(engine)
+            if engine.remote:
+                # Nothing was spawned with an env: the node learns what it owns
+                # (and the entries behind it) by a push once it answers.
+                self._pending_reload[engine.name] = sorted(engine.assigned_models)
         # The coderai-system worker: cache scan + HF downloads + cache management,
         # off the GPU engines so they never block generation. One instance.
         sysw = Engine(id=900, gpu=None, port=self._alloc_port(), role="system",
@@ -619,6 +745,19 @@ class EngineSupervisor:
         self._system_worker = sysw
         self.registry.add(sysw)
         self._spawn(sysw)
+        # The llama.cpp RPC servers THIS machine contributes to the cluster.
+        self.rpc_manager = None
+        try:
+            from codai.cluster.rpc import RpcServerManager, parse_rpc_servers
+            ccfg = getattr(self.config, "cluster", None)
+            specs = parse_rpc_servers(getattr(ccfg, "rpc_servers", None)) if ccfg else []
+            if specs:
+                self.rpc_manager = RpcServerManager(
+                    specs, binary=getattr(ccfg, "rpc_bin", "") or "",
+                    advertise=getattr(ccfg, "advertise_host", "") or "")
+                self.rpc_manager.start()
+        except Exception as exc:
+            print(f"[front] rpc servers not started: {exc}", flush=True)
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._poll_thread.start()
         # Central thermal supervisor: monitor temps from the front (responsive even
@@ -680,19 +819,27 @@ class EngineSupervisor:
         Busy engines (inflight > 0) are left queued for a later poll iteration."""
         if not self._pending_reload:
             return
+        now = time.time()
         for e in self.registry.all():
             if e.name not in self._pending_reload:
                 continue
             if getattr(e, "inflight", 0) > 0:
                 continue   # still generating — keep it queued
+            if e.remote and (not e.healthy or self._reload_retry_at.get(e.name, 0) > now):
+                continue   # a node that is down is retried when it answers again
             owned = self._pending_reload.pop(e.name)
             try:
-                client.post(e.url + "/internal/reload-config", json={"assigned": owned})
+                if e.remote:
+                    self._push_node_reload(e, owned)
+                else:
+                    client.post(e.url + "/internal/reload-config", json={"assigned": owned})
                 print(f"[front] reload-config pushed to idle engine '{e.name}' "
                       f"({len(owned)} models)", flush=True)
             except Exception as exc:
                 # Push failed (engine may have gone busy/unhealthy mid-call); requeue.
                 self._pending_reload[e.name] = owned
+                if e.remote:
+                    self._reload_retry_at[e.name] = now + 30.0
                 print(f"[front] reload-config push to '{e.name}' failed: {exc}; requeued",
                       flush=True)
 
@@ -903,6 +1050,8 @@ class EngineSupervisor:
                     for engine in self.registry.all():
                         if getattr(engine, "role", "engine") == "system":
                             continue   # the cache/downloads worker isn't on the GPU
+                        if engine.remote:
+                            continue   # the node's own front watches its cards
                         ecards = (self._engine_cards(engine, cards)
                                   if settings.gpu_enabled else [])
                         gpu_hot = gpu_warm = False
@@ -964,9 +1113,17 @@ class EngineSupervisor:
         except OSError:
             self._assign_mtime = 0.0
         while not self._stopped.is_set():
+            try:
+                self._sync_cluster_nodes()
+            except Exception as exc:
+                if self.debug:
+                    print(f"[front] cluster node sync error: {exc}", flush=True)
             self._push_assignment_if_changed(client)
             self._flush_pending_reloads(client)   # deliver queued reloads to idle engines
             for engine in self.registry.all():
+                if engine.remote:
+                    self._poll_remote(engine)
+                    continue
                 # A quarantined engine (repeated crash-loop; e.g. GPU off-bus) stays
                 # down until a manual restart_engine() revives it — don't poll/respawn.
                 if engine.id in self._quarantined:
@@ -1030,6 +1187,45 @@ class EngineSupervisor:
             self._stopped.wait(self.config.server.proxy_status_timeout)
         client.close()
 
+    def _poll_remote(self, engine: Engine) -> None:
+        """One state poll of a cluster node. Its front answers from its own
+        registry, so this is cheap and never waits on a busy GPU engine there."""
+        healthy = False
+        try:
+            r = engine.http_sync.get(engine.url + engine.state_path)
+            if r.status_code == 200:
+                d = r.json()
+                healthy = bool(d.get("healthy", True))
+                self.registry.update_state(
+                    engine.id, healthy=healthy,
+                    loaded_models=d.get("loaded_models") or [],
+                    loaded_info=d.get("loaded_info") or [],
+                    vram=d.get("vram"), tasks=d.get("tasks") or [],
+                    cooling=d.get("cooling"),
+                    capabilities=d.get("capabilities"),
+                    node_engines=d.get("engines"),
+                    rpc_servers=d.get("rpc_servers"),
+                    last_error="" if healthy else "node reports no healthy engine")
+            elif r.status_code in (401, 403):
+                self.registry.update_state(engine.id, healthy=False,
+                                           last_error=f"{r.status_code}: the node refused "
+                                           "the token (create one on its Tokens page)")
+            elif r.status_code == 404:
+                self.registry.update_state(engine.id, healthy=False,
+                                           last_error="404: not a coderai front, or "
+                                           "cluster.serve is off there")
+            else:
+                self.registry.update_state(engine.id, healthy=False,
+                                           last_error=f"HTTP {r.status_code}")
+        except Exception as exc:
+            self.registry.update_state(engine.id, healthy=False,
+                                       last_error=str(exc)[:200])
+        if self.debug and self._health.get(engine.id) != healthy:
+            self._health[engine.id] = healthy
+            print(f"[front] node '{engine.name}' "
+                  f"{'reachable' if healthy else 'not responding: ' + engine.last_error}",
+                  flush=True)
+
     def _maybe_restart(self, engine: Engine) -> None:
         with self._restart_lock:
             if self._stopped.is_set():
@@ -1065,6 +1261,9 @@ class EngineSupervisor:
             self._spawn(engine)
 
     def restart_engine(self, engine_id: int, drain_grace: Optional[float] = None) -> bool:
+        _e = self.registry.get(engine_id)
+        if _e is not None and _e.remote:
+            return False      # a node is restarted from its own admin page
         """Forcibly kill and respawn one engine (e.g. it's stuck in a loop).
 
         Before killing, mark the engine ``draining`` so the router stops sending it
@@ -1147,6 +1346,11 @@ class EngineSupervisor:
         mid-CUDA) engine, and any children it spawned (whisper-server, ds4), are
         guaranteed dead. Idempotent and safe to call from a signal handler."""
         self._stopped.set()
+        try:
+            if getattr(self, "rpc_manager", None) is not None:
+                self.rpc_manager.stop()
+        except Exception:
+            pass
 
         def _signal_group(proc, sig):
             # Engines are started in their own session (setsid), so killing the

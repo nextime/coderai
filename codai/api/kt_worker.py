@@ -142,10 +142,34 @@ def _launch_cmd(cfg, host: str, port: int, model_path: str) -> list:
     ctx = int(getattr(cfg, "ctx", 0) or 0)
     if ctx > 0:
         cmd += ["--context-length", str(ctx)]
+    tp = int(getattr(cfg, "tp_size", 0) or 0)
+    if tp > 0:
+        cmd += ["--tp-size", str(tp)]
+    # Multi-node: this process is rank 0; the other ranks were started by
+    # their configured commands (codai/cluster/multinode.SglangNodes).
+    nn = int(getattr(cfg, "nnodes", 1) or 1)
+    if nn > 1:
+        cmd += ["--nnodes", str(nn), "--node-rank", "0",
+                "--dist-init-addr", dist_init_addr(cfg)]
     extra = (getattr(cfg, "extra_args", "") or "").strip()
     if extra:
         cmd += shlex.split(extra)
     return cmd
+
+
+def dist_init_addr(cfg) -> str:
+    """host:port of rank 0 as the other ranks reach it."""
+    v = (getattr(cfg, "dist_init_addr", "") or "").strip()
+    if v:
+        return v
+    from codai.cluster.rpc import advertise_host
+    adv = ""
+    try:
+        from codai.admin.routes import config_manager
+        adv = getattr(getattr(config_manager.config, "cluster", None), "advertise_host", "") or ""
+    except Exception:
+        pass
+    return f"{advertise_host(adv)}:20000"
 
 
 def ensure_service(cfg, model_path: Optional[str] = None,
@@ -203,12 +227,27 @@ def ensure_service(cfg, model_path: Optional[str] = None,
                         applied_env[k.strip()] = v
         env_note = ("  (" + " ".join(f"{k}={v}" for k, v in applied_env.items()) + ")"
                     if applied_env else "")
+        # Multi-node: ranks 1..n-1 come up first (they block on rank 0's
+        # rendezvous address, which is what this launch is about to bind).
+        peers = None
+        nn = int(getattr(cfg, "nnodes", 1) or 1)
+        if nn > 1:
+            from codai.cluster.multinode import SglangNodes
+            peers = SglangNodes(getattr(cfg, "nodes", None), nn, dist_init_addr(cfg))
+            peers.start(model=resolved, tp_size=int(getattr(cfg, "tp_size", 0) or 0),
+                        ctx=int(getattr(cfg, "ctx", 0) or 0))
         print(f"[kt] launching SGLang: {' '.join(cmd)}{env_note}", flush=True)
         tail = collections.deque(maxlen=60)
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, bufsize=1, env=env)
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1, env=env)
+        except Exception:
+            if peers is not None:
+                peers.stop(model=resolved)
+            raise
         threading.Thread(target=_pump_logs, args=(proc, tail), daemon=True).start()
-        _services[svc_key] = {"proc": proc, "port": port, "url": url}
+        _services[svc_key] = {"proc": proc, "port": port, "url": url, "peers": peers,
+                              "model": resolved}
 
     def _tail_msg():
         joined = " | ".join(l.strip()[:300] for l in list(tail) if l.strip()).strip()
@@ -245,6 +284,12 @@ def stop_service(model_id: str) -> None:
             proc.kill()
         except Exception:
             pass
+    peers = svc.get("peers")
+    if peers is not None:
+        try:
+            peers.stop(model=svc.get("model", ""))
+        except Exception as exc:
+            print(f"[kt] peer teardown failed: {exc}", flush=True)
     print(f"[kt] service for {model_id} stopped", flush=True)
 
 

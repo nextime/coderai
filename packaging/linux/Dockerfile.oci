@@ -65,8 +65,19 @@ RUN mkdir -p /opt/wheels
 
 RUN set -eux; \
     pkg="llama-cpp-python${LLAMA_CPP_PYTHON_VERSION:+==${LLAMA_CPP_PYTHON_VERSION}}"; \
-    CMAKE_ARGS="-DGGML_CUDA=ON -DGGML_VULKAN=ON" \
+    CMAKE_ARGS="-DGGML_CUDA=ON -DGGML_VULKAN=ON -DGGML_RPC=ON" \
       uv pip wheel --python /opt/coderai/python/bin/python3 --wheel-dir /opt/wheels --no-deps --no-cache "$pkg"
+
+# rpc-server from the SAME vendored llama.cpp (the RPC protocol is versioned):
+# what this install runs to lend its cards to a GGUF loaded on another machine
+# (docs/cluster.md). Static ggml so the binary needs only the CUDA/Vulkan
+# runtime that is already in the image.
+COPY packaging/build-rpc-server.sh /tmp/build-rpc-server.sh
+RUN set -eux; \
+    uv pip install --python /opt/coderai/python/bin/python3 --find-links /opt/wheels --no-deps --no-index llama-cpp-python; \
+    PYTHON=/opt/coderai/python/bin/python3 CMAKE_CUDA_ARCHITECTURES="80;86;89;90;120" \
+      bash /tmp/build-rpc-server.sh --cuda --vulkan --dest /opt/coderai/python/bin \
+      || echo "WARNING: rpc-server not built; cluster RPC serving unavailable in this image"
 
 RUN set -eux; \
     pkg="stable-diffusion-cpp-python${SD_CPP_PYTHON_VERSION:+==${SD_CPP_PYTHON_VERSION}}"; \

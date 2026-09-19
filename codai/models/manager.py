@@ -1676,6 +1676,12 @@ class MultiModelManager:
                         kwargs[_kvk] = _kvv
                 if _raw and '_raw_cfg' not in kwargs:
                     kwargs['_raw_cfg'] = _raw
+                # Cards on other machines (llama.cpp RPC), per model only.
+                _rpc = config.get('rpc_servers') if isinstance(config, dict) else None
+                if not _rpc:
+                    _rpc = _raw.get('rpc_servers')
+                if _rpc:
+                    kwargs['rpc_servers'] = _rpc
                 # Cross-backend GPU pooling: per-model overrides global (global_args).
                 kwargs['gpu_split'] = _cfg_or_global('gpu_split', 'gpu_split', False)
                 _ts_val = _cfg_or_global('tensor_split', 'tensor_split', None)
@@ -1846,6 +1852,12 @@ class MultiModelManager:
                         kwargs[_kvk] = _kvv
                 if _raw and '_raw_cfg' not in kwargs:
                     kwargs['_raw_cfg'] = _raw
+                # Cards on other machines (llama.cpp RPC), per model only.
+                _rpc = config.get('rpc_servers') if isinstance(config, dict) else None
+                if not _rpc:
+                    _rpc = _raw.get('rpc_servers')
+                if _rpc:
+                    kwargs['rpc_servers'] = _rpc
                 # Cross-backend GPU pooling: per-model overrides global (global_args).
                 kwargs['gpu_split'] = _cfg_or_global('gpu_split', 'gpu_split', False)
                 _ts_val = _cfg_or_global('tensor_split', 'tensor_split', None)

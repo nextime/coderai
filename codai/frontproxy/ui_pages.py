@@ -160,6 +160,13 @@ def register_ui_pages(app: FastAPI, config_dir) -> bool:
             return redir
         return _tmpl(request, "runpod.html", {"username": u, "is_admin": True})
 
+    @app.get("/admin/cluster", include_in_schema=False)
+    async def _cluster_page(request: Request):
+        u, redir = _auth_or_redirect(request, admin=True)
+        if redir:
+            return redir
+        return _tmpl(request, "cluster.html", {"username": u, "is_admin": True})
+
     @app.get("/admin/archive", include_in_schema=False)
     async def _archive_page(request: Request):
         u, redir = _auth_or_redirect(request, admin=True)

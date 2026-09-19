@@ -70,6 +70,11 @@ class KtransformersBackend(ModelBackend):
         if _ctx > 0:
             self._ctx = _ctx
         model_path = self._resolve_model_dir(model_name)
+        # This model's own `kt` block over the global template: the machines it
+        # spans (nnodes + their commands), tp_size, KT weights, flags.
+        from codai.backends.overrides import KT_FIELDS, apply, model_block
+        self._cfg = apply(self._cfg, model_block(model_name, "kt") or
+                          model_block(model_name, "ktransformers"), KT_FIELDS, "kt")
         _resolved, self._svc_key = kt_worker.resolve_service_key(self._cfg, model_path)
         self._url = kt_worker.ensure_service(self._cfg, model_path=model_path)
         # SGLang serves under --served-model-name = the configured model_id; send that.

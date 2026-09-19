@@ -545,7 +545,7 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
         <div class="form-row" style="margin:0">
           <label class="form-label">Compute backend</label>
-          <select id="cfg-backend" class="form-input" onchange="_updateSttVisibility();_updateRunpodVisibility()" title="RunPod and Host are also set from 'Runs on' in the Placement section below">
+          <select id="cfg-backend" class="form-input" onchange="_updateSttVisibility();_updateRunpodVisibility();_applyCompat()" title="RunPod and Host are also set from 'Runs on' in the Placement section below">
             <option value="auto">Auto-detect</option>
             <option value="nvidia">NVIDIA (CUDA)</option>
             <option value="vulkan">Vulkan</option>
@@ -592,10 +592,11 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
       </div>
       <div class="form-row" id="cfg-engine-row" style="margin-top:.75rem;display:none">
         <label class="form-label">Engine / card</label>
-        <select id="cfg-engine" class="form-input" onchange="_updateGpuSplitVisibility()">
+        <select id="cfg-engine" class="form-input" onchange="_updateGpuSplitVisibility();_applyCompat()">
           <option value="">Auto (single GPU — by capability / free VRAM)</option>
         </select>
-        <span class="form-hint" style="font-size:11px"><b>Auto</b> runs the model on ONE card (picked by capability / most free VRAM). Pin it to a specific engine, or pick a <b>Split — &lt;card&gt; first</b> option to spread one model across all GPUs (more total VRAM) with that card leading (it holds the output/KV anchor and the larger share). Only shown when multiple engines are running.</span>
+        <span class="form-hint" style="font-size:11px"><b>Auto</b> runs the model on ONE card (picked by capability / most free VRAM). Pin it to a specific engine — a card here or a <b>cluster node</b> (another coderai on your network) — or pick a <b>Split — &lt;card&gt; first</b> option to spread one model across all GPUs of this machine (more total VRAM) with that card leading. Options an engine cannot run are greyed out for the selected backend, and vice versa. Only shown when more than one engine or a node is available.</span>
+        <div id="cfg-compat-warn" style="display:none;margin-top:.4rem;padding:.45rem .6rem;border:1px solid #c0392b;border-radius:6px;background:rgba(192,57,43,.12);font-size:12px;line-height:1.4"></div>
         <label style="display:flex;align-items:center;gap:.4rem;margin-top:.4rem;font-size:12px">
           <input type="checkbox" id="cfg-engine-fallback" style="width:auto;margin:0">
           Fall back to another engine if the pinned one is unavailable
@@ -615,6 +616,52 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <label class="form-label" style="font-weight:600;margin-top:.5rem">Weight distribution <span class="muted" style="font-weight:400">— layers per GPU (manual override)</span></label>
         <input type="text" id="cfg-tensor-split" class="form-input" placeholder="auto (uses the strategy above)">
         <span class="form-hint" style="font-size:11px">Optional explicit ratio for the lead card then the rest, e.g. <b>0.8,0.2</b>. Overrides the strategy. Blank = automatic per the strategy above.</span>
+      </div>
+      <div class="form-row" id="cfg-node-path-row" style="margin-top:.75rem;display:none">
+        <label class="form-label">Path on the node <span class="muted">(this model lives on a cluster node)</span></label>
+        <input type="text" id="cfg-node-path" class="form-input" placeholder="blank = same path as here, else the HuggingFace id / URL the node can fetch">
+        <span class="form-hint" style="font-size:11px">The node registers the model under this path when it does not share this machine's filesystem. Blank works when the path exists on the node too (NFS, same layout) or the model is a HuggingFace id.</span>
+      </div>
+      <div class="form-row" id="cfg-rpc-row" style="margin-top:.75rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
+        <label class="form-label" style="font-weight:600">Cards on other machines <span class="muted" style="font-weight:400">— llama.cpp RPC servers, one model over several machines</span></label>
+        <input type="text" id="cfg-rpc-servers" class="form-input" list="cfg-rpc-known" placeholder="host:50052, host2:50052   (blank = this machine only)">
+        <datalist id="cfg-rpc-known"></datalist>
+        <span class="form-hint" style="font-size:11px;line-height:1.5">Each <code>host:port</code> where an <code>rpc-server</code> listens becomes one more GPU in this model's layer split, <b>after this machine's cards</b> in that order (so a <b>Weight distribution</b> ratio reads: local cards…, then these). Known servers from the <a href="{{ root_path }}/admin/cluster">Cluster</a> page are suggested. Decode over a LAN is workable (activations per token are small); loading and prompt processing are wire-bound — 1 GbE hurts, 10 GbE is fine. The protocol is unauthenticated: LAN or WireGuard only. Tick <b>Split</b> above or leave Auto — a model naming RPC servers is split by definition.</span>
+        <div id="cfg-rpc-status" class="form-hint" style="font-size:11px;margin-top:.3rem"></div>
+      </div>
+      <div class="form-row" id="cfg-vllm-row" style="margin-top:.75rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
+        <label class="form-label" style="font-weight:600">vLLM <span class="muted" style="font-weight:400">— per-model parallelism and the machines it spans</span></label>
+        <span class="form-hint" style="font-size:11px;margin-bottom:.4rem">Blank = inherit the global vLLM settings. <b>Tensor parallel</b> splits every layer across GPUs (fast links only: one machine). <b>Pipeline parallel</b> gives each machine a slice of layers — that is the one to use across a network. With nodes listed (or pipeline &gt; 1) coderai starts a Ray head here, runs each node's command, waits until Ray sees tensor×pipeline GPUs, then launches vLLM on Ray.</span>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.6rem">
+          <div class="form-row" style="margin:0"><label class="form-label">Tensor parallel (GPUs per node)</label><input type="number" id="cfg-vllm-tp" class="form-input" min="1" placeholder="inherit"></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Pipeline parallel (nodes)</label><input type="number" id="cfg-vllm-pp" class="form-input" min="1" placeholder="inherit / 1"></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Executor</label>
+            <select id="cfg-vllm-executor" class="form-input"><option value="">auto (ray when nodes are listed)</option><option value="mp">mp — this machine only</option><option value="ray">ray</option></select></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-top:.5rem">
+          <div class="form-row" style="margin:0"><label class="form-label">Existing Ray cluster <span class="muted">(blank = start a head here)</span></label><input type="text" id="cfg-vllm-ray" class="form-input" placeholder="10.0.0.1:6379"></div>
+          <div class="form-row" style="margin:0"><label class="form-label">GPU memory fraction</label><input type="number" id="cfg-vllm-gmu" class="form-input" min="0.1" max="1" step="0.05" placeholder="inherit"></div>
+        </div>
+        <div class="form-row" style="margin:.5rem 0 0">
+          <label class="form-label">Nodes <span class="muted">— one per line: <code>name | start command | stop command | gpus</code></span></label>
+          <textarea id="cfg-vllm-nodes" class="form-input" rows="3" style="font-family:monospace;font-size:11px" placeholder="box2 | ssh box2 docker run -d --rm --name vllm-worker --gpus all --network host -e CODERAI_RAY_ADDRESS={ray_address} ghcr.io/nextime/coderai-vllm:latest | ssh box2 docker stop vllm-worker | 1"></textarea>
+          <span class="form-hint" style="font-size:11px"><code>{ray_address}</code>, <code>{head}</code> and <code>{port}</code> are filled in. The <code>coderai-vllm</code> image joins as a Ray worker when started with <code>CODERAI_RAY_ADDRESS</code>; every node must run the same vLLM build.</span>
+        </div>
+        <div class="form-row" style="margin:.5rem 0 0"><label class="form-label">Extra vLLM args</label><input type="text" id="cfg-vllm-extra" class="form-input" placeholder="--enable-prefix-caching"></div>
+      </div>
+      <div class="form-row" id="cfg-kt-row" style="margin-top:.75rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
+        <label class="form-label" style="font-weight:600">ktransformers / SGLang <span class="muted" style="font-weight:400">— per-model nodes</span></label>
+        <span class="form-hint" style="font-size:11px;margin-bottom:.4rem">Blank = inherit the global ktransformers settings. With <b>nodes &gt; 1</b> this machine is rank 0; ranks 1… are started by the commands below (templated with <code>{rank}</code>, <code>{nnodes}</code>, <code>{dist_init_addr}</code>, <code>{model}</code>) before rank 0 launches.</span>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.6rem">
+          <div class="form-row" style="margin:0"><label class="form-label">Nodes (nnodes)</label><input type="number" id="cfg-kt-nnodes" class="form-input" min="1" placeholder="inherit / 1"></div>
+          <div class="form-row" style="margin:0"><label class="form-label">tp-size (all GPUs)</label><input type="number" id="cfg-kt-tp" class="form-input" min="1" placeholder="inherit"></div>
+          <div class="form-row" style="margin:0"><label class="form-label">Rank 0 address</label><input type="text" id="cfg-kt-dist" class="form-input" placeholder="auto: <this host>:20000"></div>
+        </div>
+        <div class="form-row" style="margin:.5rem 0 0">
+          <label class="form-label">Node commands <span class="muted">— one per line for ranks 1…: <code>name | start command | stop command</code></span></label>
+          <textarea id="cfg-kt-nodes" class="form-input" rows="3" style="font-family:monospace;font-size:11px" placeholder="box2 | ssh box2 'sglang-node.sh --nnodes {nnodes} --node-rank {rank} --dist-init-addr {dist_init_addr} --model {model}' | ssh box2 pkill -f sglang"></textarea>
+        </div>
+        <div class="form-row" style="margin:.5rem 0 0"><label class="form-label">Extra SGLang args</label><input type="text" id="cfg-kt-extra" class="form-input" placeholder="--mem-fraction-static 0.8"></div>
       </div>
       <div class="form-row" id="cfg-ds4-row" style="margin-top:.75rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
         <label class="form-label" style="font-weight:600">ds4 (DeepSeek V4) streaming <span class="muted" style="font-weight:400">— per-model overrides</span></label>
@@ -944,6 +991,11 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
             <div class="form-row" style="margin:0"><label class="form-label">Health path</label><input type="text" id="cfg-host-health" class="form-input" placeholder="/healthz"></div>
             <div class="form-row" style="margin:0"><label class="form-label">Boot timeout (s)</label><input type="number" id="cfg-host-boot" class="form-input" min="5" placeholder="300"></div>
             <div class="form-row" style="margin:0"><label class="form-label">Idle timeout (s)</label><input type="number" id="cfg-host-idle" class="form-input" min="0" placeholder="600"></div>
+          </div>
+          <div class="form-row" style="margin:.5rem 0 0">
+            <label class="form-label">More machines <span class="muted">— one per line: <code>url | token | start command | stop command</code> (blank fields inherit the ones above)</span></label>
+            <textarea id="cfg-host-hosts" class="form-input" rows="2" style="font-family:monospace;font-size:11px" placeholder="http://gpubox2:8000 | tokenB | ssh gpubox2 docker start coderai-images | ssh gpubox2 docker stop coderai-images"></textarea>
+            <span class="form-hint" style="font-size:11px">Several machines form a pool: each request goes to the healthy one with the fewest in flight, a dead one is skipped for 30 s and the request moves on, and an on-demand machine is started only when none is up.</span>
           </div>
         </div>
 
@@ -2420,13 +2472,22 @@ let _hfModels = [];
 // Engine/card hardware info (fetched once); used to tag models with the card they
 // run on when more than one engine is configured.
 let _engineNames = [];
+let _engines = [];        // full objects: name, backend, capabilities, remote (cluster node)
+let _knownRpc = [];       // rpc-server endpoints this front and its nodes advertise
 let _defaultEngine = '';
 async function _loadEngineInfo(){
   // Live engine names from the front (covers auto-detected engines, not just those
   // declared in engine_specs); default_engine still comes from settings.
   try {
     const er = await fetch(ROOT_PATH + '/admin/api/engines');
-    if (er.ok) _engineNames = ((await er.json()).engines || []).map(e => e.name);
+    if (er.ok) {
+      _engines = (await er.json()).engines || [];
+      _engineNames = _engines.map(e => e.name);
+    }
+  } catch(e) {}
+  try {
+    const cr = await fetch(ROOT_PATH + '/admin/api/cluster');
+    if (cr.ok) _knownRpc = ((await cr.json()).rpc_servers || []);
   } catch(e) {}
   try {
     const d = await (await pageFetch('/admin/api/settings')).json();
@@ -3813,6 +3874,7 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-split-secondary-cap').value =
     (s.split_secondary_cap_gb != null ? s.split_secondary_cap_gb : '');
   _populateDs4(m, s);
+  _populateCluster(m, s);
   _populateColibri(m, s);
   _populateRunpod(s);
   _populateHost(s);
@@ -4137,19 +4199,160 @@ async function _populateEnginePin(desired){
     const want = (desired !== undefined) ? desired : sel.value;
     // Clear everything except the static "" (Auto) option.
     sel.querySelectorAll('option[value]:not([value=""])').forEach(o => o.remove());
-    _engineNames.forEach(n => {
-      const o=document.createElement('option'); o.value=n; o.textContent=n + ' (single card)'; sel.appendChild(o);
+    const local = _engines.length ? _engines.filter(e => !e.remote) : _engineNames.map(n => ({name:n}));
+    const nodes = _engines.filter(e => e.remote);
+    local.forEach(e => {
+      const o=document.createElement('option'); o.value=e.name; o.textContent=e.name + ' (single card)'; sel.appendChild(o);
     });
-    if (_engineNames.length > 1) {
-      _engineNames.forEach(n => {
-        const o=document.createElement('option'); o.value='__split__:'+n;
-        o.textContent='Split — ' + n + ' first'; sel.appendChild(o);
+    nodes.forEach(e => {
+      const o=document.createElement('option'); o.value=e.name;
+      o.textContent=e.name + ' (cluster node' + (e.healthy ? '' : ' — not reachable') + ')'; sel.appendChild(o);
+    });
+    if (local.length > 1) {
+      local.forEach(e => {
+        const o=document.createElement('option'); o.value='__split__:'+e.name;
+        o.textContent='Split — ' + e.name + ' first'; sel.appendChild(o);
       });
     }
     sel.value = want || '';   // set AFTER options exist so the selection sticks
-    row.style.display = _engineNames.length > 1 ? '' : 'none';
+    row.style.display = (local.length > 1 || nodes.length) ? '' : 'none';
   } catch(e) { row.style.display = 'none'; }
   _updateGpuSplitVisibility();
+  _applyCompat();
+}
+
+// ---- Engine ⇄ backend compatibility (mirrors codai/cluster/compat.py) -------
+// The Backend select says HOW the model runs; the Engine select says WHERE.
+// Not every pair works (a CUDA-only vLLM on the Radeon engine, transformers on
+// a Vulkan card). Instead of learning that from a 503 later, both selects are
+// narrowed live: an engine that cannot run the chosen backend is greyed out,
+// a backend the chosen engine cannot run is greyed out, and a pair that is
+// already selected but wrong shows a red note and blocks Save.
+const _BACKEND_CAP = {auto:null, nvidia:null, cpu:null, vulkan:'gguf', opencl:'gguf',
+  colibri:'colibri', ds4:'ds4', k3:'k3', kt:'kt', vllm:'vllm', runpod:'runpod', host:'',
+  wav2vec2:'transformers', 'whisper-hf':'transformers', nemo:'transformers', vosk:'',
+  'whisper-server':'whisper'};
+const _VENDOR_BACKENDS = {nvidia:['nvidia','cuda','auto'], vulkan:['vulkan','auto'], opencl:['opencl','auto']};
+let _compatError = '';
+function _cfgPathLower(){
+  const el = document.getElementById('cfg-path');
+  const p = (el && el.value) || (window._cfgCurrentPath || '');
+  return (p + '').toLowerCase();
+}
+function _requiredCap(backend){
+  const b = (backend || 'auto').toLowerCase();
+  const cap = _BACKEND_CAP.hasOwnProperty(b) ? _BACKEND_CAP[b] : null;
+  if (cap === null) { const p = _cfgPathLower(); return (p.endsWith('.gguf') || p.includes('gguf')) ? 'gguf' : 'transformers'; }
+  return cap || null;
+}
+function _engineByName(name){
+  const n = (name || '').toLowerCase();
+  return _engines.find(e => (e.name || '').toLowerCase() === n || (e.backend || '').toLowerCase() === n) || null;
+}
+// [ok, reason] — ok=false: cannot work; ok=true with a reason: works, but differently.
+function _compatCheck(engine, backend){
+  const b = (backend || 'auto').toLowerCase();
+  if (b === 'host') return [false, 'a host model runs on the machine named in its host block, not on an engine'];
+  const cap = _requiredCap(b);
+  const caps = new Set((engine.capabilities || []).map(c => (c + '').toLowerCase()));
+  const eb = (engine.backend || 'auto').toLowerCase();
+  if (cap && caps.size && !caps.has(cap)) return [false, "needs '" + cap + "' but " + engine.name + " (" + eb + ") only provides " + JSON.stringify([...caps].sort())];
+  const vend = _VENDOR_BACKENDS[b];
+  if (vend && b !== 'nvidia' && eb.startsWith('nvidia')) return [true, "backend '" + b + "' on the NVIDIA engine runs through CUDA"];
+  if (vend && !vend.includes(eb) && !eb.startsWith('nvidia') && eb !== 'node') return [true, "backend '" + b + "' on a " + eb + " engine: the engine's own API is used instead"];
+  return [true, ''];
+}
+function _applyCompat(){
+  const esel = document.getElementById('cfg-engine');
+  const bsel = document.getElementById('cfg-backend');
+  const warn = document.getElementById('cfg-compat-warn');
+  if (!esel || !bsel) return;
+  const backend = bsel.value || 'auto';
+  _compatError = '';
+  // Engine options vs the chosen backend.
+  esel.querySelectorAll('option').forEach(o => {
+    const v = o.value || '';
+    if (!v) { o.disabled = false; return; }
+    const name = v.startsWith('__split__:') ? v.slice(10) : v;
+    const eng = _engineByName(name);
+    if (!eng) { o.disabled = false; return; }
+    const [ok, why] = _compatCheck(eng, backend);
+    const base = o.textContent.replace(/ — can't run .*$/, '');
+    o.textContent = ok ? base : base + " — can't run " + backend;
+    o.disabled = !ok;
+  });
+  // Backend options vs the chosen engine.
+  const pinnedName = (esel.value || '').startsWith('__split__:') ? esel.value.slice(10) : esel.value;
+  const pinned = pinnedName ? _engineByName(pinnedName) : null;
+  bsel.querySelectorAll('option').forEach(o => {
+    const base = o.textContent.replace(/ — not on .*$/, '');
+    if (!pinned) { o.textContent = base; o.disabled = false; return; }
+    const [ok] = _compatCheck(pinned, o.value || 'auto');
+    o.textContent = ok ? base : base + ' — not on ' + pinned.name;
+    o.disabled = !ok;
+  });
+  // The selected pair itself.
+  let msg = '';
+  if (pinned) {
+    const [ok, why] = _compatCheck(pinned, backend);
+    if (!ok) { msg = '✖ ' + pinned.name + ': ' + why + '. Pick another engine or backend — this cannot be saved.'; _compatError = msg; }
+    else if (why) msg = 'ℹ ' + why + '.';
+  }
+  if (warn) { warn.textContent = msg; warn.style.display = msg ? '' : 'none';
+    warn.style.borderColor = _compatError ? '#c0392b' : '#c9a227';
+    warn.style.background = _compatError ? 'rgba(192,57,43,.12)' : 'rgba(201,162,39,.12)'; }
+  // Rows that depend on the pair: path on a node, RPC servers, vLLM / kt blocks.
+  const nprow = document.getElementById('cfg-node-path-row');
+  if (nprow) nprow.style.display = (pinned && pinned.remote) ? '' : 'none';
+  const rrow = document.getElementById('cfg-rpc-row');
+  if (rrow) rrow.style.display = (_requiredCap(backend) === 'gguf' && backend !== 'runpod' && backend !== 'host') ? '' : 'none';
+  const vrow = document.getElementById('cfg-vllm-row');
+  if (vrow) vrow.style.display = (backend === 'vllm') ? '' : 'none';
+  const krow = document.getElementById('cfg-kt-row');
+  if (krow) krow.style.display = (backend === 'kt') ? '' : 'none';
+}
+function _populateCluster(m, s){
+  window._cfgCurrentPath = (m && (m.path || m.id)) || '';
+  const set = (id,v)=>{ const el=document.getElementById(id); if(el!=null) el.value=(v==null?'':v); };
+  set('cfg-node-path', s.node_path || '');
+  set('cfg-rpc-servers', Array.isArray(s.rpc_servers) ? s.rpc_servers.join(', ') : (s.rpc_servers || ''));
+  const dl = document.getElementById('cfg-rpc-known');
+  if (dl) { dl.innerHTML = ''; (_knownRpc || []).forEach(r => { const o = document.createElement('option'); o.value = r.endpoint; o.textContent = (r.node || '') + (r.device ? ' ' + r.device : '') + (r.reachable ? '' : ' (down)'); dl.appendChild(o); }); }
+  const st = document.getElementById('cfg-rpc-status');
+  if (st) st.textContent = _knownRpc.length ? ('Known: ' + _knownRpc.map(r => r.endpoint + (r.reachable ? ' ✓' : ' ✗')).join('  ')) : 'No rpc-server is advertised by this machine or its nodes yet (Settings → Cluster).';
+  const v = s.vllm || {};
+  set('cfg-vllm-tp', v.tensor_parallel_size || ''); set('cfg-vllm-pp', v.pipeline_parallel_size || '');
+  set('cfg-vllm-executor', v.distributed_executor_backend || ''); set('cfg-vllm-ray', v.ray_address || '');
+  set('cfg-vllm-gmu', v.gpu_memory_utilization || ''); set('cfg-vllm-extra', v.extra_args || '');
+  set('cfg-vllm-nodes', _nodesToLines(v.nodes, true));
+  const k = s.kt || s.ktransformers || {};
+  set('cfg-kt-nnodes', k.nnodes || ''); set('cfg-kt-tp', k.tp_size || ''); set('cfg-kt-dist', k.dist_init_addr || '');
+  set('cfg-kt-extra', k.extra_args || ''); set('cfg-kt-nodes', _nodesToLines(k.nodes, false));
+  _applyCompat();
+}
+function _nodesToLines(nodes, withGpus){
+  if (typeof nodes === 'string') return nodes;
+  return (nodes || []).map(n => [n.name || '', n.start_cmd || '', n.stop_cmd || ''].concat(withGpus ? [n.gpus || ''] : []).join(' | ').replace(/( \| )+$/, '')).join('\n');
+}
+function _collectCluster(){
+  const val = id => ((document.getElementById(id) || {}).value || '').trim();
+  const num = id => { const v = parseFloat(val(id)); return isNaN(v) ? '' : v; };
+  const backend = val('cfg-backend') || 'auto';
+  const out = {
+    node_path: val('cfg-node-path'),
+    rpc_servers: val('cfg-rpc-servers'),
+  };
+  out.vllm = backend === 'vllm' ? {
+    tensor_parallel_size: num('cfg-vllm-tp'), pipeline_parallel_size: num('cfg-vllm-pp'),
+    distributed_executor_backend: val('cfg-vllm-executor'), ray_address: val('cfg-vllm-ray'),
+    gpu_memory_utilization: num('cfg-vllm-gmu'), extra_args: val('cfg-vllm-extra'),
+    nodes: val('cfg-vllm-nodes'),
+  } : {};
+  out.kt = backend === 'kt' ? {
+    nnodes: num('cfg-kt-nnodes'), tp_size: num('cfg-kt-tp'), dist_init_addr: val('cfg-kt-dist'),
+    extra_args: val('cfg-kt-extra'), nodes: val('cfg-kt-nodes'),
+  } : {};
+  return out;
 }
 
 // Per-model ds4 overrides: shown only when the ds4 engine is enabled globally and
@@ -4253,6 +4456,9 @@ function _populateHost(s){
   set('cfg-host-health', h.health_path || '');
   set('cfg-host-boot', h.boot_timeout_s != null ? h.boot_timeout_s : '');
   set('cfg-host-idle', h.idle_timeout_s != null ? h.idle_timeout_s : '');
+  set('cfg-host-hosts', Array.isArray(h.hosts)
+      ? h.hosts.map(x => [x.url||'', x.api_key||'', x.start_cmd||'', x.stop_cmd||''].join(' | ').replace(/( \| )+$/, '')).join('\n')
+      : (h.hosts || ''));
 }
 function _collectHost(){
   if ((document.getElementById('cfg-backend').value || '') !== 'host') return undefined;
@@ -4263,6 +4469,7 @@ function _collectHost(){
     start_cmd: val('cfg-host-start'), stop_cmd: val('cfg-host-stop'),
     health_path: val('cfg-host-health'),
     boot_timeout_s: intOrU('cfg-host-boot'), idle_timeout_s: intOrU('cfg-host-idle'),
+    hosts: val('cfg-host-hosts'),
   };
 }
 function _updateRunpodModeHint(){
@@ -4515,6 +4722,8 @@ function _collectRunpod(){
 }
 
 async function saveModelConfig(){
+  _applyCompat();
+  if (_compatError) { showAlert(_compatError); return; }
   const path = document.getElementById('cfg-path').value;
   const maxGpu = parseFloat(document.getElementById('cfg-max-gpu').value);
   const ramGb  = parseFloat(document.getElementById('cfg-ram-gb').value);
@@ -4534,6 +4743,7 @@ async function saveModelConfig(){
     backend:           document.getElementById('cfg-backend').value,
     runpod:            _collectRunpod(),
     host:              _collectHost(),
+    ..._collectCluster(),
     // Placement: serve this model from elsewhere, and/or burst the overflow.
     // Always sent, even when blank: an empty value is how you REMOVE a remote,
     // and a key that is simply absent leaves the old one in place.

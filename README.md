@@ -125,6 +125,28 @@ Full guide: [`docs/runpod.md`](docs/runpod.md) ·
 remote placement of every model type, the capability images and the `host` backend:
 [`docs/remote-execution.md`](docs/remote-execution.md).
 
+### Several machines as one (cluster)
+
+- **Cluster nodes**: other coderai installs on your network become engines of this
+  one — polled, assigned models, pinned by name from the model page (*Engine / card*),
+  routed by capability and load; the node's own front picks the card. A node needs only
+  an API token. Load/Unload from the head reach the node; the Cluster page shows every
+  node's engines, VRAM and reachability
+- **One GGUF over several machines**: llama.cpp RPC — this machine runs `rpc-server`
+  processes (Settings → Cluster) that lend its cards; a model names them under *Cards on
+  other machines* and its layer split spreads over local and remote cards alike. Built
+  from the same llama.cpp as the bundled llama-cpp-python (`packaging/build-rpc-server.sh`)
+- **One HF model over several machines**: vLLM on Ray (tensor parallel inside a node,
+  pipeline parallel across nodes) and SGLang `--nnodes` — coderai starts the peers by
+  their configured commands, waits for their GPUs, launches, tears down; per model or
+  as defaults
+- **Pools**: several URLs for one capability, several machines for one `host` model —
+  healthy + least busy wins, a dead one is skipped and the request moves on
+- **No impossible pairs**: the model form greys out engines that cannot run the chosen
+  backend and backends the pinned engine cannot run, and refuses to save a wrong pair
+
+Full guide: [`docs/cluster.md`](docs/cluster.md).
+
 ### Image Generation
 - **Text-to-Image**: Stable Diffusion, SDXL, Flux, and GGUF image models (via stable-diffusion.cpp)
 - **Image-to-Image**: Style transfer and image editing
@@ -533,6 +555,7 @@ The [`docs/`](docs/) directory carries the deep dives — one per engine and sub
 | [`frontend-engine-split.md`](docs/frontend-engine-split.md) | Front proxy, engine subprocesses, routing |
 | [`runpod.md`](docs/runpod.md) | Renting remote GPUs: pods, serverless, budgets, the reaper |
 | [`remote-execution.md`](docs/remote-execution.md) | Running any model type elsewhere: the capability gateway, per-model placement, weights and adapters on a pod, test runs |
+| [`cluster.md`](docs/cluster.md) | Several machines as one: cluster nodes as engines, one GGUF over llama.cpp RPC, vLLM/SGLang multi-node, pools of hosts and remotes |
 | [`vllm.md`](docs/vllm.md) | vLLM as a first-class engine node |
 | [`deepseek-ds4.md`](docs/deepseek-ds4.md) · [`glm-colibri.md`](docs/glm-colibri.md) · [`kimi-k3.md`](docs/kimi-k3.md) · [`ktransformers.md`](docs/ktransformers.md) | The native MoE engines |
 | [`ocr.md`](docs/ocr.md) | The OCR subsystem and schema store |
@@ -646,6 +669,7 @@ Other top-level blocks, each with its own tab on the Settings page:
 | `server.engine_specs` / `engines` / `engine_gpus` | The front/engine split — how many engines, which GPU each owns, and their capabilities |
 | `ds4`, `colibri`, `k3`, `ktransformers`, `vllm` | Per-engine enablement, install dirs, model ids and build settings |
 | `runpod` | RunPod account settings and global cost caps — see [`docs/runpod.md`](docs/runpod.md) |
+| `cluster` | Other installs used as engines (`nodes`), the `rpc_servers` this machine lends, `advertise_host` — see [`docs/cluster.md`](docs/cluster.md) |
 | `ocr` | OCR engines, DPI, concurrency, detection mode, structured-extraction model and venv paths |
 | `broker` | AISBF broker client (below) |
 
@@ -968,6 +992,13 @@ To force Vulkan to use only the AMD GPU:
 ```json
 { "vulkan": { "device_id": 1, "single_gpu": true } }
 ```
+
+### Multi-machine (cluster nodes, llama.cpp RPC, vLLM on Ray)
+
+See [`docs/cluster.md`](docs/cluster.md). In short: a node is another coderai with an
+API token; an RPC server is `cluster.rpc_servers` on the lending machine plus
+`rpc_servers` on the model; vLLM spans machines with `pipeline_parallel_size` and
+`nodes` on the model's vLLM block.
 
 ### Low VRAM
 

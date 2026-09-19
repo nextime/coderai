@@ -775,6 +775,19 @@
       <label class="form-label">Extra subprocess env</label>
       <input type="text" id="s-kt-extra-env" class="form-input" placeholder="CUDA_VISIBLE_DEVICES=0">
     </div>
+    <div style="border-top:1px solid var(--border,#333);margin:.6rem 0;padding-top:.6rem">
+      <div style="font-weight:600;font-size:13px;margin-bottom:.3rem">Several machines (defaults; a model's own kt block overrides)</div>
+      <div class="form-hint" style="font-size:11px;margin-bottom:.5rem">This machine is rank 0 of <b>nnodes</b>; ranks 1… are started by the commands below, templated with <code>{rank}</code>, <code>{nnodes}</code>, <code>{dist_init_addr}</code>, <code>{model}</code>. tp-size counts GPUs across all nodes.</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 2fr;gap:.6rem">
+        <div class="form-group" style="margin:0"><label class="form-label">nnodes</label><input type="number" id="s-kt-nnodes" class="form-input" min="1" placeholder="1"></div>
+        <div class="form-group" style="margin:0"><label class="form-label">tp-size</label><input type="number" id="s-kt-tp" class="form-input" min="0" placeholder="0 = default"></div>
+        <div class="form-group" style="margin:0"><label class="form-label">Rank 0 address (dist-init-addr)</label><input type="text" id="s-kt-dist" class="form-input" placeholder="blank = advertise host:20000"></div>
+      </div>
+      <div class="form-group" style="margin:.5rem 0 0">
+        <label class="form-label">Node commands <span class="muted">— one per line: <code>name | start command | stop command</code></span></label>
+        <textarea id="s-kt-nodes" class="form-input" rows="2" style="font-family:monospace;font-size:11px"></textarea>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -837,6 +850,53 @@
         <span>Auto-build the isolated venv (<code>pip install vllm</code>) on first use</span>
       </label>
     </div>
+    <div style="border-top:1px solid var(--border,#333);margin:.6rem 0;padding-top:.6rem">
+      <div style="font-weight:600;font-size:13px;margin-bottom:.3rem">Several machines over Ray (defaults; a model's own vLLM block overrides)</div>
+      <div class="form-hint" style="font-size:11px;margin-bottom:.5rem">Tensor parallel splits every layer across the GPUs of one machine (fast links); <b>pipeline parallel</b> gives each machine a slice of layers — use that across a network. With nodes listed coderai starts a Ray head here, runs each node's command (<code>{ray_address}</code>, <code>{head}</code>, <code>{port}</code> filled in), waits until Ray sees tensor×pipeline GPUs, then launches vLLM on Ray. The <code>coderai-vllm</code> image joins as a worker when started with <code>CODERAI_RAY_ADDRESS</code>.</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:.6rem">
+        <div class="form-group" style="margin:0"><label class="form-label">Pipeline parallel</label><input type="number" id="s-vllm-pp" class="form-input" min="1" placeholder="1"></div>
+        <div class="form-group" style="margin:0"><label class="form-label">Executor</label>
+          <select id="s-vllm-executor" class="form-input"><option value="">auto</option><option value="mp">mp</option><option value="ray">ray</option></select></div>
+        <div class="form-group" style="margin:0"><label class="form-label">Existing Ray cluster</label><input type="text" id="s-vllm-ray" class="form-input" placeholder="blank = start a head"></div>
+        <div class="form-group" style="margin:0"><label class="form-label">Ray head port</label><input type="number" id="s-vllm-ray-port" class="form-input" min="1" placeholder="6379"></div>
+      </div>
+      <div class="form-group" style="margin:.5rem 0 0">
+        <label class="form-label">Nodes <span class="muted">— one per line: <code>name | start command | stop command | gpus</code></span></label>
+        <textarea id="s-vllm-nodes" class="form-input" rows="2" style="font-family:monospace;font-size:11px" placeholder="box2 | ssh box2 docker run -d --rm --name vllm-worker --gpus all --network host -e CODERAI_RAY_ADDRESS={ray_address} ghcr.io/nextime/coderai-vllm:latest | ssh box2 docker stop vllm-worker | 1"></textarea>
+      </div>
+      <div class="form-group" style="margin:.5rem 0 0"><label class="form-label">Wait for the nodes' GPUs (s)</label><input type="number" id="s-vllm-nodes-timeout" class="form-input" min="30" placeholder="600"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Cluster: other coderai installs as engines of this one; RPC servers this machine lends -->
+<div class="card">
+  <div class="card-title">Cluster</div>
+  <p class="form-hint" style="margin-bottom:.6rem">Other coderai installs on your network become <b>engines of this one</b>: this front polls each node's state, assigns models to it, pins a model to it by name on the Models page (Engine / card), and routes requests there by capability and load — the node's own front picks the card. A node needs only an API token created on its Tokens page. This section also lists the llama.cpp <b>rpc-server</b> processes this machine runs to lend its cards to a GGUF loaded on another node (per model: <em>Cards on other machines</em>). Reachability of everything is on the <a href="{{ root_path }}/admin/cluster">Cluster page</a>; the full story is in <code>docs/cluster.md</code>.</p>
+  <div class="form-row">
+    <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+      <input type="checkbox" id="s-cluster-enabled" onchange="toggleClusterFields()">
+      <span style="font-size:13px;font-weight:500">Use the nodes below as engines</span>
+    </label>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:.6rem">
+    <div class="form-group" style="margin:0"><label class="form-label">This node's name</label><input type="text" id="s-cluster-node-name" class="form-input" placeholder="hostname"><span class="form-hint" style="font-size:11px">What a head calls this install; the key of a model's per-node path.</span></div>
+    <div class="form-group" style="margin:0"><label class="form-label">Advertise host</label><input type="text" id="s-cluster-advertise" class="form-input" placeholder="auto (default route IP)"><span class="form-hint" style="font-size:11px">The address other machines reach this one at (RPC endpoints, Ray head).</span></div>
+    <div class="form-group" style="margin:0"><label class="form-label">Node poll timeout (s)</label><input type="number" id="s-cluster-poll" class="form-input" min="1" step="0.5" placeholder="4"></div>
+    <div class="form-group" style="margin:0;align-self:end"><label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer"><input type="checkbox" id="s-cluster-serve"><span>Let other heads use this install as a node</span></label></div>
+  </div>
+  <div id="cluster-fields" style="margin-top:.6rem">
+    <div style="font-weight:600;font-size:13px;margin:.4rem 0">Nodes</div>
+    <div id="s-cluster-nodes"></div>
+    <button type="button" class="btn btn-secondary btn-sm" onclick="_addClusterNode()">+ Add node</button>
+    <span class="form-hint" style="font-size:11px;margin-left:.6rem">Verify: <b>system</b> = public certificate, <b>pem</b> = paste the node's self-signed certificate, <b>off</b> = no check (plain http, or a LAN you trust). Capabilities blank = whatever the node reports.</span>
+  </div>
+  <div style="margin-top:.8rem">
+    <div style="font-weight:600;font-size:13px;margin:.4rem 0">RPC servers this machine runs</div>
+    <div class="form-hint" style="font-size:11px;margin-bottom:.4rem">One <code>rpc-server</code> process per row (built by <code>packaging/build-rpc-server.sh</code>, from the same llama.cpp as the bundled llama-cpp-python — the protocol is versioned). Device = a ggml device name (<code>CUDA0</code>, <code>Vulkan1</code> …, blank = default). Unauthenticated protocol: bind to a LAN or WireGuard address, never the internet.</div>
+    <div id="s-cluster-rpc"></div>
+    <button type="button" class="btn btn-secondary btn-sm" onclick="_addClusterRpc()">+ Add rpc-server</button>
+    <div class="form-group" style="margin:.5rem 0 0"><label class="form-label">rpc-server binary <span class="muted">(blank = auto: venv/bin, /opt/coderai/local-bin, PATH)</span></label><input type="text" id="s-cluster-rpc-bin" class="form-input" placeholder="/opt/coderai/python/bin/rpc-server"></div>
   </div>
 </div>
 
@@ -1828,6 +1888,10 @@ async function loadSettings(){
     document.getElementById('s-kt-extra-args').value = kt.extra_args ?? '';
     document.getElementById('s-kt-auto-build').checked = !!kt.auto_build;
     document.getElementById('s-kt-extra-env').value = kt.extra_env ?? '';
+    document.getElementById('s-kt-nnodes').value = kt.nnodes ?? 1;
+    document.getElementById('s-kt-tp').value = kt.tp_size ?? 0;
+    document.getElementById('s-kt-dist').value = kt.dist_init_addr ?? '';
+    document.getElementById('s-kt-nodes').value = _nodesLines(kt.nodes, false);
     toggleKtFields();
 
     // vLLM
@@ -1848,7 +1912,14 @@ async function loadSettings(){
     document.getElementById('s-vllm-extra-args').value = vll.extra_args ?? '';
     document.getElementById('s-vllm-extra-env').value = vll.extra_env ?? '';
     document.getElementById('s-vllm-auto-build').checked = !!vll.auto_build;
+    document.getElementById('s-vllm-pp').value = vll.pipeline_parallel_size ?? 1;
+    document.getElementById('s-vllm-executor').value = vll.distributed_executor_backend ?? '';
+    document.getElementById('s-vllm-ray').value = vll.ray_address ?? '';
+    document.getElementById('s-vllm-ray-port').value = vll.ray_port ?? 6379;
+    document.getElementById('s-vllm-nodes').value = _nodesLines(vll.nodes, true);
+    document.getElementById('s-vllm-nodes-timeout').value = vll.nodes_ready_timeout_s ?? 600;
     toggleVllmFields();
+    _populateCluster(d.cluster || {});
 
     // RunPod remote GPUs
     const rp = d.runpod || {};
@@ -2038,6 +2109,10 @@ async function saveSettings(silent){
       extra_args: document.getElementById('s-kt-extra-args').value.trim(),
       auto_build: document.getElementById('s-kt-auto-build').checked,
       extra_env: document.getElementById('s-kt-extra-env').value.trim(),
+      nnodes: parseInt(document.getElementById('s-kt-nnodes').value) || 1,
+      tp_size: parseInt(document.getElementById('s-kt-tp').value) || 0,
+      dist_init_addr: document.getElementById('s-kt-dist').value.trim(),
+      nodes: document.getElementById('s-kt-nodes').value,
     },
     vllm:{
       enabled: document.getElementById('s-vllm-enabled').checked,
@@ -2056,8 +2131,15 @@ async function saveSettings(silent){
       extra_args: document.getElementById('s-vllm-extra-args').value.trim(),
       extra_env: document.getElementById('s-vllm-extra-env').value.trim(),
       auto_build: document.getElementById('s-vllm-auto-build').checked,
+      pipeline_parallel_size: parseInt(document.getElementById('s-vllm-pp').value) || 1,
+      distributed_executor_backend: document.getElementById('s-vllm-executor').value,
+      ray_address: document.getElementById('s-vllm-ray').value.trim(),
+      ray_port: parseInt(document.getElementById('s-vllm-ray-port').value) || 6379,
+      nodes: document.getElementById('s-vllm-nodes').value,
+      nodes_ready_timeout_s: parseInt(document.getElementById('s-vllm-nodes-timeout').value) || 600,
     },
     remotes: _collectRemotes(),
+    cluster: _collectCluster(),
     runpod:{
       enabled: document.getElementById('s-runpod-enabled').checked,
       // Blank = keep the current key (backend ignores empty / masked values).
@@ -2267,7 +2349,7 @@ function _remoteRowHtml(cap, label, paths){
       <option value="url">Remote URL</option>
       <option value="pod">RunPod pod</option>
     </select>
-    <input type="text" id="rc-${cap}-url" class="form-input" style="flex:1;min-width:200px;display:none" placeholder="http://gpu-box:8000">
+    <input type="text" id="rc-${cap}-url" class="form-input" style="flex:1;min-width:200px;display:none" placeholder="http://gpu-box:8000, http://gpu-box2:8000  (several = a pool with failover)">
     <div id="rc-${cap}-pod" style="display:none;flex:1;min-width:320px">
       <div style="display:flex;gap:.4rem;flex-wrap:wrap">
         <input type="text" id="rc-${cap}-image" class="form-input" style="flex:2;min-width:200px" placeholder="${_defaultCapImage(cap) || 'image required — no published one for this capability'}">
@@ -2310,13 +2392,92 @@ function _populateRemotes(rem){
       set('image', b.image); set('pool', b.pool); set('vram', b.min_vram_gb);
       set('hourly', b.max_hourly_usd); set('maxpods', b.max_pods); set('idle', b.idle_timeout_s);
     } else if (ep) {
-      set('where', 'url'); set('url', ep);
+      set('where', 'url'); set('url', Array.isArray(ep) ? ep.join(', ') : ep);
     } else {
       set('where', 'local');
     }
     _updateRemoteRow(cap);
   });
   toggleRemotesFields();
+}
+
+function _nodesLines(nodes, withGpus){
+  if (typeof nodes === 'string') return nodes;
+  return (nodes || []).map(n => [n.name || '', n.start_cmd || '', n.stop_cmd || ''].concat(withGpus ? [n.gpus || ''] : []).join(' | ').replace(/( \| )+$/, '')).join('\n');
+}
+
+// ---- Cluster: nodes and rpc-servers as editable rows -------------------
+function toggleClusterFields(){
+  const on = document.getElementById('s-cluster-enabled').checked;
+  document.getElementById('cluster-fields').style.opacity = on ? '1' : '.6';
+}
+function _clusterNodeRowHtml(n){
+  n = n || {};
+  const caps = Array.isArray(n.capabilities) ? n.capabilities.join(', ') : (n.capabilities || '');
+  const esc = v => (v == null ? '' : String(v)).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+  return `<div class="cl-node" style="border:1px solid var(--border,#333);border-radius:8px;padding:.5rem;margin-bottom:.5rem">
+    <div style="display:grid;grid-template-columns:1fr 2fr 1.5fr .8fr auto;gap:.5rem;align-items:end">
+      <div class="form-group" style="margin:0"><label class="form-label">Name</label><input type="text" class="form-input cl-name" value="${esc(n.name)}" placeholder="box2"></div>
+      <div class="form-group" style="margin:0"><label class="form-label">URL</label><input type="text" class="form-input cl-url" value="${esc(n.url)}" placeholder="https://box2:8776"></div>
+      <div class="form-group" style="margin:0"><label class="form-label">API token of the node ${n.api_key_set ? '<span class="muted">(set — blank keeps it)</span>' : ''}</label><input type="password" class="form-input cl-key" value="" placeholder="${n.api_key_set ? '••••••••' : 'from its Tokens page'}"></div>
+      <div class="form-group" style="margin:0"><label class="form-label">Verify</label><select class="form-input cl-verify"><option value="system" ${(n.verify||'system')==='system'?'selected':''}>system</option><option value="pem" ${n.verify==='pem'?'selected':''}>pem</option><option value="off" ${n.verify==='off'?'selected':''}>off</option></select></div>
+      <div style="display:flex;gap:.4rem;align-items:center;padding-bottom:.2rem"><label style="display:flex;align-items:center;gap:.3rem;font-size:12px"><input type="checkbox" class="cl-enabled" style="width:auto" ${n.enabled === false ? '' : 'checked'}> on</label><button type="button" class="btn btn-secondary btn-sm" onclick="this.closest('.cl-node').remove()">✕</button></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 2fr;gap:.5rem;margin-top:.4rem">
+      <div class="form-group" style="margin:0"><label class="form-label">Capabilities <span class="muted">(blank = as reported)</span></label><input type="text" class="form-input cl-caps" value="${esc(caps)}" placeholder="transformers, gguf, whisper"></div>
+      <div class="form-group" style="margin:0"><label class="form-label">Certificate PEM <span class="muted">(verify = pem)</span></label><textarea class="form-input cl-pem" rows="1" style="font-family:monospace;font-size:10px">${esc(n.ca_pem)}</textarea></div>
+    </div>
+  </div>`;
+}
+function _clusterRpcRowHtml(r){
+  r = r || {};
+  const esc = v => (v == null ? '' : String(v)).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+  return `<div class="cl-rpc" style="display:grid;grid-template-columns:1fr 1fr .7fr 1fr .7fr .7fr auto;gap:.5rem;align-items:end;margin-bottom:.4rem">
+    <div class="form-group" style="margin:0"><label class="form-label">Name</label><input type="text" class="form-input rp-name" value="${esc(r.name)}" placeholder="3090"></div>
+    <div class="form-group" style="margin:0"><label class="form-label">Bind host</label><input type="text" class="form-input rp-host" value="${esc(r.host || '0.0.0.0')}"></div>
+    <div class="form-group" style="margin:0"><label class="form-label">Port</label><input type="number" class="form-input rp-port" value="${esc(r.port || 50052)}" min="1"></div>
+    <div class="form-group" style="margin:0"><label class="form-label">Device</label><input type="text" class="form-input rp-device" value="${esc(r.device)}" placeholder="CUDA0"></div>
+    <div class="form-group" style="margin:0"><label class="form-label">Mem cap (GB)</label><input type="number" class="form-input rp-mem" value="${esc(r.mem_gb || '')}" min="0" step="0.5" placeholder="all"></div>
+    <div class="form-group" style="margin:0"><label class="form-label">Threads</label><input type="number" class="form-input rp-threads" value="${esc(r.threads || '')}" min="0" placeholder="def"></div>
+    <div style="display:flex;gap:.4rem;align-items:center;padding-bottom:.2rem"><label style="display:flex;align-items:center;gap:.3rem;font-size:12px"><input type="checkbox" class="rp-enabled" style="width:auto" ${r.enabled === false ? '' : 'checked'}> on</label><button type="button" class="btn btn-secondary btn-sm" onclick="this.closest('.cl-rpc').remove()">✕</button></div>
+  </div>`;
+}
+function _addClusterNode(){ document.getElementById('s-cluster-nodes').insertAdjacentHTML('beforeend', _clusterNodeRowHtml({})); }
+function _addClusterRpc(){ document.getElementById('s-cluster-rpc').insertAdjacentHTML('beforeend', _clusterRpcRowHtml({})); }
+function _populateCluster(cl){
+  document.getElementById('s-cluster-enabled').checked = !!cl.enabled;
+  document.getElementById('s-cluster-node-name').value = cl.node_name ?? '';
+  document.getElementById('s-cluster-advertise').value = cl.advertise_host ?? '';
+  document.getElementById('s-cluster-poll').value = cl.poll_timeout_s ?? 4;
+  document.getElementById('s-cluster-serve').checked = cl.serve !== false;
+  document.getElementById('s-cluster-rpc-bin').value = cl.rpc_bin ?? '';
+  document.getElementById('s-cluster-nodes').innerHTML = (cl.nodes || []).map(_clusterNodeRowHtml).join('');
+  document.getElementById('s-cluster-rpc').innerHTML = (cl.rpc_servers || []).map(_clusterRpcRowHtml).join('');
+  toggleClusterFields();
+}
+function _collectCluster(){
+  const nodes = [...document.querySelectorAll('#s-cluster-nodes .cl-node')].map(row => {
+    const q = c => row.querySelector('.' + c);
+    return { name: q('cl-name').value.trim(), url: q('cl-url').value.trim(), api_key: q('cl-key').value.trim(),
+             verify: q('cl-verify').value, ca_pem: q('cl-pem').value, capabilities: q('cl-caps').value,
+             enabled: q('cl-enabled').checked };
+  }).filter(n => n.url);
+  const rpc = [...document.querySelectorAll('#s-cluster-rpc .cl-rpc')].map(row => {
+    const q = c => row.querySelector('.' + c);
+    return { name: q('rp-name').value.trim(), host: q('rp-host').value.trim() || '0.0.0.0',
+             port: parseInt(q('rp-port').value) || 0, device: q('rp-device').value.trim(),
+             mem_gb: parseFloat(q('rp-mem').value) || 0, threads: parseInt(q('rp-threads').value) || 0,
+             enabled: q('rp-enabled').checked };
+  }).filter(r => r.port > 0);
+  return {
+    enabled: document.getElementById('s-cluster-enabled').checked,
+    node_name: document.getElementById('s-cluster-node-name').value.trim(),
+    advertise_host: document.getElementById('s-cluster-advertise').value.trim(),
+    poll_timeout_s: parseFloat(document.getElementById('s-cluster-poll').value) || 4,
+    serve: document.getElementById('s-cluster-serve').checked,
+    rpc_bin: document.getElementById('s-cluster-rpc-bin').value.trim(),
+    nodes: nodes, rpc_servers: rpc,
+  };
 }
 
 function _collectRemotes(){

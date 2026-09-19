@@ -389,6 +389,53 @@ class RemotesConfig:
 
 
 @dataclass
+class ClusterConfig:
+    """Other coderai installs on your network, used as engines of this one.
+
+    A **node** is a whole coderai running somewhere else — its own front, its
+    own cards, its own admin — that this front treats exactly like one of the
+    engine processes it spawns: it polls the node's aggregated engine state,
+    assigns models to it, pins a model to it by name from the Models page, and
+    routes requests there by capability and load. The node needs nothing but an
+    API token; the head needs the node's URL and that token.
+
+    The same section also declares the **llama.cpp RPC servers** THIS machine
+    contributes (`rpc_servers`), so a GGUF model on another node can be spread
+    over this machine's cards too (per-model ``rpc_servers`` on the model). The
+    binary is built by ``packaging/build-rpc-server.sh`` from the very same
+    llama.cpp the bundled llama-cpp-python was built from — the RPC protocol is
+    versioned and the two must match.
+
+    Nodes: ``[{"name": "box2", "url": "https://box2:8776", "api_key": "…",
+              "verify": "system" | "off" | "pem", "ca_pem": "-----BEGIN…",
+              "capabilities": [...], "enabled": true}]``
+    ``capabilities`` blank = whatever the node reports (union of its engines).
+    """
+    enabled: bool = False
+    nodes: list = field(default_factory=list)
+    # What THIS install calls itself when it is a node (matches the head's
+    # ``cluster.nodes[].name`` and a model's ``node_paths`` key). Blank = hostname.
+    node_name: str = ""
+    # How often (s) the head polls each node for state — the same short timeout
+    # the local engines get, but a node is a network hop away.
+    poll_timeout_s: float = 4.0
+    # Answer /cluster/* to callers holding a valid API token of this install.
+    # Off = this install can be a head but never a node.
+    serve: bool = True
+    # llama.cpp RPC servers this machine runs (one process each):
+    # [{"name": "3090", "host": "0.0.0.0", "port": 50052, "device": "CUDA0",
+    #   "mem_gb": 0, "threads": 0, "enabled": true}]
+    # ``device`` names a ggml device (CUDA0, Vulkan1 …; blank = the server's
+    # default); ``mem_gb`` caps what it advertises (0 = all).
+    rpc_servers: list = field(default_factory=list)
+    rpc_bin: str = ""                        # path to rpc-server; blank = auto-find
+    # The address other machines reach THIS one at (for the RPC endpoints it
+    # advertises and the ray head it starts). Blank = best guess from the
+    # default route.
+    advertise_host: str = ""
+
+
+@dataclass
 class Ds4Config:
     """DeepSeek V4 via ds4 (antirez/DwarfStar) external-worker configuration.
 
@@ -561,6 +608,14 @@ class KtransformersConfig:
     extra_args: str = ""                   # extra flags for sglang.launch_server (e.g. --tp-size, KT knobs)
     extra_env: str = ""                    # free-form KEY=VALUE env for the subprocess
     auto_build: bool = False               # pip-install SGLang+kt-kernel if missing (heavy; off by default)
+    # Multi-node SGLang: this process is rank 0 of ``nnodes``; every other rank is
+    # started by its ``start_cmd`` (templated with {rank}, {nnodes},
+    # {dist_init_addr}, {model}) — ssh, docker, a systemd unit, whatever starts
+    # the same SGLang on that machine. Per-model ``kt`` blocks override these.
+    nnodes: int = 1
+    dist_init_addr: str = ""               # host:port of rank 0 as the others reach it; blank = advertise_host:20000
+    tp_size: int = 0                       # --tp-size across ALL nodes' GPUs (0 = SGLang default)
+    nodes: list = field(default_factory=list)   # [{"name","start_cmd","stop_cmd"}] for ranks 1..n-1
 
 
 @dataclass
@@ -605,6 +660,19 @@ class VllmConfig:
     extra_args: str = ""                 # extra flags for the api_server
     extra_env: str = ""                  # free-form KEY=VALUE env for the subprocess
     auto_build: bool = False             # create the isolated venv + pip install vllm if missing
+    # Multi-node vLLM over Ray: tensor parallel inside a node, pipeline parallel
+    # across nodes. With ``nodes`` set (or ``pipeline_parallel_size`` > 1, or the
+    # executor forced to ray) coderai starts a ray head here, runs each node's
+    # ``start_cmd`` (templated with {ray_address} — the coderai-vllm image joins
+    # with CODERAI_RAY_ADDRESS), waits until ray sees tp*pp GPUs, then launches
+    # vLLM with --distributed-executor-backend ray. Per-model ``vllm`` blocks
+    # override all of these.
+    pipeline_parallel_size: int = 1      # --pipeline-parallel-size
+    distributed_executor_backend: str = ""   # "" auto | "mp" | "ray"
+    ray_address: str = ""                # join an EXISTING ray cluster instead of starting a head
+    ray_port: int = 6379                 # the head's port when coderai starts it
+    nodes: list = field(default_factory=list)   # [{"name","start_cmd","stop_cmd","gpus"}]
+    nodes_ready_timeout_s: int = 600     # how long to wait for the nodes' GPUs to join
 
 
 @dataclass
@@ -753,6 +821,7 @@ class Config:
     jobs: JobsConfig = field(default_factory=JobsConfig)
     enhance: EnhanceConfig = field(default_factory=EnhanceConfig)
     remotes: RemotesConfig = field(default_factory=RemotesConfig)
+    cluster: ClusterConfig = field(default_factory=ClusterConfig)
     ds4: Ds4Config = field(default_factory=Ds4Config)
     colibri: ColibriConfig = field(default_factory=ColibriConfig)
     k3: K3Config = field(default_factory=K3Config)
@@ -945,6 +1014,7 @@ class ConfigManager:
                 jobs=_dc(JobsConfig, config_data.get("jobs", {})),
                 enhance=_dc(EnhanceConfig, config_data.get("enhance", {})),
                 remotes=_dc(RemotesConfig, config_data.get("remotes", {})),
+                cluster=_dc(ClusterConfig, config_data.get("cluster", {})),
                 ds4=_dc(Ds4Config, config_data.get("ds4", {})),
                 colibri=_dc(ColibriConfig, config_data.get("colibri", {})),
                 k3=_dc(K3Config, config_data.get("k3", {})),
@@ -1129,6 +1199,7 @@ class ConfigManager:
                 "endpoints": dict(self.config.remotes.endpoints or {}),
                 "pods": dict(self.config.remotes.pods or {}),
             },
+            "cluster": __import__("dataclasses").asdict(self.config.cluster),
             "ds4": {
                 "enabled": self.config.ds4.enabled,
                 "service_url": self.config.ds4.service_url,
@@ -1198,6 +1269,10 @@ class ConfigManager:
                 "extra_args": self.config.ktransformers.extra_args,
                 "extra_env": self.config.ktransformers.extra_env,
                 "auto_build": self.config.ktransformers.auto_build,
+                "nnodes": self.config.ktransformers.nnodes,
+                "dist_init_addr": self.config.ktransformers.dist_init_addr,
+                "tp_size": self.config.ktransformers.tp_size,
+                "nodes": list(self.config.ktransformers.nodes or []),
             },
             "vllm": {
                 "enabled": self.config.vllm.enabled,
@@ -1217,6 +1292,12 @@ class ConfigManager:
                 "extra_args": self.config.vllm.extra_args,
                 "extra_env": self.config.vllm.extra_env,
                 "auto_build": self.config.vllm.auto_build,
+                "pipeline_parallel_size": self.config.vllm.pipeline_parallel_size,
+                "distributed_executor_backend": self.config.vllm.distributed_executor_backend,
+                "ray_address": self.config.vllm.ray_address,
+                "ray_port": self.config.vllm.ray_port,
+                "nodes": list(self.config.vllm.nodes or []),
+                "nodes_ready_timeout_s": self.config.vllm.nodes_ready_timeout_s,
             },
             "runpod": {
                 "enabled": self.config.runpod.enabled,
