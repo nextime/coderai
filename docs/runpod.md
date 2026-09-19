@@ -215,8 +215,8 @@ local LoRAs, nothing on the Tasks page. Two more images run the same servers
 
 | `engine` | Image | What it is |
 |---|---|---|
-| `coderai-vllm` | `coderai-vllm` (light core + vLLM venv, ~10 GB) | vLLM driven by coderai's vLLM backend. Your local **vLLM settings travel** (`dtype`, `quantization`, `gpu_memory_utilization`, `max_num_seqs`, `extra_args`); tensor parallelism follows the pod's `gpu_count`. |
-| `coderai-llama` | `coderai-llama` (full core + llama-cpp-python CUDA, ~9 GB) | A GGUF on coderai's own CUDA backend — llama-cpp-python compiled for every pod GPU generation. Local LoRAs work. |
+| `coderai-vllm` | `coderai-vllm` (light core + vLLM `+cu129` venv, 12.4 GB — PyPI's wheel is CUDA 13 and dies on RunPod's 12.8 drivers) | vLLM driven by coderai's vLLM backend. Your local **vLLM settings travel** (`dtype`, `quantization`, `gpu_memory_utilization`, `max_num_seqs`, `extra_args`); tensor parallelism follows the pod's `gpu_count`. |
+| `coderai-llama` | `coderai-llama` (light core + llama-cpp-python CUDA, 5.3 GB; the GGUF backend asks NVML about the card, not torch) | A GGUF on coderai's own CUDA backend — llama-cpp-python compiled for every pod GPU generation. Local LoRAs work. |
 
 `coderai-text` remains the transformers pod (HF safetensors, 4/8-bit, PEFT
 adapters). Throughput under concurrency is vLLM's game on either image.
@@ -260,7 +260,8 @@ has; AMX hosts are the fast ones. `engine: kt` on the runpod block selects it;
 the pod launches SGLang from that venv (`CODERAI_KT_VENV`). The model path may
 be a HuggingFace repo id — SGLang downloads it into the volume's HF cache — or a
 directory on the volume; `ktransformers.extra_args` travels for the KT knobs
-(`--kt-cpuinfer`, `--kt-weight-path` …). Note the kt backend has not been run
+(`--kt-cpuinfer`, `--kt-weight-path` …). The image carries `gcc` because Triton
+JIT-compiles SGLang's kernels on the pod. Note the kt backend has not been run
 end to end on this machine either: the image is import-checked at build and
 `/healthz`-checked at boot, and the first real inference will be on a pod.
 

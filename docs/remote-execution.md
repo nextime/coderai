@@ -289,13 +289,30 @@ so the toolchain never ships. `audio` does this for deepfilterlib's Rust
 extensions, and costs ~50 MB more than a profile that needs nothing.
 
 Profiles live in `packaging/runpod/profiles/` — `core.txt` (what any pod needs to
-boot) plus one file per capability. There are fifteen images, and they come in
-two kinds:
+boot) plus one file per capability. There are nineteen images, in three kinds:
 
-| image | serves | core |
-|---|---|---|
-| `images`, `video`, `tts`, `stt`, `text`, `voice`, `audio`, `embeddings`, `ocr`, `faceswap` | one capability, in the main venv | full (torch + CUDA) |
-| `speaker`, `tts-xtts`, `stt-nemo`, `stt-crisper`, `ocr-paddle` | a stack that **cannot** share the main venv | light (no torch) |
+| image | serves | core | size |
+|---|---|---|---|
+| `images`, `video`, `tts`, `stt`, `text`, `voice`, `audio`, `embeddings`, `ocr`, `faceswap` | one capability, in the main venv | full (torch + CUDA) | 9–10 GB |
+| `speaker`, `tts-xtts`, `stt-nemo`, `stt-crisper`, `ocr-paddle` | a stack that **cannot** share the main venv | light (no torch) + its own venv | 7–8 GB |
+| `llama`, `vllm`, `engines`, `engines-kt` | an LLM server or the native MoE engines as a coderai pod | light + a venv or C binaries | 2.4 / 5.3 / 11 / 12.4 GB |
+
+RunPod refuses an image above a size it does not document; 12.4 GB has booted,
+14.5 GB was refused. A stack built on a recent torch (2.9+, cudnn 9) is about
+3 GB heavier than one on torch 2.5, which is why the vLLM image is the largest.
+
+Three more per-profile markers exist for the venv images: `<profile>.venv-<name>.uv`
+resolves that venv with **uv** instead of pip (pip spent an hour on
+sglang-kt's forty exact pins without installing a byte), `<profile>.apt` lists
+apt packages kept **at run time** (a C compiler: Triton JIT-compiles vLLM's and
+SGLang's kernels on the pod and dies without one), and wheels are cached across
+builds (PyPI's CDN throttles a machine that has pulled 100 GB in a day).
+
+One trap worth naming: **PyPI's vLLM wheel is a CUDA 13 build**, and RunPod's
+hosts run CUDA 12.8 drivers — the pod dies with *"The NVIDIA driver on your
+system is too old (found version 12080)"*. The `vllm` image installs vLLM's own
+`+cu129` variant with torch's cu129 wheels; CUDA 12.x minor-version
+compatibility runs a 12.9 runtime on a 12.8 driver.
 
 The routers import lazily, so a pod only needs the libraries its own endpoints
 touch. The build fails if a profile is missing something the app imports, and

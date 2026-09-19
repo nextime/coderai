@@ -92,11 +92,20 @@ Plus:
 - **A pod that says what it is doing**: each pod logs timestamped boot phases from the first
   instant the container exists and serves the record at `/boot` — RunPod publishes no pod-log
   API, so the pod reports on itself
-- **Fifteen capability images, every model type served**: ten ordinary ones plus five for
+- **Nineteen capability images, every model type served**: ten ordinary ones, five for
   stacks that cannot share a venv (pyannote, coqui XTTS, NeMo, CrisperWhisper, PaddleOCR),
-  each carrying its own torch on a torch-free core so it stays under RunPod's image size
-  limit. Fourteen have completed a real inference on a rented GPU; `faceswap` is the one
-  that needs real faces to test
+  each carrying its own torch on a torch-free core, and four more for the LLM servers and
+  native engines (below). Sixteen have completed a real inference on a rented GPU on the
+  current build; `faceswap` needs real faces to test and the engine images need 100 GB+
+  weights on a volume
+- **The LLM servers as coderai pods**: `coderai-llama` (llama-cpp-python compiled with CUDA
+  for every pod GPU generation, 5.3 GB) and `coderai-vllm` (vLLM in its own venv, 12.4 GB)
+  serve a GGUF or an HF repo with everything a coderai pod gives — TLS, `/boot`, seeding,
+  local LoRAs, the Tasks page — while the upstream `vllm`/`llamacpp` images stay selectable
+- **No Cloudflare in the way**: a coderai pod is reached at its public ip:port over TLS it
+  brings itself (a per-install CA signs a certificate per pod), so there is no 100 s proxy
+  cutoff — a voice clone that died at 524 through the proxy passes direct. The proxy remains
+  the default for upstream images, which cannot take a certificate
 - **The native MoE engines on rented GPUs**: an `engines` image (2.4 GB) compiles ds4, colibri
   and kimi-k3-in-c for every pod GPU generation (Ampere → Blackwell) rather than copying this
   machine's builds, and `engines-kt` carries ktransformers (SGLang + kt-kernel) in its own
