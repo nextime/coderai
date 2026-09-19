@@ -1507,6 +1507,16 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
           against, while generation still uses this model. Leave empty to train on this model.
         </div>
       </div>
+      <div class="form-row">
+        <label class="form-label">LoRA training nodes <span class="muted">(optional — cluster nodes that train alongside this machine)</span></label>
+        <input type="text" id="cfg-lora-train-nodes" class="form-input" placeholder="box2, box3">
+        <div class="muted small" style="margin-top:.25rem">
+          Every LoRA/QLoRA trained on this model runs on this machine <b>and</b> the nodes named
+          here, each on its own card with its share of the samples; the adapter's gradients are
+          averaged every step (a few MB — fine on 1 GbE), rank 0 here saves the result. The nodes
+          need the same base model. A request's own <code>nodes</code> overrides this.
+        </div>
+      </div>
 
       <!-- generation -->
       <div class="card-title" style="margin-top:1.25rem">Generation</div>
@@ -3914,6 +3924,7 @@ function openCfgModal(idx, cfgIdx){
   document.getElementById('cfg-lora-dir').value = s.lora_model_dir || '';
   document.getElementById('cfg-lora-scale').value = s.lora_scale != null ? s.lora_scale : '';
   document.getElementById('cfg-lora-train-base').value = s.lora_train_base_model || '';
+  document.getElementById('cfg-lora-train-nodes').value = Array.isArray(s.lora_train_nodes) ? s.lora_train_nodes.join(', ') : (s.lora_train_nodes || '');
   _populateAccel(s.acceleration);
   _populateTurboQuant(s.turboquant);
   openModal('cfg-modal');
@@ -4846,6 +4857,7 @@ async function saveModelConfig(){
     lora_model_dir:    document.getElementById('cfg-lora-dir').value.trim() || null,
     lora_scale:        parseFloat(document.getElementById('cfg-lora-scale').value) || null,
     lora_train_base_model: document.getElementById('cfg-lora-train-base').value.trim() || null,
+    lora_train_nodes: document.getElementById('cfg-lora-train-nodes').value.trim() || null,
     max_vram:          parseFloat(document.getElementById('cfg-max-vram').value) || 0,
     sdcpp_flash_attn:  document.getElementById('cfg-sdcpp-flash').checked,
     sdcpp_diffusion_flash_attn: document.getElementById('cfg-sdcpp-diff-flash').checked,

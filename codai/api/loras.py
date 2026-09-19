@@ -45,6 +45,7 @@ from pydantic import BaseModel, ConfigDict
 
 from codai.platform_paths import default_loras_dir
 from codai.queue.manager import queue_manager
+from codai.cluster import ddp as _ddp
 from codai.tasks import task_registry, TaskCancelled
 
 router = APIRouter()
@@ -237,6 +238,11 @@ def _loras_dir() -> str:
 
 
 def _lora_dir(name: str) -> str:
+    # A peer rank of a multi-node training must not leave a LoRA behind: what
+    # the trainers save goes to scratch that the ddp context removes.
+    _d = _ddp.current()
+    if _d is not None and not _d.is_main:
+        return os.path.join(_d.scratch_dir(), name)
     return os.path.join(_loras_dir(), name)
 
 
@@ -457,10 +463,34 @@ class LoraTrainRequest(BaseModel):
     # and only it — can recover its job(s) after a restart. Auto-generated if
     # omitted.
     session: Optional[str] = None
+    # Several machines: cluster node names (or {url, api_key} blocks) that train
+    # the same job on their own card, gradients of the adapter averaged every
+    # step (codai/cluster/ddp.py). This engine is rank 0 and saves the result.
+    nodes: Optional[List] = None
+    dist_backend: Optional[str] = None     # gloo (default) | nccl
+    # Set by the coordinator on the request it sends to each peer; never by a
+    # client: {rank, world_size, master_addr, master_port, backend, timeout_s}.
+    distributed: Optional[dict] = None
     model_config = ConfigDict(extra="allow")
 
 
 # ── Base-model resolution ─────────────────────────────────────────────────────
+
+def _configured_train_nodes(base_model: str):
+    """Per-model `lora_train_nodes` (models.json): the cluster nodes every
+    LoRA trained on this model spreads over, unless the request names its own."""
+    try:
+        from codai.models.manager import _model_entry_for
+        entry = _model_entry_for(base_model) or {}
+        v = entry.get("lora_train_nodes")
+        if isinstance(v, str) and v.strip():
+            return v
+        if isinstance(v, list) and v:
+            return v
+    except Exception:
+        pass
+    return None
+
 
 def _configured_train_base(base_model: str) -> Optional[str]:
     """Read a per-model `lora_train_base_model` override from the image model's
@@ -746,6 +776,8 @@ def _train_state_path(name: str) -> str:
 
 
 def _save_train_checkpoint(name: str, state: dict, peft_states: dict) -> None:
+    if not _ddp.is_main():
+        return                      # rank 0's checkpoint is the job's
     from safetensors.torch import save_file
     d = _lora_dir(name)
     os.makedirs(d, exist_ok=True)
@@ -795,6 +827,8 @@ def _apply_peft_checkpoint(name: str, key: str, model) -> None:
 
 
 def _clear_train_checkpoint(name: str) -> None:
+    if not _ddp.is_main():
+        return
     d = _lora_dir(name)
     if not os.path.isdir(d):
         return
@@ -1195,6 +1229,7 @@ def _train_sd15(req, base_path, images, instance_prompt,
     _ensure_peft_awq_compat()
     unet.add_adapter(lora_cfg, adapter_name="default")
     lora_params = [p for p in unet.parameters() if p.requires_grad]
+    _ddp.broadcast_params(lora_params)      # all ranks start from rank 0's init
     optimizer = torch.optim.AdamW(lora_params, lr=lr)
 
     # Resume from a mid-training checkpoint if one survives a prior restart.
@@ -1235,7 +1270,7 @@ def _train_sd15(req, base_path, images, instance_prompt,
     n = len(latents_list)
     for step in range(start_step, steps):
         _check_train_cancel()
-        latents = latents_list[step % n].to(device)
+        latents = latents_list[_ddp.index(step, n)].to(device)
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
         timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps,
@@ -1249,6 +1284,7 @@ def _train_sd15(req, base_path, images, instance_prompt,
             target = noise
         loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
         loss.backward()
+        _ddp.sync_grads(lora_params)      # average over the ranks
         torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
         optimizer.step()
         optimizer.zero_grad()
@@ -1340,6 +1376,7 @@ def _train_sdxl(req, base_path, images, instance_prompt,
     _ensure_peft_awq_compat()
     unet.add_adapter(lora_cfg, adapter_name="default")
     lora_params = [p for p in unet.parameters() if p.requires_grad]
+    _ddp.broadcast_params(lora_params)      # all ranks start from rank 0's init
     optimizer = torch.optim.AdamW(lora_params, lr=lr)
 
     # Resume from a mid-training checkpoint if one survives a prior restart.
@@ -1407,7 +1444,7 @@ def _train_sdxl(req, base_path, images, instance_prompt,
     n = len(latents_list)
     for step in range(start_step, steps):
         _check_train_cancel()
-        latents = latents_list[step % n].to(device)
+        latents = latents_list[_ddp.index(step, n)].to(device)
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
         timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps,
@@ -1422,6 +1459,7 @@ def _train_sdxl(req, base_path, images, instance_prompt,
             target = noise
         loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
         loss.backward()
+        _ddp.sync_grads(lora_params)      # average over the ranks
         torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
         optimizer.step()
         optimizer.zero_grad()
@@ -1629,6 +1667,7 @@ def _train_dit(req, base_path, images, instance_prompt,
     if not lora_params:
         raise HTTPException(status_code=500,
                             detail="Z-Image LoRA: no trainable adapter params were created")
+    _ddp.broadcast_params(lora_params)      # all ranks start from rank 0's init
     optimizer = torch.optim.AdamW(lora_params, lr=lr)
 
     start_step = 0
@@ -1669,7 +1708,7 @@ def _train_dit(req, base_path, images, instance_prompt,
     embed_dev = prompt_embed.to(device)
     for step in range(start_step, steps):
         _check_train_cancel()
-        x0 = latents_list[step % n].to(device, dtype=compute_dtype)   # [1,C,h,w]
+        x0 = latents_list[_ddp.index(step, n)].to(device, dtype=compute_dtype)   # [1,C,h,w]
         noise = torch.randn_like(x0)
         j = _random.randint(0, len(node_t) - 1)
         t = node_t[j]; sigma = node_sigma[j]
@@ -1684,6 +1723,7 @@ def _train_dit(req, base_path, images, instance_prompt,
         pred = torch.stack([o.float() for o in out], dim=0).squeeze(2)  # [1,C,h,w]
         loss = F.mse_loss(pred, target.float(), reduction="mean")
         loss.backward()
+        _ddp.sync_grads(lora_params)      # average over the ranks
         torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
         optimizer.step(); optimizer.zero_grad()
 
@@ -1947,6 +1987,7 @@ def _train_flow_dit(arch: str, req, base_path, images, instance_prompt,
     if not lora_params:
         raise HTTPException(status_code=500,
                             detail=f"{arch} LoRA: no trainable adapter params were created")
+    _ddp.broadcast_params(lora_params)      # all ranks start from rank 0's init
     optimizer = torch.optim.AdamW(lora_params, lr=lr)
 
     start_step = 0
@@ -1969,7 +2010,7 @@ def _train_flow_dit(arch: str, req, base_path, images, instance_prompt,
     n = len(latents_list)
     for step in range(start_step, steps):
         _check_train_cancel()
-        x0 = latents_list[step % n].to(device, dtype=compute_dtype)
+        x0 = latents_list[_ddp.index(step, n)].to(device, dtype=compute_dtype)
         noise = torch.randn_like(x0)
         u = torch.rand(1, device=device, dtype=torch.float32)
         sigma = (shift * u) / (1.0 + (shift - 1.0) * u)
@@ -1983,6 +2024,7 @@ def _train_flow_dit(arch: str, req, base_path, images, instance_prompt,
                            return_dict=False)[0]
         loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
         loss.backward()
+        _ddp.sync_grads(lora_params)      # average over the ranks
         torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
         optimizer.step()
         optimizer.zero_grad()
@@ -2165,6 +2207,7 @@ def _train_wan(req, base_path, images, instance_prompt,
     if not lora_params:
         raise HTTPException(status_code=500,
                             detail="Wan LoRA: no trainable adapter params were created")
+    _ddp.broadcast_params(lora_params)      # all ranks start from rank 0's init
     optimizer = torch.optim.AdamW(lora_params, lr=lr)
 
     # Resume from a mid-training checkpoint if one survives a prior restart. This
@@ -2227,7 +2270,7 @@ def _train_wan(req, base_path, images, instance_prompt,
     n = len(latents_list)
     for step in range(start_step, steps):
         _check_train_cancel()
-        x0 = latents_list[step % n].to(device, dtype=compute_dtype)
+        x0 = latents_list[_ddp.index(step, n)].to(device, dtype=compute_dtype)
         noise = torch.randn_like(x0)
         # Rectified-flow timestep with Wan resolution shift applied to sigma.
         # Compute the interpolation in fp32 for stability, then cast x_t back to
@@ -2253,6 +2296,7 @@ def _train_wan(req, base_path, images, instance_prompt,
                   return_dict=False)[0]
         loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
         loss.backward()
+        _ddp.sync_grads(lora_params)      # average over the ranks
         torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
         optimizer.step()
         optimizer.zero_grad()
@@ -2372,6 +2416,93 @@ def active_training_model() -> Optional[str]:
     return None
 
 
+def _ddp_is_main_block(req) -> bool:
+    d = getattr(req, "distributed", None)
+    return not d or int(d.get("rank") or 0) == 0
+
+
+def _dispatch_peers(req: LoraTrainRequest, job_id: Optional[str]) -> list:
+    """Send this job to each node in ``req.nodes`` as a peer rank, with the
+    images inlined (a character or environment profile exists only here),
+    and mark this request as rank 0. Returns the peers with their job ids —
+    what a cancel or a failure here must reach."""
+    import base64
+    import io
+    from codai.api import pod_http
+    from codai.cluster.rpc import advertise_host
+    nodes = _ddp.parse_nodes(req.nodes)
+    peers = _ddp.resolve_peers(nodes)
+    if not peers:
+        return []
+    adv = ""
+    try:
+        from codai.admin.routes import config_manager
+        adv = getattr(getattr(config_manager.config, "cluster", None), "advertise_host", "") or ""
+    except Exception:
+        pass
+    master = advertise_host(adv)
+    port = _ddp.free_port()
+    world = 1 + len(peers)
+    backend = (req.dist_backend or "").strip().lower() or "gloo"
+    # The peers receive the images themselves: a profile name means nothing
+    # on another machine.
+    images = _gather_images(req)
+    if not images:
+        raise HTTPException(status_code=400,
+                            detail="No training images (provide `character` or `images`)")
+    inline = []
+    for im in images:
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        inline.append("data:image/png;base64," + base64.b64encode(buf.getvalue()).decode())
+    payload = req.model_dump(exclude_none=True)
+    for k in ("nodes", "character", "environment", "session", "wait"):
+        payload.pop(k, None)
+    payload["images"] = inline
+    payload["wait"] = False
+    req.distributed = {"rank": 0, "world_size": world, "master_addr": master,
+                       "master_port": port, "backend": backend, "timeout_s": 600}
+    out = []
+    for rank, peer in enumerate(peers, 1):
+        body = dict(payload)
+        body["distributed"] = {**req.distributed, "rank": rank}
+        headers = {"Content-Type": "application/json"}
+        if peer.get("api_key"):
+            headers["Authorization"] = f"Bearer {peer['api_key']}"
+        try:
+            r = pod_http.post(peer["url"] + "/v1/loras/train", json=body, headers=headers,
+                              timeout=120, verify=(False if peer.get("verify") == "off" else True))
+            if r.status_code != 200:
+                raise RuntimeError(f"{r.status_code} {(r.text or '')[:200]}")
+            pj = (r.json() or {}).get("job_id")
+        except Exception as exc:
+            _cancel_peers(out)
+            raise HTTPException(status_code=502,
+                                detail=f"training node {peer['name']} refused the job: {exc}")
+        out.append({**peer, "job_id": pj, "rank": rank})
+        print(f"  [lora][ddp] rank {rank} → {peer['name']} ({peer['url']}) job {pj}", flush=True)
+    print(f"  [lora][ddp] rank 0 here, rendezvous {master}:{port}, world {world}, {backend}",
+          flush=True)
+    _set_progress(message=f"training on {world} machines: " +
+                  ", ".join(["local"] + [p["name"] for p in peers]))
+    return out
+
+
+def _cancel_peers(peers) -> None:
+    """Best effort: a peer left waiting on an all-reduce holds its card until
+    the group times out; tell it to stop now."""
+    from codai.api import pod_http
+    for p in peers or []:
+        if not p.get("job_id"):
+            continue
+        headers = {"Authorization": f"Bearer {p['api_key']}"} if p.get("api_key") else {}
+        try:
+            pod_http.post(f"{p['url']}/v1/loras/jobs/{p['job_id']}/cancel", headers=headers,
+                          timeout=15, verify=(False if p.get("verify") == "off" else True))
+        except Exception:
+            pass
+
+
 def _train_lora_blocking(req: LoraTrainRequest, job_id: Optional[str] = None) -> dict:
     """Run one training job to completion (called inside a worker thread).
 
@@ -2411,14 +2542,28 @@ def _train_lora_blocking(req: LoraTrainRequest, job_id: Optional[str] = None) ->
         gpu_lock.reserve(f"lora-training:{getattr(req, 'name', '') or '?'}")
     except Exception as _gle:
         print(f"  [lora] could not reserve GPU lock: {_gle}")
+    peers = None
     try:
-        result = _train_lora_sync(req)
+        # Several machines: this engine is rank 0; the peers get the same job.
+        if not getattr(req, "nodes", None) and not getattr(req, "distributed", None):
+            _cfg_nodes = _configured_train_nodes(getattr(req, "base_model", "") or "")
+            if _cfg_nodes:
+                req.nodes = _cfg_nodes
+        if getattr(req, "nodes", None) and not getattr(req, "distributed", None):
+            peers = _dispatch_peers(req, job_id)
+        with _ddp.context(getattr(req, "distributed", None)):
+            result = _train_lora_sync(req)
+        if not _ddp_is_main_block(req):
+            # A peer rank: rank 0 holds the LoRA; nothing of ours outlives the job.
+            result = {"name": req.name, "path": None,
+                      "rank": int((req.distributed or {}).get("rank") or 0)}
         if job_id:
             _update_job(job_id, status="done", active=False, force=True,
                         message="done", path=result.get("path"))
             task_registry.finish(job_id, "done")
         return result
     except TaskCancelled:
+        _cancel_peers(peers)
         # Cooperative cancel from the training loop — not an error.
         try:
             _set_progress(active=False, status="cancelled", message="cancelled")
@@ -2433,6 +2578,7 @@ def _train_lora_blocking(req: LoraTrainRequest, job_id: Optional[str] = None) ->
         _drop_wan_cache()
         raise
     except Exception as e:
+        _cancel_peers(peers)
         import traceback
         traceback.print_exc()
         # On error the base may be in a half-moved / inconsistent state — drop the
@@ -2532,6 +2678,15 @@ async def _detached_train(req: LoraTrainRequest, job_id: str) -> None:
     except Exception as e:
         _update_job(job_id, status="error", active=False, force=True,
                     message=f"training failed: {e}"[:300])
+
+
+@router.post("/v1/loras/jobs/{job_id}/cancel", summary="Cancel a training job")
+async def cancel_train_job(job_id: str, _auth=Depends(_require_api_auth)):
+    """Stop a queued or running training job — also what the rank-0 machine
+    of a multi-node training calls on its peers when it aborts."""
+    if not cancel_job(job_id):
+        raise HTTPException(status_code=404, detail="unknown job")
+    return {"ok": True, "job_id": job_id}
 
 
 @router.get("/v1/loras/progress", summary="LoRA training progress")
