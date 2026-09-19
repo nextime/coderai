@@ -37,8 +37,9 @@ images) or 8776 (full image), and all of them can be a cluster node.
 Every tag is also published with its version (`:0.2.20`); `:latest` moves
 only after the image has completed a real request on real hardware.
 
-A tarball of the full image (`docker save`, gzip, ~15 GB) is attached to
-each GitHub release for offline installs: `docker load < coderai-base-<version>.tar.gz`.
+For an offline machine, pull the image where there is a connection and
+move it: `docker save ghcr.io/nextime/coderai:0.2.20 | gzip > coderai.tar.gz`
+there, `docker load < coderai.tar.gz` here.
 
 ## Linux
 
