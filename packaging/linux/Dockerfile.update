@@ -38,7 +38,10 @@ RUN set -eux; \
       /opt/coderai/app/township_output \
       /opt/coderai/app/offload \
       /opt/coderai/app/dist \
-      /opt/coderai/app/.packaging-cache; \
+      /opt/coderai/app/.packaging-cache \
+      /opt/coderai/app/.claude \
+      /opt/coderai/app/video_editor.config.json \
+      /root/.config/Ultralytics/settings.json; \
     find /opt/coderai/app -type d -name __pycache__ -prune -exec rm -rf '{}' +; \
     /opt/coderai/python/bin/python3 -c "import importlib.util, sys; m=[n for n in ('fastapi','uvicorn','torch') if importlib.util.find_spec(n) is None]; sys.exit('base image missing: '+', '.join(m) if m else 0)"
 

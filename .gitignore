@@ -58,3 +58,8 @@ venv_build.log
 
 # staged engine sources for the engines pod image (build_capability_image.sh)
 packaging/runpod/engines-src/
+
+# Local tool config with a live API token; never in git or the image
+video_editor.config.json
+# Claude Code local settings
+.claude/

@@ -47,3 +47,6 @@ coderai-*.tar.gz.partial
 checkpoints
 character_output
 tools/character_output
+
+# Claude Code local settings
+.claude
