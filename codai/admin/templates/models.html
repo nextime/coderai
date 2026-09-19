@@ -622,6 +622,21 @@ window.__DEFAULT_WHISPER_SERVER_PATH__ = {{ default_whisper_server_path|tojson }
         <input type="text" id="cfg-node-path" class="form-input" placeholder="blank = same path as here, else the HuggingFace id / URL the node can fetch">
         <span class="form-hint" style="font-size:11px">The node registers the model under this path when it does not share this machine's filesystem. Blank works when the path exists on the node too (NFS, same layout) or the model is a HuggingFace id.</span>
       </div>
+      <div class="form-row" id="cfg-dist-row" style="margin-top:.75rem;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
+        <label style="display:flex;align-items:center;gap:.5rem;font-weight:600">
+          <input type="checkbox" id="cfg-dist-enabled" style="width:auto;margin:0" onchange="_updateDistVisibility()">
+          Distribute the work of one request across engines and nodes
+        </label>
+        <span class="form-hint" style="font-size:11px;line-height:1.5">Splits what a request carries — <b>n</b> images or videos, a list to embed or rerank, a long text to speak (by sentences), a long recording to transcribe (cut at silences), a batch of documents to OCR — over every engine that has this model, here and on cluster nodes, and merges the answers. One generation is never split; that is <em>Cards on other machines</em> / vLLM nodes above.</span>
+        <div id="cfg-dist-fields" style="display:none;margin-top:.5rem">
+          <div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:.6rem">
+            <div class="form-row" style="margin:0"><label class="form-label">Engines / nodes <span class="muted">(blank = every one that can)</span></label><input type="text" id="cfg-dist-nodes" class="form-input" placeholder="auto — or: local, box2, box3"></div>
+            <div class="form-row" style="margin:0"><label class="form-label">Max parts</label><input type="number" id="cfg-dist-max" class="form-input" min="0" placeholder="0 = no cap"></div>
+            <div class="form-row" style="margin:0"><label class="form-label">Min items to split</label><input type="number" id="cfg-dist-min" class="form-input" min="2" placeholder="2"></div>
+            <div class="form-row" style="margin:0"><label class="form-label">Audio chunk (s)</label><input type="number" id="cfg-dist-chunk" class="form-input" min="10" placeholder="120"></div>
+          </div>
+        </div>
+      </div>
       <div class="form-row" id="cfg-rpc-row" style="margin-top:.75rem;display:none;border:1px solid var(--border,#333);border-radius:8px;padding:.6rem">
         <label class="form-label" style="font-weight:600">Cards on other machines <span class="muted" style="font-weight:400">— llama.cpp RPC servers, one model over several machines</span></label>
         <input type="text" id="cfg-rpc-servers" class="form-input" list="cfg-rpc-known" placeholder="host:50052, host2:50052   (blank = this machine only)">
@@ -4311,9 +4326,18 @@ function _applyCompat(){
   const krow = document.getElementById('cfg-kt-row');
   if (krow) krow.style.display = (backend === 'kt') ? '' : 'none';
 }
+function _updateDistVisibility(){
+  const on = !!(document.getElementById('cfg-dist-enabled') || {}).checked;
+  const f = document.getElementById('cfg-dist-fields'); if (f) f.style.display = on ? '' : 'none';
+}
 function _populateCluster(m, s){
   window._cfgCurrentPath = (m && (m.path || m.id)) || '';
   const set = (id,v)=>{ const el=document.getElementById(id); if(el!=null) el.value=(v==null?'':v); };
+  const dz = s.distribute || {};
+  document.getElementById('cfg-dist-enabled').checked = !!dz.enabled;
+  set('cfg-dist-nodes', Array.isArray(dz.nodes) ? dz.nodes.join(', ') : (dz.nodes || ''));
+  set('cfg-dist-max', dz.max_parts || ''); set('cfg-dist-min', dz.min_items || ''); set('cfg-dist-chunk', dz.chunk_seconds || '');
+  _updateDistVisibility();
   set('cfg-node-path', s.node_path || '');
   set('cfg-rpc-servers', Array.isArray(s.rpc_servers) ? s.rpc_servers.join(', ') : (s.rpc_servers || ''));
   const dl = document.getElementById('cfg-rpc-known');
@@ -4341,6 +4365,11 @@ function _collectCluster(){
   const out = {
     node_path: val('cfg-node-path'),
     rpc_servers: val('cfg-rpc-servers'),
+    distribute: {
+      enabled: !!document.getElementById('cfg-dist-enabled').checked,
+      nodes: val('cfg-dist-nodes'), max_parts: num('cfg-dist-max'),
+      min_items: num('cfg-dist-min'), chunk_seconds: num('cfg-dist-chunk'),
+    },
   };
   out.vllm = backend === 'vllm' ? {
     tensor_parallel_size: num('cfg-vllm-tp'), pipeline_parallel_size: num('cfg-vllm-pp'),

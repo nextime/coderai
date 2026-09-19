@@ -15,6 +15,7 @@ UI stays live even while an engine is busy loading a model.
 """
 
 import json
+import re
 import sys
 import time
 from typing import Optional
@@ -113,6 +114,7 @@ class FrontProxy:
         self._mls_cache: dict = {}
         self.registry = EngineRegistry()
         self.supervisor: Optional[EngineSupervisor] = None
+        self._node_files: dict = {}
         # Per-run secret shared only with the engines (passed via env at spawn). The
         # front stamps every engine request with it and engines reject requests that
         # lack it, so nothing on localhost can talk to an engine bypassing the front.
@@ -640,6 +642,97 @@ class FrontProxy:
     def _pin_for(self, model: Optional[str]) -> Optional[str]:
         return self._model_info(model).get("engine")
 
+    #: Generated files that live on a cluster node: name -> engine. A node's
+    #: answer names its files by ITS base URL; the head rewrites them to its
+    #: own and fetches from the node when the client comes for them.
+    _FILE_URL_RE = re.compile(rb'https?://[^"\s]*?/v1/files/([^"\s/?]+)')
+
+    def _rewrite_node_files(self, engine, raw: bytes, request: Request) -> bytes:
+        if not getattr(engine, "remote", False) or b"/v1/files/" not in (raw or b""):
+            return raw
+        proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "http").split(",")[0]
+        host = request.headers.get("host") or ""
+        prefix = (request.headers.get("x-forwarded-prefix") or "").rstrip("/")
+        base = f"{proto}://{host}{prefix}".encode("latin-1") if host else prefix.encode("latin-1")
+        files = self._node_files
+
+        def _sub(m):
+            files[m.group(1).decode("latin-1")] = engine
+            return base + b"/v1/files/" + m.group(1)
+        return self._FILE_URL_RE.sub(_sub, raw)
+
+    async def _serve_node_file(self, request: Request, name: str):
+        engine = self._node_files.get(name)
+        if engine is None or not engine.healthy:
+            return None
+        try:
+            rp_req = self._lc(engine).build_request(
+                "GET", engine.url + "/v1/files/" + name, headers=self._eh(engine, {}))
+            rp_resp = await self._lc(engine).send(rp_req, stream=True)
+        except Exception as exc:
+            return JSONResponse({"error": f"node {engine.name} unreachable: {exc}"},
+                                status_code=502)
+
+        async def _it():
+            try:
+                async for chunk in rp_resp.aiter_raw():
+                    yield chunk
+            finally:
+                await rp_resp.aclose()
+        return StreamingResponse(_it(), status_code=rp_resp.status_code,
+                                 headers=dict(self._filter_headers(rp_resp.headers, _DROP_RESP)))
+
+    async def _maybe_fanout(self, request: Request, path: str, model: Optional[str],
+                            body_bytes: Optional[bytes]):
+        """Split this request over several engines when the model asks for it
+        and the request carries more than one unit of work; None = serve as
+        one request. Never raises: a fan-out that cannot happen falls back."""
+        from codai.cluster import fanout as _fan
+        kind = _fan.kind_for(path)
+        if kind is None:
+            return None
+        ct = (request.headers.get("content-type") or "").lower()
+        if model is None and "multipart/form-data" in ct:
+            body_bytes = await request.body()
+            model = self._peek_model_multipart(body_bytes)
+        dcfg = _fan.parse_distribute(self._model_info(model).get("distribute"))
+        if not dcfg["enabled"]:
+            return None
+        cap = self._required_cap(path, model)
+        engines = _fan.choose_engines(self.registry, model or "", cap, dcfg["nodes"],
+                                      dcfg["max_parts"])
+        if len(engines) < 2:
+            return None
+        try:
+            if kind == "audio":
+                await request.body()          # cache it: form() re-reads, fallback forwards
+                res = await _fan.run_transcription(self, request, path, engines, model or "", dcfg)
+            elif kind == "files":
+                await request.body()
+                res = await _fan.run_ocr_batch(self, request, path, engines, model or "", dcfg)
+            else:
+                if "application/json" not in ct or not body_bytes:
+                    return None
+                try:
+                    body = json.loads(body_bytes)
+                except Exception:
+                    return None
+                if not isinstance(body, dict) or body.get("stream"):
+                    return None
+                if kind == "text:input":
+                    res = await _fan.run_speech(self, request, path, body, engines, model or "", dcfg)
+                else:
+                    res = await _fan.run_json(self, request, path, kind, body, engines,
+                                              model or "", dcfg)
+        except Exception as exc:
+            print(f"[fanout] {path} {model}: not split ({exc}); serving as one request",
+                  flush=True)
+            return None
+        if res is None:
+            return None
+        self._record_activity(model, self._task_kind(path), res.status, time.time())
+        return Response(content=res.content, status_code=res.status, media_type=res.media_type)
+
     def _load_pins(self) -> dict:
         import json as _json
         info: dict = {}
@@ -674,7 +767,10 @@ class FrontProxy:
                        # (enabled + triggers + serverless target). Used by the front
                        # to reroute when local can't serve.
                        "runpod_spillover": (m.get("runpod_spillover")
-                                            if isinstance(m.get("runpod_spillover"), dict) else None)}
+                                            if isinstance(m.get("runpod_spillover"), dict) else None),
+                       # Work-parallel fan-out over engines/nodes (cluster/fanout.py).
+                       "distribute": (m.get("distribute")
+                                      if isinstance(m.get("distribute"), dict) else None)}
                 for field_ in (m.get("path"), m.get("id"), m.get("alias")):
                     if not field_:
                         continue
@@ -2137,6 +2233,12 @@ class FrontProxy:
             if sysw is not None:
                 return await self._proxy_passthrough(request, sysw)
 
+        # A generated file that a cluster node holds is fetched from that node.
+        if method == "GET" and path.startswith("/v1/files/") and self._node_files:
+            served = await self._serve_node_file(request, path.rsplit("/", 1)[-1])
+            if served is not None:
+                return served
+
         # Inference JSON bodies are small: buffer so we can route by `model`, then
         # forward the buffered bytes. Everything else streams through unbuffered.
         body_bytes: Optional[bytes] = None
@@ -2144,6 +2246,15 @@ class FrontProxy:
         if method == "POST" and _router.is_inference_path(path):
             body_bytes = await request.body()
             model = self._peek_model(body_bytes, request.headers.get("content-type", ""))
+
+        # Work-parallel fan-out (codai/cluster/fanout.py): a model configured to
+        # distribute has its n images / input list / sentences / audio chunks /
+        # document batch spread over every engine that holds it, here and on the
+        # nodes, and the parts merged back into one answer.
+        if method == "POST":
+            fanned = await self._maybe_fanout(request, path, model, body_bytes)
+            if fanned is not None:
+                return fanned
 
         engine = _router.pick_engine(
             self.registry, path, method, model,
@@ -2289,6 +2400,20 @@ class FrontProxy:
                 if _meta is not None:
                     self._record_activity(model, self._task_kind(path),
                                           rp_resp.status_code, _started)
+
+        # A node's JSON answer may name files by the node's own URL: rewrite
+        # them to this front (small bodies only; streams pass untouched).
+        _rct = (rp_resp.headers.get("content-type") or "").lower()
+        if getattr(engine, "remote", False) and "application/json" in _rct:
+            try:
+                raw = await rp_resp.aread()
+            finally:
+                await _release()
+            raw = self._rewrite_node_files(engine, raw, request)
+            hdrs = dict(self._filter_headers(rp_resp.headers, _DROP_RESP))
+            hdrs.pop("content-length", None)
+            return Response(content=raw, status_code=rp_resp.status_code, headers=hdrs,
+                            media_type=rp_resp.headers.get("content-type"))
 
         # Measure throughput from the SSE stream the front relays, and publish it on
         # the in-flight metadata. This gives the Tasks page a live it/s for the

@@ -2756,6 +2756,28 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 ):
         if key in data:
             entry[key] = data[key]
+    # Work-parallel fan-out over engines and nodes (codai/cluster/fanout.py).
+    if "distribute" in data:
+        src = data.get("distribute") if isinstance(data.get("distribute"), dict) else {}
+        blk = {}
+        if src.get("enabled"):
+            blk["enabled"] = True
+            nodes = src.get("nodes")
+            if isinstance(nodes, str):
+                nodes = [x.strip() for x in nodes.split(",") if x.strip()]
+            if nodes and nodes != ["auto"]:
+                blk["nodes"] = [str(x) for x in nodes]
+            for k in ("max_parts", "min_items", "chunk_seconds"):
+                v = src.get(k)
+                if v not in (None, ""):
+                    try:
+                        blk[k] = int(v)
+                    except (TypeError, ValueError):
+                        pass
+        if blk:
+            entry["distribute"] = blk
+        else:
+            entry.pop("distribute", None)
     # Per-model engine blocks laid over the global template: vLLM (parallelism,
     # ray nodes), SGLang/kt (nnodes, ranks' commands). A block with nothing set
     # is dropped so the entry stays clean.
