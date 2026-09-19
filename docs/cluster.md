@@ -207,7 +207,87 @@ for ranks 1… — `name | start command | stop command`, templated with
 `{rank}`, `{nnodes}`, `{dist_init_addr}`, `{model}`. Ranks 1… are started
 first; rank 0 launches here with `--nnodes N --node-rank 0 --dist-init-addr`.
 
-## 4. Pools — several machines for one capability or one host model
+## 4. Every generation capability — distributing the *work*
+
+An image, video, audio, embedding or OCR request often carries more than one
+unit of work. Tick **Distribute the work of one request across engines and
+nodes** on the model (or ``"distribute": {"enabled": true}`` in models.json)
+and the front splits it over every engine that has the model — here and on
+cluster nodes — sends the parts concurrently and merges the answers:
+
+| Endpoint | Split by | Merge |
+|---|---|---|
+| `/v1/images/generations`, `/v1/video/generations` | `n` (each part gets its own seed offset) | images/videos in order |
+| `/v1/embeddings` | the `input` list | vectors re-indexed, usage summed |
+| `/v1/rerank` | the `documents` list | scores re-indexed, sorted, `top_n` applied |
+| `/v1/audio/speech` | sentences of `input` | spoken parts joined with ffmpeg into the requested format |
+| `/v1/audio/transcriptions` | time windows cut at silences (`chunk_seconds`) | text joined, segment/word timestamps shifted (`json`, `verbose_json`, `text`; srt/vtt and diarization stay on one engine) |
+| `/v1/ocr/batch` | files | results in order |
+
+Options: which engines/nodes (`nodes`, blank = every one that can serve the
+capability, the one already holding the model first), `max_parts`,
+`min_items` (below it nothing is split), `chunk_seconds`. A part that fails
+is retried once on another engine before the request fails. Files a node
+generates are addressed through the head (`/v1/files/…` rewritten and
+fetched from the node). Streaming requests are never split. One
+*generation* is never split either — that is what the next section and the
+RPC / vLLM sections are for.
+
+## 5. Parts of a video pipeline on other machines
+
+A video model is several models run one after the other — text encoder
+(UMT5-XXL, 11 GB), one or two denoising experts (Wan 2.2: high-noise then
+low-noise, ~10 GB each at 4-bit), VAE — and what passes between them is
+small: prompt embeddings, a latent tensor of a few MB. So each part can live
+on a different machine and a generation becomes a relay over the LAN, which
+lets a 14B dual-expert model run where no single card holds it all.
+
+Per model, **Pipeline parts on other machines** (``"components"``):
+
+```json
+{"components": {"text_encoder": "box2", "low_noise": "box3", "vae": "box3"}}
+```
+
+* `text_encoder` — the prompt is encoded there (the head never runs its own
+  text encoder for this model);
+* `low_noise` — the head runs the high-noise steps, hands the latents over
+  at the expert boundary, the node runs the rest;
+* `vae` — the latents are decoded there and the node returns the finished
+  video (the head's post-processing — upscale, audio, subtitles — is then
+  skipped, since the node's answer is the answer).
+
+Each named node needs the same model configured. The node runs the ordinary
+`/v1/video/generations` with a `_handoff` block (`encode`, `denoise` from a
+step, `decode`), so loading, acceleration presets and LoRAs happen exactly
+as for a normal generation there. Wan T2V and I2V pipelines; other pipelines
+run on one machine with a note in the log.
+
+## 6. LoRA / QLoRA training over several machines
+
+Every LoRA trained on a model can run on this machine **and** on cluster
+nodes at once: each machine trains on its own card with its share of the
+samples, and after every step the gradients of the adapter — a few MB — are
+averaged across all machines (synchronous data parallel over
+`torch.distributed`, gloo by default, `nccl` on request), so every machine
+holds the same adapter throughout and the result on this machine is the
+whole cluster's work. Steps are the same; each step now sees N samples
+instead of one.
+
+* Per model: **LoRA training nodes** (`lora_train_nodes`) on the base
+  model's page; or per job: `"nodes": ["box2", "box3"]` on
+  `POST /v1/loras/train` (also `{url, api_key}` blocks for machines outside
+  `cluster.nodes`), `dist_backend`.
+* The machine that takes the job is rank 0: it resolves the images (a
+  character/environment profile exists only there), sends the same job with
+  the images inlined to each node, then trains. Peers save nothing that
+  outlives the job and are cancelled when rank 0 aborts.
+* The nodes need the same base model. Rank 0's advertise host and a free
+  port are the rendezvous (`cluster.advertise_host` when the default route's
+  address is not the one the nodes can reach).
+* Covers the in-process trainers: SD1.5, SDXL, Z-Image, the flow-DiT
+  family (LTX-2 …) and Wan, 4-bit QLoRA included.
+
+## 7. Pools — several machines for one capability or one host model
 
 * **Remote capabilities** (Settings → Remote capabilities): a capability's
   URL field takes several URLs, comma-separated. They form a pool: the
@@ -227,11 +307,13 @@ first; rank 0 launches here with `--nnodes N --node-rank 0 --dist-init-addr`.
   ray_address / ray_port / nodes / nodes_ready_timeout_s`;
   `ktransformers.nnodes / dist_init_addr / tp_size / nodes`.
 * Per model (models.json): `engine` (a node name), `node_path` /
-  `node_paths`, `rpc_servers`, `vllm` block, `kt` block, `host.hosts`.
+  `node_paths`, `rpc_servers`, `vllm` block, `kt` block, `host.hosts`,
+  `distribute` block, `components` block, `lora_train_nodes`.
 * Node API (token of the node): `GET /cluster/state`, `GET /cluster/rpc-servers`,
   `POST /cluster/reload-config`, `POST /cluster/model-load`, `POST /cluster/model-unload`.
 * Head: `GET /admin/api/cluster` (what the Cluster page shows).
-* Code: `codai/cluster/` (nodes, rpc, multinode, compat, overview),
+* Code: `codai/cluster/` (nodes, rpc, multinode, compat, overview, fanout,
+  components, ddp),
   `codai/backends/ggml_rpc.py`, `codai/backends/overrides.py`,
   `codai/frontproxy/engine_supervisor.py` (remote engines),
   `codai/api/remote_gateway.EndpointPool`, `codai/api/host_worker.HostPool`.

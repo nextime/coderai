@@ -21,7 +21,10 @@ one isn't enough.
   cloud — engines per GPU here, other coderai installs as **cluster nodes**, pools of hosts
   and remotes, RunPod pods — by capability, load and per-model pins
 - **Distribution**: one model over several machines' cards — a GGUF over llama.cpp RPC,
-  an HF model over vLLM on Ray or SGLang multi-node — as easily as over two local GPUs
+  an HF model over vLLM on Ray or SGLang multi-node, a video pipeline's text encoder /
+  experts / VAE on different nodes — and the *work* of one request over every machine
+  that has the model: images, videos, embeddings, rerank, speech, transcriptions, OCR
+  batches split and merged; LoRA/QLoRA training data-parallel across nodes
 - **Escalation**: when the local cards are not enough, the same model runs on a machine you
   own, then on a GPU rented by the second, with budgets and a reaper; remote or bursting,
   chosen per model. See [`docs/cluster.md`](docs/cluster.md), [`docs/remote-execution.md`](docs/remote-execution.md), [`docs/runpod.md`](docs/runpod.md)
@@ -154,6 +157,11 @@ remote placement of every model type, the capability images and the `host` backe
   pipeline parallel across nodes) and SGLang `--nnodes` — coderai starts the peers by
   their configured commands, waits for their GPUs, launches, tears down; per model or
   as defaults
+- **Distributed generation and training**: a model's *Distribute* switch fans `n` images,
+  embedding/rerank lists, TTS sentences, transcription windows and OCR batches over every
+  engine and node holding it; *Pipeline parts on other machines* relays a Wan video through
+  the text encoder, the low-noise expert and the VAE wherever they live; *LoRA training
+  nodes* train one adapter on several machines at once
 - **Pools**: several URLs for one capability, several machines for one `host` model —
   healthy + least busy wins, a dead one is skipped and the request moves on
 - **No impossible pairs**: the model form greys out engines that cannot run the chosen
