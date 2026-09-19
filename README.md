@@ -415,6 +415,12 @@ That's it. Open `http://127.0.0.1:8776/admin` and log in with `admin` / `admin`.
 
 ## Installation
 
+**From the published packages (no build):** `docker pull ghcr.io/nextime/coderai:latest` and
+`packaging/linux/run_oci.sh --nvidia -d` on Linux; `CoderAI-Setup-<version>.exe` (Docker Desktop +
+WSL2, NVIDIA) on Windows — see [`docs/install-from-packages.md`](docs/install-from-packages.md)
+for every package (the full image and the nineteen capability images), the plain `docker run`,
+the offline tarball and the Windows notes. The rest of this section is the from-source install.
+
 ### Prerequisites
 
 - Python 3.8+
@@ -577,6 +583,7 @@ The [`docs/`](docs/) directory carries the deep dives — one per engine and sub
 | [`frontend-engine-split.md`](docs/frontend-engine-split.md) | Front proxy, engine subprocesses, routing |
 | [`runpod.md`](docs/runpod.md) | Renting remote GPUs: pods, serverless, budgets, the reaper |
 | [`remote-execution.md`](docs/remote-execution.md) | Running any model type elsewhere: the capability gateway, per-model placement, weights and adapters on a pod, test runs |
+| [`install-from-packages.md`](docs/install-from-packages.md) | The published images (full + nineteen capability images), Linux and Windows installs, the offline tarball |
 | [`cluster.md`](docs/cluster.md) | Several machines as one: cluster nodes as engines, one GGUF over llama.cpp RPC, vLLM/SGLang multi-node, pools of hosts and remotes |
 | [`vllm.md`](docs/vllm.md) | vLLM as a first-class engine node |
 | [`deepseek-ds4.md`](docs/deepseek-ds4.md) · [`glm-colibri.md`](docs/glm-colibri.md) · [`kimi-k3.md`](docs/kimi-k3.md) · [`ktransformers.md`](docs/ktransformers.md) | The native MoE engines |
