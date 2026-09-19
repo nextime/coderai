@@ -1,0 +1,78 @@
+# syntax=docker/dockerfile:1
+# Re-baseline ONLY the GGUF runtime of an already-built coderai image:
+# llama-cpp-python rebuilt from source with the RPC backend, plus the
+# rpc-server binary from the very same vendored llama.cpp (the RPC protocol
+# is versioned — client and server must come from one tree).
+#
+# The shipped image is a CUDA *runtime* image: no nvcc, no toolchain. So the
+# wheel is built in a CUDA devel stage against the same interpreter the image
+# runs (python-build-standalone, cp313) and only the wheel and the binary
+# cross into the final layer. The CUDA major must match what the image's
+# torch and the rest of its llama-cpp-python link (libcudart.so.13 today) —
+# CUDA_BUILDER pins that.
+#
+# Driven by update_oci_image.sh with REBUILD_LLAMA=1 after the ordinary app
+# overlay; the result is what flatten_oci_image.sh squashes into coderai:base.
+ARG BASE_IMAGE=coderai:dist
+ARG CUDA_BUILDER=nvidia/cuda:13.0.2-devel-ubuntu24.04
+
+# ---------------------------------------------------------------- build stage
+FROM ${CUDA_BUILDER} AS llamabuild
+ARG PYTHON_VERSION=3.13.5
+ARG PBS_RELEASE=20250612
+ARG LLAMA_CPP_PYTHON_VERSION=0.3.30
+# SASS for every card the release may meet (Ampere → Blackwell). sm_86 alone
+# is what the local box needs; the GitHub release is for anyone.
+ARG CUDA_ARCHS="80;86;89;90;120"
+# python-build-standalone was built with clang and says so in its sysconfig
+# (CC=clang), which scikit-build then asks CMake for; the builder has gcc.
+ENV DEBIAN_FRONTEND=noninteractive FORCE_CMAKE=1 CMAKE_BUILD_PARALLEL_LEVEL=8 MAX_JOBS=8 \
+    CC=gcc CXX=g++ CUDAHOSTCXX=g++
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential ca-certificates cmake curl git libgomp1 libvulkan-dev \
+      ninja-build pkg-config vulkan-tools glslang-tools glslc \
+    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    curl -fsSL -o /tmp/python.tar.gz \
+      "https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_RELEASE}/cpython-${PYTHON_VERSION}+${PBS_RELEASE}-x86_64-unknown-linux-gnu-install_only.tar.gz"; \
+    mkdir -p /opt/coderai; tar -xzf /tmp/python.tar.gz -C /opt/coderai; rm /tmp/python.tar.gz
+ENV PATH=/opt/coderai/python/bin:$PATH
+RUN python3 -m pip install --no-cache-dir -U pip wheel scikit-build-core cmake ninja
+RUN --mount=type=cache,target=/root/.cache/pip set -eux; \
+    CMAKE_ARGS="-DGGML_CUDA=ON -DGGML_VULKAN=ON -DGGML_RPC=ON -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS} -DGGML_NATIVE=OFF -DGGML_AVX2=ON" \
+      python3 -m pip wheel --no-deps --no-binary llama-cpp-python \
+        "llama-cpp-python==${LLAMA_CPP_PYTHON_VERSION}" -w /wheels; \
+    python3 -m pip install --no-deps /wheels/llama_cpp_python-*.whl; \
+    ls -la /wheels
+COPY packaging/build-rpc-server.sh /tmp/build-rpc-server.sh
+RUN set -eux; \
+    PYTHON=/opt/coderai/python/bin/python3 CMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+      bash /tmp/build-rpc-server.sh --cuda --vulkan --dest /wheels; \
+    /wheels/rpc-server --help | head -3
+
+# -------------------------------------------------------------- final stage
+FROM ${BASE_IMAGE}
+COPY --from=llamabuild /wheels/ /tmp/llama-wheels/
+RUN set -eux; \
+    /opt/coderai/python/bin/python3 -m pip install --no-input --no-cache-dir --no-deps \
+        --force-reinstall /tmp/llama-wheels/llama_cpp_python-*.whl; \
+    install -m 755 /tmp/llama-wheels/rpc-server /opt/coderai/python/bin/rpc-server; \
+    rm -rf /tmp/llama-wheels; \
+    # The wheel must load in THIS image (its CUDA runtime is on local-libs) and
+    # carry the RPC backend — a wheel that links a library the image lacks is
+    # exactly the failure this stage exists to catch before the flatten.
+    LD_LIBRARY_PATH=/opt/coderai/local-libs:/usr/local/nvidia/lib64 \
+      /opt/coderai/python/bin/python3 - <<'PY'
+import ctypes, glob, os, llama_cpp
+d = os.path.join(os.path.dirname(llama_cpp.__file__), "lib")
+libs = [ctypes.CDLL(p, mode=ctypes.RTLD_GLOBAL) for p in
+        (glob.glob(d + "/libggml.so")[:1] + glob.glob(d + "/libggml-base.so")[:1])]
+fn = next(getattr(l, "ggml_backend_reg_by_name") for l in libs if hasattr(l, "ggml_backend_reg_by_name"))
+fn.restype = ctypes.c_void_p; fn.argtypes = [ctypes.c_char_p]
+try:
+    getattr(libs[0], "ggml_backend_load_all")()
+except Exception:
+    pass
+assert fn(b"RPC"), "RPC backend missing from the rebuilt llama-cpp-python"
+print("llama-cpp-python", llama_cpp.__version__, "with RPC backend: OK")
+PY

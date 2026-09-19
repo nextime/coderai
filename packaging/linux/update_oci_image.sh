@@ -45,4 +45,19 @@ t0=$(date +%s)
   --build-arg BASE_IMAGE="$BASE_IMAGE" \
   -t "$TAG" "$REPO_ROOT"
 echo "== done in $(( $(date +%s) - t0 ))s: '$TAG' (base '$BASE_IMAGE' unchanged) =="
+
+# REBUILD_LLAMA=1: also rebuild llama-cpp-python (with the RPC backend) and
+# rpc-server in a CUDA devel stage and lay them over '$TAG' — the one part of
+# the bundle the app overlay cannot refresh (Dockerfile.update-llama).
+if [ "${REBUILD_LLAMA:-0}" = "1" ]; then
+  echo "== rebuilding llama-cpp-python + rpc-server over '$TAG' =="
+  t1=$(date +%s)
+  DOCKER_BUILDKIT=1 "${DK[@]}" build \
+    -f "$HERE/Dockerfile.update-llama" \
+    --build-arg BASE_IMAGE="$TAG" \
+    ${CUDA_BUILDER:+--build-arg CUDA_BUILDER="$CUDA_BUILDER"} \
+    ${CUDA_ARCHS:+--build-arg CUDA_ARCHS="$CUDA_ARCHS"} \
+    -t "$TAG" "$REPO_ROOT"
+  echo "== llama runtime rebuilt in $(( $(date +%s) - t1 ))s =="
+fi
 echo "   Tip: 'docker image prune -f' to drop the now-dangling previous '$TAG' layer."
