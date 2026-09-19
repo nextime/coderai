@@ -29,8 +29,10 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-VER=$("$PYTHON" -c "import llama_cpp; print(llama_cpp.__version__)")
-LIBDIR=$("$PYTHON" -c "import llama_cpp, os; print(os.path.join(os.path.dirname(llama_cpp.__file__), 'lib'))")
+# Version and lib dir WITHOUT importing the package: a wheel installed
+# --no-deps (as the image builds do) cannot be imported before its deps are.
+VER=$("$PYTHON" -c "from importlib.metadata import version; print(version('llama-cpp-python'))")
+LIBDIR=$("$PYTHON" -c "import importlib.util, os; s=importlib.util.find_spec('llama_cpp'); print(os.path.join(os.path.dirname(s.origin), 'lib'))")
 BINDIR=$("$PYTHON" -c "import sys, os; print(os.path.dirname(sys.executable))")
 DEST="${DEST:-$BINDIR}"
 if [ -z "$CUDA$VULKAN" ]; then
