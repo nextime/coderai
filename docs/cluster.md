@@ -1,5 +1,7 @@
 # Several machines as one coderai
 
+*Complete orchestration, distribution and escalation of remotizable advanced inference* — this is the page where the three words earn their keep: orchestration (nodes as engines, pools), distribution (one model over several machines), escalation (hosts you own, then pods rented by the second).
+
 Three things are possible once coderai runs on more than one machine, and
 they answer three different needs:
 

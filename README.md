@@ -4,6 +4,8 @@
 
 ![CoderAI](CoderAI.gif)
 
+**CoderAI — complete orchestration, distribution and escalation of remotizable advanced inference.**
+
 A multimodal and multi-backend local model orchestrator with an OpenAI-compatible API server to run models on local GPUs, supporting multiple GPU backends: NVIDIA (CUDA), AMD (Vulkan), and Intel (Vulkan). Configuration-driven architecture with per-model settings and full multi-modal support.
 
 Text, images, video, speech, embeddings, OCR and LoRA training behind one API — served by

@@ -1,5 +1,7 @@
 # CoderAI documentation
 
+**CoderAI — complete orchestration, distribution and escalation of remotizable advanced inference.**
+
 Subsystem guides. The [top-level README](../README.md) is the overview and API
 reference; these are the deep dives.
 

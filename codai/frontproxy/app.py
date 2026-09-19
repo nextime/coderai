@@ -2889,7 +2889,9 @@ def run_front(config, args) -> None:
     app.state.front.debug_engine = getattr(args, "debug_engine", False)
     host = config.server.host
     port = config.server.port
-    print(f"\n[front] CoderAI front proxy on http://{host}:{port}")
+    from codai import __tagline__, __version__
+    print(f"\n[front] CoderAI {__version__} — {__tagline__}")
+    print(f"[front] front proxy on http://{host}:{port}")
     print(f"[front] Admin UI: http://{host}:{port}/admin")
 
     _log_config = _front_log_config(getattr(args, "debug_web", False))
