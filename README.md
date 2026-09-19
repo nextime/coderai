@@ -385,6 +385,18 @@ a reason instead of failing or faking it. The response carries `status` (`comple
 
 ## Quick Start
 
+The fastest way is the published image — nothing to build:
+
+```bash
+docker pull ghcr.io/nextime/coderai:latest
+curl -fsSLO https://raw.githubusercontent.com/nextime/coderai/master/packaging/linux/run_oci.sh
+chmod +x run_oci.sh && ./run_oci.sh --nvidia -d        # or --vulkan / --all
+# → http://localhost:8776/admin   (Windows: CoderAI-Setup.exe from the GitHub release)
+```
+
+All packages, the plain `docker run`, the Windows installer and the offline route:
+[`docs/install-from-packages.md`](docs/install-from-packages.md). From source:
+
 ```bash
 git clone git@git.nexlab.net:nexlab/coderai.git
 cd coderai

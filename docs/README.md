@@ -33,4 +33,5 @@ reference; these are the deep dives.
 
 | Doc | Subject |
 |---|---|
+| [install-from-packages.md](install-from-packages.md) | `docker pull ghcr.io/nextime/coderai` — the full image and the nineteen capability images, Linux, Windows, offline |
 | [reverse-proxy-nginx.md](reverse-proxy-nginx.md) | nginx at root, on a subdomain, or under a sub-path |
