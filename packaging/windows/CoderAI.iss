@@ -2,7 +2,7 @@
 ; on first launch, runs install-coderai.ps1 (WSL2, Docker Desktop, the image).
 ; Build: iscc CoderAI.iss   (or packaging/windows/build-installer.sh under wine)
 #ifndef AppVersion
-  #define AppVersion "0.2.20"
+  #define AppVersion "0.2.21"
 #endif
 [Setup]
 AppId={{7C1E7F2A-6B3D-4B2D-9C7B-CODERAI0001}

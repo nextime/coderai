@@ -14,7 +14,7 @@
   coderai -Stop           # stop the container
   coderai -Logs           # follow the log
   coderai -Upgrade        # pull the production branch into the image in place
-  coderai -DataDir D:\coderai -Port 9000 -Image ghcr.io/nextime/coderai:0.2.20
+  coderai -DataDir D:\coderai -Port 9000 -Image ghcr.io/nextime/coderai:0.2.21
 #>
 [CmdletBinding()]
 param(

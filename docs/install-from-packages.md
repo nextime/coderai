@@ -7,7 +7,7 @@ public, pulled without credentials. There is nothing to build.
 
 | Package | What it is | Pull |
 |---|---|---|
-| `ghcr.io/nextime/coderai` | **The full CoderAI** — every capability, every engine, the Web Studio and admin UI, the cluster head/node, llama.cpp with the RPC backend and `rpc-server`. One layer, ~28 GB. Tags: `latest`, `0.2.20`, … | `docker pull ghcr.io/nextime/coderai:latest` |
+| `ghcr.io/nextime/coderai` | **The full CoderAI** — every capability, every engine, the Web Studio and admin UI, the cluster head/node, llama.cpp with the RPC backend and `rpc-server`. One layer, ~28 GB. Tags: `latest`, `0.2.21`, … | `docker pull ghcr.io/nextime/coderai:latest` |
 | `ghcr.io/nextime/coderai-images` | Image generation only (SDXL, Flux, Z-Image …) | `docker pull ghcr.io/nextime/coderai-images:latest` |
 | `ghcr.io/nextime/coderai-video` | Video generation (Wan, LTX-2 …), upscale, interpolation | `…/coderai-video:latest` |
 | `ghcr.io/nextime/coderai-text` | LLMs with transformers / llama.cpp, incl. local LoRA adapters | `…/coderai-text:latest` |
@@ -34,7 +34,7 @@ cluster node that only needs one thing runs; the full image is what a
 workstation runs. All of them expose the same API on port 8000 (capability
 images) or 8776 (full image), and all of them can be a cluster node.
 
-Every tag is also published with its version (`:0.2.20`); `:latest` moves
+Every tag is also published with its version (`:0.2.21`); `:latest` moves
 only after the image has completed a real request on real hardware.
 
 **Every published image is signed** with [cosign](https://github.com/sigstore/cosign)
@@ -54,7 +54,7 @@ a `policy-controller` / `cosign` admission rule on a cluster, or simply the
 command above in whatever pulls.
 
 For an offline machine, pull the image where there is a connection and
-move it: `docker save ghcr.io/nextime/coderai:0.2.20 | gzip > coderai.tar.gz`
+move it: `docker save ghcr.io/nextime/coderai:0.2.21 | gzip > coderai.tar.gz`
 there, `docker load < coderai.tar.gz` here.
 
 ## Linux
