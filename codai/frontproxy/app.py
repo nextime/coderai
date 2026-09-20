@@ -108,6 +108,16 @@ class FrontProxy:
         # without asking the engine. Newest first; bounded.
         import collections as _collections
         self._recent_activity = _collections.deque(maxlen=25)
+        # Prometheus counters + per-key usage (codai/frontproxy/metrics.py), and
+        # the conversation → engine map for prefix-cache-aware routing.
+        from codai.frontproxy.metrics import Metrics
+        from codai.frontproxy.affinity import PrefixAffinity
+        self.metrics = Metrics()
+        _ccfg = getattr(config, "cluster", None)
+        self.affinity = PrefixAffinity(
+            ttl_s=float(getattr(_ccfg, "prefix_affinity_ttl_s", 1800.0) or 0.0))
+        self._key_names: dict = {}
+        self._key_names_at = 0.0
         # Last-good per-model instance detail from an engine (synced only when the
         # engine is idle), so model-loaded-status can serve loaded/running from the
         # front's own state without ever hitting a busy engine.
@@ -333,12 +343,18 @@ class FrontProxy:
                 model = None
         _is_infer = _router.is_inference_path(path)
 
+        _akey = self._affinity_key(path, body, headers)
+
         def _pick():
-            return _router.pick_engine(
+            e = _router.pick_engine(
                 self.registry, path, method, model,
                 required_cap=self._required_cap(path, model),
                 default_engine=self.default_engine, pinned=self._pin_for(model),
-                pin_fallback=bool(self._model_info(model).get("engine_fallback")))
+                pin_fallback=bool(self._model_info(model).get("engine_fallback")),
+                prefer=self.affinity.get(_akey))
+            if e is not None:
+                self.affinity.remember(_akey, e.name)
+            return e
 
         # Brokered requests must not hard-fail in the startup/reload window where no
         # engine is ready yet (e.g. an OOM-triggered evict+reload in progress). Wait
@@ -435,7 +451,8 @@ class FrontProxy:
             self._swap_release(_swap_tok)
             self._rate_release(_rate_tok)
             if _router.is_inference_path(path):
-                self._record_activity(model, self._task_kind(path), _status, _started)
+                self._record_activity(model, self._task_kind(path), _status, _started,
+                                      engine=engine, headers=headers)
         # Surface the engine's actual reply so a brokered request that "doesn't get
         # executed" (e.g. an instant small error body) is diagnosable from the log.
         print("[front] broker route: %s %s -> engine#%s(%s) status=%s bytes=%d preview=%r"
@@ -492,12 +509,18 @@ class FrontProxy:
                 "x_queue_info": {"status": "loading", "message": msg},
             }) + "\n\n"
 
+        _akey = self._affinity_key(path, body, headers)
+
         def _pick():
-            return _router.pick_engine(
+            e = _router.pick_engine(
                 self.registry, path, method, model,
                 required_cap=self._required_cap(path, model),
                 default_engine=self.default_engine, pinned=self._pin_for(model),
-                pin_fallback=bool(self._model_info(model).get("engine_fallback")))
+                pin_fallback=bool(self._model_info(model).get("engine_fallback")),
+                prefer=self.affinity.get(_akey))
+            if e is not None:
+                self.affinity.remember(_akey, e.name)
+            return e
 
         engine = _pick()
         if engine is None and _is_infer:
@@ -613,7 +636,8 @@ class FrontProxy:
             self._swap_release(_swap_tok)
             self._rate_release(_rate_tok)
             if _is_infer:
-                self._record_activity(model, self._task_kind(path), _status, _started)
+                self._record_activity(model, self._task_kind(path), _status, _started,
+                                      engine=engine, headers=headers)
 
     # ------------------------------------------------------------------ helpers
     @staticmethod
@@ -691,6 +715,7 @@ class FrontProxy:
         kind = _fan.kind_for(path)
         if kind is None:
             return None
+        _t0 = time.time()
         ct = (request.headers.get("content-type") or "").lower()
         if model is None and "multipart/form-data" in ct:
             body_bytes = await request.body()
@@ -730,7 +755,8 @@ class FrontProxy:
             return None
         if res is None:
             return None
-        self._record_activity(model, self._task_kind(path), res.status, time.time())
+        self._record_activity(model, self._task_kind(path), res.status, _t0,
+                              engine="fanout", headers=request.headers)
         return Response(content=res.content, status_code=res.status, media_type=res.media_type)
 
     def _load_pins(self) -> dict:
@@ -786,19 +812,69 @@ class FrontProxy:
                         info[f[:-5]] = rec
         return info
 
-    def _record_activity(self, model, kind, status, started_at):
+    def _record_activity(self, model, kind, status, started_at, engine=None, headers=None):
         """Append one completed inference to the recent-activity ring (newest first),
-        for the front-native Overview dashboard."""
+        for the front-native Overview dashboard — and count it for /metrics,
+        attributed to the API key (``headers``) and the engine that served it."""
         try:
             import time as _t
+            now = _t.time()
+            dur = now - (started_at or now)
             self._recent_activity.appendleft({
-                "time": started_at or _t.time(),
+                "time": started_at or now,
                 "model": model or "", "type": kind or "text",
                 "status": int(status or 0),
-                "duration": round(_t.time() - (started_at or _t.time()), 1),
+                "duration": round(dur, 1),
             })
+            ename = getattr(engine, "name", engine) if engine is not None else ""
+            self.metrics.observe(self._key_label(headers), model, kind, status,
+                                 ename or "", dur)
         except Exception:
             pass
+
+    def _key_label(self, headers) -> str:
+        """Who made the request, for metering: the NAME of the API token (Tokens
+        page), ``session`` for a browser session, ``anonymous`` otherwise. Token
+        values never leave the process; the name map is refreshed every 30 s."""
+        try:
+            if headers is None:
+                return "anonymous"
+            get = headers.get if hasattr(headers, "get") else (lambda k, d="": d)
+            auth = get("authorization") or get("Authorization") or ""
+            if auth.lower().startswith("bearer "):
+                tok = auth[7:].strip()
+                import time as _t
+                if _t.time() - self._key_names_at > 30.0 and self._config_dir:
+                    try:
+                        from pathlib import Path
+                        from codai.admin.auth import SessionManager
+                        data = SessionManager(Path(self._config_dir))._load_auth_data()
+                        self._key_names = {t.get("token", ""): (t.get("name") or f"token{t.get('id')}")
+                                           for t in data.get("tokens", []) if t.get("token")}
+                    except Exception:
+                        pass
+                    self._key_names_at = _t.time()
+                if tok in self._key_names:
+                    return self._key_names[tok]
+                ccfg = getattr(self.config, "cluster", None)
+                if ccfg is not None and getattr(ccfg, "token", "") and tok == ccfg.token:
+                    return "cluster"
+                return "unknown-token"
+            cookie = get("cookie") or get("Cookie") or ""
+            if "session" in cookie:
+                return "session"
+        except Exception:
+            pass
+        return "anonymous"
+
+    def _affinity_key(self, path, body, headers=None):
+        ccfg = getattr(self.config, "cluster", None)
+        if ccfg is not None:
+            if not getattr(ccfg, "prefix_affinity", True):
+                return None
+            self.affinity.ttl_s = float(getattr(ccfg, "prefix_affinity_ttl_s", 1800.0) or 0.0)
+        from codai.frontproxy.affinity import conversation_key
+        return conversation_key(path, body, headers)
 
     async def _spill_open(self, model, trigger, path, body_bytes):
         """Open a burst request against this model's RunPod spillover target.
@@ -1614,6 +1690,7 @@ class FrontProxy:
                         "pid": pid,
                         "capabilities": sorted(e.capabilities or ()),
                         "remote": bool(getattr(e, "remote", False)),
+                        "discovered": bool(getattr(e, "discovered", False)),
                         "url": e.url if getattr(e, "remote", False) else "",
                         "node_engines": list(getattr(e, "node_engines", []) or []),
                         "rpc_servers": list(getattr(e, "rpc_servers", []) or []),
@@ -1998,7 +2075,8 @@ class FrontProxy:
                     _swap_acq.cancel()
                 self._swap_release(_swap_tok)
                 if _router.is_inference_path(path):
-                    self._record_activity(model, self._task_kind(path), _status, _started)
+                    self._record_activity(model, self._task_kind(path), _status, _started,
+                                          engine=engine, headers=request.headers)
 
         return StreamingResponse(_gen(), status_code=200,
                                  media_type="text/event-stream")
@@ -2256,11 +2334,15 @@ class FrontProxy:
             if fanned is not None:
                 return fanned
 
+        _akey = self._affinity_key(path, body_bytes, request.headers)
         engine = _router.pick_engine(
             self.registry, path, method, model,
             required_cap=self._required_cap(path, model),
             default_engine=self.default_engine, pinned=self._pin_for(model),
-            pin_fallback=bool(self._model_info(model).get("engine_fallback")))
+            pin_fallback=bool(self._model_info(model).get("engine_fallback")),
+            prefer=self.affinity.get(_akey))
+        if engine is not None:
+            self.affinity.remember(_akey, engine.name)
         if engine is None:
             # No local engine can serve it (none ready / no GPU meeting specs).
             # If this model has RunPod spillover for that case, burst to the cloud.
@@ -2399,7 +2481,8 @@ class FrontProxy:
                 self._rate_release(_rate_tok)
                 if _meta is not None:
                     self._record_activity(model, self._task_kind(path),
-                                          rp_resp.status_code, _started)
+                                          rp_resp.status_code, _started,
+                                          engine=engine, headers=request.headers)
 
         # A node's JSON answer may name files by the node's own URL: rewrite
         # them to this front (small bodies only; streams pass untouched).
@@ -2736,7 +2819,15 @@ def build_app(config, config_dir=None) -> FastAPI:
         if not auth.lower().startswith("bearer "):
             return False
         tok = auth[7:].strip()
-        if not tok or not config_dir:
+        if not tok:
+            return False
+        # The shared cluster token (Settings → Cluster) is enough: it is what a
+        # head that found this node on the LAN presents.
+        import hmac as _hmac
+        shared = (getattr(ccfg, "token", "") or "") if ccfg is not None else ""
+        if shared and _hmac.compare_digest(shared, tok):
+            return True
+        if not config_dir:
             return False
         try:
             from pathlib import Path
@@ -2878,6 +2969,62 @@ def build_app(config, config_dir=None) -> FastAPI:
             None, build_overview, front, _rpc_endpoints())
         return JSONResponse(data)
 
+    @app.get("/cluster/logs", include_in_schema=False)
+    async def _cluster_logs(request: Request):
+        """This front's recent output (its own lines and every engine line it
+        re-emits), for a head's Cluster page. Node side."""
+        if not _cluster_token_ok(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        try:
+            n = max(1, min(2000, int(request.query_params.get("lines", "200"))))
+        except ValueError:
+            n = 200
+        return JSONResponse({"node": _node_name(), "lines": recent_log_lines(n)})
+
+    @app.get("/admin/api/cluster/logs", include_in_schema=False)
+    async def _cluster_node_logs(request: Request):
+        """Head side: the log tail of one node (``?node=NAME``), or of this
+        front when ``node`` is blank."""
+        if not front._has_cred(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        name = (request.query_params.get("node") or "").strip()
+        try:
+            n = max(1, min(2000, int(request.query_params.get("lines", "200"))))
+        except ValueError:
+            n = 200
+        if not name:
+            return JSONResponse({"node": _node_name(), "lines": recent_log_lines(n)})
+        eng = next((e for e in front.registry.remotes() if e.name == name), None)
+        if eng is None:
+            return JSONResponse({"error": f"no node named {name!r}"}, status_code=404)
+        try:
+            r = await eng.http_short.get(eng.url + "/cluster/logs", params={"lines": n})
+            if r.status_code != 200:
+                return JSONResponse({"node": name, "error": f"HTTP {r.status_code}",
+                                     "lines": []}, status_code=502)
+            return JSONResponse(r.json())
+        except Exception as exc:
+            return JSONResponse({"node": name, "error": str(exc)[:200], "lines": []},
+                                status_code=502)
+
+    @app.get("/admin/api/usage", include_in_schema=False)
+    async def _usage(request: Request):
+        """Requests, errors and time per API key / model / kind since the front
+        started — the same numbers /metrics exports, as a table."""
+        if not front._has_cred(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        return JSONResponse(front.metrics.usage_tables())
+
+    @app.get("/metrics", include_in_schema=False)
+    async def _metrics(request: Request):
+        """Prometheus exposition. Open when ``server.metrics_public`` is on,
+        otherwise the same light credential the telemetry endpoints take."""
+        pub = bool(getattr(config.server, "metrics_public", False))
+        if not pub and not front._has_cred(request) and not _cluster_token_ok(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        from codai.frontproxy.metrics import render
+        return Response(content=render(front), media_type="text/plain; version=0.0.4; charset=utf-8")
+
     # Serve the admin / Studio UI pages from the FRONT (rendered here, sessions
     # validated locally) so navigating the dashboard never waits on a GIL-busy
     # engine mid-generation. The engine handles only generation; pages live here.
@@ -2977,6 +3124,22 @@ class _TimestampedStdout:
     def __init__(self, stream):
         self._stream = stream
         self._at_line_start = True
+        self._partial = ""
+
+    def _ring(self, text: str) -> None:
+        """Keep the last lines (complete ones) for /cluster/logs."""
+        try:
+            self._partial += text
+            if '\n' not in self._partial:
+                return
+            *lines, self._partial = self._partial.split('\n')
+            for ln in lines:
+                if ln.startswith('\r'):
+                    ln = ln.rsplit('\r', 1)[-1]     # a progress bar: keep its last state
+                if ln.strip():
+                    _LOG_RING.append(ln[:400])
+        except Exception:
+            pass
 
     def write(self, s):
         if not s:
@@ -2996,10 +3159,21 @@ class _TimestampedStdout:
                     buf.append(ts)
                 self._at_line_start = False
             buf.append(part)
-        return self._stream.write(''.join(buf))
+        out = ''.join(buf)
+        self._ring(out)
+        return self._stream.write(out)
 
     def __getattr__(self, name):
         return getattr(self._stream, name)
+
+
+_LOG_RING = __import__("collections").deque(maxlen=2000)
+
+
+def recent_log_lines(n: int = 200) -> list:
+    """The front's last ``n`` output lines (what `docker logs` would show)."""
+    items = list(_LOG_RING)
+    return items[-n:] if n < len(items) else items
 
 
 def run_front(config, args) -> None:

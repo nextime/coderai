@@ -44,6 +44,39 @@ the head holds. Optionally, in Settings → Cluster:
 If the node serves HTTPS with a self-signed certificate, copy its PEM: the
 head pastes it in the node row (verify = *pem*).
 
+### Zero-config: a shared token and mDNS
+
+The manual way above (a token per node, its URL on the head) still works
+and is what you use across subnets or VPNs. On one LAN there is a shorter
+way — the same on every box, head and nodes alike, Settings → Cluster:
+
+1. **Cluster token** — one secret, typed on every install. A node accepts
+   it on its `/cluster/*` endpoints exactly like one of its own API tokens;
+   a head uses it as the API key of every node it discovers, and of any
+   listed node whose token field is blank.
+2. **Find nodes on the LAN (mDNS)** — the install announces itself as a
+   `_coderai._tcp.local.` service (name, version, port, capabilities) and
+   browses for the others. The announcement carries an HMAC fingerprint of
+   the token, never the token: peers with the same fingerprint are
+   *members*, everyone else is merely *seen*. The Cluster page lists both.
+3. **Auto-join members as nodes** (on by default) — every member that
+   serves becomes a cluster node of this head, with no row to fill in. It
+   leaves when its announcement stops; a node listed by hand under the same
+   name is never duplicated.
+
+```json
+"cluster": {"enabled": true, "token": "…", "discovery": true, "auto_join": true}
+```
+
+Every box can have all three on: each is then a head of the others and a
+node of the others, and a model pinned to a name runs where that name is.
+
+mDNS is link-local multicast: it does not cross routers, and a container
+only sees it on the host's network — `coderai-docker --host-network` (the
+server then listens on the host port directly; RPC and Ray ports need no
+mapping either). The `zeroconf` package is in the images and in
+`requirements.txt`; without it the Cluster page says discovery is off.
+
 ### On the head
 
 Settings → Cluster → *Use the nodes below as engines*, one row per node:
@@ -146,6 +179,17 @@ devices included (the VRAM and Speed strategies both see them).
  "tensor_split": "0.4,0.3,0.3"}
 ```
 
+**How the split is made** (same page, *Cards on other machines*):
+*layer* (default) gives each device whole layers, and per token only the
+activations between consecutive layers cross to the next device — what
+Ethernet carries well. *Row* is llama.cpp's tensor parallelism: every
+matrix is split by rows over all the devices, local cards and RPC servers
+alike, so they work on every layer together — at the price of an
+all-reduce per layer. On one PCIe bus it is faster; over a network it wants
+a fabric measured in tens of Gb/s (10 GbE is the floor, RDMA the point),
+and on 1 GbE it is slower than layer split. `"split_mode": "row"` in
+models.json.
+
 Under the hood (`codai/backends/ggml_rpc.py`): the RPC registration is
 process-wide and permanent, so from the first registration on every load in
 that engine gets an explicit device list — this machine's cards plus exactly
@@ -164,10 +208,15 @@ vLLM and SGLang spread a model over machines on their own; coderai does the
 choreography: starts the peers, tells them where rank 0 is, waits for them,
 launches, and tears everything down with the service.
 
-**Keep tensor parallel inside a machine** (an all-reduce every layer wants
-NVLink/PCIe) and **make pipeline parallel the number of machines** (one
-activation transfer per layer boundary). Every machine must run the same
-build — the `coderai-vllm` image on all of them is the easy way.
+**On ordinary Ethernet keep tensor parallel inside a machine** (an all-reduce
+every layer wants NVLink/PCIe) and **make pipeline parallel the number of
+machines** (one activation transfer per layer boundary). Tensor parallel
+*may* span the nodes — set it larger than this machine's cards and Ray
+places the ranks across the cluster, the two combining as tensor × pipeline
+GPUs in total — which pays off on 10 GbE and up and is the right choice on
+RDMA / InfiniBand (`NCCL_IB_*`, `NCCL_SOCKET_IFNAME` in the node's start
+command environment). Every machine must run the same build — the
+`coderai-vllm` image on all of them is the easy way.
 
 ### vLLM
 
@@ -287,7 +336,27 @@ instead of one.
 * Covers the in-process trainers: SD1.5, SDXL, Z-Image, the flow-DiT
   family (LTX-2 …) and Wan, 4-bit QLoRA included.
 
-## 7. Pools — several machines for one capability or one host model
+## 7. Prefix-cache-aware routing
+
+A model resident in more than one place — two local engines, a local engine
+and a node, replicas after a fan-out — is served by the **least busy**
+holder, local before remote on a tie. For a *conversation*, though, the
+better place is where its earlier turns went: that engine's KV / prefix
+cache (the multi-slot cache of the GGUF and HF backends, vLLM's prefix
+caching) already holds the shared opening, and the prompt is processed
+from the first new token rather than from scratch.
+
+So the front keeps a small map *conversation → engine* and prefers that
+engine while it is alive, capable and still holds the model. The key is
+the one the engines use for their own slot affinity: an `X-Session-Id`
+header or the OpenAI `user` field when the client sends one, else a hash
+of the conversation's stable opening (system prompt + first user turn, or
+the prompt head). A pin still wins; a preference never routes to an engine
+that cannot serve. Settings → Cluster → *Prefix-cache routing* (on by
+default, TTL 30 min): `cluster.prefix_affinity`,
+`cluster.prefix_affinity_ttl_s`.
+
+## 8. Pools — several machines for one capability or one host model
 
 * **Remote capabilities** (Settings → Remote capabilities): a capability's
   URL field takes several URLs, comma-separated. They form a pool: the
@@ -299,21 +368,95 @@ instead of one.
   one is started only when none is up, and one that dies mid-request hands
   the request to another.
 
+## 9. Operating it — metrics, usage, logs, recovery
+
+* **`GET /metrics`** — Prometheus exposition, no client library. Per
+  completed request: `coderai_requests_total` and
+  `coderai_request_seconds_{sum,count}` labelled by **API key name** (the
+  name on the Tokens page; `session` for a browser; `anonymous`; `cluster`
+  for a head), model, kind, status and the engine or node that served it.
+  Gauges: `coderai_engine_up / _inflight / _vram_free_bytes / _vram_total_bytes
+  / _loaded_models {engine,backend,remote}`, `coderai_node_up{node}`,
+  `coderai_node_recoveries_total`, `coderai_rpc_server_up{endpoint}`,
+  `coderai_discovery_peers / _members`, `coderai_runpod_spend_usd{model,period}`,
+  `coderai_runpod_pods`, `coderai_requests_active`, `coderai_info{version}`.
+  Guarded like the other telemetry (a session, an API token, or the cluster
+  token) unless Settings → Server → *Serve /metrics without a credential*
+  (`server.metrics_public`). A scrape config:
+
+  ```yaml
+  scrape_configs:
+    - job_name: coderai
+      static_configs: [{targets: ["box1:8776", "box2:8776"]}]
+      authorization: {credentials: "<an API token or the cluster token>"}
+  ```
+
+* **Usage by key / by model** — the same counters as tables on the Cluster
+  page (`GET /admin/api/usage`): requests, errors, wall time, kinds, where
+  they ran. Since the front started; Prometheus is the durable store.
+* **Node logs** — the Cluster page shows each node's recent output (its
+  front's lines and every engine line it re-emits) with the *log* button
+  on the node row, and this front's own with the button on the engines
+  card: `GET /cluster/logs?lines=N` on the node (token-guarded),
+  `GET /admin/api/cluster/logs?node=NAME` on the head.
+* **Recovery** — a node that stops answering keeps its assignment; when it
+  answers again (it very likely restarted, and the entries the head pushed
+  lived only in its memory) the head pushes its assigned models again and
+  they load there without anyone clicking (`coderai_node_recoveries_total`).
+  Local engines have had this since the supervisor: a crashed engine is
+  respawned, a crash-looping one quarantined, and its models come back with
+  the next assignment push. A discovered node that vanishes from mDNS is
+  dropped and re-added when it reappears.
+
+## 10. Apple Silicon, MLX and other accelerators — what fits
+
+CoderAI's images are x86-64, CUDA + Vulkan; nothing of CoderAI runs
+natively on macOS or on Ascend/Hygon/MThreads cards, and a container on
+those has no GPU. What already works, and what would be needed:
+
+* **A Mac as a text node today**: `mlx_lm.server` (or LM Studio, Ollama)
+  is OpenAI-compatible, so it is a *remote capability* for `text`
+  (Settings → Remote capabilities, its URL) or a `backend: host` model with
+  no start command. It is then one more place a text request can go — with
+  pools, failover and metering, but without CoderAI's model page, VRAM
+  accounting, or fan-out awareness. This is the cheapest useful step and
+  needs no code.
+* **A real MLX node** would be a small Python package (`coderai-node-mlx`:
+  the front's `/cluster/state` + `/v1/chat/completions` + `/v1/embeddings`
+  over `mlx-lm`, later `mlx-audio` / diffusers-mlx) installed with pip on
+  the Mac and joining by token and mDNS like any node. Two to three days;
+  the node protocol is already the only contract a node must honour. That
+  is the point where "a stack of Macs" stops being exo's story alone.
+* **Tensor parallel over Thunderbolt/RDMA** (exo's headline) is MLX-only
+  and macOS-only; nothing to port, and the same reasoning that keeps our
+  cross-machine split at layer/pipeline granularity applies on Ethernet.
+* **Ascend / Hygon / MThreads / Iluvatar / MetaX** (GPUStack's list) each
+  come with a vLLM fork (vllm-ascend, …) or a llama.cpp backend (CANN,
+  MUSA). The cheapest route is the one we already have for anything that
+  speaks OpenAI: run the vendor's vLLM as a `service_url` / host model.
+  Native support means building their llama.cpp backends into the wheel
+  and a per-vendor image; do it when there is a card to test on, not
+  before.
+
 ## Reference
 
 * Config: `cluster` section in `config.json` — `enabled`, `nodes`,
   `node_name`, `serve`, `poll_timeout_s`, `rpc_servers`, `rpc_bin`,
-  `advertise_host`; `vllm.pipeline_parallel_size / distributed_executor_backend /
+  `advertise_host`, `token`, `discovery`, `auto_join`, `prefix_affinity`,
+  `prefix_affinity_ttl_s`; `server.metrics_public`; `vllm.pipeline_parallel_size / distributed_executor_backend /
   ray_address / ray_port / nodes / nodes_ready_timeout_s`;
   `ktransformers.nnodes / dist_init_addr / tp_size / nodes`.
 * Per model (models.json): `engine` (a node name), `node_path` /
-  `node_paths`, `rpc_servers`, `vllm` block, `kt` block, `host.hosts`,
+  `node_paths`, `rpc_servers`, `split_mode`, `vllm` block, `kt` block, `host.hosts`,
   `distribute` block, `components` block, `lora_train_nodes`.
-* Node API (token of the node): `GET /cluster/state`, `GET /cluster/rpc-servers`,
-  `POST /cluster/reload-config`, `POST /cluster/model-load`, `POST /cluster/model-unload`.
-* Head: `GET /admin/api/cluster` (what the Cluster page shows).
-* Code: `codai/cluster/` (nodes, rpc, multinode, compat, overview, fanout,
-  components, ddp),
+* Node API (a token of the node, or the cluster token): `GET /cluster/state`,
+  `GET /cluster/rpc-servers`, `GET /cluster/logs`, `POST /cluster/reload-config`,
+  `POST /cluster/model-load`, `POST /cluster/model-unload`.
+* Head: `GET /admin/api/cluster` (what the Cluster page shows),
+  `GET /admin/api/cluster/logs?node=`, `GET /admin/api/usage`; `GET /metrics`.
+* Code: `codai/cluster/` (nodes, discovery, rpc, multinode, compat, overview,
+  fanout, components, ddp), `codai/frontproxy/affinity.py`,
+  `codai/frontproxy/metrics.py`,
   `codai/backends/ggml_rpc.py`, `codai/backends/overrides.py`,
   `codai/frontproxy/engine_supervisor.py` (remote engines),
   `codai/api/remote_gateway.EndpointPool`, `codai/api/host_worker.HostPool`.

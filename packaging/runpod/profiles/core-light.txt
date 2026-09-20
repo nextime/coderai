@@ -57,3 +57,4 @@ websockets>=12.0
 # (libnppicc.so.12). torch does not use NPP, so nothing else pulls it in, and
 # torchcodec — which arrives as a transitive dependency of f5-tts — then fails
 # to load with a message that blames FFmpeg and the torch version. It is neither.
+zeroconf>=0.130

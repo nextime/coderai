@@ -2753,6 +2753,9 @@ async def api_model_configure(request: Request, username: str = Depends(require_
                 # and where the weights are on a cluster node this model is
                 # pinned to (a path, or {node: path}).
                 "rpc_servers", "node_path", "node_paths",
+                # llama.cpp split mode over those devices: "" / "layer" | "row"
+                # (row = tensor parallel; see backends/vulkan.py).
+                "split_mode",
                 ):
         if key in data:
             entry[key] = data[key]
@@ -3612,6 +3615,7 @@ def build_settings_dict(c, gpu_cards):
             "https": c.server.https,
             "https_key_path": c.server.https_key_path,
             "https_cert_path": c.server.https_cert_path,
+            "metrics_public": c.server.metrics_public,
             "queue_max_size": c.server.queue_max_size,
             "max_parallel_requests": c.server.max_parallel_requests,
             "max_parallel_requests_overrides": c.server.max_parallel_requests_overrides,
@@ -3806,6 +3810,12 @@ def build_settings_dict(c, gpu_cards):
             "poll_timeout_s": c.cluster.poll_timeout_s,
             "advertise_host": c.cluster.advertise_host,
             "rpc_bin": c.cluster.rpc_bin,
+            "discovery": c.cluster.discovery,
+            "auto_join": c.cluster.auto_join,
+            "prefix_affinity": c.cluster.prefix_affinity,
+            "prefix_affinity_ttl_s": c.cluster.prefix_affinity_ttl_s,
+            # The shared cluster token is a secret: only whether it is set.
+            "token": "", "token_set": bool(c.cluster.token),
             # The node token is a secret of the NODE: masked like the RunPod key.
             "nodes": [{**n, "api_key": "", "api_key_set": bool(n.get("api_key"))}
                       for n in (c.cluster.nodes or []) if isinstance(n, dict)],
@@ -3918,6 +3928,8 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         c.server.https = bool(srv.get("https", c.server.https))
         c.server.https_key_path = srv.get("https_key_path") or None
         c.server.https_cert_path = srv.get("https_cert_path") or None
+        if "metrics_public" in srv:
+            c.server.metrics_public = bool(srv["metrics_public"])
         if "queue_max_size" in srv:
             c.server.queue_max_size = max(1, int(srv["queue_max_size"]))
             from codai.queue.manager import queue_manager
@@ -4422,6 +4434,16 @@ async def api_save_settings(request: Request, username: str = Depends(require_ad
         if "node_name" in d: cl.node_name = (d.get("node_name") or "").strip()
         if "advertise_host" in d: cl.advertise_host = (d.get("advertise_host") or "").strip()
         if "rpc_bin" in d: cl.rpc_bin = (d.get("rpc_bin") or "").strip()
+        if "discovery" in d: cl.discovery = bool(d["discovery"])
+        if "auto_join" in d: cl.auto_join = bool(d["auto_join"])
+        if "prefix_affinity" in d: cl.prefix_affinity = bool(d["prefix_affinity"])
+        if "prefix_affinity_ttl_s" in d:
+            try: cl.prefix_affinity_ttl_s = max(0.0, float(d.get("prefix_affinity_ttl_s") or 0))
+            except (TypeError, ValueError): pass
+        # Blank keeps the stored token; the literal "-" clears it.
+        tok = d.get("token")
+        if isinstance(tok, str) and tok.strip():
+            cl.token = "" if tok.strip() == "-" else tok.strip()
         if "poll_timeout_s" in d:
             try: cl.poll_timeout_s = max(1.0, float(d.get("poll_timeout_s") or 4.0))
             except (TypeError, ValueError): pass

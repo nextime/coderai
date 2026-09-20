@@ -59,6 +59,14 @@ def _unauthorized():
     )
 
 
+
+def _cluster_token() -> str:
+    try:
+        from codai.admin.routes import config_manager
+        return getattr(getattr(config_manager.config, "cluster", None), "token", "") or ""
+    except Exception:
+        return ""
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Reject /v1/ API requests that lack a valid Bearer token or active web session."""
 
@@ -94,6 +102,13 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         _env_token = os.environ.get("CODERAI_API_TOKEN", "")
         if _env_token and auth_header.lower().startswith("bearer "):
             if hmac.compare_digest(auth_header[7:].strip(), _env_token):
+                return await call_next(request)
+        # The shared cluster token (Settings → Cluster, or CODERAI_CLUSTER_TOKEN
+        # on a capability image): what a head that discovered this install
+        # presents on every request it forwards here.
+        if auth_header.lower().startswith("bearer "):
+            _ctok = os.environ.get("CODERAI_CLUSTER_TOKEN", "") or _cluster_token()
+            if _ctok and hmac.compare_digest(auth_header[7:].strip(), _ctok):
                 return await call_next(request)
 
         from codai.admin import routes as _admin_routes

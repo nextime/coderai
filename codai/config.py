@@ -32,6 +32,9 @@ class ServerConfig:
     https: bool = False
     https_key_path: Optional[str] = None
     https_cert_path: Optional[str] = None
+    # GET /metrics (Prometheus) without a credential. Off = a session cookie,
+    # an API token or the cluster token is required, as for the other telemetry.
+    metrics_public: bool = False
     queue_max_size: int = 6
     max_parallel_requests: int = 2
     # Per-engine overrides for max_parallel_requests, keyed by engine name
@@ -433,6 +436,23 @@ class ClusterConfig:
     # advertises and the ray head it starts). Blank = best guess from the
     # default route.
     advertise_host: str = ""
+    # --- zero-config membership (codai/cluster/discovery.py) ---
+    # One secret shared by every box of the cluster. A node accepts it on its
+    # /cluster/* endpoints (besides its own API tokens); a head uses it as the
+    # API key of every node it discovers, and of a listed node whose api_key
+    # is blank. The mDNS announcement carries only an HMAC fingerprint of it.
+    token: str = ""
+    # Announce this install as _coderai._tcp on the LAN and listen for the
+    # others (needs the zeroconf package; link-local only).
+    discovery: bool = False
+    # Turn every discovered member (same token, serve on) into a cluster node.
+    auto_join: bool = True
+    # --- routing ---
+    # Prefer, for a follow-up turn of a conversation, the engine or node that
+    # served its earlier turns (its KV/prefix cache is warm there) when the
+    # model is resident in more than one place.
+    prefix_affinity: bool = True
+    prefix_affinity_ttl_s: float = 1800.0
 
 
 @dataclass
@@ -1038,7 +1058,18 @@ class ConfigManager:
             )
         else:
             self.config = Config()
-        
+        # A capability image has no config to edit: its cluster membership
+        # comes from the environment it was launched with (docker -e …).
+        _env = __import__("os").environ
+        if _env.get("CODERAI_CLUSTER_TOKEN"):
+            self.config.cluster.token = _env["CODERAI_CLUSTER_TOKEN"].strip()
+        if _env.get("CODERAI_DISCOVERY", "").strip().lower() in ("1", "true", "yes", "on"):
+            self.config.cluster.discovery = True
+        if _env.get("CODERAI_NODE_NAME"):
+            self.config.cluster.node_name = _env["CODERAI_NODE_NAME"].strip()
+        if _env.get("CODERAI_ADVERTISE_HOST"):
+            self.config.cluster.advertise_host = _env["CODERAI_ADVERTISE_HOST"].strip()
+
         # Load models.json
         if self.models_path.exists():
             with open(self.models_path, 'r') as f:
@@ -1094,6 +1125,7 @@ class ConfigManager:
                 "https": self.config.server.https,
                 "https_key_path": self.config.server.https_key_path,
                 "https_cert_path": self.config.server.https_cert_path,
+                "metrics_public": self.config.server.metrics_public,
                 "queue_max_size": self.config.server.queue_max_size,
                 "max_parallel_requests": self.config.server.max_parallel_requests,
                 "max_parallel_requests_overrides": self.config.server.max_parallel_requests_overrides,

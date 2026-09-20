@@ -37,6 +37,22 @@ images) or 8776 (full image), and all of them can be a cluster node.
 Every tag is also published with its version (`:0.2.20`); `:latest` moves
 only after the image has completed a real request on real hardware.
 
+**Every published image is signed** with [cosign](https://github.com/sigstore/cosign)
+against the key pair in `packaging/cosign.pub` (the private half never
+leaves the release machine). Check before you run:
+
+```bash
+cosign verify --key https://raw.githubusercontent.com/nextime/coderai/master/packaging/cosign.pub \
+       ghcr.io/nextime/coderai:latest
+```
+
+It prints the signed digest and the `version` / `git` annotations of the
+build; a tag whose digest does not verify is not ours (or was re-pushed and
+not yet re-signed — `packaging/sign-images.sh` is the release step that
+signs, `… verify` the check across all images). Docker can enforce this:
+a `policy-controller` / `cosign` admission rule on a cluster, or simply the
+command above in whatever pulls.
+
 For an offline machine, pull the image where there is a connection and
 move it: `docker save ghcr.io/nextime/coderai:0.2.20 | gzip > coderai.tar.gz`
 there, `docker load < coderai.tar.gz` here.
@@ -60,7 +76,10 @@ the log; `./run_oci.sh --help` lists every option: `--vulkan`, `--all`,
 
 `packaging/linux/run_oci.sh` installs itself as `coderai-docker`
 (`~/.local/usr/bin`) on first use, so afterwards it is simply
-`coderai-docker --nvidia -d` and `coderai-docker --upgrade`.
+`coderai-docker --nvidia -d` and `coderai-docker --upgrade`. Add
+`--host-network` on a box that should find, or be found by, the others over
+mDNS (Settings → Cluster → discovery + a shared cluster token): link-local
+multicast never crosses Docker's bridge.
 
 Without the script, the plain `docker run` it builds is:
 
@@ -114,7 +133,10 @@ docker run -d --name coderai-images --gpus all -p 8000:8000 \
 
 then on the head: model → *Runs on: a machine of yours*, URL
 `http://thatbox:8000`, token `some-token` — or Settings → Cluster → add it
-as a node. `CODERAI_RPC_SERVER_PORT=50052` on the `coderai-llama` image also
+as a node — or give both the same cluster token with discovery on and let
+them find each other: on the capability container `--network host -e
+CODERAI_CLUSTER_TOKEN=… -e CODERAI_DISCOVERY=1` (and `-e CODERAI_NODE_NAME=…`
+to name it; `CODERAI_ADVERTISE_HOST` when it has several addresses). `CODERAI_RPC_SERVER_PORT=50052` on the `coderai-llama` image also
 lends its card to a GGUF loaded elsewhere; `CODERAI_RAY_ADDRESS=…` turns the
 `coderai-vllm` image into a Ray worker for a multi-node vLLM launch. See
 [`cluster.md`](cluster.md) and [`remote-execution.md`](remote-execution.md).

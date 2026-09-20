@@ -157,6 +157,15 @@ else
     say "${c_ok}all ${#built[@]} images pushed to ${NS}${c_off}"
 fi
 
+# ---- sign ------------------------------------------------------------------ #
+# cosign signatures next to each pushed digest (packaging/sign-images.sh);
+# users verify with packaging/cosign.pub. SIGN=0 skips it.
+if [[ "${SIGN:-1}" == "1" && ${#push_failed[@]} -eq 0 ]]; then
+    sign_list=()
+    for t in "${built[@]}"; do sign_list+=("$t" "${t%:*}:latest"); done
+    IMAGES="${sign_list[*]}" NS="$NS" ./packaging/sign-images.sh || say "${c_warn}signing failed — run ./packaging/sign-images.sh all later${c_off}"
+fi
+
 # ---- make them public --------------------------------------------------- #
 if [[ "$REGISTRY" == "ghcr.io" ]]; then
     owner="${NS#*/}"

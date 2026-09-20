@@ -154,12 +154,15 @@ def pick_engine(registry: EngineRegistry, path: str, method: str,
                 model: Optional[str], required_cap: Optional[str] = None,
                 default_engine: Optional[str] = None,
                 pinned: Optional[str] = None,
-                pin_fallback: bool = False) -> Optional[Engine]:
+                pin_fallback: bool = False,
+                prefer: Optional[str] = None) -> Optional[Engine]:
     """Return the engine to proxy this request to, or None if none are ready.
 
-    Precedence for inference: per-model pin → engine already holding the model →
-    configured default engine → least-loaded compatible engine. Each candidate must
-    be capability-compatible (``required_cap``) and healthy. Works even when the
+    Precedence for inference: per-model pin → the engine that served this
+    conversation before (``prefer``, prefix-cache affinity) when it still
+    holds the model → engine already holding the model → configured default
+    engine → least-loaded compatible engine. Each candidate must be
+    capability-compatible (``required_cap``) and healthy. Works even when the
     model id isn't known (e.g. a multipart transcription upload), routing purely by
     capability.
     """
@@ -203,6 +206,16 @@ def pick_engine(registry: EngineRegistry, path: str, method: str,
             # model opts in (engine_fallback), fall through to pick another engine.
             if not pin_fallback:
                 return None
+
+        # 0b. Prefix-cache affinity: the conversation's earlier turns ran on
+        # ``prefer`` — go back there while it is alive and still holds the
+        # model, so its warm KV/prefix cache is reused. Only matters when the
+        # model is resident in more than one place; never overrides a pin.
+        if prefer and model:
+            pe = registry.by_name(prefer)
+            if (pe is not None and pe.is_alive() and pe.can_serve(cap)
+                    and registry.engine_holds(pe, model)):
+                return pe
 
         # 1. The front's precomputed assignment is authoritative — it already folds
         # in the default engine and balanced auto-selection, and keeps a model on

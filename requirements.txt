@@ -6,6 +6,7 @@ pydantic>=2.5.0
 # CLI dependencies
 requests>=2.31.0  # for the coder CLI tool
 python-multipart>=0.0.6  # for multipart form data parsing
+zeroconf>=0.130  # cluster discovery: mDNS/DNS-SD announce + browse (codai/cluster/discovery.py)
 
 # PyTorch - Uncomment the appropriate version for your system.
 # IMPORTANT: Use quotes around version specifiers to prevent shell interpretation!

@@ -47,6 +47,10 @@
       <input type="text" id="s-cert" class="form-input" placeholder="/path/to/cert.pem">
     </div>
   </div>
+  <div class="form-row" style="margin-top:.8rem;margin-bottom:0">
+    <label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer"><input type="checkbox" id="s-metrics-public"><span>Serve <code>/metrics</code> (Prometheus) without a credential</span></label>
+    <span class="form-hint" style="font-size:11px">Off = a session, an API token or the cluster token is required. Exported: requests per key/model/kind/status/engine with wall time, engines and nodes up, VRAM, in-flight, RPC servers, discovery, RunPod spend.</span>
+  </div>
   <div class="form-row" style="margin-top:1rem;margin-bottom:0">
     <label class="form-label">Request queue max size</label>
     <input type="number" id="s-queue-max" class="form-input" placeholder="6" min="1" max="1000" style="max-width:160px">
@@ -885,8 +889,14 @@
     <div class="form-group" style="margin:0"><label class="form-label">Node poll timeout (s)</label><input type="number" id="s-cluster-poll" class="form-input" min="1" step="0.5" placeholder="4"></div>
     <div class="form-group" style="margin:0;align-self:end"><label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer"><input type="checkbox" id="s-cluster-serve"><span>Let other heads use this install as a node</span></label></div>
   </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:.6rem;margin-top:.6rem">
+    <div class="form-group" style="margin:0"><label class="form-label">Cluster token <span class="muted" id="s-cluster-token-state"></span></label><input type="password" id="s-cluster-token" class="form-input" placeholder="one secret shared by every box" autocomplete="new-password"><span class="form-hint" style="font-size:11px">Type the same on every install. Nodes accept it on <code>/cluster/*</code>; a head uses it for discovered nodes and for listed nodes with a blank token. Blank keeps the stored one, <code>-</code> clears it.</span></div>
+    <div class="form-group" style="margin:0;align-self:end"><label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer"><input type="checkbox" id="s-cluster-discovery"><span>Find nodes on the LAN (mDNS)</span></label><span class="form-hint" style="font-size:11px">Announces this install as <code>_coderai._tcp</code> and lists the others on the Cluster page. Link-local: same subnet, container on the host network.</span></div>
+    <div class="form-group" style="margin:0;align-self:end"><label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer"><input type="checkbox" id="s-cluster-autojoin"><span>Auto-join members as nodes</span></label><span class="form-hint" style="font-size:11px">Every discovered install with the same token becomes a node, no listing needed.</span></div>
+    <div class="form-group" style="margin:0;align-self:end"><label class="toggle-row" style="display:flex;align-items:center;gap:.5rem;cursor:pointer"><input type="checkbox" id="s-cluster-affinity"><span>Prefix-cache routing</span></label><input type="number" id="s-cluster-affinity-ttl" class="form-input" min="0" step="60" placeholder="1800" style="margin-top:.3rem" title="seconds a conversation stays bound to its engine"><span class="form-hint" style="font-size:11px">A conversation's next turn goes back to the engine or node that served it (warm KV cache) when the model is loaded in several places. TTL in seconds.</span></div>
+  </div>
   <div id="cluster-fields" style="margin-top:.6rem">
-    <div style="font-weight:600;font-size:13px;margin:.4rem 0">Nodes</div>
+    <div style="font-weight:600;font-size:13px;margin:.4rem 0">Nodes <span class="muted" style="font-weight:400">— listed by hand; discovered members are added on their own</span></div>
     <div id="s-cluster-nodes"></div>
     <button type="button" class="btn btn-secondary btn-sm" onclick="_addClusterNode()">+ Add node</button>
     <span class="form-hint" style="font-size:11px;margin-left:.6rem">Verify: <b>system</b> = public certificate, <b>pem</b> = paste the node's self-signed certificate, <b>off</b> = no check (plain http, or a LAN you trust). Capabilities blank = whatever the node reports.</span>
@@ -1720,6 +1730,7 @@ async function loadSettings(){
     document.getElementById('s-https').checked = !!d.server?.https;
     document.getElementById('s-key').value   = d.server?.https_key_path ?? '';
     document.getElementById('s-cert').value  = d.server?.https_cert_path ?? '';
+    document.getElementById('s-metrics-public').checked = !!d.server?.metrics_public;
     document.getElementById('s-queue-max').value = d.server?.queue_max_size ?? 6;
     document.getElementById('s-internal-port-base').value = d.server?.internal_port_base ?? 8780;
     // Default engine — surfaced when 2+ engines are running. Sourced from the
@@ -1994,6 +2005,7 @@ async function saveSettings(silent){
       https: document.getElementById('s-https').checked,
       https_key_path:  strOrNull('s-key'),
       https_cert_path: strOrNull('s-cert'),
+      metrics_public: document.getElementById('s-metrics-public').checked,
       queue_max_size: parseInt(document.getElementById('s-queue-max').value) || 6,
       internal_port_base: parseInt(document.getElementById('s-internal-port-base').value) || 8780,
       max_parallel_requests: parseInt(document.getElementById('s-max-parallel').value) || 2,
@@ -2451,6 +2463,12 @@ function _populateCluster(cl){
   document.getElementById('s-cluster-poll').value = cl.poll_timeout_s ?? 4;
   document.getElementById('s-cluster-serve').checked = cl.serve !== false;
   document.getElementById('s-cluster-rpc-bin').value = cl.rpc_bin ?? '';
+  document.getElementById('s-cluster-token').value = '';
+  document.getElementById('s-cluster-token-state').textContent = cl.token_set ? '(set)' : '(not set)';
+  document.getElementById('s-cluster-discovery').checked = !!cl.discovery;
+  document.getElementById('s-cluster-autojoin').checked = cl.auto_join !== false;
+  document.getElementById('s-cluster-affinity').checked = cl.prefix_affinity !== false;
+  document.getElementById('s-cluster-affinity-ttl').value = cl.prefix_affinity_ttl_s ?? 1800;
   document.getElementById('s-cluster-nodes').innerHTML = (cl.nodes || []).map(_clusterNodeRowHtml).join('');
   document.getElementById('s-cluster-rpc').innerHTML = (cl.rpc_servers || []).map(_clusterRpcRowHtml).join('');
   toggleClusterFields();
@@ -2476,6 +2494,11 @@ function _collectCluster(){
     poll_timeout_s: parseFloat(document.getElementById('s-cluster-poll').value) || 4,
     serve: document.getElementById('s-cluster-serve').checked,
     rpc_bin: document.getElementById('s-cluster-rpc-bin').value.trim(),
+    token: document.getElementById('s-cluster-token').value,
+    discovery: document.getElementById('s-cluster-discovery').checked,
+    auto_join: document.getElementById('s-cluster-autojoin').checked,
+    prefix_affinity: document.getElementById('s-cluster-affinity').checked,
+    prefix_affinity_ttl_s: parseFloat(document.getElementById('s-cluster-affinity-ttl').value) || 0,
     nodes: nodes, rpc_servers: rpc,
   };
 }

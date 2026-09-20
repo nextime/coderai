@@ -1770,6 +1770,23 @@ class VulkanBackend(ModelBackend):
                 print(f"  gpu split    : tensor_split={_parsed} (multi-GPU pool)")
             if _parsed and _llama_accepts('tensor_split'):
                 llama_kwargs['tensor_split'] = _parsed
+            # HOW the split is made across the devices (local cards and RPC
+            # servers alike):
+            #   layer (llama.cpp default) — each device holds whole layers; per
+            #     token only the activations between consecutive layers move,
+            #     which is what an Ethernet link can carry;
+            #   row — every matrix is split by rows over ALL devices (tensor
+            #     parallelism): the devices work on each layer together, at the
+            #     price of an all-reduce per layer. Faster when the devices sit
+            #     on one PCIe bus; across a network it needs a fabric measured
+            #     in tens of Gb/s (10 GbE is the floor, RDMA the point).
+            _sm = str(kwargs.get('split_mode', _raw_cfg.get('split_mode')) or 'layer').lower()
+            if _sm in ('row', 'tensor') and _llama_accepts('split_mode'):
+                _row = getattr(_llama_cpp, 'LLAMA_SPLIT_MODE_ROW', 2)
+                llama_kwargs['split_mode'] = _row
+                print(f"  gpu split    : split_mode=row (tensor parallel over "
+                      f"{len(_parsed) if _parsed else 'all'} devices"
+                      f"{', incl. RPC' if _rpc_eps else ''})")
         elif _n_cuda > 0 and _n_vk > 0 and _llama_accepts('tensor_split'):
             # NOT a split model, but the engine can see BOTH backends' cards (cross
             # visibility was enabled for some other split model). Confine THIS model

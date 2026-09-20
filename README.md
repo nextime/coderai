@@ -148,13 +148,19 @@ remote placement of every model type, the capability images and the `host` backe
   one — polled, assigned models, pinned by name from the model page (*Engine / card*),
   routed by capability and load; the node's own front picks the card. A node needs only
   an API token. Load/Unload from the head reach the node; the Cluster page shows every
-  node's engines, VRAM and reachability
+  node's engines, VRAM, reachability and log tail
+- **Zero-config on a LAN**: one **cluster token** typed on every box, **mDNS discovery**
+  (`_coderai._tcp`) and auto-join — members find each other and become nodes with no
+  URL and no per-node token; a node that restarts gets its models pushed again
+- **Prefix-cache-aware routing**: a conversation's next turn goes back to the engine or
+  node that served it (warm KV cache) when the model is loaded in several places
 - **One GGUF over several machines**: llama.cpp RPC — this machine runs `rpc-server`
   processes (Settings → Cluster) that lend its cards; a model names them under *Cards on
-  other machines* and its layer split spreads over local and remote cards alike. Built
-  from the same llama.cpp as the bundled llama-cpp-python (`packaging/build-rpc-server.sh`)
-- **One HF model over several machines**: vLLM on Ray (tensor parallel inside a node,
-  pipeline parallel across nodes) and SGLang `--nnodes` — coderai starts the peers by
+  other machines* and its layer split — or *row* split, llama.cpp's tensor parallelism,
+  for a fast fabric — spreads over local and remote cards alike. Built from the same
+  llama.cpp as the bundled llama-cpp-python (`packaging/build-rpc-server.sh`)
+- **One HF model over several machines**: vLLM on Ray (pipeline parallel across nodes on
+  Ethernet; tensor parallel may span them on 10 GbE/RDMA) and SGLang `--nnodes` — coderai starts the peers by
   their configured commands, waits for their GPUs, launches, tears down; per model or
   as defaults
 - **Distributed generation and training**: a model's *Distribute* switch fans `n` images,
@@ -166,6 +172,9 @@ remote placement of every model type, the capability images and the `host` backe
   healthy + least busy wins, a dead one is skipped and the request moves on
 - **No impossible pairs**: the model form greys out engines that cannot run the chosen
   backend and backends the pinned engine cannot run, and refuses to save a wrong pair
+- **Operable**: `GET /metrics` for Prometheus (requests per API key / model / engine,
+  engines and nodes up, VRAM, RunPod spend), usage tables on the Cluster page, node logs
+  from the head; every published image is cosign-signed (`packaging/cosign.pub`)
 
 Full guide: [`docs/cluster.md`](docs/cluster.md).
 
@@ -596,7 +605,7 @@ The [`docs/`](docs/) directory carries the deep dives — one per engine and sub
 | [`runpod.md`](docs/runpod.md) | Renting remote GPUs: pods, serverless, budgets, the reaper |
 | [`remote-execution.md`](docs/remote-execution.md) | Running any model type elsewhere: the capability gateway, per-model placement, weights and adapters on a pod, test runs |
 | [`install-from-packages.md`](docs/install-from-packages.md) | The published images (full + nineteen capability images), Linux and Windows installs, the offline tarball |
-| [`cluster.md`](docs/cluster.md) | Several machines as one: cluster nodes as engines, one GGUF over llama.cpp RPC, vLLM/SGLang multi-node, pools of hosts and remotes |
+| [`cluster.md`](docs/cluster.md) | Several machines as one: cluster nodes as engines, mDNS + shared token, one GGUF over llama.cpp RPC, vLLM/SGLang multi-node, prefix-cache routing, pools, Prometheus, node logs |
 | [`vllm.md`](docs/vllm.md) | vLLM as a first-class engine node |
 | [`deepseek-ds4.md`](docs/deepseek-ds4.md) · [`glm-colibri.md`](docs/glm-colibri.md) · [`kimi-k3.md`](docs/kimi-k3.md) · [`ktransformers.md`](docs/ktransformers.md) | The native MoE engines |
 | [`ocr.md`](docs/ocr.md) | The OCR subsystem and schema store |
@@ -710,7 +719,7 @@ Other top-level blocks, each with its own tab on the Settings page:
 | `server.engine_specs` / `engines` / `engine_gpus` | The front/engine split — how many engines, which GPU each owns, and their capabilities |
 | `ds4`, `colibri`, `k3`, `ktransformers`, `vllm` | Per-engine enablement, install dirs, model ids and build settings |
 | `runpod` | RunPod account settings and global cost caps — see [`docs/runpod.md`](docs/runpod.md) |
-| `cluster` | Other installs used as engines (`nodes`), the `rpc_servers` this machine lends, `advertise_host` — see [`docs/cluster.md`](docs/cluster.md) |
+| `cluster` | Other installs used as engines (`nodes`), the shared `token`, mDNS `discovery` + `auto_join`, `prefix_affinity`, the `rpc_servers` this machine lends, `advertise_host` — see [`docs/cluster.md`](docs/cluster.md) |
 | `ocr` | OCR engines, DPI, concurrency, detection mode, structured-extraction model and venv paths |
 | `broker` | AISBF broker client (below) |
 
@@ -1037,9 +1046,13 @@ To force Vulkan to use only the AMD GPU:
 ### Multi-machine (cluster nodes, llama.cpp RPC, vLLM on Ray)
 
 See [`docs/cluster.md`](docs/cluster.md). In short: a node is another coderai with an
-API token; an RPC server is `cluster.rpc_servers` on the lending machine plus
-`rpc_servers` on the model; vLLM spans machines with `pipeline_parallel_size` and
-`nodes` on the model's vLLM block.
+API token — or, on one LAN, every box with the same `cluster.token` and
+`"discovery": true` finds the others over mDNS and joins (`coderai-docker
+--host-network` so the container sees the LAN); an RPC server is `cluster.rpc_servers`
+on the lending machine plus `rpc_servers` on the model (`"split_mode": "row"` for
+tensor parallel on a fast fabric); vLLM spans machines with `pipeline_parallel_size`
+(and/or a `tensor_parallel_size` larger than the local cards) and `nodes` on the
+model's vLLM block. `GET /metrics` is the Prometheus page.
 
 ### Low VRAM
 

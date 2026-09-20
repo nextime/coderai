@@ -272,24 +272,36 @@ class EngineRegistry:
             elif not healthy:
                 e.cooling = None
 
+    @staticmethod
+    def engine_holds(e: Engine, model_key: str) -> bool:
+        """Does this engine have the model resident (forgiving key match)?"""
+        if not model_key:
+            return False
+        short = _short_stem(model_key)
+        for k in e.loaded_models:
+            if k == model_key or _short_stem(k) == short \
+                    or k.endswith(model_key) or model_key.endswith(k.split(":")[-1]):
+                return True
+        return False
+
     def engine_for_model(self, model_key: str, required_cap: Optional[str] = None) -> Optional[Engine]:
         """Return a healthy, capability-compatible engine that already has the model
-        resident, if any.
+        resident, if any — the least busy one when several hold it (replicas
+        here and on nodes), local before remote on a tie.
 
         Matching is forgiving: exact key, short-name, or type-prefixed variants —
         the same fuzzy spirit the manager uses, but read-only over loaded keys."""
         if not model_key:
             return None
-        short = _short_stem(model_key)
         with self._lock:
-            for e in self._engines.values():
-                if not e.healthy or not e.can_serve(required_cap):
-                    continue
-                for k in e.loaded_models:
-                    if k == model_key or _short_stem(k) == short \
-                            or k.endswith(model_key) or model_key.endswith(k.split(":")[-1]):
-                        return e
-        return None
+            holders = [e for e in self._engines.values()
+                       if e.healthy and e.can_serve(required_cap)
+                       and self.engine_holds(e, model_key)]
+        if not holders:
+            return None
+        holders.sort(key=lambda e: (int(getattr(e, "inflight", 0) or 0),
+                                    1 if getattr(e, "remote", False) else 0, e.id))
+        return holders[0]
 
     def engine_for_assigned(self, model_key: str) -> Optional[Engine]:
         """The engine the front ASSIGNED this model to (single owner), or None.

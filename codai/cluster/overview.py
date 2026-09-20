@@ -156,4 +156,37 @@ def build_overview(front, local_rpc: list) -> dict:
         "hosts": _host_targets(front),
         "remotes": _remote_targets(front),
         "pods": _pods(),
+        "discovery": _discovery(front, ccfg),
+        "usage": _usage(front),
     }
+
+
+def _discovery(front, ccfg) -> dict:
+    """mDNS: what this install announces and who it sees (cluster/discovery.py)."""
+    from codai.cluster import discovery as _d
+    sup = getattr(front, "supervisor", None)
+    disc = getattr(sup, "discovery", None) if sup else None
+    want = bool(getattr(ccfg, "discovery", False)) if ccfg else False
+    out = {"enabled": want, "available": _d.available(), "running": False,
+           "token_set": bool(getattr(ccfg, "token", "")) if ccfg else False,
+           "auto_join": bool(getattr(ccfg, "auto_join", True)) if ccfg else True,
+           "error": "", "peers": []}
+    if disc is None:
+        if want and not out["available"]:
+            out["error"] = "the zeroconf package is not installed"
+        return out
+    st = disc.status()
+    out.update({"running": st["running"], "error": st["error"], "name": st["name"],
+                "instance": st["instance"], "port": st["port"]})
+    joined = {e.name.lower() for e in front.registry.remotes()}
+    for p in st["peers"]:
+        p["joined"] = p["name"].lower() in joined
+        out["peers"].append(p)
+    return out
+
+
+def _usage(front) -> dict:
+    try:
+        return front.metrics.usage_tables()
+    except Exception:
+        return {"by_key": {}, "by_model": {}}

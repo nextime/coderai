@@ -374,12 +374,40 @@ class EngineSupervisor:
     _NODE_ID_BASE = 500
 
     def _node_specs(self) -> list:
+        """The nodes this head uses: ``cluster.nodes`` from config, plus — with
+        discovery + auto_join — every member found on the LAN holding the same
+        cluster token. A listed node with a blank api_key gets the shared
+        token, so one secret really is the whole setup."""
+        ccfg = getattr(self.config, "cluster", None)
         try:
             from codai.cluster.nodes import enabled_nodes
-            return enabled_nodes(getattr(self.config, "cluster", None))
+            specs = enabled_nodes(ccfg)
         except Exception as exc:
             print(f"[front] cluster nodes not read: {exc}", flush=True)
-            return []
+            specs = []
+        token = (getattr(ccfg, "token", "") or "") if ccfg else ""
+        if token:
+            for sp in specs:
+                if not sp.api_key:
+                    sp.api_key = token
+        disc = getattr(self, "discovery", None)
+        if (disc is not None and token and ccfg is not None
+                and getattr(ccfg, "enabled", False) and getattr(ccfg, "auto_join", True)):
+            try:
+                from codai.cluster.discovery import member_node_specs
+                known = [sp.name for sp in specs] + [sp.url for sp in specs]
+                # Every listed node, enabled or not, blocks auto-join of the same name.
+                for n in (getattr(ccfg, "nodes", None) or []):
+                    if isinstance(n, dict):
+                        known += [str(n.get("name") or ""), str(n.get("url") or "").rstrip("/")]
+                found = member_node_specs(disc.members(), token, known,
+                                          timeout_s=float(getattr(ccfg, "poll_timeout_s", 4.0) or 4.0))
+                for sp in found:
+                    sp.discovered = True
+                specs += found
+            except Exception as exc:
+                print(f"[front] discovered nodes not merged: {exc}", flush=True)
+        return specs
 
     def _make_remote_engine(self, spec, eid: int) -> Engine:
         from codai.cluster.nodes import async_clients, sync_client
@@ -394,6 +422,7 @@ class EngineSupervisor:
         e.http_short, e.http_long = async_clients(spec)
         e.http_sync = sync_client(spec)
         e.node_sig = self._node_sig(spec)
+        e.discovered = bool(getattr(spec, "discovered", False))
         return e
 
     def _build_remote_engines(self, next_id: int) -> list:
@@ -758,6 +787,10 @@ class EngineSupervisor:
                 self.rpc_manager.start()
         except Exception as exc:
             print(f"[front] rpc servers not started: {exc}", flush=True)
+        # mDNS: announce this install, find the others (codai/cluster/discovery.py).
+        self.discovery = None
+        self._discovery_sig = None
+        self._sync_discovery()
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._poll_thread.start()
         # Central thermal supervisor: monitor temps from the front (responsive even
@@ -1118,6 +1151,18 @@ class EngineSupervisor:
             except Exception as exc:
                 if self.debug:
                     print(f"[front] cluster node sync error: {exc}", flush=True)
+            try:
+                self._sync_discovery()
+            except Exception as exc:
+                print(f"[front] discovery sync error: {exc}", flush=True)
+            disc = getattr(self, "discovery", None)
+            if disc is not None and disc.started_at:
+                # Re-announce when what this machine offers changes (an engine
+                # came up with new capabilities), so heads see the right set.
+                caps = tuple(self._local_capabilities())
+                if caps != getattr(self, "_announced_caps", None):
+                    self._announced_caps = caps
+                    disc.refresh()
             self._push_assignment_if_changed(client)
             self._flush_pending_reloads(client)   # deliver queued reloads to idle engines
             for engine in self.registry.all():
@@ -1187,10 +1232,63 @@ class EngineSupervisor:
             self._stopped.wait(self.config.server.proxy_status_timeout)
         client.close()
 
+    def _discovery_wanted(self):
+        """(signature, kwargs) of the discovery the config asks for, or (None, None)."""
+        ccfg = getattr(self.config, "cluster", None)
+        if ccfg is None or not getattr(ccfg, "discovery", False):
+            return None, None
+        srv = self.config.server
+        kw = dict(name=(getattr(ccfg, "node_name", "") or "").strip(),
+                  port=int(getattr(srv, "port", 8776) or 8776),
+                  token=getattr(ccfg, "token", "") or "",
+                  advertise_host=getattr(ccfg, "advertise_host", "") or "",
+                  scheme="https" if getattr(srv, "https", False) else "http",
+                  serve=bool(getattr(ccfg, "serve", True)))
+        return tuple(sorted(kw.items())), kw
+
+    def _sync_discovery(self) -> None:
+        """Start, restart or stop discovery to match the (live-refreshed) config."""
+        sig, kw = self._discovery_wanted()
+        if sig == self._discovery_sig:
+            return
+        if self.discovery is not None:
+            try:
+                self.discovery.stop()
+            except Exception:
+                pass
+            self.discovery = None
+        self._discovery_sig = sig
+        if kw is None:
+            return
+        try:
+            from codai.cluster.discovery import Discovery
+            from codai import __version__
+            self.discovery = Discovery(version=__version__,
+                                       capabilities=self._local_capabilities, **kw)
+            if not self.discovery.start():
+                self.discovery.stop()
+                # keep the object: its .error tells the Cluster page why
+        except Exception as exc:
+            print(f"[front] discovery not started: {exc}", flush=True)
+
+    def _local_capabilities(self) -> list:
+        """Union of the local engines' capabilities (what we announce on mDNS)."""
+        caps = set()
+        for e in self.registry.all():
+            if not e.remote and getattr(e, "role", "engine") == "engine":
+                caps |= set(e.capabilities or ())
+        return sorted(caps)
+
     def _poll_remote(self, engine: Engine) -> None:
         """One state poll of a cluster node. Its front answers from its own
-        registry, so this is cheap and never waits on a busy GPU engine there."""
+        registry, so this is cheap and never waits on a busy GPU engine there.
+
+        Recovery: a node that comes back after being unreachable has very
+        likely restarted, and the model entries this head pushed live only in
+        its memory — so its assignment is queued for a fresh push, and the
+        models it was assigned load again there without anyone clicking."""
         healthy = False
+        was_healthy = bool(engine.healthy)
         try:
             r = engine.http_sync.get(engine.url + engine.state_path)
             if r.status_code == 200:
@@ -1220,11 +1318,19 @@ class EngineSupervisor:
         except Exception as exc:
             self.registry.update_state(engine.id, healthy=False,
                                        last_error=str(exc)[:200])
-        if self.debug and self._health.get(engine.id) != healthy:
+        if healthy and not was_healthy and self._health.get(engine.id) is False:
+            owned = sorted(engine.assigned_models)
+            if owned:
+                self._pending_reload[engine.name] = owned
+                self._node_recoveries = getattr(self, "_node_recoveries", 0) + 1
+                print(f"[front] node '{engine.name}' is back — re-pushing its "
+                      f"{len(owned)} assigned model(s)", flush=True)
+        if self._health.get(engine.id) != healthy:
             self._health[engine.id] = healthy
-            print(f"[front] node '{engine.name}' "
-                  f"{'reachable' if healthy else 'not responding: ' + engine.last_error}",
-                  flush=True)
+            if self.debug or not healthy:
+                print(f"[front] node '{engine.name}' "
+                      f"{'reachable' if healthy else 'not responding: ' + engine.last_error}",
+                      flush=True)
 
     def _maybe_restart(self, engine: Engine) -> None:
         with self._restart_lock:
@@ -1349,6 +1455,11 @@ class EngineSupervisor:
         try:
             if getattr(self, "rpc_manager", None) is not None:
                 self.rpc_manager.stop()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "discovery", None) is not None:
+                self.discovery.stop()
         except Exception:
             pass
 

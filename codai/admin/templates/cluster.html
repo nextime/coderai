@@ -29,15 +29,28 @@
   <div style="overflow-x:auto">
     <table style="width:100%;border-collapse:collapse;font-size:13px">
       <thead><tr style="text-align:left;color:var(--text-3)">
-        <th>Node</th><th>URL</th><th>State</th><th>Capabilities</th><th>VRAM</th><th>Its engines</th><th>Loaded</th><th>Assigned</th><th>In-flight</th>
+        <th>Node</th><th>URL</th><th>State</th><th>Capabilities</th><th>VRAM</th><th>Its engines</th><th>Loaded</th><th>Assigned</th><th>In-flight</th><th></th>
       </tr></thead>
-      <tbody id="cl-nodes"><tr><td colspan="9" class="dim">No nodes configured — Settings → Cluster.</td></tr></tbody>
+      <tbody id="cl-nodes"><tr><td colspan="10" class="dim">No nodes configured — Settings → Cluster.</td></tr></tbody>
     </table>
   </div>
 </div>
 
 <div class="card" style="margin-bottom:1rem">
-  <div class="card-title">Engines on this machine</div>
+  <div class="card-title">Seen on the network <span class="dim small">— mDNS <code>_coderai._tcp</code>; members hold this cluster's token and join by themselves</span></div>
+  <div id="cl-disc-note" class="dim small" style="margin-bottom:.4rem"></div>
+  <div style="overflow-x:auto">
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="text-align:left;color:var(--text-3)">
+        <th>Name</th><th>URL</th><th>Version</th><th>Capabilities</th><th>Member</th><th>Joined</th><th>Last seen</th>
+      </tr></thead>
+      <tbody id="cl-disc"><tr><td colspan="7" class="dim">—</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card" style="margin-bottom:1rem">
+  <div class="card-title">Engines on this machine <button class="btn btn-secondary" style="float:right;padding:.15rem .5rem;font-size:12px" onclick="clLogs('')">This front's log</button></div>
   <div style="overflow-x:auto">
     <table style="width:100%;border-collapse:collapse;font-size:13px">
       <thead><tr style="text-align:left;color:var(--text-3)">
@@ -77,6 +90,29 @@
   </div>
 </div>
 
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem">
+  <div class="card">
+    <div class="card-title">Usage by API key <span class="dim small">— since the front started; the same numbers <code>/metrics</code> exports</span></div>
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="text-align:left;color:var(--text-3)"><th>Key</th><th>Requests</th><th>Errors</th><th>Time</th><th>Kinds</th><th>Where</th></tr></thead>
+      <tbody id="cl-usage-key"><tr><td colspan="6" class="dim">No requests yet.</td></tr></tbody>
+    </table>
+  </div>
+  <div class="card">
+    <div class="card-title">Usage by model</div>
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="text-align:left;color:var(--text-3)"><th>Model</th><th>Requests</th><th>Errors</th><th>Time</th><th>Where</th></tr></thead>
+      <tbody id="cl-usage-model"><tr><td colspan="5" class="dim">No requests yet.</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div id="cl-logbox" class="card" style="display:none;margin-bottom:1rem">
+  <div class="card-title"><span id="cl-log-title">Log</span> <button class="btn btn-secondary" style="float:right;padding:.15rem .5rem;font-size:12px" onclick="document.getElementById('cl-logbox').style.display='none'">close</button>
+    <button class="btn btn-secondary" style="float:right;margin-right:.4rem;padding:.15rem .5rem;font-size:12px" onclick="clLogs(_logNode)">refresh</button></div>
+  <pre id="cl-log" style="max-height:420px;overflow:auto;font-size:11px;line-height:1.35;margin:0;white-space:pre-wrap"></pre>
+</div>
+
 <div class="card">
   <div class="card-title">RunPod pods <span class="dim small">— live list, costs on the <a href="{{ root_path }}/admin/runpod">RunPod page</a></span></div>
   <table style="width:100%;border-collapse:collapse;font-size:13px">
@@ -86,7 +122,7 @@
 </div>
 
 <style>
-  #cl-nodes td, #cl-engines td, #cl-rpc td, #cl-hosts td, #cl-remotes td, #cl-pods td { padding:.35rem .4rem; border-top:1px solid var(--border,#333); vertical-align:top }
+  #cl-nodes td, #cl-engines td, #cl-rpc td, #cl-hosts td, #cl-remotes td, #cl-pods td, #cl-disc td, #cl-usage-key td, #cl-usage-model td { padding:.35rem .4rem; border-top:1px solid var(--border,#333); vertical-align:top }
   .cl-ok { color:#2ecc71; font-weight:600 } .cl-bad { color:#e74c3c; font-weight:600 } .cl-dim { color:var(--text-3) }
   .cl-pill { display:inline-block; padding:.05rem .4rem; border-radius:999px; border:1px solid var(--border,#444); font-size:11px; margin:0 .15rem .15rem 0 }
 </style>
@@ -124,12 +160,41 @@ async function clRefresh(){
   document.getElementById('cl-n-pods').textContent = pods.length;
 
   document.getElementById('cl-nodes').innerHTML = nodes.length ? nodes.map(n => `<tr>
-    <td><b>${esc(n.name)}</b></td><td class="cl-dim">${esc(n.url)}</td>
+    <td><b>${esc(n.name)}</b>${n.discovered ? ' <span class="cl-pill" title="found over mDNS with the cluster token">mDNS</span>' : ''}</td><td class="cl-dim">${esc(n.url)}</td>
     <td>${ok(n.healthy, 'reachable', 'unreachable')}${n.last_error ? '<br><span class="cl-dim" style="font-size:11px">' + esc(n.last_error) + '</span>' : ''}</td>
     <td>${pills(n.capabilities)}</td><td>${vram(n.vram)}</td>
     <td>${(n.node_engines || []).map(e => '<span class="cl-pill" title="' + esc(vram(e.vram)) + '">' + esc(e.name) + (e.healthy ? '' : ' ✗') + '</span>').join('') || '<span class="cl-dim">—</span>'}</td>
-    <td>${short(n.loaded_models)}</td><td>${short(n.assigned_models)}</td><td>${n.inflight || 0}</td></tr>`).join('')
-    : '<tr><td colspan="9" class="dim">No nodes configured — Settings → Cluster.</td></tr>';
+    <td>${short(n.loaded_models)}</td><td>${short(n.assigned_models)}</td><td>${n.inflight || 0}</td>
+    <td><button class="btn btn-secondary" style="padding:.1rem .45rem;font-size:11px" onclick="clLogs(${JSON.stringify(n.name)})">log</button></td></tr>`).join('')
+    : '<tr><td colspan="10" class="dim">No nodes configured — Settings → Cluster (or turn on discovery and share a cluster token).</td></tr>';
+
+  const disc = d.discovery || {};
+  const dn = [];
+  if (!disc.enabled) dn.push('Discovery is <b>off</b> — Settings → Cluster → <em>Find nodes on the LAN</em>.');
+  else if (!disc.available) dn.push('Discovery is on but the <code>zeroconf</code> package is missing in this install.');
+  else if (disc.error) dn.push('Discovery error: ' + esc(disc.error));
+  else if (disc.running) dn.push('Announcing as <b>' + esc(disc.name) + '</b> on port ' + esc(disc.port) + (disc.token_set ? '' : ' — <b>no cluster token set</b>: this install is visible but joins nothing and nobody joins it') + (disc.auto_join ? '' : '; auto-join is off (members are listed, not used)') + '.');
+  document.getElementById('cl-disc-note').innerHTML = dn.join(' ');
+  const peers = disc.peers || [];
+  document.getElementById('cl-disc').innerHTML = peers.length ? peers.map(p => `<tr>
+    <td><b>${esc(p.name)}</b></td><td class="cl-dim">${esc(p.url)}</td><td>${esc(p.version)}</td><td>${pills(p.capabilities)}</td>
+    <td>${p.member ? '<span class="cl-ok">same token</span>' : '<span class="cl-dim">other token</span>'}${p.serve === false ? ' <span class="cl-dim">(does not serve)</span>' : ''}</td>
+    <td>${p.joined ? '<span class="cl-ok">node</span>' : (p.member ? (disc.auto_join ? '<span class="cl-dim">joining…</span>' : '<span class="cl-dim">auto-join off</span>') : '<span class="cl-dim">—</span>')}</td>
+    <td class="cl-dim">${Math.max(0, Math.round((Date.now()/1000) - p.seen))}s ago</td></tr>`).join('')
+    : '<tr><td colspan="7" class="dim">' + (disc.running ? 'No other coderai announcing on this link.' : '—') + '</td></tr>';
+
+  const usage = d.usage || {};
+  const byKey = usage.by_key || {}, byModel = usage.by_model || {};
+  const mins = s => (s >= 3600 ? (s/3600).toFixed(1) + ' h' : s >= 60 ? (s/60).toFixed(1) + ' min' : s.toFixed(1) + ' s');
+  const kv = o => Object.entries(o || {}).sort((a,b) => b[1]-a[1]).map(([k,v]) => esc(k) + ' ' + v).join(', ') || '—';
+  const keys = Object.entries(byKey).sort((a,b) => b[1].requests - a[1].requests);
+  document.getElementById('cl-usage-key').innerHTML = keys.length ? keys.map(([k, r]) => `<tr>
+    <td><b>${esc(k)}</b></td><td>${r.requests}</td><td>${r.errors ? '<span class="cl-bad">' + r.errors + '</span>' : 0}</td><td>${mins(r.seconds)}</td><td class="cl-dim">${kv(r.kinds)}</td><td class="cl-dim">${kv(r.engines)}</td></tr>`).join('')
+    : '<tr><td colspan="6" class="dim">No requests yet.</td></tr>';
+  const models = Object.entries(byModel).sort((a,b) => b[1].requests - a[1].requests);
+  document.getElementById('cl-usage-model').innerHTML = models.length ? models.map(([k, r]) => `<tr>
+    <td><b>${esc(k)}</b></td><td>${r.requests}</td><td>${r.errors ? '<span class="cl-bad">' + r.errors + '</span>' : 0}</td><td>${mins(r.seconds)}</td><td class="cl-dim">${kv(r.engines)}</td></tr>`).join('')
+    : '<tr><td colspan="5" class="dim">No requests yet.</td></tr>';
 
   document.getElementById('cl-engines').innerHTML = engines.length ? engines.map(e => `<tr>
     <td><b>${esc(e.name)}</b>${e.primary ? ' <span class="cl-dim">(primary)</span>' : ''}</td><td>${esc(e.backend)}</td>
@@ -157,6 +222,20 @@ async function clRefresh(){
     <td>${esc(p.model)}</td><td class="cl-dim">${esc(p.pod_id)}</td><td>${esc(p.gpu)}</td>
     <td>${esc(p.state)}${p.healthy ? ' <span class="cl-ok">healthy</span>' : ''}</td><td>${p.inflight || 0}</td><td>${p.hourly_usd != null ? '$' + p.hourly_usd : '—'}</td></tr>`).join('')
     : '<tr><td colspan="6" class="dim">None running.</td></tr>';
+}
+let _logNode = '';
+async function clLogs(node){
+  _logNode = node || '';
+  const box = document.getElementById('cl-logbox'), pre = document.getElementById('cl-log');
+  box.style.display = '';
+  document.getElementById('cl-log-title').textContent = node ? 'Log of node ' + node : "This front's log";
+  pre.textContent = 'loading…';
+  try {
+    const r = await fetch(ROOT_PATH + '/admin/api/cluster/logs?lines=300' + (node ? '&node=' + encodeURIComponent(node) : ''));
+    const d = await r.json();
+    pre.textContent = (d.error ? '[' + d.error + ']\n' : '') + (d.lines || []).join('\n');
+    pre.scrollTop = pre.scrollHeight;
+  } catch (e) { pre.textContent = 'error: ' + e.message; }
 }
 clRefresh();
 setInterval(clRefresh, 10000);

@@ -40,6 +40,10 @@ PORT="${CODERAI_PORT:-8776}"
 # Host interface the published port binds to. Empty = Docker's default (all
 # interfaces, 0.0.0.0). Set e.g. 127.0.0.1 to expose only on localhost.
 HOST_BIND="${CODERAI_HOST_BIND:-}"
+# --host-network: share the host's network namespace (no port mapping). Needed
+# for mDNS cluster discovery (link-local multicast never crosses the docker
+# bridge) and handy for RPC servers / Ray, whose ports then need no publishing.
+HOST_NETWORK="${CODERAI_HOST_NETWORK:-0}"
 # Extra CLI flags passed straight through to the coderai server inside the
 # container (via CODERAI_EXTRA_ARGS, appended by the in-image coderai launcher).
 # Built from --coderai-arg (repeatable, one token each) and --coderai-args "...".
@@ -148,6 +152,9 @@ Upgrade (refresh the in-image code instead of running the server):
   --host ADDR         Host interface to bind the published port to (e.g.
                       127.0.0.1 for localhost-only, 0.0.0.0 for all interfaces).
                       Default: Docker's default (all interfaces).
+  --host-network      Run on the host's network (docker --network host): the
+                      server listens on PORT directly, and mDNS cluster
+                      discovery, rpc-server and Ray ports work without mapping.
   --coderai-arg ARG   Pass one extra flag straight through to the coderai server
                       (e.g. --coderai-arg --some-flag). Repeatable; each ARG is a
                       single token (no embedded spaces).
@@ -245,6 +252,8 @@ while [[ $# -gt 0 ]]; do
     -p|--port)
       [[ $# -ge 2 ]] || { echo "Error: $1 requires a port" >&2; exit 2; }
       PORT="$2"; shift 2 ;;
+    --host-network)
+      HOST_NETWORK=1; shift ;;
     --host)
       [[ $# -ge 2 ]] || { echo "Error: --host requires an address" >&2; exit 2; }
       HOST_BIND="$2"; shift 2 ;;
@@ -458,7 +467,11 @@ if [[ -n "$HOST_BIND" ]]; then
 else
   PUBLISH="$PORT:8776"
 fi
-args=(run --rm --name "$NAME" --ipc=host -p "$PUBLISH" -e CODERAI_HOST=0.0.0.0 -e CODERAI_PORT=8776)
+if [[ "$HOST_NETWORK" == "1" ]]; then
+  args=(run --rm --name "$NAME" --ipc=host --network host -e CODERAI_HOST="${HOST_BIND:-0.0.0.0}" -e CODERAI_PORT="$PORT")
+else
+  args=(run --rm --name "$NAME" --ipc=host -p "$PUBLISH" -e CODERAI_HOST=0.0.0.0 -e CODERAI_PORT=8776)
+fi
 # Forward a HuggingFace token from the host env so the engines authenticate to the
 # HF Hub (higher rate limits + gated models) instead of sending unauthenticated
 # requests. huggingface_hub auto-reads these; no-op when unset.

@@ -45,3 +45,4 @@ bitsandbytes>=0.43.0
 # torchcodec — which arrives as a transitive dependency of f5-tts — then fails
 # to load with a message that blames FFmpeg and the torch version. It is neither.
 nvidia-npp-cu12
+zeroconf>=0.130
