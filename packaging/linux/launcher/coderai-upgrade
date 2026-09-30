@@ -20,7 +20,9 @@
 #
 # Configuration (all optional; the host runner passes these as env):
 #   CODERAI_UPGRADE_REPO   git URL to fetch (https or ssh). Default: the nexlab
-#                          HTTPS repo, or its SSH form when a key is provided.
+#                          HTTPS repo, or its SSH form when a key is provided;
+#                          when THAT default is unreachable (expired cert, DNS,
+#                          outage) the public GitHub mirror is used instead.
 #   CODERAI_UPGRADE_REF    branch/tag/commit to fetch. Default: production.
 #   CODERAI_UPGRADE_FORCE  "1" to upgrade even if not strictly newer.
 #   CODERAI_UPGRADE_SSH_KEY  path (inside the container) to an SSH private key;
@@ -30,6 +32,12 @@ set -euo pipefail
 APP_DIR="/opt/coderai/app"
 DEFAULT_HTTPS_REPO="https://git.nexlab.net/nexlab/coderai.git"
 DEFAULT_SSH_REPO="git@git.nexlab.net:nexlab/coderai.git"
+# The public mirror, tried when the default remote cannot be reached at all —
+# an expired certificate or a DNS/outage on one host must not make --upgrade
+# impossible, least of all for someone running the published image who has no
+# stake in that host. Only used as a FALLBACK to the defaults above: a repo the
+# operator named explicitly is never silently replaced.
+MIRROR_REPO="https://github.com/nextime/coderai.git"
 
 REF="${CODERAI_UPGRADE_REF:-production}"
 FORCE="${CODERAI_UPGRADE_FORCE:-0}"
@@ -42,8 +50,10 @@ PYBIN="/opt/coderai/python/bin/python3"
 
 # Pick the default repo form to match the auth method: SSH URL when a key was
 # supplied, HTTPS otherwise. An explicit CODERAI_UPGRADE_REPO always wins.
+REPO_EXPLICIT=0
 if [[ -n "${CODERAI_UPGRADE_REPO:-}" ]]; then
   REPO="$CODERAI_UPGRADE_REPO"
+  REPO_EXPLICIT=1
 elif [[ -n "$SSH_KEY" ]]; then
   REPO="$DEFAULT_SSH_REPO"
 else
@@ -85,12 +95,17 @@ vercmp() {
 # stripped so the diff below reflects real dependency changes, not formatting.
 reqs_content() {
   local d="$1"
+  # `set -o pipefail` is on, so every stage's status counts: a tree without
+  # requirements-oci.txt made the group exit 1 and killed the whole upgrade one
+  # line after "upgrading x -> y" with no message at all. A missing file and an
+  # empty result are both valid answers here.
   { [[ -f "$d/requirements.txt" ]] && cat "$d/requirements.txt"
     [[ -f "$d/packaging/common/requirements-oci.txt" ]] \
       && grep -vE '^[[:space:]]*-r[[:space:]]' "$d/packaging/common/requirements-oci.txt"
+    true
   } 2>/dev/null \
     | sed 's/#.*//' | sed 's/[[:space:]]*$//' \
-    | grep -vE '^[[:space:]]*$' | sort -u
+    | { grep -vE '^[[:space:]]*$' || true; } | sort -u
 }
 
 # Refresh the launcher scripts and service configs that live OUTSIDE the app tree
@@ -161,21 +176,57 @@ cleanup(){ rm -rf "$WORK"; }
 trap cleanup EXIT
 
 log "fetching '$REF'…"
+
 # Shallow single-branch clone: minimal transfer, no history. A ref that is a tag
 # or bare commit also works with --branch for tags; for a raw commit we fall back
 # to a full-ish fetch.
-if ! git clone --depth 1 --branch "$REF" --single-branch "$REPO" "$WORK/src" 2>"$WORK/clone.err"; then
-  if grep -qiE "Could not find remote branch|not found in upstream" "$WORK/clone.err"; then
-    log "ref '$REF' is not a branch/tag; trying to fetch it as a commit…"
+clone_from() {   # clone_from <repo> <errfile> -> 0 ok, 1 unreachable, 2 no such ref
+  local repo="$1" err="$2"
+  rm -rf "$WORK/src"
+  if git clone --depth 1 --branch "$REF" --single-branch "$repo" "$WORK/src" 2>"$err"; then
+    return 0
+  fi
+  if grep -qiE "Could not find remote branch|not found in upstream" "$err"; then
+    log "ref '$REF' is not a branch/tag on $repo; trying to fetch it as a commit…"
+    rm -rf "$WORK/src"
     git init -q "$WORK/src"
-    git -C "$WORK/src" remote add origin "$REPO"
-    git -C "$WORK/src" fetch -q --depth 1 origin "$REF" || { cat "$WORK/clone.err" >&2; die "fetch of ref '$REF' failed"; }
-    git -C "$WORK/src" checkout -q FETCH_HEAD
+    git -C "$WORK/src" remote add origin "$repo"
+    if git -C "$WORK/src" fetch -q --depth 1 origin "$REF" 2>>"$err"; then
+      git -C "$WORK/src" checkout -q FETCH_HEAD
+      return 0
+    fi
+    return 2
+  fi
+  return 1
+}
+
+# NOTE: `if ! cmd; then rc=$?` captures the status of the NEGATION (0 when the
+# command failed), not the command's — which is exactly how the fallback below
+# was first written, and why it never ran. Capture it with `|| rc=$?`.
+rc=0
+clone_from "$REPO" "$WORK/clone.err" || rc=$?
+if [[ "$rc" -ne 0 ]]; then
+  # A TLS/DNS/connection problem with the default remote is not the operator's
+  # fault and not a reason to give up: the public mirror carries the same
+  # production branch. A ref that simply does not exist IS a reason to stop.
+  if [[ "$rc" -eq 1 && "$REPO_EXPLICIT" -eq 0 && "$REPO" != "$MIRROR_REPO" && -z "$SSH_KEY" ]]; then
+    log "cannot reach $REPO:"
+    sed 's/^/[upgrade]   /' "$WORK/clone.err" >&2
+    log "falling back to the public mirror $MIRROR_REPO …"
+    if ! clone_from "$MIRROR_REPO" "$WORK/clone2.err"; then
+      cat "$WORK/clone.err" "$WORK/clone2.err" >&2
+      die "neither $REPO nor the mirror could be cloned (network? proxy? wrong ref '$REF'?)"
+    fi
+    REPO="$MIRROR_REPO"
   else
     cat "$WORK/clone.err" >&2
-    die "clone failed (auth? network? wrong repo/ref?)"
+    if [[ "$rc" -eq 2 ]]; then
+      die "ref '$REF' does not exist on $REPO (use CODERAI_UPGRADE_REF / --upgrade-ref)"
+    fi
+    die "clone of $REPO failed (auth? network? certificate? use --upgrade-repo to name another)"
   fi
 fi
+log "source used:       $REPO"
 
 NEW_VER="$(read_version "$WORK/src/codai/__init__.py" || true)"
 [[ -n "$NEW_VER" ]] || die "fetched tree has no codai/__init__.py __version__"

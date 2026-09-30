@@ -131,7 +131,9 @@ Upgrade (refresh the in-image code instead of running the server):
                       not strictly newer than what's installed.
   --upgrade-ref REF   Branch/tag/commit to upgrade to (default: production).
   --upgrade-repo URL  Git URL to fetch from (default: the nexlab HTTPS repo, or
-                      its SSH form when --ssh-key is given).
+                      its SSH form when --ssh-key is given; if that default
+                      cannot be reached — expired certificate, DNS, outage — the
+                      public GitHub mirror is used automatically).
   --ssh-key PATH      Host path to an SSH private key; mounted into the upgrade
                       container so git can authenticate over SSH.
   --no-pip            With --upgrade, refresh the code only; do not re-run pip
